@@ -1,0 +1,24 @@
+[package]
+name = "newt-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "Newt-Agent core types, errors, and the NeMoCode-style tier router"
+keywords = ["newt", "agent", "router", "llm", "nemo"]
+categories = ["api-bindings", "text-processing"]
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+# TODO: depend on thoon-core once it publishes (currently path-only in hermes-thoon).
+# thoon-core = "0.5"
+
+[lints]
+workspace = true
