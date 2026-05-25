@@ -1,0 +1,24 @@
+[package]
+name = "newt-tui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "Newt-Agent TUI surfaces (ratatui): code mode + pilot mode"
+keywords = ["newt", "agent", "tui", "ratatui"]
+categories = ["command-line-interface"]
+
+[dependencies]
+newt-core.workspace = true
+newt-inference.workspace = true
+newt-tools.workspace = true
+anyhow.workspace = true
+ratatui.workspace = true
+crossterm.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

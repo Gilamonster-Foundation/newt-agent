@@ -1,0 +1,75 @@
+[workspace]
+resolver = "2"
+members = [
+    "newt-core",
+    "newt-inference",
+    "newt-tools",
+    "newt-tui",
+    "newt-acp-worker",
+    "newt-mcp-server",
+    "newt-cli",
+    "plugins-protocol",
+]
+
+[workspace.package]
+# Kyln versioning: 0.{month}.{YYYYMMDD}
+version = "0.5.20260525"
+edition = "2021"
+rust-version = "1.75"
+license = "Apache-2.0"
+repository = "https://github.com/hartsock/newt-agent"
+homepage = "https://github.com/hartsock/newt-agent"
+authors = ["Shawn Hartsock <hartsock@users.noreply.github.com>"]
+
+[workspace.dependencies]
+# Core utilities
+anyhow = "1.0"
+thiserror = "2.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+chrono = { version = "0.4", features = ["serde"] }
+toml = "1.0"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+
+# HTTP for local inference backends
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# JSON-RPC for ACP / MCP / provider-plugin protocols
+jsonrpc-core = "18"
+
+# TUI (only newt-tui pulls this)
+ratatui = "0.29"
+crossterm = "0.28"
+
+# Internal crates — pinned with = for lock-step publishing
+newt-core         = { path = "newt-core",         version = "=0.5.20260525" }
+newt-inference    = { path = "newt-inference",    version = "=0.5.20260525" }
+newt-tools        = { path = "newt-tools",        version = "=0.5.20260525" }
+newt-tui          = { path = "newt-tui",          version = "=0.5.20260525" }
+newt-acp-worker   = { path = "newt-acp-worker",   version = "=0.5.20260525" }
+newt-mcp-server   = { path = "newt-mcp-server",   version = "=0.5.20260525" }
+plugins-protocol  = { path = "plugins-protocol",  version = "=0.5.20260525" }
+
+[workspace.lints.clippy]
+explicit_iter_loop            = "warn"
+flat_map_option               = "warn"
+implicit_clone                = "warn"
+needless_for_each             = "warn"
+semicolon_if_nothing_returned = "warn"
+uninlined_format_args         = "warn"
+useless_conversion            = "warn"
+use_self                      = "warn"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
