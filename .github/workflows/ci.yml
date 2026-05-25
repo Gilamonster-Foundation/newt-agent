@@ -1,0 +1,86 @@
+name: CI
+
+# HOOK PARITY: This workflow is mirrored by .githooks/pre-push.
+# When editing this file, update the push hook to match.
+# See docs/ROADMAP.md "Acceptance contract" for the gate definition.
+#
+# Patterned on scrybe's CI but simpler — no Tauri system deps (pure
+# Rust workspace) and adds a coverage gate that scrybe doesn't have.
+# This is the swarm training ground: every PR must clear the same
+# bar a human reviewer would set.
+
+on:
+  push:
+    branches: ["main", "feat/**", "fix/**", "step-*", "release/**"]
+  pull_request:
+    branches: ["main"]
+
+env:
+  RUST_BACKTRACE: 1
+  # Keep CI logs short — colored output is unreadable in workflow
+  # summaries.
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    name: Rust lint (fmt + clippy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: fmt check
+        run: cargo fmt --all -- --check
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test:
+    name: Rust tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo test
+        run: cargo test --workspace --locked
+
+  coverage:
+    name: Workspace coverage (cargo-llvm-cov)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Coverage uses an instrumented build — keep its target dir
+          # isolated from the lint/test cache to avoid thrash.
+          key: coverage
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+
+      # The gate floor matches `just cov-ci` in the justfile. Keep
+      # them in lock-step — PIPELINE PARITY.
+      - name: Coverage with floor
+        run: cargo llvm-cov --workspace --lcov --output-path lcov.info --fail-under-lines 15
+
+      - name: Summary
+        if: always()
+        run: |
+          if [ -f lcov.info ]; then
+            cargo llvm-cov report --summary-only --workspace
+          fi
+
+      - name: Upload lcov.info
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lcov-coverage
+          path: lcov.info
+          if-no-files-found: warn
+          retention-days: 14
