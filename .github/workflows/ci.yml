@@ -73,7 +73,7 @@ jobs:
         if: always()
         run: |
           if [ -f lcov.info ]; then
-            cargo llvm-cov report --summary-only --workspace
+            cargo llvm-cov report --summary-only
           fi
 
       - name: Upload lcov.info
