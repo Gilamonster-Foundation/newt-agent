@@ -54,8 +54,12 @@ level, not by a runtime feature flag.
 
 ## Status
 
-v0.x — workspace scaffold landed; v0.1 (`newt worker` + `LocalOllamaBackend`)
-is the next slice. See the working plan at
+v0.x — workspace scaffold landed; building toward v0.1 (`newt worker` +
+`LocalOllamaBackend` end-to-end).
+
+The work is broken into ~33 drake-flight-sized steps in
+[`docs/ROADMAP.md`](./docs/ROADMAP.md). Each step is one PR, fully tested,
+≥80% coverage. See the working design at
 `~/.claude/plans/flickering-fluttering-otter.md` (internal).
 
 ## License
