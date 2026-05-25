@@ -1,7 +1,7 @@
 # Newt-Agent
 
 <p align="center">
-  <img src="docs/logos/newt-agent-logo_256.png" alt="Newt-Agent logo" width="256" height="256" />
+  <img src="docs/logos/newt-agent-logo_source.png" alt="Newt-Agent logo" width="256" />
 </p>
 
 > Small, fast, local-first agentic coder.
