@@ -3,6 +3,10 @@
 **/*.rs.bk
 Cargo.lock.bak
 
+# Coverage output (Step 0.1 — justfile cov / cov-ci targets)
+/lcov.info
+/llvm-cov-*.profraw
+
 # Python / maturin
 __pycache__/
 *.py[cod]

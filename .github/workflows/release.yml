@@ -1,0 +1,200 @@
+name: Release
+
+# Patterned on scrybe's release.yml but simpler:
+#  - No Tauri/desktop app stage (newt-agent ships CLI binaries only)
+#  - No maturin wheels (no PyO3 bindings in v0; reserved for Phase 11)
+#  - Two binaries (`newt`, `newt-mcp-server`) cross-compiled to three OSes
+#  - crates.io publish is sequenced topologically per the internal
+#    dep graph in workspace Cargo.toml
+#
+# Triggers:
+#  - Tag push `v*`           → full release: build binaries + publish crates
+#  - Branch push `release/**` → build binaries only (publish to crates.io
+#                                 is tag-gated to prevent accidental
+#                                 publication)
+#
+# CARGO_REGISTRY_TOKEN must be configured as a repo secret before the
+# first `v*` tag. Until then the publish job will fail and the binaries
+# stage still ships the GitHub release.
+
+on:
+  push:
+    tags:
+      - "v*"
+    branches:
+      - "release/**"
+
+permissions:
+  contents: write   # `gh release create` + binary asset upload
+
+env:
+  RUST_BACKTRACE: 1
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ── Build cross-platform binaries ──────────────────────────────────────
+
+  build-binaries:
+    name: Build (${{ matrix.label }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            label: linux-x86_64
+            archive_ext: tar.gz
+          - platform: macos-latest
+            target: aarch64-apple-darwin
+            label: macos-arm64
+            archive_ext: tar.gz
+          - platform: windows-latest
+            target: x86_64-pc-windows-msvc
+            label: windows-x86_64
+            archive_ext: zip
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Build binaries
+        run: |
+          cargo build --release --locked --target ${{ matrix.target }} -p newt-cli -p newt-mcp-server
+
+      # Bundle the binaries + the workspace LICENSE + README into a
+      # single archive per platform. Naming pattern:
+      #   newt-agent-<version>-<label>.{tar.gz,zip}
+      # where <version> = the tag for v* pushes, or the branch for
+      # release/** pushes (e.g. release-2026-05-25).
+      - name: Stage release contents (Unix)
+        if: matrix.platform != 'windows-latest'
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME//\//-}"
+          STAGE="newt-agent-${VERSION}-${{ matrix.label }}"
+          mkdir -p "$STAGE"
+          cp target/${{ matrix.target }}/release/newt "$STAGE/"
+          cp target/${{ matrix.target }}/release/newt-mcp-server "$STAGE/"
+          cp LICENSE README.md "$STAGE/"
+          tar -czf "$STAGE.tar.gz" "$STAGE"
+          echo "ARCHIVE=$STAGE.tar.gz" >> "$GITHUB_ENV"
+
+      - name: Stage release contents (Windows)
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        run: |
+          $VERSION = "${env:GITHUB_REF_NAME}" -replace '/', '-'
+          $STAGE = "newt-agent-$VERSION-${{ matrix.label }}"
+          New-Item -ItemType Directory -Path $STAGE
+          Copy-Item "target/${{ matrix.target }}/release/newt.exe" $STAGE/
+          Copy-Item "target/${{ matrix.target }}/release/newt-mcp-server.exe" $STAGE/
+          Copy-Item LICENSE, README.md $STAGE/
+          Compress-Archive -Path $STAGE -DestinationPath "$STAGE.zip"
+          echo "ARCHIVE=$STAGE.zip" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Upload archive artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: newt-agent-${{ matrix.label }}
+          path: ${{ env.ARCHIVE }}
+          if-no-files-found: error
+          retention-days: 30
+
+  # ── GitHub release (tag-only) ─────────────────────────────────────────
+
+  github-release:
+    name: GitHub release (${{ github.ref_name }})
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [build-binaries]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download all binary artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: all-artifacts/
+      - name: Collect archives
+        run: |
+          mkdir -p dist
+          find all-artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' \) -exec cp {} dist/ \;
+          ls -la dist/
+      - name: Create or update release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: "Newt-Agent ${{ github.ref_name }}"
+          draft: true
+          prerelease: false
+          generate_release_notes: true
+          files: dist/*
+
+  # ── Publish to crates.io (tag-only, sequenced topologically) ──────────
+  #
+  # Tag-only — release/** branch pushes build binaries only. Once a
+  # version lands on crates.io it cannot be re-uploaded under the same
+  # version (only yanked), so accidental publication from a branch push
+  # would be costly to undo.
+  #
+  # Order is the topological sort of the internal dep graph in
+  # workspace Cargo.toml. `cargo publish` blocks until the new version
+  # is live on the registry index, so this serial chain is safe.
+  #
+  #     newt-core        plugins-protocol     ← leaves (independent)
+  #          \                /
+  #         newt-inference   newt-tools
+  #              \    \    /
+  #               \    \  /
+  #               newt-tui   newt-acp-worker   newt-mcp-server
+  #                          \      |      /
+  #                            newt-cli
+
+  publish-crates:
+    name: Publish ${{ matrix.crate }} → crates.io
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [build-binaries]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false   # leaves keep going if one fails
+      max-parallel: 1    # but ONE at a time — internal deps need order
+      matrix:
+        # Iterated in array order; matrix runs serially per
+        # max-parallel: 1, so this IS the topological sequence.
+        crate:
+          - newt-core
+          - plugins-protocol
+          - newt-inference
+          - newt-tools
+          - newt-tui
+          - newt-acp-worker
+          - newt-mcp-server
+          - newt-cli
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: publish-${{ matrix.crate }}
+
+      - name: Confirm CARGO_REGISTRY_TOKEN is mounted
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          if [ -z "${CARGO_REGISTRY_TOKEN}" ]; then
+            echo "::error::CARGO_REGISTRY_TOKEN repo secret not set — add it under Settings → Secrets and variables → Actions before the first release tag"
+            exit 1
+          fi
+          echo "CARGO_REGISTRY_TOKEN: present (${#CARGO_REGISTRY_TOKEN} chars)"
+
+      - name: cargo publish ${{ matrix.crate }}
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        # --locked so Cargo.lock drift fails the publish
+        # --no-verify so the publish doesn't re-build everything from the
+        # extracted tarball (ci.yml already exercised the same code on
+        # this commit; we don't need a third compile).
+        run: cargo publish -p ${{ matrix.crate }} --locked --no-verify
