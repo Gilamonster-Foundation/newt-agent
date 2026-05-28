@@ -75,10 +75,7 @@ impl McpServer {
             };
 
             let id = request.get("id").cloned().unwrap_or(Value::Null);
-            let method = request
-                .get("method")
-                .and_then(|m| m.as_str())
-                .unwrap_or("");
+            let method = request.get("method").and_then(|m| m.as_str()).unwrap_or("");
             let params = request.get("params").cloned().unwrap_or(Value::Null);
 
             let response = match self.handlers.get(method) {
@@ -129,10 +126,7 @@ mod tests {
         let input = format!("{}\n", serde_json::to_string(request).unwrap());
         let mut output: Vec<u8> = Vec::new();
 
-        server
-            .run(input.as_bytes(), &mut output)
-            .await
-            .unwrap();
+        server.run(input.as_bytes(), &mut output).await.unwrap();
 
         let response_str = String::from_utf8(output).unwrap();
         serde_json::from_str(response_str.trim()).unwrap()
@@ -142,10 +136,7 @@ mod tests {
     async fn roundtrip_raw(server: &McpServer, raw: &str) -> Value {
         let mut output: Vec<u8> = Vec::new();
 
-        server
-            .run(raw.as_bytes(), &mut output)
-            .await
-            .unwrap();
+        server.run(raw.as_bytes(), &mut output).await.unwrap();
 
         let response_str = String::from_utf8(output).unwrap();
         serde_json::from_str(response_str.trim()).unwrap()
