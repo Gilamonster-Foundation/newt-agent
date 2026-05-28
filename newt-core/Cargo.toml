@@ -17,6 +17,7 @@ serde_json.workspace = true
 thiserror.workspace = true
 toml.workspace = true
 tracing.workspace = true
+uuid.workspace = true
 
 # TODO: depend on thoon-core once it publishes (currently path-only in hermes-thoon).
 # thoon-core = "0.5"
