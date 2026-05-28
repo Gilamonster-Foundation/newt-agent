@@ -70,6 +70,23 @@ cov:
 cov-ci:
     cargo llvm-cov --workspace --lcov --output-path lcov.info --fail-under-lines 15
 
+# --- Evaluation ---
+
+# Run the end-to-end eval suite against a real local Ollama.
+#
+# Mock-mode runs in CI via `cargo test -p newt-eval --test mock_e2e`;
+# `just eval` is the opt-in live-mode entry point developers use to
+# track regressions against an actual model. Pass extra `newt-eval run`
+# args after the recipe, e.g.:
+#
+#   just eval                           # all bundled cases
+#   just eval --case 001                # only the rename-function case
+#   just eval --model llama3.1:8b       # pick a specific model
+eval *ARGS:
+    cargo build --release --bin newt
+    cargo build --release --bin newt-eval
+    ./target/release/newt-eval run --mode live {{ARGS}}
+
 # --- Hook installation ---
 
 # Point this repo at .githooks/ for pre-push gating.
