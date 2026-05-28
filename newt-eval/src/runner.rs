@@ -186,8 +186,11 @@ fn spawn_worker(config: &RunnerConfig) -> anyhow::Result<Child> {
         cmd.env("OLLAMA_HOST", url);
     }
 
-    // Quieter logs in eval runs — the worker is chatty at info level.
-    cmd.env("RUST_LOG", "warn");
+    // The worker's tracing_subscriber writes to STDOUT, which is also
+    // the ACP wire — any log line would corrupt JSON-RPC parsing. So
+    // we silence the worker entirely. (Live-mode users who want logs
+    // can run the worker by hand outside the eval harness.)
+    cmd.env("RUST_LOG", "off");
 
     cmd.spawn()
         .map_err(|e| anyhow::anyhow!("spawn {}: {e}", config.worker_bin.display()))
