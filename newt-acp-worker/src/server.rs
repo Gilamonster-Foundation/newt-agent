@@ -38,10 +38,24 @@ pub struct AcpServer {
     backend: Arc<dyn newt_inference::InferenceBackend>,
 }
 
-/// Structured reply for a `prompt` turn.
+/// Structured reply for one `prompt` turn.
 ///
-/// `model_id` is non-Option so it cannot be silently omitted.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// # Contract
+///
+/// Per workspace memory `feedback_drake_patch_not_prose` and
+/// `feedback_empty_diff_is_a_crash`:
+///
+/// - `model_id` is **mandatory**. It is a non-Option `String` so the
+///   field cannot be silently omitted from the wire format. Use
+///   [`TaskReply::new`] for the validated constructor that rejects an
+///   empty `model_id` — foreman uses this field to attribute the
+///   patch and update the model's scorecard, so a missing id is
+///   non-recoverable.
+/// - `empty_diff: true` means the worker produced no real edits and
+///   foreman should disqualify it pre-arbiter.
+/// - `diff_applied: true` means a unified diff was found in `content`
+///   and `newt_tools::apply_patch` accepted it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TaskReply {
     /// MANDATORY — the model that produced this reply.
     pub model_id: String,
@@ -54,6 +68,31 @@ pub struct TaskReply {
     /// True if a unified diff was detected in `content` and applied
     /// successfully.
     pub diff_applied: bool,
+}
+
+impl TaskReply {
+    /// Validated constructor. Rejects an empty `model_id` so a buggy
+    /// backend can't silently produce an unattributable reply.
+    pub fn new(
+        model_id: impl Into<String>,
+        content: impl Into<String>,
+        diff: impl Into<String>,
+        diff_applied: bool,
+    ) -> anyhow::Result<Self> {
+        let model_id = model_id.into();
+        if model_id.is_empty() {
+            anyhow::bail!("TaskReply.model_id is mandatory and must not be empty");
+        }
+        let diff = diff.into();
+        let empty_diff = crate::diff::is_empty_diff(&diff);
+        Ok(Self {
+            model_id,
+            content: content.into(),
+            diff,
+            empty_diff,
+            diff_applied,
+        })
+    }
 }
 
 impl AcpServer {
@@ -192,10 +231,10 @@ impl AcpServer {
     /// `prompt` — run one inference turn against the session's workspace.
     ///
     /// Sends the prompt to the configured backend, optionally applies a
-    /// unified diff returned by the model, and returns a [`TaskReply`]
-    /// carrying the (mandatory) `model_id` plus assistant content. Diff
-    /// capture lands in Step 9.4; for Step 9.3 the returned reply has
-    /// an empty `diff` field.
+    /// unified diff returned by the model, captures the post-turn
+    /// workspace diff, and returns a [`TaskReply`] carrying the
+    /// (mandatory) `model_id`, assistant content, captured diff, and
+    /// `empty_diff` / `diff_applied` flags.
     async fn handle_prompt(&self, params: Value) -> anyhow::Result<Value> {
         let session_id: SessionId = params
             .get("session_id")
@@ -244,15 +283,13 @@ impl AcpServer {
         // binary can translate `empty_diff: true` into a non-zero
         // exit when running `newt worker --once`).
         let diff = crate::diff::capture_diff(&session.workspace_path)?;
-        let empty_diff = crate::diff::is_empty_diff(&diff);
 
-        let task_reply = TaskReply {
-            model_id: reply.model_id,
-            content: reply.content,
-            diff,
-            empty_diff,
-            diff_applied,
-        };
+        let task_reply = TaskReply::new(reply.model_id, reply.content, diff, diff_applied)
+            .map_err(|e| {
+                // If the backend handed us an empty model_id, fail
+                // loudly — foreman cannot attribute the patch.
+                anyhow::anyhow!("backend returned malformed reply: {e}")
+            })?;
         Ok(serde_json::to_value(task_reply)?)
     }
 }
@@ -283,4 +320,65 @@ fn error_response(id: Value, code: i32, message: &str) -> Value {
         "id": id,
         "error": { "code": code, "message": message },
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn task_reply_rejects_empty_model_id() {
+        let err = TaskReply::new("", "content", "", false).unwrap_err();
+        assert!(
+            err.to_string().contains("mandatory"),
+            "expected mandatory-id error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn task_reply_accepts_nonempty_model_id() {
+        let r = TaskReply::new("qwen2.5-coder:32b", "hi", "", false).unwrap();
+        assert_eq!(r.model_id, "qwen2.5-coder:32b");
+        assert_eq!(r.content, "hi");
+    }
+
+    #[test]
+    fn task_reply_sets_empty_diff_from_diff_string() {
+        let r = TaskReply::new("m", "c", "", false).unwrap();
+        assert!(r.empty_diff);
+
+        let r = TaskReply::new("m", "c", "real\nchanges\n", true).unwrap();
+        assert!(!r.empty_diff);
+    }
+
+    #[test]
+    fn task_reply_serde_round_trip_preserves_model_id() {
+        let r = TaskReply::new("m", "c", "d\n", true).unwrap();
+        let json = serde_json::to_string(&r).unwrap();
+        // The wire format must always include model_id.
+        assert!(json.contains("\"model_id\":\"m\""));
+        let back: TaskReply = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, r);
+    }
+
+    #[test]
+    fn task_reply_deserialize_without_model_id_fails() {
+        // Direct serde deserialization of a payload missing model_id
+        // must fail — the field is required.
+        let bad = r#"{"content":"c","diff":"","empty_diff":true,"diff_applied":false}"#;
+        let err = serde_json::from_str::<TaskReply>(bad).unwrap_err();
+        assert!(
+            err.to_string().contains("model_id"),
+            "expected missing-model_id error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn looks_like_unified_diff_detects_headers() {
+        assert!(looks_like_unified_diff(
+            "--- a/f\n+++ b/f\n@@ -1,1 +1,1 @@\n-a\n+b\n"
+        ));
+        assert!(!looks_like_unified_diff("just prose"));
+        assert!(!looks_like_unified_diff("--- only the old header"));
+    }
 }
