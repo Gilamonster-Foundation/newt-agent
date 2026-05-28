@@ -18,8 +18,12 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+regex.workspace = true
 
 # TODO: depend on thoon-fileops + thoon-toolreg once published.
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true
