@@ -10,6 +10,19 @@
 //!   against the model's scorecard.
 //! - `TaskReply.model_id` is mandatory.
 
+mod diff;
+mod server;
+
+pub use diff::{capture_diff, is_empty_diff};
+pub use server::{AcpServer, Session, TaskReply};
+
+/// Spawn the default ACP worker over stdio.
+///
+/// Discovers a local Ollama endpoint (per `LocalOllamaBackend::discover`)
+/// using the default model `llama3.1:8b` and runs the server until stdin
+/// closes.
 pub async fn run_stdio() -> anyhow::Result<()> {
-    anyhow::bail!("newt-acp-worker::run_stdio not yet implemented")
+    let backend = newt_inference::local::LocalOllamaBackend::discover("llama3.1:8b").await?;
+    let server = AcpServer::new(std::sync::Arc::new(backend));
+    server.run_stdio().await
 }
