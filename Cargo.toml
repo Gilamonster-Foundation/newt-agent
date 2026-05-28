@@ -38,6 +38,10 @@ toml = "1.0"
 tokio = { version = "1", features = ["full"] }
 async-trait = "0.1"
 
+# Streaming
+futures-core = "0.3"
+tokio-stream = "0.1"
+
 # HTTP for local inference backends
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 

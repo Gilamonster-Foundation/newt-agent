@@ -22,6 +22,8 @@ serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+futures-core.workspace = true
+tokio-stream.workspace = true
 
 [dev-dependencies]
 tests-common = { path = "../tests/common" }

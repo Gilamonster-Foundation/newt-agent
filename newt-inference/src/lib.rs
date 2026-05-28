@@ -11,6 +11,8 @@ pub mod backend;
 pub mod local;
 pub mod provider_plugin;
 pub mod registry;
+pub mod stream;
 
 pub use backend::{ChatReply, ChatRequest, InferenceBackend};
 pub use registry::BackendRegistry;
+pub use stream::{ChatChunk, ChatStream};
