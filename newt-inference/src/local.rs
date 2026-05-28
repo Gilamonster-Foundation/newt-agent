@@ -6,6 +6,7 @@ use newt_core::router::Tier;
 
 use crate::backend::{ChatReply, ChatRequest, InferenceBackend};
 
+#[derive(Debug)]
 pub struct LocalOllamaBackend {
     endpoint: String,
     model: String,
@@ -21,6 +22,11 @@ impl LocalOllamaBackend {
         }
     }
 
+    /// Return the configured endpoint URL.
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
     /// Override the HTTP client timeout. Useful for testing.
     pub fn with_timeout(mut self, timeout: std::time::Duration) -> Self {
         self.client = reqwest::Client::builder()
@@ -28,6 +34,58 @@ impl LocalOllamaBackend {
             .build()
             .expect("build client");
         self
+    }
+
+    /// Try endpoints in order, return the first reachable one.
+    /// Reachability = GET /api/tags returns 2xx within 500ms.
+    /// Checks `OLLAMA_HOST` env var first, then the default endpoint list.
+    pub async fn discover(model: &str) -> anyhow::Result<Self> {
+        Self::discover_with_candidates(model, &Self::default_endpoints()).await
+    }
+
+    /// Like [`discover`](Self::discover), but with a caller-supplied candidate
+    /// list instead of the built-in defaults. `OLLAMA_HOST` is still checked
+    /// first.
+    pub async fn discover_with_candidates(
+        model: &str,
+        candidates: &[String],
+    ) -> anyhow::Result<Self> {
+        let probe_client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(500))
+            .build()?;
+
+        if let Ok(host) = std::env::var("OLLAMA_HOST") {
+            if Self::probe(&probe_client, &host).await {
+                return Ok(Self::new(host, model));
+            }
+        }
+
+        for endpoint in candidates {
+            if Self::probe(&probe_client, endpoint).await {
+                return Ok(Self::new(endpoint, model));
+            }
+        }
+
+        anyhow::bail!("no reachable Ollama endpoint found")
+    }
+
+    /// The built-in fallback endpoint list for [`discover`](Self::discover).
+    pub fn default_endpoints() -> Vec<String> {
+        vec![
+            "http://ollama-proxy.inference.svc.cluster.local:11434".to_string(),
+            "http://ollama.home.lab:11434".to_string(),
+            "http://dgx-ollama.home.lab:11434".to_string(),
+            "http://gnuc-ollama.home.lab:11434".to_string(),
+            "http://127.0.0.1:11434".to_string(),
+        ]
+    }
+
+    async fn probe(client: &reqwest::Client, endpoint: &str) -> bool {
+        let url = format!("{}/api/tags", endpoint.trim_end_matches('/'));
+        match client.get(&url).send().await {
+            Ok(resp) => resp.status().is_success(),
+            Err(_) => false,
+        }
     }
 }
 
