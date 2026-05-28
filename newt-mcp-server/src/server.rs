@@ -154,7 +154,7 @@ mod tests {
     #[tokio::test]
     async fn echo_handler() {
         let mut server = McpServer::new();
-        server.register("echo", |params| Ok(params));
+        server.register("echo", Ok);
 
         let request = serde_json::json!({
             "jsonrpc": "2.0",
