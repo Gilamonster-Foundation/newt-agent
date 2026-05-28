@@ -29,9 +29,16 @@ newt-acp-worker.workspace = true
 newt-mcp-server.workspace = true
 anyhow.workspace = true
 clap.workspace = true
+reqwest.workspace = true
 tokio.workspace = true
+toml.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[dev-dependencies]
+assert_cmd.workspace = true
+predicates.workspace = true
+tempfile.workspace = true
 
 [lints]
 workspace = true
