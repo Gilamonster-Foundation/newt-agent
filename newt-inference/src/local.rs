@@ -40,7 +40,8 @@ impl LocalOllamaBackend {
     /// Reachability = GET /api/tags returns 2xx within 500ms.
     /// Checks `OLLAMA_HOST` env var first, then the default endpoint list.
     pub async fn discover(model: &str) -> anyhow::Result<Self> {
-        Self::discover_with_candidates(model, &Self::default_endpoints()).await
+        let env_host = std::env::var("OLLAMA_HOST").ok();
+        Self::discover_inner(model, env_host.as_deref(), &Self::default_endpoints()).await
     }
 
     /// Like [`discover`](Self::discover), but with a caller-supplied candidate
@@ -50,12 +51,32 @@ impl LocalOllamaBackend {
         model: &str,
         candidates: &[String],
     ) -> anyhow::Result<Self> {
+        let env_host = std::env::var("OLLAMA_HOST").ok();
+        Self::discover_inner(model, env_host.as_deref(), candidates).await
+    }
+
+    /// Like [`discover`](Self::discover), but with an explicit env-host
+    /// override and candidate list. Useful for testing without mutating
+    /// process-global environment variables.
+    pub async fn discover_with_env(
+        model: &str,
+        env_host: Option<&str>,
+        candidates: &[String],
+    ) -> anyhow::Result<Self> {
+        Self::discover_inner(model, env_host, candidates).await
+    }
+
+    async fn discover_inner(
+        model: &str,
+        env_host: Option<&str>,
+        candidates: &[String],
+    ) -> anyhow::Result<Self> {
         let probe_client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_millis(500))
             .build()?;
 
-        if let Ok(host) = std::env::var("OLLAMA_HOST") {
-            if Self::probe(&probe_client, &host).await {
+        if let Some(host) = env_host {
+            if Self::probe(&probe_client, host).await {
                 return Ok(Self::new(host, model));
             }
         }
@@ -87,23 +108,10 @@ impl LocalOllamaBackend {
             Err(_) => false,
         }
     }
-}
 
-#[async_trait]
-impl InferenceBackend for LocalOllamaBackend {
-    fn name(&self) -> &str {
-        "ollama-local"
-    }
-
-    fn model_id(&self) -> &str {
-        &self.model
-    }
-
-    fn supports_tier(&self, _tier: Tier) -> bool {
-        true
-    }
-
-    async fn complete(&self, req: ChatRequest) -> anyhow::Result<ChatReply> {
+    /// Single HTTP attempt — no retries. Returns a structured error that
+    /// [`is_retryable`](Self::is_retryable) can classify.
+    async fn try_complete(&self, req: &ChatRequest) -> anyhow::Result<ChatReply> {
         let body = serde_json::json!({
             "model": self.model,
             "messages": req.messages.iter().map(|m| {
@@ -138,6 +146,69 @@ impl InferenceBackend for LocalOllamaBackend {
             content,
             model_id: self.model.clone(),
         })
+    }
+
+    /// Returns `true` for errors worth retrying: connection failures and 5xx
+    /// status codes. Returns `false` for 4xx (client errors) which won't
+    /// succeed on retry.
+    fn is_retryable(err: &anyhow::Error) -> bool {
+        let msg = err.to_string();
+        // Connection / timeout errors from reqwest.
+        if msg.contains("request failed") {
+            return true;
+        }
+        // 5xx status codes extracted from our "Ollama returned {status}" message.
+        if let Some(rest) = msg.strip_prefix("Ollama returned ") {
+            if let Some(code_str) = rest.split_whitespace().next() {
+                // Handle both "503 Service Unavailable" and bare "503"
+                if let Ok(code) = code_str.parse::<u16>() {
+                    return (500..600).contains(&code);
+                }
+            }
+        }
+        false
+    }
+}
+
+#[async_trait]
+impl InferenceBackend for LocalOllamaBackend {
+    fn name(&self) -> &str {
+        "ollama-local"
+    }
+
+    fn model_id(&self) -> &str {
+        &self.model
+    }
+
+    fn supports_tier(&self, _tier: Tier) -> bool {
+        true
+    }
+
+    async fn complete(&self, req: ChatRequest) -> anyhow::Result<ChatReply> {
+        let retry_delays_ms: &[u64] = &[250, 500, 1000];
+        let mut last_err = anyhow::anyhow!("no attempts made");
+
+        for (attempt, delay_ms) in std::iter::once(0)
+            .chain(retry_delays_ms.iter().copied())
+            .enumerate()
+        {
+            if attempt > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            }
+
+            match self.try_complete(&req).await {
+                Ok(reply) => return Ok(reply),
+                Err(e) => {
+                    if !Self::is_retryable(&e) {
+                        return Err(e);
+                    }
+                    tracing::warn!(attempt, error = %e, "retrying Ollama request");
+                    last_err = e;
+                }
+            }
+        }
+
+        Err(last_err)
     }
 }
 
