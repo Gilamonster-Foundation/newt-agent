@@ -465,4 +465,40 @@ mod tests {
         let content2 = fs::read_to_string(&file2).unwrap();
         assert_eq!(content2, "xxx\nyyy\n", "second file should be unchanged");
     }
+
+    #[test]
+    fn edit_applies_patch() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("hello.txt");
+        fs::write(&file, "line1\nline2\n").unwrap();
+
+        let diff = "\
+--- a/hello.txt
++++ b/hello.txt
+@@ -1,2 +1,2 @@
+ line1
+-line2
++edited
+";
+        edit(&file, diff).unwrap();
+        let result = fs::read_to_string(&file).unwrap();
+        assert_eq!(result, "line1\nedited\n");
+    }
+
+    #[test]
+    fn edit_error_propagated() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("hello.txt");
+        fs::write(&file, "aaa\n").unwrap();
+
+        let diff = "\
+--- a/hello.txt
++++ b/hello.txt
+@@ -1,1 +1,1 @@
+ WRONG
+";
+        let err = edit(&file, diff).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("mismatch"), "expected mismatch error: {msg}");
+    }
 }
