@@ -985,7 +985,10 @@ dependencies = [
  "newt-tools",
  "serde",
  "serde_json",
+ "tempfile",
+ "tests-common",
  "tokio",
+ "tokio-test",
  "tracing",
 ]
 

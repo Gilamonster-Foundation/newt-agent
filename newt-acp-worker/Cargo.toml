@@ -24,5 +24,10 @@ tracing.workspace = true
 
 # TODO: depend on agent-client-protocol crate (Apache-2.0) for ACP wire layer.
 
+[dev-dependencies]
+tests-common.workspace = true
+tempfile.workspace = true
+tokio-test.workspace = true
+
 [lints]
 workspace = true
