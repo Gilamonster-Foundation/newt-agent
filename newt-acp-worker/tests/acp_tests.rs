@@ -52,6 +52,62 @@ fn mock_backend(reply: &str) -> Arc<dyn newt_inference::InferenceBackend> {
     Arc::new(MockBackend::all_tiers("mock", reply))
 }
 
+/// Drive two sequential requests through one `run` invocation, where
+/// the second request is built from the first response.
+///
+/// The session map only persists for the lifetime of a single `run`
+/// call — so any test that needs session continuity must pipeline its
+/// requests through the same loop. A duplex stream lets us write the
+/// second request after observing the first reply on stdout, then
+/// close the write half so `run` returns.
+async fn drive_dependent<F>(
+    backend: Arc<dyn newt_inference::InferenceBackend>,
+    first: Value,
+    build_second: F,
+) -> Vec<Value>
+where
+    F: FnOnce(&Value) -> Value + Send + 'static,
+{
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    // server reads from server_rx, writes to server_tx
+    let (server_rx, mut client_tx) = tokio::io::duplex(8 * 1024);
+    let (mut server_tx, client_rx) = tokio::io::duplex(8 * 1024);
+
+    let server = AcpServer::new(backend);
+    let server_task = tokio::spawn(async move { server.run(server_rx, &mut server_tx).await });
+
+    // Write the first request.
+    let mut first_line = serde_json::to_string(&first).unwrap();
+    first_line.push('\n');
+    client_tx.write_all(first_line.as_bytes()).await.unwrap();
+    client_tx.flush().await.unwrap();
+
+    // Read the first response.
+    let mut reader = BufReader::new(client_rx);
+    let mut first_resp_line = String::new();
+    reader.read_line(&mut first_resp_line).await.unwrap();
+    let first_resp: Value = serde_json::from_str(first_resp_line.trim()).unwrap();
+
+    // Build + send the second request.
+    let second = build_second(&first_resp);
+    let mut second_line = serde_json::to_string(&second).unwrap();
+    second_line.push('\n');
+    client_tx.write_all(second_line.as_bytes()).await.unwrap();
+    client_tx.flush().await.unwrap();
+
+    // Read the second response.
+    let mut second_resp_line = String::new();
+    reader.read_line(&mut second_resp_line).await.unwrap();
+    let second_resp: Value = serde_json::from_str(second_resp_line.trim()).unwrap();
+
+    // Close the write half so `run` returns cleanly.
+    drop(client_tx);
+    server_task.await.unwrap().unwrap();
+
+    vec![first_resp, second_resp]
+}
+
 #[tokio::test]
 async fn initialize_returns_capabilities() {
     let backend = mock_backend("");
@@ -135,6 +191,106 @@ async fn new_session_requires_workspace_path() {
         .as_str()
         .unwrap()
         .contains("workspace_path required"));
+}
+
+#[tokio::test]
+async fn set_session_model_unknown_session_errors() {
+    // No prior new_session — random UUID should be rejected.
+    let backend = mock_backend("");
+    let resp = one(
+        backend,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 10,
+            "method": "set_session_model",
+            "params": {
+                "session_id": "00000000-0000-0000-0000-000000000000",
+                "model": "qwen2.5-coder:32b",
+            },
+        }),
+    )
+    .await;
+
+    assert_eq!(resp["error"]["code"], -32603);
+    assert!(resp["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("unknown session"));
+}
+
+#[tokio::test]
+async fn set_session_model_happy_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    let backend = mock_backend("");
+
+    // Use the duplex driver so we can build the second request from the
+    // first response (set_session_model needs the freshly-issued
+    // session_id). The session map only lives for the duration of one
+    // `run` call, so both requests must travel through the same loop.
+    let responses = drive_dependent(
+        backend,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "new_session",
+            "params": { "workspace_path": tmp.path().to_str().unwrap() },
+        }),
+        |first| {
+            let sid = first["result"]["session_id"].as_str().unwrap().to_string();
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "set_session_model",
+                "params": { "session_id": sid, "model": "qwen2.5-coder:32b" },
+            })
+        },
+    )
+    .await;
+
+    assert!(responses[0]["result"]["session_id"].is_string());
+    assert_eq!(responses[1]["result"]["ok"], true);
+}
+
+#[tokio::test]
+async fn set_session_model_requires_session_id() {
+    let backend = mock_backend("");
+    let resp = one(
+        backend,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 11,
+            "method": "set_session_model",
+            "params": { "model": "qwen2.5-coder:32b" },
+        }),
+    )
+    .await;
+
+    assert_eq!(resp["error"]["code"], -32603);
+    assert!(resp["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("session_id required"));
+}
+
+#[tokio::test]
+async fn set_session_model_requires_model() {
+    let backend = mock_backend("");
+    let resp = one(
+        backend,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 12,
+            "method": "set_session_model",
+            "params": { "session_id": "00000000-0000-0000-0000-000000000000" },
+        }),
+    )
+    .await;
+
+    assert_eq!(resp["error"]["code"], -32603);
+    assert!(resp["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("model required"));
 }
 
 #[tokio::test]

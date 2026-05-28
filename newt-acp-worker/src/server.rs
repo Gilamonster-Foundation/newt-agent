@@ -118,6 +118,7 @@ impl AcpServer {
         match method {
             "initialize" => self.handle_initialize(params).await,
             "new_session" => self.handle_new_session(params).await,
+            "set_session_model" => self.handle_set_session_model(params).await,
             _ => anyhow::bail!("method not found: {method}"),
         }
     }
@@ -163,6 +164,29 @@ impl AcpServer {
         );
 
         Ok(serde_json::json!({ "session_id": session_id.to_string() }))
+    }
+
+    /// `set_session_model` — override the model used for subsequent
+    /// `prompt` turns within an existing session.
+    async fn handle_set_session_model(&self, params: Value) -> anyhow::Result<Value> {
+        let session_id: SessionId = params
+            .get("session_id")
+            .and_then(|s| s.as_str())
+            .ok_or_else(|| anyhow::anyhow!("session_id required"))?
+            .parse()?;
+        let model = params
+            .get("model")
+            .and_then(|m| m.as_str())
+            .ok_or_else(|| anyhow::anyhow!("model required"))?
+            .to_string();
+
+        let mut sessions = self.sessions.lock().await;
+        let session = sessions
+            .get_mut(&session_id)
+            .ok_or_else(|| anyhow::anyhow!("unknown session: {session_id}"))?;
+        session.model_override = Some(model);
+
+        Ok(serde_json::json!({ "ok": true }))
     }
 }
 
