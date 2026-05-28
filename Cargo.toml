@@ -9,6 +9,7 @@ members = [
     "newt-mcp-server",
     "newt-cli",
     "plugins-protocol",
+    "tests/common",
 ]
 
 [workspace.package]
@@ -48,6 +49,16 @@ jsonrpc-core = "18"
 # TUI (only newt-tui pulls this)
 ratatui = "0.29"
 crossterm = "0.28"
+
+# Test utilities (dev-only)
+tempfile = "3"
+wiremock = "0.6"
+mockall = "0.13"
+assert_cmd = "2"
+predicates = "3"
+tokio-test = "0.4"
+insta = "1"
+tests-common = { path = "tests/common" }
 
 # Internal crates — pinned with = for lock-step publishing
 newt-core         = { path = "newt-core",         version = "=0.5.20260525" }
