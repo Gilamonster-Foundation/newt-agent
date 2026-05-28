@@ -2,6 +2,9 @@
 //!
 //! Subcommands: `code`, `pilot`, `worker`, `mcp`, `doctor`, `config`.
 
+mod config_cmd;
+mod doctor;
+
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
@@ -12,6 +15,10 @@ use std::path::PathBuf;
     about = "Small, fast, local-first agentic coder"
 )]
 pub struct Cli {
+    /// Path to config file (overrides default search order).
+    #[arg(short, long, global = true)]
+    pub config: Option<PathBuf>,
+
     #[command(subcommand)]
     pub command: Command,
 }
@@ -44,13 +51,7 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         Command::Pilot { flight_id } => newt_tui::run_pilot(&flight_id),
         Command::Worker => newt_acp_worker::run_stdio().await,
         Command::Mcp => newt_mcp_server::run_stdio().await,
-        Command::Doctor => {
-            println!("newt doctor: not yet implemented");
-            Ok(())
-        }
-        Command::Config => {
-            println!("newt config: not yet implemented");
-            Ok(())
-        }
+        Command::Doctor => doctor::run(cli.config.as_deref()).await,
+        Command::Config => config_cmd::run(cli.config.as_deref()),
     }
 }
