@@ -138,3 +138,122 @@ async fn timeout_returns_error() {
         "error should indicate a timeout: {err}"
     );
 }
+
+// --- Discovery tests (Step 3.2) ---
+
+#[tokio::test]
+async fn discover_first_wins() {
+    let server1 = MockServer::start().await;
+    let server2 = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/tags"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "models": []
+        })))
+        .mount(&server1)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/tags"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "models": []
+        })))
+        .mount(&server2)
+        .await;
+
+    let candidates = vec![server1.uri(), server2.uri()];
+    let backend = LocalOllamaBackend::discover_with_candidates("test-model", &candidates)
+        .await
+        .unwrap();
+
+    assert_eq!(backend.model_id(), "test-model");
+    // The first reachable candidate should win.
+    assert_eq!(backend.endpoint(), server1.uri());
+}
+
+#[tokio::test]
+async fn discover_fallthrough_on_failure() {
+    let server1 = MockServer::start().await;
+    let server2 = MockServer::start().await;
+
+    // server1 returns 500 for /api/tags — probe treats non-2xx as unreachable.
+    Mock::given(method("GET"))
+        .and(path("/api/tags"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server1)
+        .await;
+
+    // server2 returns 200.
+    Mock::given(method("GET"))
+        .and(path("/api/tags"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "models": []
+        })))
+        .mount(&server2)
+        .await;
+
+    let candidates = vec![server1.uri(), server2.uri()];
+    let backend = LocalOllamaBackend::discover_with_candidates("test-model", &candidates)
+        .await
+        .unwrap();
+
+    // server1 failed probe, so server2 should be chosen.
+    assert_eq!(backend.endpoint(), server2.uri());
+}
+
+#[tokio::test]
+async fn discover_all_down_returns_error() {
+    // Use endpoints that are guaranteed not to be listening.
+    let candidates = vec![
+        "http://127.0.0.1:19999".to_string(),
+        "http://127.0.0.1:19998".to_string(),
+    ];
+    let result = LocalOllamaBackend::discover_with_candidates("test-model", &candidates).await;
+
+    assert!(
+        result.is_err(),
+        "discover should fail when no endpoints are reachable"
+    );
+    assert!(
+        result.unwrap_err().to_string().contains("no reachable"),
+        "error message should mention 'no reachable'"
+    );
+}
+
+#[tokio::test]
+async fn env_var_override() {
+    let server = MockServer::start().await;
+    let other_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/tags"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "models": []
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/tags"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "models": []
+        })))
+        .mount(&other_server)
+        .await;
+
+    // SAFETY: test binary is single-threaded for this test.
+    unsafe { std::env::set_var("OLLAMA_HOST", server.uri()) };
+
+    // Even though other_server is in the candidate list, OLLAMA_HOST wins.
+    let candidates = vec![other_server.uri()];
+    let backend = LocalOllamaBackend::discover_with_candidates("my-model", &candidates)
+        .await
+        .unwrap();
+
+    unsafe { std::env::remove_var("OLLAMA_HOST") };
+
+    assert_eq!(backend.endpoint(), server.uri());
+    assert_eq!(backend.model_id(), "my-model");
+}
