@@ -1,0 +1,40 @@
+[package]
+name = "newt-eval"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "End-to-end evaluation framework for the newt worker"
+keywords = ["newt", "agent", "eval", "drake", "scorecard"]
+categories = ["development-tools::testing"]
+
+[[bin]]
+name = "newt-eval"
+path = "src/bin/newt-eval.rs"
+
+[dependencies]
+newt-core.workspace = true
+newt-acp-worker.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true
+regex.workspace = true
+tempfile.workspace = true
+walkdir = "2"
+fs_extra = "1"
+
+[dev-dependencies]
+wiremock.workspace = true
+assert_cmd.workspace = true
+predicates.workspace = true
+
+[lints]
+workspace = true
