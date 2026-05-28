@@ -10,8 +10,10 @@
 //!   against the model's scorecard.
 //! - `TaskReply.model_id` is mandatory.
 
+mod diff;
 mod server;
 
+pub use diff::{capture_diff, is_empty_diff};
 pub use server::{AcpServer, Session, TaskReply};
 
 /// Spawn the default ACP worker over stdio.

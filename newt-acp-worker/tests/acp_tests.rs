@@ -4,11 +4,41 @@
 //! `AcpServer`, drives one or more JSON-RPC requests through an
 //! in-memory reader/writer, and asserts on the parsed responses.
 
+use std::path::Path;
 use std::sync::Arc;
 
 use newt_acp_worker::AcpServer;
 use serde_json::Value;
 use tests_common::MockBackend;
+
+/// `git init` + identity config so `git diff` works inside the tempdir.
+fn init_git_repo(path: &Path) {
+    let run = |args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(path)
+            .output()
+            .expect("git command failed")
+    };
+    run(&["init", "-q"]);
+    run(&["config", "user.email", "test@test"]);
+    run(&["config", "user.name", "test"]);
+}
+
+/// Commit `path/file` with the given content so subsequent edits show
+/// up in `git diff`.
+fn commit_initial(path: &Path, file: &str, content: &str) {
+    std::fs::write(path.join(file), content).unwrap();
+    let run = |args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(path)
+            .output()
+            .expect("git command failed")
+    };
+    run(&["add", file]);
+    run(&["commit", "-q", "-m", "init"]);
+}
 
 /// Send a batch of JSON-RPC requests through a fresh server and return
 /// the parsed responses (one per request, in order).
@@ -327,9 +357,9 @@ async fn prompt_returns_model_id() {
 #[tokio::test]
 async fn prompt_applies_diff_when_present() {
     let tmp = tempfile::tempdir().unwrap();
-    // Seed a file the patch will modify.
-    let hello_path = tmp.path().join("hello.txt");
-    std::fs::write(&hello_path, "line1\nline2\nline3\n").unwrap();
+    // git repo + committed baseline so the post-turn diff is non-empty.
+    init_git_repo(tmp.path());
+    commit_initial(tmp.path(), "hello.txt", "line1\nline2\nline3\n");
 
     let diff = "\
 --- a/hello.txt
@@ -364,10 +394,80 @@ async fn prompt_applies_diff_when_present() {
 
     let result = &responses[1]["result"];
     assert_eq!(result["diff_applied"], true);
+    assert_eq!(result["empty_diff"], false);
+    assert!(result["diff"].as_str().unwrap().contains("-line2"));
+    assert!(result["diff"].as_str().unwrap().contains("+EDITED"));
 
     // The file on disk should now contain the patched content.
-    let after = std::fs::read_to_string(&hello_path).unwrap();
+    let after = std::fs::read_to_string(tmp.path().join("hello.txt")).unwrap();
     assert_eq!(after, "line1\nEDITED\nline3\n");
+}
+
+#[tokio::test]
+async fn prompt_captures_empty_diff_on_no_changes() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_git_repo(tmp.path());
+    commit_initial(tmp.path(), "hello.txt", "unchanged\n");
+
+    // Model returns prose with no diff — nothing to apply, no edits.
+    let backend = mock_backend("I thought about it and decided not to change anything.");
+
+    let responses = drive_dependent(
+        backend,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "new_session",
+            "params": { "workspace_path": tmp.path().to_str().unwrap() },
+        }),
+        |first| {
+            let sid = first["result"]["session_id"].as_str().unwrap().to_string();
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "prompt",
+                "params": { "session_id": sid, "prompt": "do nothing" },
+            })
+        },
+    )
+    .await;
+
+    let result = &responses[1]["result"];
+    assert_eq!(result["diff_applied"], false);
+    assert_eq!(result["empty_diff"], true);
+    assert_eq!(result["diff"], "");
+}
+
+#[tokio::test]
+async fn prompt_non_git_workspace_reports_empty_diff() {
+    // Non-git workspace: capture_diff returns "" with a tracing warn.
+    // The server still completes the turn, just with empty_diff=true.
+    let tmp = tempfile::tempdir().unwrap();
+    let backend = mock_backend("just prose, no diff");
+
+    let responses = drive_dependent(
+        backend,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "new_session",
+            "params": { "workspace_path": tmp.path().to_str().unwrap() },
+        }),
+        |first| {
+            let sid = first["result"]["session_id"].as_str().unwrap().to_string();
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "prompt",
+                "params": { "session_id": sid, "prompt": "hi" },
+            })
+        },
+    )
+    .await;
+
+    let result = &responses[1]["result"];
+    assert_eq!(result["empty_diff"], true);
+    assert_eq!(result["diff"], "");
 }
 
 #[tokio::test]
