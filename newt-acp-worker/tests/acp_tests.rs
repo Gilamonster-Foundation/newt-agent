@@ -294,6 +294,149 @@ async fn set_session_model_requires_model() {
 }
 
 #[tokio::test]
+async fn prompt_returns_model_id() {
+    let tmp = tempfile::tempdir().unwrap();
+    let backend = mock_backend("hello from mock");
+
+    let responses = drive_dependent(
+        backend,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "new_session",
+            "params": { "workspace_path": tmp.path().to_str().unwrap() },
+        }),
+        |first| {
+            let sid = first["result"]["session_id"].as_str().unwrap().to_string();
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "prompt",
+                "params": { "session_id": sid, "prompt": "do something" },
+            })
+        },
+    )
+    .await;
+
+    let result = &responses[1]["result"];
+    assert_eq!(result["model_id"], "mock-model");
+    assert_eq!(result["content"], "hello from mock");
+    assert_eq!(result["diff_applied"], false);
+}
+
+#[tokio::test]
+async fn prompt_applies_diff_when_present() {
+    let tmp = tempfile::tempdir().unwrap();
+    // Seed a file the patch will modify.
+    let hello_path = tmp.path().join("hello.txt");
+    std::fs::write(&hello_path, "line1\nline2\nline3\n").unwrap();
+
+    let diff = "\
+--- a/hello.txt
++++ b/hello.txt
+@@ -1,3 +1,3 @@
+ line1
+-line2
++EDITED
+ line3
+";
+    let backend = mock_backend(diff);
+
+    let responses = drive_dependent(
+        backend,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "new_session",
+            "params": { "workspace_path": tmp.path().to_str().unwrap() },
+        }),
+        |first| {
+            let sid = first["result"]["session_id"].as_str().unwrap().to_string();
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "prompt",
+                "params": { "session_id": sid, "prompt": "edit line2" },
+            })
+        },
+    )
+    .await;
+
+    let result = &responses[1]["result"];
+    assert_eq!(result["diff_applied"], true);
+
+    // The file on disk should now contain the patched content.
+    let after = std::fs::read_to_string(&hello_path).unwrap();
+    assert_eq!(after, "line1\nEDITED\nline3\n");
+}
+
+#[tokio::test]
+async fn prompt_unknown_session_errors() {
+    let backend = mock_backend("");
+    let resp = one(
+        backend,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 20,
+            "method": "prompt",
+            "params": {
+                "session_id": "00000000-0000-0000-0000-000000000000",
+                "prompt": "hi",
+            },
+        }),
+    )
+    .await;
+
+    assert_eq!(resp["error"]["code"], -32603);
+    assert!(resp["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("unknown session"));
+}
+
+#[tokio::test]
+async fn prompt_requires_session_id() {
+    let backend = mock_backend("");
+    let resp = one(
+        backend,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 21,
+            "method": "prompt",
+            "params": { "prompt": "hi" },
+        }),
+    )
+    .await;
+
+    assert_eq!(resp["error"]["code"], -32603);
+    assert!(resp["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("session_id required"));
+}
+
+#[tokio::test]
+async fn prompt_requires_prompt() {
+    let backend = mock_backend("");
+    let resp = one(
+        backend,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 22,
+            "method": "prompt",
+            "params": { "session_id": "00000000-0000-0000-0000-000000000000" },
+        }),
+    )
+    .await;
+
+    assert_eq!(resp["error"]["code"], -32603);
+    assert!(resp["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("prompt required"));
+}
+
+#[tokio::test]
 async fn unknown_method_returns_error() {
     let backend = mock_backend("");
     let resp = one(
