@@ -4,8 +4,10 @@
 //! into a `Tier` (FAST / STANDARD / COMPLEX / REVIEW), and asks the
 //! configured backends which can serve that tier.
 
+pub mod config;
 pub mod error;
 pub mod router;
 
+pub use config::Config;
 pub use error::NewtError;
 pub use router::{Router, Tier};
