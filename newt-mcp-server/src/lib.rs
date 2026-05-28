@@ -1,12 +1,16 @@
 //! Newt-Agent MCP server — stdio JSON-RPC.
 //!
 //! v0 tool surface (vi-minimal):
-//! - `code.read(path)`
-//! - `code.edit(path, patch)`
-//! - `code.search(query, path)`
-//! - `goal.run(prompt, tier?)`
-//! - `flight.dispatch(prompt, models[])`
+//! - `code_read` — read a file
+//! - `code_edit` — apply a unified diff patch
+//! - `code_search` — regex search across a directory tree
+//! - `goal_run` — tier-routed inference (placeholder)
+
+pub mod handlers;
+pub mod server;
 
 pub async fn run_stdio() -> anyhow::Result<()> {
-    anyhow::bail!("newt-mcp-server::run_stdio not yet implemented")
+    let mut server = server::McpServer::new();
+    handlers::register_handlers(&mut server);
+    server.run_stdio().await
 }
