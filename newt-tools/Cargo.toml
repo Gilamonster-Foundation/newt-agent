@@ -21,5 +21,8 @@ tracing.workspace = true
 
 # TODO: depend on thoon-fileops + thoon-toolreg once published.
 
+[dev-dependencies]
+tempfile.workspace = true
+
 [lints]
 workspace = true
