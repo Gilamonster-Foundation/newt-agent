@@ -35,7 +35,6 @@ pub struct Session {
 /// session map.
 pub struct AcpServer {
     sessions: Arc<Mutex<HashMap<SessionId, Session>>>,
-    #[allow(dead_code)] // wired up in Step 9.3
     backend: Arc<dyn newt_inference::InferenceBackend>,
 }
 
@@ -119,6 +118,7 @@ impl AcpServer {
             "initialize" => self.handle_initialize(params).await,
             "new_session" => self.handle_new_session(params).await,
             "set_session_model" => self.handle_set_session_model(params).await,
+            "prompt" => self.handle_prompt(params).await,
             _ => anyhow::bail!("method not found: {method}"),
         }
     }
@@ -188,6 +188,72 @@ impl AcpServer {
 
         Ok(serde_json::json!({ "ok": true }))
     }
+
+    /// `prompt` — run one inference turn against the session's workspace.
+    ///
+    /// Sends the prompt to the configured backend, optionally applies a
+    /// unified diff returned by the model, and returns a [`TaskReply`]
+    /// carrying the (mandatory) `model_id` plus assistant content. Diff
+    /// capture lands in Step 9.4; for Step 9.3 the returned reply has
+    /// an empty `diff` field.
+    async fn handle_prompt(&self, params: Value) -> anyhow::Result<Value> {
+        let session_id: SessionId = params
+            .get("session_id")
+            .and_then(|s| s.as_str())
+            .ok_or_else(|| anyhow::anyhow!("session_id required"))?
+            .parse()?;
+        let prompt = params
+            .get("prompt")
+            .and_then(|p| p.as_str())
+            .ok_or_else(|| anyhow::anyhow!("prompt required"))?
+            .to_string();
+
+        let session = {
+            let sessions = self.sessions.lock().await;
+            sessions
+                .get(&session_id)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("unknown session: {session_id}"))?
+        };
+
+        let req = newt_inference::ChatRequest::new()
+            .system("You are a coding assistant. Respond with unified diffs only.")
+            .user(prompt);
+
+        let reply = self.backend.complete(req).await?;
+
+        // If the reply contains a unified diff, try to apply it. We
+        // accept the patch unconditionally on success; on failure we
+        // log and continue so the diff text still makes it back to the
+        // caller for debugging.
+        let diff_applied = if looks_like_unified_diff(&reply.content) {
+            match newt_tools::apply_patch(&session.workspace_path, &reply.content) {
+                Ok(()) => true,
+                Err(e) => {
+                    tracing::warn!(error = %e, "patch application failed");
+                    false
+                }
+            }
+        } else {
+            false
+        };
+
+        let task_reply = TaskReply {
+            model_id: reply.model_id,
+            content: reply.content,
+            diff: String::new(),
+            empty_diff: true,
+            diff_applied,
+        };
+        Ok(serde_json::to_value(task_reply)?)
+    }
+}
+
+/// True if `content` looks like a unified diff (has both `--- ` and
+/// `+++ ` headers). Cheap heuristic — the real parser in
+/// `newt_tools::apply_patch` is the source of truth on validity.
+fn looks_like_unified_diff(content: &str) -> bool {
+    content.contains("--- ") && content.contains("+++ ")
 }
 
 /// Write a JSON-RPC response as a single newline-terminated line.
