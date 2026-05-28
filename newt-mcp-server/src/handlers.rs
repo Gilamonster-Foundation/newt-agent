@@ -119,10 +119,7 @@ fn tool_definitions() -> Value {
 
 fn register_tools_call(server: &mut McpServer) {
     server.register("tools/call", |params| {
-        let name = params
-            .get("name")
-            .and_then(|n| n.as_str())
-            .unwrap_or("");
+        let name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
         let arguments = params
             .get("arguments")
             .cloned()
@@ -250,10 +247,7 @@ mod tests {
         let tools = resp["result"]["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 4);
 
-        let names: Vec<&str> = tools
-            .iter()
-            .map(|t| t["name"].as_str().unwrap())
-            .collect();
+        let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"code_read"));
         assert!(names.contains(&"code_edit"));
         assert!(names.contains(&"code_search"));
@@ -439,7 +433,10 @@ mod tests {
         .await;
 
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
-        assert!(text.contains("not yet wired"), "expected placeholder, got: {text}");
+        assert!(
+            text.contains("not yet wired"),
+            "expected placeholder, got: {text}"
+        );
     }
 
     // ── tools/call — unknown tool ───────────────────────────────────────────
