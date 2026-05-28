@@ -6,10 +6,12 @@
 
 pub mod config;
 pub mod error;
+pub mod model_id;
 pub mod router;
 pub mod session;
 
 pub use config::Config;
 pub use error::NewtError;
+pub use model_id::ModelId;
 pub use router::{Router, Tier};
 pub use session::SessionId;
