@@ -15,30 +15,80 @@ pub enum Tier {
     Review,
 }
 
+/// Result of [`Router::classify_detailed`]: the chosen tier, a confidence
+/// score in `[0.0, 1.0]`, and human-readable reasons explaining the decision.
+#[derive(Debug, Clone)]
+pub struct Classification {
+    pub tier: Tier,
+    pub confidence: f64,
+    pub reasons: Vec<String>,
+}
+
 #[derive(Debug, Default)]
-pub struct Router;
+pub struct Router {
+    tier_override: Option<Tier>,
+}
 
 impl Router {
     pub fn new() -> Self {
-        Self
+        Self {
+            tier_override: None,
+        }
+    }
+
+    /// Create a router that always returns the given tier (confidence 1.0).
+    pub fn with_override(tier: Tier) -> Self {
+        Self {
+            tier_override: Some(tier),
+        }
     }
 
     /// Classify an incoming prompt. v0 heuristics: length + keyword triggers.
     /// Refine with empirical signals before v1.
     pub fn classify(&self, prompt: &str) -> Tier {
+        self.classify_detailed(prompt).tier
+    }
+
+    /// Like [`classify`](Self::classify), but returns confidence and reasons
+    /// alongside the tier.
+    pub fn classify_detailed(&self, prompt: &str) -> Classification {
+        if let Some(tier) = self.tier_override {
+            return Classification {
+                tier,
+                confidence: 1.0,
+                reasons: vec!["tier override active".to_string()],
+            };
+        }
+
         let len = prompt.len();
         let lower = prompt.to_ascii_lowercase();
 
         if lower.contains("review") || lower.contains("grade") || lower.contains("critique") {
-            return Tier::Review;
+            return Classification {
+                tier: Tier::Review,
+                confidence: 0.85,
+                reasons: vec!["review keyword detected".to_string()],
+            };
         }
         if lower.contains("refactor") || lower.contains("redesign") || lower.contains("architect") {
-            return Tier::Complex;
+            return Classification {
+                tier: Tier::Complex,
+                confidence: 0.80,
+                reasons: vec!["complex keyword detected".to_string()],
+            };
         }
         if len < 200 {
-            return Tier::Fast;
+            return Classification {
+                tier: Tier::Fast,
+                confidence: 0.70,
+                reasons: vec![format!("short prompt ({len} chars < 200)")],
+            };
         }
-        Tier::Standard
+        Classification {
+            tier: Tier::Standard,
+            confidence: 0.5,
+            reasons: vec!["no keyword match, length >= 200".to_string()],
+        }
     }
 }
 
@@ -61,6 +111,62 @@ mod tests {
         assert_eq!(
             Router::new().classify("refactor the auth middleware to use traits"),
             Tier::Complex
+        );
+    }
+
+    #[test]
+    fn classify_detailed_short_has_confidence() {
+        let c = Router::new().classify_detailed("fix typo");
+        assert_eq!(c.tier, Tier::Fast);
+        assert!(c.confidence >= 0.5, "expected confidence >= 0.5");
+    }
+
+    #[test]
+    fn classify_detailed_review_has_reasons() {
+        let c = Router::new().classify_detailed("review this PR");
+        assert!(!c.reasons.is_empty(), "reasons should be non-empty");
+        assert!(
+            c.reasons.iter().any(|r| r.contains("review")),
+            "reasons should mention 'review'"
+        );
+    }
+
+    #[test]
+    fn classify_detailed_confidence_bounded() {
+        for prompt in &["hi", "review me", "refactor everything", &"x".repeat(300)] {
+            let c = Router::new().classify_detailed(prompt);
+            assert!(
+                (0.0..=1.0).contains(&c.confidence),
+                "confidence {} out of [0,1] for {:?}",
+                c.confidence,
+                c.tier
+            );
+        }
+    }
+
+    #[test]
+    fn override_always_returns_its_tier() {
+        assert_eq!(
+            Router::with_override(Tier::Complex).classify("short"),
+            Tier::Complex
+        );
+    }
+
+    #[test]
+    fn override_has_full_confidence() {
+        let c = Router::with_override(Tier::Fast).classify_detailed("anything");
+        assert!(
+            (c.confidence - 1.0).abs() < f64::EPSILON,
+            "override confidence should be 1.0"
+        );
+    }
+
+    #[test]
+    fn override_reason_mentions_override() {
+        let c = Router::with_override(Tier::Review).classify_detailed("whatever");
+        assert!(
+            c.reasons.iter().any(|r| r.contains("override")),
+            "reasons should mention 'override'"
         );
     }
 }
