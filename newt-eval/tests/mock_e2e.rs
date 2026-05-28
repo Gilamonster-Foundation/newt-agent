@@ -34,7 +34,8 @@ async fn all_bundled_cases_pass_in_mock_mode() {
     let worker = locate_worker_bin();
     assert!(
         worker.exists(),
-        "expected newt binary at {} — `cargo build --bin newt` must have run",
+        "expected newt binary somewhere in target/ — checked CARGO_TARGET_DIR={:?}, fell back to {}",
+        std::env::var_os("CARGO_TARGET_DIR"),
         worker.display()
     );
 
@@ -137,23 +138,30 @@ fn ensure_worker_built() {
 
 /// Locate the `newt` binary in the workspace's `target/` dir.
 ///
-/// During `cargo test -p newt-eval`, integration tests run with
-/// `target/debug/deps/` on PATH and the binaries are in
-/// `target/debug/`. The shared workspace target is at
-/// `<manifest>/../target/<profile>/newt`.
+/// Searches common cargo target directories in priority order:
+/// 1. `$CARGO_TARGET_DIR` (set by `cargo llvm-cov` to `target/llvm-cov-target`)
+/// 2. `<manifest>/../target/{debug,release}/`
 fn locate_worker_bin() -> PathBuf {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let workspace_target = manifest
-        .parent()
-        .expect("manifest dir has parent")
-        .join("target");
-    for profile in ["debug", "release"] {
-        let candidate = workspace_target.join(profile).join("newt");
-        if candidate.exists() {
-            return candidate;
+    let workspace_root = manifest.parent().expect("manifest dir has parent");
+
+    // cargo llvm-cov sets CARGO_TARGET_DIR — honor it first.
+    let mut target_dirs: Vec<PathBuf> = Vec::new();
+    if let Some(tdir) = std::env::var_os("CARGO_TARGET_DIR") {
+        target_dirs.push(PathBuf::from(tdir));
+    }
+    target_dirs.push(workspace_root.join("target"));
+    target_dirs.push(workspace_root.join("target").join("llvm-cov-target"));
+
+    for tdir in &target_dirs {
+        for profile in ["debug", "release"] {
+            let candidate = tdir.join(profile).join("newt");
+            if candidate.exists() {
+                return candidate;
+            }
         }
     }
-    // Fallback to the debug build path even if it doesn't exist yet —
-    // the caller's assertion will report the missing path cleanly.
-    workspace_target.join("debug").join("newt")
+    // Fallback to the conventional debug path; the caller's assertion
+    // surfaces the missing path cleanly.
+    workspace_root.join("target").join("debug").join("newt")
 }
