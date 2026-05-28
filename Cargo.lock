@@ -888,6 +888,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "tests-common",
  "thiserror",
  "tokio",
  "tracing",
