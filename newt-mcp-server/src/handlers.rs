@@ -276,4 +276,190 @@ mod tests {
             );
         }
     }
+
+    // ── tools/call — code_read ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn code_read_happy_path() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), "hello from newt\n").unwrap();
+
+        let resp = rpc(&serde_json::json!({
+            "jsonrpc": "2.0", "id": 10, "method": "tools/call",
+            "params": {
+                "name": "code_read",
+                "arguments": { "path": tmp.path().to_str().unwrap() }
+            }
+        }))
+        .await;
+
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("hello from newt"));
+    }
+
+    #[tokio::test]
+    async fn code_read_missing_file() {
+        let resp = rpc(&serde_json::json!({
+            "jsonrpc": "2.0", "id": 11, "method": "tools/call",
+            "params": {
+                "name": "code_read",
+                "arguments": { "path": "/tmp/newt-mcp-no-such-file-xyz" }
+            }
+        }))
+        .await;
+
+        assert!(resp["error"].is_object(), "expected error, got: {resp}");
+        assert_eq!(resp["error"]["code"], -32603);
+    }
+
+    // ── tools/call — code_search ────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn code_search_happy_path() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("a.txt"), "needle in hay\nhay only\n").unwrap();
+        std::fs::write(tmp.path().join("b.txt"), "more hay\nneedle again\n").unwrap();
+
+        let resp = rpc(&serde_json::json!({
+            "jsonrpc": "2.0", "id": 20, "method": "tools/call",
+            "params": {
+                "name": "code_search",
+                "arguments": {
+                    "query": "needle",
+                    "path": tmp.path().to_str().unwrap()
+                }
+            }
+        }))
+        .await;
+
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("needle"), "expected hits, got: {text}");
+        // Two files should have matches
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2, "expected 2 hits, got: {text}");
+    }
+
+    #[tokio::test]
+    async fn code_search_no_matches() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("a.txt"), "nothing here\n").unwrap();
+
+        let resp = rpc(&serde_json::json!({
+            "jsonrpc": "2.0", "id": 21, "method": "tools/call",
+            "params": {
+                "name": "code_search",
+                "arguments": {
+                    "query": "zzz_absent",
+                    "path": tmp.path().to_str().unwrap()
+                }
+            }
+        }))
+        .await;
+
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert_eq!(text, "no matches");
+    }
+
+    // ── tools/call — code_edit ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn code_edit_happy_path() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let file = tmp.path().join("hello.txt");
+        std::fs::write(&file, "line1\nline2\n").unwrap();
+
+        let patch = "\
+--- a/hello.txt
++++ b/hello.txt
+@@ -1,2 +1,2 @@
+ line1
+-line2
++edited
+";
+
+        let resp = rpc(&serde_json::json!({
+            "jsonrpc": "2.0", "id": 30, "method": "tools/call",
+            "params": {
+                "name": "code_edit",
+                "arguments": {
+                    "path": file.to_str().unwrap(),
+                    "patch": patch
+                }
+            }
+        }))
+        .await;
+
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("patched"), "expected success, got: {text}");
+
+        let content = std::fs::read_to_string(&file).unwrap();
+        assert_eq!(content, "line1\nedited\n");
+    }
+
+    #[tokio::test]
+    async fn code_edit_bad_patch() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let file = tmp.path().join("hello.txt");
+        std::fs::write(&file, "actual\n").unwrap();
+
+        let patch = "\
+--- a/hello.txt
++++ b/hello.txt
+@@ -1,1 +1,1 @@
+ WRONG_CONTEXT
+";
+
+        let resp = rpc(&serde_json::json!({
+            "jsonrpc": "2.0", "id": 31, "method": "tools/call",
+            "params": {
+                "name": "code_edit",
+                "arguments": {
+                    "path": file.to_str().unwrap(),
+                    "patch": patch
+                }
+            }
+        }))
+        .await;
+
+        assert!(resp["error"].is_object(), "expected error, got: {resp}");
+        assert_eq!(resp["error"]["code"], -32603);
+    }
+
+    // ── tools/call — goal_run ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn goal_run_returns_placeholder() {
+        let resp = rpc(&serde_json::json!({
+            "jsonrpc": "2.0", "id": 40, "method": "tools/call",
+            "params": {
+                "name": "goal_run",
+                "arguments": { "prompt": "hello" }
+            }
+        }))
+        .await;
+
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("not yet wired"), "expected placeholder, got: {text}");
+    }
+
+    // ── tools/call — unknown tool ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn unknown_tool_returns_error() {
+        let resp = rpc(&serde_json::json!({
+            "jsonrpc": "2.0", "id": 50, "method": "tools/call",
+            "params": {
+                "name": "nonexistent_tool",
+                "arguments": {}
+            }
+        }))
+        .await;
+
+        assert!(resp["error"].is_object(), "expected error, got: {resp}");
+        assert_eq!(resp["error"]["code"], -32603);
+        assert!(resp["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("unknown tool"));
+    }
 }
