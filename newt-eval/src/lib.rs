@@ -35,7 +35,7 @@ pub mod evaluators;
 pub mod runner;
 pub mod scorecard;
 
-pub use cases::{MockResponse, TestCase};
+pub use cases::{default_cases_dir, load_all, MockResponse, TestCase};
 pub use evaluators::{
     default_evaluators, evaluator_by_name, DiffAppliesEvaluator, DiffNonemptyEvaluator, Evaluator,
     PatternMatchEvaluator, RustCompilesEvaluator, TestsPassEvaluator,

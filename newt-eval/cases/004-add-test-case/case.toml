@@ -1,0 +1,36 @@
+name = "004-add-test-case"
+description = "Add a new #[test] function to the existing tests module"
+language = "rust"
+prompt = """
+Add a new `#[test] fn doubles_negative()` to the `mod tests` block in
+src/lib.rs that asserts `double(-3) == -6`. Respond with a unified diff only.
+"""
+
+evaluators = [
+    "diff_nonempty",
+    "diff_applies",
+    "rust_compiles",
+    "tests_pass",
+    "pattern_match",
+]
+
+expected_patterns = [
+    "doubles_negative",
+    "\\+    #\\[test\\]",
+]
+
+[mock_response]
+content = """
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -10,4 +10,9 @@
+     fn doubles_two() {
+         assert_eq!(double(2), 4);
+     }
++
++    #[test]
++    fn doubles_negative() {
++        assert_eq!(double(-3), -6);
++    }
+ }
+"""

@@ -232,6 +232,37 @@ content = ""
         assert!(err.to_string().contains("does not exist"));
     }
 
+    /// The bundled cases under `newt-eval/cases/` must all parse and
+    /// must declare only known evaluator names. This is the cheap
+    /// regression catch for "you added a case but typo'd an evaluator".
+    #[test]
+    fn bundled_cases_load_and_reference_known_evaluators() {
+        let dir = default_cases_dir();
+        if !dir.exists() {
+            // Possible during a fresh `cargo test` before the cases
+            // directory has been created. Treated as a soft-pass so this
+            // test doesn't fail in unrelated scaffolds.
+            return;
+        }
+        let cases = load_all(&dir).expect("bundled cases should load");
+        assert!(!cases.is_empty(), "expected at least one bundled case");
+        for case in &cases {
+            assert!(
+                !case.evaluators.is_empty(),
+                "{} has no evaluators",
+                case.name
+            );
+            for ev in &case.evaluators {
+                assert!(
+                    crate::evaluators::evaluator_by_name(ev).is_some(),
+                    "case {} references unknown evaluator '{}'",
+                    case.name,
+                    ev
+                );
+            }
+        }
+    }
+
     #[test]
     fn is_rust_case_insensitive() {
         let mut c = TestCase {
