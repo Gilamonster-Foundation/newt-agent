@@ -27,6 +27,8 @@ tokio-stream.workspace = true
 
 [dev-dependencies]
 tests-common = { path = "../tests/common" }
+wiremock.workspace = true
+tokio-test.workspace = true
 
 [lints]
 workspace = true
