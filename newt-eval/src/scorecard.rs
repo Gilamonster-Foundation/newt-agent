@@ -133,12 +133,18 @@ impl Scorecard {
     }
 }
 
+/// Truncate `s` to at most `max` characters (NOT bytes), appending `…`
+/// when truncation happens. Operates on chars to avoid slicing inside a
+/// multi-byte codepoint (which would panic).
 fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
-    } else {
-        format!("{}…", &s[..max.saturating_sub(1)])
+    let char_count = s.chars().count();
+    if char_count <= max {
+        return s.to_string();
     }
+    let keep = max.saturating_sub(1);
+    let mut out: String = s.chars().take(keep).collect();
+    out.push('…');
+    out
 }
 
 #[cfg(test)]
@@ -252,6 +258,22 @@ mod tests {
         let s = Scorecard::new();
         let table = s.render_table();
         assert!(table.contains("(no cases)"));
+    }
+
+    #[test]
+    fn render_table_safe_with_multibyte_chars() {
+        // Regression: truncate() used to slice by byte index and would
+        // panic when a multi-byte codepoint straddled the boundary.
+        let mut s = Scorecard::new();
+        s.push(CaseScorecard {
+            case_name: "x".into(),
+            results: vec![EvalResult::fail(
+                "ev",
+                "an em dash — appears here, then a lot more text to force truncation",
+            )],
+        });
+        // Must not panic.
+        let _ = s.render_table();
     }
 
     #[test]
