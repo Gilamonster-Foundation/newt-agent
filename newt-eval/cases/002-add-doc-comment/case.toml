@@ -1,0 +1,31 @@
+name = "002-add-doc-comment"
+description = "Add a /// doc comment to a public function"
+language = "rust"
+prompt = """
+Add a Rust doc comment (`///`) above the public function `add` in
+src/lib.rs explaining that it returns the sum of two integers. Respond
+with a unified diff only.
+"""
+
+evaluators = [
+    "diff_nonempty",
+    "diff_applies",
+    "rust_compiles",
+    "tests_pass",
+    "pattern_match",
+]
+
+expected_patterns = [
+    "\\+/// ",
+]
+
+[mock_response]
+content = """
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,3 +1,4 @@
++/// Returns the sum of two `i32` values.
+ pub fn add(a: i32, b: i32) -> i32 {
+     a + b
+ }
+"""

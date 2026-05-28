@@ -1,0 +1,43 @@
+name = "001-rename-function"
+description = "Rename `fn greet` to `fn hello` in src/lib.rs"
+language = "rust"
+prompt = """
+Rename the function `greet` to `hello` in src/lib.rs. Update both the
+function definition AND the call site in the in-file unit test so the
+crate still compiles and tests still pass. Respond with a unified diff only.
+"""
+
+evaluators = [
+    "diff_nonempty",
+    "diff_applies",
+    "rust_compiles",
+    "tests_pass",
+    "pattern_match",
+]
+
+expected_patterns = [
+    "fn hello\\(",
+    "-pub fn greet\\(",
+]
+
+[mock_response]
+content = """
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,12 +1,12 @@
+-pub fn greet(name: &str) -> String {
++pub fn hello(name: &str) -> String {
+     format!("Hello, {name}!")
+ }
+
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+
+     #[test]
+     fn greets() {
+-        assert_eq!(greet("a"), "Hello, a!");
++        assert_eq!(hello("a"), "Hello, a!");
+     }
+ }
+"""
