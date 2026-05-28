@@ -56,6 +56,22 @@ schema in [`plugins-protocol/`](./plugins-protocol/). No cloud client code is
 compiled into the default Newt binary — the opt-in is enforced at the build
 level, not by a runtime feature flag.
 
+## Evaluation
+
+The [`newt-eval`](./newt-eval/) crate is the end-to-end scorecard for
+the worker. It spawns the real `newt worker` binary, drives ACP against
+a mock or real Ollama, then grades the captured diff with five
+evaluators (`diff_nonempty`, `diff_applies`, `rust_compiles`,
+`tests_pass`, `pattern_match`).
+
+```bash
+cargo test -p newt-eval --test mock_e2e   # CI gate (mock Ollama)
+just eval                                 # live mode (real Ollama)
+```
+
+See [`newt-eval/README.md`](./newt-eval/README.md) for how to add a
+new case.
+
 ## Status
 
 v0.x — workspace scaffold landed; building toward v0.1 (`newt worker` +

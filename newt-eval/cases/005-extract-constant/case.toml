@@ -1,0 +1,37 @@
+name = "005-extract-constant"
+description = "Extract the magic seconds-per-day expression into a named const"
+language = "rust"
+prompt = """
+In src/lib.rs, extract the magic expression `60 * 60 * 24` into a
+`const SECONDS_PER_DAY: u64 = 60 * 60 * 24;` declared at the top of
+the file and use that constant in the body of `seconds_in(days)`.
+Respond with a unified diff only.
+"""
+
+evaluators = [
+    "diff_nonempty",
+    "diff_applies",
+    "rust_compiles",
+    "tests_pass",
+    "pattern_match",
+]
+
+expected_patterns = [
+    "const SECONDS_PER_DAY",
+    "SECONDS_PER_DAY \\* days",
+]
+
+[mock_response]
+content = """
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,5 +1,7 @@
++const SECONDS_PER_DAY: u64 = 60 * 60 * 24;
++
+ pub fn seconds_in(days: u64) -> u64 {
+-    60 * 60 * 24 * days
++    SECONDS_PER_DAY * days
+ }
+
+ #[cfg(test)]
+"""
