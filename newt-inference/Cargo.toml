@@ -23,5 +23,8 @@ thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 
+[dev-dependencies]
+tests-common = { path = "../tests/common" }
+
 [lints]
 workspace = true
