@@ -238,11 +238,19 @@ impl AcpServer {
             false
         };
 
+        // Capture the post-turn diff. Empty diff is the deterministic
+        // "the worker did nothing useful" signal — we surface it as a
+        // boolean field rather than crashing the server (the CLI
+        // binary can translate `empty_diff: true` into a non-zero
+        // exit when running `newt worker --once`).
+        let diff = crate::diff::capture_diff(&session.workspace_path)?;
+        let empty_diff = crate::diff::is_empty_diff(&diff);
+
         let task_reply = TaskReply {
             model_id: reply.model_id,
             content: reply.content,
-            diff: String::new(),
-            empty_diff: true,
+            diff,
+            empty_diff,
             diff_applied,
         };
         Ok(serde_json::to_value(task_reply)?)
