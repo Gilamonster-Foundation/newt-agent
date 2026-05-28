@@ -4,11 +4,11 @@
 //! Thin wrappers — when `thoon-fileops` publishes, this crate delegates
 //! to it rather than reimplementing.
 
+pub mod read;
+
 use std::path::Path;
 
-pub fn read(_path: &Path) -> anyhow::Result<String> {
-    anyhow::bail!("newt-tools::read not yet implemented")
-}
+pub use read::read;
 
 pub fn edit(_path: &Path, _patch: &str) -> anyhow::Result<()> {
     anyhow::bail!("newt-tools::edit not yet implemented")
