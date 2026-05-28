@@ -6,9 +6,11 @@
 //! - `code_search` — regex search across a directory tree
 //! - `goal_run` — tier-routed inference (placeholder)
 
+pub mod handlers;
 pub mod server;
 
 pub async fn run_stdio() -> anyhow::Result<()> {
-    let server = server::McpServer::new();
+    let mut server = server::McpServer::new();
+    handlers::register_handlers(&mut server);
     server.run_stdio().await
 }
