@@ -1014,8 +1014,10 @@ version = "0.5.20260525"
 dependencies = [
  "anyhow",
  "newt-core",
+ "regex",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
  "tracing",
 ]
