@@ -30,10 +30,11 @@ async fn happy_path() {
 async fn non_200_returns_error() {
     let server = MockServer::start().await;
 
+    // 500 is retryable, so complete() will attempt 1 + 3 retries = 4 requests.
     Mock::given(method("POST"))
         .and(path("/api/chat"))
         .respond_with(ResponseTemplate::new(500).set_body_string("server error"))
-        .expect(1)
+        .expect(4)
         .mount(&server)
         .await;
 
@@ -113,6 +114,7 @@ async fn model_id_correctly_returned() {
 async fn timeout_returns_error() {
     let server = MockServer::start().await;
 
+    // Timeout errors are retryable, so expect 4 total attempts.
     Mock::given(method("POST"))
         .and(path("/api/chat"))
         .respond_with(
@@ -122,7 +124,7 @@ async fn timeout_returns_error() {
                 }))
                 .set_delay(Duration::from_secs(5)),
         )
-        .expect(1)
+        .expect(4)
         .mount(&server)
         .await;
 
@@ -163,7 +165,7 @@ async fn discover_first_wins() {
         .await;
 
     let candidates = vec![server1.uri(), server2.uri()];
-    let backend = LocalOllamaBackend::discover_with_candidates("test-model", &candidates)
+    let backend = LocalOllamaBackend::discover_with_env("test-model", None, &candidates)
         .await
         .unwrap();
 
@@ -194,7 +196,7 @@ async fn discover_fallthrough_on_failure() {
         .await;
 
     let candidates = vec![server1.uri(), server2.uri()];
-    let backend = LocalOllamaBackend::discover_with_candidates("test-model", &candidates)
+    let backend = LocalOllamaBackend::discover_with_env("test-model", None, &candidates)
         .await
         .unwrap();
 
@@ -209,7 +211,7 @@ async fn discover_all_down_returns_error() {
         "http://127.0.0.1:19999".to_string(),
         "http://127.0.0.1:19998".to_string(),
     ];
-    let result = LocalOllamaBackend::discover_with_candidates("test-model", &candidates).await;
+    let result = LocalOllamaBackend::discover_with_env("test-model", None, &candidates).await;
 
     assert!(
         result.is_err(),
@@ -243,17 +245,109 @@ async fn env_var_override() {
         .mount(&other_server)
         .await;
 
-    // SAFETY: test binary is single-threaded for this test.
-    unsafe { std::env::set_var("OLLAMA_HOST", server.uri()) };
-
-    // Even though other_server is in the candidate list, OLLAMA_HOST wins.
+    // Pass the env host explicitly instead of mutating the process env.
     let candidates = vec![other_server.uri()];
-    let backend = LocalOllamaBackend::discover_with_candidates("my-model", &candidates)
-        .await
-        .unwrap();
-
-    unsafe { std::env::remove_var("OLLAMA_HOST") };
+    let backend =
+        LocalOllamaBackend::discover_with_env("my-model", Some(&server.uri()), &candidates)
+            .await
+            .unwrap();
 
     assert_eq!(backend.endpoint(), server.uri());
     assert_eq!(backend.model_id(), "my-model");
+}
+
+// --- Retry tests (Step 3.3) ---
+
+#[tokio::test]
+async fn retries_on_503() {
+    let server = MockServer::start().await;
+
+    // First two calls return 503 (retryable), third returns 200.
+    // wiremock matches the most recently mounted mock first, so mount the
+    // success mock first (lower priority) then the 503 mock with up_to_n_times.
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "message": { "content": "recovered" }
+        })))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .respond_with(ResponseTemplate::new(503).set_body_string("temporarily unavailable"))
+        .up_to_n_times(2)
+        .mount(&server)
+        .await;
+
+    let backend = LocalOllamaBackend::new(server.uri(), "test-model");
+    let req = ChatRequest::new().user("hi");
+    let reply = backend.complete(req).await.unwrap();
+
+    assert_eq!(reply.content, "recovered");
+}
+
+#[tokio::test]
+async fn gives_up_after_max_retries() {
+    let server = MockServer::start().await;
+
+    // Always return 503 — expect 4 total attempts (1 initial + 3 retries).
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .respond_with(ResponseTemplate::new(503).set_body_string("always down"))
+        .expect(4)
+        .mount(&server)
+        .await;
+
+    let backend = LocalOllamaBackend::new(server.uri(), "test-model");
+    let req = ChatRequest::new().user("hi");
+    let err = backend.complete(req).await.unwrap_err();
+
+    assert!(
+        err.to_string().contains("503"),
+        "final error should mention 503: {err}"
+    );
+}
+
+#[tokio::test]
+async fn non_retryable_4xx_fails_immediately() {
+    let server = MockServer::start().await;
+
+    // 400 is not retryable — should get exactly 1 request.
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .respond_with(ResponseTemplate::new(400).set_body_string("bad request"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let backend = LocalOllamaBackend::new(server.uri(), "test-model");
+    let req = ChatRequest::new().user("hi");
+    let err = backend.complete(req).await.unwrap_err();
+
+    assert!(
+        err.to_string().contains("400"),
+        "error should mention 400: {err}"
+    );
+}
+
+#[tokio::test]
+async fn success_on_first_try_no_retry() {
+    let server = MockServer::start().await;
+
+    // Exactly 1 request expected — no retries needed.
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "message": { "content": "first try" }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let backend = LocalOllamaBackend::new(server.uri(), "test-model");
+    let req = ChatRequest::new().user("hi");
+    let reply = backend.complete(req).await.unwrap();
+
+    assert_eq!(reply.content, "first try");
 }
