@@ -14,6 +14,13 @@ pub struct ChatReply {
     pub model_id: String,
 }
 
+impl ChatReply {
+    /// Format an audit-trail line: "backend=<name> model_id=<id>".
+    pub fn audit_string(&self, backend_name: &str) -> String {
+        format!("backend={} model_id={}", backend_name, self.model_id)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Message {
     pub role: String,
@@ -136,5 +143,17 @@ mod tests {
         let req = ChatRequest::default();
         assert!(req.messages.is_empty());
         assert_eq!(req.max_tokens, None);
+    }
+
+    #[test]
+    fn audit_string_format() {
+        let reply = ChatReply {
+            content: "hello".to_string(),
+            model_id: "llama3.1:8b".to_string(),
+        };
+        assert_eq!(
+            reply.audit_string("ollama-local"),
+            "backend=ollama-local model_id=llama3.1:8b"
+        );
     }
 }
