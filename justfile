@@ -48,6 +48,14 @@ check:
     cargo clippy --workspace --all-targets -- -D warnings
     cargo test --workspace
 
+# Build + test the out-of-workspace newt-mesh crate. Requires the
+# sibling `../agent-mesh/` checkout. Not run by `just check` /
+# CI — see docs/decisions/mesh_integration.md.
+check-mesh:
+    cargo fmt --manifest-path newt-mesh/Cargo.toml -- --check
+    cargo clippy --manifest-path newt-mesh/Cargo.toml --all-targets -- -D warnings
+    cargo test --manifest-path newt-mesh/Cargo.toml
+
 # --- Coverage ---
 #
 # Coverage is gated at 80% workspace-wide from Step 0.3 onward. The

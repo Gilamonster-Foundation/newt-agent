@@ -9,10 +9,20 @@ members = [
     "newt-mcp-server",
     "newt-cli",
     "newt-eval",
-    "newt-mesh",
     "plugins-protocol",
     "tests/common",
 ]
+# `newt-mesh` is intentionally NOT a workspace member: it depends on
+# `../agent-mesh/` via path, which isn't present on stock GitHub
+# Actions checkouts. Keeping it out of `members` lets the default
+# workspace load on plain CI without needing an agent-mesh sibling.
+# Local development picks it up by running its tests through cargo
+# with an explicit manifest path:
+#
+#   cargo test --manifest-path newt-mesh/Cargo.toml
+#
+# See docs/decisions/mesh_integration.md for the full rationale.
+exclude = ["newt-mesh"]
 
 [workspace.package]
 # Kyln versioning: 0.{month}.{YYYYMMDD}
@@ -76,15 +86,12 @@ newt-tui          = { path = "newt-tui",          version = "=0.5.20260529" }
 newt-acp-worker   = { path = "newt-acp-worker",   version = "=0.5.20260529" }
 newt-mcp-server   = { path = "newt-mcp-server",   version = "=0.5.20260529" }
 newt-eval         = { path = "newt-eval",         version = "=0.5.20260529" }
-newt-mesh         = { path = "newt-mesh",         version = "=0.5.20260529" }
 plugins-protocol  = { path = "plugins-protocol",  version = "=0.5.20260529" }
 
-# agent-mesh path deps — used ONLY when the `mesh` cargo feature is enabled.
-# CI builds the default features; GitHub-side cross-checkout for agent-mesh
-# is out of scope for Phase 4. See docs/decisions/mesh_integration.md.
-agent-mesh-core      = { path = "../agent-mesh/agent-mesh-core" }
-agent-mesh-bus       = { path = "../agent-mesh/agent-mesh-bus" }
-agent-mesh-discovery = { path = "../agent-mesh/agent-mesh-discovery" }
+# NOTE on agent-mesh / newt-mesh: see the `[workspace] exclude = [...]`
+# block above. Those deps are NOT declared as workspace-level
+# dependencies because `newt-mesh` is intentionally excluded from the
+# default workspace — see docs/decisions/mesh_integration.md.
 
 [workspace.lints.clippy]
 explicit_iter_loop            = "warn"

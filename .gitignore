@@ -1,5 +1,8 @@
 # Rust
 /target
+# newt-mesh is a sibling crate outside the workspace; its target dir
+# lives under newt-mesh/ rather than the workspace root.
+/newt-mesh/target
 **/*.rs.bk
 Cargo.lock.bak
 
