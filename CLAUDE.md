@@ -55,7 +55,8 @@ job in `.github/workflows/ci.yml`. The floor **ratchets up, never
 down** — if your PR drops coverage below the floor, raise the
 coverage; don't lower the floor.
 
-Bootstrap floor: 15% (current scaffold baseline).
+Bootstrap floor: 15% → ratcheted to 75% in the stdio-safety PR
+(workspace coverage is ~89.78%).
 Target floor: 80% (per the roadmap acceptance contract).
 
 ## Editor / shell preferences

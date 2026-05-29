@@ -65,9 +65,10 @@ jobs:
           tool: cargo-llvm-cov
 
       # The gate floor matches `just cov-ci` in the justfile. Keep
-      # them in lock-step — PIPELINE PARITY.
+      # them in lock-step — PIPELINE PARITY. Ratcheted from 15 to
+      # 75 in the stdio-safety PR (workspace is at ~89.78%).
       - name: Coverage with floor
-        run: cargo llvm-cov --workspace --lcov --output-path lcov.info --fail-under-lines 15
+        run: cargo llvm-cov --workspace --lcov --output-path lcov.info --fail-under-lines 75
 
       - name: Summary
         if: always()
