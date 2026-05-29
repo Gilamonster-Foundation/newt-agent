@@ -25,6 +25,19 @@ tracing.workspace = true
 futures-core.workspace = true
 tokio-stream.workspace = true
 
+# Optional PyO3 bindings — opt in only via the umbrella `newt-agent-py`
+# crate; default builds stay Python-free.
+pyo3 = { workspace = true, optional = true }
+pyo3-async-runtimes = { workspace = true, optional = true }
+
+[features]
+default = []
+pyo3 = [
+    "dep:pyo3",
+    "dep:pyo3-async-runtimes",
+    "newt-core/pyo3",
+]
+
 [dev-dependencies]
 tests-common = { path = "../tests/common" }
 wiremock.workspace = true
