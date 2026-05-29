@@ -1,24 +1,40 @@
 //! MCP protocol handlers: initialize, tools/list, and tools/call.
 //!
 //! Registers all JSON-RPC methods that the newt MCP server exposes.
+//!
+//! `goal_run` is the only handler that needs runtime state — it
+//! borrows a [`BackendRegistry`] (to pick a backend) and a [`Router`]
+//! (to classify the prompt into a [`Tier`]). The other tools
+//! (`code_read` / `code_edit` / `code_search`) are pure file I/O and
+//! need no shared state.
 
 use std::path::Path;
+use std::sync::Arc;
 
+use newt_core::router::{Router, Tier};
+use newt_inference::BackendRegistry;
 use serde_json::Value;
 
 use crate::server::McpServer;
 
 /// Register the core MCP protocol handlers on `server`.
-pub fn register_handlers(server: &mut McpServer) {
+///
+/// `registry` and `router` are wired into the `goal_run` handler;
+/// every other handler ignores them.
+pub fn register_handlers(
+    server: &mut McpServer,
+    registry: Arc<BackendRegistry>,
+    router: Arc<Router>,
+) {
     register_initialize(server);
     register_tools_list(server);
-    register_tools_call(server);
+    register_tools_call(server, registry, router);
 }
 
 // ── initialize ─────────────────────────────────────────────────────────────
 
 fn register_initialize(server: &mut McpServer) {
-    server.register("initialize", |_params| {
+    server.register("initialize", |_params| async move {
         Ok(serde_json::json!({
             "protocolVersion": "2024-11-05",
             "capabilities": { "tools": {} },
@@ -33,7 +49,7 @@ fn register_initialize(server: &mut McpServer) {
 // ── tools/list ─────────────────────────────────────────────────────────────
 
 fn register_tools_list(server: &mut McpServer) {
-    server.register("tools/list", |_params| {
+    server.register("tools/list", |_params| async move {
         Ok(serde_json::json!({
             "tools": tool_definitions()
         }))
@@ -117,20 +133,34 @@ fn tool_definitions() -> Value {
 
 // ── tools/call ─────────────────────────────────────────────────────────────
 
-fn register_tools_call(server: &mut McpServer) {
-    server.register("tools/call", |params| {
-        let name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
-        let arguments = params
-            .get("arguments")
-            .cloned()
-            .unwrap_or_else(|| Value::Object(Default::default()));
+fn register_tools_call(
+    server: &mut McpServer,
+    registry: Arc<BackendRegistry>,
+    router: Arc<Router>,
+) {
+    server.register("tools/call", move |params| {
+        // Move clones into the async block so each invocation owns its
+        // own Arc (the outer closure is `Fn`, not `FnOnce`).
+        let registry = registry.clone();
+        let router = router.clone();
+        async move {
+            let name = params
+                .get("name")
+                .and_then(|n| n.as_str())
+                .unwrap_or("")
+                .to_string();
+            let arguments = params
+                .get("arguments")
+                .cloned()
+                .unwrap_or_else(|| Value::Object(Default::default()));
 
-        match name {
-            "code_read" => handle_code_read(&arguments),
-            "code_edit" => handle_code_edit(&arguments),
-            "code_search" => handle_code_search(&arguments),
-            "goal_run" => handle_goal_run(&arguments),
-            _ => anyhow::bail!("unknown tool: {name}"),
+            match name.as_str() {
+                "code_read" => handle_code_read(&arguments),
+                "code_edit" => handle_code_edit(&arguments),
+                "code_search" => handle_code_search(&arguments),
+                "goal_run" => handle_goal_run(&arguments, &registry, &router).await,
+                other => anyhow::bail!("unknown tool: {other}"),
+            }
         }
     });
 }
@@ -184,12 +214,55 @@ fn handle_code_search(args: &Value) -> anyhow::Result<Value> {
     Ok(mcp_text_content(&text))
 }
 
-fn handle_goal_run(_args: &Value) -> anyhow::Result<Value> {
-    // Placeholder — wiring BackendRegistry requires async handlers.
-    // For v0, signal that the tool exists but isn't connected yet.
-    Ok(mcp_text_content(
-        "goal_run is not yet wired to an inference backend",
-    ))
+/// Parse a `tier` argument from the JSON-RPC call. Accepts the four
+/// canonical names (case-insensitive) per the tools/list schema.
+fn parse_tier(s: &str) -> anyhow::Result<Tier> {
+    match s.to_ascii_uppercase().as_str() {
+        "FAST" => Ok(Tier::Fast),
+        "STANDARD" => Ok(Tier::Standard),
+        "COMPLEX" => Ok(Tier::Complex),
+        "REVIEW" => Ok(Tier::Review),
+        other => anyhow::bail!("invalid tier: {other} (expected FAST|STANDARD|COMPLEX|REVIEW)"),
+    }
+}
+
+/// Wire `goal_run`:
+///   1. validate `prompt` (required)
+///   2. validate `tier` override if present, else `Router::classify`
+///   3. pick a backend from the registry for that tier
+///   4. await `backend.complete(...)`
+///   5. wrap the reply in the MCP content envelope, prefixed with the
+///      backend's `model_id` so callers can see which model answered
+async fn handle_goal_run(
+    args: &Value,
+    registry: &BackendRegistry,
+    router: &Router,
+) -> anyhow::Result<Value> {
+    let prompt = args
+        .get("prompt")
+        .and_then(|p| p.as_str())
+        .ok_or_else(|| anyhow::anyhow!("missing required argument: prompt"))?
+        .to_string();
+
+    let tier = match args.get("tier").and_then(|t| t.as_str()) {
+        Some(s) => parse_tier(s)?,
+        None => router.classify(&prompt),
+    };
+
+    let backend = registry
+        .pick(tier)
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+
+    let chat = newt_inference::ChatRequest::new().user(prompt);
+    let reply = backend
+        .complete(chat)
+        .await
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+
+    Ok(mcp_text_content(&format!(
+        "[{}] {}",
+        reply.model_id, reply.content
+    )))
 }
 
 /// Wrap a string in the MCP content envelope: `{ "content": [{ "type": "text", "text": ... }] }`.
@@ -208,10 +281,26 @@ mod tests {
 
     // ── Helper ──────────────────────────────────────────────────────────────
 
-    /// Build a fully-wired McpServer and send a single request through it.
+    /// Build a fully-wired McpServer with an empty registry and default
+    /// router, then send a single request through it.
     async fn rpc(request: &Value) -> Value {
+        rpc_with(
+            Arc::new(BackendRegistry::new()),
+            Arc::new(Router::new()),
+            request,
+        )
+        .await
+    }
+
+    /// Like [`rpc`], but with a caller-supplied registry and router so
+    /// goal_run tests can swap in a mock backend.
+    async fn rpc_with(
+        registry: Arc<BackendRegistry>,
+        router: Arc<Router>,
+        request: &Value,
+    ) -> Value {
         let mut server = McpServer::new();
-        register_handlers(&mut server);
+        register_handlers(&mut server, registry, router);
 
         let input = format!("{}\n", serde_json::to_string(request).unwrap());
         let mut output: Vec<u8> = Vec::new();
@@ -419,26 +508,6 @@ mod tests {
         assert_eq!(resp["error"]["code"], -32603);
     }
 
-    // ── tools/call — goal_run ───────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn goal_run_returns_placeholder() {
-        let resp = rpc(&serde_json::json!({
-            "jsonrpc": "2.0", "id": 40, "method": "tools/call",
-            "params": {
-                "name": "goal_run",
-                "arguments": { "prompt": "hello" }
-            }
-        }))
-        .await;
-
-        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
-        assert!(
-            text.contains("not yet wired"),
-            "expected placeholder, got: {text}"
-        );
-    }
-
     // ── tools/call — unknown tool ───────────────────────────────────────────
 
     #[tokio::test]
@@ -458,5 +527,28 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("unknown tool"));
+    }
+
+    // ── parse_tier — unit tests ─────────────────────────────────────────────
+
+    #[test]
+    fn parse_tier_canonical_names() {
+        assert_eq!(parse_tier("FAST").unwrap(), Tier::Fast);
+        assert_eq!(parse_tier("STANDARD").unwrap(), Tier::Standard);
+        assert_eq!(parse_tier("COMPLEX").unwrap(), Tier::Complex);
+        assert_eq!(parse_tier("REVIEW").unwrap(), Tier::Review);
+    }
+
+    #[test]
+    fn parse_tier_is_case_insensitive() {
+        assert_eq!(parse_tier("fast").unwrap(), Tier::Fast);
+        assert_eq!(parse_tier("Complex").unwrap(), Tier::Complex);
+    }
+
+    #[test]
+    fn parse_tier_rejects_unknown() {
+        let err = parse_tier("BOGUS").unwrap_err().to_string();
+        assert!(err.contains("invalid tier"), "got: {err}");
+        assert!(err.contains("BOGUS"), "got: {err}");
     }
 }
