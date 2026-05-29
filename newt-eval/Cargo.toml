@@ -31,6 +31,18 @@ tempfile.workspace = true
 walkdir = "2"
 fs_extra = "1"
 
+# Optional PyO3 bindings — opt in only via the umbrella `newt-agent-py`
+# crate; default builds stay Python-free.
+pyo3 = { workspace = true, optional = true }
+
+[features]
+default = []
+pyo3 = [
+    "dep:pyo3",
+    "newt-core/pyo3",
+    "newt-acp-worker/pyo3",
+]
+
 [dev-dependencies]
 wiremock.workspace = true
 assert_cmd.workspace = true

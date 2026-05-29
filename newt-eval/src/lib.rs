@@ -35,6 +35,9 @@ pub mod evaluators;
 pub mod runner;
 pub mod scorecard;
 
+#[cfg(feature = "pyo3")]
+pub mod pyo3_module;
+
 pub use cases::{default_cases_dir, load_all, MockResponse, TestCase};
 pub use evaluators::{
     default_evaluators, evaluator_by_name, DiffAppliesEvaluator, DiffNonemptyEvaluator, Evaluator,
