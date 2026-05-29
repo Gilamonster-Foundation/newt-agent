@@ -77,8 +77,14 @@ cov:
 # 75% here to give a margin while approaching the 80% target.
 # Each PR that adds tests should also bump this threshold higher;
 # each PR that adds untested code will fail the gate.
+#
+# pyo3_module.rs files are excluded: they only compile under the
+# `pyo3` cargo feature (umbrella `newt-agent-py` crate turns it on)
+# and have their own pytest suite at newt-agent-py/tests/. Counting
+# them as zero-coverage in the default-feature build would falsely
+# tank the workspace number.
 cov-ci:
-    cargo llvm-cov --workspace --lcov --output-path lcov.info --fail-under-lines 75
+    cargo llvm-cov --workspace --lcov --output-path lcov.info --fail-under-lines 75 --ignore-filename-regex 'pyo3_module\.rs$'
 
 # --- Evaluation ---
 
