@@ -25,6 +25,17 @@ tracing.workspace = true
 
 # TODO: depend on agent-client-protocol crate (Apache-2.0) for ACP wire layer.
 
+# Optional PyO3 bindings — opt in only via the umbrella `newt-agent-py`
+# crate; default builds stay Python-free.
+pyo3 = { workspace = true, optional = true }
+
+[features]
+default = []
+pyo3 = [
+    "dep:pyo3",
+    "newt-core/pyo3",
+]
+
 [dev-dependencies]
 tests-common.workspace = true
 tempfile.workspace = true
