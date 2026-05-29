@@ -49,7 +49,9 @@ enum Command {
         /// Only run the case whose name matches this string (substring match).
         #[arg(long)]
         case: Option<String>,
-        /// Override the model name (sent via ACP `set_session_model`).
+        /// Override the model name (sent via ACP `set_session_model` AND
+        /// `NEWT_DEFAULT_MODEL` env on the spawned worker — latter is
+        /// the load-bearing one today).
         #[arg(long)]
         model: Option<String>,
         /// Path to the cases directory (defaults to bundled).
@@ -58,6 +60,12 @@ enum Command {
         /// Path to the `newt` binary (defaults to `target/<profile>/newt`).
         #[arg(long)]
         worker_bin: Option<PathBuf>,
+        /// Spawn the worker with `--coder` so the newt-coder plugin
+        /// handles prompts (whole-file emit + diff normalization).
+        /// Required for local Ollama coder models that can't fabricate
+        /// valid hunk headers (failure mode T0b).
+        #[arg(long)]
+        coder: bool,
     },
 }
 
@@ -109,7 +117,8 @@ async fn real_main() -> Result<bool> {
             model,
             cases_dir,
             worker_bin,
-        } => run_command(mode, case, model, cases_dir, worker_bin).await,
+            coder,
+        } => run_command(mode, case, model, cases_dir, worker_bin, coder).await,
     }
 }
 
@@ -119,6 +128,7 @@ async fn run_command(
     model: Option<String>,
     cases_dir: Option<PathBuf>,
     worker_bin: Option<PathBuf>,
+    coder: bool,
 ) -> Result<bool> {
     if let Mode::Mock = mode {
         anyhow::bail!(
@@ -144,6 +154,9 @@ async fn run_command(
     let mut config = RunnerConfig::new(&worker);
     if let Some(m) = model {
         config = config.with_model(m);
+    }
+    if coder {
+        config = config.with_coder_mode(true);
     }
 
     let mut scorecard = Scorecard::new();
