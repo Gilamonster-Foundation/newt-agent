@@ -20,6 +20,19 @@ path = "src/main.rs"
 name = "newt_cli"
 path = "src/lib.rs"
 
+[features]
+default = []
+# Opt-in mesh integration. CI builds default features only — the
+# `mesh` feature pulls in agent-mesh path deps that aren't in
+# `actions/checkout`. See docs/decisions/mesh_integration.md.
+mesh = [
+    "dep:newt-mesh",
+    "dep:agent-mesh-bus",
+    "dep:agent-mesh-core",
+    "dep:agent-mesh-discovery",
+    "dep:chrono",
+]
+
 [dependencies]
 newt-core.workspace = true
 newt-inference.workspace = true
@@ -34,6 +47,13 @@ tokio.workspace = true
 toml.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+# Optional, only enabled by `--features mesh`.
+newt-mesh = { workspace = true, optional = true }
+agent-mesh-bus = { workspace = true, optional = true }
+agent-mesh-core = { workspace = true, optional = true }
+agent-mesh-discovery = { workspace = true, optional = true }
+chrono = { workspace = true, optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
