@@ -982,7 +982,7 @@ dependencies = [
 
 [[package]]
 name = "newt-acp-worker"
-version = "0.5.20260525"
+version = "0.5.20260529"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1000,7 +1000,7 @@ dependencies = [
 
 [[package]]
 name = "newt-agent"
-version = "0.5.20260525"
+version = "0.5.20260529"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -1024,7 +1024,7 @@ dependencies = [
 
 [[package]]
 name = "newt-core"
-version = "0.5.20260525"
+version = "0.5.20260529"
 dependencies = [
  "serde",
  "serde_json",
@@ -1037,7 +1037,7 @@ dependencies = [
 
 [[package]]
 name = "newt-eval"
-version = "0.5.20260525"
+version = "0.5.20260529"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -1060,7 +1060,7 @@ dependencies = [
 
 [[package]]
 name = "newt-inference"
-version = "0.5.20260525"
+version = "0.5.20260529"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1081,7 +1081,7 @@ dependencies = [
 
 [[package]]
 name = "newt-mcp-server"
-version = "0.5.20260525"
+version = "0.5.20260529"
 dependencies = [
  "anyhow",
  "newt-core",
@@ -1098,7 +1098,7 @@ dependencies = [
 
 [[package]]
 name = "newt-tools"
-version = "0.5.20260525"
+version = "0.5.20260529"
 dependencies = [
  "anyhow",
  "newt-core",
@@ -1112,7 +1112,7 @@ dependencies = [
 
 [[package]]
 name = "newt-tui"
-version = "0.5.20260525"
+version = "0.5.20260529"
 dependencies = [
  "anyhow",
  "crossterm",
@@ -1212,7 +1212,7 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
 name = "plugins-protocol"
-version = "0.5.20260525"
+version = "0.5.20260529"
 dependencies = [
  "serde",
  "serde_json",
@@ -1835,7 +1835,7 @@ checksum = "8f50febec83f5ee1df3015341d8bd429f2d1cc62bcba7ea2076759d315084683"
 
 [[package]]
 name = "tests-common"
-version = "0.5.20260525"
+version = "0.5.20260529"
 dependencies = [
  "anyhow",
  "async-trait",

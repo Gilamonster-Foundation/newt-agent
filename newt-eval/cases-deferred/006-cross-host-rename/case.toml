@@ -1,0 +1,65 @@
+# DEFERRED — cross-host eval case for newt-mesh.
+#
+# This case exercises a scenario the current `newt-eval` framework does
+# NOT support: dispatching a rename via `newt mesh ask <peer>` (i.e. the
+# asker side of newt-mesh) rather than `newt worker` (the local ACP
+# subprocess the runner already drives). To wire this up we'd need a
+# mesh-aware runner that:
+#
+#   1. Spawns or assumes a second `newt mesh announce` responder bound
+#      to a fresh agent fingerprint.
+#   2. Reads the responder's fingerprint from its stdout.
+#   3. Invokes `newt mesh ask <fp> "<prompt>"` and captures the reply.
+#   4. Applies the returned diff against the case's workspace, then
+#      runs the standard evaluators against the result.
+#
+# That mesh-aware runner is out of scope for Phase 4 (newt-mesh
+# integration); see `docs/decisions/mesh_integration.md`. The
+# `newt-mesh/tests/inference_roundtrip.rs` smoke test covers the
+# same plumbing end-to-end in-process, so we're not blind on the
+# happy path.
+#
+# When the eval framework grows mesh awareness, move this directory
+# back to `cases/` and the existing evaluators apply unchanged.
+name = "006-cross-host-rename"
+description = "Rename via cross-host newt-mesh dispatch — deferred (see comments)."
+language = "rust"
+prompt = """
+Rename the function `cross_host_greet` to `cross_host_hello` in
+src/lib.rs. Respond with a unified diff only.
+"""
+
+evaluators = [
+    "diff_nonempty",
+    "diff_applies",
+    "rust_compiles",
+    "tests_pass",
+    "pattern_match",
+]
+
+expected_patterns = [
+    "fn cross_host_hello\\(",
+    "-pub fn cross_host_greet\\(",
+]
+
+[mock_response]
+content = """
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,12 +1,12 @@
+-pub fn cross_host_greet(name: &str) -> String {
++pub fn cross_host_hello(name: &str) -> String {
+     format!("Hello, {name}!")
+ }
+
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+
+     #[test]
+     fn greets() {
+-        assert_eq!(cross_host_greet("a"), "Hello, a!");
++        assert_eq!(cross_host_hello("a"), "Hello, a!");
+     }
+ }
+"""

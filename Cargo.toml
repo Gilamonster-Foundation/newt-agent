@@ -12,10 +12,21 @@ members = [
     "plugins-protocol",
     "tests/common",
 ]
+# `newt-mesh` is intentionally NOT a workspace member: it depends on
+# `../agent-mesh/` via path, which isn't present on stock GitHub
+# Actions checkouts. Keeping it out of `members` lets the default
+# workspace load on plain CI without needing an agent-mesh sibling.
+# Local development picks it up by running its tests through cargo
+# with an explicit manifest path:
+#
+#   cargo test --manifest-path newt-mesh/Cargo.toml
+#
+# See docs/decisions/mesh_integration.md for the full rationale.
+exclude = ["newt-mesh"]
 
 [workspace.package]
 # Kyln versioning: 0.{month}.{YYYYMMDD}
-version = "0.5.20260525"
+version = "0.5.20260529"
 edition = "2021"
 rust-version = "1.75"
 license = "Apache-2.0"
@@ -68,14 +79,19 @@ insta = "1"
 tests-common = { path = "tests/common" }
 
 # Internal crates — pinned with = for lock-step publishing
-newt-core         = { path = "newt-core",         version = "=0.5.20260525" }
-newt-inference    = { path = "newt-inference",    version = "=0.5.20260525" }
-newt-tools        = { path = "newt-tools",        version = "=0.5.20260525" }
-newt-tui          = { path = "newt-tui",          version = "=0.5.20260525" }
-newt-acp-worker   = { path = "newt-acp-worker",   version = "=0.5.20260525" }
-newt-mcp-server   = { path = "newt-mcp-server",   version = "=0.5.20260525" }
-newt-eval         = { path = "newt-eval",         version = "=0.5.20260525" }
-plugins-protocol  = { path = "plugins-protocol",  version = "=0.5.20260525" }
+newt-core         = { path = "newt-core",         version = "=0.5.20260529" }
+newt-inference    = { path = "newt-inference",    version = "=0.5.20260529" }
+newt-tools        = { path = "newt-tools",        version = "=0.5.20260529" }
+newt-tui          = { path = "newt-tui",          version = "=0.5.20260529" }
+newt-acp-worker   = { path = "newt-acp-worker",   version = "=0.5.20260529" }
+newt-mcp-server   = { path = "newt-mcp-server",   version = "=0.5.20260529" }
+newt-eval         = { path = "newt-eval",         version = "=0.5.20260529" }
+plugins-protocol  = { path = "plugins-protocol",  version = "=0.5.20260529" }
+
+# NOTE on agent-mesh / newt-mesh: see the `[workspace] exclude = [...]`
+# block above. Those deps are NOT declared as workspace-level
+# dependencies because `newt-mesh` is intentionally excluded from the
+# default workspace — see docs/decisions/mesh_integration.md.
 
 [workspace.lints.clippy]
 explicit_iter_loop            = "warn"
