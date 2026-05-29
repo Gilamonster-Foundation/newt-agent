@@ -150,11 +150,21 @@ fn copy_fixture(src: &Path, dst: &Path) -> anyhow::Result<()> {
 
 /// `git init` + commit everything as baseline so the worker's
 /// `git diff --no-color` capture step has something to compare against.
+///
+/// `GIT_DIR` / `GIT_WORK_TREE` / friends are stripped from the child
+/// env so this works when invoked from inside a git hook (e.g. the
+/// pre-push hook that calls `cargo test`). Without this, `git init`
+/// targets the hook's repo instead of `workspace`.
 fn init_baseline_git(workspace: &Path) -> anyhow::Result<()> {
     let run = |args: &[&str]| -> anyhow::Result<()> {
         let output = std::process::Command::new("git")
             .args(args)
             .current_dir(workspace)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .env_remove("GIT_COMMON_DIR")
+            .env_remove("GIT_PREFIX")
             .output()?;
         if !output.status.success() {
             anyhow::bail!(
@@ -387,10 +397,16 @@ content = ""
         init_baseline_git(tmp.path()).unwrap();
         // .git directory exists
         assert!(tmp.path().join(".git").exists());
-        // and a clean working tree
+        // and a clean working tree (env_remove to stay scoped to `tmp`
+        // when running from inside a git hook).
         let status = std::process::Command::new("git")
             .args(["status", "--porcelain"])
             .current_dir(tmp.path())
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .env_remove("GIT_COMMON_DIR")
+            .env_remove("GIT_PREFIX")
             .output()
             .unwrap();
         assert!(status.stdout.is_empty(), "expected clean working tree");
