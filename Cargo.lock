@@ -428,8 +428,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c673075a2e0e5f4a1dde27ce9dee1ea4558c7ffe648f576438a20ca1d2acc4b0"
 dependencies = [
  "iana-time-zone",
+ "js-sys",
  "num-traits",
  "serde",
+ "wasm-bindgen",
  "windows-link",
 ]
 
@@ -2574,14 +2576,19 @@ dependencies = [
 name = "newt-agent"
 version = "0.5.20260529"
 dependencies = [
+ "agent-mesh-bus",
+ "agent-mesh-core",
+ "agent-mesh-discovery",
  "anyhow",
  "assert_cmd",
+ "chrono",
  "clap",
  "libc",
  "newt-acp-worker",
  "newt-core",
  "newt-inference",
  "newt-mcp-server",
+ "newt-mesh",
  "newt-tools",
  "newt-tui",
  "predicates",

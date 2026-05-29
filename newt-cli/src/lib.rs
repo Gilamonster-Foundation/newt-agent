@@ -1,9 +1,12 @@
 //! Newt CLI dispatch surface.
 //!
 //! Subcommands: `code`, `pilot`, `worker`, `mcp`, `doctor`, `config`.
+//! With `--features mesh`: also `mesh announce` / `mesh ask`.
 
 mod config_cmd;
 mod doctor;
+#[cfg(feature = "mesh")]
+mod mesh;
 pub mod stdio_guard;
 
 use clap::{Parser, Subcommand};
@@ -44,6 +47,63 @@ pub enum Command {
     Doctor,
     /// Print resolved config.
     Config,
+    /// Mesh operations (requires the `mesh` cargo feature).
+    #[cfg(feature = "mesh")]
+    Mesh {
+        #[command(subcommand)]
+        action: MeshAction,
+    },
+}
+
+/// Subcommands under `newt mesh`. Only compiled with `--features mesh`.
+#[cfg(feature = "mesh")]
+#[derive(Subcommand, Debug)]
+pub enum MeshAction {
+    /// Bind a responder service: announce this newt on the LAN and
+    /// answer inference requests from peers.
+    Announce {
+        /// Extra capability tags to advertise (`newt-inference` and
+        /// `model=<id>` are always included).
+        #[arg(long = "capability")]
+        capabilities: Vec<String>,
+        /// Bind port (`0` lets the OS choose).
+        #[arg(long, default_value = "0")]
+        port: u16,
+        /// Path to the user key (defaults to `~/.agent-mesh/user.key`).
+        #[arg(long)]
+        user_key: Option<PathBuf>,
+        /// Role label.
+        #[arg(long, default_value = "newt-worker")]
+        role: String,
+        /// Model to serve (defaults to `llama3.1:8b`).
+        #[arg(long)]
+        model: Option<String>,
+    },
+    /// Send an inference request to a peer newt and print the reply.
+    Ask {
+        /// Peer agent fingerprint — full 64-char hex, 12-char short
+        /// form, or any hex prefix.
+        peer_fp: String,
+        /// The prompt to ask.
+        prompt: String,
+        /// Tier hint (FAST/STANDARD/COMPLEX/REVIEW).
+        #[arg(long)]
+        tier: Option<String>,
+        /// Pin the model — responder must serve this exact model or
+        /// return an error.
+        #[arg(long)]
+        model: Option<String>,
+        /// Max output tokens.
+        #[arg(long)]
+        max_tokens: Option<u32>,
+        /// Path to the user key (defaults to `~/.agent-mesh/user.key`).
+        #[arg(long)]
+        user_key: Option<PathBuf>,
+        /// How long to wait for the peer + reply. Accepts `Ns`, `Nm`,
+        /// `Nms`, or a bare integer (seconds).
+        #[arg(long, default_value = "30s")]
+        timeout: String,
+    },
 }
 
 pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
@@ -54,6 +114,25 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         Command::Mcp => run_mcp().await,
         Command::Doctor => doctor::run(cli.config.as_deref()).await,
         Command::Config => config_cmd::run(cli.config.as_deref()),
+        #[cfg(feature = "mesh")]
+        Command::Mesh { action } => match action {
+            MeshAction::Announce {
+                capabilities,
+                port,
+                user_key,
+                role,
+                model,
+            } => mesh::announce(user_key, capabilities, port, role, model).await,
+            MeshAction::Ask {
+                peer_fp,
+                prompt,
+                tier,
+                model,
+                max_tokens,
+                user_key,
+                timeout,
+            } => mesh::ask(user_key, peer_fp, prompt, tier, model, max_tokens, timeout).await,
+        },
     }
 }
 
