@@ -1023,6 +1023,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "newt-coder"
+version = "0.5.20260529"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "newt-core",
+ "newt-inference",
+ "newt-tools",
+ "plugins-protocol",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tests-common",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "newt-core"
 version = "0.5.20260529"
 dependencies = [
