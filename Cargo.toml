@@ -8,6 +8,7 @@ members = [
     "newt-acp-worker",
     "newt-mcp-server",
     "newt-cli",
+    "newt-coder",
     "newt-eval",
     "plugins-protocol",
     "tests/common",
@@ -85,6 +86,7 @@ newt-tools        = { path = "newt-tools",        version = "=0.5.20260529" }
 newt-tui          = { path = "newt-tui",          version = "=0.5.20260529" }
 newt-acp-worker   = { path = "newt-acp-worker",   version = "=0.5.20260529" }
 newt-mcp-server   = { path = "newt-mcp-server",   version = "=0.5.20260529" }
+newt-coder        = { path = "newt-coder",        version = "=0.5.20260529" }
 newt-eval         = { path = "newt-eval",         version = "=0.5.20260529" }
 plugins-protocol  = { path = "plugins-protocol",  version = "=0.5.20260529" }
 

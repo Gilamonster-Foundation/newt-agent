@@ -50,3 +50,42 @@ pub struct Usage {
 }
 
 pub const PROTOCOL_VERSION: u32 = 0;
+
+/// Emission shapes a coder plugin can produce, surfaced in
+/// `TaskReply.emission_shape` when the newt-coder plugin processed the
+/// request.
+///
+/// Downstream consumers (drake-foreman scorecard, audit logs, the
+/// pilot dashboard) compare against these constants so the wire-level
+/// strings can't drift between producer and consumer.
+///
+/// The taxonomy is documented in
+/// `~/workspaces/knowledge/board/drake/2026-05-29_newt-coder-failure-mode-taxonomy.md`.
+pub mod emission_shape {
+    /// One or more `FILE: <path>\n<contents>\nEND-FILE` blocks — the
+    /// S5 whole-file-emit strategy's preferred shape.
+    pub const WHOLE_FILES: &str = "whole_files";
+
+    /// A unified diff (fenced or unfenced). Legacy path; useful when a
+    /// model ignores the whole-file directive but lands a valid hunk.
+    pub const UNIFIED_DIFF: &str = "unified_diff";
+
+    /// No structured emission detected; the model emitted prose only
+    /// (failure mode T0a in the taxonomy).
+    pub const PROSE: &str = "prose";
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn emission_shape_constants_are_stable_strings() {
+        // These constants are part of the wire protocol. Changing them
+        // breaks every downstream consumer; pin them with an explicit
+        // test so a careless rename fails CI loudly.
+        assert_eq!(emission_shape::WHOLE_FILES, "whole_files");
+        assert_eq!(emission_shape::UNIFIED_DIFF, "unified_diff");
+        assert_eq!(emission_shape::PROSE, "prose");
+    }
+}
