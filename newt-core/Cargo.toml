@@ -22,6 +22,14 @@ uuid.workspace = true
 # TODO: depend on thoon-core once it publishes (currently path-only in hermes-thoon).
 # thoon-core = "0.5"
 
+# Optional PyO3 bindings — opt in only via the umbrella `newt-agent-py`
+# crate; default builds stay Python-free.
+pyo3 = { workspace = true, optional = true }
+
+[features]
+default = []
+pyo3 = ["dep:pyo3"]
+
 [dev-dependencies]
 tempfile = "3"
 

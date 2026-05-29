@@ -982,7 +982,7 @@ dependencies = [
 
 [[package]]
 name = "newt-acp-worker"
-version = "0.5.20260529"
+version = "0.5.20260530"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -990,6 +990,7 @@ dependencies = [
  "newt-core",
  "newt-inference",
  "newt-tools",
+ "pyo3",
  "serde",
  "serde_json",
  "tempfile",
@@ -1001,7 +1002,7 @@ dependencies = [
 
 [[package]]
 name = "newt-agent"
-version = "0.5.20260529"
+version = "0.5.20260530"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -1025,7 +1026,7 @@ dependencies = [
 
 [[package]]
 name = "newt-coder"
-version = "0.5.20260529"
+version = "0.5.20260530"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1033,6 +1034,7 @@ dependencies = [
  "newt-inference",
  "newt-tools",
  "plugins-protocol",
+ "pyo3",
  "serde",
  "serde_json",
  "tempfile",
@@ -1044,8 +1046,9 @@ dependencies = [
 
 [[package]]
 name = "newt-core"
-version = "0.5.20260529"
+version = "0.5.20260530"
 dependencies = [
+ "pyo3",
  "serde",
  "serde_json",
  "tempfile",
@@ -1057,7 +1060,7 @@ dependencies = [
 
 [[package]]
 name = "newt-eval"
-version = "0.5.20260529"
+version = "0.5.20260530"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -1066,6 +1069,7 @@ dependencies = [
  "newt-acp-worker",
  "newt-core",
  "predicates",
+ "pyo3",
  "regex",
  "serde",
  "serde_json",
@@ -1080,13 +1084,15 @@ dependencies = [
 
 [[package]]
 name = "newt-inference"
-version = "0.5.20260529"
+version = "0.5.20260530"
 dependencies = [
  "anyhow",
  "async-trait",
  "futures-core",
  "newt-core",
  "plugins-protocol",
+ "pyo3",
+ "pyo3-async-runtimes",
  "reqwest",
  "serde",
  "serde_json",
@@ -1101,12 +1107,13 @@ dependencies = [
 
 [[package]]
 name = "newt-mcp-server"
-version = "0.5.20260529"
+version = "0.5.20260530"
 dependencies = [
  "anyhow",
  "newt-core",
  "newt-inference",
  "newt-tools",
+ "pyo3",
  "serde",
  "serde_json",
  "tempfile",
@@ -1119,10 +1126,11 @@ dependencies = [
 
 [[package]]
 name = "newt-tools"
-version = "0.5.20260529"
+version = "0.5.20260530"
 dependencies = [
  "anyhow",
  "newt-core",
+ "pyo3",
  "regex",
  "serde",
  "serde_json",
@@ -1133,7 +1141,7 @@ dependencies = [
 
 [[package]]
 name = "newt-tui"
-version = "0.5.20260529"
+version = "0.5.20260530"
 dependencies = [
  "anyhow",
  "crossterm",
@@ -1233,12 +1241,18 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
 name = "plugins-protocol"
-version = "0.5.20260529"
+version = "0.5.20260530"
 dependencies = [
  "serde",
  "serde_json",
  "thiserror",
 ]
+
+[[package]]
+name = "portable-atomic"
+version = "1.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c33a9471896f1c69cecef8d20cbe2f7accd12527ce60845ff44c153bb2a21b49"
 
 [[package]]
 name = "potential_utf"
@@ -1305,6 +1319,78 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8fd00f0bb2e90d81d1044c2b32617f68fcb9fa3bb7640c23e9c748e53fb30934"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "pyo3"
+version = "0.28.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "91fd8e38a3b50ed1167fb981cd6fd60147e091784c427b8f7183a7ee32c31c12"
+dependencies = [
+ "libc",
+ "once_cell",
+ "portable-atomic",
+ "pyo3-build-config",
+ "pyo3-ffi",
+ "pyo3-macros",
+]
+
+[[package]]
+name = "pyo3-async-runtimes"
+version = "0.28.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9e7364a95bf00e8377bbf9b0f09d7ff9715a29d8fcf93b47d1a967363b973178"
+dependencies = [
+ "futures-channel",
+ "futures-util",
+ "once_cell",
+ "pin-project-lite",
+ "pyo3",
+ "tokio",
+]
+
+[[package]]
+name = "pyo3-build-config"
+version = "0.28.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e368e7ddfdeb98c9bca7f8383be1648fd84ab466bf2bc015e94008db6d35611e"
+dependencies = [
+ "target-lexicon",
+]
+
+[[package]]
+name = "pyo3-ffi"
+version = "0.28.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7f29e10af80b1f7ccaf7f69eace800a03ecd13e883acfacc1e5d0988605f651e"
+dependencies = [
+ "libc",
+ "pyo3-build-config",
+]
+
+[[package]]
+name = "pyo3-macros"
+version = "0.28.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "df6e520eff47c45997d2fc7dd8214b25dd1310918bbb2642156ef66a67f29813"
+dependencies = [
+ "proc-macro2",
+ "pyo3-macros-backend",
+ "quote",
+ "syn",
+]
+
+[[package]]
+name = "pyo3-macros-backend"
+version = "0.28.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c4cdc218d835738f81c2338f822078af45b4afdf8b2e33cbb5916f108b813acb"
+dependencies = [
+ "heck",
+ "proc-macro2",
+ "pyo3-build-config",
+ "quote",
+ "syn",
 ]
 
 [[package]]
@@ -1836,6 +1922,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "target-lexicon"
+version = "0.13.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "adb6935a6f5c20170eeceb1a3835a49e12e19d792f6dd344ccc76a985ca5a6ca"
+
+[[package]]
 name = "tempfile"
 version = "3.27.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1856,7 +1948,7 @@ checksum = "8f50febec83f5ee1df3015341d8bd429f2d1cc62bcba7ea2076759d315084683"
 
 [[package]]
 name = "tests-common"
-version = "0.5.20260529"
+version = "0.5.20260530"
 dependencies = [
  "anyhow",
  "async-trait",
