@@ -13,6 +13,9 @@
 mod diff;
 mod server;
 
+#[cfg(feature = "pyo3")]
+pub mod pyo3_module;
+
 pub use diff::{capture_diff, is_empty_diff};
 pub use server::{AcpServer, Session, TaskReply};
 

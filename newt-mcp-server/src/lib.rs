@@ -15,6 +15,9 @@ use newt_inference::BackendRegistry;
 pub mod handlers;
 pub mod server;
 
+#[cfg(feature = "pyo3")]
+pub mod pyo3_module;
+
 /// Default model name handed to the discovered Ollama backend.
 ///
 /// A follow-up will read this from `Config` (see `newt_core::Config`)

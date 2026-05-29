@@ -30,6 +30,9 @@ pub mod error;
 pub mod prompt;
 pub mod workspace_scan;
 
+#[cfg(feature = "pyo3")]
+pub mod pyo3_module;
+
 pub use coder::{Coder, CoderRun};
 pub use emission::{normalize_emission, Emission};
 pub use error::{CoderError, Result};

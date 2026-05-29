@@ -22,6 +22,14 @@ regex.workspace = true
 
 # TODO: depend on thoon-fileops + thoon-toolreg once published.
 
+# Optional PyO3 bindings — opt in only via the umbrella `newt-agent-py`
+# crate; default builds stay Python-free.
+pyo3 = { workspace = true, optional = true }
+
+[features]
+default = []
+pyo3 = ["dep:pyo3", "newt-core/pyo3"]
+
 [dev-dependencies]
 tempfile.workspace = true
 

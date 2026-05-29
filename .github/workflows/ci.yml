@@ -67,8 +67,14 @@ jobs:
       # The gate floor matches `just cov-ci` in the justfile. Keep
       # them in lock-step — PIPELINE PARITY. Ratcheted from 15 to
       # 75 in the stdio-safety PR (workspace is at ~89.78%).
+      #
+      # pyo3_module.rs files are excluded: they only compile under
+      # the `pyo3` cargo feature (umbrella `newt-agent-py` crate
+      # turns it on) and have their own pytest suite at
+      # newt-agent-py/tests/. Counting them as zero-coverage in the
+      # default-feature build would falsely tank the workspace number.
       - name: Coverage with floor
-        run: cargo llvm-cov --workspace --lcov --output-path lcov.info --fail-under-lines 75
+        run: cargo llvm-cov --workspace --lcov --output-path lcov.info --fail-under-lines 75 --ignore-filename-regex 'pyo3_module\.rs$'
 
       - name: Summary
         if: always()

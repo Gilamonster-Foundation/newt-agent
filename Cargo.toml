@@ -10,6 +10,7 @@ members = [
     "newt-cli",
     "newt-coder",
     "newt-eval",
+    "newt-agent-py",
     "plugins-protocol",
     "tests/common",
 ]
@@ -27,7 +28,7 @@ exclude = ["newt-mesh"]
 
 [workspace.package]
 # Kyln versioning: 0.{month}.{YYYYMMDD}
-version = "0.5.20260529"
+version = "0.5.20260530"
 edition = "2021"
 rust-version = "1.75"
 license = "Apache-2.0"
@@ -80,20 +81,27 @@ insta = "1"
 tests-common = { path = "tests/common" }
 
 # Internal crates — pinned with = for lock-step publishing
-newt-core         = { path = "newt-core",         version = "=0.5.20260529" }
-newt-inference    = { path = "newt-inference",    version = "=0.5.20260529" }
-newt-tools        = { path = "newt-tools",        version = "=0.5.20260529" }
-newt-tui          = { path = "newt-tui",          version = "=0.5.20260529" }
-newt-acp-worker   = { path = "newt-acp-worker",   version = "=0.5.20260529" }
-newt-mcp-server   = { path = "newt-mcp-server",   version = "=0.5.20260529" }
-newt-coder        = { path = "newt-coder",        version = "=0.5.20260529" }
-newt-eval         = { path = "newt-eval",         version = "=0.5.20260529" }
-plugins-protocol  = { path = "plugins-protocol",  version = "=0.5.20260529" }
+newt-core         = { path = "newt-core",         version = "=0.5.20260530" }
+newt-inference    = { path = "newt-inference",    version = "=0.5.20260530" }
+newt-tools        = { path = "newt-tools",        version = "=0.5.20260530" }
+newt-tui          = { path = "newt-tui",          version = "=0.5.20260530" }
+newt-acp-worker   = { path = "newt-acp-worker",   version = "=0.5.20260530" }
+newt-mcp-server   = { path = "newt-mcp-server",   version = "=0.5.20260530" }
+newt-coder        = { path = "newt-coder",        version = "=0.5.20260530" }
+newt-eval         = { path = "newt-eval",         version = "=0.5.20260530" }
+plugins-protocol  = { path = "plugins-protocol",  version = "=0.5.20260530" }
 
 # NOTE on agent-mesh / newt-mesh: see the `[workspace] exclude = [...]`
 # block above. Those deps are NOT declared as workspace-level
 # dependencies because `newt-mesh` is intentionally excluded from the
 # default workspace — see docs/decisions/mesh_integration.md.
+
+# Python bindings (optional, opt-in per-crate via `pyo3` feature).
+# The umbrella crate `newt-agent-py` is the only consumer that turns
+# these on; default-feature builds of the rest of the workspace stay
+# Python-free.
+pyo3 = { version = "0.28", default-features = false, features = ["macros"] }
+pyo3-async-runtimes = { version = "0.28", default-features = false, features = ["tokio-runtime"] }
 
 [workspace.lints.clippy]
 explicit_iter_loop            = "warn"
