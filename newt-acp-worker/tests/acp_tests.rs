@@ -580,3 +580,156 @@ async fn malformed_json_returns_parse_error() {
         .unwrap()
         .contains("Parse error"));
 }
+
+// ── newt-coder plugin integration ──────────────────────────────────────
+//
+// These tests drive the `coder: true` opt-in through the full ACP loop
+// and assert that the response carries the wire-stable `emission_shape`
+// label so the foreman's scorecard can distinguish T0a / T0b / T0c.
+
+#[tokio::test]
+async fn new_session_with_coder_param_echoes_opt_in() {
+    let tmp = tempfile::tempdir().unwrap();
+    let backend = mock_backend("");
+    let resp = one(
+        backend,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "new_session",
+            "params": {
+                "workspace_path": tmp.path().to_str().unwrap(),
+                "coder": true,
+            },
+        }),
+    )
+    .await;
+    assert_eq!(resp["result"]["coder"], true);
+    assert!(resp["result"]["session_id"].is_string());
+}
+
+#[tokio::test]
+async fn coder_prompt_writes_whole_file_and_reports_shape() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_git_repo(tmp.path());
+    commit_initial(tmp.path(), "lib.rs", "pub fn greet() {}\n");
+
+    // Canned reply in the S5 shape: rename greet -> hello.
+    let canned = "FILE: lib.rs\npub fn hello() {}\nEND-FILE\n";
+    let backend = mock_backend(canned);
+
+    let responses = drive_dependent(
+        backend,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "new_session",
+            "params": {
+                "workspace_path": tmp.path().to_str().unwrap(),
+                "coder": true,
+            },
+        }),
+        |first| {
+            let sid = first["result"]["session_id"].as_str().unwrap().to_string();
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "prompt",
+                "params": {
+                    "session_id": sid,
+                    "prompt": "Rename greet to hello in lib.rs",
+                },
+            })
+        },
+    )
+    .await;
+
+    let result = &responses[1]["result"];
+    assert_eq!(result["emission_shape"], "whole_files");
+    assert_eq!(result["model_id"], "mock-model");
+    assert_eq!(result["empty_diff"], false);
+    assert!(result["diff"].as_str().unwrap().contains("-pub fn greet"));
+    assert!(result["diff"].as_str().unwrap().contains("+pub fn hello"));
+
+    // The on-disk file should now carry the renamed function.
+    let after = std::fs::read_to_string(tmp.path().join("lib.rs")).unwrap();
+    assert!(after.contains("pub fn hello()"));
+}
+
+#[tokio::test]
+async fn coder_prompt_prose_only_reports_t0a_shape() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_git_repo(tmp.path());
+    commit_initial(tmp.path(), "lib.rs", "pub fn greet() {}\n");
+
+    // T0a-style reply: pure prose. The workspace must stay unchanged.
+    let canned = "I've updated src/lib.rs as requested.";
+    let backend = mock_backend(canned);
+
+    let responses = drive_dependent(
+        backend,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "new_session",
+            "params": {
+                "workspace_path": tmp.path().to_str().unwrap(),
+                "coder": true,
+            },
+        }),
+        |first| {
+            let sid = first["result"]["session_id"].as_str().unwrap().to_string();
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "prompt",
+                "params": {
+                    "session_id": sid,
+                    "prompt": "Rename greet to hello in lib.rs",
+                },
+            })
+        },
+    )
+    .await;
+
+    let result = &responses[1]["result"];
+    assert_eq!(result["emission_shape"], "prose");
+    assert_eq!(result["empty_diff"], true);
+    let after = std::fs::read_to_string(tmp.path().join("lib.rs")).unwrap();
+    assert_eq!(after, "pub fn greet() {}\n");
+}
+
+#[tokio::test]
+async fn flat_path_omits_emission_shape_field() {
+    // The legacy newt-flat path (no `coder: true`) must not carry an
+    // `emission_shape` key on the wire — downstream consumers can
+    // pre-date the field.
+    let tmp = tempfile::tempdir().unwrap();
+    let backend = mock_backend("a plain prose reply");
+
+    let responses = drive_dependent(
+        backend,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "new_session",
+            "params": { "workspace_path": tmp.path().to_str().unwrap() },
+        }),
+        |first| {
+            let sid = first["result"]["session_id"].as_str().unwrap().to_string();
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "prompt",
+                "params": { "session_id": sid, "prompt": "do a thing" },
+            })
+        },
+    )
+    .await;
+
+    let result = &responses[1]["result"];
+    assert!(
+        result.get("emission_shape").is_none(),
+        "newt-flat path leaked emission_shape: {result}"
+    );
+}

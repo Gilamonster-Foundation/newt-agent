@@ -87,6 +87,48 @@ pub fn edit(path: &Path, patch: &str) -> anyhow::Result<()> {
     apply_patch(root, patch)
 }
 
+/// Write a set of whole files into `workspace` atomically.
+///
+/// For each `(relative_path, contents)` entry: create parent
+/// directories as needed, write to `<file>.newt-coder-tmp`, then
+/// rename into place. Returns the list of relative paths actually
+/// written so the caller can log them and (after writing) capture
+/// the diff via `git diff`.
+///
+/// This is the multi-file landing pad for the newt-coder plugin's
+/// `Emission::WholeFiles` shape. Kept here (rather than inline in
+/// newt-coder) so any other caller that produces a set of whole
+/// files (test harnesses, future strategies) can share the atomic
+/// write semantics.
+///
+/// # Errors
+///
+/// - `create_dir_all` failure on a parent directory.
+/// - `write` failure on the temp file.
+/// - `rename` failure when moving temp -> final.
+pub fn apply_whole_files<P, M, S, T>(workspace: P, files: M) -> anyhow::Result<Vec<String>>
+where
+    P: AsRef<Path>,
+    M: IntoIterator<Item = (S, T)>,
+    S: Into<String>,
+    T: AsRef<str>,
+{
+    let workspace = workspace.as_ref();
+    let mut written = Vec::new();
+    for (rel, contents) in files {
+        let rel = rel.into();
+        let abs = workspace.join(&rel);
+        if let Some(parent) = abs.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let tmp = abs.with_extension("newt-coder-tmp");
+        std::fs::write(&tmp, contents.as_ref())?;
+        std::fs::rename(&tmp, &abs)?;
+        written.push(rel);
+    }
+    Ok(written)
+}
+
 // ── Diff parser ─────────────────────────────────────────────────────────────
 
 fn parse_unified_diff(diff: &str) -> anyhow::Result<Vec<FilePatch>> {
@@ -483,6 +525,70 @@ mod tests {
         edit(&file, diff).unwrap();
         let result = fs::read_to_string(&file).unwrap();
         assert_eq!(result, "line1\nedited\n");
+    }
+
+    #[test]
+    fn apply_whole_files_writes_single_file() {
+        let tmp = TempDir::new().unwrap();
+        let files = vec![("src/lib.rs".to_string(), "pub fn hello() {}\n".to_string())];
+        let written = apply_whole_files(tmp.path(), files).unwrap();
+        assert_eq!(written, vec!["src/lib.rs".to_string()]);
+        let got = fs::read_to_string(tmp.path().join("src/lib.rs")).unwrap();
+        assert_eq!(got, "pub fn hello() {}\n");
+    }
+
+    #[test]
+    fn apply_whole_files_creates_parent_dirs() {
+        let tmp = TempDir::new().unwrap();
+        let files = vec![("a/b/c/d.rs".to_string(), "fn x() {}\n".to_string())];
+        apply_whole_files(tmp.path(), files).unwrap();
+        assert!(tmp.path().join("a/b/c/d.rs").exists());
+    }
+
+    #[test]
+    fn apply_whole_files_overwrites_existing() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("src/lib.rs");
+        fs::create_dir_all(tmp.path().join("src")).unwrap();
+        fs::write(&file, "OLD\n").unwrap();
+
+        let files = vec![("src/lib.rs".to_string(), "NEW\n".to_string())];
+        apply_whole_files(tmp.path(), files).unwrap();
+        let got = fs::read_to_string(&file).unwrap();
+        assert_eq!(got, "NEW\n");
+    }
+
+    #[test]
+    fn apply_whole_files_no_tmp_residue() {
+        // After a successful run, no `.newt-coder-tmp` files should
+        // remain anywhere under the workspace.
+        let tmp = TempDir::new().unwrap();
+        let files = vec![
+            ("a.rs".to_string(), "fn a() {}".to_string()),
+            ("b.rs".to_string(), "fn b() {}".to_string()),
+        ];
+        apply_whole_files(tmp.path(), files).unwrap();
+
+        for entry in fs::read_dir(tmp.path()).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name().to_string_lossy().to_string();
+            assert!(
+                !name.ends_with(".newt-coder-tmp"),
+                "leftover temp file: {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn apply_whole_files_accepts_str_slice_values() {
+        // Ergonomics: callers should be able to pass &str without
+        // .to_string()-ing every value.
+        let tmp = TempDir::new().unwrap();
+        let files: Vec<(&str, &str)> = vec![("hello.txt", "hi\n")];
+        let written = apply_whole_files(tmp.path(), files).unwrap();
+        assert_eq!(written, vec!["hello.txt".to_string()]);
+        let got = fs::read_to_string(tmp.path().join("hello.txt")).unwrap();
+        assert_eq!(got, "hi\n");
     }
 
     #[test]
