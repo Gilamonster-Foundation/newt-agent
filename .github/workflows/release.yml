@@ -1,28 +1,23 @@
 name: Release
 
-# Patterned on scrybe's release.yml but simpler:
-#  - No Tauri/desktop app stage (newt-agent ships CLI binaries only)
-#  - Two binaries (`newt`, `newt-mcp-server`) cross-compiled to three OSes
-#  - crates.io publish is sequenced topologically per the internal
-#    dep graph in workspace Cargo.toml
-#  - Phase 11: maturin builds two PyPI wheels (`newt-agent`,
-#    `newt-mcp-server`) per (linux, macOS, windows) and publishes them
-#    to PyPI on tag push. Both wheels are bin-bindings (no PyO3) — they
-#    ship the same release binaries the GitHub release does, packaged
-#    for `pip install`.
+# Patterned on agent-mesh's release.yml: a single PyO3 cdylib wheel
+# (`newt-agent-py`) for two OSes (Linux + macOS — Windows fails on
+# the iroh/quinn-style native deps in our transitive graph). Plus
+# cross-platform release binaries (`newt`, `newt-mcp-server`) and a
+# topologically-ordered crates.io publish chain.
 #
 # Triggers:
 #  - Tag push `v*`           → full release: build binaries + publish crates + wheels
 #  - Branch push `release/**` → build binaries only (publish to crates.io
-#                                 and PyPI is tag-gated to prevent accidental
-#                                 publication)
+#                                 and PyPI is tag-gated)
+#  - workflow_dispatch       → manual wheel build (no upload)
 #
-# Secrets required before the first `v*` tag:
+# Secrets / environment:
 #  - CARGO_REGISTRY_TOKEN — crates.io publish (publish-crates job)
-#  - PYPI_API_TOKEN       — PyPI publish (publish-pypi job)
-# If PYPI_API_TOKEN is missing the publish-pypi step is SKIPPED, not
-# failed — wheels still build and upload as workflow artifacts so the
-# operator can publish them manually.
+#  - GitHub environment `pypi` with trusted publisher configured
+#    (PyPI side: pending publisher for project `newt-agent-py` under
+#    owner `Gilamonster-Foundation`, repo `newt-agent`, workflow
+#    `release.yml`, env `pypi`)
 
 on:
   push:
@@ -30,6 +25,7 @@ on:
       - "v*"
     branches:
       - "release/**"
+  workflow_dispatch:
 
 permissions:
   contents: write   # `gh release create` + binary asset upload
@@ -73,11 +69,6 @@ jobs:
         run: |
           cargo build --release --locked --target ${{ matrix.target }} -p newt-cli -p newt-mcp-server
 
-      # Bundle the binaries + the workspace LICENSE + README into a
-      # single archive per platform. Naming pattern:
-      #   newt-agent-<version>-<label>.{tar.gz,zip}
-      # where <version> = the tag for v* pushes, or the branch for
-      # release/** pushes (e.g. release-2026-05-25).
       - name: Stage release contents (Unix)
         if: matrix.platform != 'windows-latest'
         shell: bash
@@ -141,24 +132,6 @@ jobs:
           files: dist/*
 
   # ── Publish to crates.io (tag-only, sequenced topologically) ──────────
-  #
-  # Tag-only — release/** branch pushes build binaries only. Once a
-  # version lands on crates.io it cannot be re-uploaded under the same
-  # version (only yanked), so accidental publication from a branch push
-  # would be costly to undo.
-  #
-  # Order is the topological sort of the internal dep graph in
-  # workspace Cargo.toml. `cargo publish` blocks until the new version
-  # is live on the registry index, so this serial chain is safe.
-  #
-  #     newt-core        plugins-protocol     ← leaves (independent)
-  #          \                /
-  #         newt-inference   newt-tools
-  #              \    \    /
-  #               \    \  /
-  #               newt-tui   newt-acp-worker   newt-mcp-server
-  #                          \      |      /
-  #                            newt-cli
 
   publish-crates:
     name: Publish ${{ matrix.crate }} → crates.io
@@ -169,8 +142,6 @@ jobs:
       fail-fast: false   # leaves keep going if one fails
       max-parallel: 1    # but ONE at a time — internal deps need order
       matrix:
-        # Iterated in array order; matrix runs serially per
-        # max-parallel: 1, so this IS the topological sequence.
         crate:
           - newt-core
           - plugins-protocol
@@ -200,102 +171,108 @@ jobs:
       - name: cargo publish ${{ matrix.crate }}
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        # --locked so Cargo.lock drift fails the publish
-        # --no-verify so the publish doesn't re-build everything from the
-        # extracted tarball (ci.yml already exercised the same code on
-        # this commit; we don't need a third compile).
         run: cargo publish -p ${{ matrix.crate }} --locked --no-verify
 
   # ── Build PyPI wheels (tag-only, maturin matrix) ──────────────────────
   #
-  # Phase 11 of the roadmap. Two wheels, three OSes, six total builds:
-  #   - newt-agent       (binds the `newt` binary, root pyproject.toml)
-  #   - newt-mcp-server  (binds the MCP stdio server, sub-package pyproject)
+  # ONE wheel: `newt-agent-py` — a PyO3 cdylib hosting seven submodules
+  # (core, tools, coder, eval, inference, acp_worker, mcp). Built on
+  # Linux + macOS only; Windows fails on the iroh/quinn transitive
+  # graph the same way agent-mesh-py does. Add Windows back when the
+  # underlying QUIC stack builds cleanly there.
   #
-  # Both are `bindings = "bin"` — no PyO3 in v0. The wheel just packages
-  # the release binary so `pip install newt-agent` and
-  # `pip install newt-mcp-server` work without a Rust toolchain.
-  #
-  # Each wheel uploads as a workflow artifact so the publish-pypi job
-  # can collect them all and ship in one batch.
+  # The wheel is built from the root pyproject.toml, which points at
+  # `newt-agent-py/Cargo.toml` via `tool.maturin.manifest-path`.
 
-  wheels:
-    name: Build wheel (${{ matrix.package.name }}, ${{ matrix.os }})
-    if: startsWith(github.ref, 'refs/tags/v')
+  build-wheels:
+    name: Build wheel (${{ matrix.os }})
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-        package:
-          # `manifest` is the Cargo.toml of the binary crate. maturin
-          # discovers the matching pyproject.toml in the same directory
-          # automatically (root pyproject for newt-cli; sub-package
-          # pyproject for newt-mcp-server).
-          - { name: "newt-agent",      manifest: "newt-cli/Cargo.toml" }
-          - { name: "newt-mcp-server", manifest: "newt-mcp-server/Cargo.toml" }
+        # Windows is intentionally OUT for v0.5 — same iroh/quinn
+        # transitive link failures we hit on agent-mesh-py. Re-add
+        # when those resolve.
+        os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
         with:
-          key: wheels-${{ matrix.package.name }}-${{ matrix.os }}
+          python-version: "3.12"
 
-      - name: Build wheel
+      - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
+          # Root pyproject drives maturin; underlying Cargo project is
+          # newt-agent-py/Cargo.toml.
           command: build
-          args: --release --strip --out dist -m ${{ matrix.package.manifest }}
+          args: --release --strip --interpreter "3.9 3.10 3.11 3.12"
+          # Linux uses the official auditwheel container for manylinux.
+          manylinux: ${{ matrix.os == 'ubuntu-latest' && 'auto' || 'off' }}
 
       - name: Upload wheel artifact
         uses: actions/upload-artifact@v4
         with:
-          name: wheels-${{ matrix.package.name }}-${{ matrix.os }}
-          path: dist/*.whl
+          name: wheels-${{ matrix.os }}
+          path: target/wheels/*.whl
           if-no-files-found: error
-          retention-days: 30
+          retention-days: 14
 
-  # ── Publish wheels to PyPI (tag-only) ─────────────────────────────────
-  #
-  # Collects every wheel from the matrix and uploads in one batch via
-  # `maturin upload`. If PYPI_API_TOKEN is missing the step is SKIPPED
-  # (not failed) so a first-time tag push still produces a green CI run
-  # and the wheels remain available as artifacts for manual upload.
-
-  publish-pypi:
-    name: Publish wheels → PyPI
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: [wheels]
+  build-sdist:
+    name: Build sdist
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
         with:
-          path: dist
-          pattern: wheels-*
-          merge-multiple: true
+          python-version: "3.12"
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+      - name: Upload sdist artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: target/wheels/*.tar.gz
+          if-no-files-found: error
+          retention-days: 14
 
-      - name: List collected wheels
-        run: ls -la dist/
+  # ── Publish wheels to PyPI (tag-only, trusted publishing) ─────────────
+  #
+  # Uses PyPI's OIDC trusted publishing — no API token in repo secrets.
+  # Requires the GitHub `pypi` environment to exist (Settings →
+  # Environments → New environment) and a pending publisher
+  # configured at https://pypi.org/manage/account/publishing/ pointing
+  # at this repo + workflow + environment.
 
-      - name: Check for PYPI_API_TOKEN
-        id: token_check
-        env:
-          PYPI_API_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+  publish-pypi:
+    name: Publish to PyPI
+    runs-on: ubuntu-latest
+    needs: [build-wheels, build-sdist]
+    if: startsWith(github.ref, 'refs/tags/v')
+    environment:
+      name: pypi
+      url: https://pypi.org/p/newt-agent-py
+    permissions:
+      id-token: write
+    steps:
+      - name: Download all wheels + sdist
+        uses: actions/download-artifact@v4
+        with:
+          path: dist-merged
+      - name: Flatten dist layout
         run: |
-          if [ -z "${PYPI_API_TOKEN}" ]; then
-            echo "::warning::PYPI_API_TOKEN repo secret not set — skipping PyPI upload. Wheels are available as artifacts; upload manually with: maturin upload --username __token__ --password \$TOKEN dist/*.whl"
-            echo "have_token=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "have_token=true" >> "$GITHUB_OUTPUT"
-          fi
-
+          set -eux
+          mkdir -p dist
+          find dist-merged -type f \( -name '*.whl' -o -name '*.tar.gz' \) -exec cp {} dist/ \;
+          ls -lh dist/
       - name: Publish to PyPI
-        if: steps.token_check.outputs.have_token == 'true'
-        env:
-          PYPI_API_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
-        run: |
-          pipx run --spec 'maturin>=1.7,<2.0' maturin upload \
-            --username __token__ \
-            --password "$PYPI_API_TOKEN" \
-            --skip-existing \
-            dist/*.whl
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/
+          skip-existing: true

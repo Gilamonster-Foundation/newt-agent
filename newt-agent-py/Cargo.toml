@@ -1,0 +1,30 @@
+[package]
+name = "newt-agent-py"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "Python bindings for newt-agent"
+publish = false
+
+[lib]
+name = "_newt_agent"
+crate-type = ["cdylib"]
+
+[dependencies]
+newt-core = { workspace = true, features = ["pyo3"] }
+newt-inference = { workspace = true, features = ["pyo3"] }
+newt-tools = { workspace = true, features = ["pyo3"] }
+newt-coder = { workspace = true, features = ["pyo3"] }
+newt-eval = { workspace = true, features = ["pyo3"] }
+newt-acp-worker = { workspace = true, features = ["pyo3"] }
+newt-mcp-server = { workspace = true, features = ["pyo3"] }
+pyo3 = { workspace = true, features = ["extension-module"] }
+pyo3-async-runtimes = { workspace = true, features = ["tokio-runtime"] }
+tokio = { workspace = true }
+
+[lints]
+workspace = true
