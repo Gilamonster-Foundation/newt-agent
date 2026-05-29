@@ -986,6 +986,7 @@ version = "0.5.20260529"
 dependencies = [
  "anyhow",
  "async-trait",
+ "newt-coder",
  "newt-core",
  "newt-inference",
  "newt-tools",

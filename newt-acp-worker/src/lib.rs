@@ -34,12 +34,19 @@ pub async fn run_stdio() -> anyhow::Result<()> {
 /// is what protects the JSON-RPC wire from rogue `println!` calls in
 /// dependencies — see the module-level doc on `stdio_guard` for the
 /// full rationale.
+///
+/// Picks the initial Ollama model from `NEWT_DEFAULT_MODEL` env, falling
+/// back to `llama3.1:8b`. Lets the bake-off harness iterate models by
+/// spawning fresh worker subprocesses with different model envs while
+/// session-level model swap isn't wired through `ChatRequest` yet.
 pub async fn run_with_io<R, W>(reader: R, writer: W) -> anyhow::Result<()>
 where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
 {
-    let backend = newt_inference::local::LocalOllamaBackend::discover("llama3.1:8b").await?;
+    let default_model =
+        std::env::var("NEWT_DEFAULT_MODEL").unwrap_or_else(|_| "llama3.1:8b".to_string());
+    let backend = newt_inference::local::LocalOllamaBackend::discover(&default_model).await?;
     let server = AcpServer::new(std::sync::Arc::new(backend));
     server.run(reader, writer).await
 }
