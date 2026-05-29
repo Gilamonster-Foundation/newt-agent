@@ -12,11 +12,20 @@ use serde_json::Value;
 use tests_common::MockBackend;
 
 /// `git init` + identity config so `git diff` works inside the tempdir.
+///
+/// We clear inherited `GIT_DIR` / `GIT_WORK_TREE` / `GIT_INDEX_FILE`
+/// so the test stays scoped to `path` when run from inside a git hook
+/// (e.g. the pre-push hook that invokes `cargo test --workspace`).
 fn init_git_repo(path: &Path) {
     let run = |args: &[&str]| {
         std::process::Command::new("git")
             .args(args)
             .current_dir(path)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .env_remove("GIT_COMMON_DIR")
+            .env_remove("GIT_PREFIX")
             .output()
             .expect("git command failed")
     };
@@ -26,13 +35,18 @@ fn init_git_repo(path: &Path) {
 }
 
 /// Commit `path/file` with the given content so subsequent edits show
-/// up in `git diff`.
+/// up in `git diff`. See `init_git_repo` for the env-clearing rationale.
 fn commit_initial(path: &Path, file: &str, content: &str) {
     std::fs::write(path.join(file), content).unwrap();
     let run = |args: &[&str]| {
         std::process::Command::new("git")
             .args(args)
             .current_dir(path)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .env_remove("GIT_COMMON_DIR")
+            .env_remove("GIT_PREFIX")
             .output()
             .expect("git command failed")
     };
