@@ -42,7 +42,15 @@ pub enum Command {
         flight_id: String,
     },
     /// ACP worker (stdio JSON-RPC, no TUI).
-    Worker,
+    Worker {
+        /// Activate the newt-coder plugin (whole-file emit +
+        /// server-side diff normalization). Equivalent to setting
+        /// `NEWT_CODER=1` in the environment. Closes failure mode
+        /// T0b — see the knowledge card
+        /// `~/workspaces/knowledge/board/drake/2026-05-29_newt-coder-failure-mode-taxonomy.md`.
+        #[arg(long, env = "NEWT_CODER", default_value_t = false)]
+        coder: bool,
+    },
     /// MCP server (stdio JSON-RPC, no TUI).
     Mcp,
     /// Health-check local backends + provider plugins.
@@ -55,7 +63,7 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
         Command::Code { path } => newt_tui::run_code(path.as_deref()),
         Command::Pilot { flight_id } => newt_tui::run_pilot(&flight_id),
-        Command::Worker => run_worker().await,
+        Command::Worker { coder } => run_worker(coder).await,
         Command::Mcp => run_mcp().await,
         Command::Doctor => doctor::run(cli.config.as_deref()).await,
         Command::Config => config_cmd::run(cli.config.as_deref()),
@@ -69,7 +77,24 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
 /// will land on stderr instead of corrupting the JSON-RPC wire. On
 /// non-Unix targets we fall back to plain stdout — a deliberate
 /// out-of-scope corner documented in the PR.
-async fn run_worker() -> anyhow::Result<()> {
+///
+/// `coder` activates the newt-coder plugin (whole-file emit +
+/// server-side diff normalization). The flag is plumbed through to
+/// the server via `NEWT_CODER=1`, which `handle_new_session` reads;
+/// this is the same env the ACP server already honors, so a user
+/// invoking the daemon under systemd can either pass `--coder` or
+/// set `NEWT_CODER=1` in the unit file — both work.
+async fn run_worker(coder: bool) -> anyhow::Result<()> {
+    if coder {
+        // SAFETY: single-threaded section before tokio takes over —
+        // set_var is safe here because no other thread reads/writes
+        // env yet. handle_new_session reads this for every session.
+        unsafe {
+            std::env::set_var("NEWT_CODER", "1");
+        }
+        tracing::info!("newt-coder plugin activated (whole-file emit)");
+    }
+
     #[cfg(unix)]
     {
         match stdio_guard::redirect_stdout_to_stderr() {
