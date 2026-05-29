@@ -1025,6 +1025,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "newt-agent-py"
+version = "0.5.20260530"
+dependencies = [
+ "newt-acp-worker",
+ "newt-coder",
+ "newt-core",
+ "newt-eval",
+ "newt-inference",
+ "newt-mcp-server",
+ "newt-tools",
+ "pyo3",
+ "pyo3-async-runtimes",
+ "tokio",
+]
+
+[[package]]
 name = "newt-coder"
 version = "0.5.20260530"
 dependencies = [
