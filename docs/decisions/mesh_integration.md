@@ -21,9 +21,26 @@ proceeds.
 
 ## What landed
 
-A single new workspace member, `newt-mesh/`, plus a CLI subcommand
-tree behind the new `mesh` cargo feature on `newt-agent`. Line counts
-(rust source incl. doc-comments and tests):
+A new crate `newt-mesh/` — **deliberately excluded from the default
+newt-agent workspace** — that ships both:
+
+- A library (`newt_mesh`) exposing `NewtMeshService` (responder) and
+  `MeshAsker` (client) plus the `InferenceRequest`/`InferenceReply`
+  wire types.
+- A binary (`newt-mesh`) with `announce` and `ask` subcommands that
+  load `~/.agent-mesh/user.key`, discover a local Ollama, and either
+  bind a responder or send a request to a peer.
+
+The exclusion is the load-bearing architectural choice. See
+"Limitations encountered" → "agent-mesh path dep + GitHub CI" for the
+detail. Short version: stock `actions/checkout` runners don't have
+`../agent-mesh/` sitting beside `newt-agent/`, and cargo's workspace
+metadata resolution validates path deps eagerly — even for *optional*
+deps gated behind a feature flag. So the only way to keep default-
+workspace CI green without checking out two repos is to leave
+newt-mesh outside the workspace.
+
+Line counts (rust source incl. doc-comments and tests):
 
 | File | Lines |
 |---|---|
@@ -32,14 +49,32 @@ tree behind the new `mesh` cargo feature on `newt-agent`. Line counts
 | `newt-mesh/src/service.rs` | 263 |
 | `newt-mesh/src/ask.rs` | 124 |
 | `newt-mesh/src/error.rs` | 73 |
+| `newt-mesh/src/bin/newt-mesh-cli.rs` | 360 |
 | `newt-mesh/tests/inference_roundtrip.rs` | 150 |
-| `newt-cli/src/mesh.rs` | 282 |
-| **total** | **1,154** |
+| **total** | **1,232** |
 
-Of those 1,154 lines, roughly 350 are tests and 300 are doc-comments;
+Of those 1,232 lines, roughly 400 are tests and 350 are doc-comments;
 the load-bearing wire-and-dispatch code is closer to 500. That is
 genuinely small for "make one of my agents serve inference to another
 agent over a cryptographically-authenticated p2p transport".
+
+## Local commands
+
+Default workspace (everything except newt-mesh, runs in CI):
+
+```sh
+just check    # fmt + clippy + cargo test --workspace
+just cov-ci   # workspace coverage with 75% floor
+```
+
+newt-mesh (requires `../agent-mesh/` sibling checkout):
+
+```sh
+just check-mesh                                                # fmt + clippy + test
+cargo build --release --manifest-path newt-mesh/Cargo.toml     # build the binary
+./newt-mesh/target/release/newt-mesh announce --role gnuc      # responder
+./newt-mesh/target/release/newt-mesh ask <fp> "what is this?"  # client
+```
 
 ## The shape
 
@@ -156,19 +191,31 @@ deployment friction.
 
 ## Limitations encountered
 
-1. **agent-mesh path-dep + GitHub CI.** `newt-mesh` and the `mesh`
-   feature on `newt-cli` both depend on `../agent-mesh/` via path,
-   which doesn't exist on stock `actions/checkout` runners.
-   The default-features build (which CI runs) does **not** enable
-   the mesh feature, so CI stays green; the trade-off is that
-   `--features mesh` only builds where agent-mesh is checked out
-   side-by-side. Resolving this means either (a) publishing
-   agent-mesh crates to crates.io and switching to version deps,
-   (b) extending CI to check out both repos before building, or
-   (c) vendoring agent-mesh into newt-agent. All three are
-   reasonable; (a) is the cleanest long-term answer and the one
-   aligned with the rest of the kyln/gilamonster open-source push.
-   This is out of scope for Phase 4.
+1. **agent-mesh path-dep + GitHub CI.** `newt-mesh` depends on
+   `../agent-mesh/` via path, which doesn't exist on stock
+   `actions/checkout` runners. We initially tried to keep newt-mesh
+   in the workspace under a cargo feature on `newt-agent` (so the
+   default build wouldn't link agent-mesh). **That didn't work**:
+   cargo's workspace metadata resolution validates path deps eagerly,
+   even for *optional* deps gated behind a feature flag, so the
+   workspace fails to load at `cargo metadata` time before any
+   feature selection happens. The fix that landed:
+
+   - `newt-mesh/` is listed under `[workspace] exclude = [...]` —
+     it's NOT a workspace member; it's a sibling crate with its own
+     manifest and its own `target/`.
+   - The mesh CLI lives in `newt-mesh/src/bin/newt-mesh-cli.rs` as
+     a binary named `newt-mesh` (separate from the `newt` binary).
+   - `just check-mesh` runs the standalone build/lint/test cycle;
+     `just check` (which CI mirrors) does not.
+
+   Resolving this properly means either (a) publishing agent-mesh
+   crates to crates.io and switching to version deps, (b) extending
+   CI to check out both repos before building, or (c) vendoring
+   agent-mesh into newt-agent. All three are reasonable; (a) is
+   the cleanest long-term answer and the one aligned with the rest
+   of the kyln/gilamonster open-source push. This is out of scope
+   for Phase 4.
 
 2. **Backend errors via reply payload, not BusError.** The bus's
    `register_handler` signature returns `Result<Vec<u8>, BusError>`,

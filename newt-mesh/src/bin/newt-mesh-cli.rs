@@ -1,15 +1,19 @@
-//! `newt mesh` subcommands — only compiled with `--features mesh`.
+//! `newt-mesh` CLI binary.
 //!
 //! Two operations:
 //!
-//! - `newt mesh announce` — bind a responder service on the LAN that
+//! - `newt-mesh announce` — bind a responder service on the LAN that
 //!   answers `InferenceRequest`s using the local Ollama backend.
-//! - `newt mesh ask <peer_fp> <prompt>` — resolve a peer by
+//! - `newt-mesh ask <peer_fp> <prompt>` — resolve a peer by
 //!   fingerprint (full or short prefix) via mDNS, then send it an
 //!   `InferenceRequest` and print the reply.
 //!
 //! The trust root is loaded from `~/.agent-mesh/user.key` by default;
 //! both subcommands accept a `--user-key` override.
+//!
+//! This binary lives in the out-of-workspace `newt-mesh` crate so the
+//! default newt workspace stays buildable without a side-by-side
+//! `../agent-mesh/` checkout. See `docs/decisions/mesh_integration.md`.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -18,6 +22,7 @@ use std::time::Duration;
 use agent_mesh_core::{AgentKey, AgentMetadata, Fingerprint, UserKey};
 use agent_mesh_discovery::{Browser, BrowserEvent};
 use anyhow::{Context, Result};
+use clap::{Parser, Subcommand};
 use newt_inference::backend::InferenceBackend;
 use newt_inference::local::LocalOllamaBackend;
 use newt_mesh::{InferenceRequest, MeshAsker, NewtMeshService, CAPABILITY_TAG};
@@ -25,12 +30,100 @@ use newt_mesh::{InferenceRequest, MeshAsker, NewtMeshService, CAPABILITY_TAG};
 /// Default model when the user doesn't override it via env or flag.
 const DEFAULT_MODEL: &str = "llama3.1:8b";
 
+#[derive(Parser, Debug)]
+#[command(
+    name = "newt-mesh",
+    version,
+    about = "Mesh inference dispatch for newt-agent (announce + ask)"
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Bind a responder service: announce this newt on the LAN and
+    /// answer inference requests from peers.
+    Announce {
+        /// Extra capability tags to advertise (`newt-inference` and
+        /// `model=<id>` are always included).
+        #[arg(long = "capability")]
+        capabilities: Vec<String>,
+        /// Bind port (`0` lets the OS choose).
+        #[arg(long, default_value = "0")]
+        port: u16,
+        /// Path to the user key (defaults to `~/.agent-mesh/user.key`).
+        #[arg(long)]
+        user_key: Option<PathBuf>,
+        /// Role label.
+        #[arg(long, default_value = "newt-worker")]
+        role: String,
+        /// Model to serve (defaults to `llama3.1:8b`).
+        #[arg(long)]
+        model: Option<String>,
+    },
+    /// Send an inference request to a peer newt and print the reply.
+    Ask {
+        /// Peer agent fingerprint — full 64-char hex, 12-char short
+        /// form, or any hex prefix.
+        peer_fp: String,
+        /// The prompt to ask.
+        prompt: String,
+        /// Tier hint (FAST/STANDARD/COMPLEX/REVIEW).
+        #[arg(long)]
+        tier: Option<String>,
+        /// Pin the model — responder must serve this exact model or
+        /// return an error.
+        #[arg(long)]
+        model: Option<String>,
+        /// Max output tokens.
+        #[arg(long)]
+        max_tokens: Option<u32>,
+        /// Path to the user key (defaults to `~/.agent-mesh/user.key`).
+        #[arg(long)]
+        user_key: Option<PathBuf>,
+        /// How long to wait for the peer + reply. Accepts `Ns`, `Nm`,
+        /// `Nms`, or a bare integer (seconds).
+        #[arg(long, default_value = "30s")]
+        timeout: String,
+    },
+}
+
+#[tokio::main(flavor = "multi_thread")]
+async fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .with_writer(std::io::stderr)
+        .try_init()
+        .ok();
+
+    let cli = Cli::parse();
+    match cli.command {
+        Command::Announce {
+            capabilities,
+            port,
+            user_key,
+            role,
+            model,
+        } => announce(user_key, capabilities, port, role, model).await,
+        Command::Ask {
+            peer_fp,
+            prompt,
+            tier,
+            model,
+            max_tokens,
+            user_key,
+            timeout,
+        } => ask(user_key, peer_fp, prompt, tier, model, max_tokens, timeout).await,
+    }
+}
+
 /// Run the `announce` subcommand.
-///
-/// Binds a [`NewtMeshService`] backed by the local Ollama instance
-/// (discovered the same way `newt worker` does), then blocks until
-/// the user hits Ctrl-C.
-pub async fn announce(
+async fn announce(
     user_key_path: Option<PathBuf>,
     extra_capabilities: Vec<String>,
     port: u16,
@@ -70,7 +163,8 @@ pub async fn announce(
 }
 
 /// Run the `ask` subcommand.
-pub async fn ask(
+#[allow(clippy::too_many_arguments)]
+async fn ask(
     user_key_path: Option<PathBuf>,
     peer_fp_str: String,
     prompt: String,
@@ -276,7 +370,6 @@ mod tests {
     fn now_rfc3339_renders_zulu() {
         let s = now_rfc3339();
         assert!(s.ends_with('Z'), "got {s}");
-        // YYYY-MM-DDTHH:MM:SSZ is 20 chars.
         assert_eq!(s.len(), 20, "got {s}");
     }
 }
