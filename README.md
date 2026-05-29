@@ -18,36 +18,63 @@ but stops there: Newt is opinionated, not extensible.
 
 ## Install
 
-### From PyPI (recommended)
+### Python library (PyPI)
 
 ```bash
-pip install newt-agent          # ships the `newt` CLI
-pip install newt-mcp-server     # ships just the MCP server binary
+pip install newt-agent-py
 ```
 
-Both wheels are binary-only — they ship the same release binary the
-GitHub release does, packaged so you don't need a Rust toolchain to
-install. After install:
+The distribution name has a `-py` suffix because PyPI's similarity
+check may block the bare `newt-agent` against the existing `newt`
+package. The Python import path is `newt_agent`:
+
+```python
+from newt_agent.core import Router, Tier
+from newt_agent.coder import build_prompt, normalize_emission
+from newt_agent.eval import TestCase, RunnerConfig
+
+router = Router()
+print(router.classify("rename foo to bar"))   # Tier.Fast
+
+import asyncio
+from newt_agent.inference import LocalOllamaBackend, ChatRequest
+
+async def main():
+    backend = await LocalOllamaBackend.discover("llama3.1:8b")
+    req = ChatRequest()
+    req.system("You are a coding assistant.")
+    req.user("Hello!")
+    reply = await backend.complete(req)
+    print(reply.model_id, reply.content)
+
+asyncio.run(main())
+```
+
+Submodules: `newt_agent.core`, `newt_agent.tools`, `newt_agent.coder`,
+`newt_agent.eval`, `newt_agent.inference`, `newt_agent.acp_worker`,
+`newt_agent.mcp`. See each crate's `pyo3_module.rs` for the bound
+surface.
+
+### Rust CLI binary
+
+The `newt` CLI is shipped separately from the Python wheel. For now,
+install from source:
 
 ```bash
+git clone https://github.com/Gilamonster-Foundation/newt-agent
+cargo install --path newt-agent/newt-cli           # `newt`
+cargo install --path newt-agent/newt-mcp-server    # `newt-mcp-server`
 newt --help
-newt-mcp-server                  # stdio JSON-RPC MCP server
-python -m newt_agent --help      # equivalent to `newt --help`
-```
-
-### From source
-
-```bash
-cargo install --path newt-cli                 # newt
-cargo install --path newt-mcp-server          # newt-mcp-server
 ```
 
 Or from crates.io once published:
 
 ```bash
-cargo install newt-agent          # newt
-cargo install newt-mcp-server     # newt-mcp-server
+cargo install newt-agent
+cargo install newt-mcp-server
 ```
+
+(A `pip install`-able Python CLI script is planned as a follow-up.)
 
 ## Modes
 
