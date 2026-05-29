@@ -225,35 +225,89 @@ async fn discover_all_down_returns_error() {
 
 #[tokio::test]
 async fn env_var_override() {
-    let server = MockServer::start().await;
+    // OLLAMA_HOST is honored verbatim — no probe, no fallback.
+    // We don't even need a wiremock here; the env-host wins
+    // unconditionally and discover() never makes a network call.
     let other_server = MockServer::start().await;
+
+    let candidates = vec![other_server.uri()];
+    let backend = LocalOllamaBackend::discover_with_env(
+        "my-model",
+        Some("http://envhost.example:11434"),
+        &candidates,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(backend.endpoint(), "http://envhost.example:11434");
+    assert_eq!(backend.model_id(), "my-model");
+}
+
+#[tokio::test]
+async fn env_host_used_verbatim_no_probe() {
+    // Even if the env host is provably unreachable, discover() must
+    // return it verbatim. User intent wins. Use discover_strict() to
+    // get the old probe-then-fall-through behavior.
+    let candidates = vec!["http://127.0.0.1:11434".to_string()];
+    let backend = LocalOllamaBackend::discover_with_env(
+        "verbatim-model",
+        Some("http://nonexistent.invalid:9999"),
+        &candidates,
+    )
+    .await
+    .expect("discover() must succeed when env host is set (verbatim contract)");
+
+    assert_eq!(backend.endpoint(), "http://nonexistent.invalid:9999");
+}
+
+#[tokio::test]
+async fn discover_strict_errors_if_env_host_unreachable() {
+    // discover_strict() probes every candidate (including env host)
+    // and errors if none answer. This is the test-only variant — it's
+    // what you want when you're asserting "this specific endpoint is
+    // up", not "trust whatever OLLAMA_HOST says".
+    let candidates = vec!["http://127.0.0.1:19997".to_string()];
+    let result = LocalOllamaBackend::discover_strict_with_env(
+        "strict-model",
+        Some("http://nonexistent.invalid:9999"),
+        &candidates,
+    )
+    .await;
+
+    assert!(
+        result.is_err(),
+        "discover_strict should fail when nothing answers"
+    );
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("no reachable") || err.contains("discover_strict"),
+        "error should explain the failure mode: {err}"
+    );
+}
+
+#[tokio::test]
+async fn discover_strict_accepts_reachable_env_host() {
+    // When the env host is up, discover_strict() returns it.
+    let server = MockServer::start().await;
 
     Mock::given(method("GET"))
         .and(path("/api/tags"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "models": []
         })))
-        .expect(1)
         .mount(&server)
         .await;
 
-    Mock::given(method("GET"))
-        .and(path("/api/tags"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "models": []
-        })))
-        .mount(&other_server)
-        .await;
-
-    // Pass the env host explicitly instead of mutating the process env.
-    let candidates = vec![other_server.uri()];
-    let backend =
-        LocalOllamaBackend::discover_with_env("my-model", Some(&server.uri()), &candidates)
-            .await
-            .unwrap();
+    let candidates = vec!["http://127.0.0.1:19996".to_string()];
+    let backend = LocalOllamaBackend::discover_strict_with_env(
+        "strict-model",
+        Some(&server.uri()),
+        &candidates,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(backend.endpoint(), server.uri());
-    assert_eq!(backend.model_id(), "my-model");
 }
 
 // --- Retry tests (Step 3.3) ---

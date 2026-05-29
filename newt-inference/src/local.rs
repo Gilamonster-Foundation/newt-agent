@@ -71,23 +71,78 @@ impl LocalOllamaBackend {
         env_host: Option<&str>,
         candidates: &[String],
     ) -> anyhow::Result<Self> {
+        // If OLLAMA_HOST is explicitly set, use it VERBATIM — no probe,
+        // no fallback. User intent overrides discovery. This eliminates
+        // the silent-fallthrough foot-gun where a stale env var (or a
+        // mocked endpoint missing /api/tags) causes discover() to hit
+        // a different Ollama than the user asked for.
+        //
+        // Use `discover_strict` if you want the env host to be probed.
+        if let Some(host) = env_host {
+            tracing::info!(
+                endpoint = %host,
+                "Ollama endpoint chosen via OLLAMA_HOST (verbatim, not probed)"
+            );
+            return Ok(Self::new(host, model));
+        }
+
         let probe_client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_millis(500))
             .build()?;
 
-        if let Some(host) = env_host {
-            if Self::probe(&probe_client, host).await {
-                return Ok(Self::new(host, model));
-            }
-        }
-
         for endpoint in candidates {
             if Self::probe(&probe_client, endpoint).await {
+                tracing::info!(endpoint = %endpoint, "Ollama endpoint chosen by discovery probe");
                 return Ok(Self::new(endpoint, model));
             }
         }
 
-        anyhow::bail!("no reachable Ollama endpoint found")
+        anyhow::bail!(
+            "no reachable Ollama endpoint found (tried {} candidates)",
+            candidates.len()
+        )
+    }
+
+    /// Like [`discover`](Self::discover) but requires successful
+    /// probing — no silent fallthrough. Even if `OLLAMA_HOST` is
+    /// set, the probe must succeed. Use this in tests and CI to
+    /// assert a specific endpoint is reachable rather than just
+    /// trusted by env-var contract.
+    pub async fn discover_strict(model: &str) -> anyhow::Result<Self> {
+        let env_host = std::env::var("OLLAMA_HOST").ok();
+        Self::discover_strict_with_env(model, env_host.as_deref(), &Self::default_endpoints()).await
+    }
+
+    /// Like [`discover_strict`](Self::discover_strict), but with an
+    /// explicit env-host override and candidate list. Useful for
+    /// testing without mutating process-global environment variables.
+    pub async fn discover_strict_with_env(
+        model: &str,
+        env_host: Option<&str>,
+        candidates: &[String],
+    ) -> anyhow::Result<Self> {
+        // Build the full candidate list with the env-host (if any) at
+        // the front. We probe every candidate, including the env-host.
+        let all_candidates: Vec<&str> = env_host
+            .into_iter()
+            .chain(candidates.iter().map(String::as_str))
+            .collect();
+
+        let probe_client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(500))
+            .build()?;
+
+        for endpoint in &all_candidates {
+            if Self::probe(&probe_client, endpoint).await {
+                tracing::info!(endpoint = %endpoint, "Ollama endpoint chosen (strict)");
+                return Ok(Self::new(*endpoint, model));
+            }
+        }
+
+        anyhow::bail!(
+            "discover_strict: no reachable Ollama endpoint (tried {} candidates)",
+            all_candidates.len()
+        )
     }
 
     /// The built-in fallback endpoint list for [`discover`](Self::discover).

@@ -63,12 +63,14 @@ cov:
 # PIPELINE PARITY: must match the coverage job in .github/workflows/ci.yml.
 #
 # The floor RATCHETS UP — never down — as the codebase grows. The
-# roadmap targets 80% workspace-wide; bootstrap baseline is ~17%
-# (Step 0.3 lands the workflow before there's enough code to justify
-# 80%). Each PR that adds tests should also bump this threshold
-# higher; each PR that adds untested code will fail the gate.
+# roadmap targets 80% workspace-wide; bootstrap baseline was 15%
+# (Step 0.3 landed the workflow before there was enough code to
+# justify 80%). Workspace coverage is now ~89.78% — ratcheted to
+# 75% here to give a margin while approaching the 80% target.
+# Each PR that adds tests should also bump this threshold higher;
+# each PR that adds untested code will fail the gate.
 cov-ci:
-    cargo llvm-cov --workspace --lcov --output-path lcov.info --fail-under-lines 15
+    cargo llvm-cov --workspace --lcov --output-path lcov.info --fail-under-lines 75
 
 # --- Evaluation ---
 
