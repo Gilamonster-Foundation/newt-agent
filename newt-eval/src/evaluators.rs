@@ -92,10 +92,17 @@ impl Evaluator for DiffAppliesEvaluator {
             return EvalResult::fail(self.name(), format!("git init: {e}"));
         }
 
-        // Pipe the diff to `git apply --check`.
+        // Pipe the diff to `git apply --check`. env_remove() ensures the
+        // check targets `scratch`, not whichever repo the caller's
+        // inherited GIT_DIR points at.
         let mut child = match Command::new("git")
             .args(["apply", "--check"])
             .current_dir(scratch.path())
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .env_remove("GIT_COMMON_DIR")
+            .env_remove("GIT_PREFIX")
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -319,6 +326,11 @@ fn git_init(path: &Path) -> anyhow::Result<()> {
     let out = Command::new("git")
         .args(["init", "-q", "-b", "main"])
         .current_dir(path)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_PREFIX")
         .output()?;
     if !out.status.success() {
         anyhow::bail!("git init failed: {}", String::from_utf8_lossy(&out.stderr));
