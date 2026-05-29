@@ -1,35 +1,66 @@
+# PyPI distribution for newt-agent, published as `newt-agent-py`.
+#
+# Why the PyPI name differs from the GitHub repo name: PyPI's
+# similarity check may flag a bare `newt-agent` against the existing
+# `newt` package. The python import path is unaffected — it stays
+# `newt_agent.core` etc. Only the `pip install <name>` differs.
+#
+# Build with:
+#   maturin develop --release   # editable install in a venv
+#   maturin build --release     # produce a wheel
+#
+# This pyproject is the umbrella PyO3 wheel: one cdylib hosting seven
+# submodules (core, tools, coder, eval, inference, acp_worker, mcp).
+# The Rust `newt` CLI binary is shipped separately via:
+#   cargo install --path newt-cli
+
 [build-system]
 requires = ["maturin>=1.7,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "newt-agent"
-description = "Small, fast, local-first agentic coder (vi to Hermes's emacs)"
+name = "newt-agent-py"
+description = "Python bindings for newt-agent — agentic coder runtime (newt-core, newt-tools, newt-coder, newt-eval, newt-inference, newt-acp-worker, newt-mcp-server submodules)"
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "Apache-2.0" }
+license-files = ["LICENSE"]
 authors = [
     { name = "Shawn Hartsock", email = "hartsock@users.noreply.github.com" },
 ]
-keywords = ["newt", "agent", "coder", "llm", "cli"]
+keywords = ["newt", "agentic", "coder", "llm", "ollama", "vllm", "mcp", "acp"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: Apache Software License",
-    "Operating System :: POSIX :: Linux",
-    "Operating System :: MacOS",
-    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
     "Programming Language :: Rust",
-    "Topic :: Software Development :: Code Generators",
+    "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 dynamic = ["version"]
+
+[project.optional-dependencies]
+test = ["pytest>=7", "pytest-asyncio>=0.21"]
 
 [project.urls]
 Homepage = "https://github.com/Gilamonster-Foundation/newt-agent"
 Repository = "https://github.com/Gilamonster-Foundation/newt-agent"
 
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["newt-agent-py/tests"]
+
 [tool.maturin]
-manifest-path = "newt-cli/Cargo.toml"
-bindings = "bin"
-python-source = "python"
-module-name = "newt_agent"
+manifest-path = "newt-agent-py/Cargo.toml"
+python-source = "newt-agent-py/python"
+module-name = "newt_agent._newt_agent"
+bindings = "pyo3"
+features = ["pyo3/extension-module"]
+# Ship LICENSE inside both the wheel and the sdist so PyPI's
+# License-File metadata validation accepts the upload.
+include = [{ path = "LICENSE", format = ["wheel", "sdist"] }]
