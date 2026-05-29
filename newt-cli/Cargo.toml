@@ -35,6 +35,12 @@ toml.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
+# NOTE: the `newt mesh` subcommands live in their own binary,
+# `newt-mesh-cli`, inside the excluded `newt-mesh/` crate — see
+# docs/decisions/mesh_integration.md. Pulling them in here would
+# require the agent-mesh sibling checkout for every `cargo metadata`
+# call, which breaks default CI.
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 

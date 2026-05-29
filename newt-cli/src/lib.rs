@@ -1,6 +1,11 @@
 //! Newt CLI dispatch surface.
 //!
 //! Subcommands: `code`, `pilot`, `worker`, `mcp`, `doctor`, `config`.
+//!
+//! The mesh subcommands (`announce`, `ask`) live in a sibling binary,
+//! `newt-mesh-cli`, inside the out-of-workspace `newt-mesh/` crate.
+//! See `docs/decisions/mesh_integration.md` for why that crate is
+//! kept out of the default workspace.
 
 mod config_cmd;
 mod doctor;
