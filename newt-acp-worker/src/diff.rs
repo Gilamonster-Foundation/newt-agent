@@ -19,10 +19,21 @@ use std::process::Command;
 /// binary, or non-git workspace all return an empty string with a
 /// tracing warning — the absence of a diff is itself the signal we
 /// want to surface, and the empty-diff detector picks it up.
+///
+/// We explicitly clear `GIT_DIR` / `GIT_WORK_TREE` / `GIT_INDEX_FILE`
+/// inherited from the parent process so that callers invoked from
+/// inside a git hook (e.g. a worker spawned during `git push`'s
+/// pre-push) don't accidentally diff the *hook's* repo instead of
+/// the workspace passed in.
 pub fn capture_diff(workspace: &Path) -> anyhow::Result<String> {
     let output = Command::new("git")
         .args(["diff", "--no-color"])
         .current_dir(workspace)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_PREFIX")
         .output();
 
     match output {
@@ -56,10 +67,18 @@ mod tests {
     use std::process::Command as StdCommand;
 
     fn init_git_repo(path: &Path) {
+        // Clear inherited git env vars so the test's `git init` is
+        // scoped to `path` and doesn't accidentally mutate the outer
+        // worktree when the test runs from a git hook (e.g. pre-push).
         let run = |args: &[&str]| {
             StdCommand::new("git")
                 .args(args)
                 .current_dir(path)
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .env_remove("GIT_INDEX_FILE")
+                .env_remove("GIT_COMMON_DIR")
+                .env_remove("GIT_PREFIX")
                 .output()
                 .expect("git command failed")
         };
@@ -96,14 +115,26 @@ mod tests {
         // Commit a file so we have something to diff against.
         let file = tmp.path().join("hello.txt");
         std::fs::write(&file, "before\n").unwrap();
+        // Inherited GIT_DIR etc. are cleared so the add/commit land in
+        // `tmp`, not the outer worktree.
         StdCommand::new("git")
             .args(["add", "hello.txt"])
             .current_dir(tmp.path())
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .env_remove("GIT_COMMON_DIR")
+            .env_remove("GIT_PREFIX")
             .output()
             .unwrap();
         StdCommand::new("git")
             .args(["commit", "-q", "-m", "init"])
             .current_dir(tmp.path())
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .env_remove("GIT_COMMON_DIR")
+            .env_remove("GIT_PREFIX")
             .output()
             .unwrap();
 
@@ -123,5 +154,53 @@ mod tests {
 
         let diff = capture_diff(tmp.path()).unwrap();
         assert!(is_empty_diff(&diff));
+    }
+
+    /// Regression: when called from inside a git hook (which sets
+    /// `GIT_DIR`, `GIT_WORK_TREE`, etc. in the child env), `capture_diff`
+    /// used to inherit those vars and diff the *hook's* repo instead of
+    /// the workspace passed in. We now strip them explicitly. Before the
+    /// fix this test would return a non-empty diff (the parent repo's
+    /// working-tree noise).
+    #[test]
+    fn capture_diff_ignores_inherited_git_env() {
+        use std::sync::Mutex;
+        // Setting env vars races across parallel tests; serialize this one.
+        static ENV_LOCK: Mutex<()> = Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        init_git_repo(tmp.path());
+
+        // Simulate the hook environment: point GIT_DIR at a bogus path.
+        // Without env_remove() in capture_diff(), git would either error
+        // or diff something other than tmp.path().
+        let prev_git_dir = std::env::var_os("GIT_DIR");
+        let prev_git_work_tree = std::env::var_os("GIT_WORK_TREE");
+        // SAFETY: serialized by ENV_LOCK above; no other thread reads/writes
+        // these vars while we hold the guard.
+        unsafe {
+            std::env::set_var("GIT_DIR", "/nonexistent/git/dir");
+            std::env::set_var("GIT_WORK_TREE", "/nonexistent/work/tree");
+        }
+
+        let diff = capture_diff(tmp.path()).unwrap();
+
+        // Restore.
+        unsafe {
+            match prev_git_dir {
+                Some(v) => std::env::set_var("GIT_DIR", v),
+                None => std::env::remove_var("GIT_DIR"),
+            }
+            match prev_git_work_tree {
+                Some(v) => std::env::set_var("GIT_WORK_TREE", v),
+                None => std::env::remove_var("GIT_WORK_TREE"),
+            }
+        }
+
+        assert!(
+            is_empty_diff(&diff),
+            "capture_diff must clear inherited GIT_DIR/GIT_WORK_TREE; got: {diff:?}"
+        );
     }
 }
