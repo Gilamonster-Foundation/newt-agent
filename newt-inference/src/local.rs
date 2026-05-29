@@ -267,9 +267,17 @@ impl InferenceBackend for LocalOllamaBackend {
     }
 }
 
+/// A backend that speaks the OpenAI-compatible HTTP API exposed by a
+/// local vLLM server (`POST /v1/chat/completions`).
+///
+/// vLLM endpoints are explicit — unlike Ollama, vLLM has no canonical
+/// default port, so we deliberately skip endpoint auto-discovery here.
+/// Callers must supply the endpoint via config or CLI flag.
+#[derive(Debug)]
 pub struct LocalVllmBackend {
     endpoint: String,
     model: String,
+    client: reqwest::Client,
 }
 
 impl LocalVllmBackend {
@@ -277,7 +285,90 @@ impl LocalVllmBackend {
         Self {
             endpoint: endpoint.into(),
             model: model.into(),
+            client: reqwest::Client::new(),
         }
+    }
+
+    /// Return the configured endpoint URL.
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
+    /// Override the HTTP client timeout. Useful for testing.
+    pub fn with_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.client = reqwest::Client::builder()
+            .timeout(timeout)
+            .build()
+            .expect("build client");
+        self
+    }
+
+    /// Single HTTP attempt — no retries. Returns a structured error that
+    /// [`is_retryable`](Self::is_retryable) can classify.
+    async fn try_complete(&self, req: &ChatRequest) -> anyhow::Result<ChatReply> {
+        let mut body = serde_json::json!({
+            "model": self.model,
+            "messages": req.messages.iter().map(|m| {
+                serde_json::json!({ "role": &m.role, "content": &m.content })
+            }).collect::<Vec<_>>(),
+            "stream": false,
+        });
+        if let Some(max) = req.max_tokens {
+            body["max_tokens"] = serde_json::json!(max);
+        }
+
+        let url = format!(
+            "{}/v1/chat/completions",
+            self.endpoint.trim_end_matches('/')
+        );
+        let resp = self
+            .client
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("vLLM request failed: {e}"))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("vLLM returned {status}: {text}");
+        }
+
+        let json: serde_json::Value = resp.json().await?;
+        // OpenAI-compatible: choices[0].message.content
+        let content = json["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+        // Prefer the model echoed back by the server (helps callers
+        // distinguish aliases) but fall back to the configured id.
+        let model_id = json["model"]
+            .as_str()
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| self.model.clone());
+
+        Ok(ChatReply { content, model_id })
+    }
+
+    /// Returns `true` for errors worth retrying: connection failures and 5xx
+    /// status codes. Returns `false` for 4xx (client errors) which won't
+    /// succeed on retry.
+    fn is_retryable(err: &anyhow::Error) -> bool {
+        let msg = err.to_string();
+        // Connection / timeout errors from reqwest.
+        if msg.contains("request failed") {
+            return true;
+        }
+        // 5xx status codes extracted from our "vLLM returned {status}" message.
+        if let Some(rest) = msg.strip_prefix("vLLM returned ") {
+            if let Some(code_str) = rest.split_whitespace().next() {
+                if let Ok(code) = code_str.parse::<u16>() {
+                    return (500..600).contains(&code);
+                }
+            }
+        }
+        false
     }
 }
 
@@ -295,11 +386,30 @@ impl InferenceBackend for LocalVllmBackend {
         true
     }
 
-    async fn complete(&self, _req: ChatRequest) -> anyhow::Result<ChatReply> {
-        anyhow::bail!(
-            "LocalVllmBackend.complete not yet implemented (endpoint={}, model={})",
-            self.endpoint,
-            self.model
-        )
+    async fn complete(&self, req: ChatRequest) -> anyhow::Result<ChatReply> {
+        let retry_delays_ms: &[u64] = &[250, 500, 1000];
+        let mut last_err = anyhow::anyhow!("no attempts made");
+
+        for (attempt, delay_ms) in std::iter::once(0)
+            .chain(retry_delays_ms.iter().copied())
+            .enumerate()
+        {
+            if attempt > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            }
+
+            match self.try_complete(&req).await {
+                Ok(reply) => return Ok(reply),
+                Err(e) => {
+                    if !Self::is_retryable(&e) {
+                        return Err(e);
+                    }
+                    tracing::warn!(attempt, error = %e, "retrying vLLM request");
+                    last_err = e;
+                }
+            }
+        }
+
+        Err(last_err)
     }
 }
