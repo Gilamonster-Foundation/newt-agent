@@ -18,7 +18,7 @@ pub fn register_handlers(server: &mut McpServer) {
 // ── initialize ─────────────────────────────────────────────────────────────
 
 fn register_initialize(server: &mut McpServer) {
-    server.register("initialize", |_params| {
+    server.register("initialize", |_params| async move {
         Ok(serde_json::json!({
             "protocolVersion": "2024-11-05",
             "capabilities": { "tools": {} },
@@ -33,7 +33,7 @@ fn register_initialize(server: &mut McpServer) {
 // ── tools/list ─────────────────────────────────────────────────────────────
 
 fn register_tools_list(server: &mut McpServer) {
-    server.register("tools/list", |_params| {
+    server.register("tools/list", |_params| async move {
         Ok(serde_json::json!({
             "tools": tool_definitions()
         }))
@@ -118,19 +118,23 @@ fn tool_definitions() -> Value {
 // ── tools/call ─────────────────────────────────────────────────────────────
 
 fn register_tools_call(server: &mut McpServer) {
-    server.register("tools/call", |params| {
-        let name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
+    server.register("tools/call", |params| async move {
+        let name = params
+            .get("name")
+            .and_then(|n| n.as_str())
+            .unwrap_or("")
+            .to_string();
         let arguments = params
             .get("arguments")
             .cloned()
             .unwrap_or_else(|| Value::Object(Default::default()));
 
-        match name {
+        match name.as_str() {
             "code_read" => handle_code_read(&arguments),
             "code_edit" => handle_code_edit(&arguments),
             "code_search" => handle_code_search(&arguments),
             "goal_run" => handle_goal_run(&arguments),
-            _ => anyhow::bail!("unknown tool: {name}"),
+            other => anyhow::bail!("unknown tool: {other}"),
         }
     });
 }

@@ -2,14 +2,25 @@
 //!
 //! Generic over reader/writer so tests can use in-memory streams
 //! instead of stdin/stdout.
+//!
+//! Handlers are async — each handler returns a boxed future. Sync work
+//! still wraps trivially via `Box::pin(async move { ... })`. The async
+//! signature is what lets `goal_run` await on real inference backends.
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-/// A synchronous handler: receives `params` and returns a result or error.
-type Handler = Box<dyn Fn(Value) -> anyhow::Result<Value> + Send + Sync>;
+/// Future returned by a [`Handler`]: produces a JSON-RPC `result` value
+/// or an `anyhow::Error` to surface as `-32603`.
+pub type HandlerFuture = Pin<Box<dyn Future<Output = anyhow::Result<Value>> + Send + 'static>>;
+
+/// An async JSON-RPC handler: receives `params` and returns a boxed
+/// future of the result.
+pub type Handler = Box<dyn Fn(Value) -> HandlerFuture + Send + Sync>;
 
 /// Minimal JSON-RPC 2.0 server that dispatches by method name.
 pub struct McpServer {
@@ -29,13 +40,18 @@ impl McpServer {
         }
     }
 
-    /// Register a handler for a JSON-RPC method.
-    pub fn register(
-        &mut self,
-        method: &str,
-        handler: impl Fn(Value) -> anyhow::Result<Value> + Send + Sync + 'static,
-    ) {
-        self.handlers.insert(method.to_string(), Box::new(handler));
+    /// Register an async handler for a JSON-RPC method.
+    ///
+    /// Accepts any closure returning a `Send + 'static` future. The
+    /// future is boxed once at registration time so dispatch can call
+    /// every handler through a uniform [`HandlerFuture`].
+    pub fn register<F, Fut>(&mut self, method: &str, handler: F)
+    where
+        F: Fn(Value) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = anyhow::Result<Value>> + Send + 'static,
+    {
+        let boxed: Handler = Box::new(move |params| Box::pin(handler(params)));
+        self.handlers.insert(method.to_string(), boxed);
     }
 
     /// Run the server over stdin/stdout.
@@ -79,7 +95,7 @@ impl McpServer {
             let params = request.get("params").cloned().unwrap_or(Value::Null);
 
             let response = match self.handlers.get(method) {
-                Some(handler) => match handler(params) {
+                Some(handler) => match handler(params).await {
                     Ok(result) => serde_json::json!({
                         "jsonrpc": "2.0",
                         "id": id,
@@ -145,7 +161,7 @@ mod tests {
     #[tokio::test]
     async fn echo_handler() {
         let mut server = McpServer::new();
-        server.register("echo", Ok);
+        server.register("echo", |v| async move { Ok(v) });
 
         let request = serde_json::json!({
             "jsonrpc": "2.0",
@@ -192,7 +208,7 @@ mod tests {
     #[tokio::test]
     async fn handler_error_returns_internal_error() {
         let mut server = McpServer::new();
-        server.register("fail", |_| anyhow::bail!("something broke"));
+        server.register("fail", |_| async move { anyhow::bail!("something broke") });
 
         let request = serde_json::json!({
             "jsonrpc": "2.0",
@@ -211,7 +227,7 @@ mod tests {
     #[tokio::test]
     async fn blank_lines_skipped() {
         let mut server = McpServer::new();
-        server.register("ping", |_| Ok(serde_json::json!("pong")));
+        server.register("ping", |_| async move { Ok(serde_json::json!("pong")) });
 
         let input = format!(
             "\n\n{}\n\n",
@@ -240,5 +256,23 @@ mod tests {
         let response_str = String::from_utf8(output).unwrap();
         let resp: Value = serde_json::from_str(response_str.trim()).unwrap();
         assert!(resp["id"].is_null());
+    }
+
+    #[tokio::test]
+    async fn async_handler_awaits_real_future() {
+        // A handler that actually awaits something — proves the async
+        // dispatch path works, not just the wrap-a-ready-value path.
+        let mut server = McpServer::new();
+        server.register("delayed", |_| async move {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            Ok(serde_json::json!("awoken"))
+        });
+
+        let request = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "delayed"
+        });
+
+        let resp = roundtrip(&server, &request).await;
+        assert_eq!(resp["result"], "awoken");
     }
 }
