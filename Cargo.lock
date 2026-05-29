@@ -1014,6 +1014,7 @@ dependencies = [
  "newt-tui",
  "predicates",
  "reqwest",
+ "serde_json",
  "tempfile",
  "tokio",
  "toml",

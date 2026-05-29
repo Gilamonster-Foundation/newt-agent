@@ -50,18 +50,10 @@ async fn all_bundled_cases_pass_in_mock_mode() {
         // tied to the case's mock_response.content.
         let mock = MockServer::start().await;
 
-        // The worker's discover() probes GET /api/tags before adopting
-        // an endpoint; without this stub the probe would fail, discover
-        // would fall through to its default endpoint list, and the
-        // worker would (silently!) hit a real Ollama. Ask me how I know.
-        Mock::given(method("GET"))
-            .and(path("/api/tags"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "models": [{"name": "mock-llama"}],
-            })))
-            .mount(&mock)
-            .await;
-
+        // As of the OLLAMA_HOST-verbatim fix, the worker's discover()
+        // no longer probes GET /api/tags when OLLAMA_HOST is set — it
+        // trusts the env var. So we only need the /api/chat mock here.
+        // (The runner config below sets OLLAMA_HOST to the wiremock URL.)
         Mock::given(method("POST"))
             .and(path("/api/chat"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
