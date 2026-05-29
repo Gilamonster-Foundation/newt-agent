@@ -57,6 +57,11 @@ pub struct RunnerConfig {
     /// Hard upper bound on a single case. 60s is roomy for mock and
     /// short enough that a hung live model doesn't stall CI forever.
     pub timeout: Duration,
+    /// When true, spawn the worker with `--coder` so the newt-coder
+    /// plugin handles prompts (whole-file emit + diff normalization).
+    /// Closes failure mode T0b for local Ollama models that can't
+    /// fabricate valid hunk headers.
+    pub coder_mode: bool,
 }
 
 impl RunnerConfig {
@@ -66,6 +71,7 @@ impl RunnerConfig {
             mock_endpoint: None,
             model_override: None,
             timeout: Duration::from_secs(60),
+            coder_mode: false,
         }
     }
 
@@ -81,6 +87,11 @@ impl RunnerConfig {
 
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
+        self
+    }
+
+    pub fn with_coder_mode(mut self, on: bool) -> Self {
+        self.coder_mode = on;
         self
     }
 }
@@ -192,8 +203,21 @@ fn spawn_worker(config: &RunnerConfig) -> anyhow::Result<Child> {
         .stderr(Stdio::piped())
         .kill_on_drop(true);
 
+    if config.coder_mode {
+        cmd.arg("--coder");
+    }
+
     if let Some(url) = &config.mock_endpoint {
         cmd.env("OLLAMA_HOST", url);
+    }
+
+    // The worker honors NEWT_DEFAULT_MODEL when picking the initial
+    // backend model. Setting it AND firing the ACP set_session_model
+    // both belt-and-suspenders the model choice — the env wins at
+    // backend-construction time, the ACP call is a no-op today but
+    // documents intent at the wire layer.
+    if let Some(model) = &config.model_override {
+        cmd.env("NEWT_DEFAULT_MODEL", model);
     }
 
     // The worker's tracing_subscriber writes to STDOUT, which is also
