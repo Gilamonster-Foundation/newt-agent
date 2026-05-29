@@ -8,6 +8,6 @@ pub mod patch;
 pub mod read;
 pub mod search;
 
-pub use patch::{apply_patch, edit};
+pub use patch::{apply_patch, apply_whole_files, edit};
 pub use read::read;
 pub use search::{search, Hit};
