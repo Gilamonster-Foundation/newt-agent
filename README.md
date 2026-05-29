@@ -54,11 +54,38 @@ cargo install newt-mcp-server     # newt-mcp-server
 ```
 newt code [PATH]              # standalone TUI coder
 newt pilot <flight-id>        # drake-swarm dashboard
-newt worker                   # ACP worker (stdio JSON-RPC, headless)
+newt worker [--coder]         # ACP worker (stdio JSON-RPC, headless)
 newt mcp                      # MCP server (stdio JSON-RPC, headless)
 newt doctor                   # health-check local backends + provider plugins
 newt config                   # print resolved config
 ```
+
+### Coder mode
+
+`newt worker --coder` (or `NEWT_CODER=1 newt worker`) activates the
+**newt-coder** plugin: tasks are handled by injecting the relevant file
+contents into the prompt and asking the model to emit the **complete
+updated file**. The plugin parses the reply, writes any whole-file blocks
+to the workspace atomically, then captures a real `git diff` so the
+foreman gets a hunk-shaped diff to grade.
+
+This closes failure mode **T0b** (model invents file contents) that the
+default newt-flat path hits on every local Ollama coder model tested in
+the 2026-05-29 bake-off. See
+`~/workspaces/knowledge/board/drake/2026-05-29_newt-coder-failure-mode-taxonomy.md`
+for the failure-mode taxonomy, the bake-off results, and the design
+rationale.
+
+Per-session opt-in (ACP):
+
+```jsonrpc
+{ "method": "new_session", "params": { "workspace_path": "/path/to/repo", "coder": true } }
+```
+
+Coder-path replies carry an additional `emission_shape` field on
+`TaskReply` (`"whole_files"`, `"unified_diff"`, or `"prose"`) so the
+foreman's scorecard can distinguish T0a / T0b / T0c instead of lumping
+them as "empty diff."
 
 ## Inference, by default, is local
 
