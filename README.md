@@ -18,9 +18,35 @@ but stops there: Newt is opinionated, not extensible.
 
 ## Install
 
+### From PyPI (recommended)
+
 ```bash
-cargo install newt-agent          # crates.io
-pip install newt-agent            # PyPI (binary wheel, same binary)
+pip install newt-agent          # ships the `newt` CLI
+pip install newt-mcp-server     # ships just the MCP server binary
+```
+
+Both wheels are binary-only — they ship the same release binary the
+GitHub release does, packaged so you don't need a Rust toolchain to
+install. After install:
+
+```bash
+newt --help
+newt-mcp-server                  # stdio JSON-RPC MCP server
+python -m newt_agent --help      # equivalent to `newt --help`
+```
+
+### From source
+
+```bash
+cargo install --path newt-cli                 # newt
+cargo install --path newt-mcp-server          # newt-mcp-server
+```
+
+Or from crates.io once published:
+
+```bash
+cargo install newt-agent          # newt
+cargo install newt-mcp-server     # newt-mcp-server
 ```
 
 ## Modes
