@@ -2,20 +2,27 @@ name: Release
 
 # Patterned on scrybe's release.yml but simpler:
 #  - No Tauri/desktop app stage (newt-agent ships CLI binaries only)
-#  - No maturin wheels (no PyO3 bindings in v0; reserved for Phase 11)
 #  - Two binaries (`newt`, `newt-mcp-server`) cross-compiled to three OSes
 #  - crates.io publish is sequenced topologically per the internal
 #    dep graph in workspace Cargo.toml
+#  - Phase 11: maturin builds two PyPI wheels (`newt-agent`,
+#    `newt-mcp-server`) per (linux, macOS, windows) and publishes them
+#    to PyPI on tag push. Both wheels are bin-bindings (no PyO3) — they
+#    ship the same release binaries the GitHub release does, packaged
+#    for `pip install`.
 #
 # Triggers:
-#  - Tag push `v*`           → full release: build binaries + publish crates
+#  - Tag push `v*`           → full release: build binaries + publish crates + wheels
 #  - Branch push `release/**` → build binaries only (publish to crates.io
-#                                 is tag-gated to prevent accidental
+#                                 and PyPI is tag-gated to prevent accidental
 #                                 publication)
 #
-# CARGO_REGISTRY_TOKEN must be configured as a repo secret before the
-# first `v*` tag. Until then the publish job will fail and the binaries
-# stage still ships the GitHub release.
+# Secrets required before the first `v*` tag:
+#  - CARGO_REGISTRY_TOKEN — crates.io publish (publish-crates job)
+#  - PYPI_API_TOKEN       — PyPI publish (publish-pypi job)
+# If PYPI_API_TOKEN is missing the publish-pypi step is SKIPPED, not
+# failed — wheels still build and upload as workflow artifacts so the
+# operator can publish them manually.
 
 on:
   push:
@@ -198,3 +205,97 @@ jobs:
         # extracted tarball (ci.yml already exercised the same code on
         # this commit; we don't need a third compile).
         run: cargo publish -p ${{ matrix.crate }} --locked --no-verify
+
+  # ── Build PyPI wheels (tag-only, maturin matrix) ──────────────────────
+  #
+  # Phase 11 of the roadmap. Two wheels, three OSes, six total builds:
+  #   - newt-agent       (binds the `newt` binary, root pyproject.toml)
+  #   - newt-mcp-server  (binds the MCP stdio server, sub-package pyproject)
+  #
+  # Both are `bindings = "bin"` — no PyO3 in v0. The wheel just packages
+  # the release binary so `pip install newt-agent` and
+  # `pip install newt-mcp-server` work without a Rust toolchain.
+  #
+  # Each wheel uploads as a workflow artifact so the publish-pypi job
+  # can collect them all and ship in one batch.
+
+  wheels:
+    name: Build wheel (${{ matrix.package.name }}, ${{ matrix.os }})
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        package:
+          # `manifest` is the Cargo.toml of the binary crate. maturin
+          # discovers the matching pyproject.toml in the same directory
+          # automatically (root pyproject for newt-cli; sub-package
+          # pyproject for newt-mcp-server).
+          - { name: "newt-agent",      manifest: "newt-cli/Cargo.toml" }
+          - { name: "newt-mcp-server", manifest: "newt-mcp-server/Cargo.toml" }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: wheels-${{ matrix.package.name }}-${{ matrix.os }}
+
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          args: --release --strip --out dist -m ${{ matrix.package.manifest }}
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.package.name }}-${{ matrix.os }}
+          path: dist/*.whl
+          if-no-files-found: error
+          retention-days: 30
+
+  # ── Publish wheels to PyPI (tag-only) ─────────────────────────────────
+  #
+  # Collects every wheel from the matrix and uploads in one batch via
+  # `maturin upload`. If PYPI_API_TOKEN is missing the step is SKIPPED
+  # (not failed) so a first-time tag push still produces a green CI run
+  # and the wheels remain available as artifacts for manual upload.
+
+  publish-pypi:
+    name: Publish wheels → PyPI
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [wheels]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: wheels-*
+          merge-multiple: true
+
+      - name: List collected wheels
+        run: ls -la dist/
+
+      - name: Check for PYPI_API_TOKEN
+        id: token_check
+        env:
+          PYPI_API_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+        run: |
+          if [ -z "${PYPI_API_TOKEN}" ]; then
+            echo "::warning::PYPI_API_TOKEN repo secret not set — skipping PyPI upload. Wheels are available as artifacts; upload manually with: maturin upload --username __token__ --password \$TOKEN dist/*.whl"
+            echo "have_token=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "have_token=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish to PyPI
+        if: steps.token_check.outputs.have_token == 'true'
+        env:
+          PYPI_API_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+        run: |
+          pipx run --spec 'maturin>=1.7,<2.0' maturin upload \
+            --username __token__ \
+            --password "$PYPI_API_TOKEN" \
+            --skip-existing \
+            dist/*.whl
