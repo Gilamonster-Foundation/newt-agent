@@ -267,8 +267,16 @@ impl InferenceBackend for LocalOllamaBackend {
     }
 }
 
+/// Metadata for a single model exposed by a vLLM server's `/v1/models`
+/// endpoint. The shape mirrors the OpenAI-compatible response — we
+/// only surface the fields the rest of Newt cares about today.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelInfo {
+    pub id: String,
+}
+
 /// A backend that speaks the OpenAI-compatible HTTP API exposed by a
-/// local vLLM server (`POST /v1/chat/completions`).
+/// local vLLM server (`POST /v1/chat/completions`, `GET /v1/models`).
 ///
 /// vLLM endpoints are explicit — unlike Ollama, vLLM has no canonical
 /// default port, so we deliberately skip endpoint auto-discovery here.
@@ -369,6 +377,47 @@ impl LocalVllmBackend {
             }
         }
         false
+    }
+
+    /// List the models the vLLM server is currently serving.
+    ///
+    /// Mirrors the OpenAI `GET /v1/models` response shape:
+    ///
+    /// ```json
+    /// { "data": [{ "id": "llama3.1:8b", "object": "model" }, ...] }
+    /// ```
+    ///
+    /// Used by `newt doctor` (follow-up) to probe vLLM endpoints.
+    pub async fn list_models(&self) -> anyhow::Result<Vec<ModelInfo>> {
+        let url = format!("{}/v1/models", self.endpoint.trim_end_matches('/'));
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("vLLM list_models request failed: {e}"))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("vLLM list_models returned {status}: {text}");
+        }
+
+        let json: serde_json::Value = resp.json().await?;
+        let data = json["data"]
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("vLLM list_models response missing 'data' array"))?;
+
+        let models = data
+            .iter()
+            .filter_map(|entry| {
+                entry["id"]
+                    .as_str()
+                    .map(|id| ModelInfo { id: id.to_string() })
+            })
+            .collect();
+
+        Ok(models)
     }
 }
 

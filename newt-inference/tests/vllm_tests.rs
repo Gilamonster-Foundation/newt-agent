@@ -236,6 +236,130 @@ async fn complete_timeout() {
     );
 }
 
+// --- list_models() ---
+
+#[tokio::test]
+async fn list_models_happy_path() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": [
+                { "id": "m1", "object": "model" },
+                { "id": "m2", "object": "model" }
+            ]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let backend = LocalVllmBackend::new(server.uri(), "ignored");
+    let models = backend.list_models().await.unwrap();
+
+    assert_eq!(models.len(), 2);
+    assert_eq!(models[0].id, "m1");
+    assert_eq!(models[1].id, "m2");
+}
+
+#[tokio::test]
+async fn list_models_empty() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": []
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let backend = LocalVllmBackend::new(server.uri(), "ignored");
+    let models = backend.list_models().await.unwrap();
+
+    assert!(models.is_empty());
+}
+
+#[tokio::test]
+async fn list_models_server_down() {
+    // Guaranteed-unreachable endpoint — no MockServer needed.
+    let backend = LocalVllmBackend::new("http://127.0.0.1:19995", "ignored");
+    let result = backend.list_models().await;
+
+    assert!(
+        result.is_err(),
+        "list_models() should error when the server is down"
+    );
+}
+
+#[tokio::test]
+async fn list_models_malformed_json() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string("not json")
+                .insert_header("content-type", "application/json"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let backend = LocalVllmBackend::new(server.uri(), "ignored");
+    let result = backend.list_models().await;
+
+    assert!(
+        result.is_err(),
+        "list_models() should error on malformed JSON"
+    );
+}
+
+#[tokio::test]
+async fn list_models_missing_data_field() {
+    // A 200 with valid JSON but no `data` array should be a structured error.
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "object": "list"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let backend = LocalVllmBackend::new(server.uri(), "ignored");
+    let err = backend.list_models().await.unwrap_err();
+
+    assert!(
+        err.to_string().contains("data"),
+        "error should mention the missing 'data' field: {err}"
+    );
+}
+
+#[tokio::test]
+async fn list_models_non_200_returns_error() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(503).set_body_string("down"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let backend = LocalVllmBackend::new(server.uri(), "ignored");
+    let err = backend.list_models().await.unwrap_err();
+
+    assert!(
+        err.to_string().contains("503"),
+        "error should mention status: {err}"
+    );
+}
+
 // --- InferenceBackend trait surface ---
 
 #[tokio::test]
