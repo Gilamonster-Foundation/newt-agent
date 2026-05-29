@@ -13,6 +13,9 @@ pub mod provider_plugin;
 pub mod registry;
 pub mod stream;
 
+#[cfg(feature = "pyo3")]
+pub mod pyo3_module;
+
 pub use backend::{ChatReply, ChatRequest, InferenceBackend};
 pub use registry::BackendRegistry;
 pub use stream::{ChatChunk, ChatStream};
