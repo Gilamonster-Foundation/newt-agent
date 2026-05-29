@@ -29,6 +29,13 @@ pub struct Session {
     pub workspace_path: PathBuf,
     /// Optional model override set via `set_session_model`.
     pub model_override: Option<String>,
+    /// Whether this session uses the `newt-coder` plugin
+    /// (whole-file emit + server-side diff normalization).
+    /// Activated per-session via the `coder: true` field on
+    /// `new_session` params, or process-wide via `NEWT_CODER=1`.
+    /// See the failure-mode taxonomy in
+    /// `~/workspaces/knowledge/board/drake/2026-05-29_newt-coder-failure-mode-taxonomy.md`.
+    pub coder_enabled: bool,
 }
 
 /// JSON-RPC ACP server. Holds the inference backend and an in-memory
@@ -68,6 +75,15 @@ pub struct TaskReply {
     /// True if a unified diff was detected in `content` and applied
     /// successfully.
     pub diff_applied: bool,
+    /// Set by the newt-coder plugin: "whole_files", "unified_diff",
+    /// or "prose" (the wire-stable constants in
+    /// `plugins_protocol::emission_shape`). `None` when the legacy
+    /// newt-flat path produced the reply.
+    ///
+    /// Lets the foreman's scorecard distinguish failure modes T0a /
+    /// T0b / T0c instead of lumping them together as "empty diff".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub emission_shape: Option<String>,
 }
 
 impl TaskReply {
@@ -91,7 +107,16 @@ impl TaskReply {
             diff,
             empty_diff,
             diff_applied,
+            emission_shape: None,
         })
+    }
+
+    /// Builder: attach the emission shape label the newt-coder plugin
+    /// produced. The legacy newt-flat path leaves this `None`.
+    #[must_use]
+    pub fn with_emission_shape(mut self, shape: impl Into<String>) -> Self {
+        self.emission_shape = Some(shape.into());
+        self
     }
 }
 
@@ -178,6 +203,12 @@ impl AcpServer {
     }
 
     /// `new_session` — create a session bound to a workspace path.
+    ///
+    /// Optional params:
+    /// - `coder: true` — opt this session into the `newt-coder`
+    ///   plugin (whole-file emit + server-side diff normalization).
+    ///   The `NEWT_CODER=1` process-wide env opts every session in;
+    ///   this per-session field is the finer-grained switch.
     async fn handle_new_session(&self, params: Value) -> anyhow::Result<Value> {
         let workspace_path: PathBuf = params
             .get("workspace_path")
@@ -192,6 +223,15 @@ impl AcpServer {
             );
         }
 
+        let env_coder = std::env::var("NEWT_CODER")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        let param_coder = params
+            .get("coder")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let coder_enabled = env_coder || param_coder;
+
         let session_id = SessionId::new();
         let mut sessions = self.sessions.lock().await;
         sessions.insert(
@@ -199,10 +239,14 @@ impl AcpServer {
             Session {
                 workspace_path,
                 model_override: None,
+                coder_enabled,
             },
         );
 
-        Ok(serde_json::json!({ "session_id": session_id.to_string() }))
+        Ok(serde_json::json!({
+            "session_id": session_id.to_string(),
+            "coder": coder_enabled,
+        }))
     }
 
     /// `set_session_model` — override the model used for subsequent
@@ -230,11 +274,27 @@ impl AcpServer {
 
     /// `prompt` — run one inference turn against the session's workspace.
     ///
-    /// Sends the prompt to the configured backend, optionally applies a
-    /// unified diff returned by the model, captures the post-turn
-    /// workspace diff, and returns a [`TaskReply`] carrying the
-    /// (mandatory) `model_id`, assistant content, captured diff, and
-    /// `empty_diff` / `diff_applied` flags.
+    /// Two dispatch paths:
+    ///
+    /// - **newt-flat (default).** Sends the operator's prompt verbatim
+    ///   with the "respond with unified diffs only" directive; if the
+    ///   reply looks like a diff, tries to apply it. This is the
+    ///   minimal path that hits failure mode T0b on most local Ollama
+    ///   models (see the taxonomy card).
+    ///
+    /// - **newt-coder.** Activated when `session.coder_enabled` is
+    ///   true (via `NEWT_CODER=1` env or `coder: true` on
+    ///   `new_session`). Delegates to [`newt_coder::Coder`]: scans
+    ///   the workspace for referenced files, injects their contents
+    ///   into the prompt, asks the model for whole-file emit, and
+    ///   writes the result back to the workspace. The captured
+    ///   `git diff` then represents real edits the model actually
+    ///   made — closing T0b.
+    ///
+    /// Both paths capture the post-turn `git diff` and return a
+    /// [`TaskReply`] with the mandatory `model_id`, the assistant
+    /// content, the diff, `empty_diff` / `diff_applied` flags, and
+    /// (newt-coder only) the `emission_shape` label.
     async fn handle_prompt(&self, params: Value) -> anyhow::Result<Value> {
         let session_id: SessionId = params
             .get("session_id")
@@ -255,9 +315,26 @@ impl AcpServer {
                 .ok_or_else(|| anyhow::anyhow!("unknown session: {session_id}"))?
         };
 
+        let task_reply = if session.coder_enabled {
+            self.handle_prompt_coder(&session, &prompt).await?
+        } else {
+            self.handle_prompt_flat(&session, &prompt).await?
+        };
+
+        Ok(serde_json::to_value(task_reply)?)
+    }
+
+    /// Legacy newt-flat path: verbatim prompt + "unified diffs only"
+    /// directive. Kept for callers (and the existing eval corpus) that
+    /// rely on the minimal-prompt contract.
+    async fn handle_prompt_flat(
+        &self,
+        session: &Session,
+        prompt: &str,
+    ) -> anyhow::Result<TaskReply> {
         let req = newt_inference::ChatRequest::new()
             .system("You are a coding assistant. Respond with unified diffs only.")
-            .user(prompt);
+            .user(prompt.to_string());
 
         let reply = self.backend.complete(req).await?;
 
@@ -277,20 +354,38 @@ impl AcpServer {
             false
         };
 
-        // Capture the post-turn diff. Empty diff is the deterministic
-        // "the worker did nothing useful" signal — we surface it as a
-        // boolean field rather than crashing the server (the CLI
-        // binary can translate `empty_diff: true` into a non-zero
-        // exit when running `newt worker --once`).
         let diff = crate::diff::capture_diff(&session.workspace_path)?;
+        TaskReply::new(reply.model_id, reply.content, diff, diff_applied)
+            .map_err(|e| anyhow::anyhow!("backend returned malformed reply: {e}"))
+    }
 
-        let task_reply = TaskReply::new(reply.model_id, reply.content, diff, diff_applied)
-            .map_err(|e| {
-                // If the backend handed us an empty model_id, fail
-                // loudly — foreman cannot attribute the patch.
-                anyhow::anyhow!("backend returned malformed reply: {e}")
-            })?;
-        Ok(serde_json::to_value(task_reply)?)
+    /// newt-coder path: whole-file emit + server-side diff normalization.
+    /// Closes failure mode T0b on local Ollama coder models.
+    async fn handle_prompt_coder(
+        &self,
+        session: &Session,
+        prompt: &str,
+    ) -> anyhow::Result<TaskReply> {
+        let coder = newt_coder::Coder::new(Arc::clone(&self.backend));
+        let run = coder
+            .run(&session.workspace_path, prompt)
+            .await
+            .map_err(|e| anyhow::anyhow!("newt-coder run failed: {e}"))?;
+
+        // newt-coder already wrote any whole-file or unified-diff
+        // edits to the workspace; capture the resulting real diff.
+        let diff = crate::diff::capture_diff(&session.workspace_path)?;
+        let diff_applied = !run.files_written.is_empty() || !diff.trim().is_empty();
+
+        let content = format!(
+            "[newt-coder] {} file(s) written via {}",
+            run.files_written.len(),
+            run.emission_shape,
+        );
+
+        Ok(TaskReply::new(run.model_id, content, diff, diff_applied)
+            .map_err(|e| anyhow::anyhow!("newt-coder returned malformed reply: {e}"))?
+            .with_emission_shape(run.emission_shape))
     }
 }
 
@@ -371,6 +466,55 @@ mod tests {
             err.to_string().contains("model_id"),
             "expected missing-model_id error, got: {err}"
         );
+    }
+
+    #[test]
+    fn task_reply_emission_shape_defaults_none() {
+        let r = TaskReply::new("m", "c", "", false).unwrap();
+        assert_eq!(r.emission_shape, None);
+    }
+
+    #[test]
+    fn task_reply_with_emission_shape_builder() {
+        let r = TaskReply::new("m", "c", "", false)
+            .unwrap()
+            .with_emission_shape("whole_files");
+        assert_eq!(r.emission_shape.as_deref(), Some("whole_files"));
+    }
+
+    #[test]
+    fn task_reply_omits_null_emission_shape_from_wire() {
+        // The legacy newt-flat path produces None; the wire format
+        // should not carry a `"emission_shape": null` key (downstream
+        // consumers can pre-date the field).
+        let r = TaskReply::new("m", "c", "", false).unwrap();
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(
+            !json.contains("emission_shape"),
+            "expected emission_shape omitted when None, got: {json}"
+        );
+    }
+
+    #[test]
+    fn task_reply_carries_emission_shape_on_wire_when_set() {
+        let r = TaskReply::new("m", "c", "", true)
+            .unwrap()
+            .with_emission_shape("whole_files");
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(json.contains("\"emission_shape\":\"whole_files\""));
+        let back: TaskReply = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.emission_shape.as_deref(), Some("whole_files"));
+    }
+
+    #[test]
+    fn task_reply_old_wire_without_emission_shape_still_parses() {
+        // A producer that pre-dates this field must still deserialize
+        // cleanly — `emission_shape` is `serde(default)`.
+        let old =
+            r#"{"model_id":"m","content":"c","diff":"","empty_diff":true,"diff_applied":false}"#;
+        let r: TaskReply = serde_json::from_str(old).unwrap();
+        assert_eq!(r.model_id, "m");
+        assert_eq!(r.emission_shape, None);
     }
 
     #[test]
