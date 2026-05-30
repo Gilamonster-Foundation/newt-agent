@@ -58,7 +58,11 @@ futures-core = "0.3"
 tokio-stream = "0.1"
 
 # HTTP for local inference backends
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+# `rustls-tls-native-roots` loads the OS trust store (like curl) in addition to
+# the bundled Mozilla roots, so newt can validate private/home-lab CAs (e.g. a
+# Traefik-fronted DGX serving a `*.home.lan` cert). Plain `rustls-tls` ignores
+# the system store and rejects such certs with "error sending request".
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "json", "stream"] }
 
 # CLI
 clap = { version = "4", features = ["derive", "env"] }
