@@ -5,7 +5,6 @@ prompt = """
 In src/lib.rs, extract the magic expression `60 * 60 * 24` into a
 `const SECONDS_PER_DAY: u64 = 60 * 60 * 24;` declared at the top of
 the file and use that constant in the body of `seconds_in(days)`.
-Respond with a unified diff only.
 """
 
 evaluators = [

@@ -3,7 +3,7 @@ description = "Add a new #[test] function to the existing tests module"
 language = "rust"
 prompt = """
 Add a new `#[test] fn doubles_negative()` to the `mod tests` block in
-src/lib.rs that asserts `double(-3) == -6`. Respond with a unified diff only.
+src/lib.rs that asserts `double(-3) == -6`.
 """
 
 evaluators = [
