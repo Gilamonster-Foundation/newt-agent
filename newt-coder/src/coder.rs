@@ -98,6 +98,16 @@ impl Coder {
     fn apply(&self, emission: &Emission, workspace: &Path) -> Result<Vec<String>> {
         match emission {
             Emission::WholeFiles(files) => {
+                // Shape guards before writing. A whole-file emission
+                // legitimately rewrites every line (renames, signature
+                // changes, new doc comments), so we do NOT compare the
+                // body against what's on disk. We reject only bodies
+                // whose *shape* is wrong; the real correctness gate is
+                // the downstream `git diff` capture plus the eval
+                // compile/test evaluators.
+                for (path, contents) in files {
+                    reject_bad_shape(path, contents)?;
+                }
                 // `apply_whole_files` wants `(String, String)` tuples;
                 // collect to give it owned values without leaking the
                 // BTreeMap iterator's lifetime into the call.
@@ -123,6 +133,45 @@ impl Coder {
                 );
                 Ok(Vec::new())
             }
+        }
+    }
+}
+
+/// Reject a whole-file emission whose body has the wrong *shape*.
+///
+/// This replaces the old "first non-blank line must equal the file's
+/// existing anchor line" check, which wrongly rejected correct output
+/// whenever a rename or signature change altered line 1. Instead we
+/// only refuse bodies that are:
+///
+/// - empty / whitespace-only ([`CoderError::EmptyEmission`]),
+/// - diff-shaped — first non-blank line starts with `--- `, `+++ `, or
+///   `@@` ([`CoderError::LooksLikeDiff`]), or
+/// - still prefixed with a leaked `FILE:` marker as their first
+///   non-blank line ([`CoderError::LeakedMarker`]) — defense in depth
+///   in case [`crate::emission`] did not strip it.
+fn reject_bad_shape(path: &str, contents: &str) -> Result<()> {
+    let first_non_blank = contents.lines().find(|l| !l.trim().is_empty());
+    match first_non_blank {
+        None => Err(CoderError::EmptyEmission {
+            path: path.to_string(),
+        }),
+        Some(first) => {
+            let trimmed = first.trim_start();
+            if trimmed.starts_with("--- ")
+                || trimmed.starts_with("+++ ")
+                || trimmed.starts_with("@@")
+            {
+                return Err(CoderError::LooksLikeDiff {
+                    path: path.to_string(),
+                });
+            }
+            if trimmed.starts_with("FILE:") {
+                return Err(CoderError::LeakedMarker {
+                    path: path.to_string(),
+                });
+            }
+            Ok(())
         }
     }
 }
@@ -217,5 +266,111 @@ mod tests {
         let bad = Emission::UnifiedDiff("not a real diff".to_string());
         let err = coder.apply(&bad, tmp.path()).unwrap_err();
         assert!(matches!(err, CoderError::FileWrite(_)));
+    }
+
+    fn whole_files(path: &str, contents: &str) -> Emission {
+        let mut m = BTreeMap::new();
+        m.insert(path.to_string(), contents.to_string());
+        Emission::WholeFiles(m)
+    }
+
+    #[test]
+    fn apply_whole_files_accepts_line_one_change() {
+        // Regression for failures 1 & 2 (rename / signature change):
+        // the emitted first line differs from the existing first line,
+        // which the old anchor check wrongly rejected. It must now apply.
+        let tmp = TempDir::new().unwrap();
+        let coder = coder_with_no_backend_used();
+        fs::create_dir_all(tmp.path().join("src")).unwrap();
+        fs::write(
+            tmp.path().join("src/lib.rs"),
+            "pub fn hello(name: &str) -> String {\n    format!(\"hi {name}\")\n}\n",
+        )
+        .unwrap();
+
+        let new_body = "pub fn greet(name: &str) -> String {\n    format!(\"hi {name}\")\n}\n";
+        let written = coder
+            .apply(&whole_files("src/lib.rs", new_body), tmp.path())
+            .unwrap();
+        assert_eq!(written, vec!["src/lib.rs".to_string()]);
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("src/lib.rs")).unwrap(),
+            new_body
+        );
+    }
+
+    #[test]
+    fn apply_whole_files_rejects_diff_shaped_contents() {
+        let tmp = TempDir::new().unwrap();
+        let coder = coder_with_no_backend_used();
+        fs::write(tmp.path().join("a.txt"), "old\n").unwrap();
+        let diff = "--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-old\n+new\n";
+        let err = coder
+            .apply(&whole_files("a.txt", diff), tmp.path())
+            .unwrap_err();
+        assert!(matches!(err, CoderError::LooksLikeDiff { ref path } if path == "a.txt"));
+        // The file must not have been overwritten.
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("a.txt")).unwrap(),
+            "old\n"
+        );
+    }
+
+    #[test]
+    fn apply_whole_files_rejects_hunk_only_contents() {
+        let tmp = TempDir::new().unwrap();
+        let coder = coder_with_no_backend_used();
+        let hunk = "@@ -1,2 +1,2 @@\n-old\n+new\n";
+        let err = coder
+            .apply(&whole_files("a.txt", hunk), tmp.path())
+            .unwrap_err();
+        assert!(matches!(err, CoderError::LooksLikeDiff { .. }));
+    }
+
+    #[test]
+    fn apply_whole_files_rejects_empty_contents() {
+        let tmp = TempDir::new().unwrap();
+        let coder = coder_with_no_backend_used();
+        let err = coder
+            .apply(&whole_files("a.txt", ""), tmp.path())
+            .unwrap_err();
+        assert!(matches!(err, CoderError::EmptyEmission { ref path } if path == "a.txt"));
+    }
+
+    #[test]
+    fn apply_whole_files_rejects_whitespace_only_contents() {
+        let tmp = TempDir::new().unwrap();
+        let coder = coder_with_no_backend_used();
+        let err = coder
+            .apply(&whole_files("a.txt", "   \n\t\n"), tmp.path())
+            .unwrap_err();
+        assert!(matches!(err, CoderError::EmptyEmission { .. }));
+    }
+
+    #[test]
+    fn apply_whole_files_rejects_leaked_file_marker() {
+        // Defense in depth (failures 3 & 4): even if a leaked FILE:
+        // marker slipped past the parser, the writer must refuse it.
+        let tmp = TempDir::new().unwrap();
+        let coder = coder_with_no_backend_used();
+        let body = "FILE: src/lib.rs\npub fn add(a: i32, b: i32) -> i32 { a + b }\n";
+        let err = coder
+            .apply(&whole_files("src/lib.rs", body), tmp.path())
+            .unwrap_err();
+        assert!(matches!(err, CoderError::LeakedMarker { ref path } if path == "src/lib.rs"));
+    }
+
+    #[test]
+    fn reject_bad_shape_messages_start_with_file_write_failed() {
+        for err in [
+            super::reject_bad_shape("p", "").unwrap_err(),
+            super::reject_bad_shape("p", "--- a/p\n").unwrap_err(),
+            super::reject_bad_shape("p", "FILE: p\n").unwrap_err(),
+        ] {
+            assert!(
+                err.to_string().starts_with("file write failed:"),
+                "message did not start with prefix: {err}"
+            );
+        }
     }
 }
