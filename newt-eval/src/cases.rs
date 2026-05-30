@@ -325,7 +325,10 @@ content = ""
 "#,
         );
         let case = TestCase::load_dir(&case_dir).unwrap();
-        assert_eq!(case.difficulty, "L1", "missing difficulty must default to L1");
+        assert_eq!(
+            case.difficulty, "L1",
+            "missing difficulty must default to L1"
+        );
     }
 
     #[test]

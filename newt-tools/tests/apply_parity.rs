@@ -172,7 +172,10 @@ fn nonmatching_diff() -> String {
 fn clean_diff_both_accept() {
     let seed = [("src/lib.rs", SEED_001)];
     let diff = clean_rename_diff();
-    assert!(fuzzy_accepts(&seed, &diff), "fuzzy must accept a clean diff");
+    assert!(
+        fuzzy_accepts(&seed, &diff),
+        "fuzzy must accept a clean diff"
+    );
     assert!(
         git_apply_accepts(&seed, &diff),
         "git apply --check must accept a clean diff"
