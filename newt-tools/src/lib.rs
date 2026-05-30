@@ -11,8 +11,10 @@ pub mod search;
 #[cfg(feature = "pyo3")]
 pub mod pyo3_module;
 
-pub use patch::{apply_patch, apply_whole_files, applier_from_env, edit, FuzzyApplier, PatchApplier};
 #[cfg(feature = "applier-diffy")]
 pub use patch::DiffyApplier;
+pub use patch::{
+    applier_from_env, apply_patch, apply_whole_files, edit, FuzzyApplier, PatchApplier,
+};
 pub use read::read;
 pub use search::{search, Hit};
