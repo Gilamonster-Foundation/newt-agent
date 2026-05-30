@@ -40,7 +40,21 @@ just eval
 
 # Live: one case, specific model:
 just eval --case 001 --model llama3.1:8b
+
+# Coder mode + raised timeout for a slower local model:
+newt-eval run --mode live --case 008 --coder --worker-timeout-ms 180000
 ```
+
+### Coder mode and slow models
+
+- `--coder` spawns the worker with the `newt-coder` plugin (whole-file
+  emit + server-side diff normalization). Use it for local Ollama coder
+  models that otherwise trip failure mode T0b (invented hunk context).
+- `--worker-timeout-ms <ms>` (env `NEWT_EVAL_WORKER_TIMEOUT_MS`, default
+  `60000`) is the per-case wall-clock budget. A model slower than this is
+  scored `dispatch_error` even if it would have produced correct output —
+  raise it (e.g. `180000`) when evaluating slower models so the scorecard
+  measures capability, not just latency.
 
 Exit codes from `newt-eval run`:
 
@@ -53,7 +67,7 @@ Exit codes from `newt-eval run`:
 | Name | What it checks |
 |------|----------------|
 | `diff_nonempty` | `reply.diff` is non-empty AND `!reply.empty_diff` |
-| `diff_applies`  | Copy baseline to a tempdir, `git apply --check` accepts the diff |
+| `diff_applies`  | Copy baseline to a tempdir, `git apply --check` accepts the model's **raw emission** (when diff-shaped, fence peeled) — not the post-hoc captured diff — so a header-lying diff the fuzzy worker rescued is scored honestly (#30B) |
 | `rust_compiles` | `cargo check` on the post-worker workspace (Rust cases only) |
 | `tests_pass`    | `cargo test` on the post-worker workspace (Rust cases with `#[test]` only) |
 | `pattern_match` | At least one of `expected_patterns` regex matches the captured diff |
