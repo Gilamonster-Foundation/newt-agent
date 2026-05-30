@@ -49,6 +49,12 @@ uuid = { version = "1", features = ["v4", "serde"] }
 toml = "1.0"
 regex = "1"
 
+# Patch application — optional strict backend behind newt-tools'
+# `applier-diffy` feature (default applier stays the in-house fuzzy
+# parser). Pure-Rust, no C deps → preserves the PyO3 wheel story.
+# Pinned to 0.4: diffy 0.5 raises its MSRV to 1.85, above our 1.75.
+diffy = "0.4"
+
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 async-trait = "0.1"

@@ -33,9 +33,93 @@ enum DiffLine {
     Remove(String),
 }
 
+// ── Pluggable applier backends ───────────────────────────────────────────────
+
+/// A patch-application backend.
+///
+/// The default is [`FuzzyApplier`] — the in-house unified-diff parser with
+/// `git apply -C`-style fuzzy hunk location (tolerant of the off-by-N line
+/// numbers and whitespace drift weak local models emit, while still
+/// rejecting genuinely-wrong and ambiguous hunks). It is the backend the
+/// worker-agent bake-off validated, so it stays the default.
+///
+/// Alternative backends select at runtime via `NEWT_PATCH_APPLIER`:
+///
+/// - `fuzzy` (default) — [`FuzzyApplier`].
+/// - `diffy` — [`DiffyApplier`], the strict pure-Rust `diffy` crate.
+///   Requires the `applier-diffy` cargo feature; without it,
+///   `NEWT_PATCH_APPLIER=diffy` warns and falls back to fuzzy.
+///
+/// Future backends are just more `impl PatchApplier`: a `gix` (gitoxide)
+/// applier once `gix-apply` publishes, or a `kyln` content-addressed
+/// applier. The seam exists so the choice of *how* a patch is applied is a
+/// swappable instrument, not baked into every call site.
+pub trait PatchApplier: Send + Sync {
+    /// Validate and apply `diff` rooted at `root`. All-or-nothing: a
+    /// multi-file diff either applies fully or leaves the tree untouched.
+    fn apply(&self, root: &Path, diff: &str) -> anyhow::Result<()>;
+    /// Short stable name for logs/diagnostics (`"fuzzy"`, `"diffy"`).
+    fn name(&self) -> &'static str;
+}
+
+/// The default in-house fuzzy applier (see [`PatchApplier`]).
+pub struct FuzzyApplier;
+
+impl PatchApplier for FuzzyApplier {
+    fn apply(&self, root: &Path, diff: &str) -> anyhow::Result<()> {
+        fuzzy_apply_patch(root, diff)
+    }
+    fn name(&self) -> &'static str {
+        "fuzzy"
+    }
+}
+
+/// Strict `diffy`-backed applier. Only compiled with the `applier-diffy`
+/// feature; selectable at runtime via `NEWT_PATCH_APPLIER=diffy`.
+#[cfg(feature = "applier-diffy")]
+pub struct DiffyApplier;
+
+#[cfg(feature = "applier-diffy")]
+impl PatchApplier for DiffyApplier {
+    fn apply(&self, root: &Path, diff: &str) -> anyhow::Result<()> {
+        diffy_apply_patch(root, diff)
+    }
+    fn name(&self) -> &'static str {
+        "diffy"
+    }
+}
+
+/// Select the applier backend from the `NEWT_PATCH_APPLIER` env var,
+/// defaulting to [`FuzzyApplier`].
+pub fn applier_from_env() -> Box<dyn PatchApplier> {
+    match std::env::var("NEWT_PATCH_APPLIER").ok().as_deref() {
+        Some("diffy") => diffy_applier(),
+        Some("fuzzy") | None => Box::new(FuzzyApplier),
+        Some(other) => {
+            tracing::warn!(applier = %other, "unknown NEWT_PATCH_APPLIER; using fuzzy");
+            Box::new(FuzzyApplier)
+        }
+    }
+}
+
+#[cfg(feature = "applier-diffy")]
+fn diffy_applier() -> Box<dyn PatchApplier> {
+    Box::new(DiffyApplier)
+}
+
+#[cfg(not(feature = "applier-diffy"))]
+fn diffy_applier() -> Box<dyn PatchApplier> {
+    tracing::warn!(
+        "NEWT_PATCH_APPLIER=diffy requested but the `applier-diffy` feature is \
+         not compiled in; falling back to the fuzzy applier"
+    );
+    Box::new(FuzzyApplier)
+}
+
 // ── Public API ──────────────────────────────────────────────────────────────
 
-/// Apply a unified diff to files under `root`.
+/// Apply a unified diff to files under `root` using the
+/// [`applier_from_env`]-selected backend (fuzzy by default).
 ///
 /// Each file referenced in the diff is resolved relative to `root`.
 /// New files are created if they don't exist. Writes are atomic
@@ -47,6 +131,11 @@ enum DiffLine {
 /// - Context mismatch (the file doesn't match what the diff expects).
 /// - I/O errors on read/write.
 pub fn apply_patch(root: &Path, diff: &str) -> anyhow::Result<()> {
+    applier_from_env().apply(root, diff)
+}
+
+/// The in-house fuzzy applier implementation (the default backend).
+fn fuzzy_apply_patch(root: &Path, diff: &str) -> anyhow::Result<()> {
     let patches = parse_unified_diff(diff)?;
 
     if patches.is_empty() {
@@ -127,6 +216,77 @@ where
         written.push(rel);
     }
     Ok(written)
+}
+
+// ── Strict `diffy` backend (feature = "applier-diffy") ───────────────────────
+
+/// Strict applier built on the `diffy` crate. Splits a (possibly
+/// multi-file) unified diff into per-file sections and applies each with
+/// `diffy::apply`. Validates every file before writing (atomic
+/// temp-then-rename), matching the fuzzy applier's all-or-nothing
+/// semantics. Unlike the fuzzy backend, `diffy` is strict about hunk
+/// headers/context — the point of offering it as an option.
+#[cfg(feature = "applier-diffy")]
+fn diffy_apply_patch(root: &Path, diff: &str) -> anyhow::Result<()> {
+    let sections = split_file_sections(diff);
+    if sections.is_empty() {
+        anyhow::bail!("no file patches found in diff");
+    }
+
+    let mut results: Vec<(std::path::PathBuf, String)> = Vec::new();
+    for section in &sections {
+        let patch = diffy::Patch::from_str(section)
+            .map_err(|e| anyhow::anyhow!("diffy parse error: {e}"))?;
+        let plus = section
+            .lines()
+            .find(|l| l.starts_with("+++ "))
+            .ok_or_else(|| anyhow::anyhow!("diff section missing +++ header"))?;
+        let rel = extract_path(plus)?;
+        let file_path = root.join(&rel);
+        let original = if file_path.exists() {
+            std::fs::read_to_string(&file_path)?
+        } else {
+            String::new()
+        };
+        let patched = diffy::apply(&original, &patch)
+            .map_err(|e| anyhow::anyhow!("diffy rejected patch for {rel}: {e}"))?;
+        results.push((file_path, patched));
+    }
+
+    for (file_path, content) in &results {
+        let tmp_path = file_path.with_extension("newt-tmp");
+        if let Some(parent) = file_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&tmp_path, content)?;
+        std::fs::rename(&tmp_path, file_path)?;
+    }
+    Ok(())
+}
+
+/// Split a unified diff into per-file sections, each beginning at a
+/// `--- ` header line. Any preamble before the first `--- ` (a
+/// `diff --git` line, prose) is dropped.
+#[cfg(feature = "applier-diffy")]
+fn split_file_sections(diff: &str) -> Vec<String> {
+    let mut sections: Vec<String> = Vec::new();
+    let mut cur: Option<String> = None;
+    for line in diff.lines() {
+        if line.starts_with("--- ") {
+            if let Some(prev) = cur.take() {
+                sections.push(prev);
+            }
+            cur = Some(String::new());
+        }
+        if let Some(buf) = cur.as_mut() {
+            buf.push_str(line);
+            buf.push('\n');
+        }
+    }
+    if let Some(last) = cur {
+        sections.push(last);
+    }
+    sections
 }
 
 // ── Diff parser ─────────────────────────────────────────────────────────────
