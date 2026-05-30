@@ -1,6 +1,7 @@
 name = "004-add-test-case"
 description = "Add a new #[test] function to the existing tests module"
 language = "rust"
+difficulty = "L1"
 prompt = """
 Add a new `#[test] fn doubles_negative()` to the `mod tests` block in
 src/lib.rs that asserts `double(-3) == -6`.

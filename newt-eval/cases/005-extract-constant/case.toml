@@ -1,6 +1,7 @@
 name = "005-extract-constant"
 description = "Extract the magic seconds-per-day expression into a named const"
 language = "rust"
+difficulty = "L1"
 prompt = """
 In src/lib.rs, extract the magic expression `60 * 60 * 24` into a
 `const SECONDS_PER_DAY: u64 = 60 * 60 * 24;` declared at the top of
