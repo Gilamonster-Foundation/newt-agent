@@ -1,0 +1,48 @@
+name = "006-handle-empty-input"
+description = "Add a guard clause for empty input + a regression test"
+language = "rust"
+prompt = """
+The function `first_word` in src/lib.rs panics on empty input because the
+slice access `&s[..]` returns an empty slice but the loop doesn't run.
+Make the behavior explicit: at the very top of `first_word`, return an
+empty string immediately if `s` is empty. Then add a unit test
+`first_word_handles_empty` that calls `first_word("")` and asserts the
+result is the empty string `""`.
+"""
+
+evaluators = [
+    "diff_nonempty",
+    "diff_applies",
+    "rust_compiles",
+    "tests_pass",
+    "pattern_match",
+]
+
+expected_patterns = [
+    "s\\.is_empty\\(\\)",
+    "fn first_word_handles_empty",
+]
+
+[mock_response]
+content = """
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,4 +1,7 @@
+ pub fn first_word(s: &str) -> &str {
++    if s.is_empty() {
++        return "";
++    }
+     let bytes = s.as_bytes();
+     for (i, &item) in bytes.iter().enumerate() {
+         if item == b' ' {
+@@ -16,4 +19,9 @@ mod tests {
+     fn finds_first_word() {
+         assert_eq!(first_word("hello world"), "hello");
+     }
++
++    #[test]
++    fn first_word_handles_empty() {
++        assert_eq!(first_word(""), "");
++    }
+ }
+"""
