@@ -32,6 +32,7 @@
 
 pub mod cases;
 pub mod evaluators;
+pub mod lint;
 pub mod runner;
 pub mod scorecard;
 
@@ -43,5 +44,6 @@ pub use evaluators::{
     default_evaluators, evaluator_by_name, DiffAppliesEvaluator, DiffNonemptyEvaluator, Evaluator,
     PatternMatchEvaluator, RustCompilesEvaluator, TestsPassEvaluator,
 };
+pub use lint::{lint_case_prompts, lint_prompt, LintError};
 pub use runner::{run_case, RunOutcome, RunnerConfig};
 pub use scorecard::{CaseScorecard, EvalContext, EvalResult, Scorecard};
