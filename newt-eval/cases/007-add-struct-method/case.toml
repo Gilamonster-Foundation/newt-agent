@@ -1,6 +1,7 @@
 name = "007-add-struct-method"
 description = "Add a method to an existing impl block + a test"
 language = "rust"
+difficulty = "L1"
 prompt = """
 Add a method `increment(&mut self)` to the `Counter` impl in src/lib.rs
 that increments `self.count` by 1. Also add a unit test

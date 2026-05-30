@@ -171,23 +171,29 @@ fn select_apply_target(ctx: &EvalContext) -> (String, &'static str) {
     (ctx.reply.diff.clone(), "captured diff")
 }
 
-/// Peel a single enclosing ``` fence (mirrors newt-coder's
-/// `strip_outer_fences`) so a correct diff wrapped in a ```diff … ``` block
-/// is not falsely rejected by `git apply --check`.
+/// Peel a single enclosing ``` fence so a correct diff wrapped in a
+/// ```diff … ``` block is not falsely rejected by `git apply --check`.
+///
+/// Unlike newt-coder's `strip_outer_fences` (which trims aggressively for
+/// parsing), this preserves the diff bytes verbatim when there is no fence
+/// — a trailing blank *context* line (` `) is significant to `git apply`
+/// and must not be trimmed away.
 fn strip_outer_fences(raw: &str) -> String {
-    let trimmed = raw.trim();
-    if let Some(rest) = trimmed.strip_prefix("```") {
-        let after_tag = match rest.find('\n') {
-            Some(nl) => &rest[nl + 1..],
-            None => rest,
-        };
-        let body = after_tag
-            .strip_suffix("```")
-            .or_else(|| after_tag.strip_suffix("```\n"))
-            .unwrap_or(after_tag);
-        return body.trim_end_matches('\n').to_string();
+    if !raw.trim_matches('\n').starts_with("```") {
+        return raw.to_string();
     }
-    trimmed.to_string()
+    // Fenced: drop the opening fence line (with optional language tag) and a
+    // trailing line that is only ```. Rejoin verbatim with a trailing newline.
+    let mut lines: Vec<&str> = raw.trim_matches('\n').lines().collect();
+    if !lines.is_empty() {
+        lines.remove(0);
+    }
+    if lines.last().is_some_and(|l| l.trim() == "```") {
+        lines.pop();
+    }
+    let mut out = lines.join("\n");
+    out.push('\n');
+    out
 }
 
 /// Detect a unified diff by header pattern (mirrors newt-coder's
@@ -449,6 +455,7 @@ mod tests {
             evaluators: vec![],
             expected_patterns,
             mock_response: MockResponse { content: "".into() },
+            difficulty: "L1".into(),
             case_dir: PathBuf::new(),
         };
         EvalContext {
@@ -593,6 +600,7 @@ mod tests {
             evaluators: vec![],
             expected_patterns: vec![],
             mock_response: MockResponse { content: "".into() },
+            difficulty: "L1".into(),
             case_dir: PathBuf::new(),
         };
         EvalContext {

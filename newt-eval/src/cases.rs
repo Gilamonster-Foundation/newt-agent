@@ -34,6 +34,14 @@ pub struct TestCase {
     pub expected_patterns: Vec<String>,
     /// What the mock Ollama returns in mock mode. Ignored in live mode.
     pub mock_response: MockResponse,
+    /// Difficulty tier, used by the `--difficulty` filter:
+    /// - `"L1"` — saturated single-edit tasks (every modern coder model passes)
+    /// - `"L2"` — multi-step, single-domain reasoning
+    /// - `"L3"` — cross-domain / long-context (future)
+    ///
+    /// Defaults to `"L1"` so pre-existing cases need no change.
+    #[serde(default = "default_difficulty")]
+    pub difficulty: String,
 
     // ── Not serialized; populated by the loader ─────────────────────
     /// Absolute path to the case directory (the parent of `case.toml`).
@@ -110,6 +118,24 @@ pub fn load_all(cases_dir: impl AsRef<Path>) -> anyhow::Result<Vec<TestCase>> {
         cases.push(TestCase::load_dir(&path)?);
     }
     Ok(cases)
+}
+
+/// Default difficulty tier for cases that don't declare one.
+fn default_difficulty() -> String {
+    "L1".to_string()
+}
+
+/// Keep only cases whose `difficulty` is in `wanted` (case-insensitive).
+/// An empty `wanted` means "all tiers" — the default when `--difficulty`
+/// is not passed.
+pub fn filter_by_difficulty(cases: Vec<TestCase>, wanted: &[String]) -> Vec<TestCase> {
+    if wanted.is_empty() {
+        return cases;
+    }
+    cases
+        .into_iter()
+        .filter(|c| wanted.iter().any(|w| w.eq_ignore_ascii_case(&c.difficulty)))
+        .collect()
 }
 
 /// Return the conventional cases directory:
@@ -273,10 +299,58 @@ content = ""
             evaluators: vec![],
             expected_patterns: vec![],
             mock_response: MockResponse { content: "".into() },
+            difficulty: "L1".into(),
             case_dir: PathBuf::new(),
         };
         assert!(c.is_rust());
         c.language = "python".into();
         assert!(!c.is_rust());
+    }
+
+    #[test]
+    fn difficulty_defaults_to_l1_when_absent() {
+        let tmp = tempdir().unwrap();
+        let case_dir = write_case(
+            tmp.path(),
+            "001-demo",
+            r#"
+name = "demo"
+description = ""
+language = "rust"
+prompt = ""
+evaluators = ["diff_nonempty"]
+
+[mock_response]
+content = ""
+"#,
+        );
+        let case = TestCase::load_dir(&case_dir).unwrap();
+        assert_eq!(case.difficulty, "L1", "missing difficulty must default to L1");
+    }
+
+    #[test]
+    fn filter_by_difficulty_selects_requested_tiers() {
+        let mk = |name: &str, diff: &str| TestCase {
+            name: name.into(),
+            description: "".into(),
+            language: "rust".into(),
+            prompt: "".into(),
+            evaluators: vec![],
+            expected_patterns: vec![],
+            mock_response: MockResponse { content: "".into() },
+            difficulty: diff.into(),
+            case_dir: PathBuf::new(),
+        };
+        let cases = vec![mk("a", "L1"), mk("b", "L2"), mk("c", "L1"), mk("d", "L3")];
+
+        // Empty filter => all tiers.
+        assert_eq!(filter_by_difficulty(cases.clone(), &[]).len(), 4);
+        // Single tier (case-insensitive).
+        let l2 = filter_by_difficulty(cases.clone(), &["l2".to_string()]);
+        assert_eq!(l2.len(), 1);
+        assert_eq!(l2[0].name, "b");
+        // Multiple tiers.
+        let l2l3 = filter_by_difficulty(cases, &["L2".to_string(), "L3".to_string()]);
+        assert_eq!(l2l3.len(), 2);
     }
 }

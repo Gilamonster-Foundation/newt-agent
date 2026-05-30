@@ -14,7 +14,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use anyhow::Result;
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use newt_eval::{
     cases, default_evaluators, evaluator_by_name, run_case, CaseScorecard, EvalContext,
     RunnerConfig, Scorecard, TestCase,
@@ -41,40 +41,49 @@ enum Command {
     },
 
     /// Run cases against the configured backend.
-    Run {
-        /// `mock` requires the test runner — this binary only supports
-        /// `live`. The flag is here for symmetry with `cargo test -p
-        /// newt-eval --test mock_e2e`.
-        #[arg(long, value_enum, default_value_t = Mode::Live)]
-        mode: Mode,
-        /// Only run the case whose name matches this string (substring match).
-        #[arg(long)]
-        case: Option<String>,
-        /// Override the model name (sent via ACP `set_session_model` AND
-        /// `NEWT_DEFAULT_MODEL` env on the spawned worker — latter is
-        /// the load-bearing one today).
-        #[arg(long)]
-        model: Option<String>,
-        /// Path to the cases directory (defaults to bundled).
-        #[arg(long)]
-        cases_dir: Option<PathBuf>,
-        /// Path to the `newt` binary (defaults to `target/<profile>/newt`).
-        #[arg(long)]
-        worker_bin: Option<PathBuf>,
-        /// Spawn the worker with `--coder` so the newt-coder plugin
-        /// handles prompts (whole-file emit + diff normalization).
-        /// Required for local Ollama coder models that can't fabricate
-        /// valid hunk headers (failure mode T0b).
-        #[arg(long)]
-        coder: bool,
-        /// Per-case worker wall-clock budget in milliseconds. A model that
-        /// takes longer is scored `dispatch_error` even if it would have
-        /// produced correct output given more time — the single binding
-        /// constraint on evaluating slower models. Raise it (e.g. 180000)
-        /// for slow local models. Default 60000 (backward compatible).
-        #[arg(long, env = "NEWT_EVAL_WORKER_TIMEOUT_MS", default_value_t = 60_000)]
-        worker_timeout_ms: u64,
-    },
+    Run(RunArgs),
+}
+
+/// Arguments for the `run` subcommand.
+#[derive(Args, Debug)]
+struct RunArgs {
+    /// `mock` requires the test runner — this binary only supports
+    /// `live`. The flag is here for symmetry with `cargo test -p
+    /// newt-eval --test mock_e2e`.
+    #[arg(long, value_enum, default_value_t = Mode::Live)]
+    mode: Mode,
+    /// Only run the case whose name matches this string (substring match).
+    #[arg(long)]
+    case: Option<String>,
+    /// Override the model name (sent via ACP `set_session_model` AND
+    /// `NEWT_DEFAULT_MODEL` env on the spawned worker — latter is
+    /// the load-bearing one today).
+    #[arg(long)]
+    model: Option<String>,
+    /// Path to the cases directory (defaults to bundled).
+    #[arg(long)]
+    cases_dir: Option<PathBuf>,
+    /// Path to the `newt` binary (defaults to `target/<profile>/newt`).
+    #[arg(long)]
+    worker_bin: Option<PathBuf>,
+    /// Spawn the worker with `--coder` so the newt-coder plugin
+    /// handles prompts (whole-file emit + diff normalization).
+    /// Required for local Ollama coder models that can't fabricate
+    /// valid hunk headers (failure mode T0b).
+    #[arg(long)]
+    coder: bool,
+    /// Per-case worker wall-clock budget in milliseconds. A model that
+    /// takes longer is scored `dispatch_error` even if it would have
+    /// produced correct output given more time — the single binding
+    /// constraint on evaluating slower models. Raise it (e.g. 180000)
+    /// for slow local models. Default 60000 (backward compatible).
+    #[arg(long, env = "NEWT_EVAL_WORKER_TIMEOUT_MS", default_value_t = 60_000)]
+    worker_timeout_ms: u64,
+    /// Only run cases in these difficulty tiers (comma-separated, e.g.
+    /// `L2` or `L2,L3`). Default: all tiers. L1 = saturated single edits;
+    /// L2 = multi-step single-domain; L3 = cross-domain.
+    #[arg(long, value_delimiter = ',')]
+    difficulty: Vec<String>,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -119,38 +128,22 @@ async fn real_main() -> Result<bool> {
             }
             Ok(true)
         }
-        Command::Run {
-            mode,
-            case,
-            model,
-            cases_dir,
-            worker_bin,
-            coder,
-            worker_timeout_ms,
-        } => {
-            run_command(
-                mode,
-                case,
-                model,
-                cases_dir,
-                worker_bin,
-                coder,
-                worker_timeout_ms,
-            )
-            .await
-        }
+        Command::Run(args) => run_command(args).await,
     }
 }
 
-async fn run_command(
-    mode: Mode,
-    case_filter: Option<String>,
-    model: Option<String>,
-    cases_dir: Option<PathBuf>,
-    worker_bin: Option<PathBuf>,
-    coder: bool,
-    worker_timeout_ms: u64,
-) -> Result<bool> {
+async fn run_command(args: RunArgs) -> Result<bool> {
+    let RunArgs {
+        mode,
+        case: case_filter,
+        model,
+        cases_dir,
+        worker_bin,
+        coder,
+        worker_timeout_ms,
+        difficulty,
+    } = args;
+
     if let Mode::Mock = mode {
         anyhow::bail!(
             "mock mode is implemented by `cargo test -p newt-eval --test mock_e2e` — \
@@ -160,15 +153,16 @@ async fn run_command(
 
     let dir = cases_dir.unwrap_or_else(cases::default_cases_dir);
     let all = cases::load_all(&dir)?;
-    let cases: Vec<TestCase> = match &case_filter {
+    let by_name: Vec<TestCase> = match &case_filter {
         Some(needle) => all
             .into_iter()
             .filter(|c| c.name.contains(needle))
             .collect(),
         None => all,
     };
+    let cases = cases::filter_by_difficulty(by_name, &difficulty);
     if cases.is_empty() {
-        anyhow::bail!("no cases matched filter {case_filter:?}");
+        anyhow::bail!("no cases matched filters (case={case_filter:?}, difficulty={difficulty:?})");
     }
 
     let worker = worker_bin.unwrap_or_else(default_worker_bin);

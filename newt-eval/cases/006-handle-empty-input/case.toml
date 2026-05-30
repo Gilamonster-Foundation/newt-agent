@@ -1,6 +1,7 @@
 name = "006-handle-empty-input"
 description = "Add a guard clause for empty input + a regression test"
 language = "rust"
+difficulty = "L1"
 prompt = """
 The function `first_word` in src/lib.rs panics on empty input because the
 slice access `&s[..]` returns an empty slice but the loop doesn't run.

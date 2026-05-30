@@ -1,6 +1,7 @@
 name = "008-extract-helper"
 description = "Refactor: extract a shared `* 2` pattern into a helper function"
 language = "rust"
+difficulty = "L1"
 prompt = """
 Both `double_first` and `double_last` in src/lib.rs share the same `n * 2`
 doubling pattern. Extract this into a private helper function
