@@ -4,7 +4,7 @@ language = "rust"
 prompt = """
 Rename the function `greet` to `hello` in src/lib.rs. Update both the
 function definition AND the call site in the in-file unit test so the
-crate still compiles and tests still pass. Respond with a unified diff only.
+crate still compiles and tests still pass.
 """
 
 evaluators = [
