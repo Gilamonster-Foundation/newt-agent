@@ -31,6 +31,18 @@ pub enum DgxCmd {
     Models,
     /// Probe every configured DGX endpoint flavor and report reachability.
     Doctor,
+    /// Pre-load a model into VRAM on the active endpoint so the first real
+    /// request doesn't pay the cold-load latency (which can blow past tight
+    /// per-task timeouts, e.g. in `newt-eval`). Uses Ollama's load-only
+    /// request — no tokens generated — and pins it resident via `keep_alive`.
+    Warm {
+        /// Model to warm. Defaults to the active model
+        /// (`[dgx].active_model` / `NEWT_DGX_MODEL`).
+        model: Option<String>,
+        /// How long Ollama keeps the model resident after warming.
+        #[arg(long, default_value = "30m")]
+        keep_alive: String,
+    },
 }
 
 /// Dispatch a `newt dgx` subcommand.
@@ -40,6 +52,7 @@ pub async fn run(cmd: DgxCmd, config_path: Option<&Path>) -> anyhow::Result<()> 
         DgxCmd::Status => status(config_path).await,
         DgxCmd::Models => models(config_path).await,
         DgxCmd::Doctor => doctor(config_path).await,
+        DgxCmd::Warm { model, keep_alive } => warm(config_path, model, &keep_alive).await,
     }
 }
 
@@ -308,6 +321,73 @@ async fn probe(client: &reqwest::Client, base: &str, path: &str) -> String {
     }
 }
 
+// ---------------------------------------------------------------------------
+// warm
+// ---------------------------------------------------------------------------
+
+/// Ollama load-only request body: a `/api/generate` call with no `prompt`
+/// and a `keep_alive` window loads the model into VRAM (and pins it resident)
+/// without generating any tokens.
+fn warm_body(model: &str, keep_alive: &str) -> serde_json::Value {
+    serde_json::json!({ "model": model, "keep_alive": keep_alive, "stream": false })
+}
+
+/// POST the load-only request and return the load time in seconds when Ollama
+/// actually had to load the model (absent / `None` when it was already
+/// resident — a warm hit returns near-instantly with no `load_duration`).
+async fn warm_model(
+    client: &reqwest::Client,
+    base: &str,
+    model: &str,
+    keep_alive: &str,
+) -> anyhow::Result<Option<f64>> {
+    let url = format!("{}/api/generate", base.trim_end_matches('/'));
+    let resp = client
+        .post(&url)
+        .json(&warm_body(model, keep_alive))
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("request failed: {e}"))?;
+    if !resp.status().is_success() {
+        anyhow::bail!("HTTP {}", resp.status());
+    }
+    let json: serde_json::Value = resp.json().await?;
+    Ok(json["load_duration"].as_u64().map(|ns| ns as f64 / 1e9))
+}
+
+async fn warm(
+    config_path: Option<&Path>,
+    model: Option<String>,
+    keep_alive: &str,
+) -> anyhow::Result<()> {
+    let dgx = dgx_config(config_path)?;
+    let kind = dgx.active_endpoint;
+    if kind.is_openai_compatible() {
+        anyhow::bail!(
+            "`newt dgx warm` targets Ollama endpoints; the active endpoint is vLLM \
+             (vLLM keeps its served model resident already)"
+        );
+    }
+    let base = dgx.resolve_endpoint()?;
+    let model = match model {
+        Some(m) => m,
+        None => dgx.resolve_active_model()?,
+    };
+    println!("Warming {model} on {kind} endpoint ({base}) — keep_alive={keep_alive}");
+
+    // Cold loads of large models can take tens of seconds; give warm its own
+    // generous timeout rather than the short probe client.
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(600))
+        .build()
+        .expect("build reqwest client");
+    match warm_model(&client, &base, &model, keep_alive).await? {
+        Some(secs) => println!("  loaded in {secs:.1}s — now resident"),
+        None => println!("  ready (already resident)"),
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -460,5 +540,65 @@ mod tests {
         // Port 1 is reserved/closed — connection fails fast.
         let s = probe(&http_client(), "http://127.0.0.1:1", "/api/tags").await;
         assert!(s.starts_with("unreachable"), "got: {s}");
+    }
+
+    // --- warm ----------------------------------------------------------
+
+    #[test]
+    fn warm_body_is_load_only() {
+        let b = warm_body("qwen2.5-coder:7b", "30m");
+        assert_eq!(b["model"], "qwen2.5-coder:7b");
+        assert_eq!(b["keep_alive"], "30m");
+        assert_eq!(b["stream"], false);
+        // No prompt => Ollama loads without generating.
+        assert!(b.get("prompt").is_none());
+    }
+
+    #[tokio::test]
+    async fn warm_model_reports_load_seconds() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(wm_path("/api/generate"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "model": "m",
+                "done": true,
+                "load_duration": 13_000_000_000u64
+            })))
+            .mount(&server)
+            .await;
+        let secs = warm_model(&http_client(), &server.uri(), "m", "30m")
+            .await
+            .unwrap();
+        assert_eq!(secs, Some(13.0));
+    }
+
+    #[tokio::test]
+    async fn warm_model_already_resident_is_none() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(wm_path("/api/generate"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "model": "m", "done": true })),
+            )
+            .mount(&server)
+            .await;
+        let secs = warm_model(&http_client(), &server.uri(), "m", "30m")
+            .await
+            .unwrap();
+        assert_eq!(secs, None);
+    }
+
+    #[tokio::test]
+    async fn warm_model_http_error_is_err() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(wm_path("/api/generate"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        assert!(warm_model(&http_client(), &server.uri(), "m", "30m")
+            .await
+            .is_err());
     }
 }
