@@ -1,0 +1,46 @@
+name = "008-extract-helper"
+description = "Refactor: extract a shared `* 2` pattern into a helper function"
+language = "rust"
+prompt = """
+Both `double_first` and `double_last` in src/lib.rs share the same `n * 2`
+doubling pattern. Extract this into a private helper function
+`fn double(n: i32) -> i32` (defined as a top-level private function in
+src/lib.rs, NOT a method). Update both `double_first` and `double_last`
+to call `double(n)` instead of writing `n * 2` inline. Tests must still
+pass unchanged.
+"""
+
+evaluators = [
+    "diff_nonempty",
+    "diff_applies",
+    "rust_compiles",
+    "tests_pass",
+    "pattern_match",
+]
+
+expected_patterns = [
+    "fn double\\(n: i32\\) -> i32",
+    "double\\(n\\)",
+]
+
+[mock_response]
+content = """
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,9 +1,13 @@
++fn double(n: i32) -> i32 {
++    n * 2
++}
++
+ pub fn double_first(v: &[i32]) -> Option<i32> {
+-    v.first().map(|&n| n * 2)
++    v.first().map(|&n| double(n))
+ }
+ 
+ pub fn double_last(v: &[i32]) -> Option<i32> {
+-    v.last().map(|&n| n * 2)
++    v.last().map(|&n| double(n))
+ }
+ 
+ #[cfg(test)]
+"""
