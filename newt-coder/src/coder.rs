@@ -104,13 +104,19 @@ impl Coder {
                     raw_reply: raw,
                 })
             }
-            // The first emission was a diff that did not apply (bad line
-            // numbers / context too far off for the fuzzy matcher). Issue
-            // a single re-prompt for whole files and apply that instead.
-            Err(first_err) if matches!(emission, Emission::UnifiedDiff(_)) => {
+            // The first emission was diff-shaped and did not apply: either a
+            // unified diff whose context was too far off even for the fuzzy
+            // matcher, or diff content the model wrapped in FILE:/END-FILE
+            // markers (classified as whole-files but rejected by the
+            // diff-shape guard). Both are recoverable with a single re-prompt
+            // for proper whole-file output.
+            Err(first_err)
+                if matches!(emission, Emission::UnifiedDiff(_))
+                    || matches!(first_err, CoderError::LooksLikeDiff { .. }) =>
+            {
                 tracing::warn!(
                     error = %first_err,
-                    "newt-coder: unified-diff apply failed, re-prompting for whole files"
+                    "newt-coder: diff-shaped emission did not apply, re-prompting for whole files"
                 );
                 self.reprompt_whole_files(workspace, task, raw, first_err)
                     .await
