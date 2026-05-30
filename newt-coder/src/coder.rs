@@ -24,7 +24,7 @@ use newt_inference::{ChatRequest, InferenceBackend};
 
 use crate::emission::{normalize_emission, Emission};
 use crate::error::{CoderError, Result};
-use crate::prompt::build_prompt;
+use crate::prompt::{build_prompt, build_reprompt};
 
 /// The coder. Holds the inference backend the orchestrator uses for
 /// each `run` call; the backend is `Arc<dyn …>` so callers can share
@@ -58,6 +58,17 @@ impl Coder {
     }
 
     /// Run one turn against `workspace`.
+    ///
+    /// Happy path: build prompt -> infer -> normalize -> apply.
+    ///
+    /// Weak-model fallback: when the model emits a [`Emission::UnifiedDiff`]
+    /// (even under the whole-file directive) and that diff fails to apply
+    /// — its line numbers / context are too far off even for the fuzzy
+    /// matcher in `newt-tools::apply_patch` — we issue exactly ONE
+    /// re-prompt asking for the COMPLETE file(s) in `FILE:`/`END-FILE`
+    /// form, then apply via the hardened `apply_whole_files` path. The
+    /// retry is bounded to a single attempt; if it still doesn't yield
+    /// usable whole-file output we return the original apply error.
     pub async fn run(&self, workspace: &Path, task: &str) -> Result<CoderRun> {
         let prompt = build_prompt(workspace, task)?;
         tracing::info!(
@@ -77,20 +88,120 @@ impl Coder {
 
         let emission = normalize_emission(&raw)?;
         let shape_label = emission.shape_label().to_string();
-        let files_written = self.apply(&emission, workspace)?;
 
-        tracing::info!(
-            emission_shape = %shape_label,
-            files_written = files_written.len(),
-            "newt-coder run complete"
-        );
+        // Try to apply the first emission.
+        match self.apply(&emission, workspace) {
+            Ok(files_written) => {
+                tracing::info!(
+                    emission_shape = %shape_label,
+                    files_written = files_written.len(),
+                    "newt-coder run complete"
+                );
+                Ok(CoderRun {
+                    emission_shape: shape_label,
+                    model_id,
+                    files_written,
+                    raw_reply: raw,
+                })
+            }
+            // The first emission was a diff that did not apply (bad line
+            // numbers / context too far off for the fuzzy matcher). Issue
+            // a single re-prompt for whole files and apply that instead.
+            Err(first_err) if matches!(emission, Emission::UnifiedDiff(_)) => {
+                tracing::warn!(
+                    error = %first_err,
+                    "newt-coder: unified-diff apply failed, re-prompting for whole files"
+                );
+                self.reprompt_whole_files(workspace, task, raw, first_err)
+                    .await
+            }
+            Err(other) => Err(other),
+        }
+    }
 
-        Ok(CoderRun {
-            emission_shape: shape_label,
-            model_id,
-            files_written,
-            raw_reply: raw,
-        })
+    /// Single-retry fallback: re-prompt the model for the complete
+    /// file(s) and apply via `apply_whole_files`.
+    ///
+    /// Bounded to ONE additional inference call — there is no loop. On any
+    /// failure of the retry (inference error, the model returning yet
+    /// another diff / prose, or the whole-file apply failing the shape
+    /// guards) we return `original_err`, the error from the first attempt,
+    /// so the caller sees the root cause rather than a confusing
+    /// second-order failure.
+    async fn reprompt_whole_files(
+        &self,
+        workspace: &Path,
+        task: &str,
+        first_raw: String,
+        original_err: CoderError,
+    ) -> Result<CoderRun> {
+        let prompt = match build_reprompt(workspace, task) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(error = %e, "newt-coder: re-prompt build failed");
+                return Err(original_err);
+            }
+        };
+
+        let req = ChatRequest::new().system(prompt.system).user(prompt.user);
+        let reply = match self.backend.complete(req).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(error = %e, "newt-coder: re-prompt inference failed");
+                return Err(original_err);
+            }
+        };
+        let retry_raw = reply.content.clone();
+        let model_id = reply.model_id.clone();
+
+        // The retry must yield whole files; anything else (another diff,
+        // prose) is not usable for this fallback.
+        let emission = match normalize_emission(&retry_raw) {
+            Ok(em @ Emission::WholeFiles(_)) => em,
+            Ok(other) => {
+                tracing::warn!(
+                    emission_shape = %other.shape_label(),
+                    "newt-coder: re-prompt did not return whole files"
+                );
+                return Err(original_err);
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "newt-coder: re-prompt emission malformed");
+                return Err(original_err);
+            }
+        };
+
+        let shape_label = emission.shape_label().to_string();
+        match self.apply(&emission, workspace) {
+            Ok(files_written) => {
+                tracing::info!(
+                    emission_shape = %shape_label,
+                    files_written = files_written.len(),
+                    "newt-coder: re-prompt whole-file fallback applied"
+                );
+                Ok(CoderRun {
+                    // Reflect what *actually* applied: the whole-file retry,
+                    // not the original diff.
+                    emission_shape: shape_label,
+                    model_id,
+                    files_written,
+                    // Keep an audit trail of both turns: the first
+                    // (rejected) diff and the retry that landed.
+                    raw_reply: format!(
+                        "[diff-apply failed, re-prompted for whole files]\n\
+                         --- first reply ---\n{first_raw}\n\
+                         --- retry reply ---\n{retry_raw}"
+                    ),
+                })
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "newt-coder: re-prompt whole-file apply failed"
+                );
+                Err(original_err)
+            }
+        }
     }
 
     /// Apply one classified emission to `workspace`. Returns the
