@@ -41,6 +41,8 @@ For each file you change, emit ONLY the complete updated file contents. \
 Do not include diffs, code fences, prose, or explanations. \
 Start each file with a single line:  FILE: <relative path>\n\
 Then the verbatim updated file contents, followed by a line containing only END-FILE. \
+Output the COMPLETE file body only; do NOT repeat the FILE: line inside the body, \
+and do NOT emit a unified diff. \
 If you do not change a file, do not emit it. \
 Do not invent files that don't exist.\
 ";

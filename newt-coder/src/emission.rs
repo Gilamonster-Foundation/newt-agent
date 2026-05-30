@@ -89,20 +89,45 @@ fn strip_outer_fences(raw: &str) -> String {
 /// Returns `None` if no `FILE:` header is found at all; otherwise
 /// returns whatever it could extract (last block is allowed to omit
 /// `END-FILE` — some models miss the trailing marker).
+///
+/// Defends against the model *restating* the `FILE:` marker as the
+/// first line of a block's body (e.g. the directive's `FILE: <path>`
+/// header followed immediately by `FILE: <path>` again, then the real
+/// contents — frequently after `strip_outer_fences` peels a code
+/// fence). Such a leaked marker, if treated as content, would write a
+/// file whose first line is `FILE: …`, poisoning the apply step. We
+/// skip at most one leaked marker per block: a `FILE:` line that
+/// arrives while the current block's body is still empty (modulo a
+/// single blank line) re-targets the same/new path instead of being
+/// appended as content.
 fn try_parse_whole_files(body: &str) -> Option<BTreeMap<String, String>> {
     let mut files = BTreeMap::new();
     let mut cur_path: Option<String> = None;
     let mut cur_buf = String::new();
     let mut saw_header = false;
+    // True until the current block has accumulated real content. While
+    // true, a `FILE:` line is a leaked-marker restatement, not content.
+    let mut block_body_empty = true;
 
     for line in body.lines() {
         if let Some(rest) = line.strip_prefix("FILE: ") {
             saw_header = true;
+            // If we are still at the very start of the current block
+            // (no real content yet), this `FILE:` line is a leaked
+            // restatement of the marker. Re-target the path and drop
+            // any held-back blank instead of flushing an empty file.
+            if cur_path.is_some() && block_body_empty {
+                cur_buf.clear();
+                cur_path = Some(rest.trim().to_string());
+                block_body_empty = true;
+                continue;
+            }
             if let Some(path) = cur_path.take() {
                 files.insert(path, cur_buf.trim_end_matches('\n').to_string());
                 cur_buf.clear();
             }
             cur_path = Some(rest.trim().to_string());
+            block_body_empty = true;
             continue;
         }
         if line.trim() == "END-FILE" {
@@ -110,9 +135,15 @@ fn try_parse_whole_files(body: &str) -> Option<BTreeMap<String, String>> {
                 files.insert(path, cur_buf.trim_end_matches('\n').to_string());
                 cur_buf.clear();
             }
+            block_body_empty = true;
             continue;
         }
         if cur_path.is_some() {
+            // A single leading blank line does not count as real
+            // content yet — it may precede a leaked marker.
+            if !(block_body_empty && line.trim().is_empty()) {
+                block_body_empty = false;
+            }
             cur_buf.push_str(line);
             cur_buf.push('\n');
         }
@@ -269,5 +300,89 @@ END-FILE
 ";
         let em = normalize_emission(raw).unwrap();
         assert!(matches!(em, Emission::WholeFiles(_)));
+    }
+
+    #[test]
+    fn strips_leaked_file_marker_restated_in_body() {
+        // Failures 3 & 4: the model restates the `FILE:` marker as the
+        // first body line (commonly inside a fence that gets peeled).
+        // The marker must NOT leak into the file contents.
+        let raw = "FILE: src/lib.rs\nFILE: src/lib.rs\npub fn add(a: i32, b: i32) -> i32 { a + b }\nEND-FILE\n";
+        let em = normalize_emission(raw).unwrap();
+        match em {
+            Emission::WholeFiles(files) => {
+                assert_eq!(files.len(), 1);
+                assert_eq!(
+                    files.get("src/lib.rs").unwrap(),
+                    "pub fn add(a: i32, b: i32) -> i32 { a + b }"
+                );
+            }
+            other => panic!("expected WholeFiles, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn strips_leaked_marker_inside_peeled_fence() {
+        // Whole reply wrapped in a fence; after peeling, the body opens
+        // with a leaked `FILE:` restatement.
+        let raw = "```rust\nFILE: src/lib.rs\nFILE: src/lib.rs\npub fn a() {}\n```";
+        let em = normalize_emission(raw).unwrap();
+        if let Emission::WholeFiles(files) = em {
+            assert_eq!(files.get("src/lib.rs").unwrap(), "pub fn a() {}");
+        } else {
+            panic!("expected whole files");
+        }
+    }
+
+    #[test]
+    fn strips_leaked_marker_after_leading_blank() {
+        let raw = "FILE: src/lib.rs\n\nFILE: src/lib.rs\npub fn a() {}\nEND-FILE\n";
+        let em = normalize_emission(raw).unwrap();
+        if let Emission::WholeFiles(files) = em {
+            assert_eq!(files.get("src/lib.rs").unwrap(), "pub fn a() {}");
+        } else {
+            panic!("expected whole files");
+        }
+    }
+
+    #[test]
+    fn does_not_strip_second_file_block_as_leaked_marker() {
+        // Two genuinely distinct files, each with real content, must
+        // both survive — the leaked-marker skip only fires while a
+        // block's body is still empty.
+        let raw = "\
+FILE: a.rs
+pub fn a() {}
+FILE: b.rs
+pub fn b() {}
+";
+        let em = normalize_emission(raw).unwrap();
+        match em {
+            Emission::WholeFiles(files) => {
+                assert_eq!(files.len(), 2);
+                assert_eq!(files.get("a.rs").unwrap(), "pub fn a() {}");
+                assert_eq!(files.get("b.rs").unwrap(), "pub fn b() {}");
+            }
+            other => panic!("expected two WholeFiles, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parsed_leaked_marker_body_is_applyable() {
+        // End-to-end: a leaked-marker reply parses to clean contents
+        // whose first line is real code, so the writer's shape guards
+        // accept it.
+        let raw = "FILE: src/lib.rs\nFILE: src/lib.rs\npub fn add() {}\nEND-FILE\n";
+        let em = normalize_emission(raw).unwrap();
+        if let Emission::WholeFiles(files) = em {
+            let contents = files.get("src/lib.rs").unwrap();
+            let first = contents.lines().find(|l| !l.trim().is_empty()).unwrap();
+            assert!(
+                !first.trim_start().starts_with("FILE:"),
+                "marker leaked: {first}"
+            );
+        } else {
+            panic!("expected whole files");
+        }
     }
 }
