@@ -11,6 +11,7 @@
 
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::Duration;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
@@ -66,6 +67,13 @@ enum Command {
         /// valid hunk headers (failure mode T0b).
         #[arg(long)]
         coder: bool,
+        /// Per-case worker wall-clock budget in milliseconds. A model that
+        /// takes longer is scored `dispatch_error` even if it would have
+        /// produced correct output given more time — the single binding
+        /// constraint on evaluating slower models. Raise it (e.g. 180000)
+        /// for slow local models. Default 60000 (backward compatible).
+        #[arg(long, env = "NEWT_EVAL_WORKER_TIMEOUT_MS", default_value_t = 60_000)]
+        worker_timeout_ms: u64,
     },
 }
 
@@ -118,7 +126,19 @@ async fn real_main() -> Result<bool> {
             cases_dir,
             worker_bin,
             coder,
-        } => run_command(mode, case, model, cases_dir, worker_bin, coder).await,
+            worker_timeout_ms,
+        } => {
+            run_command(
+                mode,
+                case,
+                model,
+                cases_dir,
+                worker_bin,
+                coder,
+                worker_timeout_ms,
+            )
+            .await
+        }
     }
 }
 
@@ -129,6 +149,7 @@ async fn run_command(
     cases_dir: Option<PathBuf>,
     worker_bin: Option<PathBuf>,
     coder: bool,
+    worker_timeout_ms: u64,
 ) -> Result<bool> {
     if let Mode::Mock = mode {
         anyhow::bail!(
@@ -158,6 +179,7 @@ async fn run_command(
     if coder {
         config = config.with_coder_mode(true);
     }
+    config = config.with_timeout(Duration::from_millis(worker_timeout_ms));
 
     let mut scorecard = Scorecard::new();
     for case in &cases {
