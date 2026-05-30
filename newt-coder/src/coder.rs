@@ -48,7 +48,15 @@ pub struct CoderRun {
     /// re-parsing).
     pub files_written: Vec<String>,
     /// The raw model reply. Useful for audit logs and post-mortem.
+    /// NOTE: when the whole-file re-prompt fallback fires this becomes a
+    /// composite first+retry transcript — use [`Self::first_emission`]
+    /// when you need just the model's initial output.
     pub raw_reply: String,
+    /// The model's *first* raw emission, before any re-prompt fallback.
+    /// Always the initial reply (never a composite), so the eval
+    /// scorecard can judge it with `git apply --check` (#30B) to tell a
+    /// clean diff from a sloppy one the fuzzy worker merely rescued.
+    pub first_emission: String,
 }
 
 impl Coder {
@@ -101,6 +109,7 @@ impl Coder {
                     emission_shape: shape_label,
                     model_id,
                     files_written,
+                    first_emission: raw.clone(),
                     raw_reply: raw,
                 })
             }
@@ -191,6 +200,10 @@ impl Coder {
                     emission_shape: shape_label,
                     model_id,
                     files_written,
+                    // The first emission is the diff the model actually
+                    // produced for the task; the scorecard judges *that*,
+                    // not the rescued retry.
+                    first_emission: first_raw.clone(),
                     // Keep an audit trail of both turns: the first
                     // (rejected) diff and the retry that landed.
                     raw_reply: format!(

@@ -84,6 +84,15 @@ pub struct TaskReply {
     /// T0b / T0c instead of lumping them together as "empty diff".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub emission_shape: Option<String>,
+    /// The model's first raw emission — newt-coder's
+    /// `CoderRun.first_emission`, or the flat path's reply content.
+    ///
+    /// The eval `diff_applies` evaluator runs `git apply --check` against
+    /// this (when it is diff-shaped) rather than the post-hoc captured
+    /// diff, so a model that emits an unappliable diff the fuzzy worker
+    /// only rescued is scored honestly (#30B). `None` for legacy payloads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_emission: Option<String>,
 }
 
 impl TaskReply {
@@ -108,6 +117,7 @@ impl TaskReply {
             empty_diff,
             diff_applied,
             emission_shape: None,
+            raw_emission: None,
         })
     }
 
@@ -116,6 +126,14 @@ impl TaskReply {
     #[must_use]
     pub fn with_emission_shape(mut self, shape: impl Into<String>) -> Self {
         self.emission_shape = Some(shape.into());
+        self
+    }
+
+    /// Builder: attach the model's first raw emission so the eval
+    /// `diff_applies` evaluator can judge it with the strict oracle (#30B).
+    #[must_use]
+    pub fn with_raw_emission(mut self, raw: impl Into<String>) -> Self {
+        self.raw_emission = Some(raw.into());
         self
     }
 }
@@ -355,7 +373,11 @@ impl AcpServer {
         };
 
         let diff = crate::diff::capture_diff(&session.workspace_path)?;
+        // Flat path has no re-prompt fallback, so the reply content IS the
+        // model's first (and only) emission.
+        let raw_emission = reply.content.clone();
         TaskReply::new(reply.model_id, reply.content, diff, diff_applied)
+            .map(|r| r.with_raw_emission(raw_emission))
             .map_err(|e| anyhow::anyhow!("backend returned malformed reply: {e}"))
     }
 
@@ -385,7 +407,8 @@ impl AcpServer {
 
         Ok(TaskReply::new(run.model_id, content, diff, diff_applied)
             .map_err(|e| anyhow::anyhow!("newt-coder returned malformed reply: {e}"))?
-            .with_emission_shape(run.emission_shape))
+            .with_emission_shape(run.emission_shape)
+            .with_raw_emission(run.first_emission))
     }
 }
 
