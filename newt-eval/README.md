@@ -84,14 +84,21 @@ A case is a directory under `newt-eval/cases/NNN-name/` with two parts:
 2. `workspace/` — the initial filesystem state, copied verbatim into a
    tempdir at the start of each run.
 
+> See [`cases/CASE_AUTHORING.md`](cases/CASE_AUTHORING.md) for the full
+> guide — the emission-contract rule and how to generate byte-accurate
+> goldens from `git diff`.
+
 ```toml
-# newt-eval/cases/006-your-case/case.toml
-name = "006-your-case"
+# newt-eval/cases/010-your-case/case.toml
+name = "010-your-case"
 description = "One-line summary"
 language = "rust"
+difficulty = "L1"   # L1 saturated edit · L2 multi-step · L3 cross-domain
 prompt = """
-Multi-line instruction to the worker. End with "Respond with a unified
-diff only." so the model knows what shape to return.
+Multi-line instruction describing the TASK only. Do NOT specify the
+response format — the system prompt owns the emission shape, and a
+`case_prompt_lint` test fails on directives like "respond with a
+unified diff only" (see CASE_AUTHORING.md).
 """
 
 evaluators = [
