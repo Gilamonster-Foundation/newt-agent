@@ -16,8 +16,8 @@ use std::time::Duration;
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use newt_eval::{
-    cases, default_evaluators, evaluator_by_name, run_case, CaseScorecard, EvalContext,
-    RunnerConfig, Scorecard, TestCase,
+    cases, default_evaluators, evaluator_by_name, resolve_worker_bin, run_case, CaseScorecard,
+    EvalContext, RunnerConfig, Scorecard, TestCase,
 };
 
 #[derive(Parser, Debug)]
@@ -63,7 +63,10 @@ struct RunArgs {
     /// Path to the cases directory (defaults to bundled).
     #[arg(long)]
     cases_dir: Option<PathBuf>,
-    /// Path to the `newt` binary (defaults to `target/<profile>/newt`).
+    /// Path to the `newt` worker binary. When unset the resolver
+    /// searches `NEWT_WORKER_BIN`, the sibling of the running binary,
+    /// `$CARGO_TARGET_DIR/{release,debug}/newt`, and finally
+    /// `target/{release,debug}/newt` under the cwd. Issue #40.
     #[arg(long)]
     worker_bin: Option<PathBuf>,
     /// Spawn the worker with `--coder` so the newt-coder plugin
@@ -84,6 +87,14 @@ struct RunArgs {
     /// L2 = multi-step single-domain; L3 = cross-domain.
     #[arg(long, value_delimiter = ',')]
     difficulty: Vec<String>,
+    /// Restore the pre-#41 exit-code behavior: process exit is always 0
+    /// (when the run completes) or 2 (when at least one case failed),
+    /// regardless of whether a `runner` evaluator FAIL appears in the
+    /// scorecard. The new behavior is to exit 1 on any `runner` FAIL so
+    /// CI / shell scripts can fail-fast on a worker that never produced
+    /// a diff.
+    #[arg(long)]
+    legacy_exit_codes: bool,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -105,8 +116,13 @@ async fn main() -> ExitCode {
         .init();
 
     match real_main().await {
-        Ok(true) => ExitCode::SUCCESS,
-        Ok(false) => ExitCode::from(2),
+        Ok(RunOutcomeStatus::AllPassed) => ExitCode::SUCCESS,
+        // Issue #41: a `runner` evaluator FAIL means the worker never
+        // produced a usable patch — fail-fast with exit 1 so the
+        // headline CI check is honest. The legacy exit-2 behavior is
+        // still available behind `--legacy-exit-codes`.
+        Ok(RunOutcomeStatus::RunnerFailed) => ExitCode::from(1),
+        Ok(RunOutcomeStatus::CaseFailed) => ExitCode::from(2),
         Err(e) => {
             eprintln!("newt-eval: {e:#}");
             ExitCode::FAILURE
@@ -114,9 +130,21 @@ async fn main() -> ExitCode {
     }
 }
 
-/// Returns `Ok(true)` if the run passed every gate, `Ok(false)` if it
-/// completed but some case failed, `Err` for a hard error.
-async fn real_main() -> Result<bool> {
+/// Top-level outcome of one `newt-eval` invocation, mapped to the
+/// process exit code by `main`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunOutcomeStatus {
+    /// The whole scorecard is green (or we ran `list-cases`).
+    AllPassed,
+    /// At least one row has `evaluator == "runner"` and `passed ==
+    /// false`. Exit 1 — the worker itself failed to produce output.
+    RunnerFailed,
+    /// The scorecard has at least one evaluator failure, but it isn't
+    /// a `runner` FAIL. Exit 2 — same as the pre-#41 behavior.
+    CaseFailed,
+}
+
+async fn real_main() -> Result<RunOutcomeStatus> {
     let cli = Cli::parse();
     match cli.command {
         Command::ListCases { cases_dir } => {
@@ -126,13 +154,13 @@ async fn real_main() -> Result<bool> {
             for c in &cases {
                 println!("  {:<28}  {}  {}", c.name, c.language, c.description);
             }
-            Ok(true)
+            Ok(RunOutcomeStatus::AllPassed)
         }
         Command::Run(args) => run_command(args).await,
     }
 }
 
-async fn run_command(args: RunArgs) -> Result<bool> {
+async fn run_command(args: RunArgs) -> Result<RunOutcomeStatus> {
     let RunArgs {
         mode,
         case: case_filter,
@@ -142,6 +170,7 @@ async fn run_command(args: RunArgs) -> Result<bool> {
         coder,
         worker_timeout_ms,
         difficulty,
+        legacy_exit_codes,
     } = args;
 
     if let Mode::Mock = mode {
@@ -165,8 +194,19 @@ async fn run_command(args: RunArgs) -> Result<bool> {
         anyhow::bail!("no cases matched filters (case={case_filter:?}, difficulty={difficulty:?})");
     }
 
-    let worker = worker_bin.unwrap_or_else(default_worker_bin);
-    let mut config = RunnerConfig::new(&worker);
+    // Issue #40: resolve the worker binary across CLI flag, env var,
+    // argv[0] sibling, $CARGO_TARGET_DIR, and the historical cwd
+    // fallbacks. On miss we surface every path that was tried.
+    let resolution = resolve_worker_bin(worker_bin);
+    if !resolution.found {
+        anyhow::bail!(
+            "newt worker binary not found. Tried:\n{}\nPass --worker-bin <PATH>, \
+             set NEWT_WORKER_BIN, or run `cargo build --release --bin newt`.",
+            resolution.render_candidates()
+        );
+    }
+
+    let mut config = RunnerConfig::new(&resolution.path);
     if let Some(m) = model {
         config = config.with_model(m);
     }
@@ -205,7 +245,37 @@ async fn run_command(args: RunArgs) -> Result<bool> {
     }
 
     print!("{}", scorecard.render_table());
-    Ok(scorecard.all_passed())
+    Ok(classify_outcome(&scorecard, legacy_exit_codes))
+}
+
+/// Map the finished scorecard to the exit-code-carrying status enum.
+///
+/// Issue #41: when any row reports `evaluator == "runner"` and the row
+/// failed, the worker itself never produced usable output — the
+/// process should exit 1 so CI / `set -e` shell scripts fail-fast.
+/// `--legacy-exit-codes` opts back into the previous behavior where
+/// a runner FAIL was indistinguishable from any other case failure
+/// (exit 2).
+fn classify_outcome(scorecard: &Scorecard, legacy_exit_codes: bool) -> RunOutcomeStatus {
+    if scorecard.all_passed() {
+        return RunOutcomeStatus::AllPassed;
+    }
+    if !legacy_exit_codes && scorecard_has_runner_failure(scorecard) {
+        return RunOutcomeStatus::RunnerFailed;
+    }
+    RunOutcomeStatus::CaseFailed
+}
+
+/// True iff any row in the scorecard has `evaluator == "runner"` and
+/// `passed == false`. The "runner" evaluator name is the sentinel the
+/// run loop above stamps onto a row when `run_case` itself errors
+/// (worker spawn failed, ACP handshake failed, worker timed out).
+fn scorecard_has_runner_failure(scorecard: &Scorecard) -> bool {
+    scorecard
+        .cases
+        .iter()
+        .flat_map(|c| c.results.iter())
+        .any(|r| r.evaluator == "runner" && !r.passed)
 }
 
 fn run_evaluators(ctx: &EvalContext) -> Result<Vec<newt_eval::EvalResult>> {
@@ -227,20 +297,84 @@ fn run_evaluators(ctx: &EvalContext) -> Result<Vec<newt_eval::EvalResult>> {
     Ok(results)
 }
 
-/// Best-effort guess for `target/<profile>/newt` based on common cargo
-/// layouts. Callers can always pass `--worker-bin` explicitly.
-fn default_worker_bin() -> PathBuf {
-    let candidates = [
-        "target/release/newt",
-        "target/debug/newt",
-        "../target/release/newt",
-        "../target/debug/newt",
-    ];
-    for c in candidates {
-        let p = PathBuf::from(c);
-        if p.exists() {
-            return p;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use newt_eval::EvalResult;
+
+    fn sc_with(rows: Vec<(&str, &str, bool)>) -> Scorecard {
+        let mut sc = Scorecard::new();
+        for (case_name, evaluator, passed) in rows {
+            let r = if passed {
+                EvalResult::pass(evaluator, "ok")
+            } else {
+                EvalResult::fail(evaluator, "nope")
+            };
+            sc.push(CaseScorecard {
+                case_name: case_name.into(),
+                results: vec![r],
+            });
         }
+        sc
     }
-    PathBuf::from("target/release/newt")
+
+    #[test]
+    fn classify_outcome_all_passed() {
+        let sc = sc_with(vec![("a", "diff_applies", true)]);
+        assert_eq!(classify_outcome(&sc, false), RunOutcomeStatus::AllPassed);
+    }
+
+    #[test]
+    fn classify_outcome_runner_failure_exits_one() {
+        // Issue #41: a "runner" FAIL is the headline signal — exit 1.
+        let sc = sc_with(vec![("a", "runner", false)]);
+        assert_eq!(classify_outcome(&sc, false), RunOutcomeStatus::RunnerFailed);
+    }
+
+    #[test]
+    fn classify_outcome_non_runner_failure_exits_two() {
+        // A non-"runner" evaluator failure stays at exit 2 (pre-#41
+        // behavior, unchanged).
+        let sc = sc_with(vec![("a", "diff_applies", false)]);
+        assert_eq!(classify_outcome(&sc, false), RunOutcomeStatus::CaseFailed);
+    }
+
+    #[test]
+    fn classify_outcome_legacy_flag_collapses_runner_to_case_failed() {
+        // `--legacy-exit-codes` opts back into the old behavior where
+        // a runner FAIL was indistinguishable from any other failure
+        // (exit 2).
+        let sc = sc_with(vec![("a", "runner", false)]);
+        assert_eq!(classify_outcome(&sc, true), RunOutcomeStatus::CaseFailed);
+    }
+
+    #[test]
+    fn scorecard_has_runner_failure_detects_buried_fail() {
+        // The detector should find a runner FAIL even when it's not
+        // the only row in the scorecard.
+        let mut sc = Scorecard::new();
+        sc.push(CaseScorecard {
+            case_name: "a".into(),
+            results: vec![EvalResult::pass("diff_applies", "ok")],
+        });
+        sc.push(CaseScorecard {
+            case_name: "b".into(),
+            results: vec![
+                EvalResult::pass("diff_applies", "ok"),
+                EvalResult::fail("runner", "spawn failed"),
+            ],
+        });
+        assert!(scorecard_has_runner_failure(&sc));
+    }
+
+    #[test]
+    fn scorecard_has_runner_failure_ignores_runner_passes() {
+        // A `runner` row that *passed* must not trip the detector.
+        let mut sc = Scorecard::new();
+        sc.push(CaseScorecard {
+            case_name: "a".into(),
+            results: vec![EvalResult::pass("runner", "all good")],
+        });
+        assert!(!scorecard_has_runner_failure(&sc));
+    }
 }
