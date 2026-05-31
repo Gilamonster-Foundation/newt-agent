@@ -29,7 +29,7 @@
 use std::io::{self, IsTerminal, Write as _};
 
 use crossterm::{
-    cursor::{Hide, MoveTo, Show},
+    cursor::{Hide, MoveTo, SetCursorStyle, Show},
     event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
     execute, queue,
     style::{Color as CtColor, Print, ResetColor, SetForegroundColor},
@@ -80,11 +80,10 @@ const LOGO_PLAIN: &str = include_str!("../../docs/logos/newt-ascii-40.txt");
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 const NEWT_ORANGE: Color = Color::Rgb(220, 60, 20);
-const NEWT_ORANGE_CT: CtColor = CtColor::Rgb {
-    r: 220,
-    g: 60,
-    b: 20,
-};
+/// Newt output marker — orange matches the logo.
+const NEWT_ORANGE_CT: CtColor = CtColor::Rgb { r: 220, g: 60, b: 20 };
+/// Human input marker — blue signals "you are typing here".
+const HUMAN_BLUE_CT: CtColor = CtColor::Rgb { r: 80, g: 140, b: 255 };
 
 // ---------------------------------------------------------------------------
 // Public entry points
@@ -304,26 +303,63 @@ fn splash_key_action(ev: &Event) -> bool {
 //
 // No alternate screen, no custom scroll. The terminal's own scrollback
 // buffer handles history. Works identically over SSH and inside tmux.
+//
+// NEWT_CHAT_STYLE=verbose  — show "newt" / "you" labels before the caret
+// (default is compact: just the colored caret / symbol)
 // ---------------------------------------------------------------------------
 
-fn print_newt(msg: &str, color: bool) {
+/// Whether to show "newt" / "you" labels before the carets.
+fn verbose_mode() -> bool {
+    std::env::var("NEWT_CHAT_STYLE")
+        .map(|v| v.eq_ignore_ascii_case("verbose"))
+        .unwrap_or(false)
+}
+
+/// Print a newt response line.
+/// Color: orange ▸ (matches the logo).  No-color: >.
+fn print_newt(msg: &str, color: bool, verbose: bool) {
     if color {
+        let prefix = if verbose { "newt ▸  " } else { "▸  " };
         execute!(
             io::stdout(),
-            SetForegroundColor(CtColor::Cyan),
-            Print(" newt ▸  "),
+            SetForegroundColor(NEWT_ORANGE_CT),
+            Print(prefix),
             ResetColor,
             Print(msg),
             Print("\n"),
         )
         .ok();
     } else {
-        println!(" newt >  {msg}");
+        let prefix = if verbose { "newt >  " } else { ">  " };
+        println!("{prefix}{msg}");
     }
+}
+
+/// Print the human input prompt and set a blinking cursor.
+/// Color: blue $  No-color: $.
+fn print_prompt(color: bool, verbose: bool) -> anyhow::Result<()> {
+    if color {
+        let label = if verbose { "you " } else { "" };
+        execute!(
+            io::stdout(),
+            Print(label),
+            SetForegroundColor(HUMAN_BLUE_CT),
+            Print("$"),
+            ResetColor,
+            Print(" "),
+            SetCursorStyle::BlinkingBlock,
+        )?;
+    } else {
+        let label = if verbose { "you " } else { "" };
+        print!("{label}$ ");
+    }
+    io::stdout().flush()?;
+    Ok(())
 }
 
 fn run_chat(workspace: &str, color: bool) -> anyhow::Result<()> {
     use std::io::BufRead as _;
+    let verbose = verbose_mode();
 
     // Header line — one-time print, then normal scroll from here.
     if color {
@@ -342,10 +378,9 @@ fn run_chat(workspace: &str, color: bool) -> anyhow::Result<()> {
     }
 
     print_newt(
-        &format!(
-            "v{VERSION} ready. Type a task and press Enter. (Ctrl-D or Ctrl-C to quit.)"
-        ),
+        &format!("v{VERSION} ready. Type a task and press Enter. (Ctrl-D or /exit to quit.)"),
         color,
+        verbose,
     );
     println!();
 
@@ -353,20 +388,7 @@ fn run_chat(workspace: &str, color: bool) -> anyhow::Result<()> {
     let mut line = String::new();
 
     loop {
-        // Prompt: label in default color, caret in orange as a visual accent.
-        if color {
-            execute!(
-                io::stdout(),
-                Print("  you "),
-                SetForegroundColor(NEWT_ORANGE_CT),
-                Print("▸"),
-                ResetColor,
-                Print("  "),
-            )?;
-        } else {
-            print!("  you >  ");
-        }
-        io::stdout().flush()?;
+        print_prompt(color, verbose)?;
 
         line.clear();
         match stdin.lock().read_line(&mut line) {
@@ -378,7 +400,7 @@ fn run_chat(workspace: &str, color: bool) -> anyhow::Result<()> {
                 }
                 println!();
                 if task.starts_with('/') {
-                    if !dispatch_slash(task, workspace, color)? {
+                    if !dispatch_slash(task, workspace, color, verbose)? {
                         break;
                     }
                 } else if matches!(task, "exit" | "quit") {
@@ -390,6 +412,7 @@ fn run_chat(workspace: &str, color: bool) -> anyhow::Result<()> {
                              Try `just eval --case 001` to run against a real Ollama."
                         ),
                         color,
+                        verbose,
                     );
                 }
                 println!();
@@ -406,7 +429,7 @@ fn run_chat(workspace: &str, color: bool) -> anyhow::Result<()> {
 
 /// Dispatch a `/command` line. Returns `true` to keep the session alive,
 /// `false` to exit.
-fn dispatch_slash(input: &str, workspace: &str, color: bool) -> anyhow::Result<bool> {
+fn dispatch_slash(input: &str, workspace: &str, color: bool, verbose: bool) -> anyhow::Result<bool> {
     // Strip leading slash and split into at most 3 tokens.
     let body = input.trim_start_matches('/');
     let mut parts = body.splitn(3, ' ');
@@ -418,7 +441,7 @@ fn dispatch_slash(input: &str, workspace: &str, color: bool) -> anyhow::Result<b
         "exit" | "quit" => return Ok(false),
 
         "help" => {
-            print_newt("Available commands:", color);
+            print_newt("Available commands:", color, verbose);
             for line in [
                 "  /dgx status              — DGX endpoint health + running models",
                 "  /dgx models              — list models installed on the DGX",
@@ -434,27 +457,27 @@ fn dispatch_slash(input: &str, workspace: &str, color: bool) -> anyhow::Result<b
             }
         }
 
-        "version" => print_newt(&format!("v{VERSION}"), color),
+        "version" => print_newt(&format!("v{VERSION}"), color, verbose),
 
-        "workspace" => print_newt(workspace, color),
+        "workspace" => print_newt(workspace, color, verbose),
 
         "dgx" => {
             if arg1.is_empty() {
                 print_newt(
                     "usage: /dgx <status|models|warm [model]|route <task>|doctor>",
                     color,
+                    verbose,
                 );
             } else {
-                // Build args: ["dgx", subcmd, optional-extra]
                 let mut dgx_args = vec!["dgx", arg1];
                 if !arg2.is_empty() {
                     dgx_args.push(arg2);
                 }
-                run_newt_subcmd(&dgx_args, color)?;
+                run_newt_subcmd(&dgx_args, color, verbose)?;
             }
         }
 
-        other => print_newt(&format!("unknown command: /{other}  (try /help)"), color),
+        other => print_newt(&format!("unknown command: /{other}  (try /help)"), color, verbose),
     }
     Ok(true)
 }
@@ -462,16 +485,14 @@ fn dispatch_slash(input: &str, workspace: &str, color: bool) -> anyhow::Result<b
 /// Run `newt <args>` as a subprocess using the current executable path so
 /// the command works even when newt is not on PATH. stdout/stderr pass
 /// through to the terminal unchanged.
-fn run_newt_subcmd(args: &[&str], color: bool) -> anyhow::Result<()> {
+fn run_newt_subcmd(args: &[&str], color: bool, verbose: bool) -> anyhow::Result<()> {
     let exe = std::env::current_exe()?;
     let status = std::process::Command::new(&exe).args(args).status()?;
     if !status.success() {
         print_newt(
-            &format!(
-                "command exited with status {}",
-                status.code().unwrap_or(-1)
-            ),
+            &format!("command exited with status {}", status.code().unwrap_or(-1)),
             color,
+            verbose,
         );
     }
     Ok(())
@@ -607,33 +628,33 @@ mod tests {
     #[test]
     fn slash_exit_returns_false() {
         for cmd in ["/exit", "/quit"] {
-            let result = dispatch_slash(cmd, "/ws", false).unwrap();
+            let result = dispatch_slash(cmd, "/ws", false, false).unwrap();
             assert!(!result, "{cmd} should return false (exit)");
         }
     }
 
     #[test]
     fn slash_help_returns_true() {
-        assert!(dispatch_slash("/help", "/ws", false).unwrap());
+        assert!(dispatch_slash("/help", "/ws", false, false).unwrap());
     }
 
     #[test]
     fn slash_version_returns_true() {
-        assert!(dispatch_slash("/version", "/ws", false).unwrap());
+        assert!(dispatch_slash("/version", "/ws", false, false).unwrap());
     }
 
     #[test]
     fn slash_workspace_returns_true() {
-        assert!(dispatch_slash("/workspace", "/ws", false).unwrap());
+        assert!(dispatch_slash("/workspace", "/ws", false, false).unwrap());
     }
 
     #[test]
     fn slash_unknown_returns_true() {
-        assert!(dispatch_slash("/notacommand", "/ws", false).unwrap());
+        assert!(dispatch_slash("/notacommand", "/ws", false, false).unwrap());
     }
 
     #[test]
     fn slash_dgx_no_subcmd_returns_true() {
-        assert!(dispatch_slash("/dgx", "/ws", false).unwrap());
+        assert!(dispatch_slash("/dgx", "/ws", false, false).unwrap());
     }
 }
