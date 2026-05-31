@@ -159,51 +159,38 @@ fn run_splash_color(path: Option<&std::path::Path>) -> anyhow::Result<()> {
     write!(out, "{}", logo.replace('\n', "\r\n"))?;
     out.flush()?;
 
-    // Status panel: to the right of the logo, vertically centred.
-    let status_col = logo_cols + 2;
-    let start_row = logo_rows.saturating_sub(6) / 2;
+    // Right panel — static branding only. Never put environment-specific
+    // content here: it can overlap the image if the logo renders unevenly.
+    let brand_col = logo_cols + 2;
+    let brand_row = logo_rows.saturating_sub(4) / 2;
 
-    let status: &[&dyn Fn(&mut io::Stdout) -> anyhow::Result<()>] = &[
-        &|o| {
-            queue!(
-                o,
-                SetForegroundColor(NEWT_ORANGE_CT),
-                Print("newt"),
-                ResetColor,
-                Print("  ·  Small, fast, local-first agentic coder")
-            )?;
-            Ok(())
-        },
-        &|o| {
-            queue!(
-                o,
-                SetForegroundColor(CtColor::DarkGrey),
-                Print(format!("v{VERSION}")),
-                ResetColor
-            )?;
-            Ok(())
-        },
-        &|_| Ok(()),
-        &|o| {
-            queue!(o, Print(format!("Workspace:  {workspace}")))?;
-            Ok(())
-        },
-        &|_| Ok(()),
-        &|o| {
-            queue!(
-                o,
-                SetForegroundColor(CtColor::DarkGrey),
-                Print("q quit  ·  Ctrl-C quit  ·  coder UI coming soon"),
-                ResetColor
-            )?;
-            Ok(())
-        },
-    ];
+    queue!(out, MoveTo(brand_col, brand_row))?;
+    queue!(
+        out,
+        SetForegroundColor(NEWT_ORANGE_CT),
+        Print("newt"),
+        ResetColor,
+        Print("  ·  Small, fast, local-first agentic coder")
+    )?;
+    queue!(out, MoveTo(brand_col, brand_row + 1))?;
+    queue!(
+        out,
+        SetForegroundColor(CtColor::DarkGrey),
+        Print(format!("v{VERSION}")),
+        ResetColor
+    )?;
+    queue!(out, MoveTo(brand_col, brand_row + 3))?;
+    queue!(
+        out,
+        SetForegroundColor(CtColor::DarkGrey),
+        Print("q quit  ·  Ctrl-C quit  ·  coder UI coming soon"),
+        ResetColor
+    )?;
 
-    for (i, render) in status.iter().enumerate() {
-        queue!(out, MoveTo(status_col, start_row + i as u16))?;
-        render(&mut out)?;
-    }
+    // Environment-specific context goes below the image, never beside it.
+    queue!(out, MoveTo(0, logo_rows + 1))?;
+    queue!(out, Print(format!("Workspace:  {workspace}")))?;
+
     out.flush()?;
 
     splash_event_loop()?;
