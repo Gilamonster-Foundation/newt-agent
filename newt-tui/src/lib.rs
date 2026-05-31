@@ -20,7 +20,7 @@ use crossterm::{
     execute, queue,
     style::{Color as CtColor, Print, ResetColor, SetForegroundColor},
     terminal::{
-        disable_raw_mode, enable_raw_mode, Clear, ClearType, EnterAlternateScreen,
+        self, disable_raw_mode, enable_raw_mode, Clear, ClearType, EnterAlternateScreen,
         LeaveAlternateScreen,
     },
 };
@@ -33,9 +33,14 @@ use ratatui::{
     Terminal,
 };
 
-/// 24-bit ANSI braille art — 10 lines × ~60 display columns.
-/// Used on color-capable terminals; printed directly (not through ratatui).
-const LOGO_COLOR: &str = include_str!("../../docs/logos/newt-ansi-20.txt");
+/// 24-bit ANSI braille art at three sizes (cols × lines):
+///   SM  ~60 × 10   newt-ansi-20
+///   MD ~120 × 20   newt-ansi-40
+///   LG ~240 × 40   newt-ansi-full
+/// Chosen at runtime by `logo_for_width`. Printed directly (not ratatui).
+const LOGO_SM: &str = include_str!("../../docs/logos/newt-ansi-20.txt");
+const LOGO_MD: &str = include_str!("../../docs/logos/newt-ansi-40.txt");
+const LOGO_LG: &str = include_str!("../../docs/logos/newt-ansi-full.txt");
 
 /// Plain ASCII art — 14 lines × ~40 display columns.
 /// Used as the no-color fallback, rendered as a ratatui Paragraph.
@@ -95,8 +100,21 @@ fn color_supported_with(get_env: &dyn Fn(&str) -> Option<String>) -> bool {
 // Color splash — crossterm direct rendering
 // ---------------------------------------------------------------------------
 
+/// Pick the largest ANSI logo that fits the terminal width.
+fn logo_for_width(cols: u16) -> &'static str {
+    if cols >= 240 {
+        LOGO_LG
+    } else if cols >= 120 {
+        LOGO_MD
+    } else {
+        LOGO_SM
+    }
+}
+
 fn run_splash_color(path: Option<&std::path::Path>) -> anyhow::Result<()> {
     let workspace = resolve_workspace(path);
+    let term_cols = terminal::size().map(|(w, _)| w).unwrap_or(80);
+    let logo = logo_for_width(term_cols);
 
     enable_raw_mode()?;
     let mut out = io::stdout();
@@ -111,11 +129,11 @@ fn run_splash_color(path: Option<&std::path::Path>) -> anyhow::Result<()> {
     // Print the ANSI logo directly — the file already contains all escape codes.
     // In raw mode \n is line-feed only; replace with \r\n so each new line
     // starts at column 0 (carriage return is not implicit in raw mode).
-    write!(out, "{}", LOGO_COLOR.replace('\n', "\r\n"))?;
+    write!(out, "{}", logo.replace('\n', "\r\n"))?;
     out.flush()?;
 
     // Position the status block just below the logo.
-    let logo_rows = LOGO_COLOR.lines().count() as u16;
+    let logo_rows = logo.lines().count() as u16;
     let row = logo_rows + 1;
 
     queue!(out, MoveTo(0, row))?;
@@ -323,8 +341,24 @@ mod tests {
     fn logo_assets_are_embedded() {
         assert!(!LOGO_PLAIN.is_empty());
         assert!(LOGO_PLAIN.lines().count() > 5);
-        assert!(!LOGO_COLOR.is_empty());
-        assert!(LOGO_COLOR.lines().count() > 3);
+        for logo in [LOGO_SM, LOGO_MD, LOGO_LG] {
+            assert!(!logo.is_empty());
+            assert!(logo.lines().count() > 3);
+        }
+    }
+
+    #[test]
+    fn logo_for_width_picks_correct_size() {
+        let sm = LOGO_SM.lines().count();
+        let md = LOGO_MD.lines().count();
+        let lg = LOGO_LG.lines().count();
+        // Each size has a distinct line count — use that to verify selection.
+        assert!(sm < md && md < lg, "logo sizes must be strictly ordered");
+        assert_eq!(logo_for_width(80).lines().count(), sm);
+        assert_eq!(logo_for_width(119).lines().count(), sm);
+        assert_eq!(logo_for_width(120).lines().count(), md);
+        assert_eq!(logo_for_width(239).lines().count(), md);
+        assert_eq!(logo_for_width(240).lines().count(), lg);
     }
 
     #[test]
