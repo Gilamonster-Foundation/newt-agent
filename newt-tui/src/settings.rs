@@ -356,7 +356,7 @@ fn render(f: &mut Frame, app: &SettingsApp) {
             Constraint::Length(3), // tabs
             Constraint::Fill(1),   // fields
             Constraint::Length(4), // preview
-            Constraint::Length(1), // hints
+            Constraint::Length(2), // hints (border + text)
         ])
         .split(cols[1]);
 
@@ -550,26 +550,29 @@ fn render_preview(f: &mut Frame, area: Rect, app: &SettingsApp, dim: Style, oran
 }
 
 fn render_hints(f: &mut Frame, area: Rect, app: &SettingsApp, dim: Style) {
-    let dirty_marker = if app.is_dirty() { " ● unsaved " } else { "" };
-    let save_hint = if app.is_dirty() { "Ctrl-S save  " } else { "" };
     let status = app.status.as_deref().unwrap_or("");
+    let dirty = if app.is_dirty() { "  ● unsaved" } else { "" };
 
-    let text = if !status.is_empty() {
+    // Always show the key hints; append status or dirty marker after them.
+    let hints = format!(
+        "  ↑↓ navigate   Enter toggle/edit   Tab next tab   Ctrl-S save   q quit{dirty}"
+    );
+    let status_line = if !status.is_empty() {
         format!("  {status}")
     } else {
-        format!(
-            "  ↑↓ navigate  Enter toggle/edit  Tab next tab  {save_hint}q quit{dirty_marker}"
-        )
+        String::new()
     };
 
-    let style = if !status.is_empty() {
-        Style::default().fg(NEWT_ORANGE)
-    } else {
-        dim
-    };
+    let mut lines = vec![Line::from(Span::styled(hints, dim))];
+    if !status_line.is_empty() {
+        lines.push(Line::from(Span::styled(
+            status_line,
+            Style::default().fg(NEWT_ORANGE),
+        )));
+    }
 
     f.render_widget(
-        Paragraph::new(Span::styled(text, style)).block(
+        Paragraph::new(Text::from(lines)).block(
             Block::default()
                 .borders(Borders::TOP)
                 .border_style(dim),
