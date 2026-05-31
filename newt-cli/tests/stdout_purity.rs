@@ -117,10 +117,23 @@ async fn spawn_and_assert_pure(bin: &PathBuf, args: &[&str]) {
     );
 }
 
-/// Same locator strategy as `newt-eval/tests/mock_e2e.rs`:
+/// The cargo target directory, resolved the way cargo itself resolves it: the
+/// `CARGO_TARGET_DIR` env var, then a workspace or user `config.toml`'s `[build]
+/// target-dir`, then the default. This makes the test robust to a target-dir set
+/// in `~/.cargo/config.toml` (newt-agent#64), which a plain
+/// `workspace_root/target` guess misses (failing with a confusing `NotFound`).
+fn cargo_target_dir() -> Option<PathBuf> {
+    cargo_metadata::MetadataCommand::new()
+        .exec()
+        .ok()
+        .map(|m| m.target_directory.into_std_path_buf())
+}
+
+/// Locator strategy (first hit wins):
 /// 1. `$CARGO_TARGET_DIR` (set by `cargo llvm-cov`)
-/// 2. `<manifest>/../target/{debug,release}/newt`
-/// 3. `<manifest>/../target/llvm-cov-target/{debug,release}/newt`
+/// 2. the cargo-resolved target dir (honors `~/.cargo/config.toml`, newt-agent#64)
+/// 3. `<manifest>/../target/{debug,release}/newt`
+/// 4. `<manifest>/../target/llvm-cov-target/{debug,release}/newt`
 fn locate_newt_bin() -> PathBuf {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let workspace_root = manifest.parent().expect("manifest dir has parent");
@@ -128,6 +141,10 @@ fn locate_newt_bin() -> PathBuf {
     let mut target_dirs: Vec<PathBuf> = Vec::new();
     if let Some(tdir) = std::env::var_os("CARGO_TARGET_DIR") {
         target_dirs.push(PathBuf::from(tdir));
+    }
+    // Honor `[build] target-dir` from cargo config (newt-agent#64).
+    if let Some(tdir) = cargo_target_dir() {
+        target_dirs.push(tdir);
     }
     target_dirs.push(workspace_root.join("target"));
     target_dirs.push(workspace_root.join("target").join("llvm-cov-target"));
@@ -147,5 +164,10 @@ fn locate_newt_bin() -> PathBuf {
         .args(["build", "--bin", "newt"])
         .output();
 
-    workspace_root.join("target").join("debug").join("newt")
+    // Final fallback: the cargo-resolved target dir (newt-agent#64), else the
+    // conventional path.
+    cargo_target_dir()
+        .unwrap_or_else(|| workspace_root.join("target"))
+        .join("debug")
+        .join("newt")
 }

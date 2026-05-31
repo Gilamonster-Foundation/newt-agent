@@ -47,6 +47,7 @@ libc = "0.2"
 
 [dev-dependencies]
 assert_cmd.workspace = true
+cargo_metadata.workspace = true
 predicates.workspace = true
 tempfile.workspace = true
 wiremock.workspace = true

@@ -25,6 +25,20 @@ build:
 release:
     cargo build --workspace --release
 
+# Install newt + newt-mcp-server release binaries to DEST (default: ~/bin).
+# Override: just install /usr/local/bin
+install dest=`echo $HOME/bin`:
+    cargo build --release --bin newt --bin newt-mcp-server
+    mkdir -p {{dest}}
+    cp target/release/newt {{dest}}/newt
+    cp target/release/newt-mcp-server {{dest}}/newt-mcp-server
+    @echo "Installed: {{dest}}/newt  {{dest}}/newt-mcp-server"
+    @case ":$PATH:" in *":{{dest}}:"*) ;; *) echo "Note: {{dest}} is not in PATH — add:  export PATH={{dest}}:\$PATH" ;; esac
+
+# Remove all Cargo build artefacts (force a clean rebuild / free disk space).
+clean:
+    cargo clean
+
 # --- Test ---
 
 # Run every test in the workspace.

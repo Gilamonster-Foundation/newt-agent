@@ -18,6 +18,32 @@ but stops there: Newt is opinionated, not extensible.
 
 ## Install
 
+### Developer install (from source)
+
+Clone the repo, activate a Python virtualenv, and install in editable mode.
+pip uses [maturin](https://github.com/PyO3/maturin) automatically as the
+build backend — no separate `maturin` install needed.
+
+```bash
+git clone https://github.com/Gilamonster-Foundation/newt-agent
+cd newt-agent
+source ~/venv/bin/activate   # or your preferred venv
+pip install -e .             # Python library only — installs newt_agent.*
+```
+
+**This installs the Python library (`import newt_agent`) but does NOT put
+`newt` on your PATH.** The `newt` CLI is a Rust binary; build it separately:
+
+```bash
+cargo install --path newt-cli           # installs `newt`
+cargo install --path newt-mcp-server    # installs `newt-mcp-server`
+newt --help
+```
+
+Changes to Python source in `newt-agent-py/python/` are picked up
+immediately; changes to Rust source require re-running `pip install -e .`
+(Python bindings) or `cargo install --path newt-cli` (CLI binary).
+
 ### Python library (PyPI)
 
 ```bash
@@ -62,9 +88,15 @@ install from source:
 
 ```bash
 git clone https://github.com/Gilamonster-Foundation/newt-agent
-cargo install --path newt-agent/newt-cli           # `newt`
-cargo install --path newt-agent/newt-mcp-server    # `newt-mcp-server`
+cd newt-agent
+just install          # builds release binaries → ~/bin/newt, ~/bin/newt-mcp-server
 newt --help
+```
+
+Pass a different destination to override the default `~/bin`:
+
+```bash
+just install /usr/local/bin
 ```
 
 Or from crates.io once published:
