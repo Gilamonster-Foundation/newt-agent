@@ -40,7 +40,7 @@ use crossterm::{
 };
 use ratatui::{
     backend::CrosstermBackend,
-    layout::{Alignment, Constraint, Direction, Layout},
+    layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{Block, Borders, Paragraph, Wrap},
@@ -76,8 +76,6 @@ const LOGO_160_COLS: u16 = 166;
 /// Plain ASCII art — 14 lines × ~40 display columns.
 /// Rendered via ratatui in chat-mode header and no-color splash.
 const LOGO_PLAIN: &str = include_str!("../../docs/logos/newt-ascii-40.txt");
-const LOGO_PLAIN_ROWS: u16 = 14;
-const LOGO_PLAIN_COLS: u16 = 42; // +2 padding
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -250,7 +248,7 @@ fn show_splash_plain(_out: &mut io::Stdout, workspace: &str) -> anyhow::Result<b
                 .constraints([Constraint::Fill(1), Constraint::Length(w), Constraint::Fill(1)])
                 .split(area);
             f.render_widget(
-                Paragraph::new(Text::from(lines)).alignment(Alignment::Left),
+                Paragraph::new(Text::from(lines)),
                 cols[1],
             );
         })?;
@@ -445,76 +443,29 @@ fn run_chat(workspace: &str) -> anyhow::Result<()> {
 
 fn render_chat(f: &mut ratatui::Frame, app: &ChatApp) {
     let area = f.area();
-    let orange = Style::default().fg(NEWT_ORANGE);
     let dim = Style::default().fg(Color::DarkGray);
     let bold_orange = Style::default()
         .fg(NEWT_ORANGE)
         .add_modifier(Modifier::BOLD);
 
-    // Outer vertical split: header | messages | input.
-    // If the terminal is too short for the full logo header, collapse it to
-    // a single-line title bar so the chat area always has room.
-    let min_rows_for_logo = LOGO_PLAIN_ROWS + 2;
-    let header_height = if area.height > min_rows_for_logo + 8 {
-        min_rows_for_logo
-    } else {
-        1
-    };
+    // Layout: thin title bar | messages | input
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(header_height),
+            Constraint::Length(1),
             Constraint::Fill(1),
             Constraint::Length(3),
         ])
         .split(area);
 
-    // ── Header ───────────────────────────────────────────────────────────────
-    if header_height > 1 {
-        // Full logo header: logo left, branding right.
-        let header_cols = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Length(LOGO_PLAIN_COLS), Constraint::Fill(1)])
-            .split(chunks[0]);
-
-        let logo_lines: Vec<Line> = LOGO_PLAIN
-            .lines()
-            .map(|l| Line::from(Span::styled(l.to_owned(), orange)))
-            .collect();
-        f.render_widget(
-            Paragraph::new(Text::from(logo_lines)),
-            header_cols[0],
-        );
-
-        let mut brand: Vec<Line> = vec![Line::from("")];
-        brand.push(Line::from(vec![
+    // ── Title bar ────────────────────────────────────────────────────────────
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
             Span::styled("newt", bold_orange),
-            Span::raw("  ·  Small, fast, local-first agentic coder"),
-        ]));
-        brand.push(Line::from(Span::styled(
-            format!("v{VERSION}"),
-            dim,
-        )));
-        brand.push(Line::from(""));
-        brand.push(Line::from(Span::styled(
-            format!("Workspace:  {}", app.workspace),
-            dim,
-        )));
-        f.render_widget(
-            Paragraph::new(Text::from(brand)),
-            header_cols[1],
-        );
-    } else {
-        // Compact single-line header for short terminals.
-        let title = Line::from(vec![
-            Span::styled("newt", bold_orange),
-            Span::styled(
-                format!(" v{VERSION}  ·  {}", app.workspace),
-                dim,
-            ),
-        ]);
-        f.render_widget(Paragraph::new(title), chunks[0]);
-    }
+            Span::styled(format!("  ·  {}", app.workspace), dim),
+        ])),
+        chunks[0],
+    );
 
     // ── Messages ─────────────────────────────────────────────────────────────
     let msg_lines: Vec<Line> = app
@@ -526,8 +477,7 @@ fn render_chat(f: &mut ratatui::Frame, app: &ChatApp) {
             } else {
                 Span::styled(" newt ▸  ", Style::default().fg(Color::Cyan))
             };
-            // First line gets the prefix; continuation lines are indented.
-            let mut msg_text_lines: Vec<Line> = m
+            let mut lines: Vec<Line> = m
                 .text
                 .lines()
                 .enumerate()
@@ -535,38 +485,27 @@ fn render_chat(f: &mut ratatui::Frame, app: &ChatApp) {
                     if i == 0 {
                         Line::from(vec![prefix.clone(), Span::raw(l.to_owned())])
                     } else {
-                        Line::from(vec![
-                            Span::raw("         "),
-                            Span::raw(l.to_owned()),
-                        ])
+                        Line::from(vec![Span::raw("         "), Span::raw(l.to_owned())])
                     }
                 })
                 .collect();
-            msg_text_lines.push(Line::from(""));
-            msg_text_lines
+            lines.push(Line::from(""));
+            lines
         })
         .collect();
 
-    let scroll = app.scroll as u16;
     f.render_widget(
         Paragraph::new(Text::from(msg_lines))
             .wrap(Wrap { trim: false })
-            .scroll((scroll, 0))
+            .scroll((app.scroll as u16, 0))
             .block(Block::default().borders(Borders::TOP)),
         chunks[1],
     );
 
     // ── Input ─────────────────────────────────────────────────────────────────
-    let input_display = format!(" ▸  {}█", app.input);
     f.render_widget(
-        Paragraph::new(input_display)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(Span::styled(" task ", dim))
-                    .border_style(dim),
-            )
-            .style(Style::default()),
+        Paragraph::new(format!(" ▸  {}█", app.input))
+            .block(Block::default().borders(Borders::TOP).border_style(dim)),
         chunks[2],
     );
 }
