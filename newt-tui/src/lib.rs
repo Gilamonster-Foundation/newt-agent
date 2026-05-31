@@ -38,8 +38,8 @@ use ratatui::{
 ///   LOGO_20:   20 × 10    (original, small)
 ///   LOGO_40:   40 × 20    (original, medium)
 ///   LOGO_FULL: 80 × 40    (original, large)
-///   LOGO_120: 126 × 41    (chafa-generated from source PNG)
-///   LOGO_160: 166 × 41    (chafa-generated from source PNG)
+///   LOGO_120: 126 × 61    (chafa-generated from source PNG, natural ratio)
+///   LOGO_160: 166 × 81    (chafa-generated from source PNG, natural ratio)
 /// Chosen at runtime by `logo_for_width`. Printed directly (not ratatui).
 const LOGO_10: &str = include_str!("../../docs/logos/newt-ansi-10.txt");
 const LOGO_20: &str = include_str!("../../docs/logos/newt-ansi-20.txt");
