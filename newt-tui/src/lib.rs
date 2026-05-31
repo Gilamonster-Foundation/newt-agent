@@ -43,7 +43,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Paragraph, Wrap},
+    widgets::Paragraph,
     Terminal,
 };
 
@@ -94,22 +94,21 @@ pub fn run_code(path: Option<&std::path::Path>) -> anyhow::Result<()> {
     let color = color_supported_with(&|k| std::env::var(k).ok());
     let workspace = resolve_workspace(path);
 
-    // Enter alt screen once — both splash and chat share this session.
+    // Splash runs in alt screen + raw mode.
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, Hide, Clear(ClearType::All), MoveTo(0, 0))?;
+    let cont = show_splash(&mut stdout, &workspace, color)?;
 
-    let result = (|| {
-        if show_splash(&mut stdout, &workspace, color)? {
-            run_chat(&workspace)
-        } else {
-            Ok(())
-        }
-    })();
-
+    // Return to the normal terminal before the chat loop so the user's
+    // own scrollback handles history — no custom scroll management needed.
     let _ = disable_raw_mode();
     let _ = execute!(io::stdout(), Show, LeaveAlternateScreen);
-    result
+
+    if cont {
+        run_chat(&workspace, color)?;
+    }
+    Ok(())
 }
 
 pub fn run_pilot(_flight_id: &str) -> anyhow::Result<()> {
@@ -174,7 +173,7 @@ fn show_splash(out: &mut io::Stdout, workspace: &str, color: bool) -> anyhow::Re
     }
 }
 
-fn show_splash_color(out: &mut io::Stdout, workspace: &str) -> anyhow::Result<bool> {
+fn show_splash_color(out: &mut io::Stdout, _workspace: &str) -> anyhow::Result<bool> {
     let (term_cols, _) = terminal::size().unwrap_or((80, 24));
     let (logo, logo_cols) = logo_for_width(term_cols);
     let logo_rows = logo.lines().count() as u16;
@@ -301,213 +300,97 @@ fn splash_key_action(ev: &Event) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Chat TUI phase
+// Chat — plain terminal REPL
+//
+// No alternate screen, no custom scroll. The terminal's own scrollback
+// buffer handles history. Works identically over SSH and inside tmux.
 // ---------------------------------------------------------------------------
 
-#[derive(Clone)]
-struct ChatMessage {
-    from_user: bool,
-    text: String,
-}
-
-struct ChatApp {
-    workspace: String,
-    messages: Vec<ChatMessage>,
-    input: String,
-    scroll: usize,
-}
-
-impl ChatApp {
-    fn new(workspace: &str) -> Self {
-        Self {
-            workspace: workspace.to_owned(),
-            messages: vec![ChatMessage {
-                from_user: false,
-                text: format!(
-                    "newt v{VERSION} ready.  \
-                     Type a coding task and press Enter. \
-                     (Coder runtime arrives in Step 0.4 — routing and eval are live.)"
-                ),
-            }],
-            input: String::new(),
-            scroll: 0,
-        }
-    }
-
-    fn submit(&mut self) {
-        let text = std::mem::take(&mut self.input);
-        if text.is_empty() {
-            return;
-        }
-        self.messages.push(ChatMessage {
-            from_user: true,
-            text: text.clone(),
-        });
-        // Mock response until the real coder is wired in.
-        let reply = format!(
-            "Got it: \"{text}\" — coder runtime not yet connected. \
-             Try `just eval --case 001` to run the eval suite against a real Ollama."
-        );
-        self.messages.push(ChatMessage {
-            from_user: false,
-            text: reply,
-        });
-        // Scroll to bottom.
-        self.scroll = self.messages.len().saturating_sub(1);
-    }
-
-    fn scroll_up(&mut self) {
-        self.scroll = self.scroll.saturating_sub(1);
-    }
-    fn scroll_down(&mut self) {
-        self.scroll = (self.scroll + 1).min(self.messages.len().saturating_sub(1));
+fn print_newt(msg: &str, color: bool) {
+    if color {
+        execute!(
+            io::stdout(),
+            SetForegroundColor(CtColor::Cyan),
+            Print(" newt ▸  "),
+            ResetColor,
+            Print(msg),
+            Print("\n"),
+        )
+        .ok();
+    } else {
+        println!(" newt >  {msg}");
     }
 }
 
-fn run_chat(workspace: &str) -> anyhow::Result<()> {
-    // Re-use the already-open alt screen; just hand stdout to ratatui.
-    execute!(io::stdout(), Clear(ClearType::All))?;
-    let backend = CrosstermBackend::new(io::stdout());
-    let mut terminal = Terminal::new(backend)?;
-    let mut app = ChatApp::new(workspace);
+fn run_chat(workspace: &str, color: bool) -> anyhow::Result<()> {
+    use std::io::BufRead as _;
+
+    // Header line — one-time print, then normal scroll from here.
+    if color {
+        execute!(
+            io::stdout(),
+            Print("\n"),
+            SetForegroundColor(NEWT_ORANGE_CT),
+            Print("newt"),
+            ResetColor,
+            SetForegroundColor(CtColor::DarkGrey),
+            Print(format!("  ·  {workspace}\n")),
+            ResetColor,
+        )?;
+    } else {
+        println!("\nnewt  ·  {workspace}");
+    }
+
+    print_newt(
+        &format!(
+            "v{VERSION} ready. Type a task and press Enter. (Ctrl-D or Ctrl-C to quit.)"
+        ),
+        color,
+    );
+    println!();
+
+    let stdin = io::stdin();
+    let mut line = String::new();
 
     loop {
-        terminal.draw(|f| render_chat(f, &app))?;
+        // Prompt
+        if color {
+            execute!(
+                io::stdout(),
+                SetForegroundColor(NEWT_ORANGE_CT),
+                Print("  you ▸  "),
+                ResetColor,
+            )?;
+        } else {
+            print!("  you >  ");
+        }
+        io::stdout().flush()?;
 
-        if event::poll(std::time::Duration::from_millis(50))? {
-            match event::read()? {
-                // Quit
-                Event::Key(KeyEvent {
-                    code: KeyCode::Char('c'),
-                    modifiers,
-                    ..
-                }) if modifiers.contains(KeyModifiers::CONTROL) => break,
-
-                // Submit
-                Event::Key(KeyEvent {
-                    code: KeyCode::Enter,
-                    ..
-                }) => app.submit(),
-
-                // Editing
-                Event::Key(KeyEvent {
-                    code: KeyCode::Backspace,
-                    ..
-                }) => {
-                    app.input.pop();
+        line.clear();
+        match stdin.lock().read_line(&mut line) {
+            Ok(0) => break, // EOF / Ctrl-D
+            Ok(_) => {
+                let task = line.trim();
+                if task.is_empty() {
+                    continue;
                 }
-                Event::Key(KeyEvent {
-                    code: KeyCode::Char(c),
-                    modifiers,
-                    ..
-                }) if !modifiers.contains(KeyModifiers::CONTROL)
-                    && !modifiers.contains(KeyModifiers::ALT) =>
-                {
-                    app.input.push(c);
+                if matches!(task, "/exit" | "/quit" | "exit" | "quit") {
+                    break;
                 }
-
-                // Scrolling
-                Event::Key(KeyEvent {
-                    code: KeyCode::Up, ..
-                }) => app.scroll_up(),
-                Event::Key(KeyEvent {
-                    code: KeyCode::Down,
-                    ..
-                }) => app.scroll_down(),
-                Event::Key(KeyEvent {
-                    code: KeyCode::PageUp,
-                    ..
-                }) => {
-                    for _ in 0..5 {
-                        app.scroll_up();
-                    }
-                }
-                Event::Key(KeyEvent {
-                    code: KeyCode::PageDown,
-                    ..
-                }) => {
-                    for _ in 0..5 {
-                        app.scroll_down();
-                    }
-                }
-
-                // Terminal resize — ratatui handles it automatically on next draw.
-                Event::Resize(_, _) => {}
-
-                _ => {}
+                println!();
+                print_newt(
+                    &format!(
+                        "Got it: \"{task}\" — coder runtime not yet connected. \
+                         Try `just eval --case 001` to run against a real Ollama."
+                    ),
+                    color,
+                );
+                println!();
             }
+            Err(e) => return Err(e.into()),
         }
     }
     Ok(())
-}
-
-fn render_chat(f: &mut ratatui::Frame, app: &ChatApp) {
-    let area = f.area();
-    let dim = Style::default().fg(Color::DarkGray);
-    let bold_orange = Style::default()
-        .fg(NEWT_ORANGE)
-        .add_modifier(Modifier::BOLD);
-
-    // Layout: thin title bar | messages | input
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Fill(1),
-            Constraint::Length(3),
-        ])
-        .split(area);
-
-    // ── Title bar ────────────────────────────────────────────────────────────
-    f.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled("newt", bold_orange),
-            Span::styled(format!("  ·  {}", app.workspace), dim),
-        ])),
-        chunks[0],
-    );
-
-    // ── Messages ─────────────────────────────────────────────────────────────
-    let msg_lines: Vec<Line> = app
-        .messages
-        .iter()
-        .flat_map(|m| {
-            let prefix = if m.from_user {
-                Span::styled("  you ▸  ", bold_orange)
-            } else {
-                Span::styled(" newt ▸  ", Style::default().fg(Color::Cyan))
-            };
-            let mut lines: Vec<Line> = m
-                .text
-                .lines()
-                .enumerate()
-                .map(|(i, l)| {
-                    if i == 0 {
-                        Line::from(vec![prefix.clone(), Span::raw(l.to_owned())])
-                    } else {
-                        Line::from(vec![Span::raw("         "), Span::raw(l.to_owned())])
-                    }
-                })
-                .collect();
-            lines.push(Line::from(""));
-            lines
-        })
-        .collect();
-
-    f.render_widget(
-        Paragraph::new(Text::from(msg_lines))
-            .wrap(Wrap { trim: false })
-            .scroll((app.scroll as u16, 0))
-            .block(Block::default().borders(Borders::TOP)),
-        chunks[1],
-    );
-
-    // ── Input ─────────────────────────────────────────────────────────────────
-    f.render_widget(
-        Paragraph::new(format!(" ▸  {}█", app.input))
-            .block(Block::default().borders(Borders::TOP).border_style(dim)),
-        chunks[2],
-    );
 }
 
 // ---------------------------------------------------------------------------
@@ -638,33 +521,12 @@ mod tests {
     }
 
     #[test]
-    fn chat_app_submit_adds_messages() {
-        let mut app = ChatApp::new("/workspace");
-        assert_eq!(app.messages.len(), 1); // welcome message
-        app.input = "rename foo to bar".into();
-        app.submit();
-        assert_eq!(app.messages.len(), 3); // + user + mock reply
-        assert!(app.messages[1].from_user);
-        assert!(!app.messages[2].from_user);
-    }
-
-    #[test]
-    fn chat_app_empty_input_ignored() {
-        let mut app = ChatApp::new("/workspace");
-        app.submit();
-        assert_eq!(app.messages.len(), 1);
-    }
-
-    #[test]
-    fn chat_app_scroll_bounds() {
-        let mut app = ChatApp::new("/workspace");
-        app.scroll_up(); // should not underflow
-        assert_eq!(app.scroll, 0);
-        app.input = "hi".into();
-        app.submit();
-        app.scroll_down();
-        app.scroll_down();
-        app.scroll_down(); // should not exceed message count
-        assert!(app.scroll < app.messages.len());
+    fn exit_commands_are_recognised() {
+        for cmd in ["/exit", "/quit", "exit", "quit"] {
+            assert!(
+                matches!(cmd, "/exit" | "/quit" | "exit" | "quit"),
+                "{cmd} should be recognised as an exit command"
+            );
+        }
     }
 }
