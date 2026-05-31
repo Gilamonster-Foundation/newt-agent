@@ -53,11 +53,13 @@
 #![doc(html_root_url = "https://docs.rs/newt-mesh")]
 
 pub mod ask;
+pub mod caveats;
 pub mod error;
 pub mod protocol;
 pub mod service;
 
 pub use ask::MeshAsker;
+pub use caveats::{caveats_for_peer, CaveatsError};
 pub use error::MeshIntegrationError;
 pub use protocol::{InferenceReply, InferenceRequest, TokenUsage, CAPABILITY_TAG, INFERENCE_TOPIC};
 pub use service::NewtMeshService;
