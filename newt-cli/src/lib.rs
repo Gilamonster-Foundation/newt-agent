@@ -26,8 +26,9 @@ pub struct Cli {
     #[arg(short, long, global = true)]
     pub config: Option<PathBuf>,
 
+    /// Subcommand to run. Defaults to `code` (TUI coder) when omitted.
     #[command(subcommand)]
-    pub command: Command,
+    pub command: Option<Command>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -67,7 +68,7 @@ pub enum Command {
 }
 
 pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
-    match cli.command {
+    match cli.command.unwrap_or(Command::Code { path: None }) {
         Command::Code { path } => newt_tui::run_code(path.as_deref()),
         Command::Pilot { flight_id } => newt_tui::run_pilot(&flight_id),
         Command::Worker { coder } => run_worker(coder).await,

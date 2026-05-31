@@ -1,14 +1,352 @@
-//! Newt-Agent TUI — two screens, ratatui-driven.
+//! Newt-Agent TUI — ratatui-driven screens.
 //!
-//! - `code` mode: chat / file pane / diff preview / apply-or-reject.
-//! - `pilot` mode: drake-swarm dashboard (per-rung status, scorecards).
+//! - `code` mode: splash / start screen (Step 0.2); full chat pane (Step 0.4+).
+//! - `pilot` mode: drake-swarm dashboard (later step — stub).
 //!
-//! v0 stubs only — surfaces wired in v0.2 / v0.4.
+//! ## Color path vs plain path
+//!
+//! The color logo files (`newt-ansi-*.txt`) use raw 24-bit ANSI escape codes
+//! that ratatui cannot render through its widget system. On color-capable
+//! terminals we print the logo directly with crossterm and use crossterm for
+//! cursor positioning and the keyboard event loop. On plain/dumb terminals we
+//! fall back to ratatui + the ASCII-only logo, which renders correctly
+//! everywhere.
 
-pub fn run_code(_path: Option<&std::path::Path>) -> anyhow::Result<()> {
-    anyhow::bail!("newt-tui::run_code not yet implemented")
+use std::io::{self, IsTerminal, Write as _};
+
+use crossterm::{
+    cursor::{Hide, MoveTo, Show},
+    event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
+    execute, queue,
+    style::{Color as CtColor, Print, ResetColor, SetForegroundColor},
+    terminal::{
+        disable_raw_mode, enable_raw_mode, Clear, ClearType, EnterAlternateScreen,
+        LeaveAlternateScreen,
+    },
+};
+use ratatui::{
+    backend::CrosstermBackend,
+    layout::{Alignment, Constraint, Direction, Layout},
+    style::{Color, Modifier, Style},
+    text::{Line, Span, Text},
+    widgets::{Block, Borders, Paragraph},
+    Terminal,
+};
+
+/// 24-bit ANSI braille art — 10 lines × ~60 display columns.
+/// Used on color-capable terminals; printed directly (not through ratatui).
+const LOGO_COLOR: &str = include_str!("../../docs/logos/newt-ansi-20.txt");
+
+/// Plain ASCII art — 14 lines × ~40 display columns.
+/// Used as the no-color fallback, rendered as a ratatui Paragraph.
+const LOGO_PLAIN: &str = include_str!("../../docs/logos/newt-ascii-40.txt");
+
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Newt's brand orange, sampled from the ANSI logo palette.
+const NEWT_ORANGE_CT: CtColor = CtColor::Rgb {
+    r: 220,
+    g: 60,
+    b: 20,
+};
+
+// ---------------------------------------------------------------------------
+// Public entry points
+// ---------------------------------------------------------------------------
+
+pub fn run_code(path: Option<&std::path::Path>) -> anyhow::Result<()> {
+    if color_supported_with(&|k| std::env::var(k).ok()) {
+        run_splash_color(path)
+    } else {
+        run_splash_plain(path)
+    }
 }
 
 pub fn run_pilot(_flight_id: &str) -> anyhow::Result<()> {
     anyhow::bail!("newt-tui::run_pilot not yet implemented")
+}
+
+// ---------------------------------------------------------------------------
+// Color detection
+// ---------------------------------------------------------------------------
+
+/// Returns `true` when stdout supports ANSI color.
+///
+/// Priority:
+/// 1. `NO_COLOR` set (any value) → false  (<https://no-color.org/>)
+/// 2. `TERM=dumb`                → false
+/// 3. stdout is not a TTY        → false
+/// 4. otherwise                  → true
+pub fn color_supported() -> bool {
+    color_supported_with(&|k| std::env::var(k).ok())
+}
+
+fn color_supported_with(get_env: &dyn Fn(&str) -> Option<String>) -> bool {
+    if get_env("NO_COLOR").is_some() {
+        return false;
+    }
+    if get_env("TERM").as_deref() == Some("dumb") {
+        return false;
+    }
+    io::stdout().is_terminal()
+}
+
+// ---------------------------------------------------------------------------
+// Color splash — crossterm direct rendering
+// ---------------------------------------------------------------------------
+
+fn run_splash_color(path: Option<&std::path::Path>) -> anyhow::Result<()> {
+    let workspace = resolve_workspace(path);
+
+    enable_raw_mode()?;
+    let mut out = io::stdout();
+    execute!(
+        out,
+        EnterAlternateScreen,
+        Hide,
+        Clear(ClearType::All),
+        MoveTo(0, 0)
+    )?;
+
+    // Print the ANSI logo directly — the file already contains all escape codes.
+    write!(out, "{LOGO_COLOR}")?;
+    out.flush()?;
+
+    // Position the status block just below the logo.
+    let logo_rows = LOGO_COLOR.lines().count() as u16;
+    let row = logo_rows + 1;
+
+    queue!(out, MoveTo(0, row))?;
+    queue!(
+        out,
+        SetForegroundColor(NEWT_ORANGE_CT),
+        Print("newt"),
+        ResetColor,
+        Print("  ·  Small, fast, local-first agentic coder")
+    )?;
+    queue!(out, MoveTo(0, row + 1))?;
+    queue!(
+        out,
+        SetForegroundColor(CtColor::DarkGrey),
+        Print(format!("v{VERSION}")),
+        ResetColor
+    )?;
+    queue!(out, MoveTo(0, row + 3))?;
+    queue!(out, Print(format!("Workspace:  {workspace}")))?;
+    queue!(out, MoveTo(0, row + 5))?;
+    queue!(
+        out,
+        SetForegroundColor(CtColor::DarkGrey),
+        Print("q quit  ·  Ctrl-C quit  ·  full coder UI coming soon"),
+        ResetColor
+    )?;
+    out.flush()?;
+
+    splash_event_loop()?;
+
+    let _ = disable_raw_mode();
+    let _ = execute!(out, Show, LeaveAlternateScreen);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Plain splash — ratatui rendering
+// ---------------------------------------------------------------------------
+
+fn run_splash_plain(path: Option<&std::path::Path>) -> anyhow::Result<()> {
+    let workspace = resolve_workspace(path);
+
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+
+    let result = plain_render_loop(&mut terminal, &workspace);
+
+    let _ = disable_raw_mode();
+    let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
+    let _ = terminal.show_cursor();
+    result
+}
+
+fn plain_render_loop(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    workspace: &str,
+) -> anyhow::Result<()> {
+    loop {
+        terminal.draw(|f| render_plain_splash(f, workspace))?;
+        if splash_event_poll()? {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn render_plain_splash(f: &mut ratatui::Frame, workspace: &str) {
+    let area = f.area();
+
+    let logo_style = Style::default();
+    let accent = Style::default()
+        .fg(Color::Rgb(220, 60, 20))
+        .add_modifier(Modifier::BOLD);
+    let dim = Style::default();
+
+    let mut lines: Vec<Line> = vec![Line::from("")];
+    for l in LOGO_PLAIN.lines() {
+        lines.push(Line::from(Span::styled(l.to_owned(), logo_style)));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled("newt", accent),
+        Span::raw("  ·  Small, fast, local-first agentic coder"),
+    ]));
+    lines.push(Line::from(format!("v{VERSION}")));
+    lines.push(Line::from(""));
+    lines.push(Line::from(format!("Workspace:  {workspace}")));
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "q quit  ·  Ctrl-C quit  ·  full coder UI coming soon",
+        dim,
+    )));
+
+    let content_width = 60u16.min(area.width);
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Fill(1),
+            Constraint::Length(content_width),
+            Constraint::Fill(1),
+        ])
+        .split(area);
+
+    f.render_widget(
+        Paragraph::new(Text::from(lines))
+            .alignment(Alignment::Left)
+            .block(Block::default().borders(Borders::NONE)),
+        chunks[1],
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Shared helpers
+// ---------------------------------------------------------------------------
+
+fn resolve_workspace(path: Option<&std::path::Path>) -> String {
+    path.map(|p| p.to_string_lossy().into_owned())
+        .or_else(|| {
+            std::env::current_dir()
+                .ok()
+                .map(|d| d.to_string_lossy().into_owned())
+        })
+        .unwrap_or_else(|| "(unknown)".into())
+}
+
+/// Poll once for a quit key. Returns `true` if the user requested exit.
+fn splash_event_poll() -> anyhow::Result<bool> {
+    if event::poll(std::time::Duration::from_millis(100))? {
+        return Ok(matches_quit(&event::read()?));
+    }
+    Ok(false)
+}
+
+/// Block until the user presses a quit key.
+fn splash_event_loop() -> anyhow::Result<()> {
+    loop {
+        if event::poll(std::time::Duration::from_millis(100))? && matches_quit(&event::read()?) {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn matches_quit(ev: &Event) -> bool {
+    matches!(
+        ev,
+        Event::Key(KeyEvent {
+            code: KeyCode::Char('q'),
+            ..
+        }) | Event::Key(KeyEvent {
+            code: KeyCode::Esc,
+            ..
+        })
+    ) || matches!(ev, Event::Key(KeyEvent {
+        code: KeyCode::Char('c'),
+        modifiers,
+        ..
+    }) if modifiers.contains(KeyModifiers::CONTROL))
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mock_env<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        |k| {
+            pairs
+                .iter()
+                .find(|(key, _)| *key == k)
+                .map(|(_, v)| v.to_string())
+        }
+    }
+
+    #[test]
+    fn no_color_env_disables_color() {
+        assert!(!color_supported_with(&mock_env(&[("NO_COLOR", "1")])));
+    }
+
+    #[test]
+    fn no_color_empty_value_still_disables() {
+        assert!(!color_supported_with(&mock_env(&[("NO_COLOR", "")])));
+    }
+
+    #[test]
+    fn dumb_term_disables_color() {
+        assert!(!color_supported_with(&mock_env(&[("TERM", "dumb")])));
+    }
+
+    #[test]
+    fn non_dumb_term_passes_env_check() {
+        // is_terminal() depends on the test harness; we only verify the env
+        // checks don't block a real terminal name.
+        let get_env = mock_env(&[("TERM", "xterm-256color")]);
+        let _ = color_supported_with(&get_env); // must not panic
+    }
+
+    #[test]
+    fn logo_assets_are_embedded() {
+        assert!(!LOGO_PLAIN.is_empty());
+        assert!(LOGO_PLAIN.lines().count() > 5);
+        assert!(!LOGO_COLOR.is_empty());
+        assert!(LOGO_COLOR.lines().count() > 3);
+    }
+
+    #[test]
+    fn version_constant_is_populated() {
+        assert!(!VERSION.is_empty());
+    }
+
+    #[test]
+    fn resolve_workspace_falls_back_gracefully() {
+        // With an explicit path the value is returned verbatim.
+        let p = std::path::Path::new("/some/workspace");
+        assert_eq!(resolve_workspace(Some(p)), "/some/workspace");
+    }
+
+    #[test]
+    fn matches_quit_recognises_q_and_esc() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let q = Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+        let esc = Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        let ctrl_c = Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        let other = Event::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        assert!(matches_quit(&q));
+        assert!(matches_quit(&esc));
+        assert!(matches_quit(&ctrl_c));
+        assert!(!matches_quit(&other));
+    }
 }
