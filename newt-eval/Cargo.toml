@@ -47,6 +47,7 @@ pyo3 = [
 wiremock.workspace = true
 assert_cmd.workspace = true
 predicates.workspace = true
+cargo_metadata = "0.23"
 
 [lints]
 workspace = true

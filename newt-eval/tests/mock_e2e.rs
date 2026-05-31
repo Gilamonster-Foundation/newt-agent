@@ -131,29 +131,74 @@ fn ensure_worker_built() {
 /// Locate the `newt` binary in the workspace's `target/` dir.
 ///
 /// Searches common cargo target directories in priority order:
-/// 1. `$CARGO_TARGET_DIR` (set by `cargo llvm-cov` to `target/llvm-cov-target`)
-/// 2. `<manifest>/../target/{debug,release}/`
+/// 1. `$CARGO_TARGET_DIR` — explicit env var always wins (set by
+///    `cargo llvm-cov` to `target/llvm-cov-target`, and by tooling
+///    that wants to redirect builds).
+/// 2. `cargo metadata` — picks up `~/.cargo/config.toml`'s
+///    `[build] target-dir`. Best-effort: if the call fails (e.g.
+///    offline registry, partially-built sysroot) we just skip it
+///    and fall back to the conventional paths below.
+/// 3. `<manifest>/../target` — final fallback for environments where
+///    `cargo metadata` itself fails.
+/// 4. `<manifest>/../target/llvm-cov-target` — legacy llvm-cov path
+///    kept for parity with older CI invocations that didn't set
+///    `CARGO_TARGET_DIR`.
+///
+/// Each directory is probed for `release/newt` first, then `debug/newt`.
+///
+/// If nothing is found, panic with the full list of directories
+/// searched — same UX as the runner-side #40/#43 fix and the
+/// stdout_purity locator.
 fn locate_worker_bin() -> PathBuf {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let workspace_root = manifest.parent().expect("manifest dir has parent");
 
-    // cargo llvm-cov sets CARGO_TARGET_DIR — honor it first.
     let mut target_dirs: Vec<PathBuf> = Vec::new();
+
+    // 1. Explicit env var — always wins.
     if let Some(tdir) = std::env::var_os("CARGO_TARGET_DIR") {
         target_dirs.push(PathBuf::from(tdir));
     }
+
+    // 2. `cargo metadata` — picks up `~/.cargo/config.toml`'s
+    //    `[build] target-dir`. Best-effort: if the call fails (e.g.
+    //    offline registry, partially-built sysroot) we just skip it
+    //    and fall back to the conventional paths below.
+    if let Ok(meta) = cargo_metadata::MetadataCommand::new()
+        .manifest_path(workspace_root.join("Cargo.toml"))
+        .no_deps()
+        .exec()
+    {
+        target_dirs.push(PathBuf::from(meta.target_directory.as_std_path()));
+    }
+
+    // 3 + 4. Conventional fallbacks.
     target_dirs.push(workspace_root.join("target"));
     target_dirs.push(workspace_root.join("target").join("llvm-cov-target"));
 
     for tdir in &target_dirs {
-        for profile in ["debug", "release"] {
+        for profile in ["release", "debug"] {
             let candidate = tdir.join(profile).join("newt");
             if candidate.exists() {
                 return candidate;
             }
         }
     }
-    // Fallback to the conventional debug path; the caller's assertion
-    // surfaces the missing path cleanly.
-    workspace_root.join("target").join("debug").join("newt")
+
+    // Nothing found. Surface every path we tried — the runner-side
+    // #40/#43 fix taught us that "binary not found" is useless without
+    // the search list.
+    let searched: Vec<String> = target_dirs
+        .iter()
+        .flat_map(|d| {
+            ["release", "debug"]
+                .iter()
+                .map(move |p| d.join(p).join("newt").display().to_string())
+        })
+        .collect();
+    panic!(
+        "newt binary not found. Searched:\n  - {}\n\
+         Hint: run `cargo build -p newt-agent` (or `--release`) in the workspace root.",
+        searched.join("\n  - "),
+    );
 }
