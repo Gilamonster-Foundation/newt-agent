@@ -34,6 +34,66 @@ pub struct Config {
     /// dials a DGX endpoint unless this (or a `NEWT_DGX_*` env var) is set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dgx: Option<crate::dgx::DgxConfig>,
+
+    /// TUI appearance and behaviour. `None` → built-in defaults apply.
+    /// Overridable at runtime via `NEWT_CHAT_STYLE` and `NEWT_PROMPT`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tui: Option<TuiConfig>,
+}
+
+// ---------------------------------------------------------------------------
+// TUI config
+// ---------------------------------------------------------------------------
+
+/// TUI appearance preferences stored under `[tui]` in `newt.toml`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TuiConfig {
+    /// Whether to show "newt" / "you" labels before the carets.
+    pub chat_style: ChatStyle,
+
+    /// PS1-style prompt template.
+    ///
+    /// Tokens: `\w` workspace basename, `\W` full path, `\h` hostname,
+    /// `\v` newt version.  Default: `"\\w $ "` (compact) / `"you $ "` (verbose).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+}
+
+impl Default for TuiConfig {
+    fn default() -> Self {
+        Self {
+            chat_style: ChatStyle::Compact,
+            prompt: None,
+        }
+    }
+}
+
+/// Chat REPL display density.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ChatStyle {
+    /// Just the caret symbol — no "newt" / "you" labels.
+    #[default]
+    Compact,
+    /// Full "newt ▸" / "you $" labels before each message.
+    Verbose,
+}
+
+impl ChatStyle {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Compact => "compact",
+            Self::Verbose => "verbose",
+        }
+    }
+
+    pub fn toggle(&self) -> Self {
+        match self {
+            Self::Compact => Self::Verbose,
+            Self::Verbose => Self::Compact,
+        }
+    }
 }
 
 /// A single inference backend entry.
@@ -71,6 +131,7 @@ impl Default for Config {
             providers: Vec::new(),
             default_tier_order: vec![Tier::Fast, Tier::Standard, Tier::Complex, Tier::Review],
             dgx: None,
+            tui: None,
         }
     }
 }
@@ -103,6 +164,22 @@ impl Config {
             }
         }
         Ok(Self::default())
+    }
+
+    /// The user-writable config path: `~/.newt/config.toml`.
+    /// This is the first path `resolve()` reads and the target for `save()`.
+    pub fn user_config_path() -> Option<PathBuf> {
+        home_dir().map(|h| h.join(".newt").join("config.toml"))
+    }
+
+    /// Serialize this config and write it to `path`, creating parent dirs if needed.
+    pub fn save(&self, path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(NewtError::Io)?;
+        }
+        let text = toml::to_string_pretty(self)
+            .map_err(|e| NewtError::Config(e.to_string()))?;
+        std::fs::write(path, text).map_err(NewtError::Io)
     }
 
     /// Build the ordered list of candidate config file paths.

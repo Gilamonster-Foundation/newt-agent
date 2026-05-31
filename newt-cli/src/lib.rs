@@ -58,6 +58,8 @@ pub enum Command {
     Doctor,
     /// Print resolved config.
     Config,
+    /// Open the interactive settings TUI.
+    Settings,
     /// NVIDIA DGX endpoint management (route a task to a formation; more
     /// subcommands land in later Phase 14 steps).
     Dgx {
@@ -74,6 +76,7 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         Command::Mcp => run_mcp().await,
         Command::Doctor => doctor::run(cli.config.as_deref()).await,
         Command::Config => config_cmd::run(cli.config.as_deref()),
+        Command::Settings => newt_tui::run_settings(cli.config.as_deref()),
         Command::Dgx { cmd } => dgx::run(cmd, cli.config.as_deref()).await,
     }
 }

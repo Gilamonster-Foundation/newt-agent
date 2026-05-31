@@ -14,7 +14,7 @@ pub mod session;
 #[cfg(feature = "pyo3")]
 pub mod pyo3_module;
 
-pub use config::Config;
+pub use config::{ChatStyle, Config, TuiConfig};
 pub use dgx::{DgxConfig, DgxFormation, DgxNode, DgxNotConfigured, EndpointKind};
 pub use error::NewtError;
 pub use model_id::ModelId;
