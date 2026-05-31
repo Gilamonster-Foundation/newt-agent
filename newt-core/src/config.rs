@@ -58,6 +58,11 @@ pub struct TuiConfig {
     /// `\v` newt version.  Default: `"\\w $ "` (compact) / `"you $ "` (verbose).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt: Option<String>,
+
+    /// Skip the full-screen ANSI art splash and show a compact header instead.
+    /// Equivalent to the `--no-splash` CLI flag.
+    #[serde(default)]
+    pub no_splash: bool,
 }
 
 impl Default for TuiConfig {
@@ -65,6 +70,7 @@ impl Default for TuiConfig {
         Self {
             chat_style: ChatStyle::Compact,
             prompt: None,
+            no_splash: false,
         }
     }
 }

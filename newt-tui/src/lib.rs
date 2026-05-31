@@ -55,15 +55,30 @@ const HUMAN_BLUE_CT: CtColor = CtColor::Rgb { r: 80, g: 140, b: 255 };
 // Public entry points
 // ---------------------------------------------------------------------------
 
-pub fn run_code(path: Option<&std::path::Path>) -> anyhow::Result<()> {
+pub fn run_code(path: Option<&std::path::Path>, no_splash: bool) -> anyhow::Result<()> {
     let color = color_supported_with(&|k| std::env::var(k).ok());
     let workspace = resolve_workspace(path);
 
+    // --no-splash (or [tui] no_splash = true): print a compact inline header
+    // and go straight to chat. No alt screen, no raw mode — scrolls into
+    // history naturally. Safe for SSH, tmux, and piped output.
+    let inline = no_splash
+        || newt_core::Config::resolve()
+            .ok()
+            .and_then(|c| c.tui)
+            .map(|t| t.no_splash)
+            .unwrap_or(false);
+
+    if inline {
+        print_inline_header(&workspace, color);
+        return run_chat(&workspace, color);
+    }
+
+    // Default: full ANSI splash in alt screen — blinks off on Enter.
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, Hide, Clear(ClearType::All), MoveTo(0, 0))?;
     let cont = show_splash(&mut stdout, &workspace, color)?;
-
     let _ = disable_raw_mode();
     let _ = execute!(io::stdout(), Show, LeaveAlternateScreen);
 
@@ -71,6 +86,49 @@ pub fn run_code(path: Option<&std::path::Path>) -> anyhow::Result<()> {
         run_chat(&workspace, color)?;
     }
     Ok(())
+}
+
+/// Compact inline header for `--no-splash` mode.
+/// Prints LOGO_20 with text to the right using ANSI column-move escapes,
+/// then scrolls naturally into history. No alt screen, no raw mode.
+fn print_inline_header(workspace: &str, color: bool) {
+    if !color {
+        println!("newt v{VERSION}  ·  {workspace}");
+        println!();
+        return;
+    }
+
+    // Place text at column 23 (just past the 20-col logo).
+    let text_col = 23u16;
+    let logo_lines: Vec<&str> = LOGO_20.lines().collect();
+    let n = logo_lines.len();
+
+    // Text lines aligned to the middle-right of the logo.
+    let mid = n / 2;
+    let text: &[(&str, bool)] = &[
+        ("newt  ·  Small, fast, local-first agentic coder", false),
+        (std::concat!("v", env!("CARGO_PKG_VERSION")), true), // dim
+        ("", false),
+        ("ready — type a task, /help for commands, /exit to quit", true),
+    ];
+    let text_start = mid.saturating_sub(1);
+
+    for (i, logo_line) in logo_lines.iter().enumerate() {
+        // Print logo line (already contains ANSI color codes).
+        print!("{logo_line}");
+        // Move cursor to column text_col on this row, print text if scheduled.
+        let ti = i.wrapping_sub(text_start);
+        if let Some((msg, dim)) = text.get(ti) {
+            if !msg.is_empty() {
+                // \x1b[{col}G moves cursor to absolute column (1-indexed).
+                let style_on = if *dim { "\x1b[38;2;100;100;100m" } else { "" };
+                let style_off = if *dim { "\x1b[0m" } else { "" };
+                print!("\x1b[{text_col}G{style_on}{msg}{style_off}");
+            }
+        }
+        println!();
+    }
+    println!();
 }
 
 pub fn run_pilot(_flight_id: &str) -> anyhow::Result<()> {
