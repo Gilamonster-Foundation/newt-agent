@@ -128,7 +128,9 @@ pub enum DgxNotConfigured {
     NoNodes,
 
     /// Several nodes exist but none is marked active.
-    #[error("no active DGX node selected ({count} configured) — set [dgx].active_node in your config")]
+    #[error(
+        "no active DGX node selected ({count} configured) — set [dgx].active_node in your config"
+    )]
     NoActiveNode { count: usize },
 
     /// `active_node` names a node that isn't in the list.

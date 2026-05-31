@@ -237,7 +237,9 @@ async fn doctor(config_path: Option<&Path>) -> anyhow::Result<()> {
     if !any {
         println!("\n  No DGX endpoints configured. Set:");
         println!("    NEWT_DGX_HOST=<host>          (synthesizes ollama + vllm URLs from a bare hostname)");
-        println!("    NEWT_DGX_OLLAMA_URL=<url>     (direct URL, e.g. https://dgx-ollama.home.lab)");
+        println!(
+            "    NEWT_DGX_OLLAMA_URL=<url>     (direct URL, e.g. https://dgx-ollama.home.lab)"
+        );
     }
     println!("\n  DNS note: on the Google-WiFi mesh, .home.lab resolves but .home.lan does");
     println!("  not (the pucks intercept the .lan TLD). Use .home.lab from a laptop; inside");
