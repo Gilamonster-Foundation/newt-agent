@@ -25,6 +25,10 @@ build:
 release:
     cargo build --workspace --release
 
+# Remove all Cargo build artefacts (force a clean rebuild / free disk space).
+clean:
+    cargo clean
+
 # --- Test ---
 
 # Run every test in the workspace.
