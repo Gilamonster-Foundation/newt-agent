@@ -72,7 +72,7 @@ fn route(task: &str, config_path: Option<&Path>) -> anyhow::Result<()> {
     );
     match &rec.formation {
         Some(name) => println!("  Formation:   {name}"),
-        None => println!("  Formation:   (none configured — run `newt dgx setup`)"),
+        None => println!("  Formation:   (none configured — set NEWT_DGX_HOST=<host>)"),
     }
     match &rec.model {
         Some(model) => println!("  Model:       {model}"),
@@ -207,7 +207,7 @@ async fn status(config_path: Option<&Path>) -> anyhow::Result<()> {
             Err(e) => println!("  Running:  (unavailable: {e})"),
         }
     }
-    println!("  GPU mem:  (run `newt dgx run nvidia-smi` once SSH lands in Step 14.6)");
+    println!("  GPU mem:  (SSH to the host and run: nvidia-smi)");
     Ok(())
 }
 
@@ -235,8 +235,11 @@ async fn doctor(config_path: Option<&Path>) -> anyhow::Result<()> {
     }
 
     if !any {
-        println!("\n  No DGX endpoints configured. Run `newt dgx setup` (Step 14.4) or set");
-        println!("  NEWT_DGX_OLLAMA_URL=https://dgx-ollama.home.lab (or NEWT_DGX_HOST=<host>).");
+        println!("\n  No DGX endpoints configured. Set:");
+        println!("    NEWT_DGX_HOST=<host>          (synthesizes ollama + vllm URLs from a bare hostname)");
+        println!(
+            "    NEWT_DGX_OLLAMA_URL=<url>     (direct URL, e.g. https://dgx-ollama.home.lab)"
+        );
     }
     println!("\n  DNS note: on the Google-WiFi mesh, .home.lab resolves but .home.lan does");
     println!("  not (the pucks intercept the .lan TLD). Use .home.lab from a laptop; inside");
