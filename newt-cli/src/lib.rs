@@ -26,6 +26,12 @@ pub struct Cli {
     #[arg(short, long, global = true)]
     pub config: Option<PathBuf>,
 
+    /// Skip the full-screen splash: print a compact inline header instead.
+    /// Applies to the `code` subcommand (the default). Also configurable
+    /// via `[tui] no_splash = true` in newt.toml.
+    #[arg(long, global = true, default_value_t = false)]
+    pub no_splash: bool,
+
     /// Subcommand to run. Defaults to `code` (TUI coder) when omitted.
     #[command(subcommand)]
     pub command: Option<Command>,
@@ -37,10 +43,6 @@ pub enum Command {
     Code {
         /// Optional working path.
         path: Option<PathBuf>,
-        /// Skip the full-screen splash and show a compact header instead.
-        /// Also controllable via `[tui] no_splash = true` in newt.toml.
-        #[arg(long, default_value_t = false)]
-        no_splash: bool,
     },
     /// Drake-swarm pilot dashboard.
     Pilot {
@@ -74,8 +76,8 @@ pub enum Command {
 }
 
 pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
-    match cli.command.unwrap_or(Command::Code { path: None, no_splash: false }) {
-        Command::Code { path, no_splash } => newt_tui::run_code(path.as_deref(), no_splash),
+    match cli.command.unwrap_or(Command::Code { path: None }) {
+        Command::Code { path } => newt_tui::run_code(path.as_deref(), cli.no_splash),
         Command::Pilot { flight_id } => newt_tui::run_pilot(&flight_id),
         Command::Worker { coder } => run_worker(coder).await,
         Command::Mcp => run_mcp().await,
