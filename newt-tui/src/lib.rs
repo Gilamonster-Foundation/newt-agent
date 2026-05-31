@@ -7,7 +7,7 @@ pub use settings::run_settings;
 use std::io::{self, IsTerminal, Write as _};
 
 use crossterm::{
-    cursor::{Hide, MoveTo, SetCursorStyle, Show},
+    cursor::{Hide, MoveTo, Show},
     event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
     execute, queue,
     style::{Color as CtColor, Print, ResetColor, SetForegroundColor},
@@ -356,30 +356,25 @@ fn print_newt(msg: &str, color: bool, verbose: bool) {
     }
 }
 
-/// Print the human input prompt and set a blinking cursor.
-/// Color: blue $  No-color: $.
-fn print_prompt(color: bool, verbose: bool) -> anyhow::Result<()> {
+/// Build the rustyline prompt string.
+/// ANSI codes are wrapped in \x01..\x02 so rustyline measures display width correctly.
+fn prompt_str(color: bool, verbose: bool) -> String {
     if color {
-        let label = if verbose { "you " } else { "" };
-        execute!(
-            io::stdout(),
-            Print(label),
-            SetForegroundColor(HUMAN_BLUE_CT),
-            Print("$"),
-            ResetColor,
-            Print(" "),
-            SetCursorStyle::BlinkingBlock,
-        )?;
+        let blue = "\x01\x1b[38;2;80;140;255m\x02";
+        let reset = "\x01\x1b[0m\x02";
+        if verbose {
+            format!("you {blue}${reset} ")
+        } else {
+            format!("{blue}${reset} ")
+        }
+    } else if verbose {
+        "you $ ".to_string()
     } else {
-        let label = if verbose { "you " } else { "" };
-        print!("{label}$ ");
+        "$ ".to_string()
     }
-    io::stdout().flush()?;
-    Ok(())
 }
 
 fn run_chat(workspace: &str, color: bool) -> anyhow::Result<()> {
-    use std::io::BufRead as _;
     let verbose = verbose_mode();
 
     // Header line — one-time print, then normal scroll from here.
@@ -405,26 +400,30 @@ fn run_chat(workspace: &str, color: bool) -> anyhow::Result<()> {
     );
     println!();
 
-    let stdin = io::stdin();
-    let mut line = String::new();
+    // History file: ~/.newt/history (created alongside config.toml).
+    let history_path = newt_core::Config::user_config_path()
+        .map(|p| p.with_file_name("history"));
 
+    let mut rl = rustyline::DefaultEditor::new()?;
+    if let Some(ref hp) = history_path {
+        let _ = rl.load_history(hp);
+    }
+
+    let prompt = prompt_str(color, verbose);
     loop {
-        print_prompt(color, verbose)?;
-
-        line.clear();
-        match stdin.lock().read_line(&mut line) {
-            Ok(0) => break, // EOF / Ctrl-D
-            Ok(_) => {
-                let task = line.trim();
+        match rl.readline(&prompt) {
+            Ok(line) => {
+                let task = line.trim().to_string();
                 if task.is_empty() {
                     continue;
                 }
+                let _ = rl.add_history_entry(&task);
                 println!();
                 if task.starts_with('/') {
-                    if !dispatch_slash(task, workspace, color, verbose)? {
+                    if !dispatch_slash(&task, workspace, color, verbose)? {
                         break;
                     }
-                } else if matches!(task, "exit" | "quit") {
+                } else if matches!(task.as_str(), "exit" | "quit") {
                     break;
                 } else {
                     print_newt(
@@ -438,8 +437,14 @@ fn run_chat(workspace: &str, color: bool) -> anyhow::Result<()> {
                 }
                 println!();
             }
+            Err(rustyline::error::ReadlineError::Interrupted) => break, // Ctrl-C
+            Err(rustyline::error::ReadlineError::Eof) => break,          // Ctrl-D
             Err(e) => return Err(e.into()),
         }
+    }
+
+    if let Some(ref hp) = history_path {
+        let _ = rl.save_history(hp);
     }
     Ok(())
 }

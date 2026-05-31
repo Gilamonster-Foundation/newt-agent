@@ -57,6 +57,7 @@ diffy = "0.4"
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
+rustyline = { version = "14", default-features = false, features = ["with-file-history"] }
 async-trait = "0.1"
 
 # Streaming
