@@ -471,6 +471,7 @@ fn dispatch_slash(input: &str, workspace: &str, color: bool, verbose: bool) -> a
                 "  /dgx doctor              — probe every configured endpoint",
                 "  /workspace               — show current workspace path",
                 "  /version                 — print newt version",
+                "  /settings                — open the interactive settings TUI",
                 "  /help                    — this message",
                 "  /exit  /quit  exit  quit — leave the session",
             ] {
@@ -481,6 +482,8 @@ fn dispatch_slash(input: &str, workspace: &str, color: bool, verbose: bool) -> a
         "version" => print_newt(&format!("v{VERSION}"), color, verbose),
 
         "workspace" => print_newt(workspace, color, verbose),
+
+        "settings" => settings::run_settings(None)?,
 
         "dgx" => {
             if arg1.is_empty() {
