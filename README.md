@@ -28,12 +28,21 @@ build backend — no separate `maturin` install needed.
 git clone https://github.com/Gilamonster-Foundation/newt-agent
 cd newt-agent
 source ~/venv/bin/activate   # or your preferred venv
-pip install -e .
+pip install -e .             # Python library only — installs newt_agent.*
 ```
 
-This builds the Rust extension and installs `newt_agent` as a live editable
-link — changes to Python source in `newt-agent-py/python/` are picked up
-immediately; changes to Rust source require re-running `pip install -e .`.
+**This installs the Python library (`import newt_agent`) but does NOT put
+`newt` on your PATH.** The `newt` CLI is a Rust binary; build it separately:
+
+```bash
+cargo install --path newt-cli           # installs `newt`
+cargo install --path newt-mcp-server    # installs `newt-mcp-server`
+newt --help
+```
+
+Changes to Python source in `newt-agent-py/python/` are picked up
+immediately; changes to Rust source require re-running `pip install -e .`
+(Python bindings) or `cargo install --path newt-cli` (CLI binary).
 
 ### Python library (PyPI)
 
