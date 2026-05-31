@@ -37,8 +37,8 @@ use newt_core::{ChatStyle, Config, TuiConfig};
 // Constants
 // ---------------------------------------------------------------------------
 
-const LOGO_PLAIN: &str = include_str!("../../docs/logos/newt-ascii-40.txt");
-const LOGO_COLS: u16 = 42; // logo width + 2 border
+const LOGO_ANSI: &str = include_str!("../../docs/logos/newt-ansi-40.txt");
+const LOGO_COLS: u16 = 42; // logo display width (40) + right border (1) + pad (1)
 
 const NEWT_ORANGE: Color = Color::Rgb(220, 60, 20);
 const SEL_BG: Color = Color::Rgb(40, 40, 60);
@@ -360,18 +360,67 @@ fn render(f: &mut Frame, app: &SettingsApp) {
         ])
         .split(cols[1]);
 
-    render_logo(f, cols[0], orange);
+    render_logo(f, cols[0], dim); // style arg unused — ANSI colors come from the file
     render_tabs(f, rows[0], app, bold_orange, dim);
     render_fields(f, rows[1], app, bold_orange, dim);
     render_preview(f, rows[2], app, dim, orange);
     render_hints(f, rows[3], app, dim);
 }
 
-fn render_logo(f: &mut Frame, area: Rect, style: Style) {
-    let lines: Vec<Line> = LOGO_PLAIN
-        .lines()
-        .map(|l| Line::from(Span::styled(l.to_owned(), style)))
-        .collect();
+/// Parse a 24-bit ANSI art file into ratatui `Line`s.
+///
+/// Handles `\x1b[38;2;R;G;Bm` (fg) and `\x1b[48;2;R;G;Bm` (bg) sequences,
+/// building one `Span` per character cell with the current fg+bg style.
+fn parse_ansi_logo(src: &str) -> Vec<Line<'static>> {
+    let mut out = Vec::new();
+    for raw in src.lines() {
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        let bytes = raw.as_bytes();
+        let mut i = 0;
+        let mut fg = Color::Reset;
+        let mut bg = Color::Reset;
+
+        while i < bytes.len() {
+            if bytes[i] == 0x1b && bytes.get(i + 1) == Some(&b'[') {
+                // Consume ESC [ ... m
+                i += 2;
+                let start = i;
+                while i < bytes.len() && bytes[i] != b'm' {
+                    i += 1;
+                }
+                if let Ok(seq) = std::str::from_utf8(&bytes[start..i]) {
+                    let nums: Vec<u8> = seq
+                        .split(';')
+                        .filter_map(|s| s.parse().ok())
+                        .collect();
+                    match nums.as_slice() {
+                        [38, 2, r, g, b] => fg = Color::Rgb(*r, *g, *b),
+                        [48, 2, r, g, b] => bg = Color::Rgb(*r, *g, *b),
+                        [0] | [] => { fg = Color::Reset; bg = Color::Reset; }
+                        _ => {}
+                    }
+                }
+                i += 1; // skip 'm'
+            } else {
+                // UTF-8 character — advance over all continuation bytes
+                let start = i;
+                i += 1;
+                while i < bytes.len() && (bytes[i] & 0xC0) == 0x80 {
+                    i += 1;
+                }
+                if let Ok(ch) = std::str::from_utf8(&bytes[start..i]) {
+                    let style = Style::default().fg(fg).bg(bg);
+                    spans.push(Span::styled(ch.to_string(), style));
+                }
+            }
+        }
+        out.push(Line::from(spans));
+    }
+    out
+}
+
+fn render_logo(f: &mut Frame, area: Rect, _style: Style) {
+    let lines = parse_ansi_logo(LOGO_ANSI);
     f.render_widget(
         Paragraph::new(Text::from(lines)).block(
             Block::default()
