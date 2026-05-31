@@ -167,16 +167,18 @@ fn color_supported_with(get_env: &dyn Fn(&str) -> Option<String>) -> bool {
 const STATUS_MIN_COLS: u16 = 44;
 const LOGO_160_MIN_TERM_COLS: u16 = 260;
 
-fn logo_for_width(cols: u16) -> (&'static str, u16) {
-    for (art, w, min_term) in [
-        (LOGO_160, LOGO_160_COLS, LOGO_160_MIN_TERM_COLS),
-        (LOGO_120, LOGO_120_COLS, LOGO_120_COLS + STATUS_MIN_COLS + 2),
-        (LOGO_FULL, LOGO_FULL_COLS, LOGO_FULL_COLS + STATUS_MIN_COLS + 2),
-        (LOGO_40, LOGO_40_COLS, LOGO_40_COLS + STATUS_MIN_COLS + 2),
-        (LOGO_20, LOGO_20_COLS, LOGO_20_COLS + STATUS_MIN_COLS + 2),
-        (LOGO_10, LOGO_10_COLS, LOGO_10_COLS + STATUS_MIN_COLS + 2),
+fn logo_for_size(cols: u16, rows: u16) -> (&'static str, u16) {
+    // Each entry: (art, display_cols, display_rows, min_term_cols).
+    // A logo is only selected if both width AND height fit the terminal.
+    for (art, w, h, min_w) in [
+        (LOGO_160, LOGO_160_COLS, 81u16, LOGO_160_MIN_TERM_COLS),
+        (LOGO_120, LOGO_120_COLS, 61u16, LOGO_120_COLS + STATUS_MIN_COLS + 2),
+        (LOGO_FULL, LOGO_FULL_COLS, 40u16, LOGO_FULL_COLS + STATUS_MIN_COLS + 2),
+        (LOGO_40,   LOGO_40_COLS,   20u16, LOGO_40_COLS   + STATUS_MIN_COLS + 2),
+        (LOGO_20,   LOGO_20_COLS,   10u16, LOGO_20_COLS   + STATUS_MIN_COLS + 2),
+        (LOGO_10,   LOGO_10_COLS,    5u16, LOGO_10_COLS   + STATUS_MIN_COLS + 2),
     ] {
-        if cols >= min_term {
+        if cols >= min_w && rows >= h + 4 {
             return (art, w);
         }
     }
@@ -194,8 +196,8 @@ fn show_splash(out: &mut io::Stdout, workspace: &str, color: bool) -> anyhow::Re
 }
 
 fn show_splash_color(out: &mut io::Stdout, _workspace: &str) -> anyhow::Result<bool> {
-    let (term_cols, _) = terminal::size().unwrap_or((80, 24));
-    let (logo, logo_cols) = logo_for_width(term_cols);
+    let (term_cols, term_rows) = terminal::size().unwrap_or((80, 24));
+    let (logo, logo_cols) = logo_for_size(term_cols, term_rows);
     let logo_rows = logo.lines().count() as u16;
 
     // Print ANSI logo flush to top. In raw mode \n is LF only; \r\n resets column.
@@ -356,6 +358,31 @@ fn print_newt(msg: &str, color: bool, verbose: bool) {
     }
 }
 
+/// Build a rustyline config reading edit mode from env then config file.
+fn build_rl_config() -> rustyline::config::Config {
+    let em = std::env::var("NEWT_EDIT_MODE")
+        .ok()
+        .and_then(|v| match v.to_lowercase().as_str() {
+            "vi" | "vim" => Some(newt_core::EditMode::Vi),
+            "emacs" => Some(newt_core::EditMode::Emacs),
+            _ => None,
+        })
+        .or_else(|| {
+            newt_core::Config::resolve()
+                .ok()
+                .and_then(|c| c.tui)
+                .map(|t| t.edit_mode)
+        })
+        .unwrap_or(newt_core::EditMode::Emacs);
+
+    rustyline::config::Builder::new()
+        .edit_mode(match em {
+            newt_core::EditMode::Vi => rustyline::config::EditMode::Vi,
+            newt_core::EditMode::Emacs => rustyline::config::EditMode::Emacs,
+        })
+        .build()
+}
+
 /// Build the rustyline prompt string — plain text only.
 ///
 /// ANSI escape codes in rustyline prompts require careful \x01/\x02 wrapping
@@ -400,34 +427,12 @@ fn run_chat(workspace: &str, color: bool) -> anyhow::Result<()> {
     let history_path = newt_core::Config::user_config_path()
         .map(|p| p.with_file_name("history"));
 
-    // Edit mode: config file < NEWT_EDIT_MODE env var.
-    let em = std::env::var("NEWT_EDIT_MODE")
-        .ok()
-        .and_then(|v| match v.to_lowercase().as_str() {
-            "vi" | "vim" => Some(newt_core::EditMode::Vi),
-            "emacs" => Some(newt_core::EditMode::Emacs),
-            _ => None,
-        })
-        .or_else(|| {
-            newt_core::Config::resolve()
-                .ok()
-                .and_then(|c| c.tui)
-                .map(|t| t.edit_mode)
-        })
-        .unwrap_or(newt_core::EditMode::Emacs);
-
-    let rl_config = rustyline::config::Builder::new()
-        .edit_mode(match em {
-            newt_core::EditMode::Vi => rustyline::config::EditMode::Vi,
-            newt_core::EditMode::Emacs => rustyline::config::EditMode::Emacs,
-        })
-        .build();
-    let mut rl = rustyline::DefaultEditor::with_config(rl_config)?;
+    let mut rl = rustyline::DefaultEditor::with_config(build_rl_config())?;
     if let Some(ref hp) = history_path {
         let _ = rl.load_history(hp);
     }
 
-    let is_vi = matches!(em, newt_core::EditMode::Vi);
+    let is_vi = build_rl_config().edit_mode() == rustyline::config::EditMode::Vi;
     let prompt = prompt_str(verbose, is_vi);
     loop {
         match rl.readline(&prompt) {
@@ -440,13 +445,14 @@ fn run_chat(workspace: &str, color: bool) -> anyhow::Result<()> {
                 println!();
                 if task.starts_with('/') {
                     let cont = dispatch_slash(&task, workspace, color, verbose)?;
-                    // Recreate the editor so rustyline re-initialises its terminal
-                    // state after any command that may have entered an alt screen
-                    // (e.g. /settings). History is saved/reloaded around it.
+                    // Recreate the editor after any alt-screen command so rustyline
+                    // re-initialises terminal state. Re-read config so settings
+                    // changes (e.g. vi mode toggled in /settings) take effect now.
                     if let Some(ref hp) = history_path {
                         let _ = rl.save_history(hp);
                     }
-                    rl = rustyline::DefaultEditor::with_config(rl_config)?;
+                    let fresh_cfg = build_rl_config();
+                    rl = rustyline::DefaultEditor::with_config(fresh_cfg)?;
                     if let Some(ref hp) = history_path {
                         let _ = rl.load_history(hp);
                     }
@@ -621,16 +627,16 @@ mod tests {
 
     #[test]
     fn logo_for_width_picks_correct_size() {
-        let (_, w) = logo_for_width(LOGO_160_MIN_TERM_COLS);
+        let (_, w) = logo_for_size(LOGO_160_MIN_TERM_COLS, 999);
         assert_eq!(w, LOGO_160_COLS);
 
-        let (_, w) = logo_for_width(LOGO_160_MIN_TERM_COLS - 1);
+        let (_, w) = logo_for_size(LOGO_160_MIN_TERM_COLS - 1, 999);
         assert_eq!(w, LOGO_120_COLS);
 
-        let (_, w) = logo_for_width(LOGO_120_COLS + STATUS_MIN_COLS + 1);
+        let (_, w) = logo_for_size(LOGO_120_COLS + STATUS_MIN_COLS + 1, 999);
         assert_eq!(w, LOGO_FULL_COLS);
 
-        let (_, w) = logo_for_width(10);
+        let (_, w) = logo_for_size(10, 999);
         assert_eq!(w, LOGO_10_COLS);
     }
 
