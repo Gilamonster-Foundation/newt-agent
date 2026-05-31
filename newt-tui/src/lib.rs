@@ -1,16 +1,30 @@
 //! Newt-Agent TUI — ratatui-driven screens.
 //!
-//! - `code` mode: splash / start screen (Step 0.2); full chat pane (Step 0.4+).
-//! - `pilot` mode: drake-swarm dashboard (later step — stub).
+//! ## Flow
 //!
-//! ## Color path vs plain path
+//! `run_code` opens a single alternate-screen session and runs two phases:
 //!
-//! The color logo files (`newt-ansi-*.txt`) use raw 24-bit ANSI escape codes
-//! that ratatui cannot render through its widget system. On color-capable
-//! terminals we print the logo directly with crossterm and use crossterm for
-//! cursor positioning and the keyboard event loop. On plain/dumb terminals we
-//! fall back to ratatui + the ASCII-only logo, which renders correctly
-//! everywhere.
+//! 1. **Splash** — ANSI color logo (or plain ASCII fallback) with branding.
+//!    Press Enter to continue; q / Esc / Ctrl-C to quit.
+//!
+//! 2. **Chat TUI** — ratatui-managed layout that handles terminal resize
+//!    automatically. Safe for SSH and tmux.
+//!
+//! The alt-screen is entered once and never left between phases, so there
+//! is no flicker on the transition.
+//!
+//! ## Layout (chat mode)
+//!
+//! ```text
+//! ┌─ header (ASCII logo + branding) ──────────────────────────────┐
+//! │                                                                │
+//! ├─ messages (scrollable, fills remaining space) ─────────────────┤
+//! │  you ▸  hello                                                  │
+//! │  newt ▸ ...                                                    │
+//! ├─ input ────────────────────────────────────────────────────────┤
+//! │  ▸ type a task and press Enter                                 │
+//! └────────────────────────────────────────────────────────────────┘
+//! ```
 
 use std::io::{self, IsTerminal, Write as _};
 
@@ -29,18 +43,22 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Paragraph},
+    widgets::{Block, Borders, Paragraph, Wrap},
     Terminal,
 };
+
+// ---------------------------------------------------------------------------
+// Logo assets
+// ---------------------------------------------------------------------------
 
 /// 24-bit ANSI half-block art. Display dimensions (cols × rows):
 ///   LOGO_10:   10 × 5     (original, tiny)
 ///   LOGO_20:   20 × 10    (original, small)
 ///   LOGO_40:   40 × 20    (original, medium)
 ///   LOGO_FULL: 80 × 40    (original, large)
-///   LOGO_120: 126 × 61    (chafa-generated from source PNG, natural ratio)
-///   LOGO_160: 166 × 81    (chafa-generated from source PNG, natural ratio)
-/// Chosen at runtime by `logo_for_width`. Printed directly (not ratatui).
+///   LOGO_120: 126 × 61    (chafa, natural ratio)
+///   LOGO_160: 166 × 81    (chafa, natural ratio — very wide terminals only)
+/// Printed directly via crossterm (not ratatui) in splash mode.
 const LOGO_10: &str = include_str!("../../docs/logos/newt-ansi-10.txt");
 const LOGO_20: &str = include_str!("../../docs/logos/newt-ansi-20.txt");
 const LOGO_40: &str = include_str!("../../docs/logos/newt-ansi-40.txt");
@@ -48,7 +66,6 @@ const LOGO_FULL: &str = include_str!("../../docs/logos/newt-ansi-full.txt");
 const LOGO_120: &str = include_str!("../../docs/logos/newt-ansi-120.txt");
 const LOGO_160: &str = include_str!("../../docs/logos/newt-ansi-160.txt");
 
-/// Display column widths matching the logo constants above.
 const LOGO_10_COLS: u16 = 10;
 const LOGO_20_COLS: u16 = 20;
 const LOGO_40_COLS: u16 = 40;
@@ -57,12 +74,14 @@ const LOGO_120_COLS: u16 = 126;
 const LOGO_160_COLS: u16 = 166;
 
 /// Plain ASCII art — 14 lines × ~40 display columns.
-/// Used as the no-color fallback, rendered as a ratatui Paragraph.
+/// Rendered via ratatui in chat-mode header and no-color splash.
 const LOGO_PLAIN: &str = include_str!("../../docs/logos/newt-ascii-40.txt");
+const LOGO_PLAIN_ROWS: u16 = 14;
+const LOGO_PLAIN_COLS: u16 = 42; // +2 padding
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Newt's brand orange, sampled from the ANSI logo palette.
+const NEWT_ORANGE: Color = Color::Rgb(220, 60, 20);
 const NEWT_ORANGE_CT: CtColor = CtColor::Rgb {
     r: 220,
     g: 60,
@@ -74,11 +93,25 @@ const NEWT_ORANGE_CT: CtColor = CtColor::Rgb {
 // ---------------------------------------------------------------------------
 
 pub fn run_code(path: Option<&std::path::Path>) -> anyhow::Result<()> {
-    if color_supported_with(&|k| std::env::var(k).ok()) {
-        run_splash_color(path)
-    } else {
-        run_splash_plain(path)
-    }
+    let color = color_supported_with(&|k| std::env::var(k).ok());
+    let workspace = resolve_workspace(path);
+
+    // Enter alt screen once — both splash and chat share this session.
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen, Hide, Clear(ClearType::All), MoveTo(0, 0))?;
+
+    let result = (|| {
+        if show_splash(&mut stdout, &workspace, color)? {
+            run_chat(&workspace)
+        } else {
+            Ok(())
+        }
+    })();
+
+    let _ = disable_raw_mode();
+    let _ = execute!(io::stdout(), Show, LeaveAlternateScreen);
+    result
 }
 
 pub fn run_pilot(_flight_id: &str) -> anyhow::Result<()> {
@@ -111,32 +144,20 @@ fn color_supported_with(get_env: &dyn Fn(&str) -> Option<String>) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Color splash — crossterm direct rendering
+// Splash phase
 // ---------------------------------------------------------------------------
 
-/// Pick the largest ANSI logo whose display width fits within `cols`,
-/// leaving at least `STATUS_MIN_COLS` columns for the status panel.
-/// Returns `(art, display_col_width)`.
-///
-/// Status panel minimum — enough for "Workspace: /very/long/path".
 const STATUS_MIN_COLS: u16 = 44;
-
-/// The 166-col logo is 81 rows tall — genuinely large. Reserve it for
-/// terminals that are notably wider than the minimum that would fit it,
-/// so "normal wide" terminals get the 126-col logo instead.
 const LOGO_160_MIN_TERM_COLS: u16 = 260;
 
 fn logo_for_width(cols: u16) -> (&'static str, u16) {
-    // Each entry: (art, display_width, minimum_terminal_cols_required).
-    // The minimum for LOGO_160 is intentionally higher than its natural
-    // fit threshold so it only appears on very wide terminals.
     for (art, w, min_term) in [
         (LOGO_160, LOGO_160_COLS, LOGO_160_MIN_TERM_COLS),
         (LOGO_120, LOGO_120_COLS, LOGO_120_COLS + STATUS_MIN_COLS + 2),
         (LOGO_FULL, LOGO_FULL_COLS, LOGO_FULL_COLS + STATUS_MIN_COLS + 2),
-        (LOGO_40,   LOGO_40_COLS,   LOGO_40_COLS   + STATUS_MIN_COLS + 2),
-        (LOGO_20,   LOGO_20_COLS,   LOGO_20_COLS   + STATUS_MIN_COLS + 2),
-        (LOGO_10,   LOGO_10_COLS,   LOGO_10_COLS   + STATUS_MIN_COLS + 2),
+        (LOGO_40, LOGO_40_COLS, LOGO_40_COLS + STATUS_MIN_COLS + 2),
+        (LOGO_20, LOGO_20_COLS, LOGO_20_COLS + STATUS_MIN_COLS + 2),
+        (LOGO_10, LOGO_10_COLS, LOGO_10_COLS + STATUS_MIN_COLS + 2),
     ] {
         if cols >= min_term {
             return (art, w);
@@ -145,32 +166,25 @@ fn logo_for_width(cols: u16) -> (&'static str, u16) {
     (LOGO_10, LOGO_10_COLS)
 }
 
-fn run_splash_color(path: Option<&std::path::Path>) -> anyhow::Result<()> {
-    let workspace = resolve_workspace(path);
-    let (term_cols, term_rows) = terminal::size().unwrap_or((80, 24));
+/// Render the splash. Returns `true` if the user pressed Enter (continue to
+/// chat), `false` if they pressed q / Esc / Ctrl-C (quit).
+fn show_splash(out: &mut io::Stdout, workspace: &str, color: bool) -> anyhow::Result<bool> {
+    if color {
+        show_splash_color(out, workspace)
+    } else {
+        show_splash_plain(out, workspace)
+    }
+}
+
+fn show_splash_color(out: &mut io::Stdout, workspace: &str) -> anyhow::Result<bool> {
+    let (term_cols, _) = terminal::size().unwrap_or((80, 24));
     let (logo, logo_cols) = logo_for_width(term_cols);
     let logo_rows = logo.lines().count() as u16;
 
-    // Header band: always flush to the top of the screen.
-    // The chat window will open below it; don't centre.
-    enable_raw_mode()?;
-    let mut out = io::stdout();
-    execute!(
-        out,
-        EnterAlternateScreen,
-        Hide,
-        Clear(ClearType::All),
-        MoveTo(0, 0)
-    )?;
-
-    // Print the ANSI logo directly — the file already contains all escape codes.
-    // In raw mode \n is line-feed only; replace with \r\n so each new line
-    // starts at column 0 (carriage return is not implicit in raw mode).
+    // Print ANSI logo flush to top. In raw mode \n is LF only; \r\n resets column.
     write!(out, "{}", logo.replace('\n', "\r\n"))?;
     out.flush()?;
 
-    // Right panel — static branding only. Never put environment-specific
-    // content here: it can overlap the image if the logo renders unevenly.
     let brand_col = logo_cols + 2;
     let brand_row = logo_rows.saturating_sub(4) / 2;
 
@@ -193,101 +207,367 @@ fn run_splash_color(path: Option<&std::path::Path>) -> anyhow::Result<()> {
     queue!(
         out,
         SetForegroundColor(CtColor::DarkGrey),
-        Print("q quit  ·  Ctrl-C quit  ·  coder UI coming soon"),
+        Print("Enter  start coder   ·   q quit"),
         ResetColor
     )?;
-
-    // Footer: Workspace pinned at the bottom of the screen.
-    // Future: backend/model status, session info, etc. go here too.
-    let footer_row = term_rows.saturating_sub(2);
-    queue!(out, MoveTo(0, footer_row))?;
-    queue!(out, Print(format!("Workspace:  {workspace}")))?;
-
     out.flush()?;
 
-    splash_event_loop()?;
-
-    let _ = disable_raw_mode();
-    let _ = execute!(out, Show, LeaveAlternateScreen);
-    Ok(())
+    splash_wait_for_continue()
 }
 
-// ---------------------------------------------------------------------------
-// Plain splash — ratatui rendering
-// ---------------------------------------------------------------------------
-
-fn run_splash_plain(path: Option<&std::path::Path>) -> anyhow::Result<()> {
-    let workspace = resolve_workspace(path);
-
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
-    let backend = CrosstermBackend::new(stdout);
+fn show_splash_plain(_out: &mut io::Stdout, workspace: &str) -> anyhow::Result<bool> {
+    // For the plain path ratatui takes a fresh io::stdout() handle — fine since
+    // stdout is a singleton and we already hold raw mode + alt screen.
+    let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
-
-    let result = plain_render_loop(&mut terminal, &workspace);
-
-    let _ = disable_raw_mode();
-    let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
-    let _ = terminal.show_cursor();
-    result
+    let result = loop {
+        terminal.draw(|f| {
+            let area = f.area();
+            let orange_bold = Style::default()
+                .fg(NEWT_ORANGE)
+                .add_modifier(Modifier::BOLD);
+            let dim = Style::default().fg(Color::DarkGray);
+            let mut lines: Vec<Line> = vec![Line::from("")];
+            for l in LOGO_PLAIN.lines() {
+                lines.push(Line::from(l.to_owned()));
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![
+                Span::styled("newt", orange_bold),
+                Span::raw("  ·  Small, fast, local-first agentic coder"),
+            ]));
+            lines.push(Line::from(Span::styled(format!("v{VERSION}"), dim)));
+            lines.push(Line::from(""));
+            lines.push(Line::from(format!("Workspace:  {workspace}")));
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "Enter  start coder   ·   q quit",
+                dim,
+            )));
+            let w = 60u16.min(area.width);
+            let cols = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Fill(1), Constraint::Length(w), Constraint::Fill(1)])
+                .split(area);
+            f.render_widget(
+                Paragraph::new(Text::from(lines)).alignment(Alignment::Left),
+                cols[1],
+            );
+        })?;
+        if let Some(cont) = splash_poll_event()? {
+            break cont;
+        }
+    };
+    Ok(result)
 }
 
-fn plain_render_loop(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    workspace: &str,
-) -> anyhow::Result<()> {
+/// Poll for a splash keypress. Returns `Some(true)` = continue, `Some(false)` = quit, `None` = keep waiting.
+fn splash_poll_event() -> anyhow::Result<Option<bool>> {
+    if event::poll(std::time::Duration::from_millis(100))? {
+        return Ok(Some(splash_key_action(&event::read()?)));
+    }
+    Ok(None)
+}
+
+/// Block until the user presses Enter (true) or a quit key (false).
+fn splash_wait_for_continue() -> anyhow::Result<bool> {
     loop {
-        terminal.draw(|f| render_plain_splash(f, workspace))?;
-        if splash_event_poll()? {
-            break;
+        if event::poll(std::time::Duration::from_millis(100))? {
+            return Ok(splash_key_action(&event::read()?));
+        }
+    }
+}
+
+/// Map a key event to splash intent: `true` = continue, `false` = quit.
+/// Any printable char or Enter continues; q / Esc / Ctrl-C quits.
+fn splash_key_action(ev: &Event) -> bool {
+    match ev {
+        Event::Key(KeyEvent {
+            code: KeyCode::Char('q'),
+            ..
+        }) => false,
+        Event::Key(KeyEvent {
+            code: KeyCode::Esc, ..
+        }) => false,
+        Event::Key(KeyEvent {
+            code: KeyCode::Char('c'),
+            modifiers,
+            ..
+        }) if modifiers.contains(KeyModifiers::CONTROL) => false,
+        Event::Key(KeyEvent {
+            code: KeyCode::Enter | KeyCode::Char(_),
+            ..
+        }) => true,
+        _ => true, // any other key also continues
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Chat TUI phase
+// ---------------------------------------------------------------------------
+
+#[derive(Clone)]
+struct ChatMessage {
+    from_user: bool,
+    text: String,
+}
+
+struct ChatApp {
+    workspace: String,
+    messages: Vec<ChatMessage>,
+    input: String,
+    scroll: usize,
+}
+
+impl ChatApp {
+    fn new(workspace: &str) -> Self {
+        Self {
+            workspace: workspace.to_owned(),
+            messages: vec![ChatMessage {
+                from_user: false,
+                text: format!(
+                    "newt v{VERSION} ready.  \
+                     Type a coding task and press Enter. \
+                     (Coder runtime arrives in Step 0.4 — routing and eval are live.)"
+                ),
+            }],
+            input: String::new(),
+            scroll: 0,
+        }
+    }
+
+    fn submit(&mut self) {
+        let text = std::mem::take(&mut self.input);
+        if text.is_empty() {
+            return;
+        }
+        self.messages.push(ChatMessage {
+            from_user: true,
+            text: text.clone(),
+        });
+        // Mock response until the real coder is wired in.
+        let reply = format!(
+            "Got it: \"{text}\" — coder runtime not yet connected. \
+             Try `just eval --case 001` to run the eval suite against a real Ollama."
+        );
+        self.messages.push(ChatMessage {
+            from_user: false,
+            text: reply,
+        });
+        // Scroll to bottom.
+        self.scroll = self.messages.len().saturating_sub(1);
+    }
+
+    fn scroll_up(&mut self) {
+        self.scroll = self.scroll.saturating_sub(1);
+    }
+    fn scroll_down(&mut self) {
+        self.scroll = (self.scroll + 1).min(self.messages.len().saturating_sub(1));
+    }
+}
+
+fn run_chat(workspace: &str) -> anyhow::Result<()> {
+    // Re-use the already-open alt screen; just hand stdout to ratatui.
+    execute!(io::stdout(), Clear(ClearType::All))?;
+    let backend = CrosstermBackend::new(io::stdout());
+    let mut terminal = Terminal::new(backend)?;
+    let mut app = ChatApp::new(workspace);
+
+    loop {
+        terminal.draw(|f| render_chat(f, &app))?;
+
+        if event::poll(std::time::Duration::from_millis(50))? {
+            match event::read()? {
+                // Quit
+                Event::Key(KeyEvent {
+                    code: KeyCode::Char('c'),
+                    modifiers,
+                    ..
+                }) if modifiers.contains(KeyModifiers::CONTROL) => break,
+
+                // Submit
+                Event::Key(KeyEvent {
+                    code: KeyCode::Enter,
+                    ..
+                }) => app.submit(),
+
+                // Editing
+                Event::Key(KeyEvent {
+                    code: KeyCode::Backspace,
+                    ..
+                }) => {
+                    app.input.pop();
+                }
+                Event::Key(KeyEvent {
+                    code: KeyCode::Char(c),
+                    modifiers,
+                    ..
+                }) if !modifiers.contains(KeyModifiers::CONTROL)
+                    && !modifiers.contains(KeyModifiers::ALT) =>
+                {
+                    app.input.push(c);
+                }
+
+                // Scrolling
+                Event::Key(KeyEvent {
+                    code: KeyCode::Up, ..
+                }) => app.scroll_up(),
+                Event::Key(KeyEvent {
+                    code: KeyCode::Down,
+                    ..
+                }) => app.scroll_down(),
+                Event::Key(KeyEvent {
+                    code: KeyCode::PageUp,
+                    ..
+                }) => {
+                    for _ in 0..5 {
+                        app.scroll_up();
+                    }
+                }
+                Event::Key(KeyEvent {
+                    code: KeyCode::PageDown,
+                    ..
+                }) => {
+                    for _ in 0..5 {
+                        app.scroll_down();
+                    }
+                }
+
+                // Terminal resize — ratatui handles it automatically on next draw.
+                Event::Resize(_, _) => {}
+
+                _ => {}
+            }
         }
     }
     Ok(())
 }
 
-fn render_plain_splash(f: &mut ratatui::Frame, workspace: &str) {
+fn render_chat(f: &mut ratatui::Frame, app: &ChatApp) {
     let area = f.area();
-
-    let logo_style = Style::default();
-    let accent = Style::default()
-        .fg(Color::Rgb(220, 60, 20))
+    let orange = Style::default().fg(NEWT_ORANGE);
+    let dim = Style::default().fg(Color::DarkGray);
+    let bold_orange = Style::default()
+        .fg(NEWT_ORANGE)
         .add_modifier(Modifier::BOLD);
-    let dim = Style::default();
 
-    let mut lines: Vec<Line> = vec![Line::from("")];
-    for l in LOGO_PLAIN.lines() {
-        lines.push(Line::from(Span::styled(l.to_owned(), logo_style)));
-    }
-    lines.push(Line::from(""));
-    lines.push(Line::from(vec![
-        Span::styled("newt", accent),
-        Span::raw("  ·  Small, fast, local-first agentic coder"),
-    ]));
-    lines.push(Line::from(format!("v{VERSION}")));
-    lines.push(Line::from(""));
-    lines.push(Line::from(format!("Workspace:  {workspace}")));
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "q quit  ·  Ctrl-C quit  ·  full coder UI coming soon",
-        dim,
-    )));
-
-    let content_width = 60u16.min(area.width);
+    // Outer vertical split: header | messages | input.
+    // If the terminal is too short for the full logo header, collapse it to
+    // a single-line title bar so the chat area always has room.
+    let min_rows_for_logo = LOGO_PLAIN_ROWS + 2;
+    let header_height = if area.height > min_rows_for_logo + 8 {
+        min_rows_for_logo
+    } else {
+        1
+    };
     let chunks = Layout::default()
-        .direction(Direction::Horizontal)
+        .direction(Direction::Vertical)
         .constraints([
+            Constraint::Length(header_height),
             Constraint::Fill(1),
-            Constraint::Length(content_width),
-            Constraint::Fill(1),
+            Constraint::Length(3),
         ])
         .split(area);
 
+    // ── Header ───────────────────────────────────────────────────────────────
+    if header_height > 1 {
+        // Full logo header: logo left, branding right.
+        let header_cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(LOGO_PLAIN_COLS), Constraint::Fill(1)])
+            .split(chunks[0]);
+
+        let logo_lines: Vec<Line> = LOGO_PLAIN
+            .lines()
+            .map(|l| Line::from(Span::styled(l.to_owned(), orange)))
+            .collect();
+        f.render_widget(
+            Paragraph::new(Text::from(logo_lines)),
+            header_cols[0],
+        );
+
+        let mut brand: Vec<Line> = vec![Line::from("")];
+        brand.push(Line::from(vec![
+            Span::styled("newt", bold_orange),
+            Span::raw("  ·  Small, fast, local-first agentic coder"),
+        ]));
+        brand.push(Line::from(Span::styled(
+            format!("v{VERSION}"),
+            dim,
+        )));
+        brand.push(Line::from(""));
+        brand.push(Line::from(Span::styled(
+            format!("Workspace:  {}", app.workspace),
+            dim,
+        )));
+        f.render_widget(
+            Paragraph::new(Text::from(brand)),
+            header_cols[1],
+        );
+    } else {
+        // Compact single-line header for short terminals.
+        let title = Line::from(vec![
+            Span::styled("newt", bold_orange),
+            Span::styled(
+                format!(" v{VERSION}  ·  {}", app.workspace),
+                dim,
+            ),
+        ]);
+        f.render_widget(Paragraph::new(title), chunks[0]);
+    }
+
+    // ── Messages ─────────────────────────────────────────────────────────────
+    let msg_lines: Vec<Line> = app
+        .messages
+        .iter()
+        .flat_map(|m| {
+            let prefix = if m.from_user {
+                Span::styled("  you ▸  ", bold_orange)
+            } else {
+                Span::styled(" newt ▸  ", Style::default().fg(Color::Cyan))
+            };
+            // First line gets the prefix; continuation lines are indented.
+            let mut msg_text_lines: Vec<Line> = m
+                .text
+                .lines()
+                .enumerate()
+                .map(|(i, l)| {
+                    if i == 0 {
+                        Line::from(vec![prefix.clone(), Span::raw(l.to_owned())])
+                    } else {
+                        Line::from(vec![
+                            Span::raw("         "),
+                            Span::raw(l.to_owned()),
+                        ])
+                    }
+                })
+                .collect();
+            msg_text_lines.push(Line::from(""));
+            msg_text_lines
+        })
+        .collect();
+
+    let scroll = app.scroll as u16;
     f.render_widget(
-        Paragraph::new(Text::from(lines))
-            .alignment(Alignment::Left)
-            .block(Block::default().borders(Borders::NONE)),
+        Paragraph::new(Text::from(msg_lines))
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0))
+            .block(Block::default().borders(Borders::TOP)),
         chunks[1],
+    );
+
+    // ── Input ─────────────────────────────────────────────────────────────────
+    let input_display = format!(" ▸  {}█", app.input);
+    f.render_widget(
+        Paragraph::new(input_display)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(Span::styled(" task ", dim))
+                    .border_style(dim),
+            )
+            .style(Style::default()),
+        chunks[2],
     );
 }
 
@@ -303,41 +583,6 @@ fn resolve_workspace(path: Option<&std::path::Path>) -> String {
                 .map(|d| d.to_string_lossy().into_owned())
         })
         .unwrap_or_else(|| "(unknown)".into())
-}
-
-/// Poll once for a quit key. Returns `true` if the user requested exit.
-fn splash_event_poll() -> anyhow::Result<bool> {
-    if event::poll(std::time::Duration::from_millis(100))? {
-        return Ok(matches_quit(&event::read()?));
-    }
-    Ok(false)
-}
-
-/// Block until the user presses a quit key.
-fn splash_event_loop() -> anyhow::Result<()> {
-    loop {
-        if event::poll(std::time::Duration::from_millis(100))? && matches_quit(&event::read()?) {
-            break;
-        }
-    }
-    Ok(())
-}
-
-fn matches_quit(ev: &Event) -> bool {
-    matches!(
-        ev,
-        Event::Key(KeyEvent {
-            code: KeyCode::Char('q'),
-            ..
-        }) | Event::Key(KeyEvent {
-            code: KeyCode::Esc,
-            ..
-        })
-    ) || matches!(ev, Event::Key(KeyEvent {
-        code: KeyCode::Char('c'),
-        modifiers,
-        ..
-    }) if modifiers.contains(KeyModifiers::CONTROL))
 }
 
 // ---------------------------------------------------------------------------
@@ -374,10 +619,8 @@ mod tests {
 
     #[test]
     fn non_dumb_term_passes_env_check() {
-        // is_terminal() depends on the test harness; we only verify the env
-        // checks don't block a real terminal name.
         let get_env = mock_env(&[("TERM", "xterm-256color")]);
-        let _ = color_supported_with(&get_env); // must not panic
+        let _ = color_supported_with(&get_env);
     }
 
     #[test]
@@ -392,20 +635,15 @@ mod tests {
 
     #[test]
     fn logo_for_width_picks_correct_size() {
-        // Very wide terminal gets the 160-col logo.
         let (_, w) = logo_for_width(LOGO_160_MIN_TERM_COLS);
         assert_eq!(w, LOGO_160_COLS);
 
-        // Just below the elevated 160 threshold → 120-col logo,
-        // even though 166+44+2=212 would technically fit.
         let (_, w) = logo_for_width(LOGO_160_MIN_TERM_COLS - 1);
         assert_eq!(w, LOGO_120_COLS);
 
-        // Just below the 120 threshold → full (80-col).
         let (_, w) = logo_for_width(LOGO_120_COLS + STATUS_MIN_COLS + 1);
         assert_eq!(w, LOGO_FULL_COLS);
 
-        // Narrow terminal falls back to smallest.
         let (_, w) = logo_for_width(10);
         assert_eq!(w, LOGO_10_COLS);
     }
@@ -426,21 +664,68 @@ mod tests {
 
     #[test]
     fn resolve_workspace_falls_back_gracefully() {
-        // With an explicit path the value is returned verbatim.
         let p = std::path::Path::new("/some/workspace");
         assert_eq!(resolve_workspace(Some(p)), "/some/workspace");
     }
 
     #[test]
-    fn matches_quit_recognises_q_and_esc() {
+    fn splash_key_action_quit_keys() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-        let q = Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
-        let esc = Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        let ctrl_c = Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
-        let other = Event::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
-        assert!(matches_quit(&q));
-        assert!(matches_quit(&esc));
-        assert!(matches_quit(&ctrl_c));
-        assert!(!matches_quit(&other));
+        assert!(!splash_key_action(&Event::Key(KeyEvent::new(
+            KeyCode::Char('q'),
+            KeyModifiers::NONE
+        ))));
+        assert!(!splash_key_action(&Event::Key(KeyEvent::new(
+            KeyCode::Esc,
+            KeyModifiers::NONE
+        ))));
+        assert!(!splash_key_action(&Event::Key(KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL
+        ))));
+    }
+
+    #[test]
+    fn splash_key_action_continue_keys() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        assert!(splash_key_action(&Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE
+        ))));
+        assert!(splash_key_action(&Event::Key(KeyEvent::new(
+            KeyCode::Char('h'),
+            KeyModifiers::NONE
+        ))));
+    }
+
+    #[test]
+    fn chat_app_submit_adds_messages() {
+        let mut app = ChatApp::new("/workspace");
+        assert_eq!(app.messages.len(), 1); // welcome message
+        app.input = "rename foo to bar".into();
+        app.submit();
+        assert_eq!(app.messages.len(), 3); // + user + mock reply
+        assert!(app.messages[1].from_user);
+        assert!(!app.messages[2].from_user);
+    }
+
+    #[test]
+    fn chat_app_empty_input_ignored() {
+        let mut app = ChatApp::new("/workspace");
+        app.submit();
+        assert_eq!(app.messages.len(), 1);
+    }
+
+    #[test]
+    fn chat_app_scroll_bounds() {
+        let mut app = ChatApp::new("/workspace");
+        app.scroll_up(); // should not underflow
+        assert_eq!(app.scroll, 0);
+        app.input = "hi".into();
+        app.submit();
+        app.scroll_down();
+        app.scroll_down();
+        app.scroll_down(); // should not exceed message count
+        assert!(app.scroll < app.messages.len());
     }
 }
