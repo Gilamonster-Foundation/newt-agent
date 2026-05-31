@@ -44,8 +44,9 @@ agent-mesh-discovery = { path = "../../agent-mesh/agent-mesh-discovery" }
 
 # newt's own crates — sibling path deps; no version pins since this
 # crate isn't part of the workspace and isn't published in lock-step.
-newt-core      = { path = "../newt-core" }
-newt-inference = { path = "../newt-inference" }
+newt-core        = { path = "../newt-core" }
+newt-inference   = { path = "../newt-inference" }
+plugins-protocol = { path = "../plugins-protocol" }
 
 # Standalone deps (not pulled from the workspace because we're not a
 # workspace member).
@@ -59,6 +60,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 async-trait        = "0.1"
 clap               = { version = "4", features = ["derive", "env"] }
 chrono             = { version = "0.4", features = ["serde"] }
+# Plugin-envelope transport: base64 wraps a JSON CertChain into an
+# env-var-safe string for handoff to provider-plugin subprocesses (phase
+# 1c of issue #35). Already a transitive dep via agent-mesh-discovery;
+# declared here directly because plugin_envelope.rs uses it by name.
+base64             = "0.22"
 
 [dev-dependencies]
 tempfile    = "3"
