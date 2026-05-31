@@ -24,7 +24,7 @@ use newt_inference::{ChatRequest, InferenceBackend};
 
 use crate::emission::{normalize_emission, Emission};
 use crate::error::{CoderError, Result};
-use crate::prompt::build_prompt;
+use crate::prompt::{build_prompt, build_reprompt};
 
 /// The coder. Holds the inference backend the orchestrator uses for
 /// each `run` call; the backend is `Arc<dyn …>` so callers can share
@@ -48,7 +48,15 @@ pub struct CoderRun {
     /// re-parsing).
     pub files_written: Vec<String>,
     /// The raw model reply. Useful for audit logs and post-mortem.
+    /// NOTE: when the whole-file re-prompt fallback fires this becomes a
+    /// composite first+retry transcript — use [`Self::first_emission`]
+    /// when you need just the model's initial output.
     pub raw_reply: String,
+    /// The model's *first* raw emission, before any re-prompt fallback.
+    /// Always the initial reply (never a composite), so the eval
+    /// scorecard can judge it with `git apply --check` (#30B) to tell a
+    /// clean diff from a sloppy one the fuzzy worker merely rescued.
+    pub first_emission: String,
 }
 
 impl Coder {
@@ -58,6 +66,17 @@ impl Coder {
     }
 
     /// Run one turn against `workspace`.
+    ///
+    /// Happy path: build prompt -> infer -> normalize -> apply.
+    ///
+    /// Weak-model fallback: when the model emits a [`Emission::UnifiedDiff`]
+    /// (even under the whole-file directive) and that diff fails to apply
+    /// — its line numbers / context are too far off even for the fuzzy
+    /// matcher in `newt-tools::apply_patch` — we issue exactly ONE
+    /// re-prompt asking for the COMPLETE file(s) in `FILE:`/`END-FILE`
+    /// form, then apply via the hardened `apply_whole_files` path. The
+    /// retry is bounded to a single attempt; if it still doesn't yield
+    /// usable whole-file output we return the original apply error.
     pub async fn run(&self, workspace: &Path, task: &str) -> Result<CoderRun> {
         let prompt = build_prompt(workspace, task)?;
         tracing::info!(
@@ -77,20 +96,131 @@ impl Coder {
 
         let emission = normalize_emission(&raw)?;
         let shape_label = emission.shape_label().to_string();
-        let files_written = self.apply(&emission, workspace)?;
 
-        tracing::info!(
-            emission_shape = %shape_label,
-            files_written = files_written.len(),
-            "newt-coder run complete"
-        );
+        // Try to apply the first emission.
+        match self.apply(&emission, workspace) {
+            Ok(files_written) => {
+                tracing::info!(
+                    emission_shape = %shape_label,
+                    files_written = files_written.len(),
+                    "newt-coder run complete"
+                );
+                Ok(CoderRun {
+                    emission_shape: shape_label,
+                    model_id,
+                    files_written,
+                    first_emission: raw.clone(),
+                    raw_reply: raw,
+                })
+            }
+            // The first emission was diff-shaped and did not apply: either a
+            // unified diff whose context was too far off even for the fuzzy
+            // matcher, or diff content the model wrapped in FILE:/END-FILE
+            // markers (classified as whole-files but rejected by the
+            // diff-shape guard). Both are recoverable with a single re-prompt
+            // for proper whole-file output.
+            Err(first_err)
+                if matches!(emission, Emission::UnifiedDiff(_))
+                    || matches!(first_err, CoderError::LooksLikeDiff { .. }) =>
+            {
+                tracing::warn!(
+                    error = %first_err,
+                    "newt-coder: diff-shaped emission did not apply, re-prompting for whole files"
+                );
+                self.reprompt_whole_files(workspace, task, raw, first_err)
+                    .await
+            }
+            Err(other) => Err(other),
+        }
+    }
 
-        Ok(CoderRun {
-            emission_shape: shape_label,
-            model_id,
-            files_written,
-            raw_reply: raw,
-        })
+    /// Single-retry fallback: re-prompt the model for the complete
+    /// file(s) and apply via `apply_whole_files`.
+    ///
+    /// Bounded to ONE additional inference call — there is no loop. On any
+    /// failure of the retry (inference error, the model returning yet
+    /// another diff / prose, or the whole-file apply failing the shape
+    /// guards) we return `original_err`, the error from the first attempt,
+    /// so the caller sees the root cause rather than a confusing
+    /// second-order failure.
+    async fn reprompt_whole_files(
+        &self,
+        workspace: &Path,
+        task: &str,
+        first_raw: String,
+        original_err: CoderError,
+    ) -> Result<CoderRun> {
+        let prompt = match build_reprompt(workspace, task) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(error = %e, "newt-coder: re-prompt build failed");
+                return Err(original_err);
+            }
+        };
+
+        let req = ChatRequest::new().system(prompt.system).user(prompt.user);
+        let reply = match self.backend.complete(req).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(error = %e, "newt-coder: re-prompt inference failed");
+                return Err(original_err);
+            }
+        };
+        let retry_raw = reply.content.clone();
+        let model_id = reply.model_id.clone();
+
+        // The retry must yield whole files; anything else (another diff,
+        // prose) is not usable for this fallback.
+        let emission = match normalize_emission(&retry_raw) {
+            Ok(em @ Emission::WholeFiles(_)) => em,
+            Ok(other) => {
+                tracing::warn!(
+                    emission_shape = %other.shape_label(),
+                    "newt-coder: re-prompt did not return whole files"
+                );
+                return Err(original_err);
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "newt-coder: re-prompt emission malformed");
+                return Err(original_err);
+            }
+        };
+
+        let shape_label = emission.shape_label().to_string();
+        match self.apply(&emission, workspace) {
+            Ok(files_written) => {
+                tracing::info!(
+                    emission_shape = %shape_label,
+                    files_written = files_written.len(),
+                    "newt-coder: re-prompt whole-file fallback applied"
+                );
+                Ok(CoderRun {
+                    // Reflect what *actually* applied: the whole-file retry,
+                    // not the original diff.
+                    emission_shape: shape_label,
+                    model_id,
+                    files_written,
+                    // The first emission is the diff the model actually
+                    // produced for the task; the scorecard judges *that*,
+                    // not the rescued retry.
+                    first_emission: first_raw.clone(),
+                    // Keep an audit trail of both turns: the first
+                    // (rejected) diff and the retry that landed.
+                    raw_reply: format!(
+                        "[diff-apply failed, re-prompted for whole files]\n\
+                         --- first reply ---\n{first_raw}\n\
+                         --- retry reply ---\n{retry_raw}"
+                    ),
+                })
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "newt-coder: re-prompt whole-file apply failed"
+                );
+                Err(original_err)
+            }
+        }
     }
 
     /// Apply one classified emission to `workspace`. Returns the
@@ -98,6 +228,16 @@ impl Coder {
     fn apply(&self, emission: &Emission, workspace: &Path) -> Result<Vec<String>> {
         match emission {
             Emission::WholeFiles(files) => {
+                // Shape guards before writing. A whole-file emission
+                // legitimately rewrites every line (renames, signature
+                // changes, new doc comments), so we do NOT compare the
+                // body against what's on disk. We reject only bodies
+                // whose *shape* is wrong; the real correctness gate is
+                // the downstream `git diff` capture plus the eval
+                // compile/test evaluators.
+                for (path, contents) in files {
+                    reject_bad_shape(path, contents)?;
+                }
                 // `apply_whole_files` wants `(String, String)` tuples;
                 // collect to give it owned values without leaking the
                 // BTreeMap iterator's lifetime into the call.
@@ -123,6 +263,45 @@ impl Coder {
                 );
                 Ok(Vec::new())
             }
+        }
+    }
+}
+
+/// Reject a whole-file emission whose body has the wrong *shape*.
+///
+/// This replaces the old "first non-blank line must equal the file's
+/// existing anchor line" check, which wrongly rejected correct output
+/// whenever a rename or signature change altered line 1. Instead we
+/// only refuse bodies that are:
+///
+/// - empty / whitespace-only ([`CoderError::EmptyEmission`]),
+/// - diff-shaped — first non-blank line starts with `--- `, `+++ `, or
+///   `@@` ([`CoderError::LooksLikeDiff`]), or
+/// - still prefixed with a leaked `FILE:` marker as their first
+///   non-blank line ([`CoderError::LeakedMarker`]) — defense in depth
+///   in case [`crate::emission`] did not strip it.
+fn reject_bad_shape(path: &str, contents: &str) -> Result<()> {
+    let first_non_blank = contents.lines().find(|l| !l.trim().is_empty());
+    match first_non_blank {
+        None => Err(CoderError::EmptyEmission {
+            path: path.to_string(),
+        }),
+        Some(first) => {
+            let trimmed = first.trim_start();
+            if trimmed.starts_with("--- ")
+                || trimmed.starts_with("+++ ")
+                || trimmed.starts_with("@@")
+            {
+                return Err(CoderError::LooksLikeDiff {
+                    path: path.to_string(),
+                });
+            }
+            if trimmed.starts_with("FILE:") {
+                return Err(CoderError::LeakedMarker {
+                    path: path.to_string(),
+                });
+            }
+            Ok(())
         }
     }
 }
@@ -217,5 +396,111 @@ mod tests {
         let bad = Emission::UnifiedDiff("not a real diff".to_string());
         let err = coder.apply(&bad, tmp.path()).unwrap_err();
         assert!(matches!(err, CoderError::FileWrite(_)));
+    }
+
+    fn whole_files(path: &str, contents: &str) -> Emission {
+        let mut m = BTreeMap::new();
+        m.insert(path.to_string(), contents.to_string());
+        Emission::WholeFiles(m)
+    }
+
+    #[test]
+    fn apply_whole_files_accepts_line_one_change() {
+        // Regression for failures 1 & 2 (rename / signature change):
+        // the emitted first line differs from the existing first line,
+        // which the old anchor check wrongly rejected. It must now apply.
+        let tmp = TempDir::new().unwrap();
+        let coder = coder_with_no_backend_used();
+        fs::create_dir_all(tmp.path().join("src")).unwrap();
+        fs::write(
+            tmp.path().join("src/lib.rs"),
+            "pub fn hello(name: &str) -> String {\n    format!(\"hi {name}\")\n}\n",
+        )
+        .unwrap();
+
+        let new_body = "pub fn greet(name: &str) -> String {\n    format!(\"hi {name}\")\n}\n";
+        let written = coder
+            .apply(&whole_files("src/lib.rs", new_body), tmp.path())
+            .unwrap();
+        assert_eq!(written, vec!["src/lib.rs".to_string()]);
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("src/lib.rs")).unwrap(),
+            new_body
+        );
+    }
+
+    #[test]
+    fn apply_whole_files_rejects_diff_shaped_contents() {
+        let tmp = TempDir::new().unwrap();
+        let coder = coder_with_no_backend_used();
+        fs::write(tmp.path().join("a.txt"), "old\n").unwrap();
+        let diff = "--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-old\n+new\n";
+        let err = coder
+            .apply(&whole_files("a.txt", diff), tmp.path())
+            .unwrap_err();
+        assert!(matches!(err, CoderError::LooksLikeDiff { ref path } if path == "a.txt"));
+        // The file must not have been overwritten.
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("a.txt")).unwrap(),
+            "old\n"
+        );
+    }
+
+    #[test]
+    fn apply_whole_files_rejects_hunk_only_contents() {
+        let tmp = TempDir::new().unwrap();
+        let coder = coder_with_no_backend_used();
+        let hunk = "@@ -1,2 +1,2 @@\n-old\n+new\n";
+        let err = coder
+            .apply(&whole_files("a.txt", hunk), tmp.path())
+            .unwrap_err();
+        assert!(matches!(err, CoderError::LooksLikeDiff { .. }));
+    }
+
+    #[test]
+    fn apply_whole_files_rejects_empty_contents() {
+        let tmp = TempDir::new().unwrap();
+        let coder = coder_with_no_backend_used();
+        let err = coder
+            .apply(&whole_files("a.txt", ""), tmp.path())
+            .unwrap_err();
+        assert!(matches!(err, CoderError::EmptyEmission { ref path } if path == "a.txt"));
+    }
+
+    #[test]
+    fn apply_whole_files_rejects_whitespace_only_contents() {
+        let tmp = TempDir::new().unwrap();
+        let coder = coder_with_no_backend_used();
+        let err = coder
+            .apply(&whole_files("a.txt", "   \n\t\n"), tmp.path())
+            .unwrap_err();
+        assert!(matches!(err, CoderError::EmptyEmission { .. }));
+    }
+
+    #[test]
+    fn apply_whole_files_rejects_leaked_file_marker() {
+        // Defense in depth (failures 3 & 4): even if a leaked FILE:
+        // marker slipped past the parser, the writer must refuse it.
+        let tmp = TempDir::new().unwrap();
+        let coder = coder_with_no_backend_used();
+        let body = "FILE: src/lib.rs\npub fn add(a: i32, b: i32) -> i32 { a + b }\n";
+        let err = coder
+            .apply(&whole_files("src/lib.rs", body), tmp.path())
+            .unwrap_err();
+        assert!(matches!(err, CoderError::LeakedMarker { ref path } if path == "src/lib.rs"));
+    }
+
+    #[test]
+    fn reject_bad_shape_messages_start_with_file_write_failed() {
+        for err in [
+            super::reject_bad_shape("p", "").unwrap_err(),
+            super::reject_bad_shape("p", "--- a/p\n").unwrap_err(),
+            super::reject_bad_shape("p", "FILE: p\n").unwrap_err(),
+        ] {
+            assert!(
+                err.to_string().starts_with("file write failed:"),
+                "message did not start with prefix: {err}"
+            );
+        }
     }
 }

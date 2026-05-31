@@ -30,6 +30,7 @@ newt-mcp-server.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 reqwest.workspace = true
+serde_json.workspace = true
 tokio.workspace = true
 toml.workspace = true
 tracing.workspace = true
@@ -48,7 +49,7 @@ libc = "0.2"
 assert_cmd.workspace = true
 predicates.workspace = true
 tempfile.workspace = true
-serde_json.workspace = true
+wiremock.workspace = true
 
 [lints]
 workspace = true

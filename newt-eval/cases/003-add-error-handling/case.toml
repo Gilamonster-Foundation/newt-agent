@@ -1,11 +1,12 @@
 name = "003-add-error-handling"
 description = "Replace .unwrap() with proper Result-returning parser"
 language = "rust"
+difficulty = "L1"
 prompt = """
 Change `pub fn parse(s: &str) -> i32 { s.parse().unwrap() }` in
 src/lib.rs to return `Result<i32, std::num::ParseIntError>` and propagate
 the error with `?`. Update the existing unit test to call `.unwrap()`
-on the result so the test still passes. Respond with a unified diff only.
+on the result so the test still passes.
 """
 
 evaluators = [

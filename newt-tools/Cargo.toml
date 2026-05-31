@@ -22,6 +22,12 @@ regex.workspace = true
 
 # TODO: depend on thoon-fileops + thoon-toolreg once published.
 
+# Optional strict patch backend, selected at runtime via
+# `NEWT_PATCH_APPLIER=diffy`. Off by default so the default dependency
+# graph (and the PyO3 wheel) stays unchanged; the in-house `FuzzyApplier`
+# remains the default.
+diffy = { workspace = true, optional = true }
+
 # Optional PyO3 bindings — opt in only via the umbrella `newt-agent-py`
 # crate; default builds stay Python-free.
 pyo3 = { workspace = true, optional = true }
@@ -29,6 +35,9 @@ pyo3 = { workspace = true, optional = true }
 [features]
 default = []
 pyo3 = ["dep:pyo3", "newt-core/pyo3"]
+# Compile the `diffy`-backed PatchApplier. Selectable at runtime with
+# NEWT_PATCH_APPLIER=diffy once enabled.
+applier-diffy = ["dep:diffy"]
 
 [dev-dependencies]
 tempfile.workspace = true

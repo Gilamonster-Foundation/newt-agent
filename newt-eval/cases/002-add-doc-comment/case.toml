@@ -1,10 +1,10 @@
 name = "002-add-doc-comment"
 description = "Add a /// doc comment to a public function"
 language = "rust"
+difficulty = "L1"
 prompt = """
 Add a Rust doc comment (`///`) above the public function `add` in
-src/lib.rs explaining that it returns the sum of two integers. Respond
-with a unified diff only.
+src/lib.rs explaining that it returns the sum of two integers.
 """
 
 evaluators = [

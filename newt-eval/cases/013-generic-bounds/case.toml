@@ -1,0 +1,46 @@
+name = "013-generic-bounds"
+description = "Generalize a monomorphic function with trait bounds"
+language = "rust"
+difficulty = "L2"
+prompt = """
+Make `largest` in src/lib.rs generic over any `T: PartialOrd + Copy`
+(signature `fn largest<T: PartialOrd + Copy>(list: &[T]) -> T`) so it works
+for more than i32. Keep the body and the existing `largest_int` test
+working, and add a `largest_char` test asserting
+largest(&['a', 'z', 'm']) == 'z'.
+"""
+
+evaluators = [
+    "diff_nonempty",
+    "diff_applies",
+    "rust_compiles",
+    "tests_pass",
+    "pattern_match",
+]
+
+expected_patterns = [
+    "largest<T",
+    "largest_char",
+]
+
+[mock_response]
+content = """
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,4 +1,4 @@
+-pub fn largest(list: &[i32]) -> i32 {
++pub fn largest<T: PartialOrd + Copy>(list: &[T]) -> T {
+     let mut max = list[0];
+     for &x in list {
+         if x > max {
+@@ -16,4 +16,9 @@ mod tests {
+     fn largest_int() {
+         assert_eq!(largest(&[3, 7, 2, 9, 4]), 9);
+     }
++
++    #[test]
++    fn largest_char() {
++        assert_eq!(largest(&['a', 'z', 'm']), 'z');
++    }
+ }
+"""

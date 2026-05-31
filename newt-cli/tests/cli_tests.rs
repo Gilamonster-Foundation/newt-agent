@@ -83,3 +83,97 @@ default_tier_order = ["FAST"]
         .success()
         .stdout(predicate::str::contains("custom-backend"));
 }
+
+#[test]
+fn dgx_route_review_task() {
+    Command::cargo_bin("newt")
+        .unwrap()
+        .args(["dgx", "route", "review this code for security bugs"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Complexity"))
+        .stdout(predicate::str::contains("review"));
+}
+
+#[test]
+fn dgx_route_complex_task() {
+    Command::cargo_bin("newt")
+        .unwrap()
+        .args(["dgx", "route", "refactor the entire module across services"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("complex"));
+}
+
+#[test]
+fn dgx_requires_subcommand() {
+    Command::cargo_bin("newt")
+        .unwrap()
+        .arg("dgx")
+        .assert()
+        .failure();
+}
+
+/// A dgx-less config file used by the probe tests so they don't depend on
+/// the developer's `~/.newt/config.toml`.
+fn dgx_less_config() -> tempfile::NamedTempFile {
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    f.write_all(
+        br#"
+[[backends]]
+name = "x"
+endpoint = "http://localhost:11434"
+model = "m"
+tiers = ["FAST"]
+
+default_tier_order = ["FAST"]
+"#,
+    )
+    .unwrap();
+    f.flush().unwrap();
+    f
+}
+
+#[test]
+fn dgx_doctor_unconfigured_shows_guidance() {
+    let f = dgx_less_config();
+    Command::cargo_bin("newt")
+        .unwrap()
+        .env_remove("NEWT_DGX_OLLAMA_URL")
+        .env_remove("NEWT_DGX_OLLAMA_LB_URL")
+        .env_remove("NEWT_DGX_IN_CLUSTER_URL")
+        .env_remove("NEWT_DGX_VLLM_URL")
+        .env_remove("NEWT_DGX_HOST")
+        .args(["--config", f.path().to_str().unwrap(), "dgx", "doctor"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("not set"))
+        .stdout(predicate::str::contains("home.lab"));
+}
+
+#[test]
+fn dgx_models_unconfigured_fails() {
+    let f = dgx_less_config();
+    Command::cargo_bin("newt")
+        .unwrap()
+        .env_remove("NEWT_DGX_OLLAMA_URL")
+        .env_remove("NEWT_DGX_HOST")
+        .args(["--config", f.path().to_str().unwrap(), "dgx", "models"])
+        .assert()
+        .failure();
+}
+
+#[test]
+fn dgx_models_uses_env_endpoint() {
+    // NEWT_DGX_OLLAMA_URL set to an unreachable host: `models` resolves the
+    // endpoint (no "not configured" error) and fails on the network call —
+    // proving env-only wiring. The dgx-less --config keeps it independent
+    // of ~/.newt.
+    let f = dgx_less_config();
+    Command::cargo_bin("newt")
+        .unwrap()
+        .env("NEWT_DGX_OLLAMA_URL", "http://127.0.0.1:1")
+        .args(["--config", f.path().to_str().unwrap(), "dgx", "models"])
+        .assert()
+        .failure();
+}

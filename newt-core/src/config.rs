@@ -28,6 +28,12 @@ pub struct Config {
     /// Default tier ordering used by the router when no per-backend
     /// override is specified.
     pub default_tier_order: Vec<Tier>,
+
+    /// Optional NVIDIA DGX endpoint-management config powering the
+    /// `newt dgx` command suite. `None` when unconfigured — newt never
+    /// dials a DGX endpoint unless this (or a `NEWT_DGX_*` env var) is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dgx: Option<crate::dgx::DgxConfig>,
 }
 
 /// A single inference backend entry.
@@ -64,6 +70,7 @@ impl Default for Config {
             }],
             providers: Vec::new(),
             default_tier_order: vec![Tier::Fast, Tier::Standard, Tier::Complex, Tier::Review],
+            dgx: None,
         }
     }
 }
@@ -232,5 +239,24 @@ default_tier_order = ["FAST", "STANDARD", "COMPLEX", "REVIEW"]
 
         assert_eq!(cfg.backends.len(), 1);
         assert_eq!(cfg.backends[0].name, "ollama");
+    }
+
+    #[test]
+    fn config_default_has_no_dgx() {
+        assert!(Config::default().dgx.is_none());
+    }
+
+    #[test]
+    fn config_with_dgx_roundtrips() {
+        let cfg = Config {
+            dgx: Some(crate::dgx::DgxConfig::home_template()),
+            ..Config::default()
+        };
+        let text = toml::to_string_pretty(&cfg).unwrap();
+        let back = toml::from_str::<Config>(&text).unwrap();
+        let dgx = back.dgx.expect("dgx should round-trip");
+        assert_eq!(dgx.active_node.as_deref(), Some("home"));
+        assert_eq!(dgx.nodes.len(), 1);
+        assert_eq!(dgx.formations.len(), 2);
     }
 }

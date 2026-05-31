@@ -1,0 +1,62 @@
+name = "010-decompose-god-function"
+description = "Decompose a god-function into three behavior-preserving helpers"
+language = "rust"
+difficulty = "L2"
+prompt = """
+The function `summarize` in src/lib.rs computes the count, sum, and max
+of a slice inline. Extract three private helper functions — `total(nums:
+&[i32]) -> i32`, `maximum(nums: &[i32]) -> i32`, and `count_items(nums:
+&[i32]) -> usize` — and rewrite `summarize` to call them. Behavior and the
+existing test must be unchanged.
+"""
+
+evaluators = [
+    "diff_nonempty",
+    "diff_applies",
+    "rust_compiles",
+    "tests_pass",
+    "pattern_match",
+]
+
+expected_patterns = [
+    "fn total",
+    "fn maximum",
+]
+
+[mock_response]
+content = """
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,15 +1,29 @@
+-pub fn summarize(nums: &[i32]) -> String {
++fn total(nums: &[i32]) -> i32 {
+     let mut sum = 0;
+     for n in nums {
+         sum += n;
+     }
++    sum
++}
++
++fn maximum(nums: &[i32]) -> i32 {
+     let mut max = i32::MIN;
+     for n in nums {
+         if *n > max {
+             max = *n;
+         }
+     }
+-    let count = nums.len();
++    max
++}
++
++fn count_items(nums: &[i32]) -> usize {
++    nums.len()
++}
++
++pub fn summarize(nums: &[i32]) -> String {
++    let sum = total(nums);
++    let max = maximum(nums);
++    let count = count_items(nums);
+     format!("count={count} sum={sum} max={max}")
+ }
+ 
+"""

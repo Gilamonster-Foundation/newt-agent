@@ -11,6 +11,9 @@ pub enum NewtError {
     #[error("config error: {0}")]
     Config(String),
 
+    #[error(transparent)]
+    Dgx(#[from] crate::dgx::DgxNotConfigured),
+
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 

@@ -1,0 +1,53 @@
+name = "007-add-struct-method"
+description = "Add a method to an existing impl block + a test"
+language = "rust"
+difficulty = "L1"
+prompt = """
+Add a method `increment(&mut self)` to the `Counter` impl in src/lib.rs
+that increments `self.count` by 1. Also add a unit test
+`increment_twice_yields_two` that creates a new Counter, calls
+`increment()` twice, and asserts that `counter.count == 2`.
+"""
+
+evaluators = [
+    "diff_nonempty",
+    "diff_applies",
+    "rust_compiles",
+    "tests_pass",
+    "pattern_match",
+]
+
+expected_patterns = [
+    "pub fn increment",
+    "fn increment_twice_yields_two",
+]
+
+[mock_response]
+content = """
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -6,6 +6,10 @@ impl Counter {
+     pub fn new() -> Self {
+         Counter { count: 0 }
+     }
++
++    pub fn increment(&mut self) {
++        self.count += 1;
++    }
+ }
+ 
+ #[cfg(test)]
+@@ -16,4 +20,12 @@ mod tests {
+     fn new_starts_at_zero() {
+         assert_eq!(Counter::new().count, 0);
+     }
++
++    #[test]
++    fn increment_twice_yields_two() {
++        let mut c = Counter::new();
++        c.increment();
++        c.increment();
++        assert_eq!(c.count, 2);
++    }
+ }
+"""

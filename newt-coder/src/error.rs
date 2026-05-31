@@ -18,6 +18,24 @@ pub enum CoderError {
     BadEmission(String),
     #[error("file write failed: {0}")]
     FileWrite(String),
+    /// The emitted body for `path` was empty or whitespace-only.
+    ///
+    /// A whole-file emission must contain something to write; an empty
+    /// body is never a legitimate rewrite. The `file write failed:`
+    /// prefix is load-bearing — the ACP worker and existing call sites
+    /// match on it.
+    #[error("file write failed: empty emission for '{path}'")]
+    EmptyEmission { path: String },
+    /// The emitted body for `path` looked like a unified diff rather
+    /// than the complete file contents (its first non-blank line begins
+    /// with `--- `, `+++ `, or `@@`).
+    #[error("file write failed: emission for '{path}' looks like a diff, not a whole file")]
+    LooksLikeDiff { path: String },
+    /// The emitted body for `path` still began with a leaked `FILE:`
+    /// marker as its first non-blank line (defense in depth in case the
+    /// parser did not strip it).
+    #[error("file write failed: emission for '{path}' still begins with a leaked FILE: marker")]
+    LeakedMarker { path: String },
     #[error("inference: {0}")]
     Inference(String),
     #[error("io: {0}")]
@@ -57,6 +75,36 @@ mod tests {
     fn file_write_renders() {
         let e = CoderError::FileWrite("permission denied".to_string());
         assert!(e.to_string().contains("permission denied"));
+    }
+
+    #[test]
+    fn empty_emission_renders_with_prefix() {
+        let e = CoderError::EmptyEmission {
+            path: "src/lib.rs".to_string(),
+        };
+        let s = e.to_string();
+        assert!(s.starts_with("file write failed:"), "got: {s}");
+        assert!(s.contains("src/lib.rs"));
+    }
+
+    #[test]
+    fn looks_like_diff_renders_with_prefix() {
+        let e = CoderError::LooksLikeDiff {
+            path: "src/lib.rs".to_string(),
+        };
+        let s = e.to_string();
+        assert!(s.starts_with("file write failed:"), "got: {s}");
+        assert!(s.contains("diff"));
+    }
+
+    #[test]
+    fn leaked_marker_renders_with_prefix() {
+        let e = CoderError::LeakedMarker {
+            path: "src/lib.rs".to_string(),
+        };
+        let s = e.to_string();
+        assert!(s.starts_with("file write failed:"), "got: {s}");
+        assert!(s.contains("FILE:"));
     }
 
     #[test]

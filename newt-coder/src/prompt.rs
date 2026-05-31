@@ -41,6 +41,8 @@ For each file you change, emit ONLY the complete updated file contents. \
 Do not include diffs, code fences, prose, or explanations. \
 Start each file with a single line:  FILE: <relative path>\n\
 Then the verbatim updated file contents, followed by a line containing only END-FILE. \
+Output the COMPLETE file body only; do NOT repeat the FILE: line inside the body, \
+and do NOT emit a unified diff. \
 If you do not change a file, do not emit it. \
 Do not invent files that don't exist.\
 ";
@@ -65,6 +67,41 @@ pub fn build_prompt(workspace: &Path, task: &str) -> Result<CoderPrompt> {
 
     let user = format!(
         "Task:\n{}\n\nFiles in the workspace (verbatim contents):\n{}",
+        task.trim(),
+        file_block,
+    );
+
+    Ok(CoderPrompt {
+        system: WHOLE_FILE_SYSTEM_PROMPT.to_string(),
+        user,
+        included_files: included,
+    })
+}
+
+/// Build a **re-prompt** for the single-retry whole-file fallback.
+///
+/// Weak local models non-deterministically emit a unified diff even
+/// under the whole-file directive, and those diffs sometimes fail to
+/// apply. When that happens, [`crate::coder::Coder::run`] asks the model
+/// one more time — this time with an emphatic, focused reminder to emit
+/// the COMPLETE file(s) in `FILE:`/`END-FILE` form, never a diff.
+///
+/// We reuse the pinned [`WHOLE_FILE_SYSTEM_PROMPT`] verbatim (its exact
+/// wording is load-bearing per the bake-off) and re-inject the same
+/// workspace file context so the model still has the source in front of
+/// it. The user message leads with the explicit corrective instruction,
+/// then restates the task and the files.
+pub fn build_reprompt(workspace: &Path, task: &str) -> Result<CoderPrompt> {
+    let files = scan_workspace_for_files(workspace, task)?;
+    let (file_block, included) = render_files_block(workspace, &files, DEFAULT_CONTEXT_CAP_CHARS)?;
+
+    let user = format!(
+        "Your previous reply could not be applied (it was a unified diff or a \
+         diff that did not match the file). Do NOT emit a diff this time.\n\n\
+         For EACH file you change, output the COMPLETE updated file contents as:\n\
+         FILE: <relative path>\n<the entire file body>\nEND-FILE\n\n\
+         No diffs, no code fences, no prose.\n\n\
+         Task:\n{}\n\nFiles in the workspace (verbatim contents):\n{}",
         task.trim(),
         file_block,
     );
