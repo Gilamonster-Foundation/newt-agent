@@ -81,7 +81,7 @@ impl TuiField {
         match self {
             Self::ChatStyle => "chat style",
             Self::EditMode => "edit mode",
-            Self::NoSplash => "no splash",
+            Self::NoSplash => "splash",
             Self::Prompt => "prompt",
         }
     }
@@ -604,8 +604,8 @@ fn render_tui_fields(f: &mut Frame, area: Rect, app: &SettingsApp, bold_orange: 
                 field.label(),
                 label_s,
                 &[
-                    ("off", !app.tui.no_splash),
-                    ("on", app.tui.no_splash),
+                    ("on",  !app.tui.no_splash), // splash on  = no_splash false (default)
+                    ("off",  app.tui.no_splash), // splash off = no_splash true
                 ],
                 dim,
             ),
