@@ -383,18 +383,66 @@ fn build_rl_config() -> rustyline::config::Config {
         .build()
 }
 
-/// Build the rustyline prompt string — plain text only.
+/// Build the rustyline prompt string — plain text, PS1 tokens expanded.
 ///
-/// ANSI escape codes in rustyline prompts require careful \x01/\x02 wrapping
-/// and interact badly with vi-mode indicators. Keep the prompt plain and let
-/// `print_newt` / response output handle all the colour.
-fn prompt_str(verbose: bool, is_vi: bool) -> String {
-    let mode = if is_vi { "[i] " } else { "" };
-    if verbose {
-        format!("{mode}you $ ")
+/// Reads `[tui].prompt` from config (overridable via `NEWT_PROMPT`).
+/// Falls back to `\w $ ` (compact) or `you \w $ ` (verbose) if unset.
+/// Vi-mode prefixes `[i] ` so the user knows which mode is active.
+///
+/// Supported tokens: `\w` workspace basename, `\W` full path,
+/// `\h` hostname, `\v` newt version.
+fn prompt_str(workspace: &str, verbose: bool, is_vi: bool) -> String {
+    // Resolve template: NEWT_PROMPT env var > config > built-in default.
+    let template = std::env::var("NEWT_PROMPT").ok().or_else(|| {
+        newt_core::Config::resolve()
+            .ok()
+            .and_then(|c| c.tui)
+            .and_then(|t| t.prompt)
+    });
+
+    let expanded = if let Some(ref tmpl) = template {
+        expand_prompt_tokens(tmpl, workspace)
+    } else if verbose {
+        format!(
+            "you {} $ ",
+            std::path::Path::new(workspace)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        )
     } else {
-        format!("{mode}$ ")
+        format!(
+            "{} $ ",
+            std::path::Path::new(workspace)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        )
+    };
+
+    if is_vi {
+        format!("[i] {expanded}")
+    } else {
+        expanded
     }
+}
+
+fn expand_prompt_tokens(template: &str, workspace: &str) -> String {
+    let ws_base = std::path::Path::new(workspace)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| workspace.to_string());
+    let host = std::process::Command::new("hostname")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| "localhost".into());
+    template
+        .replace("\\W", workspace)
+        .replace("\\w", &ws_base)
+        .replace("\\h", &host)
+        .replace("\\v", env!("CARGO_PKG_VERSION"))
 }
 
 fn run_chat(workspace: &str, color: bool) -> anyhow::Result<()> {
@@ -433,7 +481,7 @@ fn run_chat(workspace: &str, color: bool) -> anyhow::Result<()> {
     }
 
     let is_vi = build_rl_config().edit_mode() == rustyline::config::EditMode::Vi;
-    let prompt = prompt_str(verbose, is_vi);
+    let prompt = prompt_str(workspace, verbose, is_vi);
     loop {
         match rl.readline(&prompt) {
             Ok(line) => {
