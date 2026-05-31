@@ -88,9 +88,15 @@ install from source:
 
 ```bash
 git clone https://github.com/Gilamonster-Foundation/newt-agent
-cargo install --path newt-agent/newt-cli           # `newt`
-cargo install --path newt-agent/newt-mcp-server    # `newt-mcp-server`
+cd newt-agent
+just install          # builds release binaries → ~/bin/newt, ~/bin/newt-mcp-server
 newt --help
+```
+
+Pass a different destination to override the default `~/bin`:
+
+```bash
+just install /usr/local/bin
 ```
 
 Or from crates.io once published:
