@@ -56,6 +56,14 @@ fn run_accepts_worker_timeout_flag() {
 }
 
 /// Without a worker binary, live mode fails fast with a helpful message.
+///
+/// Issue #41: a missing-worker run now produces `evaluator == "runner"`
+/// FAIL rows in the scorecard, which exits 1 (not 2). The scorecard
+/// itself doesn't get rendered because the resolver errors out before
+/// any case runs once `--worker-bin` is given a path that doesn't
+/// exist. We use `--legacy-exit-codes` together with a path *that*
+/// `resolve_worker_bin` can resolve to exercise the runner-FAIL branch
+/// in `run_live_mode_runner_failure_exits_one` below.
 #[test]
 fn run_live_mode_reports_missing_worker() {
     Command::cargo_bin("newt-eval")
@@ -70,7 +78,78 @@ fn run_live_mode_reports_missing_worker() {
             "/definitely/not/here/newt",
         ])
         .assert()
-        // Exit code 2 = "ran cleanly but at least one case failed", which
-        // is what we get when the runner errors on each case.
+        // The resolver short-circuits before any case runs and the
+        // process bails with anyhow → exit code 1 (FAILURE).
+        .failure()
+        .stderr(contains("not found"))
+        .stderr(contains("/definitely/not/here/newt"));
+}
+
+/// #40: the help text mentions the new resolution order so an operator
+/// who hits "binary not found" can see what to try.
+#[test]
+fn run_help_documents_worker_bin_resolution() {
+    Command::cargo_bin("newt-eval")
+        .unwrap()
+        .args(["run", "--help"])
+        .assert()
+        .success()
+        .stdout(contains("NEWT_WORKER_BIN"))
+        .stdout(contains("--worker-bin"));
+}
+
+/// #41: the `--legacy-exit-codes` flag exists and is documented.
+#[test]
+fn run_help_documents_legacy_exit_codes_flag() {
+    Command::cargo_bin("newt-eval")
+        .unwrap()
+        .args(["run", "--help"])
+        .assert()
+        .success()
+        .stdout(contains("--legacy-exit-codes"));
+}
+
+/// #41: when the worker binary resolves but every case ends in a
+/// runner FAIL (we point at a path that does exist but isn't a real
+/// `newt` worker), the process exits 1.
+#[test]
+fn run_live_mode_runner_failure_exits_one() {
+    // Use `/bin/true` as a stand-in: it exists, so the resolver is
+    // happy, but it isn't an ACP-speaking worker — the runner will
+    // record a "runner" FAIL row for every case it tries.
+    Command::cargo_bin("newt-eval")
+        .unwrap()
+        .args([
+            "run",
+            "--mode",
+            "live",
+            "--case",
+            "001",
+            "--worker-bin",
+            "/bin/true",
+        ])
+        .assert()
+        // Issue #41: exit 1 on any runner FAIL.
+        .code(1);
+}
+
+/// #41: with `--legacy-exit-codes`, the same situation reverts to the
+/// pre-#41 exit code (2).
+#[test]
+fn run_live_mode_runner_failure_legacy_exit_code() {
+    Command::cargo_bin("newt-eval")
+        .unwrap()
+        .args([
+            "run",
+            "--mode",
+            "live",
+            "--case",
+            "001",
+            "--worker-bin",
+            "/bin/true",
+            "--legacy-exit-codes",
+        ])
+        .assert()
+        // Pre-#41 behavior: exit 2.
         .code(2);
 }
