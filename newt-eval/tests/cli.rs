@@ -31,6 +31,30 @@ fn run_mock_mode_directs_user_to_test_harness() {
         .stderr(contains("cargo test"));
 }
 
+/// #29: the worker timeout is exposed as a flag + env var.
+#[test]
+fn run_help_shows_worker_timeout_flag() {
+    Command::cargo_bin("newt-eval")
+        .unwrap()
+        .args(["run", "--help"])
+        .assert()
+        .success()
+        .stdout(contains("--worker-timeout-ms"))
+        .stdout(contains("NEWT_EVAL_WORKER_TIMEOUT_MS"));
+}
+
+/// #29: the flag parses and is accepted alongside the other run args
+/// (clap would exit 2 with an "unexpected argument" error otherwise).
+#[test]
+fn run_accepts_worker_timeout_flag() {
+    Command::cargo_bin("newt-eval")
+        .unwrap()
+        .args(["run", "--mode", "mock", "--worker-timeout-ms", "180000"])
+        .assert()
+        .failure()
+        .stderr(contains("cargo test"));
+}
+
 /// Without a worker binary, live mode fails fast with a helpful message.
 #[test]
 fn run_live_mode_reports_missing_worker() {

@@ -650,6 +650,129 @@ once Phases 0–12 are landed and `newt worker` is dogfooded end-to-end.
 
 ---
 
+# Phase 14 - `newt dgx` command suite (9 steps)
+
+Native NVIDIA DGX / Ollama endpoint management, ported from the hermes-agent
+`hermes dgx` plugin (NousResearch/hermes-agent#28009) and retargeted to newt's
+Rust surface. Unlike hermes (a Python plugin loaded via `plugin.yaml`), this is
+a built-in `newt dgx` subcommand group plus a DGX-aware backend - newt is
+opinionated and single-binary, not plugin-extensible. Reuses the already-landed
+`Config`, `LocalOllamaBackend` / `LocalVllmBackend`, `Router`, and
+`BackendRegistry`. No new third-party crates: ssh / rsync / nvidia-smi are
+external binaries invoked through a mockable `CommandRunner` trait.
+
+**No leaky defaults:** the `[dgx]` config table and every `NEWT_DGX_*` env var
+default to unset; an unconfigured install never contacts a DGX host.
+
+**Sequence:** 14.1 -> 14.2 -> {14.3, 14.5} -> 14.4 -> 14.6 -> 14.7 -> 14.8 -> 14.9.
+
+## Step 14.1 - dgx config model + endpoint resolution
+
+**Branch:** `step-14.1-dgx-config`
+**Touches:** `newt-core/src/dgx.rs` (new), `newt-core/src/lib.rs`,
+              `newt-core/src/config.rs`, `newt-core/src/error.rs`.
+**Implements:** `DgxConfig` / `DgxNode` / `DgxFormation` / `EndpointKind`;
+optional `Config.dgx` (`[dgx]`), back-compatible with dgx-less configs;
+endpoint resolution (per-flavor URL env var -> node URL -> `NEWT_DGX_HOST`
+host+port synthesis for ollama/vllm); `active_node`, `resolve_endpoint[_for]`,
+`resolve_active_model`, `ssh_host`, `ssh_user`, `home_template()`;
+`DgxNotConfigured` error wired into `NewtError`. Injectable env (`*_with`) for
+deterministic tests.
+**Tests:** 24+ - kind parse/serde, node accessor, active-node selection,
+resolution precedence, model/ssh chains, home-template + TOML round-trip.
+**Mocks:** none (pure data + injected env closures).
+**Out of scope:** any CLI surface; Python bindings for the dgx types.
+**Estimated diff:** ~560 lines.
+
+## Step 14.2 - `newt dgx` skeleton + `route`
+
+**Branch:** `step-14.2-dgx-cli-route`
+**Touches:** `newt-cli/src/dgx/mod.rs` (new), `newt-cli/src/lib.rs`.
+**Implements:** nested `Command::Dgx { cmd: DgxCmd }` clap group + dispatch;
+`newt dgx route "<task>"` (and `use --for`) reusing `newt_core::Router`
+to classify a tier and recommend a formation.
+**Tests:** 5+ (`assert_cmd`) - each tier classifies, recommendation output,
+unknown-formation handling.
+**Out of scope:** network probes, config writes.
+**Estimated diff:** ~220 lines.
+
+## Step 14.3 - read-only probes: `status` / `models` / `doctor`
+
+**Branch:** `step-14.3-dgx-probes`
+**Touches:** `newt-cli/src/dgx/`, reuse `newt-inference` Ollama/vLLM clients.
+**Implements:** `models` (Ollama `/api/tags` + vLLM `/v1/models`), `status`
+(endpoint health + `/api/ps` + GPU mem via `CommandRunner`), `dgx doctor`
+(probe each configured flavor; surface the .home.lab vs .home.lan DNS note).
+**Tests:** 8+ (`wiremock`, incl. HTTPS endpoints; mock `CommandRunner`) -
+degrades gracefully when no `ssh_host` is set.
+**Out of scope:** config mutation, SSH file transfer.
+**Estimated diff:** ~320 lines.
+
+## Step 14.4 - config-mutating: `setup` / `use` / `endpoint` / `formation` / `node`
+
+**Branch:** `step-14.4-dgx-config-cmds`
+**Touches:** `newt-cli/src/dgx/`, `newt-core/src/dgx.rs` (atomic save helper).
+**Implements:** interactive `setup` (offers `home_template`); `use <model>` /
+`use --for`; `endpoint <kind>`; `formation [--list]`; `node add/list/use`.
+Atomic write to `~/.newt/config.toml`; non-interactive flags for tests.
+**Tests:** 8+ (`tempfile` + `assert_cmd`).
+**Out of scope:** SSH, nim.
+**Estimated diff:** ~360 lines.
+
+## Step 14.5 - Ollama lifecycle: `pull` / `rm` / `ps`
+
+**Branch:** `step-14.5-dgx-ollama-lifecycle`
+**Touches:** `newt-cli/src/dgx/`, `newt-inference` (pull/delete helpers).
+**Implements:** `pull` (`/api/pull`, stream progress to stderr), `rm`
+(`/api/delete`), `ps` (`/api/ps`).
+**Tests:** 5+ (`wiremock`, streaming body).
+**Out of scope:** vLLM model management.
+**Estimated diff:** ~240 lines.
+
+## Step 14.6 - SSH ops: `run` / `push` + `watch`
+
+**Branch:** `step-14.6-dgx-ssh`
+**Touches:** `newt-cli/src/dgx/`, new `CommandRunner` trait.
+**Implements:** `run "<cmd>"` (ssh), `push <local> <remote>` (rsync),
+`watch` (periodic nvidia-smi refresh). All shelled out via `CommandRunner`,
+mocked in tests so no live DGX is required.
+**Tests:** 6+ (`mockall`) - arg construction, exit-code propagation,
+missing-host error path.
+**Out of scope:** interactive SSH sessions.
+**Estimated diff:** ~280 lines.
+
+## Step 14.7 - `nim list` / `nim deploy`
+
+**Branch:** `step-14.7-dgx-nim`
+**Touches:** `newt-cli/src/dgx/nim.rs` (new), vendored NIM catalog JSON.
+**Implements:** `nim list` (catalog) and `nim deploy <model>` (emit a
+Kubernetes manifest to stdout).
+**Tests:** 5+ (`insta` snapshots of emitted manifests).
+**Out of scope:** applying manifests to a cluster.
+**Estimated diff:** ~260 lines.
+
+## Step 14.8 - MCP agent tools
+
+**Branch:** `step-14.8-dgx-mcp-tools`
+**Touches:** `newt-mcp-server/src/handlers.rs`.
+**Implements:** `dgx_gpu_status`, `dgx_run`, `dgx_pull_model` exposed via
+`tools/list` + `tools/call`, delegating to the dgx module.
+**Tests:** 5+ (in-memory duplex transport + mock `CommandRunner`).
+**Out of scope:** non-dgx MCP tools.
+**Estimated diff:** ~220 lines.
+
+## Step 14.9 - docs
+
+**Branch:** `step-14.9-dgx-docs`
+**Touches:** `README.md`, `docs/`.
+**Implements:** DGX section, topology table, `.home.lab` vs `.home.lan` DNS
+caveat, example `newt.toml`.
+**Tests:** `documentation-audit` pass; no code.
+**Out of scope:** n/a.
+**Estimated diff:** ~120 lines.
+
+---
+
 # Cross-cutting notes
 
 - **drake-foreman dispatch:** each step's branch is the unit of work. The

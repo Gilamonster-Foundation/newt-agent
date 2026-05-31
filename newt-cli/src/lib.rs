@@ -1,6 +1,6 @@
 //! Newt CLI dispatch surface.
 //!
-//! Subcommands: `code`, `pilot`, `worker`, `mcp`, `doctor`, `config`.
+//! Subcommands: `code`, `pilot`, `worker`, `mcp`, `doctor`, `config`, `dgx`.
 //!
 //! The mesh subcommands (`announce`, `ask`) live in a sibling binary,
 //! `newt-mesh-cli`, inside the out-of-workspace `newt-mesh/` crate.
@@ -8,6 +8,7 @@
 //! kept out of the default workspace.
 
 mod config_cmd;
+mod dgx;
 mod doctor;
 pub mod stdio_guard;
 
@@ -57,6 +58,12 @@ pub enum Command {
     Doctor,
     /// Print resolved config.
     Config,
+    /// NVIDIA DGX endpoint management (route a task to a formation; more
+    /// subcommands land in later Phase 14 steps).
+    Dgx {
+        #[command(subcommand)]
+        cmd: dgx::DgxCmd,
+    },
 }
 
 pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
@@ -67,6 +74,7 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         Command::Mcp => run_mcp().await,
         Command::Doctor => doctor::run(cli.config.as_deref()).await,
         Command::Config => config_cmd::run(cli.config.as_deref()),
+        Command::Dgx { cmd } => dgx::run(cmd, cli.config.as_deref()).await,
     }
 }
 

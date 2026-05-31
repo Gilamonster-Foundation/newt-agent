@@ -40,7 +40,21 @@ just eval
 
 # Live: one case, specific model:
 just eval --case 001 --model llama3.1:8b
+
+# Coder mode + raised timeout for a slower local model:
+newt-eval run --mode live --case 008 --coder --worker-timeout-ms 180000
 ```
+
+### Coder mode and slow models
+
+- `--coder` spawns the worker with the `newt-coder` plugin (whole-file
+  emit + server-side diff normalization). Use it for local Ollama coder
+  models that otherwise trip failure mode T0b (invented hunk context).
+- `--worker-timeout-ms <ms>` (env `NEWT_EVAL_WORKER_TIMEOUT_MS`, default
+  `60000`) is the per-case wall-clock budget. A model slower than this is
+  scored `dispatch_error` even if it would have produced correct output —
+  raise it (e.g. `180000`) when evaluating slower models so the scorecard
+  measures capability, not just latency.
 
 Exit codes from `newt-eval run`:
 
@@ -53,7 +67,7 @@ Exit codes from `newt-eval run`:
 | Name | What it checks |
 |------|----------------|
 | `diff_nonempty` | `reply.diff` is non-empty AND `!reply.empty_diff` |
-| `diff_applies`  | Copy baseline to a tempdir, `git apply --check` accepts the diff |
+| `diff_applies`  | Copy baseline to a tempdir, `git apply --check` accepts the model's **raw emission** (when diff-shaped, fence peeled) — not the post-hoc captured diff — so a header-lying diff the fuzzy worker rescued is scored honestly (#30B) |
 | `rust_compiles` | `cargo check` on the post-worker workspace (Rust cases only) |
 | `tests_pass`    | `cargo test` on the post-worker workspace (Rust cases with `#[test]` only) |
 | `pattern_match` | At least one of `expected_patterns` regex matches the captured diff |
@@ -70,14 +84,21 @@ A case is a directory under `newt-eval/cases/NNN-name/` with two parts:
 2. `workspace/` — the initial filesystem state, copied verbatim into a
    tempdir at the start of each run.
 
+> See [`cases/CASE_AUTHORING.md`](cases/CASE_AUTHORING.md) for the full
+> guide — the emission-contract rule and how to generate byte-accurate
+> goldens from `git diff`.
+
 ```toml
-# newt-eval/cases/006-your-case/case.toml
-name = "006-your-case"
+# newt-eval/cases/010-your-case/case.toml
+name = "010-your-case"
 description = "One-line summary"
 language = "rust"
+difficulty = "L1"   # L1 saturated edit · L2 multi-step · L3 cross-domain
 prompt = """
-Multi-line instruction to the worker. End with "Respond with a unified
-diff only." so the model knows what shape to return.
+Multi-line instruction describing the TASK only. Do NOT specify the
+response format — the system prompt owns the emission shape, and a
+`case_prompt_lint` test fails on directives like "respond with a
+unified diff only" (see CASE_AUTHORING.md).
 """
 
 evaluators = [

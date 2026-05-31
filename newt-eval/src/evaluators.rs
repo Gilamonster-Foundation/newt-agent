@@ -77,7 +77,14 @@ impl Evaluator for DiffAppliesEvaluator {
     }
 
     fn evaluate(&self, ctx: &EvalContext) -> EvalResult {
-        if ctx.reply.diff.trim().is_empty() {
+        // #30B: judge the model's first raw emission when it is diff-shaped
+        // (the strict oracle on what the model actually produced), else fall
+        // back to the captured workspace diff. The captured diff is
+        // well-formed by construction and so always "applies" — checking it
+        // is what let header-lying diffs score `ok` despite real
+        // `git apply --check` rejecting them.
+        let (target, artifact) = select_apply_target(ctx);
+        if target.trim().is_empty() {
             return EvalResult::fail(self.name(), "no diff to apply");
         }
 
@@ -114,7 +121,7 @@ impl Evaluator for DiffAppliesEvaluator {
 
         if let Some(mut stdin) = child.stdin.take() {
             use std::io::Write;
-            if let Err(e) = stdin.write_all(ctx.reply.diff.as_bytes()) {
+            if let Err(e) = stdin.write_all(target.as_bytes()) {
                 return EvalResult::fail(self.name(), format!("write diff to git apply: {e}"));
             }
         }
@@ -125,17 +132,77 @@ impl Evaluator for DiffAppliesEvaluator {
         };
 
         if output.status.success() {
-            EvalResult::pass(self.name(), "git apply --check accepted the diff")
+            EvalResult::pass(
+                self.name(),
+                format!("git apply --check accepted the {artifact}"),
+            )
         } else {
             EvalResult::fail(
                 self.name(),
                 format!(
-                    "git apply --check rejected the diff: {}",
+                    "git apply --check rejected the {artifact}: {}",
                     String::from_utf8_lossy(&output.stderr).trim()
                 ),
             )
         }
     }
+}
+
+/// Choose what `diff_applies` feeds to `git apply --check`.
+///
+/// Returns the diff text plus a human label for the verdict message. When
+/// the worker surfaced the model's first raw emission and it is diff-shaped
+/// (after peeling a single ``` fence), we judge *that* — the strict oracle
+/// on the model's actual output (#30B). Otherwise (whole-file or prose
+/// emissions, or legacy replies with no `raw_emission`) we fall back to the
+/// captured workspace diff, preserving the previous behavior.
+fn select_apply_target(ctx: &EvalContext) -> (String, &'static str) {
+    if let Some(raw) = ctx.reply.raw_emission.as_deref() {
+        let mut stripped = strip_outer_fences(raw);
+        if looks_like_unified_diff(&stripped) {
+            // `strip_outer_fences` trims the trailing newline (along with any
+            // closing fence); `git apply` wants one on the final hunk line.
+            if !stripped.ends_with('\n') {
+                stripped.push('\n');
+            }
+            return (stripped, "raw emission");
+        }
+    }
+    (ctx.reply.diff.clone(), "captured diff")
+}
+
+/// Peel a single enclosing ``` fence so a correct diff wrapped in a
+/// ```diff … ``` block is not falsely rejected by `git apply --check`.
+///
+/// Unlike newt-coder's `strip_outer_fences` (which trims aggressively for
+/// parsing), this preserves the diff bytes verbatim when there is no fence
+/// — a trailing blank *context* line (` `) is significant to `git apply`
+/// and must not be trimmed away.
+fn strip_outer_fences(raw: &str) -> String {
+    if !raw.trim_matches('\n').starts_with("```") {
+        return raw.to_string();
+    }
+    // Fenced: drop the opening fence line (with optional language tag) and a
+    // trailing line that is only ```. Rejoin verbatim with a trailing newline.
+    let mut lines: Vec<&str> = raw.trim_matches('\n').lines().collect();
+    if !lines.is_empty() {
+        lines.remove(0);
+    }
+    if lines.last().is_some_and(|l| l.trim() == "```") {
+        lines.pop();
+    }
+    let mut out = lines.join("\n");
+    out.push('\n');
+    out
+}
+
+/// Detect a unified diff by header pattern (mirrors newt-coder's
+/// `try_parse_unified_diff`): a `--- `/`+++ ` header pair plus a `@@ ` hunk.
+fn looks_like_unified_diff(body: &str) -> bool {
+    let has_minus = body.starts_with("--- ") || body.contains("\n--- ");
+    let has_plus = body.contains("\n+++ ");
+    let has_hunk = body.contains("\n@@ ") || body.contains("@@ -");
+    has_minus && has_plus && has_hunk
 }
 
 // ── rust_compiles ───────────────────────────────────────────────────
@@ -388,6 +455,7 @@ mod tests {
             evaluators: vec![],
             expected_patterns,
             mock_response: MockResponse { content: "".into() },
+            difficulty: "L1".into(),
             case_dir: PathBuf::new(),
         };
         EvalContext {
@@ -501,6 +569,99 @@ mod tests {
         let r = DiffAppliesEvaluator.evaluate(&ctx);
         assert!(!r.passed);
         assert!(r.details.contains("no diff"));
+    }
+
+    // ── #30B: judge the model's raw first emission ──────────────────────
+
+    /// The bundled `001-rename-function` seed (13 lines).
+    const SEED_001: &str = "pub fn greet(name: &str) -> String {\n    format!(\"Hello, {name}!\")\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n\n    #[test]\n    fn greets() {\n        assert_eq!(greet(\"a\"), \"Hello, a!\");\n    }\n}\n";
+
+    /// A correct rename diff with an accurate header (blank context lines
+    /// carry their leading space).
+    const CLEAN_RENAME_DIFF: &str = "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,13 +1,13 @@\n-pub fn greet(name: &str) -> String {\n+pub fn hello(name: &str) -> String {\n     format!(\"Hello, {name}!\")\n }\n \n #[cfg(test)]\n mod tests {\n     use super::*;\n \n     #[test]\n     fn greets() {\n-        assert_eq!(greet(\"a\"), \"Hello, a!\");\n+        assert_eq!(hello(\"a\"), \"Hello, a!\");\n     }\n }\n";
+
+    /// The devstral lying diff from #30: header claims 11 old lines but the
+    /// body spans 13, and `pub fn greet` is left as context. `git apply
+    /// --check` rejects it; the fuzzy worker would rescue it.
+    const LYING_DIFF: &str = "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,11 +1,11 @@\n pub fn greet(name: &str) -> String {\n     format!(\"Hello, {name}!\")\n }\n \n #[cfg(test)]\n mod tests {\n     use super::*;\n \n     #[test]\n     fn greets() {\n-        assert_eq!(greet(\"a\"), \"Hello, a!\");\n+        assert_eq!(hello(\"a\"), \"Hello, a!\");\n     }\n }\n";
+
+    fn make_ctx_raw(captured_diff: &str, raw_emission: &str, baseline: PathBuf) -> EvalContext {
+        let reply = TaskReply::new("test-model", "content", captured_diff, false)
+            .unwrap()
+            .with_raw_emission(raw_emission);
+        let workspace = tempfile::tempdir().unwrap();
+        let ws = workspace.path().to_path_buf();
+        std::mem::forget(workspace);
+        let case = TestCase {
+            name: "ctx".into(),
+            description: "".into(),
+            language: "rust".into(),
+            prompt: "".into(),
+            evaluators: vec![],
+            expected_patterns: vec![],
+            mock_response: MockResponse { content: "".into() },
+            difficulty: "L1".into(),
+            case_dir: PathBuf::new(),
+        };
+        EvalContext {
+            case,
+            workspace: ws,
+            baseline,
+            reply,
+        }
+    }
+
+    fn seed_baseline(contents: &str) -> PathBuf {
+        let baseline = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(baseline.path().join("src")).unwrap();
+        std::fs::write(baseline.path().join("src/lib.rs"), contents).unwrap();
+        let p = baseline.path().to_path_buf();
+        std::mem::forget(baseline);
+        p
+    }
+
+    #[test]
+    fn diff_applies_judges_raw_emission_over_captured_diff() {
+        // Regression for #30B: the captured diff is clean and would apply,
+        // but the model's RAW first emission is a header-lying diff that
+        // real `git apply --check` rejects. The evaluator must judge the raw
+        // emission and FAIL. Under the old behavior (checking the captured
+        // diff) this scored a false `ok`.
+        let baseline = seed_baseline(SEED_001);
+        let ctx = make_ctx_raw(CLEAN_RENAME_DIFF, LYING_DIFF, baseline);
+        let r = DiffAppliesEvaluator.evaluate(&ctx);
+        assert!(!r.passed, "lying raw emission must fail: {}", r.details);
+        assert!(
+            r.details.contains("raw emission"),
+            "should report it judged the raw emission: {}",
+            r.details
+        );
+    }
+
+    #[test]
+    fn diff_applies_strips_fence_on_correct_raw_emission() {
+        // A correct diff wrapped in a ```diff fence must still pass — the
+        // evaluator peels the fence before `git apply --check`, so a model
+        // is not penalized for fencing its (valid) output.
+        let baseline = seed_baseline(SEED_001);
+        let fenced = format!("```diff\n{CLEAN_RENAME_DIFF}```");
+        let ctx = make_ctx_raw("", &fenced, baseline);
+        let r = DiffAppliesEvaluator.evaluate(&ctx);
+        assert!(r.passed, "fenced correct diff must pass: {}", r.details);
+        assert!(r.details.contains("raw emission"));
+    }
+
+    #[test]
+    fn diff_applies_falls_back_to_captured_for_whole_file_emission() {
+        // A whole-file (non-diff) raw emission has no diff to lie about, so
+        // the evaluator falls back to the captured diff (previous behavior).
+        let baseline = seed_baseline("before\n");
+        let captured = "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,1 +1,1 @@\n-before\n+after\n";
+        let whole_file = "FILE: src/lib.rs\npub fn hello() {}\nEND-FILE\n";
+        let ctx = make_ctx_raw(captured, whole_file, baseline);
+        let r = DiffAppliesEvaluator.evaluate(&ctx);
+        assert!(r.passed, "should fall back to captured diff: {}", r.details);
+        assert!(r.details.contains("captured diff"));
     }
 
     #[test]

@@ -1,0 +1,49 @@
+name = "011-state-machine-drain"
+description = "Fix control flow: skip negatives instead of returning early"
+language = "rust"
+difficulty = "L2"
+prompt = """
+In src/lib.rs, `sum_until_zero` should sum positive numbers up to the
+first `0` sentinel, SKIPPING negatives. It currently returns early when it
+hits a negative. Fix the control flow so a negative is skipped (not
+terminal), and add a test `skips_negatives` asserting
+sum_until_zero(&[1, -9, 2, 0]) == 3.
+"""
+
+evaluators = [
+    "diff_nonempty",
+    "diff_applies",
+    "rust_compiles",
+    "tests_pass",
+    "pattern_match",
+]
+
+expected_patterns = [
+    "continue;",
+    "fn skips_negatives",
+]
+
+[mock_response]
+content = """
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -6,7 +6,7 @@ pub fn sum_until_zero(xs: &[i32]) -> i32 {
+             break;
+         }
+         if x < 0 {
+-            return sum;
++            continue;
+         }
+         sum += x;
+     }
+@@ -21,4 +21,9 @@ mod tests {
+     fn stops_at_zero() {
+         assert_eq!(sum_until_zero(&[1, 2, 0, 5]), 3);
+     }
++
++    #[test]
++    fn skips_negatives() {
++        assert_eq!(sum_until_zero(&[1, -9, 2, 0]), 3);
++    }
+ }
+"""

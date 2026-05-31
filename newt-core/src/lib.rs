@@ -5,6 +5,7 @@
 //! configured backends which can serve that tier.
 
 pub mod config;
+pub mod dgx;
 pub mod error;
 pub mod model_id;
 pub mod router;
@@ -14,6 +15,7 @@ pub mod session;
 pub mod pyo3_module;
 
 pub use config::Config;
+pub use dgx::{DgxConfig, DgxFormation, DgxNode, DgxNotConfigured, EndpointKind};
 pub use error::NewtError;
 pub use model_id::ModelId;
 pub use router::{Router, Tier};
