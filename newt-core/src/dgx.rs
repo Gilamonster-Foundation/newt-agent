@@ -124,11 +124,11 @@ impl FromStr for EndpointKind {
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum DgxNotConfigured {
     /// No nodes in config and no `NEWT_DGX_*` fallback.
-    #[error("no DGX nodes configured — run `newt dgx setup` or set NEWT_DGX_HOST")]
+    #[error("no DGX nodes configured — set NEWT_DGX_HOST=<host>  or  NEWT_DGX_OLLAMA_URL=<url>")]
     NoNodes,
 
     /// Several nodes exist but none is marked active.
-    #[error("no active DGX node selected ({count} configured) — set [dgx].active_node or run `newt dgx node use <name>`")]
+    #[error("no active DGX node selected ({count} configured) — set [dgx].active_node in your config")]
     NoActiveNode { count: usize },
 
     /// `active_node` names a node that isn't in the list.
@@ -140,7 +140,7 @@ pub enum DgxNotConfigured {
     EndpointUnset { node: String, kind: EndpointKind },
 
     /// No active model and no `NEWT_DGX_MODEL`.
-    #[error("no active DGX model — set [dgx].active_model, NEWT_DGX_MODEL, or run `newt dgx use <model>`")]
+    #[error("no active DGX model — set [dgx].active_model or NEWT_DGX_MODEL=<model-id>")]
     NoActiveModel,
 
     /// No SSH host for `run`/`push`.
