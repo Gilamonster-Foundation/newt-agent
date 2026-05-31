@@ -67,7 +67,7 @@ jobs:
 
       - name: Build binaries
         run: |
-          cargo build --release --locked --target ${{ matrix.target }} -p newt-cli -p newt-mcp-server
+          cargo build --release --locked --target ${{ matrix.target }} -p newt-agent -p newt-mcp-server
 
       - name: Stage release contents (Unix)
         if: matrix.platform != 'windows-latest'
@@ -150,7 +150,7 @@ jobs:
           - newt-tui
           - newt-acp-worker
           - newt-mcp-server
-          - newt-cli
+          - newt-agent  # package name for the newt-cli/ dir (binary: `newt`)
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
