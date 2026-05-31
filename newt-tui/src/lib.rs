@@ -49,7 +49,6 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 const NEWT_ORANGE: Color = Color::Rgb(220, 60, 20);
 const NEWT_ORANGE_CT: CtColor = CtColor::Rgb { r: 220, g: 60, b: 20 };
-const HUMAN_BLUE_CT: CtColor = CtColor::Rgb { r: 80, g: 140, b: 255 };
 
 // ---------------------------------------------------------------------------
 // Public entry points
