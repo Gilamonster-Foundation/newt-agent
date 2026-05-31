@@ -109,7 +109,9 @@ fn run_splash_color(path: Option<&std::path::Path>) -> anyhow::Result<()> {
     )?;
 
     // Print the ANSI logo directly — the file already contains all escape codes.
-    write!(out, "{LOGO_COLOR}")?;
+    // In raw mode \n is line-feed only; replace with \r\n so each new line
+    // starts at column 0 (carriage return is not implicit in raw mode).
+    write!(out, "{}", LOGO_COLOR.replace('\n', "\r\n"))?;
     out.flush()?;
 
     // Position the status block just below the logo.
