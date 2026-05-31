@@ -147,9 +147,12 @@ fn logo_for_width(cols: u16) -> (&'static str, u16) {
 
 fn run_splash_color(path: Option<&std::path::Path>) -> anyhow::Result<()> {
     let workspace = resolve_workspace(path);
-    let term_cols = terminal::size().map(|(w, _)| w).unwrap_or(80);
+    let (term_cols, term_rows) = terminal::size().unwrap_or((80, 24));
     let (logo, logo_cols) = logo_for_width(term_cols);
     let logo_rows = logo.lines().count() as u16;
+
+    // Vertically centre the logo; if taller than the terminal, start at 0.
+    let logo_top = term_rows.saturating_sub(logo_rows) / 2;
 
     enable_raw_mode()?;
     let mut out = io::stdout();
@@ -158,7 +161,7 @@ fn run_splash_color(path: Option<&std::path::Path>) -> anyhow::Result<()> {
         EnterAlternateScreen,
         Hide,
         Clear(ClearType::All),
-        MoveTo(0, 0)
+        MoveTo(0, logo_top)
     )?;
 
     // Print the ANSI logo directly — the file already contains all escape codes.
@@ -170,7 +173,7 @@ fn run_splash_color(path: Option<&std::path::Path>) -> anyhow::Result<()> {
     // Right panel — static branding only. Never put environment-specific
     // content here: it can overlap the image if the logo renders unevenly.
     let brand_col = logo_cols + 2;
-    let brand_row = logo_rows.saturating_sub(4) / 2;
+    let brand_row = logo_top + logo_rows.saturating_sub(4) / 2;
 
     queue!(out, MoveTo(brand_col, brand_row))?;
     queue!(
@@ -195,8 +198,12 @@ fn run_splash_color(path: Option<&std::path::Path>) -> anyhow::Result<()> {
         ResetColor
     )?;
 
-    // Environment-specific context goes below the image, never beside it.
-    queue!(out, MoveTo(0, logo_rows + 1))?;
+    // Environment-specific context: just below the logo, or pinned two rows
+    // from the bottom of the terminal — whichever is lower — so it never
+    // floats in blank space when the logo is shorter than the terminal.
+    let logo_bottom = logo_top + logo_rows + 1;
+    let footer_row = logo_bottom.max(term_rows.saturating_sub(2));
+    queue!(out, MoveTo(0, footer_row))?;
     queue!(out, Print(format!("Workspace:  {workspace}")))?;
 
     out.flush()?;
