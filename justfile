@@ -35,6 +35,10 @@ install dest=`echo $HOME/bin`:
     @echo "Installed: {{dest}}/newt  {{dest}}/newt-mcp-server"
     @case ":$PATH:" in *":{{dest}}:"*) ;; *) echo "Note: {{dest}} is not in PATH — add:  export PATH={{dest}}:\$PATH" ;; esac
 
+# Remove all Cargo build artefacts (force a clean rebuild / free disk space).
+clean:
+    cargo clean
+
 # --- Test ---
 
 # Run every test in the workspace.

@@ -239,6 +239,10 @@ impl InferenceBackend for LocalOllamaBackend {
         true
     }
 
+    fn endpoint(&self) -> Option<&str> {
+        Some(&self.endpoint)
+    }
+
     async fn complete(&self, req: ChatRequest) -> anyhow::Result<ChatReply> {
         let retry_delays_ms: &[u64] = &[250, 500, 1000];
         let mut last_err = anyhow::anyhow!("no attempts made");
@@ -433,6 +437,10 @@ impl InferenceBackend for LocalVllmBackend {
 
     fn supports_tier(&self, _tier: Tier) -> bool {
         true
+    }
+
+    fn endpoint(&self) -> Option<&str> {
+        Some(&self.endpoint)
     }
 
     async fn complete(&self, req: ChatRequest) -> anyhow::Result<ChatReply> {

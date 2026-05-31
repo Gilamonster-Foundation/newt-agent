@@ -85,6 +85,23 @@ pub trait InferenceBackend: Send + Sync {
     fn model_id(&self) -> &str;
     fn supports_tier(&self, tier: Tier) -> bool;
     async fn complete(&self, req: ChatRequest) -> anyhow::Result<ChatReply>;
+
+    /// Optional HTTP endpoint URL the backend will hit when `complete`
+    /// is called. Used by the dispatch-time `Caveats::net` enforcement
+    /// in `newt-coder` to decide whether a peer's signed authority
+    /// permits this network call.
+    ///
+    /// Returns `None` for backends that don't make a network call
+    /// (mocks, subprocess plugins that bridge in-process inference,
+    /// future in-tree inference). When `None`, the network-axis check
+    /// is treated as vacuously satisfied — there is no host to consult.
+    ///
+    /// The default returns `None` so existing implementations stay
+    /// source-compatible; backends that do speak HTTP (e.g.
+    /// `LocalOllamaBackend`, `LocalVllmBackend`) override this.
+    fn endpoint(&self) -> Option<&str> {
+        None
+    }
 }
 
 #[cfg(test)]
