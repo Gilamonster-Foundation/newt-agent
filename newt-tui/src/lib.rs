@@ -34,21 +34,27 @@ use ratatui::{
 };
 
 /// 24-bit ANSI half-block art. Display dimensions (cols × rows):
-///   LOGO_10:   10 × 5
-///   LOGO_20:   20 × 10
-///   LOGO_40:   40 × 20
-///   LOGO_FULL: 80 × 40
+///   LOGO_10:   10 × 5     (original, tiny)
+///   LOGO_20:   20 × 10    (original, small)
+///   LOGO_40:   40 × 20    (original, medium)
+///   LOGO_FULL: 80 × 40    (original, large)
+///   LOGO_120: 126 × 41    (chafa-generated from source PNG)
+///   LOGO_160: 166 × 41    (chafa-generated from source PNG)
 /// Chosen at runtime by `logo_for_width`. Printed directly (not ratatui).
 const LOGO_10: &str = include_str!("../../docs/logos/newt-ansi-10.txt");
 const LOGO_20: &str = include_str!("../../docs/logos/newt-ansi-20.txt");
 const LOGO_40: &str = include_str!("../../docs/logos/newt-ansi-40.txt");
 const LOGO_FULL: &str = include_str!("../../docs/logos/newt-ansi-full.txt");
+const LOGO_120: &str = include_str!("../../docs/logos/newt-ansi-120.txt");
+const LOGO_160: &str = include_str!("../../docs/logos/newt-ansi-160.txt");
 
-/// Display column widths matching the four logo constants.
+/// Display column widths matching the logo constants above.
 const LOGO_10_COLS: u16 = 10;
 const LOGO_20_COLS: u16 = 20;
 const LOGO_40_COLS: u16 = 40;
 const LOGO_FULL_COLS: u16 = 80;
+const LOGO_120_COLS: u16 = 126;
+const LOGO_160_COLS: u16 = 166;
 
 /// Plain ASCII art — 14 lines × ~40 display columns.
 /// Used as the no-color fallback, rendered as a ratatui Paragraph.
@@ -117,6 +123,8 @@ const STATUS_MIN_COLS: u16 = 44;
 
 fn logo_for_width(cols: u16) -> (&'static str, u16) {
     for (art, w) in [
+        (LOGO_160, LOGO_160_COLS),
+        (LOGO_120, LOGO_120_COLS),
         (LOGO_FULL, LOGO_FULL_COLS),
         (LOGO_40, LOGO_40_COLS),
         (LOGO_20, LOGO_20_COLS),
@@ -377,7 +385,7 @@ mod tests {
     fn logo_assets_are_embedded() {
         assert!(!LOGO_PLAIN.is_empty());
         assert!(LOGO_PLAIN.lines().count() > 5);
-        for logo in [LOGO_10, LOGO_20, LOGO_40, LOGO_FULL] {
+        for logo in [LOGO_10, LOGO_20, LOGO_40, LOGO_FULL, LOGO_120, LOGO_160] {
             assert!(!logo.is_empty());
             assert!(logo.lines().count() >= 5);
         }
@@ -385,16 +393,17 @@ mod tests {
 
     #[test]
     fn logo_for_width_picks_correct_size() {
-        // LOGO_FULL (80 cols) needs 80 + STATUS_MIN_COLS + 2 = 126 cols.
-        let (_, w) = logo_for_width(200);
-        assert_eq!(w, LOGO_FULL_COLS);
+        // Wide terminal gets the largest logo.
+        let (_, w) = logo_for_width(LOGO_160_COLS + STATUS_MIN_COLS + 2);
+        assert_eq!(w, LOGO_160_COLS);
 
-        let (_, w) = logo_for_width(LOGO_FULL_COLS + STATUS_MIN_COLS + 2);
-        assert_eq!(w, LOGO_FULL_COLS);
+        // Just below 160 threshold → 120.
+        let (_, w) = logo_for_width(LOGO_160_COLS + STATUS_MIN_COLS + 1);
+        assert_eq!(w, LOGO_120_COLS);
 
-        // Just below the LOGO_FULL threshold → should pick LOGO_40.
-        let (_, w) = logo_for_width(LOGO_FULL_COLS + STATUS_MIN_COLS + 1);
-        assert_eq!(w, LOGO_40_COLS);
+        // Just below 120 threshold → full (80).
+        let (_, w) = logo_for_width(LOGO_120_COLS + STATUS_MIN_COLS + 1);
+        assert_eq!(w, LOGO_FULL_COLS);
 
         // Narrow terminal falls back to smallest.
         let (_, w) = logo_for_width(10);
@@ -406,6 +415,8 @@ mod tests {
         assert!(LOGO_10_COLS < LOGO_20_COLS);
         assert!(LOGO_20_COLS < LOGO_40_COLS);
         assert!(LOGO_40_COLS < LOGO_FULL_COLS);
+        assert!(LOGO_FULL_COLS < LOGO_120_COLS);
+        assert!(LOGO_120_COLS < LOGO_160_COLS);
     }
 
     #[test]
