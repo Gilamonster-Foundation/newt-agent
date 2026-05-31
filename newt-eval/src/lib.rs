@@ -35,6 +35,7 @@ pub mod evaluators;
 pub mod lint;
 pub mod runner;
 pub mod scorecard;
+pub mod worker_bin;
 
 #[cfg(feature = "pyo3")]
 pub mod pyo3_module;
@@ -47,3 +48,4 @@ pub use evaluators::{
 pub use lint::{lint_case_prompts, lint_prompt, LintError};
 pub use runner::{run_case, RunOutcome, RunnerConfig};
 pub use scorecard::{CaseScorecard, EvalContext, EvalResult, Scorecard};
+pub use worker_bin::{resolve_worker_bin, resolve_worker_bin_with, Resolution, ResolutionSource};
