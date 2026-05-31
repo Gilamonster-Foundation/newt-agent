@@ -19,7 +19,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use agent_mesh_core::{AgentKey, AgentMetadata, Fingerprint, UserKey};
+use agent_mesh_core::{AgentKey, AgentMetadata, Caveats, Fingerprint, UserKey};
 use agent_mesh_discovery::{Browser, BrowserEvent};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -228,6 +228,7 @@ fn issue_agent(user: &UserKey, role: &str, capabilities: Vec<String>) -> AgentKe
             capabilities,
             issued_at: now_rfc3339(),
             expires_at: None,
+            caveats: Caveats::top(),
         },
     )
 }

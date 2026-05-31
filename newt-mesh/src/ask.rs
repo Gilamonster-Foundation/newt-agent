@@ -76,7 +76,7 @@ impl MeshAsker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_mesh_core::{AgentMetadata, UserKey};
+    use agent_mesh_core::{AgentMetadata, Caveats, UserKey};
 
     fn agent(user: &UserKey, role: &str) -> AgentKey {
         AgentKey::issue(
@@ -87,6 +87,7 @@ mod tests {
                 capabilities: vec!["test".into()],
                 issued_at: "2026-05-29T00:00:00Z".into(),
                 expires_at: None,
+                caveats: Caveats::top(),
             },
         )
     }

@@ -35,8 +35,10 @@ name = "newt-mesh"
 path = "src/bin/newt-mesh-cli.rs"
 
 [dependencies]
-# agent-mesh path deps — relative to this Cargo.toml.
-agent-mesh-core      = { path = "../../agent-mesh/agent-mesh-core" }
+# agent-mesh path deps — relative to this Cargo.toml. `agent-mesh-core`
+# was renamed to `agent-mesh-protocol`; the dependency-rename keeps the
+# `agent_mesh_core::` import name so call sites don't churn.
+agent-mesh-core      = { package = "agent-mesh-protocol", path = "../../agent-mesh/agent-mesh-protocol" }
 agent-mesh-bus       = { path = "../../agent-mesh/agent-mesh-bus" }
 agent-mesh-discovery = { path = "../../agent-mesh/agent-mesh-discovery" }
 
