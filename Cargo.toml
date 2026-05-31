@@ -27,8 +27,8 @@ members = [
 exclude = ["newt-mesh"]
 
 [workspace.package]
-# Kyln versioning: 0.{month}.{YYYYMMDD}
-version = "0.5.20260530"
+# Semver — first crates.io release 0.6.0 (matches agent-mesh 0.6.0).
+version = "0.6.0"
 edition = "2021"
 rust-version = "1.75"
 license = "Apache-2.0"
@@ -91,15 +91,15 @@ insta = "1"
 tests-common = { path = "tests/common" }
 
 # Internal crates — pinned with = for lock-step publishing
-newt-core         = { path = "newt-core",         version = "=0.5.20260530" }
-newt-inference    = { path = "newt-inference",    version = "=0.5.20260530" }
-newt-tools        = { path = "newt-tools",        version = "=0.5.20260530" }
-newt-tui          = { path = "newt-tui",          version = "=0.5.20260530" }
-newt-acp-worker   = { path = "newt-acp-worker",   version = "=0.5.20260530" }
-newt-mcp-server   = { path = "newt-mcp-server",   version = "=0.5.20260530" }
-newt-coder        = { path = "newt-coder",        version = "=0.5.20260530" }
-newt-eval         = { path = "newt-eval",         version = "=0.5.20260530" }
-plugins-protocol  = { path = "plugins-protocol",  version = "=0.5.20260530" }
+newt-core         = { path = "newt-core",         version = "=0.6.0" }
+newt-inference    = { path = "newt-inference",    version = "=0.6.0" }
+newt-tools        = { path = "newt-tools",        version = "=0.6.0" }
+newt-tui          = { path = "newt-tui",          version = "=0.6.0" }
+newt-acp-worker   = { path = "newt-acp-worker",   version = "=0.6.0" }
+newt-mcp-server   = { path = "newt-mcp-server",   version = "=0.6.0" }
+newt-coder        = { path = "newt-coder",        version = "=0.6.0" }
+newt-eval         = { path = "newt-eval",         version = "=0.6.0" }
+plugins-protocol  = { path = "plugins-protocol",  version = "=0.6.0" }
 
 # NOTE on agent-mesh / newt-mesh: see the `[workspace] exclude = [...]`
 # block above. Those deps are NOT declared as workspace-level

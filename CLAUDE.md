@@ -69,9 +69,11 @@ Target floor: 80% (per the roadmap acceptance contract).
 
 ## Versioning
 
-Kyln-style: `0.{month}.{YYYYMMDD}`. The workspace package version is
-set in the top-level `Cargo.toml` under `[workspace.package]`; all
-internal crates inherit via `version.workspace = true`.
+**Semver** (`0.MINOR.PATCH`). First crates.io release is **`0.6.0`**
+(matching `agent-mesh` `0.6.0`); the earlier date-based scheme
+(`0.{month}.{YYYYMMDD}`) is retired. The workspace package version is set
+in the top-level `Cargo.toml` under `[workspace.package]`; all internal
+crates inherit via `version.workspace = true`.
 
 ## When in doubt
 
