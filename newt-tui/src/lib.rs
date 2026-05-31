@@ -353,17 +353,8 @@ fn run_chat(workspace: &str, color: bool) -> anyhow::Result<()> {
     let mut line = String::new();
 
     loop {
-        // Prompt
-        if color {
-            execute!(
-                io::stdout(),
-                SetForegroundColor(NEWT_ORANGE_CT),
-                Print("  you ▸  "),
-                ResetColor,
-            )?;
-        } else {
-            print!("  you >  ");
-        }
+        // Prompt — default terminal color so it's readable for everyone.
+        print!("  you ▸  ");
         io::stdout().flush()?;
 
         line.clear();
