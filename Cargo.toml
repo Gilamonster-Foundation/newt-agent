@@ -27,9 +27,10 @@ members = [
 exclude = ["newt-mesh"]
 
 [workspace.package]
-# Semver — 0.6.0 line matches agent-mesh 0.6.0. 0.6.1 is the bug-fix release
-# (newt-agent#49/#50/#53/#54/#57/#64).
-version = "0.6.1"
+# Semver — 0.6.0 line matches agent-mesh 0.6.0. 0.6.2 is the bug-fix release
+# (newt-agent#49/#50/#53/#54/#57/#64); 0.6.1's publish partially failed because
+# newt-coder was missing from release.yml's publish matrix — fixed here.
+version = "0.6.2"
 edition = "2021"
 rust-version = "1.75"
 license = "Apache-2.0"
@@ -96,15 +97,15 @@ insta = "1"
 tests-common = { path = "tests/common" }
 
 # Internal crates — pinned with = for lock-step publishing
-newt-core         = { path = "newt-core",         version = "=0.6.1" }
-newt-inference    = { path = "newt-inference",    version = "=0.6.1" }
-newt-tools        = { path = "newt-tools",        version = "=0.6.1" }
-newt-tui          = { path = "newt-tui",          version = "=0.6.1" }
-newt-acp-worker   = { path = "newt-acp-worker",   version = "=0.6.1" }
-newt-mcp-server   = { path = "newt-mcp-server",   version = "=0.6.1" }
-newt-coder        = { path = "newt-coder",        version = "=0.6.1" }
-newt-eval         = { path = "newt-eval",         version = "=0.6.1" }
-plugins-protocol  = { path = "plugins-protocol",  version = "=0.6.1" }
+newt-core         = { path = "newt-core",         version = "=0.6.2" }
+newt-inference    = { path = "newt-inference",    version = "=0.6.2" }
+newt-tools        = { path = "newt-tools",        version = "=0.6.2" }
+newt-tui          = { path = "newt-tui",          version = "=0.6.2" }
+newt-acp-worker   = { path = "newt-acp-worker",   version = "=0.6.2" }
+newt-mcp-server   = { path = "newt-mcp-server",   version = "=0.6.2" }
+newt-coder        = { path = "newt-coder",        version = "=0.6.2" }
+newt-eval         = { path = "newt-eval",         version = "=0.6.2" }
+plugins-protocol  = { path = "plugins-protocol",  version = "=0.6.2" }
 
 # NOTE on agent-mesh / newt-mesh: see the `[workspace] exclude = [...]`
 # block above. Those deps are NOT declared as workspace-level

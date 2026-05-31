@@ -148,6 +148,7 @@ jobs:
           - newt-inference
           - newt-tools
           - newt-tui
+          - newt-coder      # newt-acp-worker depends on this — must publish before it
           - newt-acp-worker
           - newt-mcp-server
           - newt-agent  # package name for the newt-cli/ dir (binary: `newt`)
@@ -171,7 +172,19 @@ jobs:
       - name: cargo publish ${{ matrix.crate }}
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo publish -p ${{ matrix.crate }} --locked --no-verify
+        # Idempotent: tolerate a crate version that is already on crates.io so a
+        # re-run after a partial publish doesn't fail. Any other error is fatal.
+        run: |
+          if cargo publish -p ${{ matrix.crate }} --locked --no-verify 2>publish.err; then
+            cat publish.err >&2 || true
+            echo "published ${{ matrix.crate }}"
+          elif grep -qiE 'already (exists|uploaded)|is already uploaded|already published' publish.err; then
+            cat publish.err >&2
+            echo "::notice::${{ matrix.crate }} already published at this version — skipping"
+          else
+            cat publish.err >&2
+            exit 1
+          fi
 
   # ── Build PyPI wheels (tag-only, maturin matrix) ──────────────────────
   #
