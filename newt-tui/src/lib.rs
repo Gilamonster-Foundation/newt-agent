@@ -374,21 +374,103 @@ fn run_chat(workspace: &str, color: bool) -> anyhow::Result<()> {
                 if task.is_empty() {
                     continue;
                 }
-                if matches!(task, "/exit" | "/quit" | "exit" | "quit") {
-                    break;
-                }
                 println!();
-                print_newt(
-                    &format!(
-                        "Got it: \"{task}\" — coder runtime not yet connected. \
-                         Try `just eval --case 001` to run against a real Ollama."
-                    ),
-                    color,
-                );
+                if task.starts_with('/') {
+                    if !dispatch_slash(task, workspace, color)? {
+                        break;
+                    }
+                } else if matches!(task, "exit" | "quit") {
+                    break;
+                } else {
+                    print_newt(
+                        &format!(
+                            "Got it: \"{task}\" — coder runtime not yet connected. \
+                             Try `just eval --case 001` to run against a real Ollama."
+                        ),
+                        color,
+                    );
+                }
                 println!();
             }
             Err(e) => return Err(e.into()),
         }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Slash command dispatcher
+// ---------------------------------------------------------------------------
+
+/// Dispatch a `/command` line. Returns `true` to keep the session alive,
+/// `false` to exit.
+fn dispatch_slash(input: &str, workspace: &str, color: bool) -> anyhow::Result<bool> {
+    // Strip leading slash and split into at most 3 tokens.
+    let body = input.trim_start_matches('/');
+    let mut parts = body.splitn(3, ' ');
+    let cmd = parts.next().unwrap_or("");
+    let arg1 = parts.next().unwrap_or("").trim();
+    let arg2 = parts.next().unwrap_or("").trim();
+
+    match cmd {
+        "exit" | "quit" => return Ok(false),
+
+        "help" => {
+            print_newt("Available commands:", color);
+            for line in [
+                "  /dgx status              — DGX endpoint health + running models",
+                "  /dgx models              — list models installed on the DGX",
+                "  /dgx warm [model]        — pre-load a model into VRAM",
+                "  /dgx route <task>        — recommend a formation for a task",
+                "  /dgx doctor              — probe every configured endpoint",
+                "  /workspace               — show current workspace path",
+                "  /version                 — print newt version",
+                "  /help                    — this message",
+                "  /exit  /quit  exit  quit — leave the session",
+            ] {
+                println!("{line}");
+            }
+        }
+
+        "version" => print_newt(&format!("v{VERSION}"), color),
+
+        "workspace" => print_newt(workspace, color),
+
+        "dgx" => {
+            if arg1.is_empty() {
+                print_newt(
+                    "usage: /dgx <status|models|warm [model]|route <task>|doctor>",
+                    color,
+                );
+            } else {
+                // Build args: ["dgx", subcmd, optional-extra]
+                let mut dgx_args = vec!["dgx", arg1];
+                if !arg2.is_empty() {
+                    dgx_args.push(arg2);
+                }
+                run_newt_subcmd(&dgx_args, color)?;
+            }
+        }
+
+        other => print_newt(&format!("unknown command: /{other}  (try /help)"), color),
+    }
+    Ok(true)
+}
+
+/// Run `newt <args>` as a subprocess using the current executable path so
+/// the command works even when newt is not on PATH. stdout/stderr pass
+/// through to the terminal unchanged.
+fn run_newt_subcmd(args: &[&str], color: bool) -> anyhow::Result<()> {
+    let exe = std::env::current_exe()?;
+    let status = std::process::Command::new(&exe).args(args).status()?;
+    if !status.success() {
+        print_newt(
+            &format!(
+                "command exited with status {}",
+                status.code().unwrap_or(-1)
+            ),
+            color,
+        );
     }
     Ok(())
 }
@@ -521,12 +603,35 @@ mod tests {
     }
 
     #[test]
-    fn exit_commands_are_recognised() {
-        for cmd in ["/exit", "/quit", "exit", "quit"] {
-            assert!(
-                matches!(cmd, "/exit" | "/quit" | "exit" | "quit"),
-                "{cmd} should be recognised as an exit command"
-            );
+    fn slash_exit_returns_false() {
+        for cmd in ["/exit", "/quit"] {
+            let result = dispatch_slash(cmd, "/ws", false).unwrap();
+            assert!(!result, "{cmd} should return false (exit)");
         }
+    }
+
+    #[test]
+    fn slash_help_returns_true() {
+        assert!(dispatch_slash("/help", "/ws", false).unwrap());
+    }
+
+    #[test]
+    fn slash_version_returns_true() {
+        assert!(dispatch_slash("/version", "/ws", false).unwrap());
+    }
+
+    #[test]
+    fn slash_workspace_returns_true() {
+        assert!(dispatch_slash("/workspace", "/ws", false).unwrap());
+    }
+
+    #[test]
+    fn slash_unknown_returns_true() {
+        assert!(dispatch_slash("/notacommand", "/ws", false).unwrap());
+    }
+
+    #[test]
+    fn slash_dgx_no_subcmd_returns_true() {
+        assert!(dispatch_slash("/dgx", "/ws", false).unwrap());
     }
 }
