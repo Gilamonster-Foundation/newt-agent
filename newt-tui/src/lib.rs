@@ -121,16 +121,24 @@ fn color_supported_with(get_env: &dyn Fn(&str) -> Option<String>) -> bool {
 /// Status panel minimum — enough for "Workspace: /very/long/path".
 const STATUS_MIN_COLS: u16 = 44;
 
+/// The 166-col logo is 81 rows tall — genuinely large. Reserve it for
+/// terminals that are notably wider than the minimum that would fit it,
+/// so "normal wide" terminals get the 126-col logo instead.
+const LOGO_160_MIN_TERM_COLS: u16 = 260;
+
 fn logo_for_width(cols: u16) -> (&'static str, u16) {
-    for (art, w) in [
-        (LOGO_160, LOGO_160_COLS),
-        (LOGO_120, LOGO_120_COLS),
-        (LOGO_FULL, LOGO_FULL_COLS),
-        (LOGO_40, LOGO_40_COLS),
-        (LOGO_20, LOGO_20_COLS),
-        (LOGO_10, LOGO_10_COLS),
+    // Each entry: (art, display_width, minimum_terminal_cols_required).
+    // The minimum for LOGO_160 is intentionally higher than its natural
+    // fit threshold so it only appears on very wide terminals.
+    for (art, w, min_term) in [
+        (LOGO_160, LOGO_160_COLS, LOGO_160_MIN_TERM_COLS),
+        (LOGO_120, LOGO_120_COLS, LOGO_120_COLS + STATUS_MIN_COLS + 2),
+        (LOGO_FULL, LOGO_FULL_COLS, LOGO_FULL_COLS + STATUS_MIN_COLS + 2),
+        (LOGO_40,   LOGO_40_COLS,   LOGO_40_COLS   + STATUS_MIN_COLS + 2),
+        (LOGO_20,   LOGO_20_COLS,   LOGO_20_COLS   + STATUS_MIN_COLS + 2),
+        (LOGO_10,   LOGO_10_COLS,   LOGO_10_COLS   + STATUS_MIN_COLS + 2),
     ] {
-        if w + STATUS_MIN_COLS + 2 <= cols {
+        if cols >= min_term {
             return (art, w);
         }
     }
@@ -380,15 +388,16 @@ mod tests {
 
     #[test]
     fn logo_for_width_picks_correct_size() {
-        // Wide terminal gets the largest logo.
-        let (_, w) = logo_for_width(LOGO_160_COLS + STATUS_MIN_COLS + 2);
+        // Very wide terminal gets the 160-col logo.
+        let (_, w) = logo_for_width(LOGO_160_MIN_TERM_COLS);
         assert_eq!(w, LOGO_160_COLS);
 
-        // Just below 160 threshold → 120.
-        let (_, w) = logo_for_width(LOGO_160_COLS + STATUS_MIN_COLS + 1);
+        // Just below the elevated 160 threshold → 120-col logo,
+        // even though 166+44+2=212 would technically fit.
+        let (_, w) = logo_for_width(LOGO_160_MIN_TERM_COLS - 1);
         assert_eq!(w, LOGO_120_COLS);
 
-        // Just below 120 threshold → full (80).
+        // Just below the 120 threshold → full (80-col).
         let (_, w) = logo_for_width(LOGO_120_COLS + STATUS_MIN_COLS + 1);
         assert_eq!(w, LOGO_FULL_COLS);
 
