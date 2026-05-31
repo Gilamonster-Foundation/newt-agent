@@ -33,14 +33,22 @@ use ratatui::{
     Terminal,
 };
 
-/// 24-bit ANSI braille art at three sizes (cols × lines):
-///   SM  ~60 × 10   newt-ansi-20
-///   MD ~120 × 20   newt-ansi-40
-///   LG ~240 × 40   newt-ansi-full
+/// 24-bit ANSI half-block art. Display dimensions (cols × rows):
+///   LOGO_10:   10 × 5
+///   LOGO_20:   20 × 10
+///   LOGO_40:   40 × 20
+///   LOGO_FULL: 80 × 40
 /// Chosen at runtime by `logo_for_width`. Printed directly (not ratatui).
-const LOGO_SM: &str = include_str!("../../docs/logos/newt-ansi-20.txt");
-const LOGO_MD: &str = include_str!("../../docs/logos/newt-ansi-40.txt");
-const LOGO_LG: &str = include_str!("../../docs/logos/newt-ansi-full.txt");
+const LOGO_10: &str = include_str!("../../docs/logos/newt-ansi-10.txt");
+const LOGO_20: &str = include_str!("../../docs/logos/newt-ansi-20.txt");
+const LOGO_40: &str = include_str!("../../docs/logos/newt-ansi-40.txt");
+const LOGO_FULL: &str = include_str!("../../docs/logos/newt-ansi-full.txt");
+
+/// Display column widths matching the four logo constants.
+const LOGO_10_COLS: u16 = 10;
+const LOGO_20_COLS: u16 = 20;
+const LOGO_40_COLS: u16 = 40;
+const LOGO_FULL_COLS: u16 = 80;
 
 /// Plain ASCII art — 14 lines × ~40 display columns.
 /// Used as the no-color fallback, rendered as a ratatui Paragraph.
@@ -100,21 +108,32 @@ fn color_supported_with(get_env: &dyn Fn(&str) -> Option<String>) -> bool {
 // Color splash — crossterm direct rendering
 // ---------------------------------------------------------------------------
 
-/// Pick the largest ANSI logo that fits the terminal width.
-fn logo_for_width(cols: u16) -> &'static str {
-    if cols >= 240 {
-        LOGO_LG
-    } else if cols >= 120 {
-        LOGO_MD
-    } else {
-        LOGO_SM
+/// Pick the largest ANSI logo whose display width fits within `cols`,
+/// leaving at least `STATUS_MIN_COLS` columns for the status panel.
+/// Returns `(art, display_col_width)`.
+///
+/// Status panel minimum — enough for "Workspace: /very/long/path".
+const STATUS_MIN_COLS: u16 = 44;
+
+fn logo_for_width(cols: u16) -> (&'static str, u16) {
+    for (art, w) in [
+        (LOGO_FULL, LOGO_FULL_COLS),
+        (LOGO_40, LOGO_40_COLS),
+        (LOGO_20, LOGO_20_COLS),
+        (LOGO_10, LOGO_10_COLS),
+    ] {
+        if w + STATUS_MIN_COLS + 2 <= cols {
+            return (art, w);
+        }
     }
+    (LOGO_10, LOGO_10_COLS)
 }
 
 fn run_splash_color(path: Option<&std::path::Path>) -> anyhow::Result<()> {
     let workspace = resolve_workspace(path);
     let term_cols = terminal::size().map(|(w, _)| w).unwrap_or(80);
-    let logo = logo_for_width(term_cols);
+    let (logo, logo_cols) = logo_for_width(term_cols);
+    let logo_rows = logo.lines().count() as u16;
 
     enable_raw_mode()?;
     let mut out = io::stdout();
@@ -132,34 +151,51 @@ fn run_splash_color(path: Option<&std::path::Path>) -> anyhow::Result<()> {
     write!(out, "{}", logo.replace('\n', "\r\n"))?;
     out.flush()?;
 
-    // Position the status block just below the logo.
-    let logo_rows = logo.lines().count() as u16;
-    let row = logo_rows + 1;
+    // Status panel: to the right of the logo, vertically centred.
+    let status_col = logo_cols + 2;
+    let start_row = logo_rows.saturating_sub(6) / 2;
 
-    queue!(out, MoveTo(0, row))?;
-    queue!(
-        out,
-        SetForegroundColor(NEWT_ORANGE_CT),
-        Print("newt"),
-        ResetColor,
-        Print("  ·  Small, fast, local-first agentic coder")
-    )?;
-    queue!(out, MoveTo(0, row + 1))?;
-    queue!(
-        out,
-        SetForegroundColor(CtColor::DarkGrey),
-        Print(format!("v{VERSION}")),
-        ResetColor
-    )?;
-    queue!(out, MoveTo(0, row + 3))?;
-    queue!(out, Print(format!("Workspace:  {workspace}")))?;
-    queue!(out, MoveTo(0, row + 5))?;
-    queue!(
-        out,
-        SetForegroundColor(CtColor::DarkGrey),
-        Print("q quit  ·  Ctrl-C quit  ·  full coder UI coming soon"),
-        ResetColor
-    )?;
+    let status: &[&dyn Fn(&mut io::Stdout) -> anyhow::Result<()>] = &[
+        &|o| {
+            queue!(
+                o,
+                SetForegroundColor(NEWT_ORANGE_CT),
+                Print("newt"),
+                ResetColor,
+                Print("  ·  Small, fast, local-first agentic coder")
+            )?;
+            Ok(())
+        },
+        &|o| {
+            queue!(
+                o,
+                SetForegroundColor(CtColor::DarkGrey),
+                Print(format!("v{VERSION}")),
+                ResetColor
+            )?;
+            Ok(())
+        },
+        &|_| Ok(()),
+        &|o| {
+            queue!(o, Print(format!("Workspace:  {workspace}")))?;
+            Ok(())
+        },
+        &|_| Ok(()),
+        &|o| {
+            queue!(
+                o,
+                SetForegroundColor(CtColor::DarkGrey),
+                Print("q quit  ·  Ctrl-C quit  ·  coder UI coming soon"),
+                ResetColor
+            )?;
+            Ok(())
+        },
+    ];
+
+    for (i, render) in status.iter().enumerate() {
+        queue!(out, MoveTo(status_col, start_row + i as u16))?;
+        render(&mut out)?;
+    }
     out.flush()?;
 
     splash_event_loop()?;
@@ -341,24 +377,35 @@ mod tests {
     fn logo_assets_are_embedded() {
         assert!(!LOGO_PLAIN.is_empty());
         assert!(LOGO_PLAIN.lines().count() > 5);
-        for logo in [LOGO_SM, LOGO_MD, LOGO_LG] {
+        for logo in [LOGO_10, LOGO_20, LOGO_40, LOGO_FULL] {
             assert!(!logo.is_empty());
-            assert!(logo.lines().count() > 3);
+            assert!(logo.lines().count() >= 5);
         }
     }
 
     #[test]
     fn logo_for_width_picks_correct_size() {
-        let sm = LOGO_SM.lines().count();
-        let md = LOGO_MD.lines().count();
-        let lg = LOGO_LG.lines().count();
-        // Each size has a distinct line count — use that to verify selection.
-        assert!(sm < md && md < lg, "logo sizes must be strictly ordered");
-        assert_eq!(logo_for_width(80).lines().count(), sm);
-        assert_eq!(logo_for_width(119).lines().count(), sm);
-        assert_eq!(logo_for_width(120).lines().count(), md);
-        assert_eq!(logo_for_width(239).lines().count(), md);
-        assert_eq!(logo_for_width(240).lines().count(), lg);
+        // LOGO_FULL (80 cols) needs 80 + STATUS_MIN_COLS + 2 = 126 cols.
+        let (_, w) = logo_for_width(200);
+        assert_eq!(w, LOGO_FULL_COLS);
+
+        let (_, w) = logo_for_width(LOGO_FULL_COLS + STATUS_MIN_COLS + 2);
+        assert_eq!(w, LOGO_FULL_COLS);
+
+        // Just below the LOGO_FULL threshold → should pick LOGO_40.
+        let (_, w) = logo_for_width(LOGO_FULL_COLS + STATUS_MIN_COLS + 1);
+        assert_eq!(w, LOGO_40_COLS);
+
+        // Narrow terminal falls back to smallest.
+        let (_, w) = logo_for_width(10);
+        assert_eq!(w, LOGO_10_COLS);
+    }
+
+    #[test]
+    fn logo_widths_are_strictly_ordered() {
+        assert!(LOGO_10_COLS < LOGO_20_COLS);
+        assert!(LOGO_20_COLS < LOGO_40_COLS);
+        assert!(LOGO_40_COLS < LOGO_FULL_COLS);
     }
 
     #[test]
