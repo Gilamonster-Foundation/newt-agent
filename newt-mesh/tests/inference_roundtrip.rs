@@ -10,7 +10,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use agent_mesh_core::{AgentKey, AgentMetadata, UserKey};
+use agent_mesh_core::{AgentKey, AgentMetadata, Caveats, UserKey};
 use newt_mesh::{InferenceRequest, MeshAsker, NewtMeshService};
 use tests_common::MockBackend;
 
@@ -23,6 +23,7 @@ fn agent(user: &UserKey, role: &str, caps: Vec<String>) -> AgentKey {
             capabilities: caps,
             issued_at: "2026-05-29T12:00:00Z".into(),
             expires_at: None,
+            caveats: Caveats::top(),
         },
     )
 }

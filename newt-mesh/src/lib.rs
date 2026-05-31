@@ -12,7 +12,7 @@
 //! ```no_run
 //! use std::sync::Arc;
 //! use std::time::Duration;
-//! use agent_mesh_core::{AgentKey, AgentMetadata, UserKey};
+//! use agent_mesh_core::{AgentKey, AgentMetadata, Caveats, UserKey};
 //! use newt_mesh::{NewtMeshService, MeshAsker, InferenceRequest};
 //!
 //! # async fn demo() -> anyhow::Result<()> {
@@ -23,6 +23,7 @@
 //!     capabilities: vec!["newt-inference".into()],
 //!     issued_at: "2026-05-29T12:00:00Z".into(),
 //!     expires_at: None,
+//!     caveats: Caveats::top(),
 //! });
 //! let responder_fp = responder_agent.fingerprint();
 //!
@@ -36,6 +37,7 @@
 //!     capabilities: vec!["newt-asker".into()],
 //!     issued_at: "2026-05-29T12:00:00Z".into(),
 //!     expires_at: None,
+//!     caveats: Caveats::top(),
 //! });
 //! let asker = MeshAsker::bind(&user, asker_agent).await?;
 //! let reply = asker.ask(
