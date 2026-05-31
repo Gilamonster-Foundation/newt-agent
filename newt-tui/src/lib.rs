@@ -356,21 +356,17 @@ fn print_newt(msg: &str, color: bool, verbose: bool) {
     }
 }
 
-/// Build the rustyline prompt string.
-/// ANSI codes are wrapped in \x01..\x02 so rustyline measures display width correctly.
-fn prompt_str(color: bool, verbose: bool) -> String {
-    if color {
-        let blue = "\x01\x1b[38;2;80;140;255m\x02";
-        let reset = "\x01\x1b[0m\x02";
-        if verbose {
-            format!("you {blue}${reset} ")
-        } else {
-            format!("{blue}${reset} ")
-        }
-    } else if verbose {
-        "you $ ".to_string()
+/// Build the rustyline prompt string — plain text only.
+///
+/// ANSI escape codes in rustyline prompts require careful \x01/\x02 wrapping
+/// and interact badly with vi-mode indicators. Keep the prompt plain and let
+/// `print_newt` / response output handle all the colour.
+fn prompt_str(verbose: bool, is_vi: bool) -> String {
+    let mode = if is_vi { "[i] " } else { "" };
+    if verbose {
+        format!("{mode}you $ ")
     } else {
-        "$ ".to_string()
+        format!("{mode}$ ")
     }
 }
 
@@ -431,7 +427,8 @@ fn run_chat(workspace: &str, color: bool) -> anyhow::Result<()> {
         let _ = rl.load_history(hp);
     }
 
-    let prompt = prompt_str(color, verbose);
+    let is_vi = matches!(em, newt_core::EditMode::Vi);
+    let prompt = prompt_str(verbose, is_vi);
     loop {
         match rl.readline(&prompt) {
             Ok(line) => {
