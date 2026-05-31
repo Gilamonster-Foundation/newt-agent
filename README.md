@@ -18,6 +18,23 @@ but stops there: Newt is opinionated, not extensible.
 
 ## Install
 
+### Developer install (from source)
+
+Clone the repo, activate a Python virtualenv, and install in editable mode.
+pip uses [maturin](https://github.com/PyO3/maturin) automatically as the
+build backend — no separate `maturin` install needed.
+
+```bash
+git clone https://github.com/Gilamonster-Foundation/newt-agent
+cd newt-agent
+source ~/venv/bin/activate   # or your preferred venv
+pip install -e .
+```
+
+This builds the Rust extension and installs `newt_agent` as a live editable
+link — changes to Python source in `newt-agent-py/python/` are picked up
+immediately; changes to Rust source require re-running `pip install -e .`.
+
 ### Python library (PyPI)
 
 ```bash
