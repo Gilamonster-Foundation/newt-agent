@@ -404,7 +404,29 @@ fn run_chat(workspace: &str, color: bool) -> anyhow::Result<()> {
     let history_path = newt_core::Config::user_config_path()
         .map(|p| p.with_file_name("history"));
 
-    let mut rl = rustyline::DefaultEditor::new()?;
+    // Edit mode: config file < NEWT_EDIT_MODE env var.
+    let em = std::env::var("NEWT_EDIT_MODE")
+        .ok()
+        .and_then(|v| match v.to_lowercase().as_str() {
+            "vi" | "vim" => Some(newt_core::EditMode::Vi),
+            "emacs" => Some(newt_core::EditMode::Emacs),
+            _ => None,
+        })
+        .or_else(|| {
+            newt_core::Config::resolve()
+                .ok()
+                .and_then(|c| c.tui)
+                .map(|t| t.edit_mode)
+        })
+        .unwrap_or(newt_core::EditMode::Emacs);
+
+    let rl_config = rustyline::config::Builder::new()
+        .edit_mode(match em {
+            newt_core::EditMode::Vi => rustyline::config::EditMode::Vi,
+            newt_core::EditMode::Emacs => rustyline::config::EditMode::Emacs,
+        })
+        .build();
+    let mut rl = rustyline::DefaultEditor::with_config(rl_config)?;
     if let Some(ref hp) = history_path {
         let _ = rl.load_history(hp);
     }
@@ -420,7 +442,18 @@ fn run_chat(workspace: &str, color: bool) -> anyhow::Result<()> {
                 let _ = rl.add_history_entry(&task);
                 println!();
                 if task.starts_with('/') {
-                    if !dispatch_slash(&task, workspace, color, verbose)? {
+                    let cont = dispatch_slash(&task, workspace, color, verbose)?;
+                    // Recreate the editor so rustyline re-initialises its terminal
+                    // state after any command that may have entered an alt screen
+                    // (e.g. /settings). History is saved/reloaded around it.
+                    if let Some(ref hp) = history_path {
+                        let _ = rl.save_history(hp);
+                    }
+                    rl = rustyline::DefaultEditor::with_config(rl_config)?;
+                    if let Some(ref hp) = history_path {
+                        let _ = rl.load_history(hp);
+                    }
+                    if !cont {
                         break;
                     }
                 } else if matches!(task.as_str(), "exit" | "quit") {

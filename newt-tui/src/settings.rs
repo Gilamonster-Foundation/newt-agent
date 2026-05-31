@@ -31,7 +31,7 @@ use ratatui::{
     Frame, Terminal,
 };
 
-use newt_core::{ChatStyle, Config, TuiConfig};
+use newt_core::{ChatStyle, Config, EditMode, TuiConfig};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -72,22 +72,24 @@ impl Category {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TuiField {
     ChatStyle,
+    EditMode,
     Prompt,
 }
 
 impl TuiField {
-    const ALL: [Self; 2] = [Self::ChatStyle, Self::Prompt];
+    const ALL: [Self; 3] = [Self::ChatStyle, Self::EditMode, Self::Prompt];
 
     fn label(self) -> &'static str {
         match self {
             Self::ChatStyle => "chat style",
+            Self::EditMode => "edit mode",
             Self::Prompt => "prompt",
         }
     }
 }
 
 #[derive(Clone, PartialEq, Eq)]
-enum EditMode {
+enum InputMode {
     Navigate,
     EditingText { field: TuiField, buf: String },
 }
@@ -97,7 +99,7 @@ struct SettingsApp {
     tui_cursor: usize, // index into TuiField::ALL
     tui: TuiConfig,
     original_tui: TuiConfig,
-    edit_mode: EditMode,
+    edit_mode: InputMode,
     save_path: PathBuf,
     status: Option<String>,
 }
@@ -110,7 +112,7 @@ impl SettingsApp {
             tui_cursor: 0,
             original_tui: tui.clone(),
             tui,
-            edit_mode: EditMode::Navigate,
+            edit_mode: InputMode::Navigate,
             save_path,
             status: None,
         }
@@ -134,16 +136,25 @@ impl SettingsApp {
     }
 
     fn toggle_current(&mut self) {
-        if self.category == Category::Tui && self.current_field() == TuiField::ChatStyle {
-            self.tui.chat_style = self.tui.chat_style.toggle();
-            self.status = None;
+        if self.category == Category::Tui {
+            match self.current_field() {
+                TuiField::ChatStyle => {
+                    self.tui.chat_style = self.tui.chat_style.toggle();
+                    self.status = None;
+                }
+                TuiField::EditMode => {
+                    self.tui.edit_mode = self.tui.edit_mode.toggle();
+                    self.status = None;
+                }
+                TuiField::Prompt => self.begin_edit(),
+            }
         }
     }
 
     fn begin_edit(&mut self) {
         if self.category == Category::Tui && self.current_field() == TuiField::Prompt {
             let buf = self.tui.prompt.clone().unwrap_or_default();
-            self.edit_mode = EditMode::EditingText {
+            self.edit_mode = InputMode::EditingText {
                 field: TuiField::Prompt,
                 buf,
             };
@@ -151,25 +162,25 @@ impl SettingsApp {
     }
 
     fn confirm_edit(&mut self) {
-        if let EditMode::EditingText { buf, .. } = &self.edit_mode.clone() {
+        if let InputMode::EditingText { buf, .. } = &self.edit_mode.clone() {
             self.tui.prompt = if buf.is_empty() { None } else { Some(buf.clone()) };
-            self.edit_mode = EditMode::Navigate;
+            self.edit_mode = InputMode::Navigate;
             self.status = None;
         }
     }
 
     fn cancel_edit(&mut self) {
-        self.edit_mode = EditMode::Navigate;
+        self.edit_mode = InputMode::Navigate;
     }
 
     fn type_char(&mut self, c: char) {
-        if let EditMode::EditingText { buf, .. } = &mut self.edit_mode {
+        if let InputMode::EditingText { buf, .. } = &mut self.edit_mode {
             buf.push(c);
         }
     }
 
     fn backspace(&mut self) {
-        if let EditMode::EditingText { buf, .. } = &mut self.edit_mode {
+        if let InputMode::EditingText { buf, .. } = &mut self.edit_mode {
             buf.pop();
         }
     }
@@ -258,11 +269,11 @@ fn run_loop(
                 Event::Key(KeyEvent {
                     code: KeyCode::Char('q'),
                     ..
-                }) if app.edit_mode == EditMode::Navigate => break,
+                }) if app.edit_mode == InputMode::Navigate => break,
 
                 Event::Key(KeyEvent {
                     code: KeyCode::Tab, ..
-                }) if app.edit_mode == EditMode::Navigate => {
+                }) if app.edit_mode == InputMode::Navigate => {
                     let idx = (app.category.index() + 1) % Category::ALL.len();
                     app.category = Category::ALL[idx];
                     app.tui_cursor = 0;
@@ -270,7 +281,7 @@ fn run_loop(
 
                 Event::Key(KeyEvent {
                     code: KeyCode::Up, ..
-                }) if app.edit_mode == EditMode::Navigate => {
+                }) if app.edit_mode == InputMode::Navigate => {
                     if app.category == Category::Tui {
                         app.tui_cursor = app.tui_cursor.saturating_sub(1);
                     }
@@ -279,7 +290,7 @@ fn run_loop(
                 Event::Key(KeyEvent {
                     code: KeyCode::Down,
                     ..
-                }) if app.edit_mode == EditMode::Navigate => {
+                }) if app.edit_mode == InputMode::Navigate => {
                     if app.category == Category::Tui {
                         app.tui_cursor =
                             (app.tui_cursor + 1).min(TuiField::ALL.len().saturating_sub(1));
@@ -289,9 +300,9 @@ fn run_loop(
                 Event::Key(KeyEvent {
                     code: KeyCode::Enter | KeyCode::Char(' '),
                     ..
-                }) if app.edit_mode == EditMode::Navigate => match app.category {
+                }) if app.edit_mode == InputMode::Navigate => match app.category {
                     Category::Tui => match app.current_field() {
-                        TuiField::ChatStyle => app.toggle_current(),
+                        TuiField::ChatStyle | TuiField::EditMode => app.toggle_current(),
                         TuiField::Prompt => app.begin_edit(),
                     },
                     Category::About => {}
@@ -301,7 +312,7 @@ fn run_loop(
                 Event::Key(KeyEvent {
                     code: KeyCode::Enter,
                     ..
-                }) if app.edit_mode != EditMode::Navigate => app.confirm_edit(),
+                }) if app.edit_mode != InputMode::Navigate => app.confirm_edit(),
 
                 Event::Key(KeyEvent {
                     code: KeyCode::Esc, ..
@@ -317,7 +328,7 @@ fn run_loop(
                     modifiers,
                     ..
                 }) if !modifiers.contains(KeyModifiers::CONTROL)
-                    && app.edit_mode != EditMode::Navigate =>
+                    && app.edit_mode != InputMode::Navigate =>
                 {
                     app.type_char(c);
                 }
@@ -484,30 +495,34 @@ fn render_tui_fields(f: &mut Frame, area: Rect, app: &SettingsApp, bold_orange: 
         let content: Line = match field {
             TuiField::ChatStyle => {
                 let opts = [ChatStyle::Compact, ChatStyle::Verbose];
-                let mut spans = vec![
-                    Span::styled(format!("  {:<14}", field.label()), label_style),
-                ];
+                let mut spans = vec![Span::styled(format!("  {:<14}", field.label()), label_style)];
                 for opt in &opts {
                     let bullet = if opt == &app.tui.chat_style { "◉ " } else { "○ " };
-                    let s = if opt == &app.tui.chat_style {
-                        Style::default().fg(NEWT_ORANGE)
-                    } else {
-                        dim
-                    };
+                    let s = if opt == &app.tui.chat_style { Style::default().fg(NEWT_ORANGE) } else { dim };
+                    spans.push(Span::styled(format!("{bullet}{} ", opt.as_str()), s));
+                }
+                Line::from(spans)
+            }
+            TuiField::EditMode => {
+                let opts = [EditMode::Emacs, EditMode::Vi];
+                let mut spans = vec![Span::styled(format!("  {:<14}", field.label()), label_style)];
+                for opt in &opts {
+                    let bullet = if opt == &app.tui.edit_mode { "◉ " } else { "○ " };
+                    let s = if opt == &app.tui.edit_mode { Style::default().fg(NEWT_ORANGE) } else { dim };
                     spans.push(Span::styled(format!("{bullet}{} ", opt.as_str()), s));
                 }
                 Line::from(spans)
             }
             TuiField::Prompt => {
                 let value = match &app.edit_mode {
-                    EditMode::EditingText { buf, .. } => format!("{buf}█"),
+                    InputMode::EditingText { buf, .. } => format!("{buf}█"),
                     _ => app
                         .tui
                         .prompt
                         .clone()
                         .unwrap_or_else(|| "\\w $ ".into()),
                 };
-                let value_style = if matches!(app.edit_mode, EditMode::EditingText { .. }) {
+                let value_style = if matches!(app.edit_mode, InputMode::EditingText { .. }) {
                     Style::default().fg(Color::Yellow)
                 } else {
                     Style::default()
@@ -515,7 +530,7 @@ fn render_tui_fields(f: &mut Frame, area: Rect, app: &SettingsApp, bold_orange: 
                 Line::from(vec![
                     Span::styled(format!("  {:<14}", field.label()), label_style),
                     Span::styled(value, value_style),
-                    if matches!(app.edit_mode, EditMode::EditingText { .. }) {
+                    if matches!(app.edit_mode, InputMode::EditingText { .. }) {
                         Span::styled("  Esc cancel  Enter confirm", dim)
                     } else {
                         Span::styled("  Enter to edit", dim)
@@ -557,7 +572,7 @@ fn render_about(f: &mut Frame, area: Rect, dim: Style) {
 
 fn render_preview(f: &mut Frame, area: Rect, app: &SettingsApp, dim: Style, orange: Style) {
     let prompt = match &app.edit_mode {
-        EditMode::EditingText { buf, .. } => {
+        InputMode::EditingText { buf, .. } => {
             let template = if buf.is_empty() { "\\w $ " } else { buf.as_str() };
             let ws = std::env::current_dir()
                 .ok()

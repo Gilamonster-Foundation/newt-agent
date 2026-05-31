@@ -63,6 +63,38 @@ pub struct TuiConfig {
     /// Equivalent to the `--no-splash` CLI flag.
     #[serde(default)]
     pub no_splash: bool,
+
+    /// Key binding mode for the chat input line.
+    /// `"emacs"` (default) or `"vi"`. Also overridable via `NEWT_EDIT_MODE`.
+    #[serde(default)]
+    pub edit_mode: EditMode,
+}
+
+/// Key binding style for the chat REPL input line.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum EditMode {
+    /// Readline / emacs-style bindings (default).
+    #[default]
+    Emacs,
+    /// Vi / vim-style bindings — Esc for normal mode, i for insert.
+    Vi,
+}
+
+impl EditMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Emacs => "emacs",
+            Self::Vi => "vi",
+        }
+    }
+
+    pub fn toggle(&self) -> Self {
+        match self {
+            Self::Emacs => Self::Vi,
+            Self::Vi => Self::Emacs,
+        }
+    }
 }
 
 impl Default for TuiConfig {
@@ -71,6 +103,7 @@ impl Default for TuiConfig {
             chat_style: ChatStyle::Compact,
             prompt: None,
             no_splash: false,
+            edit_mode: EditMode::Emacs,
         }
     }
 }
