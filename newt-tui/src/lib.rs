@@ -606,7 +606,9 @@ fn run_chat(workspace: &str, color: bool) -> anyhow::Result<()> {
                 } else if matches!(task.as_str(), "exit" | "quit") {
                     break;
                 } else {
-                    // Show a "thinking" line; overwrite it with the response.
+                    // Show "thinking…" while tool-call rounds execute.
+                    // stream_response() prints its own "▸  " prefix and erases
+                    // the thinking line via the newline at the end of streaming.
                     print_thinking(color);
 
                     let response = tokio::task::block_in_place(|| {
@@ -622,13 +624,17 @@ fn run_chat(workspace: &str, color: bool) -> anyhow::Result<()> {
                         }))
                     });
 
-                    // Erase the thinking line then print the real response.
+                    // Erase the thinking line.
+                    // stream_response() already printed the response inline;
+                    // for the non-streaming fallback we print it ourselves.
                     erase_line();
                     match response {
-                        Ok(reply) => {
+                        Ok((reply, was_streamed)) => {
                             conv.push((true, task.clone()));
                             conv.push((false, reply.clone()));
-                            print_newt(&reply, color, verbose);
+                            if !was_streamed {
+                                print_newt(&reply, color, verbose);
+                            }
                         }
                         Err(e) => print_newt(&format!("error: {e}"), color, verbose),
                     }
@@ -1055,7 +1061,10 @@ struct ChatCtx<'a> {
 }
 
 /// Main agentic loop: call model → execute tool calls → feed results back → repeat.
-async fn chat_complete(ctx: ChatCtx<'_>) -> anyhow::Result<String> {
+/// Returns `(reply_text, was_streamed)`.
+/// When `was_streamed` is true the text was already printed token-by-token;
+/// the caller should NOT call `print_newt` again.
+async fn chat_complete(ctx: ChatCtx<'_>) -> anyhow::Result<(String, bool)> {
     let ChatCtx {
         url,
         model,
@@ -1097,7 +1106,11 @@ async fn chat_complete(ctx: ChatCtx<'_>) -> anyhow::Result<String> {
             }
         }
 
-        let body = serde_json::json!({
+        // Tool-call rounds: stream:false (fast, just JSON).
+        // Final text round: stream:true so the user sees tokens arrive.
+        // We don't know which round is last, so we probe with stream:false first
+        // and switch to streaming only when the model returns no tool calls.
+        let body_no_stream = serde_json::json!({
             "model": model,
             "messages": messages,
             "stream": false,
@@ -1106,7 +1119,7 @@ async fn chat_complete(ctx: ChatCtx<'_>) -> anyhow::Result<String> {
 
         let resp = client
             .post(&chat_url)
-            .json(&body)
+            .json(&body_no_stream)
             .send()
             .await
             .map_err(|e| anyhow::anyhow!("request failed: {e}"))?;
@@ -1119,22 +1132,38 @@ async fn chat_complete(ctx: ChatCtx<'_>) -> anyhow::Result<String> {
 
         let json: serde_json::Value = resp.json().await?;
         let message = &json["message"];
-        let content = message["content"].as_str().unwrap_or("").to_string();
 
         let tool_calls = message["tool_calls"].as_array();
         let has_tools = tool_calls.map(|tc| !tc.is_empty()).unwrap_or(false);
 
         if !has_tools {
-            return Ok(content);
+            // No tool calls — re-issue with stream:true so the user sees tokens.
+            // `messages` already contains the task; just replay with streaming.
+            let body_stream = serde_json::json!({
+                "model": model,
+                "messages": &messages,
+                "stream": true,
+                "tools": tool_definitions(),
+            });
+            let sresp = client
+                .post(&chat_url)
+                .json(&body_stream)
+                .send()
+                .await
+                .map_err(|e| anyhow::anyhow!("stream request failed: {e}"))?;
+
+            if !sresp.status().is_success() {
+                let content = message["content"].as_str().unwrap_or("").to_string();
+                return Ok((content, false));
+            }
+            let streamed = stream_response(sresp, color).await?;
+            return Ok((streamed, true));
         }
 
-        // Add the assistant turn (may have empty content when it only calls tools).
+        // Has tool calls — add assistant turn and execute them.
         messages.push(message.clone());
-
-        // Execute each tool and feed result back.
         for tc in tool_calls.unwrap() {
             let name = tc["function"]["name"].as_str().unwrap_or("unknown");
-            // Ollama may send arguments as a JSON string or as an object.
             let args = match &tc["function"]["arguments"] {
                 serde_json::Value::String(s) => {
                     serde_json::from_str(s).unwrap_or(serde_json::Value::Null)
@@ -1149,7 +1178,55 @@ async fn chat_complete(ctx: ChatCtx<'_>) -> anyhow::Result<String> {
         }
     }
 
-    Ok("(reached tool-call limit)".into())
+    Ok(("(reached tool-call limit)".into(), false))
+}
+
+/// Stream an Ollama NDJSON response, printing tokens as they arrive.
+/// Returns the fully accumulated text.
+async fn stream_response(resp: reqwest::Response, color: bool) -> anyhow::Result<String> {
+    let mut full = String::new();
+    let mut started = false;
+
+    let mut resp = resp;
+    while let Some(chunk) = resp.chunk().await? {
+        let text = String::from_utf8_lossy(&chunk);
+        for line in text.lines() {
+            if line.is_empty() {
+                continue;
+            }
+            let Ok(json) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            let token = json["message"]["content"].as_str().unwrap_or("");
+            if !token.is_empty() {
+                if !started {
+                    // Print the response prefix on the first token.
+                    if color {
+                        execute!(
+                            io::stdout(),
+                            SetForegroundColor(NEWT_ORANGE_CT),
+                            Print("▸  "),
+                            ResetColor,
+                        )
+                        .ok();
+                    } else {
+                        print!("▸  ");
+                    }
+                    started = true;
+                }
+                print!("{token}");
+                io::stdout().flush().ok();
+                full.push_str(token);
+            }
+            if json["done"].as_bool().unwrap_or(false) {
+                break;
+            }
+        }
+    }
+    if started {
+        println!(); // newline after streamed response
+    }
+    Ok(full)
 }
 
 fn print_thinking(color: bool) {
