@@ -26,8 +26,15 @@ pub struct Cli {
     #[arg(short, long, global = true)]
     pub config: Option<PathBuf>,
 
+    /// Skip the full-screen splash: print a compact inline header instead.
+    /// Applies to the `code` subcommand (the default). Also configurable
+    /// via `[tui] no_splash = true` in newt.toml.
+    #[arg(long, global = true, default_value_t = false)]
+    pub no_splash: bool,
+
+    /// Subcommand to run. Defaults to `code` (TUI coder) when omitted.
     #[command(subcommand)]
-    pub command: Command,
+    pub command: Option<Command>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -58,6 +65,8 @@ pub enum Command {
     Doctor,
     /// Print resolved config.
     Config,
+    /// Open the interactive settings TUI.
+    Settings,
     /// NVIDIA DGX endpoint management (route a task to a formation; more
     /// subcommands land in later Phase 14 steps).
     Dgx {
@@ -67,13 +76,14 @@ pub enum Command {
 }
 
 pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
-    match cli.command {
-        Command::Code { path } => newt_tui::run_code(path.as_deref()),
+    match cli.command.unwrap_or(Command::Code { path: None }) {
+        Command::Code { path } => newt_tui::run_code(path.as_deref(), cli.no_splash),
         Command::Pilot { flight_id } => newt_tui::run_pilot(&flight_id),
         Command::Worker { coder } => run_worker(coder).await,
         Command::Mcp => run_mcp().await,
         Command::Doctor => doctor::run(cli.config.as_deref()).await,
         Command::Config => config_cmd::run(cli.config.as_deref()),
+        Command::Settings => newt_tui::run_settings(cli.config.as_deref()),
         Command::Dgx { cmd } => dgx::run(cmd, cli.config.as_deref()).await,
     }
 }
