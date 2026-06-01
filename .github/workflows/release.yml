@@ -12,12 +12,12 @@ name: Release
 #                                 and PyPI is tag-gated)
 #  - workflow_dispatch       → manual wheel build (no upload)
 #
-# Secrets / environment:
+# Secrets (Settings → Secrets and variables → Actions). Both are
+# account-scoped tokens, so NEW components publish with no per-registry
+# per-project setup — just add the crate to the publish matrix:
 #  - CARGO_REGISTRY_TOKEN — crates.io publish (publish-crates job)
-#  - GitHub environment `pypi` with trusted publisher configured
-#    (PyPI side: pending publisher for project `newt-agent-py` under
-#    owner `Gilamonster-Foundation`, repo `newt-agent`, workflow
-#    `release.yml`, env `pypi`)
+#  - PYPI_API_TOKEN       — PyPI wheel publish (publish-pypi job),
+#                           scope "Entire account"
 
 on:
   push:
@@ -172,19 +172,35 @@ jobs:
       - name: cargo publish ${{ matrix.crate }}
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        # Idempotent: tolerate a crate version that is already on crates.io so a
-        # re-run after a partial publish doesn't fail. Any other error is fatal.
+        # Resilient publish:
+        #   - Idempotent: tolerate a version already on crates.io so a re-run
+        #     after a partial publish doesn't fail.
+        #   - 429-aware: publishing several NEW crate names in one release trips
+        #     crates.io's new-crate rate limit (HTTP 429). Back off and retry
+        #     instead of failing, so a batch of new components lands cleanly.
+        #   - Any other error is fatal.
         run: |
-          if cargo publish -p ${{ matrix.crate }} --locked --no-verify 2>publish.err; then
-            cat publish.err >&2 || true
-            echo "published ${{ matrix.crate }}"
-          elif grep -qiE 'already (exists|uploaded)|is already uploaded|already published' publish.err; then
-            cat publish.err >&2
-            echo "::notice::${{ matrix.crate }} already published at this version — skipping"
-          else
-            cat publish.err >&2
-            exit 1
-          fi
+          for attempt in 1 2 3 4 5 6; do
+            if cargo publish -p ${{ matrix.crate }} --locked --no-verify 2>publish.err; then
+              cat publish.err >&2 || true
+              echo "published ${{ matrix.crate }}"
+              exit 0
+            elif grep -qiE 'already (exists|uploaded)|is already uploaded|already published' publish.err; then
+              cat publish.err >&2
+              echo "::notice::${{ matrix.crate }} already published at this version — skipping"
+              exit 0
+            elif grep -qi '429 Too Many Requests' publish.err; then
+              cat publish.err >&2
+              wait=$((attempt * 90))
+              echo "::warning::crates.io rate-limited (429) on ${{ matrix.crate }} — waiting ${wait}s, retry ${attempt}/6"
+              sleep "$wait"
+            else
+              cat publish.err >&2
+              exit 1
+            fi
+          done
+          echo "::error::${{ matrix.crate }} still rate-limited (429) after 6 retries"
+          exit 1
 
   # ── Build PyPI wheels (tag-only, maturin matrix) ──────────────────────
   #
@@ -255,24 +271,24 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-  # ── Publish wheels to PyPI (tag-only, trusted publishing) ─────────────
+  # ── Publish wheels to PyPI (tag-only, account-scoped API token) ───────
   #
-  # Uses PyPI's OIDC trusted publishing — no API token in repo secrets.
-  # Requires the GitHub `pypi` environment to exist (Settings →
-  # Environments → New environment) and a pending publisher
-  # configured at https://pypi.org/manage/account/publishing/ pointing
-  # at this repo + workflow + environment.
+  # Auth: an account-scoped PyPI API token in the `PYPI_API_TOKEN` repo
+  # secret (Settings → Secrets and variables → Actions). Account scope is
+  # deliberate: it can upload ANY project, including brand-new package
+  # names, with NO per-project trusted-publisher registration. This is the
+  # PyPI analogue of the crates.io `CARGO_REGISTRY_TOKEN` above — set once,
+  # publishes every component. (Trusted publishing was dropped because it
+  # required a manual per-project pending-publisher entry for every new
+  # wheel, which blocked first-time publishes.)
+  # To rotate: create a new token at https://pypi.org/manage/account/token/
+  # (scope "Entire account") and replace the secret.
 
   publish-pypi:
     name: Publish to PyPI
     runs-on: ubuntu-latest
     needs: [build-wheels, build-sdist]
     if: startsWith(github.ref, 'refs/tags/v')
-    environment:
-      name: pypi
-      url: https://pypi.org/p/newt-agent-py
-    permissions:
-      id-token: write
     steps:
       - name: Download all wheels + sdist
         uses: actions/download-artifact@v4
@@ -288,4 +304,7 @@ jobs:
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist/
+          # Account-scoped token — publishes any project, new ones included,
+          # with no per-project trusted-publisher config. See PYPI_API_TOKEN.
+          password: ${{ secrets.PYPI_API_TOKEN }}
           skip-existing: true
