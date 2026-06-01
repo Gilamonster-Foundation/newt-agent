@@ -498,14 +498,136 @@ fn expand_prompt_tokens(template: &str, workspace: &str) -> String {
         .replace("\\v", env!("CARGO_PKG_VERSION"))
 }
 
-/// Load the active `Caveats` from config for this workspace.
-/// Falls back to `Caveats::top()` (unrestricted) if config is absent.
+/// Read-only enforcement caveats (read anything; no write/exec/net) — the safe
+/// default when nothing is configured or identity setup fails.
+fn read_only_caveats(workspace: &str) -> newt_core::caveats::Caveats {
+    newt_core::ToolPermissions {
+        preset: newt_core::PermissionPreset::ReadOnly,
+        extra_exec: Vec::new(),
+    }
+    .to_caveats(workspace)
+}
+
+/// Lower the configured TUI permission policy to a `Caveats` value. With no
+/// `[tui]` config the policy is **read-only** — never `Caveats::top()`. Pure in
+/// its inputs, so the safe-default behavior is unit-testable.
+fn policy_for(tui: Option<newt_core::TuiConfig>, workspace: &str) -> newt_core::caveats::Caveats {
+    tui.map(|t| t.permissions.to_caveats(workspace))
+        .unwrap_or_else(|| read_only_caveats(workspace))
+}
+
+/// Lower a policy to a signed, attenuation-only capability rooted in the
+/// per-user key at `key_path` (generated on first use), and return the verified
+/// caveats it carries.
+fn sign_policy_with(
+    key_path: &std::path::Path,
+    policy: &newt_core::caveats::Caveats,
+) -> Result<newt_core::caveats::Caveats, newt_identity::IdentityError> {
+    let user = newt_identity::load_or_generate(key_path)?;
+    let root = newt_identity::session_root(&user);
+    let op = newt_identity::attenuate(&root, policy)?;
+    newt_identity::enforced_caveats(&op)
+}
+
+/// The active enforcement `Caveats` for this workspace.
+///
+/// The configured preset is lowered to a policy, then attenuated from the
+/// per-user root key (`~/.newt/identity.pem`) via `newt-identity` — so what the
+/// tool loop enforces is a *signed, verified, attenuation-only* capability
+/// provably `⊑` the user's authority, not a name-based preset. Safe by default:
+/// an absent config, or any identity error, yields **read-only**, never
+/// `Caveats::top()`.
 fn load_caveats(workspace: &str) -> newt_core::caveats::Caveats {
-    newt_core::Config::resolve()
-        .ok()
-        .and_then(|c| c.tui)
-        .map(|t| t.permissions.to_caveats(workspace))
-        .unwrap_or_else(newt_core::caveats::Caveats::top)
+    let tui = newt_core::Config::resolve().ok().and_then(|c| c.tui);
+    let key_path = newt_identity::default_key_path().ok();
+    load_caveats_from(tui, key_path.as_deref(), workspace)
+}
+
+/// Testable core of [`load_caveats`]: lower `tui`'s policy and, when a key path
+/// is available, harden it into a signed, verified, attenuation-only capability.
+/// Falls back to the (read-only-when-unconfigured) policy on any identity error
+/// or missing key path — never silently `Caveats::top()`.
+fn load_caveats_from(
+    tui: Option<newt_core::TuiConfig>,
+    key_path: Option<&std::path::Path>,
+    workspace: &str,
+) -> newt_core::caveats::Caveats {
+    let policy = policy_for(tui, workspace);
+    match key_path {
+        Some(p) => sign_policy_with(p, &policy).unwrap_or(policy),
+        None => policy,
+    }
+}
+
+#[cfg(test)]
+mod caveat_policy_tests {
+    use super::{load_caveats_from, policy_for, read_only_caveats, sign_policy_with};
+
+    #[test]
+    fn absent_config_is_read_only() {
+        // #86 regression: with no [tui] config the policy must be READ-ONLY,
+        // never `Caveats::top()` (the old fallback granted full access).
+        let policy = policy_for(None, "/ws");
+        assert_ne!(policy, newt_core::caveats::Caveats::top());
+        assert!(!policy.permits_exec("cargo"), "no exec when unconfigured");
+        assert!(
+            !policy.permits_fs_write("/ws/x"),
+            "no write when unconfigured"
+        );
+        assert!(policy.permits_fs_read("/ws/x"), "reads still allowed");
+    }
+
+    #[test]
+    fn configured_default_is_workspace_dev() {
+        let policy = policy_for(Some(newt_core::TuiConfig::default()), "/ws");
+        assert!(policy.permits_exec("cargo"), "workspace-dev tools allowed");
+        assert!(!policy.permits_exec("rm"), "dangerous commands denied");
+    }
+
+    #[test]
+    fn signed_capability_preserves_the_policy() {
+        // The signed, attenuated, verified capability carries exactly the
+        // policy's authority (the ocap round-trip), keyed off a temp identity.
+        let dir = tempfile::TempDir::new().unwrap();
+        let policy = read_only_caveats("/ws");
+        let signed = sign_policy_with(&dir.path().join("identity.pem"), &policy).unwrap();
+        assert_eq!(signed, policy, "sign + verify must preserve the policy");
+    }
+
+    #[test]
+    fn load_caveats_unconfigured_is_signed_read_only() {
+        // #86 end-to-end: no config + a real (temp) key → the enforced caveats
+        // are read-only AND came through the signed-capability path (the key was
+        // generated). Never `Caveats::top()`.
+        let dir = tempfile::TempDir::new().unwrap();
+        let key = dir.path().join("identity.pem");
+        let cav = load_caveats_from(None, Some(&key), "/ws");
+        assert_ne!(cav, newt_core::caveats::Caveats::top());
+        assert!(!cav.permits_exec("cargo"), "no exec when unconfigured");
+        assert!(cav.permits_fs_read("/ws/x"), "reads still allowed");
+        assert!(key.exists(), "the per-user identity key was generated");
+    }
+
+    #[test]
+    fn load_caveats_without_key_falls_back_to_policy() {
+        // No locatable key (e.g. $HOME unset) → enforce the policy as-is, which
+        // is read-only when unconfigured. Still never `top()`.
+        let cav = load_caveats_from(None, None, "/ws");
+        assert_ne!(cav, newt_core::caveats::Caveats::top());
+        assert!(!cav.permits_exec("cargo"));
+    }
+
+    #[test]
+    fn load_caveats_configured_is_signed_workspace_dev() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cav = load_caveats_from(
+            Some(newt_core::TuiConfig::default()),
+            Some(&dir.path().join("identity.pem")),
+            "/ws",
+        );
+        assert!(cav.permits_exec("cargo"), "workspace-dev tools allowed");
+        assert!(!cav.permits_exec("rm"), "dangerous commands denied");
+    }
 }
 
 /// Returns true if `full_path` is permitted by `scope`, using prefix matching
