@@ -84,15 +84,48 @@ jobs:
       # turns it on) and have their own pytest suite at
       # newt-agent-py/tests/. Counting them as zero-coverage in the
       # default-feature build would falsely tank the workspace number.
-      - name: Coverage with floor
-        run: cargo llvm-cov --workspace --lcov --output-path lcov.info --fail-under-lines 75 --ignore-filename-regex 'pyo3_module\.rs$'
+      #
+      # Why we don't rely on cargo-llvm-cov's --fail-under-lines:
+      # issue #100 caught it silently exit-0'ing on a sub-floor commit
+      # (cargo-llvm-cov 0.8.5 ignores --fail-under-lines when --lcov
+      # --output-path is set, and the `report --summary-only` variant
+      # is also unreliable). We instead parse the TOTAL line out of
+      # `report --summary-only` and gate in shell — deterministic,
+      # version-independent, and the percentage is visible in the log.
+      - name: Generate coverage data (no report yet)
+        run: cargo llvm-cov --workspace --no-report
 
-      - name: Summary
-        if: always()
+      - name: Export lcov
+        run: cargo llvm-cov report --lcov --output-path lcov.info --ignore-filename-regex 'pyo3_module\.rs$'
+
+      - name: Enforce coverage floor (>= 75% lines)
+        env:
+          COVERAGE_FLOOR: "75"
         run: |
-          if [ -f lcov.info ]; then
-            cargo llvm-cov report --summary-only
+          set -euo pipefail
+          # Capture the summary table; the TOTAL row's 8th-from-last
+          # printable column is line coverage as a "NN.NN%" string.
+          # We pipe through awk to extract a numeric percentage from
+          # the TOTAL line and compare against $COVERAGE_FLOOR.
+          summary=$(cargo llvm-cov report --summary-only --ignore-filename-regex 'pyo3_module\.rs$')
+          echo "$summary"
+          # The TOTAL row looks like:
+          #   TOTAL   <regions> <missed> <cov%>  <funcs> <missed> <cov%>  <lines> <missed> <cov%>  <branches> <missed> <cov%>
+          # Line coverage is the 10th column (i.e. the 3rd "Cover" column).
+          line_cov=$(printf '%s\n' "$summary" \
+            | awk '$1 == "TOTAL" { gsub("%", "", $10); print $10 }')
+          if [ -z "${line_cov:-}" ]; then
+            echo "::error::could not parse line coverage from cargo-llvm-cov summary"
+            exit 1
           fi
+          echo "measured line coverage: ${line_cov}% (floor: ${COVERAGE_FLOOR}%)"
+          # Numeric comparison via awk (bash can't do float compare).
+          if awk -v cov="$line_cov" -v floor="$COVERAGE_FLOOR" \
+               'BEGIN { exit !(cov + 0 < floor + 0) }'; then
+            echo "::error::workspace line coverage ${line_cov}% is below the ${COVERAGE_FLOOR}% floor"
+            exit 1
+          fi
+          echo "coverage gate OK: ${line_cov}% >= ${COVERAGE_FLOOR}%"
 
       - name: Upload lcov.info
         if: always()
