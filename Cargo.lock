@@ -1225,6 +1225,7 @@ dependencies = [
  "newt-tools",
  "ratatui",
  "rustyline",
+ "tokio",
  "tracing",
 ]
 
