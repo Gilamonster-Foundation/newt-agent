@@ -611,8 +611,13 @@ fn run_chat(workspace: &str, color: bool) -> anyhow::Result<()> {
 
                     let response = tokio::task::block_in_place(|| {
                         rt.block_on(chat_complete(ChatCtx {
-                            url: &inf_url, model: &inf_model, system: &system,
-                            history: &conv, task: &task, workspace, color,
+                            url: &inf_url,
+                            model: &inf_model,
+                            system: &system,
+                            history: &conv,
+                            task: &task,
+                            workspace,
+                            color,
                             caveats: &caveats,
                         }))
                     });
@@ -1051,7 +1056,16 @@ struct ChatCtx<'a> {
 
 /// Main agentic loop: call model → execute tool calls → feed results back → repeat.
 async fn chat_complete(ctx: ChatCtx<'_>) -> anyhow::Result<String> {
-    let ChatCtx { url, model, system, history, task, workspace, color, caveats } = ctx;
+    let ChatCtx {
+        url,
+        model,
+        system,
+        history,
+        task,
+        workspace,
+        color,
+        caveats,
+    } = ctx;
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(120))
         .build()?;
