@@ -563,7 +563,10 @@ fn run_chat(workspace: &str, color: bool) -> anyhow::Result<()> {
                     print_thinking(color);
 
                     let response = tokio::task::block_in_place(|| {
-                        rt.block_on(chat_complete(&inf_url, &inf_model, &system, &conv, &task))
+                        rt.block_on(chat_complete(
+                            &inf_url, &inf_model, &system, &conv, &task,
+                            workspace, color,
+                        ))
                     });
 
                     // Erase the thinking line then print the real response.
@@ -571,8 +574,8 @@ fn run_chat(workspace: &str, color: bool) -> anyhow::Result<()> {
                     match response {
                         Ok(reply) => {
                             conv.push((true, task.clone()));
-                            conv.push((false, reply.content.clone()));
-                            print_newt(&reply.content, color, verbose);
+                            conv.push((false, reply.clone()));
+                            print_newt(&reply, color, verbose);
                         }
                         Err(e) => print_newt(&format!("error: {e}"), color, verbose),
                     }
@@ -629,12 +632,9 @@ fn resolve_backend_config() -> (String, String) {
 fn build_system_prompt(workspace: &str) -> String {
     let mut ctx = format!(
         "You are newt, a small, fast, local-first agentic coder. \
-         Be concise and direct.\n\n\
-         IMPORTANT: You do not have tool access in this session. \
-         You cannot execute commands, read files, or write files. \
-         When asked to run a command or edit a file, give the user \
-         the exact command or unified diff to run themselves — \
-         never claim you ran something or made a change you did not make.\n\n\
+         Be concise and direct. \
+         You have tools: run_command, read_file, write_file, list_dir. \
+         Use them to actually complete tasks rather than describing what to do.\n\n\
          Workspace: {workspace}\n"
     );
 
@@ -686,30 +686,308 @@ fn build_system_prompt(workspace: &str) -> String {
     ctx
 }
 
-/// Send a chat turn to Ollama and return the reply.
+// ---------------------------------------------------------------------------
+// Tool-use loop — the real agentic core
+// ---------------------------------------------------------------------------
+
+fn tool_definitions() -> serde_json::Value {
+    serde_json::json!([
+        {
+            "type": "function",
+            "function": {
+                "name": "run_command",
+                "description": "Run a shell command in the workspace directory and return its output",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": { "type": "string", "description": "The shell command to run" }
+                    },
+                    "required": ["command"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "Read the contents of a file in the workspace",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "File path relative to workspace root" }
+                    },
+                    "required": ["path"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "write_file",
+                "description": "Write or overwrite a file in the workspace (asks user to confirm before writing)",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "File path relative to workspace root" },
+                        "content": { "type": "string", "description": "The complete new file contents" }
+                    },
+                    "required": ["path", "content"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "list_dir",
+                "description": "List files in a directory",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "Directory path relative to workspace root (use '.' for root)" }
+                    },
+                    "required": ["path"]
+                }
+            }
+        }
+    ])
+}
+
+/// Print a tool-call header so the user can see what the agent is doing.
+fn print_tool_call(name: &str, detail: &str, color: bool) {
+    if color {
+        execute!(
+            io::stdout(),
+            SetForegroundColor(NEWT_ORANGE_CT),
+            Print(format!("⚙  {name}")),
+            ResetColor,
+            SetForegroundColor(CtColor::DarkGrey),
+            Print(format!(": {detail}\n")),
+            ResetColor,
+        )
+        .ok();
+    } else {
+        println!("⚙  {name}: {detail}");
+    }
+    io::stdout().flush().ok();
+}
+
+/// Print tool output (stdout/stderr from commands, file contents, etc.).
+fn print_tool_output(output: &str, color: bool) {
+    if output.is_empty() {
+        return;
+    }
+    let truncated: String = output.chars().take(4000).collect();
+    let suffix = if output.len() > 4000 { "\n…[truncated]" } else { "" };
+    if color {
+        execute!(
+            io::stdout(),
+            SetForegroundColor(CtColor::DarkGrey),
+            Print(format!("{truncated}{suffix}\n")),
+            ResetColor,
+        )
+        .ok();
+    } else {
+        println!("{truncated}{suffix}");
+    }
+    io::stdout().flush().ok();
+}
+
+/// Execute a single tool call and return the result string sent back to the model.
+fn execute_tool(
+    name: &str,
+    args: &serde_json::Value,
+    workspace: &str,
+    color: bool,
+) -> String {
+    match name {
+        "run_command" => {
+            let cmd = args["command"].as_str().unwrap_or("");
+            print_tool_call("run_command", cmd, color);
+            match std::process::Command::new("sh")
+                .arg("-c")
+                .arg(cmd)
+                .current_dir(workspace)
+                .output()
+            {
+                Ok(o) => {
+                    let out = format!(
+                        "{}{}",
+                        String::from_utf8_lossy(&o.stdout),
+                        String::from_utf8_lossy(&o.stderr)
+                    );
+                    print_tool_output(&out, color);
+                    if out.trim().is_empty() {
+                        format!("(exit {})", o.status.code().unwrap_or(-1))
+                    } else {
+                        out
+                    }
+                }
+                Err(e) => format!("error: {e}"),
+            }
+        }
+
+        "read_file" => {
+            let path = args["path"].as_str().unwrap_or("");
+            print_tool_call("read_file", path, color);
+            let full = std::path::Path::new(workspace).join(path);
+            match std::fs::read_to_string(&full) {
+                Ok(contents) => {
+                    print_tool_output(&contents, color);
+                    contents
+                }
+                Err(e) => format!("error reading {path}: {e}"),
+            }
+        }
+
+        "write_file" => {
+            let path = args["path"].as_str().unwrap_or("");
+            let content = args["content"].as_str().unwrap_or("");
+            print_tool_call(
+                "write_file",
+                &format!("{path} ({} bytes)", content.len()),
+                color,
+            );
+
+            // Show first 20 lines as preview.
+            let preview: String = content.lines().take(20).collect::<Vec<_>>().join("\n");
+            let has_more = content.lines().count() > 20;
+            print_tool_output(
+                &format!("{preview}{}", if has_more { "\n…" } else { "" }),
+                color,
+            );
+
+            // Confirm before writing.
+            print!("Write this file? [y/N] ");
+            io::stdout().flush().ok();
+            let mut answer = String::new();
+            if std::io::stdin().read_line(&mut answer).is_ok()
+                && answer.trim().eq_ignore_ascii_case("y")
+            {
+                let full = std::path::Path::new(workspace).join(path);
+                if let Some(parent) = full.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                match std::fs::write(&full, content) {
+                    Ok(_) => {
+                        println!("✓ wrote {path}");
+                        format!("wrote {path}")
+                    }
+                    Err(e) => format!("error writing {path}: {e}"),
+                }
+            } else {
+                println!("skipped");
+                format!("user declined to write {path}")
+            }
+        }
+
+        "list_dir" => {
+            let path = args["path"].as_str().unwrap_or(".");
+            print_tool_call("list_dir", path, color);
+            let full = std::path::Path::new(workspace).join(path);
+            match std::fs::read_dir(&full) {
+                Ok(entries) => {
+                    let mut names: Vec<String> = entries
+                        .flatten()
+                        .map(|e| e.file_name().to_string_lossy().into_owned())
+                        .collect();
+                    names.sort();
+                    let listing = names.join("\n");
+                    print_tool_output(&listing, color);
+                    listing
+                }
+                Err(e) => format!("error: {e}"),
+            }
+        }
+
+        other => format!("unknown tool: {other}"),
+    }
+}
+
+/// Main agentic loop: call model → execute tool calls → feed results back → repeat.
 async fn chat_complete(
     url: &str,
     model: &str,
     system: &str,
     history: &[(bool, String)],
     task: &str,
-) -> anyhow::Result<newt_inference::backend::ChatReply> {
-    use newt_inference::backend::{ChatRequest, InferenceBackend as _};
-    use newt_inference::local::LocalOllamaBackend;
+    workspace: &str,
+    color: bool,
+) -> anyhow::Result<String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .build()?;
+    let chat_url = format!("{}/api/chat", url.trim_end_matches('/'));
 
-    let backend = LocalOllamaBackend::new(url, model);
-
-    let mut req = ChatRequest::new().system(system);
+    // Build message list.
+    let mut messages: Vec<serde_json::Value> = vec![
+        serde_json::json!({"role": "system", "content": system}),
+    ];
     for (is_user, text) in history {
-        req = if *is_user {
-            req.user(text)
-        } else {
-            req.assistant(text)
-        };
+        messages.push(serde_json::json!({
+            "role": if *is_user { "user" } else { "assistant" },
+            "content": text
+        }));
     }
-    req = req.user(task);
+    messages.push(serde_json::json!({"role": "user", "content": task}));
 
-    backend.complete(req).await
+    // Agentic loop — up to 10 tool-call rounds.
+    for round in 0..10 {
+        if round > 0 {
+            // Brief separator between rounds so user can follow the flow.
+            if color {
+                execute!(io::stdout(), SetForegroundColor(CtColor::DarkGrey), Print("…\n"), ResetColor).ok();
+            }
+        }
+
+        let body = serde_json::json!({
+            "model": model,
+            "messages": messages,
+            "stream": false,
+            "tools": tool_definitions(),
+        });
+
+        let resp = client.post(&chat_url).json(&body).send().await
+            .map_err(|e| anyhow::anyhow!("request failed: {e}"))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Ollama {status}: {text}");
+        }
+
+        let json: serde_json::Value = resp.json().await?;
+        let message = &json["message"];
+        let content = message["content"].as_str().unwrap_or("").to_string();
+
+        let tool_calls = message["tool_calls"].as_array();
+        let has_tools = tool_calls.map(|tc| !tc.is_empty()).unwrap_or(false);
+
+        if !has_tools {
+            return Ok(content);
+        }
+
+        // Add the assistant turn (may have empty content when it only calls tools).
+        messages.push(message.clone());
+
+        // Execute each tool and feed result back.
+        for tc in tool_calls.unwrap() {
+            let name = tc["function"]["name"].as_str().unwrap_or("unknown");
+            // Ollama may send arguments as a JSON string or as an object.
+            let args = match &tc["function"]["arguments"] {
+                serde_json::Value::String(s) => {
+                    serde_json::from_str(s).unwrap_or(serde_json::Value::Null)
+                }
+                v => v.clone(),
+            };
+            let result = execute_tool(name, &args, workspace, color);
+            messages.push(serde_json::json!({
+                "role": "tool",
+                "content": result
+            }));
+        }
+    }
+
+    Ok("(reached tool-call limit)".into())
 }
 
 fn print_thinking(color: bool) {
@@ -726,7 +1004,6 @@ fn print_thinking(color: bool) {
 }
 
 fn erase_line() {
-    // \r goes to start of line; spaces overwrite; \r positions for next print.
     print!("\r{}\r", " ".repeat(20));
     io::stdout().flush().ok();
 }
