@@ -463,16 +463,22 @@ fn run_chat(workspace: &str, color: bool) -> anyhow::Result<()> {
         println!("\nnewt  ·  {workspace}");
     }
 
+    // Input history file and tokio runtime for async inference.
+    let history_path = newt_core::Config::user_config_path()
+        .map(|p| p.with_file_name("history"));
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+
+    // Resolve the inference backend once (re-read if /settings changes it).
+    let (mut inf_url, mut inf_model) = resolve_backend_config();
     print_newt(
-        &format!("v{VERSION} ready. Type a task and press Enter. (Ctrl-D or /exit to quit.)"),
+        &format!("v{VERSION} ready — {inf_model} @ {inf_url}  (Ctrl-D or /exit to quit)"),
         color,
         verbose,
     );
     println!();
-
-    // History file: ~/.newt/history (created alongside config.toml).
-    let history_path = newt_core::Config::user_config_path()
-        .map(|p| p.with_file_name("history"));
 
     let mut rl = rustyline::DefaultEditor::with_config(build_rl_config())?;
     if let Some(ref hp) = history_path {
@@ -481,6 +487,10 @@ fn run_chat(workspace: &str, color: bool) -> anyhow::Result<()> {
 
     let is_vi = build_rl_config().edit_mode() == rustyline::config::EditMode::Vi;
     let prompt = prompt_str(workspace, verbose, is_vi);
+
+    // Conversation history for multi-turn context.
+    let mut conv: Vec<(bool, String)> = Vec::new(); // (is_user, text)
+
     loop {
         match rl.readline(&prompt) {
             Ok(line) => {
@@ -492,12 +502,11 @@ fn run_chat(workspace: &str, color: bool) -> anyhow::Result<()> {
                 println!();
                 if task.starts_with('/') {
                     let cont = dispatch_slash(&task, workspace, color, verbose)?;
-                    // Recreate the editor after any alt-screen command so rustyline
-                    // re-initialises terminal state. Re-read config so settings
-                    // changes (e.g. vi mode toggled in /settings) take effect now.
                     if let Some(ref hp) = history_path {
                         let _ = rl.save_history(hp);
                     }
+                    // Re-read config after alt-screen commands (e.g. /settings).
+                    (inf_url, inf_model) = resolve_backend_config();
                     let fresh_cfg = build_rl_config();
                     rl = rustyline::DefaultEditor::with_config(fresh_cfg)?;
                     if let Some(ref hp) = history_path {
@@ -509,19 +518,31 @@ fn run_chat(workspace: &str, color: bool) -> anyhow::Result<()> {
                 } else if matches!(task.as_str(), "exit" | "quit") {
                     break;
                 } else {
-                    print_newt(
-                        &format!(
-                            "Got it: \"{task}\" — coder runtime not yet connected. \
-                             Try `just eval --case 001` to run against a real Ollama."
-                        ),
-                        color,
-                        verbose,
-                    );
+                    // Show a "thinking" line; overwrite it with the response.
+                    print_thinking(color);
+
+                    let response = rt.block_on(chat_complete(
+                        &inf_url,
+                        &inf_model,
+                        &conv,
+                        &task,
+                    ));
+
+                    // Erase the thinking line then print the real response.
+                    erase_line();
+                    match response {
+                        Ok(reply) => {
+                            conv.push((true, task.clone()));
+                            conv.push((false, reply.content.clone()));
+                            print_newt(&reply.content, color, verbose);
+                        }
+                        Err(e) => print_newt(&format!("error: {e}"), color, verbose),
+                    }
                 }
                 println!();
             }
-            Err(rustyline::error::ReadlineError::Interrupted) => break, // Ctrl-C
-            Err(rustyline::error::ReadlineError::Eof) => break,          // Ctrl-D
+            Err(rustyline::error::ReadlineError::Interrupted) => break,
+            Err(rustyline::error::ReadlineError::Eof) => break,
             Err(e) => return Err(e.into()),
         }
     }
@@ -530,6 +551,80 @@ fn run_chat(workspace: &str, color: bool) -> anyhow::Result<()> {
         let _ = rl.save_history(hp);
     }
     Ok(())
+}
+
+/// Resolve Ollama URL + model from env vars then config.
+/// Priority: NEWT_DGX_OLLAMA_URL > NEWT_DGX_HOST synthesis > DGX config node > localhost.
+fn resolve_backend_config() -> (String, String) {
+    let url = std::env::var("NEWT_DGX_OLLAMA_URL")
+        .ok()
+        .or_else(|| {
+            std::env::var("NEWT_DGX_HOST").ok().map(|h| {
+                let scheme = std::env::var("NEWT_DGX_SCHEME").unwrap_or_else(|_| "http".into());
+                let port = std::env::var("NEWT_DGX_OLLAMA_PORT").unwrap_or_else(|_| "11434".into());
+                format!("{scheme}://{h}:{port}")
+            })
+        })
+        .or_else(|| {
+            newt_core::Config::resolve().ok()
+                .and_then(|c| c.dgx)
+                .and_then(|d| d.nodes.into_iter().next())
+                .and_then(|n| n.ollama)
+        })
+        .unwrap_or_else(|| "http://localhost:11434".into());
+
+    let model = std::env::var("NEWT_DGX_MODEL")
+        .ok()
+        .or_else(|| {
+            newt_core::Config::resolve().ok()
+                .and_then(|c| c.dgx)
+                .and_then(|d| d.active_model)
+        })
+        .unwrap_or_else(|| "llama3.1:8b".into());
+
+    (url, model)
+}
+
+/// Send a chat turn to Ollama and return the reply.
+async fn chat_complete(
+    url: &str,
+    model: &str,
+    history: &[(bool, String)],
+    task: &str,
+) -> anyhow::Result<newt_inference::backend::ChatReply> {
+    use newt_inference::backend::{ChatRequest, InferenceBackend as _};
+    use newt_inference::local::LocalOllamaBackend;
+
+    let backend = LocalOllamaBackend::new(url, model);
+
+    let mut req = ChatRequest::new().system(
+        "You are newt, a small, fast, local-first agentic coder. \
+         Be concise and direct. Help with coding tasks.",
+    );
+    for (is_user, text) in history {
+        req = if *is_user { req.user(text) } else { req.assistant(text) };
+    }
+    req = req.user(task);
+
+    backend.complete(req).await
+}
+
+fn print_thinking(color: bool) {
+    if color {
+        execute!(
+            io::stdout(),
+            SetForegroundColor(CtColor::DarkGrey),
+            Print("▸  thinking…"),
+            ResetColor,
+        ).ok();
+        io::stdout().flush().ok();
+    }
+}
+
+fn erase_line() {
+    // \r goes to start of line; spaces overwrite; \r positions for next print.
+    print!("\r{}\r", " ".repeat(20));
+    io::stdout().flush().ok();
 }
 
 // ---------------------------------------------------------------------------
