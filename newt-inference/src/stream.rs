@@ -38,7 +38,11 @@ pub async fn collect_stream(stream: ChatStream) -> anyhow::Result<ChatReply> {
         }
     }
 
-    Ok(ChatReply { content, model_id })
+    Ok(ChatReply {
+        content,
+        model_id,
+        usage: None,
+    })
 }
 
 #[cfg(test)]

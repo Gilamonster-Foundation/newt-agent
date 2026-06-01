@@ -171,7 +171,11 @@ impl PyChatReply {
     #[new]
     fn new(content: String, model_id: String) -> Self {
         Self {
-            inner: ChatReply { content, model_id },
+            inner: ChatReply {
+                content,
+                model_id,
+                usage: None,
+            },
         }
     }
 

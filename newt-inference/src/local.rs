@@ -197,9 +197,20 @@ impl LocalOllamaBackend {
             .unwrap_or("")
             .to_string();
 
+        // Extract token counts from Ollama's response if present.
+        let usage = {
+            let input = json["prompt_eval_count"].as_u64().map(|n| n as u32);
+            let output = json["eval_count"].as_u64().map(|n| n as u32);
+            input.zip(output).map(|(i, o)| newt_core::TokenUsage {
+                input_tokens: i,
+                output_tokens: o,
+            })
+        };
+
         Ok(ChatReply {
             content,
             model_id: self.model.clone(),
+            usage,
         })
     }
 
@@ -360,7 +371,11 @@ impl LocalVllmBackend {
             .map(|s| s.to_string())
             .unwrap_or_else(|| self.model.clone());
 
-        Ok(ChatReply { content, model_id })
+        Ok(ChatReply {
+            content,
+            model_id,
+            usage: None,
+        })
     }
 
     /// Returns `true` for errors worth retrying: connection failures and 5xx

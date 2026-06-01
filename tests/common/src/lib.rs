@@ -85,6 +85,7 @@ impl InferenceBackend for MockBackend {
         Ok(ChatReply {
             content: self.reply.clone(),
             model_id: self.model_id.clone(),
+            usage: None,
         })
     }
 }

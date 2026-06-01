@@ -62,7 +62,10 @@ pub struct AcpServer {
 ///   foreman should disqualify it pre-arbiter.
 /// - `diff_applied: true` means a unified diff was found in `content`
 ///   and `newt_tools::apply_patch` accepted it.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+///
+/// `PartialEq` excludes `metrics` — test assertions compare business logic,
+/// not telemetry values that vary per run.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskReply {
     /// MANDATORY — the model that produced this reply.
     pub model_id: String,
@@ -93,6 +96,26 @@ pub struct TaskReply {
     /// only rescued is scored honestly (#30B). `None` for legacy payloads.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub raw_emission: Option<String>,
+
+    /// Inference telemetry for this turn (timing, token counts, cost).
+    /// `None` for legacy/partial responses. Foreman code that does not read
+    /// this field is unaffected — the field is skipped when serializing `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metrics: Option<newt_core::TurnMetrics>,
+}
+
+impl PartialEq for TaskReply {
+    fn eq(&self, other: &Self) -> bool {
+        // Intentionally excludes `metrics` — test assertions compare
+        // business logic; telemetry values vary per run.
+        self.model_id == other.model_id
+            && self.content == other.content
+            && self.diff == other.diff
+            && self.empty_diff == other.empty_diff
+            && self.diff_applied == other.diff_applied
+            && self.emission_shape == other.emission_shape
+            && self.raw_emission == other.raw_emission
+    }
 }
 
 impl TaskReply {
@@ -118,6 +141,7 @@ impl TaskReply {
             diff_applied,
             emission_shape: None,
             raw_emission: None,
+            metrics: None,
         })
     }
 
@@ -134,6 +158,11 @@ impl TaskReply {
     #[must_use]
     pub fn with_raw_emission(mut self, raw: impl Into<String>) -> Self {
         self.raw_emission = Some(raw.into());
+        self
+    }
+
+    pub fn with_metrics(mut self, m: newt_core::TurnMetrics) -> Self {
+        self.metrics = Some(m);
         self
     }
 }
@@ -354,12 +383,10 @@ impl AcpServer {
             .system("You are a coding assistant. Respond with unified diffs only.")
             .user(prompt.to_string());
 
+        let t0 = std::time::Instant::now();
         let reply = self.backend.complete(req).await?;
+        let elapsed_ms = t0.elapsed().as_millis() as u64;
 
-        // If the reply contains a unified diff, try to apply it. We
-        // accept the patch unconditionally on success; on failure we
-        // log and continue so the diff text still makes it back to the
-        // caller for debugging.
         let diff_applied = if looks_like_unified_diff(&reply.content) {
             match newt_tools::apply_patch(&session.workspace_path, &reply.content) {
                 Ok(()) => true,
@@ -373,11 +400,22 @@ impl AcpServer {
         };
 
         let diff = crate::diff::capture_diff(&session.workspace_path)?;
-        // Flat path has no re-prompt fallback, so the reply content IS the
-        // model's first (and only) emission.
         let raw_emission = reply.content.clone();
+
+        let pricing = newt_core::Config::resolve()
+            .ok()
+            .and_then(|c| c.pricing)
+            .unwrap_or_default();
+        let metrics = newt_core::TurnMetrics {
+            elapsed_ms,
+            usage: reply.usage,
+            cost_usd: pricing.estimate_cost(&reply.model_id, reply.usage.as_ref()),
+            model_id: reply.model_id.clone(),
+            endpoint: self.backend.endpoint().unwrap_or("unknown").to_string(),
+        };
+
         TaskReply::new(reply.model_id, reply.content, diff, diff_applied)
-            .map(|r| r.with_raw_emission(raw_emission))
+            .map(|r| r.with_raw_emission(raw_emission).with_metrics(metrics))
             .map_err(|e| anyhow::anyhow!("backend returned malformed reply: {e}"))
     }
 
@@ -396,10 +434,12 @@ impl AcpServer {
         // authority), preserving pre-35b behavior; the enforcement
         // machinery is wired so 35c only needs to swap the argument.
         let caveats = newt_core::Caveats::top();
+        let t0 = std::time::Instant::now();
         let run = coder
             .run(&session.workspace_path, prompt, &caveats)
             .await
             .map_err(|e| anyhow::anyhow!("newt-coder run failed: {e}"))?;
+        let elapsed_ms = t0.elapsed().as_millis() as u64;
 
         // newt-coder already wrote any whole-file or unified-diff
         // edits to the workspace; capture the resulting real diff.
@@ -412,10 +452,24 @@ impl AcpServer {
             run.emission_shape,
         );
 
+        let pricing = newt_core::Config::resolve()
+            .ok()
+            .and_then(|c| c.pricing)
+            .unwrap_or_default();
+        let coder_metrics = newt_core::TurnMetrics {
+            elapsed_ms,
+            usage: None, // newt-coder doesn't yet propagate per-turn usage
+            cost_usd: None,
+            model_id: run.model_id.clone(),
+            endpoint: self.backend.endpoint().unwrap_or("unknown").to_string(),
+        };
+        let _ = pricing; // suppress unused warning until token usage is wired
+
         Ok(TaskReply::new(run.model_id, content, diff, diff_applied)
             .map_err(|e| anyhow::anyhow!("newt-coder returned malformed reply: {e}"))?
             .with_emission_shape(run.emission_shape)
-            .with_raw_emission(run.first_emission))
+            .with_raw_emission(run.first_emission)
+            .with_metrics(coder_metrics))
     }
 }
 
