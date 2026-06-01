@@ -176,6 +176,20 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn load_or_generate_writes_a_0600_key() {
+        // The root private key's `0600` mode is set by agent-mesh's
+        // `UserKey::save`, not by this crate. Pin it here so a dependency bump
+        // can't silently widen the permissions of a key we generate.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("identity.pem");
+        let _ = load_or_generate(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "generated key must be 0600, got {mode:o}");
+    }
+
+    #[test]
     fn attenuated_preset_is_signed_and_verifies() {
         let dir = TempDir::new().unwrap();
         let root = session_root(&fresh_user(&dir));
