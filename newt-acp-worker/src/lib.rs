@@ -11,13 +11,17 @@
 //! - `TaskReply.model_id` is mandatory.
 
 mod diff;
+pub mod prom;
 mod server;
 
 #[cfg(feature = "pyo3")]
 pub mod pyo3_module;
 
 pub use diff::{capture_diff, is_empty_diff};
+pub use prom::NewtMetrics;
 pub use server::{AcpServer, Session, TaskReply};
+
+use std::sync::Arc;
 
 /// Spawn the default ACP worker over stdio.
 ///
@@ -28,21 +32,31 @@ pub async fn run_stdio() -> anyhow::Result<()> {
     run_with_io(tokio::io::stdin(), tokio::io::stdout()).await
 }
 
-/// Spawn the default ACP worker against an explicit reader/writer pair.
+/// Like [`run_stdio`] but with an explicit reader/writer pair, and an optional
+/// Prometheus metrics registry that will receive per-turn observations.
 ///
 /// Used by the CLI binary's `Worker` dispatch arm to feed a private
 /// "real stdout" file handle (obtained from
 /// [`newt_cli::stdio_guard::redirect_stdout_to_stderr`]) into the
-/// server *after* fd 1 has been redirected to stderr. That sequence
-/// is what protects the JSON-RPC wire from rogue `println!` calls in
-/// dependencies — see the module-level doc on `stdio_guard` for the
-/// full rationale.
+/// server *after* fd 1 has been redirected to stderr.
 ///
-/// Picks the initial Ollama model from `NEWT_DEFAULT_MODEL` env, falling
-/// back to `llama3.1:8b`. Lets the bake-off harness iterate models by
-/// spawning fresh worker subprocesses with different model envs while
-/// session-level model swap isn't wired through `ChatRequest` yet.
+/// When `metrics` is `Some`, the server records timing, token counts, and
+/// cost into the Prometheus counters after every `prompt` turn.
 pub async fn run_with_io<R, W>(reader: R, writer: W) -> anyhow::Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    run_with_io_and_metrics(reader, writer, None).await
+}
+
+/// Full entry-point used by the CLI: accepts explicit I/O streams and an
+/// optional metrics registry.
+pub async fn run_with_io_and_metrics<R, W>(
+    reader: R,
+    writer: W,
+    metrics: Option<Arc<NewtMetrics>>,
+) -> anyhow::Result<()>
 where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
@@ -50,6 +64,6 @@ where
     let default_model =
         std::env::var("NEWT_DEFAULT_MODEL").unwrap_or_else(|_| "llama3.1:8b".to_string());
     let backend = newt_inference::local::LocalOllamaBackend::discover(&default_model).await?;
-    let server = AcpServer::new(std::sync::Arc::new(backend));
+    let server = AcpServer::new(std::sync::Arc::new(backend)).with_metrics(metrics);
     server.run(reader, writer).await
 }

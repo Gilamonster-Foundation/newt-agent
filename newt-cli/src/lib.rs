@@ -116,26 +116,65 @@ async fn run_worker(coder: bool) -> anyhow::Result<()> {
         tracing::info!("newt-coder plugin activated (whole-file emit)");
     }
 
+    // Start the Prometheus /metrics endpoint if NEWT_METRICS_PORT is set.
+    // The registry lives for the lifetime of the worker process.
+    let metrics = maybe_start_metrics_server();
+
     #[cfg(unix)]
     {
         match stdio_guard::redirect_stdout_to_stderr() {
             Ok(private_stdout) => {
                 let tokio_stdout = tokio::fs::File::from_std(private_stdout);
-                newt_acp_worker::run_with_io(tokio::io::stdin(), tokio_stdout).await
+                newt_acp_worker::run_with_io_and_metrics(tokio::io::stdin(), tokio_stdout, metrics)
+                    .await
             }
             Err(e) => {
                 tracing::warn!(
                     error = %e,
                     "stdio_guard fd redirect failed; falling back to raw stdout"
                 );
-                newt_acp_worker::run_stdio().await
+                newt_acp_worker::run_with_io_and_metrics(
+                    tokio::io::stdin(),
+                    tokio::io::stdout(),
+                    metrics,
+                )
+                .await
             }
         }
     }
     #[cfg(not(unix))]
     {
-        newt_acp_worker::run_stdio().await
+        newt_acp_worker::run_with_io_and_metrics(tokio::io::stdin(), tokio::io::stdout(), metrics)
+            .await
     }
+}
+
+/// Check `NEWT_METRICS_PORT`; if set, create a metrics registry and spawn the
+/// HTTP scrape server as a background task.
+///
+/// Returns the registry for injection into the ACP server, or `None` if the
+/// env var is absent or invalid.
+fn maybe_start_metrics_server() -> Option<std::sync::Arc<newt_acp_worker::NewtMetrics>> {
+    let port: u16 = std::env::var("NEWT_METRICS_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&p| p > 0)?;
+
+    let registry = match newt_acp_worker::NewtMetrics::new() {
+        Ok(r) => std::sync::Arc::new(r),
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to create Prometheus registry — metrics disabled");
+            return None;
+        }
+    };
+
+    let reg = registry.clone();
+    tokio::spawn(async move {
+        newt_acp_worker::prom::serve(port, reg).await;
+    });
+
+    tracing::info!(port, "Prometheus metrics server started");
+    Some(registry)
 }
 
 /// Spawn the MCP server with the same stdio safety dance as

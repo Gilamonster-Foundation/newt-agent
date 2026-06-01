@@ -120,6 +120,9 @@ plugins-protocol  = { path = "plugins-protocol",  version = "=0.6.4" }
 pyo3 = { version = "0.28", default-features = false, features = ["macros"] }
 pyo3-async-runtimes = { version = "0.28", default-features = false, features = ["tokio-runtime"] }
 
+# Prometheus metrics (opt-in, used by newt-acp-worker for /metrics endpoint)
+prometheus = { version = "0.13", default-features = false }
+
 [workspace.lints.clippy]
 explicit_iter_loop            = "warn"
 flat_map_option               = "warn"
