@@ -188,12 +188,16 @@ fn save_config(path: &std::path::Path, url: &str, model: &str, color: bool) -> a
 
     // Build a minimal config with a DGX Ollama entry.
     let mut config = Config::default();
-    let mut dgx = DgxConfig::default();
-    dgx.active_model = Some(model.to_string());
-    let mut node = newt_core::DgxNode::default();
-    node.name = "default".into();
-    node.ollama = Some(url.to_string());
-    dgx.nodes.push(node);
+    let node = newt_core::DgxNode {
+        name: "default".into(),
+        ollama: Some(url.to_string()),
+        ..Default::default()
+    };
+    let dgx = DgxConfig {
+        active_model: Some(model.to_string()),
+        nodes: vec![node],
+        ..Default::default()
+    };
     config.dgx = Some(dgx);
 
     print!("\n{dim}Saving config to {} …{reset} ", path.display());

@@ -1262,6 +1262,7 @@ dependencies = [
  "reqwest",
  "rustyline",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
 ]
