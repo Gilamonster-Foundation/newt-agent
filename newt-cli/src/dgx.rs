@@ -31,6 +31,11 @@ pub enum DgxCmd {
     Models,
     /// Probe every configured DGX endpoint flavor and report reachability.
     Doctor,
+    /// Set the active DGX model and persist it to ~/.newt/config.toml.
+    Use {
+        /// Model id to activate (e.g. gemma4:e2b, qwen2.5-coder:32b).
+        model: String,
+    },
     /// Pre-load a model into VRAM on the active endpoint so the first real
     /// request doesn't pay the cold-load latency (which can blow past tight
     /// per-task timeouts, e.g. in `newt-eval`). Uses Ollama's load-only
@@ -52,6 +57,7 @@ pub async fn run(cmd: DgxCmd, config_path: Option<&Path>) -> anyhow::Result<()> 
         DgxCmd::Status => status(config_path).await,
         DgxCmd::Models => models(config_path).await,
         DgxCmd::Doctor => doctor(config_path).await,
+        DgxCmd::Use { model } => use_model(config_path, &model),
         DgxCmd::Warm { model, keep_alive } => warm(config_path, model, &keep_alive).await,
     }
 }
@@ -322,6 +328,28 @@ async fn probe(client: &reqwest::Client, base: &str, path: &str) -> String {
         Ok(resp) => format!("HTTP {}", resp.status()),
         Err(e) => format!("unreachable: {e}"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// use — persist active model to config
+// ---------------------------------------------------------------------------
+
+fn use_model(config_path: Option<&Path>, model: &str) -> anyhow::Result<()> {
+    let mut config = load_config(config_path)?;
+
+    // Update or create the [dgx] section with the chosen model.
+    let dgx = config.dgx.get_or_insert_with(Default::default);
+    dgx.active_model = Some(model.to_string());
+
+    let save_path = config_path
+        .map(std::path::PathBuf::from)
+        .or_else(newt_core::Config::user_config_path)
+        .ok_or_else(|| anyhow::anyhow!("cannot determine config file path"))?;
+
+    config.save(&save_path)?;
+    println!("Active model set to {model}");
+    println!("Saved → {}", save_path.display());
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
