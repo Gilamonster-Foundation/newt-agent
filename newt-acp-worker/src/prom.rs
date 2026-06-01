@@ -19,7 +19,9 @@
 
 use std::sync::Arc;
 
-use prometheus::{CounterVec, HistogramOpts, HistogramVec, IntCounterVec, Opts, Registry, TextEncoder};
+use prometheus::{
+    CounterVec, HistogramOpts, HistogramVec, IntCounterVec, Opts, Registry, TextEncoder,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use newt_core::TurnMetrics;
