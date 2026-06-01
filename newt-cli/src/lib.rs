@@ -201,3 +201,37 @@ async fn run_mcp() -> anyhow::Result<()> {
         newt_mcp_server::run_stdio().await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::maybe_start_metrics_server;
+
+    /// `maybe_start_metrics_server` is gated entirely on `NEWT_METRICS_PORT`:
+    /// absent / unparseable / zero → `None`; a valid port → `Some(registry)`
+    /// and the scrape server is spawned. Exercised in one test so the
+    /// (process-global) env var isn't raced by parallel cases.
+    #[tokio::test]
+    async fn maybe_start_metrics_server_honors_env() {
+        // SAFETY: single-purpose test; no other test touches NEWT_METRICS_PORT.
+        unsafe { std::env::remove_var("NEWT_METRICS_PORT") };
+        assert!(maybe_start_metrics_server().is_none(), "absent env → None");
+
+        unsafe { std::env::set_var("NEWT_METRICS_PORT", "not-a-port") };
+        assert!(maybe_start_metrics_server().is_none(), "unparseable → None");
+
+        unsafe { std::env::set_var("NEWT_METRICS_PORT", "0") };
+        assert!(maybe_start_metrics_server().is_none(), "port 0 → None");
+
+        // A real free port → Some(registry); the spawn happens on the tokio
+        // runtime this test provides.
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        unsafe { std::env::set_var("NEWT_METRICS_PORT", port.to_string()) };
+        assert!(
+            maybe_start_metrics_server().is_some(),
+            "valid port → Some(registry)"
+        );
+        unsafe { std::env::remove_var("NEWT_METRICS_PORT") };
+    }
+}

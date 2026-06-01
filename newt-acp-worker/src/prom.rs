@@ -274,4 +274,74 @@ mod tests {
         assert!(text.contains("# TYPE newt_inference_turns_total counter"));
         assert!(text.contains("# TYPE newt_inference_duration_ms histogram"));
     }
+
+    #[test]
+    fn default_constructs_a_registry() {
+        // Exercises the Default impl (new().expect(..)).
+        let m = NewtMetrics::default();
+        m.record(&sample_metrics("default-model"));
+        assert!(m.render().contains("default-model"));
+    }
+
+    /// Drive the hand-rolled `/metrics` + `/healthz` HTTP server end to end:
+    /// bind it on a free port, then check all three response paths.
+    #[tokio::test]
+    async fn serve_handles_metrics_healthz_and_404() {
+        use tokio::net::TcpStream;
+
+        // Reserve a free port, release it, then hand it to `serve`.
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        let metrics = Arc::new(NewtMetrics::new().unwrap());
+        metrics.record(&sample_metrics("serve-test-model"));
+        tokio::spawn(serve(port, metrics.clone()));
+
+        let addr = format!("127.0.0.1:{port}");
+
+        // One request per connection (the server is no-keep-alive); retry the
+        // connect to absorb the bind race after spawn.
+        async fn get(addr: &str, path: &str) -> String {
+            let mut stream = None;
+            for _ in 0..100 {
+                if let Ok(s) = TcpStream::connect(addr).await {
+                    stream = Some(s);
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            let mut stream = stream.expect("connect to metrics server");
+            stream
+                .write_all(format!("GET {path} HTTP/1.1\r\nHost: x\r\n\r\n").as_bytes())
+                .await
+                .unwrap();
+            let mut out = Vec::new();
+            stream.read_to_end(&mut out).await.unwrap();
+            String::from_utf8_lossy(&out).into_owned()
+        }
+
+        let metrics_resp = get(&addr, "/metrics").await;
+        assert!(
+            metrics_resp.contains("200 OK"),
+            "metrics status: {metrics_resp}"
+        );
+        assert!(
+            metrics_resp.contains("newt_inference_turns_total"),
+            "metrics body: {metrics_resp}"
+        );
+        assert!(
+            metrics_resp.contains("text/plain; version=0.0.4"),
+            "metrics content-type: {metrics_resp}"
+        );
+
+        let health_resp = get(&addr, "/healthz").await;
+        assert!(
+            health_resp.contains("200 OK") && health_resp.contains("ok"),
+            "healthz: {health_resp}"
+        );
+
+        let not_found = get(&addr, "/nope").await;
+        assert!(not_found.contains("404 Not Found"), "404: {not_found}");
+    }
 }
