@@ -122,11 +122,11 @@ impl PermissionPreset {
 
     pub fn as_str(&self) -> &'static str {
         match self {
-            Self::ReadOnly      => "read_only",
+            Self::ReadOnly => "read_only",
             Self::WorkspaceEdit => "workspace_edit",
-            Self::WorkspaceDev  => "workspace_dev",
-            Self::FullAccess    => "full_access",
-            Self::Custom        => "custom",
+            Self::WorkspaceDev => "workspace_dev",
+            Self::FullAccess => "full_access",
+            Self::Custom => "custom",
         }
     }
 
@@ -138,11 +138,11 @@ impl PermissionPreset {
 
     pub fn description(&self) -> &'static str {
         match self {
-            Self::ReadOnly      => "read files + list dirs; no writes, no commands",
+            Self::ReadOnly => "read files + list dirs; no writes, no commands",
             Self::WorkspaceEdit => "read + write workspace; no shell commands",
-            Self::WorkspaceDev  => "read, write workspace, run: cargo just git grep rg fd ...",
-            Self::FullAccess    => "unrestricted (prompts y/N before each write)",
-            Self::Custom        => "custom exec allowlist (unrestricted otherwise)",
+            Self::WorkspaceDev => "read, write workspace, run: cargo just git grep rg fd ...",
+            Self::FullAccess => "unrestricted (prompts y/N before each write)",
+            Self::Custom => "custom exec allowlist (unrestricted otherwise)",
         }
     }
 }
@@ -176,10 +176,30 @@ impl Default for ToolPermissions {
 impl ToolPermissions {
     /// Built-in exec allowlist for the `WorkspaceDev` preset.
     const WORKSPACE_DEV_EXEC: &'static [&'static str] = &[
-        "cargo", "just", "git", "grep", "rg", "ripgrep",
-        "fd", "find", "cat", "ls", "echo", "pwd", "true", "false",
-        "head", "tail", "wc", "sort", "uniq", "diff", "patch",
-        "rustfmt", "clippy-driver", "rustup",
+        "cargo",
+        "just",
+        "git",
+        "grep",
+        "rg",
+        "ripgrep",
+        "fd",
+        "find",
+        "cat",
+        "ls",
+        "echo",
+        "pwd",
+        "true",
+        "false",
+        "head",
+        "tail",
+        "wc",
+        "sort",
+        "uniq",
+        "diff",
+        "patch",
+        "rustfmt",
+        "clippy-driver",
+        "rustup",
     ];
 
     /// Build the runtime `Caveats` for this permission configuration.
@@ -233,8 +253,7 @@ impl ToolPermissions {
                 }
             }
 
-            PermissionPreset::FullAccess
-            | PermissionPreset::Custom => Caveats::top(),
+            PermissionPreset::FullAccess | PermissionPreset::Custom => Caveats::top(),
         }
     }
 }
@@ -580,7 +599,10 @@ default_tier_order = ["FAST", "STANDARD", "COMPLEX", "REVIEW"]
 
     #[test]
     fn read_only_blocks_writes_and_exec() {
-        let perms = ToolPermissions { preset: PermissionPreset::ReadOnly, extra_exec: vec![] };
+        let perms = ToolPermissions {
+            preset: PermissionPreset::ReadOnly,
+            extra_exec: vec![],
+        };
         let cav = perms.to_caveats("/workspace");
         assert!(!cav.permits_fs_write("/workspace/src/main.rs"));
         assert!(!cav.permits_exec("cargo"));
@@ -589,7 +611,10 @@ default_tier_order = ["FAST", "STANDARD", "COMPLEX", "REVIEW"]
 
     #[test]
     fn workspace_edit_allows_write_blocks_exec() {
-        let perms = ToolPermissions { preset: PermissionPreset::WorkspaceEdit, extra_exec: vec![] };
+        let perms = ToolPermissions {
+            preset: PermissionPreset::WorkspaceEdit,
+            extra_exec: vec![],
+        };
         let cav = perms.to_caveats("/workspace");
         assert!(!cav.permits_exec("cargo"));
         // The caveat stores workspace root; prefix matching is in the TUI layer.
@@ -600,17 +625,32 @@ default_tier_order = ["FAST", "STANDARD", "COMPLEX", "REVIEW"]
 
     #[test]
     fn full_access_is_top() {
-        let perms = ToolPermissions { preset: PermissionPreset::FullAccess, extra_exec: vec![] };
+        let perms = ToolPermissions {
+            preset: PermissionPreset::FullAccess,
+            extra_exec: vec![],
+        };
         let cav = perms.to_caveats("/workspace");
         assert_eq!(cav, crate::caveats::Caveats::top());
     }
 
     #[test]
     fn preset_toggle_cycles() {
-        assert_eq!(PermissionPreset::ReadOnly.toggle(), PermissionPreset::WorkspaceEdit);
-        assert_eq!(PermissionPreset::WorkspaceEdit.toggle(), PermissionPreset::WorkspaceDev);
-        assert_eq!(PermissionPreset::WorkspaceDev.toggle(), PermissionPreset::FullAccess);
-        assert_eq!(PermissionPreset::FullAccess.toggle(), PermissionPreset::ReadOnly);
+        assert_eq!(
+            PermissionPreset::ReadOnly.toggle(),
+            PermissionPreset::WorkspaceEdit
+        );
+        assert_eq!(
+            PermissionPreset::WorkspaceEdit.toggle(),
+            PermissionPreset::WorkspaceDev
+        );
+        assert_eq!(
+            PermissionPreset::WorkspaceDev.toggle(),
+            PermissionPreset::FullAccess
+        );
+        assert_eq!(
+            PermissionPreset::FullAccess.toggle(),
+            PermissionPreset::ReadOnly
+        );
     }
 
     #[test]

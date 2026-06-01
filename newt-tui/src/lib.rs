@@ -515,7 +515,9 @@ fn print_denied(axis: &str, target: &str, color: bool) {
         execute!(
             io::stdout(),
             SetForegroundColor(CtColor::DarkGrey),
-            Print(format!("⊘  capability denied: {axis} does not permit '{target}'\n")),
+            Print(format!(
+                "⊘  capability denied: {axis} does not permit '{target}'\n"
+            )),
             ResetColor,
         )
         .ok();
@@ -608,10 +610,11 @@ fn run_chat(workspace: &str, color: bool) -> anyhow::Result<()> {
                     print_thinking(color);
 
                     let response = tokio::task::block_in_place(|| {
-                        rt.block_on(chat_complete(
-                            &inf_url, &inf_model, &system, &conv, &task,
-                            workspace, color, &caveats,
-                        ))
+                        rt.block_on(chat_complete(ChatCtx {
+                            url: &inf_url, model: &inf_model, system: &system,
+                            history: &conv, task: &task, workspace, color,
+                            caveats: &caveats,
+                        }))
                     });
 
                     // Erase the thinking line then print the real response.
@@ -833,7 +836,11 @@ fn print_tool_output(output: &str, color: bool) {
     }
     let max = tool_output_lines();
     let lines: Vec<&str> = output.lines().collect();
-    let shown = if max == 0 { lines.len() } else { lines.len().min(max) };
+    let shown = if max == 0 {
+        lines.len()
+    } else {
+        lines.len().min(max)
+    };
     let hidden = lines.len().saturating_sub(shown);
 
     let display = lines[..shown].join("\n");
@@ -866,9 +873,7 @@ fn print_tool_output(output: &str, color: bool) {
         io::stdout().flush().ok();
 
         let mut ans = String::new();
-        if std::io::stdin().read_line(&mut ans).is_ok()
-            && ans.trim().eq_ignore_ascii_case("y")
-        {
+        if std::io::stdin().read_line(&mut ans).is_ok() && ans.trim().eq_ignore_ascii_case("y") {
             let rest = lines[shown..].join("\n");
             if color {
                 execute!(
@@ -974,8 +979,7 @@ fn execute_tool(
             // Auto-write when the caveat explicitly scopes fs_write (the
             // preset itself is the user's consent).  Ask y/N only under
             // full_access / custom where fs_write == Scope::All.
-            let needs_confirm =
-                matches!(caveats.fs_write, newt_core::caveats::Scope::All);
+            let needs_confirm = matches!(caveats.fs_write, newt_core::caveats::Scope::All);
 
             let confirmed = if needs_confirm {
                 print!("Write this file? [y/N] ");
@@ -1034,26 +1038,28 @@ fn execute_tool(
     }
 }
 
-/// Main agentic loop: call model → execute tool calls → feed results back → repeat.
-async fn chat_complete(
-    url: &str,
-    model: &str,
-    system: &str,
-    history: &[(bool, String)],
-    task: &str,
-    workspace: &str,
+struct ChatCtx<'a> {
+    url: &'a str,
+    model: &'a str,
+    system: &'a str,
+    history: &'a [(bool, String)],
+    task: &'a str,
+    workspace: &'a str,
     color: bool,
-    caveats: &newt_core::caveats::Caveats,
-) -> anyhow::Result<String> {
+    caveats: &'a newt_core::caveats::Caveats,
+}
+
+/// Main agentic loop: call model → execute tool calls → feed results back → repeat.
+async fn chat_complete(ctx: ChatCtx<'_>) -> anyhow::Result<String> {
+    let ChatCtx { url, model, system, history, task, workspace, color, caveats } = ctx;
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(120))
         .build()?;
     let chat_url = format!("{}/api/chat", url.trim_end_matches('/'));
 
     // Build message list.
-    let mut messages: Vec<serde_json::Value> = vec![
-        serde_json::json!({"role": "system", "content": system}),
-    ];
+    let mut messages: Vec<serde_json::Value> =
+        vec![serde_json::json!({"role": "system", "content": system})];
     for (is_user, text) in history {
         messages.push(serde_json::json!({
             "role": if *is_user { "user" } else { "assistant" },
@@ -1067,7 +1073,13 @@ async fn chat_complete(
         if round > 0 {
             // Brief separator between rounds so user can follow the flow.
             if color {
-                execute!(io::stdout(), SetForegroundColor(CtColor::DarkGrey), Print("…\n"), ResetColor).ok();
+                execute!(
+                    io::stdout(),
+                    SetForegroundColor(CtColor::DarkGrey),
+                    Print("…\n"),
+                    ResetColor
+                )
+                .ok();
             }
         }
 
@@ -1078,7 +1090,11 @@ async fn chat_complete(
             "tools": tool_definitions(),
         });
 
-        let resp = client.post(&chat_url).json(&body).send().await
+        let resp = client
+            .post(&chat_url)
+            .json(&body)
+            .send()
+            .await
             .map_err(|e| anyhow::anyhow!("request failed: {e}"))?;
 
         if !resp.status().is_success() {

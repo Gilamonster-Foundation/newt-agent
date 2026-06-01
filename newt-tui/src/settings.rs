@@ -53,10 +53,10 @@ impl Category {
 
     fn title(self) -> &'static str {
         match self {
-            Self::Tui         => "TUI",
+            Self::Tui => "TUI",
             Self::Permissions => "Permissions",
-            Self::Dgx         => "DGX",
-            Self::About       => "About",
+            Self::Dgx => "DGX",
+            Self::About => "About",
         }
     }
 
@@ -76,7 +76,7 @@ impl PermField {
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::Preset    => "preset",
+            Self::Preset => "preset",
             Self::ExtraExec => "extra cmds",
         }
     }
@@ -276,9 +276,7 @@ impl SettingsApp {
             match *field_label {
                 s if s == TuiField::Prompt.label() => self.tui.prompt = val,
                 s if s == TuiField::ToolOutputLines.label() => {
-                    self.tui.tool_output_lines = buf
-                        .parse::<usize>()
-                        .unwrap_or(20);
+                    self.tui.tool_output_lines = buf.parse::<usize>().unwrap_or(20);
                     // confirm_edit sets val from buf; we already parsed, so override
                 }
 
@@ -488,9 +486,9 @@ fn run_loop(
             Event::Key(KeyEvent {
                 code: KeyCode::Up, ..
             }) if app.input_mode == InputMode::Navigate => match app.category {
-                Category::Tui         => app.tui_cursor  = app.tui_cursor.saturating_sub(1),
+                Category::Tui => app.tui_cursor = app.tui_cursor.saturating_sub(1),
                 Category::Permissions => app.perm_cursor = app.perm_cursor.saturating_sub(1),
-                Category::Dgx         => app.dgx_cursor  = app.dgx_cursor.saturating_sub(1),
+                Category::Dgx => app.dgx_cursor = app.dgx_cursor.saturating_sub(1),
                 Category::About => {}
             },
 
@@ -498,9 +496,11 @@ fn run_loop(
                 code: KeyCode::Down,
                 ..
             }) if app.input_mode == InputMode::Navigate => match app.category {
-                Category::Tui  => app.tui_cursor  = (app.tui_cursor  + 1).min(TuiField::ALL.len()  - 1),
-                Category::Permissions => app.perm_cursor = (app.perm_cursor + 1).min(PermField::ALL.len() - 1),
-                Category::Dgx  => app.dgx_cursor  = (app.dgx_cursor  + 1).min(DgxField::ALL.len()  - 1),
+                Category::Tui => app.tui_cursor = (app.tui_cursor + 1).min(TuiField::ALL.len() - 1),
+                Category::Permissions => {
+                    app.perm_cursor = (app.perm_cursor + 1).min(PermField::ALL.len() - 1);
+                }
+                Category::Dgx => app.dgx_cursor = (app.dgx_cursor + 1).min(DgxField::ALL.len() - 1),
                 Category::About => {}
             },
 
@@ -617,10 +617,10 @@ fn render_tabs(f: &mut Frame, area: Rect, app: &SettingsApp, active: Style, dim:
 fn render_fields(f: &mut Frame, area: Rect, app: &SettingsApp, bold_orange: Style, dim: Style) {
     f.render_widget(Clear, area);
     match app.category {
-        Category::Tui         => render_tui_fields(f, area, app, bold_orange, dim),
+        Category::Tui => render_tui_fields(f, area, app, bold_orange, dim),
         Category::Permissions => render_perm_fields(f, area, app, bold_orange, dim),
-        Category::Dgx         => render_dgx_fields(f, area, app, bold_orange, dim),
-        Category::About       => render_about(f, area, dim),
+        Category::Dgx => render_dgx_fields(f, area, app, bold_orange, dim),
+        Category::About => render_about(f, area, dim),
     }
 }
 
@@ -705,12 +705,27 @@ fn render_tui_fields(f: &mut Frame, area: Rect, app: &SettingsApp, bold_orange: 
                     }
                 } else {
                     let n = app.tui.tool_output_lines;
-                    if n == 0 { "unlimited".into() } else { format!("{n}") }
+                    if n == 0 {
+                        "unlimited".into()
+                    } else {
+                        format!("{n}")
+                    }
                 };
-                let hint = if editing { "  Esc cancel  Enter confirm" } else { "  Enter to edit  (0 = unlimited)" };
+                let hint = if editing {
+                    "  Esc cancel  Enter confirm"
+                } else {
+                    "  Enter to edit  (0 = unlimited)"
+                };
                 Line::from(vec![
                     Span::styled(format!("  {:<14}", field.label()), label_s),
-                    Span::styled(val, if editing { Style::default().fg(Color::Yellow) } else { Style::default() }),
+                    Span::styled(
+                        val,
+                        if editing {
+                            Style::default().fg(Color::Yellow)
+                        } else {
+                            Style::default()
+                        },
+                    ),
                     Span::styled(hint, dim),
                 ])
             }
@@ -787,7 +802,11 @@ fn render_perm_fields(
     }
     f.render_widget(
         Paragraph::new(Line::from(spans)).style(row_s0),
-        Rect { height: 1, y: rows[0].y + 1, ..rows[0] },
+        Rect {
+            height: 1,
+            y: rows[0].y + 1,
+            ..rows[0]
+        },
     );
 
     // --- extra cmds row ---
@@ -815,8 +834,12 @@ fn render_perm_fields(
     };
     let (val_style, hint) = if !extra_applicable {
         (dim, "  (not applicable for this preset)")
-    } else if matches!(&app.input_mode, InputMode::EditingText { field_label, .. } if *field_label == PermField::ExtraExec.label()) {
-        (Style::default().fg(Color::Yellow), "  Esc cancel  Enter confirm")
+    } else if matches!(&app.input_mode, InputMode::EditingText { field_label, .. } if *field_label == PermField::ExtraExec.label())
+    {
+        (
+            Style::default().fg(Color::Yellow),
+            "  Esc cancel  Enter confirm",
+        )
     } else {
         (Style::default(), "  Enter to edit")
     };
@@ -827,15 +850,18 @@ fn render_perm_fields(
     ]);
     f.render_widget(
         Paragraph::new(extra_line).style(row_s1),
-        Rect { height: 1, y: rows[1].y + 1, ..rows[1] },
+        Rect {
+            height: 1,
+            y: rows[1].y + 1,
+            ..rows[1]
+        },
     );
 
     // --- description block ---
     let mut desc_lines = vec![Line::from("")];
     for opt in &PermissionPreset::ALL {
         let active = opt == preset
-            || (*preset == PermissionPreset::Custom
-                && *opt == PermissionPreset::FullAccess);
+            || (*preset == PermissionPreset::Custom && *opt == PermissionPreset::FullAccess);
         let s = if active { bold_orange } else { dim };
         desc_lines.push(Line::from(Span::styled(
             format!("  {:<16} {}", opt.as_str(), opt.description()),
