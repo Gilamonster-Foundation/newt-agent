@@ -43,12 +43,19 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: fetch dependencies
-        # Pre-download all packages in Cargo.lock so --locked succeeds even
-        # when the runner cache is cold (e.g. after adding a new dependency).
-        run: cargo fetch --locked
+      - name: check Cargo.lock is up-to-date
+        # Regenerate the lock file and fail if it differs. This catches both
+        # missing deps and platform-specific entries (Linux vs macOS). We do
+        # NOT use --locked on the test step itself because the lock file must
+        # be re-generated here first so the Linux-specific entries are present.
+        run: |
+          cargo generate-lockfile
+          git diff --exit-code Cargo.lock || {
+            echo "Cargo.lock is out of date. Run 'cargo generate-lockfile' on Linux (or in CI) and commit the result."
+            exit 1
+          }
       - name: cargo test
-        run: cargo test --workspace --locked
+        run: cargo test --workspace
 
   coverage:
     name: Workspace coverage (cargo-llvm-cov)
