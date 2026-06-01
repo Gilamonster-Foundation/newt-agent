@@ -629,7 +629,13 @@ fn resolve_backend_config() -> (String, String) {
 fn build_system_prompt(workspace: &str) -> String {
     let mut ctx = format!(
         "You are newt, a small, fast, local-first agentic coder. \
-         Be concise and direct.\n\nWorkspace: {workspace}\n"
+         Be concise and direct.\n\n\
+         IMPORTANT: You do not have tool access in this session. \
+         You cannot execute commands, read files, or write files. \
+         When asked to run a command or edit a file, give the user \
+         the exact command or unified diff to run themselves — \
+         never claim you ran something or made a change you did not make.\n\n\
+         Workspace: {workspace}\n"
     );
 
     // Directory listing (top-level, no hidden files)
