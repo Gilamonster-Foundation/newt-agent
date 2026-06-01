@@ -55,6 +55,12 @@ fmt:
 lint:
     cargo clippy --workspace --all-targets -- -D warnings
 
+# Regenerate Cargo.lock from scratch (authoritative resolution).
+# Run this after adding or changing dependencies so the lock file matches
+# what CI's `--locked` flag validates against.
+lock:
+    cargo generate-lockfile
+
 # fmt-check, lint, and test — the local equivalent of CI.
 # PIPELINE PARITY: must match .github/workflows/ci.yml.
 check:

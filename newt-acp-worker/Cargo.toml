@@ -22,6 +22,7 @@ serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+prometheus.workspace = true
 
 # TODO: depend on agent-client-protocol crate (Apache-2.0) for ACP wire layer.
 
