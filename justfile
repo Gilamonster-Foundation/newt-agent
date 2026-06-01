@@ -62,11 +62,17 @@ lock:
     cargo generate-lockfile
 
 # fmt-check, lint, and test — the local equivalent of CI.
-# PIPELINE PARITY: must match .github/workflows/ci.yml.
+# PIPELINE PARITY: must match .github/workflows/ci.yml. Runs all three even if
+# an earlier one fails (a fmt failure must not mask a clippy failure), matching
+# the `if: always()` on CI's clippy step; exits non-zero if any failed.
 check:
-    cargo fmt --all -- --check
-    cargo clippy --workspace --all-targets -- -D warnings
-    cargo test --workspace
+    #!/usr/bin/env bash
+    set -uo pipefail
+    rc=0
+    cargo fmt --all -- --check || rc=1
+    cargo clippy --workspace --all-targets -- -D warnings || rc=1
+    cargo test --workspace || rc=1
+    exit $rc
 
 # Build + test the out-of-workspace newt-mesh crate. Requires the
 # sibling `../agent-mesh/` checkout. Not run by `just check` /
