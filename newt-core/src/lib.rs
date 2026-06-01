@@ -8,7 +8,9 @@ pub mod caveats;
 pub mod config;
 pub mod dgx;
 pub mod error;
+pub mod metrics;
 pub mod model_id;
+pub mod pricing;
 pub mod router;
 pub mod session;
 
@@ -19,6 +21,8 @@ pub use caveats::{Caveats, CountBound, Scope};
 pub use config::{ChatStyle, Config, EditMode, PermissionPreset, ToolPermissions, TuiConfig};
 pub use dgx::{DgxConfig, DgxFormation, DgxNode, DgxNotConfigured, EndpointKind};
 pub use error::NewtError;
+pub use metrics::{TokenUsage, TurnMetrics};
 pub use model_id::ModelId;
+pub use pricing::{ModelRate, PricingConfig};
 pub use router::{Router, Tier};
 pub use session::SessionId;

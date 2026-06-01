@@ -12,6 +12,9 @@ pub struct ChatRequest {
 pub struct ChatReply {
     pub content: String,
     pub model_id: String,
+    /// Token usage reported by the backend, if available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<newt_core::TokenUsage>,
 }
 
 impl ChatReply {
@@ -167,6 +170,7 @@ mod tests {
         let reply = ChatReply {
             content: "hello".to_string(),
             model_id: "llama3.1:8b".to_string(),
+            usage: None,
         };
         assert_eq!(
             reply.audit_string("ollama-local"),
