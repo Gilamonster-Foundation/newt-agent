@@ -389,8 +389,15 @@ impl AcpServer {
         prompt: &str,
     ) -> anyhow::Result<TaskReply> {
         let coder = newt_coder::Coder::new(Arc::clone(&self.backend));
+        // 35b: every Coder::run dispatch is gated on a Caveats value.
+        // The ACP worker has no peer cert today — that's the 35c handoff
+        // (newt-mesh extracts caveats from the verified peer cert and
+        // hands them in here). Until then we pass top (= the user's full
+        // authority), preserving pre-35b behavior; the enforcement
+        // machinery is wired so 35c only needs to swap the argument.
+        let caveats = newt_core::Caveats::top();
         let run = coder
-            .run(&session.workspace_path, prompt)
+            .run(&session.workspace_path, prompt, &caveats)
             .await
             .map_err(|e| anyhow::anyhow!("newt-coder run failed: {e}"))?;
 

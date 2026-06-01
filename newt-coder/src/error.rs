@@ -38,6 +38,17 @@ pub enum CoderError {
     LeakedMarker { path: String },
     #[error("inference: {0}")]
     Inference(String),
+    /// The peer's signed [`Caveats`](newt_core::Caveats) deny the tool
+    /// call this dispatch would have made.
+    ///
+    /// `kind` names the axis that refused — one of `"fs_read"`,
+    /// `"fs_write"`, `"net"`, `"exec"`, or `"max_calls"` — and `target`
+    /// names the concrete item the dispatch tried to touch (the path, the
+    /// host, or `"<turn>"` for the `max_calls` budget). The pair is
+    /// load-bearing for arbiter scorecards: every `CapabilityDenied`
+    /// becomes a scrubbed-sortie reason, not a model failure.
+    #[error("capability denied: {kind} does not permit '{target}'")]
+    CapabilityDenied { kind: &'static str, target: String },
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -118,5 +129,28 @@ mod tests {
         let io: std::io::Error = std::io::Error::new(std::io::ErrorKind::NotFound, "x");
         let e: CoderError = io.into();
         assert!(matches!(e, CoderError::Io(_)));
+    }
+
+    #[test]
+    fn capability_denied_renders_kind_and_target() {
+        let e = CoderError::CapabilityDenied {
+            kind: "fs_write",
+            target: "forbidden.rs".to_string(),
+        };
+        let s = e.to_string();
+        assert!(s.contains("capability denied"));
+        assert!(s.contains("fs_write"));
+        assert!(s.contains("forbidden.rs"));
+    }
+
+    #[test]
+    fn capability_denied_kinds_match_dispatch_axes() {
+        for kind in ["fs_read", "fs_write", "net", "exec", "max_calls"] {
+            let e = CoderError::CapabilityDenied {
+                kind,
+                target: "x".to_string(),
+            };
+            assert!(e.to_string().contains(kind));
+        }
     }
 }

@@ -46,6 +46,7 @@ pyo3 = [
 [dev-dependencies]
 wiremock.workspace = true
 assert_cmd.workspace = true
+cargo_metadata.workspace = true
 predicates.workspace = true
 
 [lints]

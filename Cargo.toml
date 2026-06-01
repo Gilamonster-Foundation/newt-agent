@@ -27,7 +27,7 @@ members = [
 exclude = ["newt-mesh"]
 
 [workspace.package]
-# Semver — first crates.io release 0.6.0 (matches agent-mesh 0.6.0).
+# Semver — 0.7.0: TUI, live inference, settings, slash commands.
 version = "0.7.0"
 edition = "2021"
 rust-version = "1.75"
@@ -83,6 +83,10 @@ crossterm = "0.28"
 
 # Test utilities (dev-only)
 tempfile = "3"
+# Resolves the cargo target directory the way cargo itself does (env var >
+# workspace/user config.toml > defaults), so tests locate built binaries even
+# when `[build] target-dir` is set in ~/.cargo/config.toml. See newt-agent#64.
+cargo_metadata = "0.23"
 wiremock = "0.6"
 mockall = "0.13"
 assert_cmd = "2"

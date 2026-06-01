@@ -39,10 +39,10 @@ dependencies = [
 
 [[package]]
 name = "agent-mesh-bus"
-version = "0.5.20260528"
+version = "0.6.0"
 dependencies = [
- "agent-mesh-core",
  "agent-mesh-discovery",
+ "agent-mesh-protocol",
  "agent-mesh-transport",
  "anyhow",
  "async-trait",
@@ -58,8 +58,24 @@ dependencies = [
 ]
 
 [[package]]
-name = "agent-mesh-core"
-version = "0.5.20260528"
+name = "agent-mesh-discovery"
+version = "0.6.0"
+dependencies = [
+ "agent-mesh-protocol",
+ "anyhow",
+ "base64",
+ "hex",
+ "mdns-sd",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "agent-mesh-protocol"
+version = "0.6.0"
 dependencies = [
  "blake3",
  "ed25519-dalek 2.2.0",
@@ -75,27 +91,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "agent-mesh-discovery"
-version = "0.5.20260528"
-dependencies = [
- "agent-mesh-core",
- "anyhow",
- "base64",
- "hex",
- "mdns-sd",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "agent-mesh-transport"
-version = "0.5.20260528"
+version = "0.6.0"
 dependencies = [
- "agent-mesh-core",
  "agent-mesh-discovery",
+ "agent-mesh-protocol",
  "anyhow",
  "async-trait",
  "bytes",
@@ -1549,10 +1549,10 @@ dependencies = [
  "hyper",
  "hyper-util",
  "rustls",
+ "rustls-native-certs",
  "tokio",
  "tokio-rustls",
  "tower-service",
- "webpki-roots",
 ]
 
 [[package]]
@@ -2338,7 +2338,7 @@ dependencies = [
 
 [[package]]
 name = "newt-core"
-version = "0.5.20260529"
+version = "0.6.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2350,7 +2350,7 @@ dependencies = [
 
 [[package]]
 name = "newt-inference"
-version = "0.5.20260529"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2371,14 +2371,16 @@ name = "newt-mesh"
 version = "0.5.20260529"
 dependencies = [
  "agent-mesh-bus",
- "agent-mesh-core",
  "agent-mesh-discovery",
+ "agent-mesh-protocol",
  "anyhow",
  "async-trait",
+ "base64",
  "chrono",
  "clap",
  "newt-core",
  "newt-inference",
+ "plugins-protocol",
  "serde",
  "serde_json",
  "tempfile",
@@ -2813,7 +2815,7 @@ dependencies = [
 
 [[package]]
 name = "plugins-protocol"
-version = "0.5.20260529"
+version = "0.6.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -3147,6 +3149,7 @@ dependencies = [
  "pin-project-lite",
  "quinn",
  "rustls",
+ "rustls-native-certs",
  "rustls-pki-types",
  "serde",
  "serde_json",
@@ -3163,7 +3166,6 @@ dependencies = [
  "wasm-bindgen-futures",
  "wasm-streams 0.4.2",
  "web-sys",
- "webpki-roots",
 ]
 
 [[package]]
@@ -3864,7 +3866,7 @@ dependencies = [
 
 [[package]]
 name = "tests-common"
-version = "0.5.20260529"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "async-trait",

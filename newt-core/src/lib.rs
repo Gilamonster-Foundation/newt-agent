@@ -4,6 +4,7 @@
 //! into a `Tier` (FAST / STANDARD / COMPLEX / REVIEW), and asks the
 //! configured backends which can serve that tier.
 
+pub mod caveats;
 pub mod config;
 pub mod dgx;
 pub mod error;
@@ -14,6 +15,7 @@ pub mod session;
 #[cfg(feature = "pyo3")]
 pub mod pyo3_module;
 
+pub use caveats::{Caveats, CountBound, Scope};
 pub use config::{ChatStyle, Config, EditMode, TuiConfig};
 pub use dgx::{DgxConfig, DgxFormation, DgxNode, DgxNotConfigured, EndpointKind};
 pub use error::NewtError;

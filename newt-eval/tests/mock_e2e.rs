@@ -130,9 +130,10 @@ fn ensure_worker_built() {
 
 /// Locate the `newt` binary in the workspace's `target/` dir.
 ///
-/// Searches common cargo target directories in priority order:
+/// Searches cargo target directories in priority order:
 /// 1. `$CARGO_TARGET_DIR` (set by `cargo llvm-cov` to `target/llvm-cov-target`)
-/// 2. `<manifest>/../target/{debug,release}/`
+/// 2. the cargo-resolved target dir (honors `~/.cargo/config.toml`, newt-agent#64)
+/// 3. `<manifest>/../target/{debug,release}/`
 fn locate_worker_bin() -> PathBuf {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let workspace_root = manifest.parent().expect("manifest dir has parent");
@@ -141,6 +142,11 @@ fn locate_worker_bin() -> PathBuf {
     let mut target_dirs: Vec<PathBuf> = Vec::new();
     if let Some(tdir) = std::env::var_os("CARGO_TARGET_DIR") {
         target_dirs.push(PathBuf::from(tdir));
+    }
+    // Honor `[build] target-dir` from cargo config (newt-agent#64) — a plain
+    // `workspace_root/target` guess misses it (and can resolve to a stale path).
+    if let Ok(meta) = cargo_metadata::MetadataCommand::new().exec() {
+        target_dirs.push(meta.target_directory.into_std_path_buf());
     }
     target_dirs.push(workspace_root.join("target"));
     target_dirs.push(workspace_root.join("target").join("llvm-cov-target"));
@@ -153,7 +159,13 @@ fn locate_worker_bin() -> PathBuf {
             }
         }
     }
-    // Fallback to the conventional debug path; the caller's assertion
-    // surfaces the missing path cleanly.
-    workspace_root.join("target").join("debug").join("newt")
+    // Fallback to the cargo-resolved debug path (newt-agent#64), else the
+    // conventional path; the caller's assertion surfaces a missing path cleanly.
+    cargo_metadata::MetadataCommand::new()
+        .exec()
+        .ok()
+        .map(|m| m.target_directory.into_std_path_buf())
+        .unwrap_or_else(|| workspace_root.join("target"))
+        .join("debug")
+        .join("newt")
 }
