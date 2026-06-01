@@ -36,8 +36,12 @@
 
 use std::path::{Path, PathBuf};
 
-use agent_mesh_protocol::{AgentKey, AgentMetadata, Caveats as MeshCaveats, MeshError, UserKey};
+use agent_mesh_protocol::{AgentMetadata, Caveats as MeshCaveats, MeshError, UserKey};
 use newt_core::Caveats;
+
+/// Re-exported so session hosts (e.g. the TUI) can hold an operating key and
+/// delegate from it without depending on `agent-mesh-protocol` directly.
+pub use agent_mesh_protocol::AgentKey;
 
 /// Errors raised while establishing or attenuating a session identity.
 #[derive(Debug, thiserror::Error)]

@@ -516,52 +516,105 @@ fn policy_for(tui: Option<newt_core::TuiConfig>, workspace: &str) -> newt_core::
         .unwrap_or_else(|| read_only_caveats(workspace))
 }
 
-/// Lower a policy to a signed, attenuation-only capability rooted in the
-/// per-user key at `key_path` (generated on first use), and return the verified
-/// caveats it carries.
-fn sign_policy_with(
+/// Resolve the configured `[tui]` block, if any.
+fn resolve_tui() -> Option<newt_core::TuiConfig> {
+    newt_core::Config::resolve().ok().and_then(|c| c.tui)
+}
+
+/// Mint a signed operating key for `policy`, rooted in the per-user key at
+/// `key_path` (generated on first use). Its caveats are provably `⊑` the user's
+/// full authority, and it can only ever delegate *narrower* children.
+fn mint_operating_key(
     key_path: &std::path::Path,
     policy: &newt_core::caveats::Caveats,
-) -> Result<newt_core::caveats::Caveats, newt_identity::IdentityError> {
+) -> Result<newt_identity::AgentKey, newt_identity::IdentityError> {
     let user = newt_identity::load_or_generate(key_path)?;
     let root = newt_identity::session_root(&user);
-    let op = newt_identity::attenuate(&root, policy)?;
-    newt_identity::enforced_caveats(&op)
+    newt_identity::attenuate(&root, policy)
 }
 
-/// The active enforcement `Caveats` for this workspace.
+/// The session's signed operating capability.
 ///
-/// The configured preset is lowered to a policy, then attenuated from the
-/// per-user root key (`~/.newt/identity.pem`) via `newt-identity` — so what the
-/// tool loop enforces is a *signed, verified, attenuation-only* capability
-/// provably `⊑` the user's authority, not a name-based preset. Safe by default:
-/// an absent config, or any identity error, yields **read-only**, never
-/// `Caveats::top()`.
-fn load_caveats(workspace: &str) -> newt_core::caveats::Caveats {
-    let tui = newt_core::Config::resolve().ok().and_then(|c| c.tui);
-    let key_path = newt_identity::default_key_path().ok();
-    load_caveats_from(tui, key_path.as_deref(), workspace)
+/// Established once from the per-user key (`~/.newt/identity.pem`) and the
+/// configured preset, it enforces **in-session monotonic narrowing**:
+/// re-applying a policy (e.g. after `/settings`) can only ever *narrow* the live
+/// authority, never widen it — widening would require re-rooting from the user
+/// key, which only happens on a fresh session. The running agent can tighten its
+/// own leash but never loosen it.
+///
+/// Safe by default: an absent config, or any identity error, yields read-only —
+/// never `Caveats::top()`.
+struct SessionCapability {
+    /// The live operating key. `None` if the per-user key is unavailable; the
+    /// capability then degrades to a plain caveats floor (still narrowing-only).
+    op: Option<newt_identity::AgentKey>,
+    caveats: newt_core::caveats::Caveats,
 }
 
-/// Testable core of [`load_caveats`]: lower `tui`'s policy and, when a key path
-/// is available, harden it into a signed, verified, attenuation-only capability.
-/// Falls back to the (read-only-when-unconfigured) policy on any identity error
-/// or missing key path — never silently `Caveats::top()`.
-fn load_caveats_from(
-    tui: Option<newt_core::TuiConfig>,
-    key_path: Option<&std::path::Path>,
-    workspace: &str,
-) -> newt_core::caveats::Caveats {
-    let policy = policy_for(tui, workspace);
-    match key_path {
-        Some(p) => sign_policy_with(p, &policy).unwrap_or(policy),
-        None => policy,
+impl SessionCapability {
+    /// Establish the session capability from the configured policy + per-user key.
+    fn establish(
+        tui: Option<newt_core::TuiConfig>,
+        key_path: Option<&std::path::Path>,
+        workspace: &str,
+    ) -> Self {
+        let policy = policy_for(tui, workspace);
+        let op = key_path.and_then(|p| mint_operating_key(p, &policy).ok());
+        let caveats = match &op {
+            Some(k) => newt_identity::enforced_caveats(k).unwrap_or(policy),
+            None => policy,
+        };
+        Self { op, caveats }
+    }
+
+    /// The active enforcement caveats the tool loop consults.
+    fn caveats(&self) -> &newt_core::caveats::Caveats {
+        &self.caveats
+    }
+
+    /// Re-apply a (possibly changed) policy, **narrowing-only**. Returns `true`
+    /// if the request asked for *more* authority than the session currently
+    /// holds and was therefore clamped (so the caller can tell the user a
+    /// restart is required to widen).
+    fn reapply(&mut self, tui: Option<newt_core::TuiConfig>, workspace: &str) -> bool {
+        let requested = policy_for(tui, workspace);
+        let narrowed = requested.meet(&self.caveats);
+        let clamped = narrowed != requested;
+        if let Some(op) = self.op.take() {
+            match newt_identity::attenuate(&op, &narrowed)
+                .and_then(|child| newt_identity::enforced_caveats(&child).map(|c| (child, c)))
+            {
+                Ok((child, c)) => {
+                    self.op = Some(child);
+                    self.caveats = c;
+                }
+                // Unreachable in practice (narrowed ⊑ op): keep the old key but
+                // still apply the narrowed caveats.
+                Err(_) => {
+                    self.op = Some(op);
+                    self.caveats = narrowed;
+                }
+            }
+        } else {
+            self.caveats = narrowed;
+        }
+        clamped
     }
 }
 
 #[cfg(test)]
 mod caveat_policy_tests {
-    use super::{load_caveats_from, policy_for, read_only_caveats, sign_policy_with};
+    use super::{policy_for, SessionCapability};
+
+    fn tui_with(preset: newt_core::PermissionPreset) -> newt_core::TuiConfig {
+        newt_core::TuiConfig {
+            permissions: newt_core::ToolPermissions {
+                preset,
+                extra_exec: Vec::new(),
+            },
+            ..Default::default()
+        }
+    }
 
     #[test]
     fn absent_config_is_read_only() {
@@ -578,55 +631,80 @@ mod caveat_policy_tests {
     }
 
     #[test]
-    fn configured_default_is_workspace_dev() {
-        let policy = policy_for(Some(newt_core::TuiConfig::default()), "/ws");
-        assert!(policy.permits_exec("cargo"), "workspace-dev tools allowed");
-        assert!(!policy.permits_exec("rm"), "dangerous commands denied");
-    }
-
-    #[test]
-    fn signed_capability_preserves_the_policy() {
-        // The signed, attenuated, verified capability carries exactly the
-        // policy's authority (the ocap round-trip), keyed off a temp identity.
-        let dir = tempfile::TempDir::new().unwrap();
-        let policy = read_only_caveats("/ws");
-        let signed = sign_policy_with(&dir.path().join("identity.pem"), &policy).unwrap();
-        assert_eq!(signed, policy, "sign + verify must preserve the policy");
-    }
-
-    #[test]
-    fn load_caveats_unconfigured_is_signed_read_only() {
-        // #86 end-to-end: no config + a real (temp) key → the enforced caveats
-        // are read-only AND came through the signed-capability path (the key was
-        // generated). Never `Caveats::top()`.
+    fn establish_unconfigured_is_signed_read_only() {
+        // #86 end-to-end: no config + a real (temp) key → read-only caveats via
+        // the signed-capability path; the per-user key was generated.
         let dir = tempfile::TempDir::new().unwrap();
         let key = dir.path().join("identity.pem");
-        let cav = load_caveats_from(None, Some(&key), "/ws");
-        assert_ne!(cav, newt_core::caveats::Caveats::top());
-        assert!(!cav.permits_exec("cargo"), "no exec when unconfigured");
-        assert!(cav.permits_fs_read("/ws/x"), "reads still allowed");
+        let cap = SessionCapability::establish(None, Some(&key), "/ws");
+        assert_ne!(*cap.caveats(), newt_core::caveats::Caveats::top());
+        assert!(!cap.caveats().permits_exec("cargo"));
+        assert!(cap.caveats().permits_fs_read("/ws/x"));
         assert!(key.exists(), "the per-user identity key was generated");
     }
 
     #[test]
-    fn load_caveats_without_key_falls_back_to_policy() {
-        // No locatable key (e.g. $HOME unset) → enforce the policy as-is, which
-        // is read-only when unconfigured. Still never `top()`.
-        let cav = load_caveats_from(None, None, "/ws");
-        assert_ne!(cav, newt_core::caveats::Caveats::top());
-        assert!(!cav.permits_exec("cargo"));
+    fn establish_without_key_is_read_only_policy() {
+        let cap = SessionCapability::establish(None, None, "/ws");
+        assert_ne!(*cap.caveats(), newt_core::caveats::Caveats::top());
+        assert!(!cap.caveats().permits_exec("cargo"));
     }
 
     #[test]
-    fn load_caveats_configured_is_signed_workspace_dev() {
+    fn establish_configured_is_workspace_dev() {
         let dir = tempfile::TempDir::new().unwrap();
-        let cav = load_caveats_from(
+        let cap = SessionCapability::establish(
             Some(newt_core::TuiConfig::default()),
             Some(&dir.path().join("identity.pem")),
             "/ws",
         );
-        assert!(cav.permits_exec("cargo"), "workspace-dev tools allowed");
-        assert!(!cav.permits_exec("rm"), "dangerous commands denied");
+        assert!(cap.caveats().permits_exec("cargo"), "workspace-dev tools");
+        assert!(!cap.caveats().permits_exec("rm"), "dangerous cmds denied");
+    }
+
+    #[test]
+    fn reapply_narrows_but_cannot_widen() {
+        // The headline runtime property: within a session, /settings can tighten
+        // authority but never loosen it (keyed off a temp identity).
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cap = SessionCapability::establish(
+            Some(tui_with(newt_core::PermissionPreset::WorkspaceDev)),
+            Some(&dir.path().join("identity.pem")),
+            "/ws",
+        );
+        assert!(
+            cap.caveats().permits_exec("cargo"),
+            "starts at workspace-dev"
+        );
+
+        // Narrow to read-only: accepted, not clamped.
+        let clamped = cap.reapply(Some(tui_with(newt_core::PermissionPreset::ReadOnly)), "/ws");
+        assert!(!clamped, "narrowing is not a clamp");
+        assert!(!cap.caveats().permits_exec("cargo"), "now read-only");
+
+        // Try to widen back to workspace-dev: clamped, stays read-only.
+        let clamped = cap.reapply(
+            Some(tui_with(newt_core::PermissionPreset::WorkspaceDev)),
+            "/ws",
+        );
+        assert!(clamped, "a widening request must be reported as clamped");
+        assert!(
+            !cap.caveats().permits_exec("cargo"),
+            "authority must not widen within a session"
+        );
+    }
+
+    #[test]
+    fn reapply_without_key_still_narrows() {
+        let mut cap = SessionCapability::establish(
+            Some(tui_with(newt_core::PermissionPreset::WorkspaceDev)),
+            None,
+            "/ws",
+        );
+        assert!(cap.caveats().permits_exec("cargo"));
+        let clamped = cap.reapply(Some(tui_with(newt_core::PermissionPreset::ReadOnly)), "/ws");
+        assert!(!clamped);
+        assert!(!cap.caveats().permits_exec("cargo"));
     }
 }
 
@@ -693,7 +771,8 @@ fn run_chat(workspace: &str, color: bool) -> anyhow::Result<()> {
     // Resolve the inference backend and permission caveats once at session
     // start.  Both are re-read after /settings or other alt-screen commands.
     let (mut inf_url, mut inf_model) = resolve_backend_config();
-    let mut caveats = load_caveats(workspace);
+    let key_path = newt_identity::default_key_path().ok();
+    let mut cap = SessionCapability::establish(resolve_tui(), key_path.as_deref(), workspace);
     print_newt(
         &format!("v{VERSION} ready — {inf_model} @ {inf_url}  (Ctrl-D or /exit to quit)"),
         color,
@@ -730,8 +809,16 @@ fn run_chat(workspace: &str, color: bool) -> anyhow::Result<()> {
                         let _ = rl.save_history(hp);
                     }
                     // Re-read config after alt-screen commands (e.g. /settings).
+                    // Permissions can only NARROW within a session; a widening
+                    // request is clamped (restart to widen — see SessionCapability).
                     (inf_url, inf_model) = resolve_backend_config();
-                    caveats = load_caveats(workspace);
+                    if cap.reapply(resolve_tui(), workspace) {
+                        print_newt(
+                            "permissions can only narrow within a session — restart newt to widen",
+                            color,
+                            verbose,
+                        );
+                    }
                     let fresh_cfg = build_rl_config();
                     rl = rustyline::DefaultEditor::with_config(fresh_cfg)?;
                     if let Some(ref hp) = history_path {
@@ -757,7 +844,7 @@ fn run_chat(workspace: &str, color: bool) -> anyhow::Result<()> {
                             task: &task,
                             workspace,
                             color,
-                            caveats: &caveats,
+                            caveats: cap.caveats(),
                         }))
                     });
 
