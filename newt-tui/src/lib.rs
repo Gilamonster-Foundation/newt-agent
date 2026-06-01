@@ -467,9 +467,9 @@ fn run_chat(workspace: &str, color: bool) -> anyhow::Result<()> {
     let history_path = newt_core::Config::user_config_path()
         .map(|p| p.with_file_name("history"));
 
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
+    // Use the existing tokio runtime from main — block_in_place lets rustyline
+    // block the thread while still allowing block_on() inside it.
+    let rt = tokio::runtime::Handle::current();
 
     // Resolve the inference backend once (re-read if /settings changes it).
     let (mut inf_url, mut inf_model) = resolve_backend_config();
@@ -521,12 +521,9 @@ fn run_chat(workspace: &str, color: bool) -> anyhow::Result<()> {
                     // Show a "thinking" line; overwrite it with the response.
                     print_thinking(color);
 
-                    let response = rt.block_on(chat_complete(
-                        &inf_url,
-                        &inf_model,
-                        &conv,
-                        &task,
-                    ));
+                    let response = tokio::task::block_in_place(|| {
+                        rt.block_on(chat_complete(&inf_url, &inf_model, &conv, &task))
+                    });
 
                     // Erase the thinking line then print the real response.
                     erase_line();
