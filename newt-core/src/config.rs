@@ -73,10 +73,170 @@ pub struct TuiConfig {
     /// Default: 20. Set to 0 to always show everything.
     #[serde(default = "default_tool_output_lines")]
     pub tool_output_lines: usize,
+
+    /// Tool-call permission policy (ocap: which tools the model may invoke
+    /// and over which targets). Default: `WorkspaceDev` preset.
+    #[serde(default)]
+    pub permissions: ToolPermissions,
 }
 
 fn default_tool_output_lines() -> usize {
     20
+}
+
+// ---------------------------------------------------------------------------
+// Tool permissions — ocap attenuation presets
+// ---------------------------------------------------------------------------
+
+/// Named capability preset for the TUI tool loop.
+///
+/// Each preset produces a [`crate::Caveats`] value via
+/// [`ToolPermissions::to_caveats`]. `Custom` means the user has edited
+/// `extra_exec` beyond any canned preset; the settings UI shows it as
+/// "(custom)" and `to_caveats` falls through to `Caveats::top()`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionPreset {
+    /// Read files and list dirs only; no writes, no commands.
+    ReadOnly,
+    /// Read + write within the workspace; no shell commands.
+    WorkspaceEdit,
+    /// Read, write workspace, run a conservative set of dev tools.
+    /// See [`ToolPermissions::to_caveats`] for the exact allowlist.
+    #[default]
+    WorkspaceDev,
+    /// Unrestricted — `Caveats::top()`. `write_file` still prompts y/N.
+    FullAccess,
+    /// User has customised `extra_exec` beyond any preset; treated as
+    /// `FullAccess` for the exec axis (all commands allowed).
+    Custom,
+}
+
+impl PermissionPreset {
+    pub const ALL: [Self; 4] = [
+        Self::ReadOnly,
+        Self::WorkspaceEdit,
+        Self::WorkspaceDev,
+        Self::FullAccess,
+    ];
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::ReadOnly      => "read_only",
+            Self::WorkspaceEdit => "workspace_edit",
+            Self::WorkspaceDev  => "workspace_dev",
+            Self::FullAccess    => "full_access",
+            Self::Custom        => "custom",
+        }
+    }
+
+    /// Cycle through the four user-visible presets (skips `Custom`).
+    pub fn toggle(&self) -> Self {
+        let idx = Self::ALL.iter().position(|p| p == self).unwrap_or(2);
+        Self::ALL[(idx + 1) % Self::ALL.len()].clone()
+    }
+
+    pub fn description(&self) -> &'static str {
+        match self {
+            Self::ReadOnly      => "read files + list dirs; no writes, no commands",
+            Self::WorkspaceEdit => "read + write workspace; no shell commands",
+            Self::WorkspaceDev  => "read, write workspace, run: cargo just git grep rg fd ...",
+            Self::FullAccess    => "unrestricted (prompts y/N before each write)",
+            Self::Custom        => "custom exec allowlist (unrestricted otherwise)",
+        }
+    }
+}
+
+/// Permission configuration stored under `[tui.permissions]` in `newt.toml`.
+///
+/// Call [`ToolPermissions::to_caveats`] to obtain the runtime [`crate::Caveats`]
+/// enforced by every `execute_tool` dispatch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ToolPermissions {
+    /// The active preset.
+    pub preset: PermissionPreset,
+
+    /// Extra commands allowed beyond the `WorkspaceDev` built-in set.
+    /// Only consulted when `preset == WorkspaceDev` or `Custom`.
+    /// Stored as leading tokens, e.g. `["bacon", "make"]`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_exec: Vec<String>,
+}
+
+impl Default for ToolPermissions {
+    fn default() -> Self {
+        Self {
+            preset: PermissionPreset::WorkspaceDev,
+            extra_exec: Vec::new(),
+        }
+    }
+}
+
+impl ToolPermissions {
+    /// Built-in exec allowlist for the `WorkspaceDev` preset.
+    const WORKSPACE_DEV_EXEC: &'static [&'static str] = &[
+        "cargo", "just", "git", "grep", "rg", "ripgrep",
+        "fd", "find", "cat", "ls", "echo", "pwd", "true", "false",
+        "head", "tail", "wc", "sort", "uniq", "diff", "patch",
+        "rustfmt", "clippy-driver", "rustup",
+    ];
+
+    /// Build the runtime `Caveats` for this permission configuration.
+    ///
+    /// `workspace` is the absolute path to the current workspace directory;
+    /// it is stored in `Scope::Only` so the TUI enforcement layer can do
+    /// prefix matching (path within workspace → permitted).
+    ///
+    /// Note: the `Caveats` lattice uses exact-set semantics; prefix matching
+    /// is the responsibility of the enforcement site (`tui_permits_path` in
+    /// newt-tui), not this algebra. This is an intentional layer separation.
+    pub fn to_caveats(&self, workspace: &str) -> crate::caveats::Caveats {
+        use crate::caveats::{Caveats, CountBound, Scope};
+
+        let ws = workspace.to_string();
+
+        match self.preset {
+            PermissionPreset::ReadOnly => Caveats {
+                fs_read: Scope::All,
+                fs_write: Scope::none(),
+                exec: Scope::none(),
+                net: Scope::none(),
+                max_calls: CountBound::Unlimited,
+                valid_for_generation: Scope::All,
+            },
+
+            PermissionPreset::WorkspaceEdit => Caveats {
+                fs_read: Scope::All,
+                fs_write: Scope::only([ws]),
+                exec: Scope::none(),
+                net: Scope::none(),
+                max_calls: CountBound::Unlimited,
+                valid_for_generation: Scope::All,
+            },
+
+            PermissionPreset::WorkspaceDev => {
+                let mut allowed: std::collections::BTreeSet<String> = Self::WORKSPACE_DEV_EXEC
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect();
+                for cmd in &self.extra_exec {
+                    allowed.insert(cmd.clone());
+                }
+                Caveats {
+                    fs_read: Scope::All,
+                    fs_write: Scope::only([ws]),
+                    exec: Scope::Only(allowed),
+                    net: Scope::none(),
+                    max_calls: CountBound::Unlimited,
+                    valid_for_generation: Scope::All,
+                }
+            }
+
+            PermissionPreset::FullAccess
+            | PermissionPreset::Custom => Caveats::top(),
+        }
+    }
 }
 
 /// Key binding style for the chat REPL input line.
@@ -114,6 +274,7 @@ impl Default for TuiConfig {
             no_splash: false,
             edit_mode: EditMode::Emacs,
             tool_output_lines: default_tool_output_lines(),
+            permissions: ToolPermissions::default(),
         }
     }
 }
@@ -383,5 +544,85 @@ default_tier_order = ["FAST", "STANDARD", "COMPLEX", "REVIEW"]
         assert_eq!(dgx.active_node.as_deref(), Some("home"));
         assert_eq!(dgx.nodes.len(), 1);
         assert_eq!(dgx.formations.len(), 2);
+    }
+
+    // --- ToolPermissions / to_caveats ---
+
+    #[test]
+    fn workspace_dev_allows_cargo_and_just() {
+        let perms = ToolPermissions::default(); // WorkspaceDev
+        let cav = perms.to_caveats("/workspace");
+        assert!(cav.permits_exec("cargo"), "cargo must be allowed");
+        assert!(cav.permits_exec("just"), "just must be allowed");
+        assert!(cav.permits_exec("git"), "git must be allowed");
+    }
+
+    #[test]
+    fn workspace_dev_blocks_rm_and_mv() {
+        let perms = ToolPermissions::default();
+        let cav = perms.to_caveats("/workspace");
+        assert!(!cav.permits_exec("rm"), "rm must be blocked");
+        assert!(!cav.permits_exec("mv"), "mv must be blocked");
+        assert!(!cav.permits_exec("sudo"), "sudo must be blocked");
+    }
+
+    #[test]
+    fn workspace_dev_allows_extra_exec() {
+        let perms = ToolPermissions {
+            preset: PermissionPreset::WorkspaceDev,
+            extra_exec: vec!["bacon".into(), "make".into()],
+        };
+        let cav = perms.to_caveats("/workspace");
+        assert!(cav.permits_exec("bacon"));
+        assert!(cav.permits_exec("make"));
+        assert!(!cav.permits_exec("rm")); // extra_exec does not weaken the block
+    }
+
+    #[test]
+    fn read_only_blocks_writes_and_exec() {
+        let perms = ToolPermissions { preset: PermissionPreset::ReadOnly, extra_exec: vec![] };
+        let cav = perms.to_caveats("/workspace");
+        assert!(!cav.permits_fs_write("/workspace/src/main.rs"));
+        assert!(!cav.permits_exec("cargo"));
+        assert!(cav.permits_fs_read("/workspace/src/main.rs"));
+    }
+
+    #[test]
+    fn workspace_edit_allows_write_blocks_exec() {
+        let perms = ToolPermissions { preset: PermissionPreset::WorkspaceEdit, extra_exec: vec![] };
+        let cav = perms.to_caveats("/workspace");
+        assert!(!cav.permits_exec("cargo"));
+        // The caveat stores workspace root; prefix matching is in the TUI layer.
+        // Here we just verify the lattice is set up correctly (not All, not none).
+        use crate::caveats::Scope;
+        assert!(matches!(cav.fs_write, Scope::Only(_)));
+    }
+
+    #[test]
+    fn full_access_is_top() {
+        let perms = ToolPermissions { preset: PermissionPreset::FullAccess, extra_exec: vec![] };
+        let cav = perms.to_caveats("/workspace");
+        assert_eq!(cav, crate::caveats::Caveats::top());
+    }
+
+    #[test]
+    fn preset_toggle_cycles() {
+        assert_eq!(PermissionPreset::ReadOnly.toggle(), PermissionPreset::WorkspaceEdit);
+        assert_eq!(PermissionPreset::WorkspaceEdit.toggle(), PermissionPreset::WorkspaceDev);
+        assert_eq!(PermissionPreset::WorkspaceDev.toggle(), PermissionPreset::FullAccess);
+        assert_eq!(PermissionPreset::FullAccess.toggle(), PermissionPreset::ReadOnly);
+    }
+
+    #[test]
+    fn tool_permissions_toml_roundtrip() {
+        let perms = ToolPermissions {
+            preset: PermissionPreset::WorkspaceDev,
+            extra_exec: vec!["bacon".into()],
+        };
+        let toml = toml::to_string(&perms).unwrap();
+        assert!(toml.contains("workspace_dev"));
+        assert!(toml.contains("bacon"));
+        let back: ToolPermissions = toml::from_str(&toml).unwrap();
+        assert_eq!(back, perms);
     }
 }

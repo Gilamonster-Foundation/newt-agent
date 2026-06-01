@@ -483,6 +483,48 @@ fn expand_prompt_tokens(template: &str, workspace: &str) -> String {
         .replace("\\v", env!("CARGO_PKG_VERSION"))
 }
 
+/// Load the active `Caveats` from config for this workspace.
+/// Falls back to `Caveats::top()` (unrestricted) if config is absent.
+fn load_caveats(workspace: &str) -> newt_core::caveats::Caveats {
+    newt_core::Config::resolve()
+        .ok()
+        .and_then(|c| c.tui)
+        .map(|t| t.permissions.to_caveats(workspace))
+        .unwrap_or_else(newt_core::caveats::Caveats::top)
+}
+
+/// Returns true if `full_path` is permitted by `scope`, using prefix matching
+/// against the stored workspace-root strings.
+///
+/// The `Caveats` lattice stores workspace root strings (not individual file paths)
+/// and uses exact-set semantics. The TUI adds path-prefix semantics here so that
+/// "workspace root is permitted" translates to "any file under it is permitted".
+fn tui_permits_path(scope: &newt_core::caveats::Scope<String>, full_path: &str) -> bool {
+    match scope {
+        newt_core::caveats::Scope::All => true,
+        newt_core::caveats::Scope::Only(set) if set.is_empty() => false,
+        newt_core::caveats::Scope::Only(set) => {
+            set.iter().any(|root| full_path.starts_with(root.as_str()))
+        }
+    }
+}
+
+/// Print a capability-denial notice to the user.
+fn print_denied(axis: &str, target: &str, color: bool) {
+    if color {
+        execute!(
+            io::stdout(),
+            SetForegroundColor(CtColor::DarkGrey),
+            Print(format!("⊘  capability denied: {axis} does not permit '{target}'\n")),
+            ResetColor,
+        )
+        .ok();
+    } else {
+        println!("⊘  capability denied: {axis} does not permit '{target}'");
+    }
+    io::stdout().flush().ok();
+}
+
 fn run_chat(workspace: &str, color: bool) -> anyhow::Result<()> {
     let verbose = verbose_mode();
 
@@ -509,8 +551,10 @@ fn run_chat(workspace: &str, color: bool) -> anyhow::Result<()> {
     // block the thread while still allowing block_on() inside it.
     let rt = tokio::runtime::Handle::current();
 
-    // Resolve the inference backend once (re-read if /settings changes it).
+    // Resolve the inference backend and permission caveats once at session
+    // start.  Both are re-read after /settings or other alt-screen commands.
     let (mut inf_url, mut inf_model) = resolve_backend_config();
+    let mut caveats = load_caveats(workspace);
     print_newt(
         &format!("v{VERSION} ready — {inf_model} @ {inf_url}  (Ctrl-D or /exit to quit)"),
         color,
@@ -548,6 +592,7 @@ fn run_chat(workspace: &str, color: bool) -> anyhow::Result<()> {
                     }
                     // Re-read config after alt-screen commands (e.g. /settings).
                     (inf_url, inf_model) = resolve_backend_config();
+                    caveats = load_caveats(workspace);
                     let fresh_cfg = build_rl_config();
                     rl = rustyline::DefaultEditor::with_config(fresh_cfg)?;
                     if let Some(ref hp) = history_path {
@@ -565,7 +610,7 @@ fn run_chat(workspace: &str, color: bool) -> anyhow::Result<()> {
                     let response = tokio::task::block_in_place(|| {
                         rt.block_on(chat_complete(
                             &inf_url, &inf_model, &system, &conv, &task,
-                            workspace, color,
+                            workspace, color, &caveats,
                         ))
                     });
 
@@ -847,10 +892,18 @@ fn execute_tool(
     args: &serde_json::Value,
     workspace: &str,
     color: bool,
+    caveats: &newt_core::caveats::Caveats,
 ) -> String {
     match name {
         "run_command" => {
             let cmd = args["command"].as_str().unwrap_or("");
+            // Caveat check: leading token must be in exec allowlist.
+            let token = cmd.split_whitespace().next().unwrap_or("");
+            if !caveats.permits_exec(token) {
+                let msg = format!("capability denied: exec does not permit '{token}'");
+                print_denied("exec", token, color);
+                return msg;
+            }
             print_tool_call("run_command", cmd, color);
             match std::process::Command::new("sh")
                 .arg("-c")
@@ -877,8 +930,14 @@ fn execute_tool(
 
         "read_file" => {
             let path = args["path"].as_str().unwrap_or("");
-            print_tool_call("read_file", path, color);
             let full = std::path::Path::new(workspace).join(path);
+            let full_str = full.to_string_lossy();
+            if !tui_permits_path(&caveats.fs_read, &full_str) {
+                let msg = format!("capability denied: fs_read does not permit '{path}'");
+                print_denied("fs_read", path, color);
+                return msg;
+            }
+            print_tool_call("read_file", path, color);
             match std::fs::read_to_string(&full) {
                 Ok(contents) => {
                     print_tool_output(&contents, color);
@@ -891,6 +950,13 @@ fn execute_tool(
         "write_file" => {
             let path = args["path"].as_str().unwrap_or("");
             let content = args["content"].as_str().unwrap_or("");
+            let full = std::path::Path::new(workspace).join(path);
+            let full_str = full.to_string_lossy();
+            if !tui_permits_path(&caveats.fs_write, &full_str) {
+                let msg = format!("capability denied: fs_write does not permit '{path}'");
+                print_denied("fs_write", path, color);
+                return msg;
+            }
             print_tool_call(
                 "write_file",
                 &format!("{path} ({} bytes)", content.len()),
@@ -905,13 +971,23 @@ fn execute_tool(
                 color,
             );
 
-            // Confirm before writing.
-            print!("Write this file? [y/N] ");
-            io::stdout().flush().ok();
-            let mut answer = String::new();
-            if std::io::stdin().read_line(&mut answer).is_ok()
-                && answer.trim().eq_ignore_ascii_case("y")
-            {
+            // Auto-write when the caveat explicitly scopes fs_write (the
+            // preset itself is the user's consent).  Ask y/N only under
+            // full_access / custom where fs_write == Scope::All.
+            let needs_confirm =
+                matches!(caveats.fs_write, newt_core::caveats::Scope::All);
+
+            let confirmed = if needs_confirm {
+                print!("Write this file? [y/N] ");
+                io::stdout().flush().ok();
+                let mut answer = String::new();
+                std::io::stdin().read_line(&mut answer).is_ok()
+                    && answer.trim().eq_ignore_ascii_case("y")
+            } else {
+                true
+            };
+
+            if confirmed {
                 let full = std::path::Path::new(workspace).join(path);
                 if let Some(parent) = full.parent() {
                     let _ = std::fs::create_dir_all(parent);
@@ -931,8 +1007,14 @@ fn execute_tool(
 
         "list_dir" => {
             let path = args["path"].as_str().unwrap_or(".");
-            print_tool_call("list_dir", path, color);
             let full = std::path::Path::new(workspace).join(path);
+            let full_str = full.to_string_lossy();
+            if !tui_permits_path(&caveats.fs_read, &full_str) {
+                let msg = format!("capability denied: fs_read does not permit '{path}'");
+                print_denied("fs_read", path, color);
+                return msg;
+            }
+            print_tool_call("list_dir", path, color);
             match std::fs::read_dir(&full) {
                 Ok(entries) => {
                     let mut names: Vec<String> = entries
@@ -961,6 +1043,7 @@ async fn chat_complete(
     task: &str,
     workspace: &str,
     color: bool,
+    caveats: &newt_core::caveats::Caveats,
 ) -> anyhow::Result<String> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(120))
@@ -1028,7 +1111,7 @@ async fn chat_complete(
                 }
                 v => v.clone(),
             };
-            let result = execute_tool(name, &args, workspace, color);
+            let result = execute_tool(name, &args, workspace, color, caveats);
             messages.push(serde_json::json!({
                 "role": "tool",
                 "content": result

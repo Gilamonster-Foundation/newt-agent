@@ -21,7 +21,9 @@ use ratatui::{
     Frame, Terminal,
 };
 
-use newt_core::{ChatStyle, Config, DgxConfig, EditMode, EndpointKind, TuiConfig};
+use newt_core::{
+    ChatStyle, Config, DgxConfig, EditMode, EndpointKind, PermissionPreset, TuiConfig,
+};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -41,23 +43,42 @@ const DIM: Color = Color::DarkGray;
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Category {
     Tui,
+    Permissions,
     Dgx,
     About,
 }
 
 impl Category {
-    pub const ALL: [Self; 3] = [Self::Tui, Self::Dgx, Self::About];
+    pub const ALL: [Self; 4] = [Self::Tui, Self::Permissions, Self::Dgx, Self::About];
 
     fn title(self) -> &'static str {
         match self {
-            Self::Tui => "TUI",
-            Self::Dgx => "DGX",
-            Self::About => "About",
+            Self::Tui         => "TUI",
+            Self::Permissions => "Permissions",
+            Self::Dgx         => "DGX",
+            Self::About       => "About",
         }
     }
 
     pub fn index(self) -> usize {
         Self::ALL.iter().position(|c| *c == self).unwrap_or(0)
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum PermField {
+    Preset,
+    ExtraExec,
+}
+
+impl PermField {
+    pub const ALL: [Self; 2] = [Self::Preset, Self::ExtraExec];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Preset    => "preset",
+            Self::ExtraExec => "extra cmds",
+        }
     }
 }
 
@@ -126,6 +147,7 @@ pub enum InputMode {
 pub struct SettingsApp {
     pub category: Category,
     pub tui_cursor: usize,
+    pub perm_cursor: usize,
     pub dgx_cursor: usize,
     pub tui: TuiConfig,
     pub original_tui: TuiConfig,
@@ -143,6 +165,7 @@ impl SettingsApp {
         Self {
             category: Category::Tui,
             tui_cursor: 0,
+            perm_cursor: 0,
             dgx_cursor: 0,
             original_tui: tui.clone(),
             tui,
@@ -186,6 +209,12 @@ impl SettingsApp {
                 TuiField::NoSplash => self.tui.no_splash = !self.tui.no_splash,
                 TuiField::ToolOutputLines | TuiField::Prompt => self.begin_edit(),
             },
+            Category::Permissions => match PermField::ALL[self.perm_cursor] {
+                PermField::Preset => {
+                    self.tui.permissions.preset = self.tui.permissions.preset.toggle();
+                }
+                PermField::ExtraExec => self.begin_edit(),
+            },
             Category::Dgx => match self.current_dgx_field() {
                 DgxField::Endpoint => {
                     self.dgx.active_endpoint = match self.dgx.active_endpoint {
@@ -211,6 +240,13 @@ impl SettingsApp {
                 TuiField::ToolOutputLines => (
                     TuiField::ToolOutputLines.label(),
                     self.tui.tool_output_lines.to_string(),
+                ),
+                _ => return,
+            },
+            Category::Permissions => match PermField::ALL[self.perm_cursor] {
+                PermField::ExtraExec => (
+                    PermField::ExtraExec.label(),
+                    self.tui.permissions.extra_exec.join(", "),
                 ),
                 _ => return,
             },
@@ -246,6 +282,18 @@ impl SettingsApp {
                     // confirm_edit sets val from buf; we already parsed, so override
                 }
 
+                s if s == PermField::ExtraExec.label() => {
+                    self.tui.permissions.extra_exec = buf
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                    // Editing extra_exec moves preset to Custom unless it was
+                    // already FullAccess (where all cmds are allowed anyway).
+                    if self.tui.permissions.preset != PermissionPreset::FullAccess {
+                        self.tui.permissions.preset = PermissionPreset::Custom;
+                    }
+                }
                 s if s == DgxField::Host.label() => set_dgx_host(&mut self.dgx, val),
                 s if s == DgxField::Model.label() => self.dgx.active_model = val,
                 _ => {}
@@ -440,8 +488,9 @@ fn run_loop(
             Event::Key(KeyEvent {
                 code: KeyCode::Up, ..
             }) if app.input_mode == InputMode::Navigate => match app.category {
-                Category::Tui => app.tui_cursor = app.tui_cursor.saturating_sub(1),
-                Category::Dgx => app.dgx_cursor = app.dgx_cursor.saturating_sub(1),
+                Category::Tui         => app.tui_cursor  = app.tui_cursor.saturating_sub(1),
+                Category::Permissions => app.perm_cursor = app.perm_cursor.saturating_sub(1),
+                Category::Dgx         => app.dgx_cursor  = app.dgx_cursor.saturating_sub(1),
                 Category::About => {}
             },
 
@@ -449,8 +498,9 @@ fn run_loop(
                 code: KeyCode::Down,
                 ..
             }) if app.input_mode == InputMode::Navigate => match app.category {
-                Category::Tui => app.tui_cursor = (app.tui_cursor + 1).min(TuiField::ALL.len() - 1),
-                Category::Dgx => app.dgx_cursor = (app.dgx_cursor + 1).min(DgxField::ALL.len() - 1),
+                Category::Tui  => app.tui_cursor  = (app.tui_cursor  + 1).min(TuiField::ALL.len()  - 1),
+                Category::Permissions => app.perm_cursor = (app.perm_cursor + 1).min(PermField::ALL.len() - 1),
+                Category::Dgx  => app.dgx_cursor  = (app.dgx_cursor  + 1).min(DgxField::ALL.len()  - 1),
                 Category::About => {}
             },
 
@@ -567,9 +617,10 @@ fn render_tabs(f: &mut Frame, area: Rect, app: &SettingsApp, active: Style, dim:
 fn render_fields(f: &mut Frame, area: Rect, app: &SettingsApp, bold_orange: Style, dim: Style) {
     f.render_widget(Clear, area);
     match app.category {
-        Category::Tui => render_tui_fields(f, area, app, bold_orange, dim),
-        Category::Dgx => render_dgx_fields(f, area, app, bold_orange, dim),
-        Category::About => render_about(f, area, dim),
+        Category::Tui         => render_tui_fields(f, area, app, bold_orange, dim),
+        Category::Permissions => render_perm_fields(f, area, app, bold_orange, dim),
+        Category::Dgx         => render_dgx_fields(f, area, app, bold_orange, dim),
+        Category::About       => render_about(f, area, dim),
     }
 }
 
@@ -693,6 +744,109 @@ fn render_tui_fields(f: &mut Frame, area: Rect, app: &SettingsApp, bold_orange: 
         };
         field_row(f, &rows, i, is_sel, line);
     }
+}
+
+fn render_perm_fields(
+    f: &mut Frame,
+    area: Rect,
+    app: &SettingsApp,
+    bold_orange: Style,
+    dim: Style,
+) {
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2), // preset
+            Constraint::Length(2), // extra cmds
+            Constraint::Fill(1),   // description block
+        ])
+        .split(area);
+
+    // --- preset row ---
+    let is_sel_0 = app.perm_cursor == 0;
+    let label_s0 = if is_sel_0 { bold_orange } else { dim };
+    let row_s0 = if is_sel_0 {
+        Style::default().bg(crate::settings::SEL_BG)
+    } else {
+        Style::default()
+    };
+    let preset = &app.tui.permissions.preset;
+    let mut spans = vec![Span::styled(format!("  {:<14}", "preset"), label_s0)];
+    for opt in &PermissionPreset::ALL {
+        let selected = opt == preset;
+        let bullet = if selected { "◉ " } else { "○ " };
+        let s = if selected {
+            Style::default().fg(NEWT_ORANGE)
+        } else {
+            dim
+        };
+        spans.push(Span::styled(format!("{bullet}{} ", opt.as_str()), s));
+    }
+    if *preset == PermissionPreset::Custom {
+        spans.push(Span::styled(" (custom)", dim));
+    }
+    f.render_widget(
+        Paragraph::new(Line::from(spans)).style(row_s0),
+        Rect { height: 1, y: rows[0].y + 1, ..rows[0] },
+    );
+
+    // --- extra cmds row ---
+    let is_sel_1 = app.perm_cursor == 1;
+    let label_s1 = if is_sel_1 { bold_orange } else { dim };
+    let row_s1 = if is_sel_1 {
+        Style::default().bg(crate::settings::SEL_BG)
+    } else {
+        Style::default()
+    };
+    let extra_applicable = matches!(
+        preset,
+        PermissionPreset::WorkspaceDev | PermissionPreset::Custom
+    );
+    let extra_val = if matches!(&app.input_mode,
+        InputMode::EditingText { field_label, .. } if *field_label == PermField::ExtraExec.label())
+    {
+        if let InputMode::EditingText { buf, .. } = &app.input_mode {
+            format!("{buf}█")
+        } else {
+            String::new()
+        }
+    } else {
+        app.tui.permissions.extra_exec.join(", ")
+    };
+    let (val_style, hint) = if !extra_applicable {
+        (dim, "  (not applicable for this preset)")
+    } else if matches!(&app.input_mode, InputMode::EditingText { field_label, .. } if *field_label == PermField::ExtraExec.label()) {
+        (Style::default().fg(Color::Yellow), "  Esc cancel  Enter confirm")
+    } else {
+        (Style::default(), "  Enter to edit")
+    };
+    let extra_line = Line::from(vec![
+        Span::styled(format!("  {:<14}", "extra cmds"), label_s1),
+        Span::styled(extra_val, val_style),
+        Span::styled(hint, dim),
+    ]);
+    f.render_widget(
+        Paragraph::new(extra_line).style(row_s1),
+        Rect { height: 1, y: rows[1].y + 1, ..rows[1] },
+    );
+
+    // --- description block ---
+    let mut desc_lines = vec![Line::from("")];
+    for opt in &PermissionPreset::ALL {
+        let active = opt == preset
+            || (*preset == PermissionPreset::Custom
+                && *opt == PermissionPreset::FullAccess);
+        let s = if active { bold_orange } else { dim };
+        desc_lines.push(Line::from(Span::styled(
+            format!("  {:<16} {}", opt.as_str(), opt.description()),
+            s,
+        )));
+    }
+    f.render_widget(
+        Paragraph::new(Text::from(desc_lines))
+            .block(Block::default().borders(Borders::TOP).border_style(dim)),
+        rows[2],
+    );
 }
 
 fn render_dgx_fields(f: &mut Frame, area: Rect, app: &SettingsApp, bold_orange: Style, dim: Style) {

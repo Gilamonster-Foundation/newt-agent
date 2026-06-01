@@ -16,7 +16,7 @@ pub mod session;
 pub mod pyo3_module;
 
 pub use caveats::{Caveats, CountBound, Scope};
-pub use config::{ChatStyle, Config, EditMode, TuiConfig};
+pub use config::{ChatStyle, Config, EditMode, PermissionPreset, ToolPermissions, TuiConfig};
 pub use dgx::{DgxConfig, DgxFormation, DgxNode, DgxNotConfigured, EndpointKind};
 pub use error::NewtError;
 pub use model_id::ModelId;
