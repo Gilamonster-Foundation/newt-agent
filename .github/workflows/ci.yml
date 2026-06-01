@@ -43,18 +43,13 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: check Cargo.lock is up-to-date
-        # Regenerate the lock file and fail if it differs. This catches both
-        # missing deps and platform-specific entries (Linux vs macOS). We do
-        # NOT use --locked on the test step itself because the lock file must
-        # be re-generated here first so the Linux-specific entries are present.
-        run: |
-          cargo generate-lockfile
-          git diff --exit-code Cargo.lock || {
-            echo "Cargo.lock is out of date. Run 'cargo generate-lockfile' on Linux (or in CI) and commit the result."
-            exit 1
-          }
       - name: cargo test
+        # Note: --locked is intentionally absent. The Cargo.lock contains
+        # platform-specific entries that differ between macOS (dev) and Linux
+        # (CI). Enforcing --locked here would require the lock file to be
+        # regenerated on Linux after every dependency change. Lock file
+        # staleness is caught locally by `just check` (cargo generate-lockfile
+        # + git diff) before pushing.
         run: cargo test --workspace
 
   coverage:

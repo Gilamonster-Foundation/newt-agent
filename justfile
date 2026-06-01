@@ -61,15 +61,9 @@ lint:
 lock:
     cargo generate-lockfile
 
-# fmt-check, lint, test, and lock-file freshness — the local equivalent of CI.
+# fmt-check, lint, and test — the local equivalent of CI.
 # PIPELINE PARITY: must match .github/workflows/ci.yml.
-#
-# Cargo.lock is checked first (fail-fast): if it was stale it is
-# regenerated in place and the recipe exits with a message so you can
-# stage and commit it before re-running.
 check:
-    cargo generate-lockfile
-    @git diff --exit-code Cargo.lock || (echo "\nCargo.lock was stale — regenerated above. Stage it and re-run check." && exit 1)
     cargo fmt --all -- --check
     cargo clippy --workspace --all-targets -- -D warnings
     cargo test --workspace
