@@ -28,8 +28,11 @@ members = [
 exclude = ["newt-mesh"]
 
 [workspace.package]
-# Semver — 0.6.4: TUI, live inference, settings, slash commands.
-version = "0.6.4"
+# Semver — 0.6.5: first published release since 0.6.2. Ships the 0.6.3/0.6.4
+# work that never tagged (publish-infra fixes, TUI, streaming, first-run wizard,
+# inference telemetry) plus newt-identity ocap permissions (#91). Holding the
+# 0.6.x line through June rather than bumping the minor.
+version = "0.6.5"
 edition = "2021"
 rust-version = "1.75"
 license = "Apache-2.0"
@@ -97,16 +100,16 @@ insta = "1"
 tests-common = { path = "tests/common" }
 
 # Internal crates — pinned with = for lock-step publishing
-newt-core         = { path = "newt-core",         version = "=0.6.4" }
-newt-inference    = { path = "newt-inference",    version = "=0.6.4" }
-newt-tools        = { path = "newt-tools",        version = "=0.6.4" }
-newt-tui          = { path = "newt-tui",          version = "=0.6.4" }
-newt-acp-worker   = { path = "newt-acp-worker",   version = "=0.6.4" }
-newt-mcp-server   = { path = "newt-mcp-server",   version = "=0.6.4" }
-newt-coder        = { path = "newt-coder",        version = "=0.6.4" }
-newt-identity     = { path = "newt-identity",     version = "=0.6.4" }
-newt-eval         = { path = "newt-eval",         version = "=0.6.4" }
-plugins-protocol  = { path = "plugins-protocol",  version = "=0.6.4" }
+newt-core         = { path = "newt-core",         version = "=0.6.5" }
+newt-inference    = { path = "newt-inference",    version = "=0.6.5" }
+newt-tools        = { path = "newt-tools",        version = "=0.6.5" }
+newt-tui          = { path = "newt-tui",          version = "=0.6.5" }
+newt-acp-worker   = { path = "newt-acp-worker",   version = "=0.6.5" }
+newt-mcp-server   = { path = "newt-mcp-server",   version = "=0.6.5" }
+newt-coder        = { path = "newt-coder",        version = "=0.6.5" }
+newt-identity     = { path = "newt-identity",     version = "=0.6.5" }
+newt-eval         = { path = "newt-eval",         version = "=0.6.5" }
+plugins-protocol  = { path = "plugins-protocol",  version = "=0.6.5" }
 
 # NOTE on agent-mesh / newt-mesh: see the `[workspace] exclude = [...]`
 # block above. Those deps are NOT declared as workspace-level

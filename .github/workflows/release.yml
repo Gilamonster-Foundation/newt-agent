@@ -147,6 +147,7 @@ jobs:
           - plugins-protocol
           - newt-inference
           - newt-tools
+          - newt-identity   # newt-tui depends on this — must publish before it
           - newt-tui
           - newt-coder      # newt-acp-worker depends on this — must publish before it
           - newt-acp-worker
