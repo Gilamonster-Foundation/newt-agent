@@ -1,0 +1,29 @@
+[package]
+name = "newt-identity"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "Per-user object-capability identity for newt-agent: a root UserKey and signed, attenuation-only AgentKey delegations that bound an agent's tool authority."
+keywords = ["newt", "agent", "ocap", "capability", "identity"]
+categories = ["authentication", "command-line-utilities"]
+
+[dependencies]
+newt-core = { workspace = true }
+# The published, pure-Rust (ed25519-dalek + blake3) identity crate. Depending
+# on the *registry* release — not the `../agent-mesh` path dep that keeps
+# `newt-mesh` out of the default workspace — is the wheel-safe, CI-green path
+# blessed by docs/decisions/mesh_integration.md.
+agent-mesh-protocol = "0.6"
+serde_json.workspace = true
+thiserror.workspace = true
+chrono.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true
