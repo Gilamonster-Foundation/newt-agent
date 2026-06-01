@@ -194,6 +194,7 @@ impl InferenceBackend for EndpointMock {
         Ok(ChatReply {
             content: self.reply.clone(),
             model_id: self.model_id().to_string(),
+            usage: None,
         })
     }
 }

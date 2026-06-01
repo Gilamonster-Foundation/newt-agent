@@ -621,10 +621,8 @@ fn run_chat(workspace: &str, color: bool) -> anyhow::Result<()> {
                 } else if matches!(task.as_str(), "exit" | "quit") {
                     break;
                 } else {
-                    // Show "thinking…" while tool-call rounds execute.
-                    // stream_response() prints its own "▸  " prefix and erases
-                    // the thinking line via the newline at the end of streaming.
                     print_thinking(color);
+                    let t0 = std::time::Instant::now();
 
                     let response = tokio::task::block_in_place(|| {
                         rt.block_on(chat_complete(ChatCtx {
@@ -639,16 +637,33 @@ fn run_chat(workspace: &str, color: bool) -> anyhow::Result<()> {
                         }))
                     });
 
-                    // Erase the thinking line.
-                    // stream_response() already printed the response inline;
-                    // for the non-streaming fallback we print it ourselves.
+                    let elapsed = t0.elapsed();
                     erase_line();
                     match response {
-                        Ok((reply, was_streamed)) => {
+                        Ok((reply, was_streamed, usage)) => {
                             conv.push((true, task.clone()));
                             conv.push((false, reply.clone()));
                             if !was_streamed {
                                 print_newt(&reply, color, verbose);
+                            }
+                            // Build and display telemetry.
+                            let pricing = newt_core::Config::resolve()
+                                .ok()
+                                .and_then(|c| c.pricing)
+                                .unwrap_or_default();
+                            let metrics = newt_core::TurnMetrics {
+                                elapsed_ms: elapsed.as_millis() as u64,
+                                usage,
+                                cost_usd: pricing.estimate_cost(&inf_model, usage.as_ref()),
+                                model_id: inf_model.clone(),
+                                endpoint: inf_url.clone(),
+                            };
+                            print_metrics(&metrics, color);
+                            // Append to usage log (best-effort).
+                            if let Some(log) = newt_core::Config::user_config_path()
+                                .map(|p| p.with_file_name("usage.jsonl"))
+                            {
+                                metrics.append_to_log(&log);
                             }
                         }
                         Err(e) => print_newt(&format!("error: {e}"), color, verbose),
@@ -1076,10 +1091,11 @@ struct ChatCtx<'a> {
 }
 
 /// Main agentic loop: call model → execute tool calls → feed results back → repeat.
-/// Returns `(reply_text, was_streamed)`.
-/// When `was_streamed` is true the text was already printed token-by-token;
-/// the caller should NOT call `print_newt` again.
-async fn chat_complete(ctx: ChatCtx<'_>) -> anyhow::Result<(String, bool)> {
+/// Returns `(reply_text, was_streamed, token_usage)`.
+/// When `was_streamed` is true the text was already printed token-by-token.
+async fn chat_complete(
+    ctx: ChatCtx<'_>,
+) -> anyhow::Result<(String, bool, Option<newt_core::TokenUsage>)> {
     let ChatCtx {
         url,
         model,
@@ -1169,10 +1185,10 @@ async fn chat_complete(ctx: ChatCtx<'_>) -> anyhow::Result<(String, bool)> {
 
             if !sresp.status().is_success() {
                 let content = message["content"].as_str().unwrap_or("").to_string();
-                return Ok((content, false));
+                return Ok((content, false, None));
             }
-            let streamed = stream_response(sresp, color).await?;
-            return Ok((streamed, true));
+            let (streamed, usage) = stream_response(sresp, color).await?;
+            return Ok((streamed, true, usage));
         }
 
         // Has tool calls — add assistant turn and execute them.
@@ -1193,14 +1209,19 @@ async fn chat_complete(ctx: ChatCtx<'_>) -> anyhow::Result<(String, bool)> {
         }
     }
 
-    Ok(("(reached tool-call limit)".into(), false))
+    Ok(("(reached tool-call limit)".into(), false, None))
 }
 
 /// Stream an Ollama NDJSON response, printing tokens as they arrive.
-/// Returns the fully accumulated text.
-async fn stream_response(resp: reqwest::Response, color: bool) -> anyhow::Result<String> {
+/// Returns `(accumulated_text, token_usage)`.
+/// Token usage is extracted from the final chunk (`done: true`).
+async fn stream_response(
+    resp: reqwest::Response,
+    color: bool,
+) -> anyhow::Result<(String, Option<newt_core::TokenUsage>)> {
     let mut full = String::new();
     let mut started = false;
+    let mut usage: Option<newt_core::TokenUsage> = None;
 
     let mut resp = resp;
     while let Some(chunk) = resp.chunk().await? {
@@ -1215,7 +1236,6 @@ async fn stream_response(resp: reqwest::Response, color: bool) -> anyhow::Result
             let token = json["message"]["content"].as_str().unwrap_or("");
             if !token.is_empty() {
                 if !started {
-                    // Print the response prefix on the first token.
                     if color {
                         execute!(
                             io::stdout(),
@@ -1234,14 +1254,38 @@ async fn stream_response(resp: reqwest::Response, color: bool) -> anyhow::Result
                 full.push_str(token);
             }
             if json["done"].as_bool().unwrap_or(false) {
+                // Extract token counts from the final Ollama chunk.
+                let input = json["prompt_eval_count"].as_u64().map(|n| n as u32);
+                let output = json["eval_count"].as_u64().map(|n| n as u32);
+                usage = input.zip(output).map(|(i, o)| newt_core::TokenUsage {
+                    input_tokens: i,
+                    output_tokens: o,
+                });
                 break;
             }
         }
     }
     if started {
-        println!(); // newline after streamed response
+        println!();
     }
-    Ok(full)
+    Ok((full, usage))
+}
+
+/// Print the telemetry summary line after an inference turn.
+fn print_metrics(metrics: &newt_core::TurnMetrics, color: bool) {
+    let line = metrics.display_line();
+    if color {
+        execute!(
+            io::stdout(),
+            SetForegroundColor(CtColor::DarkGrey),
+            Print(format!("  {line}\n")),
+            ResetColor,
+        )
+        .ok();
+    } else {
+        println!("  {line}");
+    }
+    io::stdout().flush().ok();
 }
 
 fn print_thinking(color: bool) {

@@ -39,6 +39,10 @@ pub struct Config {
     /// Overridable at runtime via `NEWT_CHAT_STYLE` and `NEWT_PROMPT`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tui: Option<TuiConfig>,
+
+    /// Inference cost modeling. `None` → built-in rate table only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pricing: Option<crate::pricing::PricingConfig>,
 }
 
 // ---------------------------------------------------------------------------
@@ -361,6 +365,7 @@ impl Default for Config {
             default_tier_order: vec![Tier::Fast, Tier::Standard, Tier::Complex, Tier::Review],
             dgx: None,
             tui: None,
+            pricing: None,
         }
     }
 }
