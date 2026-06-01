@@ -43,6 +43,9 @@ pub struct Session {
 pub struct AcpServer {
     sessions: Arc<Mutex<HashMap<SessionId, Session>>>,
     backend: Arc<dyn newt_inference::InferenceBackend>,
+    /// Optional Prometheus metrics registry. When `Some`, every completed
+    /// `prompt` turn records timing, token counts, and cost observations.
+    metrics: Option<Arc<crate::prom::NewtMetrics>>,
 }
 
 /// Structured reply for one `prompt` turn.
@@ -173,7 +176,14 @@ impl AcpServer {
         Self {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             backend,
+            metrics: None,
         }
+    }
+
+    /// Attach a Prometheus metrics registry. Turns become observable.
+    pub fn with_metrics(mut self, metrics: Option<Arc<crate::prom::NewtMetrics>>) -> Self {
+        self.metrics = metrics;
+        self
     }
 
     /// Run the server over stdin/stdout.
@@ -367,6 +377,11 @@ impl AcpServer {
         } else {
             self.handle_prompt_flat(&session, &prompt).await?
         };
+
+        // Record Prometheus observations — best-effort, never blocks.
+        if let (Some(m), Some(ref metrics)) = (&task_reply.metrics, &self.metrics) {
+            metrics.record(m);
+        }
 
         Ok(serde_json::to_value(task_reply)?)
     }
