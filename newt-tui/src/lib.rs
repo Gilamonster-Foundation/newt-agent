@@ -1,8 +1,19 @@
 //! Newt-Agent TUI — splash, chat REPL, and settings.
 
 mod settings;
+mod wizard;
 
 pub use settings::run_settings;
+
+/// Explicitly run the first-time setup wizard (used by `newt init`).
+/// Unlike `wizard::maybe_run` this always runs even if config exists.
+pub fn run_init(color: bool) -> anyhow::Result<()> {
+    // Delete config so the wizard runs unconditionally, then call maybe_run.
+    // But `newt init` should ASK before clobbering existing config.
+    // For now: just run the wizard without deleting — it will ask the user
+    // to overwrite if they want by naturally re-saving.
+    wizard::run_init(color)
+}
 
 use std::io::{self, IsTerminal, Write as _};
 
@@ -60,6 +71,10 @@ const NEWT_ORANGE_CT: CtColor = CtColor::Rgb {
 
 pub fn run_code(path: Option<&std::path::Path>, no_splash: bool) -> anyhow::Result<()> {
     let color = color_supported_with(&|k| std::env::var(k).ok());
+
+    // First-run wizard: silent no-op if config already exists.
+    wizard::maybe_run(color)?;
+
     let workspace = resolve_workspace(path);
 
     // --no-splash (or [tui] no_splash = true): print a compact inline header
