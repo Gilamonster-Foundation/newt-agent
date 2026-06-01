@@ -1259,7 +1259,9 @@ dependencies = [
  "newt-inference",
  "newt-tools",
  "ratatui",
+ "reqwest",
  "rustyline",
+ "serde_json",
  "tokio",
  "tracing",
 ]
