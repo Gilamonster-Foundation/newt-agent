@@ -344,10 +344,8 @@ fn set_dgx_host(dgx: &mut DgxConfig, url: Option<String>) {
                 ..Default::default()
             });
         }
-    } else {
-        if let Some(node) = dgx.nodes.first_mut() {
-            node.ollama = None;
-        }
+    } else if let Some(node) = dgx.nodes.first_mut() {
+        node.ollama = None;
     }
 }
 

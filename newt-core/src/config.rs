@@ -78,8 +78,11 @@ pub struct TuiConfig {
     #[serde(default = "default_tool_output_lines")]
     pub tool_output_lines: usize,
 
-    /// Tool-call permission policy (ocap: which tools the model may invoke
-    /// and over which targets). Default: `WorkspaceDev` preset.
+    /// Tool-call permission policy for the interactive TUI: which tools the
+    /// model may invoke and over which targets. This is a *preset that selects
+    /// an attenuation* — the host (`newt-identity`) lowers it into a signed,
+    /// attenuation-only capability that enforcement consults. Default:
+    /// `WorkspaceDev`.
     #[serde(default)]
     pub permissions: ToolPermissions,
 }
@@ -89,15 +92,18 @@ fn default_tool_output_lines() -> usize {
 }
 
 // ---------------------------------------------------------------------------
-// Tool permissions — ocap attenuation presets
+// Tool permissions — preset policies, lowered to attenuated capabilities
 // ---------------------------------------------------------------------------
 
-/// Named capability preset for the TUI tool loop.
+/// A named tool-permission preset for the TUI tool loop.
 ///
-/// Each preset produces a [`crate::Caveats`] value via
-/// [`ToolPermissions::to_caveats`]. `Custom` means the user has edited
-/// `extra_exec` beyond any canned preset; the settings UI shows it as
-/// "(custom)" and `to_caveats` falls through to `Caveats::top()`.
+/// Each preset selects a [`crate::Caveats`] *policy* via
+/// [`ToolPermissions::to_caveats`]; the host (`newt-identity`) then lowers that
+/// policy into a signed, attenuation-only capability for enforcement. A preset
+/// is a name-based convenience, **not** a capability itself — the unforgeable
+/// authority is the signed `AgentKey` delegation. `Custom` means the user has
+/// added commands beyond a canned preset; it carries `WorkspaceDev` authority
+/// plus those extras (it does **not** grant full access).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum PermissionPreset {
@@ -111,8 +117,8 @@ pub enum PermissionPreset {
     WorkspaceDev,
     /// Unrestricted — `Caveats::top()`. `write_file` still prompts y/N.
     FullAccess,
-    /// User has customised `extra_exec` beyond any preset; treated as
-    /// `FullAccess` for the exec axis (all commands allowed).
+    /// User has added commands beyond a canned preset; carries `WorkspaceDev`
+    /// authority plus those `extra_exec` entries — **not** full access.
     Custom,
 }
 
@@ -146,7 +152,7 @@ impl PermissionPreset {
             Self::WorkspaceEdit => "read + write workspace; no shell commands",
             Self::WorkspaceDev => "read, write workspace, run: cargo just git grep rg fd ...",
             Self::FullAccess => "unrestricted (prompts y/N before each write)",
-            Self::Custom => "custom exec allowlist (unrestricted otherwise)",
+            Self::Custom => "workspace-dev tools plus your extra commands",
         }
     }
 }
@@ -239,7 +245,11 @@ impl ToolPermissions {
                 valid_for_generation: Scope::All,
             },
 
-            PermissionPreset::WorkspaceDev => {
+            // `Custom` shares this arm: editing `extra_exec` keeps WorkspaceDev
+            // authority plus the added commands. It must NOT escalate to
+            // `top()` — adding one command to an allowlist should never grant
+            // full access.
+            PermissionPreset::WorkspaceDev | PermissionPreset::Custom => {
                 let mut allowed: std::collections::BTreeSet<String> = Self::WORKSPACE_DEV_EXEC
                     .iter()
                     .map(|s| s.to_string())
@@ -257,7 +267,7 @@ impl ToolPermissions {
                 }
             }
 
-            PermissionPreset::FullAccess | PermissionPreset::Custom => Caveats::top(),
+            PermissionPreset::FullAccess => Caveats::top(),
         }
     }
 }
@@ -636,6 +646,37 @@ default_tier_order = ["FAST", "STANDARD", "COMPLEX", "REVIEW"]
         };
         let cav = perms.to_caveats("/workspace");
         assert_eq!(cav, crate::caveats::Caveats::top());
+    }
+
+    #[test]
+    fn custom_is_workspace_dev_not_top() {
+        // Regression: editing the exec allowlist auto-flips the preset to
+        // `Custom`, which used to map to `Caveats::top()` — a silent escalation
+        // from "add one command" to "full access". `Custom` must now carry
+        // WorkspaceDev authority plus the extra commands, never `top()`.
+        let custom = ToolPermissions {
+            preset: PermissionPreset::Custom,
+            extra_exec: vec!["bacon".into()],
+        }
+        .to_caveats("/workspace");
+        assert_ne!(
+            custom,
+            crate::caveats::Caveats::top(),
+            "Custom must not be full access"
+        );
+        assert!(custom.permits_exec("cargo"), "workspace-dev tools allowed");
+        assert!(custom.permits_exec("bacon"), "extra_exec command allowed");
+        assert!(!custom.permits_exec("rm"), "non-allowlisted command denied");
+        // Identical to WorkspaceDev with the same extras.
+        let workspace_dev = ToolPermissions {
+            preset: PermissionPreset::WorkspaceDev,
+            extra_exec: vec!["bacon".into()],
+        }
+        .to_caveats("/workspace");
+        assert_eq!(
+            custom, workspace_dev,
+            "Custom carries WorkspaceDev authority + extras"
+        );
     }
 
     #[test]
