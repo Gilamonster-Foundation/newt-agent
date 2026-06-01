@@ -34,6 +34,11 @@ jobs:
       - name: fmt check
         run: cargo fmt --all -- --check
       - name: clippy
+        # `if: always()` so a fmt failure can't mask a clippy failure: the two
+        # steps fail independently, surfacing both in one run instead of forcing
+        # a fmt fix before the clippy error is ever shown. (Mirrored by the
+        # `check` recipe in the justfile, which runs both before failing.)
+        if: always()
         run: cargo clippy --workspace --all-targets -- -D warnings
 
   test:
