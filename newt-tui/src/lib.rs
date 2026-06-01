@@ -488,6 +488,9 @@ fn run_chat(workspace: &str, color: bool) -> anyhow::Result<()> {
     let is_vi = build_rl_config().edit_mode() == rustyline::config::EditMode::Vi;
     let prompt = prompt_str(workspace, verbose, is_vi);
 
+    // Build system prompt with workspace context once at session start.
+    let system = build_system_prompt(workspace);
+
     // Conversation history for multi-turn context.
     let mut conv: Vec<(bool, String)> = Vec::new(); // (is_user, text)
 
@@ -522,7 +525,7 @@ fn run_chat(workspace: &str, color: bool) -> anyhow::Result<()> {
                     print_thinking(color);
 
                     let response = tokio::task::block_in_place(|| {
-                        rt.block_on(chat_complete(&inf_url, &inf_model, &conv, &task))
+                        rt.block_on(chat_complete(&inf_url, &inf_model, &system, &conv, &task))
                     });
 
                     // Erase the thinking line then print the real response.
@@ -582,10 +585,62 @@ fn resolve_backend_config() -> (String, String) {
     (url, model)
 }
 
+/// Build a system prompt with workspace context so the model knows the project.
+fn build_system_prompt(workspace: &str) -> String {
+    let mut ctx = format!(
+        "You are newt, a small, fast, local-first agentic coder. \
+         Be concise and direct.\n\nWorkspace: {workspace}\n"
+    );
+
+    // Directory listing (top-level, no hidden files)
+    if let Ok(mut entries) = std::fs::read_dir(workspace) {
+        let mut names: Vec<String> = entries
+            .by_ref()
+            .flatten()
+            .filter_map(|e| {
+                let name = e.file_name().to_string_lossy().into_owned();
+                if name.starts_with('.') { None } else { Some(name) }
+            })
+            .collect();
+        names.sort();
+        ctx.push_str("\nFiles:\n");
+        for name in names.iter().take(40) {
+            ctx.push_str(&format!("  {name}\n"));
+        }
+    }
+
+    // README (truncated)
+    for readme in ["README.md", "readme.md", "README.txt"] {
+        let path = std::path::Path::new(workspace).join(readme);
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            let excerpt: String = text.chars().take(3000).collect();
+            ctx.push_str(&format!("\n{readme}:\n{excerpt}\n"));
+            if text.len() > 3000 {
+                ctx.push_str("...[truncated]\n");
+            }
+            break;
+        }
+    }
+
+    // Recent git log
+    let log = std::process::Command::new("git")
+        .args(["-C", workspace, "log", "--oneline", "-10"])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .unwrap_or_default();
+    if !log.is_empty() {
+        ctx.push_str(&format!("\nRecent commits:\n{log}"));
+    }
+
+    ctx
+}
+
 /// Send a chat turn to Ollama and return the reply.
 async fn chat_complete(
     url: &str,
     model: &str,
+    system: &str,
     history: &[(bool, String)],
     task: &str,
 ) -> anyhow::Result<newt_inference::backend::ChatReply> {
@@ -594,10 +649,7 @@ async fn chat_complete(
 
     let backend = LocalOllamaBackend::new(url, model);
 
-    let mut req = ChatRequest::new().system(
-        "You are newt, a small, fast, local-first agentic coder. \
-         Be concise and direct. Help with coding tasks.",
-    );
+    let mut req = ChatRequest::new().system(system);
     for (is_user, text) in history {
         req = if *is_user { req.user(text) } else { req.assistant(text) };
     }
