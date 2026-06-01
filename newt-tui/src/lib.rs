@@ -48,7 +48,11 @@ const LOGO_PLAIN: &str = include_str!("../../docs/logos/newt-ascii-40.txt");
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 const NEWT_ORANGE: Color = Color::Rgb(220, 60, 20);
-const NEWT_ORANGE_CT: CtColor = CtColor::Rgb { r: 220, g: 60, b: 20 };
+const NEWT_ORANGE_CT: CtColor = CtColor::Rgb {
+    r: 220,
+    g: 60,
+    b: 20,
+};
 
 // ---------------------------------------------------------------------------
 // Public entry points
@@ -76,7 +80,13 @@ pub fn run_code(path: Option<&std::path::Path>, no_splash: bool) -> anyhow::Resu
     // Default: full ANSI splash in alt screen — blinks off on Enter.
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, Hide, Clear(ClearType::All), MoveTo(0, 0))?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        Hide,
+        Clear(ClearType::All),
+        MoveTo(0, 0)
+    )?;
     let cont = show_splash(&mut stdout, &workspace, color)?;
     let _ = disable_raw_mode();
     let _ = execute!(io::stdout(), Show, LeaveAlternateScreen);
@@ -108,7 +118,10 @@ fn print_inline_header(workspace: &str, color: bool) {
         ("newt  ·  Small, fast, local-first agentic coder", false),
         (std::concat!("v", env!("CARGO_PKG_VERSION")), true), // dim
         ("", false),
-        ("ready — type a task, /help for commands, /exit to quit", true),
+        (
+            "ready — type a task, /help for commands, /exit to quit",
+            true,
+        ),
     ];
     let text_start = mid.saturating_sub(1);
 
@@ -171,11 +184,36 @@ fn logo_for_size(cols: u16, rows: u16) -> (&'static str, u16) {
     // A logo is only selected if both width AND height fit the terminal.
     for (art, w, h, min_w) in [
         (LOGO_160, LOGO_160_COLS, 81u16, LOGO_160_MIN_TERM_COLS),
-        (LOGO_120, LOGO_120_COLS, 61u16, LOGO_120_COLS + STATUS_MIN_COLS + 2),
-        (LOGO_FULL, LOGO_FULL_COLS, 40u16, LOGO_FULL_COLS + STATUS_MIN_COLS + 2),
-        (LOGO_40,   LOGO_40_COLS,   20u16, LOGO_40_COLS   + STATUS_MIN_COLS + 2),
-        (LOGO_20,   LOGO_20_COLS,   10u16, LOGO_20_COLS   + STATUS_MIN_COLS + 2),
-        (LOGO_10,   LOGO_10_COLS,    5u16, LOGO_10_COLS   + STATUS_MIN_COLS + 2),
+        (
+            LOGO_120,
+            LOGO_120_COLS,
+            61u16,
+            LOGO_120_COLS + STATUS_MIN_COLS + 2,
+        ),
+        (
+            LOGO_FULL,
+            LOGO_FULL_COLS,
+            40u16,
+            LOGO_FULL_COLS + STATUS_MIN_COLS + 2,
+        ),
+        (
+            LOGO_40,
+            LOGO_40_COLS,
+            20u16,
+            LOGO_40_COLS + STATUS_MIN_COLS + 2,
+        ),
+        (
+            LOGO_20,
+            LOGO_20_COLS,
+            10u16,
+            LOGO_20_COLS + STATUS_MIN_COLS + 2,
+        ),
+        (
+            LOGO_10,
+            LOGO_10_COLS,
+            5u16,
+            LOGO_10_COLS + STATUS_MIN_COLS + 2,
+        ),
     ] {
         if cols >= min_w && rows >= h + 4 {
             return (art, w);
@@ -265,12 +303,13 @@ fn show_splash_plain(_out: &mut io::Stdout, workspace: &str) -> anyhow::Result<b
             let w = 60u16.min(area.width);
             let cols = Layout::default()
                 .direction(Direction::Horizontal)
-                .constraints([Constraint::Fill(1), Constraint::Length(w), Constraint::Fill(1)])
+                .constraints([
+                    Constraint::Fill(1),
+                    Constraint::Length(w),
+                    Constraint::Fill(1),
+                ])
                 .split(area);
-            f.render_widget(
-                Paragraph::new(Text::from(lines)),
-                cols[1],
-            );
+            f.render_widget(Paragraph::new(Text::from(lines)), cols[1]);
         })?;
         if let Some(cont) = splash_poll_event()? {
             break cont;
@@ -464,8 +503,7 @@ fn run_chat(workspace: &str, color: bool) -> anyhow::Result<()> {
     }
 
     // Input history file and tokio runtime for async inference.
-    let history_path = newt_core::Config::user_config_path()
-        .map(|p| p.with_file_name("history"));
+    let history_path = newt_core::Config::user_config_path().map(|p| p.with_file_name("history"));
 
     // Use the existing tokio runtime from main — block_in_place lets rustyline
     // block the thread while still allowing block_on() inside it.
@@ -566,7 +604,8 @@ fn resolve_backend_config() -> (String, String) {
             })
         })
         .or_else(|| {
-            newt_core::Config::resolve().ok()
+            newt_core::Config::resolve()
+                .ok()
                 .and_then(|c| c.dgx)
                 .and_then(|d| d.nodes.into_iter().next())
                 .and_then(|n| n.ollama)
@@ -576,7 +615,8 @@ fn resolve_backend_config() -> (String, String) {
     let model = std::env::var("NEWT_DGX_MODEL")
         .ok()
         .or_else(|| {
-            newt_core::Config::resolve().ok()
+            newt_core::Config::resolve()
+                .ok()
                 .and_then(|c| c.dgx)
                 .and_then(|d| d.active_model)
         })
@@ -599,7 +639,11 @@ fn build_system_prompt(workspace: &str) -> String {
             .flatten()
             .filter_map(|e| {
                 let name = e.file_name().to_string_lossy().into_owned();
-                if name.starts_with('.') { None } else { Some(name) }
+                if name.starts_with('.') {
+                    None
+                } else {
+                    Some(name)
+                }
             })
             .collect();
         names.sort();
@@ -651,7 +695,11 @@ async fn chat_complete(
 
     let mut req = ChatRequest::new().system(system);
     for (is_user, text) in history {
-        req = if *is_user { req.user(text) } else { req.assistant(text) };
+        req = if *is_user {
+            req.user(text)
+        } else {
+            req.assistant(text)
+        };
     }
     req = req.user(task);
 
@@ -665,7 +713,8 @@ fn print_thinking(color: bool) {
             SetForegroundColor(CtColor::DarkGrey),
             Print("▸  thinking…"),
             ResetColor,
-        ).ok();
+        )
+        .ok();
         io::stdout().flush().ok();
     }
 }
@@ -682,7 +731,12 @@ fn erase_line() {
 
 /// Dispatch a `/command` line. Returns `true` to keep the session alive,
 /// `false` to exit.
-fn dispatch_slash(input: &str, workspace: &str, color: bool, verbose: bool) -> anyhow::Result<bool> {
+fn dispatch_slash(
+    input: &str,
+    workspace: &str,
+    color: bool,
+    verbose: bool,
+) -> anyhow::Result<bool> {
     // Strip leading slash and split into at most 3 tokens.
     let body = input.trim_start_matches('/');
     let mut parts = body.splitn(3, ' ');
@@ -733,7 +787,11 @@ fn dispatch_slash(input: &str, workspace: &str, color: bool, verbose: bool) -> a
             }
         }
 
-        other => print_newt(&format!("unknown command: /{other}  (try /help)"), color, verbose),
+        other => print_newt(
+            &format!("unknown command: /{other}  (try /help)"),
+            color,
+            verbose,
+        ),
     }
     Ok(true)
 }
@@ -833,11 +891,14 @@ mod tests {
 
     #[test]
     fn logo_widths_are_strictly_ordered() {
-        assert!(LOGO_10_COLS < LOGO_20_COLS);
-        assert!(LOGO_20_COLS < LOGO_40_COLS);
-        assert!(LOGO_40_COLS < LOGO_FULL_COLS);
-        assert!(LOGO_FULL_COLS < LOGO_120_COLS);
-        assert!(LOGO_120_COLS < LOGO_160_COLS);
+        // Verified at compile time — use const assert to satisfy clippy.
+        const _: () = {
+            assert!(LOGO_10_COLS < LOGO_20_COLS);
+            assert!(LOGO_20_COLS < LOGO_40_COLS);
+            assert!(LOGO_40_COLS < LOGO_FULL_COLS);
+            assert!(LOGO_FULL_COLS < LOGO_120_COLS);
+            assert!(LOGO_120_COLS < LOGO_160_COLS);
+        };
     }
 
     #[test]

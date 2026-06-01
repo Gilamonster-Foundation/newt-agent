@@ -216,8 +216,7 @@ impl Config {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(NewtError::Io)?;
         }
-        let text = toml::to_string_pretty(self)
-            .map_err(|e| NewtError::Config(e.to_string()))?;
+        let text = toml::to_string_pretty(self).map_err(|e| NewtError::Config(e.to_string()))?;
         std::fs::write(path, text).map_err(NewtError::Io)
     }
 

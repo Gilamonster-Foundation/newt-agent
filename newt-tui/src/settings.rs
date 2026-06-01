@@ -109,7 +109,10 @@ impl DgxField {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum InputMode {
     Navigate,
-    EditingText { field_label: &'static str, buf: String },
+    EditingText {
+        field_label: &'static str,
+        buf: String,
+    },
     ConfirmQuit,
 }
 
@@ -176,17 +179,17 @@ impl SettingsApp {
         match self.category {
             Category::Tui => match self.current_tui_field() {
                 TuiField::ChatStyle => self.tui.chat_style = self.tui.chat_style.toggle(),
-                TuiField::EditMode  => self.tui.edit_mode  = self.tui.edit_mode.toggle(),
-                TuiField::NoSplash  => self.tui.no_splash  = !self.tui.no_splash,
-                TuiField::Prompt    => self.begin_edit(),
+                TuiField::EditMode => self.tui.edit_mode = self.tui.edit_mode.toggle(),
+                TuiField::NoSplash => self.tui.no_splash = !self.tui.no_splash,
+                TuiField::Prompt => self.begin_edit(),
             },
             Category::Dgx => match self.current_dgx_field() {
                 DgxField::Endpoint => {
                     self.dgx.active_endpoint = match self.dgx.active_endpoint {
-                        EndpointKind::Ollama    => EndpointKind::OllamaLb,
-                        EndpointKind::OllamaLb  => EndpointKind::InCluster,
+                        EndpointKind::Ollama => EndpointKind::OllamaLb,
+                        EndpointKind::OllamaLb => EndpointKind::InCluster,
                         EndpointKind::InCluster => EndpointKind::Vllm,
-                        EndpointKind::Vllm      => EndpointKind::Ollama,
+                        EndpointKind::Vllm => EndpointKind::Ollama,
                     };
                 }
                 DgxField::Host | DgxField::Model => self.begin_edit(),
@@ -205,10 +208,7 @@ impl SettingsApp {
                 _ => return,
             },
             Category::Dgx => match self.current_dgx_field() {
-                DgxField::Host => (
-                    DgxField::Host.label(),
-                    dgx_host_str(&self.dgx),
-                ),
+                DgxField::Host => (DgxField::Host.label(), dgx_host_str(&self.dgx)),
                 DgxField::Model => (
                     DgxField::Model.label(),
                     self.dgx.active_model.clone().unwrap_or_default(),
@@ -217,12 +217,19 @@ impl SettingsApp {
             },
             Category::About => return,
         };
-        self.input_mode = InputMode::EditingText { field_label: label, buf };
+        self.input_mode = InputMode::EditingText {
+            field_label: label,
+            buf,
+        };
     }
 
     pub fn confirm_edit(&mut self) {
         if let InputMode::EditingText { field_label, buf } = &self.input_mode.clone() {
-            let val = if buf.is_empty() { None } else { Some(buf.clone()) };
+            let val = if buf.is_empty() {
+                None
+            } else {
+                Some(buf.clone())
+            };
             match *field_label {
                 s if s == TuiField::Prompt.label() => self.tui.prompt = val,
                 s if s == DgxField::Host.label() => set_dgx_host(&mut self.dgx, val),
@@ -271,10 +278,11 @@ fn set_dgx_host(dgx: &mut DgxConfig, url: Option<String>) {
         if let Some(node) = dgx.nodes.first_mut() {
             node.ollama = Some(u);
         } else {
-            let mut node = newt_core::DgxNode::default();
-            node.ollama = Some(u);
-            node.name = "dgx".into();
-            dgx.nodes.push(node);
+            dgx.nodes.push(newt_core::DgxNode {
+                ollama: Some(u),
+                name: "dgx".into(),
+                ..Default::default()
+            });
         }
     } else {
         if let Some(node) = dgx.nodes.first_mut() {
@@ -289,7 +297,12 @@ fn expand_prompt(template: &str) -> String {
         .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
         .unwrap_or_else(|| "workspace".into());
     template
-        .replace("\\W", &std::env::current_dir().unwrap_or_default().to_string_lossy())
+        .replace(
+            "\\W",
+            &std::env::current_dir()
+                .unwrap_or_default()
+                .to_string_lossy(),
+        )
         .replace("\\w", &ws)
         .replace("\\h", &hostname())
         .replace("\\v", env!("CARGO_PKG_VERSION"))
@@ -422,12 +435,8 @@ fn run_loop(
                 code: KeyCode::Down,
                 ..
             }) if app.input_mode == InputMode::Navigate => match app.category {
-                Category::Tui => {
-                    app.tui_cursor = (app.tui_cursor + 1).min(TuiField::ALL.len() - 1)
-                }
-                Category::Dgx => {
-                    app.dgx_cursor = (app.dgx_cursor + 1).min(DgxField::ALL.len() - 1)
-                }
+                Category::Tui => app.tui_cursor = (app.tui_cursor + 1).min(TuiField::ALL.len() - 1),
+                Category::Dgx => app.dgx_cursor = (app.dgx_cursor + 1).min(DgxField::ALL.len() - 1),
                 Category::About => {}
             },
 
@@ -440,22 +449,16 @@ fn run_loop(
             Event::Key(KeyEvent {
                 code: KeyCode::Enter,
                 ..
-            }) if matches!(app.input_mode, InputMode::EditingText { .. }) => {
-                app.confirm_edit()
-            }
+            }) if matches!(app.input_mode, InputMode::EditingText { .. }) => app.confirm_edit(),
 
             Event::Key(KeyEvent {
                 code: KeyCode::Esc, ..
-            }) if matches!(app.input_mode, InputMode::EditingText { .. }) => {
-                app.cancel_edit()
-            }
+            }) if matches!(app.input_mode, InputMode::EditingText { .. }) => app.cancel_edit(),
 
             Event::Key(KeyEvent {
                 code: KeyCode::Backspace,
                 ..
-            }) if matches!(app.input_mode, InputMode::EditingText { .. }) => {
-                app.backspace()
-            }
+            }) if matches!(app.input_mode, InputMode::EditingText { .. }) => app.backspace(),
 
             Event::Key(KeyEvent {
                 code: KeyCode::Char(c),
@@ -482,7 +485,9 @@ fn render(f: &mut Frame, app: &SettingsApp) {
     let area = f.area();
     let orange = Style::default().fg(NEWT_ORANGE);
     let dim = Style::default().fg(DIM);
-    let bold_orange = Style::default().fg(NEWT_ORANGE).add_modifier(Modifier::BOLD);
+    let bold_orange = Style::default()
+        .fg(NEWT_ORANGE)
+        .add_modifier(Modifier::BOLD);
 
     let logo_w = LOGO_COLS.min(area.width / 2);
     let cols = Layout::default()
@@ -526,7 +531,10 @@ fn render_logo(f: &mut Frame, area: Rect) {
 }
 
 fn render_tabs(f: &mut Frame, area: Rect, app: &SettingsApp, active: Style, dim: Style) {
-    let titles: Vec<Line> = Category::ALL.iter().map(|c| Line::from(c.title())).collect();
+    let titles: Vec<Line> = Category::ALL
+        .iter()
+        .map(|c| Line::from(c.title()))
+        .collect();
     f.render_widget(
         Tabs::new(titles)
             .select(app.category.index())
@@ -551,18 +559,20 @@ fn render_fields(f: &mut Frame, area: Rect, app: &SettingsApp, bold_orange: Styl
     }
 }
 
-fn field_row(
-    f: &mut Frame,
-    rows: &[Rect],
-    idx: usize,
-    is_sel: bool,
-    content: Line,
-) {
+fn field_row(f: &mut Frame, rows: &[Rect], idx: usize, is_sel: bool, content: Line) {
     let row = rows[idx];
-    let bg = if is_sel { Style::default().bg(SEL_BG) } else { Style::default() };
+    let bg = if is_sel {
+        Style::default().bg(SEL_BG)
+    } else {
+        Style::default()
+    };
     f.render_widget(
         Paragraph::new(content).style(bg),
-        Rect { height: 1, y: row.y + 1, ..row },
+        Rect {
+            height: 1,
+            y: row.y + 1,
+            ..row
+        },
     );
 }
 
@@ -586,8 +596,14 @@ fn render_tui_fields(f: &mut Frame, area: Rect, app: &SettingsApp, bold_orange: 
                 field.label(),
                 label_s,
                 &[
-                    (ChatStyle::Compact.as_str(), app.tui.chat_style == ChatStyle::Compact),
-                    (ChatStyle::Verbose.as_str(), app.tui.chat_style == ChatStyle::Verbose),
+                    (
+                        ChatStyle::Compact.as_str(),
+                        app.tui.chat_style == ChatStyle::Compact,
+                    ),
+                    (
+                        ChatStyle::Verbose.as_str(),
+                        app.tui.chat_style == ChatStyle::Verbose,
+                    ),
                 ],
                 dim,
             ),
@@ -595,7 +611,10 @@ fn render_tui_fields(f: &mut Frame, area: Rect, app: &SettingsApp, bold_orange: 
                 field.label(),
                 label_s,
                 &[
-                    (EditMode::Emacs.as_str(), app.tui.edit_mode == EditMode::Emacs),
+                    (
+                        EditMode::Emacs.as_str(),
+                        app.tui.edit_mode == EditMode::Emacs,
+                    ),
                     (EditMode::Vi.as_str(), app.tui.edit_mode == EditMode::Vi),
                 ],
                 dim,
@@ -604,8 +623,8 @@ fn render_tui_fields(f: &mut Frame, area: Rect, app: &SettingsApp, bold_orange: 
                 field.label(),
                 label_s,
                 &[
-                    ("on",  !app.tui.no_splash), // splash on  = no_splash false (default)
-                    ("off",  app.tui.no_splash), // splash off = no_splash true
+                    ("on", !app.tui.no_splash), // splash on  = no_splash false (default)
+                    ("off", app.tui.no_splash), // splash off = no_splash true
                 ],
                 dim,
             ),
@@ -620,8 +639,16 @@ fn render_tui_fields(f: &mut Frame, area: Rect, app: &SettingsApp, bold_orange: 
                 } else {
                     app.tui.prompt.clone().unwrap_or_else(|| "\\w $ ".into())
                 };
-                let val_style = if editing { Style::default().fg(Color::Yellow) } else { Style::default() };
-                let hint = if editing { "  Esc cancel  Enter confirm" } else { "  Enter to edit" };
+                let val_style = if editing {
+                    Style::default().fg(Color::Yellow)
+                } else {
+                    Style::default()
+                };
+                let hint = if editing {
+                    "  Esc cancel  Enter confirm"
+                } else {
+                    "  Enter to edit"
+                };
                 Line::from(vec![
                     Span::styled(format!("  {:<14}", field.label()), label_s),
                     Span::styled(val, val_style),
@@ -671,8 +698,16 @@ fn render_dgx_fields(f: &mut Frame, area: Rect, app: &SettingsApp, bold_orange: 
                 } else {
                     cur
                 };
-                let val_s = if is_editing { Style::default().fg(Color::Yellow) } else { Style::default() };
-                let hint = if is_editing { "  Esc cancel  Enter confirm" } else { "  Enter to edit" };
+                let val_s = if is_editing {
+                    Style::default().fg(Color::Yellow)
+                } else {
+                    Style::default()
+                };
+                let hint = if is_editing {
+                    "  Esc cancel  Enter confirm"
+                } else {
+                    "  Enter to edit"
+                };
                 Line::from(vec![
                     Span::styled(format!("  {:<14}", field.label()), label_s),
                     Span::styled(val, val_s),
@@ -683,10 +718,16 @@ fn render_dgx_fields(f: &mut Frame, area: Rect, app: &SettingsApp, bold_orange: 
                 field.label(),
                 label_s,
                 &[
-                    ("ollama",     app.dgx.active_endpoint == EndpointKind::Ollama),
-                    ("ollama_lb",  app.dgx.active_endpoint == EndpointKind::OllamaLb),
-                    ("in_cluster", app.dgx.active_endpoint == EndpointKind::InCluster),
-                    ("vllm",       app.dgx.active_endpoint == EndpointKind::Vllm),
+                    ("ollama", app.dgx.active_endpoint == EndpointKind::Ollama),
+                    (
+                        "ollama_lb",
+                        app.dgx.active_endpoint == EndpointKind::OllamaLb,
+                    ),
+                    (
+                        "in_cluster",
+                        app.dgx.active_endpoint == EndpointKind::InCluster,
+                    ),
+                    ("vllm", app.dgx.active_endpoint == EndpointKind::Vllm),
                 ],
                 dim,
             ),
@@ -701,10 +742,14 @@ fn toggle_line<'a>(
     options: &[(&'a str, bool)],
     dim: Style,
 ) -> Line<'a> {
-    let mut spans = vec![Span::styled(format!("  {:<14}", label), label_style)];
+    let mut spans = vec![Span::styled(format!("  {label:<14}"), label_style)];
     for (name, selected) in options {
         let bullet = if *selected { "◉ " } else { "○ " };
-        let s = if *selected { Style::default().fg(NEWT_ORANGE) } else { dim };
+        let s = if *selected {
+            Style::default().fg(NEWT_ORANGE)
+        } else {
+            dim
+        };
         spans.push(Span::styled(format!("{bullet}{name} "), s));
     }
     Line::from(spans)
@@ -736,7 +781,11 @@ fn render_about(f: &mut Frame, area: Rect, dim: Style) {
 
 fn render_preview(f: &mut Frame, area: Rect, app: &SettingsApp, dim: Style, orange: Style) {
     let prompt = if let InputMode::EditingText { buf, .. } = &app.input_mode {
-        expand_prompt(if buf.is_empty() { "\\w $ " } else { buf.as_str() })
+        expand_prompt(if buf.is_empty() {
+            "\\w $ "
+        } else {
+            buf.as_str()
+        })
     } else {
         app.rendered_prompt()
     };
@@ -762,9 +811,8 @@ fn render_preview(f: &mut Frame, area: Rect, app: &SettingsApp, dim: Style, oran
     ];
 
     f.render_widget(
-        Paragraph::new(Text::from(lines)).block(
-            Block::default().borders(Borders::TOP).border_style(dim),
-        ),
+        Paragraph::new(Text::from(lines))
+            .block(Block::default().borders(Borders::TOP).border_style(dim)),
         area,
     );
 }
@@ -772,9 +820,8 @@ fn render_preview(f: &mut Frame, area: Rect, app: &SettingsApp, dim: Style, oran
 fn render_hints(f: &mut Frame, area: Rect, app: &SettingsApp, dim: Style) {
     let status = app.status.as_deref().unwrap_or("");
     let dirty = if app.is_dirty() { "  ● unsaved" } else { "" };
-    let hints = format!(
-        "  ↑↓ navigate   Enter toggle/edit   Tab next tab   Ctrl-S save   q quit{dirty}"
-    );
+    let hints =
+        format!("  ↑↓ navigate   Enter toggle/edit   Tab next tab   Ctrl-S save   q quit{dirty}");
 
     let mut lines = vec![Line::from(Span::styled(hints, dim))];
     if !status.is_empty() {
@@ -797,7 +844,12 @@ fn render_confirm_quit(f: &mut Frame, area: Rect, bold_orange: Style, dim: Style
     let h: u16 = 6;
     let x = area.x + area.width.saturating_sub(w) / 2;
     let y = area.y + area.height.saturating_sub(h) / 2;
-    let modal = Rect { x, y, width: w, height: h };
+    let modal = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
 
     f.render_widget(Clear, modal);
 
@@ -851,8 +903,7 @@ pub fn parse_ansi_logo(src: &str) -> Vec<Line<'static>> {
                     i += 1;
                 }
                 if let Ok(seq) = std::str::from_utf8(&bytes[start..i]) {
-                    let nums: Vec<u8> =
-                        seq.split(';').filter_map(|s| s.parse().ok()).collect();
+                    let nums: Vec<u8> = seq.split(';').filter_map(|s| s.parse().ok()).collect();
                     match nums.as_slice() {
                         [38, 2, r, g, b] => fg = Color::Rgb(*r, *g, *b),
                         [48, 2, r, g, b] => bg = Color::Rgb(*r, *g, *b),
@@ -910,7 +961,10 @@ mod tests {
     #[test]
     fn toggle_no_splash() {
         let mut app = make_app();
-        app.tui_cursor = TuiField::ALL.iter().position(|f| *f == TuiField::NoSplash).unwrap();
+        app.tui_cursor = TuiField::ALL
+            .iter()
+            .position(|f| *f == TuiField::NoSplash)
+            .unwrap();
         assert!(!app.tui.no_splash);
         app.toggle_current();
         assert!(app.tui.no_splash);
@@ -921,7 +975,10 @@ mod tests {
     #[test]
     fn toggle_edit_mode() {
         let mut app = make_app();
-        app.tui_cursor = TuiField::ALL.iter().position(|f| *f == TuiField::EditMode).unwrap();
+        app.tui_cursor = TuiField::ALL
+            .iter()
+            .position(|f| *f == TuiField::EditMode)
+            .unwrap();
         assert_eq!(app.tui.edit_mode, EditMode::Emacs);
         app.toggle_current();
         assert_eq!(app.tui.edit_mode, EditMode::Vi);
@@ -932,7 +989,10 @@ mod tests {
     #[test]
     fn prompt_edit_roundtrip() {
         let mut app = make_app();
-        app.tui_cursor = TuiField::ALL.iter().position(|f| *f == TuiField::Prompt).unwrap();
+        app.tui_cursor = TuiField::ALL
+            .iter()
+            .position(|f| *f == TuiField::Prompt)
+            .unwrap();
         app.begin_edit();
         assert!(matches!(app.input_mode, InputMode::EditingText { .. }));
         app.type_char('\\');
@@ -947,7 +1007,10 @@ mod tests {
     #[test]
     fn cancel_edit_restores_navigate() {
         let mut app = make_app();
-        app.tui_cursor = TuiField::ALL.iter().position(|f| *f == TuiField::Prompt).unwrap();
+        app.tui_cursor = TuiField::ALL
+            .iter()
+            .position(|f| *f == TuiField::Prompt)
+            .unwrap();
         app.begin_edit();
         app.cancel_edit();
         assert_eq!(app.input_mode, InputMode::Navigate);
@@ -982,7 +1045,10 @@ mod tests {
     fn dgx_model_edit() {
         let mut app = make_app();
         app.category = Category::Dgx;
-        app.dgx_cursor = DgxField::ALL.iter().position(|f| *f == DgxField::Model).unwrap();
+        app.dgx_cursor = DgxField::ALL
+            .iter()
+            .position(|f| *f == DgxField::Model)
+            .unwrap();
         app.begin_edit();
         for c in "gemma4:e2b".chars() {
             app.type_char(c);
@@ -996,7 +1062,10 @@ mod tests {
     fn dgx_endpoint_toggle_cycles() {
         let mut app = make_app();
         app.category = Category::Dgx;
-        app.dgx_cursor = DgxField::ALL.iter().position(|f| *f == DgxField::Endpoint).unwrap();
+        app.dgx_cursor = DgxField::ALL
+            .iter()
+            .position(|f| *f == DgxField::Endpoint)
+            .unwrap();
         assert_eq!(app.dgx.active_endpoint, EndpointKind::Ollama);
         app.toggle_current();
         assert_eq!(app.dgx.active_endpoint, EndpointKind::OllamaLb);
