@@ -771,23 +771,67 @@ fn print_tool_call(name: &str, detail: &str, color: bool) {
     io::stdout().flush().ok();
 }
 
+/// Maximum lines shown to the user for any tool output.
+/// The model always receives the full content regardless.
+const MAX_DISPLAY_LINES: usize = 20;
+
 /// Print tool output (stdout/stderr from commands, file contents, etc.).
+/// Truncates to MAX_DISPLAY_LINES for readability — full content still
+/// goes to the model.
 fn print_tool_output(output: &str, color: bool) {
     if output.is_empty() {
         return;
     }
-    let truncated: String = output.chars().take(4000).collect();
-    let suffix = if output.len() > 4000 { "\n…[truncated]" } else { "" };
+    let lines: Vec<&str> = output.lines().collect();
+    let shown = lines.len().min(MAX_DISPLAY_LINES);
+    let hidden = lines.len().saturating_sub(shown);
+
+    let display = lines[..shown].join("\n");
+
     if color {
         execute!(
             io::stdout(),
             SetForegroundColor(CtColor::DarkGrey),
-            Print(format!("{truncated}{suffix}\n")),
+            Print(format!("{display}\n")),
             ResetColor,
         )
         .ok();
     } else {
-        println!("{truncated}{suffix}");
+        println!("{display}");
+    }
+
+    if hidden > 0 {
+        // Offer to expand inline rather than dumping everything automatically.
+        if color {
+            execute!(
+                io::stdout(),
+                SetForegroundColor(CtColor::DarkGrey),
+                Print(format!("  … ({hidden} more lines)  show all? [y/N] ")),
+                ResetColor,
+            )
+            .ok();
+        } else {
+            print!("  … ({hidden} more lines)  show all? [y/N] ");
+        }
+        io::stdout().flush().ok();
+
+        let mut ans = String::new();
+        if std::io::stdin().read_line(&mut ans).is_ok()
+            && ans.trim().eq_ignore_ascii_case("y")
+        {
+            let rest = lines[shown..].join("\n");
+            if color {
+                execute!(
+                    io::stdout(),
+                    SetForegroundColor(CtColor::DarkGrey),
+                    Print(format!("{rest}\n")),
+                    ResetColor,
+                )
+                .ok();
+            } else {
+                println!("{rest}");
+            }
+        }
     }
     io::stdout().flush().ok();
 }
