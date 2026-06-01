@@ -66,14 +66,16 @@ pub enum TuiField {
     ChatStyle,
     EditMode,
     NoSplash,
+    ToolOutputLines,
     Prompt,
 }
 
 impl TuiField {
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 5] = [
         Self::ChatStyle,
         Self::EditMode,
         Self::NoSplash,
+        Self::ToolOutputLines,
         Self::Prompt,
     ];
 
@@ -82,6 +84,7 @@ impl TuiField {
             Self::ChatStyle => "chat style",
             Self::EditMode => "edit mode",
             Self::NoSplash => "splash",
+            Self::ToolOutputLines => "output lines",
             Self::Prompt => "prompt",
         }
     }
@@ -181,7 +184,7 @@ impl SettingsApp {
                 TuiField::ChatStyle => self.tui.chat_style = self.tui.chat_style.toggle(),
                 TuiField::EditMode => self.tui.edit_mode = self.tui.edit_mode.toggle(),
                 TuiField::NoSplash => self.tui.no_splash = !self.tui.no_splash,
-                TuiField::Prompt => self.begin_edit(),
+                TuiField::ToolOutputLines | TuiField::Prompt => self.begin_edit(),
             },
             Category::Dgx => match self.current_dgx_field() {
                 DgxField::Endpoint => {
@@ -204,6 +207,10 @@ impl SettingsApp {
                 TuiField::Prompt => (
                     TuiField::Prompt.label(),
                     self.tui.prompt.clone().unwrap_or_default(),
+                ),
+                TuiField::ToolOutputLines => (
+                    TuiField::ToolOutputLines.label(),
+                    self.tui.tool_output_lines.to_string(),
                 ),
                 _ => return,
             },
@@ -232,6 +239,13 @@ impl SettingsApp {
             };
             match *field_label {
                 s if s == TuiField::Prompt.label() => self.tui.prompt = val,
+                s if s == TuiField::ToolOutputLines.label() => {
+                    self.tui.tool_output_lines = buf
+                        .parse::<usize>()
+                        .unwrap_or(20);
+                    // confirm_edit sets val from buf; we already parsed, so override
+                }
+
                 s if s == DgxField::Host.label() => set_dgx_host(&mut self.dgx, val),
                 s if s == DgxField::Model.label() => self.dgx.active_model = val,
                 _ => {}
@@ -628,6 +642,27 @@ fn render_tui_fields(f: &mut Frame, area: Rect, app: &SettingsApp, bold_orange: 
                 ],
                 dim,
             ),
+            TuiField::ToolOutputLines => {
+                let editing = matches!(&app.input_mode,
+                    InputMode::EditingText { field_label, .. }
+                        if *field_label == TuiField::ToolOutputLines.label());
+                let val = if editing {
+                    if let InputMode::EditingText { buf, .. } = &app.input_mode {
+                        format!("{buf}█")
+                    } else {
+                        String::new()
+                    }
+                } else {
+                    let n = app.tui.tool_output_lines;
+                    if n == 0 { "unlimited".into() } else { format!("{n}") }
+                };
+                let hint = if editing { "  Esc cancel  Enter confirm" } else { "  Enter to edit  (0 = unlimited)" };
+                Line::from(vec![
+                    Span::styled(format!("  {:<14}", field.label()), label_s),
+                    Span::styled(val, if editing { Style::default().fg(Color::Yellow) } else { Style::default() }),
+                    Span::styled(hint, dim),
+                ])
+            }
             TuiField::Prompt => {
                 let editing = matches!(app.input_mode, InputMode::EditingText { .. });
                 let val = if editing {

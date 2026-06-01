@@ -68,6 +68,15 @@ pub struct TuiConfig {
     /// `"emacs"` (default) or `"vi"`. Also overridable via `NEWT_EDIT_MODE`.
     #[serde(default)]
     pub edit_mode: EditMode,
+
+    /// Maximum lines of tool output shown inline before offering "show all?".
+    /// Default: 20. Set to 0 to always show everything.
+    #[serde(default = "default_tool_output_lines")]
+    pub tool_output_lines: usize,
+}
+
+fn default_tool_output_lines() -> usize {
+    20
 }
 
 /// Key binding style for the chat REPL input line.
@@ -104,6 +113,7 @@ impl Default for TuiConfig {
             prompt: None,
             no_splash: false,
             edit_mode: EditMode::Emacs,
+            tool_output_lines: default_tool_output_lines(),
         }
     }
 }

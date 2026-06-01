@@ -771,19 +771,24 @@ fn print_tool_call(name: &str, detail: &str, color: bool) {
     io::stdout().flush().ok();
 }
 
-/// Maximum lines shown to the user for any tool output.
-/// The model always receives the full content regardless.
-const MAX_DISPLAY_LINES: usize = 20;
+/// Read the tool-output line limit from config (default 20, 0 = unlimited).
+fn tool_output_lines() -> usize {
+    newt_core::Config::resolve()
+        .ok()
+        .and_then(|c| c.tui)
+        .map(|t| t.tool_output_lines)
+        .unwrap_or(20)
+}
 
-/// Print tool output (stdout/stderr from commands, file contents, etc.).
-/// Truncates to MAX_DISPLAY_LINES for readability — full content still
-/// goes to the model.
+/// Print tool output truncated to the configured line limit.
+/// The model always receives the full content regardless.
 fn print_tool_output(output: &str, color: bool) {
     if output.is_empty() {
         return;
     }
+    let max = tool_output_lines();
     let lines: Vec<&str> = output.lines().collect();
-    let shown = lines.len().min(MAX_DISPLAY_LINES);
+    let shown = if max == 0 { lines.len() } else { lines.len().min(max) };
     let hidden = lines.len().saturating_sub(shown);
 
     let display = lines[..shown].join("\n");
