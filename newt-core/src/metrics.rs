@@ -122,8 +122,7 @@ fn append_jsonl(metrics: &TurnMetrics, path: &std::path::Path) -> std::io::Resul
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let mut line = serde_json::to_string(metrics)
-        .map_err(std::io::Error::other)?;
+    let mut line = serde_json::to_string(metrics).map_err(std::io::Error::other)?;
     line.push('\n');
     let mut f = std::fs::OpenOptions::new()
         .create(true)
