@@ -199,11 +199,24 @@ async fn run_command(args: RunArgs) -> Result<RunOutcomeStatus> {
     // fallbacks. On miss we surface every path that was tried.
     let resolution = resolve_worker_bin(worker_bin);
     if !resolution.found {
-        anyhow::bail!(
+        // Surface the error via the scorecard so classify_outcome can apply
+        // the correct exit code — including --legacy-exit-codes (exit 2).
+        // A bare anyhow::bail! here would exit 1 unconditionally, breaking
+        // the legacy contract (fixes #65).
+        let msg = format!(
             "newt worker binary not found. Tried:\n{}\nPass --worker-bin <PATH>, \
              set NEWT_WORKER_BIN, or run `cargo build --release --bin newt`.",
             resolution.render_candidates()
         );
+        eprintln!("newt-eval: {msg}");
+        let mut scorecard = Scorecard::new();
+        for case in &cases {
+            scorecard.cases.push(CaseScorecard {
+                case_name: case.name.clone(),
+                results: vec![newt_eval::EvalResult::fail("runner", msg.clone())],
+            });
+        }
+        return Ok(classify_outcome(&scorecard, legacy_exit_codes));
     }
 
     let mut config = RunnerConfig::new(&resolution.path);
