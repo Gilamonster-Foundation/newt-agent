@@ -1108,34 +1108,18 @@ fn print_tool_output(output: &str, color: bool) {
     }
 
     if hidden > 0 {
-        // Offer to expand inline rather than dumping everything automatically.
+        // Just print the count and keep going — no blocking prompt.
+        // The user can scroll back; the model always gets the full content.
         if color {
             execute!(
                 io::stdout(),
                 SetForegroundColor(CtColor::DarkGrey),
-                Print(format!("  … ({hidden} more lines)  show all? [y/N] ")),
+                Print(format!("  … ({hidden} more lines hidden)\n")),
                 ResetColor,
             )
             .ok();
         } else {
-            print!("  … ({hidden} more lines)  show all? [y/N] ");
-        }
-        io::stdout().flush().ok();
-
-        let mut ans = String::new();
-        if std::io::stdin().read_line(&mut ans).is_ok() && ans.trim().eq_ignore_ascii_case("y") {
-            let rest = lines[shown..].join("\n");
-            if color {
-                execute!(
-                    io::stdout(),
-                    SetForegroundColor(CtColor::DarkGrey),
-                    Print(format!("{rest}\n")),
-                    ResetColor,
-                )
-                .ok();
-            } else {
-                println!("{rest}");
-            }
+            println!("  … ({hidden} more lines hidden)");
         }
     }
     io::stdout().flush().ok();
