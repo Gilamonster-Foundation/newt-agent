@@ -196,6 +196,30 @@ impl WorkerIdentity {
     pub fn is_operator(&self) -> bool {
         matches!(self, Self::Operator { .. })
     }
+
+    /// Borrow the operator-rooted parent [`AgentKey`], if any.
+    ///
+    /// **Issue #93:** subprocess plugins spawned during a dispatch must
+    /// inherit a delegated child from this parent so the plugin's cert
+    /// chain walks back to the operator's `UserKey`
+    /// (`~/.newt/identity.pem`). The `handle_prompt_coder` path passes
+    /// this to `Coder::with_parent_key` so a future provider-plugin
+    /// spawn can mint envelopes via `Coder::plugin_envelope_for`.
+    ///
+    /// Returns `None` for [`Self::AllowNoKey`]: the debug fallback runs
+    /// with no operator key on disk, so there's nothing to root
+    /// subprocess plugins at. A subprocess plugin spawned under
+    /// `AllowNoKey` SHOULD itself fall through to its own
+    /// no-envelope debug path — the headlines audit
+    /// `synthetic_keys_remaining` check verifies that, even there, no
+    /// code path manufactures a fresh `AgentKey::generate()` /
+    /// `UserKey::generate()` to fill the gap.
+    pub fn parent_key(&self) -> Option<&Arc<AgentKey>> {
+        match self {
+            Self::Operator { root } => Some(root),
+            Self::AllowNoKey => None,
+        }
+    }
 }
 
 /// Build the *policy* caveats a headless worker should dispatch under,

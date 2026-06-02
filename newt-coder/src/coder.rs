@@ -21,6 +21,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use newt_core::{Caveats, CaveatsExt, CountBoundExt};
+use newt_identity::AgentKey;
 use newt_inference::{ChatRequest, InferenceBackend};
 
 use crate::emission::{normalize_emission, Emission};
@@ -30,8 +31,25 @@ use crate::prompt::{build_prompt, build_reprompt, CoderPrompt};
 /// The coder. Holds the inference backend the orchestrator uses for
 /// each `run` call; the backend is `Arc<dyn …>` so callers can share
 /// one backend across coder + non-coder paths.
+///
+/// # Issue #93 — operator-rooted parent key
+///
+/// `Coder` optionally holds the worker's operator-rooted parent
+/// [`AgentKey`] (from `WorkerIdentity::Operator { root }`). When a
+/// dispatch needs to spawn a subprocess plugin (today: future
+/// `ProviderPluginBackend::complete`), it derives a delegated child
+/// via [`AgentKey::delegate`] so the child's cert chain roots back to
+/// the operator's `UserKey` from `~/.newt/identity.pem` — never a
+/// synthetic key.
 pub struct Coder {
     backend: Arc<dyn InferenceBackend>,
+    /// Operator-rooted parent key (issue #93). The acp-worker plumbs
+    /// this from `WorkerIdentity::Operator { root }`; when present, any
+    /// subprocess plugin the dispatch spawns inherits a delegated child
+    /// from this parent so the cert chain walks back to the operator.
+    /// `None` for the `WorkerIdentity::AllowNoKey` debug fallback and
+    /// for legacy tests that don't yet plumb identity.
+    parent_key: Option<Arc<AgentKey>>,
 }
 
 /// Outcome of one `Coder::run` turn. Surfaced via the ACP worker's
@@ -63,7 +81,65 @@ pub struct CoderRun {
 impl Coder {
     /// Build a coder bound to `backend`.
     pub fn new(backend: Arc<dyn InferenceBackend>) -> Self {
-        Self { backend }
+        Self {
+            backend,
+            parent_key: None,
+        }
+    }
+
+    /// Builder: attach the operator-rooted parent [`AgentKey`] the coder
+    /// will use to delegate per-spawn children for subprocess plugins
+    /// (issue #93).
+    ///
+    /// The acp-worker plumbs this in from
+    /// `WorkerIdentity::Operator { root }` via
+    /// [`WorkerIdentity::parent_key`]; the `AllowNoKey` debug fallback
+    /// leaves it `None`. When present, [`Self::plugin_envelope_for`]
+    /// can be called by future dispatch paths that need to spawn a
+    /// provider plugin without first synthesizing a key.
+    #[must_use]
+    pub fn with_parent_key(mut self, parent: Arc<AgentKey>) -> Self {
+        self.parent_key = Some(parent);
+        self
+    }
+
+    /// Borrow the parent [`AgentKey`], if one is configured. Tests use
+    /// this to assert the operator-rooted threading; future dispatch
+    /// paths that spawn provider plugins use it to delegate per-spawn
+    /// children.
+    #[must_use]
+    pub fn parent_key(&self) -> Option<&Arc<AgentKey>> {
+        self.parent_key.as_ref()
+    }
+
+    /// Mint a plugin-side envelope for a subprocess running under
+    /// `role` with `child_caveats`, by delegating from the coder's
+    /// operator-rooted parent key.
+    ///
+    /// Returns:
+    /// - `Some(Ok(envelope))` on the happy path — the envelope's cert
+    ///   chain roots back to the operator's `UserKey` (issue #93).
+    /// - `Some(Err(_))` if delegation refused (`child_caveats` would
+    ///   amplify the parent's authority, etc.).
+    /// - `None` when no parent key is configured (the
+    ///   `WorkerIdentity::AllowNoKey` debug path or a legacy test that
+    ///   didn't thread identity).
+    ///
+    /// The returned envelope is the same shape `newt-mesh`'s
+    /// `plugin_envelope::serialize_for_plugin` produces — base64'd JSON
+    /// of an `agent_mesh_protocol::CertChain` — so plugins decode it
+    /// identically.
+    pub fn plugin_envelope_for(
+        &self,
+        role: &str,
+        child_caveats: Caveats,
+    ) -> Option<std::result::Result<String, newt_identity::EnvelopeError>> {
+        let parent = self.parent_key.as_ref()?;
+        Some(newt_identity::delegate_for_plugin(
+            parent.as_ref(),
+            role,
+            child_caveats,
+        ))
     }
 
     /// Run one turn against `workspace` under the authority carried by

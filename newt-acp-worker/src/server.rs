@@ -468,7 +468,15 @@ impl AcpServer {
         session: &Session,
         prompt: &str,
     ) -> anyhow::Result<TaskReply> {
-        let coder = newt_coder::Coder::new(Arc::clone(&self.backend));
+        // #93: thread the operator-rooted parent key into the Coder so
+        // any subprocess plugin the dispatch spawns inherits a delegated
+        // child from the operator's UserKey, never a synthetic key.
+        // `AllowNoKey` leaves parent_key None — the debug fallback path
+        // doesn't have an operator key to root subprocess plugins at.
+        let mut coder = newt_coder::Coder::new(Arc::clone(&self.backend));
+        if let Some(parent) = self.identity.parent_key() {
+            coder = coder.with_parent_key(Arc::clone(parent));
+        }
         // #94: every Coder::run dispatch derives an attenuated,
         // signed Caveats from the worker's operator identity. The
         // legacy "pass top()" hard-code lived here until #94; it now
