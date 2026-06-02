@@ -1519,11 +1519,14 @@ name = "newt-core"
 version = "0.6.5"
 dependencies = [
  "agent-mesh-protocol",
+ "anyhow",
+ "async-trait",
  "pyo3",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
+ "tokio",
  "toml",
  "tracing",
  "uuid",

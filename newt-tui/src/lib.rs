@@ -881,11 +881,95 @@ fn run_chat(workspace: &str, color: bool) -> anyhow::Result<()> {
     let is_vi = build_rl_config().edit_mode() == rustyline::config::EditMode::Vi;
     let prompt = prompt_str(workspace, verbose, is_vi);
 
-    // Build system prompt with workspace context once at session start.
-    let system = build_system_prompt(workspace);
+    // system prompt is built AFTER initialize_all (see below) so soul files are loaded.
+    // Placeholder until then.
+    let system: String;
 
-    // Conversation history for multi-turn context.
-    let mut conv: Vec<(bool, String)> = Vec::new(); // (is_user, text)
+    // Pluggable memory manager — replaces the old conv Vec.
+    let mem_cfg = newt_core::Config::resolve()
+        .ok()
+        .and_then(|c| c.memory)
+        .unwrap_or_default();
+    let mut memory = {
+        let mut mgr = newt_core::MemoryManager::new();
+        // Soul provider first — sets the frozen identity block.
+        let soul_override = mem_cfg.soul_file.as_ref().map(std::path::PathBuf::from);
+        mgr.add_provider(newt_core::SoulProvider::new(soul_override));
+        // History provider based on config.
+        match mem_cfg.provider {
+            newt_core::MemoryProviderKind::TokenBudget => {
+                let max = mem_cfg.context_tokens.unwrap_or(8_192);
+                mgr.add_provider(newt_core::TokenBudget::new(max, 0.80));
+            }
+            newt_core::MemoryProviderKind::Summarizing => {
+                let max = mem_cfg.context_tokens.unwrap_or(8_192);
+                // Wire the summariser to call the current model via the ACP loop.
+                // The closure captures inf_url/inf_model at session start — model
+                // switches mid-session will update on next session restart.
+                let url = inf_url.clone();
+                let model = inf_model.clone();
+                let s = newt_core::Summarizing::new(max).with_summarizer(
+                    move |prompt: &str| -> anyhow::Result<String> {
+                        let body = serde_json::json!({
+                            "model": model,
+                            "messages": [{"role": "user", "content": prompt}],
+                            "stream": false,
+                        });
+                        let chat_url = format!("{}/api/chat", url.trim_end_matches('/'));
+                        // We're called from sync_turn inside block_in_place,
+                        // so we can use Handle::current().block_on here.
+                        let json: serde_json::Value = tokio::task::block_in_place(|| {
+                            tokio::runtime::Handle::current().block_on(async {
+                                let resp = reqwest::Client::builder()
+                                    .timeout(std::time::Duration::from_secs(60))
+                                    .build()?
+                                    .post(&chat_url)
+                                    .json(&body)
+                                    .send()
+                                    .await?;
+                                resp.json::<serde_json::Value>()
+                                    .await
+                                    .map_err(anyhow::Error::from)
+                            })
+                        })?;
+                        Ok(json["message"]["content"]
+                            .as_str()
+                            .unwrap_or("(summary unavailable)")
+                            .to_string())
+                    },
+                );
+                mgr.add_provider(s);
+            }
+            _ => {
+                mgr.add_provider(newt_core::RollingWindow::new(mem_cfg.window));
+            }
+        }
+        // NoteStore is always active — manages system-prompt injection only.
+        mgr.add_provider(newt_core::NoteStore::default_path());
+        mgr
+    };
+    let ctx = newt_core::SessionContext {
+        workspace: workspace.to_string(),
+        session_id: format!(
+            "{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0)
+        ),
+    };
+    tokio::task::block_in_place(|| rt.block_on(memory.initialize_all(&ctx)));
+
+    // Build system prompt now that SoulProvider has loaded its soul file.
+    {
+        let soul_additions = memory.build_system_prompt_additions();
+        let soul_text = if soul_additions.is_empty() {
+            None
+        } else {
+            Some(soul_additions.as_str())
+        };
+        system = build_system_prompt_with_soul(workspace, soul_text);
+    }
 
     loop {
         match rl.readline(&prompt) {
@@ -897,6 +981,33 @@ fn run_chat(workspace: &str, color: bool) -> anyhow::Result<()> {
                 let _ = rl.add_history_entry(&task);
                 println!();
                 if task.starts_with('/') {
+                    // Commands that need direct access to `memory` are handled here
+                    // before delegating to the generic slash dispatcher.
+                    if task.trim_start_matches('/').starts_with("memory") {
+                        let usage = memory.usage();
+                        if usage.is_empty() {
+                            print_newt("No memory usage data available.", color, verbose);
+                        } else {
+                            print_newt("Context window usage:", color, verbose);
+                            for (label, cur, max) in &usage {
+                                let pct = if *max > 0 { cur * 100 / max } else { 0 };
+                                println!("  {label}: {cur}/{max}  ({pct}%)");
+                            }
+                        }
+                        println!();
+                        continue;
+                    }
+                    if let Some(fact) = task.trim_start_matches('/').strip_prefix("remember ") {
+                        // Find NoteStore in the manager and add the fact.
+                        // We reach it via a best-effort downcast approach using a
+                        // dedicated add_note helper on MemoryManager.
+                        match memory.add_note(fact) {
+                            Ok(()) => print_newt(&format!("Noted: {fact}"), color, verbose),
+                            Err(e) => print_newt(&format!("error: {e}"), color, verbose),
+                        }
+                        println!();
+                        continue;
+                    }
                     let cont = dispatch_slash(&task, workspace, color, verbose)?;
                     if let Some(ref hp) = history_path {
                         let _ = rl.save_history(hp);
@@ -926,12 +1037,13 @@ fn run_chat(workspace: &str, color: bool) -> anyhow::Result<()> {
                     print_thinking(color);
                     let t0 = std::time::Instant::now();
 
+                    // Build message list from memory manager.
+                    let messages = memory.build_messages(&system, &task);
                     let response = tokio::task::block_in_place(|| {
                         rt.block_on(chat_complete(ChatCtx {
                             url: &inf_url,
                             model: &inf_model,
-                            system: &system,
-                            history: &conv,
+                            messages: &messages,
                             task: &task,
                             workspace,
                             color,
@@ -943,12 +1055,10 @@ fn run_chat(workspace: &str, color: bool) -> anyhow::Result<()> {
                     erase_line();
                     match response {
                         Ok((reply, was_streamed, usage)) => {
-                            conv.push((true, task.clone()));
-                            conv.push((false, reply.clone()));
                             if !was_streamed {
                                 print_newt(&reply, color, verbose);
                             }
-                            // Build and display telemetry.
+                            // Single TurnMetrics used for both memory sync and display.
                             let pricing = newt_core::Config::resolve()
                                 .ok()
                                 .and_then(|c| c.pricing)
@@ -960,6 +1070,9 @@ fn run_chat(workspace: &str, color: bool) -> anyhow::Result<()> {
                                 model_id: inf_model.clone(),
                                 endpoint: inf_url.clone(),
                             };
+                            tokio::task::block_in_place(|| {
+                                rt.block_on(memory.sync_all(&task, &reply, &metrics));
+                            });
                             print_metrics(&metrics, color);
                             // Append to usage log (best-effort).
                             if let Some(log) = newt_core::Config::user_config_path()
@@ -1020,14 +1133,20 @@ fn resolve_backend_config() -> (String, String) {
 }
 
 /// Build a system prompt with workspace context so the model knows the project.
+// build_system_prompt_with_soul is used directly now; this wrapper kept for tests.
+#[allow(dead_code)]
 fn build_system_prompt(workspace: &str) -> String {
-    let mut ctx = format!(
+    build_system_prompt_with_soul(workspace, None)
+}
+
+fn build_system_prompt_with_soul(workspace: &str, soul: Option<&str>) -> String {
+    let identity = soul.unwrap_or(
         "You are newt, a small, fast, local-first agentic coder. \
          Be concise and direct. \
          You have tools: run_command, read_file, write_file, list_dir. \
-         Use them to actually complete tasks rather than describing what to do.\n\n\
-         Workspace: {workspace}\n"
+         Use them to actually complete tasks rather than describing what to do.",
     );
+    let mut ctx = format!("{identity}\n\nWorkspace: {workspace}\n");
 
     // Directory listing (top-level, no hidden files)
     if let Ok(mut entries) = std::fs::read_dir(workspace) {
@@ -1384,8 +1503,8 @@ fn execute_tool(
 struct ChatCtx<'a> {
     url: &'a str,
     model: &'a str,
-    system: &'a str,
-    history: &'a [(bool, String)],
+    /// Full message list already assembled by `MemoryManager::build_messages`.
+    messages: &'a [newt_core::MemMessage],
     task: &'a str,
     workspace: &'a str,
     color: bool,
@@ -1401,9 +1520,8 @@ async fn chat_complete(
     let ChatCtx {
         url,
         model,
-        system,
-        history,
-        task,
+        messages: mem_messages,
+        task: _task,
         workspace,
         color,
         caveats,
@@ -1413,16 +1531,12 @@ async fn chat_complete(
         .build()?;
     let chat_url = format!("{}/api/chat", url.trim_end_matches('/'));
 
-    // Build message list.
-    let mut messages: Vec<serde_json::Value> =
-        vec![serde_json::json!({"role": "system", "content": system})];
-    for (is_user, text) in history {
-        messages.push(serde_json::json!({
-            "role": if *is_user { "user" } else { "assistant" },
-            "content": text
-        }));
-    }
-    messages.push(serde_json::json!({"role": "user", "content": task}));
+    // Convert MemMessage list to Ollama JSON format.
+    // The memory manager already included the current task as the last user message.
+    let mut messages: Vec<serde_json::Value> = mem_messages
+        .iter()
+        .map(|m| serde_json::json!({"role": m.role.as_str(), "content": m.content}))
+        .collect();
 
     // Agentic loop — up to 10 tool-call rounds.
     for round in 0..10 {
@@ -1633,6 +1747,10 @@ fn dispatch_slash(
         "help" => {
             print_newt("Available commands:", color, verbose);
             for line in [
+                "  /models                  — list models on the active endpoint",
+                "  /model <name>            — switch model for this session",
+                "  /memory                  — show context window / notes usage",
+                "  /remember <fact>         — add a fact to persistent NOTES.md",
                 "  /dgx status              — DGX endpoint health + running models",
                 "  /dgx models              — list models installed on the DGX",
                 "  /dgx warm [model]        — pre-load a model into VRAM",
