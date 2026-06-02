@@ -43,6 +43,49 @@ pub struct Config {
     /// Inference cost modeling. `None` → built-in rate table only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pricing: Option<crate::pricing::PricingConfig>,
+
+    /// Memory / context-window management. `None` → RollingWindow(20).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<MemoryConfig>,
+}
+
+// ---------------------------------------------------------------------------
+// Memory config
+// ---------------------------------------------------------------------------
+
+/// Memory management stored under `[memory]` in `newt.toml`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MemoryConfig {
+    /// Which memory provider to activate.
+    #[serde(default)]
+    pub provider: MemoryProviderKind,
+    /// Turns retained by `RollingWindow`. Default: 20.
+    #[serde(default = "default_memory_window")]
+    pub window: usize,
+}
+
+fn default_memory_window() -> usize {
+    20
+}
+
+impl Default for MemoryConfig {
+    fn default() -> Self {
+        Self {
+            provider: MemoryProviderKind::RollingWindow,
+            window: 20,
+        }
+    }
+}
+
+/// Which built-in memory strategy to use.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryProviderKind {
+    #[default]
+    RollingWindow,
+    TokenBudget,
+    Summarizing,
 }
 
 // ---------------------------------------------------------------------------
@@ -376,6 +419,7 @@ impl Default for Config {
             dgx: None,
             tui: None,
             pricing: None,
+            memory: None,
         }
     }
 }

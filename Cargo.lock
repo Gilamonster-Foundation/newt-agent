@@ -16,7 +16,7 @@ dependencies = [
  "serde_bytes",
  "serde_json",
  "ssh-key",
- "thiserror",
+ "thiserror 2.0.18",
  "tracing",
  "zeroize",
 ]
@@ -1512,11 +1512,14 @@ dependencies = [
 name = "newt-core"
 version = "0.6.4"
 dependencies = [
+ "anyhow",
+ "async-trait",
  "pyo3",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
+ "tokio",
  "toml",
  "tracing",
  "uuid",
@@ -1556,7 +1559,7 @@ dependencies = [
  "newt-core",
  "serde_json",
  "tempfile",
- "thiserror",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

@@ -791,8 +791,28 @@ fn run_chat(workspace: &str, color: bool) -> anyhow::Result<()> {
     // Build system prompt with workspace context once at session start.
     let system = build_system_prompt(workspace);
 
-    // Conversation history for multi-turn context.
-    let mut conv: Vec<(bool, String)> = Vec::new(); // (is_user, text)
+    // Pluggable memory manager — replaces the old conv Vec.
+    let window = newt_core::Config::resolve()
+        .ok()
+        .and_then(|c| c.memory)
+        .map(|m| m.window)
+        .unwrap_or(20);
+    let mut memory = {
+        let mut mgr = newt_core::MemoryManager::new();
+        mgr.add_provider(newt_core::RollingWindow::new(window));
+        mgr
+    };
+    let ctx = newt_core::SessionContext {
+        workspace: workspace.to_string(),
+        session_id: format!(
+            "{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0)
+        ),
+    };
+    tokio::task::block_in_place(|| rt.block_on(memory.initialize_all(&ctx)));
 
     loop {
         match rl.readline(&prompt) {
@@ -833,12 +853,13 @@ fn run_chat(workspace: &str, color: bool) -> anyhow::Result<()> {
                     print_thinking(color);
                     let t0 = std::time::Instant::now();
 
+                    // Build message list from memory manager.
+                    let messages = memory.build_messages(&system, &task);
                     let response = tokio::task::block_in_place(|| {
                         rt.block_on(chat_complete(ChatCtx {
                             url: &inf_url,
                             model: &inf_model,
-                            system: &system,
-                            history: &conv,
+                            messages: &messages,
                             task: &task,
                             workspace,
                             color,
@@ -850,12 +871,10 @@ fn run_chat(workspace: &str, color: bool) -> anyhow::Result<()> {
                     erase_line();
                     match response {
                         Ok((reply, was_streamed, usage)) => {
-                            conv.push((true, task.clone()));
-                            conv.push((false, reply.clone()));
                             if !was_streamed {
                                 print_newt(&reply, color, verbose);
                             }
-                            // Build and display telemetry.
+                            // Single TurnMetrics used for both memory sync and display.
                             let pricing = newt_core::Config::resolve()
                                 .ok()
                                 .and_then(|c| c.pricing)
@@ -867,6 +886,9 @@ fn run_chat(workspace: &str, color: bool) -> anyhow::Result<()> {
                                 model_id: inf_model.clone(),
                                 endpoint: inf_url.clone(),
                             };
+                            tokio::task::block_in_place(|| {
+                                rt.block_on(memory.sync_all(&task, &reply, &metrics))
+                            });
                             print_metrics(&metrics, color);
                             // Append to usage log (best-effort).
                             if let Some(log) = newt_core::Config::user_config_path()
@@ -1291,8 +1313,8 @@ fn execute_tool(
 struct ChatCtx<'a> {
     url: &'a str,
     model: &'a str,
-    system: &'a str,
-    history: &'a [(bool, String)],
+    /// Full message list already assembled by `MemoryManager::build_messages`.
+    messages: &'a [newt_core::MemMessage],
     task: &'a str,
     workspace: &'a str,
     color: bool,
@@ -1308,8 +1330,7 @@ async fn chat_complete(
     let ChatCtx {
         url,
         model,
-        system,
-        history,
+        messages: mem_messages,
         task,
         workspace,
         color,
@@ -1320,16 +1341,12 @@ async fn chat_complete(
         .build()?;
     let chat_url = format!("{}/api/chat", url.trim_end_matches('/'));
 
-    // Build message list.
-    let mut messages: Vec<serde_json::Value> =
-        vec![serde_json::json!({"role": "system", "content": system})];
-    for (is_user, text) in history {
-        messages.push(serde_json::json!({
-            "role": if *is_user { "user" } else { "assistant" },
-            "content": text
-        }));
-    }
-    messages.push(serde_json::json!({"role": "user", "content": task}));
+    // Convert MemMessage list to Ollama JSON format.
+    // The memory manager already included the current task as the last user message.
+    let mut messages: Vec<serde_json::Value> = mem_messages
+        .iter()
+        .map(|m| serde_json::json!({"role": m.role.as_str(), "content": m.content}))
+        .collect();
 
     // Agentic loop — up to 10 tool-call rounds.
     for round in 0..10 {
