@@ -1319,34 +1319,18 @@ fn print_tool_output(output: &str, color: bool) {
     }
 
     if hidden > 0 {
-        // Offer to expand inline rather than dumping everything automatically.
+        // Just print the count and keep going — no blocking prompt.
+        // The user can scroll back; the model always gets the full content.
         if color {
             execute!(
                 io::stdout(),
                 SetForegroundColor(CtColor::DarkGrey),
-                Print(format!("  … ({hidden} more lines)  show all? [y/N] ")),
+                Print(format!("  … ({hidden} more lines hidden)\n")),
                 ResetColor,
             )
             .ok();
         } else {
-            print!("  … ({hidden} more lines)  show all? [y/N] ");
-        }
-        io::stdout().flush().ok();
-
-        let mut ans = String::new();
-        if std::io::stdin().read_line(&mut ans).is_ok() && ans.trim().eq_ignore_ascii_case("y") {
-            let rest = lines[shown..].join("\n");
-            if color {
-                execute!(
-                    io::stdout(),
-                    SetForegroundColor(CtColor::DarkGrey),
-                    Print(format!("{rest}\n")),
-                    ResetColor,
-                )
-                .ok();
-            } else {
-                println!("{rest}");
-            }
+            println!("  … ({hidden} more lines hidden)");
         }
     }
     io::stdout().flush().ok();
@@ -1768,6 +1752,59 @@ fn dispatch_slash(
 
         "workspace" => print_newt(workspace, color, verbose),
 
+        "models" => {
+            // List models on the active endpoint, highlighting the current one.
+            let (url, current) = resolve_backend_config();
+            match fetch_models_from_url(&url) {
+                Ok(names) if names.is_empty() => {
+                    print_newt(&format!("No models found on {url}"), color, verbose);
+                }
+                Ok(names) => {
+                    print_newt(&format!("Models on {url}:"), color, verbose);
+                    for name in &names {
+                        if *name == current {
+                            if color {
+                                execute!(
+                                    io::stdout(),
+                                    Print(format!("  {name}")),
+                                    SetForegroundColor(NEWT_ORANGE_CT),
+                                    Print(" ◀ active"),
+                                    ResetColor,
+                                    Print("\n"),
+                                )
+                                .ok();
+                            } else {
+                                println!("  {name} ◀ active");
+                            }
+                        } else {
+                            println!("  {name}");
+                        }
+                    }
+                }
+                Err(e) => print_newt(&format!("error: {e}"), color, verbose),
+            }
+        }
+
+        "model" => {
+            if arg1.is_empty() {
+                let (_, current) = resolve_backend_config();
+                print_newt(
+                    &format!("active model: {current}  (use /model <name> to switch)"),
+                    color,
+                    verbose,
+                );
+            } else {
+                // Persist via `newt dgx use <model>` then resolve_backend_config
+                // picks it up automatically on the next turn.
+                run_newt_subcmd(&["dgx", "use", arg1], color, verbose)?;
+                print_newt(
+                    &format!("Switched to {arg1} — takes effect on next message."),
+                    color,
+                    verbose,
+                );
+            }
+        }
+
         "dgx" => {
             if arg1.is_empty() {
                 print_newt(
@@ -1791,6 +1828,60 @@ fn dispatch_slash(
         ),
     }
     Ok(true)
+}
+
+/// Fetch model names from an Ollama endpoint's `/api/tags`.
+fn fetch_models_from_url(url: &str) -> anyhow::Result<Vec<String>> {
+    let tags_url = format!("{}/api/tags", url.trim_end_matches('/'));
+    let json: serde_json::Value = tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(async {
+            let resp = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(5))
+                .build()?
+                .get(&tags_url)
+                .send()
+                .await?;
+            if !resp.status().is_success() {
+                anyhow::bail!("HTTP {}", resp.status());
+            }
+            resp.json::<serde_json::Value>().await.map_err(Into::into)
+        })
+    })?;
+    Ok(parse_model_names(&json))
+}
+
+/// Extract model names from an Ollama `/api/tags` JSON body. Tolerant of a
+/// missing / non-array `models` field (returns empty) and of entries without a
+/// string `name`.
+fn parse_model_names(json: &serde_json::Value) -> Vec<String> {
+    json["models"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|m| m["name"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod model_list_tests {
+    use super::parse_model_names;
+    use serde_json::json;
+
+    #[test]
+    fn parses_names_and_tolerates_shape() {
+        let names = parse_model_names(&json!({
+            "models": [{"name": "llama3.1:8b"}, {"name": "gemma4:e2b"}, {"size": 1}]
+        }));
+        assert_eq!(
+            names,
+            vec!["llama3.1:8b".to_string(), "gemma4:e2b".to_string()]
+        );
+        // Missing or non-array `models` → empty, never a panic.
+        assert!(parse_model_names(&json!({})).is_empty());
+        assert!(parse_model_names(&json!({ "models": "nope" })).is_empty());
+    }
 }
 
 /// Run `newt <args>` as a subprocess using the current executable path so
