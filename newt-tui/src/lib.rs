@@ -862,7 +862,10 @@ fn run_chat(workspace: &str, color: bool) -> anyhow::Result<()> {
 
     // Resolve the inference backend and permission caveats once at session
     // start.  Both are re-read after each slash command (config.toml on disk).
-    let (mut inf_url, mut inf_model) = resolve_backend_config();
+    let mut choice = resolve_backend_choice();
+    let (mut inf_url, mut inf_model) = (choice.url.clone(), choice.model.clone());
+    let mut inf_kind = choice.kind;
+    let mut inf_key = choice.api_key.clone();
     let key_path = newt_identity::default_key_path().ok();
     let mut cap = SessionCapability::establish(resolve_tui(), key_path.as_deref(), workspace);
     print_newt(
@@ -907,34 +910,48 @@ fn run_chat(workspace: &str, color: bool) -> anyhow::Result<()> {
                 // switches mid-session will update on next session restart.
                 let url = inf_url.clone();
                 let model = inf_model.clone();
+                let kind = inf_kind;
+                let api_key = inf_key.clone();
                 let s = newt_core::Summarizing::new(max).with_summarizer(
                     move |prompt: &str| -> anyhow::Result<String> {
+                        let openai = kind == newt_core::BackendKind::Openai;
+                        // OpenAI-compatible and Ollama use different paths and
+                        // response shapes; pick per backend kind.
+                        let chat_url = if openai {
+                            format!("{}/v1/chat/completions", url.trim_end_matches('/'))
+                        } else {
+                            format!("{}/api/chat", url.trim_end_matches('/'))
+                        };
                         let body = serde_json::json!({
                             "model": model,
                             "messages": [{"role": "user", "content": prompt}],
                             "stream": false,
                         });
-                        let chat_url = format!("{}/api/chat", url.trim_end_matches('/'));
+                        let api_key = api_key.clone();
                         // We're called from sync_turn inside block_in_place,
                         // so we can use Handle::current().block_on here.
                         let json: serde_json::Value = tokio::task::block_in_place(|| {
                             tokio::runtime::Handle::current().block_on(async {
-                                let resp = reqwest::Client::builder()
+                                let mut req = reqwest::Client::builder()
                                     .timeout(std::time::Duration::from_secs(60))
                                     .build()?
                                     .post(&chat_url)
-                                    .json(&body)
-                                    .send()
-                                    .await?;
+                                    .json(&body);
+                                if let Some(key) = api_key {
+                                    req = req.bearer_auth(key);
+                                }
+                                let resp = req.send().await?;
                                 resp.json::<serde_json::Value>()
                                     .await
                                     .map_err(anyhow::Error::from)
                             })
                         })?;
-                        Ok(json["message"]["content"]
-                            .as_str()
-                            .unwrap_or("(summary unavailable)")
-                            .to_string())
+                        let content = if openai {
+                            json["choices"][0]["message"]["content"].as_str()
+                        } else {
+                            json["message"]["content"].as_str()
+                        };
+                        Ok(content.unwrap_or("(summary unavailable)").to_string())
                     },
                 );
                 mgr.add_provider(s);
@@ -1014,7 +1031,11 @@ fn run_chat(workspace: &str, color: bool) -> anyhow::Result<()> {
                     // Re-read config after a slash command (config.toml may have changed).
                     // Permissions can only NARROW within a session; a widening
                     // request is clamped (restart to widen — see SessionCapability).
-                    (inf_url, inf_model) = resolve_backend_config();
+                    choice = resolve_backend_choice();
+                    inf_url = choice.url.clone();
+                    inf_model = choice.model.clone();
+                    inf_kind = choice.kind;
+                    inf_key = choice.api_key.clone();
                     if cap.reapply(resolve_tui(), workspace) {
                         print_newt(
                             "permissions can only narrow within a session — restart newt to widen",
@@ -1042,6 +1063,8 @@ fn run_chat(workspace: &str, color: bool) -> anyhow::Result<()> {
                         rt.block_on(chat_complete(ChatCtx {
                             url: &inf_url,
                             model: &inf_model,
+                            kind: inf_kind,
+                            api_key: inf_key.as_deref(),
                             messages: &messages,
                             task: &task,
                             workspace,
@@ -1129,6 +1152,44 @@ fn resolve_backend_config() -> (String, String) {
         .unwrap_or_else(|| "llama3.1:8b".into());
 
     (url, model)
+}
+
+/// The inference backend the TUI session should talk to: endpoint, model,
+/// wire protocol, and (for authenticated OpenAI-compatible endpoints) the
+/// resolved bearer token.
+struct BackendChoice {
+    url: String,
+    model: String,
+    kind: newt_core::BackendKind,
+    api_key: Option<String>,
+}
+
+/// Resolve the backend for the TUI. An explicit `kind = "openai"` backend in
+/// the config (`~/.newt/config.toml`) wins — endpoint/model/auth come straight
+/// from it. Otherwise we fall back to the historical Ollama/DGX resolution
+/// ([`resolve_backend_config`]), which the rest of the TUI already understands.
+fn resolve_backend_choice() -> BackendChoice {
+    if let Ok(cfg) = newt_core::Config::resolve() {
+        if let Some(b) = cfg
+            .backends
+            .iter()
+            .find(|b| b.kind == newt_core::BackendKind::Openai)
+        {
+            return BackendChoice {
+                url: b.endpoint.clone(),
+                model: b.model.clone(),
+                kind: newt_core::BackendKind::Openai,
+                api_key: b.resolve_api_key(),
+            };
+        }
+    }
+    let (url, model) = resolve_backend_config();
+    BackendChoice {
+        url,
+        model,
+        kind: newt_core::BackendKind::Ollama,
+        api_key: None,
+    }
 }
 
 /// Build a system prompt with workspace context so the model knows the project.
@@ -1486,6 +1547,10 @@ fn execute_tool(
 struct ChatCtx<'a> {
     url: &'a str,
     model: &'a str,
+    /// Wire protocol of the active backend (Ollama vs OpenAI-compatible).
+    kind: newt_core::BackendKind,
+    /// Bearer token for authenticated OpenAI-compatible endpoints.
+    api_key: Option<&'a str>,
     /// Full message list already assembled by `MemoryManager::build_messages`.
     messages: &'a [newt_core::MemMessage],
     task: &'a str,
@@ -1500,9 +1565,16 @@ struct ChatCtx<'a> {
 async fn chat_complete(
     ctx: ChatCtx<'_>,
 ) -> anyhow::Result<(String, bool, Option<newt_core::TokenUsage>)> {
+    // OpenAI-compatible endpoints speak a different wire format (request,
+    // tool_calls, and usage shapes all differ), so they get their own loop.
+    if ctx.kind == newt_core::BackendKind::Openai {
+        return openai_chat_complete(ctx).await;
+    }
     let ChatCtx {
         url,
         model,
+        kind: _,
+        api_key: _,
         messages: mem_messages,
         task: _task,
         workspace,
@@ -1609,6 +1681,116 @@ async fn chat_complete(
     }
 
     Ok(("(reached tool-call limit)".into(), false, None))
+}
+
+/// OpenAI-compatible variant of [`chat_complete`]: the same agentic tool-call
+/// loop, but over `POST {endpoint}/v1/chat/completions` with bearer auth and
+/// the OpenAI `tool_calls` / `tool_call_id` / `usage` shapes.
+///
+/// Non-streaming for now — the final answer is returned (and printed by the
+/// caller) rather than streamed token-by-token. Token-by-token SSE streaming
+/// is a follow-up; functionally the loop is complete, including tools.
+async fn openai_chat_complete(
+    ctx: ChatCtx<'_>,
+) -> anyhow::Result<(String, bool, Option<newt_core::TokenUsage>)> {
+    let ChatCtx {
+        url,
+        model,
+        kind: _,
+        api_key,
+        messages: mem_messages,
+        task: _task,
+        workspace,
+        color,
+        caveats,
+    } = ctx;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .build()?;
+    let chat_url = format!("{}/v1/chat/completions", url.trim_end_matches('/'));
+
+    let mut messages: Vec<serde_json::Value> = mem_messages
+        .iter()
+        .map(|m| serde_json::json!({"role": m.role.as_str(), "content": m.content}))
+        .collect();
+
+    // Agentic loop — up to 10 tool-call rounds (matches the Ollama path).
+    for round in 0..10 {
+        if round > 0 && color {
+            execute!(
+                io::stdout(),
+                SetForegroundColor(CtColor::DarkGrey),
+                Print("…\n"),
+                ResetColor
+            )
+            .ok();
+        }
+
+        let body = serde_json::json!({
+            "model": model,
+            "messages": messages,
+            "tools": tool_definitions(),
+            "tool_choice": "auto",
+            "stream": false,
+        });
+        let mut req = client.post(&chat_url).json(&body);
+        if let Some(key) = api_key {
+            req = req.bearer_auth(key);
+        }
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("request failed: {e}"))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("inference endpoint {status}: {text}");
+        }
+
+        let json: serde_json::Value = resp.json().await?;
+        let message = &json["choices"][0]["message"];
+
+        let tool_calls = message["tool_calls"].as_array();
+        let has_tools = tool_calls.map(|tc| !tc.is_empty()).unwrap_or(false);
+
+        if !has_tools {
+            let content = message["content"].as_str().unwrap_or("").to_string();
+            return Ok((content, false, openai_usage(&json["usage"])));
+        }
+
+        // Record the assistant turn verbatim (it carries the tool_calls), then
+        // run each call and feed the result back keyed by its tool_call_id.
+        messages.push(message.clone());
+        for tc in tool_calls.unwrap() {
+            let id = tc["id"].as_str().unwrap_or("");
+            let name = tc["function"]["name"].as_str().unwrap_or("unknown");
+            let args = match &tc["function"]["arguments"] {
+                serde_json::Value::String(s) => {
+                    serde_json::from_str(s).unwrap_or(serde_json::Value::Null)
+                }
+                v => v.clone(),
+            };
+            let result = execute_tool(name, &args, workspace, color, caveats);
+            messages.push(serde_json::json!({
+                "role": "tool",
+                "tool_call_id": id,
+                "content": result,
+            }));
+        }
+    }
+
+    Ok(("(reached tool-call limit)".into(), false, None))
+}
+
+/// Parse an OpenAI `usage` object (`prompt_tokens` / `completion_tokens`).
+fn openai_usage(usage: &serde_json::Value) -> Option<newt_core::TokenUsage> {
+    let input = usage["prompt_tokens"].as_u64()? as u32;
+    let output = usage["completion_tokens"].as_u64()? as u32;
+    Some(newt_core::TokenUsage {
+        input_tokens: input,
+        output_tokens: output,
+    })
 }
 
 /// Stream an Ollama NDJSON response, printing tokens as they arrive.
@@ -1754,8 +1936,15 @@ fn dispatch_slash(
 
         "models" => {
             // List models on the active endpoint, highlighting the current one.
-            let (url, current) = resolve_backend_config();
-            match fetch_models_from_url(&url) {
+            let choice = resolve_backend_choice();
+            let url = choice.url;
+            let current = choice.model;
+            let fetched = if choice.kind == newt_core::BackendKind::Openai {
+                fetch_openai_models(&url, choice.api_key.as_deref())
+            } else {
+                fetch_models_from_url(&url)
+            };
+            match fetched {
                 Ok(names) if names.is_empty() => {
                     print_newt(&format!("No models found on {url}"), color, verbose);
                 }
@@ -1787,7 +1976,7 @@ fn dispatch_slash(
 
         "model" => {
             if arg1.is_empty() {
-                let (_, current) = resolve_backend_config();
+                let current = resolve_backend_choice().model;
                 print_newt(
                     &format!("active model: {current}  (use /model <name> to switch)"),
                     color,
@@ -1850,6 +2039,42 @@ fn fetch_models_from_url(url: &str) -> anyhow::Result<Vec<String>> {
     Ok(parse_model_names(&json))
 }
 
+/// Fetch model ids from an OpenAI-compatible endpoint's `/v1/models`, with
+/// optional bearer auth.
+fn fetch_openai_models(url: &str, api_key: Option<&str>) -> anyhow::Result<Vec<String>> {
+    let models_url = format!("{}/v1/models", url.trim_end_matches('/'));
+    let api_key = api_key.map(str::to_string);
+    let json: serde_json::Value = tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(async {
+            let mut req = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()?
+                .get(&models_url);
+            if let Some(key) = api_key {
+                req = req.bearer_auth(key);
+            }
+            let resp = req.send().await?;
+            if !resp.status().is_success() {
+                anyhow::bail!("HTTP {}", resp.status());
+            }
+            resp.json::<serde_json::Value>().await.map_err(Into::into)
+        })
+    })?;
+    Ok(parse_openai_model_ids(&json))
+}
+
+/// Extract model ids from an OpenAI `/v1/models` body (`data[].id`).
+fn parse_openai_model_ids(json: &serde_json::Value) -> Vec<String> {
+    json["data"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|m| m["id"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Extract model names from an Ollama `/api/tags` JSON body. Tolerant of a
 /// missing / non-array `models` field (returns empty) and of entries without a
 /// string `name`.
@@ -1881,6 +2106,28 @@ mod model_list_tests {
         // Missing or non-array `models` → empty, never a panic.
         assert!(parse_model_names(&json!({})).is_empty());
         assert!(parse_model_names(&json!({ "models": "nope" })).is_empty());
+    }
+
+    #[test]
+    fn parses_openai_model_ids_and_tolerates_shape() {
+        use super::parse_openai_model_ids;
+        let ids = parse_openai_model_ids(&json!({
+            "data": [{"id": "gpt-5", "object": "model"}, {"id": "claude"}, {"object": "x"}]
+        }));
+        assert_eq!(ids, vec!["gpt-5".to_string(), "claude".to_string()]);
+        assert!(parse_openai_model_ids(&json!({})).is_empty());
+        assert!(parse_openai_model_ids(&json!({ "data": 5 })).is_empty());
+    }
+
+    #[test]
+    fn openai_usage_parses_or_none() {
+        use super::openai_usage;
+        let u = openai_usage(&json!({"prompt_tokens": 12, "completion_tokens": 34})).unwrap();
+        assert_eq!(u.input_tokens, 12);
+        assert_eq!(u.output_tokens, 34);
+        // Missing either field → None (no partial/garbage usage).
+        assert!(openai_usage(&json!({"prompt_tokens": 12})).is_none());
+        assert!(openai_usage(&json!({})).is_none());
     }
 }
 
