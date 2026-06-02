@@ -25,7 +25,10 @@ pub use config::{
 };
 pub use dgx::{DgxConfig, DgxFormation, DgxNode, DgxNotConfigured, EndpointKind};
 pub use error::NewtError;
-pub use memory::{MemMessage, MemoryManager, MemoryProvider, Role, RollingWindow, SessionContext};
+pub use memory::{
+    MemMessage, MemoryManager, MemoryProvider, NoteStore, Role, RollingWindow, SessionContext,
+    TokenBudget,
+};
 pub use metrics::{TokenUsage, TurnMetrics};
 pub use model_id::ModelId;
 pub use pricing::{ModelRate, PricingConfig};

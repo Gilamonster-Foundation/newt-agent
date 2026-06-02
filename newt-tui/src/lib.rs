@@ -792,14 +792,24 @@ fn run_chat(workspace: &str, color: bool) -> anyhow::Result<()> {
     let system = build_system_prompt(workspace);
 
     // Pluggable memory manager — replaces the old conv Vec.
-    let window = newt_core::Config::resolve()
+    let mem_cfg = newt_core::Config::resolve()
         .ok()
         .and_then(|c| c.memory)
-        .map(|m| m.window)
-        .unwrap_or(20);
+        .unwrap_or_default();
     let mut memory = {
         let mut mgr = newt_core::MemoryManager::new();
-        mgr.add_provider(newt_core::RollingWindow::new(window));
+        // History provider based on config.
+        match mem_cfg.provider {
+            newt_core::MemoryProviderKind::TokenBudget => {
+                let max = mem_cfg.context_tokens.unwrap_or(8_192);
+                mgr.add_provider(newt_core::TokenBudget::new(max, 0.80));
+            }
+            _ => {
+                mgr.add_provider(newt_core::RollingWindow::new(mem_cfg.window));
+            }
+        }
+        // NoteStore is always active — manages system-prompt injection only.
+        mgr.add_provider(newt_core::NoteStore::default_path());
         mgr
     };
     let ctx = newt_core::SessionContext {
@@ -824,6 +834,33 @@ fn run_chat(workspace: &str, color: bool) -> anyhow::Result<()> {
                 let _ = rl.add_history_entry(&task);
                 println!();
                 if task.starts_with('/') {
+                    // Commands that need direct access to `memory` are handled here
+                    // before delegating to the generic slash dispatcher.
+                    if task.trim_start_matches('/').starts_with("memory") {
+                        let usage = memory.usage();
+                        if usage.is_empty() {
+                            print_newt("No memory usage data available.", color, verbose);
+                        } else {
+                            print_newt("Context window usage:", color, verbose);
+                            for (label, cur, max) in &usage {
+                                let pct = if *max > 0 { cur * 100 / max } else { 0 };
+                                println!("  {label}: {cur}/{max}  ({pct}%)");
+                            }
+                        }
+                        println!();
+                        continue;
+                    }
+                    if let Some(fact) = task.trim_start_matches('/').strip_prefix("remember ") {
+                        // Find NoteStore in the manager and add the fact.
+                        // We reach it via a best-effort downcast approach using a
+                        // dedicated add_note helper on MemoryManager.
+                        match memory.add_note(fact) {
+                            Ok(()) => print_newt(&format!("Noted: {fact}"), color, verbose),
+                            Err(e) => print_newt(&format!("error: {e}"), color, verbose),
+                        }
+                        println!();
+                        continue;
+                    }
                     let cont = dispatch_slash(&task, workspace, color, verbose)?;
                     if let Some(ref hp) = history_path {
                         let _ = rl.save_history(hp);
@@ -1557,6 +1594,10 @@ fn dispatch_slash(
         "help" => {
             print_newt("Available commands:", color, verbose);
             for line in [
+                "  /models                  — list models on the active endpoint",
+                "  /model <name>            — switch model for this session",
+                "  /memory                  — show context window / notes usage",
+                "  /remember <fact>         — add a fact to persistent NOTES.md",
                 "  /dgx status              — DGX endpoint health + running models",
                 "  /dgx models              — list models installed on the DGX",
                 "  /dgx warm [model]        — pre-load a model into VRAM",

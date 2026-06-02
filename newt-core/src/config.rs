@@ -63,6 +63,10 @@ pub struct MemoryConfig {
     /// Turns retained by `RollingWindow`. Default: 20.
     #[serde(default = "default_memory_window")]
     pub window: usize,
+    /// Model context length for `TokenBudget` (overrides Ollama's reported value).
+    /// Default: 8192.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_tokens: Option<u32>,
 }
 
 fn default_memory_window() -> usize {
@@ -74,6 +78,7 @@ impl Default for MemoryConfig {
         Self {
             provider: MemoryProviderKind::RollingWindow,
             window: 20,
+            context_tokens: None,
         }
     }
 }
