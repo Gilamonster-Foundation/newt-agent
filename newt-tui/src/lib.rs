@@ -1540,6 +1540,8 @@ fn dispatch_slash(
         "help" => {
             print_newt("Available commands:", color, verbose);
             for line in [
+                "  /models                  — list models on the active endpoint",
+                "  /model <name>            — switch model for this session",
                 "  /dgx status              — DGX endpoint health + running models",
                 "  /dgx models              — list models installed on the DGX",
                 "  /dgx warm [model]        — pre-load a model into VRAM",
@@ -1558,6 +1560,36 @@ fn dispatch_slash(
         "version" => print_newt(&format!("v{VERSION}"), color, verbose),
 
         "workspace" => print_newt(workspace, color, verbose),
+
+        "models" => {
+            // List models on the active endpoint, highlighting the current one.
+            let (url, current) = resolve_backend_config();
+            match fetch_models_from_url(&url) {
+                Ok(names) if names.is_empty() => {
+                    print_newt(&format!("No models found on {url}"), color, verbose)
+                }
+                Ok(names) => {
+                    print_newt(&format!("Models on {url}:"), color, verbose);
+                    for name in &names {
+                        let marker = if *name == current { " ◀ active" } else { "" };
+                        println!("  {name}{marker}");
+                    }
+                }
+                Err(e) => print_newt(&format!("error: {e}"), color, verbose),
+            }
+        }
+
+        "model" => {
+            if arg1.is_empty() {
+                let (_, current) = resolve_backend_config();
+                print_newt(&format!("active model: {current}  (use /model <name> to switch)"), color, verbose);
+            } else {
+                // Persist via `newt dgx use <model>` then resolve_backend_config
+                // picks it up automatically on the next turn.
+                run_newt_subcmd(&["dgx", "use", arg1], color, verbose)?;
+                print_newt(&format!("Switched to {arg1} — takes effect on next message."), color, verbose);
+            }
+        }
 
         "settings" => settings::run_settings(None)?,
 
@@ -1584,6 +1616,33 @@ fn dispatch_slash(
         ),
     }
     Ok(true)
+}
+
+/// Fetch model names from an Ollama endpoint's `/api/tags`.
+fn fetch_models_from_url(url: &str) -> anyhow::Result<Vec<String>> {
+    let tags_url = format!("{}/api/tags", url.trim_end_matches('/'));
+    let json: serde_json::Value = tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(async {
+            let resp = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(5))
+                .build()?
+                .get(&tags_url)
+                .send()
+                .await?;
+            if !resp.status().is_success() {
+                anyhow::bail!("HTTP {}", resp.status());
+            }
+            resp.json::<serde_json::Value>().await.map_err(Into::into)
+        })
+    })?;
+    Ok(json["models"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|m| m["name"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default())
 }
 
 /// Run `newt <args>` as a subprocess using the current executable path so
