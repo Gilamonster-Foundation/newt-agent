@@ -109,8 +109,35 @@ cov:
 # and have their own pytest suite at newt-agent-py/tests/. Counting
 # them as zero-coverage in the default-feature build would falsely
 # tank the workspace number.
+#
+# Why we don't rely on cargo-llvm-cov's --fail-under-lines:
+# issue #100 caught it silently exit-0'ing on a sub-floor commit
+# (cargo-llvm-cov 0.8.5 ignores --fail-under-lines when --lcov
+# --output-path is set, and `report --summary-only --fail-under-lines`
+# is also unreliable in that version). We instead parse the TOTAL
+# line from `report --summary-only` and gate in shell — deterministic,
+# version-independent, and the measured percentage is always visible.
 cov-ci:
-    cargo llvm-cov --workspace --lcov --output-path lcov.info --fail-under-lines 75 --ignore-filename-regex 'pyo3_module\.rs$'
+    #!/usr/bin/env bash
+    set -euo pipefail
+    floor=75
+    cargo llvm-cov --workspace --no-report
+    cargo llvm-cov report --lcov --output-path lcov.info --ignore-filename-regex 'pyo3_module\.rs$'
+    summary=$(cargo llvm-cov report --summary-only --ignore-filename-regex 'pyo3_module\.rs$')
+    echo "$summary"
+    # TOTAL row columns: regions missed cov% funcs missed cov% lines missed cov% ...
+    # Line coverage is column 10 (3rd "Cover" column).
+    line_cov=$(printf '%s\n' "$summary" | awk '$1 == "TOTAL" { gsub("%", "", $10); print $10 }')
+    if [ -z "${line_cov:-}" ]; then
+        echo "ERROR: could not parse line coverage from cargo-llvm-cov summary" >&2
+        exit 1
+    fi
+    echo "measured line coverage: ${line_cov}% (floor: ${floor}%)"
+    if awk -v cov="$line_cov" -v floor="$floor" 'BEGIN { exit !(cov + 0 < floor + 0) }'; then
+        echo "ERROR: workspace line coverage ${line_cov}% is below the ${floor}% floor" >&2
+        exit 1
+    fi
+    echo "coverage gate OK: ${line_cov}% >= ${floor}%"
 
 # --- Evaluation ---
 
