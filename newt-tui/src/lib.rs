@@ -788,8 +788,9 @@ fn run_chat(workspace: &str, color: bool) -> anyhow::Result<()> {
     let is_vi = build_rl_config().edit_mode() == rustyline::config::EditMode::Vi;
     let prompt = prompt_str(workspace, verbose, is_vi);
 
-    // Build system prompt with workspace context once at session start.
-    let system = build_system_prompt(workspace);
+    // system prompt is built AFTER initialize_all (see below) so soul files are loaded.
+    // Placeholder until then.
+    let system: String;
 
     // Pluggable memory manager — replaces the old conv Vec.
     let mem_cfg = newt_core::Config::resolve()
@@ -798,6 +799,9 @@ fn run_chat(workspace: &str, color: bool) -> anyhow::Result<()> {
         .unwrap_or_default();
     let mut memory = {
         let mut mgr = newt_core::MemoryManager::new();
+        // Soul provider first — sets the frozen identity block.
+        let soul_override = mem_cfg.soul_file.as_ref().map(std::path::PathBuf::from);
+        mgr.add_provider(newt_core::SoulProvider::new(soul_override));
         // History provider based on config.
         match mem_cfg.provider {
             newt_core::MemoryProviderKind::TokenBudget => {
@@ -862,6 +866,17 @@ fn run_chat(workspace: &str, color: bool) -> anyhow::Result<()> {
         ),
     };
     tokio::task::block_in_place(|| rt.block_on(memory.initialize_all(&ctx)));
+
+    // Build system prompt now that SoulProvider has loaded its soul file.
+    {
+        let soul_additions = memory.build_system_prompt_additions();
+        let soul_text = if soul_additions.is_empty() {
+            None
+        } else {
+            Some(soul_additions.as_str())
+        };
+        system = build_system_prompt_with_soul(workspace, soul_text);
+    }
 
     loop {
         match rl.readline(&prompt) {
@@ -1026,13 +1041,17 @@ fn resolve_backend_config() -> (String, String) {
 
 /// Build a system prompt with workspace context so the model knows the project.
 fn build_system_prompt(workspace: &str) -> String {
-    let mut ctx = format!(
+    build_system_prompt_with_soul(workspace, None)
+}
+
+fn build_system_prompt_with_soul(workspace: &str, soul: Option<&str>) -> String {
+    let identity = soul.unwrap_or(
         "You are newt, a small, fast, local-first agentic coder. \
          Be concise and direct. \
          You have tools: run_command, read_file, write_file, list_dir. \
-         Use them to actually complete tasks rather than describing what to do.\n\n\
-         Workspace: {workspace}\n"
+         Use them to actually complete tasks rather than describing what to do.",
     );
+    let mut ctx = format!("{identity}\n\nWorkspace: {workspace}\n");
 
     // Directory listing (top-level, no hidden files)
     if let Ok(mut entries) = std::fs::read_dir(workspace) {

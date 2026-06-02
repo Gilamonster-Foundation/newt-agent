@@ -863,6 +863,151 @@ impl MemoryProvider for Summarizing {
 }
 
 // ---------------------------------------------------------------------------
+// SoulProvider — built-in provider #5 (closes #111)
+// ---------------------------------------------------------------------------
+
+/// Default identity injected when no soul file is found.
+const DEFAULT_SOUL: &str = "\
+You are newt, a small, fast, local-first agentic coder. \
+Be concise and direct. \
+You have tools: run_command, read_file, write_file, list_dir. \
+Use them to actually complete tasks rather than describing what to do.";
+
+/// Loads an agent identity from a Markdown soul file and injects it as a
+/// frozen system-prompt block.
+///
+/// Resolution order (first non-empty file wins):
+/// 1. Explicit path in `[memory] soul_file = "..."` config
+/// 2. `.newt/soul.md` in the current workspace
+/// 3. `~/.newt/soul.md` (global user soul)
+/// 4. Built-in default identity
+///
+/// The soul is read **once** at `initialize()` and frozen — mid-session
+/// writes don't rebuild the system prompt (preserves the KV/prefix cache).
+pub struct SoulProvider {
+    /// The soul text after resolution — frozen at `initialize()`.
+    soul: String,
+    /// Resolved path of the soul that was actually loaded (for display).
+    pub source: SoulSource,
+    /// Explicit override path (from config).
+    override_path: Option<std::path::PathBuf>,
+}
+
+/// Where the soul was loaded from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SoulSource {
+    /// Built-in default identity.
+    Default,
+    /// `~/.newt/soul.md`
+    Global,
+    /// `.newt/soul.md` in the workspace.
+    Workspace,
+    /// Explicit path from `[memory] soul_file = "..."`.
+    Explicit(std::path::PathBuf),
+}
+
+impl std::fmt::Display for SoulSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Default => write!(f, "built-in default"),
+            Self::Global => write!(f, "~/.newt/soul.md"),
+            Self::Workspace => write!(f, ".newt/soul.md"),
+            Self::Explicit(p) => write!(f, "{}", p.display()),
+        }
+    }
+}
+
+impl SoulProvider {
+    /// Create with an optional explicit override path (from config).
+    pub fn new(override_path: Option<std::path::PathBuf>) -> Self {
+        Self {
+            soul: DEFAULT_SOUL.to_string(),
+            source: SoulSource::Default,
+            override_path,
+        }
+    }
+
+    /// Create from config, reading `[memory] soul_file` if present.
+    pub fn from_config() -> Self {
+        let override_path = crate::Config::resolve()
+            .ok()
+            .and_then(|c| c.memory)
+            .and_then(|m| m.soul_file)
+            .map(std::path::PathBuf::from);
+        Self::new(override_path)
+    }
+
+    fn try_load(path: &std::path::Path) -> Option<String> {
+        let text = std::fs::read_to_string(path).ok()?;
+        let trimmed = text.trim().to_string();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        }
+    }
+
+    /// Resolve and load the soul for `workspace`. Called from `initialize`.
+    pub fn load(&mut self, workspace: &str) {
+        // 1. Explicit override.
+        if let Some(ref p) = self.override_path {
+            if let Some(text) = Self::try_load(p) {
+                self.soul = text;
+                self.source = SoulSource::Explicit(p.clone());
+                return;
+            }
+        }
+
+        // 2. Per-workspace soul.
+        let ws_soul = std::path::Path::new(workspace)
+            .join(".newt")
+            .join("soul.md");
+        if let Some(text) = Self::try_load(&ws_soul) {
+            self.soul = text;
+            self.source = SoulSource::Workspace;
+            return;
+        }
+
+        // 3. Global user soul.
+        if let Some(global) = crate::Config::user_config_path().map(|p| p.with_file_name("soul.md"))
+        {
+            if let Some(text) = Self::try_load(&global) {
+                self.soul = text;
+                self.source = SoulSource::Global;
+                return;
+            }
+        }
+
+        // 4. Built-in default (already set in `new()`).
+    }
+}
+
+#[async_trait]
+impl MemoryProvider for SoulProvider {
+    fn name(&self) -> &str {
+        "soul"
+    }
+
+    async fn initialize(&mut self, ctx: &SessionContext) -> anyhow::Result<()> {
+        self.load(&ctx.workspace);
+        tracing::info!(source = %self.source, "soul loaded");
+        Ok(())
+    }
+
+    /// Return the frozen soul as the system prompt base.
+    fn system_prompt_block(&self) -> Option<String> {
+        Some(self.soul.clone())
+    }
+
+    fn build_messages(&self, _system_prompt: &str, _new_task: &str) -> Vec<MemMessage> {
+        // Soul is system-prompt-only; history is managed by other providers.
+        Vec::new()
+    }
+
+    async fn sync_turn(&mut self, _user: &str, _assistant: &str, _metrics: &TurnMetrics) {}
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1023,6 +1168,84 @@ mod tests {
     }
 
     // --- Summarizing tests ---
+
+    // --- SoulProvider tests ---
+
+    #[tokio::test]
+    async fn soul_provider_uses_default_when_no_file() {
+        let mut sp = SoulProvider::new(None);
+        let ctx = SessionContext {
+            workspace: "/nonexistent".into(),
+            session_id: "s".into(),
+        };
+        sp.initialize(&ctx).await.unwrap();
+        assert_eq!(sp.source, SoulSource::Default);
+        let block = sp.system_prompt_block().unwrap();
+        assert!(block.contains("newt"), "default soul should mention newt");
+    }
+
+    #[tokio::test]
+    async fn soul_provider_loads_workspace_soul() {
+        let dir = tempfile::tempdir().unwrap();
+        // Create .newt/soul.md inside the temp dir.
+        let newt_dir = dir.path().join(".newt");
+        std::fs::create_dir_all(&newt_dir).unwrap();
+        std::fs::write(newt_dir.join("soul.md"), "You are a Django expert.").unwrap();
+
+        let mut sp = SoulProvider::new(None);
+        let ctx = SessionContext {
+            workspace: dir.path().to_string_lossy().into(),
+            session_id: "s".into(),
+        };
+        sp.initialize(&ctx).await.unwrap();
+        assert_eq!(sp.source, SoulSource::Workspace);
+        let block = sp.system_prompt_block().unwrap();
+        assert!(block.contains("Django"), "should use workspace soul");
+    }
+
+    #[tokio::test]
+    async fn soul_provider_explicit_path_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let soul_file = dir.path().join("custom_soul.md");
+        std::fs::write(&soul_file, "You are a security auditor.").unwrap();
+
+        // Also create a workspace soul — explicit should win.
+        let ws_dir = tempfile::tempdir().unwrap();
+        let newt_dir = ws_dir.path().join(".newt");
+        std::fs::create_dir_all(&newt_dir).unwrap();
+        std::fs::write(newt_dir.join("soul.md"), "You are a Django expert.").unwrap();
+
+        let mut sp = SoulProvider::new(Some(soul_file.clone()));
+        let ctx = SessionContext {
+            workspace: ws_dir.path().to_string_lossy().into(),
+            session_id: "s".into(),
+        };
+        sp.initialize(&ctx).await.unwrap();
+        assert_eq!(sp.source, SoulSource::Explicit(soul_file));
+        let block = sp.system_prompt_block().unwrap();
+        assert!(
+            block.contains("security auditor"),
+            "explicit path should win"
+        );
+    }
+
+    #[tokio::test]
+    async fn soul_provider_empty_workspace_soul_falls_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let newt_dir = dir.path().join(".newt");
+        std::fs::create_dir_all(&newt_dir).unwrap();
+        // Empty workspace soul → should fall through to default.
+        std::fs::write(newt_dir.join("soul.md"), "   ").unwrap();
+
+        let mut sp = SoulProvider::new(None);
+        let ctx = SessionContext {
+            workspace: dir.path().to_string_lossy().into(),
+            session_id: "s".into(),
+        };
+        sp.initialize(&ctx).await.unwrap();
+        // Empty file → falls through to default.
+        assert_eq!(sp.source, SoulSource::Default);
+    }
 
     #[tokio::test]
     async fn summarizing_compresses_when_over_budget() {
