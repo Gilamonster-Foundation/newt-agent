@@ -83,9 +83,8 @@ pub enum Command {
     Doctor,
     /// Print resolved config.
     Config,
-    /// Open the interactive settings TUI.
-    Settings,
-    /// Run (or re-run) the first-time setup wizard to configure ~/.newt/.
+    /// Run (or re-run) the setup wizard: probe Ollama + write ~/.newt/config.toml.
+    /// Edit that file directly for everything else — newt has no settings UI.
     Init,
     /// NVIDIA DGX endpoint management (route a task to a formation; more
     /// subcommands land in later Phase 14 steps).
@@ -107,7 +106,6 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         Command::Mcp => run_mcp().await,
         Command::Doctor => doctor::run(cli.config.as_deref()).await,
         Command::Config => config_cmd::run(cli.config.as_deref()),
-        Command::Settings => newt_tui::run_settings(cli.config.as_deref()),
         Command::Init => newt_tui::run_init(newt_tui::color_supported()),
         Command::Dgx { cmd } => dgx::run(cmd, cli.config.as_deref()).await,
     }

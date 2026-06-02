@@ -1,17 +1,16 @@
-//! Newt-Agent TUI — splash, chat REPL, and settings.
+//! Newt-Agent TUI — a lean chat + agentic-coding TUI in the spirit of Codex /
+//! Claude Code, deliberately scoped to *chat and agentic coding* (not as
+//! feature-rich). Splash + chat REPL + slash commands + ocap-gated tool use.
+//! NOT a settings UI: configuration is plain `~/.newt/config.toml`
+//! (see `newt config`). Additional features and the multi-agent matrix live in
+//! the downstream `gilamonster-agent`, which inherits these crates.
 
-mod settings;
 mod wizard;
 
-pub use settings::run_settings;
-
-/// Explicitly run the first-time setup wizard (used by `newt init`).
-/// Unlike `wizard::maybe_run` this always runs even if config exists.
+/// Run the (non-interactive) setup wizard unconditionally — used by `newt init`.
+/// Probes Ollama and (re)writes `~/.newt/config.toml`; edit that file for
+/// anything else.
 pub fn run_init(color: bool) -> anyhow::Result<()> {
-    // Delete config so the wizard runs unconditionally, then call maybe_run.
-    // But `newt init` should ASK before clobbering existing config.
-    // For now: just run the wizard without deleting — it will ask the user
-    // to overwrite if they want by naturally re-saving.
     wizard::run_init(color)
 }
 
@@ -542,7 +541,7 @@ fn mint_operating_key(
 ///
 /// Established once from the per-user key (`~/.newt/identity.pem`) and the
 /// configured preset, it enforces **in-session monotonic narrowing**:
-/// re-applying a policy (e.g. after `/settings`) can only ever *narrow* the live
+/// re-applying a policy (e.g. after a config reload) can only ever *narrow* the live
 /// authority, never widen it — widening would require re-rooting from the user
 /// key, which only happens on a fresh session. The running agent can tighten its
 /// own leash but never loosen it.
@@ -757,7 +756,7 @@ mod caveat_policy_tests {
 
     #[test]
     fn reapply_narrows_but_cannot_widen() {
-        // The headline runtime property: within a session, /settings can tighten
+        // The headline runtime property: within a session, a config reload can tighten
         // authority but never loosen it (keyed off a temp identity).
         let dir = tempfile::TempDir::new().unwrap();
         let mut cap = SessionCapability::establish(
@@ -862,7 +861,7 @@ fn run_chat(workspace: &str, color: bool) -> anyhow::Result<()> {
     let rt = tokio::runtime::Handle::current();
 
     // Resolve the inference backend and permission caveats once at session
-    // start.  Both are re-read after /settings or other alt-screen commands.
+    // start.  Both are re-read after each slash command (config.toml on disk).
     let (mut inf_url, mut inf_model) = resolve_backend_config();
     let key_path = newt_identity::default_key_path().ok();
     let mut cap = SessionCapability::establish(resolve_tui(), key_path.as_deref(), workspace);
@@ -1012,7 +1011,7 @@ fn run_chat(workspace: &str, color: bool) -> anyhow::Result<()> {
                     if let Some(ref hp) = history_path {
                         let _ = rl.save_history(hp);
                     }
-                    // Re-read config after alt-screen commands (e.g. /settings).
+                    // Re-read config after a slash command (config.toml may have changed).
                     // Permissions can only NARROW within a session; a widening
                     // request is clamped (restart to widen — see SessionCapability).
                     (inf_url, inf_model) = resolve_backend_config();
@@ -1742,7 +1741,6 @@ fn dispatch_slash(
                 "  /dgx doctor              — probe every configured endpoint",
                 "  /workspace               — show current workspace path",
                 "  /version                 — print newt version",
-                "  /settings                — open the interactive settings TUI",
                 "  /help                    — this message",
                 "  /exit  /quit  exit  quit — leave the session",
             ] {
@@ -1806,8 +1804,6 @@ fn dispatch_slash(
                 );
             }
         }
-
-        "settings" => settings::run_settings(None)?,
 
         "dgx" => {
             if arg1.is_empty() {
