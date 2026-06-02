@@ -969,8 +969,7 @@ impl SoulProvider {
         }
 
         // 3. Global user soul.
-        if let Some(global) =
-            crate::Config::user_config_path().map(|p| p.with_file_name("soul.md"))
+        if let Some(global) = crate::Config::user_config_path().map(|p| p.with_file_name("soul.md"))
         {
             if let Some(text) = Self::try_load(&global) {
                 self.soul = text;
@@ -1318,7 +1317,10 @@ mod tests {
         let path = dir.path().join("NOTES.md");
         std::fs::write(&path, "fact one\nfact two").unwrap();
         let mut ns = NoteStore::new(path, 2200);
-        let ctx = SessionContext { workspace: "/ws".into(), session_id: "s".into() };
+        let ctx = SessionContext {
+            workspace: "/ws".into(),
+            session_id: "s".into(),
+        };
         ns.initialize(&ctx).await.unwrap();
 
         let mut mgr = MemoryManager::new();
@@ -1341,9 +1343,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("NOTES.md");
         let mut ns = NoteStore::new(path, 2200);
-        ns.initialize(&SessionContext { workspace: "/ws".into(), session_id: "s".into() })
-            .await
-            .unwrap();
+        ns.initialize(&SessionContext {
+            workspace: "/ws".into(),
+            session_id: "s".into(),
+        })
+        .await
+        .unwrap();
         ns.add("fact one").unwrap();
         ns.add("fact two").unwrap();
         let removed = ns.remove("fact one").unwrap();
@@ -1357,9 +1362,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("NOTES.md");
         let mut ns = NoteStore::new(path, 2200);
-        ns.initialize(&SessionContext { workspace: "/ws".into(), session_id: "s".into() })
-            .await
-            .unwrap();
+        ns.initialize(&SessionContext {
+            workspace: "/ws".into(),
+            session_id: "s".into(),
+        })
+        .await
+        .unwrap();
         let removed = ns.remove("not there").unwrap();
         assert!(!removed);
     }
@@ -1369,9 +1377,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("NOTES.md");
         let mut ns = NoteStore::new(path, 2200);
-        ns.initialize(&SessionContext { workspace: "/ws".into(), session_id: "s".into() })
-            .await
-            .unwrap();
+        ns.initialize(&SessionContext {
+            workspace: "/ws".into(),
+            session_id: "s".into(),
+        })
+        .await
+        .unwrap();
         assert!(ns.is_empty());
         ns.add("fact").unwrap();
         assert!(!ns.is_empty());
@@ -1382,9 +1393,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("NOTES.md");
         let mut ns = NoteStore::new(path, 100);
-        ns.initialize(&SessionContext { workspace: "/ws".into(), session_id: "s".into() })
-            .await
-            .unwrap();
+        ns.initialize(&SessionContext {
+            workspace: "/ws".into(),
+            session_id: "s".into(),
+        })
+        .await
+        .unwrap();
         let (cur, max) = ns.char_usage();
         assert_eq!(cur, 0);
         assert_eq!(max, 100);
@@ -1405,7 +1419,10 @@ mod tests {
     async fn token_budget_does_not_prune_within_budget() {
         let mut tb = TokenBudget::new(200, 1.0); // budget = 200
         let mut m = dummy_metrics();
-        m.usage = Some(crate::metrics::TokenUsage { input_tokens: 50, output_tokens: 50 });
+        m.usage = Some(crate::metrics::TokenUsage {
+            input_tokens: 50,
+            output_tokens: 50,
+        });
         tb.sync_turn("q", "a", &m).await; // 100 tokens — within budget
         assert_eq!(tb.history.len(), 1);
     }
@@ -1416,12 +1433,17 @@ mod tests {
     async fn summarizing_fallback_placeholder_when_no_summarizer() {
         let mut s = Summarizing::new(10); // tiny budget to trigger compression
         let mut m = dummy_metrics();
-        m.usage = Some(crate::metrics::TokenUsage { input_tokens: 6, output_tokens: 6 });
+        m.usage = Some(crate::metrics::TokenUsage {
+            input_tokens: 6,
+            output_tokens: 6,
+        });
         s.sync_turn("q1", "a1", &m).await;
         s.sync_turn("q2", "a2", &m).await; // should trigger compression with placeholder
-        // With no summariser, placeholder text is inserted.
+                                           // With no summariser, placeholder text is inserted.
         assert!(
-            s.history.iter().any(|t| t.assistant.contains("turns summarised")),
+            s.history
+                .iter()
+                .any(|t| t.assistant.contains("turns summarised")),
             "placeholder should be inserted"
         );
     }
@@ -1437,10 +1459,12 @@ mod tests {
 
     #[tokio::test]
     async fn summarizing_on_pre_compress_returns_prev_summary() {
-        let mut s = Summarizing::new(10)
-            .with_summarizer(|_| Ok("PRIOR SUMMARY".to_string()));
+        let mut s = Summarizing::new(10).with_summarizer(|_| Ok("PRIOR SUMMARY".to_string()));
         let mut m = dummy_metrics();
-        m.usage = Some(crate::metrics::TokenUsage { input_tokens: 6, output_tokens: 6 });
+        m.usage = Some(crate::metrics::TokenUsage {
+            input_tokens: 6,
+            output_tokens: 6,
+        });
         s.sync_turn("q", "a", &m).await;
         s.sync_turn("q", "a", &m).await;
         // prev_summary should be set after compression.
