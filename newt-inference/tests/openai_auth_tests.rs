@@ -36,7 +36,10 @@ async fn complete_sends_bearer_token_when_api_key_set() {
         .await;
 
     let backend = LocalVllmBackend::new(server.uri(), "m").with_api_key("secret-abc".to_string());
-    let reply = backend.complete(ChatRequest::new().user("hi")).await.unwrap();
+    let reply = backend
+        .complete(ChatRequest::new().user("hi"))
+        .await
+        .unwrap();
     assert_eq!(reply.content, "hi");
 }
 
@@ -50,7 +53,10 @@ async fn complete_omits_authorization_when_unauthenticated() {
         .await;
 
     let backend = LocalVllmBackend::new(server.uri(), "m");
-    backend.complete(ChatRequest::new().user("hi")).await.unwrap();
+    backend
+        .complete(ChatRequest::new().user("hi"))
+        .await
+        .unwrap();
 
     let reqs = server.received_requests().await.unwrap();
     assert_eq!(reqs.len(), 1);
@@ -72,7 +78,10 @@ async fn empty_api_key_is_treated_as_unauthenticated() {
     // An empty token (e.g. an empty key file) must not produce a
     // `Bearer ` header — it would be a confusing 401 on the wire.
     let backend = LocalVllmBackend::new(server.uri(), "m").with_api_key(Some(String::new()));
-    backend.complete(ChatRequest::new().user("hi")).await.unwrap();
+    backend
+        .complete(ChatRequest::new().user("hi"))
+        .await
+        .unwrap();
 
     let reqs = server.received_requests().await.unwrap();
     assert!(reqs[0].headers.get("authorization").is_none());
@@ -121,6 +130,9 @@ async fn from_config_wires_bearer_auth_from_env() {
     let backend = LocalVllmBackend::from_config(&cfg);
     std::env::remove_var(var);
 
-    let reply = backend.complete(ChatRequest::new().user("hi")).await.unwrap();
+    let reply = backend
+        .complete(ChatRequest::new().user("hi"))
+        .await
+        .unwrap();
     assert_eq!(reply.content, "hi");
 }

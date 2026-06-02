@@ -914,7 +914,10 @@ default_tier_order = ["FAST", "STANDARD", "COMPLEX", "REVIEW"]
         std::env::set_var(var, "  from-env  ");
         let mut f = tempfile::NamedTempFile::new().unwrap();
         writeln!(f, "from-file").unwrap();
-        let cfg = openai_backend(Some(f.path().to_string_lossy().into_owned()), Some(var.into()));
+        let cfg = openai_backend(
+            Some(f.path().to_string_lossy().into_owned()),
+            Some(var.into()),
+        );
         assert_eq!(cfg.resolve_api_key().as_deref(), Some("from-env"));
         std::env::remove_var(var);
     }
@@ -936,6 +939,9 @@ default_tier_order = ["FAST", "STANDARD", "COMPLEX", "REVIEW"]
         assert_eq!(expand_tilde("~/foo/bar"), home.join("foo/bar"));
         assert_eq!(expand_tilde("~"), home);
         assert_eq!(expand_tilde("/abs/path"), PathBuf::from("/abs/path"));
-        assert_eq!(expand_tilde("relative/path"), PathBuf::from("relative/path"));
+        assert_eq!(
+            expand_tilde("relative/path"),
+            PathBuf::from("relative/path")
+        );
     }
 }
