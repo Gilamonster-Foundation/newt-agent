@@ -115,15 +115,31 @@ where
 /// Otherwise the worker falls back to local Ollama auto-discovery using
 /// `$NEWT_DEFAULT_MODEL` (default `llama3.1:8b`) — the historical
 /// behavior, unchanged when no OpenAI backend is configured.
-async fn resolve_backend() -> anyhow::Result<Arc<dyn newt_inference::InferenceBackend>> {
-    use newt_core::{BackendKind, Config};
-
-    let cfg = Config::resolve().unwrap_or_default();
-    if let Some(openai) = cfg
-        .backends
+/// Choose the configured OpenAI-compatible backend to run against, if any.
+///
+/// An explicit `OLLAMA_HOST` is an unambiguous "use this Ollama" override and
+/// wins over a configured OpenAI backend (explicit env > config file), so it
+/// forces the Ollama path by returning `None`. This also keeps the mock-mode
+/// e2e test — which points `OLLAMA_HOST` at a wiremock — hermetic against a
+/// developer's real `~/.newt/config.toml`.
+fn select_openai_backend(
+    cfg: &newt_core::Config,
+    ollama_override: bool,
+) -> Option<&newt_core::BackendConfig> {
+    if ollama_override {
+        return None;
+    }
+    cfg.backends
         .iter()
-        .find(|b| b.kind == BackendKind::Openai)
-    {
+        .find(|b| b.kind == newt_core::BackendKind::Openai)
+}
+
+async fn resolve_backend() -> anyhow::Result<Arc<dyn newt_inference::InferenceBackend>> {
+    use newt_core::Config;
+
+    let ollama_override = std::env::var_os("OLLAMA_HOST").is_some();
+    let cfg = Config::resolve().unwrap_or_default();
+    if let Some(openai) = select_openai_backend(&cfg, ollama_override) {
         tracing::info!(
             name = %openai.name,
             endpoint = %openai.endpoint,
@@ -140,4 +156,73 @@ async fn resolve_backend() -> anyhow::Result<Arc<dyn newt_inference::InferenceBa
         std::env::var("NEWT_DEFAULT_MODEL").unwrap_or_else(|_| "llama3.1:8b".to_string());
     let backend = newt_inference::local::LocalOllamaBackend::discover(&default_model).await?;
     Ok(Arc::new(backend))
+}
+
+#[cfg(test)]
+mod backend_selection_tests {
+    use super::select_openai_backend;
+    use newt_core::router::Tier;
+    use newt_core::{BackendConfig, BackendKind, Config};
+
+    fn backend(name: &str, kind: BackendKind) -> BackendConfig {
+        BackendConfig {
+            name: name.into(),
+            endpoint: "http://e".into(),
+            model: "m".into(),
+            tiers: vec![Tier::Fast],
+            kind,
+            api_key_file: None,
+            api_key_env: None,
+        }
+    }
+
+    fn cfg(backends: Vec<BackendConfig>) -> Config {
+        Config {
+            backends,
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn picks_openai_backend_when_present_and_no_override() {
+        let c = cfg(vec![
+            backend("local", BackendKind::Ollama),
+            backend("remote", BackendKind::Openai),
+        ]);
+        let chosen = select_openai_backend(&c, false).expect("openai backend");
+        assert_eq!(chosen.name, "remote");
+        assert_eq!(chosen.kind, BackendKind::Openai);
+    }
+
+    #[test]
+    fn ollama_host_override_forces_ollama_path_even_with_openai_config() {
+        // The OLLAMA_HOST override must win over a configured OpenAI backend.
+        let c = cfg(vec![backend("remote", BackendKind::Openai)]);
+        assert!(select_openai_backend(&c, true).is_none());
+    }
+
+    #[test]
+    fn no_openai_backend_yields_none() {
+        let c = cfg(vec![backend("local", BackendKind::Ollama)]);
+        assert!(select_openai_backend(&c, false).is_none());
+    }
+
+    #[test]
+    fn empty_backend_list_yields_none() {
+        let c = cfg(vec![]);
+        assert!(select_openai_backend(&c, false).is_none());
+        assert!(select_openai_backend(&c, true).is_none());
+    }
+
+    #[test]
+    fn first_openai_backend_wins_when_several() {
+        let mut first = backend("remote-a", BackendKind::Openai);
+        first.endpoint = "http://a".into();
+        let mut second = backend("remote-b", BackendKind::Openai);
+        second.endpoint = "http://b".into();
+        let c = cfg(vec![backend("local", BackendKind::Ollama), first, second]);
+        let chosen = select_openai_backend(&c, false).expect("openai backend");
+        assert_eq!(chosen.name, "remote-a");
+        assert_eq!(chosen.endpoint, "http://a");
+    }
 }
