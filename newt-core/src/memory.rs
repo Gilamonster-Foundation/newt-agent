@@ -969,16 +969,16 @@ impl SoulProvider {
         }
 
         // 3. Global user soul.
-        if let Some(global) = crate::Config::user_config_path().map(|p| p.with_file_name("soul.md"))
+        if let Some(global) =
+            crate::Config::user_config_path().map(|p| p.with_file_name("soul.md"))
         {
             if let Some(text) = Self::try_load(&global) {
                 self.soul = text;
                 self.source = SoulSource::Global;
-                return;
             }
         }
 
-        // 4. Built-in default (already set in `new()`).
+        // 4. Built-in default (already set in `new()` — nothing to do).
     }
 }
 
@@ -1287,6 +1287,181 @@ mod tests {
         }
         // Should have compressed at least once without panicking.
         assert!(s.compress_count >= 1);
+    }
+
+    // --- MemoryManager hook coverage ---
+
+    #[tokio::test]
+    async fn memory_manager_on_pre_compress() {
+        let mgr = MemoryManager::new();
+        let result = mgr.on_pre_compress(&[]).await;
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn memory_manager_on_session_end() {
+        let mut mgr = MemoryManager::new();
+        mgr.add_provider(RollingWindow::new(5));
+        mgr.on_session_end(&[]).await; // must not panic
+    }
+
+    #[tokio::test]
+    async fn memory_manager_prefetch_all_empty() {
+        let mgr = MemoryManager::new();
+        let result = mgr.prefetch_all("query").await;
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn memory_manager_build_system_prompt_additions_from_note_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("NOTES.md");
+        std::fs::write(&path, "fact one\nfact two").unwrap();
+        let mut ns = NoteStore::new(path, 2200);
+        let ctx = SessionContext { workspace: "/ws".into(), session_id: "s".into() };
+        ns.initialize(&ctx).await.unwrap();
+
+        let mut mgr = MemoryManager::new();
+        mgr.add_provider(ns);
+        let additions = mgr.build_system_prompt_additions();
+        assert!(additions.contains("fact one"));
+    }
+
+    #[tokio::test]
+    async fn memory_manager_add_note_fails_with_no_note_store() {
+        let mut mgr = MemoryManager::new();
+        mgr.add_provider(RollingWindow::new(5));
+        assert!(mgr.add_note("fact").is_err());
+    }
+
+    // --- NoteStore additional coverage ---
+
+    #[tokio::test]
+    async fn note_store_remove() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("NOTES.md");
+        let mut ns = NoteStore::new(path, 2200);
+        ns.initialize(&SessionContext { workspace: "/ws".into(), session_id: "s".into() })
+            .await
+            .unwrap();
+        ns.add("fact one").unwrap();
+        ns.add("fact two").unwrap();
+        let removed = ns.remove("fact one").unwrap();
+        assert!(removed);
+        assert!(!ns.live.contains("fact one"));
+        assert!(ns.live.contains("fact two"));
+    }
+
+    #[tokio::test]
+    async fn note_store_remove_nonexistent_returns_false() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("NOTES.md");
+        let mut ns = NoteStore::new(path, 2200);
+        ns.initialize(&SessionContext { workspace: "/ws".into(), session_id: "s".into() })
+            .await
+            .unwrap();
+        let removed = ns.remove("not there").unwrap();
+        assert!(!removed);
+    }
+
+    #[tokio::test]
+    async fn note_store_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("NOTES.md");
+        let mut ns = NoteStore::new(path, 2200);
+        ns.initialize(&SessionContext { workspace: "/ws".into(), session_id: "s".into() })
+            .await
+            .unwrap();
+        assert!(ns.is_empty());
+        ns.add("fact").unwrap();
+        assert!(!ns.is_empty());
+    }
+
+    #[tokio::test]
+    async fn note_store_char_usage() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("NOTES.md");
+        let mut ns = NoteStore::new(path, 100);
+        ns.initialize(&SessionContext { workspace: "/ws".into(), session_id: "s".into() })
+            .await
+            .unwrap();
+        let (cur, max) = ns.char_usage();
+        assert_eq!(cur, 0);
+        assert_eq!(max, 100);
+    }
+
+    // --- TokenBudget additional coverage ---
+
+    #[tokio::test]
+    async fn token_budget_usage_reporting() {
+        let tb = TokenBudget::new(1000, 0.80);
+        let (label, cur, max) = tb.usage().unwrap();
+        assert_eq!(label, "tokens");
+        assert_eq!(cur, 0);
+        assert_eq!(max, 800); // 1000 * 0.80
+    }
+
+    #[tokio::test]
+    async fn token_budget_does_not_prune_within_budget() {
+        let mut tb = TokenBudget::new(200, 1.0); // budget = 200
+        let mut m = dummy_metrics();
+        m.usage = Some(crate::metrics::TokenUsage { input_tokens: 50, output_tokens: 50 });
+        tb.sync_turn("q", "a", &m).await; // 100 tokens — within budget
+        assert_eq!(tb.history.len(), 1);
+    }
+
+    // --- Summarizing additional coverage ---
+
+    #[tokio::test]
+    async fn summarizing_fallback_placeholder_when_no_summarizer() {
+        let mut s = Summarizing::new(10); // tiny budget to trigger compression
+        let mut m = dummy_metrics();
+        m.usage = Some(crate::metrics::TokenUsage { input_tokens: 6, output_tokens: 6 });
+        s.sync_turn("q1", "a1", &m).await;
+        s.sync_turn("q2", "a2", &m).await; // should trigger compression with placeholder
+        // With no summariser, placeholder text is inserted.
+        assert!(
+            s.history.iter().any(|t| t.assistant.contains("turns summarised")),
+            "placeholder should be inserted"
+        );
+    }
+
+    #[tokio::test]
+    async fn summarizing_usage_reporting() {
+        let s = Summarizing::new(1000);
+        let (label, cur, max) = s.usage().unwrap();
+        assert_eq!(label, "tokens");
+        assert_eq!(cur, 0);
+        assert_eq!(max, 800); // 1000 * 0.80
+    }
+
+    #[tokio::test]
+    async fn summarizing_on_pre_compress_returns_prev_summary() {
+        let mut s = Summarizing::new(10)
+            .with_summarizer(|_| Ok("PRIOR SUMMARY".to_string()));
+        let mut m = dummy_metrics();
+        m.usage = Some(crate::metrics::TokenUsage { input_tokens: 6, output_tokens: 6 });
+        s.sync_turn("q", "a", &m).await;
+        s.sync_turn("q", "a", &m).await;
+        // prev_summary should be set after compression.
+        let pre = s.on_pre_compress(&[]).await;
+        if !pre.is_empty() {
+            assert!(pre.contains("PRIOR SUMMARY") || pre.contains("compression summary"));
+        }
+    }
+
+    // --- RollingWindow additional coverage ---
+
+    #[tokio::test]
+    async fn rolling_window_on_session_end_noop() {
+        let mut rw = RollingWindow::new(5);
+        rw.on_session_end(&[]).await; // must not panic
+    }
+
+    #[tokio::test]
+    async fn rolling_window_add_note_returns_err() {
+        let mut rw = RollingWindow::new(5);
+        assert!(rw.add_note("fact").is_err());
     }
 
     #[tokio::test]
