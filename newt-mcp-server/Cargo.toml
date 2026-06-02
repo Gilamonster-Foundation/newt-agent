@@ -34,11 +34,19 @@ tracing-subscriber.workspace = true
 # crate; default builds stay Python-free.
 pyo3 = { workspace = true, optional = true }
 
+# Optional SCM tools — pulls in kyln-git (path dep, not on crates.io).
+newt-tools-scm = { workspace = true, optional = true }
+
 [features]
-default = []
+default = ["tools-git"]
 pyo3 = [
     "dep:pyo3",
     "newt-core/pyo3",
+]
+# kyln-backed git tools — on by default; opt out with --no-default-features.
+tools-git = [
+    "dep:newt-tools-scm",
+    "newt-tools-scm/tools-git",
 ]
 
 [dev-dependencies]

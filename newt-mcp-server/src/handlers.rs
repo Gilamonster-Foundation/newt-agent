@@ -57,9 +57,11 @@ fn register_tools_list(server: &mut McpServer) {
 }
 
 /// Return the JSON array of tool definitions (shared by tools/list).
+///
+/// Optional SCM tools are appended when the `tools-git` feature is enabled.
 fn tool_definitions() -> Value {
-    serde_json::json!([
-        {
+    let mut tools = vec![
+        serde_json::json!({
             "name": "code_read",
             "description": "Read a file's contents",
             "inputSchema": {
@@ -72,8 +74,8 @@ fn tool_definitions() -> Value {
                 },
                 "required": ["path"]
             }
-        },
-        {
+        }),
+        serde_json::json!({
             "name": "code_edit",
             "description": "Apply a unified diff patch to a file",
             "inputSchema": {
@@ -90,8 +92,8 @@ fn tool_definitions() -> Value {
                 },
                 "required": ["path", "patch"]
             }
-        },
-        {
+        }),
+        serde_json::json!({
             "name": "code_search",
             "description": "Search files for a regex pattern",
             "inputSchema": {
@@ -108,8 +110,8 @@ fn tool_definitions() -> Value {
                 },
                 "required": ["query", "path"]
             }
-        },
-        {
+        }),
+        serde_json::json!({
             "name": "goal_run",
             "description": "Run a tier-routed inference turn",
             "inputSchema": {
@@ -127,8 +129,49 @@ fn tool_definitions() -> Value {
                 },
                 "required": ["prompt"]
             }
-        }
-    ])
+        }),
+        serde_json::json!({
+            "name": "fs_list",
+            "description": "List directory contents (dirs first, then files, alphabetical). Returns name, kind, and size_bytes for each entry.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Directory path to list"
+                    }
+                },
+                "required": ["path"]
+            }
+        }),
+        serde_json::json!({
+            "name": "shell_run",
+            "description": "Run a shell command and capture stdout/stderr. Returns exit_code, stdout, stderr, timed_out. Max timeout 300s.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "cmd": {
+                        "type": "string",
+                        "description": "Shell command to execute (run via sh -c)"
+                    },
+                    "cwd": {
+                        "type": "string",
+                        "description": "Working directory (default: current directory)"
+                    },
+                    "timeout_secs": {
+                        "type": "integer",
+                        "description": "Timeout in seconds (default 30, max 300)"
+                    }
+                },
+                "required": ["cmd"]
+            }
+        }),
+    ];
+
+    #[cfg(feature = "tools-git")]
+    tools.extend(newt_tools_scm::git::tool_definitions());
+
+    Value::Array(tools)
 }
 
 // ── tools/call ─────────────────────────────────────────────────────────────
@@ -155,10 +198,34 @@ fn register_tools_call(
                 .unwrap_or_else(|| Value::Object(Default::default()));
 
             match name.as_str() {
-                "code_read" => handle_code_read(&arguments),
-                "code_edit" => handle_code_edit(&arguments),
+                "code_read"  => handle_code_read(&arguments),
+                "code_edit"  => handle_code_edit(&arguments),
                 "code_search" => handle_code_search(&arguments),
-                "goal_run" => handle_goal_run(&arguments, &registry, &router).await,
+                "goal_run"   => handle_goal_run(&arguments, &registry, &router).await,
+                "fs_list"    => handle_fs_list(&arguments),
+                "shell_run"  => handle_shell_run(&arguments).await,
+                #[cfg(feature = "tools-git")]
+                "scm_git_log"           => newt_tools_scm::git::handle_scm_git_log(&arguments),
+                #[cfg(feature = "tools-git")]
+                "scm_git_blame"         => newt_tools_scm::git::handle_scm_git_blame(&arguments),
+                #[cfg(feature = "tools-git")]
+                "scm_git_grep"          => newt_tools_scm::git::handle_scm_git_grep(&arguments),
+                #[cfg(feature = "tools-git")]
+                "scm_git_diff"          => newt_tools_scm::git::handle_scm_git_diff(&arguments),
+                #[cfg(feature = "tools-git")]
+                "scm_git_status"        => newt_tools_scm::git::handle_scm_git_status(&arguments),
+                #[cfg(feature = "tools-git")]
+                "scm_git_branch_list"   => newt_tools_scm::git::handle_scm_git_branch_list(&arguments),
+                #[cfg(feature = "tools-git")]
+                "scm_git_branch_create" => newt_tools_scm::git::handle_scm_git_branch_create(&arguments),
+                #[cfg(feature = "tools-git")]
+                "scm_git_branch_delete" => newt_tools_scm::git::handle_scm_git_branch_delete(&arguments),
+                #[cfg(feature = "tools-git")]
+                "scm_git_commit"        => newt_tools_scm::git::handle_scm_git_commit(&arguments),
+                #[cfg(feature = "tools-git")]
+                "scm_git_push"          => newt_tools_scm::git::handle_scm_git_push(&arguments),
+                #[cfg(feature = "tools-git")]
+                "scm_git_pull"          => newt_tools_scm::git::handle_scm_git_pull(&arguments),
                 other => anyhow::bail!("unknown tool: {other}"),
             }
         }
@@ -212,6 +279,55 @@ fn handle_code_search(args: &Value) -> anyhow::Result<Value> {
         lines.join("\n")
     };
     Ok(mcp_text_content(&text))
+}
+
+fn handle_fs_list(args: &Value) -> anyhow::Result<Value> {
+    let path = args
+        .get("path")
+        .and_then(|p| p.as_str())
+        .ok_or_else(|| anyhow::anyhow!("missing required argument: path"))?;
+
+    let entries = newt_tools::list_dir(Path::new(path))?;
+    Ok(mcp_text_content(&serde_json::to_string_pretty(&entries)?))
+}
+
+async fn handle_shell_run(args: &Value) -> anyhow::Result<Value> {
+    use std::time::Duration;
+    use tokio::process::Command;
+
+    let cmd = args
+        .get("cmd")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("missing required argument: cmd"))?;
+    let cwd = args.get("cwd").and_then(|v| v.as_str()).unwrap_or(".");
+    let timeout_secs = args
+        .get("timeout_secs")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(30)
+        .min(300);
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(timeout_secs),
+        Command::new("sh").arg("-c").arg(cmd).current_dir(cwd).output(),
+    )
+    .await;
+
+    let envelope = match result {
+        Ok(Ok(out)) => serde_json::json!({
+            "exit_code": out.status.code().unwrap_or(-1),
+            "stdout":    String::from_utf8_lossy(&out.stdout),
+            "stderr":    String::from_utf8_lossy(&out.stderr),
+            "timed_out": false
+        }),
+        Ok(Err(e)) => anyhow::bail!("failed to spawn command: {e}"),
+        Err(_) => serde_json::json!({
+            "exit_code": -1,
+            "stdout":    "",
+            "stderr":    format!("timed out after {timeout_secs}s"),
+            "timed_out": true
+        }),
+    };
+    Ok(mcp_text_content(&serde_json::to_string_pretty(&envelope)?))
 }
 
 /// Parse a `tier` argument from the JSON-RPC call. Accepts the four
@@ -327,20 +443,32 @@ mod tests {
     // ── tools/list ──────────────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn tools_list_returns_four_tools() {
+    async fn tools_list_returns_expected_tools() {
         let resp = rpc(&serde_json::json!({
             "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}
         }))
         .await;
 
         let tools = resp["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 4);
+        // At least the four core tools; optional feature sets add more.
+        assert!(
+            tools.len() >= 4,
+            "expected at least 4 tools, got {}",
+            tools.len()
+        );
 
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"code_read"));
         assert!(names.contains(&"code_edit"));
         assert!(names.contains(&"code_search"));
         assert!(names.contains(&"goal_run"));
+
+        #[cfg(feature = "tools-git")]
+        {
+            assert!(names.contains(&"scm_git_log"));
+            assert!(names.contains(&"scm_git_blame"));
+            assert!(names.contains(&"scm_git_grep"));
+        }
     }
 
     #[tokio::test]
