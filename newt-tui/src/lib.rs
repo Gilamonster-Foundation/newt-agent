@@ -978,7 +978,7 @@ fn run_chat(workspace: &str, color: bool) -> anyhow::Result<()> {
                                 endpoint: inf_url.clone(),
                             };
                             tokio::task::block_in_place(|| {
-                                rt.block_on(memory.sync_all(&task, &reply, &metrics))
+                                rt.block_on(memory.sync_all(&task, &reply, &metrics));
                             });
                             print_metrics(&metrics, color);
                             // Append to usage log (best-effort).
@@ -1040,6 +1040,8 @@ fn resolve_backend_config() -> (String, String) {
 }
 
 /// Build a system prompt with workspace context so the model knows the project.
+// build_system_prompt_with_soul is used directly now; this wrapper kept for tests.
+#[allow(dead_code)]
 fn build_system_prompt(workspace: &str) -> String {
     build_system_prompt_with_soul(workspace, None)
 }
@@ -1426,7 +1428,7 @@ async fn chat_complete(
         url,
         model,
         messages: mem_messages,
-        task,
+        task: _task,
         workspace,
         color,
         caveats,
