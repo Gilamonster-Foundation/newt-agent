@@ -67,6 +67,11 @@ pub struct MemoryConfig {
     /// Default: 8192.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_tokens: Option<u32>,
+
+    /// Explicit path to a soul file (overrides workspace + global resolution).
+    /// Default: auto-resolve from `.newt/soul.md` → `~/.newt/soul.md`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub soul_file: Option<String>,
 }
 
 fn default_memory_window() -> usize {
@@ -79,6 +84,7 @@ impl Default for MemoryConfig {
             provider: MemoryProviderKind::RollingWindow,
             window: 20,
             context_tokens: None,
+            soul_file: None,
         }
     }
 }
