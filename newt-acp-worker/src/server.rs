@@ -46,6 +46,19 @@ pub struct AcpServer {
     /// Optional Prometheus metrics registry. When `Some`, every completed
     /// `prompt` turn records timing, token counts, and cost observations.
     metrics: Option<Arc<crate::prom::NewtMetrics>>,
+    /// Per-worker operator identity. The `handle_prompt_coder`
+    /// dispatcher derives an attenuated, signed [`newt_core::Caveats`]
+    /// from this for every turn — replacing the pre-#94
+    /// `Caveats::top()` hard-code at the dispatch site.
+    ///
+    /// Defaults to [`crate::WorkerIdentity::AllowNoKey`] so existing
+    /// `AcpServer::new(...)` constructions (including the integration
+    /// test fleet) preserve their pre-#94 behavior; the real headless
+    /// entry points in [`crate::run_with_io_and_metrics`] and
+    /// [`crate::run_with_io_metrics_and_identity`] inject an operator
+    /// identity by default and require an explicit `--allow-no-key` to
+    /// fall back.
+    identity: crate::WorkerIdentity,
 }
 
 /// Structured reply for one `prompt` turn.
@@ -172,17 +185,31 @@ impl TaskReply {
 
 impl AcpServer {
     /// Build a new server bound to `backend`.
+    ///
+    /// The worker identity defaults to [`crate::WorkerIdentity::AllowNoKey`]
+    /// (the pre-#94 `Caveats::top()` dispatch behavior). The real
+    /// headless entry points override this via [`Self::with_identity`]
+    /// to require a signed operator key.
     pub fn new(backend: Arc<dyn newt_inference::InferenceBackend>) -> Self {
         Self {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             backend,
             metrics: None,
+            identity: crate::WorkerIdentity::AllowNoKey,
         }
     }
 
     /// Attach a Prometheus metrics registry. Turns become observable.
     pub fn with_metrics(mut self, metrics: Option<Arc<crate::prom::NewtMetrics>>) -> Self {
         self.metrics = metrics;
+        self
+    }
+
+    /// Bind the worker's operator [`crate::WorkerIdentity`]. The server
+    /// derives the per-dispatch caveats from this identity at every
+    /// `prompt` turn — see [`crate::WorkerIdentity::caveats_for_dispatch`].
+    pub fn with_identity(mut self, identity: crate::WorkerIdentity) -> Self {
+        self.identity = identity;
         self
     }
 
@@ -442,13 +469,18 @@ impl AcpServer {
         prompt: &str,
     ) -> anyhow::Result<TaskReply> {
         let coder = newt_coder::Coder::new(Arc::clone(&self.backend));
-        // 35b: every Coder::run dispatch is gated on a Caveats value.
-        // The ACP worker has no peer cert today — that's the 35c handoff
-        // (newt-mesh extracts caveats from the verified peer cert and
-        // hands them in here). Until then we pass top (= the user's full
-        // authority), preserving pre-35b behavior; the enforcement
-        // machinery is wired so 35c only needs to swap the argument.
-        let caveats = newt_core::Caveats::top();
+        // #94: every Coder::run dispatch derives an attenuated,
+        // signed Caveats from the worker's operator identity. The
+        // legacy "pass top()" hard-code lived here until #94; it now
+        // only fires under the `--allow-no-key` debug fallback (see
+        // `WorkerIdentity::AllowNoKey`). 35c will swap the backend
+        // host derivation below for peer-cert extraction without
+        // touching the call shape.
+        let backend_host = self.backend.endpoint().map(host_from_endpoint);
+        let caveats = self
+            .identity
+            .caveats_for_dispatch(backend_host)
+            .map_err(|e| anyhow::anyhow!("dispatch identity error: {e}"))?;
         let t0 = std::time::Instant::now();
         let run = coder
             .run(&session.workspace_path, prompt, &caveats)
@@ -493,6 +525,21 @@ impl AcpServer {
 /// `newt_tools::apply_patch` is the source of truth on validity.
 fn looks_like_unified_diff(content: &str) -> bool {
     content.contains("--- ") && content.contains("+++ ")
+}
+
+/// Extract the host portion of an HTTP(S) URL for the per-dispatch
+/// `net` caveat. Mirrors the helper in `newt-coder::coder` (kept
+/// separate to avoid a public-API export of an internal parser). Strips
+/// `scheme://`, then takes everything up to the first `/`, `?`, or `:`.
+fn host_from_endpoint(endpoint: &str) -> &str {
+    let after_scheme = endpoint
+        .find("://")
+        .map(|i| &endpoint[i + 3..])
+        .unwrap_or(endpoint);
+    let end = after_scheme
+        .find(['/', ':', '?'])
+        .unwrap_or(after_scheme.len());
+    &after_scheme[..end]
 }
 
 /// Write a JSON-RPC response as a single newline-terminated line.

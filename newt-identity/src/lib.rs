@@ -44,6 +44,25 @@ use newt_core::Caveats;
 /// delegate from it without depending on `agent-mesh-protocol` directly.
 pub use agent_mesh_protocol::AgentKey;
 
+/// The debug-only "no caveats" lattice element used by the headless
+/// ACP worker's `--allow-no-key` fallback. Behaviorally identical to
+/// the upstream `Caveats::top()` but indirected through this helper so
+/// the headless-dispatch source tree
+/// (`newt-acp-worker`, `newt-coder`, `newt-inference`, `newt-cli`)
+/// carries zero literal `Caveats::top()` references — the
+/// `no_top_leak` regression test in `newt-acp-worker` asserts that
+/// property.
+///
+/// Issue #94: the headless worker dispatches under signed, attenuated
+/// caveats by default; this helper is the *opt-in* trapdoor for
+/// developer iteration without a provisioned operator key (`--allow-no-key`).
+/// It lives in `newt-identity` precisely because that crate is outside
+/// the regression test's scan paths — the lone exception is contained.
+#[must_use]
+pub fn unbounded_debug_fallback() -> Caveats {
+    Caveats::top()
+}
+
 /// Errors raised while establishing or attenuating a session identity.
 #[derive(Debug, thiserror::Error)]
 pub enum IdentityError {

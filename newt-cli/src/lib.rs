@@ -58,6 +58,24 @@ pub enum Command {
         /// `~/workspaces/knowledge/board/drake/2026-05-29_newt-coder-failure-mode-taxonomy.md`.
         #[arg(long, env = "NEWT_CODER", default_value_t = false)]
         coder: bool,
+
+        /// Per-user operator key path the headless worker derives its
+        /// signed, attenuated dispatch [`newt_core::Caveats`] from.
+        /// Default: `~/.newt/identity.pem` (resolved via
+        /// `newt_identity::default_key_path`). Generated on first run
+        /// with mode `0600` if the file doesn't yet exist.
+        ///
+        /// CLI > env > default file resolution. The env override is
+        /// `NEWT_OPERATOR_KEY`. Issue #94.
+        #[arg(long, env = "NEWT_OPERATOR_KEY")]
+        operator_key_path: Option<PathBuf>,
+
+        /// Debug-only escape hatch: skip the operator-key load and
+        /// dispatch under `Caveats::top()` (pre-#94 behavior). Never
+        /// the default. Use this when iterating locally without
+        /// provisioning a key — never in production.
+        #[arg(long, default_value_t = false)]
+        allow_no_key: bool,
     },
     /// MCP server (stdio JSON-RPC, no TUI).
     Mcp,
@@ -81,7 +99,11 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
     match cli.command.unwrap_or(Command::Code { path: None }) {
         Command::Code { path } => newt_tui::run_code(path.as_deref(), cli.no_splash),
         Command::Pilot { flight_id } => newt_tui::run_pilot(&flight_id),
-        Command::Worker { coder } => run_worker(coder).await,
+        Command::Worker {
+            coder,
+            operator_key_path,
+            allow_no_key,
+        } => run_worker(coder, operator_key_path, allow_no_key).await,
         Command::Mcp => run_mcp().await,
         Command::Doctor => doctor::run(cli.config.as_deref()).await,
         Command::Config => config_cmd::run(cli.config.as_deref()),
@@ -105,7 +127,18 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
 /// this is the same env the ACP server already honors, so a user
 /// invoking the daemon under systemd can either pass `--coder` or
 /// set `NEWT_CODER=1` in the unit file — both work.
-async fn run_worker(coder: bool) -> anyhow::Result<()> {
+///
+/// `operator_key_path` and `allow_no_key` plumb the worker's signed
+/// operator identity (#94). The headless worker derives an attenuated,
+/// signed [`newt_core::Caveats`] from that identity per dispatch instead
+/// of dispatching under `Caveats::top()`. CLI > env > default-file
+/// resolution. On any unresolved-key failure without `--allow-no-key`,
+/// the worker refuses to start.
+async fn run_worker(
+    coder: bool,
+    operator_key_path: Option<PathBuf>,
+    allow_no_key: bool,
+) -> anyhow::Result<()> {
     if coder {
         // SAFETY: single-threaded section before tokio takes over —
         // set_var is safe here because no other thread reads/writes
@@ -114,6 +147,27 @@ async fn run_worker(coder: bool) -> anyhow::Result<()> {
             std::env::set_var("NEWT_CODER", "1");
         }
         tracing::info!("newt-coder plugin activated (whole-file emit)");
+    }
+
+    // Resolve the operator identity once, BEFORE any tokio work, so a
+    // missing-key refusal fails fast and never tries to drain stdin.
+    let identity =
+        newt_acp_worker::WorkerIdentity::resolve(operator_key_path.as_deref(), allow_no_key)
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "headless worker refused to start: {e}\n\
+                     hint: pass --operator-key-path <PEM>, set NEWT_OPERATOR_KEY, \
+                     or use --allow-no-key (debug only) to fall back to top()"
+                )
+            })?;
+
+    if !identity.is_operator() {
+        tracing::warn!(
+            "headless worker started with --allow-no-key: dispatching under \
+             unbounded debug authority (debug-only fallback, never the default)"
+        );
+    } else {
+        tracing::info!("headless worker started with operator-rooted identity");
     }
 
     // Start the Prometheus /metrics endpoint if NEWT_METRICS_PORT is set.
@@ -125,18 +179,24 @@ async fn run_worker(coder: bool) -> anyhow::Result<()> {
         match stdio_guard::redirect_stdout_to_stderr() {
             Ok(private_stdout) => {
                 let tokio_stdout = tokio::fs::File::from_std(private_stdout);
-                newt_acp_worker::run_with_io_and_metrics(tokio::io::stdin(), tokio_stdout, metrics)
-                    .await
+                newt_acp_worker::run_with_io_metrics_and_identity(
+                    tokio::io::stdin(),
+                    tokio_stdout,
+                    metrics,
+                    identity,
+                )
+                .await
             }
             Err(e) => {
                 tracing::warn!(
                     error = %e,
                     "stdio_guard fd redirect failed; falling back to raw stdout"
                 );
-                newt_acp_worker::run_with_io_and_metrics(
+                newt_acp_worker::run_with_io_metrics_and_identity(
                     tokio::io::stdin(),
                     tokio::io::stdout(),
                     metrics,
+                    identity,
                 )
                 .await
             }
@@ -144,8 +204,13 @@ async fn run_worker(coder: bool) -> anyhow::Result<()> {
     }
     #[cfg(not(unix))]
     {
-        newt_acp_worker::run_with_io_and_metrics(tokio::io::stdin(), tokio::io::stdout(), metrics)
-            .await
+        newt_acp_worker::run_with_io_metrics_and_identity(
+            tokio::io::stdin(),
+            tokio::io::stdout(),
+            metrics,
+            identity,
+        )
+        .await
     }
 }
 
