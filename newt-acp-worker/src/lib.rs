@@ -98,11 +98,46 @@ where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
 {
-    let default_model =
-        std::env::var("NEWT_DEFAULT_MODEL").unwrap_or_else(|_| "llama3.1:8b".to_string());
-    let backend = newt_inference::local::LocalOllamaBackend::discover(&default_model).await?;
-    let server = AcpServer::new(std::sync::Arc::new(backend))
+    let backend = resolve_backend().await?;
+    let server = AcpServer::new(backend)
         .with_metrics(metrics)
         .with_identity(identity);
     server.run(reader, writer).await
+}
+
+/// Pick the inference backend the worker runs against.
+///
+/// If the resolved config (`~/.newt/config.toml` et al.) declares an
+/// OpenAI-compatible backend, the first such entry is used — with bearer
+/// auth resolved from its `api_key_env` / `api_key_file`. This is how
+/// Newt targets a hosted OpenAI-compatible endpoint.
+///
+/// Otherwise the worker falls back to local Ollama auto-discovery using
+/// `$NEWT_DEFAULT_MODEL` (default `llama3.1:8b`) — the historical
+/// behavior, unchanged when no OpenAI backend is configured.
+async fn resolve_backend() -> anyhow::Result<Arc<dyn newt_inference::InferenceBackend>> {
+    use newt_core::{BackendKind, Config};
+
+    let cfg = Config::resolve().unwrap_or_default();
+    if let Some(openai) = cfg
+        .backends
+        .iter()
+        .find(|b| b.kind == BackendKind::Openai)
+    {
+        tracing::info!(
+            name = %openai.name,
+            endpoint = %openai.endpoint,
+            model = %openai.model,
+            authenticated = openai.resolve_api_key().is_some(),
+            "worker: using configured OpenAI-compatible backend"
+        );
+        return Ok(Arc::new(
+            newt_inference::local::LocalVllmBackend::from_config(openai),
+        ));
+    }
+
+    let default_model =
+        std::env::var("NEWT_DEFAULT_MODEL").unwrap_or_else(|_| "llama3.1:8b".to_string());
+    let backend = newt_inference::local::LocalOllamaBackend::discover(&default_model).await?;
+    Ok(Arc::new(backend))
 }

@@ -301,6 +301,10 @@ pub struct LocalVllmBackend {
     endpoint: String,
     model: String,
     client: reqwest::Client,
+    /// Optional bearer token sent as `Authorization: Bearer <token>`.
+    /// `None` for unauthenticated local servers (the default); `Some`
+    /// for hosted OpenAI-compatible endpoints that require an API key.
+    api_key: Option<String>,
 }
 
 impl LocalVllmBackend {
@@ -309,12 +313,38 @@ impl LocalVllmBackend {
             endpoint: endpoint.into(),
             model: model.into(),
             client: reqwest::Client::new(),
+            api_key: None,
         }
     }
 
     /// Return the configured endpoint URL.
     pub fn endpoint(&self) -> &str {
         &self.endpoint
+    }
+
+    /// Attach a bearer token, sent as `Authorization: Bearer <token>` on
+    /// every request. A `None` argument (or an empty token) leaves the
+    /// backend unauthenticated, so callers can pass a resolved
+    /// `Option<String>` straight through.
+    pub fn with_api_key(mut self, api_key: impl Into<Option<String>>) -> Self {
+        self.api_key = api_key.into().filter(|k| !k.is_empty());
+        self
+    }
+
+    /// Build from a [`BackendConfig`](newt_core::BackendConfig), wiring up
+    /// the endpoint, model, and bearer auth resolved from the config's
+    /// `api_key_env` / `api_key_file`. Used by the worker to construct an
+    /// authenticated OpenAI-compatible backend from `~/.newt/config.toml`.
+    pub fn from_config(cfg: &newt_core::BackendConfig) -> Self {
+        Self::new(cfg.endpoint.clone(), cfg.model.clone()).with_api_key(cfg.resolve_api_key())
+    }
+
+    /// Apply bearer auth to a request builder when a token is configured.
+    fn authed(&self, rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match &self.api_key {
+            Some(key) => rb.bearer_auth(key),
+            None => rb,
+        }
     }
 
     /// Override the HTTP client timeout. Useful for testing.
@@ -345,9 +375,7 @@ impl LocalVllmBackend {
             self.endpoint.trim_end_matches('/')
         );
         let resp = self
-            .client
-            .post(&url)
-            .json(&body)
+            .authed(self.client.post(&url).json(&body))
             .send()
             .await
             .map_err(|e| anyhow::anyhow!("vLLM request failed: {e}"))?;
@@ -410,8 +438,7 @@ impl LocalVllmBackend {
     pub async fn list_models(&self) -> anyhow::Result<Vec<ModelInfo>> {
         let url = format!("{}/v1/models", self.endpoint.trim_end_matches('/'));
         let resp = self
-            .client
-            .get(&url)
+            .authed(self.client.get(&url))
             .send()
             .await
             .map_err(|e| anyhow::anyhow!("vLLM list_models request failed: {e}"))?;
