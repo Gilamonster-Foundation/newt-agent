@@ -1,211 +1,103 @@
-//! First-run setup wizard.
+//! First-run setup — functional, non-interactive.
 //!
-//! Triggered automatically when `~/.newt/config.toml` does not exist.
-//! Probes for reachable Ollama endpoints, lets the user pick one and
-//! a model, then writes a minimal `~/.newt/config.toml` so subsequent
-//! runs skip the wizard.
-
-use std::io::{self, Write as _};
+//! Triggered automatically when `~/.newt/config.toml` does not exist (and by
+//! `newt init`). Probes for a reachable Ollama endpoint, auto-selects the
+//! best one and a model, and writes a minimal `~/.newt/config.toml` so
+//! subsequent runs skip setup. There is **no** interactive UI: this is a
+//! functional bootstrap, not a settings UX. Edit `~/.newt/config.toml`
+//! directly to change anything (see `newt config` to print the resolved view).
 
 use newt_core::{Config, DgxConfig};
 
 // ---------------------------------------------------------------------------
-// Entry point
+// Entry points
 // ---------------------------------------------------------------------------
 
-/// Run the first-run wizard if `~/.newt/config.toml` does not exist.
-/// Returns immediately (no-op) when config is already present.
+/// Run first-run setup if `~/.newt/config.toml` does not exist; no-op when it
+/// already does.
 pub fn maybe_run(color: bool) -> anyhow::Result<()> {
     let config_path = match Config::user_config_path() {
         Some(p) => p,
         None => return Ok(()), // can't determine home dir — skip
     };
-
     if config_path.exists() {
         return Ok(());
     }
-
-    run_wizard(color, &config_path)
+    run_setup(color, &config_path)
 }
 
-/// Force the wizard to run, even if config already exists.
-/// Used by `newt init`.
+/// Force setup to run, (re)writing config even if it already exists. Used by
+/// `newt init`.
 pub fn run_init(color: bool) -> anyhow::Result<()> {
     let config_path =
         Config::user_config_path().unwrap_or_else(|| std::path::PathBuf::from("newt.toml"));
-    run_wizard(color, &config_path)
+    run_setup(color, &config_path)
 }
 
 // ---------------------------------------------------------------------------
-// Wizard implementation
+// Setup (no prompts — probe, auto-select, write)
 // ---------------------------------------------------------------------------
 
-fn run_wizard(color: bool, config_path: &std::path::Path) -> anyhow::Result<()> {
+fn run_setup(color: bool, config_path: &std::path::Path) -> anyhow::Result<()> {
     let accent = if color { "\x1b[38;2;220;60;20m" } else { "" };
     let dim = if color { "\x1b[38;2;100;100;100m" } else { "" };
     let reset = if color { "\x1b[0m" } else { "" };
 
     println!();
     println!(
-        "{accent}Welcome to newt v{}!{reset}",
+        "{accent}newt v{} — first-run setup{reset}",
         env!("CARGO_PKG_VERSION")
     );
-    println!();
-    println!("{dim}No config found at {}.", config_path.display());
-    println!("Let's find your Ollama — probing common endpoints…{reset}");
-    println!();
+    println!("{dim}Probing common Ollama endpoints…{reset}");
 
-    // Probe candidates in parallel via the existing tokio runtime.
     let candidates = probe_candidates();
-    let found: Vec<FoundEndpoint> = tokio::task::block_in_place(|| {
+    let found = tokio::task::block_in_place(|| {
         tokio::runtime::Handle::current().block_on(probe_all(&candidates))
     });
 
-    if found.is_empty() {
-        println!(
-            "{dim}No reachable Ollama found at: {}",
-            candidates.join(", ")
-        );
-        println!();
-        print!("Enter Ollama URL (e.g. http://localhost:11434): {reset}");
-        io::stdout().flush()?;
-        let mut url = String::new();
-        io::stdin().read_line(&mut url)?;
-        let url = url.trim().to_string();
-        if url.is_empty() {
-            println!(
-                "Skipping setup — you can configure manually in {}",
-                config_path.display()
-            );
-            return Ok(());
+    // Auto-select: the first reachable endpoint (probe order is priority order —
+    // NEWT_DGX_HOST first, then localhost, then home-lab hosts) and its first
+    // model. Fall back to localhost + a sensible default when nothing answers,
+    // so a config file always gets written for the user to edit.
+    let (url, model, note) = match found.into_iter().next() {
+        Some(ep) => {
+            let model = ep
+                .models
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| "llama3.1:8b".to_string());
+            (ep.url, model, "reachable")
         }
-        // Probe user-supplied URL for models.
-        let models = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(fetch_models(&url))
-                .unwrap_or_default()
-        });
-        let model = pick_model(&models, color)?;
-        return save_config(config_path, &url, &model, color);
-    }
-
-    // Show what was found.
-    for (i, ep) in found.iter().enumerate() {
-        let model_list = if ep.models.is_empty() {
-            "(no models loaded)".into()
-        } else {
-            ep.models.join(", ")
-        };
-        println!(
-            "  {accent}[{}]{reset} {}  {dim}— {}{reset}",
-            i + 1,
-            ep.url,
-            model_list
-        );
-    }
-    println!();
-
-    // Pick endpoint.
-    let ep = if found.len() == 1 {
-        println!("{dim}Using: {}{reset}", found[0].url);
-        &found[0]
-    } else {
-        let default_idx = found.len(); // last entry = default
-        print!(
-            "Which endpoint? [1–{}] (default {}): ",
-            found.len(),
-            default_idx
-        );
-        io::stdout().flush()?;
-        let mut input = String::new();
-        io::stdin().read_line(&mut input)?;
-        let input = input.trim();
-        let idx = if input.is_empty() {
-            default_idx - 1
-        } else {
-            input
-                .parse::<usize>()
-                .unwrap_or(default_idx)
-                .saturating_sub(1)
-        };
-        &found[idx.min(found.len() - 1)]
+        None => (
+            "http://localhost:11434".to_string(),
+            "llama3.1:8b".to_string(),
+            "no endpoint answered — wrote a default, edit to point at yours",
+        ),
     };
 
+    save_config(config_path, &url, &model)?;
+    println!(
+        "{dim}wrote {} → {url}  ({model})  [{note}]{reset}",
+        config_path.display()
+    );
+    println!("{dim}edit that file to change endpoints, model, or permissions{reset}");
     println!();
-
-    // Pick model.
-    let model = if ep.models.is_empty() {
-        print!("No models found. Enter model name: ");
-        io::stdout().flush()?;
-        let mut m = String::new();
-        io::stdin().read_line(&mut m)?;
-        m.trim().to_string()
-    } else {
-        pick_model(&ep.models, color)?
-    };
-
-    save_config(config_path, &ep.url, &model, color)
+    Ok(())
 }
 
-fn pick_model(models: &[String], color: bool) -> anyhow::Result<String> {
-    let accent = if color { "\x1b[38;2;220;60;20m" } else { "" };
-    let dim = if color { "\x1b[38;2;100;100;100m" } else { "" };
-    let reset = if color { "\x1b[0m" } else { "" };
-
-    if models.is_empty() {
-        print!("Enter model name: ");
-        io::stdout().flush()?;
-        let mut m = String::new();
-        io::stdin().read_line(&mut m)?;
-        return Ok(m.trim().to_string());
-    }
-
-    if models.len() == 1 {
-        println!("{dim}Using model: {}{reset}", models[0]);
-        return Ok(models[0].clone());
-    }
-
-    println!("Available models:");
-    for (i, m) in models.iter().enumerate() {
-        println!("  {accent}[{}]{reset} {m}", i + 1);
-    }
-    print!("Which model? [1] (default 1): ");
-    io::stdout().flush()?;
-    let mut input = String::new();
-    io::stdin().read_line(&mut input)?;
-    let idx: usize = input
-        .trim()
-        .parse::<usize>()
-        .unwrap_or(1)
-        .saturating_sub(1)
-        .min(models.len() - 1);
-    Ok(models[idx].clone())
-}
-
-fn save_config(path: &std::path::Path, url: &str, model: &str, color: bool) -> anyhow::Result<()> {
-    let dim = if color { "\x1b[38;2;100;100;100m" } else { "" };
-    let reset = if color { "\x1b[0m" } else { "" };
-
-    // Build a minimal config with a DGX Ollama entry.
+fn save_config(path: &std::path::Path, url: &str, model: &str) -> anyhow::Result<()> {
     let mut config = Config::default();
     let node = newt_core::DgxNode {
         name: "default".into(),
         ollama: Some(url.to_string()),
         ..Default::default()
     };
-    let dgx = DgxConfig {
+    config.dgx = Some(DgxConfig {
         active_model: Some(model.to_string()),
         nodes: vec![node],
         ..Default::default()
-    };
-    config.dgx = Some(dgx);
-
-    print!("\n{dim}Saving config to {} …{reset} ", path.display());
-    io::stdout().flush()?;
+    });
     config.save(path)?;
-    println!("done.");
-    println!();
-
     Ok(())
 }
 
@@ -224,13 +116,13 @@ fn probe_candidates() -> Vec<String> {
         "http://REDACTED-HOST:11434".to_string(),
         "http://REDACTED-HOST:11434".to_string(),
     ];
-    // Also probe NEWT_DGX_HOST if set.
+    // Probe NEWT_DGX_HOST first when set.
     if let Ok(host) = std::env::var("NEWT_DGX_HOST") {
         let scheme = std::env::var("NEWT_DGX_SCHEME").unwrap_or_else(|_| "http".into());
         let port = std::env::var("NEWT_DGX_OLLAMA_PORT").unwrap_or_else(|_| "11434".into());
         let url = format!("{scheme}://{host}:{port}");
         if !candidates.contains(&url) {
-            candidates.insert(0, url); // check env-var host first
+            candidates.insert(0, url);
         }
     }
     candidates
@@ -247,7 +139,7 @@ async fn probe_all(candidates: &[String]) -> Vec<FoundEndpoint> {
         let url = url.clone();
         let c = client.clone();
         handles.push(tokio::spawn(async move {
-            let models = fetch_models_with_client(&c, &url).await.ok()?;
+            let models = fetch_models(&c, &url).await.ok()?;
             Some(FoundEndpoint { url, models })
         }));
     }
@@ -261,32 +153,21 @@ async fn probe_all(candidates: &[String]) -> Vec<FoundEndpoint> {
     found
 }
 
-async fn fetch_models(url: &str) -> anyhow::Result<Vec<String>> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .build()?;
-    fetch_models_with_client(&client, url).await
-}
-
-async fn fetch_models_with_client(
-    client: &reqwest::Client,
-    url: &str,
-) -> anyhow::Result<Vec<String>> {
+async fn fetch_models(client: &reqwest::Client, url: &str) -> anyhow::Result<Vec<String>> {
     let tags_url = format!("{}/api/tags", url.trim_end_matches('/'));
     let resp = client.get(&tags_url).send().await?;
     if !resp.status().is_success() {
         anyhow::bail!("HTTP {}", resp.status());
     }
     let json: serde_json::Value = resp.json().await?;
-    let names = json["models"]
+    Ok(json["models"]
         .as_array()
         .map(|arr| {
             arr.iter()
                 .filter_map(|m| m["name"].as_str().map(str::to_string))
                 .collect()
         })
-        .unwrap_or_default();
-    Ok(names)
+        .unwrap_or_default())
 }
 
 // ---------------------------------------------------------------------------
@@ -299,8 +180,7 @@ mod tests {
 
     #[test]
     fn probe_candidates_includes_localhost() {
-        let c = probe_candidates();
-        assert!(c.iter().any(|u| u.contains("localhost")));
+        assert!(probe_candidates().iter().any(|u| u.contains("localhost")));
     }
 
     #[test]
@@ -309,16 +189,23 @@ mod tests {
         let c = probe_candidates();
         std::env::remove_var("NEWT_DGX_HOST");
         assert!(c.iter().any(|u| u.contains("myhost.local")));
+        // env host is probed first
+        assert!(c[0].contains("myhost.local"));
     }
 
     #[test]
-    fn maybe_run_skips_when_config_exists() {
-        // Create a temp file to simulate existing config.
+    fn save_config_writes_endpoint_and_model() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
-        std::fs::write(&path, "").unwrap();
-        // We can't easily call maybe_run() with a custom path, but we can
-        // at least verify the file-existence short-circuit logic.
-        assert!(path.exists());
+        save_config(&path, "http://localhost:11434", "gemma4:e2b").unwrap();
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.contains("11434"));
+        assert!(written.contains("gemma4:e2b"));
+        // Round-trips through the real loader.
+        let cfg = Config::load(&path).unwrap();
+        assert_eq!(
+            cfg.dgx.and_then(|d| d.active_model).as_deref(),
+            Some("gemma4:e2b")
+        );
     }
 }
