@@ -114,8 +114,9 @@ fn run_help_documents_legacy_exit_codes_flag() {
 /// `newt` worker), the process exits 1.
 #[test]
 fn run_live_mode_runner_failure_exits_one() {
-    // Use `/bin/true` as a stand-in: it exists, so the resolver is
-    // happy, but it isn't an ACP-speaking worker — the runner will
+    // Use `/usr/bin/true` as a stand-in: it exists on both Linux and
+    // macOS (unlike `/bin/true`, which is Linux-only), so the resolver
+    // is happy, but it isn't an ACP-speaking worker — the runner will
     // record a "runner" FAIL row for every case it tries.
     Command::cargo_bin("newt-eval")
         .unwrap()
@@ -126,7 +127,7 @@ fn run_live_mode_runner_failure_exits_one() {
             "--case",
             "001",
             "--worker-bin",
-            "/bin/true",
+            "/usr/bin/true",
         ])
         .assert()
         // Issue #41: exit 1 on any runner FAIL.
@@ -146,7 +147,7 @@ fn run_live_mode_runner_failure_legacy_exit_code() {
             "--case",
             "001",
             "--worker-bin",
-            "/bin/true",
+            "/usr/bin/true",
             "--legacy-exit-codes",
         ])
         .assert()
