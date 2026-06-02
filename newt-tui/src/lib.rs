@@ -1,7 +1,9 @@
-//! Newt-Agent TUI — a sharp protocol console: splash + chat REPL + slash
-//! commands. Deliberately *not* a settings UI — configuration is plain
-//! `~/.newt/config.toml` (see `newt config`). Rich interactive surfaces live
-//! in the downstream `gilamonster-agent` matrix, which inherits these crates.
+//! Newt-Agent TUI — a lean chat + agentic-coding TUI in the spirit of Codex /
+//! Claude Code, deliberately scoped to *chat and agentic coding* (not as
+//! feature-rich). Splash + chat REPL + slash commands + ocap-gated tool use.
+//! NOT a settings UI: configuration is plain `~/.newt/config.toml`
+//! (see `newt config`). Additional features and the multi-agent matrix live in
+//! the downstream `gilamonster-agent`, which inherits these crates.
 
 mod wizard;
 
