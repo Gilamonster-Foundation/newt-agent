@@ -43,6 +43,60 @@ pub struct Config {
     /// Inference cost modeling. `None` → built-in rate table only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pricing: Option<crate::pricing::PricingConfig>,
+
+    /// Memory / context-window management. `None` → RollingWindow(20).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<MemoryConfig>,
+}
+
+// ---------------------------------------------------------------------------
+// Memory config
+// ---------------------------------------------------------------------------
+
+/// Memory management stored under `[memory]` in `newt.toml`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MemoryConfig {
+    /// Which memory provider to activate.
+    #[serde(default)]
+    pub provider: MemoryProviderKind,
+    /// Turns retained by `RollingWindow`. Default: 20.
+    #[serde(default = "default_memory_window")]
+    pub window: usize,
+    /// Model context length for `TokenBudget` (overrides Ollama's reported value).
+    /// Default: 8192.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_tokens: Option<u32>,
+
+    /// Explicit path to a soul file (overrides workspace + global resolution).
+    /// Default: auto-resolve from `.newt/soul.md` → `~/.newt/soul.md`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub soul_file: Option<String>,
+}
+
+fn default_memory_window() -> usize {
+    20
+}
+
+impl Default for MemoryConfig {
+    fn default() -> Self {
+        Self {
+            provider: MemoryProviderKind::RollingWindow,
+            window: 20,
+            context_tokens: None,
+            soul_file: None,
+        }
+    }
+}
+
+/// Which built-in memory strategy to use.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryProviderKind {
+    #[default]
+    RollingWindow,
+    TokenBudget,
+    Summarizing,
 }
 
 // ---------------------------------------------------------------------------
@@ -376,6 +430,7 @@ impl Default for Config {
             dgx: None,
             tui: None,
             pricing: None,
+            memory: None,
         }
     }
 }
@@ -463,6 +518,9 @@ fn home_dir() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The `permits_*` adaptors live on `CaveatsExt` (post-#95 the
+    // upstream `agent-mesh-protocol::Caveats` ships algebra only).
+    use crate::caveats::CaveatsExt;
     use std::io::Write;
     use tempfile::NamedTempFile;
 

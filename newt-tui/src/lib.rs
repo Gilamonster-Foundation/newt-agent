@@ -17,6 +17,11 @@ pub fn run_init(color: bool) -> anyhow::Result<()> {
 
 use std::io::{self, IsTerminal, Write as _};
 
+// Bring `Caveats` enforcement helpers into scope. Since #95 the lattice
+// types live in `agent-mesh-protocol`; `CaveatsExt` adds the
+// `permits_*` adaptors the dispatch sites below call as methods.
+use newt_core::CaveatsExt;
+
 use crossterm::{
     cursor::{Hide, MoveTo, Show},
     event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
@@ -572,6 +577,34 @@ impl SessionCapability {
         &self.caveats
     }
 
+    /// Mint a plugin-side envelope for a subprocess running under `role`
+    /// with `child_caveats`, by delegating from the live operating key.
+    ///
+    /// **Issue #93:** when the TUI eventually spawns a subprocess
+    /// plugin (today: in-process tool calls only), the resulting
+    /// `AgentKey` it hands the plugin MUST chain back to the operator's
+    /// `UserKey` from `~/.newt/identity.pem` — never a synthetic key
+    /// minted at spawn time. This helper is the chokepoint the TUI's
+    /// future subprocess-spawn path will route through.
+    ///
+    /// Returns:
+    /// - `Some(Ok(envelope))` when the operating key is present and the
+    ///   delegation succeeded — the envelope's cert chain roots back to
+    ///   the operator.
+    /// - `Some(Err(_))` when delegation refused (`child_caveats` would
+    ///   amplify the operating key's authority).
+    /// - `None` when the per-user key is unavailable (`SessionCapability`
+    ///   degraded to a plain caveats floor).
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn plugin_envelope_for(
+        &self,
+        role: &str,
+        child_caveats: newt_core::Caveats,
+    ) -> Option<std::result::Result<String, newt_identity::EnvelopeError>> {
+        let op = self.op.as_ref()?;
+        Some(newt_identity::delegate_for_plugin(op, role, child_caveats))
+    }
+
     /// Re-apply a (possibly changed) policy, **narrowing-only**. Returns `true`
     /// if the request asked for *more* authority than the session currently
     /// holds and was therefore clamped (so the caller can tell the user a
@@ -605,6 +638,8 @@ impl SessionCapability {
 #[cfg(test)]
 mod caveat_policy_tests {
     use super::{policy_for, SessionCapability};
+    // The `permits_*` adaptors live on `CaveatsExt` (post-#95).
+    use newt_core::CaveatsExt;
 
     fn tui_with(preset: newt_core::PermissionPreset) -> newt_core::TuiConfig {
         newt_core::TuiConfig {
@@ -648,6 +683,64 @@ mod caveat_policy_tests {
         let cap = SessionCapability::establish(None, None, "/ws");
         assert_ne!(*cap.caveats(), newt_core::caveats::Caveats::top());
         assert!(!cap.caveats().permits_exec("cargo"));
+    }
+
+    /// Issue #93: a subprocess plugin spawned from the TUI must inherit
+    /// an `AgentKey` whose cert chain walks back to the operator's
+    /// `UserKey` from `~/.newt/identity.pem`. This pins the chain-
+    /// rooting property end to end through `SessionCapability`'s
+    /// envelope-mint chokepoint.
+    #[test]
+    fn plugin_envelope_chain_roots_at_operator_userkey() {
+        use base64::Engine;
+        let dir = tempfile::TempDir::new().unwrap();
+        let key_path = dir.path().join("identity.pem");
+        let cap = SessionCapability::establish(
+            Some(tui_with(newt_core::PermissionPreset::WorkspaceDev)),
+            Some(&key_path),
+            "/ws",
+        );
+
+        // Re-load the user key to get its fingerprint for the chain walk.
+        let user = newt_identity::load_or_generate(&key_path).unwrap();
+        let user_fp = user.fingerprint();
+
+        // Plugin runs read-only — strictly narrower than WorkspaceDev.
+        let plugin_caveats = newt_core::Caveats {
+            fs_write: newt_core::Scope::none(),
+            exec: newt_core::Scope::none(),
+            ..cap.caveats().clone()
+        };
+        let envelope = cap
+            .plugin_envelope_for("tui-spawned-plugin", plugin_caveats)
+            .expect("operating key present → envelope path is available")
+            .expect("attenuating delegation must succeed");
+
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(&envelope)
+            .unwrap();
+        let leaf: agent_mesh_protocol::CertChain = serde_json::from_slice(&bytes).unwrap();
+        leaf.verify().expect("plugin cert chain must verify");
+        assert_eq!(
+            leaf.user_fingerprint(),
+            user_fp,
+            "TUI-side plugin envelope must root at the operator's UserKey, \
+             not a synthetic key"
+        );
+    }
+
+    #[test]
+    fn plugin_envelope_unavailable_without_operating_key() {
+        // When the per-user key isn't on disk (None path), the TUI
+        // degrades to a caveats-only floor. The plugin-spawn chokepoint
+        // returns None — the caller must NOT manufacture an AgentKey
+        // (issue #93). No synthetic-key fallback exists.
+        let cap = SessionCapability::establish(None, None, "/ws");
+        assert!(
+            cap.plugin_envelope_for("tui-plugin", newt_core::Caveats::top())
+                .is_none(),
+            "no operating key → no envelope minted (issue #93: no synthetic fallback)"
+        );
     }
 
     #[test]
@@ -788,11 +881,95 @@ fn run_chat(workspace: &str, color: bool) -> anyhow::Result<()> {
     let is_vi = build_rl_config().edit_mode() == rustyline::config::EditMode::Vi;
     let prompt = prompt_str(workspace, verbose, is_vi);
 
-    // Build system prompt with workspace context once at session start.
-    let system = build_system_prompt(workspace);
+    // system prompt is built AFTER initialize_all (see below) so soul files are loaded.
+    // Placeholder until then.
+    let system: String;
 
-    // Conversation history for multi-turn context.
-    let mut conv: Vec<(bool, String)> = Vec::new(); // (is_user, text)
+    // Pluggable memory manager — replaces the old conv Vec.
+    let mem_cfg = newt_core::Config::resolve()
+        .ok()
+        .and_then(|c| c.memory)
+        .unwrap_or_default();
+    let mut memory = {
+        let mut mgr = newt_core::MemoryManager::new();
+        // Soul provider first — sets the frozen identity block.
+        let soul_override = mem_cfg.soul_file.as_ref().map(std::path::PathBuf::from);
+        mgr.add_provider(newt_core::SoulProvider::new(soul_override));
+        // History provider based on config.
+        match mem_cfg.provider {
+            newt_core::MemoryProviderKind::TokenBudget => {
+                let max = mem_cfg.context_tokens.unwrap_or(8_192);
+                mgr.add_provider(newt_core::TokenBudget::new(max, 0.80));
+            }
+            newt_core::MemoryProviderKind::Summarizing => {
+                let max = mem_cfg.context_tokens.unwrap_or(8_192);
+                // Wire the summariser to call the current model via the ACP loop.
+                // The closure captures inf_url/inf_model at session start — model
+                // switches mid-session will update on next session restart.
+                let url = inf_url.clone();
+                let model = inf_model.clone();
+                let s = newt_core::Summarizing::new(max).with_summarizer(
+                    move |prompt: &str| -> anyhow::Result<String> {
+                        let body = serde_json::json!({
+                            "model": model,
+                            "messages": [{"role": "user", "content": prompt}],
+                            "stream": false,
+                        });
+                        let chat_url = format!("{}/api/chat", url.trim_end_matches('/'));
+                        // We're called from sync_turn inside block_in_place,
+                        // so we can use Handle::current().block_on here.
+                        let json: serde_json::Value = tokio::task::block_in_place(|| {
+                            tokio::runtime::Handle::current().block_on(async {
+                                let resp = reqwest::Client::builder()
+                                    .timeout(std::time::Duration::from_secs(60))
+                                    .build()?
+                                    .post(&chat_url)
+                                    .json(&body)
+                                    .send()
+                                    .await?;
+                                resp.json::<serde_json::Value>()
+                                    .await
+                                    .map_err(anyhow::Error::from)
+                            })
+                        })?;
+                        Ok(json["message"]["content"]
+                            .as_str()
+                            .unwrap_or("(summary unavailable)")
+                            .to_string())
+                    },
+                );
+                mgr.add_provider(s);
+            }
+            _ => {
+                mgr.add_provider(newt_core::RollingWindow::new(mem_cfg.window));
+            }
+        }
+        // NoteStore is always active — manages system-prompt injection only.
+        mgr.add_provider(newt_core::NoteStore::default_path());
+        mgr
+    };
+    let ctx = newt_core::SessionContext {
+        workspace: workspace.to_string(),
+        session_id: format!(
+            "{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0)
+        ),
+    };
+    tokio::task::block_in_place(|| rt.block_on(memory.initialize_all(&ctx)));
+
+    // Build system prompt now that SoulProvider has loaded its soul file.
+    {
+        let soul_additions = memory.build_system_prompt_additions();
+        let soul_text = if soul_additions.is_empty() {
+            None
+        } else {
+            Some(soul_additions.as_str())
+        };
+        system = build_system_prompt_with_soul(workspace, soul_text);
+    }
 
     loop {
         match rl.readline(&prompt) {
@@ -804,6 +981,33 @@ fn run_chat(workspace: &str, color: bool) -> anyhow::Result<()> {
                 let _ = rl.add_history_entry(&task);
                 println!();
                 if task.starts_with('/') {
+                    // Commands that need direct access to `memory` are handled here
+                    // before delegating to the generic slash dispatcher.
+                    if task.trim_start_matches('/').starts_with("memory") {
+                        let usage = memory.usage();
+                        if usage.is_empty() {
+                            print_newt("No memory usage data available.", color, verbose);
+                        } else {
+                            print_newt("Context window usage:", color, verbose);
+                            for (label, cur, max) in &usage {
+                                let pct = if *max > 0 { cur * 100 / max } else { 0 };
+                                println!("  {label}: {cur}/{max}  ({pct}%)");
+                            }
+                        }
+                        println!();
+                        continue;
+                    }
+                    if let Some(fact) = task.trim_start_matches('/').strip_prefix("remember ") {
+                        // Find NoteStore in the manager and add the fact.
+                        // We reach it via a best-effort downcast approach using a
+                        // dedicated add_note helper on MemoryManager.
+                        match memory.add_note(fact) {
+                            Ok(()) => print_newt(&format!("Noted: {fact}"), color, verbose),
+                            Err(e) => print_newt(&format!("error: {e}"), color, verbose),
+                        }
+                        println!();
+                        continue;
+                    }
                     let cont = dispatch_slash(&task, workspace, color, verbose)?;
                     if let Some(ref hp) = history_path {
                         let _ = rl.save_history(hp);
@@ -833,12 +1037,13 @@ fn run_chat(workspace: &str, color: bool) -> anyhow::Result<()> {
                     print_thinking(color);
                     let t0 = std::time::Instant::now();
 
+                    // Build message list from memory manager.
+                    let messages = memory.build_messages(&system, &task);
                     let response = tokio::task::block_in_place(|| {
                         rt.block_on(chat_complete(ChatCtx {
                             url: &inf_url,
                             model: &inf_model,
-                            system: &system,
-                            history: &conv,
+                            messages: &messages,
                             task: &task,
                             workspace,
                             color,
@@ -850,12 +1055,10 @@ fn run_chat(workspace: &str, color: bool) -> anyhow::Result<()> {
                     erase_line();
                     match response {
                         Ok((reply, was_streamed, usage)) => {
-                            conv.push((true, task.clone()));
-                            conv.push((false, reply.clone()));
                             if !was_streamed {
                                 print_newt(&reply, color, verbose);
                             }
-                            // Build and display telemetry.
+                            // Single TurnMetrics used for both memory sync and display.
                             let pricing = newt_core::Config::resolve()
                                 .ok()
                                 .and_then(|c| c.pricing)
@@ -867,6 +1070,9 @@ fn run_chat(workspace: &str, color: bool) -> anyhow::Result<()> {
                                 model_id: inf_model.clone(),
                                 endpoint: inf_url.clone(),
                             };
+                            tokio::task::block_in_place(|| {
+                                rt.block_on(memory.sync_all(&task, &reply, &metrics));
+                            });
                             print_metrics(&metrics, color);
                             // Append to usage log (best-effort).
                             if let Some(log) = newt_core::Config::user_config_path()
@@ -927,14 +1133,20 @@ fn resolve_backend_config() -> (String, String) {
 }
 
 /// Build a system prompt with workspace context so the model knows the project.
+// build_system_prompt_with_soul is used directly now; this wrapper kept for tests.
+#[allow(dead_code)]
 fn build_system_prompt(workspace: &str) -> String {
-    let mut ctx = format!(
+    build_system_prompt_with_soul(workspace, None)
+}
+
+fn build_system_prompt_with_soul(workspace: &str, soul: Option<&str>) -> String {
+    let identity = soul.unwrap_or(
         "You are newt, a small, fast, local-first agentic coder. \
          Be concise and direct. \
          You have tools: run_command, read_file, write_file, list_dir. \
-         Use them to actually complete tasks rather than describing what to do.\n\n\
-         Workspace: {workspace}\n"
+         Use them to actually complete tasks rather than describing what to do.",
     );
+    let mut ctx = format!("{identity}\n\nWorkspace: {workspace}\n");
 
     // Directory listing (top-level, no hidden files)
     if let Ok(mut entries) = std::fs::read_dir(workspace) {
@@ -1275,8 +1487,8 @@ fn execute_tool(
 struct ChatCtx<'a> {
     url: &'a str,
     model: &'a str,
-    system: &'a str,
-    history: &'a [(bool, String)],
+    /// Full message list already assembled by `MemoryManager::build_messages`.
+    messages: &'a [newt_core::MemMessage],
     task: &'a str,
     workspace: &'a str,
     color: bool,
@@ -1292,9 +1504,8 @@ async fn chat_complete(
     let ChatCtx {
         url,
         model,
-        system,
-        history,
-        task,
+        messages: mem_messages,
+        task: _task,
         workspace,
         color,
         caveats,
@@ -1304,16 +1515,12 @@ async fn chat_complete(
         .build()?;
     let chat_url = format!("{}/api/chat", url.trim_end_matches('/'));
 
-    // Build message list.
-    let mut messages: Vec<serde_json::Value> =
-        vec![serde_json::json!({"role": "system", "content": system})];
-    for (is_user, text) in history {
-        messages.push(serde_json::json!({
-            "role": if *is_user { "user" } else { "assistant" },
-            "content": text
-        }));
-    }
-    messages.push(serde_json::json!({"role": "user", "content": task}));
+    // Convert MemMessage list to Ollama JSON format.
+    // The memory manager already included the current task as the last user message.
+    let mut messages: Vec<serde_json::Value> = mem_messages
+        .iter()
+        .map(|m| serde_json::json!({"role": m.role.as_str(), "content": m.content}))
+        .collect();
 
     // Agentic loop — up to 10 tool-call rounds.
     for round in 0..10 {
@@ -1526,6 +1733,8 @@ fn dispatch_slash(
             for line in [
                 "  /models                  — list models on the active endpoint",
                 "  /model <name>            — switch model for this session",
+                "  /memory                  — show context window / notes usage",
+                "  /remember <fact>         — add a fact to persistent NOTES.md",
                 "  /dgx status              — DGX endpoint health + running models",
                 "  /dgx models              — list models installed on the DGX",
                 "  /dgx warm [model]        — pre-load a model into VRAM",
@@ -1550,7 +1759,7 @@ fn dispatch_slash(
             let (url, current) = resolve_backend_config();
             match fetch_models_from_url(&url) {
                 Ok(names) if names.is_empty() => {
-                    print_newt(&format!("No models found on {url}"), color, verbose)
+                    print_newt(&format!("No models found on {url}"), color, verbose);
                 }
                 Ok(names) => {
                     print_newt(&format!("Models on {url}:"), color, verbose);
@@ -1581,12 +1790,20 @@ fn dispatch_slash(
         "model" => {
             if arg1.is_empty() {
                 let (_, current) = resolve_backend_config();
-                print_newt(&format!("active model: {current}  (use /model <name> to switch)"), color, verbose);
+                print_newt(
+                    &format!("active model: {current}  (use /model <name> to switch)"),
+                    color,
+                    verbose,
+                );
             } else {
                 // Persist via `newt dgx use <model>` then resolve_backend_config
                 // picks it up automatically on the next turn.
                 run_newt_subcmd(&["dgx", "use", arg1], color, verbose)?;
-                print_newt(&format!("Switched to {arg1} — takes effect on next message."), color, verbose);
+                print_newt(
+                    &format!("Switched to {arg1} — takes effect on next message."),
+                    color,
+                    verbose,
+                );
             }
         }
 
@@ -1634,14 +1851,41 @@ fn fetch_models_from_url(url: &str) -> anyhow::Result<Vec<String>> {
             resp.json::<serde_json::Value>().await.map_err(Into::into)
         })
     })?;
-    Ok(json["models"]
+    Ok(parse_model_names(&json))
+}
+
+/// Extract model names from an Ollama `/api/tags` JSON body. Tolerant of a
+/// missing / non-array `models` field (returns empty) and of entries without a
+/// string `name`.
+fn parse_model_names(json: &serde_json::Value) -> Vec<String> {
+    json["models"]
         .as_array()
         .map(|arr| {
             arr.iter()
                 .filter_map(|m| m["name"].as_str().map(str::to_string))
                 .collect()
         })
-        .unwrap_or_default())
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod model_list_tests {
+    use super::parse_model_names;
+    use serde_json::json;
+
+    #[test]
+    fn parses_names_and_tolerates_shape() {
+        let names = parse_model_names(&json!({
+            "models": [{"name": "llama3.1:8b"}, {"name": "gemma4:e2b"}, {"size": 1}]
+        }));
+        assert_eq!(
+            names,
+            vec!["llama3.1:8b".to_string(), "gemma4:e2b".to_string()]
+        );
+        // Missing or non-array `models` → empty, never a panic.
+        assert!(parse_model_names(&json!({})).is_empty());
+        assert!(parse_model_names(&json!({ "models": "nope" })).is_empty());
+    }
 }
 
 /// Run `newt <args>` as a subprocess using the current executable path so
