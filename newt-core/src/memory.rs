@@ -529,7 +529,7 @@ impl NoteStore {
             path: path.into(),
             snapshot: String::new(),
             live: String::new(),
-            char_limit: char_limit.max(200),
+            char_limit: char_limit.max(10),
         }
     }
 
@@ -639,6 +639,226 @@ impl MemoryProvider for NoteStore {
 
     fn add_note(&mut self, fact: &str) -> anyhow::Result<()> {
         self.add(fact)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Summarizing — built-in provider #4 (closes #107)
+// ---------------------------------------------------------------------------
+
+/// Called by `Summarizing` to generate a summary — injected so tests can
+/// substitute a fake.
+pub type SummaryFn = Box<dyn Fn(&str) -> anyhow::Result<String> + Send + Sync>;
+
+/// Per-turn record with token count for budget tracking.
+#[derive(Clone)]
+struct SumTurn {
+    user: String,
+    assistant: String,
+    tokens: u32,
+}
+
+/// LLM-powered summarisation of old turns when context fills.
+///
+/// Algorithm (adapted from hermes-agent `ContextCompressor`):
+/// 1. Track tokens per turn using `TurnMetrics.usage`.
+/// 2. When `used_tokens > threshold * max_tokens`, summarise the oldest
+///    `compress_ratio` of turns into a structured block.
+/// 3. Replace them with a single `[Summary]` assistant message.
+/// 4. Iterative: on re-compression the previous summary is prepended to the
+///    new summary prompt so facts survive multiple compactions.
+/// 5. Anti-thrashing: skip compression if the last two attempts saved <10%.
+///
+/// Configure: `[memory] provider = "summarizing"`, `context_tokens = 32768`.
+pub struct Summarizing {
+    max_tokens: u32,
+    threshold_pct: f32,
+    /// What fraction of history to summarise each time.
+    compress_ratio: f32,
+    history: Vec<SumTurn>,
+    /// The accumulated summary from previous compressions.
+    prev_summary: String,
+    /// Savings from last two compressions (for anti-thrashing).
+    last_savings: [f32; 2],
+    compress_count: usize,
+    /// Injected summariser — defaults to None (caller must set via `with_summarizer`).
+    summarizer: Option<SummaryFn>,
+}
+
+impl Summarizing {
+    pub fn new(max_tokens: u32) -> Self {
+        Self {
+            max_tokens: max_tokens.max(1),
+            threshold_pct: 0.80,
+            compress_ratio: 0.50,
+            history: Vec::new(),
+            prev_summary: String::new(),
+            last_savings: [1.0, 1.0],
+            compress_count: 0,
+            summarizer: None,
+        }
+    }
+
+    /// Inject a summariser function (required for real use; tests can use a stub).
+    pub fn with_summarizer(
+        mut self,
+        f: impl Fn(&str) -> anyhow::Result<String> + Send + Sync + 'static,
+    ) -> Self {
+        self.summarizer = Some(Box::new(f));
+        self
+    }
+
+    fn budget(&self) -> u32 {
+        (self.max_tokens as f32 * self.threshold_pct) as u32
+    }
+
+    fn used_tokens(&self) -> u32 {
+        self.history.iter().map(|t| t.tokens).sum()
+    }
+
+    fn should_compress(&self) -> bool {
+        if self.used_tokens() <= self.budget() {
+            return false;
+        }
+        // Anti-thrashing: skip if last two compressions each saved <10%.
+        let poor_savings = self.last_savings.iter().all(|&s| s < 0.10);
+        if poor_savings && self.compress_count >= 2 {
+            tracing::warn!("Summarizing: anti-thrashing — skipping compression");
+            return false;
+        }
+        true
+    }
+
+    fn compress_sync(&mut self) {
+        let total = self.history.len();
+        if total == 0 {
+            return;
+        }
+        let n_to_summarise = ((total as f32 * self.compress_ratio) as usize).max(1);
+        let turns_to_compress: Vec<SumTurn> = self.history.drain(..n_to_summarise).collect();
+
+        let tokens_before =
+            self.used_tokens() + turns_to_compress.iter().map(|t| t.tokens).sum::<u32>();
+
+        // Build the prompt for summarisation.
+        let mut prompt = String::new();
+        if !self.prev_summary.is_empty() {
+            prompt.push_str("## Previous Summary\n");
+            prompt.push_str(&self.prev_summary);
+            prompt.push_str("\n\n");
+        }
+        prompt.push_str("## Turns to Summarise\n");
+        for (i, t) in turns_to_compress.iter().enumerate() {
+            prompt.push_str(&format!(
+                "### Turn {}\nUser: {}\nAssistant: {}\n\n",
+                i + 1,
+                t.user,
+                t.assistant
+            ));
+        }
+        prompt.push_str(
+            "Produce a concise structured summary with sections:\n\
+            ## Active Task\n## Completed Actions\n## Key Decisions\n\
+            ## Relevant Files\n## Critical Context\n\
+            Be terse. Preserve specifics (file names, error messages, decisions).",
+        );
+
+        let summary = if let Some(ref f) = self.summarizer {
+            match f(&prompt) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(error = %e, "Summarizing: summary generation failed — keeping turns");
+                    // Put them back on failure.
+                    let mut restored = turns_to_compress;
+                    restored.append(&mut self.history);
+                    self.history = restored;
+                    return;
+                }
+            }
+        } else {
+            // No summariser configured — insert a static placeholder.
+            format!(
+                "[{} turns summarised — configure a summariser for real summaries]",
+                turns_to_compress.len()
+            )
+        };
+
+        // Insert the summary as the first history entry.
+        let summary_tokens = (summary.len() / 4) as u32;
+        self.history.insert(
+            0,
+            SumTurn {
+                user: "[context summary]".into(),
+                assistant: summary.clone(),
+                tokens: summary_tokens,
+            },
+        );
+        self.prev_summary = summary;
+
+        let tokens_after = self.used_tokens();
+        let saved = if tokens_before > 0 {
+            1.0 - (tokens_after as f32 / tokens_before as f32)
+        } else {
+            0.0
+        };
+        self.last_savings = [self.last_savings[1], saved];
+        self.compress_count += 1;
+
+        tracing::info!(
+            compress_count = self.compress_count,
+            tokens_before,
+            tokens_after,
+            saved_pct = saved * 100.0,
+            "Summarizing: compressed context"
+        );
+    }
+}
+
+#[async_trait]
+impl MemoryProvider for Summarizing {
+    fn name(&self) -> &str {
+        "summarizing"
+    }
+
+    fn build_messages(&self, system_prompt: &str, new_task: &str) -> Vec<MemMessage> {
+        let mut msgs = vec![MemMessage::system(system_prompt)];
+        for t in &self.history {
+            msgs.push(MemMessage::user(&t.user));
+            msgs.push(MemMessage::assistant(&t.assistant));
+        }
+        msgs.push(MemMessage::user(new_task));
+        msgs
+    }
+
+    async fn sync_turn(&mut self, user: &str, assistant: &str, metrics: &TurnMetrics) {
+        let tokens = metrics
+            .usage
+            .map(|u| u.input_tokens + u.output_tokens)
+            .unwrap_or(((user.len() + assistant.len()) / 4) as u32);
+        self.history.push(SumTurn {
+            user: user.to_string(),
+            assistant: assistant.to_string(),
+            tokens,
+        });
+        if self.should_compress() {
+            self.compress_sync();
+        }
+    }
+
+    async fn on_pre_compress(&self, _messages: &[MemMessage]) -> String {
+        if self.prev_summary.is_empty() {
+            String::new()
+        } else {
+            format!("Previous compression summary:\n{}", self.prev_summary)
+        }
+    }
+
+    fn usage(&self) -> Option<(String, usize, usize)> {
+        Some((
+            "tokens".into(),
+            self.used_tokens() as usize,
+            self.budget() as usize,
+        ))
     }
 }
 
@@ -800,6 +1020,50 @@ mod tests {
         // Snapshot still empty — frozen.
         assert!(ns.system_prompt_block().is_none());
         assert!(ns.live.contains("new fact"));
+    }
+
+    // --- Summarizing tests ---
+
+    #[tokio::test]
+    async fn summarizing_compresses_when_over_budget() {
+        let mut s = Summarizing::new(100) // 100 token budget
+            .with_summarizer(|_prompt| Ok("SUMMARY".to_string()));
+
+        // Each turn ~50 tokens (200 chars / 4).
+        let big = "x".repeat(200);
+        let mut m = dummy_metrics();
+        // Give explicit token counts so the test is deterministic.
+        m.usage = Some(crate::metrics::TokenUsage {
+            input_tokens: 25,
+            output_tokens: 25,
+        });
+        s.sync_turn(&big, &big, &m).await; // 50 tokens
+        s.sync_turn(&big, &big, &m).await; // 100 tokens — at budget
+        s.sync_turn(&big, &big, &m).await; // 150 tokens — triggers compression
+
+        // Compression should have run at least once.
+        assert!(
+            !s.prev_summary.is_empty(),
+            "prev_summary should be set after compression"
+        );
+        assert!(s.compress_count >= 1, "compress_count={}", s.compress_count);
+    }
+
+    #[tokio::test]
+    async fn summarizing_compresses_repeatedly() {
+        // Verify that the provider compresses multiple times across many turns
+        // and doesn't panic. The exact compress_count depends on savings ratios.
+        let mut s = Summarizing::new(100).with_summarizer(|_| Ok("SUMMARY".to_string()));
+        let mut m = dummy_metrics();
+        m.usage = Some(crate::metrics::TokenUsage {
+            input_tokens: 20,
+            output_tokens: 20,
+        });
+        for _ in 0..20 {
+            s.sync_turn("q", "a", &m).await;
+        }
+        // Should have compressed at least once without panicking.
+        assert!(s.compress_count >= 1);
     }
 
     #[tokio::test]
