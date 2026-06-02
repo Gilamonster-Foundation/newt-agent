@@ -13,6 +13,7 @@ categories = ["development-tools"]
 
 [dependencies]
 newt-core.workspace = true
+newt-identity.workspace = true
 newt-inference.workspace = true
 newt-tools.workspace = true
 plugins-protocol.workspace = true
@@ -40,6 +41,13 @@ pyo3 = [
 tests-common.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true }
+# Chain-rooting integration test (issue #93): decode the base64-JSON
+# envelope back into a CertChain and walk it to the operator UserKey.
+agent-mesh-protocol = { workspace = true }
+base64.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+serde_json.workspace = true
 
 [lints]
 workspace = true

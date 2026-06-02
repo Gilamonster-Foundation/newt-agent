@@ -214,8 +214,41 @@ deployment friction.
    CI to check out both repos before building, or (c) vendoring
    agent-mesh into newt-agent. All three are reasonable; (a) is
    the cleanest long-term answer and the one aligned with the rest
-   of the kyln/gilamonster open-source push. This is out of scope
-   for Phase 4.
+   of the kyln/gilamonster open-source push.
+
+   **Partial resolution (issue #95, 2026-06-01).** With
+   `agent-mesh-protocol 0.6.0` published on crates.io, the
+   *protocol-level* types (`Caveats`, `Scope`, `CountBound`,
+   `AgentKey`, `UserKey`, `CertChain`, `AgentMetadata`,
+   `MeshError`) are now consumed via a registry dep from
+   default-workspace crates (`newt-core`, `newt-identity`,
+   `newt-coder`, `newt-tui`, `newt-acp-worker`). This kills the
+   hand-mirrored `newt_core::caveats` module — `Caveats` is now
+   re-exported straight from `agent-mesh-protocol` — and removes
+   the drift surface that used to live between the wire type and
+   the enforcement-side type.
+
+   The workspace exclusion still applies for `newt-mesh` itself
+   because `agent-mesh-bus` and `agent-mesh-discovery` aren't
+   published; `newt-mesh` keeps its path-dep to those siblings
+   and (for type-graph consistency) to `agent-mesh-protocol` as
+   well. Cargo therefore compiles `agent-mesh-protocol 0.6.0`
+   twice — once from the registry for the workspace, once from
+   the path-dep for `newt-mesh` — so `plugin_envelope.rs` still
+   bridges between the two `Caveats` Rust types via JSON. The
+   bridge is now between two crate instances of the *same source*,
+   so the round-trip is a structural identity by construction;
+   any drift surfaces as a deserialize error rather than silent
+   semantic skew at enforcement sites.
+
+   Per-axis enforcement helpers (`Caveats::permits_fs_write`,
+   `CountBound::permits_one_more`, etc.) aren't part of
+   `agent-mesh-protocol`'s 0.6 surface — that crate ships the
+   lattice algebra (`top`/`leq`/`meet`) only. They live as
+   extension traits in `newt-core`: `CaveatsExt`, `CountBoundExt`,
+   `ScopeExt`. Importing one of those traits brings the
+   adaptors into scope at the call site; the algebra itself is
+   unchanged.
 
 2. **Backend errors via reply payload, not BusError.** The bus's
    `register_handler` signature returns `Result<Vec<u8>, BusError>`,

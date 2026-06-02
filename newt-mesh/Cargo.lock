@@ -42,7 +42,7 @@ name = "agent-mesh-bus"
 version = "0.6.0"
 dependencies = [
  "agent-mesh-discovery",
- "agent-mesh-protocol",
+ "agent-mesh-protocol 0.6.0",
  "agent-mesh-transport",
  "anyhow",
  "async-trait",
@@ -61,7 +61,7 @@ dependencies = [
 name = "agent-mesh-discovery"
 version = "0.6.0"
 dependencies = [
- "agent-mesh-protocol",
+ "agent-mesh-protocol 0.6.0",
  "anyhow",
  "base64",
  "hex",
@@ -91,11 +91,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent-mesh-protocol"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0299274a9ee2d15d3f0505447d648ca7ab7d65d1ea2ba8076c91f8885fbdec14"
+dependencies = [
+ "blake3",
+ "ed25519-dalek 2.2.0",
+ "hex",
+ "rand 0.8.6",
+ "serde",
+ "serde_bytes",
+ "serde_json",
+ "ssh-key",
+ "thiserror",
+ "tracing",
+ "zeroize",
+]
+
+[[package]]
 name = "agent-mesh-transport"
 version = "0.6.0"
 dependencies = [
  "agent-mesh-discovery",
- "agent-mesh-protocol",
+ "agent-mesh-protocol 0.6.0",
  "anyhow",
  "async-trait",
  "bytes",
@@ -2338,8 +2357,9 @@ dependencies = [
 
 [[package]]
 name = "newt-core"
-version = "0.6.0"
+version = "0.6.5"
 dependencies = [
+ "agent-mesh-protocol 0.6.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "serde",
  "serde_json",
  "thiserror",
@@ -2350,7 +2370,7 @@ dependencies = [
 
 [[package]]
 name = "newt-inference"
-version = "0.6.0"
+version = "0.6.5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2372,7 +2392,7 @@ version = "0.5.20260529"
 dependencies = [
  "agent-mesh-bus",
  "agent-mesh-discovery",
- "agent-mesh-protocol",
+ "agent-mesh-protocol 0.6.0",
  "anyhow",
  "async-trait",
  "base64",
@@ -2815,7 +2835,7 @@ dependencies = [
 
 [[package]]
 name = "plugins-protocol"
-version = "0.6.0"
+version = "0.6.5"
 dependencies = [
  "serde",
  "serde_json",
@@ -3866,7 +3886,7 @@ dependencies = [
 
 [[package]]
 name = "tests-common"
-version = "0.6.0"
+version = "0.6.5"
 dependencies = [
  "anyhow",
  "async-trait",
