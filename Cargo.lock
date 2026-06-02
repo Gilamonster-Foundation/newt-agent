@@ -1495,9 +1495,12 @@ dependencies = [
 name = "newt-coder"
 version = "0.6.5"
 dependencies = [
+ "agent-mesh-protocol",
  "anyhow",
  "async-trait",
+ "base64",
  "newt-core",
+ "newt-identity",
  "newt-inference",
  "newt-tools",
  "plugins-protocol",
@@ -1556,6 +1559,7 @@ name = "newt-identity"
 version = "0.6.5"
 dependencies = [
  "agent-mesh-protocol",
+ "base64",
  "chrono",
  "newt-core",
  "serde_json",
@@ -1567,16 +1571,20 @@ dependencies = [
 name = "newt-inference"
 version = "0.6.5"
 dependencies = [
+ "agent-mesh-protocol",
  "anyhow",
  "async-trait",
+ "base64",
  "futures-core",
  "newt-core",
+ "newt-identity",
  "plugins-protocol",
  "pyo3",
  "pyo3-async-runtimes",
  "reqwest",
  "serde",
  "serde_json",
+ "tempfile",
  "tests-common",
  "thiserror 2.0.18",
  "tokio",
@@ -1625,7 +1633,9 @@ dependencies = [
 name = "newt-tui"
 version = "0.6.5"
 dependencies = [
+ "agent-mesh-protocol",
  "anyhow",
+ "base64",
  "crossterm",
  "newt-core",
  "newt-identity",

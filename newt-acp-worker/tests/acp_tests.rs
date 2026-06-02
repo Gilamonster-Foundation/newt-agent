@@ -928,3 +928,44 @@ async fn flat_path_omits_emission_shape_field() {
         "newt-flat path leaked emission_shape: {result}"
     );
 }
+
+#[tokio::test]
+async fn operator_identity_exposes_parent_key_for_plugin_spawn() {
+    // Issue #93: `WorkerIdentity::Operator { root }` must surface the
+    // operator-rooted `Arc<AgentKey>` so the ACP server can thread it
+    // into `Coder::with_parent_key`. Without that exposure, subprocess
+    // plugin spawn would fall back to a synthetic-key path.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("identity.pem");
+    let identity = WorkerIdentity::from_operator_key(&path).unwrap();
+    assert!(identity.is_operator());
+    assert!(
+        identity.parent_key().is_some(),
+        "Operator identity MUST expose its parent_key for plugin spawn (#93)"
+    );
+
+    // And the parent_key roots at the same user key on disk.
+    let user = newt_identity::load_or_generate(&path).unwrap();
+    let parent = identity.parent_key().unwrap();
+    let cert = parent.cert();
+    cert.verify().unwrap();
+    assert_eq!(cert.user_fingerprint(), user.fingerprint());
+}
+
+#[tokio::test]
+async fn allow_no_key_identity_has_no_parent_key() {
+    // The debug fallback has no operator key on disk, so there is no
+    // parent_key to root subprocess plugins at. The Coder threading
+    // path must see `None` and the consequence (per #93 design) is:
+    // subprocess plugin spawn from this path also runs without an
+    // envelope, NOT with a freshly-minted synthetic key. The
+    // companion `no_synthetic_keys.rs` source-text scanner verifies
+    // the dispatch chain doesn't reach for `UserKey::generate()` to
+    // fill the gap.
+    let identity = WorkerIdentity::AllowNoKey;
+    assert!(!identity.is_operator());
+    assert!(
+        identity.parent_key().is_none(),
+        "AllowNoKey has no operator key — parent_key MUST be None (#93)"
+    );
+}

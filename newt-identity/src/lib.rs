@@ -37,12 +37,13 @@
 
 use std::path::{Path, PathBuf};
 
-use agent_mesh_protocol::{AgentMetadata, MeshError, UserKey};
+use agent_mesh_protocol::{MeshError, UserKey};
+use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use newt_core::Caveats;
 
 /// Re-exported so session hosts (e.g. the TUI) can hold an operating key and
 /// delegate from it without depending on `agent-mesh-protocol` directly.
-pub use agent_mesh_protocol::AgentKey;
+pub use agent_mesh_protocol::{AgentKey, AgentMetadata};
 
 /// The debug-only "no caveats" lattice element used by the headless
 /// ACP worker's `--allow-no-key` fallback. Behaviorally identical to
@@ -139,6 +140,20 @@ pub fn enforced_caveats(key: &AgentKey) -> Result<Caveats, IdentityError> {
 /// Build the signed metadata for a session key. `issued_at` is a *claim* in a
 /// signed cert (never a coordination primitive), so wall-clock is appropriate.
 fn meta(role: &str, caveats: Caveats) -> AgentMetadata {
+    plugin_child_metadata(role, caveats)
+}
+
+/// Convenience constructor for the [`AgentMetadata`] of a delegated child
+/// key — including the per-plugin envelope minted by
+/// [`serialize_for_plugin`].
+///
+/// Centralizing the metadata construction here keeps the "fresh child cert"
+/// shape consistent across the headless dispatch path (this crate) and any
+/// plugin-spawning chokepoint that ends up reaching for delegation — every
+/// such site mints with the same role/host conventions, so the
+/// subprocess-side `caveats_from_envelope` extractor sees a uniform shape.
+#[must_use]
+pub fn plugin_child_metadata(role: &str, caveats: Caveats) -> AgentMetadata {
     AgentMetadata {
         role: role.to_string(),
         host: "local".to_string(),
@@ -147,6 +162,87 @@ fn meta(role: &str, caveats: Caveats) -> AgentMetadata {
         expires_at: None,
         caveats,
     }
+}
+
+/// Errors raised while serializing a parent [`AgentKey`] into a base64
+/// envelope ready for the `NEWT_AGENT_KEY` env var.
+///
+/// Distinct from [`IdentityError`] because amplification is a *caller bug*
+/// (request a child whose caveats are not `⊑` the parent's), not an I/O
+/// failure on the operator key.
+#[derive(Debug, thiserror::Error)]
+pub enum EnvelopeError {
+    /// [`AgentKey::delegate`] refused to mint a child whose authority is
+    /// not `⊑` the parent's. Mirrors
+    /// [`agent_mesh_protocol::MeshError::CaveatAmplification`].
+    #[error("requested child caveats amplify parent authority")]
+    Amplification,
+    /// The cert chain could not be serialized to JSON, or the underlying
+    /// `agent-mesh-protocol` operation failed for some other reason.
+    #[error("envelope serialization failed: {0}")]
+    Serialize(String),
+}
+
+impl From<MeshError> for EnvelopeError {
+    fn from(err: MeshError) -> Self {
+        match err {
+            MeshError::CaveatAmplification => Self::Amplification,
+            other => Self::Serialize(other.to_string()),
+        }
+    }
+}
+
+/// Mint a delegated **plugin** [`AgentKey`] from `parent` with the requested
+/// `child_metadata`, then encode its cert chain as a base64-wrapped JSON
+/// string ready to drop into the
+/// [`AGENT_KEY_ENV`](plugins_protocol::AGENT_KEY_ENV) env var.
+///
+/// This is the *headless* counterpart of `newt_mesh::plugin_envelope::serialize_for_plugin`:
+/// `newt-mesh` is path-dep'd against the local `agent-mesh-core` workspace
+/// and therefore excluded from the default workspace, so the headless
+/// dispatch path (`newt-acp-worker` → `newt-coder` → `newt-inference`)
+/// — which depends on the *published* `agent-mesh-protocol` crate via
+/// this `newt-identity` crate — needs a parallel helper that produces
+/// the same wire format (base64-JSON [`agent_mesh_protocol::CertChain`])
+/// from the *same* root user key.
+///
+/// # Chain-rooting guarantee
+///
+/// The returned envelope, when decoded and verified by the plugin
+/// subprocess (via `caveats_from_envelope`), walks a cert chain whose
+/// leaf is the freshly-minted child and whose root is `parent`'s
+/// `root_user_pubkey()` — i.e. the operator's `UserKey` from
+/// `~/.newt/identity.pem`. **Issue #93** locks this in: subprocess plugin
+/// AgentKeys MUST be derived from the operator's TUI/headless key root,
+/// never from a synthetic `UserKey::generate()` at spawn time.
+///
+/// # Errors
+///
+/// Returns [`EnvelopeError::Amplification`] if `child_metadata.caveats` is
+/// not `⊑ parent.cert().metadata.caveats` — [`AgentKey::delegate`] refuses
+/// to mint an amplifying child, and we surface that refusal here rather
+/// than panicking. JSON serialization errors are surfaced as
+/// [`EnvelopeError::Serialize`].
+pub fn serialize_for_plugin(
+    parent: &AgentKey,
+    child_metadata: AgentMetadata,
+) -> Result<String, EnvelopeError> {
+    let child = parent.delegate(child_metadata)?;
+    let json = serde_json::to_string(child.cert())
+        .map_err(|e| EnvelopeError::Serialize(format!("cert chain: {e}")))?;
+    Ok(B64.encode(json.as_bytes()))
+}
+
+/// Convenience: build an envelope for a plugin running under `role` with
+/// the given enforcement `caveats`. Wraps [`plugin_child_metadata`] +
+/// [`serialize_for_plugin`].
+pub fn delegate_for_plugin(
+    parent: &AgentKey,
+    role: &str,
+    caveats: Caveats,
+) -> Result<String, EnvelopeError> {
+    let metadata = plugin_child_metadata(role, caveats);
+    serialize_for_plugin(parent, metadata)
 }
 
 #[cfg(test)]
@@ -220,6 +316,111 @@ mod tests {
             widen.is_err(),
             "an operating key must not be able to delegate wider authority than it holds"
         );
+    }
+
+    #[test]
+    fn serialize_for_plugin_round_trips_and_roots_at_operator_user() {
+        // Issue #93: the subprocess plugin's leaf AgentKey must verify
+        // back through the chain to the operator's `UserKey` — i.e. the
+        // same root user that wrote `~/.newt/identity.pem`. A synthetic
+        // `UserKey::generate()` at spawn time would break this property.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("identity.pem");
+        let user = load_or_generate(&path).unwrap();
+        let user_fp = user.fingerprint();
+
+        // Mint the headless worker's session root then attenuate to a
+        // realistic per-dispatch caveats (mirrors what
+        // `WorkerIdentity::caveats_for_dispatch` does).
+        let session = session_root(&user);
+        let dispatch_caveats = preset_caveats(PermissionPreset::WorkspaceDev);
+        let worker = attenuate(&session, &dispatch_caveats).unwrap();
+
+        // Serialize a plugin envelope under the worker's authority,
+        // further-narrowed to a read-only subset for the subprocess.
+        let mut plugin_caveats = dispatch_caveats.clone();
+        plugin_caveats.exec = newt_core::Scope::none();
+        plugin_caveats.fs_write = newt_core::Scope::none();
+        let envelope = delegate_for_plugin(&worker, "provider-plugin", plugin_caveats).unwrap();
+
+        // The envelope is base64-encoded JSON; decode + reconstruct the
+        // cert chain, verify end-to-end, and walk to the root.
+        use base64::Engine;
+        let json = base64::engine::general_purpose::STANDARD
+            .decode(&envelope)
+            .unwrap();
+        let cert: agent_mesh_protocol::CertChain = serde_json::from_slice(&json).unwrap();
+        cert.verify().expect("plugin cert chain must verify");
+        assert_eq!(
+            cert.user_fingerprint(),
+            user_fp,
+            "plugin leaf must chain back to the operator UserKey, \
+             NOT a freshly-generated synthetic key"
+        );
+        assert_eq!(cert.root_user_pubkey(), user.public());
+    }
+
+    #[test]
+    fn serialize_for_plugin_refuses_amplification() {
+        // Defense in depth: the parent holds a narrowed authority, the
+        // caller asks the plugin to run with strictly more. `delegate()`
+        // refuses, and we surface that as `EnvelopeError::Amplification`
+        // rather than panicking.
+        let dir = TempDir::new().unwrap();
+        let user = fresh_user(&dir);
+        let session = session_root(&user);
+        let narrow = preset_caveats(PermissionPreset::ReadOnly);
+        let worker = attenuate(&session, &narrow).unwrap();
+
+        let amplifying = preset_caveats(PermissionPreset::FullAccess);
+        let err = delegate_for_plugin(&worker, "evil-plugin", amplifying)
+            .expect_err("amplifying delegation must refuse");
+        assert!(
+            matches!(err, EnvelopeError::Amplification),
+            "expected Amplification, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn serialize_for_plugin_three_link_chain_operator_worker_plugin() {
+        // The classic threading the PR enforces:
+        //   operator UserKey
+        //     └── session_root (issue) ← AgentKey #1, ⊤
+        //         └── worker (delegate) ← AgentKey #2, dispatch caveats
+        //             └── plugin (delegate) ← AgentKey #3, plugin caveats
+        // Verifying the leaf must walk all three links and end at the
+        // operator UserKey.
+        let dir = TempDir::new().unwrap();
+        let user = fresh_user(&dir);
+        let root = session_root(&user);
+        let worker = attenuate(&root, &preset_caveats(PermissionPreset::WorkspaceDev)).unwrap();
+        let envelope = delegate_for_plugin(
+            &worker,
+            "plugin",
+            preset_caveats(PermissionPreset::ReadOnly),
+        )
+        .unwrap();
+
+        use base64::Engine;
+        let json = base64::engine::general_purpose::STANDARD
+            .decode(&envelope)
+            .unwrap();
+        let leaf: agent_mesh_protocol::CertChain = serde_json::from_slice(&json).unwrap();
+        leaf.verify().expect("three-link chain must verify");
+        assert_eq!(leaf.user_fingerprint(), user.fingerprint());
+        // And the chain has the expected depth: leaf -> worker -> root.
+        match &leaf.issuer {
+            agent_mesh_protocol::Issuer::Agent { parent, .. } => match &parent.issuer {
+                agent_mesh_protocol::Issuer::Agent { parent: gp, .. } => match &gp.issuer {
+                    agent_mesh_protocol::Issuer::User(u) => {
+                        assert_eq!(u.fingerprint(), user.fingerprint());
+                    }
+                    _ => panic!("third link must be Issuer::User"),
+                },
+                _ => panic!("middle link must be Issuer::Agent"),
+            },
+            _ => panic!("leaf must be Issuer::Agent"),
+        }
     }
 
     #[test]

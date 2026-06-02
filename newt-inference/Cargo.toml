@@ -13,6 +13,7 @@ categories = ["api-bindings"]
 
 [dependencies]
 newt-core.workspace = true
+newt-identity.workspace = true
 plugins-protocol.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
@@ -42,6 +43,12 @@ pyo3 = [
 tests-common = { path = "../tests/common" }
 wiremock.workspace = true
 tokio-test.workspace = true
+# The chain-rooting unit tests (issue #93) need to decode the
+# base64-JSON envelope back into a `CertChain` so the assertion can
+# walk it to the operator UserKey.
+agent-mesh-protocol = { workspace = true }
+base64.workspace = true
+tempfile.workspace = true
 
 [lints]
 workspace = true
