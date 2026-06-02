@@ -158,6 +158,12 @@ pub trait MemoryProvider: Send + Sync {
     fn usage(&self) -> Option<(String, usize, usize)> {
         None
     }
+
+    /// Add a persistent note (only meaningful for `NoteStore`).
+    /// Default: return an error explaining the provider doesn't support notes.
+    fn add_note(&mut self, _fact: &str) -> anyhow::Result<()> {
+        anyhow::bail!("this memory provider does not support persistent notes")
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -263,9 +269,27 @@ impl MemoryManager {
         }
     }
 
-    /// Report usage from the first provider that has something to say.
+    /// Report usage from all providers.
     pub fn usage(&self) -> Vec<(String, usize, usize)> {
         self.providers.iter().filter_map(|p| p.usage()).collect()
+    }
+
+    /// Add a fact to the first `NoteStore` provider found.
+    /// Returns `Err` if no `NoteStore` is registered or the note is rejected.
+    pub fn add_note(&mut self, fact: &str) -> anyhow::Result<()> {
+        for p in &mut self.providers {
+            // Downcast attempt: NoteStore exposes its name.
+            if p.name() == "note_store" {
+                // Safe: we know it's a NoteStore because of the name match.
+                // Use Any downcasting for the actual mutation.
+                // Since we can't easily downcast Box<dyn MemoryProvider>,
+                // we use a dedicated add_note method on MemoryProvider.
+                return p.add_note(fact);
+            }
+        }
+        anyhow::bail!(
+            "no NoteStore registered — add [memory] provider = \"note_store\" to newt.toml"
+        )
     }
 }
 
@@ -358,6 +382,267 @@ impl MemoryProvider for RollingWindow {
 }
 
 // ---------------------------------------------------------------------------
+// TokenBudget — built-in provider #2 (closes #106)
+// ---------------------------------------------------------------------------
+
+/// Per-turn token record stored by `TokenBudget`.
+#[derive(Debug, Clone)]
+struct TurnRecord {
+    user: String,
+    assistant: String,
+    /// Total tokens (input + output) for this turn.
+    tokens: u32,
+}
+
+/// Keep turns up to `threshold_pct` of the model's context window.
+///
+/// Uses `TurnMetrics.usage` (already collected) to track token consumption.
+/// Prunes oldest turns first when approaching the budget.
+///
+/// Configure via `[memory] provider = "token_budget"` plus an optional
+/// `context_tokens` override (default: 8192).
+pub struct TokenBudget {
+    /// Maximum context tokens (model's `num_ctx`; can be overridden).
+    max_tokens: u32,
+    /// Prune when used tokens exceed this fraction of `max_tokens`.
+    threshold_pct: f32,
+    history: Vec<TurnRecord>,
+    pruned_count: usize,
+}
+
+impl TokenBudget {
+    pub fn new(max_tokens: u32, threshold_pct: f32) -> Self {
+        Self {
+            max_tokens: max_tokens.max(512),
+            threshold_pct: threshold_pct.clamp(0.1, 0.99),
+            history: Vec::new(),
+            pruned_count: 0,
+        }
+    }
+
+    /// Create from config, defaulting to 8 192 tokens and 80% threshold.
+    pub fn from_config() -> Self {
+        let max = crate::Config::resolve()
+            .ok()
+            .and_then(|c| c.memory)
+            .and_then(|m| m.context_tokens)
+            .unwrap_or(8_192);
+        Self::new(max, 0.80)
+    }
+
+    fn budget_tokens(&self) -> u32 {
+        (self.max_tokens as f32 * self.threshold_pct) as u32
+    }
+
+    fn used_tokens(&self) -> u32 {
+        self.history.iter().map(|r| r.tokens).sum()
+    }
+
+    /// Prune oldest turns until we're within budget. Returns how many were dropped.
+    fn prune_to_budget(&mut self) -> usize {
+        let budget = self.budget_tokens();
+        let mut dropped = 0;
+        while self.used_tokens() > budget && !self.history.is_empty() {
+            self.history.remove(0);
+            dropped += 1;
+        }
+        dropped
+    }
+}
+
+#[async_trait]
+impl MemoryProvider for TokenBudget {
+    fn name(&self) -> &str {
+        "token_budget"
+    }
+
+    fn build_messages(&self, system_prompt: &str, new_task: &str) -> Vec<MemMessage> {
+        let mut msgs = vec![MemMessage::system(system_prompt)];
+        for r in &self.history {
+            msgs.push(MemMessage::user(&r.user));
+            msgs.push(MemMessage::assistant(&r.assistant));
+        }
+        msgs.push(MemMessage::user(new_task));
+        msgs
+    }
+
+    async fn sync_turn(&mut self, user: &str, assistant: &str, metrics: &TurnMetrics) {
+        let tokens = metrics
+            .usage
+            .map(|u| u.input_tokens + u.output_tokens)
+            .unwrap_or(
+                // Rough estimate when Ollama doesn't report counts.
+                ((user.len() + assistant.len()) / 4) as u32,
+            );
+        self.history.push(TurnRecord {
+            user: user.to_string(),
+            assistant: assistant.to_string(),
+            tokens,
+        });
+        let dropped = self.prune_to_budget();
+        self.pruned_count += dropped;
+        if dropped > 0 {
+            tracing::info!(
+                dropped,
+                budget = self.budget_tokens(),
+                used = self.used_tokens(),
+                "TokenBudget pruned old turns"
+            );
+        }
+    }
+
+    fn usage(&self) -> Option<(String, usize, usize)> {
+        Some((
+            "tokens".into(),
+            self.used_tokens() as usize,
+            self.budget_tokens() as usize,
+        ))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// NoteStore — built-in provider #3 (closes #108)
+// ---------------------------------------------------------------------------
+
+/// Persistent agent notes at `~/.newt/NOTES.md`.
+///
+/// Notes are read once at session start and **frozen** into the system prompt
+/// so the model's prefix cache stays valid.  Mid-session writes (via
+/// `/remember <fact>`) update the file but NOT the system prompt block —
+/// changes take effect next session.
+///
+/// Modelled on hermes-agent's `MemoryStore` (MEMORY.md pattern).
+pub struct NoteStore {
+    path: std::path::PathBuf,
+    /// Content read at initialize — frozen for the system prompt.
+    snapshot: String,
+    /// Live content (may differ from snapshot mid-session).
+    live: String,
+    char_limit: usize,
+}
+
+impl NoteStore {
+    pub const DEFAULT_CHAR_LIMIT: usize = 2_200;
+
+    pub fn new(path: impl Into<std::path::PathBuf>, char_limit: usize) -> Self {
+        Self {
+            path: path.into(),
+            snapshot: String::new(),
+            live: String::new(),
+            char_limit: char_limit.max(200),
+        }
+    }
+
+    /// Create at the default location `~/.newt/NOTES.md`.
+    pub fn default_path() -> Self {
+        let path = crate::Config::user_config_path()
+            .map(|p| p.with_file_name("NOTES.md"))
+            .unwrap_or_else(|| std::path::PathBuf::from("NOTES.md"));
+        Self::new(path, Self::DEFAULT_CHAR_LIMIT)
+    }
+
+    /// Add a fact. Returns `Err` if it would exceed the char limit.
+    pub fn add(&mut self, fact: &str) -> anyhow::Result<()> {
+        let fact = fact.trim().to_string();
+        if fact.is_empty() {
+            return Ok(());
+        }
+        // Reject if already present (exact match).
+        if self.live.contains(&fact) {
+            return Ok(());
+        }
+        let separator = if self.live.is_empty() { "" } else { "\n" };
+        let candidate = format!("{}{}{}", self.live, separator, fact);
+        if candidate.len() > self.char_limit {
+            anyhow::bail!(
+                "NOTES.md would exceed {} char limit ({}/{} used)",
+                self.char_limit,
+                self.live.len(),
+                self.char_limit
+            );
+        }
+        self.live = candidate;
+        self.save()?;
+        Ok(())
+    }
+
+    /// Remove a fact by exact match.
+    pub fn remove(&mut self, fact: &str) -> anyhow::Result<bool> {
+        let before = self.live.len();
+        self.live = self
+            .live
+            .lines()
+            .filter(|l| l.trim() != fact.trim())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let removed = self.live.len() != before;
+        if removed {
+            self.save()?;
+        }
+        Ok(removed)
+    }
+
+    fn save(&self) -> anyhow::Result<()> {
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&self.path, &self.live)?;
+        Ok(())
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.live.trim().is_empty()
+    }
+
+    pub fn char_usage(&self) -> (usize, usize) {
+        (self.live.len(), self.char_limit)
+    }
+}
+
+#[async_trait]
+impl MemoryProvider for NoteStore {
+    fn name(&self) -> &str {
+        "note_store"
+    }
+
+    async fn initialize(&mut self, _ctx: &SessionContext) -> anyhow::Result<()> {
+        if self.path.exists() {
+            self.live = std::fs::read_to_string(&self.path).unwrap_or_default();
+        }
+        // Freeze the snapshot — this is what goes into the system prompt.
+        self.snapshot = self.live.clone();
+        Ok(())
+    }
+
+    fn system_prompt_block(&self) -> Option<String> {
+        if self.snapshot.trim().is_empty() {
+            return None;
+        }
+        Some(format!(
+            "## Agent Notes ({}/{})\n{}",
+            self.snapshot.len(),
+            self.char_limit,
+            self.snapshot.trim()
+        ))
+    }
+
+    fn build_messages(&self, _system_prompt: &str, _new_task: &str) -> Vec<MemMessage> {
+        // NoteStore is a system-prompt-only provider — it doesn't manage history.
+        Vec::new()
+    }
+
+    async fn sync_turn(&mut self, _user: &str, _assistant: &str, _metrics: &TurnMetrics) {}
+
+    fn usage(&self) -> Option<(String, usize, usize)> {
+        Some(("notes".into(), self.live.len(), self.char_limit))
+    }
+
+    fn add_note(&mut self, fact: &str) -> anyhow::Result<()> {
+        self.add(fact)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -436,6 +721,100 @@ mod tests {
         let msgs = mgr.build_messages("sys", "hello");
         assert_eq!(msgs[0].role, Role::System);
         assert_eq!(msgs.last().unwrap().content, "hello");
+    }
+
+    // --- TokenBudget tests ---
+
+    #[tokio::test]
+    async fn token_budget_prunes_oldest_when_over_budget() {
+        let mut tb = TokenBudget::new(100, 1.0); // budget = 100 tokens
+                                                 // Each turn costs ~50 tokens (200 chars / 4)
+        let big = "x".repeat(200);
+        tb.sync_turn(&big, &big, &dummy_metrics()).await;
+        tb.sync_turn(&big, &big, &dummy_metrics()).await;
+        tb.sync_turn(&big, &big, &dummy_metrics()).await;
+        // Should have pruned to fit within 100 tokens
+        assert!(tb.used_tokens() <= 100);
+    }
+
+    #[tokio::test]
+    async fn token_budget_uses_metrics_when_available() {
+        let mut tb = TokenBudget::new(1000, 1.0);
+        let mut m = dummy_metrics();
+        m.usage = Some(crate::metrics::TokenUsage {
+            input_tokens: 30,
+            output_tokens: 20,
+        });
+        tb.sync_turn("q", "a", &m).await;
+        assert_eq!(tb.used_tokens(), 50); // 30 + 20
+    }
+
+    // --- NoteStore tests ---
+
+    #[tokio::test]
+    async fn note_store_add_and_system_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("NOTES.md");
+        let mut ns = NoteStore::new(path, 2200);
+        let ctx = SessionContext {
+            workspace: "/ws".into(),
+            session_id: "s1".into(),
+        };
+        ns.initialize(&ctx).await.unwrap();
+        assert!(ns.system_prompt_block().is_none()); // empty at start
+
+        ns.add("gemma4:e2b is the preferred model").unwrap();
+        assert!(ns.live.contains("gemma4:e2b"));
+    }
+
+    #[tokio::test]
+    async fn note_store_rejects_over_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("NOTES.md");
+        let mut ns = NoteStore::new(path, 50);
+        ns.initialize(&SessionContext {
+            workspace: "/ws".into(),
+            session_id: "s".into(),
+        })
+        .await
+        .unwrap();
+        let long = "x".repeat(60);
+        assert!(ns.add(&long).is_err());
+    }
+
+    #[tokio::test]
+    async fn note_store_frozen_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("NOTES.md");
+        let mut ns = NoteStore::new(path, 2200);
+        ns.initialize(&SessionContext {
+            workspace: "/ws".into(),
+            session_id: "s".into(),
+        })
+        .await
+        .unwrap();
+        // Snapshot is empty at init.
+        assert!(ns.system_prompt_block().is_none());
+        // Add a note mid-session.
+        ns.add("new fact").unwrap();
+        // Snapshot still empty — frozen.
+        assert!(ns.system_prompt_block().is_none());
+        assert!(ns.live.contains("new fact"));
+    }
+
+    #[tokio::test]
+    async fn memory_manager_add_note_routes_to_note_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("NOTES.md");
+        let mut mgr = MemoryManager::new();
+        mgr.add_provider(RollingWindow::new(5));
+        mgr.add_provider(NoteStore::new(path, 2200));
+        let ctx = SessionContext {
+            workspace: "/ws".into(),
+            session_id: "s".into(),
+        };
+        mgr.initialize_all(&ctx).await;
+        mgr.add_note("the answer is 42").unwrap();
     }
 
     #[tokio::test]
