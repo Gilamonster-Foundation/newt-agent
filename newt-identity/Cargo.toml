@@ -16,8 +16,9 @@ newt-core = { workspace = true }
 # The published, pure-Rust (ed25519-dalek + blake3) identity crate. Depending
 # on the *registry* release — not the `../agent-mesh` path dep that keeps
 # `newt-mesh` out of the default workspace — is the wheel-safe, CI-green path
-# blessed by docs/decisions/mesh_integration.md.
-agent-mesh-protocol = "0.6"
+# blessed by docs/decisions/mesh_integration.md. Workspace pin (= "0.6") keeps
+# every consumer of `Caveats` locked to the same agent-mesh-protocol version.
+agent-mesh-protocol = { workspace = true }
 serde_json.workspace = true
 thiserror.workspace = true
 chrono.workspace = true

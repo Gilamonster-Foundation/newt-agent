@@ -20,7 +20,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use newt_core::Caveats;
+use newt_core::{Caveats, CaveatsExt, CountBoundExt};
 use newt_inference::{ChatRequest, InferenceBackend};
 
 use crate::emission::{normalize_emission, Emission};

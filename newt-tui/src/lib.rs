@@ -17,6 +17,11 @@ pub fn run_init(color: bool) -> anyhow::Result<()> {
 
 use std::io::{self, IsTerminal, Write as _};
 
+// Bring `Caveats` enforcement helpers into scope. Since #95 the lattice
+// types live in `agent-mesh-protocol`; `CaveatsExt` adds the
+// `permits_*` adaptors the dispatch sites below call as methods.
+use newt_core::CaveatsExt;
+
 use crossterm::{
     cursor::{Hide, MoveTo, Show},
     event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
@@ -605,6 +610,8 @@ impl SessionCapability {
 #[cfg(test)]
 mod caveat_policy_tests {
     use super::{policy_for, SessionCapability};
+    // The `permits_*` adaptors live on `CaveatsExt` (post-#95).
+    use newt_core::CaveatsExt;
 
     fn tui_with(preset: newt_core::PermissionPreset) -> newt_core::TuiConfig {
         newt_core::TuiConfig {
