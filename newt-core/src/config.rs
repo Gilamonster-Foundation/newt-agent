@@ -463,6 +463,9 @@ fn home_dir() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The `permits_*` adaptors live on `CaveatsExt` (post-#95 the
+    // upstream `agent-mesh-protocol::Caveats` ships algebra only).
+    use crate::caveats::CaveatsExt;
     use std::io::Write;
     use tempfile::NamedTempFile;
 

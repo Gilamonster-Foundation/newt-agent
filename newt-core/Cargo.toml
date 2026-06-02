@@ -19,6 +19,14 @@ toml.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 
+# Issue #95: the `Caveats` / `CountBound` / `Scope` types are re-exported
+# straight from the published `agent-mesh-protocol` crate (registry pin,
+# not the path dep that keeps newt-mesh out of the default workspace).
+# This kills the hand-mirrored `caveats` module and the JSON bridge in
+# `newt-mesh::plugin_envelope` — the signed wire type and the
+# enforcement-side type are now literally the same Rust type.
+agent-mesh-protocol = { workspace = true }
+
 # TODO: depend on thoon-core once it publishes (currently path-only in hermes-thoon).
 # thoon-core = "0.5"
 
