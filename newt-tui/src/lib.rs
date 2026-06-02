@@ -1571,8 +1571,23 @@ fn dispatch_slash(
                 Ok(names) => {
                     print_newt(&format!("Models on {url}:"), color, verbose);
                     for name in &names {
-                        let marker = if *name == current { " ◀ active" } else { "" };
-                        println!("  {name}{marker}");
+                        if *name == current {
+                            if color {
+                                execute!(
+                                    io::stdout(),
+                                    Print(format!("  {name}")),
+                                    SetForegroundColor(NEWT_ORANGE_CT),
+                                    Print(" ◀ active"),
+                                    ResetColor,
+                                    Print("\n"),
+                                )
+                                .ok();
+                            } else {
+                                println!("  {name} ◀ active");
+                            }
+                        } else {
+                            println!("  {name}");
+                        }
                     }
                 }
                 Err(e) => print_newt(&format!("error: {e}"), color, verbose),
