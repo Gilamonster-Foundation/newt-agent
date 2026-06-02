@@ -17,6 +17,11 @@ pub fn run_init(color: bool) -> anyhow::Result<()> {
 
 use std::io::{self, IsTerminal, Write as _};
 
+// Bring `Caveats` enforcement helpers into scope. Since #95 the lattice
+// types live in `agent-mesh-protocol`; `CaveatsExt` adds the
+// `permits_*` adaptors the dispatch sites below call as methods.
+use newt_core::CaveatsExt;
+
 use crossterm::{
     cursor::{Hide, MoveTo, Show},
     event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
@@ -572,6 +577,34 @@ impl SessionCapability {
         &self.caveats
     }
 
+    /// Mint a plugin-side envelope for a subprocess running under `role`
+    /// with `child_caveats`, by delegating from the live operating key.
+    ///
+    /// **Issue #93:** when the TUI eventually spawns a subprocess
+    /// plugin (today: in-process tool calls only), the resulting
+    /// `AgentKey` it hands the plugin MUST chain back to the operator's
+    /// `UserKey` from `~/.newt/identity.pem` — never a synthetic key
+    /// minted at spawn time. This helper is the chokepoint the TUI's
+    /// future subprocess-spawn path will route through.
+    ///
+    /// Returns:
+    /// - `Some(Ok(envelope))` when the operating key is present and the
+    ///   delegation succeeded — the envelope's cert chain roots back to
+    ///   the operator.
+    /// - `Some(Err(_))` when delegation refused (`child_caveats` would
+    ///   amplify the operating key's authority).
+    /// - `None` when the per-user key is unavailable (`SessionCapability`
+    ///   degraded to a plain caveats floor).
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn plugin_envelope_for(
+        &self,
+        role: &str,
+        child_caveats: newt_core::Caveats,
+    ) -> Option<std::result::Result<String, newt_identity::EnvelopeError>> {
+        let op = self.op.as_ref()?;
+        Some(newt_identity::delegate_for_plugin(op, role, child_caveats))
+    }
+
     /// Re-apply a (possibly changed) policy, **narrowing-only**. Returns `true`
     /// if the request asked for *more* authority than the session currently
     /// holds and was therefore clamped (so the caller can tell the user a
@@ -605,6 +638,8 @@ impl SessionCapability {
 #[cfg(test)]
 mod caveat_policy_tests {
     use super::{policy_for, SessionCapability};
+    // The `permits_*` adaptors live on `CaveatsExt` (post-#95).
+    use newt_core::CaveatsExt;
 
     fn tui_with(preset: newt_core::PermissionPreset) -> newt_core::TuiConfig {
         newt_core::TuiConfig {
@@ -648,6 +683,64 @@ mod caveat_policy_tests {
         let cap = SessionCapability::establish(None, None, "/ws");
         assert_ne!(*cap.caveats(), newt_core::caveats::Caveats::top());
         assert!(!cap.caveats().permits_exec("cargo"));
+    }
+
+    /// Issue #93: a subprocess plugin spawned from the TUI must inherit
+    /// an `AgentKey` whose cert chain walks back to the operator's
+    /// `UserKey` from `~/.newt/identity.pem`. This pins the chain-
+    /// rooting property end to end through `SessionCapability`'s
+    /// envelope-mint chokepoint.
+    #[test]
+    fn plugin_envelope_chain_roots_at_operator_userkey() {
+        use base64::Engine;
+        let dir = tempfile::TempDir::new().unwrap();
+        let key_path = dir.path().join("identity.pem");
+        let cap = SessionCapability::establish(
+            Some(tui_with(newt_core::PermissionPreset::WorkspaceDev)),
+            Some(&key_path),
+            "/ws",
+        );
+
+        // Re-load the user key to get its fingerprint for the chain walk.
+        let user = newt_identity::load_or_generate(&key_path).unwrap();
+        let user_fp = user.fingerprint();
+
+        // Plugin runs read-only — strictly narrower than WorkspaceDev.
+        let plugin_caveats = newt_core::Caveats {
+            fs_write: newt_core::Scope::none(),
+            exec: newt_core::Scope::none(),
+            ..cap.caveats().clone()
+        };
+        let envelope = cap
+            .plugin_envelope_for("tui-spawned-plugin", plugin_caveats)
+            .expect("operating key present → envelope path is available")
+            .expect("attenuating delegation must succeed");
+
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(&envelope)
+            .unwrap();
+        let leaf: agent_mesh_protocol::CertChain = serde_json::from_slice(&bytes).unwrap();
+        leaf.verify().expect("plugin cert chain must verify");
+        assert_eq!(
+            leaf.user_fingerprint(),
+            user_fp,
+            "TUI-side plugin envelope must root at the operator's UserKey, \
+             not a synthetic key"
+        );
+    }
+
+    #[test]
+    fn plugin_envelope_unavailable_without_operating_key() {
+        // When the per-user key isn't on disk (None path), the TUI
+        // degrades to a caveats-only floor. The plugin-spawn chokepoint
+        // returns None — the caller must NOT manufacture an AgentKey
+        // (issue #93). No synthetic-key fallback exists.
+        let cap = SessionCapability::establish(None, None, "/ws");
+        assert!(
+            cap.plugin_envelope_for("tui-plugin", newt_core::Caveats::top())
+                .is_none(),
+            "no operating key → no envelope minted (issue #93: no synthetic fallback)"
+        );
     }
 
     #[test]

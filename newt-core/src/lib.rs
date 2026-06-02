@@ -18,7 +18,8 @@ pub mod session;
 #[cfg(feature = "pyo3")]
 pub mod pyo3_module;
 
-pub use caveats::{Caveats, CountBound, Scope};
+pub use agent_mesh_protocol::{Caveats, CountBound, Scope};
+pub use caveats::{CaveatsExt, CountBoundExt, ScopeExt};
 pub use config::{
     ChatStyle, Config, EditMode, MemoryConfig, MemoryProviderKind, PermissionPreset,
     ToolPermissions, TuiConfig,

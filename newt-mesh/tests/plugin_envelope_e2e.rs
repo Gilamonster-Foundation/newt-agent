@@ -20,6 +20,9 @@ use std::os::unix::fs::PermissionsExt;
 
 use agent_mesh_core::{AgentKey, AgentMetadata, Caveats as AmCaveats, CountBound, Scope, UserKey};
 use newt_core::router::Tier;
+// `permits_*` / `permits_one_more` live on newt-core's extension traits
+// (post-#95 agent-mesh-protocol exports only the lattice algebra).
+use newt_core::{CaveatsExt, CountBoundExt};
 use newt_inference::provider_plugin::ProviderPluginBackend;
 use newt_mesh::plugin_envelope::{caveats_from_envelope, serialize_for_plugin};
 use plugins_protocol::AGENT_KEY_ENV;

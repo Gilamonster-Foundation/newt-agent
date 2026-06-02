@@ -33,8 +33,17 @@
 //! [`CertChain::verify`](agent_mesh_core::CertChain::verify) — which walks
 //! the chain to its root [`Issuer::User`](agent_mesh_core::Issuer::User),
 //! checks every signature, *and* re-checks attenuation at every link — and
-//! then converts the verified [`Caveats`](agent_mesh_core::Caveats) into
-//! the local enforcement-side [`newt_core::Caveats`] mirror.
+//! then converts the verified [`Caveats`](agent_mesh_core::Caveats) into the
+//! enforcement-side [`newt_core::Caveats`] consumers hold.
+//!
+//! Since issue #95 those two types share their *source code* — both are
+//! `agent_mesh_protocol::caveats::Caveats` 0.6.0 — but they live in
+//! different compilation graphs (newt-mesh path-deps the local agent-mesh
+//! workspace; newt-core consumes the published crate). Cargo treats them
+//! as distinct Rust types, so we still serde-bridge across the boundary;
+//! the round-trip is a structural identity by construction (same serde
+//! shape) and any future drift surfaces as a deserialize error here, not
+//! as silent semantic skew at the enforcement sites.
 //!
 //! No external trust anchor is needed: the chain self-roots at a
 //! [`UserPublic`](agent_mesh_core::UserPublic) and signatures verify
@@ -130,22 +139,34 @@ pub fn serialize_for_plugin(
 }
 
 /// Plugin-side: decode the base64-wrapped JSON envelope, verify the cert
-/// chain end to end, and convert the verified
-/// [`Caveats`](agent_mesh_core::Caveats) into the local
-/// [`newt_core::Caveats`] mirror that this workspace's enforcement code
-/// (`newt-coder` and friends) consults.
+/// chain end to end, and hand back the verified
+/// [`Caveats`](agent_mesh_core::Caveats) in the shape `newt-core`
+/// consumers (`newt-coder` and friends) hold.
 ///
 /// # Errors
 ///
 /// - [`EnvelopeError::BadBase64`] if the envelope isn't base64.
 /// - [`EnvelopeError::BadCertChain`] if the JSON doesn't parse as a
-///   [`CertChain`], or the chain's caveats don't round-trip into
-///   [`newt_core::Caveats`] (structurally impossible today; the field
-///   shapes are identical).
+///   [`CertChain`], or the chain's caveats don't round-trip into the
+///   `newt-core` view (structurally impossible today; the serde shapes
+///   are identical — they're the *same crate source*, just compiled
+///   under different graph instances).
 /// - [`EnvelopeError::Verification`] if any signature in the chain
 ///   fails or the chain is structurally inconsistent.
 /// - [`EnvelopeError::Amplification`] if any link in the chain grants
 ///   more authority than its parent.
+///
+/// # Why the JSON bridge
+///
+/// Issue #95 collapsed the hand-mirrored `newt_core::caveats` into a
+/// re-export of `agent_mesh_protocol::caveats`. `newt-mesh` keeps its
+/// path-dep on the local agent-mesh workspace (for `agent-mesh-bus` /
+/// `-discovery`, which aren't published), while default-workspace
+/// consumers pull `agent-mesh-protocol` from crates.io. Same source,
+/// same version (0.6.0), but cargo treats them as distinct Rust
+/// types, so we bridge via JSON. A future drift in the serde shape
+/// surfaces as a deserialize error here, not as silent semantic skew
+/// at the enforcement sites.
 ///
 /// # No trust anchor
 ///
@@ -161,10 +182,8 @@ pub fn caveats_from_envelope(envelope: &str) -> Result<newt_core::Caveats, Envel
     let cert: CertChain =
         serde_json::from_slice(&bytes).map_err(|e| EnvelopeError::BadCertChain(e.to_string()))?;
     cert.verify()?;
-    // agent_mesh_core::Caveats and newt_core::Caveats are structurally
-    // identical (same field names, same serde shape). Bridge via JSON
-    // so a future shape divergence surfaces as a deserialize error
-    // here, not as a silent semantic skew at enforcement sites.
+    // The two `Caveats` Rust types are different crate instances of the
+    // same 0.6.0 source — bridge via JSON. See the doc comment above.
     let json = serde_json::to_string(&cert.metadata.caveats)
         .map_err(|e| EnvelopeError::BadCertChain(format!("caveats serialize: {e}")))?;
     serde_json::from_str(&json).map_err(|e| {
@@ -176,6 +195,10 @@ pub fn caveats_from_envelope(envelope: &str) -> Result<newt_core::Caveats, Envel
 mod tests {
     use super::*;
     use agent_mesh_core::{Caveats as AmCaveats, CountBound, Scope, UserKey};
+    // The `permits_*` / `permits_one_more` adaptors live on `newt-core`'s
+    // extension traits (`agent-mesh-protocol` itself ships algebra only);
+    // bring them into scope so the round-trip assertions read as before.
+    use newt_core::{CaveatsExt, CountBoundExt};
 
     fn fixture_metadata(role: &str, caveats: AmCaveats) -> AgentMetadata {
         AgentMetadata {
