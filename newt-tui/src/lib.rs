@@ -804,6 +804,45 @@ fn run_chat(workspace: &str, color: bool) -> anyhow::Result<()> {
                 let max = mem_cfg.context_tokens.unwrap_or(8_192);
                 mgr.add_provider(newt_core::TokenBudget::new(max, 0.80));
             }
+            newt_core::MemoryProviderKind::Summarizing => {
+                let max = mem_cfg.context_tokens.unwrap_or(8_192);
+                // Wire the summariser to call the current model via the ACP loop.
+                // The closure captures inf_url/inf_model at session start — model
+                // switches mid-session will update on next session restart.
+                let url = inf_url.clone();
+                let model = inf_model.clone();
+                let s = newt_core::Summarizing::new(max).with_summarizer(
+                    move |prompt: &str| -> anyhow::Result<String> {
+                        let body = serde_json::json!({
+                            "model": model,
+                            "messages": [{"role": "user", "content": prompt}],
+                            "stream": false,
+                        });
+                        let chat_url = format!("{}/api/chat", url.trim_end_matches('/'));
+                        // We're called from sync_turn inside block_in_place,
+                        // so we can use Handle::current().block_on here.
+                        let json: serde_json::Value = tokio::task::block_in_place(|| {
+                            tokio::runtime::Handle::current().block_on(async {
+                                let resp = reqwest::Client::builder()
+                                    .timeout(std::time::Duration::from_secs(60))
+                                    .build()?
+                                    .post(&chat_url)
+                                    .json(&body)
+                                    .send()
+                                    .await?;
+                                resp.json::<serde_json::Value>()
+                                    .await
+                                    .map_err(anyhow::Error::from)
+                            })
+                        })?;
+                        Ok(json["message"]["content"]
+                            .as_str()
+                            .unwrap_or("(summary unavailable)")
+                            .to_string())
+                    },
+                );
+                mgr.add_provider(s);
+            }
             _ => {
                 mgr.add_provider(newt_core::RollingWindow::new(mem_cfg.window));
             }
