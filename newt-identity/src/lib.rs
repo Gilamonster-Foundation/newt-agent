@@ -27,16 +27,17 @@
 //! machinery through the **published** `agent-mesh-protocol` crate — pure Rust
 //! (ed25519 + blake3), so the PyO3 wheel story is unaffected.
 //!
-//! The signed wire `Caveats` ([`agent_mesh_protocol::Caveats`]) and the
-//! enforcement-side `Caveats` ([`newt_core::Caveats`]) are deliberate mirrors;
-//! [`enforced_caveats`] bridges one to the other via a JSON round-trip, exactly
-//! as `newt-mesh`'s plugin envelope does.
+//! Since issue #95 the signed wire `Caveats` and the enforcement-side
+//! `Caveats` are the *same* Rust type: `newt_core::Caveats` is now a re-export
+//! of [`agent_mesh_protocol::Caveats`]. The JSON-bridge previous versions of
+//! this crate ran is therefore the identity function — `enforced_caveats`
+//! just clones the verified leaf metadata out of the cert chain.
 //!
 //! [1]: ../../docs/decisions/mesh_integration.md
 
 use std::path::{Path, PathBuf};
 
-use agent_mesh_protocol::{AgentMetadata, Caveats as MeshCaveats, MeshError, UserKey};
+use agent_mesh_protocol::{AgentMetadata, MeshError, UserKey};
 use newt_core::Caveats;
 
 /// Re-exported so session hosts (e.g. the TUI) can hold an operating key and
@@ -52,9 +53,6 @@ pub enum IdentityError {
     /// A key operation (load/save/issue/delegate/verify) failed.
     #[error("identity key error: {0}")]
     Key(String),
-    /// The two `Caveats` mirrors failed to round-trip — they have drifted.
-    #[error("caveats bridge failed: {0}")]
-    Bridge(#[from] serde_json::Error),
 }
 
 impl From<MeshError> for IdentityError {
@@ -92,7 +90,7 @@ pub fn load_or_generate(path: &Path) -> Result<UserKey, IdentityError> {
 /// can exceed the human's own authority.
 #[must_use]
 pub fn session_root(user: &UserKey) -> AgentKey {
-    AgentKey::issue(user, meta("newt-session-root", MeshCaveats::top()))
+    AgentKey::issue(user, meta("newt-session-root", Caveats::top()))
 }
 
 /// Attenuate `root` to the given enforcement `caveats`, producing a **signed**
@@ -104,35 +102,24 @@ pub fn session_root(user: &UserKey) -> AgentKey {
 /// [`agent_mesh_protocol::MeshError::CaveatAmplification`]. That is what makes
 /// downstream delegation (e.g. to subprocess plugins) attenuation-only.
 pub fn attenuate(parent: &AgentKey, caveats: &Caveats) -> Result<AgentKey, IdentityError> {
-    let mesh = to_mesh(caveats)?;
-    Ok(parent.delegate(meta("newt-session", mesh))?)
+    Ok(parent.delegate(meta("newt-session", caveats.clone()))?)
 }
 
 /// Verify `key`'s cert chain and return the enforcement-side [`Caveats`] it
 /// carries. The verification re-checks attenuation at every link, so the
 /// returned authority is trustworthy even for a multi-hop delegation.
+///
+/// Since issue #95 the signed wire `Caveats` and the enforcement-side
+/// `Caveats` are the same Rust type, so this is a verify + clone — no JSON
+/// bridge.
 pub fn enforced_caveats(key: &AgentKey) -> Result<Caveats, IdentityError> {
     key.cert().verify()?;
-    from_mesh(&key.cert().metadata.caveats)
-}
-
-/// Bridge enforcement-side `Caveats` → the signed wire type via a JSON
-/// round-trip. The two are structural mirrors; a failure here means they have
-/// drifted (guarded by `bridge_roundtrips_every_preset`).
-fn to_mesh(c: &Caveats) -> Result<MeshCaveats, IdentityError> {
-    let json = serde_json::to_string(c)?;
-    Ok(serde_json::from_str(&json)?)
-}
-
-/// Bridge the signed wire `Caveats` → the enforcement-side type.
-fn from_mesh(c: &MeshCaveats) -> Result<Caveats, IdentityError> {
-    let json = serde_json::to_string(c)?;
-    Ok(serde_json::from_str(&json)?)
+    Ok(key.cert().metadata.caveats.clone())
 }
 
 /// Build the signed metadata for a session key. `issued_at` is a *claim* in a
 /// signed cert (never a coordination primitive), so wall-clock is appropriate.
-fn meta(role: &str, caveats: MeshCaveats) -> AgentMetadata {
+fn meta(role: &str, caveats: Caveats) -> AgentMetadata {
     AgentMetadata {
         role: role.to_string(),
         host: "local".to_string(),
@@ -217,8 +204,15 @@ mod tests {
     }
 
     #[test]
-    fn bridge_roundtrips_every_preset() {
-        // Guards against the newt-core / agent-mesh `Caveats` mirrors drifting.
+    fn caveats_round_trip_through_sign_and_verify_is_identity() {
+        // Post-#95: `newt_core::Caveats` is `agent_mesh_protocol::Caveats`,
+        // so the previous JSON bridge between the two collapses to the
+        // identity function. Pin that property: every preset survives
+        // attenuate → enforced_caveats unchanged. If a future
+        // agent-mesh-protocol bump ever re-splits the types, this test
+        // fails loudly instead of silently dropping fields.
+        let dir = TempDir::new().unwrap();
+        let root = session_root(&fresh_user(&dir));
         for p in [
             PermissionPreset::ReadOnly,
             PermissionPreset::WorkspaceEdit,
@@ -227,8 +221,9 @@ mod tests {
         ] {
             let label = format!("{p:?}");
             let c = preset_caveats(p);
-            let back = from_mesh(&to_mesh(&c).unwrap()).unwrap();
-            assert_eq!(c, back, "preset {label} must survive the caveats bridge");
+            let op = attenuate(&root, &c).unwrap();
+            let back = enforced_caveats(&op).unwrap();
+            assert_eq!(c, back, "preset {label} must survive sign+verify");
         }
     }
 }
