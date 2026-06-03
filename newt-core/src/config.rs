@@ -132,6 +132,15 @@ pub struct TuiConfig {
     #[serde(default = "default_tool_output_lines")]
     pub tool_output_lines: usize,
 
+    /// Maximum number of tool-call rounds the model may take within a single
+    /// turn before the agent forces a final, tools-disabled completion. Each
+    /// round is one model response that may emit tool calls; once this many
+    /// rounds have run without a tool-free answer, newt asks the model once
+    /// more with tools disabled so the user still gets a real (partial)
+    /// answer instead of a placeholder. Default: 25.
+    #[serde(default = "default_max_tool_rounds")]
+    pub max_tool_rounds: usize,
+
     /// Tool-call permission policy for the interactive TUI: which tools the
     /// model may invoke and over which targets. This is a *preset that selects
     /// an attenuation* — the host (`newt-identity`) lowers it into a signed,
@@ -143,6 +152,10 @@ pub struct TuiConfig {
 
 fn default_tool_output_lines() -> usize {
     20
+}
+
+fn default_max_tool_rounds() -> usize {
+    25
 }
 
 // ---------------------------------------------------------------------------
@@ -361,6 +374,7 @@ impl Default for TuiConfig {
             no_splash: false,
             edit_mode: EditMode::Emacs,
             tool_output_lines: default_tool_output_lines(),
+            max_tool_rounds: default_max_tool_rounds(),
             permissions: ToolPermissions::default(),
         }
     }
@@ -943,5 +957,32 @@ default_tier_order = ["FAST", "STANDARD", "COMPLEX", "REVIEW"]
             expand_tilde("relative/path"),
             PathBuf::from("relative/path")
         );
+    }
+
+    #[test]
+    fn default_max_tool_rounds_is_25() {
+        // The function default and the struct default agree on 25.
+        assert_eq!(default_max_tool_rounds(), 25);
+        assert_eq!(TuiConfig::default().max_tool_rounds, 25);
+    }
+
+    #[test]
+    fn tui_max_tool_rounds_defaults_when_field_absent() {
+        // An empty `[tui]` table => serde default kicks in => 25.
+        let toml = r#"
+            [tui]
+        "#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.tui.unwrap().max_tool_rounds, 25);
+    }
+
+    #[test]
+    fn tui_max_tool_rounds_can_be_overridden() {
+        let toml = r#"
+            [tui]
+            max_tool_rounds = 7
+        "#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.tui.unwrap().max_tool_rounds, 7);
     }
 }

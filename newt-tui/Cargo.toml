@@ -49,6 +49,9 @@ tempfile.workspace = true
 # a CertChain so we can walk it to the operator UserKey.
 agent-mesh-protocol = { workspace = true }
 base64.workspace = true
+# HTTP mocking for the tool-call loop tests (cap honoured + graceful cap-exit
+# issuing a final tools-disabled completion). Mirrors newt-inference's pattern.
+wiremock.workspace = true
 
 [lints]
 workspace = true
