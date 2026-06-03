@@ -321,31 +321,30 @@ async fn handle_shell_run(args: Value, bridle: &Registry, granted: &Caveats) -> 
     // verbatim — no field translation needed.
     match bridle.dispatch("shell", args, granted).await {
         // The confined shell ran. Its envelope carries
-        // `{ exit_code, stdout, stderr, timed_out, sandbox_kind }`.
+        // `{ exit_code, stdout, stderr, timed_out, sandbox_kind }` plus —
+        // when the leash refused a capability — the STRUCTURED denial fields
+        // `{ denied: true, denials: [{ kind, target, reason }] }`.
         //
         // IMPORTANT (free-form `cmd` semantics): in free-form mode an
         // out-of-scope command is NOT a `ToolError::Denied` from `dispatch` —
         // there is no single named program to pre-check, so the brush
         // `CommandInterceptor`'s `before_exec` / `before_open` hook denies the
         // command *inside* the shell. The command genuinely does not run
-        // (confinement is real), but the denial surfaces as a non-zero
-        // `exit_code` plus a denial reason in `stderr` of an `Ok` envelope.
+        // (confinement is real), and the denial is reported through the
+        // envelope's `denied` flag.
         //
         // To keep the leash observable end-to-end, we lift such an in-envelope
         // confinement denial to an MCP tool error (`isError: true`) carrying
-        // the denial reason — the same shape an argv-mode `ToolError::Denied`
-        // produces. An in-scope command (even one that exits non-zero for its
-        // own reasons) is returned as a normal success envelope.
-        Ok(envelope) => {
-            if let Some(reason) = confinement_denial_reason(&envelope) {
-                mcp_error_content(&reason)
-            } else {
-                match serde_json::to_string_pretty(&envelope) {
-                    Ok(text) => mcp_text_content(&text),
-                    Err(e) => mcp_error_content(&format!("failed to serialize shell result: {e}")),
-                }
-            }
-        }
+        // the joined denial reason(s) — the same shape an argv-mode
+        // `ToolError::Denied` produces. Detection reads the structured
+        // `denied` field, NEVER parses stdout/stderr. An in-scope command
+        // (even one that exits non-zero for its own reasons) is returned as a
+        // normal success envelope.
+        Ok(envelope) if is_denied(&envelope) => mcp_error_content(&denial_reason(&envelope)),
+        Ok(envelope) => match serde_json::to_string_pretty(&envelope) {
+            Ok(text) => mcp_text_content(&text),
+            Err(e) => mcp_error_content(&format!("failed to serialize shell result: {e}")),
+        },
         // An argv-mode leash denial (or budget / generation / unknown tool, or
         // an error from inside a tool that passed the leash) — surface the
         // reason in-band as an MCP tool error, never a transport fault.
@@ -355,30 +354,40 @@ async fn handle_shell_run(args: Value, bridle: &Registry, granted: &Caveats) -> 
     }
 }
 
-/// If a confined-shell envelope represents a **capability denial** (the brush
-/// `CaveatInterceptor` refused an exec / open in free-form mode), return the
-/// denial reason; otherwise `None`.
+/// Whether a confined-shell envelope carries the STRUCTURED `denied: true`
+/// flag — the leash's machine-readable signal that the brush `CaveatInterceptor`
+/// refused an exec / open in free-form mode.
 ///
-/// A denial is recognised by a non-zero `exit_code` together with the leash's
-/// stable denial signature in `stderr`. The signature comes from
-/// `agent_bridle_core::ToolError`'s `Display` (`"denied: ... is not within the
-/// granted authority"`) wrapped by the interceptor (`"execution denied"` /
-/// `"open denied"`) — all three substrings are stable across agent-bridle's own
-/// free-form confinement tests. Requiring a non-zero exit avoids treating a
-/// successful command that merely *prints* the word "denied" as a leash denial.
-fn confinement_denial_reason(envelope: &Value) -> Option<String> {
-    let exit_code = envelope.get("exit_code").and_then(Value::as_i64)?;
-    if exit_code == 0 {
-        return None;
-    }
-    let stderr = envelope.get("stderr").and_then(Value::as_str)?;
-    let is_denial = stderr.contains("is not within the granted")
-        || stderr.contains("execution denied")
-        || stderr.contains("open denied");
-    if is_denial {
-        Some(stderr.trim().to_string())
+/// This reads the structured field agent-bridle now emits; it does NOT parse
+/// stdout/stderr. The old stderr string-match (`"is not within the granted"`,
+/// etc.) was fragile — a successful command that merely *printed* a denial-like
+/// phrase could be misread, and any wording drift in the leash would silently
+/// break detection. The structured envelope removes both hazards.
+fn is_denied(envelope: &Value) -> bool {
+    envelope
+        .get("denied")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// Build a human-readable denial message from the envelope's structured
+/// `denials: [{ kind, target, reason }]` list, joining each entry's `reason`.
+/// Falls back to a generic message when the list is missing or empty.
+fn denial_reason(envelope: &Value) -> String {
+    let reasons: Vec<String> = envelope
+        .get("denials")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|d| d.get("reason").and_then(Value::as_str))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    if reasons.is_empty() {
+        "denied: the capability leash refused an operation".to_string()
     } else {
-        None
+        reasons.join("; ")
     }
 }
 
@@ -799,6 +808,12 @@ mod tests {
     /// is DENIED — surfaced as an MCP tool error (`isError: true`) carrying the
     /// reason, NOT a transport fault, and the command never runs. Against the
     /// old unconfined `sh -c` this `cmd` would have executed `rm`.
+    ///
+    /// Detection here goes through the STRUCTURED `denied` field of the
+    /// agent-bridle envelope (see `is_denied` / `denial_reason`), NOT a stderr
+    /// string-match. The removed `confinement_denial_reason` helper grepped
+    /// `stderr` for `"is not within the granted"`; this asserts the new path
+    /// produces the same in-band `isError` outcome from the structured signal.
     #[tokio::test]
     async fn shell_run_out_of_scope_rm_is_denied() {
         let resp = rpc_with_caveats(
@@ -823,19 +838,142 @@ mod tests {
             result["isError"], true,
             "out-of-scope rm must be denied (isError): {result}"
         );
-        // The reason is carried back to the model. The brush interceptor's
-        // before_exec hook reports the program is not within granted authority;
-        // the non-zero exit + denial text prove `rm` did not run.
+        // The reason carried back to the model is the structured `denials[].reason`,
+        // joined by `denial_reason`. It must NOT be the raw envelope JSON (which a
+        // stderr-grep success path would have emitted instead).
         let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(
+            !text.contains("\"exit_code\""),
+            "denial text must be the structured reason, not the raw envelope: {text}"
+        );
         assert!(
             text.contains("denied")
                 || text.contains("not within the granted")
                 || text.contains("authority"),
             "expected an exec-denial reason for rm, got: {text}"
         );
+    }
+
+    /// REGRESSION (P1): detection is now driven by the STRUCTURED `denied`
+    /// field, exercised directly against `is_denied` / `denial_reason`. This
+    /// pins the contract that we read the machine-readable envelope, never
+    /// parse stdout/stderr. (A regression to stderr-grepping would make these
+    /// helpers ignore the `denied`/`denials` fields and break.)
+    #[test]
+    fn denial_detection_reads_structured_fields_not_stderr() {
+        // A denial envelope: `denied: true`, even with an EMPTY stderr and a
+        // stdout that merely mentions success — the structured field wins.
+        let denied = serde_json::json!({
+            "exit_code": 126,
+            "stdout": "all good, nothing denied here",
+            "stderr": "",
+            "denied": true,
+            "denials": [
+                { "kind": "exec", "target": "rm", "reason": "rm is not within the granted authority" }
+            ]
+        });
         assert!(
-            !text.contains("\"exit_code\": 0"),
-            "rm must not have succeeded with exit 0: {text}"
+            is_denied(&denied),
+            "structured denied:true must be detected"
+        );
+        assert_eq!(
+            denial_reason(&denied),
+            "rm is not within the granted authority"
+        );
+
+        // A clean envelope whose stdout merely PRINTS denial-like words must NOT
+        // be misread as a denial — the old stderr-grep hazard, now impossible.
+        let clean = serde_json::json!({
+            "exit_code": 0,
+            "stdout": "execution denied is not within the granted authority",
+            "stderr": "open denied",
+        });
+        assert!(
+            !is_denied(&clean),
+            "absence of denied:true must mean not denied, regardless of output"
+        );
+
+        // Multiple denials are joined.
+        let multi = serde_json::json!({
+            "denied": true,
+            "denials": [
+                { "kind": "exec", "target": "rm", "reason": "exec rm denied" },
+                { "kind": "open", "target": "/etc/x", "reason": "open /etc/x denied" }
+            ]
+        });
+        assert_eq!(denial_reason(&multi), "exec rm denied; open /etc/x denied");
+    }
+
+    /// REGRESSION (P1 — the exec-bypass close): an `exec`-style invocation
+    /// (`rm <marker>` / `touch <marker>`) under the `echo`-only grant is DENIED
+    /// AND the program genuinely does not run — proven by the marker file NOT
+    /// being created. This case SLIPPED on the old `129a1adf` pin (pre
+    /// exec-bypass fix), where a free-form `exec` could escape the leash; it
+    /// passing here proves the bump to the hardened agent-bridle closed the
+    /// bypass *through newt's shell_run*, with the denial seen via the
+    /// structured field.
+    #[tokio::test]
+    async fn shell_run_exec_bypass_is_denied_and_program_does_not_run() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let marker = tmp.path().join("exec-bypass-marker");
+        let marker_str = marker.to_str().unwrap();
+        assert!(!marker.exists(), "precondition: marker must not exist yet");
+
+        // `touch <marker>` exercises an out-of-scope exec that, if it ran, would
+        // create the marker. Under the echo-only grant it must be refused.
+        let resp = rpc_with_caveats(
+            echo_only_grant(),
+            &serde_json::json!({
+                "jsonrpc": "2.0", "id": 65, "method": "tools/call",
+                "params": {
+                    "name": "shell_run",
+                    "arguments": { "cmd": format!("touch {marker_str}") }
+                }
+            }),
+        )
+        .await;
+
+        assert!(
+            resp["error"].is_null(),
+            "denial must be in-band, not transport: {resp}"
+        );
+        let result = &resp["result"];
+        assert_eq!(
+            result["isError"], true,
+            "out-of-scope touch must be denied (isError): {result}"
+        );
+        // Confinement is REAL, not cosmetic: the program never ran, so the
+        // marker was never created. This is the bit that would have failed on
+        // the vulnerable `129a1adf` pin.
+        assert!(
+            !marker.exists(),
+            "exec-bypass: touch must NOT have created the marker {marker_str}"
+        );
+
+        // And again with `rm` against a file we pre-create: the denial must
+        // leave the file intact.
+        let victim = tmp.path().join("victim");
+        std::fs::write(&victim, "do not delete me").unwrap();
+        let victim_str = victim.to_str().unwrap();
+        let resp = rpc_with_caveats(
+            echo_only_grant(),
+            &serde_json::json!({
+                "jsonrpc": "2.0", "id": 66, "method": "tools/call",
+                "params": {
+                    "name": "shell_run",
+                    "arguments": { "cmd": format!("rm {victim_str}") }
+                }
+            }),
+        )
+        .await;
+        assert_eq!(
+            resp["result"]["isError"], true,
+            "out-of-scope rm must be denied: {}",
+            resp["result"]
+        );
+        assert!(
+            victim.exists(),
+            "exec-bypass: rm must NOT have deleted the victim {victim_str}"
         );
     }
 
