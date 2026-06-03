@@ -1,0 +1,26 @@
+[package]
+name = "newt-skills"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "Newt-Agent agentskills.io-compatible skills — discovery + SKILL.md parsing for progressive disclosure"
+keywords = ["newt", "agent", "skills", "agentskills"]
+categories = ["development-tools", "parsing"]
+
+[dependencies]
+serde.workspace = true
+# YAML frontmatter parsing for SKILL.md files. Kept deliberately light —
+# serde_yaml is pure-Rust, no C deps, and resolves under MSRV 1.75, so it
+# preserves the PyO3 wheel story for the rest of the workspace.
+serde_yaml = "0.9"
+anyhow.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true
