@@ -393,6 +393,22 @@ impl ChatStyle {
     }
 }
 
+/// The wire protocol an inference backend speaks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum BackendKind {
+    /// Ollama's native `POST /api/chat` API (the historical default).
+    #[default]
+    Ollama,
+    /// An OpenAI-compatible HTTP API (`POST /v1/chat/completions`,
+    /// `GET /v1/models`): vLLM, llama.cpp's server, or any hosted
+    /// OpenAI-compatible endpoint. Optionally authenticated with a
+    /// bearer token (see [`BackendConfig::api_key_file`] /
+    /// [`BackendConfig::api_key_env`]).
+    #[serde(alias = "vllm", alias = "openai-compatible")]
+    Openai,
+}
+
 /// A single inference backend entry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackendConfig {
@@ -400,6 +416,50 @@ pub struct BackendConfig {
     pub endpoint: String,
     pub model: String,
     pub tiers: Vec<Tier>,
+    /// Which wire protocol this backend speaks. Defaults to `ollama`
+    /// so configs written before this field existed keep working.
+    #[serde(default)]
+    pub kind: BackendKind,
+    /// Optional path to a file whose first non-empty line is a bearer
+    /// token, sent as `Authorization: Bearer <token>` by
+    /// OpenAI-compatible backends. A leading `~/` is expanded to the
+    /// home directory. Keeping the secret in a file (rather than inline
+    /// in the config) keeps tokens out of version control.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_file: Option<String>,
+    /// Optional environment variable name holding a bearer token. Takes
+    /// precedence over [`api_key_file`](Self::api_key_file) when both
+    /// resolve to a non-empty value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_env: Option<String>,
+}
+
+impl BackendConfig {
+    /// Resolve this backend's bearer token, if any.
+    ///
+    /// Checks [`api_key_env`](Self::api_key_env) first (environment
+    /// variable), then [`api_key_file`](Self::api_key_file) (first
+    /// non-empty line of the file, trimmed). Returns `None` when neither
+    /// is configured or neither resolves to a non-empty value.
+    pub fn resolve_api_key(&self) -> Option<String> {
+        if let Some(var) = &self.api_key_env {
+            if let Ok(val) = std::env::var(var) {
+                let val = val.trim();
+                if !val.is_empty() {
+                    return Some(val.to_string());
+                }
+            }
+        }
+        if let Some(path) = &self.api_key_file {
+            let expanded = expand_tilde(path);
+            if let Ok(contents) = std::fs::read_to_string(&expanded) {
+                if let Some(token) = contents.lines().map(str::trim).find(|l| !l.is_empty()) {
+                    return Some(token.to_string());
+                }
+            }
+        }
+        None
+    }
 }
 
 /// A subprocess provider-plugin entry.
@@ -424,6 +484,9 @@ impl Default for Config {
                 endpoint: "http://127.0.0.1:11434".into(),
                 model: "llama3.1:8b".into(),
                 tiers: vec![Tier::Fast, Tier::Standard, Tier::Complex, Tier::Review],
+                kind: BackendKind::Ollama,
+                api_key_file: None,
+                api_key_env: None,
             }],
             providers: Vec::new(),
             default_tier_order: vec![Tier::Fast, Tier::Standard, Tier::Complex, Tier::Review],
@@ -509,6 +572,21 @@ fn home_dir() -> Option<PathBuf> {
         .or_else(|_| std::env::var("USERPROFILE"))
         .ok()
         .map(PathBuf::from)
+}
+
+/// Expand a leading `~/` (or a bare `~`) to the home directory. Paths
+/// without a leading tilde are returned unchanged.
+fn expand_tilde(path: &str) -> PathBuf {
+    if let Some(rest) = path.strip_prefix("~/") {
+        if let Some(home) = home_dir() {
+            return home.join(rest);
+        }
+    } else if path == "~" {
+        if let Some(home) = home_dir() {
+            return home;
+        }
+    }
+    PathBuf::from(path)
 }
 
 // ---------------------------------------------------------------------------
@@ -768,5 +846,102 @@ default_tier_order = ["FAST", "STANDARD", "COMPLEX", "REVIEW"]
         assert!(toml.contains("bacon"));
         let back: ToolPermissions = toml::from_str(&toml).unwrap();
         assert_eq!(back, perms);
+    }
+
+    fn openai_backend(api_key_file: Option<String>, api_key_env: Option<String>) -> BackendConfig {
+        BackendConfig {
+            name: "remote".into(),
+            endpoint: "https://example.test".into(),
+            model: "some-model".into(),
+            tiers: vec![Tier::Fast],
+            kind: BackendKind::Openai,
+            api_key_file,
+            api_key_env,
+        }
+    }
+
+    #[test]
+    fn backend_kind_defaults_to_ollama_when_absent() {
+        let toml = r#"
+            [[backends]]
+            name = "local"
+            endpoint = "http://localhost:8000"
+            model = "m"
+            tiers = ["FAST"]
+        "#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.backends[0].kind, BackendKind::Ollama);
+        assert!(cfg.backends[0].api_key_file.is_none());
+        assert!(cfg.backends[0].api_key_env.is_none());
+    }
+
+    #[test]
+    fn backend_kind_parses_openai_and_aliases() {
+        for kind_str in ["openai", "vllm", "openai-compatible"] {
+            let toml = format!(
+                "[[backends]]\nname=\"x\"\nendpoint=\"http://e\"\nmodel=\"m\"\ntiers=[\"FAST\"]\nkind=\"{kind_str}\"\n"
+            );
+            let cfg: Config = toml::from_str(&toml).unwrap();
+            assert_eq!(cfg.backends[0].kind, BackendKind::Openai, "kind={kind_str}");
+        }
+    }
+
+    #[test]
+    fn backend_config_roundtrips_auth_fields() {
+        let cfg = openai_backend(Some("~/.newt/token".into()), Some("MY_TOKEN".into()));
+        let toml = toml::to_string(&cfg).unwrap();
+        assert!(toml.contains("kind = \"openai\""));
+        assert!(toml.contains("api_key_file"));
+        assert!(toml.contains("api_key_env"));
+        let back: BackendConfig = toml::from_str(&toml).unwrap();
+        assert_eq!(back.kind, BackendKind::Openai);
+        assert_eq!(back.api_key_file.as_deref(), Some("~/.newt/token"));
+        assert_eq!(back.api_key_env.as_deref(), Some("MY_TOKEN"));
+    }
+
+    #[test]
+    fn resolve_api_key_reads_first_nonempty_line_of_file() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        // Leading blank line + surrounding whitespace must be skipped/trimmed.
+        write!(f, "\n  secret-token-123  \nignored-second-line\n").unwrap();
+        let cfg = openai_backend(Some(f.path().to_string_lossy().into_owned()), None);
+        assert_eq!(cfg.resolve_api_key().as_deref(), Some("secret-token-123"));
+    }
+
+    #[test]
+    fn resolve_api_key_env_takes_precedence_over_file() {
+        let var = "NEWT_TEST_API_KEY_PRECEDENCE";
+        std::env::set_var(var, "  from-env  ");
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(f, "from-file").unwrap();
+        let cfg = openai_backend(
+            Some(f.path().to_string_lossy().into_owned()),
+            Some(var.into()),
+        );
+        assert_eq!(cfg.resolve_api_key().as_deref(), Some("from-env"));
+        std::env::remove_var(var);
+    }
+
+    #[test]
+    fn resolve_api_key_none_when_unconfigured() {
+        assert_eq!(openai_backend(None, None).resolve_api_key(), None);
+    }
+
+    #[test]
+    fn resolve_api_key_none_for_missing_file() {
+        let cfg = openai_backend(Some("/no/such/newt/token/file".into()), None);
+        assert_eq!(cfg.resolve_api_key(), None);
+    }
+
+    #[test]
+    fn expand_tilde_expands_home_and_passes_through() {
+        let home = home_dir().expect("HOME set in test env");
+        assert_eq!(expand_tilde("~/foo/bar"), home.join("foo/bar"));
+        assert_eq!(expand_tilde("~"), home);
+        assert_eq!(expand_tilde("/abs/path"), PathBuf::from("/abs/path"));
+        assert_eq!(
+            expand_tilde("relative/path"),
+            PathBuf::from("relative/path")
+        );
     }
 }
