@@ -12,6 +12,7 @@ use std::sync::Arc;
 use newt_core::Router;
 use newt_inference::BackendRegistry;
 
+pub mod caveats;
 pub mod handlers;
 pub mod server;
 
