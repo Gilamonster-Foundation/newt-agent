@@ -255,6 +255,7 @@ mod tests {
         ToolPermissions {
             preset: p,
             extra_exec: Vec::new(),
+            net: Vec::new(),
         }
         .to_caveats("/ws")
     }
