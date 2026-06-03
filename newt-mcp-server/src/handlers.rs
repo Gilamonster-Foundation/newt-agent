@@ -11,24 +11,43 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use agent_bridle::{Caveats, Registry, ToolError};
 use newt_core::router::{Router, Tier};
 use newt_inference::BackendRegistry;
 use serde_json::Value;
 
+use crate::caveats::GrantedCaveats;
 use crate::server::McpServer;
 
 /// Register the core MCP protocol handlers on `server`.
 ///
 /// `registry` and `router` are wired into the `goal_run` handler;
 /// every other handler ignores them.
+///
+/// `shell_run` is the one tool that no longer runs free: it is dispatched
+/// through agent-bridle's Caveats-confined brush shell, under a granted
+/// [`Caveats`] leash sourced from `~/.newt/config.toml` (see
+/// [`crate::caveats`]). The bridle [`Registry`] and the granted leash are
+/// built once here and shared (via `Arc`) into the `tools/call` closure.
 pub fn register_handlers(
     server: &mut McpServer,
     registry: Arc<BackendRegistry>,
     router: Arc<Router>,
 ) {
+    let granted = GrantedCaveats::load();
+    // Surface, loudly, whether shell_run is confined or running with full
+    // ambient authority. An unconfined default is a WARNING.
+    granted.warn_to_stderr();
+
     register_initialize(server);
     register_tools_list(server);
-    register_tools_call(server, registry, router);
+    register_tools_call(
+        server,
+        registry,
+        router,
+        Arc::new(agent_bridle::registry()),
+        Arc::new(granted.caveats),
+    );
 }
 
 // ── initialize ─────────────────────────────────────────────────────────────
@@ -144,13 +163,13 @@ fn tool_definitions() -> Value {
         }),
         serde_json::json!({
             "name": "shell_run",
-            "description": "Run a shell command and capture stdout/stderr. Returns exit_code, stdout, stderr, timed_out. Max timeout 300s.",
+            "description": "Run a shell command and capture stdout/stderr. Returns exit_code, stdout, stderr, timed_out. Max timeout 300s. CAVEATS-CONFINED: the command runs inside agent-bridle's brush shell under the granted Caveats leash (from ~/.newt/config.toml [caveats]); a command outside the granted exec/fs scope is DENIED (isError) rather than executed.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "cmd": {
                         "type": "string",
-                        "description": "Shell command to execute (run via sh -c)"
+                        "description": "Shell command to execute, confined in-process by the agent-bridle capability interceptor (exec + fs scopes)"
                     },
                     "cwd": {
                         "type": "string",
@@ -175,12 +194,16 @@ fn register_tools_call(
     server: &mut McpServer,
     registry: Arc<BackendRegistry>,
     router: Arc<Router>,
+    bridle: Arc<Registry>,
+    granted: Arc<Caveats>,
 ) {
     server.register("tools/call", move |params| {
         // Move clones into the async block so each invocation owns its
         // own Arc (the outer closure is `Fn`, not `FnOnce`).
         let registry = registry.clone();
         let router = router.clone();
+        let bridle = bridle.clone();
+        let granted = granted.clone();
         async move {
             let name = params
                 .get("name")
@@ -198,7 +221,7 @@ fn register_tools_call(
                 "code_search" => handle_code_search(&arguments),
                 "goal_run" => handle_goal_run(&arguments, &registry, &router).await,
                 "fs_list" => handle_fs_list(&arguments),
-                "shell_run" => handle_shell_run(&arguments).await,
+                "shell_run" => Ok(handle_shell_run(arguments, &bridle, &granted).await),
                 other => anyhow::bail!("unknown tool: {other}"),
             }
         }
@@ -264,47 +287,99 @@ fn handle_fs_list(args: &Value) -> anyhow::Result<Value> {
     Ok(mcp_text_content(&serde_json::to_string_pretty(&entries)?))
 }
 
-async fn handle_shell_run(args: &Value) -> anyhow::Result<Value> {
-    use std::time::Duration;
-    use tokio::process::Command;
+/// `shell_run` — the Caveats-confined shell.
+///
+/// History: PR #125 implemented this as an UNCONFINED `tokio::process` `sh -c`
+/// with only a timeout — full ambient authority. P1 supersedes that: the same
+/// MCP tool name and input schema (`cmd`, `cwd`, `timeout_secs`) now route the
+/// command through agent-bridle's brush-backed confined shell under the granted
+/// [`Caveats`] leash. A command outside the granted `exec`/`fs` scope is DENIED
+/// in-process by the brush `CommandInterceptor` hook — it never runs.
+///
+/// `cmd` is mapped to agent-bridle's **free-form `cmd` mode** (added in
+/// agent-bridle#4) so it stays a drop-in for clients: pipelines, `&&`,
+/// redirections, globbing all still work, but every external spawn passes the
+/// interceptor's `before_exec` / `before_open` gate.
+///
+/// Error mapping (the load-bearing semantics): a leash **denial** is surfaced
+/// as an MCP *tool error* — `{ content: [..], isError: true }` carrying the
+/// reason — NOT a JSON-RPC transport fault. That keeps the denial observable to
+/// the model: it sees *why* it was refused without the call collapsing into a
+/// `-32603`. So this function returns a `Value` directly (the `tools/call`
+/// arm wraps it in `Ok`), and never bubbles a leash error up the transport.
+async fn handle_shell_run(args: Value, bridle: &Registry, granted: &Caveats) -> Value {
+    // Validate the one required field. A missing `cmd` is a tool-level mistake,
+    // so it comes back as an in-band tool error, matching the leash-denial
+    // shape rather than crashing the transport.
+    if args.get("cmd").and_then(Value::as_str).is_none() {
+        return mcp_error_content("missing required argument: cmd (must be a string)");
+    }
 
-    let cmd = args
-        .get("cmd")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("missing required argument: cmd"))?;
-    let cwd = args.get("cwd").and_then(|v| v.as_str()).unwrap_or(".");
-    let timeout_secs = args
-        .get("timeout_secs")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(30)
-        .min(300);
+    // Route to agent-bridle's free-form `cmd` mode. The shell tool already
+    // reads `cmd`, `cwd`, and `timeout_secs` from this exact shape (and clamps
+    // the timeout to its own 300s ceiling), so we forward the arguments
+    // verbatim — no field translation needed.
+    match bridle.dispatch("shell", args, granted).await {
+        // The confined shell ran. Its envelope carries
+        // `{ exit_code, stdout, stderr, timed_out, sandbox_kind }`.
+        //
+        // IMPORTANT (free-form `cmd` semantics): in free-form mode an
+        // out-of-scope command is NOT a `ToolError::Denied` from `dispatch` —
+        // there is no single named program to pre-check, so the brush
+        // `CommandInterceptor`'s `before_exec` / `before_open` hook denies the
+        // command *inside* the shell. The command genuinely does not run
+        // (confinement is real), but the denial surfaces as a non-zero
+        // `exit_code` plus a denial reason in `stderr` of an `Ok` envelope.
+        //
+        // To keep the leash observable end-to-end, we lift such an in-envelope
+        // confinement denial to an MCP tool error (`isError: true`) carrying
+        // the denial reason — the same shape an argv-mode `ToolError::Denied`
+        // produces. An in-scope command (even one that exits non-zero for its
+        // own reasons) is returned as a normal success envelope.
+        Ok(envelope) => {
+            if let Some(reason) = confinement_denial_reason(&envelope) {
+                mcp_error_content(&reason)
+            } else {
+                match serde_json::to_string_pretty(&envelope) {
+                    Ok(text) => mcp_text_content(&text),
+                    Err(e) => mcp_error_content(&format!("failed to serialize shell result: {e}")),
+                }
+            }
+        }
+        // An argv-mode leash denial (or budget / generation / unknown tool, or
+        // an error from inside a tool that passed the leash) — surface the
+        // reason in-band as an MCP tool error, never a transport fault.
+        // (`ToolError::Display` is safe to show the agent.)
+        Err(e @ ToolError::Denied { .. }) => mcp_error_content(&e.to_string()),
+        Err(e) => mcp_error_content(&e.to_string()),
+    }
+}
 
-    let result = tokio::time::timeout(
-        Duration::from_secs(timeout_secs),
-        Command::new("sh")
-            .arg("-c")
-            .arg(cmd)
-            .current_dir(cwd)
-            .output(),
-    )
-    .await;
-
-    let envelope = match result {
-        Ok(Ok(out)) => serde_json::json!({
-            "exit_code": out.status.code().unwrap_or(-1),
-            "stdout":    String::from_utf8_lossy(&out.stdout),
-            "stderr":    String::from_utf8_lossy(&out.stderr),
-            "timed_out": false
-        }),
-        Ok(Err(e)) => anyhow::bail!("failed to spawn command: {e}"),
-        Err(_) => serde_json::json!({
-            "exit_code": -1,
-            "stdout":    "",
-            "stderr":    format!("timed out after {timeout_secs}s"),
-            "timed_out": true
-        }),
-    };
-    Ok(mcp_text_content(&serde_json::to_string_pretty(&envelope)?))
+/// If a confined-shell envelope represents a **capability denial** (the brush
+/// `CaveatInterceptor` refused an exec / open in free-form mode), return the
+/// denial reason; otherwise `None`.
+///
+/// A denial is recognised by a non-zero `exit_code` together with the leash's
+/// stable denial signature in `stderr`. The signature comes from
+/// `agent_bridle_core::ToolError`'s `Display` (`"denied: ... is not within the
+/// granted authority"`) wrapped by the interceptor (`"execution denied"` /
+/// `"open denied"`) — all three substrings are stable across agent-bridle's own
+/// free-form confinement tests. Requiring a non-zero exit avoids treating a
+/// successful command that merely *prints* the word "denied" as a leash denial.
+fn confinement_denial_reason(envelope: &Value) -> Option<String> {
+    let exit_code = envelope.get("exit_code").and_then(Value::as_i64)?;
+    if exit_code == 0 {
+        return None;
+    }
+    let stderr = envelope.get("stderr").and_then(Value::as_str)?;
+    let is_denial = stderr.contains("is not within the granted")
+        || stderr.contains("execution denied")
+        || stderr.contains("open denied");
+    if is_denial {
+        Some(stderr.trim().to_string())
+    } else {
+        None
+    }
 }
 
 /// Parse a `tier` argument from the JSON-RPC call. Accepts the four
@@ -368,6 +443,19 @@ fn mcp_text_content(text: &str) -> Value {
     })
 }
 
+/// Wrap a reason in the MCP **tool error** envelope: the content shape plus
+/// `isError: true`. This is what a leash denial looks like across the MCP
+/// boundary — an in-band tool error the model can read, not a transport fault.
+fn mcp_error_content(reason: &str) -> Value {
+    serde_json::json!({
+        "content": [{
+            "type": "text",
+            "text": reason
+        }],
+        "isError": true
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -400,6 +488,41 @@ mod tests {
         server.run(input.as_bytes(), &mut output).await.unwrap();
         let text = String::from_utf8(output).unwrap();
         serde_json::from_str(text.trim()).unwrap()
+    }
+
+    /// Like [`rpc`], but wires `tools/call` with an EXPLICIT bridle leash so a
+    /// test can confine `shell_run` deterministically — independent of the
+    /// host's `~/.newt/config.toml`. (`register_handlers` would source the
+    /// granted Caveats from the real home dir, which a test must not depend
+    /// on.) This drives `register_tools_call` directly with a chosen grant.
+    async fn rpc_with_caveats(granted: Caveats, request: &Value) -> Value {
+        let mut server = McpServer::new();
+        register_initialize(&mut server);
+        register_tools_list(&mut server);
+        register_tools_call(
+            &mut server,
+            Arc::new(BackendRegistry::new()),
+            Arc::new(Router::new()),
+            Arc::new(agent_bridle::registry()),
+            Arc::new(granted),
+        );
+
+        let input = format!("{}\n", serde_json::to_string(request).unwrap());
+        let mut output: Vec<u8> = Vec::new();
+        server.run(input.as_bytes(), &mut output).await.unwrap();
+        let text = String::from_utf8(output).unwrap();
+        serde_json::from_str(text.trim()).unwrap()
+    }
+
+    /// A restrictive grant: only `echo` may exec, capped call budget. Used by
+    /// the superseded-`shell_run` regression tests below.
+    fn echo_only_grant() -> Caveats {
+        use agent_bridle::{CountBound, Scope};
+        Caveats {
+            exec: Scope::only(["echo".to_string()]),
+            max_calls: CountBound::AtMost(8),
+            ..Caveats::top()
+        }
     }
 
     // ── initialize ──────────────────────────────────────────────────────────
@@ -627,6 +750,168 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("unknown tool"));
+    }
+
+    // ── tools/call — shell_run is now Caveats-confined (P1 regression) ──────
+    //
+    // These prove `shell_run` ENFORCES the granted leash. They would FAIL
+    // against PR #125's unconfined `sh -c` implementation, which ran any `cmd`
+    // with full ambient authority and never consulted a Caveats grant.
+
+    /// REGRESSION (P1): with a restrictive grant (`exec` only `echo`), an
+    /// in-scope `echo` runs and its stdout is captured. Proves the superseded
+    /// shell_run still works for allowed commands.
+    #[tokio::test]
+    async fn shell_run_in_scope_echo_succeeds() {
+        let resp = rpc_with_caveats(
+            echo_only_grant(),
+            &serde_json::json!({
+                "jsonrpc": "2.0", "id": 60, "method": "tools/call",
+                "params": {
+                    "name": "shell_run",
+                    "arguments": { "cmd": "echo bridled" }
+                }
+            }),
+        )
+        .await;
+
+        // Not a transport error.
+        assert!(
+            resp["error"].is_null(),
+            "unexpected transport error: {resp}"
+        );
+        let result = &resp["result"];
+        // In-scope success is NOT an isError result.
+        assert_ne!(
+            result["isError"], true,
+            "echo should not be denied: {result}"
+        );
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("bridled"), "echo stdout missing: {text}");
+        // The bridle envelope shape carries exit_code 0 for a clean echo.
+        assert!(
+            text.contains("\"exit_code\": 0"),
+            "expected exit_code 0: {text}"
+        );
+    }
+
+    /// REGRESSION (P1): with the SAME restrictive grant, an out-of-scope `rm`
+    /// is DENIED — surfaced as an MCP tool error (`isError: true`) carrying the
+    /// reason, NOT a transport fault, and the command never runs. Against the
+    /// old unconfined `sh -c` this `cmd` would have executed `rm`.
+    #[tokio::test]
+    async fn shell_run_out_of_scope_rm_is_denied() {
+        let resp = rpc_with_caveats(
+            echo_only_grant(),
+            &serde_json::json!({
+                "jsonrpc": "2.0", "id": 61, "method": "tools/call",
+                "params": {
+                    "name": "shell_run",
+                    "arguments": { "cmd": "rm -rf /tmp/newt-bridle-should-not-run" }
+                }
+            }),
+        )
+        .await;
+
+        // The denial is an in-band TOOL error, not a JSON-RPC transport fault.
+        assert!(
+            resp["error"].is_null(),
+            "denial must not be a transport error: {resp}"
+        );
+        let result = &resp["result"];
+        assert_eq!(
+            result["isError"], true,
+            "out-of-scope rm must be denied (isError): {result}"
+        );
+        // The reason is carried back to the model. The brush interceptor's
+        // before_exec hook reports the program is not within granted authority;
+        // the non-zero exit + denial text prove `rm` did not run.
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("denied")
+                || text.contains("not within the granted")
+                || text.contains("authority"),
+            "expected an exec-denial reason for rm, got: {text}"
+        );
+        assert!(
+            !text.contains("\"exit_code\": 0"),
+            "rm must not have succeeded with exit 0: {text}"
+        );
+    }
+
+    /// REGRESSION (P1): a path-separator command (`/bin/rm`) is ALSO denied —
+    /// this is the load-bearing case a cleared PATH alone would not stop. Only
+    /// the interceptor's before_exec hook (at the single spawn funnel) closes
+    /// it. Proves shell_run's confinement is real, not cosmetic.
+    #[tokio::test]
+    async fn shell_run_bin_rm_path_separator_is_denied() {
+        let resp = rpc_with_caveats(
+            echo_only_grant(),
+            &serde_json::json!({
+                "jsonrpc": "2.0", "id": 62, "method": "tools/call",
+                "params": {
+                    "name": "shell_run",
+                    "arguments": { "cmd": "/bin/rm -rf /tmp/newt-bridle-should-not-run" }
+                }
+            }),
+        )
+        .await;
+
+        let result = &resp["result"];
+        assert_eq!(
+            result["isError"], true,
+            "/bin/rm must be denied (isError): {result}"
+        );
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("denied")
+                || text.contains("not within the granted")
+                || text.contains("authority"),
+            "expected an exec-denial reason for /bin/rm, got: {text}"
+        );
+    }
+
+    /// A missing `cmd` is an in-band tool error (matching the leash-denial
+    /// shape), not a transport fault.
+    #[tokio::test]
+    async fn shell_run_missing_cmd_is_in_band_error() {
+        let resp = rpc_with_caveats(
+            echo_only_grant(),
+            &serde_json::json!({
+                "jsonrpc": "2.0", "id": 63, "method": "tools/call",
+                "params": { "name": "shell_run", "arguments": {} }
+            }),
+        )
+        .await;
+
+        assert!(
+            resp["error"].is_null(),
+            "should be in-band, not transport: {resp}"
+        );
+        assert_eq!(resp["result"]["isError"], true);
+        assert!(resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("cmd"));
+    }
+
+    /// The `shell_run` tools/list description now advertises the confinement.
+    #[tokio::test]
+    async fn shell_run_description_notes_caveats_confinement() {
+        let resp = rpc(&serde_json::json!({
+            "jsonrpc": "2.0", "id": 64, "method": "tools/list", "params": {}
+        }))
+        .await;
+        let tools = resp["result"]["tools"].as_array().unwrap();
+        let shell = tools
+            .iter()
+            .find(|t| t["name"] == "shell_run")
+            .expect("shell_run present");
+        let desc = shell["description"].as_str().unwrap();
+        assert!(
+            desc.contains("CAVEATS-CONFINED") || desc.to_lowercase().contains("caveats"),
+            "shell_run description should note Caveats confinement: {desc}"
+        );
     }
 
     // ── parse_tier — unit tests ─────────────────────────────────────────────
