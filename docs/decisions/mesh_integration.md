@@ -214,7 +214,7 @@ deployment friction.
    CI to check out both repos before building, or (c) vendoring
    agent-mesh into newt-agent. All three are reasonable; (a) is
    the cleanest long-term answer and the one aligned with the rest
-   of the kyln/gilamonster open-source push.
+   of the gilamonster open-source push.
 
    **Partial resolution (issue #95, 2026-06-01).** With
    `agent-mesh-protocol 0.6.0` published on crates.io, the
