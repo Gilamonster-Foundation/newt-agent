@@ -1,18 +1,21 @@
 //! `newt dgx` — NVIDIA DGX endpoint management.
 //!
+//! - `setup`  — first-run DGX configuration wizard; writes `[dgx]` to config.
 //! - `route`  — classify a task and recommend a (model, endpoint) formation.
 //! - `status` — active-endpoint health + models currently loaded on the DGX.
 //! - `models` — list models available on the active endpoint.
 //! - `doctor` — probe every configured endpoint flavor + DNS guidance.
 //!
-//! Later Phase 14 steps add `setup`/`use`/`endpoint`/`formation`/`node`,
+//! Later Phase 14 steps add `endpoint`/`formation`/`node`,
 //! Ollama lifecycle (`pull`/`rm`/`ps`), SSH ops (`run`/`push`/`watch`), and
 //! `nim`.
 
 use std::path::Path;
 
+use std::io::Write as _;
+
 use clap::Subcommand;
-use newt_core::dgx::{DgxConfig, EndpointKind};
+use newt_core::dgx::{DgxConfig, DgxNode, EndpointKind};
 use newt_core::router::Classification;
 use newt_core::{Config, Router, Tier};
 use newt_inference::local::LocalVllmBackend;
@@ -20,6 +23,33 @@ use newt_inference::local::LocalVllmBackend;
 /// `newt dgx <cmd>` subcommands.
 #[derive(Subcommand, Debug)]
 pub enum DgxCmd {
+    /// First-run DGX setup: write a [dgx] block to ~/.newt/config.toml.
+    ///
+    /// With no arguments, prints setup instructions. With --host, synthesizes
+    /// Ollama / vLLM endpoint URLs from the bare hostname or IP and writes the
+    /// config (atomically via Config::save). Use --template to dump the
+    /// home.lab reference template as TOML without writing anything.
+    Setup {
+        /// DGX hostname or IP (e.g. REDACTED-IP or REDACTED-HOST).
+        #[arg(long)]
+        host: Option<String>,
+
+        /// Node name stored in config (default: "dgx").
+        #[arg(long, default_value = "dgx")]
+        name: String,
+
+        /// Active model id (e.g. qwen2.5-coder:32b, llama3.1:8b).
+        #[arg(long)]
+        model: Option<String>,
+
+        /// Print the home.lab reference template as TOML and exit without writing.
+        #[arg(long)]
+        template: bool,
+
+        /// Skip the write-confirmation prompt (useful in scripts / tests).
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
     /// Classify a task and recommend a model + endpoint formation.
     Route {
         /// Task description to classify (quote multi-word tasks).
@@ -53,6 +83,20 @@ pub enum DgxCmd {
 /// Dispatch a `newt dgx` subcommand.
 pub async fn run(cmd: DgxCmd, config_path: Option<&Path>) -> anyhow::Result<()> {
     match cmd {
+        DgxCmd::Setup {
+            host,
+            name,
+            model,
+            template,
+            yes,
+        } => setup(
+            config_path,
+            host.as_deref(),
+            &name,
+            model.as_deref(),
+            template,
+            yes,
+        ),
         DgxCmd::Route { task } => route(&task, config_path),
         DgxCmd::Status => status(config_path).await,
         DgxCmd::Models => models(config_path).await,
@@ -60,6 +104,100 @@ pub async fn run(cmd: DgxCmd, config_path: Option<&Path>) -> anyhow::Result<()> 
         DgxCmd::Use { model } => use_model(config_path, &model),
         DgxCmd::Warm { model, keep_alive } => warm(config_path, model, &keep_alive).await,
     }
+}
+
+// ---------------------------------------------------------------------------
+// setup
+// ---------------------------------------------------------------------------
+
+/// First-run DGX configuration.
+///
+/// Synthesizes Ollama / vLLM endpoint URLs from a bare `host` (e.g.
+/// `REDACTED-IP` or `REDACTED-HOST`) and writes the resulting `[dgx]`
+/// block into the resolved config file. Loads the existing config first so
+/// non-DGX fields are preserved.
+///
+/// Confirmation is skipped when `yes = true` (non-interactive / test mode).
+fn setup(
+    config_path: Option<&Path>,
+    host: Option<&str>,
+    name: &str,
+    model: Option<&str>,
+    template: bool,
+    yes: bool,
+) -> anyhow::Result<()> {
+    // --template: dump home_template as TOML then exit without writing.
+    if template {
+        let tmpl = DgxConfig::home_template();
+        let text = toml::to_string_pretty(&tmpl)
+            .map_err(|e| anyhow::anyhow!("TOML serialisation failed: {e}"))?;
+        println!("# [dgx] home.lab reference template");
+        println!("# Copy into ~/.newt/config.toml under [dgx]\n");
+        print!("{text}");
+        return Ok(());
+    }
+
+    // No --host: print guidance and exit without error.
+    let Some(host) = host else {
+        eprintln!("Usage: newt dgx setup --host <hostname-or-ip> [--model <model>] [--yes]");
+        eprintln!("       newt dgx setup --template");
+        eprintln!("\nExamples:");
+        eprintln!("  newt dgx setup --host REDACTED-IP --model qwen2.5-coder:32b --yes");
+        eprintln!("  newt dgx setup --host REDACTED-HOST --name home");
+        return Ok(());
+    };
+
+    // Build the DGX node from the bare host. Ollama default port is 11434;
+    // vLLM default port is 8000. The LB and in-cluster URLs require distinct
+    // hostnames so they cannot be synthesised from a bare host.
+    let node = DgxNode {
+        name: name.to_string(),
+        ollama: Some(format!("http://{host}:11434")),
+        vllm: Some(format!("http://{host}:8000")),
+        ssh_host: Some(host.to_string()),
+        ..Default::default()
+    };
+    let dgx = DgxConfig {
+        active_node: Some(name.to_string()),
+        active_endpoint: EndpointKind::Ollama,
+        active_model: model.map(str::to_string),
+        nodes: vec![node],
+        formations: vec![],
+    };
+
+    let text = toml::to_string_pretty(&dgx)
+        .map_err(|e| anyhow::anyhow!("TOML serialisation failed: {e}"))?;
+
+    let save_path = config_path
+        .map(std::path::PathBuf::from)
+        .or_else(newt_core::Config::user_config_path)
+        .ok_or_else(|| anyhow::anyhow!("cannot determine config file path (HOME unset?)"))?;
+
+    println!("# [dgx] config to write to {}:\n", save_path.display());
+    print!("{text}");
+
+    if !yes {
+        print!("\nWrite? [y/N] ");
+        std::io::stdout().flush()?;
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+        if !matches!(input.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+            println!("Aborted.");
+            return Ok(());
+        }
+    }
+
+    // Preserve any non-DGX fields already in the config. If the target file
+    // doesn't exist yet (first run), start from defaults rather than erroring.
+    let mut config = match config_path {
+        Some(p) if p.exists() => Config::load(p).map_err(anyhow::Error::from)?,
+        Some(_) => Config::default(),
+        None => Config::resolve().map_err(anyhow::Error::from)?,
+    };
+    config.dgx = Some(dgx);
+    config.save(&save_path)?;
+    println!("Saved → {}", save_path.display());
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -631,5 +769,97 @@ mod tests {
         assert!(warm_model(&http_client(), &server.uri(), "m", "30m")
             .await
             .is_err());
+    }
+
+    // --- setup ---------------------------------------------------------
+
+    #[test]
+    fn setup_template_prints_toml_does_not_write() {
+        // --template should succeed and not touch any file.
+        setup(None, None, "dgx", None, true, true).unwrap();
+    }
+
+    #[test]
+    fn setup_no_args_prints_usage() {
+        // No host + no template: prints guidance, still succeeds.
+        setup(None, None, "dgx", None, false, true).unwrap();
+    }
+
+    #[test]
+    fn setup_writes_config_with_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("config.toml");
+
+        setup(
+            Some(&cfg_path),
+            Some("REDACTED-IP"),
+            "dgx",
+            Some("qwen2.5-coder:32b"),
+            false,
+            true, // yes — skip prompt
+        )
+        .unwrap();
+
+        let text = std::fs::read_to_string(&cfg_path).unwrap();
+        assert!(text.contains("REDACTED-IP"), "host not in config: {text}");
+        assert!(
+            text.contains("qwen2.5-coder:32b"),
+            "model not in config: {text}"
+        );
+        assert!(text.contains(":11434"), "ollama port not in config: {text}");
+        assert!(text.contains(":8000"), "vllm port not in config: {text}");
+    }
+
+    #[test]
+    fn setup_preserves_existing_config_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("config.toml");
+
+        // Write a seed config with a custom backend.
+        std::fs::write(
+            &cfg_path,
+            r#"[[backends]]
+name = "existing"
+endpoint = "http://localhost:11434"
+model = "llama3.1:8b"
+tiers = ["FAST", "STANDARD"]
+"#,
+        )
+        .unwrap();
+
+        setup(
+            Some(&cfg_path),
+            Some("REDACTED-HOST"),
+            "home",
+            None,
+            false,
+            true,
+        )
+        .unwrap();
+
+        let text = std::fs::read_to_string(&cfg_path).unwrap();
+        assert!(
+            text.contains("existing"),
+            "pre-existing backend lost: {text}"
+        );
+        assert!(
+            text.contains("REDACTED-HOST"),
+            "new dgx host not written: {text}"
+        );
+    }
+
+    #[test]
+    fn setup_node_name_propagates() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("config.toml");
+
+        setup(Some(&cfg_path), Some("REDACTED-IP"), "lab", None, false, true).unwrap();
+
+        let text = std::fs::read_to_string(&cfg_path).unwrap();
+        assert!(
+            text.contains("\"lab\"") || text.contains("'lab'") || text.contains("lab"),
+            "node name not in config: {text}"
+        );
+        assert!(text.contains("active_node"), "active_node not set: {text}");
     }
 }
