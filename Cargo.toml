@@ -4,7 +4,6 @@ members = [
     "newt-core",
     "newt-inference",
     "newt-tools",
-    "newt-tools-scm",
     "newt-tui",
     "newt-acp-worker",
     "newt-mcp-server",
@@ -116,7 +115,6 @@ agent-mesh-protocol = "0.6"
 newt-core         = { path = "newt-core",         version = "=0.6.5" }
 newt-inference    = { path = "newt-inference",    version = "=0.6.5" }
 newt-tools        = { path = "newt-tools",        version = "=0.6.5" }
-newt-tools-scm    = { path = "newt-tools-scm",    version = "=0.6.5" }
 newt-tui          = { path = "newt-tui",          version = "=0.6.5" }
 newt-acp-worker   = { path = "newt-acp-worker",   version = "=0.6.5" }
 newt-mcp-server   = { path = "newt-mcp-server",   version = "=0.6.5" }

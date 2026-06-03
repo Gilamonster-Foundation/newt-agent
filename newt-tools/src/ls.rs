@@ -102,7 +102,9 @@ mod tests {
 
     #[test]
     fn list_dir_not_found() {
-        let err = list_dir(Path::new("/no-such-dir-xyz")).unwrap_err().to_string();
+        let err = list_dir(Path::new("/no-such-dir-xyz"))
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("cannot read"), "got: {err}");
     }
 

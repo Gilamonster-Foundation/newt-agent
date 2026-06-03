@@ -57,10 +57,8 @@ fn register_tools_list(server: &mut McpServer) {
 }
 
 /// Return the JSON array of tool definitions (shared by tools/list).
-///
-/// Optional SCM tools are appended when the `tools-git` feature is enabled.
 fn tool_definitions() -> Value {
-    let mut tools = vec![
+    let tools = vec![
         serde_json::json!({
             "name": "code_read",
             "description": "Read a file's contents",
@@ -168,9 +166,6 @@ fn tool_definitions() -> Value {
         }),
     ];
 
-    #[cfg(feature = "tools-git")]
-    tools.extend(newt_tools_scm::git::tool_definitions());
-
     Value::Array(tools)
 }
 
@@ -198,34 +193,12 @@ fn register_tools_call(
                 .unwrap_or_else(|| Value::Object(Default::default()));
 
             match name.as_str() {
-                "code_read"  => handle_code_read(&arguments),
-                "code_edit"  => handle_code_edit(&arguments),
+                "code_read" => handle_code_read(&arguments),
+                "code_edit" => handle_code_edit(&arguments),
                 "code_search" => handle_code_search(&arguments),
-                "goal_run"   => handle_goal_run(&arguments, &registry, &router).await,
-                "fs_list"    => handle_fs_list(&arguments),
-                "shell_run"  => handle_shell_run(&arguments).await,
-                #[cfg(feature = "tools-git")]
-                "scm_git_log"           => newt_tools_scm::git::handle_scm_git_log(&arguments),
-                #[cfg(feature = "tools-git")]
-                "scm_git_blame"         => newt_tools_scm::git::handle_scm_git_blame(&arguments),
-                #[cfg(feature = "tools-git")]
-                "scm_git_grep"          => newt_tools_scm::git::handle_scm_git_grep(&arguments),
-                #[cfg(feature = "tools-git")]
-                "scm_git_diff"          => newt_tools_scm::git::handle_scm_git_diff(&arguments),
-                #[cfg(feature = "tools-git")]
-                "scm_git_status"        => newt_tools_scm::git::handle_scm_git_status(&arguments),
-                #[cfg(feature = "tools-git")]
-                "scm_git_branch_list"   => newt_tools_scm::git::handle_scm_git_branch_list(&arguments),
-                #[cfg(feature = "tools-git")]
-                "scm_git_branch_create" => newt_tools_scm::git::handle_scm_git_branch_create(&arguments),
-                #[cfg(feature = "tools-git")]
-                "scm_git_branch_delete" => newt_tools_scm::git::handle_scm_git_branch_delete(&arguments),
-                #[cfg(feature = "tools-git")]
-                "scm_git_commit"        => newt_tools_scm::git::handle_scm_git_commit(&arguments),
-                #[cfg(feature = "tools-git")]
-                "scm_git_push"          => newt_tools_scm::git::handle_scm_git_push(&arguments),
-                #[cfg(feature = "tools-git")]
-                "scm_git_pull"          => newt_tools_scm::git::handle_scm_git_pull(&arguments),
+                "goal_run" => handle_goal_run(&arguments, &registry, &router).await,
+                "fs_list" => handle_fs_list(&arguments),
+                "shell_run" => handle_shell_run(&arguments).await,
                 other => anyhow::bail!("unknown tool: {other}"),
             }
         }
@@ -308,7 +281,11 @@ async fn handle_shell_run(args: &Value) -> anyhow::Result<Value> {
 
     let result = tokio::time::timeout(
         Duration::from_secs(timeout_secs),
-        Command::new("sh").arg("-c").arg(cmd).current_dir(cwd).output(),
+        Command::new("sh")
+            .arg("-c")
+            .arg(cmd)
+            .current_dir(cwd)
+            .output(),
     )
     .await;
 
@@ -462,13 +439,8 @@ mod tests {
         assert!(names.contains(&"code_edit"));
         assert!(names.contains(&"code_search"));
         assert!(names.contains(&"goal_run"));
-
-        #[cfg(feature = "tools-git")]
-        {
-            assert!(names.contains(&"scm_git_log"));
-            assert!(names.contains(&"scm_git_blame"));
-            assert!(names.contains(&"scm_git_grep"));
-        }
+        assert!(names.contains(&"fs_list"));
+        assert!(names.contains(&"shell_run"));
     }
 
     #[tokio::test]
