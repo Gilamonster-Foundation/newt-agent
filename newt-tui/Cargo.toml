@@ -16,6 +16,7 @@ newt-core.workspace = true
 newt-identity.workspace = true
 newt-inference.workspace = true
 newt-tools.workspace = true
+newt-skills.workspace = true
 anyhow.workspace = true
 rustyline.workspace = true
 tokio.workspace = true
