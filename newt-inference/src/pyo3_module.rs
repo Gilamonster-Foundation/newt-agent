@@ -340,10 +340,18 @@ pub struct PyLocalVllmBackend {
 
 #[pymethods]
 impl PyLocalVllmBackend {
+    /// Construct an OpenAI-compatible vLLM backend.
+    ///
+    /// `api_key` is optional: leave it `None` (the default) for an
+    /// unauthenticated local server, or pass a bearer token for a hosted
+    /// OpenAI-compatible endpoint that requires `Authorization: Bearer`
+    /// (e.g. NVIDIA in-house inference). An empty string is treated as
+    /// unauthenticated, mirroring `LocalVllmBackend::with_api_key`.
     #[new]
-    fn new(endpoint: String, model: String) -> Self {
+    #[pyo3(signature = (endpoint, model, api_key=None))]
+    fn new(endpoint: String, model: String, api_key: Option<String>) -> Self {
         Self {
-            inner: Arc::new(LocalVllmBackend::new(endpoint, model)),
+            inner: Arc::new(LocalVllmBackend::new(endpoint, model).with_api_key(api_key)),
         }
     }
 
