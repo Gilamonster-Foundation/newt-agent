@@ -1194,14 +1194,34 @@ fn build_system_prompt(workspace: &str) -> String {
     build_system_prompt_with_soul(workspace, None)
 }
 
+/// Build the progressive-disclosure skills index block for the system prompt
+/// from the skills under `skills_dir` (names + descriptions only, never bodies),
+/// or `None` when no skills are installed. Split out from
+/// [`build_system_prompt_with_soul`] so the injection can be unit-tested against
+/// a controlled directory without mutating the process-wide `$HOME`.
+fn skills_index_for_prompt(skills_dir: &std::path::Path) -> Option<String> {
+    newt_skills::index_block(&newt_skills::discover(skills_dir))
+}
+
 fn build_system_prompt_with_soul(workspace: &str, soul: Option<&str>) -> String {
     let identity = soul.unwrap_or(
         "You are newt, a small, fast, local-first agentic coder. \
          Be concise and direct. \
-         You have tools: run_command, read_file, write_file, list_dir. \
+         You have tools: run_command, read_file, write_file, list_dir, use_skill. \
          Use them to actually complete tasks rather than describing what to do.",
     );
     let mut ctx = format!("{identity}\n\nWorkspace: {workspace}\n");
+
+    // Progressive disclosure: inject ONLY the skills index (one
+    // `name: description` line per installed skill) — never the bodies.
+    // Bodies load on demand when the model calls the `use_skill` tool. Skills
+    // are host-scoped under ~/.newt/skills; a missing dir = no index.
+    if let Some(dir) = newt_skills::default_skills_dir() {
+        if let Some(index) = skills_index_for_prompt(&dir) {
+            ctx.push('\n');
+            ctx.push_str(&index);
+        }
+    }
 
     // Directory listing (top-level, no hidden files)
     if let Ok(mut entries) = std::fs::read_dir(workspace) {
@@ -1311,6 +1331,20 @@ fn tool_definitions() -> serde_json::Value {
                         "path": { "type": "string", "description": "Directory path relative to workspace root (use '.' for root)" }
                     },
                     "required": ["path"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "use_skill",
+                "description": "Load a skill's full procedural instructions on demand. The system prompt lists the available skills (name + description); call this with a skill's name to get its complete SKILL.md body plus the paths of any bundled files (scripts/templates) you can read or run.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "name": { "type": "string", "description": "The skill name as shown in the 'Available skills' index" }
+                    },
+                    "required": ["name"]
                 }
             }
         }
@@ -1596,6 +1630,26 @@ async fn execute_tool(
                     let listing = names.join("\n");
                     print_tool_output(&listing, color);
                     listing
+                }
+                Err(e) => format!("error: {e}"),
+            }
+        }
+
+        "use_skill" => {
+            let skill_name = args["name"].as_str().unwrap_or("");
+            print_tool_call("use_skill", skill_name, color);
+            // Reads from the host-scoped ~/.newt/skills. This is a read of
+            // trusted operator config (procedural knowledge), not an exec of
+            // arbitrary code, so it is NOT leash-gated — any SCRIPTS the skill
+            // bundles still run through `run_command`'s confined shell and are
+            // governed by the session caveats.
+            let Some(dir) = newt_skills::default_skills_dir() else {
+                return "error: could not resolve ~/.newt/skills (is $HOME set?)".to_string();
+            };
+            match newt_skills::load_body(&dir, skill_name) {
+                Ok(body) => {
+                    print_tool_output(&body, color);
+                    body
                 }
                 Err(e) => format!("error: {e}"),
             }
@@ -2566,5 +2620,51 @@ mod run_command_confinement_tests {
         )
         .await;
         assert!(out.contains("one.txt") && out.contains("two.txt"));
+    }
+}
+
+#[cfg(test)]
+mod skills_integration_tests {
+    use super::*;
+    use std::fs;
+
+    fn write_skill(root: &std::path::Path, name: &str, desc: &str) {
+        let dir = root.join(name);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: {desc}\n---\nFull body of {name}.\n"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn system_prompt_index_includes_discovered_skill_name_and_description() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_skill(tmp.path(), "commit-style", "How this repo writes commits");
+
+        let block = skills_index_for_prompt(tmp.path()).expect("an index block");
+        assert!(block.contains("Available skills (call `use_skill` to load one):"));
+        assert!(block.contains("commit-style: How this repo writes commits"));
+        // Progressive disclosure: the body must NOT appear in the index.
+        assert!(!block.contains("Full body of commit-style."));
+    }
+
+    #[test]
+    fn system_prompt_index_is_none_when_no_skills() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        assert!(skills_index_for_prompt(tmp.path()).is_none());
+    }
+
+    #[test]
+    fn use_skill_tool_is_advertised_in_definitions() {
+        let defs = tool_definitions();
+        let names: Vec<&str> = defs
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|d| d["function"]["name"].as_str())
+            .collect();
+        assert!(names.contains(&"use_skill"), "got: {names:?}");
     }
 }
