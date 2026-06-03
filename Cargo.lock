@@ -2003,7 +2003,7 @@ dependencies = [
 
 [[package]]
 name = "newt-acp-worker"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2026,7 +2026,7 @@ dependencies = [
 
 [[package]]
 name = "newt-agent"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -2053,7 +2053,7 @@ dependencies = [
 
 [[package]]
 name = "newt-agent-py"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "newt-acp-worker",
  "newt-coder",
@@ -2069,7 +2069,7 @@ dependencies = [
 
 [[package]]
 name = "newt-coder"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "agent-mesh-protocol",
  "anyhow",
@@ -2092,7 +2092,7 @@ dependencies = [
 
 [[package]]
 name = "newt-core"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "agent-mesh-protocol",
  "anyhow",
@@ -2110,7 +2110,7 @@ dependencies = [
 
 [[package]]
 name = "newt-eval"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -2135,7 +2135,7 @@ dependencies = [
 
 [[package]]
 name = "newt-identity"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "agent-mesh-protocol",
  "base64",
@@ -2148,7 +2148,7 @@ dependencies = [
 
 [[package]]
 name = "newt-inference"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "agent-mesh-protocol",
  "anyhow",
@@ -2175,7 +2175,7 @@ dependencies = [
 
 [[package]]
 name = "newt-mcp-server"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "agent-bridle 0.1.0 (git+https://github.com/Gilamonster-Foundation/agent-bridle?rev=c00259af499924527cb31350cba91f093dd432c9)",
  "agent-mesh-protocol",
@@ -2197,7 +2197,7 @@ dependencies = [
 
 [[package]]
 name = "newt-skills"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "anyhow",
  "serde",
@@ -2207,7 +2207,7 @@ dependencies = [
 
 [[package]]
 name = "newt-tools"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "anyhow",
  "diffy",
@@ -2223,7 +2223,7 @@ dependencies = [
 
 [[package]]
 name = "newt-tui"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "agent-bridle 0.1.0 (git+https://github.com/Gilamonster-Foundation/agent-bridle?rev=5adfd91f12f29a496108eba05cbca59c8ab86aeb)",
  "agent-mesh-protocol",
@@ -2587,7 +2587,7 @@ dependencies = [
 
 [[package]]
 name = "plugins-protocol"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "serde",
  "serde_json",
@@ -3691,7 +3691,7 @@ checksum = "8f50febec83f5ee1df3015341d8bd429f2d1cc62bcba7ea2076759d315084683"
 
 [[package]]
 name = "tests-common"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "anyhow",
  "async-trait",
