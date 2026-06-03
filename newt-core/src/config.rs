@@ -239,6 +239,16 @@ pub struct ToolPermissions {
     /// Stored as leading tokens, e.g. `["bacon", "make"]`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extra_exec: Vec<String>,
+
+    /// Hosts the agent may reach with `web_fetch` (the `net` capability axis).
+    ///
+    /// Empty (the default) = **no network** — `web_fetch` is denied. A single
+    /// `"*"` grants **all** hosts (still SSRF-screened + DNS-rebind-pinned by the
+    /// web tool). Otherwise an exact host allowlist, e.g.
+    /// `["docs.rs", "raw.githubusercontent.com"]`. Applies to every preset
+    /// except `FullAccess` (which is already unrestricted).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub net: Vec<String>,
 }
 
 impl Default for ToolPermissions {
@@ -246,6 +256,7 @@ impl Default for ToolPermissions {
         Self {
             preset: PermissionPreset::WorkspaceDev,
             extra_exec: Vec::new(),
+            net: Vec::new(),
         }
     }
 }
@@ -292,13 +303,14 @@ impl ToolPermissions {
         use crate::caveats::{Caveats, CountBound, Scope};
 
         let ws = workspace.to_string();
+        let net = self.net_scope();
 
         match self.preset {
             PermissionPreset::ReadOnly => Caveats {
                 fs_read: Scope::All,
                 fs_write: Scope::none(),
                 exec: Scope::none(),
-                net: Scope::none(),
+                net,
                 max_calls: CountBound::Unlimited,
                 valid_for_generation: Scope::All,
             },
@@ -307,7 +319,7 @@ impl ToolPermissions {
                 fs_read: Scope::All,
                 fs_write: Scope::only([ws]),
                 exec: Scope::none(),
-                net: Scope::none(),
+                net,
                 max_calls: CountBound::Unlimited,
                 valid_for_generation: Scope::All,
             },
@@ -328,13 +340,28 @@ impl ToolPermissions {
                     fs_read: Scope::All,
                     fs_write: Scope::only([ws]),
                     exec: Scope::Only(allowed),
-                    net: Scope::none(),
+                    net,
                     max_calls: CountBound::Unlimited,
                     valid_for_generation: Scope::All,
                 }
             }
 
             PermissionPreset::FullAccess => Caveats::top(),
+        }
+    }
+
+    /// Lower the configured `net` allowlist into a capability [`Scope`].
+    ///
+    /// Empty → `none` (no network). A `"*"` entry → `All` (every host, still
+    /// SSRF-screened by the web tool). Otherwise an exact host allowlist.
+    fn net_scope(&self) -> crate::caveats::Scope<String> {
+        use crate::caveats::Scope;
+        if self.net.is_empty() {
+            Scope::none()
+        } else if self.net.iter().any(|h| h == "*") {
+            Scope::All
+        } else {
+            Scope::only(self.net.iter().cloned())
         }
     }
 }
@@ -755,6 +782,7 @@ default_tier_order = ["FAST", "STANDARD", "COMPLEX", "REVIEW"]
         let perms = ToolPermissions {
             preset: PermissionPreset::WorkspaceDev,
             extra_exec: vec!["bacon".into(), "make".into()],
+            net: vec![],
         };
         let cav = perms.to_caveats("/workspace");
         assert!(cav.permits_exec("bacon"));
@@ -767,6 +795,7 @@ default_tier_order = ["FAST", "STANDARD", "COMPLEX", "REVIEW"]
         let perms = ToolPermissions {
             preset: PermissionPreset::ReadOnly,
             extra_exec: vec![],
+            net: vec![],
         };
         let cav = perms.to_caveats("/workspace");
         assert!(!cav.permits_fs_write("/workspace/src/main.rs"));
@@ -779,6 +808,7 @@ default_tier_order = ["FAST", "STANDARD", "COMPLEX", "REVIEW"]
         let perms = ToolPermissions {
             preset: PermissionPreset::WorkspaceEdit,
             extra_exec: vec![],
+            net: vec![],
         };
         let cav = perms.to_caveats("/workspace");
         assert!(!cav.permits_exec("cargo"));
@@ -793,9 +823,47 @@ default_tier_order = ["FAST", "STANDARD", "COMPLEX", "REVIEW"]
         let perms = ToolPermissions {
             preset: PermissionPreset::FullAccess,
             extra_exec: vec![],
+            net: vec![],
         };
         let cav = perms.to_caveats("/workspace");
         assert_eq!(cav, crate::caveats::Caveats::top());
+    }
+
+    #[test]
+    fn net_allowlist_controls_the_net_axis() {
+        use crate::caveats::Scope;
+
+        // Default (empty `net`) => no network: web_fetch is denied.
+        let none = ToolPermissions::default().to_caveats("/ws");
+        assert!(
+            matches!(none.net, Scope::Only(ref s) if s.is_empty()),
+            "empty net config must yield an empty (deny-all) net scope"
+        );
+
+        // Explicit host allowlist — works under ANY preset (here ReadOnly), so
+        // web access does not require granting writes/exec.
+        let hosts = ToolPermissions {
+            preset: PermissionPreset::ReadOnly,
+            extra_exec: vec![],
+            net: vec!["docs.rs".into(), "github.com".into()],
+        }
+        .to_caveats("/ws");
+        assert!(
+            matches!(hosts.net, Scope::Only(ref s) if s.contains("docs.rs") && s.contains("github.com")),
+            "explicit hosts must populate the net allowlist"
+        );
+
+        // A single "*" grants all hosts (still SSRF-screened by the web tool).
+        let all = ToolPermissions {
+            preset: PermissionPreset::WorkspaceDev,
+            extra_exec: vec![],
+            net: vec!["*".into()],
+        }
+        .to_caveats("/ws");
+        assert!(
+            matches!(all.net, Scope::All),
+            "a `*` entry must grant the whole net axis"
+        );
     }
 
     #[test]
@@ -807,6 +875,7 @@ default_tier_order = ["FAST", "STANDARD", "COMPLEX", "REVIEW"]
         let custom = ToolPermissions {
             preset: PermissionPreset::Custom,
             extra_exec: vec!["bacon".into()],
+            net: vec![],
         }
         .to_caveats("/workspace");
         assert_ne!(
@@ -821,6 +890,7 @@ default_tier_order = ["FAST", "STANDARD", "COMPLEX", "REVIEW"]
         let workspace_dev = ToolPermissions {
             preset: PermissionPreset::WorkspaceDev,
             extra_exec: vec!["bacon".into()],
+            net: vec![],
         }
         .to_caveats("/workspace");
         assert_eq!(
@@ -854,6 +924,7 @@ default_tier_order = ["FAST", "STANDARD", "COMPLEX", "REVIEW"]
         let perms = ToolPermissions {
             preset: PermissionPreset::WorkspaceDev,
             extra_exec: vec!["bacon".into()],
+            net: vec![],
         };
         let toml = toml::to_string(&perms).unwrap();
         assert!(toml.contains("workspace_dev"));

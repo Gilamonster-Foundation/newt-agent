@@ -503,6 +503,7 @@ fn read_only_caveats(workspace: &str) -> newt_core::caveats::Caveats {
     newt_core::ToolPermissions {
         preset: newt_core::PermissionPreset::ReadOnly,
         extra_exec: Vec::new(),
+        net: Vec::new(),
     }
     .to_caveats(workspace)
 }
@@ -640,6 +641,7 @@ mod caveat_policy_tests {
             permissions: newt_core::ToolPermissions {
                 preset,
                 extra_exec: Vec::new(),
+                net: Vec::new(),
             },
             ..Default::default()
         }
