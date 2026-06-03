@@ -311,7 +311,11 @@ jobs:
         run: |
           set -eux
           mkdir -p dist
-          find dist-merged -type f \( -name '*.whl' -o -name '*.tar.gz' \) -exec cp {} dist/ \;
+          # Only the Python package (newt_agent_py-*) may go to PyPI. The
+          # newt-agent-v* binary archives are GitHub-release assets, not Python
+          # dists; a broad *.tar.gz glob would copy those binary tarballs here
+          # and pypi-publish would fail with InvalidDistribution: No PKG-INFO.
+          find dist-merged -type f \( -name 'newt_agent_py-*.whl' -o -name 'newt_agent_py-*.tar.gz' \) -exec cp {} dist/ \;
           ls -lh dist/
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
