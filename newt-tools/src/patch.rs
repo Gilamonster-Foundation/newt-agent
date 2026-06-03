@@ -51,7 +51,7 @@ enum DiffLine {
 ///   `NEWT_PATCH_APPLIER=diffy` warns and falls back to fuzzy.
 ///
 /// Future backends are just more `impl PatchApplier`: a `gix` (gitoxide)
-/// applier once `gix-apply` publishes, or a `kyln` content-addressed
+/// applier once `gix-apply` publishes, or a content-addressed
 /// applier. The seam exists so the choice of *how* a patch is applied is a
 /// swappable instrument, not baked into every call site.
 pub trait PatchApplier: Send + Sync {
