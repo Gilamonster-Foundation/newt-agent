@@ -183,6 +183,24 @@ fn tool_definitions() -> Value {
                 "required": ["cmd"]
             }
         }),
+        serde_json::json!({
+            "name": "web_fetch",
+            "description": "Fetch an http(s) URL and return its main content as clean markdown. CAVEATS-CONFINED: reachable hosts are gated by the granted `net` scope (host allowlist + SSRF screen); an out-of-scope host is DENIED (isError) rather than fetched. Returns { url, final_url, status, title, markdown } — the markdown is untrusted page content.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "The http(s) URL to fetch"
+                    },
+                    "max_bytes": {
+                        "type": "integer",
+                        "description": "Optional cap on bytes downloaded (default 5 MiB, max 25 MiB)"
+                    }
+                },
+                "required": ["url"]
+            }
+        }),
     ];
 
     Value::Array(tools)
@@ -222,6 +240,7 @@ fn register_tools_call(
                 "goal_run" => handle_goal_run(&arguments, &registry, &router).await,
                 "fs_list" => handle_fs_list(&arguments),
                 "shell_run" => Ok(handle_shell_run(arguments, &bridle, &granted).await),
+                "web_fetch" => Ok(handle_web_fetch(arguments, &bridle, &granted).await),
                 other => anyhow::bail!("unknown tool: {other}"),
             }
         }
@@ -350,6 +369,26 @@ async fn handle_shell_run(args: Value, bridle: &Registry, granted: &Caveats) -> 
         // reason in-band as an MCP tool error, never a transport fault.
         // (`ToolError::Display` is safe to show the agent.)
         Err(e @ ToolError::Denied { .. }) => mcp_error_content(&e.to_string()),
+        Err(e) => mcp_error_content(&e.to_string()),
+    }
+}
+
+/// Fetch a web page through agent-bridle's `web_fetch`, leashed by the `net`
+/// axis. Unlike the shell tool, a capability denial here is a normal
+/// `ToolError::Denied` from `dispatch` (the `net` scope is checked inside the
+/// tool), so there is no in-envelope `denied` flag to lift — we map `Ok` to MCP
+/// text and any `Err` to an in-band MCP tool error.
+async fn handle_web_fetch(args: Value, bridle: &Registry, granted: &Caveats) -> Value {
+    if args.get("url").and_then(Value::as_str).is_none() {
+        return mcp_error_content("missing required argument: url (must be a string)");
+    }
+    match bridle.dispatch("web_fetch", args, granted).await {
+        // `{ url, final_url, status, title, markdown }` — untrusted page content.
+        Ok(result) => match serde_json::to_string_pretty(&result) {
+            Ok(text) => mcp_text_content(&text),
+            Err(e) => mcp_error_content(&format!("failed to serialize web_fetch result: {e}")),
+        },
+        // Out-of-scope host (net denial), SSRF screen, timeout, non-2xx, etc.
         Err(e) => mcp_error_content(&e.to_string()),
     }
 }
