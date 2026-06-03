@@ -1832,7 +1832,7 @@ async fn openai_chat_complete(
                 }
                 v => v.clone(),
             };
-            let result = execute_tool(name, &args, workspace, color, caveats);
+            let result = execute_tool(name, &args, workspace, color, caveats).await;
             messages.push(serde_json::json!({
                 "role": "tool",
                 "tool_call_id": id,
