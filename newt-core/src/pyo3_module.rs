@@ -308,6 +308,9 @@ impl PyBackendConfig {
                 endpoint,
                 model,
                 tiers: tiers.into_iter().map(PyTier::to_inner).collect(),
+                kind: Default::default(),
+                api_key_file: None,
+                api_key_env: None,
             },
         }
     }
