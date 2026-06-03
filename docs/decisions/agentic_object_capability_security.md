@@ -131,7 +131,7 @@ sub-principal onto whatever the system already speaks:
   delegation hierarchy *in the protocol itself*.
 - Vault: policies are a lattice.
 
-This is exactly the kyln "projection" move: a one-way transform from an
+This is exactly a "projection" move: a one-way transform from an
 authority into a derived, scoped view that carries provenance.
 
 **(B) Systems that offer nothing.** Never let the sub-principal touch the system.
