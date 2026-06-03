@@ -16,11 +16,6 @@ pub fn run_init(color: bool) -> anyhow::Result<()> {
 
 use std::io::{self, IsTerminal, Write as _};
 
-// Bring `Caveats` enforcement helpers into scope. Since #95 the lattice
-// types live in `agent-mesh-protocol`; `CaveatsExt` adds the
-// `permits_*` adaptors the dispatch sites below call as methods.
-use newt_core::CaveatsExt;
-
 use crossterm::{
     cursor::{Hide, MoveTo, Show},
     event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
@@ -1336,8 +1331,50 @@ fn print_tool_output(output: &str, color: bool) {
     io::stdout().flush().ok();
 }
 
+/// Whether a confined-shell envelope carries the STRUCTURED `denied: true`
+/// flag — the leash's machine-readable signal that the brush interceptor
+/// refused an exec / open inside the free-form command. Reads the structured
+/// field agent-bridle emits; it does NOT parse stdout/stderr (the old stderr
+/// string-match was fragile — a command that merely *printed* a denial-like
+/// phrase could be misread, and any wording drift would silently break
+/// detection).
+fn envelope_denied(envelope: &serde_json::Value) -> bool {
+    envelope
+        .get("denied")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// Build a human-readable denial message from the envelope's structured
+/// `denials: [{ kind, target, reason }]` list, joining each entry's `reason`.
+/// Falls back to a generic message when the list is missing or empty.
+fn envelope_denial_reason(envelope: &serde_json::Value) -> String {
+    let reasons: Vec<String> = envelope
+        .get("denials")
+        .and_then(serde_json::Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|d| d.get("reason").and_then(serde_json::Value::as_str))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    if reasons.is_empty() {
+        "denied: the capability leash refused an operation".to_string()
+    } else {
+        reasons.join("; ")
+    }
+}
+
 /// Execute a single tool call and return the result string sent back to the model.
-fn execute_tool(
+///
+/// `run_command` is routed through agent-bridle's Caveats-confined, brush-backed
+/// `shell` tool: the WHOLE command runs inside the leash (`echo ok && rm -rf /`
+/// no longer slips `rm` past an `echo` grant — every external spawn passes the
+/// interceptor's `before_exec` / `before_open` gate). The fs tools
+/// (`read_file` / `write_file` / `list_dir`) keep enforcing the same `caveats`
+/// via `permits_*` — rerouting them is out of scope.
+async fn execute_tool(
     name: &str,
     args: &serde_json::Value,
     workspace: &str,
@@ -1347,33 +1384,57 @@ fn execute_tool(
     match name {
         "run_command" => {
             let cmd = args["command"].as_str().unwrap_or("");
-            // Caveat check: leading token must be in exec allowlist.
-            let token = cmd.split_whitespace().next().unwrap_or("");
-            if !caveats.permits_exec(token) {
-                let msg = format!("capability denied: exec does not permit '{token}'");
-                print_denied("exec", token, color);
-                return msg;
-            }
             print_tool_call("run_command", cmd, color);
-            match std::process::Command::new("sh")
-                .arg("-c")
-                .arg(cmd)
-                .current_dir(workspace)
-                .output()
+
+            // Route the WHOLE command through agent-bridle's confined shell
+            // (free-form `cmd` mode) under the SAME Caveats the TUI resolved
+            // from `[tui].permissions`. `caveats` is `newt_core::caveats::Caveats`,
+            // a re-export of `agent_mesh_protocol::caveats::Caveats` — the exact
+            // type `Registry::dispatch` expects, so no conversion is needed.
+            let dispatch_args = serde_json::json!({
+                "cmd": cmd,
+                "cwd": workspace,
+            });
+            match agent_bridle::registry()
+                .dispatch("shell", dispatch_args, caveats)
+                .await
             {
-                Ok(o) => {
-                    let out = format!(
-                        "{}{}",
-                        String::from_utf8_lossy(&o.stdout),
-                        String::from_utf8_lossy(&o.stderr)
-                    );
+                // The confined shell ran. Its envelope carries
+                // `{ exit_code, stdout, stderr, timed_out, ... }` plus — when the
+                // leash refused a capability — the STRUCTURED denial fields
+                // `{ denied: true, denials: [{ kind, target, reason }] }`. In
+                // free-form mode an out-of-scope command is denied *inside* the
+                // shell by the brush interceptor (the command genuinely does not
+                // run); we lift that to the existing capability-denied UX by
+                // reading the structured `denied` field — NEVER a stderr grep.
+                Ok(envelope) if envelope_denied(&envelope) => {
+                    let reason = envelope_denial_reason(&envelope);
+                    print_denied("exec", &reason, color);
+                    format!("capability denied: {reason}")
+                }
+                Ok(envelope) => {
+                    let stdout = envelope
+                        .get("stdout")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("");
+                    let stderr = envelope
+                        .get("stderr")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("");
+                    let out = format!("{stdout}{stderr}");
                     print_tool_output(&out, color);
                     if out.trim().is_empty() {
-                        format!("(exit {})", o.status.code().unwrap_or(-1))
+                        let code = envelope
+                            .get("exit_code")
+                            .and_then(serde_json::Value::as_i64)
+                            .unwrap_or(-1);
+                        format!("(exit {code})")
                     } else {
                         out
                     }
                 }
+                // An argv-mode leash denial, or an error from inside the tool —
+                // surface the reason; the dispatch error Display is safe to show.
                 Err(e) => format!("error: {e}"),
             }
         }
@@ -1600,7 +1661,7 @@ async fn chat_complete(
                 }
                 v => v.clone(),
             };
-            let result = execute_tool(name, &args, workspace, color, caveats);
+            let result = execute_tool(name, &args, workspace, color, caveats).await;
             messages.push(serde_json::json!({
                 "role": "tool",
                 "content": result
@@ -2061,5 +2122,202 @@ mod tests {
     #[test]
     fn slash_dgx_no_subcmd_returns_true() {
         assert!(dispatch_slash("/dgx", "/ws", false, false).unwrap());
+    }
+}
+
+/// Regression tests for the `run_command` → agent-bridle confined-shell unification.
+///
+/// The headline property: the WHOLE command is confined under the granted
+/// `Caveats`, not just the leading token. On the old leading-token + `sh -c`
+/// path, `echo ok && rm -rf /` passed the `echo` check and then ran `rm`
+/// directly. Routing through agent-bridle's brush interceptor closes that
+/// bypass — every external spawn passes the leash's `before_exec` gate.
+#[cfg(test)]
+mod run_command_confinement_tests {
+    use super::*;
+    use newt_core::caveats::{Caveats, CountBound, Scope};
+
+    /// A `Caveats` granting exec for the given commands and full fs/read+write
+    /// (so the test's own file-survival assertions are not themselves confined),
+    /// otherwise read-only-ish. `exec` is `Scope::Only` of the named commands.
+    fn caveats_exec_only(cmds: &[&str]) -> Caveats {
+        Caveats {
+            fs_read: Scope::All,
+            fs_write: Scope::All,
+            exec: Scope::Only(cmds.iter().map(|s| s.to_string()).collect()),
+            net: Scope::none(),
+            max_calls: CountBound::Unlimited,
+            valid_for_generation: Scope::All,
+        }
+    }
+
+    /// run_command with a caveats granting exec for a real external (`env`)
+    /// succeeds: the command runs through the confined shell and returns its
+    /// output (exit 0), no denial.
+    #[tokio::test]
+    async fn run_command_allowed_external_succeeds() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let caveats = caveats_exec_only(&["env"]);
+        let args = serde_json::json!({ "command": "env" });
+        let out = execute_tool(
+            "run_command",
+            &args,
+            &ws.path().to_string_lossy(),
+            false,
+            &caveats,
+        )
+        .await;
+        assert!(
+            !out.starts_with("capability denied"),
+            "an in-scope external must not be denied, got: {out}"
+        );
+        assert!(
+            !out.starts_with("error:"),
+            "an in-scope external must run cleanly, got: {out}"
+        );
+    }
+
+    /// run_command with an out-of-scope command is DENIED via the structured
+    /// envelope field — surfaced as the capability-denied UX string, NOT a
+    /// stderr grep.
+    #[tokio::test]
+    async fn run_command_out_of_scope_is_denied() {
+        let ws = tempfile::TempDir::new().unwrap();
+        // Grant only `echo`; ask to run the external `env`.
+        let caveats = caveats_exec_only(&["echo"]);
+        let args = serde_json::json!({ "command": "env" });
+        let out = execute_tool(
+            "run_command",
+            &args,
+            &ws.path().to_string_lossy(),
+            false,
+            &caveats,
+        )
+        .await;
+        assert!(
+            out.starts_with("capability denied"),
+            "an out-of-scope external must be denied via the structured field, got: {out}"
+        );
+    }
+
+    /// THE test that justifies the change. `echo ok && rm -r <victim>` under a
+    /// grant that allows `echo` but NOT `rm`: the `rm` is DENIED inside the
+    /// confined shell and the victim file SURVIVES. On the old leading-token +
+    /// `sh -c` path the `echo` check passed and `rm` then ran directly, deleting
+    /// the victim. Full-command confinement is what stops it here.
+    #[tokio::test]
+    async fn compound_command_denies_ungranted_rm_and_victim_survives() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let victim = ws.path().join("victim.txt");
+        std::fs::write(&victim, b"do not delete me").unwrap();
+        assert!(victim.exists(), "precondition: victim file exists");
+
+        // Grant `echo` only — NOT `rm`.
+        let caveats = caveats_exec_only(&["echo"]);
+        let victim_str = victim.to_string_lossy();
+        let args = serde_json::json!({
+            "command": format!("echo ok && rm -r {victim_str}"),
+        });
+        let out = execute_tool(
+            "run_command",
+            &args,
+            &ws.path().to_string_lossy(),
+            false,
+            &caveats,
+        )
+        .await;
+
+        // The victim MUST survive: the `rm` never ran (leash denied the spawn).
+        assert!(
+            victim.exists(),
+            "victim file must survive — the ungranted `rm` must be denied by the \
+             confined shell (this would have slipped past the old leading-token \
+             + `sh -c` path). run_command returned: {out}"
+        );
+    }
+
+    /// read_file still enforces fs_read and returns contents (no regression
+    /// from the run_command rewrite).
+    #[tokio::test]
+    async fn read_file_still_works() {
+        let ws = tempfile::TempDir::new().unwrap();
+        std::fs::write(ws.path().join("a.txt"), b"hello").unwrap();
+        let caveats = Caveats {
+            fs_read: Scope::All,
+            fs_write: Scope::none(),
+            exec: Scope::none(),
+            net: Scope::none(),
+            max_calls: CountBound::Unlimited,
+            valid_for_generation: Scope::All,
+        };
+        let args = serde_json::json!({ "path": "a.txt" });
+        let out = execute_tool(
+            "read_file",
+            &args,
+            &ws.path().to_string_lossy(),
+            false,
+            &caveats,
+        )
+        .await;
+        assert_eq!(out, "hello", "read_file must still return file contents");
+    }
+
+    /// write_file still enforces fs_write and writes the file (no regression).
+    /// fs_write is scoped to the workspace (not `Scope::All`) so the y/N prompt
+    /// is skipped — the preset is the consent.
+    #[tokio::test]
+    async fn write_file_still_works() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let caveats = Caveats {
+            fs_read: Scope::All,
+            fs_write: Scope::only([ws.path().to_string_lossy().into_owned()]),
+            exec: Scope::none(),
+            net: Scope::none(),
+            max_calls: CountBound::Unlimited,
+            valid_for_generation: Scope::All,
+        };
+        let args = serde_json::json!({ "path": "b.txt", "content": "written" });
+        let out = execute_tool(
+            "write_file",
+            &args,
+            &ws.path().to_string_lossy(),
+            false,
+            &caveats,
+        )
+        .await;
+        assert!(
+            out.starts_with("wrote"),
+            "write_file must succeed, got: {out}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(ws.path().join("b.txt")).unwrap(),
+            "written"
+        );
+    }
+
+    /// list_dir still enforces fs_read and lists entries (no regression).
+    #[tokio::test]
+    async fn list_dir_still_works() {
+        let ws = tempfile::TempDir::new().unwrap();
+        std::fs::write(ws.path().join("one.txt"), b"x").unwrap();
+        std::fs::write(ws.path().join("two.txt"), b"y").unwrap();
+        let caveats = Caveats {
+            fs_read: Scope::All,
+            fs_write: Scope::none(),
+            exec: Scope::none(),
+            net: Scope::none(),
+            max_calls: CountBound::Unlimited,
+            valid_for_generation: Scope::All,
+        };
+        let args = serde_json::json!({ "path": "." });
+        let out = execute_tool(
+            "list_dir",
+            &args,
+            &ws.path().to_string_lossy(),
+            false,
+            &caveats,
+        )
+        .await;
+        assert!(out.contains("one.txt") && out.contains("two.txt"));
     }
 }

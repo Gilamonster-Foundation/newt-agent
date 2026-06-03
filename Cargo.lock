@@ -11,10 +11,31 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 [[package]]
 name = "agent-bridle"
 version = "0.1.0"
+source = "git+https://github.com/Gilamonster-Foundation/agent-bridle?rev=5adfd91f12f29a496108eba05cbca59c8ab86aeb#5adfd91f12f29a496108eba05cbca59c8ab86aeb"
+dependencies = [
+ "agent-bridle-core 0.1.0 (git+https://github.com/Gilamonster-Foundation/agent-bridle?rev=5adfd91f12f29a496108eba05cbca59c8ab86aeb)",
+ "agent-bridle-tool-shell 0.1.0 (git+https://github.com/Gilamonster-Foundation/agent-bridle?rev=5adfd91f12f29a496108eba05cbca59c8ab86aeb)",
+]
+
+[[package]]
+name = "agent-bridle"
+version = "0.1.0"
 source = "git+https://github.com/Gilamonster-Foundation/agent-bridle?rev=c00259af499924527cb31350cba91f093dd432c9#c00259af499924527cb31350cba91f093dd432c9"
 dependencies = [
- "agent-bridle-core",
- "agent-bridle-tool-shell",
+ "agent-bridle-core 0.1.0 (git+https://github.com/Gilamonster-Foundation/agent-bridle?rev=c00259af499924527cb31350cba91f093dd432c9)",
+ "agent-bridle-tool-shell 0.1.0 (git+https://github.com/Gilamonster-Foundation/agent-bridle?rev=c00259af499924527cb31350cba91f093dd432c9)",
+]
+
+[[package]]
+name = "agent-bridle-core"
+version = "0.1.0"
+source = "git+https://github.com/Gilamonster-Foundation/agent-bridle?rev=5adfd91f12f29a496108eba05cbca59c8ab86aeb#5adfd91f12f29a496108eba05cbca59c8ab86aeb"
+dependencies = [
+ "agent-mesh-protocol",
+ "anyhow",
+ "async-trait",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -32,9 +53,25 @@ dependencies = [
 [[package]]
 name = "agent-bridle-tool-shell"
 version = "0.1.0"
+source = "git+https://github.com/Gilamonster-Foundation/agent-bridle?rev=5adfd91f12f29a496108eba05cbca59c8ab86aeb#5adfd91f12f29a496108eba05cbca59c8ab86aeb"
+dependencies = [
+ "agent-bridle-core 0.1.0 (git+https://github.com/Gilamonster-Foundation/agent-bridle?rev=5adfd91f12f29a496108eba05cbca59c8ab86aeb)",
+ "anyhow",
+ "async-trait",
+ "brush-builtins",
+ "brush-core",
+ "brush-coreutils-builtins",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "agent-bridle-tool-shell"
+version = "0.1.0"
 source = "git+https://github.com/Gilamonster-Foundation/agent-bridle?rev=c00259af499924527cb31350cba91f093dd432c9#c00259af499924527cb31350cba91f093dd432c9"
 dependencies = [
- "agent-bridle-core",
+ "agent-bridle-core 0.1.0 (git+https://github.com/Gilamonster-Foundation/agent-bridle?rev=c00259af499924527cb31350cba91f093dd432c9)",
  "anyhow",
  "async-trait",
  "brush-builtins",
@@ -47,9 +84,9 @@ dependencies = [
 
 [[package]]
 name = "agent-mesh-protocol"
-version = "0.6.0"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0299274a9ee2d15d3f0505447d648ca7ab7d65d1ea2ba8076c91f8885fbdec14"
+checksum = "eca2348e2ef39fb8b3d01d64ff626d73dea03e0379bafc01ee48e2d6d6e1e119"
 dependencies = [
  "blake3",
  "ed25519-dalek",
@@ -284,9 +321,9 @@ checksum = "5e764a1d40d510daf35e07be9eb06e75770908c27d411ee6c92109c9840eaaf7"
 
 [[package]]
 name = "bitflags"
-version = "2.11.1"
+version = "2.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c4512299f36f043ab09a583e57bceb5a5aab7a73db1805848e8fef3c9e8c78b3"
+checksum = "84d7ced0ae9557296835c32bf1b1e02b44c746701f898460fb000d7eaa84f00a"
 
 [[package]]
 name = "blake3"
@@ -1902,9 +1939,9 @@ dependencies = [
 
 [[package]]
 name = "log"
-version = "0.4.30"
+version = "0.4.31"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "616ec5685824bcc94416c6d4a7a446eea774a31efd7062c8480ba6fd06d7a6e5"
+checksum = "113b30b4cd05f7c06868fdb2854f66a7b9fece9a48425351cd532e810d74024f"
 
 [[package]]
 name = "lru"
@@ -2140,7 +2177,7 @@ dependencies = [
 name = "newt-mcp-server"
 version = "0.6.5"
 dependencies = [
- "agent-bridle",
+ "agent-bridle 0.1.0 (git+https://github.com/Gilamonster-Foundation/agent-bridle?rev=c00259af499924527cb31350cba91f093dd432c9)",
  "agent-mesh-protocol",
  "anyhow",
  "newt-core",
@@ -2178,6 +2215,7 @@ dependencies = [
 name = "newt-tui"
 version = "0.6.5"
 dependencies = [
+ "agent-bridle 0.1.0 (git+https://github.com/Gilamonster-Foundation/agent-bridle?rev=5adfd91f12f29a496108eba05cbca59c8ab86aeb)",
  "agent-mesh-protocol",
  "anyhow",
  "base64",
@@ -3605,7 +3643,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "230a1b821ccbd75b185820a1f1ff7b14d21da1e442e22c0863ea5f08771a8874"
 dependencies = [
  "rustix 1.1.4",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

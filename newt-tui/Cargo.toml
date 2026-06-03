@@ -25,6 +25,22 @@ ratatui.workspace = true
 crossterm.workspace = true
 tracing.workspace = true
 
+# The bridle leash: a Caveats-confined, brush-backed `shell` tool that
+# supersedes the old leading-token + `sh -c` `run_command`. The TUI now routes
+# the WHOLE command through agent-bridle's confined shell under the SAME Caveats
+# it already resolves from `[tui].permissions`, so full-command confinement
+# replaces the leading-token check (`echo ok && rm -rf /` no longer slips `rm`
+# past an `echo` grant). Pinned to the HARDENED agent-bridle main (not on
+# crates.io yet): this rev closes the free-form `exec`-bypass, fixes
+# dangling-symlink resolution, AND matches exec grants by basename — required so
+# the bare-name preset grants the TUI uses (`git`, `cargo`, …) actually match
+# the PATH-resolved absolute path the interceptor sees. The `shell` feature
+# transitively pulls agent-bridle-core + agent-bridle-tool-shell + the brush
+# fork git-dep that carries the in-process exec/open interceptor. The structured
+# denial envelope (`denied: bool` + `denials: [{kind,target,reason}]`) is read
+# directly — never a stderr grep.
+agent-bridle = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", rev = "5adfd91f12f29a496108eba05cbca59c8ab86aeb", features = ["shell"] }
+
 [dev-dependencies]
 tempfile.workspace = true
 # Chain-rooting unit tests for the TUI's subprocess-spawn envelope
