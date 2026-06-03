@@ -1065,6 +1065,7 @@ fn run_chat(workspace: &str, color: bool) -> anyhow::Result<()> {
                             workspace,
                             color,
                             caveats: cap.caveats(),
+                            max_tool_rounds: max_tool_rounds(),
                         }))
                     });
 
@@ -1345,6 +1346,16 @@ fn tool_output_lines() -> usize {
         .unwrap_or(20)
 }
 
+/// Maximum tool-call rounds per turn, from `[tui].max_tool_rounds`.
+/// Defaults to 25 when there's no `[tui]` table or no config file.
+fn max_tool_rounds() -> usize {
+    newt_core::Config::resolve()
+        .ok()
+        .and_then(|c| c.tui)
+        .map(|t| t.max_tool_rounds)
+        .unwrap_or(25)
+}
+
 /// Print tool output truncated to the configured line limit.
 /// The model always receives the full content regardless.
 fn print_tool_output(output: &str, color: bool) {
@@ -1618,6 +1629,9 @@ struct ChatCtx<'a> {
     workspace: &'a str,
     color: bool,
     caveats: &'a newt_core::caveats::Caveats,
+    /// Maximum tool-call rounds before forcing a final tools-disabled
+    /// completion (from `[tui].max_tool_rounds`, default 25).
+    max_tool_rounds: usize,
 }
 
 /// Main agentic loop: call model → execute tool calls → feed results back → repeat.
@@ -1641,6 +1655,7 @@ async fn chat_complete(
         workspace,
         color,
         caveats,
+        max_tool_rounds,
     } = ctx;
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(120))
@@ -1654,8 +1669,8 @@ async fn chat_complete(
         .map(|m| serde_json::json!({"role": m.role.as_str(), "content": m.content}))
         .collect();
 
-    // Agentic loop — up to 10 tool-call rounds.
-    for round in 0..10 {
+    // Agentic loop — up to `max_tool_rounds` tool-call rounds.
+    for round in 0..max_tool_rounds {
         if round > 0 {
             // Brief separator between rounds so user can follow the flow.
             if color {
@@ -1741,7 +1756,106 @@ async fn chat_complete(
         }
     }
 
-    Ok(("(reached tool-call limit)".into(), false, None))
+    // Reached the round cap without a tool-free answer. Make ONE final
+    // completion with tools DISABLED so the model summarises what it found
+    // and the user gets a real (partial) answer instead of a placeholder.
+    final_summary_ollama(&client, &chat_url, model, &mut messages, max_tool_rounds).await
+}
+
+/// Build the nudge appended to the message list when the tool-round cap is hit.
+fn cap_exit_nudge(max_tool_rounds: usize) -> String {
+    format!(
+        "You have reached the tool-call limit ({max_tool_rounds} rounds). \
+         Do NOT call any more tools. Summarize what you found across the tool \
+         calls above and give your best final answer now."
+    )
+}
+
+/// Fallback message returned when even the final tools-disabled completion
+/// fails. Names the limit and points at the knob to raise it — strictly more
+/// useful than the bare `(reached tool-call limit)` placeholder.
+fn cap_exit_fallback(max_tool_rounds: usize) -> String {
+    format!(
+        "(reached the tool-call limit of {max_tool_rounds} rounds, and the \
+         final summarization request also failed — raise [tui].max_tool_rounds \
+         in your newt config to allow more rounds)"
+    )
+}
+
+/// Final tools-disabled completion for the Ollama (`/api/chat`) path.
+async fn final_summary_ollama(
+    client: &reqwest::Client,
+    chat_url: &str,
+    model: &str,
+    messages: &mut Vec<serde_json::Value>,
+    max_tool_rounds: usize,
+) -> anyhow::Result<(String, bool, Option<newt_core::TokenUsage>)> {
+    messages.push(serde_json::json!({
+        "role": "user",
+        "content": cap_exit_nudge(max_tool_rounds),
+    }));
+    // No `tools` key => the model cannot emit tool calls.
+    let body = serde_json::json!({
+        "model": model,
+        "messages": &messages,
+        "stream": false,
+    });
+    match client.post(chat_url).json(&body).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            let json: serde_json::Value = resp.json().await?;
+            let content = json["message"]["content"]
+                .as_str()
+                .unwrap_or("")
+                .to_string();
+            if content.is_empty() {
+                Ok((cap_exit_fallback(max_tool_rounds), false, None))
+            } else {
+                Ok((content, false, None))
+            }
+        }
+        _ => Ok((cap_exit_fallback(max_tool_rounds), false, None)),
+    }
+}
+
+/// Final tools-disabled completion for the OpenAI (`/v1/chat/completions`) path.
+async fn final_summary_openai(
+    client: &reqwest::Client,
+    chat_url: &str,
+    model: &str,
+    api_key: Option<&str>,
+    messages: &mut Vec<serde_json::Value>,
+    max_tool_rounds: usize,
+) -> anyhow::Result<(String, bool, Option<newt_core::TokenUsage>)> {
+    messages.push(serde_json::json!({
+        "role": "user",
+        "content": cap_exit_nudge(max_tool_rounds),
+    }));
+    // Omit `tools` / `tool_choice` => the model cannot emit tool calls.
+    let body = serde_json::json!({
+        "model": model,
+        "messages": &messages,
+        "stream": false,
+    });
+    let mut req = client.post(chat_url).json(&body);
+    if let Some(key) = api_key {
+        req = req.bearer_auth(key);
+    }
+    match req.send().await {
+        Ok(resp) if resp.status().is_success() => {
+            let json: serde_json::Value = resp.json().await?;
+            let content = json["choices"][0]["message"]["content"]
+                .as_str()
+                .unwrap_or("")
+                .to_string();
+            let usage = openai_usage(&json["usage"]);
+            if content.is_empty() {
+                Ok((cap_exit_fallback(max_tool_rounds), false, usage))
+            } else {
+                Ok((content, false, usage))
+            }
+        }
+        _ => Ok((cap_exit_fallback(max_tool_rounds), false, None)),
+    }
 }
 
 /// OpenAI-compatible variant of [`chat_complete`]: the same agentic tool-call
@@ -1764,6 +1878,7 @@ async fn openai_chat_complete(
         workspace,
         color,
         caveats,
+        max_tool_rounds,
     } = ctx;
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(120))
@@ -1775,8 +1890,8 @@ async fn openai_chat_complete(
         .map(|m| serde_json::json!({"role": m.role.as_str(), "content": m.content}))
         .collect();
 
-    // Agentic loop — up to 10 tool-call rounds (matches the Ollama path).
-    for round in 0..10 {
+    // Agentic loop — up to `max_tool_rounds` tool-call rounds (matches the Ollama path).
+    for round in 0..max_tool_rounds {
         if round > 0 && color {
             execute!(
                 io::stdout(),
@@ -1841,7 +1956,17 @@ async fn openai_chat_complete(
         }
     }
 
-    Ok(("(reached tool-call limit)".into(), false, None))
+    // Reached the round cap without a tool-free answer. Make ONE final
+    // completion with tools DISABLED (matches the Ollama path).
+    final_summary_openai(
+        &client,
+        &chat_url,
+        model,
+        api_key,
+        &mut messages,
+        max_tool_rounds,
+    )
+    .await
 }
 
 /// Parse an OpenAI `usage` object (`prompt_tokens` / `completion_tokens`).
@@ -2566,5 +2691,232 @@ mod run_command_confinement_tests {
         )
         .await;
         assert!(out.contains("one.txt") && out.contains("two.txt"));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tool-call round cap + graceful cap-exit (issue: configurable max_tool_rounds)
+// ---------------------------------------------------------------------------
+//
+// These tests exercise both agentic loops (`chat_complete` -> Ollama path and
+// `openai_chat_complete`) against a wiremock backend. The mock returns tool
+// calls while `tools` are present in the request and a real text answer once
+// they are absent — letting us assert that:
+//   (1) the loop honours the configured `max_tool_rounds` cap, and
+//   (2) on hitting the cap newt issues ONE final tools-disabled completion and
+//       returns its text (NOT the `(reached tool-call limit)` placeholder).
+#[cfg(test)]
+mod tool_round_cap_tests {
+    use super::*;
+    use newt_core::caveats::Caveats;
+    use newt_core::{BackendKind, MemMessage};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+    /// Was the `"tools"` key present on this request body?
+    fn request_has_tools(req: &Request) -> bool {
+        serde_json::from_slice::<serde_json::Value>(&req.body)
+            .ok()
+            .map(|v| v.get("tools").is_some())
+            .unwrap_or(false)
+    }
+
+    /// Ollama-shaped responder: returns a tool call whenever `tools` are
+    /// offered, and a plain text answer once they are withheld. Counts the
+    /// number of tool-offering requests it served.
+    struct OllamaResponder {
+        tool_rounds_served: Arc<AtomicUsize>,
+        final_answer: String,
+    }
+
+    impl Respond for OllamaResponder {
+        fn respond(&self, req: &Request) -> ResponseTemplate {
+            if request_has_tools(req) {
+                self.tool_rounds_served.fetch_add(1, Ordering::SeqCst);
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "message": {
+                        "content": "",
+                        "tool_calls": [{
+                            "function": { "name": "definitely_not_a_real_tool", "arguments": {} }
+                        }]
+                    }
+                }))
+            } else {
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "message": { "content": self.final_answer }
+                }))
+            }
+        }
+    }
+
+    /// OpenAI-shaped responder: same logic, OpenAI `choices[0].message` shape.
+    struct OpenAiResponder {
+        tool_rounds_served: Arc<AtomicUsize>,
+        final_answer: String,
+    }
+
+    impl Respond for OpenAiResponder {
+        fn respond(&self, req: &Request) -> ResponseTemplate {
+            if request_has_tools(req) {
+                self.tool_rounds_served.fetch_add(1, Ordering::SeqCst);
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "choices": [{ "message": {
+                        "content": null,
+                        "tool_calls": [{
+                            "id": "call_1",
+                            "type": "function",
+                            "function": { "name": "definitely_not_a_real_tool", "arguments": "{}" }
+                        }]
+                    }}]
+                }))
+            } else {
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "choices": [{ "message": { "content": self.final_answer } }]
+                }))
+            }
+        }
+    }
+
+    fn msgs() -> Vec<MemMessage> {
+        vec![
+            MemMessage::system("you are a test"),
+            MemMessage::user("do the thing"),
+        ]
+    }
+
+    #[tokio::test]
+    async fn ollama_loop_honors_configured_cap_and_returns_real_final_answer() {
+        let server = MockServer::start().await;
+        let served = Arc::new(AtomicUsize::new(0));
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(OllamaResponder {
+                tool_rounds_served: served.clone(),
+                final_answer: "here is my partial summary".into(),
+            })
+            .mount(&server)
+            .await;
+
+        let messages = msgs();
+        let caveats = Caveats::top();
+        let cap = 3;
+        let (reply, streamed, _usage) = chat_complete(ChatCtx {
+            url: &server.uri(),
+            model: "test-model",
+            kind: BackendKind::Ollama,
+            api_key: None,
+            messages: &messages,
+            task: "do the thing",
+            workspace: ".",
+            color: false,
+            caveats: &caveats,
+            max_tool_rounds: cap,
+        })
+        .await
+        .expect("chat_complete should succeed");
+
+        // The cap was honoured: exactly `cap` tool-offering rounds were served.
+        assert_eq!(served.load(Ordering::SeqCst), cap);
+        // The cap-exit issued a final tools-disabled completion and returned
+        // its text — NOT the dead placeholder.
+        assert_eq!(reply, "here is my partial summary");
+        assert_ne!(reply, "(reached tool-call limit)");
+        assert!(!streamed);
+    }
+
+    #[tokio::test]
+    async fn openai_loop_honors_configured_cap_and_returns_real_final_answer() {
+        let server = MockServer::start().await;
+        let served = Arc::new(AtomicUsize::new(0));
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(OpenAiResponder {
+                tool_rounds_served: served.clone(),
+                final_answer: "openai partial answer".into(),
+            })
+            .mount(&server)
+            .await;
+
+        let messages = msgs();
+        let caveats = Caveats::top();
+        let cap = 2;
+        let (reply, streamed, _usage) = openai_chat_complete(ChatCtx {
+            url: &server.uri(),
+            model: "test-model",
+            kind: BackendKind::Openai,
+            api_key: Some("sk-test"),
+            messages: &messages,
+            task: "do the thing",
+            workspace: ".",
+            color: false,
+            caveats: &caveats,
+            max_tool_rounds: cap,
+        })
+        .await
+        .expect("openai_chat_complete should succeed");
+
+        assert_eq!(served.load(Ordering::SeqCst), cap);
+        assert_eq!(reply, "openai partial answer");
+        assert_ne!(reply, "(reached tool-call limit)");
+        assert!(!streamed);
+    }
+
+    #[tokio::test]
+    async fn cap_exit_fallback_when_final_summary_errors() {
+        // No mock for the tools-disabled request would still 404 via the
+        // tool-offering mock only matching when... actually both match the same
+        // path, so instead we mount a server that always 500s the *second*
+        // shape. Simpler: a server that returns tool calls for tools-present
+        // and a 500 for tools-absent, forcing the fallback branch.
+        let server = MockServer::start().await;
+        let served = Arc::new(AtomicUsize::new(0));
+        struct ErrOnFinal {
+            served: Arc<AtomicUsize>,
+        }
+        impl Respond for ErrOnFinal {
+            fn respond(&self, req: &Request) -> ResponseTemplate {
+                if request_has_tools(req) {
+                    self.served.fetch_add(1, Ordering::SeqCst);
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "message": { "content": "", "tool_calls": [{
+                            "function": { "name": "definitely_not_a_real_tool", "arguments": {} }
+                        }]}
+                    }))
+                } else {
+                    ResponseTemplate::new(500).set_body_string("boom")
+                }
+            }
+        }
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(ErrOnFinal {
+                served: served.clone(),
+            })
+            .mount(&server)
+            .await;
+
+        let messages = msgs();
+        let caveats = Caveats::top();
+        let (reply, _streamed, _usage) = chat_complete(ChatCtx {
+            url: &server.uri(),
+            model: "test-model",
+            kind: BackendKind::Ollama,
+            api_key: None,
+            messages: &messages,
+            task: "do the thing",
+            workspace: ".",
+            color: false,
+            caveats: &caveats,
+            max_tool_rounds: 2,
+        })
+        .await
+        .expect("chat_complete should succeed even when final summary errors");
+
+        // Fallback names the limit + the knob — strictly better than the bare
+        // placeholder.
+        assert!(reply.contains("tool-call limit"));
+        assert!(reply.contains("max_tool_rounds"));
     }
 }
