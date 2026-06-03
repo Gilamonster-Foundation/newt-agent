@@ -29,11 +29,14 @@ members = [
 exclude = ["newt-mesh"]
 
 [workspace.package]
-# Semver — 0.6.5: first published release since 0.6.2. Ships the 0.6.3/0.6.4
-# work that never tagged (publish-infra fixes, TUI, streaming, first-run wizard,
-# inference telemetry) plus newt-identity ocap permissions (#91). Holding the
-# 0.6.x line through June rather than bumping the minor.
-version = "0.6.5"
+# Semver — 0.6.6: re-cut after the botched 0.6.5 partial publish (crates.io
+# landed 4/10 crates via the #120 publish-order bug; PyPI failed via #121
+# attestations/token-auth conflict). 0.6.6 ships the PyPI wheel fix and gates
+# the crates.io chain (blocked by the agent-bridle git-dep until brush is
+# upstreamed). Adds: bridle-confined run_command, OpenAI backend re-land,
+# configurable tool-round cap + graceful exit, agentskills.io skills, pyo3
+# api_key binding. Holding the 0.6.x line through June rather than bumping minor.
+version = "0.6.6"
 edition = "2021"
 rust-version = "1.75"
 license = "Apache-2.0"
@@ -113,17 +116,17 @@ tests-common = { path = "tests/common" }
 agent-mesh-protocol = "0.6"
 
 # Internal crates — pinned with = for lock-step publishing
-newt-core         = { path = "newt-core",         version = "=0.6.5" }
-newt-inference    = { path = "newt-inference",    version = "=0.6.5" }
-newt-tools        = { path = "newt-tools",        version = "=0.6.5" }
-newt-skills       = { path = "newt-skills",       version = "=0.6.5" }
-newt-tui          = { path = "newt-tui",          version = "=0.6.5" }
-newt-acp-worker   = { path = "newt-acp-worker",   version = "=0.6.5" }
-newt-mcp-server   = { path = "newt-mcp-server",   version = "=0.6.5" }
-newt-coder        = { path = "newt-coder",        version = "=0.6.5" }
-newt-identity     = { path = "newt-identity",     version = "=0.6.5" }
-newt-eval         = { path = "newt-eval",         version = "=0.6.5" }
-plugins-protocol  = { path = "plugins-protocol",  version = "=0.6.5" }
+newt-core         = { path = "newt-core",         version = "=0.6.6" }
+newt-inference    = { path = "newt-inference",    version = "=0.6.6" }
+newt-tools        = { path = "newt-tools",        version = "=0.6.6" }
+newt-skills       = { path = "newt-skills",       version = "=0.6.6" }
+newt-tui          = { path = "newt-tui",          version = "=0.6.6" }
+newt-acp-worker   = { path = "newt-acp-worker",   version = "=0.6.6" }
+newt-mcp-server   = { path = "newt-mcp-server",   version = "=0.6.6" }
+newt-coder        = { path = "newt-coder",        version = "=0.6.6" }
+newt-identity     = { path = "newt-identity",     version = "=0.6.6" }
+newt-eval         = { path = "newt-eval",         version = "=0.6.6" }
+plugins-protocol  = { path = "plugins-protocol",  version = "=0.6.6" }
 
 # NOTE on agent-mesh / newt-mesh: see the `[workspace] exclude = [...]`
 # block above. Those deps are NOT declared as workspace-level
