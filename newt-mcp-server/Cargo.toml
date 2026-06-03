@@ -38,15 +38,18 @@ tracing-subscriber.workspace = true
 agent-mesh-protocol.workspace = true
 
 # The bridle leash: a Caveats-confined, brush-backed `shell` tool that
-# supersedes the old unconfined `sh -c` `shell_run`. Pinned to the
-# confined-shell commit (agent-bridle is NOT on crates.io yet). The `shell`
+# supersedes the old unconfined `sh -c` `shell_run`. Pinned to the HARDENED
+# agent-bridle main (agent-bridle is NOT on crates.io yet): this rev closes the
+# free-form `exec`-bypass, fixes dangling-symlink resolution, and adds the
+# STRUCTURED denial envelope (`denied: bool` + `denials: [{kind,target,reason}]`)
+# that this crate now reads instead of stderr string-matching. The `shell`
 # feature transitively pulls agent-bridle-core + agent-bridle-tool-shell + the
 # brush fork git-dep that carries the in-process exec/open interceptor.
 #
 # NOTE: this git-dep (and its transitive brush fork git-dep) means
 # newt-mcp-server cannot publish to crates.io until the brush
 # `CommandInterceptor` hook is upstreamed. Tracked as out-of-scope.
-agent-bridle = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", rev = "129a1adf8ae11e0572ef3d6ac503d459cf26a0bd", features = ["shell"] }
+agent-bridle = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", rev = "c00259af499924527cb31350cba91f093dd432c9", features = ["shell"] }
 
 # Optional PyO3 bindings — opt in only via the umbrella `newt-agent-py`
 # crate; default builds stay Python-free.
