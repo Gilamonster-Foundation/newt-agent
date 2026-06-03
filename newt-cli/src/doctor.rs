@@ -37,6 +37,31 @@ pub async fn run(config_path: Option<&Path>) -> anyhow::Result<()> {
         Err(e) => println!("  Ollama: {e}"),
     }
 
+    // Discovered MCP servers — newt's own `[[mcp_servers]]` merged with the
+    // servers already configured for Claude Code (~/.claude.json + ./.mcp.json),
+    // so you can confirm newt sees the same set without re-configuring anything.
+    println!("\nMCP servers (newt config + Claude Code config):");
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let workspace = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let servers = newt_core::mcp::discover(&config.mcp_servers, home.as_deref(), &workspace);
+    if servers.is_empty() {
+        println!("  (none discovered)");
+    }
+    for s in &servers {
+        let detail = match s.transport {
+            newt_core::mcp::TransportKind::Stdio => s.command.clone().unwrap_or_default(),
+            newt_core::mcp::TransportKind::Sse | newt_core::mcp::TransportKind::Http => {
+                s.url.clone().unwrap_or_default()
+            }
+        };
+        let kind = match s.transport {
+            newt_core::mcp::TransportKind::Stdio => "stdio",
+            newt_core::mcp::TransportKind::Sse => "sse",
+            newt_core::mcp::TransportKind::Http => "http",
+        };
+        println!("  {} [{kind}] — {detail}", s.name);
+    }
+
     Ok(())
 }
 
