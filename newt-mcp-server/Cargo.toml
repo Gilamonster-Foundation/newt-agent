@@ -49,7 +49,7 @@ agent-mesh-protocol.workspace = true
 # NOTE: this git-dep (and its transitive brush fork git-dep) means
 # newt-mcp-server cannot publish to crates.io until the brush
 # `CommandInterceptor` hook is upstreamed. Tracked as out-of-scope.
-agent-bridle = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", rev = "c00259af499924527cb31350cba91f093dd432c9", features = ["shell"] }
+agent-bridle = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", rev = "9287392f7e481de19b940b20fb8491e852233db5", features = ["shell", "web"] }
 
 # Optional PyO3 bindings — opt in only via the umbrella `newt-agent-py`
 # crate; default builds stay Python-free.

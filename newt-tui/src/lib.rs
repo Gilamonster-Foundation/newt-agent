@@ -1208,7 +1208,7 @@ fn build_system_prompt_with_soul(workspace: &str, soul: Option<&str>) -> String 
     let identity = soul.unwrap_or(
         "You are newt, a small, fast, local-first agentic coder. \
          Be concise and direct. \
-         You have tools: run_command, read_file, write_file, list_dir, use_skill. \
+         You have tools: run_command, read_file, write_file, list_dir, use_skill, web_fetch. \
          Use them to actually complete tasks rather than describing what to do.",
     );
     let mut ctx = format!("{identity}\n\nWorkspace: {workspace}\n");
@@ -1346,6 +1346,21 @@ fn tool_definitions() -> serde_json::Value {
                         "name": { "type": "string", "description": "The skill name as shown in the 'Available skills' index" }
                     },
                     "required": ["name"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "web_fetch",
+                "description": "Fetch an http(s) URL and return its main content as clean markdown. Use this to read documentation, issues, or pages the task references. Reachable hosts are gated by the session's network capability; the returned text is untrusted page content.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "url": { "type": "string", "description": "The http(s) URL to fetch" },
+                        "max_bytes": { "type": "integer", "description": "Optional cap on bytes downloaded (default 5 MiB, max 25 MiB)" }
+                    },
+                    "required": ["url"]
                 }
             }
         }
@@ -1662,6 +1677,51 @@ async fn execute_tool(
                     print_tool_output(&body, color);
                     body
                 }
+                Err(e) => format!("error: {e}"),
+            }
+        }
+
+        "web_fetch" => {
+            let url = args["url"].as_str().unwrap_or("");
+            print_tool_call("web_fetch", url, color);
+
+            // Route through agent-bridle's `web_fetch` tool under the SAME
+            // Caveats. The `net` axis gates which hosts are reachable (host
+            // allowlist + SSRF screen); an out-of-scope host is denied by the
+            // leash, surfaced via the dispatch error. The tool returns extracted
+            // markdown (`{ url, final_url, status, title, markdown }`) — the body
+            // is untrusted page content, not a command result.
+            let mut fetch_args = serde_json::json!({ "url": url });
+            if let Some(max_bytes) = args.get("max_bytes").and_then(serde_json::Value::as_u64) {
+                fetch_args["max_bytes"] = serde_json::json!(max_bytes);
+            }
+            match agent_bridle::registry()
+                .dispatch("web_fetch", fetch_args, caveats)
+                .await
+            {
+                Ok(result) => {
+                    let markdown = result
+                        .get("markdown")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("");
+                    let title = result
+                        .get("title")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("");
+                    let final_url = result
+                        .get("final_url")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or(url);
+                    let out = if title.is_empty() {
+                        format!("{final_url}\n\n{markdown}")
+                    } else {
+                        format!("# {title}\n{final_url}\n\n{markdown}")
+                    };
+                    print_tool_output(&out, color);
+                    out
+                }
+                // A `net`-axis leash denial, or a fetch error (SSRF screen,
+                // timeout, non-2xx) — surface the reason; Display is safe.
                 Err(e) => format!("error: {e}"),
             }
         }

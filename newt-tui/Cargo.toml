@@ -40,7 +40,7 @@ tracing.workspace = true
 # fork git-dep that carries the in-process exec/open interceptor. The structured
 # denial envelope (`denied: bool` + `denials: [{kind,target,reason}]`) is read
 # directly — never a stderr grep.
-agent-bridle = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", rev = "5adfd91f12f29a496108eba05cbca59c8ab86aeb", features = ["shell"] }
+agent-bridle = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", rev = "9287392f7e481de19b940b20fb8491e852233db5", features = ["shell", "web"] }
 
 [dev-dependencies]
 tempfile.workspace = true
