@@ -47,6 +47,12 @@ pub struct Config {
     /// Memory / context-window management. `None` → RollingWindow(20).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory: Option<MemoryConfig>,
+
+    /// newt-native MCP servers (`[[mcp_servers]]`). Merged with the servers
+    /// discovered from Claude Code's config by [`crate::mcp::discover`]; these
+    /// take precedence on a name clash. Empty by default.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mcp_servers: Vec<crate::mcp::McpServerEntry>,
 }
 
 // ---------------------------------------------------------------------------
@@ -535,6 +541,7 @@ impl Default for Config {
             tui: None,
             pricing: None,
             memory: None,
+            mcp_servers: Vec::new(),
         }
     }
 }

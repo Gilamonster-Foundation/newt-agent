@@ -8,6 +8,7 @@ pub mod caveats;
 pub mod config;
 pub mod dgx;
 pub mod error;
+pub mod mcp;
 pub mod memory;
 pub mod metrics;
 pub mod model_id;
