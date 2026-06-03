@@ -61,6 +61,26 @@ def test_local_vllm_backend_construct() -> None:
     assert backend.name() == "vllm-local"
 
 
+def test_local_vllm_backend_accepts_api_key() -> None:
+    # Hosted OpenAI-compatible endpoints (e.g. NVIDIA in-house inference)
+    # require a bearer token; the constructor must accept it as an optional
+    # kwarg. Wire-level header behavior is covered by the Rust
+    # `openai_auth_tests`; here we only assert the binding threads it through.
+    backend = inference.LocalVllmBackend(
+        "https://inference-api.nvidia.com/v1",
+        "nvidia/nemotron-3-super-120b-a12b",
+        api_key="secret-abc",
+    )
+    assert backend.endpoint() == "https://inference-api.nvidia.com/v1"
+    assert backend.name() == "vllm-local"
+
+
+def test_local_vllm_backend_api_key_defaults_none() -> None:
+    # Positional, no key — the default path stays unauthenticated.
+    backend = inference.LocalVllmBackend("http://127.0.0.1:8000", "meta/llama")
+    assert backend.endpoint() == "http://127.0.0.1:8000"
+
+
 async def test_backend_registry_register_and_names() -> None:
     registry = inference.BackendRegistry()
     backend = inference.LocalOllamaBackend("http://127.0.0.1:11434", "llama3.1:8b")
