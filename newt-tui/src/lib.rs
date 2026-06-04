@@ -9,6 +9,7 @@ mod mcp;
 mod wizard;
 
 use mcp::Mcp;
+use newt_inference::retry::{with_backoff_notify, RetryPolicy};
 
 /// Run the (non-interactive) setup wizard unconditionally — used by `newt init`.
 /// Probes Ollama and (re)writes `~/.newt/config.toml`; edit that file for
@@ -1380,6 +1381,37 @@ fn tool_definitions() -> serde_json::Value {
     ])
 }
 
+/// Retry policy for TUI inference calls: more patient than the hosted-API
+/// default because local DGX nodes can drop for 30–60 s under load.
+/// Total resilience window: ~90 s (2+4+8+16+30+30 s between attempts).
+/// All thresholds are overridable via the standard `NEWT_HTTP_*` env vars.
+fn tui_retry_policy() -> RetryPolicy {
+    RetryPolicy::for_local_inference()
+}
+
+/// Print a visible retry indicator to the TUI so the user knows why there's
+/// a pause rather than seeing a silent hang.
+fn print_retry_indicator(attempt: u32, delay: std::time::Duration, color: bool) {
+    let delay_s = delay.as_secs_f32();
+    let msg = format!("  ↻ connection lost — retrying in {delay_s:.1}s (attempt {attempt})…\n");
+    if color {
+        execute!(
+            io::stdout(),
+            SetForegroundColor(CtColor::Rgb {
+                r: 200,
+                g: 140,
+                b: 0
+            }),
+            Print(&msg),
+            ResetColor,
+        )
+        .ok();
+    } else {
+        print!("{msg}");
+    }
+    io::stdout().flush().ok();
+}
+
 /// Direct tool names the model must call as tool invocations, never as shell
 /// commands passed to `run_command`.
 const DIRECT_TOOL_NAMES: &[&str] = &[
@@ -1902,6 +1934,7 @@ async fn chat_complete(
         .timeout(std::time::Duration::from_secs(120))
         .build()?;
     let chat_url = format!("{}/api/chat", url.trim_end_matches('/'));
+    let retry = tui_retry_policy();
 
     // Convert MemMessage list to Ollama JSON format.
     // The memory manager already included the current task as the last user message.
@@ -1939,20 +1972,30 @@ async fn chat_complete(
             "tools": merged_tool_definitions(mcp),
         });
 
-        let resp = client
-            .post(&chat_url)
-            .json(&body_no_stream)
-            .send()
-            .await
-            .map_err(|e| anyhow::anyhow!("request failed: {e}"))?;
+        // Retry the send+status+parse as one unit — a connection drop at any
+        // of these steps is transient and worth retrying with backoff.
+        let json: serde_json::Value = with_backoff_notify(
+            &retry,
+            || async {
+                let resp = client
+                    .post(&chat_url)
+                    .json(&body_no_stream)
+                    .send()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("request failed: {e}"))?;
+                if !resp.status().is_success() {
+                    let status = resp.status();
+                    let text = resp.text().await.unwrap_or_default();
+                    anyhow::bail!("Ollama {status}: {text}");
+                }
+                resp.json::<serde_json::Value>()
+                    .await
+                    .map_err(anyhow::Error::from)
+            },
+            |attempt, delay| print_retry_indicator(attempt, delay, color),
+        )
+        .await?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Ollama {status}: {text}");
-        }
-
-        let json: serde_json::Value = resp.json().await?;
         // Accumulate token usage from this non-streaming probe round.
         accumulated_usage = merge_usage(accumulated_usage, ollama_usage(&json));
 
@@ -1970,12 +2013,21 @@ async fn chat_complete(
                 "stream": true,
                 "tools": merged_tool_definitions(mcp),
             });
-            let sresp = client
-                .post(&chat_url)
-                .json(&body_stream)
-                .send()
-                .await
-                .map_err(|e| anyhow::anyhow!("stream request failed: {e}"))?;
+            // Retry the connection; if we connect successfully but the stream
+            // drops mid-token, that's a separate (harder) failure mode.
+            let sresp = with_backoff_notify(
+                &retry,
+                || async {
+                    client
+                        .post(&chat_url)
+                        .json(&body_stream)
+                        .send()
+                        .await
+                        .map_err(|e| anyhow::anyhow!("stream request failed: {e}"))
+                },
+                |attempt, delay| print_retry_indicator(attempt, delay, color),
+            )
+            .await?;
 
             if !sresp.status().is_success() {
                 let content = message["content"].as_str().unwrap_or("").to_string();
@@ -2086,9 +2138,30 @@ async fn final_summary_ollama(
         "messages": &messages,
         "stream": false,
     });
-    match client.post(chat_url).json(&body).send().await {
-        Ok(resp) if resp.status().is_success() => {
-            let json: serde_json::Value = resp.json().await?;
+    let retry = tui_retry_policy();
+    let result = with_backoff_notify(
+        &retry,
+        || async {
+            let resp = client
+                .post(chat_url)
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| anyhow::anyhow!("request failed: {e}"))?;
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let text = resp.text().await.unwrap_or_default();
+                anyhow::bail!("Ollama {status}: {text}");
+            }
+            resp.json::<serde_json::Value>()
+                .await
+                .map_err(anyhow::Error::from)
+        },
+        |_, _| {}, // no color context here; tracing::warn covers it
+    )
+    .await;
+    match result {
+        Ok(json) => {
             let content = json["message"]["content"]
                 .as_str()
                 .unwrap_or("")
@@ -2104,9 +2177,9 @@ async fn final_summary_ollama(
                 Ok((content, false, total))
             }
         }
-        // On any failure, still return the accumulated usage so the caller
-        // can log the tokens that were consumed during the tool rounds.
-        _ => Ok((
+        // On any failure (including exhausted retries), still return the
+        // accumulated usage so the caller can log the tokens consumed.
+        Err(_) => Ok((
             cap_exit_fallback(max_tool_rounds, accumulated),
             false,
             accumulated,
@@ -2137,13 +2210,32 @@ async fn final_summary_openai(
         "messages": &messages,
         "stream": false,
     });
-    let mut req = client.post(chat_url).json(&body);
-    if let Some(key) = api_key {
-        req = req.bearer_auth(key);
-    }
-    match req.send().await {
-        Ok(resp) if resp.status().is_success() => {
-            let json: serde_json::Value = resp.json().await?;
+    let retry = tui_retry_policy();
+    let result = with_backoff_notify(
+        &retry,
+        || async {
+            let mut req = client.post(chat_url).json(&body);
+            if let Some(key) = api_key {
+                req = req.bearer_auth(key);
+            }
+            let resp = req
+                .send()
+                .await
+                .map_err(|e| anyhow::anyhow!("request failed: {e}"))?;
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let text = resp.text().await.unwrap_or_default();
+                anyhow::bail!("inference endpoint {status}: {text}");
+            }
+            resp.json::<serde_json::Value>()
+                .await
+                .map_err(anyhow::Error::from)
+        },
+        |_, _| {},
+    )
+    .await;
+    match result {
+        Ok(json) => {
             let content = json["choices"][0]["message"]["content"]
                 .as_str()
                 .unwrap_or("")
@@ -2159,7 +2251,7 @@ async fn final_summary_openai(
                 Ok((content, false, total))
             }
         }
-        _ => Ok((
+        Err(_) => Ok((
             cap_exit_fallback(max_tool_rounds, accumulated),
             false,
             accumulated,
@@ -2195,6 +2287,7 @@ async fn openai_chat_complete(
         .timeout(std::time::Duration::from_secs(120))
         .build()?;
     let chat_url = format!("{}/v1/chat/completions", url.trim_end_matches('/'));
+    let retry = tui_retry_policy();
 
     let mut messages: Vec<serde_json::Value> = mem_messages
         .iter()
@@ -2223,22 +2316,29 @@ async fn openai_chat_complete(
             "tool_choice": "auto",
             "stream": false,
         });
-        let mut req = client.post(&chat_url).json(&body);
-        if let Some(key) = api_key {
-            req = req.bearer_auth(key);
-        }
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| anyhow::anyhow!("request failed: {e}"))?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("inference endpoint {status}: {text}");
-        }
-
-        let json: serde_json::Value = resp.json().await?;
+        let json: serde_json::Value = with_backoff_notify(
+            &retry,
+            || async {
+                let mut req = client.post(&chat_url).json(&body);
+                if let Some(key) = api_key {
+                    req = req.bearer_auth(key);
+                }
+                let resp = req
+                    .send()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("request failed: {e}"))?;
+                if !resp.status().is_success() {
+                    let status = resp.status();
+                    let text = resp.text().await.unwrap_or_default();
+                    anyhow::bail!("inference endpoint {status}: {text}");
+                }
+                resp.json::<serde_json::Value>()
+                    .await
+                    .map_err(anyhow::Error::from)
+            },
+            |attempt, delay| print_retry_indicator(attempt, delay, color),
+        )
+        .await?;
         // Accumulate per-round token usage.
         accumulated_usage = merge_usage(accumulated_usage, openai_usage(&json["usage"]));
 
