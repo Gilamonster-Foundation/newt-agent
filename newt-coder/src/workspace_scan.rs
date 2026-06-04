@@ -72,6 +72,15 @@ fn scan_all_source_files(workspace: &Path) -> Result<Vec<PathBuf>> {
     Ok(out)
 }
 
+fn repo_relative_path(path: &Path) -> PathBuf {
+    PathBuf::from(
+        path.components()
+            .map(|component| component.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/"),
+    )
+}
+
 fn walk(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     let entries = std::fs::read_dir(dir)
         .map_err(|e| CoderError::Workspace(format!("read_dir {}: {e}", dir.display())))?;
@@ -93,7 +102,7 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
                     let rel = path.strip_prefix(root).map_err(|e| {
                         CoderError::Workspace(format!("strip_prefix {}: {e}", path.display()))
                     })?;
-                    out.push(rel.to_path_buf());
+                    out.push(repo_relative_path(rel));
                 }
             }
         }

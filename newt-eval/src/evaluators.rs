@@ -103,7 +103,7 @@ impl Evaluator for DiffAppliesEvaluator {
         // check targets `scratch`, not whichever repo the caller's
         // inherited GIT_DIR points at.
         let mut child = match Command::new("git")
-            .args(["apply", "--check"])
+            .args(["apply", "--check", "--ignore-space-change"])
             .current_dir(scratch.path())
             .env_remove("GIT_DIR")
             .env_remove("GIT_WORK_TREE")
@@ -159,6 +159,7 @@ impl Evaluator for DiffAppliesEvaluator {
 fn select_apply_target(ctx: &EvalContext) -> (String, &'static str) {
     if let Some(raw) = ctx.reply.raw_emission.as_deref() {
         let mut stripped = strip_outer_fences(raw);
+        stripped = stripped.trim_start_matches(['\r', '\n']).to_string();
         if looks_like_unified_diff(&stripped) {
             // `strip_outer_fences` trims the trailing newline (along with any
             // closing fence); `git apply` wants one on the final hunk line.

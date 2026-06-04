@@ -814,6 +814,7 @@ mod tests {
     /// string-match. The removed `confinement_denial_reason` helper grepped
     /// `stderr` for `"is not within the granted"`; this asserts the new path
     /// produces the same in-band `isError` outcome from the structured signal.
+    #[cfg(unix)]
     #[tokio::test]
     async fn shell_run_out_of_scope_rm_is_denied() {
         let resp = rpc_with_caveats(
@@ -912,6 +913,7 @@ mod tests {
     /// passing here proves the bump to the hardened agent-bridle closed the
     /// bypass *through newt's shell_run*, with the denial seen via the
     /// structured field.
+    #[cfg(unix)]
     #[tokio::test]
     async fn shell_run_exec_bypass_is_denied_and_program_does_not_run() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -981,6 +983,7 @@ mod tests {
     /// this is the load-bearing case a cleared PATH alone would not stop. Only
     /// the interceptor's before_exec hook (at the single spawn funnel) closes
     /// it. Proves shell_run's confinement is real, not cosmetic.
+    #[cfg(unix)]
     #[tokio::test]
     async fn shell_run_bin_rm_path_separator_is_denied() {
         let resp = rpc_with_caveats(

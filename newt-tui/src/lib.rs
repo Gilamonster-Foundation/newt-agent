@@ -2566,6 +2566,7 @@ mod run_command_confinement_tests {
     /// A `Caveats` granting exec for the given commands and full fs/read+write
     /// (so the test's own file-survival assertions are not themselves confined),
     /// otherwise read-only-ish. `exec` is `Scope::Only` of the named commands.
+    #[cfg(unix)]
     fn caveats_exec_only(cmds: &[&str]) -> Caveats {
         Caveats {
             fs_read: Scope::All,
@@ -2580,6 +2581,7 @@ mod run_command_confinement_tests {
     /// run_command with a caveats granting exec for a real external (`env`)
     /// succeeds: the command runs through the confined shell and returns its
     /// output (exit 0), no denial.
+    #[cfg(unix)]
     #[tokio::test]
     async fn run_command_allowed_external_succeeds() {
         let ws = tempfile::TempDir::new().unwrap();
@@ -2606,6 +2608,7 @@ mod run_command_confinement_tests {
     /// run_command with an out-of-scope command is DENIED via the structured
     /// envelope field — surfaced as the capability-denied UX string, NOT a
     /// stderr grep.
+    #[cfg(unix)]
     #[tokio::test]
     async fn run_command_out_of_scope_is_denied() {
         let ws = tempfile::TempDir::new().unwrap();
@@ -2631,6 +2634,7 @@ mod run_command_confinement_tests {
     /// confined shell and the victim file SURVIVES. On the old leading-token +
     /// `sh -c` path the `echo` check passed and `rm` then ran directly, deleting
     /// the victim. Full-command confinement is what stops it here.
+    #[cfg(unix)]
     #[tokio::test]
     async fn compound_command_denies_ungranted_rm_and_victim_survives() {
         let ws = tempfile::TempDir::new().unwrap();
