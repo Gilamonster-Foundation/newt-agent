@@ -79,15 +79,10 @@ pub fn run_code(path: Option<&std::path::Path>, no_splash: bool) -> anyhow::Resu
 
     let workspace = resolve_workspace(path);
 
-    // --no-splash (or [tui] no_splash = true): print a compact inline header
-    // and go straight to chat. No alt screen, no raw mode — scrolls into
-    // history naturally. Safe for SSH, tmux, and piped output.
-    let inline = no_splash
-        || newt_core::Config::resolve()
-            .ok()
-            .and_then(|c| c.tui)
-            .map(|t| t.no_splash)
-            .unwrap_or(false);
+    // `no_splash` is already resolved by the caller (CLI flags + config).
+    // Print a compact inline header and go straight to chat — no alt screen,
+    // no raw mode, scrolls naturally into history. Safe for SSH/tmux/pipes.
+    let inline = no_splash;
 
     if inline {
         print_inline_header(&workspace, color);
