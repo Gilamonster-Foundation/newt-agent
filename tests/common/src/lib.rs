@@ -112,7 +112,7 @@ pub fn mock_plugin_binary(dir: &Path, replies: &[&str]) -> PathBuf {
 
         let script = format!("#!/usr/bin/env bash\n{body}\n");
         fs::write(&script_path, script).expect("failed to write mock plugin script");
-        #[cfg(unix)]
+        // Already inside the `#[cfg(unix)]` block — no inner attribute needed.
         fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755))
             .expect("failed to chmod mock plugin");
         script_path
