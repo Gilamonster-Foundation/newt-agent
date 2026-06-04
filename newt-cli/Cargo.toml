@@ -27,6 +27,7 @@ newt-tools.workspace = true
 newt-tui.workspace = true
 newt-acp-worker.workspace = true
 newt-mcp-server.workspace = true
+newt-mcp-client.workspace = true
 newt-identity.workspace = true
 anyhow.workspace = true
 clap.workspace = true

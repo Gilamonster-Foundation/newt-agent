@@ -1,0 +1,27 @@
+[package]
+name = "newt-mcp-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "Newt-Agent MCP client — connect to discovered MCP servers (stdio JSON-RPC) and aggregate their tools."
+keywords = ["newt", "agent", "mcp", "model-context"]
+categories = ["api-bindings"]
+
+[lib]
+name = "newt_mcp_client"
+path = "src/lib.rs"
+
+[dependencies]
+newt-core.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true
