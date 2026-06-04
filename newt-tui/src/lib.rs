@@ -5,7 +5,10 @@
 //! (see `newt config`). Additional features and the multi-agent matrix live in
 //! the downstream `gilamonster-agent`, which inherits these crates.
 
+mod mcp;
 mod wizard;
+
+use mcp::Mcp;
 
 /// Run the (non-interactive) setup wizard unconditionally — used by `newt init`.
 /// Probes Ollama and (re)writes `~/.newt/config.toml`; edit that file for
@@ -870,6 +873,25 @@ fn run_chat(workspace: &str, color: bool) -> anyhow::Result<()> {
         color,
         verbose,
     );
+
+    // Connect to discovered MCP servers ONCE for the session (newt config +
+    // Claude Code config). Failures are logged + skipped; their tools are added
+    // to the agent's tool set, namespaced `server__tool`. `newt doctor` shows
+    // the same discovery if a server is missing.
+    let cfg_mcp_servers = newt_core::Config::resolve()
+        .map(|c| c.mcp_servers)
+        .unwrap_or_default();
+    let mut mcp =
+        tokio::task::block_in_place(|| rt.block_on(Mcp::connect(workspace, &cfg_mcp_servers)));
+    if !mcp.is_empty() {
+        let summary = mcp
+            .summary()
+            .into_iter()
+            .map(|(name, n)| format!("{name} ({n})"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        print_newt(&format!("MCP: {summary}"), color, verbose);
+    }
     println!();
 
     let mut rl = rustyline::DefaultEditor::with_config(build_rl_config())?;
@@ -1057,18 +1079,21 @@ fn run_chat(workspace: &str, color: bool) -> anyhow::Result<()> {
                     // Build message list from memory manager.
                     let messages = memory.build_messages(&system, &task);
                     let response = tokio::task::block_in_place(|| {
-                        rt.block_on(chat_complete(ChatCtx {
-                            url: &inf_url,
-                            model: &inf_model,
-                            kind: inf_kind,
-                            api_key: inf_key.as_deref(),
-                            messages: &messages,
-                            task: &task,
-                            workspace,
-                            color,
-                            caveats: cap.caveats(),
-                            max_tool_rounds: max_tool_rounds(),
-                        }))
+                        rt.block_on(chat_complete(
+                            ChatCtx {
+                                url: &inf_url,
+                                model: &inf_model,
+                                kind: inf_kind,
+                                api_key: inf_key.as_deref(),
+                                messages: &messages,
+                                task: &task,
+                                workspace,
+                                color,
+                                caveats: cap.caveats(),
+                                max_tool_rounds: max_tool_rounds(),
+                            },
+                            &mut mcp,
+                        ))
                     });
 
                     let elapsed = t0.elapsed();
@@ -1369,6 +1394,18 @@ fn tool_definitions() -> serde_json::Value {
     ])
 }
 
+/// The built-in tool definitions plus every connected MCP server's tools
+/// (namespaced `server__tool`). This is what the agent loop advertises to the
+/// model so it can call remote MCP tools alongside the built-ins.
+fn merged_tool_definitions(mcp: &Mcp) -> serde_json::Value {
+    let mut defs = match tool_definitions() {
+        serde_json::Value::Array(a) => a,
+        other => vec![other],
+    };
+    defs.extend(mcp.tool_defs());
+    serde_json::Value::Array(defs)
+}
+
 /// Print a tool-call header so the user can see what the agent is doing.
 fn print_tool_call(name: &str, detail: &str, color: bool) {
     if color {
@@ -1503,7 +1540,17 @@ async fn execute_tool(
     workspace: &str,
     color: bool,
     caveats: &newt_core::caveats::Caveats,
+    mcp: &mut Mcp,
 ) -> String {
+    // Remote MCP tools (namespaced `server__tool`) route to their server before
+    // the built-in match. They carry no Caveats leash in this build.
+    if mcp.handles(name) {
+        print_tool_call(name, &args.to_string(), color);
+        let out = mcp.call(name, args).await;
+        print_tool_output(&out, color);
+        return out;
+    }
+
     match name {
         "run_command" => {
             let cmd = args["command"].as_str().unwrap_or("");
@@ -1755,11 +1802,12 @@ struct ChatCtx<'a> {
 /// When `was_streamed` is true the text was already printed token-by-token.
 async fn chat_complete(
     ctx: ChatCtx<'_>,
+    mcp: &mut Mcp,
 ) -> anyhow::Result<(String, bool, Option<newt_core::TokenUsage>)> {
     // OpenAI-compatible endpoints speak a different wire format (request,
     // tool_calls, and usage shapes all differ), so they get their own loop.
     if ctx.kind == newt_core::BackendKind::Openai {
-        return openai_chat_complete(ctx).await;
+        return openai_chat_complete(ctx, mcp).await;
     }
     let ChatCtx {
         url,
@@ -1808,7 +1856,7 @@ async fn chat_complete(
             "model": model,
             "messages": messages,
             "stream": false,
-            "tools": tool_definitions(),
+            "tools": merged_tool_definitions(mcp),
         });
 
         let resp = client
@@ -1837,7 +1885,7 @@ async fn chat_complete(
                 "model": model,
                 "messages": &messages,
                 "stream": true,
-                "tools": tool_definitions(),
+                "tools": merged_tool_definitions(mcp),
             });
             let sresp = client
                 .post(&chat_url)
@@ -1864,7 +1912,7 @@ async fn chat_complete(
                 }
                 v => v.clone(),
             };
-            let result = execute_tool(name, &args, workspace, color, caveats).await;
+            let result = execute_tool(name, &args, workspace, color, caveats, mcp).await;
             messages.push(serde_json::json!({
                 "role": "tool",
                 "content": result
@@ -1983,6 +2031,7 @@ async fn final_summary_openai(
 /// is a follow-up; functionally the loop is complete, including tools.
 async fn openai_chat_complete(
     ctx: ChatCtx<'_>,
+    mcp: &mut Mcp,
 ) -> anyhow::Result<(String, bool, Option<newt_core::TokenUsage>)> {
     let ChatCtx {
         url,
@@ -2021,7 +2070,7 @@ async fn openai_chat_complete(
         let body = serde_json::json!({
             "model": model,
             "messages": messages,
-            "tools": tool_definitions(),
+            "tools": merged_tool_definitions(mcp),
             "tool_choice": "auto",
             "stream": false,
         });
@@ -2063,7 +2112,7 @@ async fn openai_chat_complete(
                 }
                 v => v.clone(),
             };
-            let result = execute_tool(name, &args, workspace, color, caveats).await;
+            let result = execute_tool(name, &args, workspace, color, caveats, mcp).await;
             messages.push(serde_json::json!({
                 "role": "tool",
                 "tool_call_id": id,
@@ -2653,6 +2702,7 @@ mod run_command_confinement_tests {
             &ws.path().to_string_lossy(),
             false,
             &caveats,
+            &mut Mcp::empty(),
         )
         .await;
         assert!(
@@ -2680,6 +2730,7 @@ mod run_command_confinement_tests {
             &ws.path().to_string_lossy(),
             false,
             &caveats,
+            &mut Mcp::empty(),
         )
         .await;
         assert!(
@@ -2712,6 +2763,7 @@ mod run_command_confinement_tests {
             &ws.path().to_string_lossy(),
             false,
             &caveats,
+            &mut Mcp::empty(),
         )
         .await;
 
@@ -2745,6 +2797,7 @@ mod run_command_confinement_tests {
             &ws.path().to_string_lossy(),
             false,
             &caveats,
+            &mut Mcp::empty(),
         )
         .await;
         assert_eq!(out, "hello", "read_file must still return file contents");
@@ -2771,6 +2824,7 @@ mod run_command_confinement_tests {
             &ws.path().to_string_lossy(),
             false,
             &caveats,
+            &mut Mcp::empty(),
         )
         .await;
         assert!(
@@ -2804,6 +2858,7 @@ mod run_command_confinement_tests {
             &ws.path().to_string_lossy(),
             false,
             &caveats,
+            &mut Mcp::empty(),
         )
         .await;
         assert!(out.contains("one.txt") && out.contains("two.txt"));
@@ -2964,18 +3019,21 @@ mod tool_round_cap_tests {
         let messages = msgs();
         let caveats = Caveats::top();
         let cap = 3;
-        let (reply, streamed, _usage) = chat_complete(ChatCtx {
-            url: &server.uri(),
-            model: "test-model",
-            kind: BackendKind::Ollama,
-            api_key: None,
-            messages: &messages,
-            task: "do the thing",
-            workspace: ".",
-            color: false,
-            caveats: &caveats,
-            max_tool_rounds: cap,
-        })
+        let (reply, streamed, _usage) = chat_complete(
+            ChatCtx {
+                url: &server.uri(),
+                model: "test-model",
+                kind: BackendKind::Ollama,
+                api_key: None,
+                messages: &messages,
+                task: "do the thing",
+                workspace: ".",
+                color: false,
+                caveats: &caveats,
+                max_tool_rounds: cap,
+            },
+            &mut Mcp::empty(),
+        )
         .await
         .expect("chat_complete should succeed");
 
@@ -3004,18 +3062,21 @@ mod tool_round_cap_tests {
         let messages = msgs();
         let caveats = Caveats::top();
         let cap = 2;
-        let (reply, streamed, _usage) = openai_chat_complete(ChatCtx {
-            url: &server.uri(),
-            model: "test-model",
-            kind: BackendKind::Openai,
-            api_key: Some("sk-test"),
-            messages: &messages,
-            task: "do the thing",
-            workspace: ".",
-            color: false,
-            caveats: &caveats,
-            max_tool_rounds: cap,
-        })
+        let (reply, streamed, _usage) = openai_chat_complete(
+            ChatCtx {
+                url: &server.uri(),
+                model: "test-model",
+                kind: BackendKind::Openai,
+                api_key: Some("sk-test"),
+                messages: &messages,
+                task: "do the thing",
+                workspace: ".",
+                color: false,
+                caveats: &caveats,
+                max_tool_rounds: cap,
+            },
+            &mut Mcp::empty(),
+        )
         .await
         .expect("openai_chat_complete should succeed");
 
@@ -3061,18 +3122,21 @@ mod tool_round_cap_tests {
 
         let messages = msgs();
         let caveats = Caveats::top();
-        let (reply, _streamed, _usage) = chat_complete(ChatCtx {
-            url: &server.uri(),
-            model: "test-model",
-            kind: BackendKind::Ollama,
-            api_key: None,
-            messages: &messages,
-            task: "do the thing",
-            workspace: ".",
-            color: false,
-            caveats: &caveats,
-            max_tool_rounds: 2,
-        })
+        let (reply, _streamed, _usage) = chat_complete(
+            ChatCtx {
+                url: &server.uri(),
+                model: "test-model",
+                kind: BackendKind::Ollama,
+                api_key: None,
+                messages: &messages,
+                task: "do the thing",
+                workspace: ".",
+                color: false,
+                caveats: &caveats,
+                max_tool_rounds: 2,
+            },
+            &mut Mcp::empty(),
+        )
         .await
         .expect("chat_complete should succeed even when final summary errors");
 
