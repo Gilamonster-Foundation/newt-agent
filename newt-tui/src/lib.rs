@@ -6,6 +6,7 @@
 //! the downstream `gilamonster-agent`, which inherits these crates.
 
 mod mcp;
+pub mod probe;
 mod wizard;
 
 use mcp::Mcp;
@@ -381,6 +382,30 @@ fn splash_key_action(ev: &Event) -> bool {
 // NEWT_CHAT_STYLE=verbose  — show "newt" / "you" labels before the caret
 // (default is compact: just the colored caret / symbol)
 // ---------------------------------------------------------------------------
+
+/// Return today's date as `YYYY-MM-DD` using the system clock.
+fn today_date() -> String {
+    // Using std::time for a lightweight date without a chrono dep.
+    // We only need YYYY-MM-DD so we derive it from epoch seconds manually.
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // Days since Unix epoch.
+    let days = secs / 86400;
+    // Algorithm from http://howardhinnant.github.io/date_algorithms.html
+    let z = days as i64 + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z.rem_euclid(146097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02}")
+}
 
 /// Whether to show "newt" / "you" labels before the carets.
 fn verbose_mode() -> bool {
@@ -2656,7 +2681,9 @@ fn dispatch_slash(
             print_newt("Available commands:", color, verbose);
             for line in [
                 "  /models                  — list models on the active endpoint",
+                "  /models capabilities     — tool-conformance matrix (cached)",
                 "  /model <name>            — switch model for this session",
+                "  /probe [model|all]       — test tool conformance and cache the result",
                 "  /memory                  — show context window / notes usage",
                 "  /remember <fact>         — add a fact to persistent NOTES.md",
                 "  /dgx status              — DGX endpoint health + running models",
@@ -2678,43 +2705,145 @@ fn dispatch_slash(
         "workspace" => print_newt(workspace, color, verbose),
 
         "models" => {
-            // List models on the active endpoint, highlighting the current one.
             let cfg = newt_core::Config::resolve().unwrap_or_default();
             let choice = resolve_backend_choice(&cfg);
             let url = choice.url;
             let current = choice.model;
-            let fetched = if choice.kind == newt_core::BackendKind::Openai {
-                fetch_openai_models(&url, choice.api_key.as_deref())
-            } else {
-                fetch_models_from_url(&url)
-            };
-            match fetched {
-                Ok(names) if names.is_empty() => {
-                    print_newt(&format!("No models found on {url}"), color, verbose);
+
+            if arg1 == "capabilities" {
+                // Full tool-conformance matrix from the capability cache.
+                match probe::fetch_ollama_models(&url) {
+                    Err(e) => print_newt(&format!("error: {e}"), color, verbose),
+                    Ok(models) => {
+                        let cache = probe::load_cache();
+                        probe::print_capabilities_table(&models, &cache, &current, &url, color);
+                    }
                 }
-                Ok(names) => {
-                    print_newt(&format!("Models on {url}:"), color, verbose);
-                    for name in &names {
-                        if *name == current {
-                            if color {
-                                execute!(
-                                    io::stdout(),
-                                    Print(format!("  {name}")),
-                                    SetForegroundColor(NEWT_ORANGE_CT),
-                                    Print(" ◀ active"),
-                                    ResetColor,
-                                    Print("\n"),
-                                )
-                                .ok();
+            } else {
+                // Plain list, with cached conformance symbol where known.
+                let fetched = if choice.kind == newt_core::BackendKind::Openai {
+                    fetch_openai_models(&url, choice.api_key.as_deref())
+                } else {
+                    fetch_models_from_url(&url)
+                };
+                match fetched {
+                    Ok(names) if names.is_empty() => {
+                        print_newt(&format!("No models found on {url}"), color, verbose);
+                    }
+                    Ok(names) => {
+                        let cache = probe::load_cache();
+                        print_newt(&format!("Models on {url}:"), color, verbose);
+                        for name in &names {
+                            let conformance_tag = cache
+                                .get(name)
+                                .map(|e| format!("  {}", e.conformance.symbol()))
+                                .unwrap_or_default();
+                            if *name == current {
+                                if color {
+                                    execute!(
+                                        io::stdout(),
+                                        Print(format!("  {name}{conformance_tag}")),
+                                        SetForegroundColor(NEWT_ORANGE_CT),
+                                        Print(" ◀ active"),
+                                        ResetColor,
+                                        Print("\n"),
+                                    )
+                                    .ok();
+                                } else {
+                                    println!("  {name}{conformance_tag} ◀ active");
+                                }
                             } else {
-                                println!("  {name} ◀ active");
+                                println!("  {name}{conformance_tag}");
                             }
-                        } else {
-                            println!("  {name}");
+                        }
+                        let tested = names.iter().filter(|n| cache.contains_key(*n)).count();
+                        if tested < names.len() {
+                            println!(
+                                "\n  {}/{} tested — /models capabilities for the full matrix",
+                                tested,
+                                names.len()
+                            );
+                        }
+                    }
+                    Err(e) => print_newt(&format!("error: {e}"), color, verbose),
+                }
+            }
+        }
+
+        "probe" => {
+            // Test tool conformance for one model (or all untested).
+            let cfg = newt_core::Config::resolve().unwrap_or_default();
+            let choice = resolve_backend_choice(&cfg);
+
+            if choice.kind != newt_core::BackendKind::Ollama {
+                print_newt(
+                    "/probe only works with Ollama endpoints (vLLM/OpenAI keep models resident)",
+                    color,
+                    verbose,
+                );
+            } else {
+                let endpoint = &choice.url;
+                let mut cache = probe::load_cache();
+
+                // Decide which models to probe.
+                let targets: Vec<String> = if arg1 == "all" {
+                    match probe::fetch_ollama_models(endpoint) {
+                        Ok(models) => models
+                            .into_iter()
+                            .filter(|m| !cache.contains_key(&m.name))
+                            .map(|m| m.name)
+                            .collect(),
+                        Err(e) => {
+                            print_newt(&format!("error fetching model list: {e}"), color, verbose);
+                            vec![]
+                        }
+                    }
+                } else if arg1.is_empty() {
+                    vec![choice.model.clone()]
+                } else {
+                    vec![arg1.to_string()]
+                };
+
+                if targets.is_empty() {
+                    print_newt(
+                        "All models already tested — use /probe <name> to re-test one.",
+                        color,
+                        verbose,
+                    );
+                }
+
+                for model in &targets {
+                    // Warm up before probing so load time doesn't count as a timeout.
+                    print_newt(&format!("Probing {model}…"), color, verbose);
+                    warmup_if_cold(endpoint, model, color, verbose);
+
+                    let result = tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current()
+                            .block_on(probe::probe_tool_conformance(endpoint, model))
+                    });
+                    match result {
+                        Ok(conformance) => {
+                            let today = today_date();
+                            let symbol = conformance.symbol();
+                            print_newt(
+                                &format!("{model}  →  {symbol}  (tested {today})"),
+                                color,
+                                verbose,
+                            );
+                            cache.insert(
+                                model.clone(),
+                                probe::CapabilityEntry {
+                                    conformance,
+                                    tested_date: today,
+                                },
+                            );
+                            probe::save_cache(&cache);
+                        }
+                        Err(e) => {
+                            print_newt(&format!("{model}  →  error: {e}"), color, verbose);
                         }
                     }
                 }
-                Err(e) => print_newt(&format!("error: {e}"), color, verbose),
             }
         }
 
