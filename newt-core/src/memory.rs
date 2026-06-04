@@ -866,11 +866,16 @@ impl MemoryProvider for Summarizing {
 // SoulProvider — built-in provider #5 (closes #111)
 // ---------------------------------------------------------------------------
 
-/// Default identity injected when no soul file is found.
-const DEFAULT_SOUL: &str = "\
+/// Default agent identity injected when no soul file is found.
+///
+/// This is the single source of truth for the built-in identity — the TUI's
+/// system-prompt builder falls back to this same constant rather than keeping
+/// its own copy, so the tool list can't drift between the two paths again.
+/// Keep the tool list in sync with the tools the agent actually exposes.
+pub const DEFAULT_SOUL: &str = "\
 You are newt, a small, fast, local-first agentic coder. \
 Be concise and direct. \
-You have tools: run_command, read_file, write_file, list_dir. \
+You have tools: run_command, read_file, write_file, list_dir, use_skill, web_fetch. \
 Use them to actually complete tasks rather than describing what to do.";
 
 /// Loads an agent identity from a Markdown soul file and injects it as a
@@ -1181,6 +1186,26 @@ mod tests {
         assert_eq!(sp.source, SoulSource::Default);
         let block = sp.system_prompt_block().unwrap();
         assert!(block.contains("newt"), "default soul should mention newt");
+    }
+
+    #[test]
+    fn default_soul_lists_all_current_tools() {
+        // Regression: DEFAULT_SOUL went stale when use_skill (#135) and
+        // web_fetch (#139) were added but the constant wasn't updated, so
+        // default-identity sessions never learned those tools existed.
+        for tool in [
+            "run_command",
+            "read_file",
+            "write_file",
+            "list_dir",
+            "use_skill",
+            "web_fetch",
+        ] {
+            assert!(
+                DEFAULT_SOUL.contains(tool),
+                "DEFAULT_SOUL must advertise `{tool}`"
+            );
+        }
     }
 
     #[tokio::test]
