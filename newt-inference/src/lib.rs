@@ -11,6 +11,7 @@ pub mod backend;
 pub mod local;
 pub mod provider_plugin;
 pub mod registry;
+pub mod retry;
 pub mod stream;
 
 #[cfg(feature = "pyo3")]
@@ -18,4 +19,5 @@ pub mod pyo3_module;
 
 pub use backend::{ChatReply, ChatRequest, InferenceBackend};
 pub use registry::BackendRegistry;
+pub use retry::RetryPolicy;
 pub use stream::{ChatChunk, ChatStream};
