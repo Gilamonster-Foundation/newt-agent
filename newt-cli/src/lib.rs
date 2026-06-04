@@ -28,9 +28,24 @@ pub struct Cli {
 
     /// Skip the full-screen splash: print a compact inline header instead.
     /// Applies to the `code` subcommand (the default). Also configurable
-    /// via `[tui] no_splash = true` in newt.toml.
-    #[arg(long, global = true, default_value_t = false)]
+    /// via `[tui] no_splash = true` in newt.toml. Overrides `--splash`.
+    #[arg(
+        long,
+        global = true,
+        default_value_t = false,
+        overrides_with = "splash"
+    )]
     pub no_splash: bool,
+
+    /// Force the full-screen splash even when `[tui] no_splash = true` is set
+    /// in the config. Overrides `--no-splash`.
+    #[arg(
+        long,
+        global = true,
+        default_value_t = false,
+        overrides_with = "no_splash"
+    )]
+    pub splash: bool,
 
     /// Subcommand to run. Defaults to `code` (TUI coder) when omitted.
     #[command(subcommand)]
@@ -96,7 +111,17 @@ pub enum Command {
 
 pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
     match cli.command.unwrap_or(Command::Code { path: None }) {
-        Command::Code { path } => newt_tui::run_code(path.as_deref(), cli.no_splash),
+        Command::Code { path } => {
+            // Resolve splash preference: CLI flags override config, and
+            // --splash overrides --no-splash (enforced by overrides_with).
+            let config_no_splash = newt_core::Config::resolve()
+                .ok()
+                .and_then(|c| c.tui)
+                .map(|t| t.no_splash)
+                .unwrap_or(false);
+            let no_splash = (cli.no_splash || config_no_splash) && !cli.splash;
+            newt_tui::run_code(path.as_deref(), no_splash)
+        }
         Command::Pilot { flight_id } => newt_tui::run_pilot(&flight_id),
         Command::Worker {
             coder,
