@@ -48,6 +48,18 @@ green before opening any PR.
 - The PR body must include "What this PR does", "Test plan", and
   "Out of scope" sections — per the roadmap's acceptance contract.
 
+## Model attribution
+
+- If an LLM materially contributes to a commit, identify it with a
+  `Co-authored-by` trailer in the commit message.
+- Use the model/tool identity the session is actually running under. Do not
+  credit a generic "AI Assistant".
+- Known trailers:
+  - `Co-authored-by: Codex <codex@openai.com>`
+  - `Co-authored-by: Claude Opus 4.8 (1M context) <noreply@anthropic.com>`
+- If multiple LLMs contribute to the same commit, include one trailer per
+  contributing model.
+
 ## Coverage gate
 
 Workspace coverage is enforced by `just cov-ci` and the matching
