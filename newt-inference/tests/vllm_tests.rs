@@ -9,9 +9,15 @@ use std::time::Duration;
 
 use newt_inference::backend::{ChatReply, ChatRequest};
 use newt_inference::local::LocalVllmBackend;
-use newt_inference::InferenceBackend;
+use newt_inference::{InferenceBackend, RetryPolicy};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
+
+/// Zero-delay, 3-retry policy so retry tests exercise the loop (1 initial + 3
+/// retries = 4 attempts) without sleeping through the production backoff.
+fn test_retry() -> RetryPolicy {
+    RetryPolicy::immediate(3)
+}
 
 // --- complete() ---
 
@@ -99,7 +105,7 @@ async fn complete_non_200_returns_error() {
         .mount(&server)
         .await;
 
-    let backend = LocalVllmBackend::new(server.uri(), "test-model");
+    let backend = LocalVllmBackend::new(server.uri(), "test-model").with_retry_policy(test_retry());
     let req = ChatRequest::new().user("hi");
     let err = backend.complete(req).await.unwrap_err();
 
@@ -175,7 +181,41 @@ async fn complete_retries_on_503() {
         .mount(&server)
         .await;
 
-    let backend = LocalVllmBackend::new(server.uri(), "test-model");
+    let backend = LocalVllmBackend::new(server.uri(), "test-model").with_retry_policy(test_retry());
+    let req = ChatRequest::new().user("hi");
+    let reply = backend.complete(req).await.unwrap();
+
+    assert_eq!(reply.content, "recovered");
+}
+
+#[tokio::test]
+async fn complete_retries_on_429() {
+    // Regression for the live NVIDIA failure: a hosted OpenAI-compatible
+    // endpoint returns 429 Too Many Requests under load. 429 must be treated
+    // as retryable (it previously fell through as a hard error).
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{ "message": { "content": "recovered" } }],
+            "model": "x"
+        })))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .set_body_string("Too Many Requests")
+                .insert_header("retry-after", "1"),
+        )
+        .up_to_n_times(2)
+        .mount(&server)
+        .await;
+
+    let backend = LocalVllmBackend::new(server.uri(), "test-model").with_retry_policy(test_retry());
     let req = ChatRequest::new().user("hi");
     let reply = backend.complete(req).await.unwrap();
 
@@ -194,7 +234,7 @@ async fn complete_gives_up_after_max_retries() {
         .mount(&server)
         .await;
 
-    let backend = LocalVllmBackend::new(server.uri(), "test-model");
+    let backend = LocalVllmBackend::new(server.uri(), "test-model").with_retry_policy(test_retry());
     let req = ChatRequest::new().user("hi");
     let err = backend.complete(req).await.unwrap_err();
 
@@ -223,8 +263,9 @@ async fn complete_timeout() {
         .mount(&server)
         .await;
 
-    let backend =
-        LocalVllmBackend::new(server.uri(), "test-model").with_timeout(Duration::from_millis(50));
+    let backend = LocalVllmBackend::new(server.uri(), "test-model")
+        .with_timeout(Duration::from_millis(50))
+        .with_retry_policy(test_retry());
     let req = ChatRequest::new().user("hi");
     let err = backend.complete(req).await.unwrap_err();
 

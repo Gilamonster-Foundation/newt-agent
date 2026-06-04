@@ -2,9 +2,15 @@ use std::time::Duration;
 
 use newt_inference::backend::{ChatReply, ChatRequest};
 use newt_inference::local::LocalOllamaBackend;
-use newt_inference::InferenceBackend;
+use newt_inference::{InferenceBackend, RetryPolicy};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
+
+/// Zero-delay, 3-retry policy so retry tests exercise the loop (1 initial + 3
+/// retries = 4 attempts) without sleeping through the production backoff.
+fn test_retry() -> RetryPolicy {
+    RetryPolicy::immediate(3)
+}
 
 #[tokio::test]
 async fn happy_path() {
@@ -38,7 +44,8 @@ async fn non_200_returns_error() {
         .mount(&server)
         .await;
 
-    let backend = LocalOllamaBackend::new(server.uri(), "test-model");
+    let backend =
+        LocalOllamaBackend::new(server.uri(), "test-model").with_retry_policy(test_retry());
     let req = ChatRequest::new().user("hi");
     let err = backend.complete(req).await.unwrap_err();
 
@@ -128,8 +135,9 @@ async fn timeout_returns_error() {
         .mount(&server)
         .await;
 
-    let backend =
-        LocalOllamaBackend::new(server.uri(), "test-model").with_timeout(Duration::from_millis(50));
+    let backend = LocalOllamaBackend::new(server.uri(), "test-model")
+        .with_timeout(Duration::from_millis(50))
+        .with_retry_policy(test_retry());
     let req = ChatRequest::new().user("hi");
     let err = backend.complete(req).await.unwrap_err();
 
@@ -334,7 +342,37 @@ async fn retries_on_503() {
         .mount(&server)
         .await;
 
-    let backend = LocalOllamaBackend::new(server.uri(), "test-model");
+    let backend =
+        LocalOllamaBackend::new(server.uri(), "test-model").with_retry_policy(test_retry());
+    let req = ChatRequest::new().user("hi");
+    let reply = backend.complete(req).await.unwrap();
+
+    assert_eq!(reply.content, "recovered");
+}
+
+#[tokio::test]
+async fn retries_on_429() {
+    // Regression: 429 Too Many Requests must be retryable (a hosted endpoint
+    // returns it under load). It previously surfaced as a hard error.
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "message": { "content": "recovered" }
+        })))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .respond_with(ResponseTemplate::new(429).set_body_string("Too Many Requests"))
+        .up_to_n_times(2)
+        .mount(&server)
+        .await;
+
+    let backend =
+        LocalOllamaBackend::new(server.uri(), "test-model").with_retry_policy(test_retry());
     let req = ChatRequest::new().user("hi");
     let reply = backend.complete(req).await.unwrap();
 
@@ -353,7 +391,8 @@ async fn gives_up_after_max_retries() {
         .mount(&server)
         .await;
 
-    let backend = LocalOllamaBackend::new(server.uri(), "test-model");
+    let backend =
+        LocalOllamaBackend::new(server.uri(), "test-model").with_retry_policy(test_retry());
     let req = ChatRequest::new().user("hi");
     let err = backend.complete(req).await.unwrap_err();
 
