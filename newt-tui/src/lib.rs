@@ -1140,6 +1140,10 @@ fn run_chat(workspace: &str, color: bool) -> anyhow::Result<()> {
                                 max_tool_rounds: max_tool_rounds(&cfg),
                                 tool_output_lines: tool_output_lines(&cfg),
                                 debug: debug_mode(&cfg),
+                                num_ctx: num_ctx(&cfg),
+                                connect_timeout_secs: connect_timeout_secs(&cfg),
+                                inference_timeout_secs: inference_timeout_secs(&cfg),
+                                mid_loop_trim_threshold: mid_loop_trim_threshold(&cfg),
                             },
                             &mut mcp,
                         ))
@@ -1580,6 +1584,43 @@ fn max_tool_rounds(cfg: &newt_core::Config) -> usize {
     cfg.tui.as_ref().map(|t| t.max_tool_rounds).unwrap_or(25)
 }
 
+/// Ollama context-window cap from `[tui].num_ctx`. None = model default.
+fn num_ctx(cfg: &newt_core::Config) -> Option<u32> {
+    cfg.tui.as_ref().and_then(|t| t.num_ctx)
+}
+
+/// TCP connect timeout from `[tui].connect_timeout_secs` (default 5).
+fn connect_timeout_secs(cfg: &newt_core::Config) -> u64 {
+    cfg.tui
+        .as_ref()
+        .map(|t| t.connect_timeout_secs)
+        .unwrap_or(5)
+}
+
+/// Full inference timeout from `[tui].inference_timeout_secs` (default 120).
+fn inference_timeout_secs(cfg: &newt_core::Config) -> u64 {
+    cfg.tui
+        .as_ref()
+        .map(|t| t.inference_timeout_secs)
+        .unwrap_or(120)
+}
+
+/// Ollama keep_alive from `[tui].keep_alive` (default "5m").
+fn keep_alive_str(cfg: &newt_core::Config) -> String {
+    cfg.tui
+        .as_ref()
+        .map(|t| t.keep_alive.clone())
+        .unwrap_or_else(|| "5m".to_string())
+}
+
+/// Mid-loop message-trim threshold from `[tui].mid_loop_trim_threshold` (default 40).
+fn mid_loop_trim_threshold(cfg: &newt_core::Config) -> usize {
+    cfg.tui
+        .as_ref()
+        .map(|t| t.mid_loop_trim_threshold)
+        .unwrap_or(40)
+}
+
 /// Print tool output truncated to the configured line limit.
 /// The model always receives the full content regardless.
 fn print_tool_output(output: &str, max_lines: usize, color: bool) {
@@ -1955,6 +1996,18 @@ struct ChatCtx<'a> {
     /// Enable per-round diagnostic output. Set via `NEWT_DEBUG=1` or the
     /// `[tui] debug = true` config key.
     debug: bool,
+    /// Ollama `options.num_ctx` — caps KV-cache allocation to prevent VRAM
+    /// exhaustion on large models. `None` → model default (often 131k).
+    num_ctx: Option<u32>,
+    /// TCP connect timeout. Short (5 s default) so a down endpoint fails fast
+    /// rather than blocking the full `inference_timeout_secs`.
+    connect_timeout_secs: u64,
+    /// Total inference timeout. Must be long enough for the model to generate
+    /// a complete response (120 s default).
+    inference_timeout_secs: u64,
+    /// Message list size at which the agent trims the middle of the in-flight
+    /// conversation to prevent context overflow mid-turn.
+    mid_loop_trim_threshold: usize,
 }
 
 /// Main agentic loop: call model → execute tool calls → feed results back → repeat.
@@ -1982,9 +2035,14 @@ async fn chat_complete(
         max_tool_rounds,
         tool_output_lines,
         debug,
+        num_ctx,
+        connect_timeout_secs,
+        inference_timeout_secs,
+        mid_loop_trim_threshold,
     } = ctx;
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(120))
+        .connect_timeout(std::time::Duration::from_secs(connect_timeout_secs))
+        .timeout(std::time::Duration::from_secs(inference_timeout_secs))
         .build()?;
     let chat_url = format!("{}/api/chat", url.trim_end_matches('/'));
     let retry = tui_retry_policy();
@@ -2014,16 +2072,43 @@ async fn chat_complete(
             }
         }
 
+        // Mid-loop context trim: prevent VRAM exhaustion on long tool-call
+        // sessions by dropping old middle messages when the list grows large.
+        if messages.len() > mid_loop_trim_threshold {
+            let before = messages.len();
+            messages = trim_for_summary(&messages, 2, mid_loop_trim_threshold / 2);
+            if debug {
+                print_debug(
+                    &format!(
+                        "mid-loop trim: {before} → {} messages (threshold={})",
+                        messages.len(),
+                        mid_loop_trim_threshold
+                    ),
+                    color,
+                );
+            }
+        }
+
         // Tool-call rounds: stream:false (fast, just JSON).
         // Final text round: stream:true so the user sees tokens arrive.
         // We don't know which round is last, so we probe with stream:false first
         // and switch to streaming only when the model returns no tool calls.
-        let body_no_stream = serde_json::json!({
-            "model": model,
-            "messages": messages,
-            "stream": false,
-            "tools": merged_tool_definitions(mcp),
-        });
+        let body_no_stream = if let Some(ctx_size) = num_ctx {
+            serde_json::json!({
+                "model": model,
+                "messages": messages,
+                "stream": false,
+                "tools": merged_tool_definitions(mcp),
+                "options": { "num_ctx": ctx_size },
+            })
+        } else {
+            serde_json::json!({
+                "model": model,
+                "messages": messages,
+                "stream": false,
+                "tools": merged_tool_definitions(mcp),
+            })
+        };
 
         // Retry the send+status+parse as one unit — a connection drop at any
         // of these steps is transient and worth retrying with backoff.
@@ -2094,12 +2179,22 @@ async fn chat_complete(
             // from the same history; if it returns empty (non-determinism, context
             // pressure, or model quirk) we fall back to the probe content so the
             // user never sees a silent blank response.
-            let body_stream = serde_json::json!({
-                "model": model,
-                "messages": &messages,
-                "stream": true,
-                "tools": merged_tool_definitions(mcp),
-            });
+            let body_stream = if let Some(ctx_size) = num_ctx {
+                serde_json::json!({
+                    "model": model,
+                    "messages": &messages,
+                    "stream": true,
+                    "tools": merged_tool_definitions(mcp),
+                    "options": { "num_ctx": ctx_size },
+                })
+            } else {
+                serde_json::json!({
+                    "model": model,
+                    "messages": &messages,
+                    "stream": true,
+                    "tools": merged_tool_definitions(mcp),
+                })
+            };
             // Retry the connection; if we connect successfully but the stream
             // drops mid-token, that's a separate (harder) failure mode.
             let sresp = with_backoff_notify(
@@ -2404,9 +2499,14 @@ async fn openai_chat_complete(
         max_tool_rounds,
         tool_output_lines,
         debug,
+        num_ctx,
+        connect_timeout_secs,
+        inference_timeout_secs,
+        mid_loop_trim_threshold,
     } = ctx;
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(120))
+        .connect_timeout(std::time::Duration::from_secs(connect_timeout_secs))
+        .timeout(std::time::Duration::from_secs(inference_timeout_secs))
         .build()?;
     let chat_url = format!("{}/v1/chat/completions", url.trim_end_matches('/'));
     let retry = tui_retry_policy();
@@ -2431,6 +2531,24 @@ async fn openai_chat_complete(
             .ok();
         }
 
+        // Mid-loop context trim (mirrors Ollama path).
+        if messages.len() > mid_loop_trim_threshold {
+            let before = messages.len();
+            messages = trim_for_summary(&messages, 2, mid_loop_trim_threshold / 2);
+            if debug {
+                print_debug(
+                    &format!(
+                        "mid-loop trim: {before} → {} messages (threshold={})",
+                        messages.len(),
+                        mid_loop_trim_threshold
+                    ),
+                    color,
+                );
+            }
+        }
+
+        // OpenAI-compatible endpoints don't use Ollama's `options.num_ctx` —
+        // context limits are configured server-side (vLLM --max-model-len).
         let body = serde_json::json!({
             "model": model,
             "messages": messages,
@@ -2438,6 +2556,7 @@ async fn openai_chat_complete(
             "tool_choice": "auto",
             "stream": false,
         });
+        let _ = num_ctx; // not applicable for OpenAI-compatible endpoints
         let json: serde_json::Value = with_backoff_notify(
             &retry,
             || async {
@@ -2866,7 +2985,7 @@ fn dispatch_slash(
                 // Warm-up only applies to Ollama: vLLM and OpenAI-compatible
                 // endpoints keep their served model resident at all times.
                 if choice.kind == newt_core::BackendKind::Ollama {
-                    warmup_if_cold(&choice.url, arg1, color, verbose);
+                    warmup_if_cold(&choice.url, arg1, &keep_alive_str(&cfg), color, verbose);
                 } else {
                     print_newt(
                         &format!("Switched to {arg1} — takes effect on next message."),
@@ -2955,7 +3074,7 @@ fn is_model_resident(endpoint: &str, model: &str) -> bool {
 /// warm-up itself fails), then prints a ready line.
 ///
 /// Skipped silently on non-Ollama endpoints (caller's responsibility).
-fn warmup_if_cold(endpoint: &str, model: &str, color: bool, verbose: bool) {
+fn warmup_if_cold(endpoint: &str, model: &str, keep_alive: &str, color: bool, verbose: bool) {
     if is_model_resident(endpoint, model) {
         print_newt(
             &format!("✓ {model} — already resident, ready"),
@@ -2989,7 +3108,7 @@ fn warmup_if_cold(endpoint: &str, model: &str, color: bool, verbose: bool) {
     let warm_url = format!("{}/api/generate", endpoint.trim_end_matches('/'));
     let body = serde_json::json!({
         "model": model,
-        "keep_alive": "10m",
+        "keep_alive": keep_alive,
         "stream": false,
     });
     let retry = tui_retry_policy();
@@ -3787,6 +3906,10 @@ mod tool_round_cap_tests {
                 max_tool_rounds: cap,
                 tool_output_lines: 20,
                 debug: false,
+                num_ctx: None,
+                connect_timeout_secs: 5,
+                inference_timeout_secs: 120,
+                mid_loop_trim_threshold: 40,
             },
             &mut Mcp::empty(),
         )
@@ -3832,6 +3955,10 @@ mod tool_round_cap_tests {
                 max_tool_rounds: cap,
                 tool_output_lines: 20,
                 debug: false,
+                num_ctx: None,
+                connect_timeout_secs: 5,
+                inference_timeout_secs: 120,
+                mid_loop_trim_threshold: 40,
             },
             &mut Mcp::empty(),
         )
@@ -3894,6 +4021,10 @@ mod tool_round_cap_tests {
                 max_tool_rounds: 2,
                 tool_output_lines: 20,
                 debug: false,
+                num_ctx: None,
+                connect_timeout_secs: 5,
+                inference_timeout_secs: 120,
+                mid_loop_trim_threshold: 40,
             },
             &mut Mcp::empty(),
         )
@@ -4071,6 +4202,10 @@ mod tool_round_cap_tests {
                 max_tool_rounds: cap,
                 tool_output_lines: 20,
                 debug: false,
+                num_ctx: None,
+                connect_timeout_secs: 5,
+                inference_timeout_secs: 120,
+                mid_loop_trim_threshold: 40,
             },
             &mut Mcp::empty(),
         )
