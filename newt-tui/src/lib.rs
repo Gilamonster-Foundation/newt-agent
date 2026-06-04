@@ -1584,8 +1584,16 @@ fn max_tool_rounds(cfg: &newt_core::Config) -> usize {
     cfg.tui.as_ref().map(|t| t.max_tool_rounds).unwrap_or(25)
 }
 
-/// Ollama context-window cap from `[tui].num_ctx`. None = model default.
+/// Ollama context-window cap. Resolution order:
+///   1. `NEWT_NUM_CTX` env var (set by `--num-ctx` CLI flag or manually)
+///   2. `[tui] num_ctx` in config
+///   3. None → Ollama uses the model's compiled-in default
 fn num_ctx(cfg: &newt_core::Config) -> Option<u32> {
+    if let Ok(val) = std::env::var("NEWT_NUM_CTX") {
+        if let Ok(n) = val.trim().parse::<u32>() {
+            return Some(n);
+        }
+    }
     cfg.tui.as_ref().and_then(|t| t.num_ctx)
 }
 
@@ -2934,7 +2942,7 @@ fn dispatch_slash(
                 for model in &targets {
                     // Warm up before probing so load time doesn't count as a timeout.
                     print_newt(&format!("Probing {model}…"), color, verbose);
-                    warmup_if_cold(endpoint, model, color, verbose);
+                    warmup_if_cold(endpoint, model, &keep_alive_str(&cfg), color, verbose);
 
                     let result = tokio::task::block_in_place(|| {
                         tokio::runtime::Handle::current()

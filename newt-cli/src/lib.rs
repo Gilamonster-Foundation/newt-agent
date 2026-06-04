@@ -54,6 +54,14 @@ pub struct Cli {
     #[arg(long, global = true, default_value_t = false)]
     pub debug: bool,
 
+    /// Cap the Ollama context window (KV-cache) to this many tokens.
+    /// Prevents VRAM exhaustion on large models by limiting how much memory
+    /// Ollama allocates for the attention cache. Equivalent to setting
+    /// `NEWT_NUM_CTX=<N>` or `[tui] num_ctx = <N>` in newt.toml.
+    /// Recommended starting point: 8192. Omit to use the model default.
+    #[arg(long, global = true, value_name = "TOKENS")]
+    pub num_ctx: Option<u32>,
+
     /// Subcommand to run. Defaults to `code` (TUI coder) when omitted.
     #[command(subcommand)]
     pub command: Option<Command>,
@@ -119,11 +127,14 @@ pub enum Command {
 pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
     match cli.command.unwrap_or(Command::Code { path: None }) {
         Command::Code { path } => {
-            // --debug sets NEWT_DEBUG so debug_mode() in the TUI picks it up
+            // --debug / --num-ctx set env vars so the TUI picks them up
             // without requiring a run_code signature change.
             if cli.debug {
                 // SAFETY: single-threaded before the TUI starts any async work.
                 unsafe { std::env::set_var("NEWT_DEBUG", "1") };
+            }
+            if let Some(n) = cli.num_ctx {
+                unsafe { std::env::set_var("NEWT_NUM_CTX", n.to_string()) };
             }
             // Resolve splash preference: CLI flags override config, and
             // --splash overrides --no-splash (enforced by overrides_with).
