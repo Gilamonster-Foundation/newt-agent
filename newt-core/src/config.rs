@@ -154,6 +154,13 @@ pub struct TuiConfig {
     /// `WorkspaceDev`.
     #[serde(default)]
     pub permissions: ToolPermissions,
+
+    /// Enable per-round agent-loop diagnostics printed to the TUI. Shows each
+    /// round's content excerpt, tool-call count, token usage, and flags empty
+    /// model responses before they become silent failures. Also set via the
+    /// `NEWT_DEBUG=1` environment variable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub debug: Option<bool>,
 }
 
 fn default_tool_output_lines() -> usize {
@@ -428,6 +435,7 @@ impl Default for TuiConfig {
             tool_output_lines: default_tool_output_lines(),
             max_tool_rounds: default_max_tool_rounds(),
             permissions: ToolPermissions::default(),
+            debug: None,
         }
     }
 }
