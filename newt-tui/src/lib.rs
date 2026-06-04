@@ -1232,12 +1232,9 @@ fn skills_index_for_prompt(skills_dir: &std::path::Path) -> Option<String> {
 }
 
 fn build_system_prompt_with_soul(workspace: &str, soul: Option<&str>) -> String {
-    let identity = soul.unwrap_or(
-        "You are newt, a small, fast, local-first agentic coder. \
-         Be concise and direct. \
-         You have tools: run_command, read_file, write_file, list_dir, use_skill, web_fetch. \
-         Use them to actually complete tasks rather than describing what to do.",
-    );
+    // Fall back to the single canonical identity in newt-core rather than a
+    // private copy, so the built-in tool list can't drift between the two.
+    let identity = soul.unwrap_or(newt_core::DEFAULT_SOUL);
     let mut ctx = format!("{identity}\n\nWorkspace: {workspace}\n");
 
     // Progressive disclosure: inject ONLY the skills index (one
@@ -2896,6 +2893,19 @@ mod skills_integration_tests {
     fn system_prompt_index_is_none_when_no_skills() {
         let tmp = tempfile::TempDir::new().unwrap();
         assert!(skills_index_for_prompt(tmp.path()).is_none());
+    }
+
+    #[test]
+    fn system_prompt_fallback_uses_canonical_default_soul() {
+        // Regression: the no-soul fallback used to be a private copy of the
+        // identity string that drifted from newt-core's DEFAULT_SOUL. It must
+        // now embed the canonical constant verbatim so the two can't diverge.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let prompt = build_system_prompt_with_soul(tmp.path().to_str().unwrap(), None);
+        assert!(
+            prompt.contains(newt_core::DEFAULT_SOUL),
+            "fallback must embed newt_core::DEFAULT_SOUL verbatim"
+        );
     }
 
     #[test]
