@@ -214,6 +214,7 @@ mod tests {
             cost_usd: Some(0.0),
             model_id: model.into(),
             endpoint: "http://localhost:11434".into(),
+            ..Default::default()
         }
     }
 
@@ -257,6 +258,7 @@ mod tests {
             cost_usd: None,
             model_id: "no-tokens".into(),
             endpoint: "http://localhost:11434".into(),
+            ..Default::default()
         });
         let text = m.render();
         // Duration and turn counter should still appear.
