@@ -1098,7 +1098,7 @@ fn run_chat(workspace: &str, color: bool) -> anyhow::Result<()> {
                     let elapsed = t0.elapsed();
                     erase_line();
                     match response {
-                        Ok((reply, was_streamed, usage)) => {
+                        Ok((reply, was_streamed, usage, hallucinations)) => {
                             if !was_streamed {
                                 print_newt(&reply, color, verbose);
                             }
@@ -1110,6 +1110,7 @@ fn run_chat(workspace: &str, color: bool) -> anyhow::Result<()> {
                                 cost_usd: pricing.estimate_cost(&inf_model, usage.as_ref()),
                                 model_id: inf_model.clone(),
                                 endpoint: inf_url.clone(),
+                                hallucinations,
                             };
                             tokio::task::block_in_place(|| {
                                 rt.block_on(memory.sync_all(&task, &reply, &metrics));
@@ -1379,6 +1380,83 @@ fn tool_definitions() -> serde_json::Value {
     ])
 }
 
+/// Direct tool names the model must call as tool invocations, never as shell
+/// commands passed to `run_command`.
+const DIRECT_TOOL_NAMES: &[&str] = &[
+    "list_dir",
+    "read_file",
+    "write_file",
+    "use_skill",
+    "web_fetch",
+];
+
+/// Returns `true` if a tool call looks like a hallucination:
+/// - `run_command` called with a tool name as the shell command, or
+/// - An unknown tool name (excluding MCP-namespaced `server__tool` names).
+fn is_hallucination(tool_name: &str, args: &serde_json::Value) -> bool {
+    if tool_name == "run_command" {
+        let cmd = args["command"].as_str().unwrap_or("");
+        let first = cmd.split_ascii_whitespace().next().unwrap_or("");
+        return DIRECT_TOOL_NAMES.contains(&first);
+    }
+    // MCP tools are namespaced with `__` — never treat them as hallucinations.
+    if tool_name.contains("__") {
+        return false;
+    }
+    !matches!(
+        tool_name,
+        "run_command" | "list_dir" | "read_file" | "write_file" | "use_skill" | "web_fetch"
+    )
+}
+
+/// Trim a message list for the cap-exit summary: keep the first `head` messages
+/// (system prompt + original task) and the last `tail` messages (recent rounds).
+/// Inserts a single placeholder when the middle is dropped so the model knows
+/// context was omitted rather than assuming the task was simpler than it is.
+fn trim_for_summary(
+    messages: &[serde_json::Value],
+    head: usize,
+    tail: usize,
+) -> Vec<serde_json::Value> {
+    if messages.len() <= head + tail {
+        return messages.to_vec();
+    }
+    let dropped = messages.len() - head - tail;
+    let mut result = Vec::with_capacity(head + 1 + tail);
+    result.extend_from_slice(&messages[..head]);
+    result.push(serde_json::json!({
+        "role": "user",
+        "content": format!(
+            "[{dropped} earlier tool-call messages omitted to keep context within model limits]"
+        ),
+    }));
+    result.extend_from_slice(&messages[messages.len() - tail..]);
+    result
+}
+
+/// Merge two optional token usage readings (e.g. accumulated across rounds).
+fn merge_usage(
+    acc: Option<newt_core::TokenUsage>,
+    new: Option<newt_core::TokenUsage>,
+) -> Option<newt_core::TokenUsage> {
+    match (acc, new) {
+        (Some(a), Some(b)) => Some(a.saturating_add(b)),
+        (Some(a), None) | (None, Some(a)) => Some(a),
+        (None, None) => None,
+    }
+}
+
+/// Extract token usage from an Ollama non-streaming response (top-level
+/// `prompt_eval_count` / `eval_count` fields).
+fn ollama_usage(json: &serde_json::Value) -> Option<newt_core::TokenUsage> {
+    let input = json["prompt_eval_count"].as_u64()? as u32;
+    let output = json["eval_count"].as_u64()? as u32;
+    Some(newt_core::TokenUsage {
+        input_tokens: input,
+        output_tokens: output,
+    })
+}
+
 /// The built-in tool definitions plus every connected MCP server's tools
 /// (namespaced `server__tool`). This is what the agent loop advertises to the
 /// model so it can call remote MCP tools alongside the built-ins.
@@ -1532,6 +1610,21 @@ async fn execute_tool(
     match name {
         "run_command" => {
             let cmd = args["command"].as_str().unwrap_or("");
+
+            // Corrective guard: the model tried to call a tool as a shell binary.
+            // Return a correction so the model can retry with the right tool call.
+            if let Some(tool) = DIRECT_TOOL_NAMES
+                .iter()
+                .copied()
+                .find(|t| cmd.split_ascii_whitespace().next() == Some(*t))
+            {
+                return format!(
+                    "error: '{tool}' is a tool, not a shell command. \
+                     Call it as a separate tool invocation — \
+                     do not pass '{tool}' as a command argument to run_command."
+                );
+            }
+
             print_tool_call("run_command", cmd, color);
 
             // Route the WHOLE command through agent-bridle's confined shell
@@ -1781,12 +1874,12 @@ struct ChatCtx<'a> {
 }
 
 /// Main agentic loop: call model → execute tool calls → feed results back → repeat.
-/// Returns `(reply_text, was_streamed, token_usage)`.
+/// Returns `(reply_text, was_streamed, token_usage, hallucination_count)`.
 /// When `was_streamed` is true the text was already printed token-by-token.
 async fn chat_complete(
     ctx: ChatCtx<'_>,
     mcp: &mut Mcp,
-) -> anyhow::Result<(String, bool, Option<newt_core::TokenUsage>)> {
+) -> anyhow::Result<(String, bool, Option<newt_core::TokenUsage>, u32)> {
     // OpenAI-compatible endpoints speak a different wire format (request,
     // tool_calls, and usage shapes all differ), so they get their own loop.
     if ctx.kind == newt_core::BackendKind::Openai {
@@ -1816,6 +1909,9 @@ async fn chat_complete(
         .iter()
         .map(|m| serde_json::json!({"role": m.role.as_str(), "content": m.content}))
         .collect();
+
+    let mut accumulated_usage: Option<newt_core::TokenUsage> = None;
+    let mut hallucination_count: u32 = 0;
 
     // Agentic loop — up to `max_tool_rounds` tool-call rounds.
     for round in 0..max_tool_rounds {
@@ -1857,6 +1953,9 @@ async fn chat_complete(
         }
 
         let json: serde_json::Value = resp.json().await?;
+        // Accumulate token usage from this non-streaming probe round.
+        accumulated_usage = merge_usage(accumulated_usage, ollama_usage(&json));
+
         let message = &json["message"];
 
         let tool_calls = message["tool_calls"].as_array();
@@ -1880,10 +1979,15 @@ async fn chat_complete(
 
             if !sresp.status().is_success() {
                 let content = message["content"].as_str().unwrap_or("").to_string();
-                return Ok((content, false, None));
+                return Ok((content, false, accumulated_usage, hallucination_count));
             }
-            let (streamed, usage) = stream_response(sresp, color).await?;
-            return Ok((streamed, true, usage));
+            let (streamed, stream_usage) = stream_response(sresp, color).await?;
+            return Ok((
+                streamed,
+                true,
+                merge_usage(accumulated_usage, stream_usage),
+                hallucination_count,
+            ));
         }
 
         // Has tool calls — add assistant turn and execute them.
@@ -1896,6 +2000,9 @@ async fn chat_complete(
                 }
                 v => v.clone(),
             };
+            if is_hallucination(name, &args) {
+                hallucination_count += 1;
+            }
             let result = execute_tool(
                 name,
                 &args,
@@ -1913,10 +2020,20 @@ async fn chat_complete(
         }
     }
 
-    // Reached the round cap without a tool-free answer. Make ONE final
-    // completion with tools DISABLED so the model summarises what it found
-    // and the user gets a real (partial) answer instead of a placeholder.
-    final_summary_ollama(&client, &chat_url, model, &mut messages, max_tool_rounds).await
+    // Reached the round cap. Trim the bloated message list so the final
+    // summary request doesn't overflow the model's context window, then
+    // make ONE tools-disabled completion so the user gets a real partial answer.
+    let trimmed = trim_for_summary(&messages, 2, 6);
+    let (text, streamed, usage) = final_summary_ollama(
+        &client,
+        &chat_url,
+        model,
+        trimmed,
+        max_tool_rounds,
+        accumulated_usage,
+    )
+    .await?;
+    Ok((text, streamed, usage, hallucination_count))
 }
 
 /// Build the nudge appended to the message list when the tool-round cap is hit.
@@ -1929,23 +2046,35 @@ fn cap_exit_nudge(max_tool_rounds: usize) -> String {
 }
 
 /// Fallback message returned when even the final tools-disabled completion
-/// fails. Names the limit and points at the knob to raise it — strictly more
-/// useful than the bare `(reached tool-call limit)` placeholder.
-fn cap_exit_fallback(max_tool_rounds: usize) -> String {
+/// fails. Includes accumulated token counts so the user knows what was consumed,
+/// and gives actionable advice rather than just naming the limit.
+fn cap_exit_fallback(max_tool_rounds: usize, accumulated: Option<newt_core::TokenUsage>) -> String {
+    let tokens_hint = match accumulated {
+        Some(u) => format!(
+            " ({} in / {} out tokens consumed across {max_tool_rounds} rounds)",
+            u.input_tokens, u.output_tokens,
+        ),
+        None => String::new(),
+    };
     format!(
-        "(reached the tool-call limit of {max_tool_rounds} rounds, and the \
-         final summarization request also failed — raise [tui].max_tool_rounds \
-         in your newt config to allow more rounds)"
+        "(reached the tool-call limit of {max_tool_rounds} rounds{tokens_hint}, \
+         and the final summarization request also failed — \
+         raise [tui].max_tool_rounds in your config, or ask a more focused question)"
     )
 }
 
 /// Final tools-disabled completion for the Ollama (`/api/chat`) path.
+///
+/// `messages` is the already-trimmed list (caller uses `trim_for_summary`).
+/// `accumulated` carries usage from the preceding tool-call rounds so it
+/// survives even when this summary request fails.
 async fn final_summary_ollama(
     client: &reqwest::Client,
     chat_url: &str,
     model: &str,
-    messages: &mut Vec<serde_json::Value>,
+    mut messages: Vec<serde_json::Value>,
     max_tool_rounds: usize,
+    accumulated: Option<newt_core::TokenUsage>,
 ) -> anyhow::Result<(String, bool, Option<newt_core::TokenUsage>)> {
     messages.push(serde_json::json!({
         "role": "user",
@@ -1964,24 +2093,39 @@ async fn final_summary_ollama(
                 .as_str()
                 .unwrap_or("")
                 .to_string();
+            let total = merge_usage(accumulated, ollama_usage(&json));
             if content.is_empty() {
-                Ok((cap_exit_fallback(max_tool_rounds), false, None))
+                Ok((
+                    cap_exit_fallback(max_tool_rounds, accumulated),
+                    false,
+                    accumulated,
+                ))
             } else {
-                Ok((content, false, None))
+                Ok((content, false, total))
             }
         }
-        _ => Ok((cap_exit_fallback(max_tool_rounds), false, None)),
+        // On any failure, still return the accumulated usage so the caller
+        // can log the tokens that were consumed during the tool rounds.
+        _ => Ok((
+            cap_exit_fallback(max_tool_rounds, accumulated),
+            false,
+            accumulated,
+        )),
     }
 }
 
 /// Final tools-disabled completion for the OpenAI (`/v1/chat/completions`) path.
+///
+/// `messages` is the already-trimmed list (caller uses `trim_for_summary`).
+/// `accumulated` carries usage from the preceding tool-call rounds.
 async fn final_summary_openai(
     client: &reqwest::Client,
     chat_url: &str,
     model: &str,
     api_key: Option<&str>,
-    messages: &mut Vec<serde_json::Value>,
+    mut messages: Vec<serde_json::Value>,
     max_tool_rounds: usize,
+    accumulated: Option<newt_core::TokenUsage>,
 ) -> anyhow::Result<(String, bool, Option<newt_core::TokenUsage>)> {
     messages.push(serde_json::json!({
         "role": "user",
@@ -2004,14 +2148,22 @@ async fn final_summary_openai(
                 .as_str()
                 .unwrap_or("")
                 .to_string();
-            let usage = openai_usage(&json["usage"]);
+            let total = merge_usage(accumulated, openai_usage(&json["usage"]));
             if content.is_empty() {
-                Ok((cap_exit_fallback(max_tool_rounds), false, usage))
+                Ok((
+                    cap_exit_fallback(max_tool_rounds, accumulated),
+                    false,
+                    accumulated,
+                ))
             } else {
-                Ok((content, false, usage))
+                Ok((content, false, total))
             }
         }
-        _ => Ok((cap_exit_fallback(max_tool_rounds), false, None)),
+        _ => Ok((
+            cap_exit_fallback(max_tool_rounds, accumulated),
+            false,
+            accumulated,
+        )),
     }
 }
 
@@ -2025,7 +2177,7 @@ async fn final_summary_openai(
 async fn openai_chat_complete(
     ctx: ChatCtx<'_>,
     mcp: &mut Mcp,
-) -> anyhow::Result<(String, bool, Option<newt_core::TokenUsage>)> {
+) -> anyhow::Result<(String, bool, Option<newt_core::TokenUsage>, u32)> {
     let ChatCtx {
         url,
         model,
@@ -2048,6 +2200,9 @@ async fn openai_chat_complete(
         .iter()
         .map(|m| serde_json::json!({"role": m.role.as_str(), "content": m.content}))
         .collect();
+
+    let mut accumulated_usage: Option<newt_core::TokenUsage> = None;
+    let mut hallucination_count: u32 = 0;
 
     // Agentic loop — up to `max_tool_rounds` tool-call rounds (matches the Ollama path).
     for round in 0..max_tool_rounds {
@@ -2084,6 +2239,9 @@ async fn openai_chat_complete(
         }
 
         let json: serde_json::Value = resp.json().await?;
+        // Accumulate per-round token usage.
+        accumulated_usage = merge_usage(accumulated_usage, openai_usage(&json["usage"]));
+
         let message = &json["choices"][0]["message"];
 
         let tool_calls = message["tool_calls"].as_array();
@@ -2091,7 +2249,7 @@ async fn openai_chat_complete(
 
         if !has_tools {
             let content = message["content"].as_str().unwrap_or("").to_string();
-            return Ok((content, false, openai_usage(&json["usage"])));
+            return Ok((content, false, accumulated_usage, hallucination_count));
         }
 
         // Record the assistant turn verbatim (it carries the tool_calls), then
@@ -2106,6 +2264,9 @@ async fn openai_chat_complete(
                 }
                 v => v.clone(),
             };
+            if is_hallucination(name, &args) {
+                hallucination_count += 1;
+            }
             let result = execute_tool(
                 name,
                 &args,
@@ -2124,17 +2285,20 @@ async fn openai_chat_complete(
         }
     }
 
-    // Reached the round cap without a tool-free answer. Make ONE final
-    // completion with tools DISABLED (matches the Ollama path).
-    final_summary_openai(
+    // Reached the round cap. Trim the message list and make ONE final
+    // tools-disabled completion (matches the Ollama path).
+    let trimmed = trim_for_summary(&messages, 2, 6);
+    let (text, streamed, usage) = final_summary_openai(
         &client,
         &chat_url,
         model,
         api_key,
-        &mut messages,
+        trimmed,
         max_tool_rounds,
+        accumulated_usage,
     )
-    .await
+    .await?;
+    Ok((text, streamed, usage, hallucination_count))
 }
 
 /// Parse an OpenAI `usage` object (`prompt_tokens` / `completion_tokens`).
@@ -3070,7 +3234,7 @@ mod tool_round_cap_tests {
         let messages = msgs();
         let caveats = Caveats::top();
         let cap = 3;
-        let (reply, streamed, _usage) = chat_complete(
+        let (reply, streamed, _usage, _hallu) = chat_complete(
             ChatCtx {
                 url: &server.uri(),
                 model: "test-model",
@@ -3114,7 +3278,7 @@ mod tool_round_cap_tests {
         let messages = msgs();
         let caveats = Caveats::top();
         let cap = 2;
-        let (reply, streamed, _usage) = openai_chat_complete(
+        let (reply, streamed, _usage, _hallu) = openai_chat_complete(
             ChatCtx {
                 url: &server.uri(),
                 model: "test-model",
@@ -3175,7 +3339,7 @@ mod tool_round_cap_tests {
 
         let messages = msgs();
         let caveats = Caveats::top();
-        let (reply, _streamed, _usage) = chat_complete(
+        let (reply, _streamed, _usage, _hallu) = chat_complete(
             ChatCtx {
                 url: &server.uri(),
                 model: "test-model",
@@ -3198,5 +3362,200 @@ mod tool_round_cap_tests {
         // placeholder.
         assert!(reply.contains("tool-call limit"));
         assert!(reply.contains("max_tool_rounds"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Hallucination tracker + accumulated usage tests
+    // -----------------------------------------------------------------------
+
+    /// `run_command` called with a tool name as the first word must return a
+    /// corrective error message, not shell it through agent-bridle.
+    #[tokio::test]
+    async fn run_command_refuses_tool_name_as_shell_command() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let caveats = Caveats::top();
+        for tool in [
+            "list_dir",
+            "read_file",
+            "write_file",
+            "use_skill",
+            "web_fetch",
+        ] {
+            let args = serde_json::json!({ "command": format!("{tool} some/path") });
+            let out = execute_tool(
+                "run_command",
+                &args,
+                &ws.path().to_string_lossy(),
+                false,
+                20,
+                &caveats,
+                &mut Mcp::empty(),
+            )
+            .await;
+            assert!(
+                out.contains("is a tool, not a shell command"),
+                "expected corrective message for '{tool}', got: {out}"
+            );
+        }
+    }
+
+    /// `is_hallucination` correctly identifies tool-name-as-command and unknown
+    /// tool names, and correctly skips MCP-namespaced tools.
+    #[test]
+    fn hallucination_detection_coverage() {
+        // tool name passed to run_command → hallucination
+        assert!(is_hallucination(
+            "run_command",
+            &serde_json::json!({"command": "list_dir ."})
+        ));
+        // normal shell command → not a hallucination
+        assert!(!is_hallucination(
+            "run_command",
+            &serde_json::json!({"command": "cargo test"})
+        ));
+        // unknown tool → hallucination
+        assert!(is_hallucination(
+            "definitely_not_a_real_tool",
+            &serde_json::json!({})
+        ));
+        // MCP-namespaced tool → not a hallucination
+        assert!(!is_hallucination(
+            "my_server__some_tool",
+            &serde_json::json!({})
+        ));
+        // known direct tools → not hallucinations when called correctly
+        for t in [
+            "list_dir",
+            "read_file",
+            "write_file",
+            "use_skill",
+            "web_fetch",
+        ] {
+            assert!(!is_hallucination(t, &serde_json::json!({"path": "."})));
+        }
+    }
+
+    /// `trim_for_summary` keeps head + tail and inserts a placeholder for
+    /// the dropped middle section.
+    #[test]
+    fn trim_for_summary_drops_middle_and_inserts_placeholder() {
+        let msgs: Vec<serde_json::Value> = (0..10)
+            .map(|i| serde_json::json!({"role": "user", "content": format!("msg {i}")}))
+            .collect();
+
+        let trimmed = trim_for_summary(&msgs, 2, 3);
+        // head(2) + placeholder(1) + tail(3) = 6
+        assert_eq!(
+            trimmed.len(),
+            6,
+            "expected 6 messages, got {}",
+            trimmed.len()
+        );
+        // First two are the original head
+        assert_eq!(trimmed[0]["content"], "msg 0");
+        assert_eq!(trimmed[1]["content"], "msg 1");
+        // Placeholder in the middle
+        let placeholder = trimmed[2]["content"].as_str().unwrap();
+        assert!(
+            placeholder.contains("omitted"),
+            "placeholder must mention omitted messages: {placeholder}"
+        );
+        // Last three are the original tail
+        assert_eq!(trimmed[3]["content"], "msg 7");
+        assert_eq!(trimmed[4]["content"], "msg 8");
+        assert_eq!(trimmed[5]["content"], "msg 9");
+    }
+
+    #[test]
+    fn trim_for_summary_passthrough_when_short_enough() {
+        let msgs: Vec<serde_json::Value> = (0..4)
+            .map(|i| serde_json::json!({"role": "user", "content": format!("msg {i}")}))
+            .collect();
+        // head=2, tail=3 → total=5, msgs.len()=4 → no trimming needed
+        let trimmed = trim_for_summary(&msgs, 2, 3);
+        assert_eq!(trimmed.len(), 4);
+    }
+
+    /// When the final summary 500s, the accumulated usage from the tool rounds
+    /// must still be returned (not None), so usage.jsonl is not blank.
+    #[tokio::test]
+    async fn accumulated_usage_survives_summary_failure() {
+        let server = MockServer::start().await;
+        let served = Arc::new(AtomicUsize::new(0));
+
+        struct UsageRoundsErrFinal {
+            served: Arc<AtomicUsize>,
+        }
+        impl Respond for UsageRoundsErrFinal {
+            fn respond(&self, req: &Request) -> ResponseTemplate {
+                if request_has_tools(req) {
+                    self.served.fetch_add(1, Ordering::SeqCst);
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "message": { "content": "", "tool_calls": [{
+                            "function": { "name": "definitely_not_a_real_tool", "arguments": {} }
+                        }]},
+                        // Ollama reports per-round usage even in non-streaming mode.
+                        "prompt_eval_count": 100,
+                        "eval_count": 20,
+                    }))
+                } else {
+                    ResponseTemplate::new(500).set_body_string("boom")
+                }
+            }
+        }
+
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(UsageRoundsErrFinal {
+                served: served.clone(),
+            })
+            .mount(&server)
+            .await;
+
+        let messages = msgs();
+        let caveats = Caveats::top();
+        let cap = 2;
+        let (reply, _streamed, usage, hallu) = chat_complete(
+            ChatCtx {
+                url: &server.uri(),
+                model: "test-model",
+                kind: BackendKind::Ollama,
+                api_key: None,
+                messages: &messages,
+                task: "do the thing",
+                workspace: ".",
+                color: false,
+                caveats: &caveats,
+                max_tool_rounds: cap,
+                tool_output_lines: 20,
+            },
+            &mut Mcp::empty(),
+        )
+        .await
+        .expect("chat_complete must succeed even when final summary errors");
+
+        // The fallback reply must contain accumulated token counts.
+        assert!(reply.contains("tool-call limit"), "got: {reply}");
+        assert!(
+            reply.contains("in / ") && reply.contains("out tokens"),
+            "fallback must include accumulated token counts, got: {reply}"
+        );
+
+        // The usage returned must be non-None and reflect the accumulated rounds.
+        let u = usage.expect("usage must be Some even when final summary fails");
+        assert_eq!(
+            u.input_tokens, 200,
+            "2 rounds × 100 input tokens each = 200 total"
+        );
+        assert_eq!(
+            u.output_tokens, 40,
+            "2 rounds × 20 output tokens each = 40 total"
+        );
+
+        // Unknown tool calls during cap rounds counted as hallucinations.
+        assert_eq!(
+            hallu, cap as u32,
+            "each round had one hallucinated tool call"
+        );
     }
 }

@@ -25,6 +25,14 @@ impl TokenUsage {
     pub fn total(&self) -> u32 {
         self.input_tokens.saturating_add(self.output_tokens)
     }
+
+    /// Combine two usage readings (e.g. across tool-call rounds).
+    pub fn saturating_add(self, other: Self) -> Self {
+        Self {
+            input_tokens: self.input_tokens.saturating_add(other.input_tokens),
+            output_tokens: self.output_tokens.saturating_add(other.output_tokens),
+        }
+    }
 }
 
 /// Full telemetry record for one inference turn.
@@ -47,6 +55,16 @@ pub struct TurnMetrics {
 
     /// Backend endpoint that served the request.
     pub endpoint: String,
+
+    /// Number of agentic-loop hallucinations corrected during this turn
+    /// (e.g. model calling a tool name as a shell command via run_command,
+    /// or invoking a non-existent tool). Omitted from logs when zero.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub hallucinations: u32,
+}
+
+fn is_zero_u32(n: &u32) -> bool {
+    *n == 0
 }
 
 impl TurnMetrics {
@@ -81,10 +99,18 @@ impl TurnMetrics {
             None => String::new(),
         };
 
-        if cost_part.is_empty() {
+        let base = if cost_part.is_empty() {
             format!("{elapsed} · {token_part}")
         } else {
             format!("{elapsed} · {token_part} · {cost_part}")
+        };
+        if self.hallucinations > 0 {
+            format!(
+                "{base} · ⚠ {} hallucination(s) corrected",
+                self.hallucinations
+            )
+        } else {
+            base
         }
     }
 
@@ -149,6 +175,7 @@ mod tests {
             cost_usd: cost,
             model_id: "gemma4:e2b".into(),
             endpoint: "http://REDACTED-HOST:11434".into(),
+            ..Default::default()
         }
     }
 
@@ -178,6 +205,7 @@ mod tests {
             cost_usd: None,
             model_id: "gpt-4o".into(),
             endpoint: "https://api.openai.com".into(),
+            ..Default::default()
         };
         let line = m.display_line();
         assert!(line.contains("tokens unavailable"), "got: {line}");
@@ -207,6 +235,64 @@ mod tests {
             output_tokens: 150,
         };
         assert_eq!(u.total(), 450);
+    }
+
+    #[test]
+    fn token_usage_saturating_add() {
+        let a = TokenUsage {
+            input_tokens: 100,
+            output_tokens: 50,
+        };
+        let b = TokenUsage {
+            input_tokens: 200,
+            output_tokens: 75,
+        };
+        let sum = a.saturating_add(b);
+        assert_eq!(sum.input_tokens, 300);
+        assert_eq!(sum.output_tokens, 125);
+        // Saturation on overflow
+        let big = TokenUsage {
+            input_tokens: u32::MAX,
+            output_tokens: u32::MAX,
+        };
+        let sat = big.saturating_add(b);
+        assert_eq!(sat.input_tokens, u32::MAX);
+    }
+
+    #[test]
+    fn display_with_hallucinations() {
+        let mut m = metrics(3200, 847, 312, Some(0.0));
+        m.hallucinations = 2;
+        let line = m.display_line();
+        assert!(line.contains("2 hallucination(s) corrected"), "got: {line}");
+    }
+
+    #[test]
+    fn display_no_hallucinations_omits_warning() {
+        let m = metrics(3200, 847, 312, Some(0.0));
+        assert_eq!(m.hallucinations, 0);
+        assert!(
+            !m.display_line().contains("hallucination"),
+            "zero hallucinations must not appear in display"
+        );
+    }
+
+    #[test]
+    fn hallucinations_zero_skipped_in_json() {
+        let m = metrics(1000, 10, 5, Some(0.0));
+        let json = serde_json::to_string(&m).unwrap();
+        assert!(
+            !json.contains("hallucination"),
+            "zero hallucinations must be omitted from JSON"
+        );
+    }
+
+    #[test]
+    fn hallucinations_nonzero_in_json() {
+        let mut m = metrics(1000, 10, 5, Some(0.0));
+        m.hallucinations = 3;
+        let json = serde_json::to_string(&m).unwrap();
+        assert!(json.contains("\"hallucinations\":3"), "got: {json}");
     }
 
     #[test]
