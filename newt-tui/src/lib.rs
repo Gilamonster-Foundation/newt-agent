@@ -389,6 +389,29 @@ fn verbose_mode() -> bool {
         .unwrap_or(false)
 }
 
+/// Whether per-round agent-loop diagnostics are enabled.
+/// Set `NEWT_DEBUG=1` in the environment, or `[tui] debug = true` in config.
+fn debug_mode(cfg: &newt_core::Config) -> bool {
+    std::env::var("NEWT_DEBUG").is_ok() || cfg.tui.as_ref().and_then(|t| t.debug).unwrap_or(false)
+}
+
+/// Print a single-line debug diagnostic (dimmed, prefix `[debug]`).
+/// Only called when `ChatCtx.debug` is true — guard at the call site.
+fn print_debug(msg: &str, color: bool) {
+    if color {
+        execute!(
+            io::stdout(),
+            SetForegroundColor(CtColor::DarkGrey),
+            Print(format!("[debug] {msg}\n")),
+            ResetColor,
+        )
+        .ok();
+    } else {
+        println!("[debug] {msg}");
+    }
+    io::stdout().flush().ok();
+}
+
 /// Print a newt response line.
 /// Color: orange ▸ (matches the logo).  No-color: >.
 fn print_newt(msg: &str, color: bool, verbose: bool) {
@@ -1091,6 +1114,7 @@ fn run_chat(workspace: &str, color: bool) -> anyhow::Result<()> {
                                 caveats: cap.caveats(),
                                 max_tool_rounds: max_tool_rounds(&cfg),
                                 tool_output_lines: tool_output_lines(&cfg),
+                                debug: debug_mode(&cfg),
                             },
                             &mut mcp,
                         ))
@@ -1903,6 +1927,9 @@ struct ChatCtx<'a> {
     /// default 20). Resolved once per turn and threaded to `execute_tool` so
     /// the tool loop never re-reads config from disk.
     tool_output_lines: usize,
+    /// Enable per-round diagnostic output. Set via `NEWT_DEBUG=1` or the
+    /// `[tui] debug = true` config key.
+    debug: bool,
 }
 
 /// Main agentic loop: call model → execute tool calls → feed results back → repeat.
@@ -1929,6 +1956,7 @@ async fn chat_complete(
         caveats,
         max_tool_rounds,
         tool_output_lines,
+        debug,
     } = ctx;
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(120))
@@ -1997,16 +2025,50 @@ async fn chat_complete(
         .await?;
 
         // Accumulate token usage from this non-streaming probe round.
-        accumulated_usage = merge_usage(accumulated_usage, ollama_usage(&json));
+        let round_usage = ollama_usage(&json);
+        accumulated_usage = merge_usage(accumulated_usage, round_usage);
 
         let message = &json["message"];
+        // Capture the probe content now — it may be our only copy of the
+        // model's reply if the subsequent streaming re-issue returns empty.
+        let probe_content = message["content"].as_str().unwrap_or("").to_string();
 
         let tool_calls = message["tool_calls"].as_array();
         let has_tools = tool_calls.map(|tc| !tc.is_empty()).unwrap_or(false);
 
+        if debug {
+            let content_excerpt = if probe_content.is_empty() {
+                "(empty)".to_string()
+            } else {
+                let chars: String = probe_content.chars().take(80).collect();
+                if probe_content.len() > 80 {
+                    format!("{chars}…")
+                } else {
+                    chars
+                }
+            };
+            let tc_count = tool_calls.map(|tc| tc.len()).unwrap_or(0);
+            let usage_str = match round_usage {
+                Some(u) => format!("{} in / {} out", u.input_tokens, u.output_tokens),
+                None => "no usage".into(),
+            };
+            print_debug(
+                &format!(
+                    "round {round} probe: tool_calls={tc_count} usage=[{usage_str}] content={content_excerpt:?}"
+                ),
+                color,
+            );
+        }
+
         if !has_tools {
             // No tool calls — re-issue with stream:true so the user sees tokens.
             // `messages` already contains the task; just replay with streaming.
+            //
+            // IMPORTANT: the probe round already generated the model's answer in
+            // `probe_content`. The streaming re-issue is a *second* inference call
+            // from the same history; if it returns empty (non-determinism, context
+            // pressure, or model quirk) we fall back to the probe content so the
+            // user never sees a silent blank response.
             let body_stream = serde_json::json!({
                 "model": model,
                 "messages": &messages,
@@ -2030,10 +2092,44 @@ async fn chat_complete(
             .await?;
 
             if !sresp.status().is_success() {
-                let content = message["content"].as_str().unwrap_or("").to_string();
-                return Ok((content, false, accumulated_usage, hallucination_count));
+                if debug {
+                    print_debug("stream request non-2xx — using probe content", color);
+                }
+                return Ok((probe_content, false, accumulated_usage, hallucination_count));
             }
             let (streamed, stream_usage) = stream_response(sresp, color).await?;
+
+            if streamed.is_empty() {
+                // The streaming re-issue produced no tokens. Fall back to the
+                // probe content rather than returning silence.
+                if debug {
+                    print_debug(
+                        &format!(
+                            "stream returned empty — falling back to probe content ({} chars)",
+                            probe_content.len()
+                        ),
+                        color,
+                    );
+                }
+                if probe_content.is_empty() {
+                    // Both probe and stream are empty — the model produced nothing.
+                    let msg = "(model returned an empty response — try rephrasing, or check the model with `newt doctor`)";
+                    return Ok((
+                        msg.to_string(),
+                        false,
+                        merge_usage(accumulated_usage, stream_usage),
+                        hallucination_count,
+                    ));
+                }
+                // Use probe content; print it since it was never streamed.
+                return Ok((
+                    probe_content,
+                    false,
+                    merge_usage(accumulated_usage, stream_usage),
+                    hallucination_count,
+                ));
+            }
+
             return Ok((
                 streamed,
                 true,
@@ -2282,6 +2378,7 @@ async fn openai_chat_complete(
         caveats,
         max_tool_rounds,
         tool_output_lines,
+        debug,
     } = ctx;
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(120))
@@ -2340,16 +2437,44 @@ async fn openai_chat_complete(
         )
         .await?;
         // Accumulate per-round token usage.
-        accumulated_usage = merge_usage(accumulated_usage, openai_usage(&json["usage"]));
+        let round_usage = openai_usage(&json["usage"]);
+        accumulated_usage = merge_usage(accumulated_usage, round_usage);
 
         let message = &json["choices"][0]["message"];
 
         let tool_calls = message["tool_calls"].as_array();
         let has_tools = tool_calls.map(|tc| !tc.is_empty()).unwrap_or(false);
 
+        if debug {
+            let content = message["content"].as_str().unwrap_or("");
+            let excerpt: String = content.chars().take(80).collect();
+            let tc_count = tool_calls.map(|tc| tc.len()).unwrap_or(0);
+            let usage_str = match round_usage {
+                Some(u) => format!("{} in / {} out", u.input_tokens, u.output_tokens),
+                None => "no usage".into(),
+            };
+            print_debug(
+                &format!(
+                    "round {round}: tool_calls={tc_count} usage=[{usage_str}] content={excerpt:?}"
+                ),
+                color,
+            );
+        }
+
         if !has_tools {
             let content = message["content"].as_str().unwrap_or("").to_string();
-            return Ok((content, false, accumulated_usage, hallucination_count));
+            if content.is_empty() && debug {
+                print_debug(
+                    "empty content with no tool calls — model produced nothing",
+                    color,
+                );
+            }
+            let out = if content.is_empty() {
+                "(model returned an empty response — try rephrasing, or check the model with `newt doctor`)".to_string()
+            } else {
+                content
+            };
+            return Ok((out, false, accumulated_usage, hallucination_count));
         }
 
         // Record the assistant turn verbatim (it carries the tool_calls), then
@@ -3532,6 +3657,7 @@ mod tool_round_cap_tests {
                 caveats: &caveats,
                 max_tool_rounds: cap,
                 tool_output_lines: 20,
+                debug: false,
             },
             &mut Mcp::empty(),
         )
@@ -3576,6 +3702,7 @@ mod tool_round_cap_tests {
                 caveats: &caveats,
                 max_tool_rounds: cap,
                 tool_output_lines: 20,
+                debug: false,
             },
             &mut Mcp::empty(),
         )
@@ -3637,6 +3764,7 @@ mod tool_round_cap_tests {
                 caveats: &caveats,
                 max_tool_rounds: 2,
                 tool_output_lines: 20,
+                debug: false,
             },
             &mut Mcp::empty(),
         )
@@ -3813,6 +3941,7 @@ mod tool_round_cap_tests {
                 caveats: &caveats,
                 max_tool_rounds: cap,
                 tool_output_lines: 20,
+                debug: false,
             },
             &mut Mcp::empty(),
         )
