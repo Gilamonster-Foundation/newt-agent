@@ -2606,11 +2606,20 @@ fn dispatch_slash(
                 // Persist via `newt dgx use <model>` then resolve_backend_config
                 // picks it up automatically on the next turn.
                 run_newt_subcmd(&["dgx", "use", arg1], color, verbose)?;
-                print_newt(
-                    &format!("Switched to {arg1} — takes effect on next message."),
-                    color,
-                    verbose,
-                );
+                // Re-resolve so the warm-up targets the new endpoint.
+                let cfg = newt_core::Config::resolve().unwrap_or_default();
+                let choice = resolve_backend_choice(&cfg);
+                // Warm-up only applies to Ollama: vLLM and OpenAI-compatible
+                // endpoints keep their served model resident at all times.
+                if choice.kind == newt_core::BackendKind::Ollama {
+                    warmup_if_cold(&choice.url, arg1, color, verbose);
+                } else {
+                    print_newt(
+                        &format!("Switched to {arg1} — takes effect on next message."),
+                        color,
+                        verbose,
+                    );
+                }
             }
         }
 
@@ -2657,6 +2666,122 @@ fn fetch_models_from_url(url: &str) -> anyhow::Result<Vec<String>> {
         })
     })?;
     Ok(parse_model_names(&json))
+}
+
+/// Check whether `model` is currently loaded in Ollama's VRAM via `/api/ps`.
+/// Returns `true` when the model is resident and ready; `false` when cold.
+/// Silently returns `false` on any network or parse error so the caller always
+/// falls through to the warm-up path — a false negative just means we warm
+/// unnecessarily, which is safe.
+fn is_model_resident(endpoint: &str, model: &str) -> bool {
+    let ps_url = format!("{}/api/ps", endpoint.trim_end_matches('/'));
+    let Ok(json) = tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(async {
+            let resp = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(5))
+                .build()?
+                .get(&ps_url)
+                .send()
+                .await?;
+            resp.json::<serde_json::Value>()
+                .await
+                .map_err(anyhow::Error::from)
+        })
+    }) else {
+        return false;
+    };
+    json["models"]
+        .as_array()
+        .map(|arr| arr.iter().any(|m| m["name"].as_str() == Some(model)))
+        .unwrap_or(false)
+}
+
+/// After a `/model <name>` switch, warm the new model if it isn't already
+/// resident in Ollama's VRAM. Blocks until the model is loaded (or the
+/// warm-up itself fails), then prints a ready line.
+///
+/// Skipped silently on non-Ollama endpoints (caller's responsibility).
+fn warmup_if_cold(endpoint: &str, model: &str, color: bool, verbose: bool) {
+    if is_model_resident(endpoint, model) {
+        print_newt(
+            &format!("✓ {model} — already resident, ready"),
+            color,
+            verbose,
+        );
+        return;
+    }
+
+    // Print the warning BEFORE blocking so the user sees it immediately.
+    let msg = format!("⏳ {model} is cold — warming up (large models can take 30–60 s)…");
+    if color {
+        execute!(
+            io::stdout(),
+            SetForegroundColor(CtColor::Rgb {
+                r: 200,
+                g: 140,
+                b: 0,
+            }),
+            Print(format!("▸  {msg}\n")),
+            ResetColor,
+        )
+        .ok();
+    } else {
+        println!("▸  {msg}");
+    }
+    io::stdout().flush().ok();
+
+    // Large models (70b Q8) can take 60+ seconds to load; use a generous
+    // timeout and the same retry policy as the rest of the TUI.
+    let warm_url = format!("{}/api/generate", endpoint.trim_end_matches('/'));
+    let body = serde_json::json!({
+        "model": model,
+        "keep_alive": "10m",
+        "stream": false,
+    });
+    let retry = tui_retry_policy();
+    let result = tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(async {
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(600))
+                .build()?;
+            with_backoff_notify(
+                &retry,
+                || async {
+                    let resp = client
+                        .post(&warm_url)
+                        .json(&body)
+                        .send()
+                        .await
+                        .map_err(|e| anyhow::anyhow!("request failed: {e}"))?;
+                    if !resp.status().is_success() {
+                        anyhow::bail!("Ollama {}", resp.status());
+                    }
+                    resp.json::<serde_json::Value>()
+                        .await
+                        .map_err(anyhow::Error::from)
+                },
+                |attempt, delay| print_retry_indicator(attempt, delay, color),
+            )
+            .await
+        })
+    });
+
+    match result {
+        Ok(json) => {
+            let ready_msg = match json["load_duration"].as_u64() {
+                Some(ns) if ns > 0 => {
+                    format!("✓ {model} — loaded in {:.1}s, ready", ns as f64 / 1e9)
+                }
+                _ => format!("✓ {model} — ready"),
+            };
+            print_newt(&ready_msg, color, verbose);
+        }
+        Err(e) => print_newt(
+            &format!("⚠ warm-up failed: {e} — first response may be slow"),
+            color,
+            verbose,
+        ),
+    }
 }
 
 /// Fetch model ids from an OpenAI-compatible endpoint's `/v1/models`, with
@@ -2955,6 +3080,66 @@ mod tests {
     #[test]
     fn slash_dgx_no_subcmd_returns_true() {
         assert!(dispatch_slash("/dgx", "/ws", false, false).unwrap());
+    }
+
+    // -----------------------------------------------------------------------
+    // warmup helpers
+    // -----------------------------------------------------------------------
+
+    /// `is_model_resident` returns `false` for a model not in the `/api/ps` list.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn is_model_resident_returns_false_when_absent() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/ps"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "models": [{"name": "other-model:7b"}]
+            })))
+            .mount(&server)
+            .await;
+
+        assert!(!is_model_resident(&server.uri(), "wanted-model:13b"));
+    }
+
+    /// `is_model_resident` returns `true` when the model appears in `/api/ps`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn is_model_resident_returns_true_when_present() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/ps"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "models": [
+                    {"name": "other:7b"},
+                    {"name": "wanted-model:13b"}
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        assert!(is_model_resident(&server.uri(), "wanted-model:13b"));
+    }
+
+    /// `is_model_resident` returns `false` (safe default) when the endpoint
+    /// returns an error — the caller falls through to the warm-up path.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn is_model_resident_returns_false_on_error() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/ps"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&server)
+            .await;
+
+        assert!(!is_model_resident(&server.uri(), "any-model"));
     }
 }
 
