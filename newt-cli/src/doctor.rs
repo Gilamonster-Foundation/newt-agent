@@ -47,19 +47,36 @@ pub async fn run(config_path: Option<&Path>) -> anyhow::Result<()> {
     if servers.is_empty() {
         println!("  (none discovered)");
     }
+    // For stdio servers we actually CONNECT (spawn + initialize + tools/list)
+    // so you can see whether each is reachable and which tools it offers.
     for s in &servers {
-        let detail = match s.transport {
-            newt_core::mcp::TransportKind::Stdio => s.command.clone().unwrap_or_default(),
+        match s.transport {
+            newt_core::mcp::TransportKind::Stdio => match newt_mcp_client::connect_stdio(s).await {
+                Ok(connected) => {
+                    let names: Vec<&str> =
+                        connected.tools.iter().map(|t| t.name.as_str()).collect();
+                    let list = if names.is_empty() {
+                        "(none)".to_string()
+                    } else {
+                        names.join(", ")
+                    };
+                    println!("  {} [stdio] — OK, {} tool(s): {list}", s.name, names.len());
+                }
+                Err(e) => println!("  {} [stdio] — ERROR: {e}", s.name),
+            },
             newt_core::mcp::TransportKind::Sse | newt_core::mcp::TransportKind::Http => {
-                s.url.clone().unwrap_or_default()
+                let kind = if matches!(s.transport, newt_core::mcp::TransportKind::Sse) {
+                    "sse"
+                } else {
+                    "http"
+                };
+                let url = s.url.clone().unwrap_or_default();
+                println!(
+                    "  {} [{kind}] — {url} (skipped: only stdio is supported in this build)",
+                    s.name
+                );
             }
-        };
-        let kind = match s.transport {
-            newt_core::mcp::TransportKind::Stdio => "stdio",
-            newt_core::mcp::TransportKind::Sse => "sse",
-            newt_core::mcp::TransportKind::Http => "http",
-        };
-        println!("  {} [{kind}] — {detail}", s.name);
+        }
     }
 
     Ok(())
