@@ -294,6 +294,25 @@ impl ToolPermissions {
         "rustfmt",
         "clippy-driver",
         "rustup",
+        // Polyglot dev tools reached for routinely in a mixed workspace. Same
+        // risk tier as cargo/git — WorkspaceDev already grants workspace write
+        // and the full Rust toolchain. Anything outside this set can still be
+        // opted in per-config via `[tui.permissions] extra_exec = [...]`.
+        "gh",
+        "python",
+        "python3",
+        "pip",
+        "npm",
+        "node",
+        "make",
+        "jq",
+        "curl",
+        "awk",
+        "sed",
+        "cut",
+        "xargs",
+        "which",
+        "env",
     ];
 
     /// Build the runtime `Caveats` for this permission configuration.
@@ -782,6 +801,24 @@ default_tier_order = ["FAST", "STANDARD", "COMPLEX", "REVIEW"]
         assert!(!cav.permits_exec("rm"), "rm must be blocked");
         assert!(!cav.permits_exec("mv"), "mv must be blocked");
         assert!(!cav.permits_exec("sudo"), "sudo must be blocked");
+    }
+
+    #[test]
+    fn workspace_dev_allows_common_dev_tools() {
+        // Regression: these were denied under the default preset even though
+        // they're the same risk tier as cargo/git (issue #149). `gh` in
+        // particular is authenticated outside but was blocked in-agent.
+        let cav = ToolPermissions::default().to_caveats("/workspace");
+        for tool in [
+            "gh", "python", "python3", "pip", "npm", "node", "make", "jq", "curl", "awk", "sed",
+            "cut", "xargs", "which", "env",
+        ] {
+            assert!(cav.permits_exec(tool), "`{tool}` must be allowed");
+        }
+        // Adding tools must NOT escalate to full access — destructive commands
+        // outside the allowlist stay blocked.
+        assert!(!cav.permits_exec("rm"), "rm must still be blocked");
+        assert!(!cav.permits_exec("sudo"), "sudo must still be blocked");
     }
 
     #[test]
