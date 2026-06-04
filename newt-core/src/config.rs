@@ -161,6 +161,46 @@ pub struct TuiConfig {
     /// `NEWT_DEBUG=1` environment variable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub debug: Option<bool>,
+
+    // -----------------------------------------------------------------------
+    // DGX / inference endpoint resource management
+    // -----------------------------------------------------------------------
+    /// Ollama context-window cap sent as `options.num_ctx` on every request.
+    /// Limits the KV-cache allocation so a large model can't exhaust VRAM
+    /// mid-session. `None` → let Ollama use the model's compiled-in default
+    /// (often 131k for recent models — far too large to coexist with weights
+    /// on a single GPU). Recommended starting point: 8192 or 16384.
+    /// Tune upward if you need longer tool-call histories.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub num_ctx: Option<u32>,
+
+    /// TCP connect timeout in seconds for inference requests (default: 5).
+    /// A fast failure here means the endpoint is down (connection refused),
+    /// distinguishing it from a slow-but-alive endpoint that needs the full
+    /// `inference_timeout_secs` to respond. Keep this short.
+    #[serde(default = "default_connect_timeout_secs")]
+    pub connect_timeout_secs: u64,
+
+    /// Total inference request timeout in seconds (default: 120). This is the
+    /// wall-clock budget for the model to generate a complete response —
+    /// large models on a busy DGX may need the full window.
+    #[serde(default = "default_inference_timeout_secs")]
+    pub inference_timeout_secs: u64,
+
+    /// How long Ollama keeps a model resident in VRAM after the last request,
+    /// as an Ollama duration string (e.g. `"5m"`, `"0"`, `"-1"`).
+    /// Default: `"5m"`. Use `"0"` to unload immediately after each turn
+    /// (maximum headroom for multi-model or multi-agent workloads at the cost
+    /// of a reload on each turn). Use `"-1"` to keep forever.
+    #[serde(default = "default_keep_alive")]
+    pub keep_alive: String,
+
+    /// Maximum number of messages in the in-progress tool-call message list
+    /// before the agent trims the middle to prevent context overflow.
+    /// Default: 40 (≈ 20 tool-call rounds). Set lower on memory-constrained
+    /// endpoints or when `num_ctx` is small.
+    #[serde(default = "default_mid_loop_trim_threshold")]
+    pub mid_loop_trim_threshold: usize,
 }
 
 fn default_tool_output_lines() -> usize {
@@ -169,6 +209,22 @@ fn default_tool_output_lines() -> usize {
 
 fn default_max_tool_rounds() -> usize {
     25
+}
+
+fn default_connect_timeout_secs() -> u64 {
+    5
+}
+
+fn default_inference_timeout_secs() -> u64 {
+    120
+}
+
+fn default_keep_alive() -> String {
+    "5m".to_string()
+}
+
+fn default_mid_loop_trim_threshold() -> usize {
+    40
 }
 
 // ---------------------------------------------------------------------------
@@ -436,6 +492,11 @@ impl Default for TuiConfig {
             max_tool_rounds: default_max_tool_rounds(),
             permissions: ToolPermissions::default(),
             debug: None,
+            num_ctx: None,
+            connect_timeout_secs: default_connect_timeout_secs(),
+            inference_timeout_secs: default_inference_timeout_secs(),
+            keep_alive: default_keep_alive(),
+            mid_loop_trim_threshold: default_mid_loop_trim_threshold(),
         }
     }
 }
