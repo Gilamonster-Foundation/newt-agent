@@ -520,8 +520,8 @@ fn policy_for(tui: Option<newt_core::TuiConfig>, workspace: &str) -> newt_core::
 }
 
 /// Resolve the configured `[tui]` block, if any.
-fn resolve_tui() -> Option<newt_core::TuiConfig> {
-    newt_core::Config::resolve().ok().and_then(|c| c.tui)
+fn resolve_tui(cfg: &newt_core::Config) -> Option<newt_core::TuiConfig> {
+    cfg.tui.clone()
 }
 
 /// Mint a signed operating key for `policy`, rooted in the per-user key at
@@ -860,14 +860,19 @@ fn run_chat(workspace: &str, color: bool) -> anyhow::Result<()> {
     // block the thread while still allowing block_on() inside it.
     let rt = tokio::runtime::Handle::current();
 
+    // Resolve config ONCE per session and reuse it for every read this turn.
+    // It is re-read (`Config::resolve`) only after a slash command, the one
+    // intentional refresh point — config.toml may have changed on disk.
+    let mut cfg = newt_core::Config::resolve().unwrap_or_default();
+
     // Resolve the inference backend and permission caveats once at session
     // start.  Both are re-read after each slash command (config.toml on disk).
-    let mut choice = resolve_backend_choice();
+    let mut choice = resolve_backend_choice(&cfg);
     let (mut inf_url, mut inf_model) = (choice.url.clone(), choice.model.clone());
     let mut inf_kind = choice.kind;
     let mut inf_key = choice.api_key.clone();
     let key_path = newt_identity::default_key_path().ok();
-    let mut cap = SessionCapability::establish(resolve_tui(), key_path.as_deref(), workspace);
+    let mut cap = SessionCapability::establish(resolve_tui(&cfg), key_path.as_deref(), workspace);
     print_newt(
         &format!("v{VERSION} ready — {inf_model} @ {inf_url}  (Ctrl-D or /exit to quit)"),
         color,
@@ -878,9 +883,7 @@ fn run_chat(workspace: &str, color: bool) -> anyhow::Result<()> {
     // Claude Code config). Failures are logged + skipped; their tools are added
     // to the agent's tool set, namespaced `server__tool`. `newt doctor` shows
     // the same discovery if a server is missing.
-    let cfg_mcp_servers = newt_core::Config::resolve()
-        .map(|c| c.mcp_servers)
-        .unwrap_or_default();
+    let cfg_mcp_servers = cfg.mcp_servers.clone();
     let mut mcp =
         tokio::task::block_in_place(|| rt.block_on(Mcp::connect(workspace, &cfg_mcp_servers)));
     if !mcp.is_empty() {
@@ -907,10 +910,7 @@ fn run_chat(workspace: &str, color: bool) -> anyhow::Result<()> {
     let system: String;
 
     // Pluggable memory manager — replaces the old conv Vec.
-    let mem_cfg = newt_core::Config::resolve()
-        .ok()
-        .and_then(|c| c.memory)
-        .unwrap_or_default();
+    let mem_cfg = cfg.memory.clone().unwrap_or_default();
     let mut memory = {
         let mut mgr = newt_core::MemoryManager::new();
         // Soul provider first — sets the frozen identity block.
@@ -1048,14 +1048,17 @@ fn run_chat(workspace: &str, color: bool) -> anyhow::Result<()> {
                         let _ = rl.save_history(hp);
                     }
                     // Re-read config after a slash command (config.toml may have changed).
+                    // This is the ONE intentional refresh — re-resolve `cfg` so the
+                    // session picks up edits, then derive everything from it.
                     // Permissions can only NARROW within a session; a widening
                     // request is clamped (restart to widen — see SessionCapability).
-                    choice = resolve_backend_choice();
+                    cfg = newt_core::Config::resolve().unwrap_or_default();
+                    choice = resolve_backend_choice(&cfg);
                     inf_url = choice.url.clone();
                     inf_model = choice.model.clone();
                     inf_kind = choice.kind;
                     inf_key = choice.api_key.clone();
-                    if cap.reapply(resolve_tui(), workspace) {
+                    if cap.reapply(resolve_tui(&cfg), workspace) {
                         print_newt(
                             "permissions can only narrow within a session — restart newt to widen",
                             color,
@@ -1090,7 +1093,8 @@ fn run_chat(workspace: &str, color: bool) -> anyhow::Result<()> {
                                 workspace,
                                 color,
                                 caveats: cap.caveats(),
-                                max_tool_rounds: max_tool_rounds(),
+                                max_tool_rounds: max_tool_rounds(&cfg),
+                                tool_output_lines: tool_output_lines(&cfg),
                             },
                             &mut mcp,
                         ))
@@ -1104,10 +1108,7 @@ fn run_chat(workspace: &str, color: bool) -> anyhow::Result<()> {
                                 print_newt(&reply, color, verbose);
                             }
                             // Single TurnMetrics used for both memory sync and display.
-                            let pricing = newt_core::Config::resolve()
-                                .ok()
-                                .and_then(|c| c.pricing)
-                                .unwrap_or_default();
+                            let pricing = cfg.pricing.clone().unwrap_or_default();
                             let metrics = newt_core::TurnMetrics {
                                 elapsed_ms: elapsed.as_millis() as u64,
                                 usage,
@@ -1145,7 +1146,7 @@ fn run_chat(workspace: &str, color: bool) -> anyhow::Result<()> {
 
 /// Resolve Ollama URL + model from env vars then config.
 /// Priority: NEWT_DGX_OLLAMA_URL > NEWT_DGX_HOST synthesis > DGX config node > localhost.
-fn resolve_backend_config() -> (String, String) {
+fn resolve_backend_config(cfg: &newt_core::Config) -> (String, String) {
     let url = std::env::var("NEWT_DGX_OLLAMA_URL")
         .ok()
         .or_else(|| {
@@ -1156,22 +1157,16 @@ fn resolve_backend_config() -> (String, String) {
             })
         })
         .or_else(|| {
-            newt_core::Config::resolve()
-                .ok()
-                .and_then(|c| c.dgx)
-                .and_then(|d| d.nodes.into_iter().next())
-                .and_then(|n| n.ollama)
+            cfg.dgx
+                .as_ref()
+                .and_then(|d| d.nodes.first())
+                .and_then(|n| n.ollama.clone())
         })
         .unwrap_or_else(|| "http://localhost:11434".into());
 
     let model = std::env::var("NEWT_DGX_MODEL")
         .ok()
-        .or_else(|| {
-            newt_core::Config::resolve()
-                .ok()
-                .and_then(|c| c.dgx)
-                .and_then(|d| d.active_model)
-        })
+        .or_else(|| cfg.dgx.as_ref().and_then(|d| d.active_model.clone()))
         .unwrap_or_else(|| "llama3.1:8b".into());
 
     (url, model)
@@ -1191,22 +1186,20 @@ struct BackendChoice {
 /// the config (`~/.newt/config.toml`) wins — endpoint/model/auth come straight
 /// from it. Otherwise we fall back to the historical Ollama/DGX resolution
 /// ([`resolve_backend_config`]), which the rest of the TUI already understands.
-fn resolve_backend_choice() -> BackendChoice {
-    if let Ok(cfg) = newt_core::Config::resolve() {
-        if let Some(b) = cfg
-            .backends
-            .iter()
-            .find(|b| b.kind == newt_core::BackendKind::Openai)
-        {
-            return BackendChoice {
-                url: b.endpoint.clone(),
-                model: b.model.clone(),
-                kind: newt_core::BackendKind::Openai,
-                api_key: b.resolve_api_key(),
-            };
-        }
+fn resolve_backend_choice(cfg: &newt_core::Config) -> BackendChoice {
+    if let Some(b) = cfg
+        .backends
+        .iter()
+        .find(|b| b.kind == newt_core::BackendKind::Openai)
+    {
+        return BackendChoice {
+            url: b.endpoint.clone(),
+            model: b.model.clone(),
+            kind: newt_core::BackendKind::Openai,
+            api_key: b.resolve_api_key(),
+        };
     }
-    let (url, model) = resolve_backend_config();
+    let (url, model) = resolve_backend_config(cfg);
     BackendChoice {
         url,
         model,
@@ -1426,31 +1419,23 @@ fn print_tool_call(name: &str, detail: &str, color: bool) {
 }
 
 /// Read the tool-output line limit from config (default 20, 0 = unlimited).
-fn tool_output_lines() -> usize {
-    newt_core::Config::resolve()
-        .ok()
-        .and_then(|c| c.tui)
-        .map(|t| t.tool_output_lines)
-        .unwrap_or(20)
+fn tool_output_lines(cfg: &newt_core::Config) -> usize {
+    cfg.tui.as_ref().map(|t| t.tool_output_lines).unwrap_or(20)
 }
 
 /// Maximum tool-call rounds per turn, from `[tui].max_tool_rounds`.
 /// Defaults to 25 when there's no `[tui]` table or no config file.
-fn max_tool_rounds() -> usize {
-    newt_core::Config::resolve()
-        .ok()
-        .and_then(|c| c.tui)
-        .map(|t| t.max_tool_rounds)
-        .unwrap_or(25)
+fn max_tool_rounds(cfg: &newt_core::Config) -> usize {
+    cfg.tui.as_ref().map(|t| t.max_tool_rounds).unwrap_or(25)
 }
 
 /// Print tool output truncated to the configured line limit.
 /// The model always receives the full content regardless.
-fn print_tool_output(output: &str, color: bool) {
+fn print_tool_output(output: &str, max_lines: usize, color: bool) {
     if output.is_empty() {
         return;
     }
-    let max = tool_output_lines();
+    let max = max_lines;
     let lines: Vec<&str> = output.lines().collect();
     let shown = if max == 0 {
         lines.len()
@@ -1539,6 +1524,7 @@ async fn execute_tool(
     args: &serde_json::Value,
     workspace: &str,
     color: bool,
+    tool_output_lines: usize,
     caveats: &newt_core::caveats::Caveats,
     mcp: &mut Mcp,
 ) -> String {
@@ -1547,7 +1533,7 @@ async fn execute_tool(
     if mcp.handles(name) {
         print_tool_call(name, &args.to_string(), color);
         let out = mcp.call(name, args).await;
-        print_tool_output(&out, color);
+        print_tool_output(&out, tool_output_lines, color);
         return out;
     }
 
@@ -1592,7 +1578,7 @@ async fn execute_tool(
                         .and_then(serde_json::Value::as_str)
                         .unwrap_or("");
                     let out = format!("{stdout}{stderr}");
-                    print_tool_output(&out, color);
+                    print_tool_output(&out, tool_output_lines, color);
                     if out.trim().is_empty() {
                         let code = envelope
                             .get("exit_code")
@@ -1621,7 +1607,7 @@ async fn execute_tool(
             print_tool_call("read_file", path, color);
             match std::fs::read_to_string(&full) {
                 Ok(contents) => {
-                    print_tool_output(&contents, color);
+                    print_tool_output(&contents, tool_output_lines, color);
                     contents
                 }
                 Err(e) => format!("error reading {path}: {e}"),
@@ -1649,6 +1635,7 @@ async fn execute_tool(
             let has_more = content.lines().count() > 20;
             print_tool_output(
                 &format!("{preview}{}", if has_more { "\n…" } else { "" }),
+                tool_output_lines,
                 color,
             );
 
@@ -1703,7 +1690,7 @@ async fn execute_tool(
                         .collect();
                     names.sort();
                     let listing = names.join("\n");
-                    print_tool_output(&listing, color);
+                    print_tool_output(&listing, tool_output_lines, color);
                     listing
                 }
                 Err(e) => format!("error: {e}"),
@@ -1723,7 +1710,7 @@ async fn execute_tool(
             };
             match newt_skills::load_body(&dir, skill_name) {
                 Ok(body) => {
-                    print_tool_output(&body, color);
+                    print_tool_output(&body, tool_output_lines, color);
                     body
                 }
                 Err(e) => format!("error: {e}"),
@@ -1766,7 +1753,7 @@ async fn execute_tool(
                     } else {
                         format!("# {title}\n{final_url}\n\n{markdown}")
                     };
-                    print_tool_output(&out, color);
+                    print_tool_output(&out, tool_output_lines, color);
                     out
                 }
                 // A `net`-axis leash denial, or a fetch error (SSRF screen,
@@ -1795,6 +1782,10 @@ struct ChatCtx<'a> {
     /// Maximum tool-call rounds before forcing a final tools-disabled
     /// completion (from `[tui].max_tool_rounds`, default 25).
     max_tool_rounds: usize,
+    /// Max lines of tool output shown inline (from `[tui].tool_output_lines`,
+    /// default 20). Resolved once per turn and threaded to `execute_tool` so
+    /// the tool loop never re-reads config from disk.
+    tool_output_lines: usize,
 }
 
 /// Main agentic loop: call model → execute tool calls → feed results back → repeat.
@@ -1820,6 +1811,7 @@ async fn chat_complete(
         color,
         caveats,
         max_tool_rounds,
+        tool_output_lines,
     } = ctx;
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(120))
@@ -1912,7 +1904,16 @@ async fn chat_complete(
                 }
                 v => v.clone(),
             };
-            let result = execute_tool(name, &args, workspace, color, caveats, mcp).await;
+            let result = execute_tool(
+                name,
+                &args,
+                workspace,
+                color,
+                tool_output_lines,
+                caveats,
+                mcp,
+            )
+            .await;
             messages.push(serde_json::json!({
                 "role": "tool",
                 "content": result
@@ -2044,6 +2045,7 @@ async fn openai_chat_complete(
         color,
         caveats,
         max_tool_rounds,
+        tool_output_lines,
     } = ctx;
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(120))
@@ -2112,7 +2114,16 @@ async fn openai_chat_complete(
                 }
                 v => v.clone(),
             };
-            let result = execute_tool(name, &args, workspace, color, caveats, mcp).await;
+            let result = execute_tool(
+                name,
+                &args,
+                workspace,
+                color,
+                tool_output_lines,
+                caveats,
+                mcp,
+            )
+            .await;
             messages.push(serde_json::json!({
                 "role": "tool",
                 "tool_call_id": id,
@@ -2287,7 +2298,8 @@ fn dispatch_slash(
 
         "models" => {
             // List models on the active endpoint, highlighting the current one.
-            let choice = resolve_backend_choice();
+            let cfg = newt_core::Config::resolve().unwrap_or_default();
+            let choice = resolve_backend_choice(&cfg);
             let url = choice.url;
             let current = choice.model;
             let fetched = if choice.kind == newt_core::BackendKind::Openai {
@@ -2327,7 +2339,8 @@ fn dispatch_slash(
 
         "model" => {
             if arg1.is_empty() {
-                let current = resolve_backend_choice().model;
+                let cfg = newt_core::Config::resolve().unwrap_or_default();
+                let current = resolve_backend_choice(&cfg).model;
                 print_newt(
                     &format!("active model: {current}  (use /model <name> to switch)"),
                     color,
@@ -2637,6 +2650,33 @@ mod tests {
     }
 
     #[test]
+    fn config_helpers_read_from_passed_config_not_disk() {
+        // Regression (#150): these helpers used to call Config::resolve() — a
+        // disk read + TOML parse — on every invocation, several times per turn.
+        // They now derive from the &Config threaded in, so run_chat resolves
+        // once and reuses it. This test passes a value-bearing Config and proves
+        // the returned values come from the argument, not from a config file on
+        // disk (which the old, arg-less signatures could not have read).
+        let cfg = newt_core::Config {
+            tui: Some(newt_core::TuiConfig {
+                max_tool_rounds: 7,
+                tool_output_lines: 3,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(max_tool_rounds(&cfg), 7);
+        assert_eq!(tool_output_lines(&cfg), 3);
+        assert_eq!(resolve_tui(&cfg).map(|t| t.max_tool_rounds), Some(7));
+
+        // An empty config yields the documented defaults.
+        let empty = newt_core::Config::default();
+        assert_eq!(max_tool_rounds(&empty), 25);
+        assert_eq!(tool_output_lines(&empty), 20);
+        assert_eq!(resolve_tui(&empty), None);
+    }
+
+    #[test]
     fn slash_help_returns_true() {
         assert!(dispatch_slash("/help", "/ws", false, false).unwrap());
     }
@@ -2701,6 +2741,7 @@ mod run_command_confinement_tests {
             &args,
             &ws.path().to_string_lossy(),
             false,
+            20,
             &caveats,
             &mut Mcp::empty(),
         )
@@ -2729,6 +2770,7 @@ mod run_command_confinement_tests {
             &args,
             &ws.path().to_string_lossy(),
             false,
+            20,
             &caveats,
             &mut Mcp::empty(),
         )
@@ -2762,6 +2804,7 @@ mod run_command_confinement_tests {
             &args,
             &ws.path().to_string_lossy(),
             false,
+            20,
             &caveats,
             &mut Mcp::empty(),
         )
@@ -2796,6 +2839,7 @@ mod run_command_confinement_tests {
             &args,
             &ws.path().to_string_lossy(),
             false,
+            20,
             &caveats,
             &mut Mcp::empty(),
         )
@@ -2823,6 +2867,7 @@ mod run_command_confinement_tests {
             &args,
             &ws.path().to_string_lossy(),
             false,
+            20,
             &caveats,
             &mut Mcp::empty(),
         )
@@ -2857,6 +2902,7 @@ mod run_command_confinement_tests {
             &args,
             &ws.path().to_string_lossy(),
             false,
+            20,
             &caveats,
             &mut Mcp::empty(),
         )
@@ -3031,6 +3077,7 @@ mod tool_round_cap_tests {
                 color: false,
                 caveats: &caveats,
                 max_tool_rounds: cap,
+                tool_output_lines: 20,
             },
             &mut Mcp::empty(),
         )
@@ -3074,6 +3121,7 @@ mod tool_round_cap_tests {
                 color: false,
                 caveats: &caveats,
                 max_tool_rounds: cap,
+                tool_output_lines: 20,
             },
             &mut Mcp::empty(),
         )
@@ -3134,6 +3182,7 @@ mod tool_round_cap_tests {
                 color: false,
                 caveats: &caveats,
                 max_tool_rounds: 2,
+                tool_output_lines: 20,
             },
             &mut Mcp::empty(),
         )
