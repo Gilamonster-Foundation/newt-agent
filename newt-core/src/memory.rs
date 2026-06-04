@@ -1030,6 +1030,7 @@ mod tests {
             cost_usd: Some(0.0),
             model_id: "test".into(),
             endpoint: "http://localhost".into(),
+            ..Default::default()
         }
     }
 

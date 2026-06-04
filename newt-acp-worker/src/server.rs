@@ -454,6 +454,7 @@ impl AcpServer {
             cost_usd: pricing.estimate_cost(&reply.model_id, reply.usage.as_ref()),
             model_id: reply.model_id.clone(),
             endpoint: self.backend.endpoint().unwrap_or("unknown").to_string(),
+            ..Default::default()
         };
 
         TaskReply::new(reply.model_id, reply.content, diff, diff_applied)
@@ -517,6 +518,7 @@ impl AcpServer {
             cost_usd: None,
             model_id: run.model_id.clone(),
             endpoint: self.backend.endpoint().unwrap_or("unknown").to_string(),
+            ..Default::default()
         };
         let _ = pricing; // suppress unused warning until token usage is wired
 
