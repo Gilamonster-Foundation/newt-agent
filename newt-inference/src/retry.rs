@@ -105,30 +105,54 @@ impl Default for RetryPolicy {
 }
 
 impl RetryPolicy {
-    /// Build from the environment, falling back to [`RetryPolicy::default`]
-    /// for any unset/invalid var:
+    /// Build from environment variables, falling back to [`RetryPolicy::default`].
+    ///
+    /// Variables (all optional, unset/invalid values are silently ignored):
     /// - `NEWT_HTTP_MAX_RETRIES` — retry count after the first attempt
     /// - `NEWT_HTTP_BACKOFF_BASE_MS` — base delay in milliseconds
     /// - `NEWT_HTTP_BACKOFF_MAX_MS` — ceiling delay in milliseconds
     /// - `NEWT_HTTP_JITTER` — `0`/`false`/`off` disables jitter
     pub fn from_env() -> Self {
-        let mut p = Self::default();
+        Self::from_env_or(Self::default())
+    }
+
+    /// Like [`from_env`](Self::from_env) but starts from `base` instead of
+    /// [`Default`]. Use this when a caller has different default thresholds
+    /// from the crate default but still wants the env vars to override them.
+    pub fn from_env_or(mut base: Self) -> Self {
         if let Some(n) = env_parse::<u32>("NEWT_HTTP_MAX_RETRIES") {
-            p.max_retries = n;
+            base.max_retries = n;
         }
         if let Some(ms) = env_parse::<u64>("NEWT_HTTP_BACKOFF_BASE_MS") {
-            p.base = Duration::from_millis(ms);
+            base.base = Duration::from_millis(ms);
         }
         if let Some(ms) = env_parse::<u64>("NEWT_HTTP_BACKOFF_MAX_MS") {
-            p.max = Duration::from_millis(ms);
+            base.max = Duration::from_millis(ms);
         }
         if let Ok(v) = std::env::var("NEWT_HTTP_JITTER") {
-            p.jitter = !matches!(
+            base.jitter = !matches!(
                 v.trim().to_ascii_lowercase().as_str(),
                 "0" | "false" | "off"
             );
         }
-        p
+        base
+    }
+
+    /// A policy tuned for slow, home-lab local inference endpoints (e.g. a DGX
+    /// that can drop for 30–60 s under load). More patient than the default
+    /// hosted-API policy:
+    /// - 6 retries (7 attempts total)
+    /// - 2 s base doubling to a 30 s ceiling, with jitter
+    /// - Total resilience window: ~90 s
+    ///
+    /// Env-var overrides (`NEWT_HTTP_MAX_RETRIES` etc.) still apply.
+    pub fn for_local_inference() -> Self {
+        Self::from_env_or(Self {
+            max_retries: 6,
+            base: Duration::from_secs(2),
+            max: Duration::from_secs(30),
+            jitter: true,
+        })
     }
 
     /// A zero-delay policy with `max_retries` retries — for tests that want to
@@ -165,16 +189,24 @@ impl RetryPolicy {
     }
 }
 
-/// Drive a fallible async operation under `policy`.
+/// Drive a fallible async operation under `policy`, calling `on_retry` before
+/// each sleep so the caller can log or display a retry indicator.
+///
+/// `on_retry(attempt, delay)` is called synchronously before sleeping:
+/// `attempt` is 1-based (1 = first retry), `delay` is the sleep duration.
 ///
 /// Calls `op` until it succeeds, the error is [`Retryability::Fatal`], or
-/// `policy.max_retries` is exhausted — sleeping `policy.delay_for(attempt)`
-/// between attempts. On exhaustion the *last* error is returned (so the caller
-/// still sees e.g. the final `503`).
-pub async fn with_backoff<T, F, Fut>(policy: &RetryPolicy, mut op: F) -> anyhow::Result<T>
+/// `policy.max_retries` is exhausted. On exhaustion the *last* error is
+/// returned.
+pub async fn with_backoff_notify<T, F, Fut, N>(
+    policy: &RetryPolicy,
+    mut op: F,
+    mut on_retry: N,
+) -> anyhow::Result<T>
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = anyhow::Result<T>>,
+    N: FnMut(u32, Duration),
 {
     let mut retries = 0u32;
     loop {
@@ -186,6 +218,7 @@ where
                 }
                 retries += 1;
                 let delay = policy.delay_for(retries);
+                on_retry(retries, delay);
                 tracing::warn!(
                     attempt = retries,
                     delay_ms = delay.as_millis() as u64,
@@ -196,6 +229,21 @@ where
             }
         }
     }
+}
+
+/// Drive a fallible async operation under `policy`.
+///
+/// Convenience wrapper around [`with_backoff_notify`] with a no-op callback.
+/// Calls `op` until it succeeds, the error is [`Retryability::Fatal`], or
+/// `policy.max_retries` is exhausted — sleeping `policy.delay_for(attempt)`
+/// between attempts. On exhaustion the *last* error is returned (so the caller
+/// still sees e.g. the final `503`).
+pub async fn with_backoff<T, F, Fut>(policy: &RetryPolicy, op: F) -> anyhow::Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = anyhow::Result<T>>,
+{
+    with_backoff_notify(policy, op, |_, _| {}).await
 }
 
 /// Parse an environment variable, returning `None` if unset or unparseable.
@@ -392,5 +440,66 @@ mod tests {
         let e = result.unwrap_err();
         assert!(e.to_string().contains("503"), "last error preserved: {e}");
         assert_eq!(calls.get(), 4, "1 initial + 3 retries");
+    }
+
+    #[tokio::test]
+    async fn with_backoff_notify_fires_callback_before_each_sleep() {
+        let calls = Cell::new(0u32);
+        let notified = Cell::new(0u32);
+        let result: anyhow::Result<&str> = with_backoff_notify(
+            &RetryPolicy::immediate(3),
+            || {
+                let n = calls.get() + 1;
+                calls.set(n);
+                async move {
+                    if n <= 2 {
+                        Err(err("vLLM returned 503 Service Unavailable: down"))
+                    } else {
+                        Ok("ok")
+                    }
+                }
+            },
+            |_, _| {
+                notified.set(notified.get() + 1);
+            },
+        )
+        .await;
+        assert_eq!(result.unwrap(), "ok");
+        assert_eq!(calls.get(), 3, "two retries then success");
+        assert_eq!(
+            notified.get(),
+            2,
+            "callback fired once before each retry sleep"
+        );
+    }
+
+    #[test]
+    fn for_local_inference_is_more_patient_than_default() {
+        let local = RetryPolicy::for_local_inference();
+        let default = RetryPolicy::default();
+        assert!(
+            local.max_retries > default.max_retries,
+            "local policy must allow more retries"
+        );
+        assert!(
+            local.max > default.max,
+            "local policy must have a longer backoff ceiling"
+        );
+    }
+
+    #[test]
+    fn from_env_or_starts_from_provided_base() {
+        // No env vars set — result must equal the base.
+        let base = RetryPolicy {
+            max_retries: 9,
+            base: Duration::from_secs(3),
+            max: Duration::from_secs(60),
+            jitter: false,
+        };
+        let result = RetryPolicy::from_env_or(base.clone());
+        assert_eq!(result.max_retries, 9);
+        assert_eq!(result.base, Duration::from_secs(3));
+        assert_eq!(result.max, Duration::from_secs(60));
+        assert!(!result.jitter);
     }
 }

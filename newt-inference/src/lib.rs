@@ -19,5 +19,5 @@ pub mod pyo3_module;
 
 pub use backend::{ChatReply, ChatRequest, InferenceBackend};
 pub use registry::BackendRegistry;
-pub use retry::RetryPolicy;
+pub use retry::{with_backoff_notify, RetryPolicy};
 pub use stream::{ChatChunk, ChatStream};
