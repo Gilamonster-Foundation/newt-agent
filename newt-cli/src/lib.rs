@@ -47,6 +47,13 @@ pub struct Cli {
     )]
     pub splash: bool,
 
+    /// Enable per-round agent-loop diagnostics: prints each round's content
+    /// excerpt, tool-call count, and token usage. Also enables fallback
+    /// messages when the model returns an empty reply. Equivalent to setting
+    /// `NEWT_DEBUG=1` in the environment or `[tui] debug = true` in newt.toml.
+    #[arg(long, global = true, default_value_t = false)]
+    pub debug: bool,
+
     /// Subcommand to run. Defaults to `code` (TUI coder) when omitted.
     #[command(subcommand)]
     pub command: Option<Command>,
@@ -112,6 +119,12 @@ pub enum Command {
 pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
     match cli.command.unwrap_or(Command::Code { path: None }) {
         Command::Code { path } => {
+            // --debug sets NEWT_DEBUG so debug_mode() in the TUI picks it up
+            // without requiring a run_code signature change.
+            if cli.debug {
+                // SAFETY: single-threaded before the TUI starts any async work.
+                unsafe { std::env::set_var("NEWT_DEBUG", "1") };
+            }
             // Resolve splash preference: CLI flags override config, and
             // --splash overrides --no-splash (enforced by overrides_with).
             let config_no_splash = newt_core::Config::resolve()
