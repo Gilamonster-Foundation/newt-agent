@@ -1,5 +1,6 @@
 //! `newt doctor` — health-check local backends and provider plugins.
 
+use newt_core::dgx::{DgxConfig, EndpointKind};
 use newt_core::Config;
 use newt_inference::local::LocalOllamaBackend;
 use std::path::Path;
@@ -28,6 +29,13 @@ pub async fn run(config_path: Option<&Path>) -> anyhow::Result<()> {
             "  {} (command: {}) — {status}",
             provider.name, provider.command
         );
+    }
+
+    // DGX nodes from [dgx] config section.
+    println!("\nDGX nodes:");
+    match &config.dgx {
+        None => println!("  (none configured)"),
+        Some(dgx) => probe_dgx(dgx).await,
     }
 
     // Also try endpoint discovery.
@@ -80,6 +88,55 @@ pub async fn run(config_path: Option<&Path>) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+async fn probe_dgx(dgx: &DgxConfig) {
+    let active_node_name = dgx.active_node.as_deref();
+    let active_endpoint = dgx.active_endpoint;
+    let active_model = dgx.active_model.as_deref().unwrap_or("(none)");
+
+    if dgx.nodes.is_empty() {
+        println!("  (no nodes — using env overrides only)");
+    }
+
+    for node in &dgx.nodes {
+        let is_active_node = active_node_name.map_or(dgx.nodes.len() == 1, |n| n == node.name);
+        let node_marker = if is_active_node { " [active node]" } else { "" };
+        println!("  {}{node_marker}", node.name);
+
+        for kind in EndpointKind::ALL {
+            let Some(url) = node.endpoint(kind) else {
+                continue;
+            };
+            let is_active_ep = is_active_node && kind == active_endpoint;
+            let active_marker = if is_active_ep { " *" } else { "" };
+            let status = if kind.is_openai_compatible() {
+                probe_vllm(url).await
+            } else {
+                probe_backend(url).await
+            };
+            println!("    {kind} ({url}){active_marker} — {status}");
+        }
+    }
+
+    // Resolve and show the active endpoint URL (may come from env vars too).
+    match dgx.resolve_endpoint() {
+        Ok(url) => println!("  Active: {active_model} @ {active_endpoint} → {url}"),
+        Err(e) => println!("  Active endpoint: unresolved ({e})"),
+    }
+}
+
+async fn probe_vllm(endpoint: &str) -> String {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()
+        .unwrap();
+    let url = format!("{}/v1/models", endpoint.trim_end_matches('/'));
+    match client.get(&url).send().await {
+        Ok(resp) if resp.status().is_success() => "OK".to_string(),
+        Ok(resp) => format!("HTTP {}", resp.status()),
+        Err(e) => format!("unreachable: {e}"),
+    }
 }
 
 async fn probe_backend(endpoint: &str) -> String {
