@@ -2319,6 +2319,7 @@ dependencies = [
  "newt-core",
  "newt-identity",
  "newt-inference",
+ "newt-mcp-client",
  "newt-mcp-server",
  "newt-tools",
  "newt-tui",
@@ -2456,6 +2457,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "newt-mcp-client"
+version = "0.6.6"
+dependencies = [
+ "anyhow",
+ "newt-core",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "newt-mcp-server"
 version = "0.6.6"
 dependencies = [
@@ -2515,11 +2528,13 @@ dependencies = [
  "newt-core",
  "newt-identity",
  "newt-inference",
+ "newt-mcp-client",
  "newt-skills",
  "newt-tools",
  "ratatui",
  "reqwest",
  "rustyline",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",
