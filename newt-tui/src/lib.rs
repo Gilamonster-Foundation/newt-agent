@@ -407,6 +407,47 @@ fn today_date() -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
+// ---------------------------------------------------------------------------
+// File-descriptor hygiene — prevent EMFILE from killing rustyline
+// ---------------------------------------------------------------------------
+
+/// Mark every open fd above stderr (`fd > 2`) as `O_CLOEXEC` so that
+/// subprocesses spawned by `run_command` (via agent-bridle / brush) do NOT
+/// inherit the parent's terminal fd, history file handle, or socket fds.
+///
+/// Call this **after** rustyline and history are initialised so that their
+/// fds are also marked. Safe to call multiple times — already-CLOEXEC fds
+/// are skipped.
+///
+/// macOS returns `LONG_MAX` for `sysconf(_SC_OPEN_MAX)`; we cap the sweep
+/// at 4096 which covers any realistic fd table.
+#[cfg(unix)]
+fn mark_fds_cloexec() {
+    let max = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };
+    let max_fd = if max > 0 {
+        max.min(4096) as libc::c_int
+    } else {
+        256
+    };
+    for fd in 3..max_fd {
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFD);
+            if flags >= 0 && (flags & libc::FD_CLOEXEC == 0) {
+                libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+            }
+        }
+    }
+}
+
+/// Probe whether the fd table has at least one free slot by attempting to
+/// open `/dev/null`. Returns `false` when the process is at EMFILE — i.e.,
+/// the next `open("/dev/tty")` by rustyline would fail and panic.
+///
+/// Uses only `std::fs` (no libc dep) so it compiles on all platforms.
+fn terminal_fd_available() -> bool {
+    std::fs::File::open("/dev/null").is_ok()
+}
+
 /// Whether to show "newt" / "you" labels before the carets.
 fn verbose_mode() -> bool {
     std::env::var("NEWT_CHAT_STYLE")
@@ -945,6 +986,11 @@ fn run_chat(workspace: &str, color: bool) -> anyhow::Result<()> {
     if let Some(ref hp) = history_path {
         let _ = rl.load_history(hp);
     }
+    // Mark all open fds (terminal, history file, sockets) as O_CLOEXEC so
+    // subprocesses spawned by run_command don't inherit them. This is the
+    // primary defence against EMFILE from cargo test / rustc worker floods.
+    #[cfg(unix)]
+    mark_fds_cloexec();
 
     let is_vi = build_rl_config().edit_mode() == rustyline::config::EditMode::Vi;
     let prompt = prompt_str(workspace, verbose, is_vi);
@@ -1063,6 +1109,20 @@ fn run_chat(workspace: &str, color: bool) -> anyhow::Result<()> {
         // `DefaultEditor` state may be inconsistent after a panic, but we
         // immediately `break` out of the loop and drop it rather than
         // continuing to use it.
+        // Layer 2: probe for EMFILE before rustyline tries to open /dev/tty.
+        // Catching the panic (Layer 3 / PR #184) remains as a last resort, but
+        // this check fires first and gives a cleaner message when the fd table
+        // is already full before readline even starts.
+        if !terminal_fd_available() {
+            let _ = disable_raw_mode();
+            eprintln!("\nnewt: EMFILE — file descriptor table is full.");
+            eprintln!("      Too many subprocesses (e.g. cargo test workers) inherited fds.");
+            eprintln!(
+                "      Restart newt. The O_CLOEXEC fix prevents recurrence on rebuilt binaries."
+            );
+            break;
+        }
+
         let readline_result =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rl.readline(&prompt)));
         let readline_result = match readline_result {
@@ -4647,6 +4707,122 @@ mod tool_round_cap_tests {
         assert_eq!(
             hallu, cap as u32,
             "each round had one hallucinated tool call"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// fd_exhaustion_tests — verify O_CLOEXEC marking and EMFILE detection
+// ---------------------------------------------------------------------------
+
+#[cfg(all(test, unix))]
+mod fd_exhaustion_tests {
+    use super::*;
+
+    /// mark_fds_cloexec must never touch stdin/stdout/stderr.
+    #[test]
+    fn mark_fds_cloexec_preserves_stdio() {
+        mark_fds_cloexec();
+        // fds 0-2 must remain open and CLOEXEC-free.
+        for fd in 0..3i32 {
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            assert!(
+                flags >= 0,
+                "stdio fd {fd} must remain open after mark_fds_cloexec"
+            );
+            assert_eq!(
+                flags & libc::FD_CLOEXEC,
+                0,
+                "stdio fd {fd} must not have FD_CLOEXEC set"
+            );
+        }
+    }
+
+    /// A freshly-opened fd that lacks CLOEXEC gets the flag set by mark_fds_cloexec.
+    #[test]
+    fn mark_fds_cloexec_sets_flag_on_new_fd() {
+        let f = std::fs::File::open("/dev/null").expect("open /dev/null");
+        let fd = std::os::unix::io::AsRawFd::as_raw_fd(&f);
+
+        // Ensure CLOEXEC is NOT set initially (it may or may not be,
+        // depending on the std implementation; clear it to be sure).
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFD);
+            libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC);
+        }
+        assert_eq!(
+            unsafe { libc::fcntl(fd, libc::F_GETFD) } & libc::FD_CLOEXEC,
+            0,
+            "pre-condition: CLOEXEC should be clear"
+        );
+
+        mark_fds_cloexec();
+
+        let flags_after = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        assert_ne!(
+            flags_after & libc::FD_CLOEXEC,
+            0,
+            "mark_fds_cloexec must set FD_CLOEXEC on an open fd (fd={fd})"
+        );
+    }
+
+    /// Under normal conditions there is always at least one free fd slot.
+    #[test]
+    fn terminal_fd_available_true_normally() {
+        assert!(
+            terminal_fd_available(),
+            "fd table should have free slots normally"
+        );
+    }
+
+    /// After exhausting the fd table, terminal_fd_available returns false.
+    /// After releasing, it returns true again.
+    #[test]
+    fn terminal_fd_available_false_when_exhausted_then_true_after_release() {
+        // Open files until we hit EMFILE or a reasonable limit.
+        let mut holders: Vec<std::fs::File> = Vec::new();
+        let mut hit_limit = false;
+        for _ in 0..4096 {
+            match std::fs::File::open("/dev/null") {
+                Ok(f) => holders.push(f),
+                Err(e) if e.raw_os_error() == Some(libc::EMFILE) => {
+                    hit_limit = true;
+                    break;
+                }
+                Err(_) => break,
+            }
+        }
+
+        if hit_limit {
+            // At this point the fd table is full.
+            assert!(
+                !terminal_fd_available(),
+                "terminal_fd_available must return false when fd table is full"
+            );
+        }
+
+        // Release all holders — regardless of whether we hit the limit.
+        drop(holders);
+
+        // After release, the fd table has free slots again.
+        assert!(
+            terminal_fd_available(),
+            "terminal_fd_available must return true after releasing fds"
+        );
+    }
+
+    /// mark_fds_cloexec is idempotent — calling it twice changes nothing.
+    #[test]
+    fn mark_fds_cloexec_is_idempotent() {
+        let f = std::fs::File::open("/dev/null").expect("open /dev/null");
+        let fd = std::os::unix::io::AsRawFd::as_raw_fd(&f);
+        mark_fds_cloexec();
+        let flags_first = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        mark_fds_cloexec();
+        let flags_second = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        assert_eq!(
+            flags_first, flags_second,
+            "second call must not change fd flags"
         );
     }
 }
