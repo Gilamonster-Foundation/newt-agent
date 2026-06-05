@@ -2525,6 +2525,7 @@ dependencies = [
  "anyhow",
  "base64",
  "crossterm",
+ "libc",
  "newt-core",
  "newt-identity",
  "newt-inference",

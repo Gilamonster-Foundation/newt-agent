@@ -19,6 +19,7 @@ newt-tools.workspace = true
 newt-skills.workspace = true
 newt-mcp-client.workspace = true
 anyhow.workspace = true
+libc.workspace = true
 rustyline.workspace = true
 tokio.workspace = true
 reqwest.workspace = true
