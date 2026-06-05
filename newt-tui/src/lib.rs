@@ -1573,7 +1573,50 @@ fn trim_for_summary(
         ),
     }));
     result.extend_from_slice(&messages[messages.len() - tail..]);
+    // Anthropic/Bedrock requires every tool_use block to be followed by its
+    // tool_result. Trimming can orphan tool_calls — remove them so strict
+    // backends don't reject the whole request with 400 Bad Request.
+    repair_orphaned_tool_calls(&mut result);
     result
+}
+
+/// Remove assistant messages whose `tool_calls` have no corresponding
+/// `role = "tool"` response immediately following them.
+///
+/// This can happen after `trim_for_summary` cuts the middle of a conversation:
+/// an assistant turn that requested tools may end up with its results dropped.
+/// OpenAI/Ollama are lenient about orphans; Anthropic/Bedrock reject them
+/// with 400 `Expected toolResult blocks`.
+///
+/// Strategy: walk the list. When we find an assistant message with non-empty
+/// `tool_calls`, check whether the NEXT message is `role = "tool"`. If not,
+/// strip `tool_calls` from the assistant message (keeping any `content`) so
+/// it becomes a plain assistant turn the model can reason from.
+fn repair_orphaned_tool_calls(messages: &mut [serde_json::Value]) {
+    let mut i = 0;
+    while i < messages.len() {
+        let has_tool_calls = messages[i]["role"].as_str() == Some("assistant")
+            && messages[i]["tool_calls"]
+                .as_array()
+                .map(|tc| !tc.is_empty())
+                .unwrap_or(false);
+
+        if has_tool_calls {
+            let next_is_tool = messages.get(i + 1).and_then(|m| m["role"].as_str()) == Some("tool");
+
+            if !next_is_tool {
+                // Orphaned: drop tool_calls, keep content if any.
+                if let Some(obj) = messages[i].as_object_mut() {
+                    obj.remove("tool_calls");
+                    // If there's no content either, give it a placeholder so
+                    // the message isn't empty (some backends reject empty turns).
+                    obj.entry("content")
+                        .or_insert_with(|| serde_json::json!("[tool calls omitted]"));
+                }
+            }
+        }
+        i += 1;
+    }
 }
 
 /// Merge two optional token usage readings (e.g. accumulated across rounds).
@@ -4431,6 +4474,91 @@ mod tool_round_cap_tests {
         // head=2, tail=3 → total=5, msgs.len()=4 → no trimming needed
         let trimmed = trim_for_summary(&msgs, 2, 3);
         assert_eq!(trimmed.len(), 4);
+    }
+
+    // -----------------------------------------------------------------------
+    // repair_orphaned_tool_calls tests
+    // -----------------------------------------------------------------------
+
+    /// A complete tool_calls + tool_result pair is left untouched.
+    #[test]
+    fn repair_leaves_matched_tool_calls_intact() {
+        let mut msgs = vec![
+            serde_json::json!({"role": "user", "content": "do it"}),
+            serde_json::json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"function": {"name": "list_dir", "arguments": {}}}]
+            }),
+            serde_json::json!({"role": "tool", "content": "file.rs"}),
+        ];
+        repair_orphaned_tool_calls(&mut msgs);
+        // The assistant message must still have tool_calls.
+        assert!(
+            msgs[1]["tool_calls"].as_array().is_some(),
+            "matched tool_calls must be preserved"
+        );
+    }
+
+    /// An assistant message whose tool_calls have no following tool result
+    /// gets tool_calls stripped — Anthropic/Bedrock would 400 otherwise.
+    #[test]
+    fn repair_strips_orphaned_tool_calls() {
+        let mut msgs = vec![
+            serde_json::json!({"role": "user", "content": "first"}),
+            serde_json::json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"function": {"name": "list_dir", "arguments": {}}}]
+            }),
+            // Placeholder from trim — NOT a tool result.
+            serde_json::json!({"role": "user", "content": "[context omitted]"}),
+            serde_json::json!({"role": "assistant", "content": "done"}),
+        ];
+        repair_orphaned_tool_calls(&mut msgs);
+        assert!(
+            msgs[1].get("tool_calls").is_none(),
+            "orphaned tool_calls must be stripped"
+        );
+        // Content should be preserved or a placeholder injected.
+        assert!(
+            msgs[1]["content"].as_str().is_some(),
+            "assistant message must still have content after stripping tool_calls"
+        );
+    }
+
+    /// trim_for_summary followed by repair produces no orphaned tool_calls,
+    /// matching the Bedrock/Anthropic requirement.
+    #[test]
+    fn trim_then_repair_produces_no_orphans() {
+        // Build a conversation: user → (assistant+tool_calls → tool_result) × 5
+        let mut msgs = vec![serde_json::json!({"role": "user", "content": "task"})];
+        for i in 0..5u32 {
+            msgs.push(serde_json::json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": format!("call_{i}"), "function": {"name": "list_dir", "arguments": {}}}]
+            }));
+            msgs.push(serde_json::json!({"role": "tool", "tool_call_id": format!("call_{i}"), "content": "result"}));
+        }
+        // Trim aggressively (head=1, tail=2) — cuts through tool pairs.
+        let trimmed = trim_for_summary(&msgs, 1, 2);
+        // After trim+repair, no assistant message should have tool_calls
+        // without a following tool message.
+        for (idx, msg) in trimmed.iter().enumerate() {
+            if msg["role"].as_str() == Some("assistant") {
+                if let Some(tc) = msg["tool_calls"].as_array() {
+                    if !tc.is_empty() {
+                        let next_is_tool =
+                            trimmed.get(idx + 1).and_then(|m| m["role"].as_str()) == Some("tool");
+                        assert!(
+                            next_is_tool,
+                            "after trim+repair, every tool_calls must be followed by a tool result (idx={idx})"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// When the final summary 500s, the accumulated usage from the tool rounds
