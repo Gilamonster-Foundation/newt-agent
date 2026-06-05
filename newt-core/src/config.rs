@@ -58,6 +58,41 @@ pub struct Config {
     /// (keep last 7 sessions, no size/age limit).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub logs: Option<LogConfig>,
+
+    /// Cross-harness skill directories for `newt skills share`/`adopt`.
+    /// `None` → Claude Code's default (`~/.claude/skills`) is used and Codex
+    /// has no location (must be set here or via `--codex-dir`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skills: Option<SkillsConfig>,
+}
+
+// ---------------------------------------------------------------------------
+// Cross-harness skill directories
+// ---------------------------------------------------------------------------
+
+/// Where sibling agent harnesses keep their `SKILL.md` folders, so
+/// `newt skills share`/`adopt` can move skills between them.
+///
+/// Skills are the same agentskills.io-format folder in every harness, so this
+/// is purely about *locations*. Claude Code has a well-known default
+/// (`~/.claude/skills`); Codex has no established convention, so it is
+/// **unset** unless configured here (or passed with `--codex-dir`).
+///
+/// Example `~/.newt/config.toml`:
+/// ```toml
+/// [skills]
+/// codex_dir = "~/.codex/skills"
+/// # claude_dir = "~/.claude/skills"   # override the built-in default
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SkillsConfig {
+    /// Claude Code skills directory. `None` → `~/.claude/skills`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub claude_dir: Option<String>,
+    /// Codex skills directory. `None` → unset (no Codex default).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub codex_dir: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -720,6 +755,7 @@ impl Default for Config {
             memory: None,
             mcp_servers: Vec::new(),
             logs: None,
+            skills: None,
         }
     }
 }

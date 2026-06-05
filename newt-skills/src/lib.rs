@@ -420,6 +420,133 @@ pub fn load_body(skills_dir: impl AsRef<Path>, name: &str) -> anyhow::Result<Str
     Ok(out)
 }
 
+// ---------------------------------------------------------------------------
+// Install / share / adopt — moving a skill folder between harness directories
+// ---------------------------------------------------------------------------
+
+/// How a skill folder is materialised at its destination.
+///
+/// A skill is the same `SKILL.md`-format folder everywhere (newt, Claude Code,
+/// Codex), so "sharing" a skill across harnesses is just placing that folder
+/// where each harness looks — either an independent [`Copy`](InstallMode::Copy)
+/// or a single-source [`Link`](InstallMode::Link).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallMode {
+    /// Recursively copy the skill folder — an independent duplicate. Edits in
+    /// one harness do not propagate to the others.
+    Copy,
+    /// Symlink the destination at the source — a single source of truth, so an
+    /// edit is seen by every harness. **Unix only** (returns an error
+    /// elsewhere); copy is the portable default.
+    Link,
+}
+
+/// Install the skill folder `src` into `dest_root/<name>`.
+///
+/// This is the one primitive behind `newt skills install` (local path →
+/// `~/.newt/skills`), `share` (newt → Claude/Codex), and `adopt`
+/// (Claude/Codex → newt): they differ only in which `src`/`dest_root` they
+/// pass.
+///
+/// `src` must be a directory containing a parseable `SKILL.md`. `name`
+/// overrides the destination folder name (defaults to `src`'s folder name).
+/// With [`InstallMode::Copy`] the whole folder (SKILL.md + bundled files) is
+/// copied recursively; with [`InstallMode::Link`] a symlink `dest -> src` is
+/// created. An existing destination is an error unless `force` (which replaces
+/// it). Returns the destination path.
+///
+/// # Errors
+/// Returns an error when `src` has no parseable `SKILL.md`, when the
+/// destination exists and `force` is false, or when the filesystem operation
+/// fails (including [`InstallMode::Link`] on a non-Unix platform).
+pub fn install_skill(
+    src: &Path,
+    dest_root: &Path,
+    name: Option<&str>,
+    mode: InstallMode,
+    force: bool,
+) -> anyhow::Result<PathBuf> {
+    // Validate the source really is a skill before touching the destination.
+    let manifest = src.join("SKILL.md");
+    let text = std::fs::read_to_string(&manifest)
+        .with_context(|| format!("no SKILL.md found in {}", src.display()))?;
+    let parsed = Skill::parse(&text, src)
+        .with_context(|| format!("invalid SKILL.md in {}", src.display()))?;
+
+    let folder = match name {
+        Some(n) => n.to_string(),
+        None => src
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| parsed.name.clone()),
+    };
+    let dest = dest_root.join(&folder);
+
+    if dest.exists() || std::fs::symlink_metadata(&dest).is_ok() {
+        if !force {
+            return Err(anyhow!(
+                "destination already exists: {} (pass --force to replace it)",
+                dest.display()
+            ));
+        }
+        remove_path(&dest)?;
+    }
+    std::fs::create_dir_all(dest_root)
+        .with_context(|| format!("could not create {}", dest_root.display()))?;
+
+    match mode {
+        InstallMode::Copy => copy_dir(src, &dest)?,
+        InstallMode::Link => symlink_dir(src, &dest)?,
+    }
+    Ok(dest)
+}
+
+/// Remove a path whether it's a symlink, file, or directory.
+fn remove_path(p: &Path) -> anyhow::Result<()> {
+    let meta =
+        std::fs::symlink_metadata(p).with_context(|| format!("could not stat {}", p.display()))?;
+    if meta.file_type().is_symlink() || meta.is_file() {
+        std::fs::remove_file(p)
+    } else {
+        std::fs::remove_dir_all(p)
+    }
+    .with_context(|| format!("could not remove {}", p.display()))
+}
+
+/// Recursively copy directory `src` into `dest` (created if absent).
+fn copy_dir(src: &Path, dest: &Path) -> anyhow::Result<()> {
+    std::fs::create_dir_all(dest)
+        .with_context(|| format!("could not create {}", dest.display()))?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let from = entry.path();
+        let to = dest.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir(&from, &to)?;
+        } else {
+            std::fs::copy(&from, &to)
+                .with_context(|| format!("could not copy {}", from.display()))?;
+        }
+    }
+    Ok(())
+}
+
+/// Symlink `dest` → `src` (absolute, so it survives a CWD change). Unix only.
+#[cfg(unix)]
+fn symlink_dir(src: &Path, dest: &Path) -> anyhow::Result<()> {
+    let abs = std::fs::canonicalize(src)
+        .with_context(|| format!("could not resolve {}", src.display()))?;
+    std::os::unix::fs::symlink(&abs, dest)
+        .with_context(|| format!("could not symlink {} -> {}", dest.display(), abs.display()))
+}
+
+#[cfg(not(unix))]
+fn symlink_dir(_src: &Path, _dest: &Path) -> anyhow::Result<()> {
+    Err(anyhow!(
+        "--link (symlink) is only supported on Unix; re-run without --link to copy"
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -583,5 +710,117 @@ mod tests {
     #[test]
     fn index_block_empty_when_no_skills() {
         assert!(index_block(&[]).is_none());
+    }
+
+    // --- install_skill ----------------------------------------------------
+
+    /// Write a minimal valid skill folder `<root>/<name>/` with a bundled file.
+    fn make_skill(root: &Path, name: &str) -> PathBuf {
+        let dir = root.join(name);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: test skill {name}.\n---\nBody.\n"),
+        )
+        .unwrap();
+        fs::write(dir.join("helper.sh"), "echo hi\n").unwrap();
+        dir
+    }
+
+    #[test]
+    fn install_copy_duplicates_folder_and_bundled_files() {
+        let tmp = tempdir().unwrap();
+        let src = make_skill(tmp.path(), "commit-style");
+        let dest_root = tmp.path().join("dest");
+        let dest = install_skill(&src, &dest_root, None, InstallMode::Copy, false).unwrap();
+
+        assert_eq!(dest, dest_root.join("commit-style"));
+        assert!(dest.join("SKILL.md").is_file());
+        assert!(dest.join("helper.sh").is_file());
+        // It's a real copy, not a link.
+        assert!(!fs::symlink_metadata(&dest)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        // And it's discoverable at the destination.
+        assert_eq!(discover(&dest_root).len(), 1);
+    }
+
+    #[test]
+    fn install_honours_name_override() {
+        let tmp = tempdir().unwrap();
+        let src = make_skill(tmp.path(), "commit-style");
+        let dest_root = tmp.path().join("dest");
+        let dest =
+            install_skill(&src, &dest_root, Some("renamed"), InstallMode::Copy, false).unwrap();
+        assert_eq!(dest, dest_root.join("renamed"));
+        assert!(dest.join("SKILL.md").is_file());
+    }
+
+    #[test]
+    fn install_rejects_existing_dest_without_force() {
+        let tmp = tempdir().unwrap();
+        let src = make_skill(tmp.path(), "commit-style");
+        let dest_root = tmp.path().join("dest");
+        install_skill(&src, &dest_root, None, InstallMode::Copy, false).unwrap();
+        let err = install_skill(&src, &dest_root, None, InstallMode::Copy, false).unwrap_err();
+        assert!(err.to_string().contains("already exists"));
+    }
+
+    #[test]
+    fn install_force_replaces_existing() {
+        let tmp = tempdir().unwrap();
+        let src = make_skill(tmp.path(), "commit-style");
+        let dest_root = tmp.path().join("dest");
+        install_skill(&src, &dest_root, None, InstallMode::Copy, false).unwrap();
+        // Add a stray file in the destination, then force-replace and confirm
+        // the old contents are gone.
+        fs::write(dest_root.join("commit-style").join("stale.txt"), "x").unwrap();
+        install_skill(&src, &dest_root, None, InstallMode::Copy, true).unwrap();
+        assert!(!dest_root.join("commit-style").join("stale.txt").exists());
+        assert!(dest_root.join("commit-style").join("SKILL.md").is_file());
+    }
+
+    #[test]
+    fn install_rejects_non_skill_source() {
+        let tmp = tempdir().unwrap();
+        let not_a_skill = tmp.path().join("nope");
+        fs::create_dir_all(&not_a_skill).unwrap();
+        let dest_root = tmp.path().join("dest");
+        let err =
+            install_skill(&not_a_skill, &dest_root, None, InstallMode::Copy, false).unwrap_err();
+        assert!(err.to_string().contains("no SKILL.md"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_link_creates_symlink_to_source() {
+        let tmp = tempdir().unwrap();
+        let src = make_skill(tmp.path(), "commit-style");
+        let dest_root = tmp.path().join("dest");
+        let dest = install_skill(&src, &dest_root, None, InstallMode::Link, false).unwrap();
+        assert!(fs::symlink_metadata(&dest)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        // Editing through the link is visible at the source (single source).
+        assert!(dest.join("SKILL.md").is_file());
+        assert_eq!(discover(&dest_root).len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_force_replaces_a_symlink() {
+        let tmp = tempdir().unwrap();
+        let src = make_skill(tmp.path(), "commit-style");
+        let dest_root = tmp.path().join("dest");
+        install_skill(&src, &dest_root, None, InstallMode::Link, false).unwrap();
+        // Force-replacing a symlinked dest with a copy must remove the link
+        // cleanly (not recurse into the source).
+        let dest = install_skill(&src, &dest_root, None, InstallMode::Copy, true).unwrap();
+        assert!(!fs::symlink_metadata(&dest)
+            .unwrap()
+            .file_type()
+            .is_symlink());
     }
 }

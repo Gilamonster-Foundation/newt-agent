@@ -134,8 +134,46 @@ Skills compose with the bridle leash (`docs/decisions/agentic_object_capability_
 - Per-skill caveats **meet-enforcement** into the live session.
 - A `/skills` slash command (list/inspect installed skills).
 - Skills **shipped with** newt (bundled defaults).
-- An `install`/`add` command for fetching skills.
+- ~~An `install`/`add` command for fetching skills.~~ **Done** — see
+  *Cross-harness skill management* below.
 - Per-workspace skill overlays.
+
+## Cross-harness skill management (`newt skills`)
+
+**Status:** Accepted · **Date:** 2026-06-05
+
+Because a skill is the same `SKILL.md` folder in every harness, "sharing" a
+skill is just placing that folder where each harness looks. The `newt skills`
+subcommand group does exactly that — no format translation, ever:
+
+| command                       | does                                              |
+|-------------------------------|---------------------------------------------------|
+| `newt skills list`            | list skills in `~/.newt/skills`                   |
+| `newt skills install <path>`  | bring a local skill folder into `~/.newt/skills`  |
+| `newt skills share <name>`    | export a newt skill → Claude Code and/or Codex    |
+| `newt skills adopt <name>`    | import a Claude/Codex skill → newt                |
+
+All four are one primitive, `newt_skills::install_skill(src, dest_root, name,
+mode, force)` — they differ only in which source/destination directories the
+CLI passes.
+
+**Directories.** newt = `~/.newt/skills`; Claude Code = `~/.claude/skills`
+(built-in default, since that convention is well-established and already byte
+-compatible with newt's parser); **Codex has no default** — there is no
+established Codex skills location, so a Codex target requires
+`[skills].codex_dir` in `~/.newt/config.toml` or a `--codex-dir` flag, and
+errors clearly when neither is set. Precedence is **flag > config > default**.
+`newt skills share --to all` writes to every *configured* harness, so it never
+fails just because Codex is unset.
+
+**Copy by default, `--link` to opt in.** A share/adopt **copies** the folder
+(independent duplicates) so a harness that rewrites skill files can't corrupt
+the others. `--link` symlinks instead (a single source of truth — edit once,
+every harness sees it; Unix only). Copy is the portable default; the link is
+there for operators who want their skills to have exactly one home.
+
+This realizes the portability thesis: the user's procedural knowledge is the
+sky, not newt's to lock up. A skill authored anywhere flows to everywhere.
 
 ## Why this shape
 
