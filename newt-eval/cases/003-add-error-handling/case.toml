@@ -23,10 +23,11 @@ expected_patterns = [
 ]
 
 [mock_response]
-content = """
+content = """diff --git a/src/lib.rs b/src/lib.rs
+index 353f811..5f8448d 100644
 --- a/src/lib.rs
 +++ b/src/lib.rs
-@@ -1,12 +1,12 @@
+@@ -1,13 +1,13 @@
 -pub fn parse(s: &str) -> i32 {
 -    s.parse().unwrap()
 +pub fn parse(s: &str) -> Result<i32, std::num::ParseIntError> {

@@ -39,6 +39,18 @@ just install-hooks # wire .githooks/ as core.hooksPath
 - PR body must include "What this PR does", "Test plan", "Out of scope".
 - The pre-push hook runs `just check` + `just cov-ci`. Don't bypass it.
 
+## Model attribution
+
+- If an LLM materially contributes to a commit, identify it with a
+  `Co-authored-by` trailer in the commit message.
+- Use the model/tool identity the session is actually running under. Do not
+  credit a generic "AI Assistant".
+- Known trailers:
+  - `Co-authored-by: Codex <codex@openai.com>`
+  - `Co-authored-by: Claude Opus 4.8 (1M context) <noreply@anthropic.com>`
+- If multiple LLMs contribute to the same commit, include one trailer per
+  contributing model.
+
 ## Coverage floor
 
 Ratchets up, never down. Bootstrap is 15% (current scaffold). Target

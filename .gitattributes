@@ -1,0 +1,13 @@
+# Normalize all text files to LF in the repository and in every checkout, on
+# all platforms. This repo is developed on Linux/macOS (already LF), so this is
+# zero-churn — it simply prevents Windows checkouts (core.autocrlf=true) from
+# rewriting text to CRLF.
+#
+# Why this matters: the newt-eval bundled cases store unified diffs in
+# `cases/**/case.toml`, which are fed verbatim to `git apply --check`. With
+# CRLF line endings git rejects them as "corrupt patch" (the `\r` becomes part
+# of the patch body). Rust source, fixtures, and scripts are all LF-sensitive
+# here, so we pin LF rather than chase per-file tolerance.
+#
+# `text=auto` still auto-detects binary files (NUL bytes) and leaves them alone.
+* text=auto eol=lf

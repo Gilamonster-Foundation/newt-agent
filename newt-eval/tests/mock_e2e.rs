@@ -128,6 +128,10 @@ fn ensure_worker_built() {
         .output();
 }
 
+fn worker_exe_name() -> String {
+    format!("newt{}", std::env::consts::EXE_SUFFIX)
+}
+
 /// Locate the `newt` binary in the workspace's `target/` dir.
 ///
 /// Searches cargo target directories in priority order:
@@ -153,7 +157,7 @@ fn locate_worker_bin() -> PathBuf {
 
     for tdir in &target_dirs {
         for profile in ["debug", "release"] {
-            let candidate = tdir.join(profile).join("newt");
+            let candidate = tdir.join(profile).join(worker_exe_name());
             if candidate.exists() {
                 return candidate;
             }
@@ -167,5 +171,5 @@ fn locate_worker_bin() -> PathBuf {
         .map(|m| m.target_directory.into_std_path_buf())
         .unwrap_or_else(|| workspace_root.join("target"))
         .join("debug")
-        .join("newt")
+        .join(worker_exe_name())
 }

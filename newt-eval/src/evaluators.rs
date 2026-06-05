@@ -102,8 +102,15 @@ impl Evaluator for DiffAppliesEvaluator {
         // Pipe the diff to `git apply --check`. env_remove() ensures the
         // check targets `scratch`, not whichever repo the caller's
         // inherited GIT_DIR points at.
+        //
+        // `--ignore-space-change` makes the check tolerant of CRLF/LF and
+        // whitespace-run differences so a worker diff still validates across
+        // platforms (Windows checkouts are CRLF). Trade-off: the evaluator no
+        // longer rejects a diff that ONLY differs by whitespace — acceptable
+        // here, since we are gating "does a real change apply", not whitespace
+        // fidelity.
         let mut child = match Command::new("git")
-            .args(["apply", "--check"])
+            .args(["apply", "--check", "--ignore-space-change"])
             .current_dir(scratch.path())
             .env_remove("GIT_DIR")
             .env_remove("GIT_WORK_TREE")
@@ -159,6 +166,7 @@ impl Evaluator for DiffAppliesEvaluator {
 fn select_apply_target(ctx: &EvalContext) -> (String, &'static str) {
     if let Some(raw) = ctx.reply.raw_emission.as_deref() {
         let mut stripped = strip_outer_fences(raw);
+        stripped = stripped.trim_start_matches(['\r', '\n']).to_string();
         if looks_like_unified_diff(&stripped) {
             // `strip_outer_fences` trims the trailing newline (along with any
             // closing fence); `git apply` wants one on the final hunk line.
