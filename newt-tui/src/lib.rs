@@ -1051,7 +1051,30 @@ fn run_chat(workspace: &str, color: bool) -> anyhow::Result<()> {
     }
 
     loop {
-        match rl.readline(&prompt) {
+        // rustyline can panic (assertion `fd != -1`) when the terminal file
+        // descriptor becomes invalid — most commonly from file-descriptor
+        // exhaustion after spawning many subprocesses (e.g., `cargo test`
+        // with multiple compile workers). Without this guard the panic
+        // propagates through a non-unwindable tokio boundary and the process
+        // aborts with no useful message.
+        //
+        // `catch_unwind` catches the panic before it reaches that boundary and
+        // converts it into a clean exit. `AssertUnwindSafe` is safe here:
+        // `DefaultEditor` state may be inconsistent after a panic, but we
+        // immediately `break` out of the loop and drop it rather than
+        // continuing to use it.
+        let readline_result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rl.readline(&prompt)));
+        let readline_result = match readline_result {
+            Ok(r) => r,
+            Err(_panic) => {
+                let _ = disable_raw_mode();
+                eprintln!("\nnewt: terminal error — readline panicked (likely fd exhaustion).");
+                eprintln!("      Restart newt. If this recurs, reduce concurrent subprocesses.");
+                break;
+            }
+        };
+        match readline_result {
             Ok(line) => {
                 let task = line.trim().to_string();
                 if task.is_empty() {
