@@ -56,6 +56,51 @@ just install-hooks # wire .githooks/ as core.hooksPath
 Ratchets up, never down. Bootstrap is 15% (current scaffold). Target
 is 80% per the roadmap.
 
+## Ground truth — verify every action
+
+After every action, confirm what actually happened. Do not proceed on
+assumptions. Beliefs are not ground truth; tool results are.
+
+| Belief | Ground-truth check |
+|---|---|
+| "I wrote the file" | Tool reports line count — does it match intent? |
+| "The code compiles" | Build check runs automatically after file writes (if configured) |
+| "I'm on branch X" | `git branch --show-current` |
+| "My test passes" | `cargo test -p <crate> <test_name>` |
+| "I committed" | `git log --oneline -1` |
+| "The edit applied" | `edit_file` returns new line count — verify it |
+
+**Never commit if any of the above are uncertain.**
+
+## File editing rules
+
+- **Prefer `edit_file` over `write_file`** for any existing file.
+  You only generate the change, not the whole 4,000-line file.
+  Regenerating a large file from memory is where hallucination strikes.
+- `write_file` has a shrink guard: refuses if the proposed write removes
+  more than 30% of lines. This exists because of an observed failure
+  where a model replaced a 4,247-line file with 107 lines.
+- After `write_file` or `edit_file`, read the returned line count.
+
+## TDD discipline
+
+1. Write the failing test first. Verify it fails.
+2. Write the minimum code to make it pass.
+3. Verify it passes (`cargo test`).
+4. Run `just check` — zero warnings, all tests green.
+5. Commit.
+
+## Auto build-check (recommended)
+
+Add to `.newt/config.toml` in this workspace to enable automatic
+`cargo check` after every file write — the model sees the build result
+inline without needing to ask:
+
+```toml
+[tui]
+build_check_cmd = "cargo check -q --workspace"
+```
+
 ## When in doubt
 
 Read `docs/ROADMAP.md`. If a step's "Out of scope" says no, it means
