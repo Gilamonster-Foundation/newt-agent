@@ -10,6 +10,7 @@
 mod config_cmd;
 mod dgx;
 mod doctor;
+mod skills;
 pub mod stdio_guard;
 
 use clap::{Parser, Subcommand};
@@ -120,6 +121,12 @@ pub enum Command {
     /// endpoint, preview, and write ~/.newt/config.toml. Unlike `init` (which
     /// silently auto-probes Ollama), this prompts the human through each choice.
     Setup,
+    /// Manage skills across a configurable search path (newt + Claude Code +
+    /// Codex + …). `list` / `install <path>` / `share`.
+    Skills {
+        #[command(subcommand)]
+        cmd: skills::SkillsCmd,
+    },
     /// NVIDIA DGX endpoint management (route a task to a formation; more
     /// subcommands land in later Phase 14 steps).
     Dgx {
@@ -161,6 +168,7 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         Command::Config => config_cmd::run(cli.config.as_deref()),
         Command::Init => newt_tui::run_init(newt_tui::color_supported()),
         Command::Setup => newt_tui::run_setup(newt_tui::color_supported()),
+        Command::Skills { cmd } => skills::run(cmd, cli.config.as_deref()),
         Command::Dgx { cmd } => dgx::run(cmd, cli.config.as_deref()).await,
     }
 }

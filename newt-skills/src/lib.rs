@@ -379,6 +379,54 @@ pub fn discover_default() -> Vec<Skill> {
     }
 }
 
+/// Discover skills across an ordered **search path** of directories — the union
+/// of every `<dir>/*/SKILL.md`, deduplicated by name with **earlier
+/// directories winning** a collision (so a newt-owned or project-local skill
+/// shadows one of the same name found later in the path). Missing directories
+/// are skipped. The result is sorted by name for a deterministic index,
+/// matching [`discover`].
+///
+/// Use [`discover_paths_with_shadows`] when you need to *report* which
+/// duplicates were shadowed (e.g. `newt skills list`).
+pub fn discover_paths(dirs: &[impl AsRef<Path>]) -> Vec<Skill> {
+    discover_paths_with_shadows(dirs).0
+}
+
+/// Like [`discover_paths`], but also returns the **shadowed** duplicates: skills
+/// that lost a name collision to an earlier directory. Each shadowed entry is
+/// the losing [`Skill`] (its [`Skill::dir`] tells you where it came from), so a
+/// caller can warn "`<name>` in <dir> is shadowed by an earlier copy".
+pub fn discover_paths_with_shadows(dirs: &[impl AsRef<Path>]) -> (Vec<Skill>, Vec<Skill>) {
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut winners: Vec<Skill> = Vec::new();
+    let mut shadowed: Vec<Skill> = Vec::new();
+    for dir in dirs {
+        for skill in discover(dir) {
+            // First occurrence (earliest dir in the path) wins; any later
+            // skill of the same name is shadowed, never silently merged.
+            if seen.insert(skill.name.clone()) {
+                winners.push(skill);
+            } else {
+                shadowed.push(skill);
+            }
+        }
+    }
+    winners.sort_by(|a, b| a.name.cmp(&b.name));
+    (winners, shadowed)
+}
+
+/// Load a skill body by name across an ordered search path, honouring the same
+/// **earlier-directory-wins** precedence as [`discover_paths`]. Returns an error
+/// when no directory in the path contains a skill of that name.
+pub fn load_body_from(dirs: &[impl AsRef<Path>], name: &str) -> anyhow::Result<String> {
+    for dir in dirs {
+        if dir.as_ref().join(name).join("SKILL.md").is_file() {
+            return load_body(dir, name);
+        }
+    }
+    Err(anyhow!("unknown skill: '{name}'"))
+}
+
 /// Build the progressive-disclosure index block for the system prompt, or
 /// `None` when no skills are installed. ONLY names + descriptions (+ when_to_use)
 /// — never bodies.
@@ -418,6 +466,133 @@ pub fn load_body(skills_dir: impl AsRef<Path>, name: &str) -> anyhow::Result<Str
         }
     }
     Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// Install / share / adopt — moving a skill folder between harness directories
+// ---------------------------------------------------------------------------
+
+/// How a skill folder is materialised at its destination.
+///
+/// A skill is the same `SKILL.md`-format folder everywhere (newt, Claude Code,
+/// Codex), so "sharing" a skill across harnesses is just placing that folder
+/// where each harness looks — either an independent [`Copy`](InstallMode::Copy)
+/// or a single-source [`Link`](InstallMode::Link).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallMode {
+    /// Recursively copy the skill folder — an independent duplicate. Edits in
+    /// one harness do not propagate to the others.
+    Copy,
+    /// Symlink the destination at the source — a single source of truth, so an
+    /// edit is seen by every harness. **Unix only** (returns an error
+    /// elsewhere); copy is the portable default.
+    Link,
+}
+
+/// Install the skill folder `src` into `dest_root/<name>`.
+///
+/// This is the one primitive behind `newt skills install` (local path →
+/// `~/.newt/skills`), `share` (newt → Claude/Codex), and `adopt`
+/// (Claude/Codex → newt): they differ only in which `src`/`dest_root` they
+/// pass.
+///
+/// `src` must be a directory containing a parseable `SKILL.md`. `name`
+/// overrides the destination folder name (defaults to `src`'s folder name).
+/// With [`InstallMode::Copy`] the whole folder (SKILL.md + bundled files) is
+/// copied recursively; with [`InstallMode::Link`] a symlink `dest -> src` is
+/// created. An existing destination is an error unless `force` (which replaces
+/// it). Returns the destination path.
+///
+/// # Errors
+/// Returns an error when `src` has no parseable `SKILL.md`, when the
+/// destination exists and `force` is false, or when the filesystem operation
+/// fails (including [`InstallMode::Link`] on a non-Unix platform).
+pub fn install_skill(
+    src: &Path,
+    dest_root: &Path,
+    name: Option<&str>,
+    mode: InstallMode,
+    force: bool,
+) -> anyhow::Result<PathBuf> {
+    // Validate the source really is a skill before touching the destination.
+    let manifest = src.join("SKILL.md");
+    let text = std::fs::read_to_string(&manifest)
+        .with_context(|| format!("no SKILL.md found in {}", src.display()))?;
+    let parsed = Skill::parse(&text, src)
+        .with_context(|| format!("invalid SKILL.md in {}", src.display()))?;
+
+    let folder = match name {
+        Some(n) => n.to_string(),
+        None => src
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| parsed.name.clone()),
+    };
+    let dest = dest_root.join(&folder);
+
+    if dest.exists() || std::fs::symlink_metadata(&dest).is_ok() {
+        if !force {
+            return Err(anyhow!(
+                "destination already exists: {} (pass --force to replace it)",
+                dest.display()
+            ));
+        }
+        remove_path(&dest)?;
+    }
+    std::fs::create_dir_all(dest_root)
+        .with_context(|| format!("could not create {}", dest_root.display()))?;
+
+    match mode {
+        InstallMode::Copy => copy_dir(src, &dest)?,
+        InstallMode::Link => symlink_dir(src, &dest)?,
+    }
+    Ok(dest)
+}
+
+/// Remove a path whether it's a symlink, file, or directory.
+fn remove_path(p: &Path) -> anyhow::Result<()> {
+    let meta =
+        std::fs::symlink_metadata(p).with_context(|| format!("could not stat {}", p.display()))?;
+    if meta.file_type().is_symlink() || meta.is_file() {
+        std::fs::remove_file(p)
+    } else {
+        std::fs::remove_dir_all(p)
+    }
+    .with_context(|| format!("could not remove {}", p.display()))
+}
+
+/// Recursively copy directory `src` into `dest` (created if absent).
+fn copy_dir(src: &Path, dest: &Path) -> anyhow::Result<()> {
+    std::fs::create_dir_all(dest)
+        .with_context(|| format!("could not create {}", dest.display()))?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let from = entry.path();
+        let to = dest.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir(&from, &to)?;
+        } else {
+            std::fs::copy(&from, &to)
+                .with_context(|| format!("could not copy {}", from.display()))?;
+        }
+    }
+    Ok(())
+}
+
+/// Symlink `dest` → `src` (absolute, so it survives a CWD change). Unix only.
+#[cfg(unix)]
+fn symlink_dir(src: &Path, dest: &Path) -> anyhow::Result<()> {
+    let abs = std::fs::canonicalize(src)
+        .with_context(|| format!("could not resolve {}", src.display()))?;
+    std::os::unix::fs::symlink(&abs, dest)
+        .with_context(|| format!("could not symlink {} -> {}", dest.display(), abs.display()))
+}
+
+#[cfg(not(unix))]
+fn symlink_dir(_src: &Path, _dest: &Path) -> anyhow::Result<()> {
+    Err(anyhow!(
+        "--link (symlink) is only supported on Unix; re-run without --link to copy"
+    ))
 }
 
 #[cfg(test)]
@@ -583,5 +758,193 @@ mod tests {
     #[test]
     fn index_block_empty_when_no_skills() {
         assert!(index_block(&[]).is_none());
+    }
+
+    // --- install_skill ----------------------------------------------------
+
+    /// Write a minimal valid skill folder `<root>/<name>/` with a bundled file.
+    fn make_skill(root: &Path, name: &str) -> PathBuf {
+        let dir = root.join(name);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: test skill {name}.\n---\nBody.\n"),
+        )
+        .unwrap();
+        fs::write(dir.join("helper.sh"), "echo hi\n").unwrap();
+        dir
+    }
+
+    #[test]
+    fn install_copy_duplicates_folder_and_bundled_files() {
+        let tmp = tempdir().unwrap();
+        let src = make_skill(tmp.path(), "commit-style");
+        let dest_root = tmp.path().join("dest");
+        let dest = install_skill(&src, &dest_root, None, InstallMode::Copy, false).unwrap();
+
+        assert_eq!(dest, dest_root.join("commit-style"));
+        assert!(dest.join("SKILL.md").is_file());
+        assert!(dest.join("helper.sh").is_file());
+        // It's a real copy, not a link.
+        assert!(!fs::symlink_metadata(&dest)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        // And it's discoverable at the destination.
+        assert_eq!(discover(&dest_root).len(), 1);
+    }
+
+    #[test]
+    fn install_honours_name_override() {
+        let tmp = tempdir().unwrap();
+        let src = make_skill(tmp.path(), "commit-style");
+        let dest_root = tmp.path().join("dest");
+        let dest =
+            install_skill(&src, &dest_root, Some("renamed"), InstallMode::Copy, false).unwrap();
+        assert_eq!(dest, dest_root.join("renamed"));
+        assert!(dest.join("SKILL.md").is_file());
+    }
+
+    #[test]
+    fn install_rejects_existing_dest_without_force() {
+        let tmp = tempdir().unwrap();
+        let src = make_skill(tmp.path(), "commit-style");
+        let dest_root = tmp.path().join("dest");
+        install_skill(&src, &dest_root, None, InstallMode::Copy, false).unwrap();
+        let err = install_skill(&src, &dest_root, None, InstallMode::Copy, false).unwrap_err();
+        assert!(err.to_string().contains("already exists"));
+    }
+
+    #[test]
+    fn install_force_replaces_existing() {
+        let tmp = tempdir().unwrap();
+        let src = make_skill(tmp.path(), "commit-style");
+        let dest_root = tmp.path().join("dest");
+        install_skill(&src, &dest_root, None, InstallMode::Copy, false).unwrap();
+        // Add a stray file in the destination, then force-replace and confirm
+        // the old contents are gone.
+        fs::write(dest_root.join("commit-style").join("stale.txt"), "x").unwrap();
+        install_skill(&src, &dest_root, None, InstallMode::Copy, true).unwrap();
+        assert!(!dest_root.join("commit-style").join("stale.txt").exists());
+        assert!(dest_root.join("commit-style").join("SKILL.md").is_file());
+    }
+
+    #[test]
+    fn install_rejects_non_skill_source() {
+        let tmp = tempdir().unwrap();
+        let not_a_skill = tmp.path().join("nope");
+        fs::create_dir_all(&not_a_skill).unwrap();
+        let dest_root = tmp.path().join("dest");
+        let err =
+            install_skill(&not_a_skill, &dest_root, None, InstallMode::Copy, false).unwrap_err();
+        assert!(err.to_string().contains("no SKILL.md"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_link_creates_symlink_to_source() {
+        let tmp = tempdir().unwrap();
+        let src = make_skill(tmp.path(), "commit-style");
+        let dest_root = tmp.path().join("dest");
+        let dest = install_skill(&src, &dest_root, None, InstallMode::Link, false).unwrap();
+        assert!(fs::symlink_metadata(&dest)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        // Editing through the link is visible at the source (single source).
+        assert!(dest.join("SKILL.md").is_file());
+        assert_eq!(discover(&dest_root).len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_force_replaces_a_symlink() {
+        let tmp = tempdir().unwrap();
+        let src = make_skill(tmp.path(), "commit-style");
+        let dest_root = tmp.path().join("dest");
+        install_skill(&src, &dest_root, None, InstallMode::Link, false).unwrap();
+        // Force-replacing a symlinked dest with a copy must remove the link
+        // cleanly (not recurse into the source).
+        let dest = install_skill(&src, &dest_root, None, InstallMode::Copy, true).unwrap();
+        assert!(!fs::symlink_metadata(&dest)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    // --- discover_paths / load_body_from ---------------------------------
+
+    #[test]
+    fn discover_paths_unions_dirs_and_sorts() {
+        let tmp = tempdir().unwrap();
+        let a = tmp.path().join("a");
+        let b = tmp.path().join("b");
+        make_skill(&a, "alpha");
+        make_skill(&b, "beta");
+        let found = discover_paths(&[a, b]);
+        let names: Vec<&str> = found.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["alpha", "beta"]);
+    }
+
+    #[test]
+    fn discover_paths_first_dir_wins_and_reports_shadows() {
+        let tmp = tempdir().unwrap();
+        let first = tmp.path().join("first");
+        let second = tmp.path().join("second");
+        // Same name in both dirs; `first` precedes `second` on the path.
+        make_skill(&first, "dup");
+        make_skill(&second, "dup");
+        make_skill(&second, "unique");
+
+        let (winners, shadowed) = discover_paths_with_shadows(&[first.clone(), second.clone()]);
+        let names: Vec<&str> = winners.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["dup", "unique"]);
+        // The winning `dup` came from `first`.
+        let dup = winners.iter().find(|s| s.name == "dup").unwrap();
+        assert_eq!(dup.dir, first.join("dup"));
+        // The `second` copy is reported as shadowed, not dropped.
+        assert_eq!(shadowed.len(), 1);
+        assert_eq!(shadowed[0].name, "dup");
+        assert_eq!(shadowed[0].dir, second.join("dup"));
+    }
+
+    #[test]
+    fn discover_paths_skips_missing_dirs() {
+        let tmp = tempdir().unwrap();
+        let real = tmp.path().join("real");
+        make_skill(&real, "alpha");
+        let missing = tmp.path().join("does-not-exist");
+        assert_eq!(discover_paths(&[missing, real]).len(), 1);
+    }
+
+    #[test]
+    fn load_body_from_honours_first_dir_wins() {
+        let tmp = tempdir().unwrap();
+        let first = tmp.path().join("first");
+        let second = tmp.path().join("second");
+        fs::create_dir_all(first.join("dup")).unwrap();
+        fs::write(
+            first.join("dup").join("SKILL.md"),
+            "---\nname: dup\ndescription: d.\n---\nFIRST BODY.\n",
+        )
+        .unwrap();
+        fs::create_dir_all(second.join("dup")).unwrap();
+        fs::write(
+            second.join("dup").join("SKILL.md"),
+            "---\nname: dup\ndescription: d.\n---\nSECOND BODY.\n",
+        )
+        .unwrap();
+
+        let body = load_body_from(&[first, second], "dup").unwrap();
+        assert!(body.contains("FIRST BODY."));
+        assert!(!body.contains("SECOND BODY."));
+    }
+
+    #[test]
+    fn load_body_from_errors_for_unknown_skill() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path().join("d");
+        make_skill(&dir, "alpha");
+        assert!(load_body_from(&[dir], "missing").is_err());
     }
 }

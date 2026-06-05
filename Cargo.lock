@@ -2321,6 +2321,7 @@ dependencies = [
  "newt-inference",
  "newt-mcp-client",
  "newt-mcp-server",
+ "newt-skills",
  "newt-tools",
  "newt-tui",
  "predicates",
