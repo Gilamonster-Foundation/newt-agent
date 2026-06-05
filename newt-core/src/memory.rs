@@ -902,6 +902,13 @@ Only use write_file when creating a new file or when you have generated the \
 complete contents in full. write_file will refuse if the new content is \
 significantly shorter than the original.\n\
 \n\
+**Stop when blocked.** If the same tool call fails twice in a row with the \
+same error, stop immediately and tell the user what blocked you and why. \
+Do not try alternative installation methods, do not loop, do not pivot to \
+answering a different question. Two identical failures are a signal to report, \
+not to retry. One sentence explaining the block is worth more than ten more \
+failed tool calls.\n\
+\n\
 **Seek ground truth.** After every action, verify what actually happened — \
 not what you intended. Do not proceed on assumptions about your own actions; \
 confirm them. After writing a file, the tool reports the new line count — \
