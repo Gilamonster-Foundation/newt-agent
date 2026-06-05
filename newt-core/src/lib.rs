@@ -23,7 +23,7 @@ pub use agent_mesh_protocol::{Caveats, CountBound, Scope};
 pub use caveats::{CaveatsExt, CountBoundExt, ScopeExt};
 pub use config::{
     BackendConfig, BackendKind, ChatStyle, Config, EditMode, LogConfig, MemoryConfig,
-    MemoryProviderKind, PermissionPreset, ToolPermissions, TuiConfig,
+    MemoryProviderKind, PermissionPreset, SkillsConfig, ToolPermissions, TuiConfig,
 };
 pub use dgx::{DgxConfig, DgxFormation, DgxNode, DgxNotConfigured, EndpointKind};
 pub use error::NewtError;

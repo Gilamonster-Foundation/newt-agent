@@ -134,8 +134,64 @@ Skills compose with the bridle leash (`docs/decisions/agentic_object_capability_
 - Per-skill caveats **meet-enforcement** into the live session.
 - A `/skills` slash command (list/inspect installed skills).
 - Skills **shipped with** newt (bundled defaults).
-- An `install`/`add` command for fetching skills.
-- Per-workspace skill overlays.
+- ~~An `install`/`add` command for fetching skills.~~ **Done** — see
+  *Cross-harness skills* below.
+- ~~Per-workspace / per-harness skill discovery.~~ **Done** — the search path
+  (below) covers it.
+
+## Cross-harness skills: a discovery **search path**
+
+**Status:** Accepted · **Date:** 2026-06-05
+
+A skill is the same `SKILL.md` folder in every harness (newt, Claude Code,
+Codex, …). The cheapest way to use a skill everywhere is therefore **not** to
+copy it around — it's to point newt at the directories the other harnesses
+already use. Discovery reads a configurable, ordered **search path**:
+
+```toml
+# ~/.newt/config.toml
+[skills]
+search = ["~/.newt/skills", "~/.claude/skills", "~/.codex/skills"]
+```
+
+newt scans the **union** of these directories. Default (no `[skills]` block) is
+the single host-scoped `~/.newt/skills`, so existing behaviour is unchanged
+until you opt in. The list is **open-ended on purpose**: there is no hard-coded
+knowledge of any specific harness — Claude, Codex, a project-local `.skills/`,
+and a future hermes-thoon dir are all just entries. This is the no-lock-in
+principle applied to discovery: newt doesn't privilege a vendor.
+
+**Collision rule: first directory wins (`$PATH` semantics).** When the same
+skill `name` exists in two directories, the one in the **earlier** entry wins
+and is the copy shown in the prompt index *and* loaded by `use_skill`. Skills
+are **never merged**. The losing copy is **shadowed**, not silently dropped:
+`discover_paths_with_shadows` returns it so `newt skills list` prints a
+`note: '<name>' in <dir> is shadowed …` line. Put your most-trusted / most
+-specific directory first.
+
+### The `newt skills` commands
+
+| command                              | does                                                   |
+|--------------------------------------|--------------------------------------------------------|
+| `newt skills list`                   | list skills across the search path (+ shadow warnings) |
+| `newt skills install <path> [--into <dir>]` | bring a local skill folder onto the path (default: first dir) |
+| `newt skills share <name> --to <dir> [--from <dir>]` | copy a skill into another dir |
+
+`list` and discovery solve the **read** side — once a directory is on the path,
+its skills are visible with zero copying, which is why there is no `adopt`
+verb. `share` solves the only thing a search path can't: a harness that reads
+**only its own** directory (Claude reads `~/.claude/skills`, Codex its own) will
+not see a newt-authored skill until the folder is physically placed there. Both
+`install` and `share` are one primitive — `newt_skills::install_skill(src,
+dest_root, name, mode, force)` — differing only in source/destination.
+
+**Copy by default, `--link` to opt in.** A copy makes independent duplicates so
+a harness that rewrites skill files can't corrupt the others; `--link` symlinks
+instead (a single source of truth — edit once, every harness sees it; Unix
+only). Targets are plain directory paths — no per-harness names anywhere.
+
+This realizes the portability thesis: the user's procedural knowledge is the
+sky, not newt's to lock up. Point newt at where your skills already live.
 
 ## Why this shape
 

@@ -1361,12 +1361,13 @@ fn build_system_prompt(workspace: &str) -> String {
 }
 
 /// Build the progressive-disclosure skills index block for the system prompt
-/// from the skills under `skills_dir` (names + descriptions only, never bodies),
-/// or `None` when no skills are installed. Split out from
+/// from the skills found across `skills_dirs` (names + descriptions only, never
+/// bodies), or `None` when no skills are installed. Uses the same ordered,
+/// first-directory-wins union as discovery. Split out from
 /// [`build_system_prompt_with_soul`] so the injection can be unit-tested against
-/// a controlled directory without mutating the process-wide `$HOME`.
-fn skills_index_for_prompt(skills_dir: &std::path::Path) -> Option<String> {
-    newt_skills::index_block(&newt_skills::discover(skills_dir))
+/// controlled directories without mutating the process-wide `$HOME`.
+fn skills_index_for_prompt(skills_dirs: &[std::path::PathBuf]) -> Option<String> {
+    newt_skills::index_block(&newt_skills::discover_paths(skills_dirs))
 }
 
 fn build_system_prompt_with_soul(workspace: &str, soul: Option<&str>) -> String {
@@ -1378,12 +1379,14 @@ fn build_system_prompt_with_soul(workspace: &str, soul: Option<&str>) -> String 
     // Progressive disclosure: inject ONLY the skills index (one
     // `name: description` line per installed skill) — never the bodies.
     // Bodies load on demand when the model calls the `use_skill` tool. Skills
-    // are host-scoped under ~/.newt/skills; a missing dir = no index.
-    if let Some(dir) = newt_skills::default_skills_dir() {
-        if let Some(index) = skills_index_for_prompt(&dir) {
-            ctx.push('\n');
-            ctx.push_str(&index);
-        }
+    // come from the configured search path (`[skills].search`, default
+    // `~/.newt/skills`); a missing dir contributes nothing.
+    let skills_dirs = newt_core::Config::resolve()
+        .map(|c| c.skill_search_dirs())
+        .unwrap_or_default();
+    if let Some(index) = skills_index_for_prompt(&skills_dirs) {
+        ctx.push('\n');
+        ctx.push_str(&index);
     }
 
     // Directory listing (top-level, no hidden files)
@@ -2280,15 +2283,17 @@ async fn execute_tool(
         "use_skill" => {
             let skill_name = args["name"].as_str().unwrap_or("");
             print_tool_call("use_skill", skill_name, color);
-            // Reads from the host-scoped ~/.newt/skills. This is a read of
+            // Reads from the configured skill search path. This is a read of
             // trusted operator config (procedural knowledge), not an exec of
             // arbitrary code, so it is NOT leash-gated — any SCRIPTS the skill
             // bundles still run through `run_command`'s confined shell and are
-            // governed by the session caveats.
-            let Some(dir) = newt_skills::default_skills_dir() else {
-                return "error: could not resolve ~/.newt/skills (is $HOME set?)".to_string();
-            };
-            match newt_skills::load_body(&dir, skill_name) {
+            // governed by the session caveats. The same first-directory-wins
+            // precedence as the index means we load the copy the model was
+            // actually shown.
+            let dirs = newt_core::Config::resolve()
+                .map(|c| c.skill_search_dirs())
+                .unwrap_or_default();
+            match newt_skills::load_body_from(&dirs, skill_name) {
                 Ok(body) => {
                     print_tool_output(&body, tool_output_lines, color);
                     body
@@ -4190,7 +4195,7 @@ mod skills_integration_tests {
         let tmp = tempfile::TempDir::new().unwrap();
         write_skill(tmp.path(), "commit-style", "How this repo writes commits");
 
-        let block = skills_index_for_prompt(tmp.path()).expect("an index block");
+        let block = skills_index_for_prompt(&[tmp.path().to_path_buf()]).expect("an index block");
         assert!(block.contains("Available skills (call `use_skill` to load one):"));
         assert!(block.contains("commit-style: How this repo writes commits"));
         // Progressive disclosure: the body must NOT appear in the index.
@@ -4200,7 +4205,25 @@ mod skills_integration_tests {
     #[test]
     fn system_prompt_index_is_none_when_no_skills() {
         let tmp = tempfile::TempDir::new().unwrap();
-        assert!(skills_index_for_prompt(tmp.path()).is_none());
+        assert!(skills_index_for_prompt(&[tmp.path().to_path_buf()]).is_none());
+    }
+
+    #[test]
+    fn system_prompt_index_unions_search_path_first_dir_wins() {
+        // A skill of the same name in two dirs: the first dir on the path wins.
+        let a = tempfile::TempDir::new().unwrap();
+        let b = tempfile::TempDir::new().unwrap();
+        write_skill(a.path(), "commit-style", "newt copy");
+        write_skill(b.path(), "commit-style", "claude copy");
+        write_skill(b.path(), "judge", "scoring");
+
+        let block = skills_index_for_prompt(&[a.path().to_path_buf(), b.path().to_path_buf()])
+            .expect("an index block");
+        // First dir's description wins; second dir's same-named skill is shadowed.
+        assert!(block.contains("commit-style: newt copy"));
+        assert!(!block.contains("claude copy"));
+        // But unique skills from later dirs are still included.
+        assert!(block.contains("judge: scoring"));
     }
 
     #[test]

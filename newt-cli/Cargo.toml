@@ -23,6 +23,7 @@ path = "src/lib.rs"
 [dependencies]
 newt-core.workspace = true
 newt-inference.workspace = true
+newt-skills.workspace = true
 newt-tools.workspace = true
 newt-tui.workspace = true
 newt-acp-worker.workspace = true
