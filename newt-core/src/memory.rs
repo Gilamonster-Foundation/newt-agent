@@ -900,7 +900,16 @@ every token spent reading is a token not spent writing.\n\
 to replace a specific string — you only generate the change, not the whole file. \
 Only use write_file when creating a new file or when you have generated the \
 complete contents in full. write_file will refuse if the new content is \
-significantly shorter than the original.";
+significantly shorter than the original.\n\
+\n\
+**Seek ground truth.** After every action, verify what actually happened — \
+not what you intended. Do not proceed on assumptions about your own actions; \
+confirm them. After writing a file, the tool reports the new line count — \
+check it matches what you expected. After editing code, the tool reports \
+whether it compiled — if it did not, fix the error before committing. \
+Before committing, confirm you are on the right branch. \
+A belief that something worked is worthless; a tool result that confirms it \
+is ground truth.";
 
 /// Loads an agent identity from a Markdown soul file and injects it as a
 /// frozen system-prompt block.

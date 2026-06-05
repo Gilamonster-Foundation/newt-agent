@@ -1144,6 +1144,7 @@ fn run_chat(workspace: &str, color: bool) -> anyhow::Result<()> {
                                 connect_timeout_secs: connect_timeout_secs(&cfg),
                                 inference_timeout_secs: inference_timeout_secs(&cfg),
                                 mid_loop_trim_threshold: mid_loop_trim_threshold(&cfg),
+                                build_check_cmd: build_check_cmd(&cfg),
                             },
                             &mut mcp,
                         ))
@@ -1662,6 +1663,31 @@ fn mid_loop_trim_threshold(cfg: &newt_core::Config) -> usize {
         .unwrap_or(40)
 }
 
+/// Build-check command from `[tui].build_check_cmd`. `None` means no auto-check.
+fn build_check_cmd(cfg: &newt_core::Config) -> Option<String> {
+    cfg.tui.as_ref().and_then(|t| t.build_check_cmd.clone())
+}
+
+/// Run the configured build-check command in `workspace` and return a compact
+/// result string appended to the tool output so the model sees it immediately.
+fn run_build_check(cmd: &str, workspace: &str) -> String {
+    let result = std::process::Command::new("sh")
+        .args(["-c", cmd])
+        .current_dir(workspace)
+        .output();
+    match result {
+        Ok(out) if out.status.success() => "  ✓ build check passed".to_string(),
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let combined = format!("{stdout}{stderr}");
+            let excerpt: String = combined.lines().take(8).collect::<Vec<_>>().join("\n");
+            format!("  ✗ build check failed:\n{excerpt}")
+        }
+        Err(e) => format!("  ⚠ build check could not run: {e}"),
+    }
+}
+
 /// Print tool output truncated to the configured line limit.
 /// The model always receives the full content regardless.
 fn print_tool_output(output: &str, max_lines: usize, color: bool) {
@@ -1789,6 +1815,7 @@ fn envelope_denial_reason_with_guidance(envelope: &serde_json::Value) -> String 
 /// interceptor's `before_exec` / `before_open` gate). The fs tools
 /// (`read_file` / `write_file` / `list_dir`) keep enforcing the same `caveats`
 /// via `permits_*` — rerouting them is out of scope.
+#[allow(clippy::too_many_arguments)]
 async fn execute_tool(
     name: &str,
     args: &serde_json::Value,
@@ -1797,6 +1824,7 @@ async fn execute_tool(
     tool_output_lines: usize,
     caveats: &newt_core::caveats::Caveats,
     mcp: &mut Mcp,
+    build_check_cmd: Option<&str>,
 ) -> String {
     // Remote MCP tools (namespaced `server__tool`) route to their server before
     // the built-in match. They carry no Caveats leash in this build.
@@ -1967,8 +1995,12 @@ async fn execute_tool(
                 }
                 match std::fs::write(&full, content) {
                     Ok(_) => {
-                        println!("✓ wrote {path}");
-                        format!("wrote {path}")
+                        let line_count = content.lines().count();
+                        println!("✓ wrote {path} ({line_count} lines)");
+                        let check = build_check_cmd
+                            .map(|cmd| run_build_check(cmd, workspace))
+                            .unwrap_or_default();
+                        format!("wrote {path} ({line_count} lines){check}")
                     }
                     Err(e) => format!("error writing {path}: {e}"),
                 }
@@ -2022,8 +2054,11 @@ async fn execute_tool(
             print_tool_call("edit_file", &format!("{path} ({delta_str} lines)"), color);
             match std::fs::write(&full, &updated) {
                 Ok(_) => {
-                    println!("✓ edited {path}");
-                    format!("edited {path} ({delta_str} lines)")
+                    println!("✓ edited {path} ({delta_str} lines, now {new_lines} total)");
+                    let check = build_check_cmd
+                        .map(|cmd| run_build_check(cmd, workspace))
+                        .unwrap_or_default();
+                    format!("edited {path} ({delta_str} lines, now {new_lines} total){check}")
                 }
                 Err(e) => format!("error writing {path}: {e}"),
             }
@@ -2158,6 +2193,10 @@ struct ChatCtx<'a> {
     /// Message list size at which the agent trims the middle of the in-flight
     /// conversation to prevent context overflow mid-turn.
     mid_loop_trim_threshold: usize,
+    /// Shell command run after every successful file write to give the model
+    /// immediate ground-truth feedback (e.g. "cargo check -q --workspace").
+    /// `None` disables auto-checking. Set per-workspace in `.newt/config.toml`.
+    build_check_cmd: Option<String>,
 }
 
 /// Main agentic loop: call model → execute tool calls → feed results back → repeat.
@@ -2189,6 +2228,7 @@ async fn chat_complete(
         connect_timeout_secs,
         inference_timeout_secs,
         mid_loop_trim_threshold,
+        build_check_cmd,
     } = ctx;
     let client = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(connect_timeout_secs))
@@ -2429,6 +2469,7 @@ async fn chat_complete(
                 tool_output_lines,
                 caveats,
                 mcp,
+                build_check_cmd.as_deref(),
             )
             .await;
             messages.push(serde_json::json!({
@@ -2653,6 +2694,7 @@ async fn openai_chat_complete(
         connect_timeout_secs,
         inference_timeout_secs,
         mid_loop_trim_threshold,
+        build_check_cmd,
     } = ctx;
     let client = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(connect_timeout_secs))
@@ -2794,6 +2836,7 @@ async fn openai_chat_complete(
                 tool_output_lines,
                 caveats,
                 mcp,
+                build_check_cmd.as_deref(),
             )
             .await;
             messages.push(serde_json::json!({
@@ -3710,6 +3753,7 @@ mod run_command_confinement_tests {
             20,
             &caveats,
             &mut Mcp::empty(),
+            None,
         )
         .await;
         assert!(
@@ -3740,6 +3784,7 @@ mod run_command_confinement_tests {
             20,
             &caveats,
             &mut Mcp::empty(),
+            None,
         )
         .await;
         assert!(
@@ -3829,6 +3874,7 @@ mod run_command_confinement_tests {
             20,
             &caveats,
             &mut Mcp::empty(),
+            None,
         )
         .await;
 
@@ -3864,6 +3910,7 @@ mod run_command_confinement_tests {
             20,
             &caveats,
             &mut Mcp::empty(),
+            None,
         )
         .await;
         assert_eq!(out, "hello", "read_file must still return file contents");
@@ -3892,6 +3939,7 @@ mod run_command_confinement_tests {
             20,
             &caveats,
             &mut Mcp::empty(),
+            None,
         )
         .await;
         assert!(
@@ -3927,6 +3975,7 @@ mod run_command_confinement_tests {
             20,
             &caveats,
             &mut Mcp::empty(),
+            None,
         )
         .await;
         assert!(out.contains("one.txt") && out.contains("two.txt"));
@@ -4118,6 +4167,7 @@ mod tool_round_cap_tests {
                 connect_timeout_secs: 5,
                 inference_timeout_secs: 120,
                 mid_loop_trim_threshold: 40,
+                build_check_cmd: None,
             },
             &mut Mcp::empty(),
         )
@@ -4167,6 +4217,7 @@ mod tool_round_cap_tests {
                 connect_timeout_secs: 5,
                 inference_timeout_secs: 120,
                 mid_loop_trim_threshold: 40,
+                build_check_cmd: None,
             },
             &mut Mcp::empty(),
         )
@@ -4233,6 +4284,7 @@ mod tool_round_cap_tests {
                 connect_timeout_secs: 5,
                 inference_timeout_secs: 120,
                 mid_loop_trim_threshold: 40,
+                build_check_cmd: None,
             },
             &mut Mcp::empty(),
         )
@@ -4271,6 +4323,7 @@ mod tool_round_cap_tests {
                 20,
                 &caveats,
                 &mut Mcp::empty(),
+                None,
             )
             .await;
             assert!(
@@ -4414,6 +4467,7 @@ mod tool_round_cap_tests {
                 connect_timeout_secs: 5,
                 inference_timeout_secs: 120,
                 mid_loop_trim_threshold: 40,
+                build_check_cmd: None,
             },
             &mut Mcp::empty(),
         )
