@@ -227,6 +227,25 @@ pub struct TuiConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub debug: Option<bool>,
 
+    /// Shell command to run after every successful file write or edit, to
+    /// give the agent immediate ground-truth feedback on whether its change
+    /// compiled / passed basic checks. Output is appended to the tool result
+    /// so the model sees it without needing to ask.
+    ///
+    /// Set this per-workspace in `.newt/config.toml` — not globally — because
+    /// the right command depends on the project's build system:
+    ///
+    /// ```toml
+    /// [tui]
+    /// build_check_cmd = "cargo check -q --workspace"  # Rust
+    /// # build_check_cmd = "npm run build --silent"    # Node
+    /// # build_check_cmd = "python -m py_compile"      # Python
+    /// ```
+    ///
+    /// `None` (default) disables auto-checking — no extra command is run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_check_cmd: Option<String>,
+
     // -----------------------------------------------------------------------
     // DGX / inference endpoint resource management
     // -----------------------------------------------------------------------
@@ -557,6 +576,7 @@ impl Default for TuiConfig {
             max_tool_rounds: default_max_tool_rounds(),
             permissions: ToolPermissions::default(),
             debug: None,
+            build_check_cmd: None,
             num_ctx: None,
             connect_timeout_secs: default_connect_timeout_secs(),
             inference_timeout_secs: default_inference_timeout_secs(),
