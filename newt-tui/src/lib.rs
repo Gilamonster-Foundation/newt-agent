@@ -7,6 +7,7 @@
 
 mod mcp;
 pub mod probe;
+mod setup;
 mod wizard;
 
 use mcp::Mcp;
@@ -17,6 +18,13 @@ use newt_inference::retry::{with_backoff_notify, RetryPolicy};
 /// anything else.
 pub fn run_init(color: bool) -> anyhow::Result<()> {
     wizard::run_init(color)
+}
+
+/// Run the interactive setup wizard — used by `newt setup`. Asks where the
+/// model runs (local Ollama or a remote DGX endpoint), probes for installed
+/// models, and writes `~/.newt/config.toml` after a preview + confirmation.
+pub fn run_setup(color: bool) -> anyhow::Result<()> {
+    setup::run(color)
 }
 
 use std::io::{self, IsTerminal, Write as _};

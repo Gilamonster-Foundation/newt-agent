@@ -2539,6 +2539,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "toml",
  "tracing",
  "wiremock",
 ]

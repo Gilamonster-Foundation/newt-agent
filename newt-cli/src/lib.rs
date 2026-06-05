@@ -116,6 +116,10 @@ pub enum Command {
     /// Run (or re-run) the setup wizard: probe Ollama + write ~/.newt/config.toml.
     /// Edit that file directly for everything else — newt has no settings UI.
     Init,
+    /// Interactive first-run setup: choose Ollama or DGX, pick a model from the
+    /// endpoint, preview, and write ~/.newt/config.toml. Unlike `init` (which
+    /// silently auto-probes Ollama), this prompts the human through each choice.
+    Setup,
     /// NVIDIA DGX endpoint management (route a task to a formation; more
     /// subcommands land in later Phase 14 steps).
     Dgx {
@@ -156,6 +160,7 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         Command::Doctor => doctor::run(cli.config.as_deref()).await,
         Command::Config => config_cmd::run(cli.config.as_deref()),
         Command::Init => newt_tui::run_init(newt_tui::color_supported()),
+        Command::Setup => newt_tui::run_setup(newt_tui::color_supported()),
         Command::Dgx { cmd } => dgx::run(cmd, cli.config.as_deref()).await,
     }
 }
