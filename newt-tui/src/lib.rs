@@ -1174,6 +1174,11 @@ fn run_chat(workspace: &str, color: bool) -> anyhow::Result<()> {
                     if let Some(ref hp) = history_path {
                         let _ = rl.save_history(hp);
                     }
+                    // Skip config reload and terminal reinit when exiting — unnecessary
+                    // work that can hang if the terminal is in a degraded state.
+                    if !cont {
+                        break;
+                    }
                     // Re-read config after a slash command (config.toml may have changed).
                     // This is the ONE intentional refresh — re-resolve `cfg` so the
                     // session picks up edits, then derive everything from it.
@@ -1196,9 +1201,6 @@ fn run_chat(workspace: &str, color: bool) -> anyhow::Result<()> {
                     rl = rustyline::DefaultEditor::with_config(fresh_cfg)?;
                     if let Some(ref hp) = history_path {
                         let _ = rl.load_history(hp);
-                    }
-                    if !cont {
-                        break;
                     }
                 } else if matches!(task.as_str(), "exit" | "quit") {
                     break;
@@ -1640,43 +1642,95 @@ fn trim_for_summary(
     result
 }
 
-/// Remove assistant messages whose `tool_calls` have no corresponding
-/// `role = "tool"` response immediately following them.
+/// Remove or neutralise tool-call/result messages that form an incomplete pair
+/// after `trim_for_summary` cuts the middle of a conversation.
 ///
-/// This can happen after `trim_for_summary` cuts the middle of a conversation:
-/// an assistant turn that requested tools may end up with its results dropped.
-/// OpenAI/Ollama are lenient about orphans; Anthropic/Bedrock reject them
-/// with 400 `Expected toolResult blocks`.
+/// Two failure modes that Anthropic/Bedrock reject with 400:
 ///
-/// Strategy: walk the list. When we find an assistant message with non-empty
-/// `tool_calls`, check whether the NEXT message is `role = "tool"`. If not,
-/// strip `tool_calls` from the assistant message (keeping any `content`) so
-/// it becomes a plain assistant turn the model can reason from.
-fn repair_orphaned_tool_calls(messages: &mut [serde_json::Value]) {
-    let mut i = 0;
-    while i < messages.len() {
-        let has_tool_calls = messages[i]["role"].as_str() == Some("assistant")
-            && messages[i]["tool_calls"]
-                .as_array()
-                .map(|tc| !tc.is_empty())
-                .unwrap_or(false);
+/// 1. **Partial results** — an assistant message has `tool_calls: [tc1, tc2]` but
+///    only `tc1`'s `role="tool"` result survived trimming.  LiteLLM converts
+///    *both* IDs to Bedrock `tool_use` blocks; Bedrock then complains that
+///    `tc2` has no matching `tool_result`.  The previous check (`next message
+///    is role="tool"`) was not sufficient — it didn't verify every ID.
+///
+/// 2. **Orphaned results** — a `role="tool"` message lands at the start of the
+///    tail with no preceding assistant `tool_calls` (its assistant turn was
+///    dropped).  Some LiteLLM/Bedrock versions reject unmatched results too.
+///
+/// Strategy:
+///   Pass 1 — for each assistant with `tool_calls`, verify every ID has a
+///             `role="tool"` result anywhere in the list; if any are missing,
+///             strip **all** `tool_calls` from that assistant turn.
+///   Pass 2 — remove every `role="tool"` message whose `tool_call_id` is not
+///             referenced by any remaining assistant `tool_calls`.
+fn repair_orphaned_tool_calls(messages: &mut Vec<serde_json::Value>) {
+    // Build the set of tool_call IDs for which a role="tool" result exists.
+    let result_ids: std::collections::HashSet<String> = messages
+        .iter()
+        .filter(|m| m["role"].as_str() == Some("tool"))
+        .filter_map(|m| m["tool_call_id"].as_str().map(|s| s.to_string()))
+        .collect();
 
-        if has_tool_calls {
-            let next_is_tool = messages.get(i + 1).and_then(|m| m["role"].as_str()) == Some("tool");
+    // Pass 1: determine which assistant messages need their tool_calls stripped,
+    // then apply the changes in a second pass to avoid conflicting borrows.
+    let roles: Vec<Option<String>> = messages
+        .iter()
+        .map(|m| m["role"].as_str().map(|s| s.to_string()))
+        .collect();
 
-            if !next_is_tool {
-                // Orphaned: drop tool_calls, keep content if any.
-                if let Some(obj) = messages[i].as_object_mut() {
-                    obj.remove("tool_calls");
-                    // If there's no content either, give it a placeholder so
-                    // the message isn't empty (some backends reject empty turns).
-                    obj.entry("content")
-                        .or_insert_with(|| serde_json::json!("[tool calls omitted]"));
-                }
+    let strip_indices: std::collections::HashSet<usize> = messages
+        .iter()
+        .enumerate()
+        .filter_map(|(i, msg)| {
+            if msg["role"].as_str() != Some("assistant") {
+                return None;
             }
+            let tool_calls = msg["tool_calls"].as_array()?;
+            if tool_calls.is_empty() {
+                return None;
+            }
+            let ids: Vec<String> = tool_calls
+                .iter()
+                .filter_map(|tc| tc["id"].as_str().map(|s| s.to_string()))
+                .collect();
+            let should_strip = if ids.is_empty() {
+                // No IDs: fall back to positional check.
+                roles.get(i + 1).and_then(|r| r.as_deref()) != Some("tool")
+            } else {
+                !ids.iter().all(|id| result_ids.contains(id))
+            };
+            should_strip.then_some(i)
+        })
+        .collect();
+
+    for i in strip_indices {
+        if let Some(obj) = messages[i].as_object_mut() {
+            obj.remove("tool_calls");
+            obj.entry("content")
+                .or_insert_with(|| serde_json::json!("[tool calls omitted]"));
         }
-        i += 1;
     }
+
+    // Pass 2: remove role="tool" messages with no matching assistant tool_calls.
+    let live_call_ids: std::collections::HashSet<String> = messages
+        .iter()
+        .filter(|m| m["role"].as_str() == Some("assistant"))
+        .filter_map(|m| m["tool_calls"].as_array())
+        .flat_map(|tc| tc.iter())
+        .filter_map(|tc| tc["id"].as_str().map(|s| s.to_string()))
+        .collect();
+
+    messages.retain(|m| {
+        if m["role"].as_str() != Some("tool") {
+            return true;
+        }
+        // Keep tool results with no ID (malformed but harmless).
+        // Only drop results whose explicit ID has no matching live tool_call.
+        match m["tool_call_id"].as_str() {
+            Some(id) if !id.is_empty() => live_call_ids.contains(id),
+            _ => true,
+        }
+    });
 }
 
 /// Merge two optional token usage readings (e.g. accumulated across rounds).
@@ -4603,22 +4657,85 @@ mod tool_round_cap_tests {
         }
         // Trim aggressively (head=1, tail=2) — cuts through tool pairs.
         let trimmed = trim_for_summary(&msgs, 1, 2);
-        // After trim+repair, no assistant message should have tool_calls
-        // without a following tool message.
-        for (idx, msg) in trimmed.iter().enumerate() {
+        // After trim+repair, every remaining tool_calls must have ALL its IDs
+        // covered by a role="tool" result present somewhere in the list.
+        let result_ids: std::collections::HashSet<String> = trimmed
+            .iter()
+            .filter(|m| m["role"].as_str() == Some("tool"))
+            .filter_map(|m| m["tool_call_id"].as_str().map(|s| s.to_string()))
+            .collect();
+        for msg in &trimmed {
             if msg["role"].as_str() == Some("assistant") {
                 if let Some(tc) = msg["tool_calls"].as_array() {
-                    if !tc.is_empty() {
-                        let next_is_tool =
-                            trimmed.get(idx + 1).and_then(|m| m["role"].as_str()) == Some("tool");
+                    for call in tc {
+                        let id = call["id"].as_str().unwrap_or("");
                         assert!(
-                            next_is_tool,
-                            "after trim+repair, every tool_calls must be followed by a tool result (idx={idx})"
+                            result_ids.contains(id),
+                            "after trim+repair, tool_call id={id:?} has no matching tool result"
                         );
                     }
                 }
             }
         }
+    }
+
+    /// Regression: assistant with TWO tool_calls where only the first result
+    /// survives trimming must have ALL tool_calls stripped (not just partially).
+    /// The old code checked only "next message is role=tool" — this was enough
+    /// for single-call rounds but missed the second ID in a multi-call round,
+    /// causing Bedrock to return 400 "Expected toolResult blocks".
+    #[test]
+    fn repair_strips_partial_tool_call_results() {
+        // Simulate trim output: assistant called tc_a + tc_b but only tc_a's
+        // result survived — tc_b was dropped in the middle.
+        let mut msgs = vec![
+            serde_json::json!({"role": "user", "content": "task"}),
+            serde_json::json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "tc_a", "function": {"name": "read_file", "arguments": {}}},
+                    {"id": "tc_b", "function": {"name": "list_dir",  "arguments": {}}}
+                ]
+            }),
+            // Only tc_a's result is present; tc_b's was trimmed.
+            serde_json::json!({"role": "tool", "tool_call_id": "tc_a", "content": "file content"}),
+            serde_json::json!({"role": "assistant", "content": "done"}),
+        ];
+        repair_orphaned_tool_calls(&mut msgs);
+        // The incomplete assistant must have tool_calls stripped.
+        assert!(
+            msgs[1].get("tool_calls").is_none(),
+            "partial tool_calls (tc_b missing) must be stripped"
+        );
+        // The now-orphaned tc_a result must also be removed.
+        let has_orphaned_result = msgs.iter().any(|m| {
+            m["role"].as_str() == Some("tool")
+                && m["tool_call_id"].as_str() == Some("tc_a")
+        });
+        assert!(
+            !has_orphaned_result,
+            "tool_result for stripped tool_call must be removed"
+        );
+    }
+
+    /// Regression: orphaned role="tool" at the start of the tail (its assistant
+    /// was dropped by trimming) must be removed.
+    #[test]
+    fn repair_removes_orphaned_tool_result() {
+        let mut msgs = vec![
+            serde_json::json!({"role": "user",      "content": "task"}),
+            serde_json::json!({"role": "user",      "content": "[N messages omitted]"}),
+            // tc_old's assistant was dropped — this result is now orphaned.
+            serde_json::json!({"role": "tool", "tool_call_id": "tc_old", "content": "stale"}),
+            serde_json::json!({"role": "assistant", "content": "done"}),
+        ];
+        repair_orphaned_tool_calls(&mut msgs);
+        let has_orphan = msgs.iter().any(|m| {
+            m["role"].as_str() == Some("tool")
+                && m["tool_call_id"].as_str() == Some("tc_old")
+        });
+        assert!(!has_orphan, "orphaned tool_result with no matching assistant must be removed");
     }
 
     /// When the final summary 500s, the accumulated usage from the tool rounds
