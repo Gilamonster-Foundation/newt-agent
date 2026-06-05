@@ -33,6 +33,18 @@ venv/
 .DS_Store
 Thumbs.db
 
+# TypeScript / Node
+*.ts
+*.js
+*.mjs
+*.cjs
+node_modules/
+dist/
+*.tsbuildinfo
+tsconfig.json
+package.json
+package-lock.json
+
 # Local config / secrets — never commit
 .env
 .env.local
