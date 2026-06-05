@@ -59,40 +59,38 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub logs: Option<LogConfig>,
 
-    /// Cross-harness skill directories for `newt skills share`/`adopt`.
-    /// `None` → Claude Code's default (`~/.claude/skills`) is used and Codex
-    /// has no location (must be set here or via `--codex-dir`).
+    /// Skill discovery search path — the ordered list of directories newt
+    /// reads `SKILL.md` folders from. `None` → just `~/.newt/skills`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skills: Option<SkillsConfig>,
 }
 
 // ---------------------------------------------------------------------------
-// Cross-harness skill directories
+// Skill search path
 // ---------------------------------------------------------------------------
 
-/// Where sibling agent harnesses keep their `SKILL.md` folders, so
-/// `newt skills share`/`adopt` can move skills between them.
+/// The skill discovery **search path**: an ordered list of directories newt
+/// scans for agentskills.io-format `SKILL.md` folders.
 ///
-/// Skills are the same agentskills.io-format folder in every harness, so this
-/// is purely about *locations*. Claude Code has a well-known default
-/// (`~/.claude/skills`); Codex has no established convention, so it is
-/// **unset** unless configured here (or passed with `--codex-dir`).
+/// A skill is the same folder in every harness, so cross-harness use is just a
+/// matter of *pointing newt at the directories* — list `~/.claude/skills`,
+/// `~/.codex/skills`, a project-local `.skills/`, whatever — and their skills
+/// become visible with no copying. The list is open-ended on purpose: there is
+/// no hard-coded knowledge of any particular harness. Earlier entries win on a
+/// name collision.
 ///
 /// Example `~/.newt/config.toml`:
 /// ```toml
 /// [skills]
-/// codex_dir = "~/.codex/skills"
-/// # claude_dir = "~/.claude/skills"   # override the built-in default
+/// search = ["~/.newt/skills", "~/.claude/skills", "~/.codex/skills"]
 /// ```
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SkillsConfig {
-    /// Claude Code skills directory. `None` → `~/.claude/skills`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub claude_dir: Option<String>,
-    /// Codex skills directory. `None` → unset (no Codex default).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub codex_dir: Option<String>,
+    /// Ordered directories to scan for skills. Empty → `~/.newt/skills`.
+    /// `~/` is expanded to `$HOME`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub search: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -796,6 +794,29 @@ impl Config {
         home_dir().map(|h| h.join(".newt").join("config.toml"))
     }
 
+    /// The ordered skill-discovery search path, with `~/` expanded.
+    ///
+    /// Resolves `[skills].search` when configured; otherwise defaults to the
+    /// single host-scoped `~/.newt/skills`. Order is preserved — earlier
+    /// directories win on a name collision (see `newt_skills::discover_paths`).
+    /// The default falls back to a relative `.newt/skills` only when `$HOME`
+    /// can't be resolved, so the list is never empty.
+    #[must_use]
+    pub fn skill_search_dirs(&self) -> Vec<PathBuf> {
+        let configured = self
+            .skills
+            .as_ref()
+            .map(|s| s.search.as_slice())
+            .unwrap_or(&[]);
+        if configured.is_empty() {
+            let default = home_dir()
+                .map(|h| h.join(".newt").join("skills"))
+                .unwrap_or_else(|| PathBuf::from(".newt/skills"));
+            return vec![default];
+        }
+        configured.iter().map(|s| expand_tilde(s)).collect()
+    }
+
     /// Serialize this config and write it to `path`, creating parent dirs if needed.
     pub fn save(&self, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
@@ -862,6 +883,64 @@ mod tests {
     // upstream `agent-mesh-protocol::Caveats` ships algebra only).
     use crate::caveats::CaveatsExt;
     use std::io::Write;
+
+    #[test]
+    fn skill_search_dirs_defaults_to_single_newt_dir() {
+        let cfg = Config::default();
+        let dirs = cfg.skill_search_dirs();
+        assert_eq!(dirs.len(), 1);
+        assert!(dirs[0].ends_with("skills"));
+        // The parent component is `.newt`.
+        assert_eq!(
+            dirs[0].parent().and_then(|p| p.file_name()),
+            Some(".newt".as_ref())
+        );
+    }
+
+    #[test]
+    fn skill_search_dirs_preserves_configured_order() {
+        let cfg = Config {
+            skills: Some(SkillsConfig {
+                search: vec!["/abs/one".into(), "/abs/two".into()],
+            }),
+            ..Config::default()
+        };
+        assert_eq!(
+            cfg.skill_search_dirs(),
+            vec![PathBuf::from("/abs/one"), PathBuf::from("/abs/two")]
+        );
+    }
+
+    #[test]
+    fn skill_search_dirs_expands_tilde() {
+        let cfg = Config {
+            skills: Some(SkillsConfig {
+                search: vec!["~/skills-x".into()],
+            }),
+            ..Config::default()
+        };
+        let dirs = cfg.skill_search_dirs();
+        // The final component survives expansion regardless of whether $HOME
+        // was set; when set, the leading `~` must be gone.
+        assert!(dirs[0].ends_with("skills-x"));
+        assert!(!dirs[0].starts_with("~"));
+    }
+
+    #[test]
+    fn skills_search_round_trips_through_toml() {
+        let cfg = Config {
+            skills: Some(SkillsConfig {
+                search: vec!["~/.newt/skills".into(), "~/.claude/skills".into()],
+            }),
+            ..Config::default()
+        };
+        let text = toml::to_string_pretty(&cfg).unwrap();
+        let back: Config = toml::from_str(&text).unwrap();
+        assert_eq!(
+            back.skills.unwrap().search,
+            vec!["~/.newt/skills".to_string(), "~/.claude/skills".to_string()]
+        );
+    }
     use tempfile::NamedTempFile;
 
     #[test]

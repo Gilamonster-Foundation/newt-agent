@@ -379,6 +379,54 @@ pub fn discover_default() -> Vec<Skill> {
     }
 }
 
+/// Discover skills across an ordered **search path** of directories — the union
+/// of every `<dir>/*/SKILL.md`, deduplicated by name with **earlier
+/// directories winning** a collision (so a newt-owned or project-local skill
+/// shadows one of the same name found later in the path). Missing directories
+/// are skipped. The result is sorted by name for a deterministic index,
+/// matching [`discover`].
+///
+/// Use [`discover_paths_with_shadows`] when you need to *report* which
+/// duplicates were shadowed (e.g. `newt skills list`).
+pub fn discover_paths(dirs: &[impl AsRef<Path>]) -> Vec<Skill> {
+    discover_paths_with_shadows(dirs).0
+}
+
+/// Like [`discover_paths`], but also returns the **shadowed** duplicates: skills
+/// that lost a name collision to an earlier directory. Each shadowed entry is
+/// the losing [`Skill`] (its [`Skill::dir`] tells you where it came from), so a
+/// caller can warn "`<name>` in <dir> is shadowed by an earlier copy".
+pub fn discover_paths_with_shadows(dirs: &[impl AsRef<Path>]) -> (Vec<Skill>, Vec<Skill>) {
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut winners: Vec<Skill> = Vec::new();
+    let mut shadowed: Vec<Skill> = Vec::new();
+    for dir in dirs {
+        for skill in discover(dir) {
+            // First occurrence (earliest dir in the path) wins; any later
+            // skill of the same name is shadowed, never silently merged.
+            if seen.insert(skill.name.clone()) {
+                winners.push(skill);
+            } else {
+                shadowed.push(skill);
+            }
+        }
+    }
+    winners.sort_by(|a, b| a.name.cmp(&b.name));
+    (winners, shadowed)
+}
+
+/// Load a skill body by name across an ordered search path, honouring the same
+/// **earlier-directory-wins** precedence as [`discover_paths`]. Returns an error
+/// when no directory in the path contains a skill of that name.
+pub fn load_body_from(dirs: &[impl AsRef<Path>], name: &str) -> anyhow::Result<String> {
+    for dir in dirs {
+        if dir.as_ref().join(name).join("SKILL.md").is_file() {
+            return load_body(dir, name);
+        }
+    }
+    Err(anyhow!("unknown skill: '{name}'"))
+}
+
 /// Build the progressive-disclosure index block for the system prompt, or
 /// `None` when no skills are installed. ONLY names + descriptions (+ when_to_use)
 /// — never bodies.
@@ -822,5 +870,81 @@ mod tests {
             .unwrap()
             .file_type()
             .is_symlink());
+    }
+
+    // --- discover_paths / load_body_from ---------------------------------
+
+    #[test]
+    fn discover_paths_unions_dirs_and_sorts() {
+        let tmp = tempdir().unwrap();
+        let a = tmp.path().join("a");
+        let b = tmp.path().join("b");
+        make_skill(&a, "alpha");
+        make_skill(&b, "beta");
+        let found = discover_paths(&[a, b]);
+        let names: Vec<&str> = found.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["alpha", "beta"]);
+    }
+
+    #[test]
+    fn discover_paths_first_dir_wins_and_reports_shadows() {
+        let tmp = tempdir().unwrap();
+        let first = tmp.path().join("first");
+        let second = tmp.path().join("second");
+        // Same name in both dirs; `first` precedes `second` on the path.
+        make_skill(&first, "dup");
+        make_skill(&second, "dup");
+        make_skill(&second, "unique");
+
+        let (winners, shadowed) = discover_paths_with_shadows(&[first.clone(), second.clone()]);
+        let names: Vec<&str> = winners.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["dup", "unique"]);
+        // The winning `dup` came from `first`.
+        let dup = winners.iter().find(|s| s.name == "dup").unwrap();
+        assert_eq!(dup.dir, first.join("dup"));
+        // The `second` copy is reported as shadowed, not dropped.
+        assert_eq!(shadowed.len(), 1);
+        assert_eq!(shadowed[0].name, "dup");
+        assert_eq!(shadowed[0].dir, second.join("dup"));
+    }
+
+    #[test]
+    fn discover_paths_skips_missing_dirs() {
+        let tmp = tempdir().unwrap();
+        let real = tmp.path().join("real");
+        make_skill(&real, "alpha");
+        let missing = tmp.path().join("does-not-exist");
+        assert_eq!(discover_paths(&[missing, real]).len(), 1);
+    }
+
+    #[test]
+    fn load_body_from_honours_first_dir_wins() {
+        let tmp = tempdir().unwrap();
+        let first = tmp.path().join("first");
+        let second = tmp.path().join("second");
+        fs::create_dir_all(first.join("dup")).unwrap();
+        fs::write(
+            first.join("dup").join("SKILL.md"),
+            "---\nname: dup\ndescription: d.\n---\nFIRST BODY.\n",
+        )
+        .unwrap();
+        fs::create_dir_all(second.join("dup")).unwrap();
+        fs::write(
+            second.join("dup").join("SKILL.md"),
+            "---\nname: dup\ndescription: d.\n---\nSECOND BODY.\n",
+        )
+        .unwrap();
+
+        let body = load_body_from(&[first, second], "dup").unwrap();
+        assert!(body.contains("FIRST BODY."));
+        assert!(!body.contains("SECOND BODY."));
+    }
+
+    #[test]
+    fn load_body_from_errors_for_unknown_skill() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path().join("d");
+        make_skill(&dir, "alpha");
+        assert!(load_body_from(&[dir], "missing").is_err());
     }
 }
