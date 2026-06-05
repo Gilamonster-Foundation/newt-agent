@@ -1377,7 +1377,12 @@ fn tool_definitions() -> serde_json::Value {
             "type": "function",
             "function": {
                 "name": "write_file",
-                "description": "Write or overwrite a file in the workspace (asks user to confirm before writing)",
+                "description": "Write or overwrite a file in the workspace. \
+                                WARNING: use edit_file instead when modifying an existing file — \
+                                write_file replaces the entire contents and will fail if the new \
+                                content is significantly shorter than the original (shrink guard). \
+                                Only use write_file for new files or full rewrites you have \
+                                explicitly generated in their entirety.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -1385,6 +1390,26 @@ fn tool_definitions() -> serde_json::Value {
                         "content": { "type": "string", "description": "The complete new file contents" }
                     },
                     "required": ["path", "content"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "edit_file",
+                "description": "Make a targeted edit to an existing file by replacing one exact \
+                                string with another. Safer than write_file for modifying existing \
+                                files — you only generate the change, not the whole file. \
+                                Fails with a clear error if old_string is not found or matches \
+                                multiple times (add more surrounding context to make it unique).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "File path relative to workspace root" },
+                        "old_string": { "type": "string", "description": "Exact string to find and replace (must match exactly once)" },
+                        "new_string": { "type": "string", "description": "Replacement string" }
+                    },
+                    "required": ["path", "old_string", "new_string"]
                 }
             }
         },
@@ -1471,6 +1496,7 @@ const DIRECT_TOOL_NAMES: &[&str] = &[
     "list_dir",
     "read_file",
     "write_file",
+    "edit_file",
     "use_skill",
     "web_fetch",
 ];
@@ -1490,7 +1516,13 @@ fn is_hallucination(tool_name: &str, args: &serde_json::Value) -> bool {
     }
     !matches!(
         tool_name,
-        "run_command" | "list_dir" | "read_file" | "write_file" | "use_skill" | "web_fetch"
+        "run_command"
+            | "list_dir"
+            | "read_file"
+            | "write_file"
+            | "edit_file"
+            | "use_skill"
+            | "web_fetch"
     )
 }
 
@@ -1839,6 +1871,27 @@ async fn execute_tool(
                 print_denied("fs_write", path, color);
                 return msg;
             }
+
+            // Shrink guard: refuse if the proposed write removes > 30% of
+            // lines AND > 30 lines absolute. This catches the failure mode
+            // where a model replaces an entire large file with a small
+            // fragment (observed in the wild: 4,247 → 107 lines).
+            if let Ok(existing) = std::fs::read_to_string(&full) {
+                let orig_lines = existing.lines().count();
+                let new_lines = content.lines().count();
+                let removed = orig_lines.saturating_sub(new_lines);
+                if removed > 30 && new_lines < orig_lines * 7 / 10 {
+                    let pct = removed * 100 / orig_lines.max(1);
+                    let msg = format!(
+                        "error: write_file would shrink {path} from {orig_lines} → {new_lines} lines \
+                         (-{pct}%). This is likely unintentional. Use edit_file to make targeted \
+                         changes, or ensure your content includes the full file."
+                    );
+                    print_denied("shrink-guard", path, color);
+                    return msg;
+                }
+            }
+
             print_tool_call(
                 "write_file",
                 &format!("{path} ({} bytes)", content.len()),
@@ -1884,6 +1937,57 @@ async fn execute_tool(
             } else {
                 println!("skipped");
                 format!("user declined to write {path}")
+            }
+        }
+
+        "edit_file" => {
+            let path = args["path"].as_str().unwrap_or("");
+            let old_string = args["old_string"].as_str().unwrap_or("");
+            let new_string = args["new_string"].as_str().unwrap_or("");
+            let full = std::path::Path::new(workspace).join(path);
+            let full_str = full.to_string_lossy();
+            if !tui_permits_path(&caveats.fs_write, &full_str) {
+                let msg = format!("capability denied: fs_write does not permit '{path}'");
+                print_denied("fs_write", path, color);
+                return msg;
+            }
+            if old_string.is_empty() {
+                return "error: old_string must not be empty — use write_file to create new files"
+                    .to_string();
+            }
+            let existing = match std::fs::read_to_string(&full) {
+                Ok(s) => s,
+                Err(e) => return format!("error reading {path}: {e}"),
+            };
+            let count = existing.matches(old_string).count();
+            if count == 0 {
+                return format!(
+                    "error: old_string not found in {path}. \
+                     Check for whitespace differences or read the file first to confirm the exact text."
+                );
+            }
+            if count > 1 {
+                return format!(
+                    "error: old_string matches {count} locations in {path}. \
+                     Add more surrounding context to make it unique."
+                );
+            }
+            let updated = existing.replacen(old_string, new_string, 1);
+            let old_lines = existing.lines().count();
+            let new_lines = updated.lines().count();
+            let delta = new_lines as i64 - old_lines as i64;
+            let delta_str = if delta >= 0 {
+                format!("+{delta}")
+            } else {
+                format!("{delta}")
+            };
+            print_tool_call("edit_file", &format!("{path} ({delta_str} lines)"), color);
+            match std::fs::write(&full, &updated) {
+                Ok(_) => {
+                    println!("✓ edited {path}");
+                    format!("edited {path} ({delta_str} lines)")
+                }
+                Err(e) => format!("error writing {path}: {e}"),
             }
         }
 
