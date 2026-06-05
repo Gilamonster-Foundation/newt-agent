@@ -4710,8 +4710,7 @@ mod tool_round_cap_tests {
         );
         // The now-orphaned tc_a result must also be removed.
         let has_orphaned_result = msgs.iter().any(|m| {
-            m["role"].as_str() == Some("tool")
-                && m["tool_call_id"].as_str() == Some("tc_a")
+            m["role"].as_str() == Some("tool") && m["tool_call_id"].as_str() == Some("tc_a")
         });
         assert!(
             !has_orphaned_result,
@@ -4732,10 +4731,12 @@ mod tool_round_cap_tests {
         ];
         repair_orphaned_tool_calls(&mut msgs);
         let has_orphan = msgs.iter().any(|m| {
-            m["role"].as_str() == Some("tool")
-                && m["tool_call_id"].as_str() == Some("tc_old")
+            m["role"].as_str() == Some("tool") && m["tool_call_id"].as_str() == Some("tc_old")
         });
-        assert!(!has_orphan, "orphaned tool_result with no matching assistant must be removed");
+        assert!(
+            !has_orphan,
+            "orphaned tool_result with no matching assistant must be removed"
+        );
     }
 
     /// When the final summary 500s, the accumulated usage from the tool rounds
