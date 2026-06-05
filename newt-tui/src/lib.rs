@@ -1743,6 +1743,43 @@ fn envelope_denial_reason(envelope: &serde_json::Value) -> String {
     }
 }
 
+fn toml_string_literal(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn exec_allowlist_name(target: &str) -> &str {
+    target
+        .rsplit(['/', '\\'])
+        .find(|part| !part.is_empty())
+        .unwrap_or(target)
+}
+
+fn extra_exec_hint(envelope: &serde_json::Value) -> Option<String> {
+    let denials = envelope.get("denials")?.as_array()?;
+    let target = denials.iter().find_map(|d| {
+        let kind = d.get("kind")?.as_str()?;
+        if kind != "exec" {
+            return None;
+        }
+        d.get("target")?
+            .as_str()
+            .filter(|target| !target.is_empty())
+    })?;
+
+    Some(format!(
+        "add it via [tui.permissions] extra_exec = [\"{}\"] in your newt config",
+        toml_string_literal(exec_allowlist_name(target))
+    ))
+}
+
+fn envelope_denial_reason_with_guidance(envelope: &serde_json::Value) -> String {
+    let reason = envelope_denial_reason(envelope);
+    match extra_exec_hint(envelope) {
+        Some(hint) => format!("{reason} - {hint}"),
+        None => reason,
+    }
+}
+
 /// Execute a single tool call and return the result string sent back to the model.
 ///
 /// `run_command` is routed through agent-bridle's Caveats-confined, brush-backed
@@ -1811,7 +1848,7 @@ async fn execute_tool(
                 // run); we lift that to the existing capability-denied UX by
                 // reading the structured `denied` field — NEVER a stderr grep.
                 Ok(envelope) if envelope_denied(&envelope) => {
-                    let reason = envelope_denial_reason(&envelope);
+                    let reason = envelope_denial_reason_with_guidance(&envelope);
                     print_denied("exec", &reason, color);
                     format!("capability denied: {reason}")
                 }
@@ -3708,6 +3745,60 @@ mod run_command_confinement_tests {
             out.starts_with("capability denied"),
             "an out-of-scope external must be denied via the structured field, got: {out}"
         );
+        assert!(
+            out.contains("[tui.permissions] extra_exec = [\"env\"]"),
+            "exec denials should explain the extra_exec escape hatch, got: {out}"
+        );
+    }
+
+    #[test]
+    fn exec_denial_guidance_escapes_toml_literal() {
+        let envelope = serde_json::json!({
+            "denied": true,
+            "denials": [
+                {
+                    "kind": "exec",
+                    "target": "bad\"cmd",
+                    "reason": "exec bad command denied"
+                }
+            ]
+        });
+        let reason = envelope_denial_reason_with_guidance(&envelope);
+        assert!(reason.contains("[tui.permissions] extra_exec = [\"bad\\\"cmd\"]"));
+    }
+
+    #[test]
+    fn exec_denial_guidance_uses_command_name_for_absolute_paths() {
+        let envelope = serde_json::json!({
+            "denied": true,
+            "denials": [
+                {
+                    "kind": "exec",
+                    "target": "/usr/bin/env",
+                    "reason": "exec of \"/usr/bin/env\" is not within the granted authority"
+                }
+            ]
+        });
+        let reason = envelope_denial_reason_with_guidance(&envelope);
+        assert!(reason.contains("[tui.permissions] extra_exec = [\"env\"]"));
+        assert!(!reason.contains("extra_exec = [\"/usr/bin/env\"]"));
+    }
+
+    #[test]
+    fn exec_denial_guidance_uses_command_name_for_windows_paths() {
+        let envelope = serde_json::json!({
+            "denied": true,
+            "denials": [
+                {
+                    "kind": "exec",
+                    "target": "C:\\tools\\env.exe",
+                    "reason": "exec of \"C:\\tools\\env.exe\" is not within the granted authority"
+                }
+            ]
+        });
+        let reason = envelope_denial_reason_with_guidance(&envelope);
+        assert!(reason.contains("[tui.permissions] extra_exec = [\"env.exe\"]"));
+        assert!(!reason.contains("extra_exec = [\"C:\\\\tools\\\\env.exe\"]"));
     }
 
     /// THE test that justifies the change. `echo ok && rm -r <victim>` under a
