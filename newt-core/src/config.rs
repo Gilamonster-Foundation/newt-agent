@@ -418,6 +418,10 @@ impl ToolPermissions {
     /// Built-in exec allowlist for the `WorkspaceDev` preset.
     const WORKSPACE_DEV_EXEC: &'static [&'static str] = &[
         "cargo",
+        // rustc must be here: cargo spawns it as a subprocess to compile and
+        // test. Without it, `cargo test` fails with "could not execute rustc".
+        // rustfmt and clippy-driver are already present; this was an oversight.
+        "rustc",
         "just",
         "git",
         "grep",
