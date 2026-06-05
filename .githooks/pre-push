@@ -34,6 +34,16 @@ if ! command -v cargo-llvm-cov >/dev/null 2>&1; then
     exit 1
 fi
 
+# When Rust comes from Homebrew, llvm-tools-preview isn't available via rustup.
+# Auto-detect the Homebrew LLVM and set the env vars cargo-llvm-cov needs.
+if [ -z "$LLVM_COV" ] && command -v brew >/dev/null 2>&1; then
+    BREW_LLVM="$(brew --prefix llvm 2>/dev/null)/bin"
+    if [ -x "$BREW_LLVM/llvm-cov" ]; then
+        export LLVM_COV="$BREW_LLVM/llvm-cov"
+        export LLVM_PROFDATA="$BREW_LLVM/llvm-profdata"
+    fi
+fi
+
 echo "[pre-push] running just check..."
 just check
 
