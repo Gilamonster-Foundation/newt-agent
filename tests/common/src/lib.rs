@@ -4,6 +4,7 @@
 //! to get tracing init, temp dirs, mock backends, and mock plugin binaries.
 
 use std::fs;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
@@ -92,7 +93,7 @@ impl InferenceBackend for MockBackend {
 
 // ── Mock plugin binary ───────────────────────────────────────────────
 
-/// Write a bash script into `dir` that echoes canned JSON-RPC responses.
+/// Write a script into `dir` that echoes canned JSON-RPC responses.
 ///
 /// Each entry in `replies` is emitted line-by-line on stdout whenever the
 /// script is invoked. This is useful for testing the provider-plugin host
@@ -100,18 +101,47 @@ impl InferenceBackend for MockBackend {
 ///
 /// Returns the path to the created executable.
 pub fn mock_plugin_binary(dir: &Path, replies: &[&str]) -> PathBuf {
-    let script_path = dir.join("mock-plugin");
-    let body: String = replies
-        .iter()
-        .map(|r| format!("echo '{r}'"))
-        .collect::<Vec<_>>()
-        .join("\n");
+    #[cfg(unix)]
+    {
+        let script_path = dir.join("mock-plugin");
+        let body: String = replies
+            .iter()
+            .map(|r| format!("echo '{r}'"))
+            .collect::<Vec<_>>()
+            .join("\n");
 
-    let script = format!("#!/usr/bin/env bash\n{body}\n");
-    fs::write(&script_path, script).expect("failed to write mock plugin script");
-    fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755))
-        .expect("failed to chmod mock plugin");
-    script_path
+        let script = format!("#!/usr/bin/env bash\n{body}\n");
+        fs::write(&script_path, script).expect("failed to write mock plugin script");
+        // Already inside the `#[cfg(unix)]` block — no inner attribute needed.
+        fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755))
+            .expect("failed to chmod mock plugin");
+        script_path
+    }
+
+    #[cfg(windows)]
+    {
+        let script_path = dir.join("mock-plugin.cmd");
+        let body: String = replies
+            .iter()
+            .map(|r| format!("echo {}", escape_cmd_echo_arg(r)))
+            .collect::<Vec<_>>()
+            .join("\r\n");
+
+        let script = format!("@echo off\r\n{body}\r\n");
+        fs::write(&script_path, script).expect("failed to write mock plugin script");
+        script_path
+    }
+}
+
+#[cfg(windows)]
+fn escape_cmd_echo_arg(value: &str) -> String {
+    value
+        .replace('^', "^^")
+        .replace('&', "^&")
+        .replace('|', "^|")
+        .replace('<', "^<")
+        .replace('>', "^>")
+        .replace('%', "%%")
 }
 
 // ── Tests ────────────────────────────────────────────────────────────
@@ -168,7 +198,10 @@ mod tests {
 
         // Verify the file is executable
         let meta = std::fs::metadata(&path).unwrap();
+        #[cfg(unix)]
         assert_ne!(meta.permissions().mode() & 0o111, 0);
+        #[cfg(not(unix))]
+        assert!(!meta.permissions().readonly());
     }
 
     #[test]

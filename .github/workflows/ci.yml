@@ -1,7 +1,9 @@
 name: CI
 
-# HOOK PARITY: This workflow is mirrored by .githooks/pre-push.
-# When editing this file, update the push hook to match.
+# HOOK PARITY: The lint/test/coverage jobs are mirrored by .githooks/pre-push.
+# When editing those, update the push hook to match.
+# EXCEPTION: the `windows` job is CI-only — it cannot be mirrored locally (no
+# Windows dev box), so it is deliberately outside hook parity.
 # See docs/ROADMAP.md "Acceptance contract" for the gate definition.
 #
 # Patterned on scrybe's CI but simpler — no Tauri system deps (pure
@@ -135,3 +137,28 @@ jobs:
           path: lcov.info
           if-no-files-found: warn
           retention-days: 14
+
+  windows:
+    name: Windows build + test
+    runs-on: windows-latest
+    # CI-ONLY job — intentionally NOT mirrored by .githooks/pre-push. There is
+    # no local Windows dev environment, so the hook (which runs on the dev
+    # platform) cannot reproduce it. This job is the only thing that compiles
+    # and exercises the `#[cfg(windows)]` code paths the Linux jobs never see;
+    # without it, Windows support silently rots. clippy + test mirror the bar
+    # the lint/test jobs set on Linux.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: cargo test
+        # `if: always()` so a clippy failure can't mask a test failure — both
+        # surface in one run (same rationale as the Linux lint job).
+        if: always()
+        run: cargo test --workspace

@@ -46,12 +46,10 @@ mod tests {
     #[test]
     fn missing_file() {
         let err = read(Path::new("/tmp/newt-tools-does-not-exist-xyz")).unwrap_err();
-        // Should be an io error about the file not existing.
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("No such file") || msg.contains("not found"),
-            "unexpected error: {msg}"
-        );
+        let io = err
+            .downcast_ref::<std::io::Error>()
+            .expect("missing file should return an io error");
+        assert_eq!(io.kind(), std::io::ErrorKind::NotFound);
     }
 
     #[test]

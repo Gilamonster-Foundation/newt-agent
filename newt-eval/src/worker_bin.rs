@@ -26,6 +26,10 @@ use std::path::{Path, PathBuf};
 /// Environment variable that overrides the default `newt` binary path.
 pub const ENV_WORKER_BIN: &str = "NEWT_WORKER_BIN";
 
+fn worker_exe_name() -> String {
+    format!("newt{}", std::env::consts::EXE_SUFFIX)
+}
+
 /// Resolve the worker binary location, returning the resolved path and
 /// the full list of candidates that was considered.
 ///
@@ -74,7 +78,7 @@ where
     //    runs the eval binary directly out of the build dir.
     if let Some(exe) = current_exe() {
         if let Some(parent) = exe.parent() {
-            let sibling = parent.join("newt");
+            let sibling = parent.join(worker_exe_name());
             candidates.push(sibling.clone());
             if sibling.exists() {
                 return Resolution {
@@ -90,7 +94,7 @@ where
     // 4. $CARGO_TARGET_DIR/{release,debug}/newt.
     if let Some(td) = lookup_env("CARGO_TARGET_DIR") {
         for profile in ["release", "debug"] {
-            let p = Path::new(&td).join(profile).join("newt");
+            let p = Path::new(&td).join(profile).join(worker_exe_name());
             candidates.push(p.clone());
             if p.exists() {
                 return Resolution {
@@ -104,13 +108,22 @@ where
     }
 
     // 5. Historical cwd-relative fallbacks.
-    for rel in [
-        "target/release/newt",
-        "target/debug/newt",
-        "../target/release/newt",
-        "../target/debug/newt",
+    for p in [
+        PathBuf::from("target")
+            .join("release")
+            .join(worker_exe_name()),
+        PathBuf::from("target")
+            .join("debug")
+            .join(worker_exe_name()),
+        PathBuf::from("..")
+            .join("target")
+            .join("release")
+            .join(worker_exe_name()),
+        PathBuf::from("..")
+            .join("target")
+            .join("debug")
+            .join(worker_exe_name()),
     ] {
-        let p = PathBuf::from(rel);
         candidates.push(p.clone());
         if p.exists() {
             return Resolution {
@@ -125,7 +138,9 @@ where
     // Nothing existed. Return the first historical fallback as a
     // best-effort path so the caller's "not found" error message still
     // points at a sensible default, alongside the full candidate list.
-    let fallback = PathBuf::from("target/release/newt");
+    let fallback = PathBuf::from("target")
+        .join("release")
+        .join(worker_exe_name());
     Resolution {
         path: fallback,
         found: false,
@@ -213,7 +228,7 @@ mod tests {
     #[test]
     fn cli_flag_wins_when_present() {
         let tmp = tempfile::tempdir().unwrap();
-        let bin = tmp.path().join("newt");
+        let bin = tmp.path().join(worker_exe_name());
         std::fs::write(&bin, "").unwrap();
         let env = HashMap::new();
         let r = resolve_worker_bin_with(Some(bin.clone()), env_lookup(&env), || None);
@@ -225,7 +240,7 @@ mod tests {
     #[test]
     fn env_var_used_when_no_cli_flag() {
         let tmp = tempfile::tempdir().unwrap();
-        let bin = tmp.path().join("newt");
+        let bin = tmp.path().join(worker_exe_name());
         std::fs::write(&bin, "").unwrap();
         let mut env = HashMap::new();
         env.insert("NEWT_WORKER_BIN", bin.to_string_lossy().into_owned());
@@ -241,8 +256,8 @@ mod tests {
         // CARGO_TARGET_DIR points somewhere else.
         let exe_dir = tempfile::tempdir().unwrap();
         let target_dir = tempfile::tempdir().unwrap();
-        let sibling = exe_dir.path().join("newt");
-        let in_target = target_dir.path().join("release").join("newt");
+        let sibling = exe_dir.path().join(worker_exe_name());
+        let in_target = target_dir.path().join("release").join(worker_exe_name());
         std::fs::create_dir_all(in_target.parent().unwrap()).unwrap();
         std::fs::write(&sibling, "").unwrap();
         std::fs::write(&in_target, "").unwrap();
@@ -263,8 +278,8 @@ mod tests {
     #[test]
     fn cargo_target_dir_release_preferred_over_debug() {
         let target_dir = tempfile::tempdir().unwrap();
-        let release = target_dir.path().join("release").join("newt");
-        let debug = target_dir.path().join("debug").join("newt");
+        let release = target_dir.path().join("release").join(worker_exe_name());
+        let debug = target_dir.path().join("debug").join(worker_exe_name());
         std::fs::create_dir_all(release.parent().unwrap()).unwrap();
         std::fs::create_dir_all(debug.parent().unwrap()).unwrap();
         std::fs::write(&release, "").unwrap();
@@ -287,7 +302,7 @@ mod tests {
     #[test]
     fn cargo_target_dir_debug_when_release_missing() {
         let target_dir = tempfile::tempdir().unwrap();
-        let debug = target_dir.path().join("debug").join("newt");
+        let debug = target_dir.path().join("debug").join(worker_exe_name());
         std::fs::create_dir_all(debug.parent().unwrap()).unwrap();
         std::fs::write(&debug, "").unwrap();
 
@@ -315,7 +330,7 @@ mod tests {
         let r = resolve_worker_bin_with(None, env_lookup(&env), || {
             Some(unrelated.path().join("newt-eval"))
         });
-        assert_eq!(r.candidates[0], unrelated.path().join("newt"));
+        assert_eq!(r.candidates[0], unrelated.path().join(worker_exe_name()));
     }
 
     #[test]
@@ -348,7 +363,12 @@ mod tests {
         match r.source {
             ResolutionSource::NotFound => {
                 assert!(!r.found);
-                assert_eq!(r.path, PathBuf::from("target/release/newt"));
+                assert_eq!(
+                    r.path,
+                    PathBuf::from("target")
+                        .join("release")
+                        .join(worker_exe_name())
+                );
             }
             ResolutionSource::CwdRelative => {
                 assert!(r.found);

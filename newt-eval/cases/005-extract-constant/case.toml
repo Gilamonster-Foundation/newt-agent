@@ -25,7 +25,7 @@ expected_patterns = [
 content = """
 --- a/src/lib.rs
 +++ b/src/lib.rs
-@@ -1,5 +1,7 @@
+@@ -1,13 +1,15 @@
 +const SECONDS_PER_DAY: u64 = 60 * 60 * 24;
 +
  pub fn seconds_in(days: u64) -> u64 {
@@ -34,4 +34,12 @@ content = """
  }
 
  #[cfg(test)]
+ mod tests {
+     use super::*;
+
+     #[test]
+     fn one_day() {
+         assert_eq!(seconds_in(1), 86_400);
+     }
+ }
 """
