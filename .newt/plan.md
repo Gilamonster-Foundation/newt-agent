@@ -1,21 +1,23 @@
-# Testing Improvement Plan
+# Testing Improvements Plan
 
-## Goals
-- Add comprehensive unit and integration tests for core Rust CLI (`newt-cli`) and Python library (`newt-agent-py`).
-- Implement CI pipeline (GitHub Actions) to run linting, type checking, tests, and coverage on every PR.
-- Enforce a minimum test coverage threshold (e.g., 80%) and fail builds on regression.
+## Goal
+Implement comprehensive testing improvements for the Newt-Agent codebase.
 
 ## Tasks
-1. Write unit tests for key functions in `newt-core`, `newt-cli`, and `newt-agent-py`.
-2. Add integration tests that exercise end‑to‑end workflows (e.g., `newt --help`, file edit operations).
-3. Configure CI workflow:
-   - Set up Rust cargo test and Python pytest.
-   - Generate coverage reports (e.g., `tarpaulin` for Rust, `coverage` for Python).
-   - Upload artifacts and enforce coverage thresholds.
-4. Document testing guidelines in `README.md` and `docs/testing.md`.
-5. Add a `Makefile` target `test` to run local tests quickly.
+1. Add integration tests for core router classification functionality.
+2. Create a dedicated test utilities module under `tests/common/src`.
+3. Add a GitHub Actions CI workflow to run tests on every push.
+4. Update existing test suites with additional coverage cases.
+5. Ensure all new code adheres to formatting and linting standards.
+
+## Files to Modify/Add
+- `tests/integration/router_test.rs` - integration tests for router classification.
+- `.github/workflows/ci.yml` - CI pipeline configuration.
+- `tests/common/src/lib.rs` - enhance shared test helpers if needed.
+- Existing test files as needed for coverage.
 
 ## Success Criteria
-- All new code has corresponding tests.
-- CI runs automatically on PRs and reports pass/fail with coverage metrics.
-- Code coverage for critical modules ≥ 80%.
+- All new tests pass locally.
+- CI pipeline runs tests and reports success/failure.
+- Code coverage improves with new tests.
+- No linting or formatting violations introduced.
