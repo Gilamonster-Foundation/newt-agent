@@ -13,6 +13,7 @@ mod doctor;
 pub mod stdio_guard;
 
 use clap::{Parser, Subcommand};
+use std::env;
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
@@ -125,6 +126,16 @@ pub enum Command {
 }
 
 pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
+    // If a virtual environment is active, prepend its bin dir to PATH so child processes see it first.
+    if let Ok(venv) = std::env::var("VIRTUAL_ENV") {
+        let mut path = std::env::var("PATH").unwrap_or_default();
+        let venv_bin = format!("{}/bin", venv);
+        if !path.split(':').any(|p| p == venv_bin) {
+            path = format!("{}:{}", venv_bin, path);
+        }
+        std::env::set_var("PATH", path);
+    }
+
     match cli.command.unwrap_or(Command::Code { path: None }) {
         Command::Code { path } => {
             // --debug / --num-ctx set env vars so the TUI picks them up
