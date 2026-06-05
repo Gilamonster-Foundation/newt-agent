@@ -25,6 +25,9 @@ tokio.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# Render the resolved config as TOML for the interactive `newt setup` preview
+# before writing it (same serializer Config::save uses internally).
+toml.workspace = true
 ratatui.workspace = true
 crossterm.workspace = true
 tracing.workspace = true
