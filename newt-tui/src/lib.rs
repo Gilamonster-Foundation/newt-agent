@@ -1170,11 +1170,12 @@ fn run_chat(workspace: &str, color: bool) -> anyhow::Result<()> {
                                 rt.block_on(memory.sync_all(&task, &reply, &metrics));
                             });
                             print_metrics(&metrics, color);
-                            // Append to usage log (best-effort).
+                            // Append to usage log and enforce rotation policy.
                             if let Some(log) = newt_core::Config::user_config_path()
                                 .map(|p| p.with_file_name("usage.jsonl"))
                             {
-                                metrics.append_to_log(&log);
+                                let policy = cfg.logs.as_ref().cloned().unwrap_or_default();
+                                metrics.append_to_log_with_policy(&log, &policy);
                             }
                         }
                         Err(e) => print_newt(&format!("error: {e}"), color, verbose),

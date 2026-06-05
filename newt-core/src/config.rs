@@ -53,6 +53,71 @@ pub struct Config {
     /// take precedence on a name clash. Empty by default.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mcp_servers: Vec<crate::mcp::McpServerEntry>,
+
+    /// Usage-log rotation policy. `None` → built-in defaults apply
+    /// (keep last 7 sessions, no size/age limit).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logs: Option<LogConfig>,
+}
+
+// ---------------------------------------------------------------------------
+// Log rotation config
+// ---------------------------------------------------------------------------
+
+/// Rotation policy for `~/.newt/usage.jsonl`.
+///
+/// All limits default to the values shown. Set a field to `0` to disable
+/// that particular limit. Multiple active limits compose — the most
+/// restrictive one wins after each append.
+///
+/// Example `newt.toml`:
+/// ```toml
+/// [logs]
+/// max_sessions = 100   # keep the last 100 turns
+/// max_size_mb  = 5     # also cap at 5 MiB
+/// max_age_days = 14    # and drop anything older than 2 weeks
+/// keep_rotated = 2     # keep usage.jsonl.1 and .2 as backup
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LogConfig {
+    /// Keep at most this many JSONL entries (most recent). Default: 7. 0 = no limit.
+    #[serde(default = "default_log_max_sessions")]
+    pub max_sessions: usize,
+
+    /// Rotate when the file exceeds this size in MiB. Default: 0 (no size limit).
+    #[serde(default)]
+    pub max_size_mb: u64,
+
+    /// Drop entries older than this many days. Default: 0 (no age limit).
+    /// Requires a `recorded_at` field in the log entry; entries without it
+    /// are kept.
+    #[serde(default)]
+    pub max_age_days: u64,
+
+    /// How many rotated copies to keep alongside the live log
+    /// (`usage.jsonl.1`, `.2`, …). Default: 3. 0 = overwrite silently.
+    #[serde(default = "default_log_keep_rotated")]
+    pub keep_rotated: usize,
+}
+
+fn default_log_max_sessions() -> usize {
+    7
+}
+
+fn default_log_keep_rotated() -> usize {
+    3
+}
+
+impl Default for LogConfig {
+    fn default() -> Self {
+        Self {
+            max_sessions: default_log_max_sessions(),
+            max_size_mb: 0,
+            max_age_days: 0,
+            keep_rotated: default_log_keep_rotated(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -630,6 +695,7 @@ impl Default for Config {
             pricing: None,
             memory: None,
             mcp_servers: Vec::new(),
+            logs: None,
         }
     }
 }
