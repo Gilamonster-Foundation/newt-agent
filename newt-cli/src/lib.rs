@@ -13,7 +13,6 @@ mod doctor;
 pub mod stdio_guard;
 
 use clap::{Parser, Subcommand};
-use std::env;
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
@@ -62,6 +61,21 @@ pub struct Cli {
     /// Recommended starting point: 8192. Omit to use the model default.
     #[arg(long, global = true, value_name = "TOKENS")]
     pub num_ctx: Option<u32>,
+
+    /// Activate a Python virtual environment for all agent-run commands.
+    /// Injects `VIRTUAL_ENV` and prepends the venv's `bin/` to `PATH` inside
+    /// the confined shell, and grants exec permission for every executable in
+    /// the venv's `bin/` — a fast alternative to listing them one-by-one in
+    /// `[tui.permissions] extra_exec`. If omitted and `$VIRTUAL_ENV` is already
+    /// set (shell-activated venv), that environment is used automatically.
+    #[arg(long, global = true, value_name = "PATH")]
+    pub venv: Option<PathBuf>,
+
+    /// Grant the agent exec permission for all executables in `<DIR>` and
+    /// prepend `<DIR>` to `PATH` in the confined shell. May be repeated.
+    /// Example: `newt --exec-path ~/bin --exec-path ~/workspaces/bin`.
+    #[arg(long = "exec-path", global = true, value_name = "DIR")]
+    pub exec_paths: Vec<PathBuf>,
 
     /// Subcommand to run. Defaults to `code` (TUI coder) when omitted.
     #[command(subcommand)]
@@ -126,14 +140,36 @@ pub enum Command {
 }
 
 pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
-    // If a virtual environment is active, prepend its bin dir to PATH so child processes see it first.
-    if let Ok(venv) = std::env::var("VIRTUAL_ENV") {
+    // Resolve the venv: --venv flag wins, then fall back to an already-activated $VIRTUAL_ENV.
+    // Set NEWT_VENV so the TUI can inject it into the agent-bridle confined shell (which does
+    // not inherit the host environment, so a process-level PATH change has no effect there).
+    let venv_path = cli
+        .venv
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .or_else(|| std::env::var("VIRTUAL_ENV").ok());
+    // SAFETY: all set_var calls below are single-threaded before the TUI starts any async work.
+    if let Some(ref venv) = venv_path {
+        unsafe { std::env::set_var("NEWT_VENV", venv) };
+        // Also prepend to the process PATH for non-bridle code paths.
+        let venv_bin = format!("{venv}/bin");
         let mut path = std::env::var("PATH").unwrap_or_default();
-        let venv_bin = format!("{}/bin", venv);
         if !path.split(':').any(|p| p == venv_bin) {
-            path = format!("{}:{}", venv_bin, path);
+            path = format!("{venv_bin}:{path}");
         }
-        std::env::set_var("PATH", path);
+        unsafe { std::env::set_var("PATH", path) };
+    }
+
+    // --exec-path: store as colon-separated NEWT_EXEC_PATHS so the TUI can
+    // scan those directories and grant exec permission for their binaries.
+    if !cli.exec_paths.is_empty() {
+        let joined = cli
+            .exec_paths
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(":");
+        unsafe { std::env::set_var("NEWT_EXEC_PATHS", &joined) };
     }
 
     match cli.command.unwrap_or(Command::Code { path: None }) {
