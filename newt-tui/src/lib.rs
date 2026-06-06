@@ -2264,11 +2264,17 @@ fn keep_alive_str(cfg: &newt_core::Config) -> String {
 }
 
 /// Mid-loop message-trim threshold from `[tui].mid_loop_trim_threshold` (default 40).
+///
+/// Clamped to `max_tool_rounds - 3` so the safety valve always fires before the
+/// round ceiling — even when the config has threshold > max_rounds (e.g. default
+/// threshold=40 with max_rounds=25 meant trimming never triggered).
 fn mid_loop_trim_threshold(cfg: &newt_core::Config) -> usize {
-    cfg.tui
+    let threshold = cfg
+        .tui
         .as_ref()
         .map(|t| t.mid_loop_trim_threshold)
-        .unwrap_or(40)
+        .unwrap_or(40);
+    threshold.min(max_tool_rounds(cfg).saturating_sub(3))
 }
 
 /// Build-check command from `[tui].build_check_cmd`. `None` means no auto-check.
