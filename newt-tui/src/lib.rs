@@ -3770,11 +3770,15 @@ fn dispatch_slash(
                                 color,
                                 verbose,
                             );
+                            // Preserve existing context-window tuning if the
+                            // model was already in the cache.
+                            let existing = cache.remove(model.as_str()).unwrap_or_default();
                             cache.insert(
                                 model.clone(),
                                 probe::CapabilityEntry {
                                     conformance,
                                     tested_date: today,
+                                    ..existing
                                 },
                             );
                             probe::save_cache(&cache);
