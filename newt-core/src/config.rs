@@ -63,6 +63,27 @@ pub struct Config {
     /// reads `SKILL.md` folders from. `None` → just `~/.newt/skills`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skills: Option<SkillsConfig>,
+
+    /// Per-model inference tuning overrides (`[[model_tuning]]`).
+    ///
+    /// Each entry locks specific parameters for a named model. Values here
+    /// take precedence over empirically derived values from
+    /// `model-capabilities.json` and over global `[tui]` defaults.
+    ///
+    /// Example `~/.newt/config.toml`:
+    /// ```toml
+    /// [[model_tuning]]
+    /// model = "nemotron3:33b"
+    /// num_ctx = 24576            # explicit Ollama context window
+    /// mid_loop_trim_threshold = 12
+    /// max_tool_rounds = 20
+    /// ```
+    ///
+    /// Human-authored entries are never overwritten by the auto-tuner.
+    /// Auto-tuned entries are **appended** by the harness when
+    /// `tune_confidence` reaches `High`; delete or edit them freely.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub model_tuning: Vec<ModelTuning>,
 }
 
 // ---------------------------------------------------------------------------
@@ -342,6 +363,47 @@ fn default_keep_alive() -> String {
 
 fn default_mid_loop_trim_threshold() -> usize {
     40
+}
+
+// ---------------------------------------------------------------------------
+// Per-model tuning
+// ---------------------------------------------------------------------------
+
+/// Inference-parameter overrides for a specific model name.
+///
+/// Matched against the active model by exact string equality.  Add entries
+/// under `[[model_tuning]]` in `~/.newt/config.toml` to pin parameters
+/// for models whose defaults cause problems (e.g. context overflow).
+///
+/// Human-authored entries are never touched by the auto-tuner.  Auto-tuned
+/// entries are appended (not modified) when the harness gains high confidence
+/// in its empirical measurements.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelTuning {
+    /// Model name as it appears in Ollama (e.g. `"nemotron3:33b"`).
+    pub model: String,
+
+    /// Ollama `options.num_ctx` — hard cap on KV-cache allocation.
+    /// Overrides both the global `[tui].num_ctx` and the empirically
+    /// derived `safe_context` from `model-capabilities.json`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub num_ctx: Option<u32>,
+
+    /// Per-model `mid_loop_trim_threshold` override.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mid_loop_trim_threshold: Option<usize>,
+
+    /// Per-model `max_tool_rounds` override.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tool_rounds: Option<usize>,
+}
+
+impl Config {
+    /// Find the first `[[model_tuning]]` entry whose `model` field matches
+    /// `name` exactly.  Returns `None` when no entry exists.
+    pub fn find_model_tuning(&self, name: &str) -> Option<&ModelTuning> {
+        self.model_tuning.iter().find(|t| t.model == name)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -754,6 +816,7 @@ impl Default for Config {
             mcp_servers: Vec::new(),
             logs: None,
             skills: None,
+            model_tuning: Vec::new(),
         }
     }
 }
@@ -1373,5 +1436,50 @@ default_tier_order = ["FAST", "STANDARD", "COMPLEX", "REVIEW"]
         "#;
         let cfg: Config = toml::from_str(toml).unwrap();
         assert_eq!(cfg.tui.unwrap().max_tool_rounds, 7);
+    }
+
+    #[test]
+    fn model_tuning_parses_from_toml() {
+        let toml = r#"
+            [[model_tuning]]
+            model = "nemotron3:33b"
+            num_ctx = 24576
+            mid_loop_trim_threshold = 12
+            max_tool_rounds = 20
+
+            [[model_tuning]]
+            model = "qwen3-coder:30b"
+            num_ctx = 65536
+        "#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.model_tuning.len(), 2);
+
+        let nemo = cfg.find_model_tuning("nemotron3:33b").unwrap();
+        assert_eq!(nemo.num_ctx, Some(24576));
+        assert_eq!(nemo.mid_loop_trim_threshold, Some(12));
+        assert_eq!(nemo.max_tool_rounds, Some(20));
+
+        let qwen = cfg.find_model_tuning("qwen3-coder:30b").unwrap();
+        assert_eq!(qwen.num_ctx, Some(65536));
+        assert_eq!(qwen.mid_loop_trim_threshold, None);
+    }
+
+    #[test]
+    fn model_tuning_find_returns_none_for_unknown_model() {
+        let cfg = Config::default();
+        assert!(cfg.find_model_tuning("nonexistent:7b").is_none());
+    }
+
+    #[test]
+    fn model_tuning_partial_fields_are_optional() {
+        let toml = r#"
+            [[model_tuning]]
+            model = "llama3.1:8b"
+        "#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        let entry = cfg.find_model_tuning("llama3.1:8b").unwrap();
+        assert_eq!(entry.num_ctx, None);
+        assert_eq!(entry.mid_loop_trim_threshold, None);
+        assert_eq!(entry.max_tool_rounds, None);
     }
 }
