@@ -1354,6 +1354,19 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                     print_thinking(color);
                     let t0 = std::time::Instant::now();
 
+                    // Per-model tuning: explicit config overrides global defaults.
+                    let model_tune = cfg.find_model_tuning(&inf_model);
+                    let eff_max_tool_rounds = model_tune
+                        .and_then(|t| t.max_tool_rounds)
+                        .unwrap_or_else(|| max_tool_rounds(&cfg));
+                    let eff_num_ctx = model_tune
+                        .and_then(|t| t.num_ctx)
+                        .or_else(|| num_ctx(&cfg));
+                    let eff_mid_loop_trim = model_tune
+                        .and_then(|t| t.mid_loop_trim_threshold)
+                        .unwrap_or_else(|| mid_loop_trim_threshold(&cfg))
+                        .min(eff_max_tool_rounds.saturating_sub(3));
+
                     // Build message list from memory manager.
                     let messages = memory.build_messages(&system, &task);
                     let response = tokio::task::block_in_place(|| {
@@ -1368,13 +1381,13 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                                 workspace,
                                 color,
                                 caveats: cap.caveats(),
-                                max_tool_rounds: max_tool_rounds(&cfg),
+                                max_tool_rounds: eff_max_tool_rounds,
                                 tool_output_lines: tool_output_lines(&cfg),
                                 debug: debug_mode(&cfg),
-                                num_ctx: num_ctx(&cfg),
+                                num_ctx: eff_num_ctx,
                                 connect_timeout_secs: connect_timeout_secs(&cfg),
                                 inference_timeout_secs: inference_timeout_secs(&cfg),
-                                mid_loop_trim_threshold: mid_loop_trim_threshold(&cfg),
+                                mid_loop_trim_threshold: eff_mid_loop_trim,
                                 build_check_cmd: build_check_cmd(&cfg),
                             },
                             &mut mcp,
