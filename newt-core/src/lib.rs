@@ -15,6 +15,7 @@ pub mod model_id;
 pub mod pricing;
 pub mod router;
 pub mod session;
+pub mod tuning;
 
 #[cfg(feature = "pyo3")]
 pub mod pyo3_module;
