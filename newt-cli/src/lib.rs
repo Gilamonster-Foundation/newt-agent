@@ -1,6 +1,7 @@
 //! Newt CLI dispatch surface.
 //!
-//! Subcommands: `code`, `pilot`, `worker`, `mcp`, `doctor`, `config`, `dgx`.
+//! Subcommands: `code`, `pilot`, `worker`, `mcp`, `doctor`, `config`, `dgx`,
+//! `tunings`.
 //!
 //! The mesh subcommands (`announce`, `ask`) live in a sibling binary,
 //! `newt-mesh-cli`, inside the out-of-workspace `newt-mesh/` crate.
@@ -12,6 +13,7 @@ mod dgx;
 mod doctor;
 mod skills;
 pub mod stdio_guard;
+mod tuning_cmd;
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -153,6 +155,16 @@ pub enum Command {
         #[command(subcommand)]
         cmd: dgx::DgxCmd,
     },
+    /// Inspect, export, import, and reset per-model context-window tuning data.
+    ///
+    /// Tuning data is maintained automatically by the harness in
+    /// `~/.newt/model-capabilities.json`. Human-readable overrides live in
+    /// `~/.newt/config.toml` under `[[model_tuning]]`. Community profiles can be
+    /// shared as plain TOML files and merged with `newt tunings import`.
+    Tunings {
+        #[command(subcommand)]
+        cmd: tuning_cmd::TuningsCmd,
+    },
 }
 
 pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
@@ -222,6 +234,7 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         Command::Setup => newt_tui::run_setup(newt_tui::color_supported()),
         Command::Skills { cmd } => skills::run(cmd, cli.config.as_deref()),
         Command::Dgx { cmd } => dgx::run(cmd, cli.config.as_deref()).await,
+        Command::Tunings { cmd } => tuning_cmd::run(cmd, cli.config.as_deref()),
     }
 }
 
