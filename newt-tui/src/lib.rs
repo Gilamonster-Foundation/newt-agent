@@ -1110,6 +1110,10 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
     // intentional refresh point — config.toml may have changed on disk.
     let mut cfg = newt_core::Config::resolve().unwrap_or_default();
 
+    // Capability cache: loaded once per session, written back after each turn
+    // that updates tuning state (context window discovery, success/overflow).
+    let mut cap_cache = probe::load_cache();
+
     // Resolve the inference backend and permission caveats once at session
     // start.  Both are re-read after each slash command (config.toml on disk).
     let mut choice = resolve_backend_choice(&cfg);
@@ -1409,6 +1413,18 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                         .unwrap_or_else(|| mid_loop_trim_threshold(&cfg))
                         .min(eff_max_tool_rounds.saturating_sub(3));
 
+                    // Lazy context-window discovery: queries /api/show once per model
+                    // per session, then caches the result for the lifetime of the process.
+                    let eff_safe_context = {
+                        let entry = cap_cache.entry(inf_model.clone()).or_default();
+                        let updated = probe::ensure_context_window(entry, &inf_url, &inf_model);
+                        let sc = entry.safe_context;
+                        if updated {
+                            probe::save_cache(&cap_cache);
+                        }
+                        sc
+                    };
+
                     // Build message list from memory manager.
                     let messages = memory.build_messages(&system, &task);
                     let response = tokio::task::block_in_place(|| {
@@ -1431,7 +1447,7 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                                 inference_timeout_secs: inference_timeout_secs(&cfg),
                                 mid_loop_trim_threshold: eff_mid_loop_trim,
                                 build_check_cmd: build_check_cmd(&cfg),
-                                safe_context: None,
+                                safe_context: eff_safe_context,
                             },
                             &mut mcp,
                         ))
@@ -1439,6 +1455,7 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
 
                     let elapsed = t0.elapsed();
                     erase_line();
+                    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
                     match response {
                         Ok((reply, was_streamed, usage, hallucinations)) => {
                             if !was_streamed {
@@ -1464,6 +1481,18 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                             {
                                 let policy = cfg.logs.as_ref().cloned().unwrap_or_default();
                                 metrics.append_to_log_with_policy(&log, &policy);
+                            }
+                            // Update tuning state and persist if anything changed.
+                            if let Some(input_tokens) = usage.map(|u| u.input_tokens) {
+                                let entry = cap_cache.entry(inf_model.clone()).or_default();
+                                let dirty = if reply.is_empty() {
+                                    entry.record_overflow(input_tokens, &today)
+                                } else {
+                                    entry.record_success(input_tokens, &today)
+                                };
+                                if dirty {
+                                    probe::save_cache(&cap_cache);
+                                }
                             }
                         }
                         Err(e) => print_newt(&format!("error: {e}"), color, verbose),
