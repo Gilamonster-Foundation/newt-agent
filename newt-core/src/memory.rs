@@ -143,6 +143,11 @@ pub trait MemoryProvider: Send + Sync {
     /// chat loop never blocks on memory I/O.
     async fn sync_turn(&mut self, user: &str, assistant: &str, metrics: &TurnMetrics);
 
+    /// Clear conversation-local history while preserving provider configuration
+    /// and system-prompt state. Used when the TUI starts a fresh conversation
+    /// inside the same running process.
+    fn reset(&mut self) {}
+
     /// Called **before** old messages are discarded (e.g. during compression).
     /// Extract anything worth keeping from `messages`; return it as a string
     /// to include in the compression summary. Return empty string for nothing.
@@ -247,6 +252,13 @@ impl MemoryManager {
     pub async fn sync_all(&mut self, user: &str, assistant: &str, metrics: &TurnMetrics) {
         for p in &mut self.providers {
             p.sync_turn(user, assistant, metrics).await;
+        }
+    }
+
+    /// Clear conversation-local history from every provider.
+    pub fn reset_all(&mut self) {
+        for p in &mut self.providers {
+            p.reset();
         }
     }
 
@@ -372,6 +384,10 @@ impl MemoryProvider for RollingWindow {
         }
     }
 
+    fn reset(&mut self) {
+        self.history.clear();
+    }
+
     fn usage(&self) -> Option<(String, usize, usize)> {
         Some((
             "turns".into(),
@@ -489,6 +505,11 @@ impl MemoryProvider for TokenBudget {
                 "TokenBudget pruned old turns"
             );
         }
+    }
+
+    fn reset(&mut self) {
+        self.history.clear();
+        self.pruned_count = 0;
     }
 
     fn usage(&self) -> Option<(String, usize, usize)> {
@@ -843,6 +864,13 @@ impl MemoryProvider for Summarizing {
         if self.should_compress() {
             self.compress_sync();
         }
+    }
+
+    fn reset(&mut self) {
+        self.history.clear();
+        self.prev_summary.clear();
+        self.last_savings = [1.0, 1.0];
+        self.compress_count = 0;
     }
 
     async fn on_pre_compress(&self, _messages: &[MemMessage]) -> String {
@@ -1577,6 +1605,25 @@ mod tests {
         mgr.sync_all("q", "a", &dummy_metrics()).await;
         let usage = mgr.usage();
         assert_eq!(usage[0].1, 1); // 1 turn stored
+    }
+
+    #[tokio::test]
+    async fn memory_manager_reset_all_clears_conversation_history() {
+        let mut mgr = MemoryManager::new();
+        mgr.add_provider(RollingWindow::new(5));
+        mgr.sync_all("old task", "old reply", &dummy_metrics())
+            .await;
+
+        let before = mgr.build_messages("system", "new task");
+        assert!(before.iter().any(|m| m.content == "old task"));
+        assert!(before.iter().any(|m| m.content == "old reply"));
+
+        mgr.reset_all();
+
+        let after = mgr.build_messages("system", "new task");
+        assert!(!after.iter().any(|m| m.content == "old task"));
+        assert!(!after.iter().any(|m| m.content == "old reply"));
+        assert!(after.iter().any(|m| m.content == "new task"));
     }
 
     #[tokio::test]
