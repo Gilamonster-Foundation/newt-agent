@@ -244,7 +244,7 @@ pub fn fetch_ollama_models(endpoint: &str) -> anyhow::Result<Vec<ModelInfo>> {
 /// Query Ollama's `/api/show` and return the model's declared context window.
 ///
 /// Checks two sources in order and returns the smaller (most conservative):
-/// 1. `modelinfo["llama.context_length"]` — architecture-level limit
+/// 1. `model_info["<arch>.context_length"]` — architecture-level limit
 /// 2. `num_ctx` line in the `parameters` string — Modelfile override
 ///
 /// Returns `None` if the endpoint is unreachable or the response lacks both fields.
@@ -268,20 +268,22 @@ pub fn fetch_context_window(endpoint: &str, model: &str) -> Option<u32> {
         })
     })?;
 
-    // 1. Architecture limit from modelinfo (Llama-family key; other families may differ).
-    let arch_limit: Option<u32> = json["modelinfo"].as_object().and_then(|info| {
-        // Try common keys across architectures.
-        for key in &[
-            "llama.context_length",
-            "qwen2.context_length",
-            "gemma.context_length",
-            "context_length",
-        ] {
-            if let Some(v) = info.get(*key).and_then(|v| v.as_u64()) {
-                return Some(v as u32);
-            }
+    // 1. Architecture limit from model_info.
+    // Ollama returns the field as "model_info" (with underscore). The key name
+    // is architecture-prefixed (e.g. "llama.context_length",
+    // "nemotron_h_omni.context_length") — scan for any key ending in
+    // ".context_length" so new architectures work without code changes.
+    let arch_limit: Option<u32> = json["model_info"].as_object().and_then(|info| {
+        // Exact bare key first (unlikely but defensive).
+        if let Some(v) = info.get("context_length").and_then(|v| v.as_u64()) {
+            return Some(v as u32);
         }
-        None
+        // Any architecture-prefixed key ending in ".context_length".
+        info.iter()
+            .filter(|(k, _)| k.ends_with(".context_length"))
+            .filter_map(|(_, v)| v.as_u64())
+            .map(|v| v as u32)
+            .min() // take the smallest if there are multiple (conservative)
     });
 
     // 2. Modelfile `num_ctx` parameter line (user override, takes precedence if smaller).
