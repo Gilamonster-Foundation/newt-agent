@@ -77,7 +77,6 @@ pub struct CapabilityEntry {
     pub tested_date: String,
 
     // --- Context window tuning (all optional for backward compat) ---
-
     /// Model's declared maximum context length from Ollama `/api/show`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u32>,
@@ -270,36 +269,32 @@ pub fn fetch_context_window(endpoint: &str, model: &str) -> Option<u32> {
     })?;
 
     // 1. Architecture limit from modelinfo (Llama-family key; other families may differ).
-    let arch_limit: Option<u32> = json["modelinfo"]
-        .as_object()
-        .and_then(|info| {
-            // Try common keys across architectures.
-            for key in &[
-                "llama.context_length",
-                "qwen2.context_length",
-                "gemma.context_length",
-                "context_length",
-            ] {
-                if let Some(v) = info.get(*key).and_then(|v| v.as_u64()) {
-                    return Some(v as u32);
-                }
+    let arch_limit: Option<u32> = json["modelinfo"].as_object().and_then(|info| {
+        // Try common keys across architectures.
+        for key in &[
+            "llama.context_length",
+            "qwen2.context_length",
+            "gemma.context_length",
+            "context_length",
+        ] {
+            if let Some(v) = info.get(*key).and_then(|v| v.as_u64()) {
+                return Some(v as u32);
             }
-            None
-        });
+        }
+        None
+    });
 
     // 2. Modelfile `num_ctx` parameter line (user override, takes precedence if smaller).
-    let modelfile_ctx: Option<u32> = json["parameters"]
-        .as_str()
-        .and_then(|params| {
-            params.lines().find_map(|line| {
-                let mut parts = line.split_whitespace();
-                if parts.next()? == "num_ctx" {
-                    parts.next()?.parse::<u32>().ok()
-                } else {
-                    None
-                }
-            })
-        });
+    let modelfile_ctx: Option<u32> = json["parameters"].as_str().and_then(|params| {
+        params.lines().find_map(|line| {
+            let mut parts = line.split_whitespace();
+            if parts.next()? == "num_ctx" {
+                parts.next()?.parse::<u32>().ok()
+            } else {
+                None
+            }
+        })
+    });
 
     match (arch_limit, modelfile_ctx) {
         (Some(a), Some(b)) => Some(a.min(b)),
