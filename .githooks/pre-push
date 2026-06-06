@@ -22,6 +22,10 @@ set -e
 
 cd "$(git rev-parse --show-toplevel)"
 
+# Ensure ~/.cargo/bin is on PATH so cargo sub-commands are found even when
+# the hook is invoked from an editor or GUI that doesn't source ~/.zshrc.
+export PATH="$HOME/.cargo/bin:$PATH"
+
 if ! command -v just >/dev/null 2>&1; then
     echo "pre-push: 'just' not found in PATH"
     echo "          install via: cargo install just"
