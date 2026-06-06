@@ -463,6 +463,97 @@ fn verbose_mode() -> bool {
         .unwrap_or(false)
 }
 
+/// Collect the basenames of all executables in the CLI-granted directories
+/// (`--venv` and `--exec-path`). Used to widen the exec caveat at session start
+/// so the agent can run tools from those directories without needing them in
+/// `[tui.permissions] extra_exec` in the config file.
+#[cfg(unix)]
+fn scan_cli_exec_grants() -> Vec<String> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut dirs: Vec<String> = Vec::new();
+    if let Ok(venv) = std::env::var("NEWT_VENV") {
+        dirs.push(format!("{venv}/bin"));
+    }
+    if let Ok(paths) = std::env::var("NEWT_EXEC_PATHS") {
+        for p in paths.split(':') {
+            if !p.is_empty() {
+                dirs.push(p.to_string());
+            }
+        }
+    }
+    dirs.iter()
+        .flat_map(|dir| std::fs::read_dir(dir).ok().into_iter().flatten())
+        .flatten()
+        .filter_map(|e| {
+            let path = e.path();
+            if !path.is_file() {
+                return None;
+            }
+            let mode = path.metadata().ok()?.permissions().mode();
+            if mode & 0o111 == 0 {
+                return None;
+            }
+            path.file_name()?.to_str().map(str::to_string)
+        })
+        .collect()
+}
+
+#[cfg(not(unix))]
+fn scan_cli_exec_grants() -> Vec<String> {
+    Vec::new()
+}
+
+/// Build a shell prefix that exports venv/exec-path vars into the agent-bridle
+/// confined shell.
+///
+/// Agent-bridle's confined shell does not inherit the host environment
+/// (`do_not_inherit_env(true)`), so we inject `VIRTUAL_ENV` and prepend
+/// venv/extra `bin/` dirs to `PATH` by prefixing every `run_command` cmd.
+/// `NEWT_VENV` (set from `--venv` or auto-detected from `$VIRTUAL_ENV` by the
+/// CLI) takes precedence; falls back to `$VIRTUAL_ENV` if the TUI was invoked
+/// directly without going through the CLI's `dispatch`.
+fn venv_cmd_prefix() -> Option<String> {
+    let venv = std::env::var("NEWT_VENV")
+        .or_else(|_| std::env::var("VIRTUAL_ENV"))
+        .ok();
+    let exec_paths = std::env::var("NEWT_EXEC_PATHS").ok();
+
+    if venv.is_none() && exec_paths.is_none() {
+        return None;
+    }
+
+    // sh single-quoting: wrap in '', escape any ' as '\''
+    let q = |s: &str| format!("'{}'", s.replace('\'', r"'\''"));
+
+    // Build a list of dirs to prepend to PATH (venv/bin first, then exec-paths).
+    let mut path_dirs: Vec<String> = Vec::new();
+    let mut prefix = String::new();
+
+    if let Some(ref venv) = venv {
+        let venv_bin = format!("{venv}/bin");
+        prefix.push_str(&format!("export VIRTUAL_ENV={}; ", q(venv)));
+        path_dirs.push(venv_bin);
+    }
+    if let Some(ref paths) = exec_paths {
+        for dir in paths.split(':') {
+            if !dir.is_empty() {
+                path_dirs.push(dir.to_string());
+            }
+        }
+    }
+
+    if !path_dirs.is_empty() {
+        let quoted: Vec<String> = path_dirs.iter().map(|d| q(d)).collect();
+        prefix.push_str(&format!("export PATH={}:\"$PATH\"; ", quoted.join(":")));
+    }
+
+    if prefix.is_empty() {
+        None
+    } else {
+        Some(prefix)
+    }
+}
+
 /// Whether per-round agent-loop diagnostics are enabled.
 /// Set `NEWT_DEBUG=1` in the environment, or `[tui] debug = true` in config.
 fn debug_mode(cfg: &newt_core::Config) -> bool {
@@ -607,9 +698,22 @@ fn read_only_caveats(workspace: &str) -> newt_core::caveats::Caveats {
 /// Lower the configured TUI permission policy to a `Caveats` value. With no
 /// `[tui]` config the policy is **read-only** — never `Caveats::top()`. Pure in
 /// its inputs, so the safe-default behavior is unit-testable.
+///
+/// CLI exec grants (`--venv`, `--exec-path`) are injected here: they widen the
+/// exec scope at session-start so the agent can run tools in those directories
+/// without requiring per-binary `extra_exec` entries in the config file. Only
+/// `Scope::Only` is widened; `Scope::All` (FullAccess) is already unrestricted.
 fn policy_for(tui: Option<newt_core::TuiConfig>, workspace: &str) -> newt_core::caveats::Caveats {
-    tui.map(|t| t.permissions.to_caveats(workspace))
-        .unwrap_or_else(|| read_only_caveats(workspace))
+    let mut caveats = tui
+        .map(|t| t.permissions.to_caveats(workspace))
+        .unwrap_or_else(|| read_only_caveats(workspace));
+    let extra = scan_cli_exec_grants();
+    if !extra.is_empty() {
+        if let newt_core::caveats::Scope::Only(ref mut set) = caveats.exec {
+            set.extend(extra);
+        }
+    }
+    caveats
 }
 
 /// Resolve the configured `[tui]` block, if any.
@@ -2051,8 +2155,15 @@ async fn execute_tool(
             // from `[tui].permissions`. `caveats` is `newt_core::caveats::Caveats`,
             // a re-export of `agent_mesh_protocol::caveats::Caveats` — the exact
             // type `Registry::dispatch` expects, so no conversion is needed.
+            //
+            // Inject venv env vars if active: the confined shell does not inherit
+            // the host environment, so we prepend export statements to the cmd.
+            let cmd_with_venv = match venv_cmd_prefix() {
+                Some(prefix) => format!("{prefix}{cmd}"),
+                None => cmd.to_string(),
+            };
             let dispatch_args = serde_json::json!({
-                "cmd": cmd,
+                "cmd": cmd_with_venv,
                 "cwd": workspace,
             });
             match agent_bridle::registry()
