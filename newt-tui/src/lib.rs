@@ -581,6 +581,50 @@ fn print_debug(msg: &str, color: bool) {
     io::stdout().flush().ok();
 }
 
+/// Insert thousands separators into a token count for display.
+fn fmt_tokens(n: u32) -> String {
+    let s = n.to_string();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, c) in s.chars().rev().enumerate() {
+        if i > 0 && i % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out.chars().rev().collect()
+}
+
+/// Print a context-overflow adaptation notice to the TUI stream.
+fn emit_overflow_notice(
+    color: bool,
+    usage: Option<&newt_core::TokenUsage>,
+    safe_context: Option<u32>,
+    model: &str,
+    attempt: u32,
+) {
+    let token_str = usage
+        .map(|u| format!("{} tokens", fmt_tokens(u.input_tokens)))
+        .unwrap_or_else(|| "unknown tokens".to_string());
+    let safe_str = safe_context
+        .map(|s| format!(" > {} safe window for {model}", fmt_tokens(s)))
+        .unwrap_or_default();
+    let msg = format!(
+        "⚠  context overflow likely ({token_str}{safe_str})\n⟳  trimming context and retrying (attempt {attempt}/2)…"
+    );
+    if color {
+        execute!(
+            io::stdout(),
+            SetForegroundColor(CtColor::DarkYellow),
+            Print(format!("{msg}\n")),
+            ResetColor,
+        )
+        .ok();
+    } else {
+        println!("{msg}");
+    }
+    io::stdout().flush().ok();
+}
+
 /// Print a newt response line.
 /// Color: orange ▸ (matches the logo).  No-color: >.
 fn print_newt(msg: &str, color: bool, verbose: bool) {
@@ -1376,6 +1420,7 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                                 inference_timeout_secs: inference_timeout_secs(&cfg),
                                 mid_loop_trim_threshold: mid_loop_trim_threshold(&cfg),
                                 build_check_cmd: build_check_cmd(&cfg),
+                                safe_context: None,
                             },
                             &mut mcp,
                         ))
@@ -2814,6 +2859,11 @@ struct ChatCtx<'a> {
     /// immediate ground-truth feedback (e.g. "cargo check -q --workspace").
     /// `None` disables auto-checking. Set per-workspace in `.newt/config.toml`.
     build_check_cmd: Option<String>,
+    /// Empirically derived safe context size for this model (input tokens).
+    /// Used to detect likely overflow when the model returns an empty response.
+    /// Sourced from `model-capabilities.json` via `ensure_context_window`.
+    /// `None` disables overflow detection.
+    safe_context: Option<u32>,
 }
 
 /// Main agentic loop: call model → execute tool calls → feed results back → repeat.
@@ -2846,6 +2896,7 @@ async fn chat_complete(
         inference_timeout_secs,
         mid_loop_trim_threshold,
         build_check_cmd,
+        safe_context,
     } = ctx;
     let client = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(connect_timeout_secs))
@@ -2863,9 +2914,10 @@ async fn chat_complete(
 
     let mut accumulated_usage: Option<newt_core::TokenUsage> = None;
     let mut hallucination_count: u32 = 0;
+    let mut overflow_retries: u32 = 0;
 
     // Agentic loop — up to `max_tool_rounds` tool-call rounds.
-    for round in 0..max_tool_rounds {
+    'round_loop: for round in 0..max_tool_rounds {
         if round > 0 {
             // Brief separator between rounds so user can follow the flow.
             if color {
@@ -3039,12 +3091,32 @@ async fn chat_complete(
                     );
                 }
                 if probe_content.is_empty() {
-                    // Both probe and stream are empty — the model produced nothing.
+                    // Both probe and stream are empty — likely context overflow.
+                    let merged = merge_usage(accumulated_usage, stream_usage);
+                    let overflow_likely = merged
+                        .as_ref()
+                        .zip(safe_context)
+                        .map(|(u, safe)| u.input_tokens >= safe * 85 / 100)
+                        .unwrap_or(false);
+                    if overflow_likely && overflow_retries < 2 {
+                        emit_overflow_notice(
+                            color,
+                            merged.as_ref(),
+                            safe_context,
+                            model,
+                            overflow_retries + 1,
+                        );
+                        // Trim aggressively: keep system + first 2 + last N/4 messages.
+                        messages = trim_for_summary(&messages, 2, max_tool_rounds / 4);
+                        accumulated_usage = merged;
+                        overflow_retries += 1;
+                        continue 'round_loop;
+                    }
                     let msg = "(model returned an empty response — try rephrasing, or check the model with `newt doctor`)";
                     return Ok((
                         msg.to_string(),
                         false,
-                        merge_usage(accumulated_usage, stream_usage),
+                        merged,
                         hallucination_count,
                     ));
                 }
@@ -3312,6 +3384,7 @@ async fn openai_chat_complete(
         inference_timeout_secs,
         mid_loop_trim_threshold,
         build_check_cmd,
+        safe_context: _,
     } = ctx;
     let client = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(connect_timeout_secs))
@@ -4958,6 +5031,7 @@ mod tool_round_cap_tests {
                 inference_timeout_secs: 120,
                 mid_loop_trim_threshold: 40,
                 build_check_cmd: None,
+                safe_context: None,
             },
             &mut Mcp::empty(),
         )
@@ -5008,6 +5082,7 @@ mod tool_round_cap_tests {
                 inference_timeout_secs: 120,
                 mid_loop_trim_threshold: 40,
                 build_check_cmd: None,
+                safe_context: None,
             },
             &mut Mcp::empty(),
         )
@@ -5075,6 +5150,7 @@ mod tool_round_cap_tests {
                 inference_timeout_secs: 120,
                 mid_loop_trim_threshold: 40,
                 build_check_cmd: None,
+                safe_context: None,
             },
             &mut Mcp::empty(),
         )
@@ -5407,6 +5483,7 @@ mod tool_round_cap_tests {
                 inference_timeout_secs: 120,
                 mid_loop_trim_threshold: 40,
                 build_check_cmd: None,
+                safe_context: None,
             },
             &mut Mcp::empty(),
         )
