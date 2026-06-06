@@ -54,6 +54,11 @@ pub struct Cli {
     #[arg(long, global = true, default_value_t = false)]
     pub debug: bool,
 
+    /// Start the TUI coder with a named persona from ~/.newt/personas/<name>.md.
+    /// Defaults are created lazily the first time persona mode is used.
+    #[arg(long, global = true, value_name = "NAME")]
+    pub persona: Option<String>,
+
     /// Cap the Ollama context window (KV-cache) to this many tokens.
     /// Prevents VRAM exhaustion on large models by limiting how much memory
     /// Ollama allocates for the attention cache. Equivalent to setting
@@ -144,7 +149,7 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
                 .map(|t| t.no_splash)
                 .unwrap_or(false);
             let no_splash = (cli.no_splash || config_no_splash) && !cli.splash;
-            newt_tui::run_code(path.as_deref(), no_splash)
+            newt_tui::run_code(path.as_deref(), no_splash, cli.persona.as_deref())
         }
         Command::Pilot { flight_id } => newt_tui::run_pilot(&flight_id),
         Command::Worker {
@@ -311,5 +316,27 @@ async fn run_mcp() -> anyhow::Result<()> {
     #[cfg(not(unix))]
     {
         newt_mcp_server::run_stdio().await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn parses_global_persona_for_default_code_command() {
+        let cli = Cli::try_parse_from(["newt", "--persona", "coder"]).unwrap();
+
+        assert_eq!(cli.persona.as_deref(), Some("coder"));
+        assert!(cli.command.is_none());
+    }
+
+    #[test]
+    fn parses_global_persona_for_explicit_code_command() {
+        let cli = Cli::try_parse_from(["newt", "code", "--persona", "reviewer"]).unwrap();
+
+        assert_eq!(cli.persona.as_deref(), Some("reviewer"));
+        assert!(matches!(cli.command, Some(Command::Code { .. })));
     }
 }
