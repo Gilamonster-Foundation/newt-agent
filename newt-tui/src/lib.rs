@@ -3113,12 +3113,7 @@ async fn chat_complete(
                         continue 'round_loop;
                     }
                     let msg = "(model returned an empty response — try rephrasing, or check the model with `newt doctor`)";
-                    return Ok((
-                        msg.to_string(),
-                        false,
-                        merged,
-                        hallucination_count,
-                    ));
+                    return Ok((msg.to_string(), false, merged, hallucination_count));
                 }
                 // Use probe content; print it since it was never streamed.
                 return Ok((
