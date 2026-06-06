@@ -73,7 +73,11 @@ const NEWT_ORANGE_CT: CtColor = CtColor::Rgb {
 // Public entry points
 // ---------------------------------------------------------------------------
 
-pub fn run_code(path: Option<&std::path::Path>, no_splash: bool) -> anyhow::Result<()> {
+pub fn run_code(
+    path: Option<&std::path::Path>,
+    no_splash: bool,
+    persona: Option<&str>,
+) -> anyhow::Result<()> {
     let color = color_supported_with(&|k| std::env::var(k).ok());
 
     // First-run wizard: silent no-op if config already exists.
@@ -88,7 +92,7 @@ pub fn run_code(path: Option<&std::path::Path>, no_splash: bool) -> anyhow::Resu
 
     if inline {
         print_inline_header(&workspace, color);
-        return run_chat(&workspace, color);
+        return run_chat(&workspace, color, persona);
     }
 
     // Default: full ANSI splash in alt screen — blinks off on Enter.
@@ -106,7 +110,7 @@ pub fn run_code(path: Option<&std::path::Path>, no_splash: bool) -> anyhow::Resu
     let _ = execute!(io::stdout(), Show, LeaveAlternateScreen);
 
     if cont {
-        run_chat(&workspace, color)?;
+        run_chat(&workspace, color, persona)?;
     }
     Ok(())
 }
@@ -919,7 +923,7 @@ fn print_denied(axis: &str, target: &str, color: bool) {
     io::stdout().flush().ok();
 }
 
-fn run_chat(workspace: &str, color: bool) -> anyhow::Result<()> {
+fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Result<()> {
     let verbose = verbose_mode();
 
     // Header line — one-time print, then normal scroll from here.
@@ -998,7 +1002,11 @@ fn run_chat(workspace: &str, color: bool) -> anyhow::Result<()> {
     // system prompt is built AFTER initialize_all (see below) so soul files are loaded.
     // Placeholder until then.
     let mut system: String;
-    let mut active_persona: Option<&'static Persona> = None;
+    let persona_store = PersonaStore::default();
+    let mut active_persona: Option<Persona> = match persona {
+        Some(name) => Some(persona_store.load(name)?),
+        None => None,
+    };
 
     // Pluggable memory manager — replaces the old conv Vec.
     let mem_cfg = cfg.memory.clone().unwrap_or_default();
@@ -1087,7 +1095,7 @@ fn run_chat(workspace: &str, color: bool) -> anyhow::Result<()> {
     tokio::task::block_in_place(|| rt.block_on(memory.initialize_all(&ctx)));
 
     // Build system prompt now that SoulProvider has loaded its soul file.
-    system = rebuild_system_prompt(workspace, &memory, active_persona);
+    system = rebuild_system_prompt(workspace, &memory, active_persona.as_ref());
 
     loop {
         // rustyline can panic (assertion `fd != -1`) when the terminal file
@@ -1168,7 +1176,7 @@ fn run_chat(workspace: &str, color: bool) -> anyhow::Result<()> {
                             workspace,
                             &mut memory,
                             &mut system,
-                            active_persona,
+                            active_persona.as_ref(),
                         );
                         print_newt(&msg, color, verbose);
                         if let Some(ref hp) = history_path {
@@ -1182,6 +1190,7 @@ fn run_chat(workspace: &str, color: bool) -> anyhow::Result<()> {
                         match handle_persona_command(
                             &task,
                             workspace,
+                            &persona_store,
                             &mut memory,
                             &mut system,
                             &mut active_persona,
@@ -1377,53 +1386,155 @@ fn build_system_prompt(workspace: &str) -> String {
     build_system_prompt_with_soul(workspace, None)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Persona {
-    name: &'static str,
-    description: &'static str,
-    prompt: &'static str,
+    name: String,
+    prompt: String,
+    path: std::path::PathBuf,
 }
 
 impl Persona {
-    const ALL: &'static [Self] = &[
-        Self {
-            name: "implementer",
-            description: "Make focused code changes and verify them.",
-            prompt: "Act as an implementation-focused coding agent. Make pragmatic code changes, keep scope tight, verify behavior with tests, and summarize concrete outcomes.",
-        },
-        Self {
-            name: "reviewer",
-            description: "Review code for risks, regressions, and test gaps.",
-            prompt: "Act as a code reviewer. Prioritize bugs, regressions, missing tests, behavioral risks, and unclear assumptions. Lead with findings and keep summaries secondary.",
-        },
-        Self {
-            name: "security",
-            description: "Threat-model changes and validate exploitability.",
-            prompt: "Act as a security reviewer. Trace source-to-sink paths, separate plausible risk from speculation, calibrate severity, and recommend minimal fixes.",
-        },
-        Self {
-            name: "teacher",
-            description: "Explain reasoning and teach through the work.",
-            prompt: "Act as a teacher. Explain the reasoning behind changes, define unfamiliar terms briefly, and help the user build a reusable mental model.",
-        },
-        Self {
-            name: "terse",
-            description: "Use minimal wording and focus on direct actions.",
-            prompt: "Act as a terse operator. Use short answers, avoid extra explanation unless needed, and emphasize commands, results, and next actions.",
-        },
-    ];
-
-    fn find(name: &str) -> Option<&'static Self> {
-        let wanted = name.trim().to_ascii_lowercase();
-        Self::ALL.iter().find(|persona| persona.name == wanted)
-    }
-
-    fn list_lines() -> Vec<String> {
-        Self::ALL
-            .iter()
-            .map(|p| format!("  {} - {}", p.name, p.description))
+    fn description(&self) -> String {
+        self.prompt
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .unwrap_or("")
+            .trim_start_matches('#')
+            .trim()
+            .chars()
+            .take(96)
             .collect()
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PersonaSummary {
+    name: String,
+    description: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PersonaStore {
+    dir: std::path::PathBuf,
+}
+
+impl PersonaStore {
+    const DEFAULT_NAME: &'static str = "coder";
+
+    fn default_dir() -> std::path::PathBuf {
+        newt_core::Config::user_config_path()
+            .map(|p| p.with_file_name("personas"))
+            .unwrap_or_else(|| std::path::PathBuf::from("personas"))
+    }
+
+    fn new(dir: impl Into<std::path::PathBuf>) -> Self {
+        Self { dir: dir.into() }
+    }
+
+    fn default() -> Self {
+        Self::new(Self::default_dir())
+    }
+
+    fn load(&self, name: &str) -> anyhow::Result<Persona> {
+        self.ensure_defaults_if_empty()?;
+        let name = normalize_persona_name(name)?;
+        let path = self.dir.join(format!("{name}.md"));
+        let prompt = match std::fs::read_to_string(&path) {
+            Ok(prompt) => prompt,
+            Err(_) => anyhow::bail!("unknown persona `{name}`\n{}", self.list_message()?),
+        };
+        let prompt = prompt.trim().to_string();
+        if prompt.is_empty() {
+            anyhow::bail!("persona `{name}` is empty: {}", path.display());
+        }
+        Ok(Persona { name, prompt, path })
+    }
+
+    fn list(&self) -> anyhow::Result<Vec<PersonaSummary>> {
+        self.ensure_defaults_if_empty()?;
+        let mut personas = Vec::new();
+        for entry in std::fs::read_dir(&self.dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("md") {
+                continue;
+            }
+            let Some(name) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            let prompt = std::fs::read_to_string(&path).unwrap_or_default();
+            if prompt.trim().is_empty() {
+                continue;
+            }
+            let persona = Persona {
+                name: name.to_string(),
+                prompt,
+                path: path.clone(),
+            };
+            let description = persona.description();
+            personas.push(PersonaSummary {
+                name: persona.name,
+                description,
+            });
+        }
+        personas.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(personas)
+    }
+
+    fn list_message(&self) -> anyhow::Result<String> {
+        let personas = self.list()?;
+        let mut out = format!("Available personas in {}:", self.dir.display());
+        if personas.is_empty() {
+            out.push_str("\n  (none)");
+        } else {
+            for p in personas {
+                out.push_str(&format!("\n  {} - {}", p.name, p.description));
+            }
+        }
+        Ok(out)
+    }
+
+    fn ensure_defaults_if_empty(&self) -> anyhow::Result<()> {
+        if self.has_persona_files()? {
+            return Ok(());
+        }
+        std::fs::create_dir_all(&self.dir)?;
+        std::fs::write(
+            self.dir.join(format!("{}.md", Self::DEFAULT_NAME)),
+            default_coder_persona(),
+        )?;
+        Ok(())
+    }
+
+    fn has_persona_files(&self) -> anyhow::Result<bool> {
+        if !self.dir.exists() {
+            return Ok(false);
+        }
+        for entry in std::fs::read_dir(&self.dir)? {
+            let path = entry?.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("md") {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+}
+
+fn default_coder_persona() -> &'static str {
+    newt_core::DEFAULT_SOUL
+}
+
+fn normalize_persona_name(name: &str) -> anyhow::Result<String> {
+    let name = name.trim().to_ascii_lowercase();
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        anyhow::bail!("persona names may only contain letters, numbers, '-' and '_'");
+    }
+    Ok(name)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1445,7 +1556,8 @@ fn parse_persona_command(input: &str) -> anyhow::Result<PersonaCommand> {
     match parts.next() {
         None | Some("show") => Ok(PersonaCommand::Show),
         Some("list") => Ok(PersonaCommand::List),
-        Some("clear" | "off" | "default") => Ok(PersonaCommand::Clear),
+        Some("clear" | "off") => Ok(PersonaCommand::Clear),
+        Some("default") => Ok(PersonaCommand::Set(PersonaStore::DEFAULT_NAME.into())),
         Some("set") => match parts.next() {
             Some(name) => Ok(PersonaCommand::Set(name.to_string())),
             None => anyhow::bail!("usage: /persona set <name>"),
@@ -1562,18 +1674,18 @@ fn rebuild_system_prompt(
 
 fn persona_status(active: Option<&Persona>) -> String {
     match active {
-        Some(persona) => format!("Active persona: {} - {}", persona.name, persona.description),
+        Some(persona) => format!(
+            "Active persona: {} - {} ({})",
+            persona.name,
+            persona.description(),
+            persona.path.display()
+        ),
         None => "No active persona.".to_string(),
     }
 }
 
-fn persona_list() -> String {
-    let mut out = String::from("Available personas:");
-    for line in Persona::list_lines() {
-        out.push('\n');
-        out.push_str(&line);
-    }
-    out
+fn persona_list(store: &PersonaStore) -> anyhow::Result<String> {
+    store.list_message()
 }
 
 fn reset_conversation(
@@ -1609,25 +1721,24 @@ fn handle_new_conversation(
 fn handle_persona_command(
     input: &str,
     workspace: &str,
+    store: &PersonaStore,
     memory: &mut newt_core::MemoryManager,
     system: &mut String,
-    active_persona: &mut Option<&'static Persona>,
+    active_persona: &mut Option<Persona>,
 ) -> anyhow::Result<String> {
     match parse_persona_command(input)? {
-        PersonaCommand::List => Ok(persona_list()),
-        PersonaCommand::Show => Ok(persona_status(*active_persona)),
+        PersonaCommand::List => persona_list(store),
+        PersonaCommand::Show => Ok(persona_status(active_persona.as_ref())),
         PersonaCommand::Clear => {
             *active_persona = None;
-            reset_conversation(workspace, memory, system, *active_persona);
+            reset_conversation(workspace, memory, system, active_persona.as_ref());
             Ok("Started a new conversation with no active persona.".to_string())
         }
         PersonaCommand::Set(name) => {
-            let Some(persona) = Persona::find(&name) else {
-                anyhow::bail!("unknown persona `{name}`\n{}", persona_list());
-            };
+            let persona = store.load(&name)?;
             *active_persona = Some(persona);
-            reset_conversation(workspace, memory, system, *active_persona);
-            Ok(new_conversation_message(*active_persona))
+            reset_conversation(workspace, memory, system, active_persona.as_ref());
+            Ok(new_conversation_message(active_persona.as_ref()))
         }
     }
 }
@@ -3381,7 +3492,7 @@ fn dispatch_slash(
                 "  /memory                  — show context window / notes usage",
                 "  /remember <fact>         — add a fact to persistent NOTES.md",
                 "  /new                     — start a fresh conversation",
-                "  /persona list            — list built-in personas",
+                "  /persona list            — list configured personas",
                 "  /persona show            — show the active persona",
                 "  /persona <name>          — start fresh with a persona",
                 "  /persona clear           — start fresh with no persona",
@@ -4418,14 +4529,18 @@ mod skills_integration_tests {
     #[test]
     fn system_prompt_includes_active_persona_overlay() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let persona = Persona::find("reviewer").expect("reviewer persona exists");
+        let persona = Persona {
+            name: "reviewer".to_string(),
+            prompt: "Review from a persona file.".to_string(),
+            path: tmp.path().join("personas").join("reviewer.md"),
+        };
         let prompt = build_system_prompt_with_persona(
             tmp.path().to_str().unwrap(),
             Some(newt_core::DEFAULT_SOUL),
-            Some(persona),
+            Some(&persona),
         );
         assert!(prompt.contains("Active persona: reviewer"));
-        assert!(prompt.contains("Prioritize bugs, regressions, missing tests"));
+        assert!(prompt.contains("Review from a persona file."));
     }
 
     #[test]
@@ -4450,12 +4565,57 @@ mod skills_integration_tests {
             parse_persona_command("/persona list").unwrap(),
             PersonaCommand::List
         );
+        assert_eq!(
+            parse_persona_command("/persona default").unwrap(),
+            PersonaCommand::Set("coder".into())
+        );
+    }
+
+    #[test]
+    fn persona_store_writes_coder_default_only_when_loaded() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("personas");
+        let store = PersonaStore::new(dir.clone());
+
+        assert!(
+            !dir.exists(),
+            "constructing a store must not write defaults"
+        );
+
+        let persona = store.load("coder").unwrap();
+
+        assert_eq!(persona.name, "coder");
+        assert_eq!(persona.path, dir.join("coder.md"));
+        assert!(persona.prompt.contains(newt_core::DEFAULT_SOUL));
+        assert!(
+            dir.join("coder.md").is_file(),
+            "first persona load should materialize the default coder file"
+        );
+    }
+
+    #[test]
+    fn persona_store_does_not_seed_non_empty_persona_dir() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("personas");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("reviewer.md"), "Review from disk.").unwrap();
+        let store = PersonaStore::new(dir.clone());
+
+        let personas = store.list().unwrap();
+
+        assert_eq!(personas.len(), 1);
+        assert_eq!(personas[0].name, "reviewer");
+        assert!(!dir.join("coder.md").exists());
     }
 
     #[tokio::test]
     async fn persona_set_starts_fresh_conversation_with_overlay() {
         let tmp = tempfile::TempDir::new().unwrap();
         let workspace = tmp.path().to_str().unwrap();
+        let persona_dir = tmp.path().join("personas");
+        fs::create_dir_all(&persona_dir).unwrap();
+        fs::write(persona_dir.join("reviewer.md"), "Review from disk.").unwrap();
+        let store = PersonaStore::new(persona_dir);
         let mut memory = newt_core::MemoryManager::new();
         memory.add_provider(newt_core::RollingWindow::new(5));
         memory
@@ -4467,6 +4627,7 @@ mod skills_integration_tests {
         let message = handle_persona_command(
             "/persona reviewer",
             workspace,
+            &store,
             &mut memory,
             &mut system,
             &mut active_persona,
@@ -4477,8 +4638,12 @@ mod skills_integration_tests {
             message,
             "Started a new conversation with persona `reviewer`."
         );
-        assert_eq!(active_persona.map(|p| p.name), Some("reviewer"));
+        assert_eq!(
+            active_persona.as_ref().map(|p| p.name.as_str()),
+            Some("reviewer")
+        );
         assert!(system.contains("Active persona: reviewer"));
+        assert!(system.contains("Review from disk."));
         let messages = memory.build_messages(&system, "new task");
         assert!(!messages.iter().any(|m| m.content == "old task"));
         assert!(!messages.iter().any(|m| m.content == "old reply"));
@@ -4493,13 +4658,19 @@ mod skills_integration_tests {
         memory
             .sync_all("old task", "old reply", &newt_core::TurnMetrics::default())
             .await;
-        let active_persona = Persona::find("terse");
-        let mut system = rebuild_system_prompt(workspace, &memory, active_persona);
+        let active_persona = Some(Persona {
+            name: "terse".to_string(),
+            prompt: "Keep replies short.".to_string(),
+            path: tmp.path().join("personas").join("terse.md"),
+        });
+        let mut system = rebuild_system_prompt(workspace, &memory, active_persona.as_ref());
 
-        let message = handle_new_conversation(workspace, &mut memory, &mut system, active_persona);
+        let message =
+            handle_new_conversation(workspace, &mut memory, &mut system, active_persona.as_ref());
 
         assert_eq!(message, "Started a new conversation with persona `terse`.");
         assert!(system.contains("Active persona: terse"));
+        assert!(system.contains("Keep replies short."));
         let messages = memory.build_messages(&system, "new task");
         assert!(!messages.iter().any(|m| m.content == "old task"));
         assert!(!messages.iter().any(|m| m.content == "old reply"));
