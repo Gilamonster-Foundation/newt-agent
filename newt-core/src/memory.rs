@@ -944,7 +944,19 @@ check it matches what you expected. After editing code, the tool reports \
 whether it compiled — if it did not, fix the error before committing. \
 Before committing, confirm you are on the right branch. \
 A belief that something worked is worthless; a tool result that confirms it \
-is ground truth.";
+is ground truth.\n\
+\n\
+**Never describe a code change — make it.** Do not paste code into the chat. \
+If the task requires a code change, call edit_file or write_file immediately. \
+A markdown code block in the conversation is invisible to the filesystem — \
+it does not modify any file. Write the code once, into the file, via the tool. \
+Showing code in text is NOT completing a task; calling the tool IS.\n\
+\n\
+**Exploration budget.** Treat read-only rounds (list_dir, read_file) as expensive. \
+Spend at most three consecutive rounds on exploration before making a write. \
+Once you have read the file you need, stop reading and call edit_file or write_file. \
+Continued reading without writing means you are lost — make your best attempt \
+at the change based on what you have already read, then verify.";
 
 /// Loads an agent identity from a Markdown soul file and injects it as a
 /// frozen system-prompt block.

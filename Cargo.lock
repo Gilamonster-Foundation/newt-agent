@@ -2525,6 +2525,7 @@ dependencies = [
  "agent-mesh-protocol",
  "anyhow",
  "base64",
+ "chrono",
  "crossterm",
  "libc",
  "newt-core",

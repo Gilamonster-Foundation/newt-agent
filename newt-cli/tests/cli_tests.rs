@@ -85,6 +85,44 @@ default_tier_order = ["FAST"]
 }
 
 #[test]
+fn venv_and_exec_path_flags_are_accepted_by_dispatch() {
+    // dispatch() resolves --venv / --exec-path into NEWT_VENV / NEWT_EXEC_PATHS
+    // before running the subcommand; the flags must not break a non-TUI
+    // subcommand like `config`.
+    let venv = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(venv.path().join("bin")).unwrap();
+
+    Command::cargo_bin("newt")
+        .unwrap()
+        .env_remove("VIRTUAL_ENV")
+        .arg("--venv")
+        .arg(venv.path())
+        .arg("--exec-path")
+        .arg(venv.path().join("bin"))
+        .arg("--exec-path")
+        .arg(venv.path())
+        .arg("config")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("backends"));
+}
+
+#[test]
+fn activated_virtual_env_is_picked_up_without_flag() {
+    // With $VIRTUAL_ENV already set (shell-activated venv) and no --venv flag,
+    // dispatch takes the env fallback path and the subcommand still works.
+    let venv = tempfile::tempdir().unwrap();
+
+    Command::cargo_bin("newt")
+        .unwrap()
+        .env("VIRTUAL_ENV", venv.path())
+        .arg("config")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("backends"));
+}
+
+#[test]
 fn dgx_route_review_task() {
     Command::cargo_bin("newt")
         .unwrap()

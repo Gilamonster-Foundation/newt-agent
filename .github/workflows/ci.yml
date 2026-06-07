@@ -79,7 +79,8 @@ jobs:
 
       # The gate floor matches `just cov-ci` in the justfile. Keep
       # them in lock-step — PIPELINE PARITY. Ratcheted from 15 to
-      # 75 in the stdio-safety PR (workspace is at ~89.78%).
+      # 75 in the stdio-safety PR, then to the roadmap's 80 in the
+      # tuning-writeback PR.
       #
       # pyo3_module.rs files are excluded: they only compile under
       # the `pyo3` cargo feature (umbrella `newt-agent-py` crate
@@ -100,9 +101,9 @@ jobs:
       - name: Export lcov
         run: cargo llvm-cov report --lcov --output-path lcov.info --ignore-filename-regex 'pyo3_module\.rs$'
 
-      - name: Enforce coverage floor (>= 75% lines)
+      - name: Enforce coverage floor (>= 80% lines)
         env:
-          COVERAGE_FLOOR: "75"
+          COVERAGE_FLOOR: "80"
         run: |
           set -euo pipefail
           # Capture the summary table; the TOTAL row's 8th-from-last

@@ -1,3 +1,6 @@
+# Live Testing
+typescript*
+*.log
 # Rust
 /target
 # newt-mesh is a sibling crate outside the workspace; its target dir

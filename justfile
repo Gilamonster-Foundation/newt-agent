@@ -99,8 +99,8 @@ cov:
 # The floor RATCHETS UP — never down — as the codebase grows. The
 # roadmap targets 80% workspace-wide; bootstrap baseline was 15%
 # (Step 0.3 landed the workflow before there was enough code to
-# justify 80%). Workspace coverage is now ~89.78% — ratcheted to
-# 75% here to give a margin while approaching the 80% target.
+# justify 80%), ratcheted to 75% in the stdio-safety PR, and to the
+# roadmap's 80% in the tuning-writeback PR.
 # Each PR that adds tests should also bump this threshold higher;
 # each PR that adds untested code will fail the gate.
 #
@@ -120,7 +120,7 @@ cov:
 cov-ci:
     #!/usr/bin/env bash
     set -euo pipefail
-    floor=75
+    floor=80
     cargo llvm-cov --workspace --no-report
     cargo llvm-cov report --lcov --output-path lcov.info --ignore-filename-regex 'pyo3_module\.rs$'
     summary=$(cargo llvm-cov report --summary-only --ignore-filename-regex 'pyo3_module\.rs$')
