@@ -2132,15 +2132,17 @@ fn handle_conversation_command(
             Ok(message)
         }
         ConversationCommand::Rename { id, title } => {
-            ctx.store.rename(&id, &title)?;
-            Ok(format!("Renamed conversation `{id}`."))
+            let resolved_id = ctx.store.resolve_id(&id)?;
+            ctx.store.rename(&resolved_id, &title)?;
+            Ok(format!("Renamed conversation `{resolved_id}`."))
         }
         ConversationCommand::Delete(id) => {
-            if ctx.active_conversation_id.as_deref() == Some(id.as_str()) {
+            let resolved_id = ctx.store.resolve_id(&id)?;
+            if ctx.active_conversation_id.as_deref() == Some(resolved_id.as_str()) {
                 anyhow::bail!("cannot delete the active conversation; use /new first");
             }
-            ctx.store.delete(&id)?;
-            Ok(format!("Deleted conversation `{id}`."))
+            ctx.store.delete(&resolved_id)?;
+            Ok(format!("Deleted conversation `{resolved_id}`."))
         }
     }
 }
@@ -3929,6 +3931,37 @@ fn erase_line() {
 // Slash command dispatcher
 // ---------------------------------------------------------------------------
 
+fn help_lines() -> &'static [&'static str] {
+    &[
+        "  /models                  - list models on the active endpoint",
+        "  /models capabilities     - tool-conformance matrix (cached)",
+        "  /model <name>            - switch model for this session",
+        "  /probe [model|all]       - test tool conformance and cache the result",
+        "  /memory                  - show context window / notes usage",
+        "  /remember <fact>         - add a fact to persistent NOTES.md",
+        "  /new                     - start a fresh conversation",
+        "  /conversation list       - list saved conversations",
+        "  /conversation show <id>  - show a saved conversation",
+        "  /conversation restore <id> - restore a saved conversation",
+        "  /conversation rename <id> <title> - rename a saved conversation",
+        "  /conversation delete <id> - delete a saved conversation",
+        "  /conversation rm <id>    - alias for /conversation delete",
+        "  /persona list            - list configured personas",
+        "  /persona show            - show the active persona",
+        "  /persona <name>          - start fresh with a persona",
+        "  /persona clear           - start fresh with no persona",
+        "  /dgx status              - DGX endpoint health + running models",
+        "  /dgx models              - list models installed on the DGX",
+        "  /dgx warm [model]        - pre-load a model into VRAM",
+        "  /dgx route <task>        - recommend a formation for a task",
+        "  /dgx doctor              - probe every configured endpoint",
+        "  /workspace               - show current workspace path",
+        "  /version                 - print newt version",
+        "  /help                    - this message",
+        "  /exit  /quit  exit  quit - leave the session",
+    ]
+}
+
 /// Dispatch a `/command` line. Returns `true` to keep the session alive,
 /// `false` to exit.
 fn dispatch_slash(
@@ -3949,33 +3982,7 @@ fn dispatch_slash(
 
         "help" => {
             print_newt("Available commands:", color, verbose);
-            for line in [
-                "  /models                  — list models on the active endpoint",
-                "  /models capabilities     — tool-conformance matrix (cached)",
-                "  /model <name>            — switch model for this session",
-                "  /probe [model|all]       — test tool conformance and cache the result",
-                "  /memory                  — show context window / notes usage",
-                "  /remember <fact>         — add a fact to persistent NOTES.md",
-                "  /new                     — start a fresh conversation",
-                "  /conversation list       — list saved conversations",
-                "  /conversation show <id>  — show a saved conversation",
-                "  /conversation restore <id> — restore a saved conversation",
-                "  /conversation rename <id> <title> — rename a saved conversation",
-                "  /conversation delete <id> — delete a saved conversation",
-                "  /persona list            — list configured personas",
-                "  /persona show            — show the active persona",
-                "  /persona <name>          — start fresh with a persona",
-                "  /persona clear           — start fresh with no persona",
-                "  /dgx status              — DGX endpoint health + running models",
-                "  /dgx models              — list models installed on the DGX",
-                "  /dgx warm [model]        — pre-load a model into VRAM",
-                "  /dgx route <task>        — recommend a formation for a task",
-                "  /dgx doctor              — probe every configured endpoint",
-                "  /workspace               — show current workspace path",
-                "  /version                 — print newt version",
-                "  /help                    — this message",
-                "  /exit  /quit  exit  quit — leave the session",
-            ] {
+            for line in help_lines() {
                 println!("{line}");
             }
         }
@@ -5193,6 +5200,17 @@ mod skills_integration_tests {
             parse_conversation_command("/conversation delete abc").unwrap(),
             ConversationCommand::Delete("abc".into())
         );
+        assert_eq!(
+            parse_conversation_command("/conversation rm abc").unwrap(),
+            ConversationCommand::Delete("abc".into())
+        );
+    }
+
+    #[test]
+    fn help_documents_conversation_rm_alias() {
+        assert!(help_lines()
+            .iter()
+            .any(|line| line.contains("/conversation rm <id>")));
     }
 
     #[test]

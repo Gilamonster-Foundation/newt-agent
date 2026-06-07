@@ -12,6 +12,8 @@
 #   just cov-ci     — coverage with 80% gate, lcov output (CI mode)
 #   just install-hooks — wire .githooks/ as the repo's hooks path
 
+set windows-shell := ["powershell.exe", "-NoProfile", "-Command"]
+
 default:
     @just --list
 
@@ -65,6 +67,7 @@ lock:
 # PIPELINE PARITY: must match .github/workflows/ci.yml. Runs all three even if
 # an earlier one fails (a fmt failure must not mask a clippy failure), matching
 # the `if: always()` on CI's clippy step; exits non-zero if any failed.
+[unix]
 check:
     #!/usr/bin/env bash
     set -uo pipefail
@@ -73,6 +76,10 @@ check:
     cargo clippy --workspace --all-targets -- -D warnings || rc=1
     cargo test --workspace || rc=1
     exit $rc
+
+[windows]
+check:
+    $rc = 0; cargo fmt --all -- --check; if ($LASTEXITCODE -ne 0) { $rc = 1 }; cargo clippy --workspace --all-targets -- -D warnings; if ($LASTEXITCODE -ne 0) { $rc = 1 }; cargo test --workspace; if ($LASTEXITCODE -ne 0) { $rc = 1 }; exit $rc
 
 # Build + test the out-of-workspace newt-mesh crate. Requires the
 # sibling `../agent-mesh/` checkout. Not run by `just check` /
@@ -117,6 +124,7 @@ cov:
 # is also unreliable in that version). We instead parse the TOTAL
 # line from `report --summary-only` and gate in shell — deterministic,
 # version-independent, and the measured percentage is always visible.
+[unix]
 cov-ci:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -138,6 +146,10 @@ cov-ci:
         exit 1
     fi
     echo "coverage gate OK: ${line_cov}% >= ${floor}%"
+
+[windows]
+cov-ci:
+    $floor = 75; cargo llvm-cov --workspace --no-report; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; cargo llvm-cov report --lcov --output-path lcov.info --ignore-filename-regex 'pyo3_module\.rs$'; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; $summary = cargo llvm-cov report --summary-only --ignore-filename-regex 'pyo3_module\.rs$'; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; $summary; $total = $summary | Where-Object { $_ -match '^TOTAL\s+' } | Select-Object -First 1; if (-not $total) { Write-Error 'ERROR: could not parse line coverage from cargo-llvm-cov summary'; exit 1 }; $cols = $total -split '\s+'; $line_cov = [double]($cols[9].TrimEnd('%')); Write-Output "measured line coverage: $line_cov% (floor: $floor%)"; if ($line_cov -lt $floor) { Write-Error "ERROR: workspace line coverage $line_cov% is below the $floor% floor"; exit 1 }; Write-Output "coverage gate OK: $line_cov% >= $floor%"
 
 # --- Evaluation ---
 

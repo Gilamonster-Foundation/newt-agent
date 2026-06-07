@@ -101,11 +101,11 @@ impl ConversationStore {
     }
 
     pub fn load(&self, id: &str) -> anyhow::Result<ConversationRecord> {
-        validate_record_id(id)?;
-        let text = std::fs::read_to_string(self.record_path(id))?;
+        let resolved_id = self.resolve_id(id)?;
+        let text = std::fs::read_to_string(self.record_path(&resolved_id))?;
         let record: ConversationRecord = serde_json::from_str(&text)?;
         if record.workspace_id != self.workspace_id {
-            anyhow::bail!("conversation `{id}` does not belong to this workspace");
+            anyhow::bail!("conversation `{resolved_id}` does not belong to this workspace");
         }
         Ok(record)
     }
@@ -133,12 +133,36 @@ impl ConversationStore {
     }
 
     pub fn delete(&self, id: &str) -> anyhow::Result<()> {
-        validate_record_id(id)?;
-        let path = self.record_path(id);
+        let resolved_id = self.resolve_id(id)?;
+        let path = self.record_path(&resolved_id);
         if path.exists() {
             std::fs::remove_file(path)?;
         }
         Ok(())
+    }
+
+    pub fn resolve_id(&self, id_or_prefix: &str) -> anyhow::Result<String> {
+        validate_record_id(id_or_prefix)?;
+        if self.record_path(id_or_prefix).exists() {
+            return Ok(id_or_prefix.to_string());
+        }
+
+        let matches: Vec<_> = self
+            .load_records()?
+            .into_iter()
+            .filter(|record| record.id.starts_with(id_or_prefix))
+            .map(|record| record.id)
+            .collect();
+
+        match matches.as_slice() {
+            [id] => Ok(id.clone()),
+            [] => anyhow::bail!("conversation `{id_or_prefix}` not found"),
+            many => anyhow::bail!(
+                "ambiguous conversation id prefix `{}`; matches: {}",
+                id_or_prefix,
+                many.join(", ")
+            ),
+        }
     }
 
     fn save_record(&self, record: &ConversationRecord) -> anyhow::Result<()> {

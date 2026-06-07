@@ -93,3 +93,49 @@ fn conversation_store_rejects_path_like_ids() {
     assert!(load_err.contains("invalid conversation id"));
     assert!(delete_err.contains("invalid conversation id"));
 }
+
+#[test]
+fn conversation_store_accepts_unique_id_prefixes() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let store = ConversationStore::new(root.path(), workspace.path(), 100).unwrap();
+
+    let id = store.create("Initial task", None).unwrap();
+    store
+        .append_turn(&id, "write docs", "docs written")
+        .unwrap();
+    let prefix = &id[..12];
+
+    let restored = store.load(prefix).unwrap();
+    assert_eq!(restored.id, id);
+
+    store.rename(prefix, "Renamed").unwrap();
+    assert_eq!(store.load(&id).unwrap().title, "Renamed");
+
+    store.delete(prefix).unwrap();
+    assert!(store.load(&id).is_err());
+}
+
+#[test]
+fn conversation_store_rejects_ambiguous_id_prefixes() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let store = ConversationStore::new(root.path(), workspace.path(), 100).unwrap();
+
+    let first = store.create("one", None).unwrap();
+    let second = store.create("two", None).unwrap();
+    let shared_prefix = common_prefix(&first, &second);
+
+    let err = store.load(shared_prefix).unwrap_err().to_string();
+    assert!(err.contains("ambiguous conversation id prefix"));
+}
+
+fn common_prefix<'a>(a: &'a str, b: &str) -> &'a str {
+    let len = a
+        .bytes()
+        .zip(b.bytes())
+        .take_while(|(left, right)| left == right)
+        .count();
+    assert!(len > 0, "test ids should share the unix timestamp prefix");
+    &a[..len]
+}

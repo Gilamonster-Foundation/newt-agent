@@ -149,6 +149,11 @@ pub trait MemoryProvider: Send + Sync {
     fn reset(&mut self) {}
 
     /// Replace conversation-local history with durable restored turns.
+    ///
+    /// The default is a no-op for providers without conversation-local state.
+    /// Providers that include prior user/assistant turns in `build_messages`
+    /// must override this, otherwise `/conversation restore` will silently
+    /// leave their in-memory history unchanged.
     fn restore_turns(&mut self, _turns: &[crate::ConversationTurn]) {}
 
     /// Called **before** old messages are discarded (e.g. during compression).
