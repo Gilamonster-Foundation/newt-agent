@@ -106,8 +106,8 @@ cov:
 # The floor RATCHETS UP — never down — as the codebase grows. The
 # roadmap targets 80% workspace-wide; bootstrap baseline was 15%
 # (Step 0.3 landed the workflow before there was enough code to
-# justify 80%). Workspace coverage is now ~89.78% — ratcheted to
-# 75% here to give a margin while approaching the 80% target.
+# justify 80%), ratcheted to 75% in the stdio-safety PR, and to the
+# roadmap's 80% in the tuning-writeback PR.
 # Each PR that adds tests should also bump this threshold higher;
 # each PR that adds untested code will fail the gate.
 #
@@ -128,7 +128,7 @@ cov:
 cov-ci:
     #!/usr/bin/env bash
     set -euo pipefail
-    floor=75
+    floor=80
     cargo llvm-cov --workspace --no-report
     cargo llvm-cov report --lcov --output-path lcov.info --ignore-filename-regex 'pyo3_module\.rs$'
     summary=$(cargo llvm-cov report --summary-only --ignore-filename-regex 'pyo3_module\.rs$')
@@ -149,7 +149,7 @@ cov-ci:
 
 [windows]
 cov-ci:
-    $floor = 75; cargo llvm-cov --workspace --no-report; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; cargo llvm-cov report --lcov --output-path lcov.info --ignore-filename-regex 'pyo3_module\.rs$'; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; $summary = cargo llvm-cov report --summary-only --ignore-filename-regex 'pyo3_module\.rs$'; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; $summary; $total = $summary | Where-Object { $_ -match '^TOTAL\s+' } | Select-Object -First 1; if (-not $total) { Write-Error 'ERROR: could not parse line coverage from cargo-llvm-cov summary'; exit 1 }; $cols = $total -split '\s+'; $line_cov = [double]($cols[9].TrimEnd('%')); Write-Output "measured line coverage: $line_cov% (floor: $floor%)"; if ($line_cov -lt $floor) { Write-Error "ERROR: workspace line coverage $line_cov% is below the $floor% floor"; exit 1 }; Write-Output "coverage gate OK: $line_cov% >= $floor%"
+    $floor = 80; cargo llvm-cov --workspace --no-report; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; cargo llvm-cov report --lcov --output-path lcov.info --ignore-filename-regex 'pyo3_module\.rs$'; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; $summary = cargo llvm-cov report --summary-only --ignore-filename-regex 'pyo3_module\.rs$'; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; $summary; $total = $summary | Where-Object { $_ -match '^TOTAL\s+' } | Select-Object -First 1; if (-not $total) { Write-Error 'ERROR: could not parse line coverage from cargo-llvm-cov summary'; exit 1 }; $cols = $total -split '\s+'; $line_cov = [double]($cols[9].TrimEnd('%')); Write-Output "measured line coverage: $line_cov% (floor: $floor%)"; if ($line_cov -lt $floor) { Write-Error "ERROR: workspace line coverage $line_cov% is below the $floor% floor"; exit 1 }; Write-Output "coverage gate OK: $line_cov% >= $floor%"
 
 # --- Evaluation ---
 
