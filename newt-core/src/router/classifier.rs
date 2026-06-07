@@ -53,3 +53,64 @@ pub fn classify_detailed(prompt: &str, tier_override: Option<Tier>) -> Classific
         reasons: vec!["no keyword match, length >= 200".to_string()],
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn override_returns_given_tier_at_full_confidence() {
+        let c = classify_detailed("anything", Some(Tier::Complex));
+        assert_eq!(c.tier, Tier::Complex);
+        assert!((c.confidence - 1.0).abs() < f64::EPSILON);
+        assert!(c.reasons.iter().any(|r| r.contains("override")));
+    }
+
+    #[test]
+    fn review_keyword_routes_review_tier() {
+        for kw in &["review this", "grade my work", "critique the design"] {
+            let c = classify_detailed(kw, None);
+            assert_eq!(c.tier, Tier::Review, "failed for {kw:?}");
+        }
+    }
+
+    #[test]
+    fn complex_keyword_routes_complex_tier() {
+        for kw in &["refactor auth", "redesign the API", "architect a system"] {
+            let c = classify_detailed(kw, None);
+            assert_eq!(c.tier, Tier::Complex, "failed for {kw:?}");
+        }
+    }
+
+    #[test]
+    fn short_prompt_routes_fast_tier() {
+        let c = classify_detailed("fix typo", None);
+        assert_eq!(c.tier, Tier::Fast);
+        assert!(c.confidence >= 0.5);
+    }
+
+    #[test]
+    fn long_prompt_without_keywords_routes_standard() {
+        let prompt = "x".repeat(200);
+        let c = classify_detailed(&prompt, None);
+        assert_eq!(c.tier, Tier::Standard);
+    }
+
+    #[test]
+    fn confidence_is_always_in_unit_interval() {
+        for prompt in &[
+            "hi",
+            "review me",
+            "refactor all the things",
+            &"x".repeat(300),
+        ] {
+            let c = classify_detailed(prompt, None);
+            assert!(
+                (0.0..=1.0).contains(&c.confidence),
+                "confidence {:.2} out of [0,1] for {:?}",
+                c.confidence,
+                prompt
+            );
+        }
+    }
+}

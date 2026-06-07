@@ -268,6 +268,12 @@ pub fn fetch_context_window(endpoint: &str, model: &str) -> Option<u32> {
         })
     })?;
 
+    parse_show_response(&json)
+}
+
+/// Extract the context window from a parsed `/api/show` response.
+/// Separated from the HTTP call so it can be unit-tested without a server.
+pub(crate) fn parse_show_response(json: &serde_json::Value) -> Option<u32> {
     // 1. Architecture limit from model_info.
     // Ollama returns the field as "model_info" (with underscore). The key name
     // is architecture-prefixed (e.g. "llama.context_length",
@@ -700,5 +706,60 @@ mod tests {
         assert_eq!(e.conformance, ToolConformance::Native);
         assert_eq!(e.context_window, None);
         assert_eq!(e.tune_confidence, TuneConfidence::None);
+    }
+
+    // --- parse_show_response ---
+
+    #[test]
+    fn parse_show_response_reads_llama_key() {
+        let json = serde_json::json!({"model_info": {"llama.context_length": 32768}});
+        assert_eq!(super::parse_show_response(&json), Some(32768));
+    }
+
+    #[test]
+    fn parse_show_response_reads_nemotron_key() {
+        let json = serde_json::json!({"model_info": {"nemotron_h_omni.context_length": 131072}});
+        assert_eq!(super::parse_show_response(&json), Some(131072));
+    }
+
+    #[test]
+    fn parse_show_response_bare_context_length_key() {
+        let json = serde_json::json!({"model_info": {"context_length": 8192}});
+        assert_eq!(super::parse_show_response(&json), Some(8192));
+    }
+
+    #[test]
+    fn parse_show_response_modelfile_num_ctx_wins_when_smaller() {
+        let json = serde_json::json!({
+            "model_info": {"llama.context_length": 131072},
+            "parameters": "num_ctx 32768\ntemperature 0.7"
+        });
+        assert_eq!(super::parse_show_response(&json), Some(32768));
+    }
+
+    #[test]
+    fn parse_show_response_arch_wins_when_num_ctx_larger() {
+        let json = serde_json::json!({
+            "model_info": {"llama.context_length": 4096},
+            "parameters": "num_ctx 32768"
+        });
+        assert_eq!(super::parse_show_response(&json), Some(4096));
+    }
+
+    #[test]
+    fn parse_show_response_returns_none_when_no_keys() {
+        let json = serde_json::json!({"model_info": {"general.architecture": "llama"}});
+        assert_eq!(super::parse_show_response(&json), None);
+    }
+
+    #[test]
+    fn parse_show_response_uses_minimum_when_multiple_arch_keys() {
+        let json = serde_json::json!({
+            "model_info": {
+                "llama.context_length": 131072,
+                "gemma.context_length": 8192
+            }
+        });
+        assert_eq!(super::parse_show_response(&json), Some(8192));
     }
 }
