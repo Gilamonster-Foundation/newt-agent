@@ -83,30 +83,24 @@ surface.
 
 ### Rust CLI binary
 
-The `newt` CLI is shipped separately from the Python wheel. For now,
-install from source:
+The `newt` CLI is shipped separately from the Python wheel. Install it with the provided `just` command, optionally specifying a destination:
 
 ```bash
-git clone https://github.com/Gilamonster-Foundation/newt-agent
-cd newt-agent
-just install          # builds release binaries → ~/bin/newt, ~/bin/newt-mcp-server
-newt --help
-```
+# Default install to ~/bin
+just install
 
-Pass a different destination to override the default `~/bin`:
-
-```bash
+# Install to a custom location (e.g., /usr/local/bin)
 just install /usr/local/bin
 ```
+
+If you install to a custom location, ensure that directory is in your `$PATH`.
 
 Or from crates.io once published:
 
 ```bash
 cargo install newt-agent
 cargo install newt-mcp-server
-```
-
-(A `pip install`-able Python CLI script is planned as a follow-up.)
+\```
 
 ## Modes
 
