@@ -130,6 +130,87 @@ fn conversation_store_rejects_ambiguous_id_prefixes() {
     assert!(err.contains("ambiguous conversation id prefix"));
 }
 
+#[test]
+fn corrupt_record_does_not_poison_the_workspace() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let store = ConversationStore::new(root.path(), workspace.path(), 100).unwrap();
+
+    let id = store.create("good", None).unwrap();
+    store.append_turn(&id, "hello", "world").unwrap();
+
+    // Drop a corrupt record beside the good one, simulating a crash or a
+    // bad editor save. Every workspace-scan operation must keep working.
+    let workspace_id = ConversationStore::workspace_id_for_path(workspace.path()).unwrap();
+    let dir = root.path().join("conversations").join(&workspace_id);
+    std::fs::write(dir.join("9999999999-corrupt.json"), "{not json at all").unwrap();
+
+    let summaries = store.list().unwrap();
+    assert_eq!(
+        summaries.len(),
+        1,
+        "corrupt file must be skipped, not fatal"
+    );
+    assert_eq!(summaries[0].id, id);
+
+    store
+        .append_turn(&id, "still", "works")
+        .expect("append must survive a corrupt sibling record");
+    assert_eq!(store.load(&id).unwrap().turns.len(), 2);
+}
+
+#[test]
+fn append_turn_does_not_prune() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+
+    // Two records created under a permissive cap…
+    let wide = ConversationStore::new(root.path(), workspace.path(), 100).unwrap();
+    let first = wide.create("one", None).unwrap();
+    let second = wide.create("two", None).unwrap();
+
+    // …then a store with a tighter cap appends a turn. Appending never
+    // changes the record count, so it must not trigger pruning — only
+    // `create` prunes.
+    let tight = ConversationStore::new(root.path(), workspace.path(), 1).unwrap();
+    tight.append_turn(&second, "more", "turns").unwrap();
+
+    assert_eq!(tight.list().unwrap().len(), 2);
+    assert!(tight.load(&first).is_ok(), "append must not prune siblings");
+
+    // The next create DOES prune back to the cap.
+    let third = tight.create("three", None).unwrap();
+    let ids: Vec<_> = tight.list().unwrap().into_iter().map(|s| s.id).collect();
+    assert_eq!(ids, vec![third]);
+}
+
+#[test]
+fn save_is_atomic_and_leaves_no_temp_files() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let store = ConversationStore::new(root.path(), workspace.path(), 100).unwrap();
+
+    let id = store.create("atomic", None).unwrap();
+    store.append_turn(&id, "a", "b").unwrap();
+    store.rename(&id, "renamed").unwrap();
+
+    let workspace_id = ConversationStore::workspace_id_for_path(workspace.path()).unwrap();
+    let dir = root.path().join("conversations").join(&workspace_id);
+    let leftovers: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("tmp"))
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "no temp files after saves: {leftovers:?}"
+    );
+
+    let restored = store.load(&id).unwrap();
+    assert_eq!(restored.title, "renamed");
+    assert_eq!(restored.turns.len(), 1);
+}
+
 fn common_prefix<'a>(a: &'a str, b: &str) -> &'a str {
     let len = a
         .bytes()

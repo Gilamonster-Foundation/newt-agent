@@ -96,8 +96,10 @@ impl ConversationStore {
         let mut record = self.load(id)?;
         record.turns.push(ConversationTurn::new(user, assistant));
         record.updated_at_unix_nanos = unix_nanos();
-        self.save_record(&record)?;
-        self.prune_to_cap()
+        // No prune here: appending never changes the record count, and
+        // pruning re-reads + deserializes every record in the workspace —
+        // O(records) on every turn. Pruning happens on `create` only.
+        self.save_record(&record)
     }
 
     pub fn load(&self, id: &str) -> anyhow::Result<ConversationRecord> {
@@ -169,7 +171,16 @@ impl ConversationStore {
         validate_record_id(&record.id)?;
         std::fs::create_dir_all(self.workspace_dir())?;
         let text = serde_json::to_string_pretty(record)?;
-        std::fs::write(self.record_path(&record.id), text)?;
+        // Write-then-rename so a crash mid-write can never leave a
+        // half-written record where a good one used to be. The temp file
+        // lives in the same directory so the rename never crosses a
+        // filesystem boundary (std::fs::rename replaces the destination
+        // on both Unix and Windows). Stray `.tmp` files from a crash are
+        // ignored by `load_records` (it only reads `.json`).
+        let path = self.record_path(&record.id);
+        let tmp = self.workspace_dir().join(format!("{}.json.tmp", record.id));
+        std::fs::write(&tmp, text)?;
+        std::fs::rename(&tmp, &path)?;
         Ok(())
     }
 
@@ -200,8 +211,24 @@ impl ConversationStore {
             if path.extension().and_then(|e| e.to_str()) != Some("json") {
                 continue;
             }
-            let text = std::fs::read_to_string(&path)?;
-            let record: ConversationRecord = serde_json::from_str(&text)?;
+            // One unreadable or corrupt record must not poison the whole
+            // workspace — propagating here would break `list`, `prune`,
+            // and prefix resolution for every conversation over a single
+            // bad file. Skip it loudly instead.
+            let parsed = std::fs::read_to_string(&path)
+                .map_err(anyhow::Error::from)
+                .and_then(|text| Ok(serde_json::from_str::<ConversationRecord>(&text)?));
+            let record = match parsed {
+                Ok(record) => record,
+                Err(e) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "skipping unreadable conversation record"
+                    );
+                    continue;
+                }
+            };
             if record.workspace_id == self.workspace_id {
                 records.push(record);
             }
