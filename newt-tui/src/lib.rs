@@ -5,6 +5,7 @@
 //! (see `newt config`). Additional features and the multi-agent matrix live in
 //! the downstream `gilamonster-agent`, which inherits these crates.
 
+pub mod dgx_probe;
 mod mcp;
 pub mod probe;
 mod setup;
@@ -1118,6 +1119,11 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
     // start.  Both are re-read after each slash command (config.toml on disk).
     let mut choice = resolve_backend_choice(&cfg);
     let (mut inf_url, mut inf_model) = (choice.url.clone(), choice.model.clone());
+
+    // Hardware telemetry: best-effort, None on non-DGX backends.
+    // try_connect probes DCGM port 9400 on the same host as Ollama; returns
+    // None silently when unreachable so non-DGX paths are unaffected.
+    let mut dgx = dgx_probe::DgxTelemetry::try_connect(&inf_url);
     let mut inf_kind = choice.kind;
     let mut inf_key = choice.api_key.clone();
     let key_path = newt_identity::default_key_path().ok();
@@ -1384,6 +1390,8 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                     inf_model = choice.model.clone();
                     inf_kind = choice.kind;
                     inf_key = choice.api_key.clone();
+                    // Re-probe DCGM when the backend URL changes.
+                    dgx = dgx_probe::DgxTelemetry::try_connect(&inf_url);
                     if cap.reapply(resolve_tui(&cfg), workspace) {
                         print_newt(
                             "permissions can only narrow within a session — restart newt to widen",
@@ -1399,6 +1407,16 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                 } else if matches!(task.as_str(), "exit" | "quit") {
                     break;
                 } else {
+                    // Pre-turn hardware snapshot (best-effort; None when no DCGM).
+                    let hw_before = dgx.as_ref().map(|d| d.snapshot());
+                    if verbose {
+                        if let Some(ref snap) = hw_before {
+                            if snap.has_data() {
+                                print_newt(&format!("hw: {}", snap.summary()), color, verbose);
+                            }
+                        }
+                    }
+
                     print_thinking(color);
                     let t0 = std::time::Instant::now();
 
