@@ -263,7 +263,9 @@ default_tier_order = ["FAST"]
 
 [[mcp_servers]]
 name = "self"
-command = "{newt}"
+# TOML literal string: the path is a Windows path on Windows CI and
+# backslashes must not be treated as escapes.
+command = '{newt}'
 args = ["mcp"]
 
 [[mcp_servers]]

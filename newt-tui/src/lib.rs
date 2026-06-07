@@ -898,7 +898,10 @@ pub(crate) mod test_env_guard {
     }
 
     /// Read guard for `#[tokio::test]` tests — async-aware, safe to hold
-    /// across await points.
+    /// across await points. Its only callers are the `#[cfg(unix)]`
+    /// run_command confinement tests, so gate it the same way or the
+    /// Windows build trips `-D warnings` on dead code.
+    #[cfg(unix)]
     pub(crate) async fn env_read_guard_async() -> RwLockReadGuard<'static, ()> {
         ENV_RW.read().await
     }
