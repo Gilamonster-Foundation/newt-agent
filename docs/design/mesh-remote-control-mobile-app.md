@@ -164,6 +164,55 @@ Key properties:
 - Because issuance is **attenuation-only**, the host's `enroll` command can
   *cap* what a phone may ever request, regardless of what the request asks for.
 
+### 4.5 Numeric-comparison pairing (MITM + human-presence defense)
+
+Enrollment over a network — even local Wi-Fi — is exposed to a
+**machine-in-the-middle** who relays the key exchange and substitutes its own
+key. Signatures alone don't catch this: the operator would happily sign *the
+attacker's* public key if it arrives looking like the phone's. We close this
+with an **out-of-band human comparison step**, in the spirit of Bluetooth
+Secure Simple Pairing's *numeric comparison* and the SAS (Short Authentication
+String) used in ZRTP.
+
+**The value being compared is a commitment to the whole transcript, not a
+random number.** Both sides independently compute:
+
+```
+sas = KDF( phone_pubkey ‖ host_pubkey ‖ session_nonce )   // truncated to a small range
+```
+
+Because the SAS is derived from *both* public keys, a MITM that swapped either
+key produces a **different** SAS on the two ends — the human comparison then
+fails. (Random numbers would only prove "a human pressed a button," not "the
+keys match"; deriving from the transcript is what makes this MITM-resistant.)
+
+**The challenge-response game (your three-numbers idea):**
+
+1. The host maps its SAS into a **set of three candidate numbers**, one of
+   which is the "true" SAS digit; it displays the **true** number on its
+   **local terminal** (the out-of-band channel — see §7.1, why concurrent local
+   access matters).
+2. The phone, from *its* independently-derived SAS, presents **three choices**;
+   the human — who is physically at the machine and can read the local
+   terminal — taps the matching one.
+3. **Repeat `k` rounds** with fresh per-round derivation. A blind attacker who
+   cannot see the local terminal passes a single round with probability `1/3`,
+   so `k` rounds reduce that to **`(1/3)^k`** (e.g. `k = 5` → ~0.4%). The
+   operator picks `k` to taste; the rounds cost the human a few taps.
+
+Properties:
+
+- **MITM-resistant**: a swapped key yields mismatched SAS → the human's correct
+  choices stop matching → pairing aborts.
+- **Proves co-presence**: only someone who can see the host's local terminal
+  during pairing can answer, binding enrollment to a human at the machine.
+- **No shared secret to phish**: the human never types a code the attacker could
+  capture and replay; they make a *selection*, and the selection is only
+  meaningful against the live, transcript-bound SAS.
+
+On success, the host issues the attenuated cert (§4 step 3); on any mismatch it
+refuses and discards the request.
+
 ---
 
 ## 5. Security model — the phone holds attenuated authority
@@ -351,6 +400,46 @@ A new responder alongside `NewtMeshService`, living in the (out-of-workspace)
 This reuses `newt-acp-worker`'s existing `Session`/`TaskReply`/streaming
 machinery rather than inventing a second agent loop.
 
+### 7.1 Concurrent local + remote attach (multi-session model)
+
+The pairing step (§4.5) and the product itself both require the agent to serve a
+**local console and one or more remote phone sessions at the same time**. During
+pairing the local terminal is the out-of-band display while the phone talks over
+the mesh; in normal use a developer may be working at the keyboard while also
+driving the agent from a phone.
+
+So the agent is **not** a single-attach, one-stdin/stdout process. The model:
+
+- The agent core owns a **session registry** (§7's `SessionId → SessionState`),
+  and a *terminal attach* — local console **or** a remote `newt/session/v1`
+  peer — is just an **attachment** to a session. The same `OutputChunk` stream
+  fans out to every attachment subscribed to that session.
+- **Local console** becomes one attachment alongside mesh sessions, rather than
+  a privileged owner of fd 0/1/2. (This is a clean extension of the existing
+  `stdio_guard` discipline in `newt-cli`, which already keeps the agent's real
+  stdout separate from protocol I/O.)
+- **Two attach modes:**
+  - *Separate sessions* (default, safest): the local user and the phone each
+    drive their **own** `SessionId`, with their **own** caveats
+    (`meet(worker, local)` vs. `meet(worker, phone)`). They don't step on each
+    other; the phone can never see the local user's session, and vice-versa,
+    unless explicitly shared.
+  - *Shared/observed session* (opt-in): a phone may **attach as an observer** to
+    a running local session (read-only `OutputChunk` stream) or, with explicit
+    local confirmation, as a **co-driver**. Useful for "watch what my laptop is
+    doing from my phone."
+- **Input arbitration** for a shared, co-driven session: inputs are serialized
+  by the session's `seq`; a turn in flight must complete or be cancelled before
+  the next input is accepted, so two attachments can't interleave half-turns.
+- **Caveat composition is per-attachment**: authority for any action is
+  `meet(worker, attachment)`. A read-only observer attachment carries
+  `Caveats` with an empty `exec`/`fs_write` set, so observing can never mutate.
+
+This multi-attach model is what makes the §4.5 pairing possible (local display +
+remote choice, concurrently) and is a prerequisite for Phase 1. It is the one
+piece of newt-agent's *own* architecture this design pushes on, beyond adding a
+responder.
+
 ---
 
 ## 8. Mobile app architecture
@@ -478,6 +567,14 @@ buffered tail → terminal continues without data loss.
    (out-of-workspace, path-dep to agent-mesh) to keep CI green per
    `mesh_integration.md`. Confirm whether the app repo is separate from
    `newt-agent`.
+7. **Pairing parameters (§4.5).** Choose the SAS range and round count `k`
+   (security vs. taps), and confirm the SAS KDF/transcript binding against the
+   actual key-exchange agent-mesh performs at dial time — the SAS must commit to
+   the *real* handshake transcript to be MITM-resistant.
+8. **Multi-attach is a newt-agent change (§7.1).** Promoting the local console
+   from "owns stdio" to "one attachment among many" touches the core session
+   loop and `stdio_guard`. Confirm appetite and sequencing — Phase 1 depends on
+   it. Decide the default for shared/co-driven sessions (opt-in vs. off).
 
 ---
 
@@ -486,8 +583,9 @@ buffered tail → terminal continues without data loss.
 | Phase | Deliverable |
 |---|---|
 | 0 | This design doc; agree the §6 wire types and the §12 open questions. |
-| 1 | `newt/session/v1` wire types + `NewtSessionService` (responder) with in-process round-trip tests (mirroring `newt-mesh`'s test style). |
-| 2 | `newt mesh enroll` command + enrollment request/response types (§4). |
+| 1 | Multi-attach session model (§7.1): local console as one attachment among many; session registry. Prereq for everything else. |
+| 1b | `newt/session/v1` wire types + `NewtSessionService` (responder) with in-process round-trip tests (mirroring `newt-mesh`'s test style). |
+| 2 | `newt mesh enroll` command + enrollment request/response types (§4) **with the §4.5 numeric-comparison pairing** (local-terminal display + transcript-bound SAS). |
 | 3 | `newt-mesh-mobile` Rust core + UniFFI bindings; "signed echo" spike on both platforms (§12.4). |
 | 4 | Android Compose terminal UI on the core (enroll → discover → session). |
 | 5 | iOS SwiftUI terminal UI; reconnect/resume hardening (§6.3). |
