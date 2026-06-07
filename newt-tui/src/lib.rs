@@ -5627,6 +5627,130 @@ mod tool_round_cap_tests {
             "each round had one hallucinated tool call"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // is_read_only_tool unit tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn read_only_tools_classified_correctly() {
+        for name in &["list_dir", "read_file", "search", "web_fetch", "use_skill"] {
+            assert!(is_read_only_tool(name), "{name} should be read-only");
+        }
+    }
+
+    #[test]
+    fn write_tools_not_read_only() {
+        for name in &["edit_file", "write_file", "run_command"] {
+            assert!(!is_read_only_tool(name), "{name} should NOT be read-only");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Read-only nudge injection test
+    //
+    // Scenario: model keeps calling list_dir (read-only) for 3 rounds.
+    // On round 4 the harness injects the nudge.  The responder detects the
+    // nudge text in the message list and returns a final text answer instead
+    // of another tool call, proving the nudge reached the model.
+    // -----------------------------------------------------------------------
+
+    struct ReadOnlyNudgeResponder {
+        /// Flipped to true the first time the responder sees the nudge text.
+        nudge_seen: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Respond for ReadOnlyNudgeResponder {
+        fn respond(&self, req: &Request) -> ResponseTemplate {
+            let body = serde_json::from_slice::<serde_json::Value>(&req.body).unwrap_or_default();
+            let has_nudge = body["messages"]
+                .as_array()
+                .map(|msgs| {
+                    msgs.iter().any(|m| {
+                        m["content"]
+                            .as_str()
+                            .map(|c| c.contains("consecutive read-only rounds"))
+                            .unwrap_or(false)
+                    })
+                })
+                .unwrap_or(false);
+
+            if has_nudge {
+                self.nudge_seen
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                // Return a plain text answer — no more tool calls.
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "message": { "content": "nudge received, writing file now" }
+                }))
+            } else if request_has_tools(req) {
+                // Keep returning list_dir calls until the nudge arrives.
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "message": {
+                        "content": "",
+                        "tool_calls": [{ "function": {
+                            "name": "list_dir",
+                            "arguments": { "path": "." }
+                        }}]
+                    }
+                }))
+            } else {
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "message": { "content": "final summary" }
+                }))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn read_only_nudge_injected_after_three_rounds() {
+        let server = MockServer::start().await;
+        let nudge_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(ReadOnlyNudgeResponder {
+                nudge_seen: nudge_seen.clone(),
+            })
+            .mount(&server)
+            .await;
+
+        let messages = msgs();
+        let caveats = Caveats::top();
+        let (reply, _streamed, _usage, _hallu) = chat_complete(
+            ChatCtx {
+                url: &server.uri(),
+                model: "test-model",
+                kind: BackendKind::Ollama,
+                api_key: None,
+                messages: &messages,
+                task: "list all files",
+                workspace: ".",
+                color: false,
+                caveats: &caveats,
+                max_tool_rounds: 10,
+                tool_output_lines: 5,
+                debug: false,
+                num_ctx: None,
+                connect_timeout_secs: 5,
+                inference_timeout_secs: 30,
+                mid_loop_trim_threshold: 40,
+                build_check_cmd: None,
+                safe_context: None,
+            },
+            &mut Mcp::empty(),
+        )
+        .await
+        .expect("chat_complete should succeed");
+
+        assert!(
+            nudge_seen.load(std::sync::atomic::Ordering::SeqCst),
+            "nudge was never injected after 3 consecutive read-only rounds"
+        );
+        assert_eq!(
+            reply, "nudge received, writing file now",
+            "model should have responded to the nudge with a final answer"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
