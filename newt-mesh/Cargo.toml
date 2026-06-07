@@ -15,7 +15,9 @@
 
 [package]
 name = "newt-mesh"
-version = "0.5.20260529"
+# Aligned with the workspace's semver line (the 0.{month}.{YYYYMMDD} date
+# scheme is retired — see CLAUDE.md "Versioning").
+version = "0.6.7"
 edition = "2021"
 rust-version = "1.75"
 license = "Apache-2.0"
