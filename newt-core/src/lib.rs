@@ -6,6 +6,7 @@
 
 pub mod caveats;
 pub mod config;
+pub mod conversation;
 pub mod dgx;
 pub mod error;
 pub mod mcp;
@@ -23,8 +24,11 @@ pub mod pyo3_module;
 pub use agent_mesh_protocol::{Caveats, CountBound, Scope};
 pub use caveats::{CaveatsExt, CountBoundExt, ScopeExt};
 pub use config::{
-    BackendConfig, BackendKind, ChatStyle, Config, EditMode, LogConfig, MemoryConfig,
-    MemoryProviderKind, PermissionPreset, SkillsConfig, ToolPermissions, TuiConfig,
+    BackendConfig, BackendKind, ChatStyle, Config, ConversationsConfig, EditMode, LogConfig,
+    MemoryConfig, MemoryProviderKind, PermissionPreset, SkillsConfig, ToolPermissions, TuiConfig,
+};
+pub use conversation::{
+    ConversationRecord, ConversationStore, ConversationSummary, ConversationTurn,
 };
 pub use dgx::{DgxConfig, DgxFormation, DgxNode, DgxNotConfigured, EndpointKind};
 pub use error::NewtError;
