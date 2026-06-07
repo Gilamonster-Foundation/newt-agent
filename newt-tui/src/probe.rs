@@ -762,4 +762,136 @@ mod tests {
         });
         assert_eq!(super::parse_show_response(&json), Some(8192));
     }
+
+    #[test]
+    fn parse_show_response_modelfile_only_no_model_info() {
+        // No model_info at all — the Modelfile num_ctx line is the only source.
+        let json = serde_json::json!({
+            "parameters": "stop \"<|end|>\"\nnum_ctx 16384\ntemperature 0.2"
+        });
+        assert_eq!(super::parse_show_response(&json), Some(16384));
+    }
+
+    #[test]
+    fn parse_show_response_ignores_unparsable_num_ctx() {
+        // num_ctx value that isn't a u32 must be skipped, not panic.
+        let json = serde_json::json!({"parameters": "num_ctx lots"});
+        assert_eq!(super::parse_show_response(&json), None);
+    }
+
+    #[test]
+    fn parse_show_response_parameters_without_num_ctx() {
+        let json = serde_json::json!({"parameters": "temperature 0.7\ntop_p 0.9"});
+        assert_eq!(super::parse_show_response(&json), None);
+    }
+
+    #[test]
+    fn parse_show_response_non_numeric_context_length_ignored() {
+        // A context_length that isn't a u64 (e.g. a string) must not match.
+        let json = serde_json::json!({"model_info": {"llama.context_length": "32768"}});
+        assert_eq!(super::parse_show_response(&json), None);
+    }
+
+    #[test]
+    fn parse_show_response_empty_json() {
+        assert_eq!(super::parse_show_response(&serde_json::json!({})), None);
+    }
+
+    // --- probe_tool_schema ---
+
+    #[test]
+    fn probe_tool_schema_is_single_list_dir_function() {
+        let schema = super::probe_tool_schema();
+        let arr = schema.as_array().expect("schema is a JSON array");
+        assert_eq!(arr.len(), 1, "probe uses exactly one tool");
+        let f = &arr[0];
+        assert_eq!(f["type"], "function");
+        assert_eq!(f["function"]["name"], "list_dir");
+        // The probe prompt tells the model to pass `path` — the schema must
+        // declare it as a required string parameter or the probe is invalid.
+        let params = &f["function"]["parameters"];
+        assert_eq!(params["properties"]["path"]["type"], "string");
+        assert_eq!(params["required"][0], "path");
+    }
+
+    // --- defaults ---
+
+    #[test]
+    fn capability_entry_default_is_untested_no_tools() {
+        let e = CapabilityEntry::default();
+        assert_eq!(e.conformance, ToolConformance::NoTools);
+        assert!(e.tested_date.is_empty());
+        assert_eq!(e.context_window, None);
+        assert_eq!(e.safe_context, None);
+        assert_eq!(e.overflow_at, None);
+        assert_eq!(e.max_ok_input, None);
+        assert_eq!(e.consecutive_ok, 0);
+        assert_eq!(e.tune_confidence, TuneConfidence::None);
+        assert_eq!(e.tune_date, None);
+    }
+
+    #[test]
+    fn tune_confidence_default_is_none() {
+        assert_eq!(TuneConfidence::default(), TuneConfidence::None);
+    }
+
+    // --- print_capabilities_table ---
+    //
+    // The table writes straight to stdout, so these tests can't assert on the
+    // rendered text without refactoring production code (out of scope).  They
+    // are edge-case exercises: every formatting branch (tested/untested,
+    // every confidence level, missing ctx fields, active-row colouring, empty
+    // model list hitting the `max().unwrap_or(20)` width fallback) must
+    // complete without panicking.
+
+    #[test]
+    fn print_capabilities_table_handles_empty_model_list() {
+        let cache = CapabilityCache::default();
+        print_capabilities_table(&[], &cache, "none", "http://localhost:11434", false);
+    }
+
+    #[test]
+    fn print_capabilities_table_renders_all_branches() {
+        let mut cache = CapabilityCache::default();
+        // Fully-populated entry at each confidence level.
+        for (name, conf) in [
+            ("m-none", TuneConfidence::None),
+            ("m-low", TuneConfidence::Low),
+            ("m-med", TuneConfidence::Medium),
+            ("m-high", TuneConfidence::High),
+        ] {
+            let mut e = make_entry();
+            e.tune_confidence = conf;
+            cache.insert(name.to_string(), e);
+        }
+        // Tested entry with no ctx data (the `—` placeholders).
+        cache.insert(
+            "m-noctx".to_string(),
+            CapabilityEntry {
+                conformance: ToolConformance::TextMode,
+                tested_date: "2026-06-06".to_string(),
+                ..Default::default()
+            },
+        );
+        let models: Vec<ModelInfo> = [
+            ("m-none", "7B"),
+            ("m-low", "13B"),
+            ("m-med", ""),
+            ("m-high", "32.8B"),
+            ("m-noctx", "3B"),
+            ("m-untested", "1B"),
+        ]
+        .into_iter()
+        .map(|(n, s)| ModelInfo {
+            name: n.to_string(),
+            param_size: s.to_string(),
+        })
+        .collect();
+        // Plain path, with an active row.
+        print_capabilities_table(&models, &cache, "m-low", "http://localhost:11434", false);
+        // Colour path for the active row (execute! to stdout).
+        print_capabilities_table(&models, &cache, "m-high", "http://localhost:11434", true);
+        // Active model not in list — no row gets the active tag.
+        print_capabilities_table(&models, &cache, "absent", "http://localhost:11434", true);
+    }
 }

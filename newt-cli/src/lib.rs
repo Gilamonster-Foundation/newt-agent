@@ -412,4 +412,91 @@ mod tests {
         assert_eq!(cli.persona.as_deref(), Some("reviewer"));
         assert!(matches!(cli.command, Some(Command::Code { .. })));
     }
+
+    #[test]
+    fn parses_debug_and_num_ctx_globals() {
+        let cli = Cli::try_parse_from(["newt", "--debug", "--num-ctx", "8192"]).unwrap();
+
+        assert!(cli.debug);
+        assert_eq!(cli.num_ctx, Some(8192));
+    }
+
+    #[test]
+    fn parses_venv_and_repeated_exec_paths() {
+        let cli = Cli::try_parse_from([
+            "newt",
+            "--venv",
+            "/opt/venv",
+            "--exec-path",
+            "/home/u/bin",
+            "--exec-path",
+            "/usr/local/bin",
+        ])
+        .unwrap();
+
+        assert_eq!(cli.venv.as_deref(), Some(std::path::Path::new("/opt/venv")));
+        assert_eq!(
+            cli.exec_paths,
+            vec![
+                PathBuf::from("/home/u/bin"),
+                PathBuf::from("/usr/local/bin")
+            ]
+        );
+    }
+
+    #[test]
+    fn splash_flag_overrides_no_splash() {
+        let cli = Cli::try_parse_from(["newt", "--no-splash", "--splash"]).unwrap();
+        assert!(cli.splash);
+        assert!(!cli.no_splash);
+
+        // …and the override works in both orders.
+        let cli = Cli::try_parse_from(["newt", "--splash", "--no-splash"]).unwrap();
+        assert!(cli.no_splash);
+        assert!(!cli.splash);
+    }
+
+    #[test]
+    fn parses_worker_identity_flags() {
+        let cli = Cli::try_parse_from([
+            "newt",
+            "worker",
+            "--coder",
+            "--operator-key-path",
+            "/tmp/id.pem",
+            "--allow-no-key",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Some(Command::Worker {
+                coder,
+                operator_key_path,
+                allow_no_key,
+            }) => {
+                assert!(coder);
+                assert_eq!(operator_key_path, Some(PathBuf::from("/tmp/id.pem")));
+                assert!(allow_no_key);
+            }
+            other => panic!("expected worker command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn worker_flags_default_to_safe_values() {
+        let cli = Cli::try_parse_from(["newt", "worker"]).unwrap();
+
+        match cli.command {
+            Some(Command::Worker {
+                coder,
+                operator_key_path,
+                allow_no_key,
+            }) => {
+                assert!(!coder, "coder plugin must be opt-in");
+                assert_eq!(operator_key_path, None);
+                assert!(!allow_no_key, "allow-no-key must never be the default");
+            }
+            other => panic!("expected worker command, got {other:?}"),
+        }
+    }
 }

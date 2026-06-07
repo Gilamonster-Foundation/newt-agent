@@ -329,3 +329,23 @@ fn cmd_reset(model: Option<&str>) -> anyhow::Result<()> {
     std::fs::write(&path, out)?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fmt_k_abbreviates_kib_multiples() {
+        assert_eq!(fmt_k(32768), "32k");
+        assert_eq!(fmt_k(1024), "1k");
+        // Integer division: sub-1k remainders are truncated, not rounded.
+        assert_eq!(fmt_k(1536), "1k");
+    }
+
+    #[test]
+    fn fmt_k_keeps_small_values_verbatim() {
+        assert_eq!(fmt_k(512), "512");
+        assert_eq!(fmt_k(1023), "1023");
+        assert_eq!(fmt_k(0), "0");
+    }
+}
