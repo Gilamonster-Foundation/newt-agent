@@ -1425,7 +1425,6 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                     let eff_max_tool_rounds = model_tune
                         .and_then(|t| t.max_tool_rounds)
                         .unwrap_or_else(|| max_tool_rounds(&cfg));
-                    let eff_num_ctx = model_tune.and_then(|t| t.num_ctx).or_else(|| num_ctx(&cfg));
                     let eff_mid_loop_trim = model_tune
                         .and_then(|t| t.mid_loop_trim_threshold)
                         .unwrap_or_else(|| mid_loop_trim_threshold(&cfg))
@@ -1442,6 +1441,15 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                         }
                         sc
                     };
+
+                    // num_ctx resolution: explicit config > safe_context > model default.
+                    // Wiring safe_context as the fallback caps Ollama's KV allocation to
+                    // what we've empirically confirmed is safe, preventing silent truncation
+                    // of the system prompt when the conversation exceeds the raw context window.
+                    let eff_num_ctx = model_tune
+                        .and_then(|t| t.num_ctx)
+                        .or_else(|| num_ctx(&cfg))
+                        .or(eff_safe_context);
 
                     // Build message list from memory manager.
                     let messages = memory.build_messages(&system, &task);
