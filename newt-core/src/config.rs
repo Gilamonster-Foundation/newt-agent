@@ -84,6 +84,34 @@ pub struct Config {
     /// `tune_confidence` reaches `High`; delete or edit them freely.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub model_tuning: Vec<ModelTuning>,
+
+    /// Durable conversation save/restore policy. `None` uses built-in defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversations: Option<ConversationsConfig>,
+}
+
+// ---------------------------------------------------------------------------
+// Durable conversation config
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ConversationsConfig {
+    /// Maximum saved conversations per workspace. Default: 100. 0 = no pruning.
+    #[serde(default = "default_conversations_max_per_workspace")]
+    pub max_per_workspace: usize,
+}
+
+fn default_conversations_max_per_workspace() -> usize {
+    100
+}
+
+impl Default for ConversationsConfig {
+    fn default() -> Self {
+        Self {
+            max_per_workspace: default_conversations_max_per_workspace(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -817,6 +845,7 @@ impl Default for Config {
             logs: None,
             skills: None,
             model_tuning: Vec::new(),
+            conversations: None,
         }
     }
 }
@@ -1012,6 +1041,26 @@ mod tests {
         assert_eq!(cfg.backends.len(), 1);
         assert_eq!(cfg.providers.len(), 0);
         assert_eq!(cfg.default_tier_order.len(), 4);
+    }
+
+    #[test]
+    fn conversations_config_defaults_to_count_cap() {
+        let cfg = Config::default();
+        let conversations = cfg.conversations.unwrap_or_default();
+        assert_eq!(conversations.max_per_workspace, 100);
+    }
+
+    #[test]
+    fn conversations_config_roundtrips_through_toml() {
+        let cfg: Config = toml::from_str(
+            r#"
+[conversations]
+max_per_workspace = 25
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(cfg.conversations.unwrap_or_default().max_per_workspace, 25);
     }
 
     #[test]

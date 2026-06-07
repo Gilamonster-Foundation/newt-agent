@@ -1109,6 +1109,8 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
     // It is re-read (`Config::resolve`) only after a slash command, the one
     // intentional refresh point — config.toml may have changed on disk.
     let mut cfg = newt_core::Config::resolve().unwrap_or_default();
+    let mut conversation_store = conversation_store_for(workspace, &cfg)?;
+    let mut active_conversation_id: Option<String> = None;
 
     // Resolve the inference backend and permission caveats once at session
     // start.  Both are re-read after each slash command (config.toml on disk).
@@ -1334,6 +1336,7 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                             &mut system,
                             active_persona.as_ref(),
                         );
+                        active_conversation_id = None;
                         print_newt(&msg, color, verbose);
                         if let Some(ref hp) = history_path {
                             let _ = rl.save_history(hp);
@@ -1342,7 +1345,31 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                         continue;
                     }
                     let slash_body = task.trim_start_matches('/');
+                    if slash_body == "conversation" || slash_body.starts_with("conversation ") {
+                        let mut conversation_ctx = ConversationCommandContext {
+                            store: &conversation_store,
+                            persona_store: &persona_store,
+                            workspace,
+                            memory: &mut memory,
+                            system: &mut system,
+                            active_persona: &mut active_persona,
+                            active_conversation_id: &mut active_conversation_id,
+                        };
+                        match handle_conversation_command(&task, &mut conversation_ctx) {
+                            Ok(msg) => print_newt(&msg, color, verbose),
+                            Err(e) => print_newt(&format!("error: {e}"), color, verbose),
+                        }
+                        if let Some(ref hp) = history_path {
+                            let _ = rl.save_history(hp);
+                        }
+                        println!();
+                        continue;
+                    }
                     if slash_body == "persona" || slash_body.starts_with("persona ") {
+                        let starts_new_conversation = matches!(
+                            parse_persona_command(&task),
+                            Ok(PersonaCommand::Set(_) | PersonaCommand::Clear)
+                        );
                         match handle_persona_command(
                             &task,
                             workspace,
@@ -1351,7 +1378,12 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                             &mut system,
                             &mut active_persona,
                         ) {
-                            Ok(msg) => print_newt(&msg, color, verbose),
+                            Ok(msg) => {
+                                if starts_new_conversation {
+                                    active_conversation_id = None;
+                                }
+                                print_newt(&msg, color, verbose);
+                            }
                             Err(e) => print_newt(&format!("error: {e}"), color, verbose),
                         }
                         if let Some(ref hp) = history_path {
@@ -1375,6 +1407,7 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                     // Permissions can only NARROW within a session; a widening
                     // request is clamped (restart to widen — see SessionCapability).
                     cfg = newt_core::Config::resolve().unwrap_or_default();
+                    conversation_store = conversation_store_for(workspace, &cfg)?;
                     choice = resolve_backend_choice(&cfg);
                     inf_url = choice.url.clone();
                     inf_model = choice.model.clone();
@@ -1457,6 +1490,19 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                             tokio::task::block_in_place(|| {
                                 rt.block_on(memory.sync_all(&task, &reply, &metrics));
                             });
+                            if let Err(e) = save_successful_conversation_turn(
+                                &conversation_store,
+                                &mut active_conversation_id,
+                                active_persona.as_ref(),
+                                &task,
+                                &reply,
+                            ) {
+                                print_newt(
+                                    &format!("warning: conversation save failed: {e}"),
+                                    color,
+                                    verbose,
+                                );
+                            }
                             print_metrics(&metrics, color);
                             // Append to usage log and enforce rotation policy.
                             if let Some(log) = newt_core::Config::user_config_path()
@@ -1734,6 +1780,54 @@ fn parse_persona_command(input: &str) -> anyhow::Result<PersonaCommand> {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ConversationCommand {
+    List,
+    Show(String),
+    Restore(String),
+    Rename { id: String, title: String },
+    Delete(String),
+}
+
+fn parse_conversation_command(input: &str) -> anyhow::Result<ConversationCommand> {
+    let body = input.trim().trim_start_matches('/').trim();
+    let mut parts = body.split_whitespace();
+    match parts.next() {
+        Some("conversation") => {}
+        _ => anyhow::bail!("not a conversation command"),
+    }
+
+    match parts.next() {
+        None | Some("list") => Ok(ConversationCommand::List),
+        Some("show") => match parts.next() {
+            Some(id) => Ok(ConversationCommand::Show(id.to_string())),
+            None => anyhow::bail!("usage: /conversation show <id>"),
+        },
+        Some("restore") => match parts.next() {
+            Some(id) => Ok(ConversationCommand::Restore(id.to_string())),
+            None => anyhow::bail!("usage: /conversation restore <id>"),
+        },
+        Some("rename") => {
+            let Some(id) = parts.next() else {
+                anyhow::bail!("usage: /conversation rename <id> <title>");
+            };
+            let title = parts.collect::<Vec<_>>().join(" ");
+            if title.trim().is_empty() {
+                anyhow::bail!("usage: /conversation rename <id> <title>");
+            }
+            Ok(ConversationCommand::Rename {
+                id: id.to_string(),
+                title,
+            })
+        }
+        Some("delete" | "rm") => match parts.next() {
+            Some(id) => Ok(ConversationCommand::Delete(id.to_string())),
+            None => anyhow::bail!("usage: /conversation delete <id>"),
+        },
+        Some(other) => anyhow::bail!("unknown conversation command `{other}`"),
+    }
+}
+
 /// Build the progressive-disclosure skills index block for the system prompt
 /// from the skills found across `skills_dirs` (names + descriptions only, never
 /// bodies), or `None` when no skills are installed. Uses the same ordered,
@@ -1887,6 +1981,168 @@ fn handle_new_conversation(
 ) -> String {
     reset_conversation(workspace, memory, system, active_persona);
     new_conversation_message(active_persona)
+}
+
+fn conversation_root_dir() -> std::path::PathBuf {
+    newt_core::Config::user_config_path()
+        .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
+        .unwrap_or_else(|| std::path::PathBuf::from(".newt"))
+}
+
+fn conversation_store_for(
+    workspace: &str,
+    cfg: &newt_core::Config,
+) -> anyhow::Result<newt_core::ConversationStore> {
+    let max_per_workspace = cfg
+        .conversations
+        .clone()
+        .unwrap_or_default()
+        .max_per_workspace;
+    newt_core::ConversationStore::new(conversation_root_dir(), workspace, max_per_workspace)
+}
+
+fn conversation_title_from_task(task: &str) -> String {
+    let title: String = task
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("Untitled conversation")
+        .chars()
+        .take(80)
+        .collect();
+    if title.trim().is_empty() {
+        "Untitled conversation".to_string()
+    } else {
+        title
+    }
+}
+
+fn save_successful_conversation_turn(
+    store: &newt_core::ConversationStore,
+    active_conversation_id: &mut Option<String>,
+    active_persona: Option<&Persona>,
+    task: &str,
+    reply: &str,
+) -> anyhow::Result<()> {
+    let id = match active_conversation_id.as_ref() {
+        Some(id) => id.clone(),
+        None => {
+            let id = store.create(
+                &conversation_title_from_task(task),
+                active_persona.map(|p| p.name.as_str()),
+            )?;
+            *active_conversation_id = Some(id.clone());
+            id
+        }
+    };
+    store.append_turn(&id, task, reply)
+}
+
+fn conversation_list_message(store: &newt_core::ConversationStore) -> anyhow::Result<String> {
+    let summaries = store.list()?;
+    if summaries.is_empty() {
+        return Ok("No saved conversations for this workspace.".to_string());
+    }
+
+    let mut out = "Saved conversations:".to_string();
+    for summary in summaries {
+        let persona = summary
+            .persona
+            .as_deref()
+            .map(|p| format!(" persona={p}"))
+            .unwrap_or_default();
+        out.push_str(&format!(
+            "\n  {}  {} ({} turns{})",
+            summary.id, summary.title, summary.turn_count, persona
+        ));
+    }
+    Ok(out)
+}
+
+fn conversation_show_message(record: &newt_core::ConversationRecord) -> String {
+    let persona = record
+        .persona
+        .as_deref()
+        .map(|p| format!("persona: {p}"))
+        .unwrap_or_else(|| "persona: none".to_string());
+    let mut out = format!(
+        "Conversation {}: {}\n{}\nturns: {}",
+        record.id,
+        record.title,
+        persona,
+        record.turns.len()
+    );
+    for (idx, turn) in record.turns.iter().enumerate() {
+        out.push_str(&format!(
+            "\n\n{}. user:\n{}\n\nassistant:\n{}",
+            idx + 1,
+            turn.user,
+            turn.assistant
+        ));
+    }
+    out
+}
+
+struct ConversationCommandContext<'a> {
+    store: &'a newt_core::ConversationStore,
+    persona_store: &'a PersonaStore,
+    workspace: &'a str,
+    memory: &'a mut newt_core::MemoryManager,
+    system: &'a mut String,
+    active_persona: &'a mut Option<Persona>,
+    active_conversation_id: &'a mut Option<String>,
+}
+
+fn handle_conversation_command(
+    input: &str,
+    ctx: &mut ConversationCommandContext<'_>,
+) -> anyhow::Result<String> {
+    match parse_conversation_command(input)? {
+        ConversationCommand::List => conversation_list_message(ctx.store),
+        ConversationCommand::Show(id) => {
+            let record = ctx.store.load(&id)?;
+            Ok(conversation_show_message(&record))
+        }
+        ConversationCommand::Restore(id) => {
+            let record = ctx.store.load(&id)?;
+            ctx.memory.restore_turns(&record.turns);
+            let mut warning = None;
+            match record.persona.as_deref() {
+                Some(name) => match ctx.persona_store.load(name) {
+                    Ok(persona) => *ctx.active_persona = Some(persona),
+                    Err(e) => {
+                        *ctx.active_persona = None;
+                        warning = Some(format!("persona `{name}` unavailable: {e}"));
+                    }
+                },
+                None => *ctx.active_persona = None,
+            }
+            *ctx.system =
+                rebuild_system_prompt(ctx.workspace, ctx.memory, ctx.active_persona.as_ref());
+            *ctx.active_conversation_id = Some(record.id.clone());
+
+            let mut message = format!(
+                "Restored conversation `{}` ({} turns).",
+                record.title,
+                record.turns.len()
+            );
+            if let Some(warning) = warning {
+                message.push_str(&format!("\nwarning: {warning}"));
+            }
+            Ok(message)
+        }
+        ConversationCommand::Rename { id, title } => {
+            ctx.store.rename(&id, &title)?;
+            Ok(format!("Renamed conversation `{id}`."))
+        }
+        ConversationCommand::Delete(id) => {
+            if ctx.active_conversation_id.as_deref() == Some(id.as_str()) {
+                anyhow::bail!("cannot delete the active conversation; use /new first");
+            }
+            ctx.store.delete(&id)?;
+            Ok(format!("Deleted conversation `{id}`."))
+        }
+    }
 }
 
 fn handle_persona_command(
@@ -3701,6 +3957,11 @@ fn dispatch_slash(
                 "  /memory                  — show context window / notes usage",
                 "  /remember <fact>         — add a fact to persistent NOTES.md",
                 "  /new                     — start a fresh conversation",
+                "  /conversation list       — list saved conversations",
+                "  /conversation show <id>  — show a saved conversation",
+                "  /conversation restore <id> — restore a saved conversation",
+                "  /conversation rename <id> <title> — rename a saved conversation",
+                "  /conversation delete <id> — delete a saved conversation",
                 "  /persona list            — list configured personas",
                 "  /persona show            — show the active persona",
                 "  /persona <name>          — start fresh with a persona",
@@ -4905,6 +5166,122 @@ mod skills_integration_tests {
         let messages = memory.build_messages(&system, "new task");
         assert!(!messages.iter().any(|m| m.content == "old task"));
         assert!(!messages.iter().any(|m| m.content == "old reply"));
+    }
+
+    #[test]
+    fn conversation_commands_parse_expected_actions() {
+        assert_eq!(
+            parse_conversation_command("/conversation list").unwrap(),
+            ConversationCommand::List
+        );
+        assert_eq!(
+            parse_conversation_command("/conversation show abc").unwrap(),
+            ConversationCommand::Show("abc".into())
+        );
+        assert_eq!(
+            parse_conversation_command("/conversation restore abc").unwrap(),
+            ConversationCommand::Restore("abc".into())
+        );
+        assert_eq!(
+            parse_conversation_command("/conversation rename abc A better title").unwrap(),
+            ConversationCommand::Rename {
+                id: "abc".into(),
+                title: "A better title".into()
+            }
+        );
+        assert_eq!(
+            parse_conversation_command("/conversation delete abc").unwrap(),
+            ConversationCommand::Delete("abc".into())
+        );
+    }
+
+    #[test]
+    fn save_successful_turn_creates_and_reuses_active_conversation() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let workspace = tempfile::TempDir::new().unwrap();
+        let store = newt_core::ConversationStore::new(tmp.path(), workspace.path(), 100).unwrap();
+        let mut active_id = None;
+        let persona = Some(Persona {
+            name: "coder".to_string(),
+            prompt: "Code things.".to_string(),
+            path: tmp.path().join("personas").join("coder.md"),
+        });
+
+        save_successful_conversation_turn(
+            &store,
+            &mut active_id,
+            persona.as_ref(),
+            "first task",
+            "first reply",
+        )
+        .unwrap();
+        save_successful_conversation_turn(
+            &store,
+            &mut active_id,
+            persona.as_ref(),
+            "second task",
+            "second reply",
+        )
+        .unwrap();
+
+        let id = active_id.expect("active conversation id is set");
+        let record = store.load(&id).unwrap();
+        assert_eq!(record.title, "first task");
+        assert_eq!(record.persona.as_deref(), Some("coder"));
+        assert_eq!(record.turns.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn conversation_restore_replaces_memory_and_restores_persona() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let workspace = tmp.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let state = tmp.path().join("state");
+        let store = newt_core::ConversationStore::new(&state, &workspace, 100).unwrap();
+        let id = store.create("Saved work", Some("reviewer")).unwrap();
+        store.append_turn(&id, "saved task", "saved reply").unwrap();
+
+        let persona_dir = tmp.path().join("personas");
+        fs::create_dir_all(&persona_dir).unwrap();
+        fs::write(persona_dir.join("reviewer.md"), "Review from disk.").unwrap();
+        let persona_store = PersonaStore::new(persona_dir);
+
+        let mut memory = newt_core::MemoryManager::new();
+        memory.add_provider(newt_core::RollingWindow::new(5));
+        memory
+            .sync_all("old task", "old reply", &newt_core::TurnMetrics::default())
+            .await;
+        let workspace_str = workspace.to_str().unwrap();
+        let mut system = rebuild_system_prompt(workspace_str, &memory, None);
+        let mut active_persona = None;
+        let mut active_conversation_id = None;
+        let mut conversation_ctx = ConversationCommandContext {
+            store: &store,
+            persona_store: &persona_store,
+            workspace: workspace_str,
+            memory: &mut memory,
+            system: &mut system,
+            active_persona: &mut active_persona,
+            active_conversation_id: &mut active_conversation_id,
+        };
+
+        let message = handle_conversation_command(
+            &format!("/conversation restore {id}"),
+            &mut conversation_ctx,
+        )
+        .unwrap();
+
+        assert!(message.contains("Restored conversation"));
+        assert_eq!(active_conversation_id.as_deref(), Some(id.as_str()));
+        assert_eq!(
+            active_persona.as_ref().map(|p| p.name.as_str()),
+            Some("reviewer")
+        );
+        assert!(system.contains("Review from disk."));
+        let messages = memory.build_messages(&system, "next task");
+        assert!(!messages.iter().any(|m| m.content == "old task"));
+        assert!(messages.iter().any(|m| m.content == "saved task"));
+        assert!(messages.iter().any(|m| m.content == "saved reply"));
     }
 
     #[test]

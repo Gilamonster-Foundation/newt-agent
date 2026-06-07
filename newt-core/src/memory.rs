@@ -148,6 +148,9 @@ pub trait MemoryProvider: Send + Sync {
     /// inside the same running process.
     fn reset(&mut self) {}
 
+    /// Replace conversation-local history with durable restored turns.
+    fn restore_turns(&mut self, _turns: &[crate::ConversationTurn]) {}
+
     /// Called **before** old messages are discarded (e.g. during compression).
     /// Extract anything worth keeping from `messages`; return it as a string
     /// to include in the compression summary. Return empty string for nothing.
@@ -259,6 +262,13 @@ impl MemoryManager {
     pub fn reset_all(&mut self) {
         for p in &mut self.providers {
             p.reset();
+        }
+    }
+
+    /// Replace conversation-local history in every provider from durable turns.
+    pub fn restore_turns(&mut self, turns: &[crate::ConversationTurn]) {
+        for p in &mut self.providers {
+            p.restore_turns(turns);
         }
     }
 
@@ -388,6 +398,13 @@ impl MemoryProvider for RollingWindow {
         self.history.clear();
     }
 
+    fn restore_turns(&mut self, turns: &[crate::ConversationTurn]) {
+        self.history = turns
+            .iter()
+            .map(|t| (t.user.clone(), t.assistant.clone()))
+            .collect();
+    }
+
     fn usage(&self) -> Option<(String, usize, usize)> {
         Some((
             "turns".into(),
@@ -510,6 +527,18 @@ impl MemoryProvider for TokenBudget {
     fn reset(&mut self) {
         self.history.clear();
         self.pruned_count = 0;
+    }
+
+    fn restore_turns(&mut self, turns: &[crate::ConversationTurn]) {
+        self.history = turns
+            .iter()
+            .map(|t| TurnRecord {
+                user: t.user.clone(),
+                assistant: t.assistant.clone(),
+                tokens: ((t.user.len() + t.assistant.len()) / 4) as u32,
+            })
+            .collect();
+        self.pruned_count = self.prune_to_budget();
     }
 
     fn usage(&self) -> Option<(String, usize, usize)> {
@@ -871,6 +900,23 @@ impl MemoryProvider for Summarizing {
         self.prev_summary.clear();
         self.last_savings = [1.0, 1.0];
         self.compress_count = 0;
+    }
+
+    fn restore_turns(&mut self, turns: &[crate::ConversationTurn]) {
+        self.history = turns
+            .iter()
+            .map(|t| SumTurn {
+                user: t.user.clone(),
+                assistant: t.assistant.clone(),
+                tokens: ((t.user.len() + t.assistant.len()) / 4) as u32,
+            })
+            .collect();
+        self.prev_summary.clear();
+        self.last_savings = [1.0, 1.0];
+        self.compress_count = 0;
+        if self.should_compress() {
+            self.compress_sync();
+        }
     }
 
     async fn on_pre_compress(&self, _messages: &[MemMessage]) -> String {
@@ -1624,6 +1670,28 @@ mod tests {
         assert!(!after.iter().any(|m| m.content == "old task"));
         assert!(!after.iter().any(|m| m.content == "old reply"));
         assert!(after.iter().any(|m| m.content == "new task"));
+    }
+
+    #[tokio::test]
+    async fn memory_manager_restore_turns_replaces_conversation_history() {
+        let mut mgr = MemoryManager::new();
+        mgr.add_provider(RollingWindow::new(5));
+        mgr.sync_all("old task", "old reply", &dummy_metrics())
+            .await;
+
+        mgr.restore_turns(&[
+            crate::ConversationTurn::new("restored task", "restored reply"),
+            crate::ConversationTurn::new("follow up", "followed up"),
+        ]);
+
+        let messages = mgr.build_messages("system", "new task");
+        assert!(!messages.iter().any(|m| m.content == "old task"));
+        assert!(!messages.iter().any(|m| m.content == "old reply"));
+        assert!(messages.iter().any(|m| m.content == "restored task"));
+        assert!(messages.iter().any(|m| m.content == "restored reply"));
+        assert!(messages.iter().any(|m| m.content == "follow up"));
+        assert!(messages.iter().any(|m| m.content == "followed up"));
+        assert!(messages.iter().any(|m| m.content == "new task"));
     }
 
     #[tokio::test]
