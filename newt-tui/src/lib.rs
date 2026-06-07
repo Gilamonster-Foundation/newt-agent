@@ -2979,6 +2979,10 @@ async fn chat_complete(
     let mut accumulated_usage: Option<newt_core::TokenUsage> = None;
     let mut hallucination_count: u32 = 0;
     let mut overflow_retries: u32 = 0;
+    // Consecutive rounds where the model only called read-only tools (no writes).
+    // When this hits READ_ONLY_NUDGE_AFTER, a brief injected message tells the
+    // model to stop exploring and start writing.
+    let mut read_only_rounds: usize = 0;
 
     // Agentic loop — up to `max_tool_rounds` tool-call rounds.
     'round_loop: for round in 0..max_tool_rounds {
@@ -2993,6 +2997,26 @@ async fn chat_complete(
                 )
                 .ok();
             }
+        }
+
+        // Read-only round nudge: if the model has spent several consecutive
+        // rounds only reading (list_dir / read_file / web_fetch / search /
+        // use_skill) without writing anything, inject a brief reminder to
+        // stop exploring and call edit_file or write_file.  This breaks the
+        // "endless exploration → empty response" failure mode seen with some
+        // local models (e.g. nemotron3:33b).
+        const READ_ONLY_NUDGE_AFTER: usize = 3;
+        if read_only_rounds >= READ_ONLY_NUDGE_AFTER {
+            let remaining = max_tool_rounds.saturating_sub(round + 1);
+            messages.push(serde_json::json!({
+                "role": "user",
+                "content": format!(
+                    "[{read_only_rounds} consecutive read-only rounds with no file writes. \
+                     Stop exploring. Call edit_file or write_file now to make the change. \
+                     You have {remaining} round(s) remaining — spend them writing, not reading.]"
+                )
+            }));
+            read_only_rounds = 0;
         }
 
         // Mid-loop context trim: prevent VRAM exhaustion on long tool-call
@@ -3198,6 +3222,7 @@ async fn chat_complete(
 
         // Has tool calls — add assistant turn and execute them.
         messages.push(message.clone());
+        let mut round_wrote = false;
         for tc in tool_calls.unwrap() {
             let name = tc["function"]["name"].as_str().unwrap_or("unknown");
             let args = match &tc["function"]["arguments"] {
@@ -3208,6 +3233,9 @@ async fn chat_complete(
             };
             if is_hallucination(name, &args) {
                 hallucination_count += 1;
+            }
+            if !is_read_only_tool(name) {
+                round_wrote = true;
             }
             let result = execute_tool(
                 name,
@@ -3225,6 +3253,11 @@ async fn chat_complete(
                 "content": result
             }));
         }
+        if round_wrote {
+            read_only_rounds = 0;
+        } else {
+            read_only_rounds = read_only_rounds.saturating_add(1);
+        }
     }
 
     // Reached the round cap. Trim the bloated message list so the final
@@ -3241,6 +3274,15 @@ async fn chat_complete(
     )
     .await?;
     Ok((text, streamed, usage, hallucination_count))
+}
+
+/// Returns `true` when `name` is a pure read tool that doesn't modify the workspace.
+/// Used to count consecutive read-only rounds and inject a write-nudge.
+fn is_read_only_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "list_dir" | "read_file" | "search" | "web_fetch" | "use_skill"
+    )
 }
 
 /// Build the nudge appended to the message list when the tool-round cap is hit.
