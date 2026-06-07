@@ -6,6 +6,8 @@
 
 use serde::{Deserialize, Serialize};
 
+mod classifier;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum Tier {
@@ -52,43 +54,7 @@ impl Router {
     /// Like [`classify`](Self::classify), but returns confidence and reasons
     /// alongside the tier.
     pub fn classify_detailed(&self, prompt: &str) -> Classification {
-        if let Some(tier) = self.tier_override {
-            return Classification {
-                tier,
-                confidence: 1.0,
-                reasons: vec!["tier override active".to_string()],
-            };
-        }
-
-        let len = prompt.len();
-        let lower = prompt.to_ascii_lowercase();
-
-        if lower.contains("review") || lower.contains("grade") || lower.contains("critique") {
-            return Classification {
-                tier: Tier::Review,
-                confidence: 0.85,
-                reasons: vec!["review keyword detected".to_string()],
-            };
-        }
-        if lower.contains("refactor") || lower.contains("redesign") || lower.contains("architect") {
-            return Classification {
-                tier: Tier::Complex,
-                confidence: 0.80,
-                reasons: vec!["complex keyword detected".to_string()],
-            };
-        }
-        if len < 200 {
-            return Classification {
-                tier: Tier::Fast,
-                confidence: 0.70,
-                reasons: vec![format!("short prompt ({len} chars < 200)")],
-            };
-        }
-        Classification {
-            tier: Tier::Standard,
-            confidence: 0.5,
-            reasons: vec!["no keyword match, length >= 200".to_string()],
-        }
+        classifier::classify_detailed(prompt, self.tier_override)
     }
 }
 

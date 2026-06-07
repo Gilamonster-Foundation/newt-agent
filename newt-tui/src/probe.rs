@@ -244,7 +244,7 @@ pub fn fetch_ollama_models(endpoint: &str) -> anyhow::Result<Vec<ModelInfo>> {
 /// Query Ollama's `/api/show` and return the model's declared context window.
 ///
 /// Checks two sources in order and returns the smaller (most conservative):
-/// 1. `modelinfo["llama.context_length"]` — architecture-level limit
+/// 1. `model_info["<arch>.context_length"]` — architecture-level limit
 /// 2. `num_ctx` line in the `parameters` string — Modelfile override
 ///
 /// Returns `None` if the endpoint is unreachable or the response lacks both fields.
@@ -268,20 +268,28 @@ pub fn fetch_context_window(endpoint: &str, model: &str) -> Option<u32> {
         })
     })?;
 
-    // 1. Architecture limit from modelinfo (Llama-family key; other families may differ).
-    let arch_limit: Option<u32> = json["modelinfo"].as_object().and_then(|info| {
-        // Try common keys across architectures.
-        for key in &[
-            "llama.context_length",
-            "qwen2.context_length",
-            "gemma.context_length",
-            "context_length",
-        ] {
-            if let Some(v) = info.get(*key).and_then(|v| v.as_u64()) {
-                return Some(v as u32);
-            }
+    parse_show_response(&json)
+}
+
+/// Extract the context window from a parsed `/api/show` response.
+/// Separated from the HTTP call so it can be unit-tested without a server.
+pub(crate) fn parse_show_response(json: &serde_json::Value) -> Option<u32> {
+    // 1. Architecture limit from model_info.
+    // Ollama returns the field as "model_info" (with underscore). The key name
+    // is architecture-prefixed (e.g. "llama.context_length",
+    // "nemotron_h_omni.context_length") — scan for any key ending in
+    // ".context_length" so new architectures work without code changes.
+    let arch_limit: Option<u32> = json["model_info"].as_object().and_then(|info| {
+        // Exact bare key first (unlikely but defensive).
+        if let Some(v) = info.get("context_length").and_then(|v| v.as_u64()) {
+            return Some(v as u32);
         }
-        None
+        // Any architecture-prefixed key ending in ".context_length".
+        info.iter()
+            .filter(|(k, _)| k.ends_with(".context_length"))
+            .filter_map(|(_, v)| v.as_u64())
+            .map(|v| v as u32)
+            .min() // take the smallest if there are multiple (conservative)
     });
 
     // 2. Modelfile `num_ctx` parameter line (user override, takes precedence if smaller).
@@ -698,5 +706,192 @@ mod tests {
         assert_eq!(e.conformance, ToolConformance::Native);
         assert_eq!(e.context_window, None);
         assert_eq!(e.tune_confidence, TuneConfidence::None);
+    }
+
+    // --- parse_show_response ---
+
+    #[test]
+    fn parse_show_response_reads_llama_key() {
+        let json = serde_json::json!({"model_info": {"llama.context_length": 32768}});
+        assert_eq!(super::parse_show_response(&json), Some(32768));
+    }
+
+    #[test]
+    fn parse_show_response_reads_nemotron_key() {
+        let json = serde_json::json!({"model_info": {"nemotron_h_omni.context_length": 131072}});
+        assert_eq!(super::parse_show_response(&json), Some(131072));
+    }
+
+    #[test]
+    fn parse_show_response_bare_context_length_key() {
+        let json = serde_json::json!({"model_info": {"context_length": 8192}});
+        assert_eq!(super::parse_show_response(&json), Some(8192));
+    }
+
+    #[test]
+    fn parse_show_response_modelfile_num_ctx_wins_when_smaller() {
+        let json = serde_json::json!({
+            "model_info": {"llama.context_length": 131072},
+            "parameters": "num_ctx 32768\ntemperature 0.7"
+        });
+        assert_eq!(super::parse_show_response(&json), Some(32768));
+    }
+
+    #[test]
+    fn parse_show_response_arch_wins_when_num_ctx_larger() {
+        let json = serde_json::json!({
+            "model_info": {"llama.context_length": 4096},
+            "parameters": "num_ctx 32768"
+        });
+        assert_eq!(super::parse_show_response(&json), Some(4096));
+    }
+
+    #[test]
+    fn parse_show_response_returns_none_when_no_keys() {
+        let json = serde_json::json!({"model_info": {"general.architecture": "llama"}});
+        assert_eq!(super::parse_show_response(&json), None);
+    }
+
+    #[test]
+    fn parse_show_response_uses_minimum_when_multiple_arch_keys() {
+        let json = serde_json::json!({
+            "model_info": {
+                "llama.context_length": 131072,
+                "gemma.context_length": 8192
+            }
+        });
+        assert_eq!(super::parse_show_response(&json), Some(8192));
+    }
+
+    #[test]
+    fn parse_show_response_modelfile_only_no_model_info() {
+        // No model_info at all — the Modelfile num_ctx line is the only source.
+        let json = serde_json::json!({
+            "parameters": "stop \"<|end|>\"\nnum_ctx 16384\ntemperature 0.2"
+        });
+        assert_eq!(super::parse_show_response(&json), Some(16384));
+    }
+
+    #[test]
+    fn parse_show_response_ignores_unparsable_num_ctx() {
+        // num_ctx value that isn't a u32 must be skipped, not panic.
+        let json = serde_json::json!({"parameters": "num_ctx lots"});
+        assert_eq!(super::parse_show_response(&json), None);
+    }
+
+    #[test]
+    fn parse_show_response_parameters_without_num_ctx() {
+        let json = serde_json::json!({"parameters": "temperature 0.7\ntop_p 0.9"});
+        assert_eq!(super::parse_show_response(&json), None);
+    }
+
+    #[test]
+    fn parse_show_response_non_numeric_context_length_ignored() {
+        // A context_length that isn't a u64 (e.g. a string) must not match.
+        let json = serde_json::json!({"model_info": {"llama.context_length": "32768"}});
+        assert_eq!(super::parse_show_response(&json), None);
+    }
+
+    #[test]
+    fn parse_show_response_empty_json() {
+        assert_eq!(super::parse_show_response(&serde_json::json!({})), None);
+    }
+
+    // --- probe_tool_schema ---
+
+    #[test]
+    fn probe_tool_schema_is_single_list_dir_function() {
+        let schema = super::probe_tool_schema();
+        let arr = schema.as_array().expect("schema is a JSON array");
+        assert_eq!(arr.len(), 1, "probe uses exactly one tool");
+        let f = &arr[0];
+        assert_eq!(f["type"], "function");
+        assert_eq!(f["function"]["name"], "list_dir");
+        // The probe prompt tells the model to pass `path` — the schema must
+        // declare it as a required string parameter or the probe is invalid.
+        let params = &f["function"]["parameters"];
+        assert_eq!(params["properties"]["path"]["type"], "string");
+        assert_eq!(params["required"][0], "path");
+    }
+
+    // --- defaults ---
+
+    #[test]
+    fn capability_entry_default_is_untested_no_tools() {
+        let e = CapabilityEntry::default();
+        assert_eq!(e.conformance, ToolConformance::NoTools);
+        assert!(e.tested_date.is_empty());
+        assert_eq!(e.context_window, None);
+        assert_eq!(e.safe_context, None);
+        assert_eq!(e.overflow_at, None);
+        assert_eq!(e.max_ok_input, None);
+        assert_eq!(e.consecutive_ok, 0);
+        assert_eq!(e.tune_confidence, TuneConfidence::None);
+        assert_eq!(e.tune_date, None);
+    }
+
+    #[test]
+    fn tune_confidence_default_is_none() {
+        assert_eq!(TuneConfidence::default(), TuneConfidence::None);
+    }
+
+    // --- print_capabilities_table ---
+    //
+    // The table writes straight to stdout, so these tests can't assert on the
+    // rendered text without refactoring production code (out of scope).  They
+    // are edge-case exercises: every formatting branch (tested/untested,
+    // every confidence level, missing ctx fields, active-row colouring, empty
+    // model list hitting the `max().unwrap_or(20)` width fallback) must
+    // complete without panicking.
+
+    #[test]
+    fn print_capabilities_table_handles_empty_model_list() {
+        let cache = CapabilityCache::default();
+        print_capabilities_table(&[], &cache, "none", "http://localhost:11434", false);
+    }
+
+    #[test]
+    fn print_capabilities_table_renders_all_branches() {
+        let mut cache = CapabilityCache::default();
+        // Fully-populated entry at each confidence level.
+        for (name, conf) in [
+            ("m-none", TuneConfidence::None),
+            ("m-low", TuneConfidence::Low),
+            ("m-med", TuneConfidence::Medium),
+            ("m-high", TuneConfidence::High),
+        ] {
+            let mut e = make_entry();
+            e.tune_confidence = conf;
+            cache.insert(name.to_string(), e);
+        }
+        // Tested entry with no ctx data (the `—` placeholders).
+        cache.insert(
+            "m-noctx".to_string(),
+            CapabilityEntry {
+                conformance: ToolConformance::TextMode,
+                tested_date: "2026-06-06".to_string(),
+                ..Default::default()
+            },
+        );
+        let models: Vec<ModelInfo> = [
+            ("m-none", "7B"),
+            ("m-low", "13B"),
+            ("m-med", ""),
+            ("m-high", "32.8B"),
+            ("m-noctx", "3B"),
+            ("m-untested", "1B"),
+        ]
+        .into_iter()
+        .map(|(n, s)| ModelInfo {
+            name: n.to_string(),
+            param_size: s.to_string(),
+        })
+        .collect();
+        // Plain path, with an active row.
+        print_capabilities_table(&models, &cache, "m-low", "http://localhost:11434", false);
+        // Colour path for the active row (execute! to stdout).
+        print_capabilities_table(&models, &cache, "m-high", "http://localhost:11434", true);
+        // Active model not in list — no row gets the active tag.
+        print_capabilities_table(&models, &cache, "absent", "http://localhost:11434", true);
     }
 }
