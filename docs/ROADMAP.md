@@ -955,6 +955,49 @@ wiring/tests, 3 template files, 1 design note.
 
 ---
 
+# Phase 16 — Mesh Remote Control / Mobile
+
+Design: `docs/design/mesh-remote-control-mobile-app.md` (PR #202, merged). An
+Android + iOS app that is itself a first-class agent-mesh peer driving a remote
+`newt-agent` over the signed, replay-defended bus — no broker, no SSH-tunnelled
+shell. The phone holds a **worker-delegated, attenuated `AgentKey`** (root →
+worker → phone); every byte is cryptographically attributable and bounded by
+that key's `Caveats`.
+
+This phase is **dependency-ordered**, not strictly sequential — three spikes
+gate the build work and must resolve first. Each row is tracked by a GitHub
+issue; the UI phases (Android/iOS/WAN/biometric) are roadmap entries that
+become issues only **after** the spikes (C, H) answer.
+
+| Step | Deliverable | Issue | Kind |
+|---|---|---|---|
+| 16.0a | agent-mesh: external-pubkey delegation + envelope signer | agent-mesh#27 | build (in flight) |
+| 16.0a′ | agent-mesh: transport external-signer seam (QUIC w/o owned seed) — the `#27` remainder | agent-mesh#28 | build |
+| 16.0b | Unify `newt-mesh` onto the `newt-identity` operator root | #228 | build |
+| 16.S1 | **Spike:** does the handshake expose a transcript hash for SAS binding? (can invalidate §4.5) | agent-mesh#30 | spike |
+| 16.S2 | **Spike:** direct-dial by `(fingerprint, addr)` for WG/WAN | agent-mesh#29 | spike→build |
+| 16.S3 | **Spike:** hardware-backed ed25519 on Android/iOS, or software-key fallback | #232 | spike |
+| 16.1 | Multi-attach session model — local console as one attachment (gating prereq) | #229 | build |
+| 16.1b | `newt/session/v1` + `NewtSessionService` streaming/cancel (reconcile w/ Step 2.3, #167/#123) | #230 | build |
+| 16.2 | `newt mesh enroll` + SAS pairing + **revocation MVP** (bundled, not deferred) | #231 | build |
+| 16.3 | `newt-mesh-mobile` Rust core + UniFFI "signed echo" on both platforms | #233 | build (new crate) |
+| 16.4+ | Android Compose UI · iOS SwiftUI UI · WireGuard WAN · revocation+biometric polish | — | roadmap-only until spikes resolve |
+
+**Sequencing notes:**
+- The streaming surface (16.1b / `OutputChunk`) is the **same need** as Step 2.3
+  (`ChatChunk`/`ChatStream`) and #167/#123 — land Step 2.3 as the shared
+  substrate first; do not build streaming twice.
+- 16.S1 (SAS transcript binding) is load-bearing security: if the handshake
+  exposes no channel binding, the §4.5 numeric-comparison pairing needs
+  redesign. Resolve before 16.2.
+- Revocation (`expires_at` + worker denied-fingerprint set) ships **with**
+  enrollment (16.2), not at the end — a phone enrolled without revocation is a
+  stolen-phone window.
+- `newt-mesh-mobile` sits beside `newt-mesh` (out-of-workspace, path-dep to
+  agent-mesh) per `mesh_integration.md`, so default-workspace CI stays green.
+
+---
+
 # Cross-cutting notes
 
 - **drake-foreman dispatch:** each step's branch is the unit of work. The
