@@ -526,6 +526,121 @@ or `#[must_use]`).
 **Mocks:** `MockBackend`.
 **Estimated diff:** ~120 lines.
 
+## Step 9.6 — newt-eval: agentic runner support + deferred cases
+
+**Branch:** `step-9.6-eval-agentic-runner`
+**Touches:** `newt-eval/src/runner.rs`, `newt-eval/cases-deferred/015-agentic-create-file/`,
+              `newt-eval/cases-deferred/016-agentic-refactor-fn/`.
+**Implements:** Add `agentic_mode: bool` to `RunnerConfig` (+ builder). When set,
+`drive_acp` dispatches `agentic_prompt` instead of `prompt`. Write two eval cases
+in `cases-deferred/` — these define the acceptance criteria for Step 9.8 before
+that implementation exists. Cases stay deferred until the worker exposes the
+method (Step 9.8); use the `cases-deferred/` holding pattern already established
+by `006-cross-host-rename`.
+**Cases:**
+- `015-agentic-create-file` — prompt asks the worker to create a new Rust source
+  file; evaluators: `diff_nonempty`, `diff_applies`.
+- `016-agentic-refactor-fn` — prompt asks for a multi-step extract-function
+  refactor; evaluators: `diff_nonempty`, `rust_compiles`.
+**Tests:** Unit test `runner_config_agentic_mode_builder` alongside the existing
+`config_builders_compose`; no e2e test because the worker doesn't expose
+`agentic_prompt` yet — that's intentional.
+**Out of scope:** mock responses for the deferred cases (added in Step 9.9).
+**Mocks:** none (runner unit tests only).
+**Estimated diff:** ~120 lines.
+
+## Step 9.7 — Extract agentic loop to `newt-core::agentic`
+
+**Branch:** `step-9.7-newt-core-agentic`
+**Touches:** `newt-core/src/agentic/` (new module), `newt-tui/src/lib.rs`.
+**Implements:** Move `ChatCtx`, `chat_complete`, `openai_chat_complete`,
+`execute_tool`, and all tool-definition helpers from `newt-tui/src/lib.rs` into
+`newt-core/src/agentic/`. Keep `ChatCtx` as the concrete type — do **not**
+introduce an `InferenceBackend` trait at this step (YAGNI: there is currently
+one implementor). Pub-use the new types from `newt_core` top-level for clean
+import paths. `newt-tui` becomes a thin wrapper that constructs a `ChatCtx`
+and calls `newt_core::agentic::chat_complete()`.
+
+The wiremock agentic-loop tests travel with the code into
+`newt-core/src/agentic/` — this is the majority of the diff. As of #201
+they live in two blocks of `newt-tui/src/lib.rs`: the `openai_chat_complete`
+suite (~line 5486) and the larger `mod http_loop_tests` (~line 7364, covering
+streaming, overflow trim-and-retry, mid-loop trim, empty-summary fallbacks,
+and the read-only nudge). Both move; grep for `MockServer::start` to find
+them all rather than trusting a line number. No behavioral change; CI green
+before and after.
+**Tests:** All existing wiremock-based agentic loop tests migrate to
+`newt-core/src/agentic/` (Ollama path, OpenAI path, overflow retry,
+read-only nudge, cap-exit fallback). Net test count should be unchanged.
+Watch the coverage gate: this code is well-tested, so moving it from
+`newt-tui` to `newt-core` shifts where the covered lines count but keeps the
+workspace total flat — the 80% floor must still clear.
+**Out of scope:** `InferenceBackend` trait abstraction (future step when a
+second concrete backend exists).
+**Mocks:** existing `wiremock` HTTP mocks travel with the tests unchanged.
+**Estimated diff:** ~400 lines moved, ~50 lines new glue.
+
+## Step 9.8 — `agentic_prompt` ACP method + per-session config
+
+**Branch:** `step-9.8-acp-agentic-prompt`
+**Touches:** `newt-acp-worker/src/server.rs`, `newt-core/src/agentic/config.rs` (new).
+**Implements:**
+- `AgenticConfig` struct in `newt-core::agentic` — tunables extracted from
+  `ChatCtx` (`max_tool_rounds`, `tool_output_lines`, `mid_loop_trim_threshold`,
+  `trim_ratio`, `build_check_cmd`, `num_ctx`, `cap_exit_prompt`,
+  `read_only_nudge_prompt`). `impl Default` mirrors existing `ChatCtx` defaults.
+- Extend `Session` with `agentic_config: AgenticConfig`.
+- Parse optional `"agentic"` block in `new_session` params; per-call overrides
+  also accepted in `agentic_prompt` params (same fields, finer-grained).
+- Wire `"agentic_prompt"` into the dispatch table; handler calls
+  `newt_core::agentic::run_agentic_loop()`, returns `TaskReply` with
+  `emission_shape: "agentic_loop"`, plus `tool_rounds` and `exited_via_cap`
+  fields in the reply.
+- Update capabilities advertisement to include `"agentic_prompt"`.
+**Tests:** 5+ ACP handler unit tests with wiremock — happy path produces
+non-empty diff, `tool_rounds` is non-zero, unknown session id returns error,
+per-call `max_tool_rounds` override is respected, `emission_shape` is
+`"agentic_loop"` in the wire reply.
+**Out of scope:** streaming progress events (requires ACP protocol extension).
+**Mocks:** `wiremock` Ollama stand-in.
+**Estimated diff:** ~250 lines.
+
+## Step 9.9 — Promote deferred agentic eval cases to CI
+
+**Branch:** `step-9.9-eval-agentic-cases-promote`
+**Touches:** `newt-eval/cases/015-agentic-create-file/`,
+              `newt-eval/cases/016-agentic-refactor-fn/`,
+              `newt-eval/tests/mock_e2e.rs`.
+**Implements:** Add `mock_response` blocks (canned diffs) to the two cases
+from Step 9.6. Move them from `cases-deferred/` to `cases/`. Add both to the
+`mock_e2e` integration test so they run under `just check`. These become the
+ratchet-locked regression gate for `agentic_prompt` behavior.
+**Tests:** 2 new mock e2e test cases (one per promoted case). Each drives the
+worker with `agentic_mode: true`, verifies `diff_nonempty` and at least one
+domain evaluator. Coverage ratchet must not drop.
+**Out of scope:** live-mode eval tuning (do that in a follow-on when testing
+against a real model).
+**Mocks:** wiremock returning the canned diffs from the case fixtures.
+**Estimated diff:** ~100 lines.
+
+### Steps 9.6–9.9 are the *exposure* track — related work tracked separately
+
+These four steps make the existing, battle-tested TUI loop reachable from
+foreman/ACP and pin its behavior with eval cases. Two adjacent tracks are
+deliberately **not** folded in here, to keep each step reviewable:
+
+- **Loop hardening** — once Step 9.7 lands `newt-core::agentic`, that module
+  (not `newt-tui`) is the home for robustness work that should benefit both
+  the TUI and ACP paths: salvaging `TextMode` tool calls (models that emit
+  tool-call JSON in `content` are detected via `ToolConformance` but never
+  dispatched), and the fresh-install permissions gap (a config with no
+  `[tui]` block resolves to read-only caveats, which forces advisory drift —
+  the agent narrates instead of editing). Filed as issues, sequenced after 9.7.
+- **Model selection** — which local models drive the loop, and the
+  DGX/Spark serving tier for larger agentic coders, is a separate
+  `DgxConfig`/infra track. The eval cases here (9.6/9.9) are model-agnostic
+  by design so they gate *loop behavior*, not a specific model.
+
 ---
 
 # Phase 10 — newt-cli polish (3 steps)
