@@ -1435,7 +1435,11 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                     if slash_body == "persona" || slash_body.starts_with("persona ") {
                         let starts_new_conversation = matches!(
                             parse_persona_command(&task),
-                            Ok(PersonaCommand::Set(_) | PersonaCommand::Clear)
+                            Ok(PersonaCommand::Clear
+                                | PersonaCommand::Set {
+                                    keep_context: false,
+                                    ..
+                                })
                         );
                         match handle_persona_command(
                             &task,
@@ -1717,6 +1721,12 @@ struct Persona {
     name: String,
     prompt: String,
     path: std::path::PathBuf,
+    /// The parsed role profile. For a plain prompt-only persona (no `+++`
+    /// front-matter) every field except `prompt` is `None`, so behavior is
+    /// identical to before role profiles existed. When the file carries
+    /// front-matter, this surfaces the role's tool allow-list, caveat profile,
+    /// and model/tier router policy.
+    profile: newt_core::RoleProfile,
 }
 
 impl Persona {
@@ -1766,15 +1776,25 @@ impl PersonaStore {
         self.ensure_defaults_if_empty()?;
         let name = normalize_persona_name(name)?;
         let path = self.dir.join(format!("{name}.md"));
-        let prompt = match std::fs::read_to_string(&path) {
-            Ok(prompt) => prompt,
+        let raw = match std::fs::read_to_string(&path) {
+            Ok(raw) => raw,
             Err(_) => anyhow::bail!("unknown persona `{name}`\n{}", self.list_message()?),
         };
-        let prompt = prompt.trim().to_string();
-        if prompt.is_empty() {
+        // Parse optional `+++` front-matter into a role profile. A plain `.md`
+        // with no front-matter yields a prompt-only profile (backward
+        // compatible). The injected `prompt` is the markdown BODY, so
+        // front-matter never leaks into the system prompt.
+        let profile = newt_core::RoleProfile::parse(&raw)
+            .map_err(|e| anyhow::anyhow!("persona `{name}`: {e}"))?;
+        if profile.prompt.is_empty() {
             anyhow::bail!("persona `{name}` is empty: {}", path.display());
         }
-        Ok(Persona { name, prompt, path })
+        Ok(Persona {
+            name,
+            prompt: profile.prompt.clone(),
+            path,
+            profile,
+        })
     }
 
     fn list(&self) -> anyhow::Result<Vec<PersonaSummary>> {
@@ -1789,14 +1809,20 @@ impl PersonaStore {
             let Some(name) = path.file_stem().and_then(|s| s.to_str()) else {
                 continue;
             };
-            let prompt = std::fs::read_to_string(&path).unwrap_or_default();
-            if prompt.trim().is_empty() {
+            let raw = std::fs::read_to_string(&path).unwrap_or_default();
+            if raw.trim().is_empty() {
                 continue;
             }
+            // Skip files whose front-matter is malformed in the listing rather
+            // than failing the whole list; `load` surfaces the error on use.
+            let Ok(profile) = newt_core::RoleProfile::parse(&raw) else {
+                continue;
+            };
             let persona = Persona {
                 name: name.to_string(),
-                prompt,
+                prompt: profile.prompt.clone(),
                 path: path.clone(),
+                profile,
             };
             let description = persona.description();
             personas.push(PersonaSummary {
@@ -1868,7 +1894,25 @@ enum PersonaCommand {
     List,
     Show,
     Clear,
-    Set(String),
+    /// Swap to persona `name`. `keep_context` (the `--keep-context` flag)
+    /// swaps WITHOUT resetting the conversation, per the persistent-actor
+    /// principle; the default (`false`) preserves today's reset-on-swap
+    /// behavior.
+    Set {
+        name: String,
+        keep_context: bool,
+    },
+}
+
+#[cfg(test)]
+impl PersonaCommand {
+    /// Test-only constructor for the common `Set { keep_context: false }` case.
+    fn set(name: impl Into<String>) -> Self {
+        Self::Set {
+            name: name.into(),
+            keep_context: false,
+        }
+    }
 }
 
 fn parse_persona_command(input: &str) -> anyhow::Result<PersonaCommand> {
@@ -1879,16 +1923,40 @@ fn parse_persona_command(input: &str) -> anyhow::Result<PersonaCommand> {
         _ => anyhow::bail!("not a persona command"),
     }
 
-    match parts.next() {
+    // Pull `--keep-context` from anywhere in the remaining tokens; collect the
+    // rest as positional args.
+    let mut keep_context = false;
+    let positional: Vec<&str> = parts
+        .filter(|tok| {
+            if *tok == "--keep-context" {
+                keep_context = true;
+                false
+            } else {
+                true
+            }
+        })
+        .collect();
+    let mut positional = positional.into_iter();
+
+    match positional.next() {
         None | Some("show") => Ok(PersonaCommand::Show),
         Some("list") => Ok(PersonaCommand::List),
         Some("clear" | "off") => Ok(PersonaCommand::Clear),
-        Some("default") => Ok(PersonaCommand::Set(PersonaStore::DEFAULT_NAME.into())),
-        Some("set") => match parts.next() {
-            Some(name) => Ok(PersonaCommand::Set(name.to_string())),
-            None => anyhow::bail!("usage: /persona set <name>"),
+        Some("default") => Ok(PersonaCommand::Set {
+            name: PersonaStore::DEFAULT_NAME.into(),
+            keep_context,
+        }),
+        Some("set") => match positional.next() {
+            Some(name) => Ok(PersonaCommand::Set {
+                name: name.to_string(),
+                keep_context,
+            }),
+            None => anyhow::bail!("usage: /persona set <name> [--keep-context]"),
         },
-        Some(name) => Ok(PersonaCommand::Set(name.to_string())),
+        Some(name) => Ok(PersonaCommand::Set {
+            name: name.to_string(),
+            keep_context,
+        }),
     }
 }
 
@@ -2050,15 +2118,62 @@ fn rebuild_system_prompt(
 }
 
 fn persona_status(active: Option<&Persona>) -> String {
-    match active {
-        Some(persona) => format!(
-            "Active persona: {} - {} ({})",
-            persona.name,
-            persona.description(),
-            persona.path.display()
-        ),
-        None => "No active persona.".to_string(),
+    let Some(persona) = active else {
+        return "No active persona.".to_string();
+    };
+    let mut out = format!(
+        "Active persona: {} - {} ({})",
+        persona.name,
+        persona.description(),
+        persona.path.display()
+    );
+    let profile = &persona.profile;
+    if let Some(role) = &profile.role {
+        out.push_str(&format!("\n  role: {role}"));
     }
+    match &profile.tools {
+        Some(tools) if !tools.is_empty() => {
+            out.push_str(&format!("\n  tools: {}", tools.join(", ")));
+        }
+        Some(_) => out.push_str("\n  tools: (none)"),
+        None => out.push_str("\n  tools: (unconstrained)"),
+    }
+    if let Some(caveats) = &profile.caveats {
+        out.push_str(&format!("\n  caveats: {}", caveat_summary(caveats)));
+    }
+    match (&profile.model, &profile.tier) {
+        (Some(m), Some(t)) => out.push_str(&format!("\n  router: model={m} tier={t:?}")),
+        (Some(m), None) => out.push_str(&format!("\n  router: model={m}")),
+        (None, Some(t)) => out.push_str(&format!("\n  router: tier={t:?}")),
+        (None, None) => {}
+    }
+    if !profile.is_role_bound() {
+        out.push_str("\n  (prompt-only persona — no role bindings)");
+    }
+    out
+}
+
+/// One-line human summary of a [`newt_core::CaveatProfile`] for `/persona show`.
+fn caveat_summary(profile: &newt_core::CaveatProfile) -> String {
+    fn axis(spec: &newt_core::ScopeSpec) -> String {
+        match spec {
+            newt_core::ScopeSpec::Keyword(newt_core::ScopeKeyword::All) => "all".to_string(),
+            newt_core::ScopeSpec::Keyword(newt_core::ScopeKeyword::None) => "none".to_string(),
+            newt_core::ScopeSpec::Items(items) => format!("[{}]", items.join(", ")),
+        }
+    }
+    let calls = match profile.max_calls {
+        Some(n) => n.to_string(),
+        None => "unlimited".to_string(),
+    };
+    format!(
+        "fs_read={} fs_write={} exec={} net={} max_calls={}",
+        axis(&profile.fs_read),
+        axis(&profile.fs_write),
+        axis(&profile.exec),
+        axis(&profile.net),
+        calls,
+    )
 }
 
 fn persona_list(store: &PersonaStore) -> anyhow::Result<String> {
@@ -2275,12 +2390,29 @@ fn handle_persona_command(
             reset_conversation(workspace, memory, system, active_persona.as_ref());
             Ok("Started a new conversation with no active persona.".to_string())
         }
-        PersonaCommand::Set(name) => {
+        PersonaCommand::Set { name, keep_context } => {
             let persona = store.load(&name)?;
             *active_persona = Some(persona);
-            reset_conversation(workspace, memory, system, active_persona.as_ref());
-            Ok(new_conversation_message(active_persona.as_ref()))
+            if keep_context {
+                // Persistent-actor swap: rebuild the system prompt for the new
+                // role WITHOUT discarding the conversation history.
+                *system = rebuild_system_prompt(workspace, memory, active_persona.as_ref());
+                Ok(persona_swap_kept_context_message(active_persona.as_ref()))
+            } else {
+                reset_conversation(workspace, memory, system, active_persona.as_ref());
+                Ok(new_conversation_message(active_persona.as_ref()))
+            }
         }
+    }
+}
+
+fn persona_swap_kept_context_message(active_persona: Option<&Persona>) -> String {
+    match active_persona {
+        Some(persona) => format!(
+            "Switched to persona `{}` (kept conversation context).",
+            persona.name
+        ),
+        None => "Switched persona (kept conversation context).".to_string(),
     }
 }
 
@@ -4609,6 +4741,23 @@ fn resolve_workspace(path: Option<&std::path::Path>) -> String {
 // Tests
 // ---------------------------------------------------------------------------
 
+/// Build a prompt-only [`Persona`] (no role bindings) for tests that only care
+/// about the prompt overlay. Mirrors how a plain `.md` with no front-matter
+/// loads. Top-level (not inside a test module) so every `#[cfg(test)] mod` can
+/// reach it via `super::test_persona`.
+#[cfg(test)]
+fn test_persona(name: &str, prompt: &str, path: std::path::PathBuf) -> Persona {
+    Persona {
+        name: name.to_string(),
+        prompt: prompt.to_string(),
+        path,
+        profile: newt_core::RoleProfile {
+            prompt: prompt.to_string(),
+            ..Default::default()
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5191,11 +5340,11 @@ mod skills_integration_tests {
     #[test]
     fn system_prompt_includes_active_persona_overlay() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let persona = Persona {
-            name: "reviewer".to_string(),
-            prompt: "Review from a persona file.".to_string(),
-            path: tmp.path().join("personas").join("reviewer.md"),
-        };
+        let persona = test_persona(
+            "reviewer",
+            "Review from a persona file.",
+            tmp.path().join("personas").join("reviewer.md"),
+        );
         let prompt = build_system_prompt_with_persona(
             tmp.path().to_str().unwrap(),
             Some(newt_core::DEFAULT_SOUL),
@@ -5209,11 +5358,11 @@ mod skills_integration_tests {
     fn persona_commands_parse_expected_actions() {
         assert_eq!(
             parse_persona_command("/persona reviewer").unwrap(),
-            PersonaCommand::Set("reviewer".into())
+            PersonaCommand::set("reviewer")
         );
         assert_eq!(
             parse_persona_command("/persona set security").unwrap(),
-            PersonaCommand::Set("security".into())
+            PersonaCommand::set("security")
         );
         assert_eq!(
             parse_persona_command("/persona clear").unwrap(),
@@ -5229,7 +5378,34 @@ mod skills_integration_tests {
         );
         assert_eq!(
             parse_persona_command("/persona default").unwrap(),
-            PersonaCommand::Set("coder".into())
+            PersonaCommand::set("coder")
+        );
+    }
+
+    #[test]
+    fn persona_set_parses_keep_context_flag() {
+        // `--keep-context` flips keep_context regardless of position.
+        assert_eq!(
+            parse_persona_command("/persona set worker --keep-context").unwrap(),
+            PersonaCommand::Set {
+                name: "worker".into(),
+                keep_context: true,
+            }
+        );
+        assert_eq!(
+            parse_persona_command("/persona --keep-context set worker").unwrap(),
+            PersonaCommand::Set {
+                name: "worker".into(),
+                keep_context: true,
+            }
+        );
+        // Default (no flag) keeps the reset-on-swap behavior.
+        assert_eq!(
+            parse_persona_command("/persona set worker").unwrap(),
+            PersonaCommand::Set {
+                name: "worker".into(),
+                keep_context: false,
+            }
         );
     }
 
@@ -5320,11 +5496,11 @@ mod skills_integration_tests {
         memory
             .sync_all("old task", "old reply", &newt_core::TurnMetrics::default())
             .await;
-        let active_persona = Some(Persona {
-            name: "terse".to_string(),
-            prompt: "Keep replies short.".to_string(),
-            path: tmp.path().join("personas").join("terse.md"),
-        });
+        let active_persona = Some(test_persona(
+            "terse",
+            "Keep replies short.",
+            tmp.path().join("personas").join("terse.md"),
+        ));
         let mut system = rebuild_system_prompt(workspace, &memory, active_persona.as_ref());
 
         let message =
@@ -5382,11 +5558,11 @@ mod skills_integration_tests {
         let workspace = tempfile::TempDir::new().unwrap();
         let store = newt_core::ConversationStore::new(tmp.path(), workspace.path(), 100).unwrap();
         let mut active_id = None;
-        let persona = Some(Persona {
-            name: "coder".to_string(),
-            prompt: "Code things.".to_string(),
-            path: tmp.path().join("personas").join("coder.md"),
-        });
+        let persona = Some(test_persona(
+            "coder",
+            "Code things.",
+            tmp.path().join("personas").join("coder.md"),
+        ));
 
         save_successful_conversation_turn(
             &store,
@@ -6654,19 +6830,15 @@ mod persona_helper_tests {
 
     #[test]
     fn persona_description_takes_first_nonempty_line_truncated() {
-        let p = Persona {
-            name: "x".into(),
-            prompt: "\n\n# Reviewer persona\n\nbody text".into(),
-            path: std::path::PathBuf::from("/x.md"),
-        };
+        let p = test_persona(
+            "x",
+            "\n\n# Reviewer persona\n\nbody text",
+            std::path::PathBuf::from("/x.md"),
+        );
         assert_eq!(p.description(), "Reviewer persona");
 
         let long = "a".repeat(200);
-        let p = Persona {
-            name: "x".into(),
-            prompt: long,
-            path: std::path::PathBuf::from("/x.md"),
-        };
+        let p = test_persona("x", &long, std::path::PathBuf::from("/x.md"));
         assert_eq!(p.description().chars().count(), 96, "capped at 96 chars");
     }
 
@@ -6694,11 +6866,11 @@ mod persona_helper_tests {
     #[test]
     fn persona_status_reports_none_and_active() {
         assert_eq!(persona_status(None), "No active persona.");
-        let p = Persona {
-            name: "terse".into(),
-            prompt: "Keep it short.".into(),
-            path: std::path::PathBuf::from("/p/terse.md"),
-        };
+        let p = test_persona(
+            "terse",
+            "Keep it short.",
+            std::path::PathBuf::from("/p/terse.md"),
+        );
         let status = persona_status(Some(&p));
         assert!(status.contains("Active persona: terse"));
         assert!(status.contains("Keep it short."));
@@ -6768,11 +6940,11 @@ mod persona_helper_tests {
         memory
             .sync_all("old task", "old reply", &newt_core::TurnMetrics::default())
             .await;
-        let mut active = Some(Persona {
-            name: "terse".into(),
-            prompt: "Short.".into(),
-            path: tmp.path().join("personas").join("terse.md"),
-        });
+        let mut active = Some(test_persona(
+            "terse",
+            "Short.",
+            tmp.path().join("personas").join("terse.md"),
+        ));
         let mut system = rebuild_system_prompt(workspace, &memory, active.as_ref());
 
         // show: reports the active persona, does not reset anything.
@@ -6803,6 +6975,122 @@ mod persona_helper_tests {
         assert!(!system.contains("Active persona: terse"));
         let messages = memory.build_messages(&system, "new task");
         assert!(!messages.iter().any(|m| m.content == "old task"));
+    }
+
+    /// Writing a role-bound persona file and loading it must surface the
+    /// front-matter (role/tools/caveats), and a swap must change more than the
+    /// prompt versus the prompt-only `coder` default.
+    #[test]
+    fn role_bound_persona_loads_tools_and_caveats() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("personas");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("wing-commander.md"),
+            "+++\nrole = \"wing-commander\"\ntools = [\"read_file\", \"grade_diff\"]\ntier = \"REVIEW\"\n\n[caveats]\nfs_write = \"none\"\nmax_calls = 60\n+++\n\n# Wing-Commander\nGrade diffs.\n",
+        )
+        .unwrap();
+        let store = PersonaStore::new(dir);
+
+        let wc = store.load("wing-commander").unwrap();
+        assert_eq!(wc.profile.role.as_deref(), Some("wing-commander"));
+        assert_eq!(wc.profile.tier, Some(newt_core::Tier::Review));
+        assert_eq!(
+            wc.profile.tools.as_deref(),
+            Some(["read_file".to_string(), "grade_diff".to_string()].as_slice())
+        );
+        // Front-matter must NOT leak into the injected prompt.
+        assert!(!wc.prompt.contains("+++"));
+        assert!(wc.prompt.contains("Grade diffs."));
+        let caveats = wc.profile.caveats.as_ref().unwrap().to_caveats();
+        assert_eq!(caveats.fs_write, newt_core::Scope::none());
+        assert_eq!(caveats.max_calls, newt_core::CountBound::AtMost(60));
+
+        // The built-in `coder` default is prompt-only — a swap to
+        // wing-commander changes MORE than the prompt. Parse the default soul
+        // directly (the temp dir already has a persona file, so the `coder`
+        // default isn't seeded into it).
+        let coder = newt_core::RoleProfile::parse(newt_core::DEFAULT_SOUL).unwrap();
+        assert!(!coder.is_role_bound());
+        assert!(wc.profile.is_role_bound());
+        assert_ne!(wc.profile.tools, coder.tools);
+        assert_ne!(wc.profile.caveats, coder.caveats);
+    }
+
+    /// `/persona set <name> --keep-context` swaps the role WITHOUT discarding
+    /// conversation history (persistent-actor principle); the default resets.
+    #[tokio::test]
+    async fn persona_set_keep_context_preserves_history() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let workspace = tmp.path().to_str().unwrap();
+        let dir = tmp.path().join("personas");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("terse.md"), "Keep it short.").unwrap();
+        let store = PersonaStore::new(dir);
+        let mut memory = newt_core::MemoryManager::new();
+        memory.add_provider(newt_core::RollingWindow::new(5));
+        memory
+            .sync_all("old task", "old reply", &newt_core::TurnMetrics::default())
+            .await;
+        let mut active: Option<Persona> = None;
+        let mut system = rebuild_system_prompt(workspace, &memory, active.as_ref());
+
+        let msg = handle_persona_command(
+            "/persona set terse --keep-context",
+            workspace,
+            &store,
+            &mut memory,
+            &mut system,
+            &mut active,
+        )
+        .unwrap();
+        assert!(msg.contains("kept conversation context"), "got: {msg}");
+        assert_eq!(active.as_ref().unwrap().name, "terse");
+        // History survives the swap.
+        let messages = memory.build_messages(&system, "new task");
+        assert!(
+            messages.iter().any(|m| m.content == "old task"),
+            "keep-context must preserve prior turns"
+        );
+
+        // Without the flag, the same swap resets the conversation.
+        let _ = handle_persona_command(
+            "/persona set terse",
+            workspace,
+            &store,
+            &mut memory,
+            &mut system,
+            &mut active,
+        )
+        .unwrap();
+        let messages = memory.build_messages(&system, "new task");
+        assert!(
+            !messages.iter().any(|m| m.content == "old task"),
+            "default swap must reset the conversation"
+        );
+    }
+
+    /// All three shipped role templates under `<repo>/personas/` parse into
+    /// valid, role-bound `RoleProfile`s with distinct tool sets.
+    #[test]
+    fn shipped_role_templates_parse() {
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("newt-tui is a workspace member");
+        let personas = repo_root.join("personas");
+        for name in ["dragon-rider", "wing-commander", "worker"] {
+            let path = personas.join(format!("{name}.md"));
+            let raw = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("missing shipped template {}: {e}", path.display()));
+            let rp = newt_core::RoleProfile::parse(&raw)
+                .unwrap_or_else(|e| panic!("{name} failed to parse: {e}"));
+            assert_eq!(rp.role.as_deref(), Some(name), "{name} role mismatch");
+            assert!(rp.is_role_bound(), "{name} must be role-bound");
+            assert!(rp.tools.is_some(), "{name} must declare tools");
+            assert!(rp.caveats.is_some(), "{name} must declare caveats");
+            // Converts to canonical caveats without panicking.
+            let _ = rp.caveats.unwrap().to_caveats();
+        }
     }
 }
 
