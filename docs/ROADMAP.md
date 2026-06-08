@@ -561,12 +561,20 @@ one implementor). Pub-use the new types from `newt_core` top-level for clean
 import paths. `newt-tui` becomes a thin wrapper that constructs a `ChatCtx`
 and calls `newt_core::agentic::chat_complete()`.
 
-The wiremock tests at `newt-tui/src/lib.rs:5485+` travel with the code into
-`newt-core/src/agentic/` — this is the majority of the diff. No behavioral
-change; CI green before and after.
+The wiremock agentic-loop tests travel with the code into
+`newt-core/src/agentic/` — this is the majority of the diff. As of #201
+they live in two blocks of `newt-tui/src/lib.rs`: the `openai_chat_complete`
+suite (~line 5486) and the larger `mod http_loop_tests` (~line 7364, covering
+streaming, overflow trim-and-retry, mid-loop trim, empty-summary fallbacks,
+and the read-only nudge). Both move; grep for `MockServer::start` to find
+them all rather than trusting a line number. No behavioral change; CI green
+before and after.
 **Tests:** All existing wiremock-based agentic loop tests migrate to
 `newt-core/src/agentic/` (Ollama path, OpenAI path, overflow retry,
 read-only nudge, cap-exit fallback). Net test count should be unchanged.
+Watch the coverage gate: this code is well-tested, so moving it from
+`newt-tui` to `newt-core` shifts where the covered lines count but keeps the
+workspace total flat — the 80% floor must still clear.
 **Out of scope:** `InferenceBackend` trait abstraction (future step when a
 second concrete backend exists).
 **Mocks:** existing `wiremock` HTTP mocks travel with the tests unchanged.
@@ -614,6 +622,24 @@ domain evaluator. Coverage ratchet must not drop.
 against a real model).
 **Mocks:** wiremock returning the canned diffs from the case fixtures.
 **Estimated diff:** ~100 lines.
+
+### Steps 9.6–9.9 are the *exposure* track — related work tracked separately
+
+These four steps make the existing, battle-tested TUI loop reachable from
+foreman/ACP and pin its behavior with eval cases. Two adjacent tracks are
+deliberately **not** folded in here, to keep each step reviewable:
+
+- **Loop hardening** — once Step 9.7 lands `newt-core::agentic`, that module
+  (not `newt-tui`) is the home for robustness work that should benefit both
+  the TUI and ACP paths: salvaging `TextMode` tool calls (models that emit
+  tool-call JSON in `content` are detected via `ToolConformance` but never
+  dispatched), and the fresh-install permissions gap (a config with no
+  `[tui]` block resolves to read-only caveats, which forces advisory drift —
+  the agent narrates instead of editing). Filed as issues, sequenced after 9.7.
+- **Model selection** — which local models drive the loop, and the
+  DGX/Spark serving tier for larger agentic coders, is a separate
+  `DgxConfig`/infra track. The eval cases here (9.6/9.9) are model-agnostic
+  by design so they gate *loop behavior*, not a specific model.
 
 ---
 
