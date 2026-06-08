@@ -631,15 +631,20 @@ deliberately **not** folded in here, to keep each step reviewable:
 
 - **Loop hardening** — once Step 9.7 lands `newt-core::agentic`, that module
   (not `newt-tui`) is the home for robustness work that should benefit both
-  the TUI and ACP paths: salvaging `TextMode` tool calls (models that emit
-  tool-call JSON in `content` are detected via `ToolConformance` but never
-  dispatched), and the fresh-install permissions gap (a config with no
-  `[tui]` block resolves to read-only caveats, which forces advisory drift —
-  the agent narrates instead of editing). Filed as issues, sequenced after 9.7.
-- **Model selection** — which local models drive the loop, and the
-  DGX/Spark serving tier for larger agentic coders, is a separate
-  `DgxConfig`/infra track. The eval cases here (9.6/9.9) are model-agnostic
-  by design so they gate *loop behavior*, not a specific model.
+  the TUI and ACP paths: salvaging `TextMode` tool calls (#214 — models that
+  emit tool-call JSON in `content` are detected via `ToolConformance` but
+  never dispatched), the fresh-install permissions gap (#215 — a config with
+  no `[tui]` block resolves to read-only caveats, which forces advisory drift:
+  the agent narrates instead of editing), and surfacing the effective
+  `num_ctx` under `NEWT_DEBUG` (#216). All sequenced **after** Step 9.7 so
+  they land in the shared module.
+- **Model selection** — which local models drive the loop (#217 — pin
+  agentic-model tiers in `DgxConfig`: 1-Spark `qwen3-coder:30b`, 2-Spark
+  `Qwen3-235B-A22B` / `Qwen3-Coder-480B`) and the DGX/Spark serving tier for
+  larger agentic coders (#218 — 2-Spark vLLM tensor-parallel; prereq for the
+  Tier-B formations). The eval cases here (9.6/9.9) are model-agnostic by
+  design so they gate *loop behavior*, not a specific model. (Supersedes the
+  closed #46 model×size matrix.)
 
 ---
 
