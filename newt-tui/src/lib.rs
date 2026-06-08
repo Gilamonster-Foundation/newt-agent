@@ -4869,14 +4869,13 @@ mod run_command_confinement_tests {
         }
     }
 
-    /// run_command with a caveats granting exec for a real external (`env`)
-    /// succeeds: the command runs through the confined shell and returns its
-    /// output (exit 0), no denial.
+    /// Stub: shell tool is temporarily unavailable (pending reubeno/brush#1184).
+    /// Both in-scope and out-of-scope commands return the unavailable error.
+    /// Restore the original two tests from git history once brush support lands.
+    /// See: https://github.com/Gilamonster-Foundation/agent-bridle/issues/20
     #[cfg(unix)]
     #[tokio::test]
     async fn run_command_allowed_external_succeeds() {
-        // Serialize against env-mutating tests: run_command's confined shell
-        // reads NEWT_VENV / VIRTUAL_ENV / NEWT_EXEC_PATHS via venv_cmd_prefix.
         let _env = crate::test_env_guard::env_read_guard_async().await;
         let ws = tempfile::TempDir::new().unwrap();
         let caveats = caveats_exec_only(&["env"]);
@@ -4893,26 +4892,20 @@ mod run_command_confinement_tests {
         )
         .await;
         assert!(
-            !out.starts_with("capability denied"),
-            "an in-scope external must not be denied, got: {out}"
-        );
-        assert!(
-            !out.starts_with("error:"),
-            "an in-scope external must run cleanly, got: {out}"
+            out.contains("reubeno/brush/pull/1184"),
+            "stub error must link to tracking PR, got: {out}"
         );
     }
 
-    /// run_command with an out-of-scope command is DENIED via the structured
-    /// envelope field — surfaced as the capability-denied UX string, NOT a
-    /// stderr grep.
+    /// Stub: shell tool is temporarily unavailable (pending reubeno/brush#1184).
+    /// Out-of-scope commands return the unavailable error, not a caveats denial.
+    /// Restore from git history once brush support lands.
+    /// See: https://github.com/Gilamonster-Foundation/agent-bridle/issues/20
     #[cfg(unix)]
     #[tokio::test]
     async fn run_command_out_of_scope_is_denied() {
-        // Serialize against env-mutating tests: run_command's confined shell
-        // reads NEWT_VENV / VIRTUAL_ENV / NEWT_EXEC_PATHS via venv_cmd_prefix.
         let _env = crate::test_env_guard::env_read_guard_async().await;
         let ws = tempfile::TempDir::new().unwrap();
-        // Grant only `echo`; ask to run the external `env`.
         let caveats = caveats_exec_only(&["echo"]);
         let args = serde_json::json!({ "command": "env" });
         let out = execute_tool(
@@ -4927,12 +4920,8 @@ mod run_command_confinement_tests {
         )
         .await;
         assert!(
-            out.starts_with("capability denied"),
-            "an out-of-scope external must be denied via the structured field, got: {out}"
-        );
-        assert!(
-            out.contains("[tui.permissions] extra_exec = [\"env\"]"),
-            "exec denials should explain the extra_exec escape hatch, got: {out}"
+            out.contains("reubeno/brush/pull/1184"),
+            "stub error must link to tracking PR, got: {out}"
         );
     }
 

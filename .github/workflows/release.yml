@@ -135,19 +135,12 @@ jobs:
 
   publish-crates:
     name: Publish ${{ matrix.crate }} → crates.io
-    # GATED OFF (newt-agent#120 + agent-bridle git-dep). crates.io forbids git
-    # dependencies, and newt-tui / newt-mcp-server now depend on `agent-bridle`
-    # via git (→ Gilamonster-Foundation/agent-bridle, which pulls the brush
-    # fork git-dep). So `cargo publish` CANNOT succeed for these crates until
-    # the brush exec/open interceptor is upstreamed and agent-bridle ships a
-    # crates.io VERSION (turning the git-dep into a registry dep). Until then a
-    # tag would otherwise re-trip the 0.6.5 PARTIAL publish (#120: only 4/10
-    # crates landed because of the publish-order bug). The PyPI wheel compiles
-    # the Rust in, so git-deps are fine there — wheel + sdist + GitHub-binary +
-    # PyPI-publish jobs stay ACTIVE; only crates.io is held back.
-    # Re-enable by restoring `if: startsWith(github.ref, 'refs/tags/')` once
-    # both the brush upstream + #120 publish-order fix have landed.
-    if: false
+    # Enabled once agent-bridle 0.1.0 landed on crates.io (agent-bridle#21).
+    # newt-tui and newt-mcp-server now declare `agent-bridle = "0.1"` as a
+    # registry dep; the workspace [patch.crates-io] is removed after crates.io
+    # indexes agent-bridle. The publish-order bug (#120) is fixed by the
+    # topological matrix order below (max-parallel: 1).
+    if: startsWith(github.ref, 'refs/tags/')
     needs: [build-binaries]
     runs-on: ubuntu-latest
     strategy:
