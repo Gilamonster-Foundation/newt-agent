@@ -62,15 +62,29 @@ fn is_retryable_status(code: u16) -> bool {
     code == 408 || code == 429 || (500..600).contains(&code)
 }
 
-/// Pull the first status code out of a `"... returned <code>: ..."` message.
+/// Pull the first status code out of an error message.
+///
+/// Recognises two formats produced by the backends in this workspace:
+/// - `"<backend> returned <code> …"` — local backends (Ollama, vLLM)
+/// - `"inference endpoint <code> …"` — hosted OpenAI-compatible endpoints
+///   (NVIDIA inference API, LiteLLM proxies, etc.)
+///
+/// The code is the leading run of ASCII digits after the matched prefix
+/// (e.g. `StatusCode` Display is `"503 Service Unavailable"`, digits first).
 fn status_code_in(msg: &str) -> Option<u16> {
-    let after = msg.split_once("returned ")?.1;
-    // The code is the leading run of ASCII digits (the `StatusCode` Display is
-    // e.g. "503 Service Unavailable", so digits come first).
-    after
-        .split(|c: char| !c.is_ascii_digit())
-        .find(|s| !s.is_empty())
-        .and_then(|s| s.parse().ok())
+    const PREFIXES: &[&str] = &["returned ", "inference endpoint "];
+    for prefix in PREFIXES {
+        if let Some(after) = msg.split_once(prefix).map(|(_, r)| r) {
+            if let Some(code) = after
+                .split(|c: char| !c.is_ascii_digit())
+                .find(|s: &&str| !s.is_empty())
+                .and_then(|s| s.parse().ok())
+            {
+                return Some(code);
+            }
+        }
+    }
+    None
 }
 
 /// Exponential-backoff retry policy.
@@ -345,6 +359,42 @@ mod tests {
         );
         assert_eq!(status_code_in("Ollama returned 429: y"), Some(429));
         assert_eq!(status_code_in("no status here"), None);
+    }
+
+    #[test]
+    fn classify_inference_endpoint_5xx_is_retry() {
+        // Regression: hosted endpoints format errors as "inference endpoint <code> …"
+        // which previously fell through status_code_in and was classified Fatal.
+        assert_eq!(
+            classify(&err(
+                r#"inference endpoint 500 Internal Server Error: {"error":{"message":"instance_id not found"}}"#
+            )),
+            Retryability::Retry
+        );
+        assert_eq!(
+            classify(&err("inference endpoint 503 Service Unavailable: down")),
+            Retryability::Retry
+        );
+        assert_eq!(
+            classify(&err("inference endpoint 429 Too Many Requests: slow")),
+            Retryability::Retry
+        );
+    }
+
+    #[test]
+    fn status_code_parsing_inference_endpoint_format() {
+        assert_eq!(
+            status_code_in("inference endpoint 500 Internal Server Error: body"),
+            Some(500)
+        );
+        assert_eq!(
+            status_code_in("inference endpoint 429 Too Many Requests: body"),
+            Some(429)
+        );
+        assert_eq!(
+            status_code_in("inference endpoint 400 Bad Request: body"),
+            Some(400)
+        );
     }
 
     #[test]
