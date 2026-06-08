@@ -1,0 +1,104 @@
+name: Mesh integration
+
+# Cross-project regression gate for the agent-mesh ↔ newt-mesh seam.
+#
+# `newt-mesh` is deliberately excluded from the main workspace (see
+# docs/decisions/mesh_integration.md) because it path-depends on a
+# sibling `../agent-mesh/` checkout that stock CI doesn't have. This
+# workflow PROVIDES that sibling: it checks out
+# Gilamonster-Foundation/agent-mesh@main next to newt-agent and runs
+# the full `just check-mesh` bar (fmt + clippy -D warnings + tests),
+# which includes:
+#
+#   * newt-mesh/tests/inference_roundtrip.rs  — newt asker ↔ newt responder
+#   * newt-mesh/tests/conversation_contract.rs — RAW agent-mesh Bus client
+#     ↔ newt responder: wire-format pin (topic + JSON shapes), multi-turn
+#     threaded conversation, quiet-bind dial-back replies
+#
+# Triggers:
+#   * PRs / pushes that touch the seam (newt-mesh, the crates it
+#     consumes, or this workflow).
+#   * Nightly cron — catches DRIFT: agent-mesh@main moving in a way
+#     that breaks newt-mesh even when this repo hasn't changed.
+#   * workflow_dispatch for on-demand runs.
+#
+# HOOK PARITY EXCEPTION: like the `windows` job in ci.yml, this is
+# CI-only — the pre-push hook covers the default workspace; the local
+# equivalent of this job is `just check-mesh` (run it when you touch
+# the seam).
+#
+# The tests use real mDNS + QUIC on ephemeral UDP ports, entirely
+# inside the runner — no external services, no inference backends
+# (deterministic mock/echo backends only).
+
+on:
+  push:
+    branches: ["main", "feat/**", "fix/**", "step-*", "release/**"]
+    paths:
+      - "newt-mesh/**"
+      - "newt-core/**"
+      - "newt-inference/**"
+      - "plugins-protocol/**"
+      - "tests/common/**"
+      - ".github/workflows/mesh-integration.yml"
+  pull_request:
+    branches: ["main"]
+    paths:
+      - "newt-mesh/**"
+      - "newt-core/**"
+      - "newt-inference/**"
+      - "plugins-protocol/**"
+      - "tests/common/**"
+      - ".github/workflows/mesh-integration.yml"
+  schedule:
+    # Nightly drift check against agent-mesh@main (06:17 UTC keeps it
+    # off the top-of-hour rush).
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+env:
+  RUST_BACKTRACE: 1
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check-mesh:
+    name: agent-mesh ↔ newt-mesh contract
+    runs-on: ubuntu-latest
+    steps:
+      # Side-by-side layout matching local development:
+      #   $GITHUB_WORKSPACE/newt-agent   (this repo)
+      #   $GITHUB_WORKSPACE/agent-mesh   (the sibling path dep)
+      - uses: actions/checkout@v4
+        with:
+          path: newt-agent
+
+      - uses: actions/checkout@v4
+        with:
+          repository: Gilamonster-Foundation/agent-mesh
+          ref: main
+          path: agent-mesh
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: mesh-integration
+          workspaces: newt-agent/newt-mesh
+
+      # Mirrors `just check-mesh` (justfile) — kept as raw cargo
+      # invocations so the job doesn't need `just` installed.
+      - name: fmt check
+        working-directory: newt-agent
+        run: cargo fmt --manifest-path newt-mesh/Cargo.toml -- --check
+
+      - name: clippy (-D warnings)
+        if: always()
+        working-directory: newt-agent
+        run: cargo clippy --manifest-path newt-mesh/Cargo.toml --all-targets -- -D warnings
+
+      - name: tests (roundtrip + conversation contract)
+        if: always()
+        working-directory: newt-agent
+        run: cargo test --manifest-path newt-mesh/Cargo.toml
