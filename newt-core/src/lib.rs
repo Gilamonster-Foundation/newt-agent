@@ -14,6 +14,7 @@ pub mod memory;
 pub mod metrics;
 pub mod model_id;
 pub mod pricing;
+pub mod role_profile;
 pub mod router;
 pub mod session;
 pub mod tuning;
@@ -39,5 +40,6 @@ pub use memory::{
 pub use metrics::{TokenUsage, TurnMetrics};
 pub use model_id::ModelId;
 pub use pricing::{ModelRate, PricingConfig};
+pub use role_profile::{CaveatProfile, RoleProfile, ScopeKeyword, ScopeSpec};
 pub use router::{Router, Tier};
 pub use session::SessionId;
