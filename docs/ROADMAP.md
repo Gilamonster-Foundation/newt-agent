@@ -893,6 +893,68 @@ caveat, example `newt.toml`.
 
 ---
 
+# Phase 15 — Role Profiles (persona → tools + caveats + model)
+
+> **PROPOSED — pending roadmap-owner placement.** This phase promotes newt's
+> "persona" from a prompt-only system-prompt overlay into a *role profile* that
+> also carries a toolset, an agent-bridle capability (caveat) profile, and
+> backend/router policy (model/tier). It is the seam the one-airframe-many-roles
+> topology (dragon-rider orchestrator, wing-commander arbiter, worker) depends
+> on. Step 15.1 lands the type + parser + TUI reporting; everything that *acts*
+> on a profile (enforcement, routing, authority minting) is sequenced as
+> explicit follow-on steps below. The natural home for the profile-driven config
+> at the worker/ACP entry points is Step 9.8's `AgenticConfig` — see the note in
+> Step 15.1's out-of-scope list.
+
+## Step 15.1 — RoleProfile in newt-core + TUI wiring
+
+**Branch:** `step-15.1-role-profiles`
+**Touches:** `newt-core/src/role_profile.rs` (new), `newt-core/src/lib.rs`
+(re-exports), `newt-tui/src/lib.rs` (persona loading + `/persona` handler +
+prompt-assembly call site only), `personas/{dragon-rider,wing-commander,worker}.md`
+(new templates), `docs/design/role-profiles.md` (new design note).
+**Implements:**
+- `RoleProfile { prompt, role, tools, caveats, model, tier }` in
+  `newt-core::role_profile`, with a parser that splits an **optional** `+++`-fenced
+  TOML front-matter block from the markdown body. A file with no front-matter
+  parses into an all-`None` profile and behaves exactly like today's prompt-only
+  persona (load-bearing backward-compat guarantee).
+- `CaveatProfile` (human-friendly serde shape — `"all"`/`"none"`/list per
+  filesystem/exec/net axis + `max_calls`) converting into the canonical
+  `agent_mesh_protocol::Caveats` via `to_caveats()`, and a `summary()` reporting
+  helper. All parsing/conversion/reporting *logic* lives in `newt-core`.
+- `newt-tui`: persona loading parses the file into a `RoleProfile` stored on the
+  active `Persona` (prompt injected as before); `/persona show` reports role +
+  tool allow-list + caveat summary + router policy; new opt-in
+  `/persona set <name> --keep-context` swaps the role WITHOUT resetting the
+  conversation (persistent-actor principle), default still resets.
+- Three shipped templates under `personas/` exercising the front-matter.
+**Tests:** newt-core unit tests for parsing (front-matter present / absent /
+malformed / unclosed / sparse / empty-block / non-fence), `CaveatProfile`
+conversion + sparse-defaults-to-top, `ScopeSpec`/`CaveatProfile` `summary()`
+rendering; newt-tui tests for `--keep-context` preserves history vs default
+reset, role-bound persona load surfaces tools/caveats and differs from the
+prompt-only `coder` default, and all three shipped templates parse into valid
+role-bound profiles.
+**Out of scope / follow-on steps:**
+- **Enforcement** — gating tool dispatch on the profile's `tools`/`caveats` via
+  agent-bridle. There is no agent-bridle registry at the TUI dispatch site yet;
+  the TUI *records* the active role's tools/caveats but does not enforce them.
+  After Step 9.7 relocates the loop to `newt-core::agentic`, enforcement belongs
+  in that shared module so it benefits both the TUI and the ACP worker.
+- **Router application** — having the router actually honor the profile's
+  `model`/`tier` hints (today they are surfaced in `/persona show` only).
+- **Worker/MCP entry points minting authority from a profile** — the ACP worker
+  / MCP server reading a role profile and minting agent-bridle authority
+  (`Caveats`) from `caveats`. The natural carrier is Step 9.8's `AgenticConfig`:
+  a role profile would supply the tunables/authority a session embodies.
+**Mocks:** none — pure parsing + in-memory persona store over `tempfile` dirs;
+no network. (Front-matter fixtures are written to temp dirs in tests.)
+**Estimated diff:** ~470 lines newt-core (incl. tests), ~250 lines newt-tui
+wiring/tests, 3 template files, 1 design note.
+
+---
+
 # Cross-cutting notes
 
 - **drake-foreman dispatch:** each step's branch is the unit of work. The
