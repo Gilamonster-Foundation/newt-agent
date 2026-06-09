@@ -37,19 +37,18 @@ tracing-subscriber.workspace = true
 # version skew).
 agent-mesh-protocol.workspace = true
 
-# The bridle leash: a Caveats-confined, brush-backed `shell` tool that
-# supersedes the old unconfined `sh -c` `shell_run`. Pinned to the HARDENED
-# agent-bridle main (agent-bridle is NOT on crates.io yet): this rev closes the
-# free-form `exec`-bypass, fixes dangling-symlink resolution, and adds the
-# STRUCTURED denial envelope (`denied: bool` + `denials: [{kind,target,reason}]`)
-# that this crate now reads instead of stderr string-matching. The `shell`
-# feature transitively pulls agent-bridle-core + agent-bridle-tool-shell + the
-# brush fork git-dep that carries the in-process exec/open interceptor.
+# The bridle leash: a Caveats-confined shell tool that routes commands through
+# agent-bridle's registry. The structured denial envelope
+# (`denied: bool` + `denials: [{kind,target,reason}]`) is read directly —
+# never stderr string-matching.
 #
-# NOTE: this git-dep (and its transitive brush fork git-dep) means
-# newt-mcp-server cannot publish to crates.io until the brush
-# `CommandInterceptor` hook is upstreamed. Tracked as out-of-scope.
-agent-bridle = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", rev = "9287392f7e481de19b940b20fb8491e852233db5", features = ["shell", "web"] }
+# NOTE: the shell tool is temporarily a stub pending reubeno/brush#1184 (the
+# CommandInterceptor hook). invoke() returns a clear error; schema is preserved.
+# See: https://github.com/Gilamonster-Foundation/agent-bridle/issues/20
+#
+# The workspace [patch.crates-io] satisfies this dep from the stub-shell git
+# branch until agent-bridle 0.1.0 is indexed on crates.io.
+agent-bridle = { version = "0.1", features = ["shell", "web"] }
 
 # Optional PyO3 bindings — opt in only via the umbrella `newt-agent-py`
 # crate; default builds stay Python-free.

@@ -33,21 +33,19 @@ ratatui.workspace = true
 crossterm.workspace = true
 tracing.workspace = true
 
-# The bridle leash: a Caveats-confined, brush-backed `shell` tool that
-# supersedes the old leading-token + `sh -c` `run_command`. The TUI now routes
-# the WHOLE command through agent-bridle's confined shell under the SAME Caveats
-# it already resolves from `[tui].permissions`, so full-command confinement
-# replaces the leading-token check (`echo ok && rm -rf /` no longer slips `rm`
-# past an `echo` grant). Pinned to the HARDENED agent-bridle main (not on
-# crates.io yet): this rev closes the free-form `exec`-bypass, fixes
-# dangling-symlink resolution, AND matches exec grants by basename — required so
-# the bare-name preset grants the TUI uses (`git`, `cargo`, …) actually match
-# the PATH-resolved absolute path the interceptor sees. The `shell` feature
-# transitively pulls agent-bridle-core + agent-bridle-tool-shell + the brush
-# fork git-dep that carries the in-process exec/open interceptor. The structured
-# denial envelope (`denied: bool` + `denials: [{kind,target,reason}]`) is read
-# directly — never a stderr grep.
-agent-bridle = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", rev = "9287392f7e481de19b940b20fb8491e852233db5", features = ["shell", "web"] }
+# The bridle leash: a Caveats-confined shell tool that routes the WHOLE command
+# through agent-bridle's registry under the same Caveats resolved from
+# `[tui].permissions`, replacing the old leading-token + `sh -c` approach.
+# The structured denial envelope (`denied: bool` + `denials: [{kind,target,reason}]`)
+# is read directly — never a stderr grep.
+#
+# NOTE: the shell tool is temporarily a stub pending reubeno/brush#1184 (the
+# CommandInterceptor hook). invoke() returns a clear error; schema is preserved.
+# See: https://github.com/Gilamonster-Foundation/agent-bridle/issues/20
+#
+# The workspace [patch.crates-io] satisfies this dep from the stub-shell git
+# branch until agent-bridle 0.1.0 is indexed on crates.io.
+agent-bridle = { version = "0.1", features = ["shell", "web"] }
 
 [dev-dependencies]
 tempfile.workspace = true
