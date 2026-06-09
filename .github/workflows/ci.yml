@@ -33,7 +33,19 @@ jobs:
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
+      - name: agent-bridle stub guard
+        # PIPELINE PARITY: mirrors `just shell-check` (justfile) + the pre-push
+        # hook. Fails if [patch.crates-io] points agent-bridle at `main` (the
+        # real brush shell), which reintroduces the brush git dep and breaks
+        # the crates.io publish chain. `just shell-real` is a dev-only override.
+        run: |
+          if grep -Eq 'agent-bridle[a-z-]*[[:space:]]*= \{ git = "[^"]*agent-bridle", branch = "main"' Cargo.toml; then
+            echo "::error::[patch.crates-io] points agent-bridle at 'main' (real brush shell) — run 'just shell-stub' before pushing."
+            exit 1
+          fi
+          echo "shell guard OK: agent-bridle patch is on the publishable stub branch."
       - name: fmt check
+        if: always()
         run: cargo fmt --all -- --check
       - name: clippy
         # `if: always()` so a fmt failure can't mask a clippy failure: the two
