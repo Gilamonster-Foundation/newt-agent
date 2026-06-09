@@ -160,3 +160,22 @@ opt-level = 3
 lto = "thin"
 codegen-units = 1
 strip = true
+
+# ── Temporary patch: agent-bridle → crates.io transition ──────────────────
+#
+# newt-tui and newt-mcp-server declare `agent-bridle = "0.1"` (registry dep)
+# but agent-bridle 0.1.0 lands on crates.io only after its PR #21 merges and
+# the tag-triggered release workflow runs. Until then this patch satisfies the
+# dependency from the stub-shell branch (no brush git deps, all crates.io safe).
+#
+# After agent-bridle 0.1.0 is indexed on crates.io:
+#   1. Remove this entire [patch.crates-io] block.
+#   2. cargo update -p agent-bridle          (pulls the registry version)
+#   3. Commit the resulting Cargo.lock update.
+# See: https://github.com/Gilamonster-Foundation/agent-bridle/issues/20
+
+[patch.crates-io]
+agent-bridle           = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", branch = "feat/stub-shell" }
+agent-bridle-core      = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", branch = "feat/stub-shell" }
+agent-bridle-tool-shell = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", branch = "feat/stub-shell" }
+agent-bridle-tool-web  = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", branch = "feat/stub-shell" }

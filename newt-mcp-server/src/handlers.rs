@@ -807,8 +807,10 @@ mod tests {
     // with full ambient authority and never consulted a Caveats grant.
 
     /// REGRESSION (P1): with a restrictive grant (`exec` only `echo`), an
-    /// in-scope `echo` runs and its stdout is captured. Proves the superseded
-    /// shell_run still works for allowed commands.
+    /// Stub: shell tool is temporarily unavailable (pending reubeno/brush#1184).
+    /// Even in-scope `echo` returns the unavailable error.
+    /// Restore the original assertions from git history once brush support lands.
+    /// See: https://github.com/Gilamonster-Foundation/agent-bridle/issues/20
     #[tokio::test]
     async fn shell_run_in_scope_echo_succeeds() {
         let resp = rpc_with_caveats(
@@ -823,36 +825,26 @@ mod tests {
         )
         .await;
 
-        // Not a transport error.
         assert!(
             resp["error"].is_null(),
-            "unexpected transport error: {resp}"
+            "stub result must be in-band, not a transport error: {resp}"
         );
         let result = &resp["result"];
-        // In-scope success is NOT an isError result.
-        assert_ne!(
+        assert_eq!(
             result["isError"], true,
-            "echo should not be denied: {result}"
+            "stub must surface as MCP tool error: {result}"
         );
         let text = result["content"][0]["text"].as_str().unwrap();
-        assert!(text.contains("bridled"), "echo stdout missing: {text}");
-        // The bridle envelope shape carries exit_code 0 for a clean echo.
         assert!(
-            text.contains("\"exit_code\": 0"),
-            "expected exit_code 0: {text}"
+            text.contains("reubeno/brush/pull/1184"),
+            "stub error must link to tracking PR: {text}"
         );
     }
 
-    /// REGRESSION (P1): with the SAME restrictive grant, an out-of-scope `rm`
-    /// is DENIED — surfaced as an MCP tool error (`isError: true`) carrying the
-    /// reason, NOT a transport fault, and the command never runs. Against the
-    /// old unconfined `sh -c` this `cmd` would have executed `rm`.
-    ///
-    /// Detection here goes through the STRUCTURED `denied` field of the
-    /// agent-bridle envelope (see `is_denied` / `denial_reason`), NOT a stderr
-    /// string-match. The removed `confinement_denial_reason` helper grepped
-    /// `stderr` for `"is not within the granted"`; this asserts the new path
-    /// produces the same in-band `isError` outcome from the structured signal.
+    /// Stub: shell tool is temporarily unavailable (pending reubeno/brush#1184).
+    /// Out-of-scope `rm` returns the unavailable error rather than a caveats denial.
+    /// Restore the original assertions from git history once brush support lands.
+    /// See: https://github.com/Gilamonster-Foundation/agent-bridle/issues/20
     #[cfg(unix)]
     #[tokio::test]
     async fn shell_run_out_of_scope_rm_is_denied() {
@@ -868,29 +860,19 @@ mod tests {
         )
         .await;
 
-        // The denial is an in-band TOOL error, not a JSON-RPC transport fault.
         assert!(
             resp["error"].is_null(),
-            "denial must not be a transport error: {resp}"
+            "stub result must be in-band, not a transport error: {resp}"
         );
         let result = &resp["result"];
         assert_eq!(
             result["isError"], true,
-            "out-of-scope rm must be denied (isError): {result}"
+            "stub must surface as MCP tool error: {result}"
         );
-        // The reason carried back to the model is the structured `denials[].reason`,
-        // joined by `denial_reason`. It must NOT be the raw envelope JSON (which a
-        // stderr-grep success path would have emitted instead).
         let text = result["content"][0]["text"].as_str().unwrap();
         assert!(
-            !text.contains("\"exit_code\""),
-            "denial text must be the structured reason, not the raw envelope: {text}"
-        );
-        assert!(
-            text.contains("denied")
-                || text.contains("not within the granted")
-                || text.contains("authority"),
-            "expected an exec-denial reason for rm, got: {text}"
+            text.contains("reubeno/brush/pull/1184"),
+            "stub error must link to tracking PR: {text}"
         );
     }
 
@@ -1018,10 +1000,10 @@ mod tests {
         );
     }
 
-    /// REGRESSION (P1): a path-separator command (`/bin/rm`) is ALSO denied —
-    /// this is the load-bearing case a cleared PATH alone would not stop. Only
-    /// the interceptor's before_exec hook (at the single spawn funnel) closes
-    /// it. Proves shell_run's confinement is real, not cosmetic.
+    /// Stub: shell tool is temporarily unavailable (pending reubeno/brush#1184).
+    /// Path-separator commands also return the unavailable error rather than a denial.
+    /// Restore the original assertions from git history once brush support lands.
+    /// See: https://github.com/Gilamonster-Foundation/agent-bridle/issues/20
     #[cfg(unix)]
     #[tokio::test]
     async fn shell_run_bin_rm_path_separator_is_denied() {
@@ -1040,14 +1022,12 @@ mod tests {
         let result = &resp["result"];
         assert_eq!(
             result["isError"], true,
-            "/bin/rm must be denied (isError): {result}"
+            "stub must surface as MCP tool error: {result}"
         );
         let text = result["content"][0]["text"].as_str().unwrap();
         assert!(
-            text.contains("denied")
-                || text.contains("not within the granted")
-                || text.contains("authority"),
-            "expected an exec-denial reason for /bin/rm, got: {text}"
+            text.contains("reubeno/brush/pull/1184"),
+            "stub error must link to tracking PR: {text}"
         );
     }
 
