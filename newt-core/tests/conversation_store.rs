@@ -1,4 +1,71 @@
-use newt_core::{ConversationStore, ConversationTurn};
+use newt_core::{
+    new_conversation_id, session_plan_dir, session_plan_path, ConversationStore, ConversationTurn,
+};
+
+// --- Per-session plan files (issue #220) ---
+
+#[test]
+fn session_plan_path_is_workspace_relative_under_sessions() {
+    assert_eq!(
+        session_plan_path("abc-123"),
+        std::path::Path::new(".newt/sessions/abc-123/plan.md"),
+    );
+    assert_eq!(
+        session_plan_dir("abc-123"),
+        std::path::Path::new(".newt/sessions/abc-123"),
+    );
+}
+
+#[test]
+fn new_conversation_id_is_unique_and_record_id_valid() {
+    let a = new_conversation_id();
+    let b = new_conversation_id();
+    assert_ne!(a, b, "two ids must differ (collision fix relies on this)");
+    // Must be a valid record id (alphanumeric + '-') so create_with_id accepts it.
+    assert!(a.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'));
+    assert!(a.contains('-'));
+}
+
+#[test]
+fn create_with_id_adopts_the_supplied_id() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let store = ConversationStore::new(root.path(), workspace.path(), 100).unwrap();
+
+    let id = new_conversation_id();
+    assert!(!store.exists(&id));
+    store
+        .create_with_id(&id, "pre-assigned title", Some("coder"))
+        .unwrap();
+    assert!(store.exists(&id));
+
+    let record = store.load(&id).unwrap();
+    assert_eq!(record.id, id);
+    assert_eq!(record.title, "pre-assigned title");
+    assert_eq!(record.persona.as_deref(), Some("coder"));
+}
+
+#[test]
+fn delete_removes_the_per_session_plan_dir() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let store = ConversationStore::new(root.path(), workspace.path(), 100).unwrap();
+
+    let id = store.create("task", None).unwrap();
+    // Use the canonicalized workspace, matching what the store stores/cleans up.
+    let ws = std::fs::canonicalize(workspace.path()).unwrap();
+    // Simulate the model having written a plan into the session's dir.
+    let plan = ws.join(session_plan_path(&id));
+    std::fs::create_dir_all(plan.parent().unwrap()).unwrap();
+    std::fs::write(&plan, "# plan\n- [ ] step 1\n").unwrap();
+    assert!(plan.exists());
+
+    store.delete(&id).unwrap();
+    assert!(
+        !ws.join(session_plan_dir(&id)).exists(),
+        "deleting a conversation must remove its plan dir (issue #220)"
+    );
+}
 
 #[test]
 fn conversation_store_roundtrips_user_assistant_turns_by_workspace() {
