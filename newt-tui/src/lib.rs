@@ -1523,17 +1523,25 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                         .and_then(|t| t.mid_loop_trim_threshold)
                         .unwrap_or_else(|| mid_loop_trim_threshold(&cfg))
                         .min(eff_max_tool_rounds.saturating_sub(3));
+                    // Token-based trim trigger (issue #223): per-model override, else
+                    // the global `[tui].mid_loop_trim_tokens` (None disables).
+                    let eff_mid_loop_trim_tokens = model_tune
+                        .and_then(|t| t.mid_loop_trim_tokens)
+                        .or_else(|| cfg.tui.as_ref().and_then(|t| t.mid_loop_trim_tokens));
 
                     // Lazy context-window discovery: queries /api/show once per model
                     // per session, then caches the result for the lifetime of the process.
-                    let eff_safe_context = {
+                    // Also reads the empirically-confirmed max input (max_ok_input)
+                    // used as the pre-send budget gate (issue #223).
+                    let (eff_safe_context, eff_max_ok_input) = {
                         let entry = cap_cache.entry(inf_model.clone()).or_default();
                         let updated = probe::ensure_context_window(entry, &inf_url, &inf_model);
                         let sc = entry.safe_context;
+                        let moi = entry.max_ok_input;
                         if updated {
                             probe::save_cache(&cap_cache);
                         }
-                        sc
+                        (sc, moi)
                     };
 
                     // num_ctx resolution: explicit config > safe_context > model default.
@@ -1566,6 +1574,8 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                                 connect_timeout_secs: connect_timeout_secs(&cfg),
                                 inference_timeout_secs: inference_timeout_secs(&cfg),
                                 mid_loop_trim_threshold: eff_mid_loop_trim,
+                                mid_loop_trim_tokens: eff_mid_loop_trim_tokens,
+                                max_ok_input: eff_max_ok_input,
                                 build_check_cmd: build_check_cmd(&cfg),
                                 safe_context: eff_safe_context,
                             },
@@ -2605,6 +2615,96 @@ fn trim_for_summary(
     result
 }
 
+/// Estimate the input token count of a serialized message list.
+///
+/// Uses the standard `chars / 4` heuristic over the JSON serialization of each
+/// message. This is deliberately cheap (no tokenizer) and runs before every
+/// dispatch, so the cost must stay negligible even for large histories. The
+/// estimate only needs to be good enough to fire trimming *before* a request
+/// would blow past the model's context window — see [`trim_to_token_budget`]
+/// and issue #223.
+fn estimate_tokens(messages: &[serde_json::Value]) -> usize {
+    messages
+        .iter()
+        .map(|m| m.to_string().chars().count())
+        .sum::<usize>()
+        / 4
+}
+
+/// Trim `messages` until the estimated token count fits within `budget`,
+/// returning the (possibly unchanged) list. Trimming is progressive: it keeps
+/// the system + first `head` messages and shrinks the retained tail, halving it
+/// each pass until the estimate fits or the tail can shrink no further.
+///
+/// `head` is the number of leading messages to always preserve (system prompt
+/// plus the original task). Returns `(trimmed, fired)` where `fired` is `true`
+/// if any messages were dropped — the caller uses it to decide whether to emit
+/// a notice. See issue #223.
+fn trim_to_token_budget(
+    messages: &[serde_json::Value],
+    budget: usize,
+    head: usize,
+) -> (Vec<serde_json::Value>, bool) {
+    if budget == 0 || estimate_tokens(messages) <= budget {
+        return (messages.to_vec(), false);
+    }
+    let mut tail = messages.len().saturating_sub(head) / 2;
+    loop {
+        let candidate = trim_for_summary(messages, head, tail);
+        if estimate_tokens(&candidate) <= budget || tail == 0 {
+            return (candidate, true);
+        }
+        tail /= 2;
+    }
+}
+
+/// Mid-loop trim trigger that fires on EITHER message count OR estimated tokens.
+///
+/// The message-count threshold (`count_threshold`) is the original VRAM guard.
+/// `token_threshold` is the issue #223 addition: a single tool round can return
+/// a multi-KB payload that stays well under the message-count threshold while
+/// blowing past the model's context window. When set and exceeded, the list is
+/// further trimmed to fit the token budget. Returns `(trimmed, fired)`.
+fn mid_loop_trim(
+    messages: &[serde_json::Value],
+    count_threshold: usize,
+    token_threshold: Option<usize>,
+) -> (Vec<serde_json::Value>, bool) {
+    let mut out = messages.to_vec();
+    let mut fired = false;
+    if out.len() > count_threshold {
+        out = trim_for_summary(&out, 2, count_threshold / 2);
+        fired = true;
+    }
+    if let Some(budget) = token_threshold {
+        if estimate_tokens(&out) > budget {
+            let (trimmed, t) = trim_to_token_budget(&out, budget, 2);
+            out = trimmed;
+            fired = fired || t;
+        }
+    }
+    (out, fired)
+}
+
+/// Inspect a failed dispatch error for a recoverable context-window 400.
+///
+/// Hosted endpoints reject an over-long prompt with a non-retryable HTTP 400
+/// whose body names the model's real maximum (e.g. `prompt is too long:
+/// 5960028 tokens > 1000000 maximum`). On match this persists the discovered
+/// limit to `model-capabilities.json` (so future sessions start tightened) and
+/// returns the new pre-send budget in input tokens. Returns `None` for any
+/// other error, which the caller should propagate. See issue #223.
+fn recover_context_window_400(err: &anyhow::Error, model: &str, today: &str) -> Option<u32> {
+    let (_prompt, hard_limit) = probe::parse_context_window_error(&err.to_string())?;
+    let hard_limit = u32::try_from(hard_limit).unwrap_or(u32::MAX);
+    let mut cache = probe::load_cache();
+    let entry = cache.entry(model.to_string()).or_default();
+    entry.record_context_window_400(hard_limit, today);
+    let new_cap = entry.max_ok_input;
+    probe::save_cache(&cache);
+    new_cap
+}
+
 /// Remove or neutralise tool-call/result messages that form an incomplete pair
 /// after `trim_for_summary` cuts the middle of a conversation.
 ///
@@ -3351,6 +3451,16 @@ struct ChatCtx<'a> {
     /// Message list size at which the agent trims the middle of the in-flight
     /// conversation to prevent context overflow mid-turn.
     mid_loop_trim_threshold: usize,
+    /// Estimated-token threshold that also triggers a mid-loop trim, regardless
+    /// of message count. Guards against a single huge tool result blowing past
+    /// the context window in one round (from `[tui].mid_loop_trim_tokens`).
+    /// `None` disables token-based trimming. See issue #223.
+    mid_loop_trim_tokens: Option<usize>,
+    /// Highest input-token count this model has accepted without a 400, from
+    /// `model-capabilities.json`. Used as the pre-send budget gate: requests
+    /// estimated to exceed it are trimmed *before* dispatch. `None` falls back
+    /// to `safe_context`. See issue #223.
+    max_ok_input: Option<u32>,
     /// Shell command run after every successful file write to give the model
     /// immediate ground-truth feedback (e.g. "cargo check -q --workspace").
     /// `None` disables auto-checking. Set per-workspace in `.newt/config.toml`.
@@ -3391,6 +3501,8 @@ async fn chat_complete(
         connect_timeout_secs,
         inference_timeout_secs,
         mid_loop_trim_threshold,
+        mid_loop_trim_tokens,
+        max_ok_input,
         build_check_cmd,
         safe_context,
     } = ctx;
@@ -3411,6 +3523,13 @@ async fn chat_complete(
     let mut accumulated_usage: Option<newt_core::TokenUsage> = None;
     let mut hallucination_count: u32 = 0;
     let mut overflow_retries: u32 = 0;
+    // Hard context-window 400s recovered (parse limit → trim → retry). See #223.
+    let mut cw_retries: u32 = 0;
+    // Pre-send token budget gate: trim before dispatch when the estimate exceeds
+    // the model's empirically-confirmed max input (or the safe context). Mutable
+    // because a recovered 400 tightens it mid-turn. See issue #223.
+    let mut send_budget: Option<usize> = max_ok_input.or(safe_context).map(|c| c as usize);
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
     // Consecutive rounds where the model only called read-only tools (no writes).
     // When this hits READ_ONLY_NUDGE_AFTER, a brief injected message tells the
     // model to stop exploring and start writing.
@@ -3452,19 +3571,44 @@ async fn chat_complete(
         }
 
         // Mid-loop context trim: prevent VRAM exhaustion on long tool-call
-        // sessions by dropping old middle messages when the list grows large.
-        if messages.len() > mid_loop_trim_threshold {
+        // sessions by dropping old middle messages when the list grows large
+        // by message count OR by estimated token count (issue #223).
+        {
             let before = messages.len();
-            messages = trim_for_summary(&messages, 2, mid_loop_trim_threshold / 2);
-            if debug {
-                print_debug(
-                    &format!(
-                        "mid-loop trim: {before} → {} messages (threshold={})",
-                        messages.len(),
-                        mid_loop_trim_threshold
-                    ),
-                    color,
-                );
+            let (trimmed, fired) =
+                mid_loop_trim(&messages, mid_loop_trim_threshold, mid_loop_trim_tokens);
+            if fired {
+                messages = trimmed;
+                if debug {
+                    print_debug(
+                        &format!(
+                            "mid-loop trim: {before} → {} messages (count_threshold={}, ~{} tokens)",
+                            messages.len(),
+                            mid_loop_trim_threshold,
+                            estimate_tokens(&messages),
+                        ),
+                        color,
+                    );
+                }
+            }
+        }
+
+        // Pre-send token budget guard: estimate the request size and trim it to
+        // fit the model's confirmed input ceiling BEFORE dispatch, so a huge
+        // single round can't trigger a non-retryable 400 (issue #223).
+        if let Some(budget) = send_budget {
+            let (trimmed, fired) = trim_to_token_budget(&messages, budget, 2);
+            if fired {
+                if debug {
+                    print_debug(
+                        &format!(
+                            "pre-send trim: ~{} tokens → fit budget {budget}",
+                            estimate_tokens(&trimmed),
+                        ),
+                        color,
+                    );
+                }
+                messages = trimmed;
             }
         }
 
@@ -3491,7 +3635,7 @@ async fn chat_complete(
 
         // Retry the send+status+parse as one unit — a connection drop at any
         // of these steps is transient and worth retrying with backoff.
-        let json: serde_json::Value = with_backoff_notify(
+        let dispatch = with_backoff_notify(
             &retry,
             || async {
                 let resp = client
@@ -3511,7 +3655,30 @@ async fn chat_complete(
             },
             |attempt, delay| print_retry_indicator(attempt, delay, color),
         )
-        .await?;
+        .await;
+        let json: serde_json::Value = match dispatch {
+            Ok(j) => j,
+            Err(e) => {
+                // Graceful context-window 400 recovery: parse the model's real
+                // limit, tighten the budget, trim, and retry once (issue #223).
+                if cw_retries < 2 {
+                    if let Some(new_cap) = recover_context_window_400(&e, model, &today) {
+                        emit_overflow_notice(
+                            color,
+                            accumulated_usage.as_ref(),
+                            Some(new_cap),
+                            model,
+                            cw_retries + 1,
+                        );
+                        send_budget = Some(new_cap as usize);
+                        messages = trim_to_token_budget(&messages, new_cap as usize, 2).0;
+                        cw_retries += 1;
+                        continue 'round_loop;
+                    }
+                }
+                return Err(e);
+            }
+        };
 
         // Accumulate token usage from this non-streaming probe round.
         let round_usage = ollama_usage(&json);
@@ -3916,8 +4083,10 @@ async fn openai_chat_complete(
         connect_timeout_secs,
         inference_timeout_secs,
         mid_loop_trim_threshold,
+        mid_loop_trim_tokens,
+        max_ok_input,
         build_check_cmd,
-        safe_context: _,
+        safe_context,
     } = ctx;
     let client = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(connect_timeout_secs))
@@ -3933,9 +4102,14 @@ async fn openai_chat_complete(
 
     let mut accumulated_usage: Option<newt_core::TokenUsage> = None;
     let mut hallucination_count: u32 = 0;
+    // Hard context-window 400s recovered (parse limit → trim → retry). See #223.
+    let mut cw_retries: u32 = 0;
+    // Pre-send token budget gate; tightened mid-turn by a recovered 400 (#223).
+    let mut send_budget: Option<usize> = max_ok_input.or(safe_context).map(|c| c as usize);
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
 
     // Agentic loop — up to `max_tool_rounds` tool-call rounds (matches the Ollama path).
-    for round in 0..max_tool_rounds {
+    'round_loop: for round in 0..max_tool_rounds {
         if round > 0 && color {
             execute!(
                 io::stdout(),
@@ -3946,19 +4120,44 @@ async fn openai_chat_complete(
             .ok();
         }
 
-        // Mid-loop context trim (mirrors Ollama path).
-        if messages.len() > mid_loop_trim_threshold {
+        // Mid-loop context trim (mirrors Ollama path): fire on message count OR
+        // estimated token count (issue #223).
+        {
             let before = messages.len();
-            messages = trim_for_summary(&messages, 2, mid_loop_trim_threshold / 2);
-            if debug {
-                print_debug(
-                    &format!(
-                        "mid-loop trim: {before} → {} messages (threshold={})",
-                        messages.len(),
-                        mid_loop_trim_threshold
-                    ),
-                    color,
-                );
+            let (trimmed, fired) =
+                mid_loop_trim(&messages, mid_loop_trim_threshold, mid_loop_trim_tokens);
+            if fired {
+                messages = trimmed;
+                if debug {
+                    print_debug(
+                        &format!(
+                            "mid-loop trim: {before} → {} messages (count_threshold={}, ~{} tokens)",
+                            messages.len(),
+                            mid_loop_trim_threshold,
+                            estimate_tokens(&messages),
+                        ),
+                        color,
+                    );
+                }
+            }
+        }
+
+        // Pre-send token budget guard (mirrors Ollama path): trim to fit the
+        // confirmed input ceiling before dispatch so a huge single round can't
+        // trigger the non-retryable 400 that crashed issue #223.
+        if let Some(budget) = send_budget {
+            let (trimmed, fired) = trim_to_token_budget(&messages, budget, 2);
+            if fired {
+                if debug {
+                    print_debug(
+                        &format!(
+                            "pre-send trim: ~{} tokens → fit budget {budget}",
+                            estimate_tokens(&trimmed),
+                        ),
+                        color,
+                    );
+                }
+                messages = trimmed;
             }
         }
 
@@ -3972,7 +4171,7 @@ async fn openai_chat_complete(
             "stream": false,
         });
         let _ = num_ctx; // not applicable for OpenAI-compatible endpoints
-        let json: serde_json::Value = with_backoff_notify(
+        let dispatch = with_backoff_notify(
             &retry,
             || async {
                 let mut req = client.post(&chat_url).json(&body);
@@ -3994,7 +4193,30 @@ async fn openai_chat_complete(
             },
             |attempt, delay| print_retry_indicator(attempt, delay, color),
         )
-        .await?;
+        .await;
+        let json: serde_json::Value = match dispatch {
+            Ok(j) => j,
+            Err(e) => {
+                // Graceful context-window 400 recovery: parse the model's real
+                // limit, tighten the budget, trim, and retry once (issue #223).
+                if cw_retries < 2 {
+                    if let Some(new_cap) = recover_context_window_400(&e, model, &today) {
+                        emit_overflow_notice(
+                            color,
+                            accumulated_usage.as_ref(),
+                            Some(new_cap),
+                            model,
+                            cw_retries + 1,
+                        );
+                        send_budget = Some(new_cap as usize);
+                        messages = trim_to_token_budget(&messages, new_cap as usize, 2).0;
+                        cw_retries += 1;
+                        continue 'round_loop;
+                    }
+                }
+                return Err(e);
+            }
+        };
         // Accumulate per-round token usage.
         let round_usage = openai_usage(&json["usage"]);
         accumulated_usage = merge_usage(accumulated_usage, round_usage);
@@ -5746,6 +5968,8 @@ mod tool_round_cap_tests {
                 connect_timeout_secs: 5,
                 inference_timeout_secs: 120,
                 mid_loop_trim_threshold: 40,
+                mid_loop_trim_tokens: None,
+                max_ok_input: None,
                 build_check_cmd: None,
                 safe_context: None,
             },
@@ -5797,6 +6021,8 @@ mod tool_round_cap_tests {
                 connect_timeout_secs: 5,
                 inference_timeout_secs: 120,
                 mid_loop_trim_threshold: 40,
+                mid_loop_trim_tokens: None,
+                max_ok_input: None,
                 build_check_cmd: None,
                 safe_context: None,
             },
@@ -5809,6 +6035,115 @@ mod tool_round_cap_tests {
         assert_eq!(reply, "openai partial answer");
         assert_ne!(reply, "(reached tool-call limit)");
         assert!(!streamed);
+    }
+
+    /// Regression for issue #223: a hard context-window 400 must NOT kill the
+    /// session. The loop parses the model's real limit from the error body,
+    /// tightens the budget, trims, retries, and returns a real answer — and
+    /// persists the discovered limit so future sessions start tightened.
+    ///
+    /// Before the fix, the 400 propagated out of `with_backoff_notify(...).await?`
+    /// and the whole turn died with `error: inference endpoint 400: …`.
+    #[test]
+    fn openai_loop_recovers_from_context_window_400() {
+        struct CwResponder {
+            calls: Arc<AtomicUsize>,
+            final_answer: String,
+        }
+        impl Respond for CwResponder {
+            fn respond(&self, _req: &Request) -> ResponseTemplate {
+                let n = self.calls.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    // First dispatch overflows the context window (the real
+                    // litellm message shape from the issue).
+                    ResponseTemplate::new(400).set_body_string(
+                        "litellm.ContextWindowExceededError: prompt is too long: 5960028 tokens > 1000000 maximum",
+                    )
+                } else {
+                    // After trim+retry, answer with no tool calls so the loop ends.
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "choices": [{ "message": { "content": self.final_answer } }]
+                    }))
+                }
+            }
+        }
+
+        // Isolate cache persistence to a temp HOME so the test never touches the
+        // developer's ~/.newt/model-capabilities.json. The write guard serializes
+        // against every other env-mutating / env-reading test in this binary.
+        let _g = crate::test_env_guard::env_write_guard();
+        let tmp = tempfile::tempdir().unwrap();
+        let saved_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", tmp.path());
+        // The cache lives next to the config file; ensure the dir exists.
+        std::fs::create_dir_all(tmp.path().join(".newt")).unwrap();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (result, calls_made, persisted_cap) = rt.block_on(async {
+            let server = MockServer::start().await;
+            let calls = Arc::new(AtomicUsize::new(0));
+            Mock::given(method("POST"))
+                .and(path("/v1/chat/completions"))
+                .respond_with(CwResponder {
+                    calls: calls.clone(),
+                    final_answer: "recovered answer".into(),
+                })
+                .mount(&server)
+                .await;
+
+            let messages = msgs();
+            let caveats = Caveats::top();
+            let out = openai_chat_complete(
+                ChatCtx {
+                    url: &server.uri(),
+                    model: "cw-test-model",
+                    kind: BackendKind::Openai,
+                    api_key: Some("sk-test"),
+                    messages: &messages,
+                    task: "do the thing",
+                    workspace: ".",
+                    color: false,
+                    caveats: &caveats,
+                    max_tool_rounds: 5,
+                    tool_output_lines: 20,
+                    debug: false,
+                    num_ctx: None,
+                    connect_timeout_secs: 5,
+                    inference_timeout_secs: 120,
+                    mid_loop_trim_threshold: 40,
+                    mid_loop_trim_tokens: None,
+                    max_ok_input: None,
+                    build_check_cmd: None,
+                    safe_context: None,
+                },
+                &mut Mcp::empty(),
+            )
+            .await;
+            // Read the persisted cap while HOME still points at the temp dir.
+            let persisted = probe::load_cache()
+                .get("cw-test-model")
+                .and_then(|e| e.max_ok_input);
+            (out, calls.load(Ordering::SeqCst), persisted)
+        });
+
+        // Restore HOME before any assertion can unwind.
+        match saved_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+
+        let (reply, _streamed, _usage, _hallu) =
+            result.expect("loop must recover from the 400, not propagate it");
+        assert_eq!(reply, "recovered answer");
+        assert!(
+            calls_made >= 2,
+            "expected at least one retry after the 400, got {calls_made} call(s)"
+        );
+        // Persistence (issue #223 req 4): 1_000_000 * 80% = 800_000.
+        assert_eq!(persisted_cap, Some(800_000));
     }
 
     #[tokio::test]
@@ -5865,6 +6200,8 @@ mod tool_round_cap_tests {
                 connect_timeout_secs: 5,
                 inference_timeout_secs: 120,
                 mid_loop_trim_threshold: 40,
+                mid_loop_trim_tokens: None,
+                max_ok_input: None,
                 build_check_cmd: None,
                 safe_context: None,
             },
@@ -5990,6 +6327,94 @@ mod tool_round_cap_tests {
         // head=2, tail=3 → total=5, msgs.len()=4 → no trimming needed
         let trimmed = trim_for_summary(&msgs, 2, 3);
         assert_eq!(trimmed.len(), 4);
+    }
+
+    // -----------------------------------------------------------------------
+    // Pre-send token budget + token-aware trim (issue #223)
+    // -----------------------------------------------------------------------
+
+    /// `estimate_tokens` uses the chars/4 heuristic over serialized messages.
+    #[test]
+    fn estimate_tokens_scales_with_content_size() {
+        let small = vec![serde_json::json!({"role": "user", "content": "hi"})];
+        let big = vec![serde_json::json!({"role": "user", "content": "x".repeat(4000)})];
+        let s = estimate_tokens(&small);
+        let b = estimate_tokens(&big);
+        // ~4000 chars / 4 ≈ 1000 tokens for the big message.
+        assert!(
+            b >= 900,
+            "big message should estimate ~1000 tokens, got {b}"
+        );
+        assert!(b > s * 10, "big must dwarf small ({b} vs {s})");
+    }
+
+    /// The crux of issue #223: a SINGLE huge tool message stays well under the
+    /// message-count threshold yet must still trigger a trim by token budget.
+    #[test]
+    fn token_trim_fires_on_one_huge_message_under_count_threshold() {
+        let mut msgs = vec![
+            serde_json::json!({"role": "system", "content": "sys"}),
+            serde_json::json!({"role": "user", "content": "task"}),
+        ];
+        // One tool round returns a ~1M-char payload → ~250k tokens.
+        msgs.push(serde_json::json!({"role": "tool", "content": "z".repeat(1_000_000)}));
+        msgs.push(serde_json::json!({"role": "user", "content": "next"}));
+
+        // Message count (4) is far below the threshold (40), so the old
+        // count-only trigger would NOT fire. The token trigger must.
+        let (out, fired) = mid_loop_trim(&msgs, 40, Some(50_000));
+        assert!(fired, "token-based trim must fire on the huge payload");
+        assert!(
+            estimate_tokens(&out) <= 50_000,
+            "trim must bring estimate under budget, got {}",
+            estimate_tokens(&out)
+        );
+    }
+
+    /// With no token threshold configured, behaviour matches the legacy
+    /// count-only trigger (no trim while under the message count).
+    #[test]
+    fn mid_loop_trim_count_only_when_no_token_threshold() {
+        let msgs: Vec<serde_json::Value> = (0..5)
+            .map(|i| serde_json::json!({"role": "user", "content": format!("m{i}")}))
+            .collect();
+        let (out, fired) = mid_loop_trim(&msgs, 40, None);
+        assert!(!fired);
+        assert_eq!(out.len(), 5);
+    }
+
+    /// `trim_to_token_budget` shrinks an over-budget list and leaves a small
+    /// one untouched.
+    #[test]
+    fn trim_to_token_budget_respects_budget() {
+        let mut msgs = vec![
+            serde_json::json!({"role": "system", "content": "sys"}),
+            serde_json::json!({"role": "user", "content": "task"}),
+        ];
+        for i in 0..20 {
+            msgs.push(
+                serde_json::json!({"role": "tool", "content": "q".repeat(5_000) + &i.to_string()}),
+            );
+        }
+        let budget = 2_000; // tokens
+        let (trimmed, fired) = trim_to_token_budget(&msgs, budget, 2);
+        assert!(fired);
+        assert!(estimate_tokens(&trimmed) <= budget);
+
+        // A list already under budget is returned untouched.
+        let small = vec![serde_json::json!({"role": "user", "content": "hi"})];
+        let (out, fired2) = trim_to_token_budget(&small, 10_000, 2);
+        assert!(!fired2);
+        assert_eq!(out.len(), 1);
+    }
+
+    /// A zero budget disables the guard (no panic, no trim).
+    #[test]
+    fn trim_to_token_budget_zero_is_noop() {
+        let msgs = vec![serde_json::json!({"role": "user", "content": "x".repeat(99_999)})];
+        let (out, fired) = trim_to_token_budget(&msgs, 0, 2);
+        assert!(!fired);
+        assert_eq!(out.len(), 1);
     }
 
     // -----------------------------------------------------------------------
@@ -6198,6 +6623,8 @@ mod tool_round_cap_tests {
                 connect_timeout_secs: 5,
                 inference_timeout_secs: 120,
                 mid_loop_trim_threshold: 40,
+                mid_loop_trim_tokens: None,
+                max_ok_input: None,
                 build_check_cmd: None,
                 safe_context: None,
             },
@@ -6337,6 +6764,8 @@ mod tool_round_cap_tests {
                 connect_timeout_secs: 5,
                 inference_timeout_secs: 30,
                 mid_loop_trim_threshold: 40,
+                mid_loop_trim_tokens: None,
+                max_ok_input: None,
                 build_check_cmd: None,
                 safe_context: None,
             },
@@ -7653,6 +8082,8 @@ mod http_loop_tests {
             connect_timeout_secs: 5,
             inference_timeout_secs: 30,
             mid_loop_trim_threshold: 40,
+            mid_loop_trim_tokens: None,
+            max_ok_input: None,
             build_check_cmd: None,
             safe_context: None,
         }
