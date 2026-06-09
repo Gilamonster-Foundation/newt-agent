@@ -93,6 +93,53 @@ pub struct Config {
     /// Durable conversation save/restore policy. `None` uses built-in defaults.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conversations: Option<ConversationsConfig>,
+
+    /// How a project-local `.newt/config.toml` is layered over the global
+    /// config (issue #222). `None` → built-in default (arrays replace).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge: Option<MergeConfig>,
+}
+
+// ---------------------------------------------------------------------------
+// Project-local config layering (issue #222)
+// ---------------------------------------------------------------------------
+
+/// How arrays (`[[backends]]`, `[[providers]]`, `[[mcp_servers]]`,
+/// `[[model_tuning]]`) are combined when a project-local `.newt/config.toml`
+/// is layered over the global config.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArrayMergeStrategy {
+    /// The project array replaces the global array wholesale. Predictable and
+    /// safe — the project fully owns that list. **Default.**
+    #[default]
+    Replace,
+    /// The project array is appended to the global array (global entries first,
+    /// then the project's). Additive — e.g. register an extra local stdio MCP
+    /// server without redefining the global ones.
+    Append,
+}
+
+/// Controls how a project-local `.newt/config.toml` is merged over the global
+/// config. Tables always merge recursively (project keys win); this only
+/// governs array handling. See issue #222.
+///
+/// Example project `.newt/config.toml`:
+/// ```toml
+/// [merge]
+/// arrays = "append"     # add to the global lists instead of replacing them
+///
+/// [[mcp_servers]]
+/// name = "project-fs"
+/// command = "mcp-fs"
+/// args = ["--root", "."]
+/// ```
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MergeConfig {
+    /// Array-combination strategy. Default: [`ArrayMergeStrategy::Replace`].
+    #[serde(default)]
+    pub arrays: ArrayMergeStrategy,
 }
 
 // ---------------------------------------------------------------------------
@@ -851,6 +898,7 @@ impl Default for Config {
             skills: None,
             model_tuning: Vec::new(),
             conversations: None,
+            merge: None,
         }
     }
 }
@@ -879,8 +927,11 @@ impl Config {
     /// the current directory (see [`Config::project_config_path`]), it is
     /// deep-merged **over** the base so a repo can pin its own models, endpoints,
     /// rules, and local stdio MCP services without copying the whole global
-    /// config. Tables merge recursively (project keys win); scalars and arrays
-    /// are replaced wholesale by the project value. See issue #222.
+    /// config. Tables merge recursively (project keys win) and scalars are
+    /// replaced by the project value. Arrays follow `[merge] arrays` —
+    /// `"replace"` (default) or `"append"` (see [`ArrayMergeStrategy`]). The
+    /// project config's `[merge]` setting takes precedence, then the base's.
+    /// See issue #222.
     ///
     /// When no project override exists this is byte-for-byte the legacy
     /// first-match behavior. Returns `Config::default()` if nothing is found.
@@ -903,7 +954,12 @@ impl Config {
                     None => toml::Value::try_from(Self::default())
                         .map_err(|e| NewtError::Config(e.to_string()))?,
                 };
-                merge_toml(&mut merged, Self::load_value(proj)?);
+                let project_val = Self::load_value(proj)?;
+                // The merge strategy is itself config: the project declares how
+                // it wants to be merged (`[merge] arrays = ...`), else the global
+                // config's setting, else the built-in default (Replace).
+                let strategy = array_merge_strategy(&project_val, &merged);
+                merge_toml(&mut merged, project_val, strategy);
                 merged
                     .try_into()
                     .map_err(|e| NewtError::Config(e.to_string()))
@@ -995,24 +1051,51 @@ fn home_dir() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-/// Deep-merge `overlay` into `base`. Tables merge recursively (overlay keys
-/// win on collision); every other value type — scalars and arrays — is replaced
-/// wholesale by the overlay. Used to layer a project-local `.newt/config.toml`
-/// over the global config. See issue #222.
-fn merge_toml(base: &mut toml::Value, overlay: toml::Value) {
+/// Deep-merge `overlay` into `base`. Tables always merge recursively (overlay
+/// keys win on collision). Arrays follow `arrays`: [`ArrayMergeStrategy::Replace`]
+/// swaps the base array for the overlay's, [`ArrayMergeStrategy::Append`]
+/// concatenates (base entries first). Scalars are always replaced by the
+/// overlay. Used to layer a project-local `.newt/config.toml` over the global
+/// config. See issue #222.
+fn merge_toml(base: &mut toml::Value, overlay: toml::Value, arrays: ArrayMergeStrategy) {
     match (base, overlay) {
         (toml::Value::Table(base_tbl), toml::Value::Table(overlay_tbl)) => {
             for (key, val) in overlay_tbl {
                 match base_tbl.get_mut(&key) {
-                    Some(existing) => merge_toml(existing, val),
+                    Some(existing) => merge_toml(existing, val, arrays),
                     None => {
                         base_tbl.insert(key, val);
                     }
                 }
             }
         }
-        // Scalars and arrays: the overlay replaces the base value outright.
+        // Append mode: concatenate two arrays (global entries first).
+        (toml::Value::Array(base_arr), toml::Value::Array(overlay_arr))
+            if arrays == ArrayMergeStrategy::Append =>
+        {
+            base_arr.extend(overlay_arr);
+        }
+        // Replace mode (and any scalar): the overlay replaces the base outright.
         (slot, overlay) => *slot = overlay,
+    }
+}
+
+/// Determine the array-merge strategy from the raw config values, before they
+/// are deserialized. The project config expresses how *it* wants to be merged,
+/// so it is consulted first; then the base config; else the built-in default.
+fn array_merge_strategy(project: &toml::Value, base: &toml::Value) -> ArrayMergeStrategy {
+    read_array_strategy(project)
+        .or_else(|| read_array_strategy(base))
+        .unwrap_or_default()
+}
+
+/// Read `[merge] arrays = "replace" | "append"` from a raw config value.
+/// Returns `None` when the key is absent or unrecognized (caller falls back).
+fn read_array_strategy(value: &toml::Value) -> Option<ArrayMergeStrategy> {
+    match value.get("merge")?.get("arrays")?.as_str()? {
+        "append" => Some(ArrayMergeStrategy::Append),
+        "replace" => Some(ArrayMergeStrategy::Replace),
+        _ => None,
     }
 }
 
@@ -1249,7 +1332,7 @@ default_tier_order = ["FAST", "STANDARD", "COMPLEX", "REVIEW"]
         .unwrap();
         let overlay: toml::Value =
             toml::from_str("b = 99\nc = 3\n[tui]\nmax_tool_rounds = 5\n").unwrap();
-        merge_toml(&mut base, overlay);
+        merge_toml(&mut base, overlay, ArrayMergeStrategy::Replace);
         // Scalar overridden, untouched scalar kept, new scalar added.
         assert_eq!(base["a"].as_integer(), Some(1));
         assert_eq!(base["b"].as_integer(), Some(99));
@@ -1263,13 +1346,80 @@ default_tier_order = ["FAST", "STANDARD", "COMPLEX", "REVIEW"]
     }
 
     #[test]
-    fn merge_toml_replaces_arrays_wholesale() {
+    fn merge_toml_replaces_arrays_wholesale_by_default() {
         let mut base: toml::Value = toml::from_str("models = [\"a\", \"b\", \"c\"]").unwrap();
         let overlay: toml::Value = toml::from_str("models = [\"x\"]").unwrap();
-        merge_toml(&mut base, overlay);
+        merge_toml(&mut base, overlay, ArrayMergeStrategy::Replace);
         let arr = base["models"].as_array().unwrap();
-        assert_eq!(arr.len(), 1, "arrays replace, not append");
+        assert_eq!(arr.len(), 1, "replace strategy swaps the array");
         assert_eq!(arr[0].as_str(), Some("x"));
+    }
+
+    #[test]
+    fn merge_toml_appends_arrays_when_strategy_is_append() {
+        let mut base: toml::Value = toml::from_str("models = [\"a\", \"b\"]").unwrap();
+        let overlay: toml::Value = toml::from_str("models = [\"x\"]").unwrap();
+        merge_toml(&mut base, overlay, ArrayMergeStrategy::Append);
+        let arr = base["models"].as_array().unwrap();
+        // Global entries first, then the project's appended.
+        let got: Vec<&str> = arr.iter().filter_map(|v| v.as_str()).collect();
+        assert_eq!(got, vec!["a", "b", "x"]);
+    }
+
+    #[test]
+    fn array_merge_strategy_project_wins_then_base_then_default() {
+        let append: toml::Value = toml::from_str("[merge]\narrays = \"append\"\n").unwrap();
+        let replace: toml::Value = toml::from_str("[merge]\narrays = \"replace\"\n").unwrap();
+        let none: toml::Value = toml::from_str("x = 1").unwrap();
+        // Project setting wins over the base.
+        assert_eq!(
+            array_merge_strategy(&append, &replace),
+            ArrayMergeStrategy::Append
+        );
+        // Falls back to the base when the project is silent.
+        assert_eq!(
+            array_merge_strategy(&none, &append),
+            ArrayMergeStrategy::Append
+        );
+        // Defaults to Replace when neither sets it.
+        assert_eq!(
+            array_merge_strategy(&none, &none),
+            ArrayMergeStrategy::Replace
+        );
+        // Unrecognized values are ignored (fall through to default).
+        let bogus: toml::Value = toml::from_str("[merge]\narrays = \"sideways\"\n").unwrap();
+        assert_eq!(
+            array_merge_strategy(&bogus, &none),
+            ArrayMergeStrategy::Replace
+        );
+    }
+
+    #[test]
+    fn append_strategy_adds_project_mcp_server_to_global() {
+        // The motivating case from issue #222: a project registers an extra
+        // local stdio MCP server without redefining the global one.
+        let global = "\
+[merge]
+arrays = \"append\"
+
+[[mcp_servers]]
+name = \"global-fs\"
+command = \"mcp-fs\"
+";
+        let project = "\
+[[mcp_servers]]
+name = \"project-fs\"
+command = \"mcp-fs\"
+args = [\"--root\", \".\"]
+";
+        let mut merged: toml::Value = toml::from_str(global).unwrap();
+        let proj_val: toml::Value = toml::from_str(project).unwrap();
+        let strategy = array_merge_strategy(&proj_val, &merged);
+        assert_eq!(strategy, ArrayMergeStrategy::Append);
+        merge_toml(&mut merged, proj_val, strategy);
+        let cfg: Config = merged.try_into().unwrap();
+        let names: Vec<&str> = cfg.mcp_servers.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(names, vec!["global-fs", "project-fs"]);
     }
 
     #[test]
@@ -1313,7 +1463,11 @@ max_tool_rounds = 25
         let project = "[tui]\nmax_tool_rounds = 7\n";
 
         let mut merged: toml::Value = toml::from_str(global).unwrap();
-        merge_toml(&mut merged, toml::from_str(project).unwrap());
+        merge_toml(
+            &mut merged,
+            toml::from_str(project).unwrap(),
+            ArrayMergeStrategy::Replace,
+        );
         let cfg: Config = merged.try_into().unwrap();
 
         // Overridden value wins…
