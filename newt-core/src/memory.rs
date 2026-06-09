@@ -964,12 +964,6 @@ Make the change. Commit it. Then move to the next step. \
 Never accumulate multiple uncommitted edits — a committed partial result survives a crash; \
 an uncommitted complete result does not.\n\
 \n\
-**Plan before coding.** For any task requiring more than one file change, \
-write a plan to `.newt/plan.md` first (create it if it does not exist). \
-List the concrete steps. Check them off as you complete each one. \
-On restart, read `.newt/plan.md` before anything else so you can resume \
-exactly where you left off without re-reading the whole codebase.\n\
-\n\
 **Read minimum, act fast.** Resist reading the entire codebase before acting. \
 Read the specific file or function you are about to change, make the change, \
 commit, then read the next thing. The session has a finite context window — \
