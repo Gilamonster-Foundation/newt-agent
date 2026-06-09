@@ -1,8 +1,13 @@
 //! Configuration loading for Newt-Agent.
 //!
-//! Resolution order: `$NEWT_CONFIG` env var, then `./newt.toml`,
+//! Base resolution order: `$NEWT_CONFIG` env var, then `./newt.toml`,
 //! `~/.newt/config.toml`, `/etc/newt/config.toml`. If none exist the
 //! built-in defaults are used (a single Ollama backend on localhost).
+//!
+//! A project-local `.newt/config.toml` (found by walking up from the current
+//! directory) is then deep-merged **over** that base, so a git repo can pin its
+//! own models, endpoints, rules, and local stdio MCP services without copying
+//! the whole global config. See [`Config::resolve`] and issue #222.
 
 use std::path::{Path, PathBuf};
 
@@ -861,23 +866,64 @@ impl Config {
         toml::from_str(&text).map_err(|e| NewtError::Config(e.to_string()))
     }
 
-    /// Resolve configuration by searching well-known locations.
+    /// Resolve configuration by searching well-known locations, then layering a
+    /// project-local override on top.
     ///
-    /// Search order:
+    /// Base search order (first match wins):
     /// 1. `$NEWT_CONFIG` environment variable
     /// 2. `./newt.toml`
     /// 3. `~/.newt/config.toml`
     /// 4. `/etc/newt/config.toml`
     ///
-    /// Returns `Config::default()` if none of the candidates exist.
+    /// Then, if a project-local `.newt/config.toml` is found by walking up from
+    /// the current directory (see [`Config::project_config_path`]), it is
+    /// deep-merged **over** the base so a repo can pin its own models, endpoints,
+    /// rules, and local stdio MCP services without copying the whole global
+    /// config. Tables merge recursively (project keys win); scalars and arrays
+    /// are replaced wholesale by the project value. See issue #222.
+    ///
+    /// When no project override exists this is byte-for-byte the legacy
+    /// first-match behavior. Returns `Config::default()` if nothing is found.
     pub fn resolve() -> Result<Self> {
-        let candidates = Self::candidate_paths();
-        for path in &candidates {
-            if path.is_file() {
-                return Self::load(path);
+        let base_path = Self::candidate_paths().into_iter().find(|p| p.is_file());
+        // A project-local config that *is* the base (e.g. cwd is the project and
+        // its `.newt/config.toml` already matched) must not be merged onto itself.
+        let project_path =
+            Self::project_config_path().filter(|p| Some(p.as_path()) != base_path.as_deref());
+
+        match (&base_path, &project_path) {
+            // Fast path: no project override → exact legacy behavior.
+            (Some(p), None) => Self::load(p),
+            (None, None) => Ok(Self::default()),
+            // Project override present → layer it over the base (or the default
+            // config when there is no base file).
+            (base, Some(proj)) => {
+                let mut merged = match base {
+                    Some(p) => Self::load_value(p)?,
+                    None => toml::Value::try_from(Self::default())
+                        .map_err(|e| NewtError::Config(e.to_string()))?,
+                };
+                merge_toml(&mut merged, Self::load_value(proj)?);
+                merged
+                    .try_into()
+                    .map_err(|e| NewtError::Config(e.to_string()))
             }
         }
-        Ok(Self::default())
+    }
+
+    /// Load a config file as a raw `toml::Value` (for layered merging).
+    fn load_value(path: &Path) -> Result<toml::Value> {
+        let text = std::fs::read_to_string(path)?;
+        toml::from_str(&text).map_err(|e| NewtError::Config(e.to_string()))
+    }
+
+    /// Locate a project-local `.newt/config.toml` by walking up from the current
+    /// directory toward the filesystem root, stopping before `$HOME` so the
+    /// global `~/.newt/config.toml` is never mistaken for a project override.
+    /// Returns the nearest match (innermost project wins). See issue #222.
+    pub fn project_config_path() -> Option<PathBuf> {
+        let cwd = std::env::current_dir().ok()?;
+        find_project_config_from(&cwd, home_dir().as_deref())
     }
 
     /// The user-writable config path: `~/.newt/config.toml`.
@@ -947,6 +993,49 @@ fn home_dir() -> Option<PathBuf> {
         .or_else(|_| std::env::var("USERPROFILE"))
         .ok()
         .map(PathBuf::from)
+}
+
+/// Deep-merge `overlay` into `base`. Tables merge recursively (overlay keys
+/// win on collision); every other value type — scalars and arrays — is replaced
+/// wholesale by the overlay. Used to layer a project-local `.newt/config.toml`
+/// over the global config. See issue #222.
+fn merge_toml(base: &mut toml::Value, overlay: toml::Value) {
+    match (base, overlay) {
+        (toml::Value::Table(base_tbl), toml::Value::Table(overlay_tbl)) => {
+            for (key, val) in overlay_tbl {
+                match base_tbl.get_mut(&key) {
+                    Some(existing) => merge_toml(existing, val),
+                    None => {
+                        base_tbl.insert(key, val);
+                    }
+                }
+            }
+        }
+        // Scalars and arrays: the overlay replaces the base value outright.
+        (slot, overlay) => *slot = overlay,
+    }
+}
+
+/// Walk up from `start` looking for a project-local `.newt/config.toml`,
+/// stopping before `home` (so the global `~/.newt/config.toml` is never
+/// returned) and at the filesystem root. Returns the innermost match.
+///
+/// Split out from [`Config::project_config_path`] so it can be unit-tested
+/// against temp directories without mutating the process environment.
+fn find_project_config_from(start: &Path, home: Option<&Path>) -> Option<PathBuf> {
+    let mut dir = Some(start);
+    while let Some(current) = dir {
+        // Never treat the home directory's `.newt` as a project override.
+        if home == Some(current) {
+            break;
+        }
+        let candidate = current.join(".newt").join("config.toml");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        dir = current.parent();
+    }
+    None
 }
 
 /// Expand a leading `~/` (or a bare `~`) to the home directory. Paths
@@ -1146,6 +1235,92 @@ default_tier_order = ["FAST", "STANDARD", "COMPLEX", "REVIEW"]
             std::env::set_var("NEWT_CONFIG", v);
         }
 
+        assert_eq!(cfg.backends.len(), 1);
+        assert_eq!(cfg.backends[0].name, "ollama");
+    }
+
+    // --- Project-local `.newt/config.toml` layering (issue #222) ---
+
+    #[test]
+    fn merge_toml_recurses_tables_and_replaces_scalars() {
+        let mut base: toml::Value = toml::from_str(
+            "a = 1\nb = 2\n[tui]\nmid_loop_trim_threshold = 40\nmax_tool_rounds = 25\n",
+        )
+        .unwrap();
+        let overlay: toml::Value =
+            toml::from_str("b = 99\nc = 3\n[tui]\nmax_tool_rounds = 5\n").unwrap();
+        merge_toml(&mut base, overlay);
+        // Scalar overridden, untouched scalar kept, new scalar added.
+        assert_eq!(base["a"].as_integer(), Some(1));
+        assert_eq!(base["b"].as_integer(), Some(99));
+        assert_eq!(base["c"].as_integer(), Some(3));
+        // Table merged recursively: overridden key wins, sibling preserved.
+        assert_eq!(base["tui"]["max_tool_rounds"].as_integer(), Some(5));
+        assert_eq!(
+            base["tui"]["mid_loop_trim_threshold"].as_integer(),
+            Some(40)
+        );
+    }
+
+    #[test]
+    fn merge_toml_replaces_arrays_wholesale() {
+        let mut base: toml::Value = toml::from_str("models = [\"a\", \"b\", \"c\"]").unwrap();
+        let overlay: toml::Value = toml::from_str("models = [\"x\"]").unwrap();
+        merge_toml(&mut base, overlay);
+        let arr = base["models"].as_array().unwrap();
+        assert_eq!(arr.len(), 1, "arrays replace, not append");
+        assert_eq!(arr[0].as_str(), Some("x"));
+    }
+
+    #[test]
+    fn find_project_config_walks_up_and_stops_before_home() {
+        let home = tempfile::tempdir().unwrap();
+        // home/proj/sub  with a project config at home/proj/.newt/config.toml
+        let proj = home.path().join("proj");
+        let sub = proj.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::create_dir_all(proj.join(".newt")).unwrap();
+        std::fs::write(proj.join(".newt").join("config.toml"), "x = 1").unwrap();
+        // Also place a (global) config at home/.newt to prove it's NOT returned.
+        std::fs::create_dir_all(home.path().join(".newt")).unwrap();
+        std::fs::write(home.path().join(".newt").join("config.toml"), "x = 9").unwrap();
+
+        let found = find_project_config_from(&sub, Some(home.path()));
+        assert_eq!(found, Some(proj.join(".newt").join("config.toml")));
+
+        // From a dir with no project config above it (but under home), nothing.
+        let bare = home.path().join("empty");
+        std::fs::create_dir_all(&bare).unwrap();
+        assert_eq!(find_project_config_from(&bare, Some(home.path())), None);
+    }
+
+    #[test]
+    fn project_config_deep_merges_over_global() {
+        // global config: a backend + a tui block.
+        let global = "\
+[[backends]]
+name = \"ollama\"
+endpoint = \"http://localhost:11434\"
+model = \"llama3\"
+tiers = []
+kind = \"ollama\"
+
+[tui]
+mid_loop_trim_threshold = 40
+max_tool_rounds = 25
+";
+        // project override: change max_tool_rounds only.
+        let project = "[tui]\nmax_tool_rounds = 7\n";
+
+        let mut merged: toml::Value = toml::from_str(global).unwrap();
+        merge_toml(&mut merged, toml::from_str(project).unwrap());
+        let cfg: Config = merged.try_into().unwrap();
+
+        // Overridden value wins…
+        assert_eq!(cfg.tui.as_ref().unwrap().max_tool_rounds, 7);
+        // …sibling key preserved from global…
+        assert_eq!(cfg.tui.as_ref().unwrap().mid_loop_trim_threshold, 40);
+        // …and the global backend survived (not in the override).
         assert_eq!(cfg.backends.len(), 1);
         assert_eq!(cfg.backends[0].name, "ollama");
     }
