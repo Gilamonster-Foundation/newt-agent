@@ -1168,7 +1168,11 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
     // intentional refresh point — config.toml may have changed on disk.
     let mut cfg = newt_core::Config::resolve().unwrap_or_default();
     let mut conversation_store = conversation_store_for(workspace, &cfg)?;
-    let mut active_conversation_id: Option<String> = None;
+    // A session always has a conversation id, assigned up front so the
+    // per-session plan path (`.newt/sessions/<id>/plan.md`, issue #220) is
+    // stable from the first turn. The durable conversation record adopts this
+    // id when the first turn is saved.
+    let mut active_conversation_id: String = newt_core::new_conversation_id();
 
     // Capability cache: loaded once per session, written back after each turn
     // that updates tuning state (context window discovery, success/overflow).
@@ -1320,7 +1324,12 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
     tokio::task::block_in_place(|| rt.block_on(memory.initialize_all(&ctx)));
 
     // Build system prompt now that SoulProvider has loaded its soul file.
-    system = rebuild_system_prompt(workspace, &memory, active_persona.as_ref());
+    system = rebuild_system_prompt(
+        workspace,
+        &memory,
+        active_persona.as_ref(),
+        &active_conversation_id,
+    );
 
     loop {
         // rustyline can panic (assertion `fd != -1`) when the terminal file
@@ -1402,8 +1411,8 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                             &mut memory,
                             &mut system,
                             active_persona.as_ref(),
+                            &mut active_conversation_id,
                         );
-                        active_conversation_id = None;
                         print_newt(&msg, color, verbose);
                         if let Some(ref hp) = history_path {
                             let _ = rl.save_history(hp);
@@ -1433,14 +1442,10 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                         continue;
                     }
                     if slash_body == "persona" || slash_body.starts_with("persona ") {
-                        let starts_new_conversation = matches!(
-                            parse_persona_command(&task),
-                            Ok(PersonaCommand::Clear
-                                | PersonaCommand::Set {
-                                    keep_context: false,
-                                    ..
-                                })
-                        );
+                        // `handle_persona_command` rotates `active_conversation_id`
+                        // itself for the cases that start a new conversation
+                        // (clear / set without --keep-context), so the per-session
+                        // plan path follows (issue #220).
                         match handle_persona_command(
                             &task,
                             workspace,
@@ -1448,13 +1453,9 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                             &mut memory,
                             &mut system,
                             &mut active_persona,
+                            &mut active_conversation_id,
                         ) {
-                            Ok(msg) => {
-                                if starts_new_conversation {
-                                    active_conversation_id = None;
-                                }
-                                print_newt(&msg, color, verbose);
-                            }
+                            Ok(msg) => print_newt(&msg, color, verbose),
                             Err(e) => print_newt(&format!("error: {e}"), color, verbose),
                         }
                         if let Some(ref hp) = history_path {
@@ -1606,7 +1607,7 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                             });
                             if let Err(e) = save_successful_conversation_turn(
                                 &conversation_store,
-                                &mut active_conversation_id,
+                                &active_conversation_id,
                                 active_persona.as_ref(),
                                 &task,
                                 &reply,
@@ -1722,8 +1723,8 @@ fn resolve_backend_choice(cfg: &newt_core::Config) -> BackendChoice {
 /// Build a system prompt with workspace context so the model knows the project.
 // build_system_prompt_with_soul is used directly now; this wrapper kept for tests.
 #[allow(dead_code)]
-fn build_system_prompt(workspace: &str) -> String {
-    build_system_prompt_with_soul(workspace, None)
+fn build_system_prompt(workspace: &str, plan_path: &str) -> String {
+    build_system_prompt_with_soul(workspace, None, plan_path)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2028,14 +2029,15 @@ fn skills_index_for_prompt(skills_dirs: &[std::path::PathBuf]) -> Option<String>
     newt_skills::index_block(&newt_skills::discover_paths(skills_dirs))
 }
 
-fn build_system_prompt_with_soul(workspace: &str, soul: Option<&str>) -> String {
-    build_system_prompt_with_persona(workspace, soul, None)
+fn build_system_prompt_with_soul(workspace: &str, soul: Option<&str>, plan_path: &str) -> String {
+    build_system_prompt_with_persona(workspace, soul, None, plan_path)
 }
 
 fn build_system_prompt_with_persona(
     workspace: &str,
     soul: Option<&str>,
     persona: Option<&Persona>,
+    plan_path: &str,
 ) -> String {
     // Fall back to the single canonical identity in newt-core rather than a
     // private copy, so the built-in tool list can't drift between the two.
@@ -2047,6 +2049,20 @@ fn build_system_prompt_with_persona(
             persona.name, persona.prompt
         ));
     }
+
+    // Per-session plan instruction (issue #220). Injected here, with the
+    // resolved per-session path, rather than baked into DEFAULT_SOUL — so the
+    // path is dynamic AND custom soul.md users still get the guidance. The path
+    // is unique to this conversation, so concurrent newt instances in the same
+    // repo never clobber each other's plan.
+    ctx.push_str(&format!(
+        "\n**Plan before coding.** For any task requiring more than one file \
+         change, write a plan to `{plan_path}` first (create it if it does not \
+         exist). List the concrete steps and check them off as you complete \
+         each one. This plan file is unique to this session — read it when \
+         resuming so you can pick up exactly where you left off without \
+         re-reading the whole codebase.\n"
+    ));
 
     // Progressive disclosure: inject ONLY the skills index (one
     // `name: description` line per installed skill) — never the bodies.
@@ -2117,6 +2133,7 @@ fn rebuild_system_prompt(
     workspace: &str,
     memory: &newt_core::MemoryManager,
     persona: Option<&Persona>,
+    conversation_id: &str,
 ) -> String {
     let soul_additions = memory.build_system_prompt_additions();
     let soul_text = if soul_additions.is_empty() {
@@ -2124,7 +2141,9 @@ fn rebuild_system_prompt(
     } else {
         Some(soul_additions.as_str())
     };
-    build_system_prompt_with_persona(workspace, soul_text, persona)
+    // Per-session plan path, keyed on the durable conversation id (issue #220).
+    let plan_path = newt_core::session_plan_path(conversation_id);
+    build_system_prompt_with_persona(workspace, soul_text, persona, &plan_path.to_string_lossy())
 }
 
 fn persona_status(active: Option<&Persona>) -> String {
@@ -2172,9 +2191,10 @@ fn reset_conversation(
     memory: &mut newt_core::MemoryManager,
     system: &mut String,
     active_persona: Option<&Persona>,
+    conversation_id: &str,
 ) {
     memory.reset_all();
-    *system = rebuild_system_prompt(workspace, memory, active_persona);
+    *system = rebuild_system_prompt(workspace, memory, active_persona, conversation_id);
 }
 
 fn new_conversation_message(active_persona: Option<&Persona>) -> String {
@@ -2192,8 +2212,12 @@ fn handle_new_conversation(
     memory: &mut newt_core::MemoryManager,
     system: &mut String,
     active_persona: Option<&Persona>,
+    conversation_id: &mut String,
 ) -> String {
-    reset_conversation(workspace, memory, system, active_persona);
+    // A new conversation gets a fresh id, which rotates the per-session plan
+    // path to a new `.newt/sessions/<id>/` dir (issue #220).
+    *conversation_id = newt_core::new_conversation_id();
+    reset_conversation(workspace, memory, system, active_persona, conversation_id);
     new_conversation_message(active_persona)
 }
 
@@ -2233,23 +2257,21 @@ fn conversation_title_from_task(task: &str) -> String {
 
 fn save_successful_conversation_turn(
     store: &newt_core::ConversationStore,
-    active_conversation_id: &mut Option<String>,
+    conversation_id: &str,
     active_persona: Option<&Persona>,
     task: &str,
     reply: &str,
 ) -> anyhow::Result<()> {
-    let id = match active_conversation_id.as_ref() {
-        Some(id) => id.clone(),
-        None => {
-            let id = store.create(
-                &conversation_title_from_task(task),
-                active_persona.map(|p| p.name.as_str()),
-            )?;
-            *active_conversation_id = Some(id.clone());
-            id
-        }
-    };
-    store.append_turn(&id, task, reply)
+    // The id is pre-assigned for the whole session (issue #220), so the first
+    // turn creates the record with that id; later turns just append.
+    if !store.exists(conversation_id) {
+        store.create_with_id(
+            conversation_id,
+            &conversation_title_from_task(task),
+            active_persona.map(|p| p.name.as_str()),
+        )?;
+    }
+    store.append_turn(conversation_id, task, reply)
 }
 
 fn conversation_list_message(store: &newt_core::ConversationStore) -> anyhow::Result<String> {
@@ -2304,7 +2326,7 @@ struct ConversationCommandContext<'a> {
     memory: &'a mut newt_core::MemoryManager,
     system: &'a mut String,
     active_persona: &'a mut Option<Persona>,
-    active_conversation_id: &'a mut Option<String>,
+    active_conversation_id: &'a mut String,
 }
 
 fn handle_conversation_command(
@@ -2331,9 +2353,16 @@ fn handle_conversation_command(
                 },
                 None => *ctx.active_persona = None,
             }
-            *ctx.system =
-                rebuild_system_prompt(ctx.workspace, ctx.memory, ctx.active_persona.as_ref());
-            *ctx.active_conversation_id = Some(record.id.clone());
+            // Adopt the restored conversation's id BEFORE rebuilding so the
+            // system prompt names that conversation's plan file (issue #220):
+            // resuming a conversation resumes its plan.
+            *ctx.active_conversation_id = record.id.clone();
+            *ctx.system = rebuild_system_prompt(
+                ctx.workspace,
+                ctx.memory,
+                ctx.active_persona.as_ref(),
+                ctx.active_conversation_id,
+            );
 
             let mut message = format!(
                 "Restored conversation `{}` ({} turns).",
@@ -2352,7 +2381,7 @@ fn handle_conversation_command(
         }
         ConversationCommand::Delete(id) => {
             let resolved_id = ctx.store.resolve_id(&id)?;
-            if ctx.active_conversation_id.as_deref() == Some(resolved_id.as_str()) {
+            if *ctx.active_conversation_id == resolved_id {
                 anyhow::bail!("cannot delete the active conversation; use /new first");
             }
             ctx.store.delete(&resolved_id)?;
@@ -2368,13 +2397,22 @@ fn handle_persona_command(
     memory: &mut newt_core::MemoryManager,
     system: &mut String,
     active_persona: &mut Option<Persona>,
+    conversation_id: &mut String,
 ) -> anyhow::Result<String> {
     match parse_persona_command(input)? {
         PersonaCommand::List => persona_list(store),
         PersonaCommand::Show => Ok(persona_status(active_persona.as_ref())),
         PersonaCommand::Clear => {
             *active_persona = None;
-            reset_conversation(workspace, memory, system, active_persona.as_ref());
+            // Clearing the persona starts a new conversation → fresh id + plan.
+            *conversation_id = newt_core::new_conversation_id();
+            reset_conversation(
+                workspace,
+                memory,
+                system,
+                active_persona.as_ref(),
+                conversation_id,
+            );
             Ok("Started a new conversation with no active persona.".to_string())
         }
         PersonaCommand::Set { name, keep_context } => {
@@ -2382,11 +2420,25 @@ fn handle_persona_command(
             *active_persona = Some(persona);
             if keep_context {
                 // Persistent-actor swap: rebuild the system prompt for the new
-                // role WITHOUT discarding the conversation history.
-                *system = rebuild_system_prompt(workspace, memory, active_persona.as_ref());
+                // role WITHOUT discarding the conversation history — same
+                // conversation, same plan file.
+                *system = rebuild_system_prompt(
+                    workspace,
+                    memory,
+                    active_persona.as_ref(),
+                    conversation_id,
+                );
                 Ok(persona_swap_kept_context_message(active_persona.as_ref()))
             } else {
-                reset_conversation(workspace, memory, system, active_persona.as_ref());
+                // Swapping without keeping context starts a new conversation.
+                *conversation_id = newt_core::new_conversation_id();
+                reset_conversation(
+                    workspace,
+                    memory,
+                    system,
+                    active_persona.as_ref(),
+                    conversation_id,
+                );
                 Ok(new_conversation_message(active_persona.as_ref()))
             }
         }
@@ -5518,11 +5570,56 @@ mod skills_integration_tests {
         // identity string that drifted from newt-core's DEFAULT_SOUL. It must
         // now embed the canonical constant verbatim so the two can't diverge.
         let tmp = tempfile::TempDir::new().unwrap();
-        let prompt = build_system_prompt_with_soul(tmp.path().to_str().unwrap(), None);
+        let prompt =
+            build_system_prompt_with_soul(tmp.path().to_str().unwrap(), None, "test-plan.md");
         assert!(
             prompt.contains(newt_core::DEFAULT_SOUL),
             "fallback must embed newt_core::DEFAULT_SOUL verbatim"
         );
+    }
+
+    #[test]
+    fn system_prompt_names_the_per_session_plan_path() {
+        // Issue #220: the plan instruction must reference the per-session path
+        // passed in, not the old fixed `.newt/plan.md`.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ws = tmp.path().to_str().unwrap();
+        let path_a = newt_core::session_plan_path("sess-aaaa");
+        let path_a = path_a.to_string_lossy();
+        let prompt_a = build_system_prompt_with_soul(ws, None, &path_a);
+        assert!(
+            prompt_a.contains(path_a.as_ref()),
+            "prompt must name the session plan path"
+        );
+        assert!(
+            prompt_a.contains("Plan before coding"),
+            "the plan instruction must still be present (now injected, not in DEFAULT_SOUL)"
+        );
+
+        // Two different sessions get two different plan paths — the collision fix.
+        let path_b = newt_core::session_plan_path("sess-bbbb");
+        let prompt_b = build_system_prompt_with_soul(ws, None, &path_b.to_string_lossy());
+        assert!(prompt_b.contains(&*path_b.to_string_lossy()));
+        assert!(
+            !prompt_b.contains(path_a.as_ref()),
+            "sessions must not share a path"
+        );
+    }
+
+    #[test]
+    fn default_soul_no_longer_hardcodes_a_plan_path() {
+        // The plan path moved out of the const so it can be per-session and so
+        // custom souls also get the guidance (issue #220).
+        assert!(!newt_core::DEFAULT_SOUL.contains("plan.md"));
+        // A custom soul (no plan text of its own) still gets the injected block.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let prompt = build_system_prompt_with_soul(
+            tmp.path().to_str().unwrap(),
+            Some("You are a custom agent."),
+            ".newt/sessions/xyz/plan.md",
+        );
+        assert!(prompt.contains("You are a custom agent."));
+        assert!(prompt.contains(".newt/sessions/xyz/plan.md"));
     }
 
     #[test]
@@ -5537,6 +5634,7 @@ mod skills_integration_tests {
             tmp.path().to_str().unwrap(),
             Some(newt_core::DEFAULT_SOUL),
             Some(&persona),
+            "test-plan.md",
         );
         assert!(prompt.contains("Active persona: reviewer"));
         assert!(prompt.contains("Review from a persona file."));
@@ -5647,8 +5745,9 @@ mod skills_integration_tests {
         memory
             .sync_all("old task", "old reply", &newt_core::TurnMetrics::default())
             .await;
-        let mut system = rebuild_system_prompt(workspace, &memory, None);
+        let mut system = rebuild_system_prompt(workspace, &memory, None, "test-session");
         let mut active_persona = None;
+        let mut active_conversation_id = String::from("test-session");
 
         let message = handle_persona_command(
             "/persona reviewer",
@@ -5657,6 +5756,7 @@ mod skills_integration_tests {
             &mut memory,
             &mut system,
             &mut active_persona,
+            &mut active_conversation_id,
         )
         .unwrap();
 
@@ -5689,10 +5789,17 @@ mod skills_integration_tests {
             "Keep replies short.",
             tmp.path().join("personas").join("terse.md"),
         ));
-        let mut system = rebuild_system_prompt(workspace, &memory, active_persona.as_ref());
+        let mut system =
+            rebuild_system_prompt(workspace, &memory, active_persona.as_ref(), "test-session");
+        let mut active_conversation_id = String::from("test-session");
 
-        let message =
-            handle_new_conversation(workspace, &mut memory, &mut system, active_persona.as_ref());
+        let message = handle_new_conversation(
+            workspace,
+            &mut memory,
+            &mut system,
+            active_persona.as_ref(),
+            &mut active_conversation_id,
+        );
 
         assert_eq!(message, "Started a new conversation with persona `terse`.");
         assert!(system.contains("Active persona: terse"));
@@ -5745,7 +5852,8 @@ mod skills_integration_tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let workspace = tempfile::TempDir::new().unwrap();
         let store = newt_core::ConversationStore::new(tmp.path(), workspace.path(), 100).unwrap();
-        let mut active_id = None;
+        // The id is pre-assigned for the whole session (issue #220).
+        let active_id = newt_core::new_conversation_id();
         let persona = Some(test_persona(
             "coder",
             "Code things.",
@@ -5754,7 +5862,7 @@ mod skills_integration_tests {
 
         save_successful_conversation_turn(
             &store,
-            &mut active_id,
+            &active_id,
             persona.as_ref(),
             "first task",
             "first reply",
@@ -5762,15 +5870,16 @@ mod skills_integration_tests {
         .unwrap();
         save_successful_conversation_turn(
             &store,
-            &mut active_id,
+            &active_id,
             persona.as_ref(),
             "second task",
             "second reply",
         )
         .unwrap();
 
-        let id = active_id.expect("active conversation id is set");
-        let record = store.load(&id).unwrap();
+        let record = store.load(&active_id).unwrap();
+        // First turn creates the record (title from the first task); the second
+        // appends to the same id.
         assert_eq!(record.title, "first task");
         assert_eq!(record.persona.as_deref(), Some("coder"));
         assert_eq!(record.turns.len(), 2);
@@ -5797,9 +5906,9 @@ mod skills_integration_tests {
             .sync_all("old task", "old reply", &newt_core::TurnMetrics::default())
             .await;
         let workspace_str = workspace.to_str().unwrap();
-        let mut system = rebuild_system_prompt(workspace_str, &memory, None);
+        let mut system = rebuild_system_prompt(workspace_str, &memory, None, "test-session");
         let mut active_persona = None;
-        let mut active_conversation_id = None;
+        let mut active_conversation_id = newt_core::new_conversation_id();
         let mut conversation_ctx = ConversationCommandContext {
             store: &store,
             persona_store: &persona_store,
@@ -5817,7 +5926,7 @@ mod skills_integration_tests {
         .unwrap();
 
         assert!(message.contains("Restored conversation"));
-        assert_eq!(active_conversation_id.as_deref(), Some(id.as_str()));
+        assert_eq!(active_conversation_id, id);
         assert_eq!(
             active_persona.as_ref().map(|p| p.name.as_str()),
             Some("reviewer")
@@ -7340,7 +7449,8 @@ mod persona_helper_tests {
             "Short.",
             tmp.path().join("personas").join("terse.md"),
         ));
-        let mut system = rebuild_system_prompt(workspace, &memory, active.as_ref());
+        let mut system = rebuild_system_prompt(workspace, &memory, active.as_ref(), "test-session");
+        let mut active_conversation_id = String::from("test-session");
 
         // show: reports the active persona, does not reset anything.
         let msg = handle_persona_command(
@@ -7350,6 +7460,7 @@ mod persona_helper_tests {
             &mut memory,
             &mut system,
             &mut active,
+            &mut active_conversation_id,
         )
         .unwrap();
         assert!(msg.contains("Active persona: terse"));
@@ -7363,6 +7474,7 @@ mod persona_helper_tests {
             &mut memory,
             &mut system,
             &mut active,
+            &mut active_conversation_id,
         )
         .unwrap();
         assert_eq!(msg, "Started a new conversation with no active persona.");
@@ -7428,7 +7540,8 @@ mod persona_helper_tests {
             .sync_all("old task", "old reply", &newt_core::TurnMetrics::default())
             .await;
         let mut active: Option<Persona> = None;
-        let mut system = rebuild_system_prompt(workspace, &memory, active.as_ref());
+        let mut system = rebuild_system_prompt(workspace, &memory, active.as_ref(), "test-session");
+        let mut active_conversation_id = String::from("test-session");
 
         let msg = handle_persona_command(
             "/persona set terse --keep-context",
@@ -7437,6 +7550,7 @@ mod persona_helper_tests {
             &mut memory,
             &mut system,
             &mut active,
+            &mut active_conversation_id,
         )
         .unwrap();
         assert!(msg.contains("kept conversation context"), "got: {msg}");
@@ -7456,6 +7570,7 @@ mod persona_helper_tests {
             &mut memory,
             &mut system,
             &mut active,
+            &mut active_conversation_id,
         )
         .unwrap();
         let messages = memory.build_messages(&system, "new task");
