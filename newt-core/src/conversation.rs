@@ -74,11 +74,28 @@ impl ConversationStore {
     }
 
     pub fn create(&self, title: &str, persona: Option<&str>) -> anyhow::Result<String> {
+        let id = new_conversation_id();
+        self.create_with_id(&id, title, persona)?;
+        Ok(id)
+    }
+
+    /// Create a conversation record using a caller-supplied `id`.
+    ///
+    /// The TUI pre-generates a conversation id at session start (so the
+    /// per-session plan path is stable from turn 1, see issue #220) and then
+    /// has the record adopt that same id when the first turn is saved. Splitting
+    /// this out of [`create`](Self::create) lets the id and the record share a
+    /// value instead of `create` minting its own.
+    pub fn create_with_id(
+        &self,
+        id: &str,
+        title: &str,
+        persona: Option<&str>,
+    ) -> anyhow::Result<()> {
         std::fs::create_dir_all(self.workspace_dir())?;
         let now = unix_nanos();
-        let id = format!("{now}-{}", uuid::Uuid::new_v4());
         let record = ConversationRecord {
-            id: id.clone(),
+            id: id.to_string(),
             title: title.trim().to_string(),
             workspace: self.workspace.to_string_lossy().into_owned(),
             workspace_id: self.workspace_id.clone(),
@@ -89,7 +106,14 @@ impl ConversationStore {
         };
         self.save_record(&record)?;
         self.prune_to_cap()?;
-        Ok(id)
+        Ok(())
+    }
+
+    /// `true` if a record for `id` already exists for this workspace. Used by
+    /// the save path to decide between [`create_with_id`](Self::create_with_id)
+    /// (first turn) and [`append_turn`](Self::append_turn).
+    pub fn exists(&self, id: &str) -> bool {
+        self.record_path(id).is_file()
     }
 
     pub fn append_turn(&self, id: &str, user: &str, assistant: &str) -> anyhow::Result<()> {
@@ -140,6 +164,12 @@ impl ConversationStore {
         if path.exists() {
             std::fs::remove_file(path)?;
         }
+        // Best-effort: drop the conversation's per-session plan dir too, so plan
+        // files don't outlive their conversation (issue #220). Ignore errors —
+        // the dir may not exist (no plan was ever written) and a stray plan must
+        // never block deletion of the record.
+        let plan_dir = self.workspace.join(session_plan_dir(&resolved_id));
+        let _ = std::fs::remove_dir_all(plan_dir);
         Ok(())
     }
 
@@ -257,6 +287,33 @@ fn validate_record_id(id: &str) -> anyhow::Result<()> {
         anyhow::bail!("invalid conversation id `{id}`");
     }
     Ok(())
+}
+
+/// Mint a fresh conversation id: `{unix_nanos}-{uuid_v4}`.
+///
+/// Exposed so the TUI can pre-generate an id at session start — the same id
+/// keys both the durable conversation record and the per-session plan dir
+/// (issue #220) — and then hand it to
+/// [`ConversationStore::create_with_id`]. Two concurrent newt processes mint
+/// distinct ids (distinct nanos + distinct UUIDs), so their plan files never
+/// collide.
+pub fn new_conversation_id() -> String {
+    format!("{}-{}", unix_nanos(), uuid::Uuid::new_v4())
+}
+
+/// Workspace-relative directory holding a conversation's per-session plan:
+/// `.newt/sessions/<conversation-id>`. Workspace-relative so the file tools'
+/// workspace fence permits writing it and it travels with the repo. See #220.
+pub fn session_plan_dir(conversation_id: &str) -> PathBuf {
+    Path::new(".newt").join("sessions").join(conversation_id)
+}
+
+/// Workspace-relative per-session plan document path:
+/// `.newt/sessions/<conversation-id>/plan.md`. This is the path the system
+/// prompt tells the model to use; it replaces the old fixed `.newt/plan.md`
+/// that collided when several newt instances ran in one repo. See issue #220.
+pub fn session_plan_path(conversation_id: &str) -> PathBuf {
+    session_plan_dir(conversation_id).join("plan.md")
 }
 
 fn unix_nanos() -> u128 {

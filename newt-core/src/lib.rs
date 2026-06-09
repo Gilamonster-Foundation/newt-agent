@@ -29,7 +29,8 @@ pub use config::{
     MemoryConfig, MemoryProviderKind, PermissionPreset, SkillsConfig, ToolPermissions, TuiConfig,
 };
 pub use conversation::{
-    ConversationRecord, ConversationStore, ConversationSummary, ConversationTurn,
+    new_conversation_id, session_plan_dir, session_plan_path, ConversationRecord,
+    ConversationStore, ConversationSummary, ConversationTurn,
 };
 pub use dgx::{DgxConfig, DgxFormation, DgxNode, DgxNotConfigured, EndpointKind};
 pub use error::NewtError;
