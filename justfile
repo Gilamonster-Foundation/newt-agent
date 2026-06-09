@@ -171,14 +171,18 @@ cov-ci:
 # reintroduces the brush git dep and breaks crates.io publish). Run
 # `just shell-stub` before you commit. Rebuild after this to pick it up.
 shell-real:
-    sed -i -E 's|(agent-bridle[a-z-]*[[:space:]]*= \{ git = "[^"]*agent-bridle", branch = )"feat/stub-shell"|\1"main"|' Cargo.toml
+    # Portable across GNU and BSD/macOS sed: `[{]` (not `\{`, which BSD ERE
+    # reads as an interval) and a temp-file rewrite (not `sed -i`, whose suffix
+    # arg differs between GNU and BSD). See PR #238 followup.
+    sed -E 's|(agent-bridle[a-z-]*[[:space:]]*= [{] git = "[^"]*agent-bridle", branch = )"feat/stub-shell"|\1"main"|' Cargo.toml > Cargo.toml.shelltmp && mv Cargo.toml.shelltmp Cargo.toml
     @echo "⚠️  agent-bridle → REAL brush shell (agent-bridle main). DEV ONLY."
     @echo "⚠️  Do NOT commit Cargo.toml / Cargo.lock — run 'just shell-stub' first."
     @echo "   Now rebuild: cargo build --workspace"
 
 # Switch back to the publishable stub shell (the release / main default).
 shell-stub:
-    sed -i -E 's|(agent-bridle[a-z-]*[[:space:]]*= \{ git = "[^"]*agent-bridle", branch = )"main"|\1"feat/stub-shell"|' Cargo.toml
+    # Portable sed (see `shell-real` for why `[{]` + temp-file, not `sed -i -E`).
+    sed -E 's|(agent-bridle[a-z-]*[[:space:]]*= [{] git = "[^"]*agent-bridle", branch = )"main"|\1"feat/stub-shell"|' Cargo.toml > Cargo.toml.shelltmp && mv Cargo.toml.shelltmp Cargo.toml
     @echo "agent-bridle → stub shell (publishable). Safe to commit."
     @echo "   Now rebuild: cargo build --workspace"
 
@@ -188,7 +192,7 @@ shell-stub:
 shell-check:
     #!/usr/bin/env bash
     set -euo pipefail
-    if grep -Eq 'agent-bridle[a-z-]*[[:space:]]*= \{ git = "[^"]*agent-bridle", branch = "main"' Cargo.toml; then
+    if grep -Eq 'agent-bridle[a-z-]*[[:space:]]*= [{] git = "[^"]*agent-bridle", branch = "main"' Cargo.toml; then
         echo "ERROR: [patch.crates-io] points agent-bridle at 'main' (real brush shell)." >&2
         echo "       That build cannot publish to crates.io. Run 'just shell-stub'" >&2
         echo "       before committing/pushing — see the shell-toggle note in the justfile." >&2

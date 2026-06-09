@@ -39,7 +39,7 @@ jobs:
         # real brush shell), which reintroduces the brush git dep and breaks
         # the crates.io publish chain. `just shell-real` is a dev-only override.
         run: |
-          if grep -Eq 'agent-bridle[a-z-]*[[:space:]]*= \{ git = "[^"]*agent-bridle", branch = "main"' Cargo.toml; then
+          if grep -Eq 'agent-bridle[a-z-]*[[:space:]]*= [{] git = "[^"]*agent-bridle", branch = "main"' Cargo.toml; then
             echo "::error::[patch.crates-io] points agent-bridle at 'main' (real brush shell) — run 'just shell-stub' before pushing."
             exit 1
           fi
