@@ -114,6 +114,26 @@ fn http_get(port: u16, path: &str) -> std::io::Result<String> {
     Ok(resp)
 }
 
+/// Like [`http_get`], but retries transient connection failures for up to
+/// `secs` seconds. Even after the server answers `/healthz`, an *individual*
+/// connect can be briefly refused while the single-threaded accept loop is
+/// busy — and that window stretches under `cargo llvm-cov`, whose instrumented
+/// binary runs several times slower. Single-shot requests were flaky there
+/// (the `/nope` connect failed on `main`'s coverage job); callers that already
+/// know the server is up use this instead.
+fn http_get_retry(port: u16, path: &str, secs: u64) -> std::io::Result<String> {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    loop {
+        match http_get(port, path) {
+            Ok(resp) => return Ok(resp),
+            Err(_) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 #[test]
 fn worker_metrics_server_serves_healthz_and_metrics() {
     let home = tempfile::tempdir().unwrap();
@@ -158,10 +178,10 @@ fn worker_metrics_server_serves_healthz_and_metrics() {
     assert!(healthz.contains("200 OK"), "healthz response: {healthz}");
     assert!(healthz.contains("ok"), "healthz body: {healthz}");
 
-    let metrics = http_get(port, "/metrics").expect("GET /metrics");
+    let metrics = http_get_retry(port, "/metrics", 15).expect("GET /metrics");
     assert!(metrics.contains("200 OK"), "metrics response: {metrics}");
 
-    let not_found = http_get(port, "/nope").expect("GET /nope");
+    let not_found = http_get_retry(port, "/nope", 15).expect("GET /nope");
     assert!(not_found.contains("404 Not Found"), "response: {not_found}");
 
     // Close stdin → the worker's readline loop exits and the process ends.
