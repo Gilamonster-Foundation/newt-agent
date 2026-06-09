@@ -1,11 +1,12 @@
 //! Newt-Agent MCP client.
 //!
 //! Connects to the MCP servers resolved by [`newt_core::mcp`] and reads their
-//! tool lists. This increment speaks **stdio** JSON-RPC 2.0 (newline-delimited)
-//! — the transport the vast majority of MCP servers use — behind a [`Transport`]
-//! seam so SSE/HTTP can follow without touching the protocol logic. Tools from
-//! different servers are namespaced `server__tool` (see [`namespaced`]) so two
-//! servers exposing the same tool name do not collide.
+//! tool lists. It speaks JSON-RPC 2.0 over two transports behind a [`Transport`]
+//! seam — **stdio** (spawned subprocess) and **streamable-HTTP** (`POST` with a
+//! JSON or SSE response, MCP protocol revision 2025-03-26) — so the protocol
+//! logic is written once. The legacy SSE-only transport is not implemented.
+//! Tools from different servers are namespaced `server__tool` (see
+//! [`namespaced`]) so two servers exposing the same tool name do not collide.
 //!
 //! The protocol logic ([`McpConnection`]) is generic over [`Transport`] and so
 //! is unit-tested against an in-memory mock — no subprocess needed.
@@ -13,6 +14,7 @@
 use anyhow::{anyhow, Context, Result};
 use newt_core::mcp::{McpServerEntry, TransportKind};
 use serde_json::{json, Value};
+use std::collections::VecDeque;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
@@ -210,27 +212,190 @@ impl Transport for StdioTransport {
     }
 }
 
-/// A connected stdio server and the tools it advertised.
+/// Streamable-HTTP transport (MCP revision 2025-03-26).
+///
+/// Each [`Transport::send`] `POST`s one JSON-RPC message to the server's single
+/// endpoint and buffers the reply(ies); [`Transport::recv`] drains that buffer.
+/// This maps the request/response HTTP model onto the line-oriented
+/// [`Transport`] seam without changing [`McpConnection`]:
+///
+/// - The server may answer a `POST` with either `application/json` (one
+///   message) or `text/event-stream` (SSE — one or more `data:` messages);
+///   both are buffered as JSON lines for `recv`.
+/// - A notification (no id, e.g. `notifications/initialized`) gets a `202
+///   Accepted` with no body — nothing to buffer.
+/// - The server's `Mcp-Session-Id` response header (sent on `initialize`) is
+///   captured and echoed on every subsequent request.
+///
+/// The per-request timeout lives on the HTTP client (the [`McpConnection`]
+/// timeout wraps `recv`, but for HTTP the latency is in `send`).
+pub struct HttpTransport {
+    client: reqwest::Client,
+    url: String,
+    headers: reqwest::header::HeaderMap,
+    session_id: Option<String>,
+    /// JSON-RPC messages parsed from `POST` responses, awaiting `recv`.
+    inbox: VecDeque<String>,
+}
+
+impl HttpTransport {
+    /// Build a streamable-HTTP transport from a discovered entry. Configured
+    /// `entry.headers` (e.g. `Authorization: Bearer …`) are sent on every
+    /// request. Does no network I/O — the handshake happens in `initialize`.
+    pub fn connect(entry: &McpServerEntry) -> Result<Self> {
+        let url = entry
+            .url
+            .clone()
+            .ok_or_else(|| anyhow!("http MCP server `{}` has no url", entry.name))?;
+        let mut headers = reqwest::header::HeaderMap::new();
+        for (key, value) in &entry.headers {
+            let name =
+                reqwest::header::HeaderName::from_bytes(key.as_bytes()).with_context(|| {
+                    format!("MCP server `{}`: invalid header name `{key}`", entry.name)
+                })?;
+            let val = reqwest::header::HeaderValue::from_str(value).with_context(|| {
+                format!(
+                    "MCP server `{}`: invalid value for header `{key}`",
+                    entry.name
+                )
+            })?;
+            headers.insert(name, val);
+        }
+        let client = reqwest::Client::builder()
+            .timeout(REQUEST_TIMEOUT)
+            .build()
+            .with_context(|| format!("building HTTP client for MCP server `{}`", entry.name))?;
+        Ok(Self {
+            client,
+            url,
+            headers,
+            session_id: None,
+            inbox: VecDeque::new(),
+        })
+    }
+}
+
+impl Transport for HttpTransport {
+    async fn send(&mut self, line: String) -> Result<()> {
+        use reqwest::header::{ACCEPT, CONTENT_TYPE};
+        let mut req = self
+            .client
+            .post(&self.url)
+            .headers(self.headers.clone())
+            .header(CONTENT_TYPE, "application/json")
+            .header(ACCEPT, "application/json, text/event-stream")
+            .body(line);
+        if let Some(sid) = &self.session_id {
+            req = req.header("Mcp-Session-Id", sid);
+        }
+        let resp = req.send().await.context("MCP HTTP request failed")?;
+
+        // Capture the session id from the initialize response for later calls.
+        if let Some(sid) = resp
+            .headers()
+            .get("Mcp-Session-Id")
+            .and_then(|v| v.to_str().ok())
+        {
+            self.session_id = Some(sid.to_string());
+        }
+
+        let status = resp.status();
+        let is_sse = resp
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(|ct| ct.contains("text/event-stream"))
+            .unwrap_or(false);
+        let body = resp
+            .text()
+            .await
+            .context("reading MCP HTTP response body")?;
+
+        if !status.is_success() {
+            return Err(anyhow!(
+                "MCP server returned HTTP {status}: {}",
+                body.trim()
+            ));
+        }
+        if is_sse {
+            self.inbox.extend(parse_sse_messages(&body));
+        } else if !body.trim().is_empty() {
+            // A `202 Accepted` notification ack has an empty body — skip it.
+            self.inbox.push_back(body);
+        }
+        Ok(())
+    }
+
+    async fn recv(&mut self) -> Result<Option<String>> {
+        Ok(self.inbox.pop_front())
+    }
+}
+
+/// Parse the `data:` payloads out of an SSE response body. Each blank-line-
+/// delimited event contributes one message (multiple `data:` lines in an event
+/// are joined with `\n`, per the SSE spec); non-`data` fields and comments are
+/// ignored. Returns the messages in order.
+fn parse_sse_messages(body: &str) -> Vec<String> {
+    let mut messages = Vec::new();
+    let mut data = String::new();
+    for line in body.lines() {
+        if let Some(rest) = line.strip_prefix("data:") {
+            // SSE strips exactly one optional leading space after the colon.
+            let rest = rest.strip_prefix(' ').unwrap_or(rest);
+            if !data.is_empty() {
+                data.push('\n');
+            }
+            data.push_str(rest);
+        } else if line.is_empty() && !data.is_empty() {
+            messages.push(std::mem::take(&mut data));
+        }
+    }
+    if !data.is_empty() {
+        messages.push(data);
+    }
+    messages
+}
+
+/// A [`Transport`] that is either stdio or streamable-HTTP, chosen per server.
+///
+/// An enum (rather than `Box<dyn Transport>`) keeps static dispatch — the
+/// trait's `async fn`s are not object-safe — and lets one `Vec<ConnectedServer>`
+/// hold a mix of transports.
+pub enum AnyTransport {
+    Stdio(StdioTransport),
+    Http(HttpTransport),
+}
+
+impl Transport for AnyTransport {
+    async fn send(&mut self, line: String) -> Result<()> {
+        match self {
+            Self::Stdio(t) => t.send(line).await,
+            Self::Http(t) => t.send(line).await,
+        }
+    }
+    async fn recv(&mut self) -> Result<Option<String>> {
+        match self {
+            Self::Stdio(t) => t.recv().await,
+            Self::Http(t) => t.recv().await,
+        }
+    }
+}
+
+/// A connected server and the tools it advertised.
 pub struct ConnectedServer {
     /// The configured server name (the namespace prefix).
     pub name: String,
     /// The live connection (for [`McpConnection::call_tool`]).
-    pub conn: McpConnection<StdioTransport>,
+    pub conn: McpConnection<AnyTransport>,
     /// Tools discovered via `tools/list`.
     pub tools: Vec<RemoteTool>,
 }
 
-/// Connect to one discovered **stdio** server: spawn, initialize, list tools.
-///
-/// Non-stdio transports return an error in this build (SSE/HTTP are a follow-up).
-pub async fn connect_stdio(entry: &McpServerEntry) -> Result<ConnectedServer> {
-    if entry.transport != TransportKind::Stdio {
-        return Err(anyhow!(
-            "server `{}`: only the stdio transport is supported in this build",
-            entry.name
-        ));
-    }
-    let transport = StdioTransport::spawn(entry)?;
+/// Initialize a transport and list its tools into a [`ConnectedServer`].
+async fn finish_connect(
+    entry: &McpServerEntry,
+    transport: AnyTransport,
+) -> Result<ConnectedServer> {
     let mut conn = McpConnection::new(transport);
     tokio::time::timeout(REQUEST_TIMEOUT, conn.initialize())
         .await
@@ -244,6 +409,30 @@ pub async fn connect_stdio(entry: &McpServerEntry) -> Result<ConnectedServer> {
         conn,
         tools,
     })
+}
+
+/// Connect to one discovered **stdio** server: spawn, initialize, list tools.
+pub async fn connect_stdio(entry: &McpServerEntry) -> Result<ConnectedServer> {
+    if entry.transport != TransportKind::Stdio {
+        return Err(anyhow!(
+            "server `{}`: connect_stdio called for a non-stdio transport",
+            entry.name
+        ));
+    }
+    finish_connect(entry, AnyTransport::Stdio(StdioTransport::spawn(entry)?)).await
+}
+
+/// Connect to one discovered **streamable-HTTP** server: dial, initialize, list
+/// tools. Use this for `TransportKind::Http` entries (the legacy SSE-only
+/// transport is not supported).
+pub async fn connect_http(entry: &McpServerEntry) -> Result<ConnectedServer> {
+    if entry.transport != TransportKind::Http {
+        return Err(anyhow!(
+            "server `{}`: connect_http called for a non-http transport",
+            entry.name
+        ));
+    }
+    finish_connect(entry, AnyTransport::Http(HttpTransport::connect(entry)?)).await
 }
 
 /// Namespace a remote tool name as `server__tool`.
@@ -332,5 +521,25 @@ mod tests {
         assert_eq!(namespaced("git", "status"), "git__status");
         assert_eq!(split_namespaced("git__status"), Some(("git", "status")));
         assert_eq!(split_namespaced("nounsep"), None);
+    }
+
+    #[test]
+    fn parse_sse_extracts_data_messages_in_order() {
+        let body = "event: message\ndata: {\"id\":1}\n\nevent: message\ndata: {\"id\":2}\n\n";
+        assert_eq!(parse_sse_messages(body), vec!["{\"id\":1}", "{\"id\":2}"]);
+    }
+
+    #[test]
+    fn parse_sse_joins_multiline_data_and_ignores_other_fields() {
+        // Two data lines in one event join with '\n'; `id:`/comments are skipped.
+        let body = ": keep-alive\nid: 7\ndata: {\"a\":1,\ndata: \"b\":2}\n\n";
+        assert_eq!(parse_sse_messages(body), vec!["{\"a\":1,\n\"b\":2}"]);
+    }
+
+    #[test]
+    fn parse_sse_handles_trailing_event_without_blank_line() {
+        let body = "data: {\"only\":true}";
+        assert_eq!(parse_sse_messages(body), vec!["{\"only\":true}"]);
+        assert!(parse_sse_messages("").is_empty());
     }
 }
