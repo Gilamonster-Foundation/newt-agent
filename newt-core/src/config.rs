@@ -367,6 +367,17 @@ pub struct TuiConfig {
     /// endpoints or when `num_ctx` is small.
     #[serde(default = "default_mid_loop_trim_threshold")]
     pub mid_loop_trim_threshold: usize,
+
+    /// Estimated-token threshold that triggers a mid-loop context trim,
+    /// independent of `mid_loop_trim_threshold` (which counts *messages*).
+    /// A single tool round can return a multi-KB file listing or JSON payload
+    /// that adds hundreds of thousands of tokens in one message — far below the
+    /// message-count threshold but well past the model's context window. When
+    /// set, trimming fires as soon as the estimated token count (chars / 4)
+    /// exceeds this value. `None` disables token-based trimming.
+    /// Default: `None` (message-count trimming only). See issue #223.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mid_loop_trim_tokens: Option<usize>,
 }
 
 fn default_tool_output_lines() -> usize {
@@ -420,6 +431,10 @@ pub struct ModelTuning {
     /// Per-model `mid_loop_trim_threshold` override.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mid_loop_trim_threshold: Option<usize>,
+
+    /// Per-model `mid_loop_trim_tokens` override (estimated-token trim trigger).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mid_loop_trim_tokens: Option<usize>,
 
     /// Per-model `max_tool_rounds` override.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -709,6 +724,7 @@ impl Default for TuiConfig {
             inference_timeout_secs: default_inference_timeout_secs(),
             keep_alive: default_keep_alive(),
             mid_loop_trim_threshold: default_mid_loop_trim_threshold(),
+            mid_loop_trim_tokens: None,
         }
     }
 }

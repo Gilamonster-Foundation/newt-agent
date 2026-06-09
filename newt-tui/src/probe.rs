@@ -142,6 +142,36 @@ impl CapabilityEntry {
         changed
     }
 
+    /// Record a hard context-window rejection (HTTP 400 /
+    /// `ContextWindowExceededError`) where the endpoint reported its real
+    /// maximum input size as `hard_limit` tokens.
+    ///
+    /// Sets `max_ok_input` to 80 % of the reported limit (leaving headroom for
+    /// the chars/4 estimate's inaccuracy) so the pre-send guard trims future
+    /// requests *before* they are dispatched, and persists the discovery so
+    /// later sessions don't repeat the same crash. Confidence drops to `Low`
+    /// because the previous tuning clearly overshot. See issue #223.
+    ///
+    /// Returns `true` if state changed (caller should save cache).
+    pub fn record_context_window_400(&mut self, hard_limit: u32, today: &str) -> bool {
+        // The reported `hard_limit` is authoritative about the model's true
+        // ceiling, so set the pre-send gate to 80 % of it directly — even when
+        // that raises a previously-low `max_ok_input` (issue #223 saw a stale
+        // 251_640 while the real max was 1_000_000, so the gate must move up to
+        // ~800_000, not stay needlessly tiny).
+        let new_cap = (hard_limit as u64 * 80 / 100) as u32;
+        self.max_ok_input = Some(new_cap);
+        self.consecutive_ok = 0;
+        self.tune_confidence = TuneConfidence::Low;
+        self.tune_date = Some(today.to_string());
+        // Rein in `safe_context` (Ollama num_ctx KV allocation) only when it was
+        // set higher — never raise it, to avoid VRAM surprises.
+        if self.safe_context.map(|s| new_cap < s).unwrap_or(true) {
+            self.safe_context = Some(new_cap);
+        }
+        true // always dirty after a 400
+    }
+
     /// Record an overflow (empty response at `input_tokens` tokens).
     /// Reduces `safe_context` to 75 % of the overflow point.
     /// Returns `true` if state changed (caller should save cache).
@@ -353,6 +383,37 @@ fn probe_tool_schema() -> serde_json::Value {
             }
         }
     }])
+}
+
+/// Parse a context-window-exceeded error and extract `(prompt_tokens,
+/// max_tokens)`.
+///
+/// Hosted endpoints (NVIDIA inference API → LiteLLM → Bedrock/Anthropic)
+/// surface context overflow as an HTTP 400 whose body contains a message like:
+///
+/// ```text
+/// litellm.ContextWindowExceededError: prompt is too long: 5960028 tokens > 1000000 maximum
+/// ```
+///
+/// The error body is embedded in the harness's `"inference endpoint 400: <body>"`
+/// string, so this scans the whole message for the `prompt is too long: …`
+/// pattern (the `N` and `M` numbers) rather than parsing structured JSON.
+/// Returns `None` when the pattern is absent (the 400 was for some other
+/// reason). See issue #223.
+pub fn parse_context_window_error(msg: &str) -> Option<(u64, u64)> {
+    // Anchor on the stable phrase; tolerate surrounding JSON/escaping.
+    let after = msg.split("prompt is too long:").nth(1)?;
+    let prompt = first_number(after)?;
+    let after_gt = after.split('>').nth(1)?;
+    let max = first_number(after_gt)?;
+    Some((prompt, max))
+}
+
+/// Return the first run of ASCII digits in `s` parsed as `u64`, if any.
+fn first_number(s: &str) -> Option<u64> {
+    s.split(|c: char| !c.is_ascii_digit())
+        .find(|t| !t.is_empty())
+        .and_then(|t| t.parse().ok())
 }
 
 /// Return `true` if `content` looks like a tool-call JSON object or array
@@ -674,6 +735,63 @@ mod tests {
         // 40_000 * 75% = 30_000 > 3_750 → new_safe > old; plan says keep the lower.
         // Actually looking at the impl: changed = new_safe < current → false → skip.
         assert_eq!(e.safe_context, Some(3_750));
+    }
+
+    #[test]
+    fn parse_context_window_error_none_for_unrelated_400() {
+        let msg = "inference endpoint 400: invalid api key";
+        assert_eq!(super::parse_context_window_error(msg), None);
+    }
+
+    #[test]
+    fn parse_context_window_error_extracts_prompt_and_max() {
+        // The real litellm body from issue #223, embedded in the harness's
+        // "inference endpoint 400: <body>" wrapper.
+        let msg = "inference endpoint 400: litellm.ContextWindowExceededError: prompt is too long: 5960028 tokens > 1000000 maximum";
+        assert_eq!(
+            super::parse_context_window_error(msg),
+            Some((5_960_028, 1_000_000))
+        );
+    }
+
+    #[test]
+    fn parse_context_window_error_none_without_max_clause() {
+        // Truncated message missing the max half must not panic.
+        let msg = "prompt is too long: 5960028 tokens";
+        assert_eq!(super::parse_context_window_error(msg), None);
+    }
+
+    #[test]
+    fn record_context_window_400_tightens_max_ok_input_to_80pct() {
+        // Reproduces issue #223: max_ok_input was stale-high (251_640) while the
+        // endpoint's real limit is 1_000_000. A 400 must pull the gate down.
+        let mut e = make_entry();
+        e.max_ok_input = Some(251_640);
+        let dirty = e.record_context_window_400(1_000_000, "2026-06-08");
+        assert!(dirty);
+        // 1_000_000 * 80% = 800_000 (headroom below the hard max).
+        assert_eq!(e.max_ok_input, Some(800_000));
+        assert_eq!(e.tune_confidence, TuneConfidence::Low);
+        assert_eq!(e.consecutive_ok, 0);
+    }
+
+    #[test]
+    fn record_context_window_400_lowers_an_overshot_cap() {
+        // When tuning had overshot (max_ok_input above the model's real max),
+        // a 400 pulls the gate down to 80% of the reported limit.
+        let mut e = make_entry();
+        e.max_ok_input = Some(2_000_000);
+        e.record_context_window_400(1_000_000, "2026-06-08");
+        assert_eq!(e.max_ok_input, Some(800_000));
+    }
+
+    #[test]
+    fn record_context_window_400_caps_safe_context_without_raising_it() {
+        let mut e = make_entry();
+        e.safe_context = Some(64_000); // small KV window
+                                       // 80% of 1_000_000 = 800_000 > 64_000 → safe_context must NOT rise.
+        e.record_context_window_400(1_000_000, "2026-06-08");
+        assert_eq!(e.safe_context, Some(64_000));
     }
 
     #[test]
