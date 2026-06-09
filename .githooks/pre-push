@@ -9,6 +9,7 @@
 # Install: `just install-hooks` (or `git config core.hooksPath .githooks`)
 #
 # PIPELINE PARITY: This hook mirrors .github/workflows/ci.yml.
+#   - `just shell-check` matches the lint job's "agent-bridle stub guard" step
 #   - `just check` matches the lint + test jobs (fmt + clippy + cargo test)
 #   - `just cov-ci` matches the coverage job (cargo llvm-cov with floor)
 # When editing this hook, update the workflow to match.
@@ -59,6 +60,12 @@ else
     echo "             rustup component add llvm-tools-preview"
     SKIP_COV=1
 fi
+
+# Guard: never push a build patched onto the real brush shell (agent-bridle
+# `main`) — it reintroduces the brush git dep and breaks crates.io publish.
+# `just shell-real` is a local dev convenience only.
+echo "[pre-push] running just shell-check..."
+just shell-check
 
 echo "[pre-push] running just check..."
 just check

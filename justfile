@@ -151,6 +151,51 @@ cov-ci:
 cov-ci:
     $floor = 80; cargo llvm-cov --workspace --no-report; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; cargo llvm-cov report --lcov --output-path lcov.info --ignore-filename-regex 'pyo3_module\.rs$'; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; $summary = cargo llvm-cov report --summary-only --ignore-filename-regex 'pyo3_module\.rs$'; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; $summary; $total = $summary | Where-Object { $_ -match '^TOTAL\s+' } | Select-Object -First 1; if (-not $total) { Write-Error 'ERROR: could not parse line coverage from cargo-llvm-cov summary'; exit 1 }; $cols = $total -split '\s+'; $line_cov = [double]($cols[9].TrimEnd('%')); Write-Output "measured line coverage: $line_cov% (floor: $floor%)"; if ($line_cov -lt $floor) { Write-Error "ERROR: workspace line coverage $line_cov% is below the $floor% floor"; exit 1 }; Write-Output "coverage gate OK: $line_cov% >= $floor%"
 
+# --- agent-bridle shell toggle (publishable stub vs. real confined shell) ---
+#
+# `main`/release MUST stay on agent-bridle's `feat/stub-shell` branch: it
+# carries NO brush git deps, so the workspace publishes to crates.io (see the
+# [patch.crates-io] block in Cargo.toml, and #206 / #208). The real
+# Caveats-confined shell lives on agent-bridle `main`, but it pulls the brush
+# git fork — which crates.io forbids in any form (even optional / feature-gated)
+# — so it can only ever be a DEV-ONLY override, never committed to `main`.
+#
+# A cargo `--features` flag can't express this (it would swap a dependency
+# *source*, not toggle a feature), so the lever is this recipe pair plus a
+# guard. `shell-real` flips the local patch onto the real shell; `shell-stub`
+# flips it back; `shell-check` (run by the pre-push hook + CI) fails if the
+# dev override ever reaches `main`.
+
+# Switch the LOCAL build to the real confined brush shell (agent-bridle `main`).
+# DEV ONLY — the resulting Cargo.toml/Cargo.lock must NOT be committed (it
+# reintroduces the brush git dep and breaks crates.io publish). Run
+# `just shell-stub` before you commit. Rebuild after this to pick it up.
+shell-real:
+    sed -i -E 's|(agent-bridle[a-z-]*[[:space:]]*= \{ git = "[^"]*agent-bridle", branch = )"feat/stub-shell"|\1"main"|' Cargo.toml
+    @echo "⚠️  agent-bridle → REAL brush shell (agent-bridle main). DEV ONLY."
+    @echo "⚠️  Do NOT commit Cargo.toml / Cargo.lock — run 'just shell-stub' first."
+    @echo "   Now rebuild: cargo build --workspace"
+
+# Switch back to the publishable stub shell (the release / main default).
+shell-stub:
+    sed -i -E 's|(agent-bridle[a-z-]*[[:space:]]*= \{ git = "[^"]*agent-bridle", branch = )"main"|\1"feat/stub-shell"|' Cargo.toml
+    @echo "agent-bridle → stub shell (publishable). Safe to commit."
+    @echo "   Now rebuild: cargo build --workspace"
+
+# Guard: fail if the dev (real-shell) override is present in Cargo.toml.
+# Run by the pre-push hook and mirrored inline in CI.
+# PIPELINE PARITY: the same grep lives in .github/workflows/ci.yml (lint job).
+shell-check:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if grep -Eq 'agent-bridle[a-z-]*[[:space:]]*= \{ git = "[^"]*agent-bridle", branch = "main"' Cargo.toml; then
+        echo "ERROR: [patch.crates-io] points agent-bridle at 'main' (real brush shell)." >&2
+        echo "       That build cannot publish to crates.io. Run 'just shell-stub'" >&2
+        echo "       before committing/pushing — see the shell-toggle note in the justfile." >&2
+        exit 1
+    fi
+    echo "shell guard OK: agent-bridle patch is on the publishable stub branch."
+
 # --- Evaluation ---
 
 # Run the end-to-end eval suite against a real local Ollama.
