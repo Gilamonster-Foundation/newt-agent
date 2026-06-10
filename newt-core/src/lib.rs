@@ -15,6 +15,7 @@ pub mod memory;
 pub mod metrics;
 pub mod model_id;
 pub mod pricing;
+pub mod prune;
 pub mod role_profile;
 pub mod router;
 pub mod session;

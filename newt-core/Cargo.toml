@@ -29,6 +29,11 @@ uuid.workspace = true
 # enforcement-side type are now literally the same Rust type.
 agent-mesh-protocol = { workspace = true }
 
+# Step 18.3 (issue #247): content hashing for the structural-prune
+# duplicate-collapse pass. Already in newt-core's build graph transitively
+# via agent-mesh-protocol — promoting it to a direct dep adds no new crate.
+blake3 = "1"
+
 # TODO: depend on thoon-core once it publishes (currently path-only in hermes-thoon).
 # thoon-core = "0.5"
 
