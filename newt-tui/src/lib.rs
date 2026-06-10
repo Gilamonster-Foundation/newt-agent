@@ -2972,10 +2972,7 @@ fn build_check_cmd(cfg: &newt_core::Config) -> Option<String> {
 /// Run the configured build-check command in `workspace` and return a compact
 /// result string appended to the tool output so the model sees it immediately.
 fn run_build_check(cmd: &str, workspace: &str) -> String {
-    let result = std::process::Command::new("sh")
-        .args(["-c", cmd])
-        .current_dir(workspace)
-        .output();
+    let result = build_check_shell(cmd).current_dir(workspace).output();
     match result {
         Ok(out) if out.status.success() => "  ✓ build check passed".to_string(),
         Ok(out) => {
@@ -2987,6 +2984,40 @@ fn run_build_check(cmd: &str, workspace: &str) -> String {
         }
         Err(e) => format!("  ⚠ build check could not run: {e}"),
     }
+}
+
+#[cfg(windows)]
+fn build_check_shell(cmd: &str) -> std::process::Command {
+    let mut shell = std::process::Command::new("cmd");
+    shell.args(["/C", cmd]);
+    shell
+}
+
+#[cfg(not(windows))]
+fn build_check_shell(cmd: &str) -> std::process::Command {
+    let mut shell = std::process::Command::new("sh");
+    shell.args(["-c", cmd]);
+    shell
+}
+
+#[cfg(all(test, windows))]
+fn passing_build_check_cmd() -> &'static str {
+    "exit /B 0"
+}
+
+#[cfg(all(test, not(windows)))]
+fn passing_build_check_cmd() -> &'static str {
+    "true"
+}
+
+#[cfg(all(test, windows))]
+fn failing_build_check_cmd(message: &str) -> String {
+    format!("echo {message} 1>&2 & exit /B 1")
+}
+
+#[cfg(all(test, not(windows)))]
+fn failing_build_check_cmd(message: &str) -> String {
+    format!("echo {message} >&2; exit 1")
 }
 
 /// Print tool output truncated to the configured line limit.
@@ -7292,12 +7323,15 @@ mod helper_fn_tests {
     fn run_build_check_reports_pass_fail_and_spawn_error() {
         let ws = tempfile::TempDir::new().unwrap();
         let ws_str = ws.path().to_string_lossy();
-        assert_eq!(run_build_check("true", &ws_str), "  ✓ build check passed");
-        let failed = run_build_check("echo boom >&2; exit 1", &ws_str);
+        assert_eq!(
+            run_build_check(passing_build_check_cmd(), &ws_str),
+            "  ✓ build check passed"
+        );
+        let failed = run_build_check(&failing_build_check_cmd("boom"), &ws_str);
         assert!(failed.contains("✗ build check failed"), "got: {failed}");
         assert!(failed.contains("boom"), "stderr excerpt shown: {failed}");
         // A nonexistent workspace dir → the command can't even spawn.
-        let err = run_build_check("true", "/definitely/not/a/dir");
+        let err = run_build_check(passing_build_check_cmd(), "/definitely/not/a/dir");
         assert!(err.contains("⚠ build check could not run"), "got: {err}");
     }
 
@@ -8016,17 +8050,18 @@ mod execute_tool_branch_tests {
             serde_json::json!({"path": "f.txt", "old_string": "old", "new_string": "new"}),
             ws.path(),
             &caveats,
-            Some("true"),
+            Some(passing_build_check_cmd()),
         )
         .await;
         assert!(out.contains("✓ build check passed"), "got: {out}");
 
+        let failing_check = failing_build_check_cmd("broke");
         let out = run_tool(
             "edit_file",
             serde_json::json!({"path": "f.txt", "old_string": "new", "new_string": "newer"}),
             ws.path(),
             &caveats,
-            Some("echo broke >&2; exit 1"),
+            Some(&failing_check),
         )
         .await;
         assert!(out.contains("✗ build check failed"), "got: {out}");

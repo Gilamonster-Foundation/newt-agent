@@ -6,11 +6,12 @@
 //! agent loop: it advertises the remote tools (namespaced `server__tool`) in the
 //! tool list, and routes a namespaced call to the right server.
 //!
-//! Per the chosen scope this is **stdio only** and carries **no Caveats leash**
-//! on the remote tools — they run with whatever authority their own server has.
+//! It connects **stdio** and **streamable-HTTP** servers, and carries **no
+//! Caveats leash** on the remote tools — they run with whatever authority their
+//! own server has.
 
 use newt_core::mcp::{McpServerEntry, TransportKind};
-use newt_mcp_client::{connect_stdio, namespaced, split_namespaced, ConnectedServer};
+use newt_mcp_client::{connect_http, connect_stdio, namespaced, split_namespaced, ConnectedServer};
 use serde_json::{json, Value};
 
 /// The session's connected MCP servers.
@@ -40,15 +41,22 @@ impl Mcp {
         );
         let mut servers = Vec::new();
         for entry in &entries {
-            if entry.transport != TransportKind::Stdio {
-                tracing::info!(
-                    "MCP server `{}`: {:?} transport not supported yet — skipped",
-                    entry.name,
-                    entry.transport
-                );
-                continue;
-            }
-            match connect_stdio(entry).await {
+            // Dispatch on transport. The legacy SSE-only transport (a separate
+            // GET event-stream + POST endpoint) is not implemented; modern
+            // servers use streamable-HTTP (`type: "http"`).
+            let result = match entry.transport {
+                TransportKind::Stdio => connect_stdio(entry).await,
+                TransportKind::Http => connect_http(entry).await,
+                TransportKind::Sse => {
+                    tracing::warn!(
+                        "MCP server `{}`: legacy SSE transport is not supported \
+                         (use streamable-HTTP, `type = \"http\"`) — skipped",
+                        entry.name
+                    );
+                    continue;
+                }
+            };
+            match result {
                 Ok(connected) => servers.push(connected),
                 Err(e) => tracing::warn!("MCP server `{}` skipped: {e}", entry.name),
             }
