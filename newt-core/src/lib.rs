@@ -4,6 +4,7 @@
 //! into a `Tier` (FAST / STANDARD / COMPLEX / REVIEW), and asks the
 //! configured backends which can serve that tier.
 
+pub mod agents;
 pub mod caveats;
 pub mod config;
 pub mod conversation;
@@ -23,10 +24,12 @@ pub mod tuning;
 pub mod pyo3_module;
 
 pub use agent_mesh_protocol::{Caveats, CountBound, Scope};
+pub use agents::AgentsProvider;
 pub use caveats::{CaveatsExt, CountBoundExt, ScopeExt};
 pub use config::{
-    BackendConfig, BackendKind, ChatStyle, Config, ConversationsConfig, EditMode, LogConfig,
-    MemoryConfig, MemoryProviderKind, PermissionPreset, SkillsConfig, ToolPermissions, TuiConfig,
+    AgentsConfig, BackendConfig, BackendKind, ChatStyle, Config, ConversationsConfig, EditMode,
+    LogConfig, MemoryConfig, MemoryProviderKind, PermissionPreset, SkillsConfig, ToolPermissions,
+    TuiConfig,
 };
 pub use conversation::{
     new_conversation_id, session_plan_dir, session_plan_path, ConversationRecord,

@@ -70,6 +70,16 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "TOKENS")]
     pub num_ctx: Option<u32>,
 
+    /// Directory to search for AGENTS.md/CLAUDE.md, or a specific instructions
+    /// file. Default: the workspace (`./`). Also `[agents] path`.
+    #[arg(long, global = true, value_name = "PATH")]
+    pub agents_file: Option<String>,
+
+    /// Don't load AGENTS.md/CLAUDE.md into the system prompt (overrides
+    /// `[agents] enabled`).
+    #[arg(long, global = true, default_value_t = false)]
+    pub no_agents_file: bool,
+
     /// Activate a Python virtual environment for all agent-run commands.
     /// Injects `VIRTUAL_ENV` and prepends the venv's `bin/` to `PATH` inside
     /// the confined shell, and grants exec permission for every executable in
@@ -210,6 +220,13 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             }
             if let Some(n) = cli.num_ctx {
                 unsafe { std::env::set_var("NEWT_NUM_CTX", n.to_string()) };
+            }
+            // --no-agents-file / --agents-file thread to the TUI via env vars.
+            if cli.no_agents_file {
+                unsafe { std::env::set_var("NEWT_NO_AGENTS_FILE", "1") };
+            }
+            if let Some(p) = &cli.agents_file {
+                unsafe { std::env::set_var("NEWT_AGENTS_FILE", p) };
             }
             // Resolve splash preference: CLI flags override config, and
             // --splash overrides --no-splash (enforced by overrides_with).
@@ -419,6 +436,21 @@ mod tests {
 
         assert!(cli.debug);
         assert_eq!(cli.num_ctx, Some(8192));
+    }
+
+    #[test]
+    fn parses_agents_file_global() {
+        let cli = Cli::try_parse_from(["newt", "--agents-file", "docs/AGENTS.md"]).unwrap();
+        assert_eq!(cli.agents_file.as_deref(), Some("docs/AGENTS.md"));
+        assert!(!cli.no_agents_file);
+    }
+
+    #[test]
+    fn parses_no_agents_file_global() {
+        let cli = Cli::try_parse_from(["newt", "code", "--no-agents-file"]).unwrap();
+        assert!(cli.no_agents_file);
+        assert_eq!(cli.agents_file, None);
+        assert!(matches!(cli.command, Some(Command::Code { .. })));
     }
 
     #[test]

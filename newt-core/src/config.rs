@@ -53,6 +53,12 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory: Option<MemoryConfig>,
 
+    /// Project-instruction loading (`AGENTS.md` / `CLAUDE.md`) into the system
+    /// prompt. Enabled by default. Overridable via `--agents-file` /
+    /// `--no-agents-file`.
+    #[serde(default)]
+    pub agents: AgentsConfig,
+
     /// newt-native MCP servers (`[[mcp_servers]]`). Merged with the servers
     /// discovered from Claude Code's config by [`crate::mcp::discover`]; these
     /// take precedence on a name clash. Empty by default.
@@ -302,6 +308,35 @@ pub enum MemoryProviderKind {
     RollingWindow,
     TokenBudget,
     Summarizing,
+}
+
+// ---------------------------------------------------------------------------
+// Project-instruction (AGENTS.md / CLAUDE.md) config
+// ---------------------------------------------------------------------------
+
+/// Project-instruction loading stored under `[agents]` in `newt.toml`.
+///
+/// When enabled (the default), newt reads `AGENTS.md` / `CLAUDE.md` from the
+/// workspace and injects them into the agent's system prompt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AgentsConfig {
+    /// Whether to load project instructions into the system prompt. Default: true.
+    pub enabled: bool,
+    /// Directory to search for `AGENTS.md` / `CLAUDE.md`, or a specific
+    /// instructions file. Relative paths are resolved against the workspace.
+    /// Default: the workspace root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+}
+
+impl Default for AgentsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            path: None,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -909,6 +944,7 @@ impl Default for Config {
             tui: None,
             pricing: None,
             memory: None,
+            agents: AgentsConfig::default(),
             mcp_servers: Vec::new(),
             logs: None,
             skills: None,
@@ -1249,6 +1285,45 @@ max_per_workspace = 25
         .unwrap();
 
         assert_eq!(cfg.conversations.unwrap_or_default().max_per_workspace, 25);
+    }
+
+    #[test]
+    fn agents_config_default_enabled() {
+        let cfg = AgentsConfig::default();
+        assert!(cfg.enabled);
+        assert_eq!(cfg.path, None);
+        // A bare Config defaults agents to enabled too.
+        assert!(Config::default().agents.enabled);
+    }
+
+    #[test]
+    fn agents_config_roundtrips_with_path() {
+        let cfg: Config = toml::from_str(
+            r#"
+[agents]
+path = "docs/instructions"
+"#,
+        )
+        .unwrap();
+        assert!(cfg.agents.enabled);
+        assert_eq!(cfg.agents.path.as_deref(), Some("docs/instructions"));
+
+        // Serialize back out and confirm the path survives.
+        let text = toml::to_string(&cfg).unwrap();
+        assert!(text.contains("docs/instructions"));
+    }
+
+    #[test]
+    fn agents_config_can_be_disabled() {
+        let cfg: Config = toml::from_str(
+            r#"
+[agents]
+enabled = false
+"#,
+        )
+        .unwrap();
+        assert!(!cfg.agents.enabled);
+        assert_eq!(cfg.agents.path, None);
     }
 
     #[test]
