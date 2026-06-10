@@ -362,7 +362,7 @@ fn parse_sse_messages(body: &str) -> Vec<String> {
 /// trait's `async fn`s are not object-safe — and lets one `Vec<ConnectedServer>`
 /// hold a mix of transports.
 pub enum AnyTransport {
-    Stdio(StdioTransport),
+    Stdio(Box<StdioTransport>),
     Http(HttpTransport),
 }
 
@@ -419,7 +419,11 @@ pub async fn connect_stdio(entry: &McpServerEntry) -> Result<ConnectedServer> {
             entry.name
         ));
     }
-    finish_connect(entry, AnyTransport::Stdio(StdioTransport::spawn(entry)?)).await
+    finish_connect(
+        entry,
+        AnyTransport::Stdio(Box::new(StdioTransport::spawn(entry)?)),
+    )
+    .await
 }
 
 /// Connect to one discovered **streamable-HTTP** server: dial, initialize, list
