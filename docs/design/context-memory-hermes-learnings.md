@@ -332,3 +332,77 @@ Every phase has before/after numbers defined **in advance** in
 [`docs/testing/context-memory-benchmark.md`](../testing/context-memory-benchmark.md)
 — baseline captured before 17.1a lands, kyln-benchmark style (quantified
 TL;DR, honest interpretation, reproduce instructions, citability checklist).
+
+---
+
+## 6. Mesh-readiness amendment — ordering is causal, time is a claim (2026-06-10)
+
+> **Added at the human maintainer's direction while reviewing this PR.**
+> For the conversation store this **supersedes** every "MRU by `updated_at` /
+> `last_active = MAX(message ts)`" mechanism in §1 (the *Sessions* gap-matrix
+> `last_active` row, which had proposed *adopting* hermes's timestamp MRU) and
+> in §2 Phase 17. The decision below is **binding on 17.1a** — it is cheap to
+> choose now and expensive to retrofit once rows disperse over the mesh.
+
+**There is no mesh-store substrate today (verified against the workspace).**
+`agent-mesh` is a *messaging / coordination* fabric, not storage:
+`agent-mesh-protocol` (ed25519 user root of trust, cross-signed by the GitHub
+key; signed envelopes), `agent-mesh-discovery` (mDNS), `agent-mesh-transport`
+(authenticated QUIC / iroh), `agent-mesh-bus` (pub/sub + request/reply).
+`newt-mesh` is only the ask/reply surface. Nothing in the mesh stores,
+replicates, or merges conversations. **"Phase 16 `MeshStore`" is a promissory
+note with no backing code** — do not assume it exists.
+
+**The mesh already forbids wall-clock as a coordination primitive; newt must
+match it.** Two facts from the sibling crates:
+
+- `agent-mesh-protocol` README: *"Wall-clock time is treated as a claim, never
+  as a coordination primitive."*
+- `agent-mesh-bus/src/replay.rs` `SequenceTracker`: peers are ordered by a
+  **per-peer strictly-monotonic sequence number** (`sequence > last_seen`),
+  backed by a nonce cache — causal, never chronological.
+
+MRU-by-timestamp in `conversations.db` would therefore **contradict the very
+layer it is meant to federate with**: once a user's agents disperse
+conversation history p2p (all bound to one GitHub identity), we would be
+merging records ordered by wall-clock across nodes whose clocks the transport
+beneath us has explicitly chosen not to trust — the classic non-monotonic-clock
+merge bite.
+
+**Schema decision for 17.1a — each agent is its own clock.** This is *not* a
+new primitive; it is the pragmatic per-node ratchet that a system like
+agent-mesh already implies. Each agent ticks its own counter and **signs its
+ticks**:
+
+1. **Floor — signed per-writer monotonic tick (a Lamport clock per agent).**
+   Each conversation/turn carries `(writer_fingerprint, seq)`, where `seq` is
+   strictly monotonic *per writer* (writer = this agent's mesh-key fingerprint)
+   and each tick is signed by the issuing agent. Single-machine today: one
+   writer, `seq` = turn count, MRU = max `seq` with `writer_fingerprint` as
+   tiebreak — no clock involved. This is the *same* primitive `SequenceTracker`
+   already applies to envelopes.
+2. **Target — content-chained turns (a per-node merkle log).** Each turn
+   carries `prev_hash` = BLAKE3 of the prior turn → the conversation is a
+   content-addressed DAG: **each node maintains its own merkle log of events in
+   its own view of history.** "Latest" is the chain tip; tampering is
+   self-evident. blake3 already lands in newt-core at 17.2, so `prev_hash` is
+   nearly free, and it is the kyln / ContentAddressable thesis applied to
+   conversations — the record carries its own proof of order.
+
+Two agents will *naturally* hold **different merkle logs** — that is expected,
+not a fault. Reconciling them across the mesh is a **separate concern, handled
+by other means** (agents cross-signing one another's tips; a future
+`agent-mesh-store`), **never** by trusting a shared clock. Do not design that
+reconciliation in Phase 17.
+
+In every case wall-clock `created_at` / `started_at` survives **only as a
+display field — a claim, never the ordering key** — matching the protocol
+README verbatim.
+
+**Flagged future work, out of scope for Phases 17-19: `agent-mesh-store`.**
+Shared agentic knowledge — the `knowledge/board` pattern, but p2p over
+agent-mesh and **independent of any single backing store** — likely wants its
+own crate that reconciles per-agent merkle logs via cross-signing. Phase 17's
+conversation store should be *designed so it can later become a producer /
+consumer of such a store* (hence the signed per-writer tick and the content
+chain), but the store itself is not built here.
