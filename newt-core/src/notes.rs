@@ -276,8 +276,12 @@ impl NoteStore {
         if new_len > self.char_limit {
             return Err(self.over_budget_error(new_len));
         }
+        // Persist first, commit to memory only on success — a failed save
+        // (e.g. lock contention) must not leave a phantom in-memory entry
+        // that the next successful write would silently persist.
+        self.save(&candidate)?;
         self.entries = candidate;
-        self.save()
+        Ok(())
     }
 
     /// Replace the single entry containing `old_substr` with `new_text`.
@@ -295,16 +299,20 @@ impl NoteStore {
         if new_len > self.char_limit {
             return Err(self.over_budget_error(new_len));
         }
+        self.save(&candidate)?;
         self.entries = candidate;
-        self.save()
+        Ok(())
     }
 
     /// Remove the single entry containing `substr`.
     /// Exactly one entry must match.
     pub fn remove(&mut self, substr: &str) -> anyhow::Result<()> {
         let idx = self.find_one(substr)?;
-        self.entries.remove(idx);
-        self.save()
+        let mut candidate = self.entries.clone();
+        candidate.remove(idx);
+        self.save(&candidate)?;
+        self.entries = candidate;
+        Ok(())
     }
 
     // -- persistence -------------------------------------------------------
@@ -363,7 +371,10 @@ impl NoteStore {
     /// both Unix and Windows). A crash mid-write leaves only a stray
     /// `NOTES.md.tmp`, which the next save overwrites; reads only ever see
     /// the real file.
-    fn save(&self) -> anyhow::Result<()> {
+    ///
+    /// Takes the entries to persist rather than reading `self.entries` so
+    /// mutators can write first and commit to memory only on success.
+    fn save(&self, entries: &[String]) -> anyhow::Result<()> {
         if let Some(parent) = self.path.parent() {
             if !parent.as_os_str().is_empty() {
                 std::fs::create_dir_all(parent)?;
@@ -373,7 +384,7 @@ impl NoteStore {
         let tmp = self
             .path
             .with_file_name(format!("{}.tmp", self.file_name()));
-        std::fs::write(&tmp, Self::serialize(&self.entries))?;
+        std::fs::write(&tmp, Self::serialize(entries))?;
         std::fs::rename(&tmp, &self.path)?;
         Ok(())
         // _lock dropped here — lock file removed.
@@ -842,14 +853,21 @@ mod tests {
 
         // A holds the lock (simulating a write in progress).
         let guard = a.acquire_lock().unwrap();
-        let err = b.add("blocked fact").unwrap_err().to_string();
+        let err = b.add("rejected entry").unwrap_err().to_string();
         assert!(err.contains(".NOTES.md.lock"), "{err}");
+        // The failed save must not leave a phantom in-memory entry that a
+        // later successful write would silently persist.
+        assert!(b.is_empty(), "failed add must not mutate live entries");
         drop(guard);
 
         // Lock released — B can write now.
-        b.add("unblocked fact").unwrap();
+        b.add("accepted entry").unwrap();
         let raw = std::fs::read_to_string(&path).unwrap();
-        assert!(raw.contains("unblocked fact"));
+        assert!(raw.contains("accepted entry"));
+        assert!(
+            !raw.contains("rejected entry"),
+            "rejected write must not leak to disk"
+        );
     }
 
     #[tokio::test]
