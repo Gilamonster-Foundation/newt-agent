@@ -9,6 +9,7 @@
 use assert_cmd::Command;
 use predicates::prelude::*;
 use std::io::Write;
+use std::path::{Path, PathBuf};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -38,6 +39,46 @@ fn doctor(config: &tempfile::NamedTempFile, home: &tempfile::TempDir) -> Command
     cmd
 }
 
+fn path_with_front(front: &Path) -> std::ffi::OsString {
+    let mut paths = vec![front.to_path_buf()];
+    if let Some(existing) = std::env::var_os("PATH") {
+        paths.extend(std::env::split_paths(&existing));
+    }
+    std::env::join_paths(paths).unwrap()
+}
+
+fn write_provider_probe(dir: &Path, name: &str, exit_code: i32) -> String {
+    let command_name = provider_probe_name(name);
+    let path = dir.join(&command_name);
+    write_provider_probe_file(&path, exit_code);
+    command_name
+}
+
+#[cfg(windows)]
+fn provider_probe_name(name: &str) -> String {
+    format!("{name}.cmd")
+}
+
+#[cfg(not(windows))]
+fn provider_probe_name(name: &str) -> String {
+    name.to_string()
+}
+
+#[cfg(windows)]
+fn write_provider_probe_file(path: &PathBuf, exit_code: i32) {
+    std::fs::write(path, format!("@echo off\r\nexit /b {exit_code}\r\n")).unwrap();
+}
+
+#[cfg(not(windows))]
+fn write_provider_probe_file(path: &PathBuf, exit_code: i32) {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::write(path, format!("#!/bin/sh\nexit {exit_code}\n")).unwrap();
+    let mut permissions = std::fs::metadata(path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(path, permissions).unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn doctor_reports_backend_and_provider_statuses() {
     let ok_server = MockServer::start().await;
@@ -55,6 +96,10 @@ async fn doctor_reports_backend_and_provider_statuses() {
         .expect(1)
         .mount(&err_server)
         .await;
+
+    let provider_dir = tempfile::tempdir().unwrap();
+    let present_command = write_provider_probe(provider_dir.path(), "newt-provider-present", 0);
+    let broken_command = write_provider_probe(provider_dir.path(), "newt-provider-broken", 1);
 
     let config = write_config(&format!(
         r#"
@@ -80,12 +125,12 @@ default_tier_order = ["FAST"]
 
 [[providers]]
 name = "present"
-command = "true"
+command = "{present_command}"
 tiers = ["FAST"]
 
 [[providers]]
 name = "broken"
-command = "false"
+command = "{broken_command}"
 tiers = ["FAST"]
 
 [[providers]]
@@ -95,11 +140,15 @@ tiers = ["FAST"]
 "#,
         ok = ok_server.uri(),
         err = err_server.uri(),
+        present_command = present_command,
+        broken_command = broken_command,
     ));
     let home = tempfile::tempdir().unwrap();
 
-    doctor(&config, &home)
-        .assert()
+    let mut cmd = doctor(&config, &home);
+    cmd.env("PATH", path_with_front(provider_dir.path()));
+
+    cmd.assert()
         .success()
         .stdout(predicate::str::contains(format!(
             "good ({}) — OK",
@@ -112,12 +161,12 @@ tiers = ["FAST"]
         .stdout(predicate::str::contains(
             "down (http://127.0.0.1:1) — unreachable",
         ))
-        .stdout(predicate::str::contains(
-            "present (command: true) — found on PATH",
-        ))
-        .stdout(predicate::str::contains(
-            "broken (command: false) — found but exited with error",
-        ))
+        .stdout(predicate::str::contains(format!(
+            "present (command: {present_command}) — found on PATH"
+        )))
+        .stdout(predicate::str::contains(format!(
+            "broken (command: {broken_command}) — found but exited with error"
+        )))
         .stdout(predicate::str::contains(
             "absent (command: newt-test-no-such-binary) — not found on PATH",
         ))

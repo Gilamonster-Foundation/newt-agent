@@ -2014,10 +2014,12 @@ version = "0.6.7"
 dependencies = [
  "anyhow",
  "newt-core",
+ "reqwest",
  "serde",
  "serde_json",
  "tokio",
  "tracing",
+ "wiremock",
 ]
 
 [[package]]
