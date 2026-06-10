@@ -998,6 +998,30 @@ become issues only **after** the spikes (C, H) answer.
 
 ---
 
+# Phases 17-19 — Context, memory & conversation (hermes-agent learnings)
+
+**Canonical spec: [`docs/design/context-memory-hermes-learnings.md`](design/context-memory-hermes-learnings.md)**
+(merged via #243) — gap matrix, per-step contracts, and **§6: ordering is
+causal (signed per-writer ticks, BLAKE3 content chains); wall-clock is a
+display claim, never an ordering key — binding on every schema below.**
+This entry is deliberately thin: the design doc owns the step tables (a
+duplicated copy here drifted within hours during review — once is enough).
+Benchmarks with a captured baseline gate every phase:
+[`docs/testing/context-memory-benchmark.md`](testing/context-memory-benchmark.md)
+(baseline = #245, lands before 17.1a).
+
+| Phase | One line | Umbrella issue |
+|---|---|---|
+| **17** | Durable conversations + recall: SQLite/FTS5 store, §6 causal ordering, workspace identity = blake3(remote+branch), `recall` tool, auto-resume by activity tick | #246 |
+| **18** | Token truth + compression v2: prompt-tokens-preferred accounting, structural prune → anchored boundary → redacted summary (summarize, don't discard — retires the #223 class) | #247 |
+| **19** | Agent-curated memory: `save_note` tool where the char-cap is the curator, in-band nudge, write-time security scan | #248 |
+
+**Gate:** Step 9.7 (#244) — every †-marked step in the design doc lands inside
+`newt-core::agentic` and is blocked on the extraction. Pre-9.7 runway:
+17.1-17.4, 17.7, 18.3, 19.1-19.2.
+
+---
+
 # Cross-cutting notes
 
 - **drake-foreman dispatch:** each step's branch is the unit of work. The

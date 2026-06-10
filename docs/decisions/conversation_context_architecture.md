@@ -1,6 +1,16 @@
 # Newt-Agent Conversation Context Architecture ("a folder is a conversation")
 
-> **Status:** Proposed
+> **Status:** Proposed — **amended in part** by
+> [`docs/design/context-memory-hermes-learnings.md`](../design/context-memory-hermes-learnings.md)
+> (merged 2026-06-10 via #243; see its §4 and §6): storage is SQLite rather
+> than the `turns.jsonl` FileStore floor; the `ConversationStore` *trait* /
+> `JournalProvider` seam is deferred (YAGNI until a second store is real —
+> and the trait name collides with the existing concrete struct); the
+> "15.1-15.6" step numbers below are superseded by ROADMAP **Phases 17-19**;
+> and **ordering is causal per §6** — signed per-writer ticks + BLAKE3
+> content chains, wall-clock as a display claim only. The thesis, the
+> workspace-identity scheme, and the eval-ephemerality requirement stand
+> unchanged.
 > **Date:** 2026-06-03
 > **Scope:** `Gilamonster-Foundation/newt-agent` — this is the canonical home.
 > (Originally relayed through `hartsock/gilabot` PR #1888 because the authoring
