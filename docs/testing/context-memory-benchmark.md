@@ -40,7 +40,11 @@ per append; on-disk size at each N. Baseline: current
 `conversation.rs:119-127`). After: SQLite insert. Expectation to verify, not
 assume: JSON is O(record) per turn and SQLite is O(1) — show the crossover and
 the constant factors. Also measure `list()` at 100/1,000 conversations
-(prune-cap decision in 17.1a needs this number).
+(prune-cap decision in 17.1a needs this number), and **the per-append cost of
+the §6 ordering primitives in isolation** — the signed per-writer tick and the
+BLAKE3 `prev_hash` content chain — so the "crypto primitives are nearly free
+on the write path" claim (design doc §6; thesis #1) ships with a measured
+number, not an assertion. Target: chain+tick overhead < 5% of the bare insert.
 
 ### B2 — recall quality & latency
 
@@ -98,9 +102,12 @@ degrades through visible compression.
 
 Time `newt code` from exec to first prompt with `[context] resume` on/off at
 0 / 100 / 1,000 stored conversations (hyperfine, 10 runs). Correctness: 3
-workspaces interleaved, assert each resumes its own MRU; `--ephemeral` leaves
-no row; eval runs never resume. Target: resume adds <50ms at 1,000
-conversations.
+workspaces interleaved, assert each resumes its own **latest-by-activity-tick
+conversation (§6 — never a timestamp comparison)**; `--ephemeral` leaves no
+row; eval runs never resume. Include the **clock-skew case**: step the wall
+clock backwards between turns (e.g. `faketime`), assert resume choice and
+turn ordering are unaffected — the wall clock is a display claim, not an
+ordering key. Target: resume adds <50ms at 1,000 conversations.
 
 ### B8 — memory write quality (rubric, manual)
 

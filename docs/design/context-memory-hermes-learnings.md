@@ -1,6 +1,9 @@
 # Design: context, memory & conversation improvements — learnings from hermes-agent
 
-**Status:** accepted plan, registered as ROADMAP Phases 17-19.
+**Status:** accepted plan (amended by §6 at the maintainer's direction).
+ROADMAP registration as Phases 17-19 follows **after** this PR merges — one
+source of truth while the plan is under review; the umbrella issues carry the
+step checklists meanwhile.
 **Provenance:** 8-agent study (4 deep-readers → synthesis → 3-lens adversarial
 verification) over hermes-agent (NousResearch, MIT) and newt-agent @ `6b7d780`,
 2026-06-10. Raw reports and verdicts: [`evidence/hermes-study/`](evidence/hermes-study/).
@@ -45,9 +48,10 @@ gateway. Newt takes the algorithms and refuses the architecture (§ Do NOT copy)
 - A **lean 5-section summary template** already exists in the `Summarizing`
   provider (`memory.rs:816-821`) — it is mis-wired, not missing.
 - **Lazy record creation** (no conversation record until the first successful
-  turn — `conversation.rs:82-89`, `lib.rs:2275-2284`) and **MRU-by-activity**
-  (`updated_at` bumped per turn — `conversation.rs:122, :278-283`) already
-  exist; hermes ports of either would be redundant.
+  turn — `conversation.rs:82-89`, `lib.rs:2275-2284`) already exists; a hermes
+  port would be redundant. (`updated_at`-based recency also exists today —
+  `conversation.rs:122, :278-283` — but §6 retires *all* wall-clock ordering,
+  hermes's and newt's alike.)
 
 ---
 
@@ -106,8 +110,8 @@ Phase tags refer to § 2.
 | Two-mode `session_search` tool: empty query = zero-cost recent list → FTS with `snippet()` ±1 context, full content dropped ("snippet is enough, saves tokens") → coaching schema text ("USE THIS PROACTIVELY when… 'remember when'") (session_search_tool.py:268-538; hermes_state.py:2083-2147) | None | **ADAPT**: snippets-first; **no aux-LLM recaps** (slow/expensive on local models) (P17) |
 | Auto-title from the first exchange, async, "never adds latency", with first-N-chars preview fallback (title_generator.py:1-30; hermes_state.py:1260-1265) | Titles exist as a column but nothing produces one | **ADAPT**: cheap heuristic title (first user line), optional LLM polish later (P17) |
 | Stable key → rotating id indirection; reset/resume/branch re-point the mapping, transcripts never destroyed (gateway/session.py:600-665, :918, :1182-1235) | Fresh `new_conversation_id()` every launch (lib.rs:1175); `/new` mints another (lib.rs:2220-2233) | **ADAPT**: workspace_key → active-conversation mapping (P17) |
-| Auto-resume + `is_fresh_reset` vs `was_auto_reset` (so a deliberate `/new` doesn't print a confusing "resumed" notice, hermes #6508) (session.py:458-492) | No auto-resume; manual `/conversation restore` only | **ADAPT** lite: resume MRU by default + banner + fresh-flag; **skip** the suspended/restart-strike machinery — a TUI doesn't restart under live traffic (P17) |
-| MRU `last_active = MAX(message ts)` (hermes_state.py:2163-2185) | **Mostly HAVE**: `updated_at` bumps per turn and drives ordering (conversation.rs:122, :139-141, :278-283). Real defects: no per-turn timestamps, and `rename` also bumps `updated_at` (conversation.rs:154-159) polluting MRU | **HAVE**; 3-line fix + per-turn timestamps ride P17 |
+| Auto-resume + `is_fresh_reset` vs `was_auto_reset` (so a deliberate `/new` doesn't print a confusing "resumed" notice, hermes #6508) (session.py:458-492) | No auto-resume; manual `/conversation restore` only | **ADAPT** lite: resume the latest-by-activity-tick conversation by default (§6 — "latest" is the per-writer seq / chain tip, never a timestamp) + banner + fresh-flag; **skip** the suspended/restart-strike machinery — a TUI doesn't restart under live traffic (P17) |
+| MRU `last_active = MAX(message ts)` (hermes_state.py:2163-2185) | `updated_at` bumps per turn and drives ordering today (conversation.rs:122, :139-141, :278-283) — wall-clock, like hermes's | **SKIP — superseded by §6**: do *not* port timestamp MRU, and retire newt's own. Ordering = signed per-writer monotonic tick, target content-chained turns; wall-clock survives as a display claim only. (This also dissolves the rename-bumps-`updated_at` defect, conversation.rs:154-159 — there is no timestamp MRU left to pollute) |
 | Lazy row creation (deferred to the start of the first conversation run, retry-on-failure) (run_agent.py:1963, :12126, :2548-2568) | **HAVE** — record created only on the first successful turn (conversation.rs:82-89; lib.rs:2275-2284) | **HAVE** — carry behavior through the P17 rewrite |
 | Compression lineage `parent_session_id` + tip-projection + resume redirect (hermes_state.py:1162-1350, :1621-1684) | No lineage | **SKIP** (changed from draft): nothing in newt forks conversations — compression mutates provider-internal history. YAGNI per the roadmap's own standard (ROADMAP Step 9.7's trait deferral). Add with a real branching feature |
 | Dual-write JSONL+SQLite, prefer-longer-source reads (session.py:1255-1292, :1314-1360) | Single JSON | **SKIP** — hermes's own migration scar tissue (their #860); one-time migration instead |
@@ -141,12 +145,16 @@ conversation-context decision doc) plus cross-session recall.*
 
 **What:** replace `ConversationStore`'s JSON backend with SQLite at
 `~/.newt/conversations.db` — `conversations` (id, title, workspace_key,
-persona, started/updated, end_reason) + `turns` (conversation_id, user,
-assistant, per-turn timestamp, **events JSON** — per-round tool
+persona, started/updated **as display-only claims**, end_reason) + `turns`
+(conversation_id, user, assistant, **`(writer_fingerprint, seq)` — the signed
+per-writer monotonic tick that is the ordering key, plus `prev_hash` — the
+BLAKE3 content chain; see §6, binding** — wall-clock per-turn time kept only
+as a claim for display, **events JSON** — per-round tool
 name/args-digest/result-summary — and **token usage**, a day-one column
 because 18.x consumes it). One trigger-maintained FTS5 table over
 `user || assistant || tool_names || tool_args_digest`. A `recall` tool +
-`/recall` command. Auto-resume by workspace key.
+`/recall` command. Auto-resume by workspace key, latest = highest activity
+tick (chain tip), never a timestamp comparison.
 
 **The dependency argument (rusqlite, `bundled` + `fts5` — the one new dep).**
 Honest grounds: (a) the current store rewrites the entire pretty-printed JSON
@@ -170,14 +178,14 @@ new is the derivation and the key→active-conversation mapping.
 
 | PR | What | ~diff |
 |---|---|---|
-| 17.1a | `newt-core/src/store.rs`: rusqlite schema (incl. tokens column) + schema-diff migration + WAL→DELETE fallback + `busy_timeout`; `ConversationStore` API preserved, backend swapped; retention policy change argued here | ~600 |
-| 17.1b | One-time JSON import; old write path deleted; decision-doc storage section superseded (§ 4) | ~400 |
+| 17.1a | `newt-core/src/store.rs`: rusqlite schema (tokens column; **§6 ordering: signed per-writer tick + `prev_hash` BLAKE3 chain; wall-clock columns display-only**) + schema-diff migration + WAL→DELETE fallback + `busy_timeout`; `ConversationStore` API preserved, backend swapped; retention policy change argued here. Includes a clock-skew test: set the wall clock backwards mid-conversation; ordering must be unaffected | ~650 |
+| 17.1b | One-time JSON import (legacy `unix_nanos` ingested as display claims; ticks assigned by import order); old write path deleted; decision-doc storage section superseded (§ 4) | ~400 |
 | 17.2 | Workspace key v2: blake3(remote+branch) + path fallback + UUIDv5-dir migration | ~200 |
 | 17.3 | FTS5 table + triggers + ported query sanitizer; adversarial-query tests (paths, `P2.2`, operators) | ~350 |
-| 17.4 | `/recall` command (browse + search) + heuristic auto-title + the rename-doesn't-bump-MRU fix | ~300 |
+| 17.4 | `/recall` command (browse + search, ordered by activity tick) + heuristic auto-title (the draft's "rename-bumps-MRU fix" is moot — §6 removed timestamp MRU) | ~300 |
 | 17.5† | `recall` model tool with coaching schema text | ~250 |
 | 17.6† | Tool-event + token-usage recording: extend the turn save past `(task, reply)` (lib.rs:2268-2285); FTS picks events up via trigger | ~350 |
-| 17.7 | Auto-resume: workspace_key → MRU, `[context] resume = true`, resume banner, `/new` fresh-flag, **`--ephemeral` + `NEWT_CONVERSATION_ID` override; newt-eval runs default ephemeral** (the eval gate stays honest — CLAUDE.md) | ~350 |
+| 17.7 | Auto-resume: workspace_key → latest-by-activity-tick (§6; never a timestamp comparison), `[context] resume = true`, resume banner (wall-clock "last active" shown as a claim), `/new` fresh-flag, **`--ephemeral` + `NEWT_CONVERSATION_ID` override; newt-eval runs default ephemeral** (the eval gate stays honest — CLAUDE.md) | ~350 |
 
 **Risks:** bundled SQLite adds compile time + ~1MB binary (accepted, argued
 above); NFS homes (WAL fallback); auto-resume surprising users (banner +
