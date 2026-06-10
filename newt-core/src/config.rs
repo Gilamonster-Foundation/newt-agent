@@ -917,6 +917,8 @@ impl BackendConfig {
 pub struct ProviderConfig {
     pub name: String,
     pub command: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     #[serde(default)]
     pub env_pass: Vec<String>,
     pub tiers: Vec<Tier>,
@@ -1338,6 +1340,7 @@ tiers = ["FAST", "STANDARD"]
 [[providers]]
 name = "cloud"
 command = "newt-cloud-shim"
+model = "gpt-4.1-mini"
 env_pass = ["CLOUD_TOKEN"]
 tiers = ["COMPLEX", "REVIEW"]
 
@@ -1354,7 +1357,25 @@ default_tier_order = ["FAST", "STANDARD", "COMPLEX", "REVIEW"]
         assert_eq!(cfg.backends[0].tiers, vec![Tier::Fast, Tier::Standard]);
         assert_eq!(cfg.providers.len(), 1);
         assert_eq!(cfg.providers[0].name, "cloud");
+        assert_eq!(cfg.providers[0].model.as_deref(), Some("gpt-4.1-mini"));
         assert_eq!(cfg.providers[0].env_pass, vec!["CLOUD_TOKEN".to_string()]);
+    }
+
+    #[test]
+    fn provider_model_is_optional_for_legacy_configs() {
+        let cfg: Config = toml::from_str(
+            r#"
+[[providers]]
+name = "legacy-cloud"
+command = "newt-cloud-shim"
+env_pass = ["CLOUD_TOKEN"]
+tiers = ["COMPLEX"]
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(cfg.providers.len(), 1);
+        assert_eq!(cfg.providers[0].model, None);
     }
 
     #[test]

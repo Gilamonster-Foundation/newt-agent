@@ -358,17 +358,19 @@ pub struct PyProviderConfig {
 #[pymethods]
 impl PyProviderConfig {
     #[new]
-    #[pyo3(signature = (name, command, tiers, env_pass = None))]
+    #[pyo3(signature = (name, command, tiers, env_pass = None, model = None))]
     fn new(
         name: String,
         command: String,
         tiers: Vec<PyTier>,
         env_pass: Option<Vec<String>>,
+        model: Option<String>,
     ) -> Self {
         Self {
             inner: ProviderConfig {
                 name,
                 command,
+                model,
                 env_pass: env_pass.unwrap_or_default(),
                 tiers: tiers.into_iter().map(PyTier::to_inner).collect(),
             },
@@ -383,6 +385,11 @@ impl PyProviderConfig {
     #[getter]
     fn command(&self) -> &str {
         &self.inner.command
+    }
+
+    #[getter]
+    fn model(&self) -> Option<&str> {
+        self.inner.model.as_deref()
     }
 
     #[getter]

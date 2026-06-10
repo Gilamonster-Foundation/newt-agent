@@ -2045,6 +2045,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "newt-provider-openai"
+version = "0.6.7"
+dependencies = [
+ "anyhow",
+ "assert_cmd",
+ "async-trait",
+ "clap",
+ "plugins-protocol",
+ "predicates",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "wiremock",
+]
+
+[[package]]
 name = "newt-skills"
 version = "0.6.7"
 dependencies = [
@@ -2375,9 +2393,11 @@ dependencies = [
 name = "plugins-protocol"
 version = "0.6.7"
 dependencies = [
+ "async-trait",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]

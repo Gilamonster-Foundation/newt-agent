@@ -7,7 +7,29 @@
 //!
 //! v0 surface: `initialize`, `list_models`, `complete`, `stream`, `shutdown`.
 
+mod client;
+mod server;
+
+pub use client::PluginClient;
+pub use server::{PluginHandler, PluginServer};
+
 use serde::{Deserialize, Serialize};
+
+pub type Result<T> = std::result::Result<T, Error>;
+
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error("plugin I/O error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("plugin JSON error: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("plugin RPC error {code}: {message}")]
+    Rpc { code: i64, message: String },
+    #[error("plugin protocol error: {0}")]
+    Protocol(String),
+    #[error("plugin request timed out: {method}")]
+    Timeout { method: String },
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InitializeRequest {
@@ -38,6 +60,11 @@ pub struct CompleteResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListModelsResponse {
+    pub models: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
     pub role: String,
     pub content: String,
@@ -47,6 +74,12 @@ pub struct Message {
 pub struct Usage {
     pub input_tokens: u32,
     pub output_tokens: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RpcErrorObject {
+    pub code: i64,
+    pub message: String,
 }
 
 pub const PROTOCOL_VERSION: u32 = 0;
@@ -194,5 +227,64 @@ mod tests {
         std::env::set_var(AGENT_KEY_ENV, "");
         assert_eq!(read_agent_key_envelope_from_env(), None);
         std::env::remove_var(AGENT_KEY_ENV);
+    }
+
+    #[tokio::test]
+    async fn plugin_server_round_trips_complete() {
+        struct EchoHandler;
+
+        #[async_trait::async_trait]
+        impl crate::PluginHandler for EchoHandler {
+            async fn initialize(
+                &self,
+                _req: InitializeRequest,
+            ) -> crate::Result<InitializeResponse> {
+                Ok(InitializeResponse {
+                    plugin_name: "echo".to_string(),
+                    plugin_version: "0.0.0-test".to_string(),
+                    supported_models: vec!["gpt-test".to_string()],
+                })
+            }
+
+            async fn list_models(&self) -> crate::Result<crate::ListModelsResponse> {
+                Ok(crate::ListModelsResponse {
+                    models: vec!["gpt-test".to_string()],
+                })
+            }
+
+            async fn complete(&self, req: CompleteRequest) -> crate::Result<CompleteResponse> {
+                Ok(CompleteResponse {
+                    content: format!("{}:{}", req.model, req.messages[0].content),
+                    model_id: req.model,
+                    usage: Some(Usage {
+                        input_tokens: 3,
+                        output_tokens: 5,
+                    }),
+                })
+            }
+        }
+
+        let input = concat!(
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocol_version":0,"client_name":"test","client_version":"0"}}"#,
+            "\n",
+            r#"{"jsonrpc":"2.0","id":2,"method":"complete","params":{"model":"gpt-test","messages":[{"role":"user","content":"hi"}],"max_tokens":16}}"#,
+            "\n"
+        );
+        let mut output = Vec::new();
+
+        crate::PluginServer::new(EchoHandler)
+            .run(input.as_bytes(), &mut output)
+            .await
+            .unwrap();
+
+        let lines: Vec<serde_json::Value> = String::from_utf8(output)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0]["result"]["plugin_name"], "echo");
+        assert_eq!(lines[1]["result"]["content"], "gpt-test:hi");
+        assert_eq!(lines[1]["result"]["usage"]["input_tokens"], 3);
     }
 }

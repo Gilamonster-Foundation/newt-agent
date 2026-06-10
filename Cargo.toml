@@ -15,6 +15,7 @@ members = [
     "newt-eval",
     "newt-agent-py",
     "plugins-protocol",
+    "providers/openai",
     "tests/common",
 ]
 # `newt-mesh` is intentionally NOT a workspace member: it depends on
