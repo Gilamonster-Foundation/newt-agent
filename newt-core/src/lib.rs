@@ -14,6 +14,7 @@ pub mod mcp;
 pub mod memory;
 pub mod metrics;
 pub mod model_id;
+pub mod notes;
 pub mod pricing;
 pub mod role_profile;
 pub mod router;
@@ -38,8 +39,8 @@ pub use conversation::{
 pub use dgx::{DgxConfig, DgxFormation, DgxNode, DgxNotConfigured, EndpointKind};
 pub use error::NewtError;
 pub use memory::{
-    MemMessage, MemoryManager, MemoryProvider, NoteStore, Role, RollingWindow, SessionContext,
-    SoulProvider, SoulSource, Summarizing, TokenBudget, DEFAULT_SOUL,
+    MemMessage, MemoryManager, MemoryProvider, NoteStore, NotesUnsupported, Role, RollingWindow,
+    SessionContext, SoulProvider, SoulSource, Summarizing, TokenBudget, DEFAULT_SOUL,
 };
 pub use metrics::{TokenUsage, TurnMetrics};
 pub use model_id::ModelId;
