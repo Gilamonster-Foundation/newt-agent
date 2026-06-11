@@ -16,6 +16,7 @@ pub mod memory;
 pub mod metrics;
 pub mod model_id;
 pub mod notes;
+pub mod notes_scan;
 pub mod pricing;
 pub mod prune;
 pub mod retry;
