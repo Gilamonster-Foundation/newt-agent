@@ -1060,6 +1060,13 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
         color,
         verbose,
     );
+    // N7 (#261 review): the conversation store's WAL→DELETE fallback notice
+    // must actually reach the user. Shown ONCE, here at session start — the
+    // store is re-created after slash commands (config refresh) but only this
+    // construction reports it, so the warning never repeats mid-session.
+    if let Some(notice) = wal_fallback_startup_notice(conversation_store.wal_fallback_notice()) {
+        print_newt(&notice, color, verbose);
+    }
 
     // Connect to discovered MCP servers ONCE for the session (newt config +
     // Claude Code config). Failures are logged + skipped; their tools are added
@@ -1324,6 +1331,17 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                             active_conversation_id: &mut active_conversation_id,
                         };
                         match handle_conversation_command(&task, &mut conversation_ctx) {
+                            Ok(msg) => print_newt(&msg, color, verbose),
+                            Err(e) => print_newt(&format!("error: {e}"), color, verbose),
+                        }
+                        if let Some(ref hp) = history_path {
+                            let _ = rl.save_history(hp);
+                        }
+                        println!();
+                        continue;
+                    }
+                    if slash_body == "recall" || slash_body.starts_with("recall ") {
+                        match handle_recall_command(&task, &conversation_store) {
                             Ok(msg) => print_newt(&msg, color, verbose),
                             Err(e) => print_newt(&format!("error: {e}"), color, verbose),
                         }
@@ -2297,6 +2315,198 @@ fn handle_conversation_command(
     }
 }
 
+// ---------------------------------------------------------------------------
+// /recall — cross-session conversation recall (Step 17.4, issue #246)
+// ---------------------------------------------------------------------------
+
+/// Both `/recall` modes show at most this many rows. Browse truncates to the
+/// most recent and says so; search passes it as the FTS5 `LIMIT`.
+const RECALL_LIMIT: usize = 10;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RecallCommand {
+    /// Bare `/recall` — zero-cost browse of recent conversations.
+    Browse,
+    /// `/recall <query>` — FTS5 keyword search over this workspace's turns.
+    Search(String),
+}
+
+fn parse_recall_command(input: &str) -> anyhow::Result<RecallCommand> {
+    let body = input.trim().trim_start_matches('/').trim();
+    let Some(rest) = body.strip_prefix("recall") else {
+        anyhow::bail!("not a recall command");
+    };
+    // `/recallx` is not `/recall x`.
+    if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+        anyhow::bail!("not a recall command");
+    }
+    let query = rest.trim();
+    if query.is_empty() {
+        Ok(RecallCommand::Browse)
+    } else {
+        Ok(RecallCommand::Search(query.to_string()))
+    }
+}
+
+fn handle_recall_command(
+    input: &str,
+    store: &newt_core::ConversationStore,
+) -> anyhow::Result<String> {
+    match parse_recall_command(input)? {
+        RecallCommand::Browse => recall_browse_message(store),
+        RecallCommand::Search(query) => recall_search_message(store, &query),
+    }
+}
+
+/// Browse mode: the workspace's conversations, most recently active first.
+///
+/// "Recently active" is the §6 activity tick — `list()` returns ascending
+/// tick, so the reversal here is the whole ordering story; the timestamp
+/// shown per row is the display *claim* only (never an ordering key). Zero
+/// cost by design: one `list()` query, no FTS work, and the title fallback
+/// below only loads a record for the (abnormal) empty-title case.
+fn recall_browse_message(store: &newt_core::ConversationStore) -> anyhow::Result<String> {
+    let mut summaries = store.list()?;
+    if summaries.is_empty() {
+        return Ok("No saved conversations for this workspace.".to_string());
+    }
+    summaries.reverse(); // list() is least-recently-active first (§6 tick).
+    let total = summaries.len();
+    let mut out = String::from("Recent conversations (most recent first):");
+    for summary in summaries.iter().take(RECALL_LIMIT) {
+        out.push_str(&format!(
+            "\n  {}  {}  ({} turns, last active ~{})",
+            short_conversation_id(&summary.id),
+            recall_display_title(store, &summary.id, &summary.title),
+            summary.turn_count,
+            claim_timestamp(summary.updated_at_unix_nanos),
+        ));
+    }
+    if total > RECALL_LIMIT {
+        out.push_str(&format!(
+            "\n  … {} more — /conversation list shows all.",
+            total - RECALL_LIMIT
+        ));
+    }
+    out.push_str("\nRestore with /conversation restore <id>.");
+    Ok(out)
+}
+
+/// Search mode: FTS5 snippets, best match first (bm25 — the store's order).
+///
+/// Each hit renders as a `short-id  title  ·  seq N` header with the snippet
+/// indented under it. A query the sanitizer rejects ("reduced to nothing" —
+/// all operators/punctuation) is a *user* outcome, not an error: it returns
+/// a friendly hint instead of bubbling up through the `error:` path.
+fn recall_search_message(
+    store: &newt_core::ConversationStore,
+    query: &str,
+) -> anyhow::Result<String> {
+    // Pre-flight the sanitizer so its rejection renders friendly; real
+    // database errors from search() below still propagate as errors.
+    if newt_core::sanitize_fts5_query(query).is_err() {
+        return Ok(format!(
+            "Nothing searchable in `{query}` — every term was FTS5 syntax or \
+             punctuation. Try plain keywords, e.g. /recall tokio panic."
+        ));
+    }
+    let hits = store.search(query, RECALL_LIMIT)?;
+    if hits.is_empty() {
+        return Ok(format!(
+            "No matches for `{query}` in this workspace's conversations."
+        ));
+    }
+    let mut out = format!("Recall matches for `{query}`:");
+    for hit in &hits {
+        out.push_str(&format!(
+            "\n  {}  {}  ·  seq {}\n      {}",
+            short_conversation_id(&hit.conversation_id),
+            recall_display_title(store, &hit.conversation_id, &hit.title),
+            hit.seq,
+            readable_snippet(&hit.snippet),
+        ));
+    }
+    out.push_str("\nRestore with /conversation restore <id>.");
+    Ok(out)
+}
+
+/// Make a raw FTS5 snippet readable in the TUI: collapse internal whitespace
+/// (turn text is multi-line; each snippet must stay on its own row) and
+/// replace the store's `>>>`/`<<<` match markers with `«`/`»`, which read as
+/// highlights in plain text and survive no-color terminals. Cosmetic edge,
+/// accepted: literal `>>>`/`<<<` inside the user's own content is rewritten
+/// too — FTS5 marks matches with those exact strings, so they can't be told
+/// apart after the fact.
+fn readable_snippet(snippet: &str) -> String {
+    snippet
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .replace(">>>", "«")
+        .replace("<<<", "»")
+}
+
+/// First 12 characters of a conversation id (`{unix_nanos}-{uuid}`), enough
+/// nanos digits for 10ms granularity — distinct for any two conversations
+/// created more than 10ms apart. `resolve_id` accepts any unique prefix, so
+/// the short id pastes straight into `/conversation restore`; in the rare
+/// ambiguous case, restore lists the full matching ids.
+fn short_conversation_id(id: &str) -> &str {
+    id.get(..12).unwrap_or(id)
+}
+
+/// Render a wall-clock display claim (§6: a *claim*, never an ordering key —
+/// hence the `~`-prefix at the call sites). UTC, minute precision.
+fn claim_timestamp(unix_nanos: u128) -> String {
+    i64::try_from(unix_nanos / 1_000_000_000)
+        .ok()
+        .and_then(|secs| chrono::DateTime::<chrono::Utc>::from_timestamp(secs, 0))
+        .map(|dt| dt.format("%Y-%m-%d %H:%M UTC").to_string())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// Render-time title fallback (17.4): conversations created through the TUI
+/// always get a heuristic title (`conversation_title_from_task`), but a
+/// record created elsewhere can carry an empty one. Fall back to the first
+/// user turn's first 60 chars (whitespace-flattened), else `(untitled)` —
+/// display only, no schema or stored-title change. The extra `load()` runs
+/// only for the empty-title case, so the browse path stays zero-cost.
+fn recall_display_title(store: &newt_core::ConversationStore, id: &str, title: &str) -> String {
+    let trimmed = title.trim();
+    if !trimmed.is_empty() {
+        return trimmed.to_string();
+    }
+    if let Ok(record) = store.load(id) {
+        if let Some(turn) = record.turns.first() {
+            let fallback: String = turn
+                .user
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .chars()
+                .take(60)
+                .collect();
+            if !fallback.is_empty() {
+                return fallback;
+            }
+        }
+    }
+    "(untitled)".to_string()
+}
+
+/// The user-facing line for [`newt_core::ConversationStore::wal_fallback_notice`]
+/// (N7, #261 review): `None` when WAL is healthy, `Some(message)` when the
+/// store fell back to `journal_mode=DELETE` (typical for `~/.newt` on NFS).
+fn wal_fallback_startup_notice(notice: Option<&str>) -> Option<String> {
+    notice.map(|cause| {
+        format!(
+            "conversation store: SQLite WAL unavailable, using the journal_mode=DELETE \
+             fallback (typical for NFS homes; concurrent newts may wait on locks). \
+             Cause: {cause}"
+        )
+    })
+}
+
 fn handle_persona_command(
     input: &str,
     workspace: &str,
@@ -2502,6 +2712,7 @@ fn help_lines() -> &'static [&'static str] {
         "  /conversation rename <id> <title> - rename a saved conversation",
         "  /conversation delete <id> - delete a saved conversation",
         "  /conversation rm <id>    - alias for /conversation delete",
+        "  /recall [query]          - recent conversations, or full-text search",
         "  /persona list            - list configured personas",
         "  /persona show            - show the active persona",
         "  /persona <name>          - start fresh with a persona",
@@ -3809,6 +4020,226 @@ mod skills_integration_tests {
         assert!(help_lines()
             .iter()
             .any(|line| line.contains("/conversation rm <id>")));
+    }
+
+    // -- /recall (Step 17.4, #246) ------------------------------------------
+
+    /// A real store on tempdirs, mirroring the conversation-command tests.
+    /// Returns the dirs so they outlive the store.
+    fn recall_test_store() -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        newt_core::ConversationStore,
+    ) {
+        let state = tempfile::TempDir::new().unwrap();
+        let workspace = tempfile::TempDir::new().unwrap();
+        let store = newt_core::ConversationStore::new(state.path(), workspace.path(), 100).unwrap();
+        (state, workspace, store)
+    }
+
+    #[test]
+    fn recall_commands_parse_expected_actions() {
+        assert_eq!(
+            parse_recall_command("/recall").unwrap(),
+            RecallCommand::Browse
+        );
+        assert_eq!(
+            parse_recall_command("/recall   ").unwrap(),
+            RecallCommand::Browse
+        );
+        assert_eq!(
+            parse_recall_command("/recall tokio panic").unwrap(),
+            RecallCommand::Search("tokio panic".into())
+        );
+        // `/recallx` is some other (unknown) command, not `/recall x`.
+        assert!(parse_recall_command("/recallx").is_err());
+        assert!(parse_recall_command("/conversation list").is_err());
+    }
+
+    #[test]
+    fn recall_garbage_only_query_renders_friendly_hint() {
+        let (_state, _ws, store) = recall_test_store();
+        // "AND" sanitizes to nothing (bare operator) — must come back as a
+        // friendly Ok message, never through the `error:` path.
+        let msg = handle_recall_command("/recall AND", &store).unwrap();
+        assert!(msg.contains("Nothing searchable"), "got: {msg}");
+        assert!(msg.contains("Try plain keywords"), "got: {msg}");
+    }
+
+    #[test]
+    fn recall_browse_orders_by_activity_tick_with_short_ids() {
+        let (_state, _ws, store) = recall_test_store();
+        let alpha = store.create("Alpha task", None).unwrap();
+        store
+            .append_turn(&alpha, "alpha question", "alpha answer")
+            .unwrap();
+        let beta = store.create("Beta task", None).unwrap();
+        store
+            .append_turn(&beta, "beta question", "beta answer")
+            .unwrap();
+        // Reactivate alpha: a new turn gives it the highest activity tick.
+        store
+            .append_turn(&alpha, "alpha follow-up", "alpha again")
+            .unwrap();
+
+        let msg = handle_recall_command("/recall", &store).unwrap();
+        assert!(msg.starts_with("Recent conversations (most recent first):"));
+        let alpha_pos = msg.find("Alpha task").unwrap();
+        let beta_pos = msg.find("Beta task").unwrap();
+        assert!(alpha_pos < beta_pos, "most recently active first:\n{msg}");
+        // Ids render as 12-char prefixes, never in full.
+        assert!(msg.contains(short_conversation_id(&alpha)));
+        assert!(!msg.contains(&alpha));
+        assert!(!msg.contains(&beta));
+        // Turn counts + the last-activity display claim (§6: a claim, hence ~).
+        assert!(msg.contains("(2 turns, last active ~"), "got: {msg}");
+        assert!(msg.contains("(1 turns, last active ~"), "got: {msg}");
+        assert!(msg.ends_with("Restore with /conversation restore <id>."));
+    }
+
+    #[test]
+    fn recall_browse_empty_store_message() {
+        let (_state, _ws, store) = recall_test_store();
+        assert_eq!(
+            recall_browse_message(&store).unwrap(),
+            "No saved conversations for this workspace."
+        );
+    }
+
+    #[test]
+    fn recall_browse_truncates_to_limit_with_overflow_line() {
+        let (_state, _ws, store) = recall_test_store();
+        for i in 0..(RECALL_LIMIT + 2) {
+            store.create(&format!("conv-{i:02}"), None).unwrap();
+        }
+        let msg = recall_browse_message(&store).unwrap();
+        // The two least-recently-created fall off the end of the browse view.
+        assert!(!msg.contains("conv-00"), "got: {msg}");
+        assert!(!msg.contains("conv-01"), "got: {msg}");
+        assert!(msg.contains("conv-02"));
+        assert!(msg.contains(&format!("conv-{:02}", RECALL_LIMIT + 1)));
+        assert!(msg.contains("… 2 more — /conversation list shows all."));
+    }
+
+    #[test]
+    fn recall_search_renders_snippets_and_footer() {
+        let (_state, _ws, store) = recall_test_store();
+        let id = store.create("Login bug", None).unwrap();
+        store
+            .append_turn(
+                &id,
+                "the login form crashes on submit",
+                "fixed the crash in the submit handler",
+            )
+            .unwrap();
+        let other = store.create("Docs chore", None).unwrap();
+        store
+            .append_turn(&other, "write the readme", "done")
+            .unwrap();
+
+        let msg = handle_recall_command("/recall login", &store).unwrap();
+        assert!(msg.starts_with("Recall matches for `login`:"), "got: {msg}");
+        assert!(msg.contains(short_conversation_id(&id)));
+        assert!(!msg.contains(&id), "full ids must not render:\n{msg}");
+        assert!(msg.contains("Login bug"));
+        assert!(msg.contains("  ·  seq "), "got: {msg}");
+        // The FTS5 `>>>`/`<<<` match markers render as `«`/`»` highlights.
+        assert!(msg.contains("«login»"), "got: {msg}");
+        assert!(msg.contains("form crashes on submit"), "got: {msg}");
+        assert!(!msg.contains("Docs chore"), "non-hit leaked:\n{msg}");
+        assert!(msg.ends_with("Restore with /conversation restore <id>."));
+    }
+
+    #[test]
+    fn recall_search_no_matches_message() {
+        let (_state, _ws, store) = recall_test_store();
+        let id = store.create("Something", None).unwrap();
+        store
+            .append_turn(&id, "unrelated work", "still unrelated")
+            .unwrap();
+        assert_eq!(
+            recall_search_message(&store, "zebra").unwrap(),
+            "No matches for `zebra` in this workspace's conversations."
+        );
+    }
+
+    #[test]
+    fn help_documents_recall_command() {
+        assert!(help_lines()
+            .iter()
+            .any(|line| line.contains("/recall [query]")));
+    }
+
+    #[test]
+    fn wal_fallback_startup_notice_surfaces_only_when_present() {
+        // N7 (#261 review): the seam the run loop feeds the store's notice
+        // through. Present → a visible warning naming the fallback + cause.
+        let msg = wal_fallback_startup_notice(Some("locking protocol")).unwrap();
+        assert!(msg.contains("journal_mode=DELETE"), "got: {msg}");
+        assert!(msg.contains("locking protocol"), "got: {msg}");
+        // Absent → silence.
+        assert_eq!(wal_fallback_startup_notice(None), None);
+        // A healthy local store reports no fallback end-to-end.
+        let (_state, _ws, store) = recall_test_store();
+        assert_eq!(
+            wal_fallback_startup_notice(store.wal_fallback_notice()),
+            None
+        );
+    }
+
+    #[test]
+    fn recall_title_falls_back_to_first_user_turn_at_render() {
+        let (_state, _ws, store) = recall_test_store();
+        // An empty stored title (can't happen via the TUI create path —
+        // `conversation_title_from_task` never returns empty — but a record
+        // written elsewhere can carry one).
+        let id = store.create("", None).unwrap();
+        let task = "alpha ".repeat(20);
+        store.append_turn(&id, &task, "reply").unwrap();
+        let title = recall_display_title(&store, &id, "");
+        assert_eq!(title.chars().count(), 60);
+        assert!(task.starts_with(&title));
+        // Empty title and no turns at all → "(untitled)".
+        let bare = store.create("  ", None).unwrap();
+        assert_eq!(recall_display_title(&store, &bare, "  "), "(untitled)");
+        // And the browse view actually uses the fallback.
+        let msg = recall_browse_message(&store).unwrap();
+        assert!(msg.contains("(untitled)"), "got: {msg}");
+        assert!(msg.contains(title.trim_end()), "got: {msg}");
+        // A present title is used verbatim — no record load needed.
+        assert_eq!(
+            recall_display_title(&store, "no-such-id", " Kept title "),
+            "Kept title"
+        );
+    }
+
+    #[test]
+    fn recall_claim_timestamp_formats_and_clamps() {
+        assert_eq!(claim_timestamp(0), "1970-01-01 00:00 UTC");
+        // 2026-06-11 00:00:00 UTC in nanos.
+        assert_eq!(
+            claim_timestamp(1_781_136_000 * 1_000_000_000),
+            "2026-06-11 00:00 UTC"
+        );
+        assert_eq!(claim_timestamp(u128::MAX), "unknown");
+    }
+
+    #[test]
+    fn recall_readable_snippet_flattens_and_marks() {
+        assert_eq!(
+            readable_snippet("…the >>>tokio<<< runtime\n  panicked…"),
+            "…the «tokio» runtime panicked…"
+        );
+    }
+
+    #[test]
+    fn recall_short_id_is_a_restorable_prefix() {
+        let id = newt_core::new_conversation_id();
+        let short = short_conversation_id(&id);
+        assert_eq!(short.len(), 12);
+        assert!(id.starts_with(short));
+        // Shorter-than-prefix ids pass through whole.
+        assert_eq!(short_conversation_id("abc"), "abc");
     }
 
     #[test]
