@@ -10,7 +10,8 @@
 #   just check      — full local gate (fmt + clippy + test)
 #   just cov        — local coverage with HTML report
 #   just cov-ci     — coverage with 80% gate, lcov output (CI mode)
-#   just install-hooks — wire .githooks/ as the repo's hooks path
+#   just install-hooks — wire .githooks/ as the repo's hooks path and
+#                        rewrite GitHub pushes to HTTPS (#276)
 
 set windows-shell := ["powershell.exe", "-NoProfile", "-Command"]
 
@@ -219,8 +220,43 @@ eval *ARGS:
 
 # --- Hook installation ---
 
-# Point this repo at .githooks/ for pre-push gating.
-# Idempotent — safe to re-run.
+# Point this repo at .githooks/ for pre-push gating, and rewrite GitHub
+# pushes to HTTPS. Idempotent — safe to re-run.
+#
+# Why the pushInsteadOf rewrite (#276): for SSH remotes git opens the
+# connection and reads the advertised refs BEFORE the pre-push hook runs,
+# then sends the pack over that SAME connection afterwards. Our gate takes
+# ~10 minutes — longer than GitHub's SSH idle timeout — so every SSH push
+# passes the gate and then dies with SIGPIPE (141) writing the pack into a
+# dead connection. Over HTTPS the pack upload is a fresh request after the
+# hook, so gate duration is irrelevant. The rewrite is REPO-LOCAL and
+# affects pushes only; fetches keep their configured (SSH) URL.
+#
+# HTTPS push auth comes from a git credential helper — `gh auth setup-git`
+# configures gh's. The recipe checks for one and warns (non-fatally) if
+# missing; it deliberately does NOT run `gh auth setup-git` itself, since
+# that writes to the user's *global* git config, which a repo recipe has
+# no business touching.
+[unix]
 install-hooks:
+    #!/usr/bin/env bash
+    set -euo pipefail
     git config core.hooksPath .githooks
-    @echo "core.hooksPath -> .githooks (.githooks/pre-push lands in Step 0.2)"
+    git config url."https://github.com/".pushInsteadOf "git@github.com:"
+    echo "core.hooksPath -> .githooks (pre-push gate wired)"
+    echo "pushes to git@github.com:* rewritten to https://github.com/* (#276)"
+    if git config --get-urlmatch credential.helper https://github.com >/dev/null 2>&1; then
+        echo "credential helper for https://github.com: OK"
+    elif command -v gh >/dev/null 2>&1; then
+        echo "WARNING: no git credential helper configured for https://github.com." >&2
+        echo "         HTTPS pushes will prompt for a password (GitHub rejects those)." >&2
+        echo "         Run once: gh auth setup-git" >&2
+    else
+        echo "WARNING: no git credential helper configured for https://github.com" >&2
+        echo "         and 'gh' is not installed. Install GitHub CLI and run" >&2
+        echo "         'gh auth setup-git', or configure another credential helper." >&2
+    fi
+
+[windows]
+install-hooks:
+    git config core.hooksPath .githooks; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; git config url."https://github.com/".pushInsteadOf "git@github.com:"; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; Write-Output "core.hooksPath -> .githooks (pre-push gate wired)"; Write-Output "pushes to git@github.com:* rewritten to https://github.com/* (#276)"; git config --get-urlmatch credential.helper https://github.com *> $null; if ($LASTEXITCODE -ne 0) { Write-Warning "no git credential helper for https://github.com - run: gh auth setup-git" }
