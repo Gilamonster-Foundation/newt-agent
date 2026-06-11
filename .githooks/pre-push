@@ -23,6 +23,14 @@ set -e
 
 cd "$(git rev-parse --show-toplevel)"
 
+# Git exports its hook-time repo environment (GIT_DIR is an *absolute* path
+# when pushing from a linked worktree) into this process, and it leaks into
+# `cargo test`: integration tests that drive `git` inside temp repos
+# (newt-core/tests/workspace_key.rs) then operate on THIS repo instead of
+# their temp repo and fail. CI never runs under hook env, so parity is
+# unaffected — drop the leak so the gates see the same world CI does.
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
+
 # Ensure ~/.cargo/bin is on PATH so cargo sub-commands are found even when
 # the hook is invoked from an editor or GUI that doesn't source ~/.zshrc.
 export PATH="$HOME/.cargo/bin:$PATH"
