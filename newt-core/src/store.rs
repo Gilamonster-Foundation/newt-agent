@@ -116,9 +116,32 @@ impl ConversationStore {
         let conn = Connection::open(root.join(DB_FILE))?;
         conn.busy_timeout(BUSY_TIMEOUT)?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
-        let wal_fallback = apply_journal_mode(&conn)?;
-        create_schema(&conn)?;
-        reconcile_schema(&conn)?;
+        // First-open init under concurrency: the journal-mode transition has
+        // documented busy-handler-EXEMPT lock paths, so SQLITE_BUSY can escape
+        // despite busy_timeout when several first runs race (reproduced: 8
+        // concurrent opens under llvm-cov). Bounded retry; once the db is in
+        // WAL, re-running this phase is a no-op so steady-state never loops.
+        let wal_fallback = {
+            let mut attempt = 0u32;
+            loop {
+                match apply_journal_mode(&conn)
+                    .and_then(|fb| create_schema(&conn).map(|()| fb))
+                    .and_then(|fb| reconcile_schema(&conn).map(|()| fb))
+                {
+                    Ok(fb) => break fb,
+                    Err(e)
+                        if attempt < 20
+                            && e.to_string().to_ascii_lowercase().contains("locked") =>
+                    {
+                        attempt += 1;
+                        std::thread::sleep(std::time::Duration::from_millis(
+                            25 * u64::from(attempt.min(4)),
+                        ));
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+        };
 
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
@@ -903,25 +926,31 @@ fn load_or_create_writer_fingerprint(root: &Path) -> anyhow::Result<String> {
     let nonce = match std::fs::read_to_string(&path) {
         Ok(text) if !text.trim().is_empty() => text.trim().to_string(),
         _ => {
-            // Mint with O_EXCL (`create_new`) so two racing first-run
-            // processes converge on ONE nonce: exactly one create succeeds;
-            // the loser sees AlreadyExists and adopts the winner's nonce.
-            // (Write-then-rename is NOT safe here: rename replaces the file,
-            // so a slow racer could overwrite the winner's nonce after the
-            // winner already derived its fingerprint — permanently orphaning
-            // that writer's rows. The writer identity must mint exactly once.)
-            use std::io::Write as _;
+            // Atomic mint-with-content. Two racing first-run processes must
+            // converge on ONE nonce, and the published file must NEVER be
+            // observable half-written:
+            //   * write-then-RENAME is wrong — rename replaces, so a slow
+            //     racer can overwrite the winner's nonce after the winner
+            //     already derived its fingerprint (orphaning its rows);
+            //   * bare O_EXCL-then-write is wrong — the file exists EMPTY
+            //     between create and write, so a racing reader can adopt ""
+            //     (caught by CI: the 8-thread convergence test on Windows).
+            // hard_link is the primitive with both properties: the name
+            // appears only after the temp's content is fully written, and
+            // linking FAILS (AlreadyExists) instead of replacing a winner.
             let minted = uuid::Uuid::new_v4().to_string();
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-            {
-                Ok(mut f) => {
-                    f.write_all(minted.as_bytes())?;
-                    minted
-                }
+            let tmp = root.join(format!(
+                "{NONCE_FILE}.{}.{:?}.tmp",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            std::fs::write(&tmp, &minted)?;
+            let publish = std::fs::hard_link(&tmp, &path);
+            let _ = std::fs::remove_file(&tmp);
+            match publish {
+                Ok(()) => minted,
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    // The winner's link only exists with full content.
                     let adopted = std::fs::read_to_string(&path)?.trim().to_string();
                     if adopted.is_empty() {
                         anyhow::bail!(
