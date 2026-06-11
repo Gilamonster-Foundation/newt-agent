@@ -158,16 +158,38 @@ pub struct ConversationsConfig {
     /// Maximum saved conversations per workspace. Default: 100. 0 = no pruning.
     #[serde(default = "default_conversations_max_per_workspace")]
     pub max_per_workspace: usize,
+
+    /// Auto-resume this workspace's most recently active conversation at TUI
+    /// session start (Step 17.7, issue #246). "Most recently active" means
+    /// the highest §6 activity tick — never a wall-clock comparison.
+    ///
+    /// **Default: true.** The off-switch:
+    ///
+    /// ```toml
+    /// [conversations]
+    /// resume = false      # always start fresh
+    /// ```
+    ///
+    /// Per-session overrides win over this key either way: `--ephemeral`
+    /// (no persistence at all) and `NEWT_CONVERSATION_ID=<id>` (resume
+    /// exactly that conversation).
+    #[serde(default = "default_conversations_resume")]
+    pub resume: bool,
 }
 
 fn default_conversations_max_per_workspace() -> usize {
     100
 }
 
+fn default_conversations_resume() -> bool {
+    true
+}
+
 impl Default for ConversationsConfig {
     fn default() -> Self {
         Self {
             max_per_workspace: default_conversations_max_per_workspace(),
+            resume: default_conversations_resume(),
         }
     }
 }
@@ -1298,6 +1320,8 @@ mod tests {
         let cfg = Config::default();
         let conversations = cfg.conversations.unwrap_or_default();
         assert_eq!(conversations.max_per_workspace, 100);
+        // 17.7: auto-resume defaults ON; `resume = false` is the off-switch.
+        assert!(conversations.resume);
     }
 
     #[test]
@@ -1310,7 +1334,23 @@ max_per_workspace = 25
         )
         .unwrap();
 
-        assert_eq!(cfg.conversations.unwrap_or_default().max_per_workspace, 25);
+        let conversations = cfg.conversations.unwrap_or_default();
+        assert_eq!(conversations.max_per_workspace, 25);
+        // Partial [conversations] table: unset keys keep their defaults.
+        assert!(conversations.resume);
+    }
+
+    #[test]
+    fn conversations_resume_off_switch_parses() {
+        let cfg: Config = toml::from_str(
+            r#"
+[conversations]
+resume = false
+"#,
+        )
+        .unwrap();
+
+        assert!(!cfg.conversations.unwrap_or_default().resume);
     }
 
     #[test]
