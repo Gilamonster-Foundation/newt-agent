@@ -315,6 +315,14 @@ pub struct MemoryConfig {
     /// `0` disables the nudge. Default: 10.
     #[serde(default = "default_note_nudge_interval")]
     pub note_nudge_interval: usize,
+
+    /// End-of-conversation note extraction (Step 19.4, #248): when `true`,
+    /// closing a conversation (`/new` or a clean exit) runs ONE synchronous
+    /// tools-disabled completion that distills at most 3 durable facts into
+    /// NOTES.md through the scanned `save_note` write path. Default: `false`
+    /// — the pass is optional and costs one completion per close.
+    #[serde(default)]
+    pub extract_notes_on_close: bool,
 }
 
 fn default_memory_window() -> usize {
@@ -333,6 +341,7 @@ impl Default for MemoryConfig {
             context_tokens: None,
             soul_file: None,
             note_nudge_interval: 10,
+            extract_notes_on_close: false,
         }
     }
 }
@@ -1246,6 +1255,18 @@ mod tests {
         // 0 = nudge off.
         let cfg: MemoryConfig = toml::from_str("note_nudge_interval = 0").unwrap();
         assert_eq!(cfg.note_nudge_interval, 0);
+    }
+
+    #[test]
+    fn memory_extract_notes_on_close_defaults_off_and_parses() {
+        // Default OFF (Step 19.4, #248): the close-time extraction pass is
+        // optional and costs a completion — nobody pays for it unasked.
+        assert!(!MemoryConfig::default().extract_notes_on_close);
+        let cfg: MemoryConfig = toml::from_str("provider = \"rolling_window\"").unwrap();
+        assert!(!cfg.extract_notes_on_close);
+        // `[memory] extract_notes_on_close = true` is the opt-in.
+        let cfg: MemoryConfig = toml::from_str("extract_notes_on_close = true").unwrap();
+        assert!(cfg.extract_notes_on_close);
     }
 
     #[test]
