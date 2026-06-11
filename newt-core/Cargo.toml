@@ -14,6 +14,9 @@ categories = ["api-bindings", "text-processing"]
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
+# Step 19.2 (issue #248): the write-time security scan's injection-pattern
+# table (notes_scan.rs). Already a workspace dep used by newt-eval/newt-tools.
+regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
