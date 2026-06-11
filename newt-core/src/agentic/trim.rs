@@ -281,7 +281,10 @@ mod tests {
         let s = estimate_tokens(&small);
         let b = estimate_tokens(&big);
         // ~4000 chars / 4 ≈ 1000 tokens for the big message.
-        assert!(b >= 900, "big message should estimate ~1000 tokens, got {b}");
+        assert!(
+            b >= 900,
+            "big message should estimate ~1000 tokens, got {b}"
+        );
         assert!(b > s * 10, "big must dwarf small ({b} vs {s})");
     }
 

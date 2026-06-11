@@ -28,6 +28,8 @@ pub mod tuning;
 pub mod pyo3_module;
 
 pub use agent_mesh_protocol::{Caveats, CountBound, Scope};
+// Step 9.7: clean top-level import paths for the relocated agentic loop.
+pub use agentic::{chat_complete, execute_tool, openai_chat_complete, ChatCtx, McpTools, NoMcp};
 pub use agents::AgentsProvider;
 pub use caveats::{CaveatsExt, CountBoundExt, ScopeExt};
 pub use config::{

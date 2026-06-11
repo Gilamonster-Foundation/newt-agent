@@ -1929,11 +1929,15 @@ dependencies = [
 name = "newt-core"
 version = "0.6.7"
 dependencies = [
+ "agent-bridle",
  "agent-mesh-protocol",
  "anyhow",
  "async-trait",
- "blake3",
+ "chrono",
+ "crossterm",
+ "newt-skills",
  "pyo3",
+ "reqwest",
  "serde",
  "serde_json",
  "tempfile",
@@ -1942,6 +1946,7 @@ dependencies = [
  "toml",
  "tracing",
  "uuid",
+ "wiremock",
 ]
 
 [[package]]
@@ -2075,9 +2080,9 @@ dependencies = [
 name = "newt-tui"
 version = "0.6.7"
 dependencies = [
- "agent-bridle",
  "agent-mesh-protocol",
  "anyhow",
+ "async-trait",
  "base64",
  "chrono",
  "crossterm",

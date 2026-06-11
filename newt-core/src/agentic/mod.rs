@@ -41,6 +41,10 @@ fn tui_retry_policy() -> RetryPolicy {
     RetryPolicy::for_local_inference()
 }
 
+/// Hook recovering a hard context-window 400:
+/// `(error, model, today) → new input-token cap`. See [`ChatCtx::recover_cw_400`].
+pub type RecoverCw400 = fn(&anyhow::Error, &str, &str) -> Option<u32>;
+
 /// Everything one agentic turn needs, resolved once by the caller (the TUI
 /// resolves config + capability cache + caveats per turn and threads them in
 /// here, so the loop itself never re-reads config from disk).
@@ -104,7 +108,7 @@ pub struct ChatCtx<'a> {
     /// and persists it to `model-capabilities.json` — that cache stays
     /// TUI-side with the probe module). `None` disables recovery: the error
     /// propagates exactly as it did when no limit could be parsed. See #223.
-    pub recover_cw_400: Option<fn(&anyhow::Error, &str, &str) -> Option<u32>>,
+    pub recover_cw_400: Option<RecoverCw400>,
 }
 
 /// Main agentic loop: call model → execute tool calls → feed results back → repeat.
