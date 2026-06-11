@@ -64,5 +64,5 @@ pub use pricing::{ModelRate, PricingConfig};
 pub use role_profile::{CaveatProfile, RoleProfile, ScopeKeyword, ScopeSpec};
 pub use router::{Router, Tier};
 pub use session::SessionId;
-pub use store::ConversationStore;
+pub use store::{sanitize_fts5_query, ConversationStore, SearchHit};
 pub use workspace_key::workspace_key_v2;

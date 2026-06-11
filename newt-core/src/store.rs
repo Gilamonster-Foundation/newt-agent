@@ -100,6 +100,55 @@
 //! already supports. Ticks are still not *signed*; that needs a schema
 //! column and arrives with a later step.
 //!
+//! # FTS5 recall index (17.3)
+//!
+//! `turns_fts` is a trigger-maintained **external-content** FTS5 table
+//! (unicode61 tokenizer) over four columns per turn: `user`, `assistant`,
+//! `tool_names`, and `tool_args_digest`. The latter two are derived **at
+//! index time** from the `events` JSON column — the 17.6 seam: `events` is
+//! a JSON array, and every element carrying a `tool` / `args_digest` string
+//! field contributes to the respective column (space-joined). Today every
+//! row's events is `'[]'`, so the derived columns are empty — when 17.6
+//! starts recording real tool events, search lights up with **no further
+//! schema work here**.
+//!
+//! External content means FTS5 stores only the inverted index; at query
+//! time, column values (for [`ConversationStore::search`]'s `snippet()`)
+//! are read back through the `turns_fts_content` view, which derives the
+//! two event columns with the **same SQL expression** the triggers use
+//! ([`events_extract_sql`]) — so the indexed terms and the content read
+//! back can never disagree.
+//!
+//! Maintenance is by trigger: AFTER INSERT on `turns` (covers live appends
+//! and the one-time legacy import alike) and AFTER DELETE on `turns`
+//! (fires per row via the conversation-delete `ON DELETE CASCADE`). There
+//! is deliberately **no UPDATE trigger**: turns are append-only — no code
+//! path updates a turn row, and the §6 content chain depends on that
+//! invariant. The external-content `'delete'` command relies on it too:
+//! the values passed at delete time must equal the values indexed at
+//! insert time, which append-only rows guarantee.
+//!
+//! **Schema-diff story:** opening an older database that predates the
+//! index creates the view + virtual table + triggers AND backfills every
+//! existing turn, all in one `BEGIN IMMEDIATE` transaction. Presence of
+//! the `turns_fts` table is the idempotence marker — the backfill runs
+//! exactly once per database.
+//!
+//! **Rowid caveat (honesty note):** the index is keyed by `turns`' implicit
+//! rowid, and `turns` has a composite TEXT primary key — so SQLite's
+//! `VACUUM` is allowed to renumber those rowids, which would silently
+//! re-point index entries at the wrong turns. Nothing in newt ever VACUUMs
+//! `conversations.db`; external tools must not either. Recovery if one
+//! did: `DROP TABLE turns_fts;` and reopen — the open-time path recreates
+//! the table and re-runs the backfill.
+//!
+//! Query strings never reach `MATCH` raw: [`sanitize_fts5_query`] (the
+//! ported hermes sanitizer) preserves balanced `"phrases"`, strips FTS5
+//! metacharacters, trims dangling `AND`/`OR`/`NOT`, and auto-quotes
+//! dotted/hyphenated/path-like tokens (`chat-send`, `P2.2`,
+//! `src/store.rs`) so they are matched as text instead of parsed as
+//! syntax.
+//!
 //! # NFS / concurrency
 //!
 //! The connection opens with `journal_mode=WAL` + `synchronous=NORMAL`
@@ -212,6 +261,10 @@ impl ConversationStore {
                 match apply_journal_mode(&conn)
                     .and_then(|fb| create_schema(&conn).map(|()| fb))
                     .and_then(|fb| reconcile_schema(&conn).map(|()| fb))
+                    // After reconciliation: the FTS view reads `events`,
+                    // which on a drifted pre-17.1b db exists only once the
+                    // column reconciliation above has run.
+                    .and_then(|fb| create_fts_index(&conn).map(|()| fb))
                 {
                     Ok(fb) => break fb,
                     Err(e)
@@ -639,6 +692,57 @@ impl ConversationStore {
         Ok(())
     }
 
+    /// Full-text recall over this workspace's turns (17.3, issue #246).
+    ///
+    /// The raw query goes through [`sanitize_fts5_query`] (an empty result
+    /// after sanitizing is an error, never a match-all), then a `MATCH`
+    /// against the trigger-maintained `turns_fts` index, ranked by bm25
+    /// (best first), **fenced to this workspace** by joining
+    /// `conversations.workspace_key`. Each hit carries a `snippet()` of the
+    /// matched column — the match wrapped in `>>>`/`<<<`, roughly ±10
+    /// tokens of context, `…` at trimmed edges. Snippets are the whole
+    /// payload by design: no full turn content, no aux-LLM recaps (the
+    /// design doc explicitly skips those — slow and expensive on local
+    /// models; the hermes study's own "snippet is enough, saves tokens").
+    pub fn search(&self, query: &str, limit: usize) -> anyhow::Result<Vec<SearchHit>> {
+        let fts_query = sanitize_fts5_query(query)?;
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let conn = self.lock_conn();
+        // The JOIN on `turns` is also a safety net: an index entry whose
+        // turn row is gone (can't happen while the delete trigger holds,
+        // but defense in depth) joins to nothing instead of surfacing a
+        // ghost hit. Ties in rank break deterministically by (id, seq).
+        let mut stmt = conn.prepare(
+            "SELECT t.conversation_id, c.title, t.seq,
+                    snippet(turns_fts, -1, '>>>', '<<<', '…', 21),
+                    bm25(turns_fts)
+               FROM turns_fts
+               JOIN turns t ON t.rowid = turns_fts.rowid
+               JOIN conversations c
+                 ON c.id = t.conversation_id AND c.workspace_key = ?2
+              WHERE turns_fts MATCH ?1
+              ORDER BY bm25(turns_fts) ASC, t.conversation_id ASC, t.seq ASC
+              LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(
+            rusqlite::params![fts_query, self.workspace_id, limit],
+            |row| {
+                Ok(SearchHit {
+                    conversation_id: row.get(0)?,
+                    title: row.get(1)?,
+                    seq: row.get(2)?,
+                    snippet: row.get(3)?,
+                    rank: row.get(4)?,
+                })
+            },
+        )?;
+        let mut hits = Vec::new();
+        for row in rows {
+            hits.push(row?);
+        }
+        Ok(hits)
+    }
+
     /// Drive the display-claim clock from a test. Hidden, test-only: lets the
     /// §6 clock-skew test write *honestly skewed* claims through the normal
     /// API (clock runs backwards mid-conversation) and prove that ordering,
@@ -692,6 +796,28 @@ impl ConversationStore {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
+}
+
+/// One full-text recall hit from [`ConversationStore::search`] (17.3).
+///
+/// `rank` is the raw FTS5 bm25 score: negative, and smaller (more negative)
+/// = better. `search` returns hits best-first; the value is exposed so
+/// 17.4/17.5 callers can show or threshold it. `snippet` is the matched
+/// column's excerpt (`>>>match<<<`, `…`-trimmed) — deliberately the only
+/// content returned.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SearchHit {
+    /// The conversation the matching turn belongs to.
+    pub conversation_id: String,
+    /// That conversation's current title.
+    pub title: String,
+    /// The matching turn's §6 per-writer tick (its position in the chain).
+    pub seq: i64,
+    /// `snippet()` of the matched column: ±~10 tokens of context around the
+    /// match, which is wrapped in `>>>`/`<<<`; `…` marks trimmed edges.
+    pub snippet: String,
+    /// Raw bm25 rank (negative; more negative = better match).
+    pub rank: f64,
 }
 
 /// One turn row, exactly as stored. Internal: the canonical encoding hashes
@@ -1049,6 +1175,245 @@ fn reconcile_schema(conn: &Connection) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// SQL expression deriving a space-joined list of `$.{key}` string values
+/// from the `events` JSON array carried by `source` (e.g. `new.events`,
+/// `old.events`, or the bare column in the content view).
+///
+/// This is THE 17.6 seam: events elements are objects, and the keys read
+/// here — `tool` and `args_digest` — are the contract 17.6's recorder must
+/// write. Shared verbatim by the view and both triggers so the indexed
+/// terms and the content read back at query time can never disagree.
+/// `json_valid` guards the whole expression: a garbage events blob yields
+/// `''` instead of breaking the append (a trigger error would abort the
+/// turn's transaction).
+fn events_extract_sql(source: &str, key: &str) -> String {
+    format!(
+        "CASE WHEN json_valid({source}) THEN \
+            (SELECT coalesce(group_concat(json_extract(value, '$.{key}'), ' '), '') \
+               FROM json_each({source})) \
+         ELSE '' END"
+    )
+}
+
+/// Create the 17.3 FTS5 recall index (module docs — FTS5 recall index):
+/// the `turns_fts_content` view, the external-content `turns_fts` virtual
+/// table (unicode61), and the AFTER INSERT / AFTER DELETE triggers on
+/// `turns`. No UPDATE trigger by design: turns are append-only (§6).
+///
+/// Backfill-on-migration: when the virtual table does not exist yet (a
+/// fresh db, or a 17.1/17.2 db opened by a 17.3+ newt), every existing
+/// turn is indexed by an explicit `INSERT…SELECT` of the same derived
+/// expressions (see the in-body comment for why not FTS5 `'rebuild'`) —
+/// one-time, inside the same `BEGIN IMMEDIATE` transaction as the DDL,
+/// idempotent because the presence of the table IS the done-marker
+/// (checked under the write lock, so concurrent first opens cannot
+/// double-backfill).
+fn create_fts_index(conn: &Connection) -> anyhow::Result<()> {
+    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    let have_index = tx
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'turns_fts'",
+            [],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+
+    let view_tools = events_extract_sql("events", "tool");
+    let view_digests = events_extract_sql("events", "args_digest");
+    let new_tools = events_extract_sql("new.events", "tool");
+    let new_digests = events_extract_sql("new.events", "args_digest");
+    let old_tools = events_extract_sql("old.events", "tool");
+    let old_digests = events_extract_sql("old.events", "args_digest");
+    tx.execute_batch(&format!(
+        "CREATE VIEW IF NOT EXISTS turns_fts_content AS
+            SELECT rowid,
+                   user,
+                   assistant,
+                   {view_tools} AS tool_names,
+                   {view_digests} AS tool_args_digest
+              FROM turns;
+         CREATE VIRTUAL TABLE IF NOT EXISTS turns_fts USING fts5(
+             user, assistant, tool_names, tool_args_digest,
+             content='turns_fts_content',
+             content_rowid='rowid',
+             tokenize='unicode61'
+         );
+         CREATE TRIGGER IF NOT EXISTS turns_fts_after_insert
+         AFTER INSERT ON turns BEGIN
+             INSERT INTO turns_fts(rowid, user, assistant, tool_names, tool_args_digest)
+             VALUES (new.rowid, new.user, new.assistant, {new_tools}, {new_digests});
+         END;
+         -- Fires per cascaded row on conversation delete. The 'delete'
+         -- command must receive the values that were indexed at insert
+         -- time — guaranteed by the append-only invariant on turns.
+         CREATE TRIGGER IF NOT EXISTS turns_fts_after_delete
+         AFTER DELETE ON turns BEGIN
+             INSERT INTO turns_fts(turns_fts, rowid, user, assistant, tool_names, tool_args_digest)
+             VALUES ('delete', old.rowid, old.user, old.assistant, {old_tools}, {old_digests});
+         END;"
+    ))?;
+
+    if !have_index {
+        // One-time backfill of pre-17.3 turns. NOT the FTS5 `'rebuild'`
+        // command: rebuild scans the content table through a
+        // schema-qualified statement, and `json_each` — an eponymous
+        // virtual table inside the content view — cannot be resolved
+        // schema-qualified ("no such table: main.json_each", verified
+        // against the bundled SQLite 3.45). An explicit INSERT…SELECT of
+        // the same derived expressions is equivalent for an empty index
+        // and prepares unqualified, so the view's seam stays intact.
+        tx.execute(
+            &format!(
+                "INSERT INTO turns_fts(rowid, user, assistant, tool_names, tool_args_digest)
+                 SELECT rowid, user, assistant, {view_tools}, {view_digests} FROM turns"
+            ),
+            [],
+        )?;
+        tracing::info!("created the FTS5 recall index and backfilled existing turns (17.3)");
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// A parsed piece of a raw recall query: a ready-to-emit term (bare word or
+/// `"quoted phrase"`) or a boolean operator awaiting placement.
+enum QueryPart {
+    Term(String),
+    Op(&'static str),
+}
+
+/// Sanitize a raw user/model query into a safe FTS5 `MATCH` expression
+/// (17.3 — the hermes `_sanitize_fts5_query` port; see
+/// `docs/design/evidence/hermes-study/report-hermes-sessions.md` §6).
+///
+/// Pure function, no database required. Rules:
+///
+/// 1. **Balanced `"phrases"` are preserved** as phrase queries. A dangling
+///    unbalanced quote is dropped and its text processed as plain terms.
+/// 2. Outside phrases, the pure-syntax FTS5 metacharacters `( ) * ^ "` are
+///    stripped wherever they appear in a token.
+/// 3. Bare uppercase `AND` / `OR` / `NOT` survive as boolean operators
+///    only in positions FTS5's grammar accepts (between terms): leading
+///    and trailing operators are trimmed and operator runs collapse to
+///    their first (`NOT foo` → `foo`, `foo AND` → `foo`,
+///    `a AND OR b` → `a AND b`). Lowercase forms are ordinary terms.
+///    Bare uppercase `NEAR` is quoted into a term — FTS5 reserves it.
+/// 4. Tokens still carrying any other ASCII punctuation are **auto-quoted**
+///    so FTS5 reads them as text, not syntax: `chat-send` → `"chat-send"`,
+///    `P2.2` → `"P2.2"`, `src/store.rs` → `"src/store.rs"`,
+///    `tcp:1666` → `"tcp:1666"` (this also neutralizes `col:` filters and
+///    `-`/`.` operator injection).
+/// 5. Tokens and phrases with nothing the unicode61 tokenizer would index
+///    (no letter or digit in any script) are dropped.
+///
+/// When everything sanitizes away, this is an **error** ("query reduced to
+/// nothing") — never an empty `MATCH` (a syntax error) and never a
+/// match-all.
+pub fn sanitize_fts5_query(raw: &str) -> anyhow::Result<String> {
+    let mut parts: Vec<QueryPart> = Vec::new();
+
+    // Pass 1: split out balanced "phrases"; everything else is plain text.
+    let mut rest = raw;
+    loop {
+        let Some(open) = rest.find('"') else {
+            push_plain_tokens(rest, &mut parts);
+            break;
+        };
+        push_plain_tokens(&rest[..open], &mut parts);
+        let after_open = &rest[open + 1..];
+        match after_open.find('"') {
+            Some(close) => {
+                let phrase = after_open[..close].trim();
+                // An unindexable phrase ("--", "", …) would be dead weight
+                // or an FTS5 error; drop it like an unindexable token.
+                if phrase.chars().any(char::is_alphanumeric) {
+                    parts.push(QueryPart::Term(format!("\"{phrase}\"")));
+                }
+                rest = &after_open[close + 1..];
+            }
+            None => {
+                // Unbalanced: strip the dangling quote, keep its text.
+                push_plain_tokens(after_open, &mut parts);
+                break;
+            }
+        }
+    }
+
+    // Pass 2: place operators. An operator is emitted only between two
+    // terms: leading ops are dropped (no left operand), runs collapse to
+    // the first, and a trailing pending op is never flushed.
+    let mut out: Vec<String> = Vec::new();
+    let mut pending_op: Option<&'static str> = None;
+    for part in parts {
+        match part {
+            QueryPart::Term(term) => {
+                if let Some(op) = pending_op.take() {
+                    out.push(op.to_string());
+                }
+                out.push(term);
+            }
+            QueryPart::Op(op) => {
+                if !out.is_empty() && pending_op.is_none() {
+                    pending_op = Some(op);
+                }
+            }
+        }
+    }
+
+    if out.is_empty() {
+        anyhow::bail!("search query reduced to nothing after FTS5 sanitizing: {raw:?}");
+    }
+    Ok(out.join(" "))
+}
+
+/// Tokenize a plain (non-phrase) text run on whitespace and classify each
+/// token: uppercase boolean keywords become [`QueryPart::Op`]; everything
+/// else goes through [`sanitize_bare_token`].
+fn push_plain_tokens(text: &str, parts: &mut Vec<QueryPart>) {
+    for token in text.split_whitespace() {
+        match token {
+            "AND" => parts.push(QueryPart::Op("AND")),
+            "OR" => parts.push(QueryPart::Op("OR")),
+            "NOT" => parts.push(QueryPart::Op("NOT")),
+            // FTS5 reserves NEAR (case-sensitively); as a quoted phrase it
+            // is just the word again.
+            "NEAR" => parts.push(QueryPart::Term("\"NEAR\"".to_string())),
+            _ => {
+                if let Some(term) = sanitize_bare_token(token) {
+                    parts.push(QueryPart::Term(term));
+                }
+            }
+        }
+    }
+}
+
+/// Sanitize one bare token: strip pure-syntax metacharacters, drop tokens
+/// with nothing indexable, and auto-quote anything that is not a clean
+/// FTS5 bareword (rules 2/4/5 of [`sanitize_fts5_query`]).
+fn sanitize_bare_token(token: &str) -> Option<String> {
+    let stripped: String = token
+        .chars()
+        .filter(|c| !matches!(c, '(' | ')' | '*' | '^' | '"'))
+        .collect();
+    // Nothing the unicode61 tokenizer would index → drop the token.
+    if !stripped.chars().any(char::is_alphanumeric) {
+        return None;
+    }
+    // FTS5's bareword alphabet: ASCII alphanumerics, `_`, and everything
+    // non-ASCII. Any other character would parse as syntax — auto-quote
+    // the token so `chat-send`, `P2.2`, paths, and issue refs match as
+    // text (the hermes rule this port exists for).
+    let is_bareword = stripped
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || !c.is_ascii());
+    Some(if is_bareword {
+        stripped
+    } else {
+        format!("\"{stripped}\"")
+    })
 }
 
 /// One-time import of the retired JSON backend's tree (see the module docs).
@@ -1541,6 +1906,121 @@ mod tests {
         assert!(now > 0);
         assert_eq!(claim_to_u128(-5), 0);
         assert_eq!(claim_to_u128(42), 42);
+    }
+
+    // --- 17.3: the query-sanitizer adversarial matrix ---------------------
+
+    /// Shorthand: sanitize and unwrap (the input is expected to survive).
+    fn s(raw: &str) -> String {
+        sanitize_fts5_query(raw).unwrap()
+    }
+
+    /// The hermes examples: dotted / hyphenated / path-like / colon tokens
+    /// are auto-quoted so FTS5 reads them as text, not syntax.
+    #[test]
+    fn sanitizer_auto_quotes_dotted_hyphenated_and_path_tokens() {
+        assert_eq!(s("chat-send"), "\"chat-send\"");
+        assert_eq!(s("P2.2"), "\"P2.2\"");
+        assert_eq!(s("my-app.config.ts"), "\"my-app.config.ts\"");
+        assert_eq!(s("src/store.rs"), "\"src/store.rs\"");
+        assert_eq!(s("tcp:p4d.p4d-ascii:1666"), "\"tcp:p4d.p4d-ascii:1666\"");
+        assert_eq!(s("issue #246"), "issue \"#246\"");
+        // Clean barewords pass through untouched — including underscores
+        // (in FTS5's bareword alphabet) and non-ASCII text.
+        assert_eq!(s("hello world"), "hello world");
+        assert_eq!(s("writer_clock"), "writer_clock");
+        assert_eq!(s("schlüssel wörter"), "schlüssel wörter");
+    }
+
+    #[test]
+    fn sanitizer_preserves_balanced_phrases_and_drops_dangling_quotes() {
+        assert_eq!(s("\"exact phrase\" extra"), "\"exact phrase\" extra");
+        assert_eq!(s("say \"hello world\" now"), "say \"hello world\" now");
+        // Unbalanced quote: the quote dies, its text survives as terms.
+        assert_eq!(s("foo \"bar"), "foo bar");
+        assert_eq!(s("\"unclosed"), "unclosed");
+        assert_eq!(s("\"a b\" \"c"), "\"a b\" c");
+        // Phrase content keeps operators/metachars as text (FTS5 allows
+        // anything but a quote inside a phrase).
+        assert_eq!(s("\"AND OR\""), "\"AND OR\"");
+        assert_eq!(s("\"P2.2 chat-send\""), "\"P2.2 chat-send\"");
+        // Empty / unindexable phrases are dropped, not emitted as "".
+        let err = sanitize_fts5_query("\"\"").unwrap_err().to_string();
+        assert!(err.contains("reduced to nothing"), "{err}");
+        let err = sanitize_fts5_query("\"--\"").unwrap_err().to_string();
+        assert!(err.contains("reduced to nothing"), "{err}");
+    }
+
+    #[test]
+    fn sanitizer_trims_dangling_operators() {
+        assert_eq!(s("foo AND"), "foo");
+        assert_eq!(s("OR foo"), "foo");
+        assert_eq!(s("NOT foo"), "foo");
+        assert_eq!(s("foo AND AND bar"), "foo AND bar");
+        assert_eq!(s("foo AND OR bar"), "foo AND bar");
+        assert_eq!(s("AND foo OR"), "foo");
+        // Valid binary positions survive.
+        assert_eq!(s("foo OR bar"), "foo OR bar");
+        assert_eq!(s("foo NOT bar"), "foo NOT bar");
+        assert_eq!(s("a OR b OR c"), "a OR b OR c");
+        // Lowercase forms are ordinary terms, not operators.
+        assert_eq!(s("foo and bar"), "foo and bar");
+        // Bare AND reduces to nothing → error, not an FTS5 syntax error.
+        let err = sanitize_fts5_query("AND").unwrap_err().to_string();
+        assert!(err.contains("reduced to nothing"), "{err}");
+        // NEAR is reserved by FTS5 — it survives only as a quoted term.
+        assert_eq!(s("NEAR"), "\"NEAR\"");
+        assert_eq!(s("near"), "near");
+    }
+
+    #[test]
+    fn sanitizer_strips_metacharacter_injection() {
+        assert_eq!(s("(foo OR bar) AND baz"), "foo OR bar AND baz");
+        assert_eq!(s("foo* ^bar"), "foo bar");
+        assert_eq!(s("col*umn"), "column");
+        // A lone quote / star / caret / paren reduces to nothing.
+        for q in ["\"", "*", "^", "( )", "*^()"] {
+            let err = sanitize_fts5_query(q).unwrap_err().to_string();
+            assert!(err.contains("reduced to nothing"), "{q:?}: {err}");
+        }
+        // Mid-token quote: unbalanced → stripped; the halves survive.
+        assert_eq!(s("fo\"o bar"), "fo o bar");
+        // Punctuation-only tokens are dropped, indexable ones kept.
+        assert_eq!(s("?? foo !!"), "foo");
+        assert_eq!(s("foo \u{a0} "), "foo"); // unicode whitespace handled
+    }
+
+    #[test]
+    fn sanitizer_handles_mixed_phrases_terms_and_operators() {
+        assert_eq!(
+            s("\"tuning writeback\" OR coverage-floor"),
+            "\"tuning writeback\" OR \"coverage-floor\""
+        );
+        assert_eq!(
+            s("error \"chain violation\" NOT P2.2"),
+            "error \"chain violation\" NOT \"P2.2\""
+        );
+        // Operator directly before a phrase works too.
+        assert_eq!(s("AND \"lead phrase\" tail"), "\"lead phrase\" tail");
+    }
+
+    #[test]
+    fn sanitizer_errors_on_empty_and_whitespace_queries() {
+        for q in ["", "   ", "\t\n"] {
+            let err = sanitize_fts5_query(q).unwrap_err().to_string();
+            assert!(err.contains("reduced to nothing"), "{q:?}: {err}");
+        }
+    }
+
+    /// The events-extraction SQL is shared between the triggers and the
+    /// content view; pin its shape (json_valid guard + coalesce to '').
+    #[test]
+    fn events_extract_sql_guards_and_targets_the_seam_keys() {
+        let sql = events_extract_sql("new.events", "tool");
+        assert!(sql.contains("json_valid(new.events)"));
+        assert!(sql.contains("json_each(new.events)"));
+        assert!(sql.contains("'$.tool'"));
+        assert!(sql.contains("ELSE '' END"));
     }
 
     fn clone_row(row: &TurnRow) -> TurnRow {
