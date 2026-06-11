@@ -13,7 +13,11 @@
 /// (system prompt + original task) and the last `tail` messages (recent rounds).
 /// Inserts a single placeholder when the middle is dropped so the model knows
 /// context was omitted rather than assuming the task was simpler than it is.
-pub(crate) fn trim_for_summary(
+///
+/// `pub` since Step 19.4 (#248): the TUI's close-time note extraction bounds
+/// its transcript input with the SAME helper the cap-exit summary uses, so
+/// neither tools-disabled request ever ships an unbounded history.
+pub fn trim_for_summary(
     messages: &[serde_json::Value],
     head: usize,
     tail: usize,
