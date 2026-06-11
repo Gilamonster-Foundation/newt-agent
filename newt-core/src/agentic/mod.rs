@@ -29,8 +29,8 @@ use display::{emit_overflow_notice, print_debug, print_retry_indicator};
 use std::io::{self, Write as _};
 use tools::{is_hallucination, merged_tool_definitions};
 use trim::{
-    estimate_tokens, merge_usage, mid_loop_trim, ollama_usage, openai_usage, trim_for_summary,
-    trim_to_token_budget,
+    estimate_tokens, estimate_value_tokens, merge_round_usage, mid_loop_trim, ollama_usage,
+    openai_usage, trim_for_summary, trim_to_token_budget, PromptTracker,
 };
 
 /// Retry policy for TUI inference calls: more patient than the hosted-API
@@ -114,6 +114,13 @@ pub struct ChatCtx<'a> {
 /// Main agentic loop: call model → execute tool calls → feed results back → repeat.
 /// Returns `(reply_text, was_streamed, token_usage, hallucination_count)`.
 /// When `was_streamed` is true the text was already printed token-by-token.
+///
+/// Token-usage semantics (Step 18.1): `input_tokens` is the **largest single
+/// prompt** the backend evaluated across the turn's rounds — the truthful
+/// "how full did the context get" figure that feeds the capability ratchet —
+/// NOT the per-round sum, which double-counts history (every round's prompt
+/// re-includes all prior rounds; the B3 baseline measured 5.4× inflation).
+/// `output_tokens` is the sum across rounds (each completion is new).
 pub async fn chat_complete(
     ctx: ChatCtx<'_>,
     mcp: &mut dyn McpTools,
@@ -165,10 +172,18 @@ pub async fn chat_complete(
     let mut overflow_retries: u32 = 0;
     // Hard context-window 400s recovered (parse limit → trim → retry). See #223.
     let mut cw_retries: u32 = 0;
-    // Pre-send token budget gate: trim before dispatch when the estimate exceeds
-    // the model's empirically-confirmed max input (or the safe context). Mutable
-    // because a recovered 400 tightens it mid-turn. See issue #223.
+    // Pre-send token budget gate: trim before dispatch when the current context
+    // size exceeds the model's empirically-confirmed max input (or the safe
+    // context). Mutable because a recovered 400 tightens it mid-turn. See #223.
     let mut send_budget: Option<usize> = max_ok_input.or(safe_context).map(|c| c as usize);
+    // Tool schemas ride along in every request body; count them once (18.1).
+    // Stable for the whole turn: the builtin + MCP tool set doesn't change
+    // mid-turn, so hoisting out of the round loop is safe.
+    let tools = merged_tool_definitions(mcp);
+    let tool_tokens = estimate_value_tokens(&tools);
+    // Truthful context-size tracker: anchors on the backend's last-reported
+    // prompt token count, chars/4 + schema estimate as fallback (Step 18.1).
+    let mut prompt_tracker = PromptTracker::new();
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
     // Consecutive rounds where the model only called read-only tools (no writes).
     // When this hits READ_ONLY_NUDGE_AFTER, a brief injected message tells the
@@ -212,13 +227,20 @@ pub async fn chat_complete(
 
         // Mid-loop context trim: prevent VRAM exhaustion on long tool-call
         // sessions by dropping old middle messages when the list grows large
-        // by message count OR by estimated token count (issue #223).
+        // by message count OR by current token count (issue #223). The token
+        // figure is prompt-tokens-preferred (Step 18.1).
         {
             let before = messages.len();
-            let (trimmed, fired) =
-                mid_loop_trim(&messages, mid_loop_trim_threshold, mid_loop_trim_tokens);
+            let current = prompt_tracker.current(&messages, Some(&tools));
+            let (trimmed, fired) = mid_loop_trim(
+                &messages,
+                mid_loop_trim_threshold,
+                mid_loop_trim_tokens,
+                current,
+            );
             if fired {
                 messages = trimmed;
+                prompt_tracker.invalidate();
                 if debug {
                     print_debug(
                         &format!(
@@ -233,22 +255,32 @@ pub async fn chat_complete(
             }
         }
 
-        // Pre-send token budget guard: estimate the request size and trim it to
-        // fit the model's confirmed input ceiling BEFORE dispatch, so a huge
-        // single round can't trigger a non-retryable 400 (issue #223).
+        // Pre-send token budget guard: when the current context size — the
+        // backend's last-reported prompt tokens plus the estimate of what was
+        // appended since (or the full request estimate including tool schemas
+        // when no report exists) — exceeds the model's confirmed input
+        // ceiling, trim BEFORE dispatch so a huge single round can't trigger
+        // a non-retryable 400 (issue #223, accounting fixed in Step 18.1).
         if let Some(budget) = send_budget {
-            let (trimmed, fired) = trim_to_token_budget(&messages, budget, 2);
-            if fired {
-                if debug {
-                    print_debug(
-                        &format!(
-                            "pre-send trim: ~{} tokens → fit budget {budget}",
-                            estimate_tokens(&trimmed),
-                        ),
-                        color,
-                    );
+            let current = prompt_tracker.current(&messages, Some(&tools));
+            if current > budget {
+                // The schemas ride along in every request body, so the
+                // message list gets what's left of the budget after them.
+                let (trimmed, fired) =
+                    trim_to_token_budget(&messages, budget.saturating_sub(tool_tokens), 2);
+                if fired {
+                    if debug {
+                        print_debug(
+                            &format!(
+                                "pre-send trim: ~{current} tokens → fit budget {budget} \
+                                 (incl. ~{tool_tokens} tool-schema tokens)",
+                            ),
+                            color,
+                        );
+                    }
+                    messages = trimmed;
+                    prompt_tracker.invalidate();
                 }
-                messages = trimmed;
             }
         }
 
@@ -261,7 +293,7 @@ pub async fn chat_complete(
                 "model": model,
                 "messages": messages,
                 "stream": false,
-                "tools": merged_tool_definitions(mcp),
+                "tools": tools.clone(),
                 "options": { "num_ctx": ctx_size },
             })
         } else {
@@ -269,7 +301,7 @@ pub async fn chat_complete(
                 "model": model,
                 "messages": messages,
                 "stream": false,
-                "tools": merged_tool_definitions(mcp),
+                "tools": tools.clone(),
             })
         };
 
@@ -311,7 +343,13 @@ pub async fn chat_complete(
                             cw_retries + 1,
                         );
                         send_budget = Some(new_cap as usize);
-                        messages = trim_to_token_budget(&messages, new_cap as usize, 2).0;
+                        messages = trim_to_token_budget(
+                            &messages,
+                            (new_cap as usize).saturating_sub(tool_tokens),
+                            2,
+                        )
+                        .0;
+                        prompt_tracker.invalidate();
                         cw_retries += 1;
                         continue 'round_loop;
                     }
@@ -320,9 +358,14 @@ pub async fn chat_complete(
             }
         };
 
-        // Accumulate token usage from this non-streaming probe round.
+        // Merge token usage from this non-streaming probe round (input = max
+        // single prompt, output = sum — Step 18.1) and anchor the context-size
+        // tracker on the backend-reported prompt size of this dispatch.
         let round_usage = ollama_usage(&json);
-        accumulated_usage = merge_usage(accumulated_usage, round_usage);
+        if let Some(u) = round_usage {
+            prompt_tracker.record(u.input_tokens, messages.len());
+        }
+        accumulated_usage = merge_round_usage(accumulated_usage, round_usage);
 
         let message = &json["message"];
         // Capture the probe content now — it may be our only copy of the
@@ -370,7 +413,7 @@ pub async fn chat_complete(
                     "model": model,
                     "messages": &messages,
                     "stream": true,
-                    "tools": merged_tool_definitions(mcp),
+                    "tools": tools.clone(),
                     "options": { "num_ctx": ctx_size },
                 })
             } else {
@@ -378,7 +421,7 @@ pub async fn chat_complete(
                     "model": model,
                     "messages": &messages,
                     "stream": true,
-                    "tools": merged_tool_definitions(mcp),
+                    "tools": tools.clone(),
                 })
             };
             // Retry the connection; if we connect successfully but the stream
@@ -419,7 +462,11 @@ pub async fn chat_complete(
                 }
                 if probe_content.is_empty() {
                     // Both probe and stream are empty — likely context overflow.
-                    let merged = merge_usage(accumulated_usage, stream_usage);
+                    // `input_tokens` is the largest single prompt evaluated this
+                    // turn (Step 18.1), so the 85%-of-safe-context check now
+                    // compares one real prompt against the window instead of a
+                    // multi-round sum that inflated past it after ~2 rounds.
+                    let merged = merge_round_usage(accumulated_usage, stream_usage);
                     let overflow_likely = merged
                         .as_ref()
                         .zip(safe_context)
@@ -435,6 +482,7 @@ pub async fn chat_complete(
                         );
                         // Trim aggressively: keep system + first 2 + last N/4 messages.
                         messages = trim_for_summary(&messages, 2, max_tool_rounds / 4);
+                        prompt_tracker.invalidate();
                         accumulated_usage = merged;
                         overflow_retries += 1;
                         continue 'round_loop;
@@ -446,7 +494,7 @@ pub async fn chat_complete(
                 return Ok((
                     probe_content,
                     false,
-                    merge_usage(accumulated_usage, stream_usage),
+                    merge_round_usage(accumulated_usage, stream_usage),
                     hallucination_count,
                 ));
             }
@@ -454,7 +502,7 @@ pub async fn chat_complete(
             return Ok((
                 streamed,
                 true,
-                merge_usage(accumulated_usage, stream_usage),
+                merge_round_usage(accumulated_usage, stream_usage),
                 hallucination_count,
             ));
         }
@@ -602,7 +650,7 @@ async fn final_summary_ollama(
                 .as_str()
                 .unwrap_or("")
                 .to_string();
-            let total = merge_usage(accumulated, ollama_usage(&json));
+            let total = merge_round_usage(accumulated, ollama_usage(&json));
             if content.is_empty() {
                 Ok((
                     cap_exit_fallback(max_tool_rounds, accumulated),
@@ -676,7 +724,7 @@ async fn final_summary_openai(
                 .as_str()
                 .unwrap_or("")
                 .to_string();
-            let total = merge_usage(accumulated, openai_usage(&json["usage"]));
+            let total = merge_round_usage(accumulated, openai_usage(&json["usage"]));
             if content.is_empty() {
                 Ok((
                     cap_exit_fallback(max_tool_rounds, accumulated),
@@ -747,6 +795,11 @@ pub async fn openai_chat_complete(
     let mut cw_retries: u32 = 0;
     // Pre-send token budget gate; tightened mid-turn by a recovered 400 (#223).
     let mut send_budget: Option<usize> = max_ok_input.or(safe_context).map(|c| c as usize);
+    // Tool schemas ride along in every request body; count them once (18.1).
+    let tools = merged_tool_definitions(mcp);
+    let tool_tokens = estimate_value_tokens(&tools);
+    // Truthful context-size tracker (prompt-tokens-preferred, Step 18.1).
+    let mut prompt_tracker = PromptTracker::new();
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
 
     // Agentic loop — up to `max_tool_rounds` tool-call rounds (matches the Ollama path).
@@ -762,13 +815,19 @@ pub async fn openai_chat_complete(
         }
 
         // Mid-loop context trim (mirrors Ollama path): fire on message count OR
-        // estimated token count (issue #223).
+        // current token count (issue #223; prompt-tokens-preferred, Step 18.1).
         {
             let before = messages.len();
-            let (trimmed, fired) =
-                mid_loop_trim(&messages, mid_loop_trim_threshold, mid_loop_trim_tokens);
+            let current = prompt_tracker.current(&messages, Some(&tools));
+            let (trimmed, fired) = mid_loop_trim(
+                &messages,
+                mid_loop_trim_threshold,
+                mid_loop_trim_tokens,
+                current,
+            );
             if fired {
                 messages = trimmed;
+                prompt_tracker.invalidate();
                 if debug {
                     print_debug(
                         &format!(
@@ -783,22 +842,29 @@ pub async fn openai_chat_complete(
             }
         }
 
-        // Pre-send token budget guard (mirrors Ollama path): trim to fit the
-        // confirmed input ceiling before dispatch so a huge single round can't
+        // Pre-send token budget guard (mirrors Ollama path): when the current
+        // context size — backend-reported prompt tokens preferred, request
+        // estimate including tool schemas as fallback — exceeds the confirmed
+        // input ceiling, trim before dispatch so a huge single round can't
         // trigger the non-retryable 400 that crashed issue #223.
         if let Some(budget) = send_budget {
-            let (trimmed, fired) = trim_to_token_budget(&messages, budget, 2);
-            if fired {
-                if debug {
-                    print_debug(
-                        &format!(
-                            "pre-send trim: ~{} tokens → fit budget {budget}",
-                            estimate_tokens(&trimmed),
-                        ),
-                        color,
-                    );
+            let current = prompt_tracker.current(&messages, Some(&tools));
+            if current > budget {
+                let (trimmed, fired) =
+                    trim_to_token_budget(&messages, budget.saturating_sub(tool_tokens), 2);
+                if fired {
+                    if debug {
+                        print_debug(
+                            &format!(
+                                "pre-send trim: ~{current} tokens → fit budget {budget} \
+                                 (incl. ~{tool_tokens} tool-schema tokens)",
+                            ),
+                            color,
+                        );
+                    }
+                    messages = trimmed;
+                    prompt_tracker.invalidate();
                 }
-                messages = trimmed;
             }
         }
 
@@ -807,7 +873,7 @@ pub async fn openai_chat_complete(
         let body = serde_json::json!({
             "model": model,
             "messages": messages,
-            "tools": merged_tool_definitions(mcp),
+            "tools": tools.clone(),
             "tool_choice": "auto",
             "stream": false,
         });
@@ -850,7 +916,13 @@ pub async fn openai_chat_complete(
                             cw_retries + 1,
                         );
                         send_budget = Some(new_cap as usize);
-                        messages = trim_to_token_budget(&messages, new_cap as usize, 2).0;
+                        messages = trim_to_token_budget(
+                            &messages,
+                            (new_cap as usize).saturating_sub(tool_tokens),
+                            2,
+                        )
+                        .0;
+                        prompt_tracker.invalidate();
                         cw_retries += 1;
                         continue 'round_loop;
                     }
@@ -858,9 +930,13 @@ pub async fn openai_chat_complete(
                 return Err(e);
             }
         };
-        // Accumulate per-round token usage.
+        // Merge per-round token usage (input = max single prompt, output =
+        // sum — Step 18.1) and anchor the context-size tracker.
         let round_usage = openai_usage(&json["usage"]);
-        accumulated_usage = merge_usage(accumulated_usage, round_usage);
+        if let Some(u) = round_usage {
+            prompt_tracker.record(u.input_tokens, messages.len());
+        }
+        accumulated_usage = merge_round_usage(accumulated_usage, round_usage);
 
         let message = &json["choices"][0]["message"];
 
@@ -1430,11 +1506,14 @@ mod tool_round_cap_tests {
             "fallback must include accumulated token counts, got: {reply}"
         );
 
-        // The usage returned must be non-None and reflect the accumulated rounds.
+        // The usage returned must be non-None and reflect the rounds.
         let u = usage.expect("usage must be Some even when final summary fails");
+        // SEMANTICS CHANGED in Step 18.1: each round's 100-token prompt
+        // contained the same history, so the turn input is the largest single
+        // prompt (100), not the 200 sum that double-counted it.
         assert_eq!(
-            u.input_tokens, 200,
-            "2 rounds × 100 input tokens each = 200 total"
+            u.input_tokens, 100,
+            "largest single prompt across 2 rounds, not the sum"
         );
         assert_eq!(
             u.output_tokens, 40,
@@ -1668,7 +1747,10 @@ mod http_loop_tests {
         assert_eq!(reply, "Hello world", "tokens accumulated across chunks");
         assert!(streamed, "the streaming path printed the tokens");
         let u = usage.expect("probe + stream usage merged");
-        assert_eq!(u.input_tokens, 12, "5 (probe) + 7 (stream)");
+        // SEMANTICS CHANGED in Step 18.1: both requests carried the same
+        // conversation, so input is max(5, 7) = 7 — the old sum (12) counted
+        // the shared history twice. Output is still 2 + 3 (new generation).
+        assert_eq!(u.input_tokens, 7, "max(5 probe, 7 stream), not the sum");
         assert_eq!(u.output_tokens, 5, "2 (probe) + 3 (stream)");
         assert_eq!(hallu, 0);
     }
@@ -1805,8 +1887,11 @@ mod http_loop_tests {
         let caveats = Caveats::top();
         let uri = server.uri();
         let mut c = ctx(&uri, &messages, &caveats);
-        // Safe window of 100 input tokens: 90 (probe) + 90 (stream) = 180 ≥ 85,
-        // so the first empty round is classified as likely overflow.
+        // Safe window of 100 input tokens: the empty round reported a 90-token
+        // prompt, and 90 ≥ 85% of 100, so it is classified as likely overflow.
+        // (Step 18.1: the check compares the largest single prompt against the
+        // window — the old multi-round sum, 180 here, inflated past 85% after
+        // two rounds on EVERY long turn, firing spurious overflow retries.)
         c.safe_context = Some(100);
         let (reply, streamed, usage, _) = chat_complete(c, &mut NoMcp)
             .await
@@ -1819,12 +1904,12 @@ mod http_loop_tests {
         );
         assert_eq!(reply, "recovered after trim");
         assert!(streamed);
-        assert!(
+        assert_eq!(
             usage
                 .expect("accumulated usage survives the retry")
-                .input_tokens
-                >= 180,
-            "usage from the overflowed round must not be discarded"
+                .input_tokens,
+            90,
+            "largest single prompt across the overflowed + recovered rounds"
         );
     }
 
