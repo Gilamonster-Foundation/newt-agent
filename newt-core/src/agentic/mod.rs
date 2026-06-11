@@ -38,7 +38,9 @@ use crossterm::{
     execute,
     style::{Color as CtColor, Print, ResetColor, SetForegroundColor},
 };
-use display::{emit_compression_notice, emit_overflow_notice, print_debug, print_retry_indicator};
+use display::{
+    emit_compression_notice, emit_overflow_notice, print_debug, print_retry_indicator, print_trace,
+};
 use std::io::{self, Write as _};
 use tools::{is_hallucination, merged_tool_definitions};
 use trim::{
@@ -201,6 +203,9 @@ pub struct ChatCtx<'a> {
     /// Enable per-round diagnostic output. Set via `NEWT_DEBUG=1` or the
     /// `[tui] debug = true` config key.
     pub debug: bool,
+    /// Enable deeper backend compatibility traces. Set via `NEWT_TRACE=1` or
+    /// the `[tui] trace = true` config key.
+    pub trace: bool,
     /// Ollama `options.num_ctx` — caps KV-cache allocation to prevent VRAM
     /// exhaustion on large models. `None` → model default (often 131k).
     /// Also feeds the pre-send budget as a hard input ceiling for this turn's
@@ -312,6 +317,7 @@ pub async fn chat_complete(
         max_tool_rounds,
         tool_output_lines,
         debug,
+        trace,
         num_ctx,
         connect_timeout_secs,
         inference_timeout_secs,
@@ -366,6 +372,7 @@ pub async fn chat_complete(
     let mut accumulated_usage: Option<crate::TokenUsage> = None;
     let mut hallucination_count: u32 = 0;
     let mut overflow_retries: u32 = 0;
+    let mut suspicious_empty_retries: u32 = 0;
     // Hard context-window 400s recovered (parse limit → trim → retry). See #223.
     let mut cw_retries: u32 = 0;
     // Pre-send token budget gate: trim before dispatch when the current context
@@ -707,12 +714,45 @@ pub async fn chat_complete(
                     );
                 }
                 if probe_content.is_empty() {
+                    let merged = merge_round_usage(accumulated_usage, stream_usage);
+                    let empty_round_usage = merge_round_usage(round_usage, stream_usage);
+                    let generated_unusable_output = empty_round_usage
+                        .as_ref()
+                        .map(|u| u.output_tokens > 0)
+                        .unwrap_or(false);
+
+                    if generated_unusable_output && suspicious_empty_retries < 1 {
+                        if trace {
+                            print_trace(&ollama_response_shape(&json), color);
+                        }
+                        if debug {
+                            let fields = ollama_non_content_fields(&json);
+                            let field_note = if fields.is_empty() {
+                                "no known non-content fields".to_string()
+                            } else {
+                                format!("non-content fields: {}", fields.join(", "))
+                            };
+                            print_debug(
+                                &format!(
+                                    "empty assistant content with generated tokens — retrying once ({field_note})"
+                                ),
+                                color,
+                            );
+                        }
+                        messages.push(serde_json::json!({
+                            "role": "user",
+                            "content": "Your previous response produced generated tokens but no assistant-visible content and no tool call. Reply with either a tool call or final assistant content."
+                        }));
+                        accumulated_usage = merged;
+                        suspicious_empty_retries += 1;
+                        continue 'round_loop;
+                    }
+
                     // Both probe and stream are empty — likely context overflow.
                     // `input_tokens` is the largest single prompt evaluated this
                     // turn (Step 18.1), so the 85%-of-safe-context check now
                     // compares one real prompt against the window instead of a
                     // multi-round sum that inflated past it after ~2 rounds.
-                    let merged = merge_round_usage(accumulated_usage, stream_usage);
                     let overflow_likely = merged
                         .as_ref()
                         .zip(safe_context)
@@ -773,6 +813,17 @@ pub async fn chat_complete(
                         accumulated_usage = merged;
                         overflow_retries += 1;
                         continue 'round_loop;
+                    }
+                    if generated_unusable_output {
+                        if trace {
+                            print_trace(&ollama_response_shape(&json), color);
+                        }
+                        return Ok((
+                            suspicious_empty_ollama_diagnostic(&json),
+                            false,
+                            merged,
+                            hallucination_count,
+                        ));
                     }
                     let msg = "(model returned an empty response — try rephrasing, or check the model with `newt doctor`)";
                     return Ok((msg.to_string(), false, merged, hallucination_count));
@@ -899,6 +950,62 @@ fn append_nudge_line(messages: &mut Vec<serde_json::Value>, line: &str) {
         }
         _ => messages.push(serde_json::json!({"role": "user", "content": line})),
     }
+}
+
+fn ollama_non_content_fields(json: &serde_json::Value) -> Vec<&'static str> {
+    let message = &json["message"];
+    ["reasoning", "reasoning_content", "thinking"]
+        .into_iter()
+        .filter(|field| {
+            message[*field]
+                .as_str()
+                .map(|value| !value.trim().is_empty())
+                .unwrap_or(false)
+        })
+        .collect()
+}
+
+fn ollama_response_shape(json: &serde_json::Value) -> String {
+    let message = &json["message"];
+    let message_keys = message
+        .as_object()
+        .map(|obj| obj.keys().cloned().collect::<Vec<_>>().join(","))
+        .unwrap_or_else(|| "<missing>".to_string());
+    let content_chars = message["content"]
+        .as_str()
+        .map(|content| content.chars().count())
+        .unwrap_or(0);
+    let tool_calls = message["tool_calls"]
+        .as_array()
+        .map(|calls| calls.len())
+        .unwrap_or(0);
+    let non_content = ollama_non_content_fields(json);
+    let non_content = if non_content.is_empty() {
+        "none".to_string()
+    } else {
+        non_content.join(",")
+    };
+    format!(
+        "ollama response shape: message_keys=[{message_keys}] content_chars={content_chars} tool_calls={tool_calls} non_content_fields=[{non_content}] prompt_eval_count={} eval_count={}",
+        json["prompt_eval_count"]
+            .as_u64()
+            .map_or("missing".to_string(), |n| n.to_string()),
+        json["eval_count"]
+            .as_u64()
+            .map_or("missing".to_string(), |n| n.to_string())
+    )
+}
+
+fn suspicious_empty_ollama_diagnostic(json: &serde_json::Value) -> String {
+    let fields = ollama_non_content_fields(json);
+    let field_note = if fields.is_empty() {
+        "no known non-content fields were present".to_string()
+    } else {
+        format!("non-content field(s) present: {}", fields.join(", "))
+    };
+    format!(
+        "(model generated output tokens but returned no assistant-visible content or tool calls; {field_note}; rerun with `newt --trace` to capture the response shape)"
+    )
 }
 
 /// Build the nudge appended to the message list when the tool-round cap is hit.
@@ -1096,6 +1203,7 @@ pub async fn openai_chat_complete(
         max_tool_rounds,
         tool_output_lines,
         debug,
+        trace: _trace,
         num_ctx,
         connect_timeout_secs,
         inference_timeout_secs,
@@ -1679,6 +1787,7 @@ mod tool_round_cap_tests {
                 max_tool_rounds: cap,
                 tool_output_lines: 20,
                 debug: false,
+                trace: false,
                 num_ctx: None,
                 connect_timeout_secs: 5,
                 inference_timeout_secs: 120,
@@ -1739,6 +1848,7 @@ mod tool_round_cap_tests {
                 max_tool_rounds: cap,
                 tool_output_lines: 20,
                 debug: false,
+                trace: false,
                 num_ctx: None,
                 connect_timeout_secs: 5,
                 inference_timeout_secs: 120,
@@ -1817,6 +1927,7 @@ mod tool_round_cap_tests {
                 max_tool_rounds: 1,
                 tool_output_lines: 20,
                 debug: false,
+                trace: false,
                 num_ctx: None,
                 connect_timeout_secs: 5,
                 inference_timeout_secs: 120,
@@ -1907,6 +2018,7 @@ mod tool_round_cap_tests {
                 max_tool_rounds: 1,
                 tool_output_lines: 20,
                 debug: false,
+                trace: false,
                 num_ctx: None,
                 connect_timeout_secs: 5,
                 inference_timeout_secs: 120,
@@ -1989,6 +2101,7 @@ mod tool_round_cap_tests {
                 max_tool_rounds: 2,
                 tool_output_lines: 20,
                 debug: false,
+                trace: false,
                 num_ctx: None,
                 connect_timeout_secs: 5,
                 inference_timeout_secs: 120,
@@ -2103,6 +2216,7 @@ mod tool_round_cap_tests {
                 max_tool_rounds: cap,
                 tool_output_lines: 20,
                 debug: false,
+                trace: false,
                 num_ctx: None,
                 connect_timeout_secs: 5,
                 inference_timeout_secs: 120,
@@ -2236,6 +2350,7 @@ mod tool_round_cap_tests {
                 max_tool_rounds: 10,
                 tool_output_lines: 5,
                 debug: false,
+                trace: false,
                 num_ctx: None,
                 connect_timeout_secs: 5,
                 inference_timeout_secs: 30,
@@ -2308,6 +2423,7 @@ mod http_loop_tests {
             max_tool_rounds: 8,
             tool_output_lines: 20,
             debug: false,
+            trace: false,
             num_ctx: None,
             connect_timeout_secs: 5,
             inference_timeout_secs: 30,
@@ -2464,6 +2580,146 @@ mod http_loop_tests {
             "got: {reply}"
         );
         assert!(reply.contains("newt doctor"), "points at diagnostics");
+        assert!(!streamed);
+    }
+
+    struct SuspiciousEmptyThenRecover {
+        probes: Arc<AtomicUsize>,
+        saw_nudge: Arc<AtomicBool>,
+    }
+    impl Respond for SuspiciousEmptyThenRecover {
+        fn respond(&self, req: &Request) -> ResponseTemplate {
+            if is_stream(req) {
+                if self.probes.load(Ordering::SeqCst) <= 1 {
+                    ndjson(&[serde_json::json!({
+                        "message": {"content": ""},
+                        "done": true,
+                        "prompt_eval_count": 9,
+                        "eval_count": 4
+                    })])
+                } else {
+                    ndjson(&[
+                        serde_json::json!({"message": {"content": "recovered "}, "done": false}),
+                        serde_json::json!({
+                            "message": {"content": "after empty retry"},
+                            "done": true,
+                            "prompt_eval_count": 5,
+                            "eval_count": 3
+                        }),
+                    ])
+                }
+            } else {
+                let body = body_json(req);
+                if body["messages"].as_array().into_iter().flatten().any(|m| {
+                    m["content"]
+                        .as_str()
+                        .unwrap_or("")
+                        .contains("no assistant-visible content")
+                }) {
+                    self.saw_nudge.store(true, Ordering::SeqCst);
+                }
+                let n = self.probes.fetch_add(1, Ordering::SeqCst) + 1;
+                if n == 1 {
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "message": {
+                            "content": "",
+                            "thinking": "I know what to do but did not emit final text."
+                        },
+                        "prompt_eval_count": 10,
+                        "eval_count": 2559,
+                    }))
+                } else {
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "message": {"content": "recovered after empty retry"},
+                        "prompt_eval_count": 5,
+                        "eval_count": 3,
+                    }))
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn suspicious_empty_generated_output_retries_with_nudge() {
+        let server = MockServer::start().await;
+        let probes = Arc::new(AtomicUsize::new(0));
+        let saw_nudge = Arc::new(AtomicBool::new(false));
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(SuspiciousEmptyThenRecover {
+                probes: probes.clone(),
+                saw_nudge: saw_nudge.clone(),
+            })
+            .mount(&server)
+            .await;
+
+        let messages = msgs();
+        let caveats = Caveats::top();
+        let (reply, streamed, usage, _) =
+            chat_complete(ctx(&server.uri(), &messages, &caveats), &mut NoMcp)
+                .await
+                .expect("chat_complete should succeed");
+
+        assert_eq!(reply, "recovered after empty retry");
+        assert!(streamed);
+        assert_eq!(probes.load(Ordering::SeqCst), 2);
+        assert!(saw_nudge.load(Ordering::SeqCst));
+        assert!(
+            usage
+                .expect("usage survives suspicious retry")
+                .output_tokens
+                >= 2566,
+            "usage from the suspicious empty round must be preserved"
+        );
+    }
+
+    struct SuspiciousEmptyStaysEmpty;
+    impl Respond for SuspiciousEmptyStaysEmpty {
+        fn respond(&self, req: &Request) -> ResponseTemplate {
+            if is_stream(req) {
+                ndjson(&[serde_json::json!({
+                    "message": {"content": ""},
+                    "done": true,
+                    "prompt_eval_count": 9,
+                    "eval_count": 4
+                })])
+            } else {
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "message": {
+                        "content": "",
+                        "reasoning_content": "internal-only response"
+                    },
+                    "prompt_eval_count": 10,
+                    "eval_count": 12,
+                }))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn suspicious_empty_generated_output_reports_targeted_diagnostic() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(SuspiciousEmptyStaysEmpty)
+            .mount(&server)
+            .await;
+
+        let messages = msgs();
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut c = ctx(&uri, &messages, &caveats);
+        c.trace = true;
+        let (reply, streamed, _, _) = chat_complete(c, &mut NoMcp)
+            .await
+            .expect("chat_complete should succeed");
+
+        assert!(reply.contains("generated output tokens"), "got: {reply}");
+        assert!(
+            reply.contains("reasoning_content"),
+            "diagnostic should name the non-content field: {reply}"
+        );
+        assert!(reply.contains("--trace"), "points at trace diagnostics");
         assert!(!streamed);
     }
 
@@ -2818,6 +3074,7 @@ mod save_note_loop_tests {
             max_tool_rounds: 6,
             tool_output_lines: 20,
             debug: false,
+            trace: false,
             num_ctx: None,
             connect_timeout_secs: 5,
             inference_timeout_secs: 30,
@@ -3280,6 +3537,7 @@ mod compression_loop_tests {
             max_tool_rounds: 12,
             tool_output_lines: 2,
             debug: false,
+            trace: false,
             num_ctx: None,
             connect_timeout_secs: 5,
             inference_timeout_secs: 30,

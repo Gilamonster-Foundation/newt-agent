@@ -509,7 +509,15 @@ fn scan_cli_exec_grants() -> Vec<String> {
 /// Whether per-round agent-loop diagnostics are enabled.
 /// Set `NEWT_DEBUG=1` in the environment, or `[tui] debug = true` in config.
 fn debug_mode(cfg: &newt_core::Config) -> bool {
-    std::env::var("NEWT_DEBUG").is_ok() || cfg.tui.as_ref().and_then(|t| t.debug).unwrap_or(false)
+    trace_mode(cfg)
+        || std::env::var("NEWT_DEBUG").is_ok()
+        || cfg.tui.as_ref().and_then(|t| t.debug).unwrap_or(false)
+}
+
+/// Whether deep backend/inference diagnostics are enabled.
+/// Set `NEWT_TRACE=1` in the environment, or `[tui] trace = true` in config.
+fn trace_mode(cfg: &newt_core::Config) -> bool {
+    std::env::var("NEWT_TRACE").is_ok() || cfg.tui.as_ref().and_then(|t| t.trace).unwrap_or(false)
 }
 
 /// Build a rustyline config reading edit mode from env then config file.
@@ -1883,6 +1891,7 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                                 max_tool_rounds: eff_max_tool_rounds,
                                 tool_output_lines: tool_output_lines(&cfg),
                                 debug: debug_mode(&cfg),
+                                trace: trace_mode(&cfg),
                                 num_ctx: eff_num_ctx,
                                 connect_timeout_secs: connect_timeout_secs(&cfg),
                                 inference_timeout_secs: inference_timeout_secs(&cfg),
@@ -6243,6 +6252,7 @@ mod tool_round_cap_tests {
                     max_tool_rounds: 5,
                     tool_output_lines: 20,
                     debug: false,
+                    trace: false,
                     num_ctx: None,
                     connect_timeout_secs: 5,
                     inference_timeout_secs: 120,
@@ -7087,6 +7097,29 @@ mod env_resolution_tests {
         });
         with_env_vars(&[("NEWT_DEBUG", "1")], &[], || {
             assert!(debug_mode(&newt_core::Config::default()), "env wins");
+        });
+    }
+
+    #[test]
+    fn trace_mode_env_or_config_and_implies_debug() {
+        let trace_cfg = newt_core::Config {
+            tui: Some(newt_core::TuiConfig {
+                trace: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        with_env_vars(&[], &["NEWT_TRACE", "NEWT_DEBUG"], || {
+            assert!(trace_mode(&trace_cfg), "config trace=true is enough");
+            assert!(debug_mode(&trace_cfg), "trace implies debug");
+            assert!(!trace_mode(&newt_core::Config::default()));
+        });
+        with_env_vars(&[("NEWT_TRACE", "1")], &["NEWT_DEBUG"], || {
+            assert!(trace_mode(&newt_core::Config::default()), "env wins");
+            assert!(
+                debug_mode(&newt_core::Config::default()),
+                "env trace implies debug"
+            );
         });
     }
 
