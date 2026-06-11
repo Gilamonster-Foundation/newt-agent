@@ -1938,6 +1938,7 @@ dependencies = [
  "crossterm",
  "newt-skills",
  "pyo3",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",
