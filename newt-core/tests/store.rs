@@ -13,6 +13,7 @@
 
 use newt_core::{
     new_conversation_id, session_plan_dir, session_plan_path, ConversationRecord, ConversationTurn,
+    ToolEvent,
 };
 // The canonical (root re-exported) store IS the SQLite backend as of 17.1a.
 use newt_core::ConversationStore;
@@ -1852,4 +1853,254 @@ fn store_recall_source_truncates_to_limit_after_exclusion() {
     let hits = source.search("fts5 ranking", 2).unwrap();
     assert_eq!(hits.len(), 2, "limit applies after exclusion: {hits:?}");
     assert!(hits.iter().all(|h| h.conversation_id != current));
+}
+
+// =========================================================================
+// Part 5 — 17.6: tool-event + token-usage recording (issue #246).
+// The turn grows past `(task, reply)`: `append_turn_full` persists the
+// loop's recorded ToolEvents into the `events` JSON column and the
+// backend-reported token actuals into `tokens_in`/`tokens_out`. Events are
+// §6 content (chain-covered), their digests never carry raw args, and the
+// 17.3 FTS trigger picks the new columns up with no schema work.
+// =========================================================================
+
+/// The events the agentic loop would record for a small two-tool turn.
+fn sample_events() -> Vec<ToolEvent> {
+    vec![
+        ToolEvent::from_call(
+            "read_file",
+            &serde_json::json!({"path": "src/store.rs"}),
+            true,
+            Some(4),
+        ),
+        ToolEvent::from_call(
+            "run_command",
+            &serde_json::json!({"command": "cargo test -q"}),
+            false,
+            Some(2_500),
+        ),
+    ]
+}
+
+#[test]
+fn tool_events_and_tokens_round_trip_through_append_and_load() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let store = ConversationStore::new(root.path(), workspace.path(), 100).unwrap();
+
+    let id = store.create("tooling", None).unwrap();
+    let events = sample_events();
+    store
+        .append_turn_full(&id, "fix the bug", "fixed", &events, Some(1_204), Some(892))
+        .unwrap();
+
+    let record = store.load(&id).unwrap();
+    assert_eq!(record.turns.len(), 1);
+    let turn = &record.turns[0];
+    assert_eq!(turn.user, "fix the bug");
+    assert_eq!(turn.assistant, "fixed");
+    assert_eq!(turn.events, events, "events must round-trip verbatim");
+    assert_eq!(turn.tokens_in, Some(1_204));
+    assert_eq!(turn.tokens_out, Some(892));
+    // The outcome and duration claims survive too.
+    assert!(turn.events[0].ok);
+    assert!(!turn.events[1].ok);
+    assert_eq!(turn.events[1].duration_ms, Some(2_500));
+}
+
+/// The args digest is keys + hash, never values: feed a secret-looking arg
+/// and prove the stored row carries no trace of it anywhere.
+#[test]
+fn args_digest_never_carries_raw_arg_values() {
+    let secret = "AKIA-hunter2-SUPERSECRET";
+    let event = ToolEvent::from_call(
+        "write_file",
+        &serde_json::json!({"path": "creds.env", "content": secret}),
+        true,
+        None,
+    );
+    // Key names are searchable; the value is absent (only a digest remains).
+    assert!(event.args_digest.contains("content"));
+    assert!(event.args_digest.contains("path"));
+    assert!(event.args_digest.contains("b3:"));
+    assert!(
+        !event.args_digest.contains("hunter2"),
+        "raw arg values must never reach the digest: {}",
+        event.args_digest
+    );
+    assert!(!event.args_digest.contains("creds.env"));
+
+    // End to end: nothing in the persisted row leaks the secret either.
+    let root = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let store = ConversationStore::new(root.path(), workspace.path(), 100).unwrap();
+    let id = store.create("secret turn", None).unwrap();
+    store
+        .append_turn_full(&id, "write creds", "done", &[event], None, None)
+        .unwrap();
+    let stored: String = raw(root.path())
+        .query_row(
+            "SELECT events FROM turns WHERE conversation_id = ?1",
+            [&id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(!stored.contains("hunter2"), "leaked into events: {stored}");
+    // And identical args correlate: same digest, different turn.
+    let again = ToolEvent::from_call(
+        "write_file",
+        &serde_json::json!({"path": "creds.env", "content": secret}),
+        true,
+        None,
+    );
+    assert_eq!(
+        again.args_digest,
+        store.load(&id).unwrap().turns[0].events[0].args_digest
+    );
+}
+
+/// Tokens are measurements: present when the backend reported them, NULL
+/// when it did not — never a zero or an estimate dressed as one (18.5
+/// rehydrates from these columns and must be able to trust them).
+#[test]
+fn absent_backend_usage_stores_null_not_a_guess() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let store = ConversationStore::new(root.path(), workspace.path(), 100).unwrap();
+    let id = store.create("usage", None).unwrap();
+
+    store
+        .append_turn_full(&id, "with usage", "ok", &[], Some(100), Some(20))
+        .unwrap();
+    store
+        .append_turn_full(&id, "backend silent", "ok", &[], None, None)
+        .unwrap();
+
+    let record = store.load(&id).unwrap();
+    assert_eq!(record.turns[0].tokens_in, Some(100));
+    assert_eq!(record.turns[0].tokens_out, Some(20));
+    assert_eq!(record.turns[1].tokens_in, None);
+    assert_eq!(record.turns[1].tokens_out, None);
+
+    // At the SQL level the silent turn is genuinely NULL, not 0.
+    let (tin, tout): (Option<i64>, Option<i64>) = raw(root.path())
+        .query_row(
+            "SELECT tokens_in, tokens_out FROM turns
+              WHERE conversation_id = ?1 AND user = 'backend silent'",
+            [&id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((tin, tout), (None, None));
+}
+
+/// The 17.3 AFTER INSERT trigger derives tool_names/tool_args_digest from
+/// the events JSON — so a turn appended through `append_turn_full` is
+/// immediately recallable by the tool name it used and by digest terms.
+#[test]
+fn fts_finds_tool_names_recorded_by_append_turn_full() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let store = ConversationStore::new(root.path(), workspace.path(), 100).unwrap();
+    let id = store.create("deploy day", None).unwrap();
+    store
+        .append_turn_full(
+            &id,
+            "ship it",
+            "shipped",
+            &[ToolEvent::from_call(
+                "web_fetch",
+                &serde_json::json!({"url": "https://release.example"}),
+                true,
+                Some(90),
+            )],
+            Some(50),
+            Some(10),
+        )
+        .unwrap();
+
+    // Tool name hits via the derived tool_names column…
+    let hits = store.search("web_fetch", 10).unwrap();
+    assert_eq!(hits.len(), 1, "a recorded tool name must be recallable");
+    assert_eq!(hits[0].conversation_id, id);
+    assert!(hits[0].snippet.contains(">>>"), "{}", hits[0].snippet);
+    // …and digest key terms via tool_args_digest ("url" is in the digest;
+    // the URL value itself never reached the index).
+    assert_eq!(store.search("url", 10).unwrap().len(), 1);
+    assert!(store.search("release.example", 10).unwrap().is_empty());
+}
+
+/// §6: events and token counts are row content. The chain verifies with
+/// them populated, and editing a stored event after the fact breaks it —
+/// same tamper evidence as user/assistant text.
+#[test]
+fn chain_verifies_with_events_and_detects_event_tampering() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let store = ConversationStore::new(root.path(), workspace.path(), 100).unwrap();
+    let id = store.create("chained tools", None).unwrap();
+
+    // Mixed history: plain turn, evented turn, plain turn.
+    store.append_turn(&id, "plan", "planned").unwrap();
+    store
+        .append_turn_full(&id, "act", "acted", &sample_events(), Some(700), None)
+        .unwrap();
+    store.append_turn(&id, "wrap", "wrapped").unwrap();
+    store
+        .verify_chain(&id)
+        .expect("populated events must verify under the unchanged v1 encoding");
+
+    // Rewriting history's tool record is detectable.
+    let changed = raw(root.path())
+        .execute(
+            "UPDATE turns SET events = '[]' WHERE conversation_id = ?1 AND user = 'act'",
+            [&id],
+        )
+        .unwrap();
+    assert_eq!(changed, 1);
+    let err = store.verify_chain(&id).unwrap_err().to_string();
+    assert!(
+        err.contains("chain violation"),
+        "tampered events must break the chain: {err}"
+    );
+}
+
+/// Back-compat: rows written before 17.6 (events = '[]', token columns
+/// NULL — exactly what plain `append_turn` still writes) load as empty
+/// events and absent tokens, and verify unchanged.
+#[test]
+fn pre_17_6_rows_with_empty_events_still_load_and_verify() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let store = ConversationStore::new(root.path(), workspace.path(), 100).unwrap();
+    let id = store.create("legacy shape", None).unwrap();
+    store.append_turn(&id, "old task", "old reply").unwrap();
+
+    let record = store.load(&id).unwrap();
+    assert_eq!(record.turns.len(), 1);
+    assert!(record.turns[0].events.is_empty());
+    assert_eq!(record.turns[0].tokens_in, None);
+    assert_eq!(record.turns[0].tokens_out, None);
+    // The wrapper writes the byte-identical pre-17.6 shape ('[]'/NULL)…
+    let stored: (String, Option<i64>) = raw(root.path())
+        .query_row(
+            "SELECT events, tokens_in FROM turns WHERE conversation_id = ?1",
+            [&id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(stored, ("[]".to_string(), None));
+    // …so pre-17.6 chains keep verifying under the same v1 encoding.
+    store.verify_chain(&id).unwrap();
+
+    // A garbage events blob (writable only by an external tool) refuses to
+    // load as silent garbage — the encoding_version philosophy.
+    raw(root.path())
+        .execute(
+            "UPDATE turns SET events = 'not json' WHERE conversation_id = ?1",
+            [&id],
+        )
+        .unwrap();
+    let err = store.load(&id).unwrap_err().to_string();
+    assert!(err.contains("tool-event"), "{err}");
 }

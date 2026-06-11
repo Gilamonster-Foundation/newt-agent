@@ -47,7 +47,7 @@ pub use config::{
 };
 pub use conversation::{
     new_conversation_id, session_plan_dir, session_plan_path, ConversationRecord,
-    ConversationSummary, ConversationTurn,
+    ConversationSummary, ConversationTurn, ToolEvent,
 };
 // Steps 17.1a/17.1b (issue #246): `ConversationStore` is the SQLite backend
 // (`store` module, §6 causal ordering). The legacy JSON write path is gone;

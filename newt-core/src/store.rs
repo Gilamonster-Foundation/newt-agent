@@ -107,10 +107,12 @@
 //! `tool_names`, and `tool_args_digest`. The latter two are derived **at
 //! index time** from the `events` JSON column — the 17.6 seam: `events` is
 //! a JSON array, and every element carrying a `tool` / `args_digest` string
-//! field contributes to the respective column (space-joined). Today every
-//! row's events is `'[]'`, so the derived columns are empty — when 17.6
-//! starts recording real tool events, search lights up with **no further
-//! schema work here**.
+//! field contributes to the respective column (space-joined). As of 17.6
+//! [`ConversationStore::append_turn_full`] records real tool events
+//! ([`crate::ToolEvent`] — name, privacy-preserving args digest, outcome,
+//! duration claim), so a recall search for a tool name or digest term hits;
+//! rows written through plain `append_turn` (and every pre-17.6 row) carry
+//! `'[]'` and contribute empty derived columns.
 //!
 //! External content means FTS5 stores only the inverted index; at query
 //! time, column values (for [`ConversationStore::search`]'s `snippet()`)
@@ -422,15 +424,52 @@ impl ConversationStore {
             .is_some())
     }
 
-    /// Append one `(user, assistant)` turn. `id` may be a unique prefix.
+    /// Append one `(user, assistant)` turn with no tool events and no token
+    /// usage. `id` may be a unique prefix. Thin wrapper over
+    /// [`append_turn_full`](Self::append_turn_full): an empty event slice
+    /// serializes to `'[]'` and absent tokens to NULL — byte-identical to
+    /// the pre-17.6 row shape, so existing callers are unchanged.
+    pub fn append_turn(&self, id: &str, user: &str, assistant: &str) -> anyhow::Result<()> {
+        self.append_turn_full(id, user, assistant, &[], None, None)
+    }
+
+    /// Append one turn with its recorded tool events and backend-reported
+    /// token usage (Step 17.6, issue #246). `id` may be a unique prefix.
     ///
     /// One `BEGIN IMMEDIATE` transaction covers: tick allocation, chain
     /// extension (`prev_hash` from the current per-writer tip), the row
     /// insert, and the conversation's activity/tip update. Appending never
     /// prunes — only `create` does, matching the JSON backend.
-    pub fn append_turn(&self, id: &str, user: &str, assistant: &str) -> anyhow::Result<()> {
+    ///
+    /// **Chain (§6):** events and token counts are row content — the v1
+    /// canonical encoding has length-prefixed the serialized `events`
+    /// string and the token presence bytes since 17.1a, so populated
+    /// values hash under the exact rules empty ones did. No
+    /// `encoding_version` bump: pre-17.6 rows (`'[]'`, NULL) and 17.6 rows
+    /// verify under the same v1 dispatch, and tampering with a stored
+    /// event breaks [`verify_chain`](Self::verify_chain) like any other
+    /// field.
+    ///
+    /// **Tokens are measurements, not estimates:** pass the backend's
+    /// reported counts or `None`. `None` is stored as NULL — absence stays
+    /// observable (18.5 rehydrates from these columns and must be able to
+    /// trust them; gates-are-honest).
+    ///
+    /// **FTS:** the 17.3 AFTER INSERT trigger derives `tool_names` /
+    /// `tool_args_digest` from the events JSON at index time — recording
+    /// events here lights recall up with no schema work.
+    pub fn append_turn_full(
+        &self,
+        id: &str,
+        user: &str,
+        assistant: &str,
+        events: &[crate::ToolEvent],
+        tokens_in: Option<u32>,
+        tokens_out: Option<u32>,
+    ) -> anyhow::Result<()> {
         let id = self.resolve_id(id)?;
         let now = (self.claim_clock)();
+        let events_json = serde_json::to_string(events)?;
         let conn = self.lock_conn();
         let tx = rusqlite::Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
         let tick = next_tick(&tx, &self.writer_fingerprint)?;
@@ -450,9 +489,9 @@ impl ConversationStore {
             prev_hash,
             user: user.to_string(),
             assistant: assistant.to_string(),
-            events: "[]".to_string(),
-            tokens_in: None,
-            tokens_out: None,
+            events: events_json,
+            tokens_in: tokens_in.map(i64::from),
+            tokens_out: tokens_out.map(i64::from),
             ts_claim: now,
             encoding_version: TURN_ENCODING_VERSION_CURRENT,
         };
@@ -500,18 +539,40 @@ impl ConversationStore {
 
         // §6: turn order is the causal tick, never ts_claim.
         let mut stmt = conn.prepare(
-            "SELECT user, assistant FROM turns
+            "SELECT user, assistant, events, tokens_in, tokens_out FROM turns
               WHERE conversation_id = ?1
               ORDER BY seq ASC, writer_fingerprint ASC",
         )?;
         let turns = stmt.query_map([&id], |row| {
-            Ok(ConversationTurn::new(
+            Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+                row.get::<_, Option<i64>>(4)?,
             ))
         })?;
         for turn in turns {
-            record.turns.push(turn?);
+            let (user, assistant, events_json, tokens_in, tokens_out) = turn?;
+            // 17.6: events deserialize strictly — a row whose blob is not
+            // ToolEvent-shaped errors clearly (the encoding_version
+            // philosophy: never quietly hand back garbage). Pre-17.6 rows
+            // carry '[]' and parse to an empty vec; unknown extra keys on
+            // future events are ignored (additive growth needs no bump).
+            let events: Vec<crate::ToolEvent> =
+                serde_json::from_str(&events_json).map_err(|e| {
+                    anyhow::anyhow!(
+                        "conversation `{id}`: turn events column is not valid tool-event \
+                         JSON ({e}); refusing to load garbage"
+                    )
+                })?;
+            record.turns.push(ConversationTurn {
+                user,
+                assistant,
+                events,
+                tokens_in: tokens_from_sql(tokens_in)?,
+                tokens_out: tokens_from_sql(tokens_out)?,
+            });
         }
         Ok(record)
     }
@@ -1759,6 +1820,20 @@ fn now_claim_nanos() -> i64 {
 
 fn claim_to_u128(claim: i64) -> u128 {
     claim.max(0) as u128
+}
+
+/// Read a token-count column back to the `u32` it was written from (17.6).
+/// NULL stays `None` — an unreported count is absence, never zero-dressed-up.
+/// A value outside `u32` cannot come from `append_turn_full` (which widens
+/// from `u32`), so it errors as tampering/corruption instead of clamping —
+/// 18.5 trusts these as measurements.
+fn tokens_from_sql(value: Option<i64>) -> anyhow::Result<Option<u32>> {
+    value
+        .map(|v| {
+            u32::try_from(v)
+                .map_err(|_| anyhow::anyhow!("token count {v} out of range (tampered row?)"))
+        })
+        .transpose()
 }
 
 /// The conversation-id alphabet (ASCII alphanumeric + '-'), inherited from

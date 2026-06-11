@@ -17,10 +17,89 @@ use serde::{Deserialize, Serialize};
 
 static CLOCK_TIEBREAKER: AtomicU64 = AtomicU64::new(0);
 
+/// One tool invocation recorded during a turn (Step 17.6, issue #246).
+///
+/// Serialized (as an array element) into the store's `turns.events` JSON
+/// column. The field names `tool` and `args_digest` are **load-bearing**:
+/// the FTS5 recall index derives its `tool_names` / `tool_args_digest`
+/// columns by extracting exactly `$.tool` and `$.args_digest` from each
+/// element (see `store.rs` — `events_extract_sql`, the 17.3 seam) — rename
+/// either and tool recall goes dark. Unknown extra fields are ignored on
+/// load, so the shape can grow additively without a migration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolEvent {
+    /// Tool name exactly as the model invoked it (`read_file`,
+    /// `run_command`, an MCP `server__tool`, or a hallucinated name —
+    /// recorded as called, ok = false tells the story).
+    pub tool: String,
+    /// Privacy-preserving argument digest: the argument *key names*
+    /// (searchable) plus a truncated BLAKE3 of the canonical args JSON
+    /// (correlatable). **Never raw argument values** — args carry file
+    /// contents and can carry secrets. Built by [`ToolEvent::from_call`].
+    pub args_digest: String,
+    /// Whether the tool result read as success. Best-effort: the loop's
+    /// tool results are plain strings, so this mirrors the `error:` /
+    /// `capability denied:` / `unknown tool` prefixes `execute_tool` emits.
+    pub ok: bool,
+    /// Wall-clock duration of the tool call in milliseconds. A display
+    /// claim only (§6): never an ordering key — order within the turn is
+    /// the events array position.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+}
+
+impl ToolEvent {
+    /// Record one tool call. `args` are digested, never stored raw: the
+    /// digest is the object's key names (space-joined — useful FTS terms
+    /// that cannot leak values) plus `b3:` + the first 16 hex chars of
+    /// BLAKE3 over the canonical JSON, so two turns calling the same tool
+    /// with identical args correlate without exposing what the args were.
+    pub fn from_call(
+        tool: impl Into<String>,
+        args: &serde_json::Value,
+        ok: bool,
+        duration_ms: Option<u64>,
+    ) -> Self {
+        // serde_json's default map is ordered (BTreeMap), so `to_string`
+        // is canonical for a given parsed value and the digest is stable.
+        let hash = blake3::hash(args.to_string().as_bytes()).to_hex();
+        let short = &hash.as_str()[..16];
+        let keys = args
+            .as_object()
+            .map(|m| m.keys().cloned().collect::<Vec<_>>().join(" "))
+            .unwrap_or_default();
+        let args_digest = if keys.is_empty() {
+            format!("b3:{short}")
+        } else {
+            format!("{keys} b3:{short}")
+        };
+        Self {
+            tool: tool.into(),
+            args_digest,
+            ok,
+            duration_ms,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConversationTurn {
     pub user: String,
     pub assistant: String,
+    /// Tool events recorded during the turn (17.6). Empty for pre-17.6
+    /// rows and for turns that called no tools.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub events: Vec<ToolEvent>,
+    /// Backend-reported prompt tokens for the turn (largest single prompt
+    /// across the turn's rounds — see `chat_complete`'s Step 18.1 usage
+    /// semantics). `None` when the backend reported nothing: absence is
+    /// stored as absence, never an estimate (18.5 rehydrates from this).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens_in: Option<u32>,
+    /// Backend-reported completion tokens (summed across rounds). `None`
+    /// when the backend reported nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens_out: Option<u32>,
 }
 
 impl ConversationTurn {
@@ -28,6 +107,9 @@ impl ConversationTurn {
         Self {
             user: user.into(),
             assistant: assistant.into(),
+            events: Vec::new(),
+            tokens_in: None,
+            tokens_out: None,
         }
     }
 }
