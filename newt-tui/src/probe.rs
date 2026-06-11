@@ -105,7 +105,24 @@ pub struct CapabilityEntry {
     /// ISO-8601 date the tuning was last updated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tune_date: Option<String>,
+
+    /// Token-accounting regime this entry's tuning values were recorded
+    /// under. `0` (the serde default for entries that predate the field)
+    /// means the pre-18.1 double-counting regime, whose per-turn "input"
+    /// summed `prompt_eval_count` across every round of a turn — the B3
+    /// baseline caught `max_ok_input: 25602` persisted at High confidence
+    /// when the largest prompt the backend ever evaluated was 4,748 tokens
+    /// (5.4×). [`migrate_accounting`] invalidates such entries once on load.
+    /// NOTE: serde's missing-field default (0 = legacy) is deliberately
+    /// different from `CapabilityEntry::default()` (current version), so
+    /// entries created in-process never get migrated away.
+    #[serde(default)]
+    pub accounting_version: u32,
 }
+
+/// The token-accounting regime of the current build (Step 18.1:
+/// prompt-tokens-preferred; turn input = largest single prompt evaluated).
+pub const ACCOUNTING_VERSION: u32 = 1;
 
 impl Default for CapabilityEntry {
     fn default() -> Self {
@@ -119,6 +136,8 @@ impl Default for CapabilityEntry {
             consecutive_ok: 0,
             tune_confidence: TuneConfidence::None,
             tune_date: None,
+            // New entries are recorded under the current (truthful) regime.
+            accounting_version: ACCOUNTING_VERSION,
         }
     }
 }
@@ -209,6 +228,10 @@ fn cache_path() -> Option<PathBuf> {
 }
 
 /// Load the capability cache from disk, returning an empty map on any error.
+///
+/// Runs [`migrate_accounting`] on the parsed cache and persists the result
+/// when anything changed, so poisoned pre-18.1 ratchet values are invalidated
+/// exactly once.
 pub fn load_cache() -> CapabilityCache {
     let Some(path) = cache_path() else {
         return Default::default();
@@ -216,7 +239,54 @@ pub fn load_cache() -> CapabilityCache {
     let Ok(data) = std::fs::read_to_string(&path) else {
         return Default::default();
     };
-    serde_json::from_str(&data).unwrap_or_default()
+    let mut cache: CapabilityCache = serde_json::from_str(&data).unwrap_or_default();
+    if migrate_accounting(&mut cache) {
+        save_cache(&cache);
+    }
+    cache
+}
+
+/// One-time de-poisoning of ratchet values recorded under the pre-18.1
+/// double-counting regime (issue #247, live evidence in the B3 baseline).
+///
+/// An entry is invalidated when it predates `accounting_version` — i.e. its
+/// `max_ok_input` was ratcheted from the per-turn SUM of `prompt_eval_count`
+/// across rounds, not from any prompt the backend actually evaluated. The
+/// measured poisoned entry also fails the honesty cross-check (`max_ok_input`
+/// 25,602 > `safe_context` 6,553 — a success above the KV window is
+/// impossible for an Ollama-tuned entry); both conditions collapse onto the
+/// same set here because every versionless entry was recorded double-counted.
+///
+/// Invalidation drops `max_ok_input` and resets `consecutive_ok` /
+/// `tune_confidence` so the ratchet re-learns from truthful numbers; the
+/// entry is then stamped with the current version, making the migration
+/// idempotent. Entries already at the current version are never touched —
+/// in particular a post-#223 `max_ok_input` above `safe_context` is
+/// legitimate there (the cw-400 path derives it from the endpoint's reported
+/// hard limit while `safe_context` stays VRAM-capped).
+///
+/// Returns `true` when anything changed (caller should persist).
+pub fn migrate_accounting(cache: &mut CapabilityCache) -> bool {
+    let mut dirty = false;
+    for (model, entry) in cache.iter_mut() {
+        if entry.accounting_version >= ACCOUNTING_VERSION {
+            continue;
+        }
+        if entry.max_ok_input.is_some() {
+            tracing::info!(
+                model,
+                max_ok_input = entry.max_ok_input,
+                "invalidating max_ok_input recorded under the double-counting \
+                 regime (Step 18.1); the ratchet will re-learn"
+            );
+            entry.max_ok_input = None;
+            entry.consecutive_ok = 0;
+            entry.tune_confidence = TuneConfidence::None;
+        }
+        entry.accounting_version = ACCOUNTING_VERSION;
+        dirty = true;
+    }
+    dirty
 }
 
 /// Persist the capability cache to disk (best-effort).
@@ -683,11 +753,7 @@ mod tests {
             tested_date: "2026-06-06".to_string(),
             context_window: Some(32768),
             safe_context: Some(26214),
-            overflow_at: None,
-            max_ok_input: None,
-            consecutive_ok: 0,
-            tune_confidence: TuneConfidence::None,
-            tune_date: None,
+            ..Default::default()
         }
     }
 
@@ -824,6 +890,105 @@ mod tests {
         assert_eq!(e.conformance, ToolConformance::Native);
         assert_eq!(e.context_window, None);
         assert_eq!(e.tune_confidence, TuneConfidence::None);
+        // Missing accounting_version means the double-counting regime —
+        // NOT the current version that in-process Default entries get.
+        assert_eq!(e.accounting_version, 0);
+    }
+
+    // --- migrate_accounting (Step 18.1 ratchet de-poison) ---
+
+    /// The live poisoned entry from the B3 baseline: max_ok_input 25,602 at
+    /// High confidence when the largest evaluated prompt was 4,748 tokens
+    /// (and safe_context was 6,553 — provably impossible). Versionless →
+    /// invalidated once; tuning that is honest either way survives.
+    #[test]
+    fn migrate_accounting_invalidates_poisoned_entry() {
+        let mut cache = CapabilityCache::default();
+        cache.insert(
+            "llama3.1:8b".into(),
+            CapabilityEntry {
+                conformance: ToolConformance::Native,
+                tested_date: "2026-06-08".into(),
+                context_window: Some(8_192),
+                safe_context: Some(6_553),
+                overflow_at: None,
+                max_ok_input: Some(25_602),
+                consecutive_ok: 3,
+                tune_confidence: TuneConfidence::High,
+                tune_date: Some("2026-06-08".into()),
+                accounting_version: 0, // pre-18.1 (missing in the JSON)
+            },
+        );
+        assert!(
+            migrate_accounting(&mut cache),
+            "migration must report dirty"
+        );
+        let e = &cache["llama3.1:8b"];
+        assert_eq!(e.max_ok_input, None, "poisoned ratchet value dropped");
+        assert_eq!(e.consecutive_ok, 0);
+        assert_eq!(e.tune_confidence, TuneConfidence::None);
+        assert_eq!(e.accounting_version, ACCOUNTING_VERSION);
+        // Non-ratchet state survives: the declared window and the
+        // conservatively-derived safe_context are not regime-dependent.
+        assert_eq!(e.context_window, Some(8_192));
+        assert_eq!(e.safe_context, Some(6_553));
+        assert_eq!(e.conformance, ToolConformance::Native);
+    }
+
+    /// A clean current-version entry — including the legitimate post-#223
+    /// shape where max_ok_input (from the endpoint's reported hard limit)
+    /// exceeds the VRAM-capped safe_context — must be left untouched.
+    #[test]
+    fn migrate_accounting_leaves_current_version_entry_untouched() {
+        let mut cache = CapabilityCache::default();
+        let entry = CapabilityEntry {
+            conformance: ToolConformance::Native,
+            tested_date: "2026-06-09".into(),
+            safe_context: Some(64_000),
+            max_ok_input: Some(800_000), // cw-400 discovery: legit > safe_context
+            consecutive_ok: 2,
+            tune_confidence: TuneConfidence::Medium,
+            ..Default::default() // accounting_version = current
+        };
+        cache.insert("hosted-model".into(), entry.clone());
+        assert!(!migrate_accounting(&mut cache), "nothing to migrate");
+        let e = &cache["hosted-model"];
+        assert_eq!(e.max_ok_input, Some(800_000));
+        assert_eq!(e.consecutive_ok, 2);
+        assert_eq!(e.tune_confidence, TuneConfidence::Medium);
+    }
+
+    /// A versionless entry WITHOUT tuning values just gets stamped (still
+    /// dirty — the stamp itself must persist so the check never re-runs).
+    #[test]
+    fn migrate_accounting_stamps_untuned_legacy_entry() {
+        let mut cache = CapabilityCache::default();
+        cache.insert(
+            "old-model".into(),
+            CapabilityEntry {
+                conformance: ToolConformance::TextMode,
+                tested_date: "2026-06-04".into(),
+                accounting_version: 0,
+                ..Default::default()
+            },
+        );
+        assert!(migrate_accounting(&mut cache));
+        assert_eq!(cache["old-model"].accounting_version, ACCOUNTING_VERSION);
+        assert_eq!(cache["old-model"].conformance, ToolConformance::TextMode);
+    }
+
+    /// Running the migration twice must be a no-op the second time.
+    #[test]
+    fn migrate_accounting_is_idempotent() {
+        let mut cache = CapabilityCache::default();
+        let mut e = make_entry();
+        e.max_ok_input = Some(25_602);
+        e.accounting_version = 0;
+        cache.insert("m".into(), e);
+        assert!(migrate_accounting(&mut cache), "first pass migrates");
+        let snapshot = serde_json::to_string(&cache).unwrap();
+        assert!(!migrate_accounting(&mut cache), "second pass is a no-op");
+        assert_eq!(serde_json::to_string(&cache).unwrap(), snapshot);
     }
 
     // --- parse_show_response ---

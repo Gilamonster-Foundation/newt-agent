@@ -444,19 +444,33 @@ impl MemoryProvider for RollingWindow {
 // TokenBudget — built-in provider #2 (closes #106)
 // ---------------------------------------------------------------------------
 
-/// Per-turn token record stored by `TokenBudget`.
+/// Per-turn record stored by `TokenBudget`.
 #[derive(Debug, Clone)]
 struct TurnRecord {
     user: String,
     assistant: String,
-    /// Total tokens (input + output) for this turn.
-    tokens: u32,
+    /// chars/4 (ceiling) estimate of THIS turn's content only — what dropping
+    /// the turn removes from future prompts. NOT the backend usage reading:
+    /// `input_tokens` already contains every prior turn, so storing and
+    /// summing it per turn double-counts history (Step 18.1).
+    est_tokens: u32,
+}
+
+/// `(len + 3) / 4` ceiling estimate of one turn's content contribution.
+fn turn_content_estimate(user: &str, assistant: &str) -> u32 {
+    (user.len().div_ceil(4) + assistant.len().div_ceil(4)) as u32
 }
 
 /// Keep turns up to `threshold_pct` of the model's context window.
 ///
-/// Uses `TurnMetrics.usage` (already collected) to track token consumption.
-/// Prunes oldest turns first when approaching the budget.
+/// Budget math (fixed in Step 18.1): the fullness figure anchors on the
+/// backend's last-reported prompt size — which already includes the system
+/// prompt and ALL prior turns — plus a chars/4 estimate of content added or
+/// removed since that report. The previous implementation summed
+/// `input + output` per turn across history, double-counting every prior turn
+/// in every later reading (the B3 baseline measured 5.4× inflation by turn
+/// 20), which forced spurious pruning. Without any backend report the figure
+/// falls back to summing per-turn content estimates (each turn counted once).
 ///
 /// Configure via `[memory] provider = "token_budget"` plus an optional
 /// `context_tokens` override (default: 8192).
@@ -467,6 +481,10 @@ pub struct TokenBudget {
     threshold_pct: f32,
     history: Vec<TurnRecord>,
     pruned_count: usize,
+    /// Backend-reported prompt size of the most recent turn (truth anchor).
+    last_prompt_tokens: Option<u32>,
+    /// Estimated tokens added (+) / removed (−) relative to that anchor.
+    delta_since_prompt: i64,
 }
 
 impl TokenBudget {
@@ -476,6 +494,8 @@ impl TokenBudget {
             threshold_pct: threshold_pct.clamp(0.1, 0.99),
             history: Vec::new(),
             pruned_count: 0,
+            last_prompt_tokens: None,
+            delta_since_prompt: 0,
         }
     }
 
@@ -493,8 +513,14 @@ impl TokenBudget {
         (self.max_tokens as f32 * self.threshold_pct) as u32
     }
 
+    /// Current context fullness: last backend-reported prompt size plus the
+    /// estimated delta since, or the per-turn content-estimate sum when no
+    /// report exists (Step 18.1).
     fn used_tokens(&self) -> u32 {
-        self.history.iter().map(|r| r.tokens).sum()
+        match self.last_prompt_tokens {
+            Some(p) => (i64::from(p) + self.delta_since_prompt).max(0) as u32,
+            None => self.history.iter().map(|r| r.est_tokens).sum(),
+        }
     }
 
     /// Prune oldest turns until we're within budget. Returns how many were dropped.
@@ -502,7 +528,9 @@ impl TokenBudget {
         let budget = self.budget_tokens();
         let mut dropped = 0;
         while self.used_tokens() > budget && !self.history.is_empty() {
-            self.history.remove(0);
+            let removed = self.history.remove(0);
+            // Dropping a turn shrinks the NEXT prompt by its content estimate.
+            self.delta_since_prompt -= i64::from(removed.est_tokens);
             dropped += 1;
         }
         dropped
@@ -526,18 +554,25 @@ impl MemoryProvider for TokenBudget {
     }
 
     async fn sync_turn(&mut self, user: &str, assistant: &str, metrics: &TurnMetrics) {
-        let tokens = metrics
-            .usage
-            .map(|u| u.input_tokens + u.output_tokens)
-            .unwrap_or(
-                // Rough estimate when Ollama doesn't report counts.
-                ((user.len() + assistant.len()) / 4) as u32,
-            );
+        let est = turn_content_estimate(user, assistant);
         self.history.push(TurnRecord {
             user: user.to_string(),
             assistant: assistant.to_string(),
-            tokens,
+            est_tokens: est,
         });
+        match metrics.usage {
+            Some(u) => {
+                // `input_tokens` is the largest single prompt the backend
+                // evaluated this turn (Step 18.1) — it already contains the
+                // system prompt, all prior turns, and this user message. The
+                // only content not yet inside any prompt is the new reply.
+                self.last_prompt_tokens = Some(u.input_tokens);
+                self.delta_since_prompt = (assistant.len().div_ceil(4)) as i64;
+            }
+            // No backend report this turn: the whole turn is unaccounted
+            // relative to the (possibly absent) anchor.
+            None => self.delta_since_prompt += i64::from(est),
+        }
         let dropped = self.prune_to_budget();
         self.pruned_count += dropped;
         if dropped > 0 {
@@ -553,6 +588,8 @@ impl MemoryProvider for TokenBudget {
     fn reset(&mut self) {
         self.history.clear();
         self.pruned_count = 0;
+        self.last_prompt_tokens = None;
+        self.delta_since_prompt = 0;
     }
 
     fn restore_turns(&mut self, turns: &[crate::ConversationTurn]) {
@@ -561,9 +598,13 @@ impl MemoryProvider for TokenBudget {
             .map(|t| TurnRecord {
                 user: t.user.clone(),
                 assistant: t.assistant.clone(),
-                tokens: ((t.user.len() + t.assistant.len()) / 4) as u32,
+                est_tokens: turn_content_estimate(&t.user, &t.assistant),
             })
             .collect();
+        // No backend report covers restored turns — estimate-only until the
+        // next live turn re-anchors (token restore from the store is 18.5).
+        self.last_prompt_tokens = None;
+        self.delta_since_prompt = 0;
         self.pruned_count = self.prune_to_budget();
     }
 
@@ -594,18 +635,24 @@ pub use crate::notes::NoteStore;
 /// substitute a fake.
 pub type SummaryFn = Box<dyn Fn(&str) -> anyhow::Result<String> + Send + Sync>;
 
-/// Per-turn record with token count for budget tracking.
+/// Per-turn record with a content-size estimate for budget tracking.
 #[derive(Clone)]
 struct SumTurn {
     user: String,
     assistant: String,
-    tokens: u32,
+    /// chars/4 (ceiling) estimate of THIS turn's content only — see
+    /// [`TurnRecord::est_tokens`] for why backend usage is not stored per
+    /// turn (it would double-count history; Step 18.1).
+    est_tokens: u32,
 }
 
 /// LLM-powered summarisation of old turns when context fills.
 ///
 /// Algorithm (adapted from hermes-agent `ContextCompressor`):
-/// 1. Track tokens per turn using `TurnMetrics.usage`.
+/// 1. Track context fullness as last-backend-reported-prompt-size plus the
+///    estimated content delta since (Step 18.1 — same anchored math as
+///    [`TokenBudget`]; the old per-turn `input + output` running sum
+///    double-counted history and triggered spurious compressions).
 /// 2. When `used_tokens > threshold * max_tokens`, summarise the oldest
 ///    `compress_ratio` of turns into a structured block.
 /// 3. Replace them with a single `[Summary]` assistant message.
@@ -627,6 +674,10 @@ pub struct Summarizing {
     compress_count: usize,
     /// Injected summariser — defaults to None (caller must set via `with_summarizer`).
     summarizer: Option<SummaryFn>,
+    /// Backend-reported prompt size of the most recent turn (truth anchor).
+    last_prompt_tokens: Option<u32>,
+    /// Estimated tokens added (+) / removed (−) relative to that anchor.
+    delta_since_prompt: i64,
 }
 
 impl Summarizing {
@@ -640,6 +691,8 @@ impl Summarizing {
             last_savings: [1.0, 1.0],
             compress_count: 0,
             summarizer: None,
+            last_prompt_tokens: None,
+            delta_since_prompt: 0,
         }
     }
 
@@ -656,8 +709,14 @@ impl Summarizing {
         (self.max_tokens as f32 * self.threshold_pct) as u32
     }
 
+    /// Current context fullness: last backend-reported prompt size plus the
+    /// estimated delta since, or the per-turn content-estimate sum when no
+    /// report exists (Step 18.1).
     fn used_tokens(&self) -> u32 {
-        self.history.iter().map(|t| t.tokens).sum()
+        match self.last_prompt_tokens {
+            Some(p) => (i64::from(p) + self.delta_since_prompt).max(0) as u32,
+            None => self.history.iter().map(|t| t.est_tokens).sum(),
+        }
     }
 
     fn should_compress(&self) -> bool {
@@ -678,11 +737,13 @@ impl Summarizing {
         if total == 0 {
             return;
         }
+        // Capture fullness BEFORE mutating anything (Step 18.1: used_tokens
+        // is anchored, so it can no longer be reconstructed post-drain by
+        // adding the drained turns back).
+        let tokens_before = self.used_tokens();
         let n_to_summarise = ((total as f32 * self.compress_ratio) as usize).max(1);
         let turns_to_compress: Vec<SumTurn> = self.history.drain(..n_to_summarise).collect();
-
-        let tokens_before =
-            self.used_tokens() + turns_to_compress.iter().map(|t| t.tokens).sum::<u32>();
+        let drained_est: u32 = turns_to_compress.iter().map(|t| t.est_tokens).sum();
 
         // Build the prompt for summarisation.
         let mut prompt = String::new();
@@ -727,14 +788,17 @@ impl Summarizing {
             )
         };
 
-        // Insert the summary as the first history entry.
-        let summary_tokens = (summary.len() / 4) as u32;
+        // Insert the summary as the first history entry, and reflect the
+        // content change against the anchor: dropped turns shrink the next
+        // prompt by their estimate, the summary grows it by its own.
+        let summary_tokens = (summary.len().div_ceil(4)) as u32;
+        self.delta_since_prompt += i64::from(summary_tokens) - i64::from(drained_est);
         self.history.insert(
             0,
             SumTurn {
                 user: "[context summary]".into(),
                 assistant: summary.clone(),
-                tokens: summary_tokens,
+                est_tokens: summary_tokens,
             },
         );
         self.prev_summary = summary;
@@ -775,15 +839,21 @@ impl MemoryProvider for Summarizing {
     }
 
     async fn sync_turn(&mut self, user: &str, assistant: &str, metrics: &TurnMetrics) {
-        let tokens = metrics
-            .usage
-            .map(|u| u.input_tokens + u.output_tokens)
-            .unwrap_or(((user.len() + assistant.len()) / 4) as u32);
+        let est = turn_content_estimate(user, assistant);
         self.history.push(SumTurn {
             user: user.to_string(),
             assistant: assistant.to_string(),
-            tokens,
+            est_tokens: est,
         });
+        match metrics.usage {
+            Some(u) => {
+                // Anchor on the largest single prompt the backend evaluated
+                // this turn (Step 18.1); only the reply is not yet inside it.
+                self.last_prompt_tokens = Some(u.input_tokens);
+                self.delta_since_prompt = (assistant.len().div_ceil(4)) as i64;
+            }
+            None => self.delta_since_prompt += i64::from(est),
+        }
         if self.should_compress() {
             self.compress_sync();
         }
@@ -794,6 +864,8 @@ impl MemoryProvider for Summarizing {
         self.prev_summary.clear();
         self.last_savings = [1.0, 1.0];
         self.compress_count = 0;
+        self.last_prompt_tokens = None;
+        self.delta_since_prompt = 0;
     }
 
     fn restore_turns(&mut self, turns: &[crate::ConversationTurn]) {
@@ -802,12 +874,16 @@ impl MemoryProvider for Summarizing {
             .map(|t| SumTurn {
                 user: t.user.clone(),
                 assistant: t.assistant.clone(),
-                tokens: ((t.user.len() + t.assistant.len()) / 4) as u32,
+                est_tokens: turn_content_estimate(&t.user, &t.assistant),
             })
             .collect();
         self.prev_summary.clear();
         self.last_savings = [1.0, 1.0];
         self.compress_count = 0;
+        // No backend report covers restored turns — estimate-only until the
+        // next live turn re-anchors (token restore from the store is 18.5).
+        self.last_prompt_tokens = None;
+        self.delta_since_prompt = 0;
         if self.should_compress() {
             self.compress_sync();
         }
@@ -1109,18 +1185,42 @@ mod tests {
 
     // --- TokenBudget tests ---
 
-    #[tokio::test]
-    async fn token_budget_prunes_oldest_when_over_budget() {
-        let mut tb = TokenBudget::new(100, 1.0); // budget = 100 tokens
-                                                 // Each turn costs ~50 tokens (200 chars / 4)
-        let big = "x".repeat(200);
-        tb.sync_turn(&big, &big, &dummy_metrics()).await;
-        tb.sync_turn(&big, &big, &dummy_metrics()).await;
-        tb.sync_turn(&big, &big, &dummy_metrics()).await;
-        // Should have pruned to fit within 100 tokens
-        assert!(tb.used_tokens() <= 100);
+    /// Metrics with a given backend-reported prompt size (`input_tokens`).
+    fn metrics_with_input(input_tokens: u32) -> TurnMetrics {
+        let mut m = dummy_metrics();
+        m.usage = Some(TokenUsage {
+            input_tokens,
+            output_tokens: 20,
+        });
+        m
     }
 
+    /// SEMANTICS CHANGED in Step 18.1: pruning fires when the BACKEND-reported
+    /// prompt size exceeds the budget — the prompt already contains all prior
+    /// turns, so the provider no longer manufactures overflow by summing
+    /// per-turn readings. Here the reported prompt genuinely grows past the
+    /// 100-token budget, so the oldest turns must be dropped.
+    #[tokio::test]
+    async fn token_budget_prunes_oldest_when_over_budget() {
+        // max_tokens floors at 512; threshold caps at 0.99 → budget = 506.
+        let mut tb = TokenBudget::new(512, 0.99);
+        let budget = 506;
+        let big = "x".repeat(200); // each turn adds 100 est tokens (2×200/4)
+        tb.sync_turn(&big, &big, &metrics_with_input(200)).await;
+        // Turn 1: used = 200 (reported) + 50 (reply est) = 250 ≤ 506 → kept.
+        assert_eq!(tb.history.len(), 1);
+        tb.sync_turn(&big, &big, &metrics_with_input(520)).await;
+        // Turn 2: used = 520 (reported, includes both turns) + 50 = 570 > 506
+        // → prune the oldest turn, reclaiming its 100-token estimate.
+        assert!(tb.used_tokens() <= budget, "used = {}", tb.used_tokens());
+        assert_eq!(tb.history.len(), 1, "the oldest turn must have been pruned");
+    }
+
+    /// SEMANTICS CHANGED in Step 18.1: with a backend report, fullness =
+    /// reported prompt size (30 — already includes system + history + the
+    /// user message) + chars/4 ceiling of the reply ("a" → 1). The old
+    /// assertion (50 = input 30 + output 20) double-counted: output tokens
+    /// were added on top of every FUTURE turn's input that re-contains them.
     #[tokio::test]
     async fn token_budget_uses_metrics_when_available() {
         let mut tb = TokenBudget::new(1000, 1.0);
@@ -1130,7 +1230,66 @@ mod tests {
             output_tokens: 20,
         });
         tb.sync_turn("q", "a", &m).await;
-        assert_eq!(tb.used_tokens(), 50); // 30 + 20
+        assert_eq!(tb.used_tokens(), 31); // 30 (reported prompt) + 1 (reply est)
+    }
+
+    /// Regression for the B3 baseline's runaway drift (the 5.4× scenario):
+    /// a 20-turn session whose backend-evaluated prompts grow 2,582 → 4,748
+    /// tokens. The old running sum tracked 25,602 "used" tokens by the end —
+    /// 5.4× the largest prompt the backend ever evaluated — and would have
+    /// pruned the entire history against an 8,192 budget. The anchored math
+    /// must stay pinned to the last real prompt (+ reply estimate) and never
+    /// prune a conversation that genuinely fits.
+    #[tokio::test]
+    async fn token_budget_no_runaway_drift_b3_regression() {
+        let mut tb = TokenBudget::new(8_192, 0.80); // budget = 6,553
+        let mut old_running_sum: u64 = 0;
+        let turns = 20u32;
+        for i in 0..turns {
+            // Backend-reported prompt grows linearly 2,582 → 4,748 (B3 drift
+            // table endpoints); output fixed at 20 tokens per turn.
+            let input = 2_582 + (4_748 - 2_582) * i / (turns - 1);
+            old_running_sum += u64::from(input) + 20;
+            tb.sync_turn("reply ok", "ok", &metrics_with_input(input))
+                .await;
+        }
+        // Truthful fullness: the last real prompt (4,748) + the tiny reply
+        // estimate — comfortably inside the budget, so nothing was pruned.
+        let used = u64::from(tb.used_tokens());
+        assert!(
+            (4_748..4_800).contains(&used),
+            "used must track the last real prompt, got {used}"
+        );
+        assert_eq!(tb.history.len(), turns as usize, "no spurious pruning");
+        assert_eq!(tb.pruned_count, 0);
+        // And it must be nowhere near the old inflating sum (≥ 5× smaller —
+        // the B3 baseline measured 5.4× on the real session).
+        assert!(
+            used * 5 < old_running_sum,
+            "anchored used ({used}) must be at least 5× below the old \
+             running sum ({old_running_sum})"
+        );
+    }
+
+    /// Same B3 drift scenario through `Summarizing`: the old running sum
+    /// blew past an 8,192-token budget by turn ~2 and burned summarizer
+    /// calls on a conversation whose real prompts never exceeded 4,748
+    /// tokens. The anchored math must never trigger compression here.
+    #[tokio::test]
+    async fn summarizing_no_runaway_compression_b3_regression() {
+        let mut s = Summarizing::new(8_192) // budget = 6,553
+            .with_summarizer(|_| Ok("SUMMARY".to_string()));
+        for i in 0..20u32 {
+            let input = 2_582 + (4_748 - 2_582) * i / 19;
+            s.sync_turn("reply ok", "ok", &metrics_with_input(input))
+                .await;
+        }
+        assert_eq!(
+            s.compress_count, 0,
+            "prompts never exceeded the budget — compression must not fire"
+        );
+        assert!(s.prev_summary.is_empty());
+        assert_eq!(s.history.len(), 20);
     }
 
     // --- NoteStore tests live in crate::notes (split out in Step 19.1) ---
@@ -1236,24 +1395,22 @@ mod tests {
         assert_eq!(sp.source, SoulSource::Default);
     }
 
+    /// SEMANTICS CHANGED in Step 18.1: compression now triggers when the
+    /// BACKEND-reported prompt size crosses the budget, not when a per-turn
+    /// running sum does. The reported prompts here genuinely grow past the
+    /// 80-token budget (Summarizing::new(100) → budget 80).
     #[tokio::test]
     async fn summarizing_compresses_when_over_budget() {
-        let mut s = Summarizing::new(100) // 100 token budget
+        let mut s = Summarizing::new(100) // budget = 80 tokens
             .with_summarizer(|_prompt| Ok("SUMMARY".to_string()));
 
-        // Each turn ~50 tokens (200 chars / 4).
         let big = "x".repeat(200);
-        let mut m = dummy_metrics();
-        // Give explicit token counts so the test is deterministic.
-        m.usage = Some(crate::metrics::TokenUsage {
-            input_tokens: 25,
-            output_tokens: 25,
-        });
-        s.sync_turn(&big, &big, &m).await; // 50 tokens
-        s.sync_turn(&big, &big, &m).await; // 100 tokens — at budget
-        s.sync_turn(&big, &big, &m).await; // 150 tokens — triggers compression
+        // used = 30 (reported) + 50 (reply est) = 80 — at budget, no compress.
+        s.sync_turn(&big, &big, &metrics_with_input(30)).await;
+        assert_eq!(s.compress_count, 0);
+        // used = 90 (reported, includes turn 1) + 50 = 140 > 80 → compress.
+        s.sync_turn(&big, &big, &metrics_with_input(90)).await;
 
-        // Compression should have run at least once.
         assert!(
             !s.prev_summary.is_empty(),
             "prev_summary should be set after compression"
@@ -1261,18 +1418,19 @@ mod tests {
         assert!(s.compress_count >= 1, "compress_count={}", s.compress_count);
     }
 
+    /// SEMANTICS CHANGED in Step 18.1: the reported prompt sizes must
+    /// actually grow past the budget for compression to fire (the old test's
+    /// flat 40-token turns only crossed it because the running sum inflated).
     #[tokio::test]
     async fn summarizing_compresses_repeatedly() {
         // Verify that the provider compresses multiple times across many turns
         // and doesn't panic. The exact compress_count depends on savings ratios.
         let mut s = Summarizing::new(100).with_summarizer(|_| Ok("SUMMARY".to_string()));
-        let mut m = dummy_metrics();
-        m.usage = Some(crate::metrics::TokenUsage {
-            input_tokens: 20,
-            output_tokens: 20,
-        });
-        for _ in 0..20 {
-            s.sync_turn("q", "a", &m).await;
+        for i in 0..20u32 {
+            // Backend-reported prompt grows 50, 100, 150, … — repeatedly
+            // crossing the 80-token budget.
+            s.sync_turn("q", "a", &metrics_with_input(50 * (i + 1)))
+                .await;
         }
         // Should have compressed at least once without panicking.
         assert!(s.compress_count >= 1);
@@ -1349,23 +1507,34 @@ mod tests {
             input_tokens: 50,
             output_tokens: 50,
         });
-        tb.sync_turn("q", "a", &m).await; // 100 tokens — within budget
+        tb.sync_turn("q", "a", &m).await; // 50 + 1 reply-est — within budget
         assert_eq!(tb.history.len(), 1);
+    }
+
+    /// Without any backend report the provider falls back to summing per-turn
+    /// content estimates — each turn counted once (no double-count).
+    #[tokio::test]
+    async fn token_budget_estimate_fallback_counts_each_turn_once() {
+        let mut tb = TokenBudget::new(1000, 1.0);
+        let mut m = dummy_metrics();
+        m.usage = None; // backend reported nothing
+        let text = "x".repeat(40); // 40 chars → 10 est tokens per side
+        tb.sync_turn(&text, &text, &m).await;
+        tb.sync_turn(&text, &text, &m).await;
+        assert_eq!(tb.used_tokens(), 40, "2 turns × (10 + 10) est tokens");
     }
 
     // --- Summarizing additional coverage ---
 
+    /// SEMANTICS CHANGED in Step 18.1: the second turn's reported prompt (12)
+    /// crosses the 8-token budget on its own — under the old math the flat
+    /// 12-per-turn sum crossed it instead.
     #[tokio::test]
     async fn summarizing_fallback_placeholder_when_no_summarizer() {
-        let mut s = Summarizing::new(10); // tiny budget to trigger compression
-        let mut m = dummy_metrics();
-        m.usage = Some(crate::metrics::TokenUsage {
-            input_tokens: 6,
-            output_tokens: 6,
-        });
-        s.sync_turn("q1", "a1", &m).await;
-        s.sync_turn("q2", "a2", &m).await; // should trigger compression with placeholder
-                                           // With no summariser, placeholder text is inserted.
+        let mut s = Summarizing::new(10); // tiny budget (8) to trigger compression
+        s.sync_turn("q1", "a1", &metrics_with_input(6)).await;
+        s.sync_turn("q2", "a2", &metrics_with_input(12)).await; // 12 + 1 > 8
+                                                                // With no summariser, placeholder text is inserted.
         assert!(
             s.history
                 .iter()
@@ -1386,18 +1555,15 @@ mod tests {
     #[tokio::test]
     async fn summarizing_on_pre_compress_returns_prev_summary() {
         let mut s = Summarizing::new(10).with_summarizer(|_| Ok("PRIOR SUMMARY".to_string()));
-        let mut m = dummy_metrics();
-        m.usage = Some(crate::metrics::TokenUsage {
-            input_tokens: 6,
-            output_tokens: 6,
-        });
-        s.sync_turn("q", "a", &m).await;
-        s.sync_turn("q", "a", &m).await;
-        // prev_summary should be set after compression.
+        // Step 18.1 semantics: the second reported prompt (12) crosses the
+        // 8-token budget and triggers the compression that sets prev_summary.
+        s.sync_turn("q", "a", &metrics_with_input(6)).await;
+        s.sync_turn("q", "a", &metrics_with_input(12)).await;
         let pre = s.on_pre_compress(&[]).await;
-        if !pre.is_empty() {
-            assert!(pre.contains("PRIOR SUMMARY") || pre.contains("compression summary"));
-        }
+        assert!(
+            pre.contains("PRIOR SUMMARY"),
+            "compression must have run and set prev_summary, got: {pre:?}"
+        );
     }
 
     // --- RollingWindow additional coverage ---
