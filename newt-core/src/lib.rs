@@ -4,6 +4,7 @@
 //! into a `Tier` (FAST / STANDARD / COMPLEX / REVIEW), and asks the
 //! configured backends which can serve that tier.
 
+pub mod agentic;
 pub mod agents;
 pub mod caveats;
 pub mod config;
@@ -17,6 +18,7 @@ pub mod model_id;
 pub mod notes;
 pub mod pricing;
 pub mod prune;
+pub mod retry;
 pub mod role_profile;
 pub mod router;
 pub mod session;

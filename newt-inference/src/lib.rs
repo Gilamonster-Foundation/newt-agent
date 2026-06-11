@@ -11,13 +11,18 @@ pub mod backend;
 pub mod local;
 pub mod provider_plugin;
 pub mod registry;
-pub mod retry;
 pub mod stream;
+
+// Step 9.7: the shared retry/backoff module moved to `newt-core` so the
+// relocated agentic loop (`newt_core::agentic`) can use it without a
+// `newt-inference` ⇄ `newt-core` cycle. Re-exported here so every existing
+// `newt_inference::retry::*` path keeps working unchanged.
+pub use newt_core::retry;
 
 #[cfg(feature = "pyo3")]
 pub mod pyo3_module;
 
 pub use backend::{ChatReply, ChatRequest, InferenceBackend};
 pub use registry::BackendRegistry;
-pub use retry::{with_backoff_notify, RetryPolicy};
+pub use newt_core::retry::{with_backoff_notify, RetryPolicy};
 pub use stream::{ChatChunk, ChatStream};
