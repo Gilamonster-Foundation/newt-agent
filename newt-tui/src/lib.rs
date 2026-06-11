@@ -1240,55 +1240,23 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                 mgr.add_provider(newt_core::TokenBudget::new(mem_budget, 0.80));
             }
             newt_core::MemoryProviderKind::Summarizing => {
-                // Wire the summariser to call the current model via the ACP loop.
-                // The closure captures inf_url/inf_model at session start — model
-                // switches mid-session will update on next session restart.
-                let url = inf_url.clone();
-                let model = inf_model.clone();
-                let kind = inf_kind;
-                let api_key = inf_key.clone();
-                let s = newt_core::Summarizing::new(mem_budget).with_summarizer(
-                    move |prompt: &str| -> anyhow::Result<String> {
-                        let openai = kind == newt_core::BackendKind::Openai;
-                        // OpenAI-compatible and Ollama use different paths and
-                        // response shapes; pick per backend kind.
-                        let chat_url = if openai {
-                            format!("{}/v1/chat/completions", url.trim_end_matches('/'))
-                        } else {
-                            format!("{}/api/chat", url.trim_end_matches('/'))
-                        };
-                        let body = serde_json::json!({
-                            "model": model,
-                            "messages": [{"role": "user", "content": prompt}],
-                            "stream": false,
-                        });
-                        let api_key = api_key.clone();
-                        // We're called from sync_turn inside block_in_place,
-                        // so we can use Handle::current().block_on here.
-                        let json: serde_json::Value = tokio::task::block_in_place(|| {
-                            tokio::runtime::Handle::current().block_on(async {
-                                let mut req = reqwest::Client::builder()
-                                    .timeout(std::time::Duration::from_secs(60))
-                                    .build()?
-                                    .post(&chat_url)
-                                    .json(&body);
-                                if let Some(key) = api_key {
-                                    req = req.bearer_auth(key);
-                                }
-                                let resp = req.send().await?;
-                                resp.json::<serde_json::Value>()
-                                    .await
-                                    .map_err(anyhow::Error::from)
-                            })
-                        })?;
-                        let content = if openai {
-                            json["choices"][0]["message"]["content"].as_str()
-                        } else {
-                            json["message"]["content"].as_str()
-                        };
-                        Ok(content.unwrap_or("(summary unavailable)").to_string())
-                    },
-                );
+                // Step 18.5 (#247): the provider delegates to the shared 18.4
+                // compression pipeline, so it takes the SAME async summarizer
+                // the loop uses — one HTTP wiring, one redaction + marker
+                // path. (The old sync closure here blocked inside `sync_turn`
+                // — the contract violation this step deletes.) Captured at
+                // session start; model switches apply on next session.
+                let s =
+                    newt_core::Summarizing::new(mem_budget).with_summarizer(make_loop_summarizer(
+                        inf_url.clone(),
+                        inf_model.clone(),
+                        inf_kind,
+                        inf_key.clone(),
+                        // The same capability-derived context figure the
+                        // provider budget uses — the summary request must not
+                        // be silently truncated at Ollama's default window (F5).
+                        Some(mem_budget),
+                    ));
                 mgr.add_provider(s);
             }
             _ => {
@@ -1734,6 +1702,11 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                                 // never an estimate).
                                 &turn_tool_events,
                                 usage,
+                                // 18.5: a compaction summary minted by the
+                                // memory provider during sync_all persists as
+                                // its own turn record so restore can rehydrate
+                                // the prev-summary chain.
+                                memory.take_compaction_record(),
                             ) {
                                 print_newt(
                                     &format!("warning: conversation save failed: {e}"),
@@ -2448,6 +2421,7 @@ fn conversation_title_from_task(task: &str) -> String {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn save_successful_conversation_turn(
     store: &newt_core::ConversationStore,
     conversation_id: &str,
@@ -2456,6 +2430,7 @@ fn save_successful_conversation_turn(
     reply: &str,
     events: &[newt_core::ToolEvent],
     usage: Option<newt_core::TokenUsage>,
+    compaction: Option<String>,
 ) -> anyhow::Result<()> {
     // The id is pre-assigned for the whole session (issue #220), so the first
     // turn creates the record with that id; later turns just append.
@@ -2467,6 +2442,16 @@ fn save_successful_conversation_turn(
             &conversation_title_from_task(task),
             active_persona.map(|p| p.name.as_str()),
         )?;
+    }
+    // 18.5 (#247): a compaction summary minted while syncing THIS turn is
+    // persisted as its own turn record (user = the marked message, assistant
+    // empty, token columns NULL — it is not a backend-measured turn), and it
+    // goes in BEFORE the triggering turn: the live boundary's last-user
+    // anchor guarantees the triggering turn survived compression, so restore
+    // rebuilds `[summary] + [turns from the trigger on]` — the same working
+    // set the live session kept.
+    if let Some(summary) = compaction {
+        store.append_turn_full(conversation_id, &summary, "", &[], None, None)?;
     }
     // 17.6: persist the turn's tool events and the backend-reported token
     // actuals. `usage` is what `chat_complete` returned — input = largest
@@ -2485,6 +2470,8 @@ fn save_successful_conversation_turn(
 /// The run loop's per-turn save seam (17.7): persistent sessions route to
 /// [`save_successful_conversation_turn`]; an ephemeral session has no store
 /// (`None`) and this is a no-op — no row created, no turn appended, no error.
+/// A compaction record (18.5) taken in an ephemeral session is dropped with
+/// the rest of the turn: nothing persists, so there is nothing to rehydrate.
 fn save_turn_if_persistent(
     store: Option<&newt_core::ConversationStore>,
     conversation_id: &str,
@@ -2493,6 +2480,7 @@ fn save_turn_if_persistent(
     reply: &str,
     events: &[newt_core::ToolEvent],
     usage: Option<newt_core::TokenUsage>,
+    compaction: Option<String>,
 ) -> anyhow::Result<()> {
     match store {
         Some(store) => save_successful_conversation_turn(
@@ -2503,6 +2491,7 @@ fn save_turn_if_persistent(
             reply,
             events,
             usage,
+            compaction,
         ),
         None => Ok(()),
     }
@@ -4689,6 +4678,7 @@ mod skills_integration_tests {
                 input_tokens: 120,
                 output_tokens: 45,
             }),
+            None,
         )
         .unwrap();
         // Second turn: a recorded tool event, no usage (backend silent).
@@ -4705,6 +4695,7 @@ mod skills_integration_tests {
             "second task",
             "second reply",
             &events,
+            None,
             None,
         )
         .unwrap();
@@ -5053,6 +5044,7 @@ mod skills_integration_tests {
             "ephemeral reply",
             &[],
             None,
+            None,
         )
         .unwrap();
         assert!(
@@ -5069,6 +5061,7 @@ mod skills_integration_tests {
             "kept reply",
             &[],
             None,
+            None,
         )
         .unwrap();
         assert_eq!(store.list().unwrap().len(), 1);
@@ -5080,6 +5073,112 @@ mod skills_integration_tests {
         // ephemeral session: it must say nothing is saved AND nothing resumed.
         assert!(EPHEMERAL_SESSION_NOTICE.contains("nothing saved"));
         assert!(EPHEMERAL_SESSION_NOTICE.contains("nothing resumed"));
+    }
+
+    /// Step 18.5 (#247) compressed-session round-trip: a session that
+    /// compressed mid-flight persists the compaction record through the save
+    /// path; a fresh session restoring it gets the summary message back in
+    /// the working set (recognizable by the pipeline's marker) instead of
+    /// the raw pre-compression history — the memory.rs:919-class bug.
+    #[tokio::test]
+    async fn compressed_session_round_trips_summary_through_save_and_restore() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let workspace = tmp.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let store =
+            newt_core::ConversationStore::new(tmp.path().join("state"), &workspace, 100).unwrap();
+        let id = newt_core::new_conversation_id();
+
+        let metrics = |input_tokens: u32| newt_core::TurnMetrics {
+            usage: Some(newt_core::TokenUsage {
+                input_tokens,
+                output_tokens: 9,
+            }),
+            ..Default::default()
+        };
+
+        // Live session: Summarizing provider with a stub summarizer.
+        let mut memory = newt_core::MemoryManager::new();
+        memory.add_provider(newt_core::Summarizing::new(100).with_summarizer(
+            |_req: String| -> newt_core::SummarizeFuture {
+                Box::pin(async { Ok("FACTS FROM THE COMPRESSED MIDDLE".to_string()) })
+            },
+        ));
+        let big = "x".repeat(200);
+        for i in 0..5u32 {
+            let task = format!("early task {i}");
+            memory.sync_all(&task, &big, &metrics(10 + i)).await;
+            save_successful_conversation_turn(
+                &store,
+                &id,
+                None,
+                &task,
+                &big,
+                &[],
+                Some(newt_core::TokenUsage {
+                    input_tokens: 10 + i,
+                    output_tokens: 9,
+                }),
+                memory.take_compaction_record(),
+            )
+            .unwrap();
+        }
+        // The over-budget turn mints the compaction record during sync.
+        memory.sync_all("final task", &big, &metrics(120)).await;
+        let record = memory.take_compaction_record();
+        assert!(record.is_some(), "compression must mint a record");
+        save_successful_conversation_turn(
+            &store,
+            &id,
+            None,
+            "final task",
+            &big,
+            &[],
+            Some(newt_core::TokenUsage {
+                input_tokens: 120,
+                output_tokens: 9,
+            }),
+            record,
+        )
+        .unwrap();
+
+        // Fresh session restores through the command path (no summarizer —
+        // restore must never need one).
+        let persona_store = PersonaStore::new(tmp.path().join("personas"));
+        let mut memory2 = newt_core::MemoryManager::new();
+        memory2.add_provider(newt_core::Summarizing::new(100));
+        let workspace_str = workspace.to_str().unwrap();
+        let mut system = rebuild_system_prompt(workspace_str, &memory2, None, "test-session");
+        let mut active_persona = None;
+        let mut active_conversation_id = newt_core::new_conversation_id();
+        let mut compress_state = newt_core::CompressState::new();
+        let mut ctx = ConversationCommandContext {
+            store: &store,
+            persona_store: &persona_store,
+            workspace: workspace_str,
+            memory: &mut memory2,
+            system: &mut system,
+            active_persona: &mut active_persona,
+            active_conversation_id: &mut active_conversation_id,
+            compress_state: &mut compress_state,
+        };
+        handle_conversation_command(&format!("/conversation restore {id}"), &mut ctx).unwrap();
+
+        let messages = memory2.build_messages(&system, "next task");
+        let summary = messages
+            .iter()
+            .find(|m| m.content.starts_with(newt_core::agentic::SUMMARY_PREFIX))
+            .expect("the compaction summary must survive restore");
+        assert!(summary.content.contains("FACTS FROM THE COMPRESSED MIDDLE"));
+        assert!(summary
+            .content
+            .contains(newt_core::agentic::SUMMARY_END_MARKER));
+        // The triggering turn survives alongside the summary; the summarized
+        // early history is not duplicated next to its own summary.
+        assert!(messages.iter().any(|m| m.content == "final task"));
+        assert!(!messages.iter().any(|m| m.content == "early task 0"));
+        // The lone-sided summary record never dispatches an empty message.
+        assert!(!messages.iter().any(|m| m.content.is_empty()));
     }
 }
 
@@ -6202,5 +6301,82 @@ mod http_loop_tests {
             captured.get("options").is_none(),
             "num_ctx is Ollama-only; OpenAI windows are server-side"
         );
+    }
+
+    /// Step 18.5 (#247): the `Summarizing` provider rebased onto the shared
+    /// path — one over-budget sync drives exactly ONE call to the (mocked)
+    /// summarizer endpoint through the same `make_loop_summarizer` wiring the
+    /// loop uses, the request carries the shared pipeline's template, and the
+    /// resulting history entry carries the pipeline's compaction markers.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn summarizing_provider_delegates_through_loop_summarizer() {
+        use std::sync::{Arc, Mutex};
+        use wiremock::{Request, Respond};
+
+        struct Capture {
+            bodies: Arc<Mutex<Vec<serde_json::Value>>>,
+        }
+        impl Respond for Capture {
+            fn respond(&self, req: &Request) -> ResponseTemplate {
+                self.bodies
+                    .lock()
+                    .unwrap()
+                    .push(serde_json::from_slice(&req.body).unwrap());
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"message": {"content": "WIRE SUMMARY"}}))
+            }
+        }
+
+        let server = MockServer::start().await;
+        let bodies = Arc::new(Mutex::new(Vec::new()));
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(Capture {
+                bodies: bodies.clone(),
+            })
+            .mount(&server)
+            .await;
+
+        let mut memory = newt_core::MemoryManager::new();
+        memory.add_provider(newt_core::Summarizing::new(100).with_summarizer(
+            make_loop_summarizer(
+                server.uri(),
+                "test-model".into(),
+                newt_core::BackendKind::Ollama,
+                None,
+                Some(100),
+            ),
+        ));
+        let metrics = |input_tokens: u32| newt_core::TurnMetrics {
+            usage: Some(newt_core::TokenUsage {
+                input_tokens,
+                output_tokens: 9,
+            }),
+            ..Default::default()
+        };
+        let big = "x".repeat(200);
+        for i in 0..5u32 {
+            memory
+                .sync_all(&format!("task {i}"), &big, &metrics(10 + i))
+                .await;
+        }
+        assert!(bodies.lock().unwrap().is_empty(), "under budget — no calls");
+        memory.sync_all("final task", &big, &metrics(120)).await;
+
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 1, "exactly one summarizer call");
+        let prompt = bodies[0]["messages"][0]["content"].as_str().unwrap();
+        assert!(
+            prompt.contains("## Conversation middle to summarise"),
+            "must be the shared pipeline's request template"
+        );
+        drop(bodies);
+        // The minted record carries the shared markers.
+        let record = memory
+            .take_compaction_record()
+            .expect("compression minted a record");
+        assert!(record.starts_with(newt_core::agentic::SUMMARY_PREFIX));
+        assert!(record.contains("WIRE SUMMARY"));
+        assert!(record.contains(newt_core::agentic::SUMMARY_END_MARKER));
     }
 }

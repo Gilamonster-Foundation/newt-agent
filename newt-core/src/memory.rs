@@ -25,6 +25,7 @@
 
 use async_trait::async_trait;
 
+use crate::agentic::compress::is_compaction_text;
 use crate::metrics::TurnMetrics;
 
 // ---------------------------------------------------------------------------
@@ -155,6 +156,17 @@ pub trait MemoryProvider: Send + Sync {
     /// must override this, otherwise `/conversation restore` will silently
     /// leave their in-memory history unchanged.
     fn restore_turns(&mut self, _turns: &[crate::ConversationTurn]) {}
+
+    /// Take (and clear) the compaction record minted since the last call —
+    /// the full marked summary message a compressing provider inserted into
+    /// its working set (Step 18.5, #247). The caller persists it as a turn
+    /// record (`user` = the marked message, `assistant` = empty, token
+    /// columns NULL — it is not a backend-measured turn) so a later restore
+    /// can rehydrate the same working-set shape via [`Self::restore_turns`].
+    /// Default: `None` — providers that never compress mint nothing.
+    fn take_compaction_record(&mut self) -> Option<String> {
+        None
+    }
 
     /// Called **before** old messages are discarded (e.g. during compression).
     /// Extract anything worth keeping from `messages`; return it as a string
@@ -304,6 +316,15 @@ impl MemoryManager {
         }
     }
 
+    /// Drain the first pending compaction record from any provider — the
+    /// TUI's save site calls this after `sync_all` and persists the result
+    /// as a turn record (Step 18.5, #247).
+    pub fn take_compaction_record(&mut self) -> Option<String> {
+        self.providers
+            .iter_mut()
+            .find_map(|p| p.take_compaction_record())
+    }
+
     /// Notify all providers before old messages are dropped.
     pub async fn on_pre_compress(&self, messages: &[MemMessage]) -> String {
         let mut parts = Vec::new();
@@ -436,11 +457,15 @@ impl MemoryProvider for RollingWindow {
     fn build_messages(&self, system_prompt: &str, new_task: &str) -> Vec<MemMessage> {
         let mut msgs = vec![MemMessage::system(system_prompt)];
 
-        // Include the retained history window.
+        // Include the retained history window. A restored compaction record
+        // (Step 18.5) is a user-side summary with no reply — never dispatch
+        // an empty assistant message for it.
         let start = self.history.len().saturating_sub(self.max_turns);
         for (user, asst) in &self.history[start..] {
             msgs.push(MemMessage::user(user));
-            msgs.push(MemMessage::assistant(asst));
+            if !asst.is_empty() {
+                msgs.push(MemMessage::assistant(asst));
+            }
         }
 
         // Current turn.
@@ -509,6 +534,30 @@ struct TurnRecord {
 /// `(len + 3) / 4` ceiling estimate of one turn's content contribution.
 fn turn_content_estimate(user: &str, assistant: &str) -> u32 {
     (user.len().div_ceil(4) + assistant.len().div_ceil(4)) as u32
+}
+
+/// Column-first token anchor for restored history (Step 18.5, #247).
+///
+/// Finds the LAST turn carrying a backend-reported `tokens_in` (the 17.6
+/// column) and reconstructs the anchored state the live session had right
+/// after that turn's `sync_turn`: `last_prompt_tokens` = the measured prompt
+/// (which already contained the system prompt and every prior turn), and the
+/// delta = the chars/4 estimate of that turn's reply plus every LATER
+/// (unmeasured) turn's content — the same arithmetic the live path applies
+/// per turn. Rows with NULL columns (pre-17.6 rows, silent backends)
+/// contribute estimates to the delta but never become the anchor: a fallback
+/// estimate is never presented as a measurement (18.1 semantics). No
+/// measured turn at all → `(None, 0)`, and the provider falls back to
+/// summing per-turn content estimates exactly as before.
+fn restored_token_anchor(turns: &[crate::ConversationTurn]) -> (Option<u32>, i64) {
+    let Some(pos) = turns.iter().rposition(|t| t.tokens_in.is_some()) else {
+        return (None, 0);
+    };
+    let mut delta = turns[pos].assistant.len().div_ceil(4) as i64;
+    for t in &turns[pos + 1..] {
+        delta += i64::from(turn_content_estimate(&t.user, &t.assistant));
+    }
+    (turns[pos].tokens_in, delta)
 }
 
 /// Keep turns up to `threshold_pct` of the model's context window.
@@ -611,7 +660,11 @@ impl MemoryProvider for TokenBudget {
         let mut msgs = vec![MemMessage::system(system_prompt)];
         for r in &self.history {
             msgs.push(MemMessage::user(&r.user));
-            msgs.push(MemMessage::assistant(&r.assistant));
+            // A restored compaction record (Step 18.5) has no reply — never
+            // dispatch an empty assistant message for it.
+            if !r.assistant.is_empty() {
+                msgs.push(MemMessage::assistant(&r.assistant));
+            }
         }
         msgs.push(MemMessage::user(new_task));
         msgs
@@ -665,10 +718,14 @@ impl MemoryProvider for TokenBudget {
                 est_tokens: turn_content_estimate(&t.user, &t.assistant),
             })
             .collect();
-        // No backend report covers restored turns — estimate-only until the
-        // next live turn re-anchors (token restore from the store is 18.5).
-        self.last_prompt_tokens = None;
-        self.delta_since_prompt = 0;
+        // Step 18.5 (#247): column-first restore — re-anchor on the last
+        // backend-reported prompt size from the 17.6 columns instead of
+        // re-estimating the whole history at chars/4. NULL columns fall
+        // back to the estimate sum (anchor stays None — an estimate is
+        // never presented as a measurement).
+        let (anchor, delta) = restored_token_anchor(turns);
+        self.last_prompt_tokens = anchor;
+        self.delta_since_prompt = delta;
         self.pruned_count = self.prune_to_budget();
     }
 
@@ -695,10 +752,6 @@ pub use crate::notes::NoteStore;
 // Summarizing — built-in provider #4 (closes #107)
 // ---------------------------------------------------------------------------
 
-/// Called by `Summarizing` to generate a summary — injected so tests can
-/// substitute a fake.
-pub type SummaryFn = Box<dyn Fn(&str) -> anyhow::Result<String> + Send + Sync>;
-
 /// Per-turn record with a content-size estimate for budget tracking.
 #[derive(Clone)]
 struct SumTurn {
@@ -710,19 +763,84 @@ struct SumTurn {
     est_tokens: u32,
 }
 
+impl SumTurn {
+    fn new(user: impl Into<String>, assistant: impl Into<String>) -> Self {
+        let user = user.into();
+        let assistant = assistant.into();
+        let est_tokens = turn_content_estimate(&user, &assistant);
+        Self {
+            user,
+            assistant,
+            est_tokens,
+        }
+    }
+
+    /// Wire-shape view of this entry for the shared compression pipeline.
+    /// A compaction entry (or any unpaired side) renders only its non-empty
+    /// half — the pipeline's summary message is a lone user-role message.
+    fn to_wire(&self) -> Vec<serde_json::Value> {
+        let mut v = Vec::with_capacity(2);
+        if !self.user.is_empty() {
+            v.push(serde_json::json!({"role": "user", "content": self.user}));
+        }
+        if !self.assistant.is_empty() {
+            v.push(serde_json::json!({"role": "assistant", "content": self.assistant}));
+        }
+        v
+    }
+}
+
+/// Rebuild pair-shaped history from the pipeline's assembled wire messages.
+/// A compaction message (and any other unpaired side) becomes a lone-sided
+/// entry; `system`/`tool` roles never occur in the provider's wire view.
+fn wire_to_history(messages: &[serde_json::Value]) -> Vec<SumTurn> {
+    let mut out: Vec<SumTurn> = Vec::new();
+    for m in messages {
+        let content = m["content"].as_str().unwrap_or_default();
+        match m["role"].as_str() {
+            Some("user") => out.push(SumTurn::new(content, "")),
+            Some("assistant") => {
+                match out.last_mut() {
+                    // Pair with the preceding reply-less user entry — unless
+                    // that entry is a compaction message, which stands alone.
+                    Some(last)
+                        if last.assistant.is_empty()
+                            && !last.user.is_empty()
+                            && !is_compaction_text(&last.user) =>
+                    {
+                        last.assistant = content.to_string();
+                        last.est_tokens = turn_content_estimate(&last.user, &last.assistant);
+                    }
+                    _ => out.push(SumTurn::new("", content)),
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 /// LLM-powered summarisation of old turns when context fills.
 ///
-/// Algorithm (adapted from hermes-agent `ContextCompressor`):
-/// 1. Track context fullness as last-backend-reported-prompt-size plus the
-///    estimated content delta since (Step 18.1 — same anchored math as
-///    [`TokenBudget`]; the old per-turn `input + output` running sum
-///    double-counted history and triggered spurious compressions).
-/// 2. When `used_tokens > threshold * max_tokens`, summarise the oldest
-///    `compress_ratio` of turns into a structured block.
-/// 3. Replace them with a single `[Summary]` assistant message.
-/// 4. Iterative: on re-compression the previous summary is prepended to the
-///    new summary prompt so facts survive multiple compactions.
-/// 5. Anti-thrashing: skip compression if the last two attempts saved <10%.
+/// Since Step 18.5 (#247) this provider owns no summarisation logic of its
+/// own: when its anchored fullness figure crosses the budget it delegates to
+/// the SAME prune → boundary → redacted summary → marker assembly pipeline
+/// the agentic loop uses ([`crate::agentic::compress`], Step 18.4). The
+/// pre-18.4 implementation — its own prompt template, placeholder text, and
+/// anti-thrash counters — is deleted; the summary message in history is now
+/// the pipeline's marked compaction message ([`SUMMARY_PREFIX`]).
+///
+/// Fullness tracking is unchanged (Step 18.1): last backend-reported prompt
+/// size plus the estimated content delta since — the old per-turn
+/// `input + output` running sum double-counted history and triggered
+/// spurious compressions.
+///
+/// Continuity (Step 18.5): the latest compaction message is offered to the
+/// caller once via [`MemoryProvider::take_compaction_record`] for durable
+/// persistence, and [`MemoryProvider::restore_turns`] rehydrates it — the
+/// restored working set is `[compaction message] + [turns recorded after
+/// it]`, so the next compression chains off the previous summary instead of
+/// re-summarizing from scratch.
 ///
 /// Configure: `[memory] provider = "summarizing"`, plus an optional explicit
 /// `context_tokens` override. The compression budget (`max_tokens`) is a
@@ -734,20 +852,25 @@ struct SumTurn {
 pub struct Summarizing {
     max_tokens: u32,
     threshold_pct: f32,
-    /// What fraction of history to summarise each time.
-    compress_ratio: f32,
     history: Vec<SumTurn>,
-    /// The accumulated summary from previous compressions.
+    /// The latest compaction message (full marked text) — the prev-summary
+    /// chain. Rehydrated by `restore_turns` (Step 18.5).
     prev_summary: String,
-    /// Savings from last two compressions (for anti-thrashing).
-    last_savings: [f32; 2],
+    /// Compactions minted this session (summaries + static fallbacks).
     compress_count: usize,
-    /// Injected summariser — defaults to None (caller must set via `with_summarizer`).
-    summarizer: Option<SummaryFn>,
+    /// Anti-thrash state, shared semantics with the loop (Step 18.4): two
+    /// consecutive <10% reclaims disable compression until reset.
+    state: crate::agentic::CompressState,
+    /// Injected summariser — the loop's async [`crate::agentic::Summarizer`]
+    /// shape; `None` degrades to the pipeline's static fallback marker.
+    summarizer: Option<crate::agentic::Summarizer>,
     /// Backend-reported prompt size of the most recent turn (truth anchor).
     last_prompt_tokens: Option<u32>,
     /// Estimated tokens added (+) / removed (−) relative to that anchor.
     delta_since_prompt: i64,
+    /// Compaction message minted by the last compression, awaiting durable
+    /// persistence via `take_compaction_record` (Step 18.5).
+    pending_record: Option<String>,
 }
 
 impl Summarizing {
@@ -755,14 +878,14 @@ impl Summarizing {
         Self {
             max_tokens: max_tokens.max(1),
             threshold_pct: 0.80,
-            compress_ratio: 0.50,
             history: Vec::new(),
             prev_summary: String::new(),
-            last_savings: [1.0, 1.0],
             compress_count: 0,
+            state: crate::agentic::CompressState::new(),
             summarizer: None,
             last_prompt_tokens: None,
             delta_since_prompt: 0,
+            pending_record: None,
         }
     }
 
@@ -775,10 +898,15 @@ impl Summarizing {
         self
     }
 
-    /// Inject a summariser function (required for real use; tests can use a stub).
+    /// Inject a summariser (required for real summaries; tests can use a
+    /// stub). Takes the loop's async [`crate::agentic::SummarizeFn`] shape
+    /// since Step 18.5 — the TUI passes the very same summarizer it builds
+    /// for the loop, so there is exactly one HTTP wiring. The old sync
+    /// `Fn(&str) -> Result<String>` form (whose TUI impl blocked inside
+    /// `sync_turn`) is gone with the logic that called it.
     pub fn with_summarizer(
         mut self,
-        f: impl Fn(&str) -> anyhow::Result<String> + Send + Sync + 'static,
+        f: impl Fn(String) -> crate::agentic::SummarizeFuture + Send + Sync + 'static,
     ) -> Self {
         self.summarizer = Some(Box::new(f));
         self
@@ -798,105 +926,61 @@ impl Summarizing {
         }
     }
 
-    fn should_compress(&self) -> bool {
-        if self.used_tokens() <= self.budget() {
-            return false;
-        }
-        // Anti-thrashing: skip if last two compressions each saved <10%.
-        let poor_savings = self.last_savings.iter().all(|&s| s < 0.10);
-        if poor_savings && self.compress_count >= 2 {
-            tracing::warn!("Summarizing: anti-thrashing — skipping compression");
-            return false;
-        }
-        true
-    }
-
-    fn compress_sync(&mut self) {
-        let total = self.history.len();
-        if total == 0 {
+    /// Delegate one compression to the shared 18.4 pipeline and apply the
+    /// assembled result back to pair-shaped history (Step 18.5, #247).
+    async fn compress_via_pipeline(&mut self) {
+        use crate::agentic::compress::{compress, CompressAction, CompressRequest};
+        if self.history.is_empty() {
             return;
         }
-        // Capture fullness BEFORE mutating anything (Step 18.1: used_tokens
-        // is anchored, so it can no longer be reconstructed post-drain by
-        // adding the drained turns back).
-        let tokens_before = self.used_tokens();
-        let n_to_summarise = ((total as f32 * self.compress_ratio) as usize).max(1);
-        let turns_to_compress: Vec<SumTurn> = self.history.drain(..n_to_summarise).collect();
-        let drained_est: u32 = turns_to_compress.iter().map(|t| t.est_tokens).sum();
-
-        // Build the prompt for summarisation.
-        let mut prompt = String::new();
-        if !self.prev_summary.is_empty() {
-            prompt.push_str("## Previous Summary\n");
-            prompt.push_str(&self.prev_summary);
-            prompt.push_str("\n\n");
-        }
-        prompt.push_str("## Turns to Summarise\n");
-        for (i, t) in turns_to_compress.iter().enumerate() {
-            prompt.push_str(&format!(
-                "### Turn {}\nUser: {}\nAssistant: {}\n\n",
-                i + 1,
-                t.user,
-                t.assistant
-            ));
-        }
-        prompt.push_str(
-            "Produce a concise structured summary with sections:\n\
-            ## Active Task\n## Completed Actions\n## Key Decisions\n\
-            ## Relevant Files\n## Critical Context\n\
-            Be terse. Preserve specifics (file names, error messages, decisions).",
-        );
-
-        let summary = if let Some(ref f) = self.summarizer {
-            match f(&prompt) {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!(error = %e, "Summarizing: summary generation failed — keeping turns");
-                    // Put them back on failure.
-                    let mut restored = turns_to_compress;
-                    restored.append(&mut self.history);
-                    self.history = restored;
-                    return;
-                }
-            }
-        } else {
-            // No summariser configured — insert a static placeholder.
-            format!(
-                "[{} turns summarised — configure a summariser for real summaries]",
-                turns_to_compress.len()
-            )
-        };
-
-        // Insert the summary as the first history entry, and reflect the
-        // content change against the anchor: dropped turns shrink the next
-        // prompt by their estimate, the summary grows it by its own.
-        let summary_tokens = (summary.len().div_ceil(4)) as u32;
-        self.delta_since_prompt += i64::from(summary_tokens) - i64::from(drained_est);
-        self.history.insert(
-            0,
-            SumTurn {
-                user: "[context summary]".into(),
-                assistant: summary.clone(),
-                est_tokens: summary_tokens,
+        let messages: Vec<serde_json::Value> =
+            self.history.iter().flat_map(SumTurn::to_wire).collect();
+        // The original-task anchor: the first REAL user message — a leading
+        // compaction message (rehydrated history) is not the task.
+        let task = self
+            .history
+            .iter()
+            .find(|t| !t.user.is_empty() && !is_compaction_text(&t.user))
+            .map(|t| t.user.clone())
+            .unwrap_or_default();
+        let outcome = compress(
+            CompressRequest {
+                messages: &messages,
+                budget: self.budget() as usize,
+                max_messages: None,
+                task: &task,
+                hard_budget: true,
             },
-        );
-        self.prev_summary = summary;
-
-        let tokens_after = self.used_tokens();
-        let saved = if tokens_before > 0 {
-            1.0 - (tokens_after as f32 / tokens_before as f32)
-        } else {
-            0.0
-        };
-        self.last_savings = [self.last_savings[1], saved];
-        self.compress_count += 1;
-
+            self.summarizer.as_deref(),
+            &mut self.state,
+        )
+        .await;
+        if !outcome.fired {
+            return;
+        }
+        self.history = wire_to_history(&outcome.messages);
+        // Reflect the content change against the backend anchor. The
+        // pipeline's figures are chars/4 estimates over the wire shape —
+        // the same currency the delta already tracks.
+        self.delta_since_prompt += outcome.tokens_after as i64 - outcome.tokens_before as i64;
+        if matches!(
+            outcome.action,
+            CompressAction::Summarized | CompressAction::StaticFallback
+        ) {
+            // The pipeline inserted its marked summary at the boundary head —
+            // the first compaction entry is the freshly minted one.
+            if let Some(c) = self.history.iter().find(|t| is_compaction_text(&t.user)) {
+                self.prev_summary = c.user.clone();
+                self.pending_record = Some(c.user.clone());
+                self.compress_count += 1;
+            }
+        }
         tracing::info!(
             compress_count = self.compress_count,
-            tokens_before,
-            tokens_after,
-            saved_pct = saved * 100.0,
-            "Summarizing: compressed context"
+            action = outcome.action.describe(),
+            tokens_before = outcome.tokens_before,
+            tokens_after = outcome.tokens_after,
+            "Summarizing: compressed context via shared pipeline"
         );
     }
 }
@@ -910,8 +994,12 @@ impl MemoryProvider for Summarizing {
     fn build_messages(&self, system_prompt: &str, new_task: &str) -> Vec<MemMessage> {
         let mut msgs = vec![MemMessage::system(system_prompt)];
         for t in &self.history {
-            msgs.push(MemMessage::user(&t.user));
-            msgs.push(MemMessage::assistant(&t.assistant));
+            if !t.user.is_empty() {
+                msgs.push(MemMessage::user(&t.user));
+            }
+            if !t.assistant.is_empty() {
+                msgs.push(MemMessage::assistant(&t.assistant));
+            }
         }
         msgs.push(MemMessage::user(new_task));
         msgs
@@ -919,11 +1007,7 @@ impl MemoryProvider for Summarizing {
 
     async fn sync_turn(&mut self, user: &str, assistant: &str, metrics: &TurnMetrics) {
         let est = turn_content_estimate(user, assistant);
-        self.history.push(SumTurn {
-            user: user.to_string(),
-            assistant: assistant.to_string(),
-            est_tokens: est,
-        });
+        self.history.push(SumTurn::new(user, assistant));
         match metrics.usage {
             Some(u) => {
                 // Anchor on the largest single prompt the backend evaluated
@@ -933,39 +1017,65 @@ impl MemoryProvider for Summarizing {
             }
             None => self.delta_since_prompt += i64::from(est),
         }
-        if self.should_compress() {
-            self.compress_sync();
+        // Over budget → the shared pipeline (which owns anti-thrash); the
+        // cheap is_disabled gate just avoids rebuilding the wire view for
+        // a call that would be refused anyway.
+        if self.used_tokens() > self.budget() && !self.state.is_disabled() {
+            self.compress_via_pipeline().await;
         }
     }
 
     fn reset(&mut self) {
         self.history.clear();
         self.prev_summary.clear();
-        self.last_savings = [1.0, 1.0];
         self.compress_count = 0;
+        self.state.reset();
         self.last_prompt_tokens = None;
         self.delta_since_prompt = 0;
+        self.pending_record = None;
     }
 
     fn restore_turns(&mut self, turns: &[crate::ConversationTurn]) {
-        self.history = turns
+        // Step 18.5 (#247): rehydrate the prev-summary chain instead of
+        // dropping it. The latest persisted compaction record cuts the
+        // working set: everything before it is covered by the summary (and
+        // stays durable in the store); the record itself was appended just
+        // before the turn that triggered the compression, so the turns after
+        // it are exactly the ones the live boundary's last-user anchor
+        // guaranteed survived.
+        let cut = turns
             .iter()
-            .map(|t| SumTurn {
-                user: t.user.clone(),
-                assistant: t.assistant.clone(),
-                est_tokens: turn_content_estimate(&t.user, &t.assistant),
-            })
-            .collect();
+            .rposition(|t| is_compaction_text(&t.user) && t.assistant.is_empty());
+        let live = match cut {
+            Some(k) => &turns[k + 1..],
+            None => turns,
+        };
+        self.history.clear();
         self.prev_summary.clear();
-        self.last_savings = [1.0, 1.0];
-        self.compress_count = 0;
-        // No backend report covers restored turns — estimate-only until the
-        // next live turn re-anchors (token restore from the store is 18.5).
-        self.last_prompt_tokens = None;
-        self.delta_since_prompt = 0;
-        if self.should_compress() {
-            self.compress_sync();
+        if let Some(k) = cut {
+            self.history.push(SumTurn::new(turns[k].user.clone(), ""));
+            self.prev_summary = turns[k].user.clone();
         }
+        self.history
+            .extend(live.iter().map(|t| SumTurn::new(&*t.user, &*t.assistant)));
+        self.compress_count = 0;
+        self.pending_record = None;
+        // A restore is a conversation boundary — re-arm anti-thrash (F4).
+        self.state.reset();
+        // Column-first token accounting (Step 18.5): anchor on the last
+        // backend-reported prompt size among the turns actually in the
+        // working set — those prompts already contained the compaction
+        // message. NULL columns fall back to estimates without ever
+        // becoming the anchor. NO re-compression here: re-summarizing on
+        // restore is exactly the from-scratch behavior this step removes;
+        // the next live turn compresses if genuinely over budget.
+        let (anchor, delta) = restored_token_anchor(live);
+        self.last_prompt_tokens = anchor;
+        self.delta_since_prompt = delta;
+    }
+
+    fn take_compaction_record(&mut self) -> Option<String> {
+        self.pending_record.take()
     }
 
     async fn on_pre_compress(&self, _messages: &[MemMessage]) -> String {
@@ -1350,6 +1460,42 @@ mod tests {
         );
     }
 
+    /// Async stub summarizer in the loop's `SummarizeFn` shape (the only
+    /// shape since Step 18.5 — the provider delegates to the shared
+    /// pipeline, which is async).
+    fn stub_summarizer(
+        reply: &'static str,
+    ) -> impl Fn(String) -> crate::agentic::SummarizeFuture + Send + Sync {
+        move |_req: String| -> crate::agentic::SummarizeFuture {
+            Box::pin(async move { Ok(reply.to_string()) })
+        }
+    }
+
+    /// Stub summarizer that records every request it receives — proves the
+    /// provider routes through the shared pipeline (Step 18.5).
+    fn capturing_summarizer(
+        reply: &'static str,
+        calls: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) -> impl Fn(String) -> crate::agentic::SummarizeFuture + Send + Sync {
+        move |req: String| -> crate::agentic::SummarizeFuture {
+            calls.lock().unwrap().push(req);
+            Box::pin(async move { Ok(reply.to_string()) })
+        }
+    }
+
+    /// A turn carrying 17.6 token columns, for restore tests.
+    fn turn_with_tokens(
+        user: &str,
+        assistant: &str,
+        tokens_in: Option<u32>,
+        tokens_out: Option<u32>,
+    ) -> crate::ConversationTurn {
+        let mut t = crate::ConversationTurn::new(user, assistant);
+        t.tokens_in = tokens_in;
+        t.tokens_out = tokens_out;
+        t
+    }
+
     /// Same B3 drift scenario through `Summarizing`: the old running sum
     /// blew past an 8,192-token budget by turn ~2 and burned summarizer
     /// calls on a conversation whose real prompts never exceeded 4,748
@@ -1357,7 +1503,7 @@ mod tests {
     #[tokio::test]
     async fn summarizing_no_runaway_compression_b3_regression() {
         let mut s = Summarizing::new(8_192) // budget = 6,553
-            .with_summarizer(|_| Ok("SUMMARY".to_string()));
+            .with_summarizer(stub_summarizer("SUMMARY"));
         for i in 0..20u32 {
             let input = 2_582 + (4_748 - 2_582) * i / 19;
             s.sync_turn("reply ok", "ok", &metrics_with_input(input))
@@ -1535,27 +1681,41 @@ mod tests {
         assert_eq!(sp.source, SoulSource::Default);
     }
 
-    /// SEMANTICS CHANGED in Step 18.1: compression now triggers when the
-    /// BACKEND-reported prompt size crosses the budget, not when a per-turn
-    /// running sum does. The reported prompts here genuinely grow past the
-    /// 80-token budget (Summarizing::new(100) → budget 80).
+    /// SEMANTICS CHANGED in Step 18.5: compression delegates to the shared
+    /// 18.4 pipeline, whose boundary protects the head (the original task)
+    /// and a ≥3-message tail — so a conversation needs enough turns to leave
+    /// a summarizable middle (the old provider summarized the oldest 50%
+    /// unconditionally). The summary in history is the pipeline's marked
+    /// compaction message.
     #[tokio::test]
     async fn summarizing_compresses_when_over_budget() {
         let mut s = Summarizing::new(100) // budget = 80 tokens
-            .with_summarizer(|_prompt| Ok("SUMMARY".to_string()));
+            .with_summarizer(stub_summarizer("SUMMARY"));
 
         let big = "x".repeat(200);
-        // used = 30 (reported) + 50 (reply est) = 80 — at budget, no compress.
-        s.sync_turn(&big, &big, &metrics_with_input(30)).await;
+        // Five turns whose anchored fullness stays at/under the budget.
+        for i in 0..5u32 {
+            s.sync_turn(&big, &big, &metrics_with_input(10 + i)).await;
+        }
         assert_eq!(s.compress_count, 0);
-        // used = 90 (reported, includes turn 1) + 50 = 140 > 80 → compress.
-        s.sync_turn(&big, &big, &metrics_with_input(90)).await;
+        // The reported prompt crosses the budget → delegate to the pipeline.
+        s.sync_turn(&big, &big, &metrics_with_input(120)).await;
 
-        assert!(
-            !s.prev_summary.is_empty(),
-            "prev_summary should be set after compression"
-        );
         assert!(s.compress_count >= 1, "compress_count={}", s.compress_count);
+        // The chain head is the pipeline's marked compaction message.
+        assert!(
+            s.prev_summary.starts_with(crate::agentic::SUMMARY_PREFIX),
+            "prev_summary must be the marked compaction message"
+        );
+        assert!(s.prev_summary.contains("SUMMARY"));
+        assert!(s.prev_summary.contains(crate::agentic::SUMMARY_END_MARKER));
+        assert!(
+            s.history
+                .iter()
+                .any(|t| t.user.starts_with(crate::agentic::SUMMARY_PREFIX)
+                    && t.assistant.is_empty()),
+            "the compaction message must live in history as a lone user entry"
+        );
     }
 
     /// SEMANTICS CHANGED in Step 18.1: the reported prompt sizes must
@@ -1563,17 +1723,320 @@ mod tests {
     /// flat 40-token turns only crossed it because the running sum inflated).
     #[tokio::test]
     async fn summarizing_compresses_repeatedly() {
-        // Verify that the provider compresses multiple times across many turns
-        // and doesn't panic. The exact compress_count depends on savings ratios.
-        let mut s = Summarizing::new(100).with_summarizer(|_| Ok("SUMMARY".to_string()));
+        // Verify that the provider compresses across many turns and doesn't
+        // panic. The exact compress_count depends on savings/anti-thrash.
+        let mut s = Summarizing::new(100).with_summarizer(stub_summarizer("SUMMARY"));
+        let text = "x".repeat(120);
         for i in 0..20u32 {
             // Backend-reported prompt grows 50, 100, 150, … — repeatedly
             // crossing the 80-token budget.
-            s.sync_turn("q", "a", &metrics_with_input(50 * (i + 1)))
+            s.sync_turn(&text, &text, &metrics_with_input(50 * (i + 1)))
                 .await;
         }
         // Should have compressed at least once without panicking.
         assert!(s.compress_count >= 1);
+    }
+
+    // --- Continuity: restore + delegation (Step 18.5, #247) ---
+
+    /// Restore must route through the shared pipeline exactly once when a
+    /// later turn overflows, with the shared template and redaction applied
+    /// — the proof the legacy duplicate path is gone.
+    #[tokio::test]
+    async fn summarizing_delegates_to_shared_pipeline() {
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let mut s =
+            Summarizing::new(100).with_summarizer(capturing_summarizer("PIPE-SUM", calls.clone()));
+        let secret = "sk-aaaaaaaaaaaaaaaaaaaaaaaa";
+        let big = "x".repeat(200);
+        // An early reply carries a credential — it lands in the summarized
+        // middle and must be redacted by the SHARED pipeline's pass.
+        s.sync_turn(
+            "the original task",
+            &format!("noted {secret}"),
+            &metrics_with_input(10),
+        )
+        .await;
+        for i in 0..4u32 {
+            s.sync_turn(&big, &big, &metrics_with_input(11 + i)).await;
+        }
+        assert!(calls.lock().unwrap().is_empty(), "under budget — no calls");
+        s.sync_turn(&big, &big, &metrics_with_input(120)).await;
+
+        let reqs = calls.lock().unwrap();
+        assert_eq!(reqs.len(), 1, "exactly one summarizer call per compression");
+        let req = &reqs[0];
+        assert!(
+            req.contains("## Conversation middle to summarise"),
+            "must be the shared pipeline's request template"
+        );
+        assert!(req.contains("## Original Task"));
+        assert!(req.contains("the original task"), "task anchored verbatim");
+        assert!(
+            !req.contains(secret),
+            "secret must not reach the summarizer"
+        );
+        assert!(req.contains("[REDACTED]"), "shared redaction pass applied");
+        drop(reqs);
+        // Assembly used the shared markers around the returned body.
+        assert!(s.prev_summary.starts_with(crate::agentic::SUMMARY_PREFIX));
+        assert!(s.prev_summary.contains("PIPE-SUM"));
+        assert!(s.prev_summary.contains(crate::agentic::SUMMARY_END_MARKER));
+    }
+
+    /// The compaction record is offered for persistence exactly once.
+    #[tokio::test]
+    async fn summarizing_compaction_record_is_minted_once_and_drained() {
+        let mut s = Summarizing::new(100).with_summarizer(stub_summarizer("SUMMARY"));
+        assert!(s.take_compaction_record().is_none(), "nothing minted yet");
+        let big = "x".repeat(200);
+        for i in 0..5u32 {
+            s.sync_turn(&big, &big, &metrics_with_input(10 + i)).await;
+        }
+        s.sync_turn(&big, &big, &metrics_with_input(120)).await;
+        let record = s
+            .take_compaction_record()
+            .expect("compression must mint a record");
+        assert!(record.starts_with(crate::agentic::SUMMARY_PREFIX));
+        assert_eq!(record, s.prev_summary, "the record IS the chain head");
+        assert!(
+            s.take_compaction_record().is_none(),
+            "the record is drained on take — never persisted twice"
+        );
+    }
+
+    /// The manager drains the record from whichever provider minted it.
+    #[tokio::test]
+    async fn memory_manager_routes_take_compaction_record() {
+        let mut mgr = MemoryManager::new();
+        mgr.add_provider(RollingWindow::new(50)); // mints nothing
+        mgr.add_provider(Summarizing::new(100).with_summarizer(stub_summarizer("SUMMARY")));
+        assert!(mgr.take_compaction_record().is_none());
+        let big = "x".repeat(200);
+        for i in 0..5u32 {
+            mgr.sync_all(&big, &big, &metrics_with_input(10 + i)).await;
+        }
+        mgr.sync_all(&big, &big, &metrics_with_input(120)).await;
+        let record = mgr
+            .take_compaction_record()
+            .expect("manager must surface the Summarizing provider's record");
+        assert!(record.starts_with(crate::agentic::SUMMARY_PREFIX));
+        assert!(mgr.take_compaction_record().is_none());
+    }
+
+    /// The memory.rs:919-class bug (#247 / 18.5): restoring a compressed
+    /// conversation must rehydrate the summary message and the prev-summary
+    /// chain instead of rebuilding raw history and silently dropping both.
+    #[tokio::test]
+    async fn summarizing_restore_rehydrates_compaction_summary() {
+        let marked = format!(
+            "{}\nsummary of earlier work\n{}",
+            crate::agentic::SUMMARY_PREFIX,
+            crate::agentic::SUMMARY_END_MARKER
+        );
+        let turns = vec![
+            crate::ConversationTurn::new("old task", "old reply"), // covered by the summary
+            crate::ConversationTurn::new(marked.clone(), ""),      // the persisted record
+            crate::ConversationTurn::new("recent task", "recent reply"),
+        ];
+        let mut s = Summarizing::new(8_192);
+        s.restore_turns(&turns);
+
+        // The chain is back: the next compression sees the previous summary.
+        let pre = s.on_pre_compress(&[]).await;
+        assert!(pre.contains("summary of earlier work"), "got: {pre:?}");
+
+        // Working set = [compaction message] + turns recorded after it; the
+        // summarized turn is not duplicated alongside its own summary.
+        let msgs = s.build_messages("sys", "next");
+        assert!(msgs
+            .iter()
+            .any(|m| m.content.starts_with(crate::agentic::SUMMARY_PREFIX)));
+        assert!(!msgs.iter().any(|m| m.content == "old task"));
+        assert!(msgs.iter().any(|m| m.content == "recent task"));
+        assert!(msgs.iter().any(|m| m.content == "recent reply"));
+        // The lone-sided compaction entry never dispatches an empty message.
+        assert!(!msgs.iter().any(|m| m.content.is_empty()));
+    }
+
+    /// Restore must NOT burn a summarizer call: re-summarizing from scratch
+    /// on restore is exactly the behavior 18.5 removes. The next live turn
+    /// compresses if genuinely over budget.
+    #[tokio::test]
+    async fn summarizing_restore_never_resummarizes() {
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let mut s =
+            Summarizing::new(10).with_summarizer(capturing_summarizer("SUMMARY", calls.clone()));
+        let big = "x".repeat(400);
+        let turns: Vec<crate::ConversationTurn> = (0..6)
+            .map(|i| crate::ConversationTurn::new(format!("q{i} {big}"), format!("a{i} {big}")))
+            .collect();
+        s.restore_turns(&turns); // far over the 8-token budget
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "restore must never call the summarizer"
+        );
+        assert_eq!(s.history.len(), 6, "restored history intact");
+    }
+
+    /// After restore, the rehydrated compaction message chains into the NEXT
+    /// compression as part of the summarized middle — it is neither the task
+    /// anchor nor a fresh user message (the F1 self-poisoning shape).
+    #[tokio::test]
+    async fn restored_compaction_chains_into_next_compression() {
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let mut s =
+            Summarizing::new(100).with_summarizer(capturing_summarizer("NEW-SUM", calls.clone()));
+        let marked = format!(
+            "{}\nCHAIN-ME: facts from the first compaction\n{}",
+            crate::agentic::SUMMARY_PREFIX,
+            crate::agentic::SUMMARY_END_MARKER
+        );
+        let big = "y".repeat(100);
+        let mut turns = vec![crate::ConversationTurn::new(marked.clone(), "")];
+        for i in 0..4 {
+            turns.push(crate::ConversationTurn::new(
+                format!("task {i} {big}"),
+                format!("reply {i} {big}"),
+            ));
+        }
+        s.restore_turns(&turns);
+
+        // One live over-budget turn → one pipeline compression.
+        s.sync_turn(&big, &big, &metrics_with_input(200)).await;
+        let reqs = calls.lock().unwrap();
+        assert_eq!(reqs.len(), 1, "one call through the shared path");
+        assert!(
+            reqs[0].contains("CHAIN-ME"),
+            "the previous summary must be summarizer INPUT (the chain), got: {}",
+            &reqs[0]
+        );
+        // The Original-Task anchor (the text right under the header) must be
+        // the first REAL user message, not the compaction message.
+        let anchored = reqs[0]
+            .split("## Original Task")
+            .nth(1)
+            .and_then(|rest| rest.lines().nth(1).map(str::to_string))
+            .unwrap_or_default();
+        assert!(
+            anchored.starts_with("task 0"),
+            "task anchor must skip the compaction message, got: {anchored:?}"
+        );
+        drop(reqs);
+        // The old compaction message was replaced by the new one.
+        let compactions: Vec<&SumTurn> = s
+            .history
+            .iter()
+            .filter(|t| t.user.starts_with(crate::agentic::SUMMARY_PREFIX))
+            .collect();
+        assert_eq!(compactions.len(), 1, "exactly one compaction in history");
+        assert!(compactions[0].user.contains("NEW-SUM"));
+        assert!(s.prev_summary.contains("NEW-SUM"));
+    }
+
+    /// 18.5 token restore: the anchor comes from the persisted 17.6 column
+    /// of the LAST measured turn — not a chars/4 re-estimation of history.
+    #[test]
+    fn token_budget_restore_anchors_on_column_tokens() {
+        let mut tb = TokenBudget::new(100_000, 0.80);
+        let turns = vec![
+            turn_with_tokens("u1", "a1", Some(900), Some(10)),
+            turn_with_tokens("u2", "aa", Some(1_000), Some(12)),
+        ];
+        tb.restore_turns(&turns);
+        // 1,000 (measured prompt — already contains everything before it)
+        // + ceil(2/4) = 1 for the reply not yet inside any prompt.
+        assert_eq!(tb.last_prompt_tokens, Some(1_000));
+        assert_eq!(tb.used_tokens(), 1_001);
+    }
+
+    /// NULL columns (pre-17.6 rows, silent backends) fall back to the
+    /// estimate WITHOUT ever becoming the anchor — an estimate is never
+    /// presented as a measurement (18.1 honesty).
+    #[test]
+    fn token_budget_restore_null_columns_fall_back_to_estimate() {
+        let mut tb = TokenBudget::new(100_000, 0.80);
+        let text = "x".repeat(40); // 10 est tokens per side
+        let turns = vec![
+            crate::ConversationTurn::new(text.clone(), text.clone()),
+            crate::ConversationTurn::new(text.clone(), text.clone()),
+        ];
+        tb.restore_turns(&turns);
+        assert_eq!(
+            tb.last_prompt_tokens, None,
+            "no measurement in the store → no anchor, only estimates"
+        );
+        assert_eq!(tb.used_tokens(), 40, "2 turns × (10 + 10) est tokens");
+    }
+
+    /// Turns recorded after the last measured one (silent backend) extend
+    /// the delta with estimates while the anchor stays the real measurement.
+    #[test]
+    fn token_budget_restore_unmeasured_tail_extends_delta() {
+        let mut tb = TokenBudget::new(100_000, 0.80);
+        let turns = vec![
+            turn_with_tokens("u1", "aaaa", Some(1_000), Some(8)), // reply est 1
+            crate::ConversationTurn::new("xxxx", "yyyy"),         // est 2
+        ];
+        tb.restore_turns(&turns);
+        assert_eq!(tb.last_prompt_tokens, Some(1_000));
+        assert_eq!(tb.used_tokens(), 1_003);
+    }
+
+    /// Same column-first restore through `Summarizing`.
+    #[test]
+    fn summarizing_restore_anchors_on_column_tokens() {
+        let mut s = Summarizing::new(100_000);
+        let turns = vec![
+            turn_with_tokens("u1", "a1", Some(700), Some(9)),
+            turn_with_tokens("u2", "aaaa", Some(2_000), Some(11)),
+        ];
+        s.restore_turns(&turns);
+        assert_eq!(s.last_prompt_tokens, Some(2_000));
+        assert_eq!(s.used_tokens(), 2_001); // 2,000 + ceil(4/4)
+    }
+
+    /// Measurements taken BEFORE the compaction cut describe prompts of a
+    /// pre-compression shape — they must not anchor the restored (smaller)
+    /// working set.
+    #[test]
+    fn summarizing_restore_ignores_measurements_before_the_cut() {
+        let marked = format!(
+            "{}\nolder work compressed\n{}",
+            crate::agentic::SUMMARY_PREFIX,
+            crate::agentic::SUMMARY_END_MARKER
+        );
+        let mut s = Summarizing::new(100_000);
+        let turns = vec![
+            turn_with_tokens("old", "old", Some(50_000), Some(10)),
+            crate::ConversationTurn::new(marked, ""),
+            crate::ConversationTurn::new("after", "compaction"), // unmeasured
+        ];
+        s.restore_turns(&turns);
+        assert_eq!(
+            s.last_prompt_tokens, None,
+            "a pre-compression measurement must not anchor the cut working set"
+        );
+    }
+
+    /// A compaction record restored into the default provider stays in the
+    /// window as a user-side summary — never dispatched with an empty
+    /// assistant half.
+    #[test]
+    fn rolling_window_restores_compaction_record_without_empty_assistant() {
+        let marked = format!(
+            "{}\nearlier work\n{}",
+            crate::agentic::SUMMARY_PREFIX,
+            crate::agentic::SUMMARY_END_MARKER
+        );
+        let mut rw = RollingWindow::new(10);
+        rw.restore_turns(&[
+            crate::ConversationTurn::new(marked.clone(), ""),
+            crate::ConversationTurn::new("next task", "next reply"),
+        ]);
+        let msgs = rw.build_messages("sys", "go");
+        assert!(msgs.iter().any(|m| m.content == marked));
+        assert!(!msgs.iter().any(|m| m.content.is_empty()));
     }
 
     // --- MemoryManager hook coverage ---
@@ -1666,20 +2129,32 @@ mod tests {
 
     // --- Summarizing additional coverage ---
 
-    /// SEMANTICS CHANGED in Step 18.1: the second turn's reported prompt (12)
-    /// crosses the 8-token budget on its own — under the old math the flat
-    /// 12-per-turn sum crossed it instead.
+    /// SEMANTICS CHANGED in Step 18.5: with no summarizer the shared
+    /// pipeline inserts its STATIC fallback marker (the only surviving form
+    /// of the old placeholder-discard) — the provider's own "turns
+    /// summarised" placeholder is deleted with the rest of the legacy path.
     #[tokio::test]
     async fn summarizing_fallback_placeholder_when_no_summarizer() {
         let mut s = Summarizing::new(10); // tiny budget (8) to trigger compression
-        s.sync_turn("q1", "a1", &metrics_with_input(6)).await;
-        s.sync_turn("q2", "a2", &metrics_with_input(12)).await; // 12 + 1 > 8
-                                                                // With no summariser, placeholder text is inserted.
+        for i in 0..6u32 {
+            s.sync_turn(
+                &format!("question {i}"),
+                &format!("answer {i}"),
+                &metrics_with_input(6 + 4 * i),
+            )
+            .await;
+        }
+        let compaction = s
+            .history
+            .iter()
+            .find(|t| t.user.starts_with(crate::agentic::SUMMARY_PREFIX))
+            .expect("static fallback marker should be inserted");
         assert!(
-            s.history
-                .iter()
-                .any(|t| t.assistant.contains("turns summarised")),
-            "placeholder should be inserted"
+            compaction
+                .user
+                .contains("Summary generation was unavailable"),
+            "got: {}",
+            compaction.user
         );
     }
 
@@ -1694,11 +2169,18 @@ mod tests {
 
     #[tokio::test]
     async fn summarizing_on_pre_compress_returns_prev_summary() {
-        let mut s = Summarizing::new(10).with_summarizer(|_| Ok("PRIOR SUMMARY".to_string()));
-        // Step 18.1 semantics: the second reported prompt (12) crosses the
-        // 8-token budget and triggers the compression that sets prev_summary.
-        s.sync_turn("q", "a", &metrics_with_input(6)).await;
-        s.sync_turn("q", "a", &metrics_with_input(12)).await;
+        let mut s = Summarizing::new(10).with_summarizer(stub_summarizer("PRIOR SUMMARY"));
+        // Build up history UNDER budget first: the pipeline's boundary needs
+        // enough turns to leave a summarizable middle (Step 18.5 — head +
+        // ≥3-message tail are protected), and a too-early trigger would burn
+        // anti-thrash slots on nothing-to-summarize passes.
+        for _ in 0..5u32 {
+            s.sync_turn("question text", "answer text", &metrics_with_input(2))
+                .await;
+        }
+        // Now cross the 8-token budget → compression sets prev_summary.
+        s.sync_turn("question text", "answer text", &metrics_with_input(50))
+            .await;
         let pre = s.on_pre_compress(&[]).await;
         assert!(
             pre.contains("PRIOR SUMMARY"),
