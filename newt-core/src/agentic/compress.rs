@@ -92,6 +92,13 @@ pub(crate) fn is_compaction_message(m: &Value) -> bool {
         .is_some_and(|c| c.starts_with(SUMMARY_PREFIX))
 }
 
+/// String form of [`is_compaction_message`] for callers holding plain text
+/// instead of wire messages — the `Summarizing` provider's history entries
+/// and restored turn records (Step 18.5, #247).
+pub(crate) fn is_compaction_text(content: &str) -> bool {
+    content.starts_with(SUMMARY_PREFIX)
+}
+
 /// Hard minimum number of tail messages kept verbatim (hermes's floor) —
 /// even when the token-budgeted walk would protect fewer.
 const TAIL_MIN_MESSAGES: usize = 3;
