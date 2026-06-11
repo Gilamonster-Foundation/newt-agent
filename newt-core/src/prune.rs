@@ -465,12 +465,23 @@ fn shrink_value(v: &mut Value, cap: usize) -> bool {
             }
             None => false,
         },
-        Value::Array(items) => items
-            .iter_mut()
-            .fold(false, |acc, it| shrink_value(it, cap) || acc),
-        Value::Object(map) => map
-            .values_mut()
-            .fold(false, |acc, it| shrink_value(it, cap) || acc),
+        // Explicit loops, not `.any()`: every nested value must be visited
+        // (shrink_value mutates), and `.any()` would short-circuit after the
+        // first hit, leaving later strings unshrunk.
+        Value::Array(items) => {
+            let mut changed = false;
+            for it in items.iter_mut() {
+                changed |= shrink_value(it, cap);
+            }
+            changed
+        }
+        Value::Object(map) => {
+            let mut changed = false;
+            for it in map.values_mut() {
+                changed |= shrink_value(it, cap);
+            }
+            changed
+        }
         _ => false,
     }
 }
