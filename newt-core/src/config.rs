@@ -396,6 +396,11 @@ pub struct TuiConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub debug: Option<bool>,
 
+    /// Enable deep backend/inference diagnostics. Intended for issue reports
+    /// and compatibility debugging; also set via `NEWT_TRACE=1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace: Option<bool>,
+
     /// Shell command to run after every successful file write or edit, to
     /// give the agent immediate ground-truth feedback on whether its change
     /// compiled / passed basic checks. Output is appended to the tool result
@@ -805,6 +810,7 @@ impl Default for TuiConfig {
             max_tool_rounds: default_max_tool_rounds(),
             permissions: ToolPermissions::default(),
             debug: None,
+            trace: None,
             build_check_cmd: None,
             num_ctx: None,
             connect_timeout_secs: default_connect_timeout_secs(),

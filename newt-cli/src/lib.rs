@@ -57,6 +57,12 @@ pub struct Cli {
     #[arg(long, global = true, default_value_t = false)]
     pub debug: bool,
 
+    /// Enable deep inference diagnostics for backend compatibility failures.
+    /// Implies `--debug` and emits structural response details intended for
+    /// GitHub issues and backend debugging. Also set via `NEWT_TRACE=1`.
+    #[arg(long, global = true, default_value_t = false)]
+    pub trace: bool,
+
     /// Start the TUI coder with a named persona from ~/.newt/personas/<name>.md.
     /// Defaults are created lazily the first time persona mode is used.
     #[arg(long, global = true, value_name = "NAME")]
@@ -212,11 +218,14 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
 
     match cli.command.unwrap_or(Command::Code { path: None }) {
         Command::Code { path } => {
-            // --debug / --num-ctx set env vars so the TUI picks them up
+            // --debug / --trace / --num-ctx set env vars so the TUI picks them up
             // without requiring a run_code signature change.
-            if cli.debug {
+            if cli.debug || cli.trace {
                 // SAFETY: single-threaded before the TUI starts any async work.
                 unsafe { std::env::set_var("NEWT_DEBUG", "1") };
+            }
+            if cli.trace {
+                unsafe { std::env::set_var("NEWT_TRACE", "1") };
             }
             if let Some(n) = cli.num_ctx {
                 unsafe { std::env::set_var("NEWT_NUM_CTX", n.to_string()) };
@@ -436,6 +445,13 @@ mod tests {
 
         assert!(cli.debug);
         assert_eq!(cli.num_ctx, Some(8192));
+    }
+
+    #[test]
+    fn parses_trace_global() {
+        let cli = Cli::try_parse_from(["newt", "--trace"]).unwrap();
+
+        assert!(cli.trace);
     }
 
     #[test]
