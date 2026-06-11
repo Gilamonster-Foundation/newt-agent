@@ -36,10 +36,12 @@ pub use agent_mesh_protocol::{Caveats, CountBound, Scope};
 // loop's injected compression summarizer) join the surface.
 // Step 19.4 (#248): trim_for_summary joins it — the TUI's close-time note
 // extraction bounds its transcript with the cap-exit summary's own helper.
+// Step 18.6 (#247): compress_user_initiated (the `/compress` entry into the
+// same pipeline) + CompressCounters (read-only `/memory` snapshot).
 pub use agentic::{
-    chat_complete, execute_tool, openai_chat_complete, trim_for_summary, ChatCtx, CompressState,
-    McpTools, NoMcp, NoteNudge, NoteSink, RecallSource, StoreRecallSource, SummarizeFn,
-    SummarizeFuture, Summarizer,
+    chat_complete, compress_user_initiated, execute_tool, openai_chat_complete, trim_for_summary,
+    ChatCtx, CompressCounters, CompressState, ManualCompressOutcome, McpTools, NoMcp, NoteNudge,
+    NoteSink, RecallSource, StoreRecallSource, SummarizeFn, SummarizeFuture, Summarizer,
 };
 pub use agents::AgentsProvider;
 pub use caveats::{CaveatsExt, CountBoundExt, ScopeExt};
