@@ -58,6 +58,123 @@ fn tui_retry_policy() -> RetryPolicy {
 /// `(error, model, today) → new input-token cap`. See [`ChatCtx::recover_cw_400`].
 pub type RecoverCw400 = fn(&anyhow::Error, &str, &str) -> Option<u32>;
 
+/// Input-token ceiling implied by the `num_ctx` THIS request will carry
+/// (issue #282, the B6 hole): `num_ctx` caps the backend's whole KV window —
+/// input *plus* reply — so the input budget is 80 % of it, the same reply/
+/// estimate headroom the probe's budget math already reserves against a hard
+/// window (`safe_context` bootstraps at 80 % of the declared window; a cw-400
+/// sets `max_ok_input` to 80 % of the parsed limit). `None` (model-default
+/// window) or zero contributes nothing — the zero-is-disabled contract (F3),
+/// never a compress-to-zero.
+fn num_ctx_input_ceiling(num_ctx: Option<u32>) -> Option<usize> {
+    num_ctx.map(|c| (c as usize) * 80 / 100).filter(|&c| c > 0)
+}
+
+/// Initial pre-send budget for one turn (issue #282): the empirically-cached
+/// cap (`max_ok_input` ∥ `safe_context`) composed, via `min`, with the
+/// [`num_ctx_input_ceiling`] of the `num_ctx` the loop is about to send.
+/// Before this, the budget was the cached numbers alone — unset on a fresh
+/// capability cache until the turn ENDS, so the first turn of a session had
+/// no effective ceiling and a 41k-token request sailed into a forced 4,096
+/// window with zero compression events (the measured B6 failure: 8/10
+/// silently wrong). The ceiling is a real token budget: when it fires the
+/// trigger, `hard_budget` semantics apply (consults + feeds anti-thrash).
+fn initial_send_budget(
+    max_ok_input: Option<u32>,
+    safe_context: Option<u32>,
+    num_ctx: Option<u32>,
+) -> Option<usize> {
+    let cached = max_ok_input.or(safe_context).map(|c| c as usize);
+    match (cached, num_ctx_input_ceiling(num_ctx)) {
+        (Some(budget), Some(ceiling)) => Some(budget.min(ceiling)),
+        (budget, ceiling) => budget.or(ceiling),
+    }
+}
+
+// Unit tests for the #282 budget wiring: the `num_ctx` a request will carry
+// must participate in the pre-send budget — composing with the cached
+// capability numbers via `min`, vanishing when absent, and never turning a
+// zero/absent window into a compress-to-zero (F3).
+#[cfg(test)]
+mod send_budget_tests {
+    use super::compress::compression_trigger;
+    use super::{initial_send_budget, num_ctx_input_ceiling};
+
+    /// THE B6 first-turn hole: a fresh capability cache (no `max_ok_input`,
+    /// no `safe_context`) used to mean NO budget at all even though the
+    /// request itself carried `options.num_ctx = 4096`. The ceiling must now
+    /// arm the trigger on turn 1 — as a HARD budget (anti-thrash semantics).
+    #[test]
+    fn first_turn_fresh_cache_trigger_sees_the_num_ctx_ceiling() {
+        let budget = initial_send_budget(None, None, Some(4096));
+        assert_eq!(budget, Some(3276), "80% of 4096 — reply headroom reserved");
+        // The measured B6 shape: ~41k estimated tokens, 3 messages, no
+        // count/token thresholds in reach — pre-fix this returned None and
+        // the request sailed into the 4k window with zero events.
+        let trigger = compression_trigger(3, 41_355, 39_900, 40, None, budget, 1_432)
+            .expect("the ceiling must fire the trigger on the first turn");
+        assert!(trigger.hard_budget, "a real token budget, not a soft halve");
+        assert_eq!(
+            trigger.budget,
+            3_276 - 1_432,
+            "budget lands in message space: ceiling minus tool-schema tokens"
+        );
+        assert_eq!(trigger.max_messages, None, "no count firing here");
+    }
+
+    /// Absent `num_ctx` → exactly the pre-#282 budget (no behavior change).
+    #[test]
+    fn absent_num_ctx_leaves_the_budget_unchanged() {
+        assert_eq!(initial_send_budget(None, None, None), None);
+        assert_eq!(initial_send_budget(Some(2_000), None, None), Some(2_000));
+        assert_eq!(initial_send_budget(None, Some(5_000), None), Some(5_000));
+        assert_eq!(
+            initial_send_budget(Some(2_000), Some(5_000), None),
+            Some(2_000),
+            "max_ok_input still wins over safe_context"
+        );
+        // And with no budget at all, the trigger stays silent regardless of size.
+        assert_eq!(
+            compression_trigger(3, 41_355, 39_900, 40, None, None, 1_432),
+            None
+        );
+    }
+
+    /// The ceiling composes with existing budgets via `min` — whichever is
+    /// tighter wins, in both directions.
+    #[test]
+    fn ceiling_composes_with_cached_budgets_via_min() {
+        // Cached cap tighter than the ceiling: cached wins (mid-loop B5
+        // behavior is untouched by #282).
+        assert_eq!(
+            initial_send_budget(Some(2_135), None, Some(4_096)),
+            Some(2_135)
+        );
+        // Ceiling tighter than the cached cap: the B6 shape — bootstrap
+        // safe_context 104,857 vs forced num_ctx 4,096.
+        assert_eq!(
+            initial_send_budget(None, Some(104_857), Some(4_096)),
+            Some(3_276)
+        );
+        assert_eq!(
+            initial_send_budget(Some(104_857), Some(104_857), Some(4_096)),
+            Some(3_276)
+        );
+    }
+
+    /// Zero/tiny `num_ctx` must never become a compress-to-zero budget — the
+    /// zero-is-disabled contract (F3) holds at the source.
+    #[test]
+    fn zero_or_tiny_num_ctx_is_no_budget_at_all() {
+        assert_eq!(num_ctx_input_ceiling(None), None);
+        assert_eq!(num_ctx_input_ceiling(Some(0)), None);
+        assert_eq!(num_ctx_input_ceiling(Some(1)), None, "80% rounds to zero");
+        assert_eq!(initial_send_budget(None, None, Some(0)), None);
+        // A zero ceiling must not shadow a real cached budget either.
+        assert_eq!(initial_send_budget(Some(2_000), None, Some(0)), Some(2_000));
+    }
+}
+
 /// Everything one agentic turn needs, resolved once by the caller (the TUI
 /// resolves config + capability cache + caveats per turn and threads them in
 /// here, so the loop itself never re-reads config from disk).
@@ -86,6 +203,10 @@ pub struct ChatCtx<'a> {
     pub debug: bool,
     /// Ollama `options.num_ctx` — caps KV-cache allocation to prevent VRAM
     /// exhaustion on large models. `None` → model default (often 131k).
+    /// Also feeds the pre-send budget as a hard input ceiling for this turn's
+    /// requests (issue #282): Ollama silently evaluates only the window's
+    /// tail, so anything newt sends must already fit inside the `num_ctx` it
+    /// sends it with. Ignored on the OpenAI path (no such request field).
     pub num_ctx: Option<u32>,
     /// TCP connect timeout. Short (5 s default) so a down endpoint fails fast
     /// rather than blocking the full `inference_timeout_secs`.
@@ -249,8 +370,13 @@ pub async fn chat_complete(
     let mut cw_retries: u32 = 0;
     // Pre-send token budget gate: trim before dispatch when the current context
     // size exceeds the model's empirically-confirmed max input (or the safe
-    // context). Mutable because a recovered 400 tightens it mid-turn. See #223.
-    let mut send_budget: Option<usize> = max_ok_input.or(safe_context).map(|c| c as usize);
+    // context) — capped by the `num_ctx` every request this turn will carry
+    // (#282: on a fresh capability cache the cached numbers are unset or huge,
+    // so without the ceiling the first turn dispatched 10× over the real
+    // window with zero events — B6). Mutable because a recovered 400 tightens
+    // it mid-turn. See #223.
+    let num_ctx_ceiling = num_ctx_input_ceiling(num_ctx);
+    let mut send_budget: Option<usize> = initial_send_budget(max_ok_input, safe_context, num_ctx);
     // Tool schemas ride along in every request body; count them once (18.1).
     // Stable for the whole turn: the builtin + MCP tool set doesn't change
     // mid-turn, so hoisting out of the round loop is safe.
@@ -441,11 +567,15 @@ pub async fn chat_complete(
                             model,
                             cw_retries + 1,
                         );
-                        send_budget = Some(new_cap as usize);
+                        // A recovered cap can only tighten — the request still
+                        // carries the same `num_ctx`, so its ceiling holds (#282).
+                        let new_budget =
+                            num_ctx_ceiling.map_or(new_cap as usize, |c| (new_cap as usize).min(c));
+                        send_budget = Some(new_budget);
                         let outcome = compress(
                             CompressRequest {
                                 messages: &messages,
-                                budget: (new_cap as usize).saturating_sub(tool_tokens),
+                                budget: new_budget.saturating_sub(tool_tokens),
                                 max_messages: None,
                                 task,
                                 hard_budget: true,
@@ -1116,6 +1246,11 @@ pub async fn openai_chat_complete(
             "tool_choice": "auto",
             "stream": false,
         });
+        // No `num_ctx` is sent here, so #282's per-request input ceiling has
+        // no value to key on either — the pre-send guard stays on the cached
+        // `max_ok_input` ∥ `safe_context` numbers and the cw-400 recovery
+        // (these endpoints DO reject oversize requests with a parseable 400,
+        // unlike Ollama's silent truncation).
         let _ = num_ctx; // not applicable for OpenAI-compatible endpoints
         let dispatch = with_backoff_notify(
             &retry,
@@ -3350,6 +3485,100 @@ mod compression_loop_tests {
             after < before * 6 / 10,
             "compression must reclaim >40% here (got {before} -> {after})"
         );
+    }
+
+    /// THE B6 regression (#282): a FIRST-turn request on a fresh capability
+    /// cache (no `max_ok_input`, no `safe_context`) whose history exceeds the
+    /// `num_ctx` ceiling must compress BEFORE dispatch and dispatch under the
+    /// ceiling. Pre-fix, `send_budget` was `None` here — the after-benchmark
+    /// measured all 10 B6 runs shipping ~41k-token requests into a forced
+    /// 4,096 window with zero compression events (8/10 silently wrong),
+    /// because the `num_ctx` newt itself sent fed into nothing.
+    #[tokio::test]
+    async fn first_turn_over_num_ctx_ceiling_compresses_before_dispatch() {
+        let server = MockServer::start().await;
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let task_in_marker = Arc::new(AtomicBool::new(false));
+        let summary_in_marker = Arc::new(AtomicBool::new(false));
+        let old_placeholder = Arc::new(AtomicBool::new(false));
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(GauntletResponder {
+                final_answer: "the marker is GAUNTLET-7f3d9c".into(),
+                log: log.clone(),
+                task_in_marker_request: task_in_marker.clone(),
+                summary_in_marker_request: summary_in_marker.clone(),
+                old_placeholder_seen: old_placeholder.clone(),
+                static_marker_instead: false,
+            })
+            .mount(&server)
+            .await;
+
+        // The B6 shape, condensed: turn 1 of a fresh process already carries
+        // a history far over the forced window (a restored conversation whose
+        // assistant replies dumped file contents) — ~34k chars ≈ 9k estimated
+        // tokens against a 4,096 num_ctx. The task itself is small and sits
+        // up front (the protected head), the bulk is summarizable middle, and
+        // the recent tail is small — compression CAN reach the budget here,
+        // so a still-over-budget dispatch would be a wiring failure, not an
+        // incompressibility artifact.
+        let filler = "the quick brown newt reads three fifty-kilobyte fixtures\n".repeat(50);
+        let mut messages = vec![MemMessage::system("you are a test"), MemMessage::user(TASK)];
+        for _ in 0..12 {
+            messages.push(MemMessage::assistant(format!("file contents: {filler}")));
+            messages.push(MemMessage::user("continue"));
+        }
+
+        let ws = gauntlet_workspace();
+        let workspace = ws.path().to_string_lossy().to_string();
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let prompts = Arc::new(Mutex::new(Vec::new()));
+        let summarizer = canned_summarizer(prompts.clone());
+        let mut compress_state = CompressState::new();
+        let mut c = ctx(&uri, &messages, &caveats, &workspace);
+        // First turn of a fresh session: NO capability-cache numbers, NO
+        // token threshold — pre-#282 nothing armed the trigger. The only
+        // ceiling in play is the num_ctx the loop itself is about to send.
+        c.max_ok_input = None;
+        c.safe_context = None;
+        c.mid_loop_trim_tokens = None;
+        c.num_ctx = Some(4_096);
+        c.summarizer = Some(&*summarizer);
+        c.compress_state = Some(&mut compress_state);
+        let (reply, _streamed, _usage, _hallu) = chat_complete(c, &mut NoMcp)
+            .await
+            .expect("the first turn must complete");
+
+        // The turn produced the real answer (visibly degraded, not silently
+        // wrong: compression ran and the model answered from the summary).
+        assert_eq!(reply, "the marker is GAUNTLET-7f3d9c");
+
+        // Compression fired BEFORE the first dispatch: the summarizer ran,
+        // and the VERY FIRST request the backend ever saw already carried
+        // the compaction marker.
+        assert_eq!(prompts.lock().unwrap().len(), 1, "one pre-send compression");
+        let log = log.lock().unwrap();
+        let (first_had_marker, first_tokens) =
+            *log.first().expect("at least one request dispatched");
+        assert!(
+            first_had_marker,
+            "B6: the first dispatched request must already be compressed — \
+             pre-#282 it went out raw at ~9k tokens"
+        );
+
+        // And it dispatched UNDER the ceiling: 80% of 4,096 = 3,276 input
+        // tokens (the same reply headroom the probe math reserves).
+        assert!(
+            first_tokens <= 3_276,
+            "first dispatch must fit the num_ctx input ceiling \
+             (got ~{first_tokens} est. message tokens > 3,276)"
+        );
+
+        // Summarize-don't-discard still holds on the turn-1 path.
+        assert!(task_in_marker.load(Ordering::SeqCst), "task survives");
+        assert!(summary_in_marker.load(Ordering::SeqCst), "summary present");
+        assert!(!old_placeholder.load(Ordering::SeqCst));
     }
 
     /// Summarizer endpoint returns 500 → the static marker is dispatched
