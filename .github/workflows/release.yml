@@ -133,31 +133,144 @@ jobs:
 
   # ── Publish to crates.io (tag-only, sequenced topologically) ──────────
 
+  # Pre-flight for publish-crates (#120): fail the release BEFORE any
+  # `cargo publish` runs if the matrix below is not a valid topological
+  # order of the workspace's internal dependency graph. A mis-ordered
+  # matrix turned v0.6.5 into a 4/10 partial publish (`fail-fast: false`
+  # let the independent crates land while everything downstream of the
+  # mis-ordered crate cascaded). This job also runs on `release/**`
+  # branch pushes, so a stale matrix is caught before the tag is cut.
+  check-publish-order:
+    name: Check publish matrix order
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Verify matrix is a topological order of the internal dep graph
+        run: |
+          set -euo pipefail
+          cargo metadata --no-deps --format-version 1 > /tmp/workspace-metadata.json
+          python3 - <<'EOF'
+          import json, sys, yaml
+
+          wf = yaml.safe_load(open(".github/workflows/release.yml"))
+          matrix = wf["jobs"]["publish-crates"]["strategy"]["matrix"]["crate"]
+
+          pkgs = json.load(open("/tmp/workspace-metadata.json"))["packages"]
+          names = {p["name"] for p in pkgs}
+          # Internal deps that survive `cargo publish`: path deps carrying a
+          # version requirement (the `=0.6.x` workspace pins). Path-ONLY deps
+          # (req == "*", e.g. the tests-common dev-dep) are stripped from the
+          # published manifest and impose no ordering constraint.
+          deps = {p["name"]: sorted({d["name"] for d in p["dependencies"]
+                                     if d["name"] in names and d.get("req") != "*"})
+                  for p in pkgs}
+
+          pos = {c: i for i, c in enumerate(matrix)}
+          errors = []
+          for c in matrix:
+              if c not in names:
+                  errors.append(f"'{c}' is in the publish matrix but is not a workspace package")
+                  continue
+              for d in deps[c]:
+                  if d not in pos:
+                      errors.append(f"'{c}' depends on '{d}', which is missing from the publish matrix")
+                  elif pos[d] > pos[c]:
+                      errors.append(f"'{c}' is published before its dependency '{d}'")
+
+          if errors:
+              for e in errors:
+                  print(f"::error::publish matrix: {e}")
+              # Derive and print a valid order for the dep closure of the
+              # current matrix, so fixing the list is copy-paste.
+              need = set(matrix) & names
+              grew = True
+              while grew:
+                  grew = False
+                  for c in sorted(need):
+                      for d in deps.get(c, []):
+                          if d not in need:
+                              need.add(d)
+                              grew = True
+              order = []
+              remaining = {c: set(deps[c]) & need for c in need}
+              while remaining:
+                  ready = sorted(c for c, ds in remaining.items() if ds <= set(order))
+                  if not ready:
+                      print("::error::dependency cycle among: " + ", ".join(sorted(remaining)))
+                      break
+                  order += ready
+                  for c in ready:
+                      del remaining[c]
+              print("a valid topological order would be:")
+              for c in order:
+                  print(f"          - {c}")
+              sys.exit(1)
+
+          print(f"publish matrix OK: {len(matrix)} crates in topological order")
+          EOF
+
   publish-crates:
     name: Publish ${{ matrix.crate }} → crates.io
     # Enabled once agent-bridle 0.1.0 landed on crates.io (agent-bridle#21).
     # newt-tui and newt-mcp-server now declare `agent-bridle = "0.1"` as a
     # registry dep; the workspace [patch.crates-io] is removed after crates.io
-    # indexes agent-bridle. The publish-order bug (#120) is fixed by the
-    # topological matrix order below (max-parallel: 1).
+    # indexes agent-bridle.
     if: startsWith(github.ref, 'refs/tags/')
-    needs: [build-binaries]
+    needs: [build-binaries, check-publish-order]
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false   # leaves keep going if one fails
       max-parallel: 1    # but ONE at a time — internal deps need order
       matrix:
+        # TOPOLOGICAL ORDER — dependencies BEFORE dependents (#120).
+        # `cargo publish` of a crate fails outright when an internal dep is
+        # not on crates.io yet, and with `fail-fast: false` a mis-ordered
+        # matrix cascades into a partial release (v0.6.5 shipped 4/10). The
+        # list must contain the FULL closure of internal deps of every
+        # published crate. The comment on each line is that crate's internal
+        # deps (the `=0.6.x` workspace pins; path-only dev-deps like
+        # tests-common are stripped by cargo at publish time and don't count).
+        #
+        # The check-publish-order job above verifies this list against
+        # `cargo metadata` before any publish starts. To regenerate the
+        # order after a dependency change, topo-sort the workspace:
+        #
+        #   cargo metadata --no-deps --format-version 1 | python3 -c '
+        #   import json, sys
+        #   pkgs = json.load(sys.stdin)["packages"]
+        #   names = {p["name"] for p in pkgs}
+        #   deps = {p["name"]: {d["name"] for d in p["dependencies"]
+        #           if d["name"] in names and d.get("req") != "*"} for p in pkgs}
+        #   order = []
+        #   while deps:
+        #       ready = sorted(n for n, ds in deps.items() if ds <= set(order))
+        #       assert ready, "dependency cycle"
+        #       order += ready
+        #       for n in ready: del deps[n]
+        #   print("\n".join(order))'
+        #
+        # then drop the crates that are NOT published to crates.io:
+        # newt-agent-py (ships as the PyPI wheel), newt-eval and
+        # newt-provider-openai (unpublished; nothing published depends on
+        # them), tests-common (path-only dev-dep). newt-mesh is excluded
+        # from the workspace entirely.
         crate:
-          - newt-core
-          - plugins-protocol
-          - newt-inference
-          - newt-tools
-          - newt-identity   # newt-tui depends on this — must publish before it
-          - newt-tui
-          - newt-coder      # newt-acp-worker depends on this — must publish before it
-          - newt-acp-worker
-          - newt-mcp-server
-          - newt-agent  # package name for the newt-cli/ dir (binary: `newt`)
+          - newt-skills       # (no internal deps)
+          - plugins-protocol  # (no internal deps)
+          - newt-core         # newt-skills
+          - newt-identity     # newt-core
+          - newt-tools        # newt-core
+          - newt-mcp-client   # newt-core
+          - newt-inference    # newt-core, newt-identity, plugins-protocol
+          - newt-mcp-server   # newt-core, newt-inference, newt-tools
+          - newt-coder        # newt-core, newt-identity, newt-inference, newt-tools, plugins-protocol
+          - newt-tui          # newt-core, newt-identity, newt-inference, newt-mcp-client, newt-skills, newt-tools
+          - newt-acp-worker   # newt-coder, newt-core, newt-identity, newt-inference, newt-tools
+          # package name for the newt-cli/ dir (binary: `newt`); depends on
+          # newt-acp-worker, newt-core, newt-identity, newt-inference,
+          # newt-mcp-client, newt-mcp-server, newt-skills, newt-tools, newt-tui
+          - newt-agent
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -184,6 +297,12 @@ jobs:
         #   - 429-aware: publishing several NEW crate names in one release trips
         #     crates.io's new-crate rate limit (HTTP 429). Back off and retry
         #     instead of failing, so a batch of new components lands cleanly.
+        #   - Index-lag-aware (#120): a dependent crate's publish can briefly
+        #     see "no matching package named `<dep>`" while the sparse index
+        #     catches up with the dep published moments earlier by the previous
+        #     matrix job (cargo's own post-publish index wait can time out
+        #     without failing). Back off and retry; a dep that is GENUINELY
+        #     missing (ordering bug) still fails after the retries exhaust.
         #   - Any other error is fatal.
         run: |
           for attempt in 1 2 3 4 5 6; do
@@ -200,12 +319,17 @@ jobs:
               wait=$((attempt * 90))
               echo "::warning::crates.io rate-limited (429) on ${{ matrix.crate }} — waiting ${wait}s, retry ${attempt}/6"
               sleep "$wait"
+            elif grep -qiE 'no matching package named|failed to select a version for the requirement' publish.err; then
+              cat publish.err >&2
+              wait=$((attempt * 30))
+              echo "::warning::dependency of ${{ matrix.crate }} not yet visible in the crates.io index — waiting ${wait}s, retry ${attempt}/6"
+              sleep "$wait"
             else
               cat publish.err >&2
               exit 1
             fi
           done
-          echo "::error::${{ matrix.crate }} still rate-limited (429) after 6 retries"
+          echo "::error::${{ matrix.crate }} failed after 6 attempts (crates.io rate-limit or a dependency never appeared in the index — check the publish order)"
           exit 1
 
   # ── Build PyPI wheels (tag-only, maturin matrix) ──────────────────────
