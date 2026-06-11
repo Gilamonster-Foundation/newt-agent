@@ -1,6 +1,8 @@
-use newt_core::{
-    new_conversation_id, session_plan_dir, session_plan_path, ConversationStore, ConversationTurn,
-};
+// Step 17.1a: `newt_core::ConversationStore` now re-exports the SQLite
+// backend (tests/store.rs). This suite keeps exercising the legacy JSON
+// backend at its module path until 17.1b imports from and deletes it.
+use newt_core::conversation::ConversationStore;
+use newt_core::{new_conversation_id, session_plan_dir, session_plan_path, ConversationTurn};
 
 // --- Per-session plan files (issue #220) ---
 

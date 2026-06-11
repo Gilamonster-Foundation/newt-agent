@@ -2110,7 +2110,9 @@ fn save_successful_conversation_turn(
 ) -> anyhow::Result<()> {
     // The id is pre-assigned for the whole session (issue #220), so the first
     // turn creates the record with that id; later turns just append.
-    if !store.exists(conversation_id) {
+    // `exists()?` — an error must NOT read as "absent": routing a transient
+    // failure into create_with_id would overwrite a live conversation.
+    if !store.exists(conversation_id)? {
         store.create_with_id(
             conversation_id,
             &conversation_title_from_task(task),

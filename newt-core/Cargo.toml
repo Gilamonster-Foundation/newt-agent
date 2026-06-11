@@ -52,7 +52,21 @@ agent-mesh-protocol = { workspace = true }
 # Step 18.3 (issue #247): content hashing for the structural-prune
 # duplicate-collapse pass. Already in newt-core's build graph transitively
 # via agent-mesh-protocol — promoting it to a direct dep adds no new crate.
+# Step 17.1a (issue #246) also uses it for the §6 turn content chain
+# (`prev_hash` = BLAKE3 of the prior turn's canonical encoding) and the
+# per-install writer fingerprint.
 blake3 = "1"
+
+# Step 17.1a (issue #246): the SQLite backend for `ConversationStore`
+# (`store` module) — the one new dependency of Phase 17. Grounds (design
+# doc §Phase 17): the JSON store rewrites the whole pretty-printed record
+# on every turn (O(record) appends, measured 3.4 ms p50 at 1000 turns in
+# the B1 baseline); 17.3+ tool-event recall needs an index, not a grep;
+# FTS5 `snippet()` quality is the difference between a usable `recall`
+# and noise. NOT grounds: scale or lineage. `bundled` (no system SQLite);
+# `fts5` is deferred to 17.3. Version pinned at the workspace level for
+# MSRV 1.75 — see the root Cargo.toml comment.
+rusqlite.workspace = true
 
 # TODO: depend on thoon-core once it publishes (currently path-only in hermes-thoon).
 # thoon-core = "0.5"
@@ -68,6 +82,11 @@ pyo3 = ["dep:pyo3"]
 [dev-dependencies]
 tempfile = "3"
 tokio = { workspace = true }
+# The store integration tests (tests/store.rs) open conversations.db
+# directly to tamper with rows / build drifted schemas — exercising the
+# §6 chain-integrity detection and the schema-diff migration. Same crate
+# as the runtime dep; adds nothing to the build graph.
+rusqlite.workspace = true
 # HTTP mocking for the agentic-loop tests that moved here with the loop
 # (Step 9.7) — same pattern as newt-inference / the old newt-tui suites.
 wiremock.workspace = true
