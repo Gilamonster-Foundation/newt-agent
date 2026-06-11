@@ -55,6 +55,22 @@ pub(crate) fn print_debug(msg: &str, color: bool) {
     io::stdout().flush().ok();
 }
 
+/// Print a deeper diagnostic intended for backend compatibility issue reports.
+pub(crate) fn print_trace(msg: &str, color: bool) {
+    if color {
+        execute!(
+            io::stdout(),
+            SetForegroundColor(CtColor::DarkGrey),
+            Print(format!("[trace] {msg}\n")),
+            ResetColor,
+        )
+        .ok();
+    } else {
+        println!("[trace] {msg}");
+    }
+    io::stdout().flush().ok();
+}
+
 /// Insert thousands separators into a token count for display.
 pub(crate) fn fmt_tokens(n: u32) -> String {
     let s = n.to_string();
