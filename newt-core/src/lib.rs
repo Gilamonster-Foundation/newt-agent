@@ -4,6 +4,7 @@
 //! into a `Tier` (FAST / STANDARD / COMPLEX / REVIEW), and asks the
 //! configured backends which can serve that tier.
 
+pub mod agentic;
 pub mod agents;
 pub mod caveats;
 pub mod config;
@@ -17,6 +18,7 @@ pub mod model_id;
 pub mod notes;
 pub mod pricing;
 pub mod prune;
+pub mod retry;
 pub mod role_profile;
 pub mod router;
 pub mod session;
@@ -26,6 +28,8 @@ pub mod tuning;
 pub mod pyo3_module;
 
 pub use agent_mesh_protocol::{Caveats, CountBound, Scope};
+// Step 9.7: clean top-level import paths for the relocated agentic loop.
+pub use agentic::{chat_complete, execute_tool, openai_chat_complete, ChatCtx, McpTools, NoMcp};
 pub use agents::AgentsProvider;
 pub use caveats::{CaveatsExt, CountBoundExt, ScopeExt};
 pub use config::{

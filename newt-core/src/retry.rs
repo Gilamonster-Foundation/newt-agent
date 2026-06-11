@@ -1,9 +1,13 @@
 //! Shared HTTP retry/backoff for inference backends.
 //!
-//! Both [`LocalOllamaBackend`](crate::local::LocalOllamaBackend) and
-//! [`LocalVllmBackend`](crate::local::LocalVllmBackend) drive their single
-//! `try_complete` attempt through [`with_backoff`], so the retry policy and
-//! the error-classification rules live in exactly one place.
+//! Lived in `newt-inference` until Step 9.7 moved it here so the relocated
+//! agentic loop ([`crate::agentic`]) can share it without creating a
+//! `newt-inference` ⇄ `newt-core` dependency cycle; `newt_inference::retry`
+//! re-exports this module, so all existing import paths still work.
+//!
+//! Both `LocalOllamaBackend` and `LocalVllmBackend` (in `newt-inference`)
+//! drive their single `try_complete` attempt through [`with_backoff`], so the
+//! retry policy and the error-classification rules live in exactly one place.
 //!
 //! ## Why this exists
 //!

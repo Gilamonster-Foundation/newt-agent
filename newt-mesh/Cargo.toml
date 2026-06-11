@@ -13,6 +13,14 @@
 #
 # The binary surface is `newt-mesh announce` / `newt-mesh ask`.
 
+# An explicit (empty) workspace table: this crate is its own workspace root.
+# The parent's `exclude = ["newt-mesh"]` already implies this in the normal
+# side-by-side layout, but the explicit table makes it hold from any path
+# (e.g. a git worktree nested under the main checkout) — which the
+# [patch.crates-io] block below depends on, since patches only apply at a
+# workspace root.
+[workspace]
+
 [package]
 name = "newt-mesh"
 # Aligned with the workspace's semver line (the 0.{month}.{YYYYMMDD} date
@@ -91,3 +99,19 @@ opt-level     = 3
 lto           = "thin"
 codegen-units = 1
 strip         = true
+
+# ── Temporary patch: agent-bridle → crates.io transition ──────────────────
+#
+# Mirrors the root workspace's [patch.crates-io] block (see ../Cargo.toml).
+# Since Step 9.7 moved the agentic loop into newt-core, newt-core itself
+# declares `agent-bridle = "0.1"` — and newt-mesh, being excluded from the
+# parent workspace, is its own workspace root, so the parent's patch does
+# not apply here. Remove this together with the root block once
+# agent-bridle 0.1.0 is indexed on crates.io.
+# See: https://github.com/Gilamonster-Foundation/agent-bridle/issues/20
+
+[patch.crates-io]
+agent-bridle            = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", branch = "feat/stub-shell" }
+agent-bridle-core       = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", branch = "feat/stub-shell" }
+agent-bridle-tool-shell = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", branch = "feat/stub-shell" }
+agent-bridle-tool-web   = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", branch = "feat/stub-shell" }
