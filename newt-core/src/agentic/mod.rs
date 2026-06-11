@@ -145,6 +145,14 @@ pub struct ChatCtx<'a> {
     /// owned by the caller across user turns and lent per call (the
     /// `note_nudge` pattern). `None` ⇒ a fresh per-turn state.
     pub compress_state: Option<&'a mut CompressState>,
+    /// Per-turn tool-event recorder (Step 17.6, #246): when present, the
+    /// loop pushes one [`crate::ToolEvent`] per executed tool call — name,
+    /// privacy-preserving args digest (never raw args), outcome, duration
+    /// claim — at the same site that renders tool activity live. The TUI
+    /// lends a fresh `Vec` per turn (the `note_nudge` pattern) and persists
+    /// it into the turn's `events` column. `None` (eval / headless) ⇒
+    /// nothing is recorded.
+    pub tool_events: Option<&'a mut Vec<crate::ToolEvent>>,
 }
 
 /// Main agentic loop: call model → execute tool calls → feed results back → repeat.
@@ -193,6 +201,7 @@ pub async fn chat_complete(
         recall_source,
         summarizer,
         compress_state,
+        mut tool_events,
     } = ctx;
     // Headless callers may pass no session state — compression still works,
     // with per-turn anti-thrash accounting.
@@ -672,6 +681,7 @@ pub async fn chat_complete(
                     n.note_saved();
                 }
             }
+            let tool_t0 = std::time::Instant::now();
             let result = execute_tool(
                 name,
                 &args,
@@ -690,6 +700,16 @@ pub async fn chat_complete(
                 recall_source,
             )
             .await;
+            // 17.6: record the call for the turn's events column — args are
+            // digested (never stored raw), duration is a display claim.
+            if let Some(rec) = tool_events.as_deref_mut() {
+                rec.push(crate::ToolEvent::from_call(
+                    name,
+                    &args,
+                    tools::tool_result_ok(&result),
+                    u64::try_from(tool_t0.elapsed().as_millis()).ok(),
+                ));
+            }
             messages.push(serde_json::json!({
                 "role": "tool",
                 "content": result
@@ -953,6 +973,7 @@ pub async fn openai_chat_complete(
         recall_source,
         summarizer,
         compress_state,
+        mut tool_events,
     } = ctx;
     // Headless callers may pass no session state (mirrors the Ollama path).
     let mut local_compress_state = CompressState::new();
@@ -1224,6 +1245,7 @@ pub async fn openai_chat_complete(
                     n.note_saved();
                 }
             }
+            let tool_t0 = std::time::Instant::now();
             let result = execute_tool(
                 name,
                 &args,
@@ -1242,6 +1264,16 @@ pub async fn openai_chat_complete(
                 recall_source,
             )
             .await;
+            // 17.6: record the call for the turn's events column (mirrors
+            // the Ollama path) — digested args, duration as a display claim.
+            if let Some(rec) = tool_events.as_deref_mut() {
+                rec.push(crate::ToolEvent::from_call(
+                    name,
+                    &args,
+                    tools::tool_result_ok(&result),
+                    u64::try_from(tool_t0.elapsed().as_millis()).ok(),
+                ));
+            }
             messages.push(serde_json::json!({
                 "role": "tool",
                 "tool_call_id": id,
@@ -1517,6 +1549,7 @@ mod tool_round_cap_tests {
                 recall_source: None,
                 summarizer: None,
                 compress_state: None,
+                tool_events: None,
             },
             &mut NoMcp,
         )
@@ -1576,6 +1609,7 @@ mod tool_round_cap_tests {
                 recall_source: None,
                 summarizer: None,
                 compress_state: None,
+                tool_events: None,
             },
             &mut NoMcp,
         )
@@ -1586,6 +1620,177 @@ mod tool_round_cap_tests {
         assert_eq!(reply, "openai partial answer");
         assert_ne!(reply, "(reached tool-call limit)");
         assert!(!streamed);
+    }
+
+    /// 17.6: with a recorder lent in `ChatCtx.tool_events`, the Ollama loop
+    /// records one event per executed tool call — name as invoked, digested
+    /// args (keys + hash, never raw values), best-effort outcome, duration
+    /// claim. Without a recorder (every other test here) nothing changes.
+    #[tokio::test]
+    async fn ollama_loop_records_tool_events_with_digested_args() {
+        let server = MockServer::start().await;
+        struct TwoToolResponder;
+        impl Respond for TwoToolResponder {
+            fn respond(&self, req: &Request) -> ResponseTemplate {
+                if request_has_tools(req) {
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "message": { "content": "", "tool_calls": [
+                            { "function": { "name": "list_dir",
+                                            "arguments": {"path": "."} } },
+                            { "function": { "name": "definitely_not_a_real_tool",
+                                            "arguments": {"token": "tippy-top-secret"} } }
+                        ]}
+                    }))
+                } else {
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "message": { "content": "done" }
+                    }))
+                }
+            }
+        }
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(TwoToolResponder)
+            .mount(&server)
+            .await;
+
+        let ws = tempfile::TempDir::new().unwrap();
+        let workspace = ws.path().to_string_lossy().into_owned();
+        let messages = msgs();
+        let caveats = Caveats::top();
+        let mut events: Vec<crate::ToolEvent> = Vec::new();
+        chat_complete(
+            ChatCtx {
+                url: &server.uri(),
+                model: "test-model",
+                kind: BackendKind::Ollama,
+                api_key: None,
+                messages: &messages,
+                task: "do the thing",
+                workspace: &workspace,
+                color: false,
+                caveats: &caveats,
+                max_tool_rounds: 1,
+                tool_output_lines: 20,
+                debug: false,
+                num_ctx: None,
+                connect_timeout_secs: 5,
+                inference_timeout_secs: 120,
+                mid_loop_trim_threshold: 40,
+                mid_loop_trim_tokens: None,
+                max_ok_input: None,
+                build_check_cmd: None,
+                safe_context: None,
+                recover_cw_400: None,
+                note_sink: None,
+                note_nudge: None,
+                summarizer: None,
+                compress_state: None,
+                tool_events: Some(&mut events),
+            },
+            &mut NoMcp,
+        )
+        .await
+        .expect("chat_complete should succeed");
+
+        assert_eq!(events.len(), 2, "one event per tool call: {events:?}");
+        assert_eq!(events[0].tool, "list_dir");
+        assert!(events[0].ok, "a real listing reads as success");
+        assert!(events[0].args_digest.contains("path"));
+        assert!(events[0].duration_ms.is_some());
+        assert_eq!(events[1].tool, "definitely_not_a_real_tool");
+        assert!(!events[1].ok, "an unknown tool reads as failure");
+        // Args are digested, never recorded raw.
+        assert!(events[1].args_digest.contains("token"));
+        assert!(
+            !events[1].args_digest.contains("tippy-top-secret"),
+            "raw arg value leaked: {}",
+            events[1].args_digest
+        );
+    }
+
+    /// 17.6: the OpenAI loop records the same per-call events (its tool
+    /// arguments arrive as a JSON *string* — the digest must match the
+    /// parsed-args digest the Ollama path produces for identical args).
+    #[tokio::test]
+    async fn openai_loop_records_tool_events_with_digested_args() {
+        let server = MockServer::start().await;
+        struct OneToolResponder;
+        impl Respond for OneToolResponder {
+            fn respond(&self, req: &Request) -> ResponseTemplate {
+                if request_has_tools(req) {
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "choices": [{ "message": {
+                            "content": null,
+                            "tool_calls": [{
+                                "id": "call_1",
+                                "type": "function",
+                                "function": { "name": "list_dir",
+                                              "arguments": "{\"path\": \".\"}" }
+                            }]
+                        }}]
+                    }))
+                } else {
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "choices": [{ "message": { "content": "done" } }]
+                    }))
+                }
+            }
+        }
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(OneToolResponder)
+            .mount(&server)
+            .await;
+
+        let ws = tempfile::TempDir::new().unwrap();
+        let workspace = ws.path().to_string_lossy().into_owned();
+        let messages = msgs();
+        let caveats = Caveats::top();
+        let mut events: Vec<crate::ToolEvent> = Vec::new();
+        openai_chat_complete(
+            ChatCtx {
+                url: &server.uri(),
+                model: "test-model",
+                kind: BackendKind::Openai,
+                api_key: Some("sk-test"),
+                messages: &messages,
+                task: "do the thing",
+                workspace: &workspace,
+                color: false,
+                caveats: &caveats,
+                max_tool_rounds: 1,
+                tool_output_lines: 20,
+                debug: false,
+                num_ctx: None,
+                connect_timeout_secs: 5,
+                inference_timeout_secs: 120,
+                mid_loop_trim_threshold: 40,
+                mid_loop_trim_tokens: None,
+                max_ok_input: None,
+                build_check_cmd: None,
+                safe_context: None,
+                recover_cw_400: None,
+                note_sink: None,
+                note_nudge: None,
+                summarizer: None,
+                compress_state: None,
+                tool_events: Some(&mut events),
+            },
+            &mut NoMcp,
+        )
+        .await
+        .expect("openai_chat_complete should succeed");
+
+        assert_eq!(events.len(), 1, "one event per tool call: {events:?}");
+        assert_eq!(events[0].tool, "list_dir");
+        assert!(events[0].ok);
+        assert_eq!(
+            events[0].args_digest,
+            crate::ToolEvent::from_call("x", &serde_json::json!({"path": "."}), true, None)
+                .args_digest,
+            "string-encoded args must digest like parsed args"
+        );
     }
 
     #[tokio::test]
@@ -1652,6 +1857,7 @@ mod tool_round_cap_tests {
                 recall_source: None,
                 summarizer: None,
                 compress_state: None,
+                tool_events: None,
             },
             &mut NoMcp,
         )
@@ -1765,6 +1971,7 @@ mod tool_round_cap_tests {
                 recall_source: None,
                 summarizer: None,
                 compress_state: None,
+                tool_events: None,
             },
             &mut NoMcp,
         )
@@ -1897,6 +2104,7 @@ mod tool_round_cap_tests {
                 recall_source: None,
                 summarizer: None,
                 compress_state: None,
+                tool_events: None,
             },
             &mut NoMcp,
         )
@@ -1968,6 +2176,7 @@ mod http_loop_tests {
             recall_source: None,
             summarizer: None,
             compress_state: None,
+            tool_events: None,
         }
     }
 
@@ -2477,6 +2686,7 @@ mod save_note_loop_tests {
             recall_source: None,
             summarizer: None,
             compress_state: None,
+            tool_events: None,
         }
     }
 
@@ -2940,6 +3150,7 @@ mod compression_loop_tests {
             recall_source: None,
             summarizer: None,
             compress_state: None,
+            tool_events: None,
         }
     }
 
