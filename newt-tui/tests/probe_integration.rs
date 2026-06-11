@@ -435,6 +435,63 @@ fn save_then_load_cache_roundtrips_through_home_newt() {
     assert_eq!(e.tune_confidence, TuneConfidence::Medium);
 }
 
+/// Step 18.1 ratchet de-poison, end-to-end through the on-disk file: a
+/// pre-18.1 cache (no `accounting_version` field) carrying the live B3
+/// poisoned ratchet (`max_ok_input: 25602` at High confidence when no prompt
+/// the backend evaluated exceeded 4,748 tokens) must be invalidated by
+/// `load_cache` AND persisted back, so the migration runs exactly once.
+#[test]
+fn load_cache_migrates_legacy_poisoned_entry_once_and_persists() {
+    let _l = env_lock();
+    let (_guard, home) = HomeGuard::tempdir();
+    let newt = home.join(".newt");
+    std::fs::create_dir_all(&newt).unwrap();
+    let on_disk = newt.join("model-capabilities.json");
+    std::fs::write(
+        &on_disk,
+        serde_json::json!({
+            "llama3.1:8b": {
+                "conformance": "native",
+                "tested_date": "2026-06-08",
+                "context_window": 8192,
+                "safe_context": 6553,
+                "max_ok_input": 25602,
+                "consecutive_ok": 3,
+                "tune_confidence": "high",
+                "tune_date": "2026-06-08"
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let cache = load_cache();
+    let e = cache.get("llama3.1:8b").expect("entry survives migration");
+    assert_eq!(e.max_ok_input, None, "poisoned ratchet value dropped");
+    assert_eq!(e.consecutive_ok, 0);
+    assert_eq!(e.tune_confidence, TuneConfidence::None);
+    assert_eq!(e.accounting_version, newt_tui::probe::ACCOUNTING_VERSION);
+    // Non-regime state survives: the declared window, the VRAM-derived
+    // safe_context, and the conformance probe result.
+    assert_eq!(e.context_window, Some(8192));
+    assert_eq!(e.safe_context, Some(6553));
+    assert_eq!(e.conformance, ToolConformance::Native);
+
+    // The invalidation was persisted: the stamp is on disk, the poisoned
+    // value is gone...
+    let raw = std::fs::read_to_string(&on_disk).unwrap();
+    assert!(raw.contains("accounting_version"), "stamp must persist");
+    assert!(!raw.contains("25602"), "poisoned value must not survive");
+    // ...and a second load is a pure read — same bytes, nothing re-migrated.
+    let again = load_cache();
+    assert_eq!(again.get("llama3.1:8b").unwrap().max_ok_input, None);
+    assert_eq!(
+        std::fs::read_to_string(&on_disk).unwrap(),
+        raw,
+        "second load must not rewrite the file"
+    );
+}
+
 #[test]
 fn load_cache_empty_when_file_missing() {
     let _l = env_lock();
