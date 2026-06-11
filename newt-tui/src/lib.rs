@@ -1001,6 +1001,61 @@ impl newt_core::NoteSink for ManagerNoteSink<'_> {
     }
 }
 
+/// Build the agentic loop's compression summarizer (Step 18.4, #247): one
+/// tools-disabled completion against the active backend, mirroring the
+/// `Summarizing` provider's `with_summarizer` wiring below — but async,
+/// because the loop invokes it mid-turn from inside its own async context.
+/// A non-2xx status or empty content is an error so the loop falls back to
+/// the static compaction marker instead of injecting garbage.
+fn make_loop_summarizer(
+    url: String,
+    model: String,
+    kind: newt_core::BackendKind,
+    api_key: Option<String>,
+) -> newt_core::Summarizer {
+    Box::new(move |prompt: String| {
+        let url = url.clone();
+        let model = model.clone();
+        let api_key = api_key.clone();
+        let openai = kind == newt_core::BackendKind::Openai;
+        Box::pin(async move {
+            let chat_url = if openai {
+                format!("{}/v1/chat/completions", url.trim_end_matches('/'))
+            } else {
+                format!("{}/api/chat", url.trim_end_matches('/'))
+            };
+            // No `tools` key => the model cannot emit tool calls.
+            let body = serde_json::json!({
+                "model": model,
+                "messages": [{"role": "user", "content": prompt}],
+                "stream": false,
+            });
+            let mut req = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(60))
+                .build()?
+                .post(&chat_url)
+                .json(&body);
+            if let Some(key) = api_key {
+                req = req.bearer_auth(key);
+            }
+            let resp = req.send().await?;
+            if !resp.status().is_success() {
+                anyhow::bail!("summarizer endpoint {}", resp.status());
+            }
+            let json: serde_json::Value = resp.json().await?;
+            let content = if openai {
+                json["choices"][0]["message"]["content"].as_str()
+            } else {
+                json["message"]["content"].as_str()
+            };
+            match content {
+                Some(s) if !s.trim().is_empty() => Ok(s.to_string()),
+                _ => anyhow::bail!("summarizer returned empty content"),
+            }
+        })
+    })
+}
+
 fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Result<()> {
     let verbose = verbose_mode();
 
@@ -1204,6 +1259,10 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
     // Turn-counted memory nudge (Step 19.3, #248): owned per session, lent to
     // the loop each turn. `[memory] note_nudge_interval` (default 10, 0 = off).
     let mut note_nudge = newt_core::NoteNudge::new(mem_cfg.note_nudge_interval);
+    // Compression anti-thrash state (Step 18.4, #247): owned per session,
+    // lent to the loop each turn (same pattern as `note_nudge`). Two
+    // consecutive <10% reclaims disable auto-compression until restart.
+    let mut compress_state = newt_core::CompressState::new();
     let ctx = newt_core::SessionContext {
         workspace: workspace.to_string(),
         session_id: format!(
@@ -1454,6 +1513,15 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                     let mut note_sink = ManagerNoteSink {
                         memory: &mut memory,
                     };
+                    // Compression summarizer (Step 18.4, #247): rebuilt per
+                    // turn so a mid-session `/backend` or model switch takes
+                    // effect immediately.
+                    let loop_summarizer = make_loop_summarizer(
+                        inf_url.clone(),
+                        inf_model.clone(),
+                        inf_kind,
+                        inf_key.clone(),
+                    );
                     let response = tokio::task::block_in_place(|| {
                         rt.block_on(chat_complete(
                             ChatCtx {
@@ -1484,6 +1552,9 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                                 recover_cw_400: Some(recover_context_window_400),
                                 note_sink: Some(&mut note_sink),
                                 note_nudge: Some(&mut note_nudge),
+                                // Summarize-don't-discard (Step 18.4, #247).
+                                summarizer: Some(&*loop_summarizer),
+                                compress_state: Some(&mut compress_state),
                             },
                             &mut mcp,
                         ))
@@ -4012,6 +4083,8 @@ mod tool_round_cap_tests {
                     recover_cw_400: Some(recover_context_window_400),
                     note_sink: None,
                     note_nudge: None,
+                    summarizer: None,
+                    compress_state: None,
                 },
                 &mut Mcp::empty(),
             )

@@ -1,7 +1,13 @@
-//! Context-window management for the agentic loop: token estimation,
-//! mid-loop trimming, pre-send budget enforcement, and the tool-call/result
-//! pairing repair that keeps strict backends (Anthropic/Bedrock via LiteLLM)
-//! from rejecting a trimmed history. Moved verbatim from `newt-tui` (Step 9.7).
+//! Context-window management for the agentic loop: token estimation, the
+//! cap-exit trim, and the tool-call/result pairing repair that keeps strict
+//! backends (Anthropic/Bedrock via LiteLLM) from rejecting a rewritten
+//! history. Moved verbatim from `newt-tui` (Step 9.7).
+//!
+//! Step 18.4 (#247): the mid-loop trim and pre-send budget enforcement that
+//! used to live here (`mid_loop_trim` / `trim_to_token_budget` — the
+//! amputate-the-middle helpers measured failing in baseline B6) are replaced
+//! by the [`super::compress`] pipeline. `trim_for_summary` survives for the
+//! cap-exit summary request only.
 
 /// Trim a message list for the cap-exit summary: keep the first `head` messages
 /// (system prompt + original task) and the last `tail` messages (recent rounds).
@@ -48,9 +54,9 @@ pub(crate) fn estimate_value_tokens(v: &serde_json::Value) -> usize {
 /// even for large histories. It is the **fallback** figure only: when the
 /// backend has reported a prompt token count for the current conversation,
 /// [`PromptTracker::current`] anchors on that instead (Step 18.1). The
-/// estimate only needs to be good enough to fire trimming *before* a request
-/// would blow past the model's context window — see [`trim_to_token_budget`]
-/// and issue #223.
+/// estimate only needs to be good enough to fire compression *before* a
+/// request would blow past the model's context window — see
+/// [`super::compress`] and issue #223.
 pub(crate) fn estimate_tokens(messages: &[serde_json::Value]) -> usize {
     messages.iter().map(estimate_value_tokens).sum()
 }
@@ -117,71 +123,6 @@ impl PromptTracker {
             _ => estimate_request_tokens(messages, tools),
         }
     }
-}
-
-/// Trim `messages` until the estimated token count fits within `budget`,
-/// returning the (possibly unchanged) list. Trimming is progressive: it keeps
-/// the system + first `head` messages and shrinks the retained tail, halving it
-/// each pass until the estimate fits or the tail can shrink no further.
-///
-/// `head` is the number of leading messages to always preserve (system prompt
-/// plus the original task). Returns `(trimmed, fired)` where `fired` is `true`
-/// if any messages were dropped — the caller uses it to decide whether to emit
-/// a notice. See issue #223.
-pub(crate) fn trim_to_token_budget(
-    messages: &[serde_json::Value],
-    budget: usize,
-    head: usize,
-) -> (Vec<serde_json::Value>, bool) {
-    if budget == 0 || estimate_tokens(messages) <= budget {
-        return (messages.to_vec(), false);
-    }
-    let mut tail = messages.len().saturating_sub(head) / 2;
-    loop {
-        let candidate = trim_for_summary(messages, head, tail);
-        if estimate_tokens(&candidate) <= budget || tail == 0 {
-            return (candidate, true);
-        }
-        tail /= 2;
-    }
-}
-
-/// Mid-loop trim trigger that fires on EITHER message count OR current tokens.
-///
-/// The message-count threshold (`count_threshold`) is the original VRAM guard.
-/// `token_threshold` is the issue #223 addition: a single tool round can return
-/// a multi-KB payload that stays well under the message-count threshold while
-/// blowing past the model's context window. When set and exceeded, the list is
-/// further trimmed to fit the token budget. Returns `(trimmed, fired)`.
-///
-/// `current_tokens` is the caller's truthful context-size figure for
-/// `messages` (prompt-tokens-preferred via [`PromptTracker::current`], Step
-/// 18.1) — used for the token trigger so the decision reflects what the
-/// backend actually evaluated. If the count trim fires first, the figure is
-/// recomputed from the chars/4 estimate (the anchor no longer applies to the
-/// rewritten list). The trim *mechanics* are unchanged.
-pub(crate) fn mid_loop_trim(
-    messages: &[serde_json::Value],
-    count_threshold: usize,
-    token_threshold: Option<usize>,
-    current_tokens: usize,
-) -> (Vec<serde_json::Value>, bool) {
-    let mut out = messages.to_vec();
-    let mut fired = false;
-    let mut tokens = current_tokens;
-    if out.len() > count_threshold {
-        out = trim_for_summary(&out, 2, count_threshold / 2);
-        fired = true;
-        tokens = estimate_tokens(&out);
-    }
-    if let Some(budget) = token_threshold {
-        if tokens > budget {
-            let (trimmed, t) = trim_to_token_budget(&out, budget, 2);
-            out = trimmed;
-            fired = fired || t;
-        }
-    }
-    (out, fired)
 }
 
 /// Remove or neutralise tool-call/result messages that form an incomplete pair
@@ -379,98 +320,6 @@ mod tests {
             "big message should estimate ~1000 tokens, got {b}"
         );
         assert!(b > s * 10, "big must dwarf small ({b} vs {s})");
-    }
-
-    /// The crux of issue #223: a SINGLE huge tool message stays well under the
-    /// message-count threshold yet must still trigger a trim by token budget.
-    #[test]
-    fn token_trim_fires_on_one_huge_message_under_count_threshold() {
-        let mut msgs = vec![
-            serde_json::json!({"role": "system", "content": "sys"}),
-            serde_json::json!({"role": "user", "content": "task"}),
-        ];
-        // One tool round returns a ~1M-char payload → ~250k tokens.
-        msgs.push(serde_json::json!({"role": "tool", "content": "z".repeat(1_000_000)}));
-        msgs.push(serde_json::json!({"role": "user", "content": "next"}));
-
-        // Message count (4) is far below the threshold (40), so the old
-        // count-only trigger would NOT fire. The token trigger must.
-        let (out, fired) = mid_loop_trim(&msgs, 40, Some(50_000), estimate_tokens(&msgs));
-        assert!(fired, "token-based trim must fire on the huge payload");
-        assert!(
-            estimate_tokens(&out) <= 50_000,
-            "trim must bring estimate under budget, got {}",
-            estimate_tokens(&out)
-        );
-    }
-
-    /// With no token threshold configured, behaviour matches the legacy
-    /// count-only trigger (no trim while under the message count).
-    #[test]
-    fn mid_loop_trim_count_only_when_no_token_threshold() {
-        let msgs: Vec<serde_json::Value> = (0..5)
-            .map(|i| serde_json::json!({"role": "user", "content": format!("m{i}")}))
-            .collect();
-        let (out, fired) = mid_loop_trim(&msgs, 40, None, estimate_tokens(&msgs));
-        assert!(!fired);
-        assert_eq!(out.len(), 5);
-    }
-
-    /// The token trigger gates on the caller's truthful figure, not the
-    /// internal chars/4 estimate: when the backend-reported size is under the
-    /// threshold, no trim fires even though the chars/4 estimate of the same
-    /// list is over it (the B3 baseline measured chars/4 OVERcounting dense
-    /// English by up to +35.7% on llama3.1 — a spurious trim would discard
-    /// context the model actually had room for).
-    #[test]
-    fn mid_loop_trim_token_trigger_uses_caller_figure() {
-        let mut msgs = vec![
-            serde_json::json!({"role": "system", "content": "sys"}),
-            serde_json::json!({"role": "user", "content": "task"}),
-        ];
-        for i in 0..10 {
-            msgs.push(serde_json::json!({"role": "tool", "content": format!("result {i} {}", "y".repeat(400))}));
-        }
-        let est = estimate_tokens(&msgs);
-        let budget = est - 100; // chars/4 says over budget…
-        let truthful = est - 500; // …but the backend says comfortably under.
-        let (out, fired) = mid_loop_trim(&msgs, 40, Some(budget), truthful);
-        assert!(!fired, "no trim when the truthful figure is under budget");
-        assert_eq!(out.len(), msgs.len());
-    }
-
-    /// `trim_to_token_budget` shrinks an over-budget list and leaves a small
-    /// one untouched.
-    #[test]
-    fn trim_to_token_budget_respects_budget() {
-        let mut msgs = vec![
-            serde_json::json!({"role": "system", "content": "sys"}),
-            serde_json::json!({"role": "user", "content": "task"}),
-        ];
-        for i in 0..20 {
-            msgs.push(
-                serde_json::json!({"role": "tool", "content": "q".repeat(5_000) + &i.to_string()}),
-            );
-        }
-        let budget = 2_000; // tokens
-        let (trimmed, fired) = trim_to_token_budget(&msgs, budget, 2);
-        assert!(fired);
-        assert!(estimate_tokens(&trimmed) <= budget);
-
-        // A list already under budget is returned untouched.
-        let small = vec![serde_json::json!({"role": "user", "content": "hi"})];
-        let (out, fired2) = trim_to_token_budget(&small, 10_000, 2);
-        assert!(!fired2);
-        assert_eq!(out.len(), 1);
-    }
-
-    /// A zero budget disables the guard (no panic, no trim).
-    #[test]
-    fn trim_to_token_budget_zero_is_noop() {
-        let msgs = vec![serde_json::json!({"role": "user", "content": "x".repeat(99_999)})];
-        let (out, fired) = trim_to_token_budget(&msgs, 0, 2);
-        assert!(!fired);
-        assert_eq!(out.len(), 1);
     }
 
     /// A complete tool_calls + tool_result pair is left untouched.
