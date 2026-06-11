@@ -13,6 +13,7 @@ mod compress;
 mod display;
 mod mcp;
 mod note_sink;
+mod recall;
 mod tools;
 mod trim;
 mod warmup;
@@ -23,6 +24,7 @@ pub use compress::{
 pub use display::{print_newt, NEWT_ORANGE_CT};
 pub use mcp::{McpTools, NoMcp};
 pub use note_sink::{save_note_tool_definition, NoteNudge, NoteSink};
+pub use recall::{recall_tool_definition, RecallSource, StoreRecallSource};
 pub use tools::{execute_tool, tool_definitions, venv_cmd_prefix};
 pub use warmup::warmup_if_cold;
 
@@ -126,6 +128,12 @@ pub struct ChatCtx<'a> {
     /// across user turns and lent to the loop per call. Consulted only when
     /// `note_sink` is present; `None` disables the nudge.
     pub note_nudge: Option<&'a mut NoteNudge>,
+    /// Read-only search over PAST conversations behind the `recall` tool
+    /// (Step 17.5, #246). `None` ⇒ the tool is not advertised and the loop
+    /// never searches (eval / headless callers unaffected). The TUI passes
+    /// a [`StoreRecallSource`] over its session `ConversationStore` —
+    /// workspace-fenced, current conversation excluded.
+    pub recall_source: Option<&'a dyn RecallSource>,
     /// Compression summarizer (Step 18.4, #247): given the redacted summary
     /// request, returns the summary text — typically one tools-disabled
     /// completion against the same backend (the TUI wires this, mirroring
@@ -182,6 +190,7 @@ pub async fn chat_complete(
         recover_cw_400,
         mut note_sink,
         mut note_nudge,
+        recall_source,
         summarizer,
         compress_state,
     } = ctx;
@@ -198,8 +207,10 @@ pub async fn chat_complete(
         .build()?;
     let chat_url = format!("{}/api/chat", url.trim_end_matches('/'));
     let retry = tui_retry_policy();
-    // The save_note tool is advertised only when a sink exists (Step 19.3).
+    // The save_note tool is advertised only when a sink exists (Step 19.3);
+    // recall only when a source exists (Step 17.5) — same presence gating.
     let advertise_save_note = note_sink.is_some();
+    let advertise_recall = recall_source.is_some();
 
     // Convert MemMessage list to Ollama JSON format.
     // The memory manager already included the current task as the last user message.
@@ -230,7 +241,7 @@ pub async fn chat_complete(
     // Tool schemas ride along in every request body; count them once (18.1).
     // Stable for the whole turn: the builtin + MCP tool set doesn't change
     // mid-turn, so hoisting out of the round loop is safe.
-    let tools = merged_tool_definitions(mcp, advertise_save_note);
+    let tools = merged_tool_definitions(mcp, advertise_save_note, advertise_recall);
     let tool_tokens = estimate_value_tokens(&tools);
     // Truthful context-size tracker: anchors on the backend's last-reported
     // prompt token count, chars/4 + schema estimate as fallback (Step 18.1).
@@ -676,6 +687,7 @@ pub async fn chat_complete(
                 note_sink
                     .as_deref_mut()
                     .map(|s| &mut *s as &mut dyn NoteSink),
+                recall_source,
             )
             .await;
             messages.push(serde_json::json!({
@@ -709,11 +721,12 @@ pub async fn chat_complete(
 /// Returns `true` when `name` is a tool that doesn't modify the workspace.
 /// Used to count consecutive read-only rounds and inject a write-nudge.
 /// `save_note` writes *memory*, not the workspace — a round that only saved
-/// a note must not suppress the stop-exploring-start-writing nudge.
+/// a note must not suppress the stop-exploring-start-writing nudge; `recall`
+/// (17.5) reads past conversations and is likewise pure exploration.
 fn is_read_only_tool(name: &str) -> bool {
     matches!(
         name,
-        "list_dir" | "read_file" | "search" | "web_fetch" | "use_skill" | "save_note"
+        "list_dir" | "read_file" | "search" | "web_fetch" | "use_skill" | "save_note" | "recall"
     )
 }
 
@@ -937,6 +950,7 @@ pub async fn openai_chat_complete(
         recover_cw_400,
         mut note_sink,
         mut note_nudge,
+        recall_source,
         summarizer,
         compress_state,
     } = ctx;
@@ -952,8 +966,10 @@ pub async fn openai_chat_complete(
         .build()?;
     let chat_url = format!("{}/v1/chat/completions", url.trim_end_matches('/'));
     let retry = tui_retry_policy();
-    // The save_note tool is advertised only when a sink exists (Step 19.3).
+    // The save_note tool is advertised only when a sink exists (Step 19.3);
+    // recall only when a source exists (Step 17.5) — mirrors the Ollama path.
     let advertise_save_note = note_sink.is_some();
+    let advertise_recall = recall_source.is_some();
 
     let mut messages: Vec<serde_json::Value> = mem_messages
         .iter()
@@ -974,7 +990,7 @@ pub async fn openai_chat_complete(
     // Pre-send token budget gate; tightened mid-turn by a recovered 400 (#223).
     let mut send_budget: Option<usize> = max_ok_input.or(safe_context).map(|c| c as usize);
     // Tool schemas ride along in every request body; count them once (18.1).
-    let tools = merged_tool_definitions(mcp, advertise_save_note);
+    let tools = merged_tool_definitions(mcp, advertise_save_note, advertise_recall);
     let tool_tokens = estimate_value_tokens(&tools);
     // Truthful context-size tracker (prompt-tokens-preferred, Step 18.1).
     let mut prompt_tracker = PromptTracker::new();
@@ -1223,6 +1239,7 @@ pub async fn openai_chat_complete(
                 note_sink
                     .as_deref_mut()
                     .map(|s| &mut *s as &mut dyn NoteSink),
+                recall_source,
             )
             .await;
             messages.push(serde_json::json!({
@@ -1497,6 +1514,7 @@ mod tool_round_cap_tests {
                 recover_cw_400: None,
                 note_sink: None,
                 note_nudge: None,
+                recall_source: None,
                 summarizer: None,
                 compress_state: None,
             },
@@ -1555,6 +1573,7 @@ mod tool_round_cap_tests {
                 recover_cw_400: None,
                 note_sink: None,
                 note_nudge: None,
+                recall_source: None,
                 summarizer: None,
                 compress_state: None,
             },
@@ -1630,6 +1649,7 @@ mod tool_round_cap_tests {
                 recover_cw_400: None,
                 note_sink: None,
                 note_nudge: None,
+                recall_source: None,
                 summarizer: None,
                 compress_state: None,
             },
@@ -1666,6 +1686,7 @@ mod tool_round_cap_tests {
                 20,
                 &caveats,
                 &mut NoMcp,
+                None,
                 None,
                 None,
             )
@@ -1741,6 +1762,7 @@ mod tool_round_cap_tests {
                 recover_cw_400: None,
                 note_sink: None,
                 note_nudge: None,
+                recall_source: None,
                 summarizer: None,
                 compress_state: None,
             },
@@ -1872,6 +1894,7 @@ mod tool_round_cap_tests {
                 recover_cw_400: None,
                 note_sink: None,
                 note_nudge: None,
+                recall_source: None,
                 summarizer: None,
                 compress_state: None,
             },
@@ -1942,6 +1965,7 @@ mod http_loop_tests {
             recover_cw_400: None,
             note_sink: None,
             note_nudge: None,
+            recall_source: None,
             summarizer: None,
             compress_state: None,
         }
@@ -2450,6 +2474,7 @@ mod save_note_loop_tests {
             recover_cw_400: None,
             note_sink: None,
             note_nudge: None,
+            recall_source: None,
             summarizer: None,
             compress_state: None,
         }
@@ -2912,6 +2937,7 @@ mod compression_loop_tests {
             recover_cw_400: None,
             note_sink: None,
             note_nudge: None,
+            recall_source: None,
             summarizer: None,
             compress_state: None,
         }
