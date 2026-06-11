@@ -78,6 +78,20 @@ pub const SUMMARY_PREFIX: &str = "[CONTEXT COMPACTION — REFERENCE ONLY]";
 /// End marker terminating every compaction message.
 pub const SUMMARY_END_MARKER: &str = "--- END OF CONTEXT SUMMARY ---";
 
+/// True when `m` is a compaction message this pipeline previously inserted
+/// (LLM summary and the static fallback both carry [`SUMMARY_PREFIX`]).
+/// Every user-role scan in the pipeline must consult this: anchoring the
+/// boundary on the pipeline's own marker was the F1 self-poisoning bug —
+/// from the second compression of a session on, the tail pinned to the
+/// previous summary, the middle went empty, the message count could never
+/// shrink, and the aggressive fit pass destroyed every fresh tool result
+/// before the model saw it.
+pub(crate) fn is_compaction_message(m: &Value) -> bool {
+    m["content"]
+        .as_str()
+        .is_some_and(|c| c.starts_with(SUMMARY_PREFIX))
+}
+
 /// Hard minimum number of tail messages kept verbatim (hermes's floor) —
 /// even when the token-budgeted walk would protect fewer.
 const TAIL_MIN_MESSAGES: usize = 3;
@@ -136,6 +150,28 @@ impl CompressState {
         }
     }
 
+    /// True once anti-thrash has disabled auto-compression for this
+    /// conversation (read by callers surfacing state and by the
+    /// conversation-boundary reset tests).
+    pub fn is_disabled(&self) -> bool {
+        self.disabled
+    }
+
+    /// Re-arm after a conversation boundary. The anti-thrash notice promises
+    /// "start a new conversation to reset" — the TUI makes that true by
+    /// calling this from `/new` and `/conversation restore` (F4).
+    pub fn reset(&mut self) {
+        *self = Self::new();
+    }
+
+    /// Latch the disabled state as if anti-thrash had fired — for tests that
+    /// assert conversation-boundary resets without driving two poor passes.
+    #[doc(hidden)]
+    pub fn latch_disabled_for_tests(&mut self) {
+        self.disabled = true;
+        self.notified = true;
+    }
+
     /// One-time user-facing notice, produced when anti-thrash disables
     /// compression. Subsequent calls return `None`.
     fn take_notice(&mut self) -> Option<String> {
@@ -156,6 +192,20 @@ impl CompressState {
 // Trigger
 // ---------------------------------------------------------------------------
 
+/// What [`compression_trigger`] decided for this round.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CompressTrigger {
+    /// Message-space token budget (chars/4 estimate currency).
+    pub budget: usize,
+    /// Message-count ceiling, set only by the count trigger (structural
+    /// pruning alone can never satisfy it — pruning never removes messages).
+    pub max_messages: Option<usize>,
+    /// True when a token trigger set `budget` — the hard correctness guard
+    /// that consults and feeds anti-thrash. False for count-only (VRAM
+    /// guard) firings, whose aim-to-halve budget does neither (F2).
+    pub hard_budget: bool,
+}
+
 /// Decide whether compression fires this round, and with what message-space
 /// token budget. One decision serves all three triggers:
 ///
@@ -167,17 +217,24 @@ impl CompressState {
 /// (prompt-tokens-preferred, Step 18.1) and includes tool-schema tokens; the
 /// guard's budget therefore has `tool_tokens` subtracted to land back in
 /// message-only space (the same arithmetic the old trim used). The tightest
-/// fired budget wins. Returns `(budget, max_messages)` — `max_messages` is
-/// set only by the count trigger, because structural pruning alone can never
-/// satisfy it (pruning never removes messages).
+/// fired budget wins. `message_tokens` is the caller's chars/4 estimate of
+/// the message list alone — the currency the pipeline compares its budget
+/// against — and prices the count-only trigger's aim-to-halve budget (F1).
 pub(crate) fn compression_trigger(
     len: usize,
     current_tokens: usize,
+    message_tokens: usize,
     count_threshold: usize,
     token_threshold: Option<usize>,
     send_budget: Option<usize>,
     tool_tokens: usize,
-) -> Option<(usize, Option<usize>)> {
+) -> Option<CompressTrigger> {
+    // A zero token budget from config means DISABLED, not "compress to zero
+    // every round" — the old `trim_to_token_budget` zero-is-noop contract,
+    // re-homed here (F3).
+    let token_threshold = token_threshold.filter(|&b| b > 0);
+    let send_budget = send_budget.filter(|&b| b > 0);
+
     let count_fired = len > count_threshold;
     let token_fired = token_threshold.is_some_and(|b| current_tokens > b);
     let guard_fired = send_budget.is_some_and(|b| current_tokens > b);
@@ -195,11 +252,20 @@ pub(crate) fn compression_trigger(
                 .saturating_sub(tool_tokens),
         );
     }
-    if budget == usize::MAX {
-        // Count-only trigger: no token target configured — aim to halve.
-        budget = current_tokens / 2;
+    let hard_budget = budget != usize::MAX;
+    if !hard_budget {
+        // Count-only trigger: no token target configured — aim to halve, in
+        // MESSAGE-token space. Halving `current_tokens` (which includes
+        // tool-schema and, when anchored, chat-template tokens no message
+        // compression can ever reclaim) made the target cross-currency
+        // unreachable, so the aggressive fit pass fired every round (F1).
+        budget = message_tokens / 2;
     }
-    Some((budget, count_fired.then_some(count_threshold / 2)))
+    Some(CompressTrigger {
+        budget,
+        max_messages: count_fired.then_some(count_threshold / 2),
+        hard_budget,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -217,6 +283,13 @@ pub(crate) struct CompressRequest<'a> {
     pub max_messages: Option<usize>,
     /// The original task — anchored verbatim into the summary request.
     pub task: &'a str,
+    /// True when `budget` came from a token trigger (mid-loop token
+    /// threshold, send-budget guard, cw-400 recovery, overflow retry) — the
+    /// hard correctness guard that consults and feeds anti-thrash. Count-only
+    /// (VRAM guard) requests pass false and do neither (F2): their soft
+    /// aim-to-halve budget must never latch the disable switch or convert a
+    /// healthy session into a refused send.
+    pub hard_budget: bool,
 }
 
 /// What the pipeline did, in escalation order.
@@ -271,9 +344,11 @@ pub(crate) async fn compress(
     state: &mut CompressState,
 ) -> CompressOutcome {
     let tokens_before = estimate_tokens(req.messages);
-    // Anti-thrash protects the token budget (the correctness guard); pure
-    // message-count invocations (the VRAM guard) neither consult nor feed it.
-    let tokens_over_entry = tokens_before > req.budget;
+    // Anti-thrash protects the hard token budget (the correctness guard);
+    // count-only invocations (the VRAM guard) neither consult nor feed it —
+    // `hard_budget` carries the trigger kind so this holds even when the
+    // count trigger's soft aim-to-halve budget happens to be exceeded (F2).
+    let tokens_over_entry = req.hard_budget && tokens_before > req.budget;
     let over = |tokens: usize, len: usize| {
         tokens > req.budget || req.max_messages.is_some_and(|m| len > m)
     };
@@ -288,7 +363,7 @@ pub(crate) async fn compress(
             notice: None,
         };
     }
-    if state.disabled {
+    if state.disabled && req.hard_budget {
         if tokens_over_entry {
             // The hard guard stays: better to refuse the send than let the
             // backend silently truncate the head (B6's 9/10 failure mode).
@@ -301,8 +376,9 @@ pub(crate) async fn compress(
                 notice: state.take_notice(),
             };
         }
-        // Only the message-count ceiling is exceeded: an oversized-but-
-        // within-budget history is safe to send — pass through unchanged.
+        // A hard trigger fired but the message estimate fits its budget
+        // (e.g. mixed with the count trigger): compression is disabled —
+        // pass through unchanged.
         return CompressOutcome {
             messages: req.messages.to_vec(),
             action: CompressAction::Fit,
@@ -344,7 +420,16 @@ pub(crate) async fn compress(
         // (3) LLM summary of the middle, redaction applied to the input.
         let body = match summarizer {
             Some(f) => {
-                let request = redact_secrets(&summary_request(req.task, middle));
+                // Cap the total rendered middle so the summary request itself
+                // cannot blow the summarizer's context window — per-message
+                // caps alone do not bound the total (F5). The cap is the
+                // compression budget in chars (4 chars/token): the budget is
+                // what the *conversation* must fit after compression, so a
+                // request of the same order fits any window the compressed
+                // conversation will. Floored at 8 KiB so tight budgets still
+                // give the summarizer enough material to work with.
+                let middle_cap = req.budget.saturating_mul(4).max(8_192);
+                let request = redact_secrets(&summary_request(req.task, middle, middle_cap));
                 match f(request).await {
                     Ok(s) if !s.trim().is_empty() => Some(s),
                     Ok(_) => None,
@@ -374,13 +459,24 @@ pub(crate) async fn compress(
     repair_orphaned_tool_calls(&mut assembled);
 
     // Final structural fit pass: when the protected tail itself blows the
-    // budget (B6's shape — one giant tool round), one-line it rather than
-    // letting the backend silently truncate the head (and the task) away.
+    // budget (B6's shape — one giant tool round), one-line the AGED part
+    // rather than letting the backend silently truncate the head (and the
+    // task) away. The trailing tool group — results the model has not seen
+    // yet — is NEVER pruned (F1c): the old `keep_last: 0` destroyed every
+    // fresh result from the second compression of a session on, leaving the
+    // model unable to read anything. An over-budget dispatch is recoverable
+    // (cw-400 recovery / overflow retry); a destroyed fresh result is not.
     if estimate_tokens(&assembled) > req.budget {
+        let trailing_group = assembled
+            .iter()
+            .rev()
+            .take_while(|m| m["role"].as_str() == Some("tool"))
+            .count()
+            + 1; // + the assistant turn carrying the tool_calls
         let aggressive = prune(
             &assembled,
             &PruneConfig {
-                keep_last: 0,
+                keep_last: trailing_group.max(2),
                 ..PruneConfig::default()
             },
         );
@@ -449,11 +545,14 @@ fn compute_boundary(messages: &[Value], budget: usize, max_messages: Option<usiz
         tail_start -= 1;
     }
 
-    // Last-user anchor: the most recent user message is never summarized
-    // away (hermes #10896 — losing it loses the active request).
+    // Last-user anchor: the most recent REAL user message is never
+    // summarized away (hermes #10896 — losing it loses the active request).
+    // The pipeline's own compaction messages are user-role but must never
+    // anchor: pinning the tail to the previous summary froze the boundary
+    // for the rest of the session (F1).
     if let Some(last_user) = messages
         .iter()
-        .rposition(|m| m["role"].as_str() == Some("user"))
+        .rposition(|m| m["role"].as_str() == Some("user") && !is_compaction_message(m))
     {
         if last_user >= head {
             tail_start = tail_start.min(last_user);
@@ -467,17 +566,41 @@ fn compute_boundary(messages: &[Value], budget: usize, max_messages: Option<usiz
         tail_start -= 1;
     }
 
+    // Count-goal recheck (F1d): the anchor (or pair alignment) may have
+    // extended the tail past the count trigger's ceiling, making
+    // `max_messages` unreachable — the trigger then re-fires every round
+    // and the summarizer runs per round for nothing. Re-apply the cap by
+    // advancing the cut; the current request still survives verbatim via
+    // the summary's Active-Task rule even when the anchored message lands
+    // in the middle. Then re-align so the cut never starts inside a result
+    // group (this can give back a few messages of slack — bounded by the
+    // group size, not unbounded growth).
+    if let Some(max_tail) = max_tail {
+        let cap_start = messages.len().saturating_sub(max_tail);
+        if tail_start < cap_start {
+            tail_start = cap_start;
+            while tail_start > head && messages[tail_start]["role"].as_str() == Some("tool") {
+                tail_start -= 1;
+            }
+        }
+    }
+
     Boundary { head, tail_start }
 }
 
 /// Length of the protected head: every leading `system` message plus the
-/// first `user` message after them (the original task).
+/// first `user` message after them (the original task). A compaction
+/// message in that slot (a rehydrated history can start with one) is NOT
+/// the task and must stay summarizable.
 fn head_len(messages: &[Value]) -> usize {
     let mut head = 0;
     while head < messages.len() && messages[head]["role"].as_str() == Some("system") {
         head += 1;
     }
-    if head < messages.len() && messages[head]["role"].as_str() == Some("user") {
+    if head < messages.len()
+        && messages[head]["role"].as_str() == Some("user")
+        && !is_compaction_message(&messages[head])
+    {
         head += 1;
     }
     head
@@ -510,17 +633,40 @@ fn summary_message(body: &str) -> Value {
 }
 
 /// Build the summarizer request: the original task verbatim, the rendered
-/// middle, and the `Summarizing` provider's lean section template extended
-/// with the In-Progress slot and the verbatim-Active-Task rule (design doc
-/// §Phase 18 "Deliberately different from hermes").
-fn summary_request(task: &str, middle: &[Value]) -> String {
+/// middle (capped at `middle_cap_chars` total — most recent kept, oldest
+/// dropped with an explicit omission line, F5), and the `Summarizing`
+/// provider's lean section template extended with the In-Progress slot and
+/// the verbatim-Active-Task rule (design doc §Phase 18 "Deliberately
+/// different from hermes").
+fn summary_request(task: &str, middle: &[Value], middle_cap_chars: usize) -> String {
+    // Keep the most recent suffix of the middle that fits the cap: the
+    // recent middle is closest to the active work, and the verbatim task is
+    // injected separately so nothing load-bearing rides on the oldest part.
+    let rendered: Vec<String> = middle.iter().map(render_message).collect();
+    let mut start = rendered.len();
+    let mut total = 0usize;
+    while start > 0 {
+        let len = rendered[start - 1].chars().count();
+        if start < rendered.len() && total + len > middle_cap_chars {
+            break;
+        }
+        total += len;
+        start -= 1;
+    }
+
     let mut p = String::with_capacity(1024);
     p.push_str("You are compressing the middle of a coding-agent conversation.\n\n");
     p.push_str("## Original Task (copy this VERBATIM into \"## Active Task\")\n");
     p.push_str(task);
     p.push_str("\n\n## Conversation middle to summarise\n");
-    for m in middle {
-        p.push_str(&render_message(m));
+    if start > 0 {
+        p.push_str(&format!(
+            "[{start} older message(s) omitted from this summary input to fit \
+             the summarizer's window]\n"
+        ));
+    }
+    for r in &rendered[start..] {
+        p.push_str(r);
     }
     p.push_str(
         "\nProduce a concise structured summary with sections:\n\
@@ -535,6 +681,11 @@ fn summary_request(task: &str, middle: &[Value]) -> String {
 }
 
 /// Render one wire-shape message as a line of summarizer input.
+///
+/// Redaction runs BEFORE excerpting (N4): truncating at the excerpt cap can
+/// otherwise slice a credential into a fragment too short for any redaction
+/// pattern to match — the request-level `redact_secrets` pass would then
+/// let it through. (That request-level pass still runs as a second layer.)
 fn render_message(m: &Value) -> String {
     let role = m["role"].as_str().unwrap_or("unknown");
     let mut line = format!("[{role}]");
@@ -545,14 +696,14 @@ fn render_message(m: &Value) -> String {
             line.push_str(" called ");
             line.push_str(name);
             line.push('(');
-            line.push_str(&excerpt(&args, 200));
+            line.push_str(&excerpt(&redact_secrets(&args), 200));
             line.push(')');
         }
     }
     if let Some(content) = m["content"].as_str() {
         if !content.is_empty() {
             line.push(' ');
-            line.push_str(&excerpt(content, SUMMARY_INPUT_MSG_CAP));
+            line.push_str(&excerpt(&redact_secrets(content), SUMMARY_INPUT_MSG_CAP));
         }
     }
     line.push('\n');
@@ -602,9 +753,11 @@ const REDACTION_TABLE: &[(&str, &str)] = &[
     ),
     // Generic credential assignment: a secret-ish key, `=`/`:`, and a
     // value of 8+ non-space chars. The key list is closed (no bare
-    // "token"/"key") so token-budget talk passes.
+    // "token"/"key") so token-budget talk passes. The optional quote after
+    // the key matches the JSON-quoted shape (`"api_key": "…"`) — the native
+    // form tool-call args take in this pipeline's summarizer input (F6).
     (
-        r#"(?i)\b(api[_-]?key|secret[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret|password|passwd)\b\s*[:=]\s*["']?[^\s"']{8,}["']?"#,
+        r#"(?i)\b(api[_-]?key|secret[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret|password|passwd)\b["']?\s*[:=]\s*["']?[^\s"']{8,}["']?"#,
         "${1}=[REDACTED]",
     ),
 ];
@@ -702,6 +855,7 @@ mod tests {
         })
     }
 
+    /// Hard-budget invocation (token threshold / send-budget semantics).
     async fn run(
         messages: &[Value],
         budget: usize,
@@ -715,6 +869,30 @@ mod tests {
                 budget,
                 max_messages,
                 task: "fix the failing test",
+                hard_budget: true,
+            },
+            summarizer,
+            state,
+        )
+        .await
+    }
+
+    /// Count-only (VRAM guard) invocation: soft aim-to-halve budget that
+    /// neither consults nor feeds anti-thrash (F2).
+    async fn run_count_only(
+        messages: &[Value],
+        budget: usize,
+        max_messages: Option<usize>,
+        summarizer: Option<&SummarizeFn>,
+        state: &mut CompressState,
+    ) -> CompressOutcome {
+        compress(
+            CompressRequest {
+                messages,
+                budget,
+                max_messages,
+                task: "fix the failing test",
+                hard_budget: false,
             },
             summarizer,
             state,
@@ -818,6 +996,7 @@ mod tests {
                 budget: before / 3,
                 max_messages: None,
                 task,
+                hard_budget: true,
             },
             Some(&*s),
             &mut state,
@@ -892,11 +1071,12 @@ mod tests {
         assert_eq!(out.action, CompressAction::StaticFallback);
     }
 
-    /// The B6 shape: one giant tool round adjacent to the tail that no
-    /// boundary can split — the final structural fit pass one-lines the
-    /// results instead of letting the backend silently truncate the head.
+    /// The B6 shape with an AGED giant round: one giant tool round that no
+    /// boundary can split, followed by a newer small round — the final fit
+    /// pass one-lines the giant (aged) results under budget instead of
+    /// letting the backend silently truncate the head.
     #[tokio::test]
-    async fn giant_single_round_is_pruned_aggressively_not_shipped_over_budget() {
+    async fn giant_aged_round_is_pruned_aggressively_not_shipped_over_budget() {
         let task = "ACTIVE TASK GAUNTLET-7f3d9c: summarize the three files";
         let mut msgs = vec![sys("you are newt"), user(task)];
         msgs.push(json!({"role": "assistant", "content": "", "tool_calls": [
@@ -907,6 +1087,9 @@ mod tests {
         for _ in 0..3 {
             msgs.push(tool_result(&"z".repeat(50_000))); // ~12.5k tokens each
         }
+        // The newer (fresh) round the model has not seen yet.
+        msgs.push(assistant_call("read_file", json!({"path": "d.txt"})));
+        msgs.push(tool_result("short fresh result"));
         let mut state = CompressState::new();
         let out = run(&msgs, 3_000, None, None, &mut state).await;
         assert!(
@@ -921,14 +1104,58 @@ mod tests {
             .messages
             .iter()
             .any(|m| m["content"].as_str() == Some(task)));
-        // Pairing intact: 3 calls, 3 (one-lined) results.
+        // Pairing intact: 3 + 1 calls, 4 results (giants one-lined).
         assert_eq!(out.messages[2]["tool_calls"].as_array().unwrap().len(), 3);
         assert_eq!(
             out.messages
                 .iter()
                 .filter(|m| m["role"].as_str() == Some("tool"))
                 .count(),
-            3
+            4
+        );
+        // The fresh trailing result is untouched.
+        assert_eq!(
+            out.messages.last().unwrap()["content"].as_str(),
+            Some("short fresh result")
+        );
+    }
+
+    /// F1c: the trailing tool group — the fresh results the model has not
+    /// seen yet — is NEVER pruned, even when protecting it means the
+    /// assembled list ships over budget. (The old `keep_last: 0` fit pass
+    /// one-lined the freshest results pre-dispatch from the second
+    /// compression of a session on — the model could never read anything.)
+    #[tokio::test]
+    async fn fresh_trailing_tool_group_survives_the_aggressive_pass() {
+        let task = "ACTIVE TASK GAUNTLET-7f3d9c: summarize the three files";
+        let big = "z".repeat(50_000);
+        let mut msgs = vec![sys("you are newt"), user(task)];
+        msgs.push(json!({"role": "assistant", "content": "", "tool_calls": [
+            {"function": {"name": "read_file", "arguments": {"path": "a.txt"}}},
+            {"function": {"name": "read_file", "arguments": {"path": "b.txt"}}},
+            {"function": {"name": "read_file", "arguments": {"path": "c.txt"}}},
+        ]}));
+        for _ in 0..3 {
+            msgs.push(tool_result(&big));
+        }
+        let mut state = CompressState::new();
+        let out = run(&msgs, 3_000, None, None, &mut state).await;
+        // All three fresh results reach the model byte-identical; the
+        // over-budget dispatch is the accepted trade (recoverable via the
+        // cw-400 / overflow paths, and flagged by the N2 notice suffix).
+        let results: Vec<&str> = out
+            .messages
+            .iter()
+            .filter(|m| m["role"].as_str() == Some("tool"))
+            .map(|m| m["content"].as_str().unwrap())
+            .collect();
+        assert_eq!(results.len(), 3);
+        for r in results {
+            assert_eq!(r, big, "fresh trailing tool results must never be pruned");
+        }
+        assert!(
+            out.tokens_after > 3_000,
+            "this shape is genuinely incompressible without destroying fresh results"
         );
     }
 
@@ -941,9 +1168,101 @@ mod tests {
         let prompts = Arc::new(Mutex::new(Vec::new()));
         let s = recording_summarizer(prompts.clone(), "SUMMARY");
         let mut state = CompressState::new();
-        let out = run(&msgs, before + 1_000, Some(8), Some(&*s), &mut state).await;
+        let out = run_count_only(&msgs, before + 1_000, Some(8), Some(&*s), &mut state).await;
         assert_eq!(out.action, CompressAction::Summarized);
         assert!(out.messages.len() < msgs.len());
+    }
+
+    /// F1 (the headline regression): a SECOND compression of an already-
+    /// compressed conversation must still shrink it. The bug anchored the
+    /// boundary on the first pass's own summary message, the middle went
+    /// empty, the count never dropped, and the fit pass destroyed every
+    /// fresh tool result pre-dispatch from then on.
+    #[tokio::test]
+    async fn second_compression_still_shrinks_and_keeps_fresh_results() {
+        let fresh = format!("9:{}", "x".repeat(4_000));
+        let msgs = tool_heavy("fix the failing test", 10, 4_000);
+        let prompts = Arc::new(Mutex::new(Vec::new()));
+        let s = recording_summarizer(prompts.clone(), "SUMMARY ONE");
+        let mut state = CompressState::new();
+        let budget = estimate_tokens(&msgs) / 2;
+        let first = run_count_only(&msgs, budget, Some(8), Some(&*s), &mut state).await;
+        assert!(first.messages.len() < msgs.len(), "first pass shrinks");
+        assert!(first.messages.iter().any(is_compaction_message));
+
+        // Six more rounds land on top of the compressed list.
+        let mut grown = first.messages.clone();
+        for i in 10..16 {
+            grown.push(assistant_call(
+                "read_file",
+                json!({"path": format!("src/file_{i}.rs")}),
+            ));
+            grown.push(tool_result(&format!("{i}:{}", "x".repeat(4_000))));
+        }
+        let grown_fresh = grown.last().unwrap()["content"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let budget2 = estimate_tokens(&grown) / 2;
+        let second = run_count_only(&grown, budget2, Some(8), Some(&*s), &mut state).await;
+        assert!(
+            second.messages.len() < grown.len(),
+            "second compression must still shrink ({} -> {})",
+            grown.len(),
+            second.messages.len()
+        );
+        assert!(
+            second.messages.len() <= 10,
+            "count goal must stay reachable, got {}",
+            second.messages.len()
+        );
+        // The freshest tool result reaches the model intact, both passes.
+        assert_eq!(
+            first.messages.last().unwrap()["content"].as_str(),
+            Some(fresh.as_str()),
+            "first pass fresh result intact"
+        );
+        assert_eq!(
+            second.messages.last().unwrap()["content"].as_str(),
+            Some(grown_fresh.as_str()),
+            "second pass fresh result intact"
+        );
+        // Count-only passes never feed anti-thrash (F2).
+        assert!(!state.disabled);
+        assert_eq!(state.attempts, 0);
+    }
+
+    /// F2: count-only invocations neither feed anti-thrash (poor reclaims
+    /// never latch) nor consult it (a latched switch must not kill the
+    /// VRAM guard or convert it into a refused send).
+    #[tokio::test]
+    async fn count_only_never_feeds_or_consults_anti_thrash() {
+        // Poor-reclaim count-only shape: small messages, so replacing the
+        // middle with the marker reclaims (well) under 10%.
+        let mut msgs = vec![sys("you are newt"), user("task")];
+        for i in 0..10 {
+            msgs.push(user(&format!("note {i}")));
+        }
+        let mut state = CompressState::new();
+        for _ in 0..4 {
+            let budget = estimate_tokens(&msgs) / 2;
+            let out = run_count_only(&msgs, budget, Some(6), None, &mut state).await;
+            assert_ne!(out.action, CompressAction::Refused);
+        }
+        assert!(!state.disabled, "count-only passes must never latch");
+        assert_eq!(state.attempts, 0, "count-only passes must never record");
+
+        // A latched state must not block the VRAM guard.
+        let mut latched = CompressState::new();
+        latched.disabled = true;
+        latched.notified = true;
+        let budget = estimate_tokens(&msgs) / 2;
+        let out = run_count_only(&msgs, budget, Some(6), None, &mut latched).await;
+        assert_ne!(out.action, CompressAction::Refused);
+        assert!(
+            out.messages.len() < msgs.len(),
+            "the VRAM guard must stay alive while anti-thrash is latched"
+        );
     }
 
     // -- boundary -------------------------------------------------------------
@@ -1002,6 +1321,80 @@ mod tests {
             "tail (start {}) must include the last user message at {follow_up}",
             b.tail_start
         );
+    }
+
+    /// F1a: the last-user anchor must skip the pipeline's own compaction
+    /// message — anchoring on it pinned the tail at the marker forever
+    /// (the middle went empty and nothing could ever shrink again).
+    #[test]
+    fn boundary_anchor_skips_compaction_messages() {
+        let mut msgs = vec![sys("you are newt"), user("the task")];
+        msgs.push(summary_message("## Active Task\nthe task (summarized)"));
+        for i in 0..6 {
+            msgs.push(assistant_call(
+                "read_file",
+                json!({"path": format!("f{i}")}),
+            ));
+            msgs.push(tool_result(&"q".repeat(4_000)));
+        }
+        let b = compute_boundary(&msgs, 2_000, None);
+        assert!(
+            b.tail_start > 2,
+            "the tail must not pin to the compaction message at index 2 \
+             (tail_start {})",
+            b.tail_start
+        );
+        // A real user follow-up AFTER the marker still anchors.
+        let mut msgs2 = msgs.clone();
+        msgs2.push(user("IMPORTANT FOLLOW-UP: also update the docs"));
+        let follow_up = msgs2.len() - 1;
+        for _ in 0..4 {
+            msgs2.push(assistant_call("read_file", json!({"path": "g"})));
+            msgs2.push(tool_result(&"q".repeat(4_000)));
+        }
+        let b2 = compute_boundary(&msgs2, 2_000, None);
+        assert!(
+            b2.tail_start <= follow_up,
+            "a real user message still anchors the tail"
+        );
+    }
+
+    /// F1d: when the anchored last-user message sits deep before many tool
+    /// rounds (the multi-turn shape), the count ceiling still caps the
+    /// tail — otherwise `max_messages` is unreachable and the count
+    /// trigger re-fires (and re-summarizes) every round.
+    #[test]
+    fn boundary_count_cap_holds_after_the_anchor() {
+        let mut msgs = vec![
+            sys("you are newt"),
+            user("turn 1"),
+            json!({"role": "assistant", "content": "reply 1"}),
+            user("turn 2"),
+            json!({"role": "assistant", "content": "reply 2"}),
+            user("the current task"),
+        ];
+        let task_idx = msgs.len() - 1;
+        for i in 0..12 {
+            msgs.push(assistant_call(
+                "read_file",
+                json!({"path": format!("f{i}")}),
+            ));
+            msgs.push(tool_result(&"q".repeat(2_000)));
+        }
+        let b = compute_boundary(&msgs, 4_000, Some(10));
+        let assembled = b.head + 1 + (msgs.len() - b.tail_start);
+        assert!(
+            assembled <= 12,
+            "the anchor must not defeat the count goal (assembled {assembled})"
+        );
+        assert!(
+            b.tail_start > task_idx,
+            "the cut advanced past the deep anchor (tail_start {})",
+            b.tail_start
+        );
+        // Without a count ceiling the anchor still wins.
+        let b_token = compute_boundary(&msgs, 4_000, None);
+        assert!(b_token.tail_start <= task_idx);
     }
 
     #[test]
@@ -1114,29 +1507,65 @@ mod tests {
     #[test]
     fn trigger_fires_on_count_token_or_guard() {
         // Nothing fired.
-        assert!(compression_trigger(10, 1_000, 40, None, None, 100).is_none());
+        assert!(compression_trigger(10, 1_000, 900, 40, None, None, 100).is_none());
         // Token threshold (issue #223's crux: count far under threshold).
         assert_eq!(
-            compression_trigger(4, 60_000, 40, Some(50_000), None, 100),
-            Some((50_000, None))
+            compression_trigger(4, 60_000, 59_000, 40, Some(50_000), None, 100),
+            Some(CompressTrigger {
+                budget: 50_000,
+                max_messages: None,
+                hard_budget: true,
+            })
         );
         // Guard: budget = send_budget − tool schema tokens.
         assert_eq!(
-            compression_trigger(4, 9_000, 40, None, Some(8_000), 500),
-            Some((7_500, None))
+            compression_trigger(4, 9_000, 8_600, 40, None, Some(8_000), 500),
+            Some(CompressTrigger {
+                budget: 7_500,
+                max_messages: None,
+                hard_budget: true,
+            })
         );
-        // Count only: budget halves the current figure, max_messages set.
+        // Count only: budget halves the MESSAGE-token figure (NOT the
+        // schema-inclusive current figure — the F1 cross-currency bug),
+        // max_messages set, and the budget is soft (no anti-thrash).
         assert_eq!(
-            compression_trigger(41, 1_000, 40, None, None, 100),
-            Some((500, Some(20)))
+            compression_trigger(41, 1_000, 800, 40, None, None, 100),
+            Some(CompressTrigger {
+                budget: 400,
+                max_messages: Some(20),
+                hard_budget: false,
+            })
         );
-        // All at once: the tightest token budget wins.
+        // All at once: the tightest token budget wins and stays hard.
         assert_eq!(
-            compression_trigger(41, 60_000, 40, Some(50_000), Some(20_000), 500),
-            Some((19_500, Some(20)))
+            compression_trigger(41, 60_000, 59_000, 40, Some(50_000), Some(20_000), 500),
+            Some(CompressTrigger {
+                budget: 19_500,
+                max_messages: Some(20),
+                hard_budget: true,
+            })
         );
         // Under-threshold figures don't fire their triggers.
-        assert!(compression_trigger(4, 7_999, 40, Some(50_000), Some(8_000), 0).is_none());
+        assert!(compression_trigger(4, 7_999, 7_000, 40, Some(50_000), Some(8_000), 0).is_none());
+    }
+
+    /// Re-homed `trim_to_token_budget_zero_is_noop` (F3): a configured zero
+    /// token budget means DISABLED — `Some(0)` must not fire (the 18.4
+    /// regression flipped it to "compress to budget zero every round").
+    #[test]
+    fn trigger_zero_token_budget_is_disabled() {
+        assert!(compression_trigger(4, 100, 90, 40, Some(0), None, 0).is_none());
+        assert!(compression_trigger(4, 100, 90, 40, None, Some(0), 10).is_none());
+        // Zero token budgets stay disabled while a real count trigger fires.
+        assert_eq!(
+            compression_trigger(41, 100, 90, 40, Some(0), Some(0), 10),
+            Some(CompressTrigger {
+                budget: 45,
+                max_messages: Some(20),
+                hard_budget: false,
+            })
+        );
     }
 
     // -- redaction ----------------------------------------------------------------
@@ -1201,10 +1630,76 @@ mod tests {
         let middle = vec![tool_result(
             "config: api_key=9f8e7d6c5b4a32100ffee and more text",
         )];
-        let request = redact_secrets(&summary_request("the task", &middle));
+        let request = redact_secrets(&summary_request("the task", &middle, usize::MAX));
         assert!(!request.contains("9f8e7d6c5b4a32100ffee"), "{request}");
         assert!(request.contains("api_key=[REDACTED]"), "{request}");
         assert!(request.contains("the task"), "task still present verbatim");
+    }
+
+    /// F6: tool-call args reach the summarizer rendered AS JSON — the
+    /// quoted-key credential shape must redact.
+    #[test]
+    fn redaction_catches_json_quoted_credential_keys() {
+        let cases = [
+            (r#"{"api_key": "9f8e7d6c5b4a32100ffee"}"#, "9f8e7d6c"),
+            (r#"{"password": "hunter2hunter2"}"#, "hunter2hunter2"),
+            (
+                r#"body: "client_secret": "abcd1234efgh5678ijkl""#,
+                "abcd1234",
+            ),
+        ];
+        for (input, leaked) in cases {
+            let out = redact_secrets(input);
+            assert!(
+                !out.contains(leaked),
+                "secret fragment {leaked:?} survived: {out}"
+            );
+            assert!(out.contains("[REDACTED]"), "no redaction marker: {out}");
+        }
+    }
+
+    /// N4: redaction runs BEFORE excerpting — a credential the excerpt cap
+    /// would slice mid-value must not leak a fragment too short for any
+    /// pattern to match afterward.
+    #[test]
+    fn redaction_survives_excerpt_truncation() {
+        let secret = "sk-AbCdEf1234567890AbCdEf1234567890";
+        // The serialized args put the secret astride the 200-char arg cap:
+        // unredacted it would be cut to an unmatchable `sk-…` fragment.
+        let args = json!({
+            "command": format!("{} && export OPENAI_API_KEY={secret}", "x".repeat(140))
+        });
+        let m = assistant_call("run_command", args);
+        let line = render_message(&m);
+        assert!(!line.contains("sk-AbC"), "{line}");
+        assert!(!line.contains("AbCdEf123"), "no fragment may leak: {line}");
+        assert!(line.contains("[REDACTED]"), "{line}");
+    }
+
+    /// F5: the rendered middle fed to the summarizer is capped in TOTAL —
+    /// the most recent middle survives, the oldest is dropped with an
+    /// explicit omission line (per-message caps alone don't bound a
+    /// 50-message middle).
+    #[test]
+    fn summary_request_caps_total_middle_size() {
+        let middle: Vec<Value> = (0..50)
+            .map(|i| tool_result(&format!("MSG{i} {}", "m".repeat(1_900))))
+            .collect();
+        let capped = summary_request("the task", &middle, 8_192);
+        assert!(
+            capped.chars().count() < 12_000,
+            "total must be capped, got {}",
+            capped.chars().count()
+        );
+        assert!(capped.contains("older message(s) omitted"), "{capped:.200}");
+        assert!(capped.contains("MSG49 "), "most recent middle kept");
+        assert!(!capped.contains("MSG0 "), "oldest middle dropped");
+        assert!(capped.contains("the task"), "task always present");
+
+        // Uncapped baseline for contrast: same middle, no cap.
+        let uncapped = summary_request("the task", &middle, usize::MAX);
+        assert!(uncapped.chars().count() > 90_000);
+        assert!(!uncapped.contains("older message(s) omitted"));
     }
 
     // -- rendering ---------------------------------------------------------------
