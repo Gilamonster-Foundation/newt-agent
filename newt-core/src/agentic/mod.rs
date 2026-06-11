@@ -28,6 +28,7 @@ pub use mcp::{McpTools, NoMcp};
 pub use note_sink::{save_note_tool_definition, NoteNudge, NoteSink};
 pub use recall::{recall_tool_definition, RecallSource, StoreRecallSource};
 pub use tools::{execute_tool, tool_definitions, venv_cmd_prefix};
+pub use trim::trim_for_summary;
 pub use warmup::warmup_if_cold;
 
 use crate::retry::{with_backoff_notify, RetryPolicy};
@@ -41,7 +42,7 @@ use std::io::{self, Write as _};
 use tools::{is_hallucination, merged_tool_definitions};
 use trim::{
     estimate_tokens, estimate_value_tokens, merge_round_usage, ollama_usage, openai_usage,
-    trim_for_summary, PromptTracker,
+    PromptTracker,
 };
 
 /// Retry policy for TUI inference calls: more patient than the hosted-API

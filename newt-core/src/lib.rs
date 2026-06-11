@@ -34,9 +34,12 @@ pub use agent_mesh_protocol::{Caveats, CountBound, Scope};
 // Step 9.7: clean top-level import paths for the relocated agentic loop.
 // Step 18.4 (#247): CompressState (session anti-thrash) + Summarizer (the
 // loop's injected compression summarizer) join the surface.
+// Step 19.4 (#248): trim_for_summary joins it — the TUI's close-time note
+// extraction bounds its transcript with the cap-exit summary's own helper.
 pub use agentic::{
-    chat_complete, execute_tool, openai_chat_complete, ChatCtx, CompressState, McpTools, NoMcp,
-    NoteNudge, NoteSink, RecallSource, StoreRecallSource, SummarizeFn, SummarizeFuture, Summarizer,
+    chat_complete, execute_tool, openai_chat_complete, trim_for_summary, ChatCtx, CompressState,
+    McpTools, NoMcp, NoteNudge, NoteSink, RecallSource, StoreRecallSource, SummarizeFn,
+    SummarizeFuture, Summarizer,
 };
 pub use agents::AgentsProvider;
 pub use caveats::{CaveatsExt, CountBoundExt, ScopeExt};
