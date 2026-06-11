@@ -18,8 +18,30 @@
 # Do NOT skip this hook with `--no-verify`. If a check fails, fix the
 # issue. The hook is the local equivalent of CI; bypassing it just
 # moves the failure to the remote.
+#
+# TRANSPORT (#276): this gate takes ~10 minutes, and that is INCOMPATIBLE
+# with pushing over SSH. For SSH remotes git opens the connection and
+# reads the advertised refs BEFORE running this hook (the hook's stdin
+# carries the remote SHAs), then sends the pack over that SAME connection
+# afterwards — by which time GitHub has dropped the idle session, and git
+# exits 141 (SIGPIPE) after the gate passed. Over HTTPS the pack upload
+# is a fresh request after the hook, so gate duration is irrelevant.
+# `just install-hooks` therefore sets a repo-local
+#   url."https://github.com/".pushInsteadOf "git@github.com:"
+# so pushes transport over HTTPS while fetches keep their configured URL.
+# HTTPS push auth comes from a git credential helper; if pushes prompt
+# for a password, run `gh auth setup-git` once.
 
 set -e
+
+# Drain the ref list git writes to the hook's stdin (one
+# "<local-ref> <local-sha> <remote-ref> <remote-sha>" line per ref).
+# We gate the whole workspace regardless of which refs are pushed, so the
+# list's content is unused — but consuming it is standard hook hygiene:
+# git must never take SIGPIPE writing refs to a hook that exited without
+# reading, and the gate commands below must not inherit the list on
+# their stdin.
+cat >/dev/null
 
 cd "$(git rev-parse --show-toplevel)"
 
