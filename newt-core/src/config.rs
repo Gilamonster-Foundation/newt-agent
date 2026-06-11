@@ -274,8 +274,12 @@ pub struct MemoryConfig {
     /// Turns retained by `RollingWindow`. Default: 20.
     #[serde(default = "default_memory_window")]
     pub window: usize,
-    /// Model context length for `TokenBudget` (overrides Ollama's reported value).
-    /// Default: 8192.
+    /// Explicit context-token budget for `TokenBudget` / `Summarizing` — a
+    /// deliberate user override that wins over everything else (Step 18.2,
+    /// #247). When unset, the budget derives from the empirical capability
+    /// cache (`max_ok_input` else `safe_context` in
+    /// `model-capabilities.json`); the static default
+    /// (`DEFAULT_CONTEXT_TOKENS`, 8,192) applies only when neither exists.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_tokens: Option<u32>,
 

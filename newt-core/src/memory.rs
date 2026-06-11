@@ -482,6 +482,18 @@ impl MemoryProvider for RollingWindow {
 // TokenBudget — built-in provider #2 (closes #106)
 // ---------------------------------------------------------------------------
 
+/// Static context-token budget used only when neither an explicit
+/// `[memory] context_tokens` override nor empirical capability data exists
+/// (a fresh model with no probe history — Step 18.2, #247).
+///
+/// This is the LAST tier of the budget precedence. Callers that have probe
+/// capability data (the TUI's `model-capabilities.json`) must resolve a
+/// budget from it and inject the value at provider construction
+/// ([`TokenBudget::new`] / [`Summarizing::new`] / `with_budget`) — the old
+/// `from_config()` path that silently fell back to this constant while
+/// ignoring probe data was deleted in Step 18.2.
+pub const DEFAULT_CONTEXT_TOKENS: u32 = 8_192;
+
 /// Per-turn record stored by `TokenBudget`.
 #[derive(Debug, Clone)]
 struct TurnRecord {
@@ -510,8 +522,19 @@ fn turn_content_estimate(user: &str, assistant: &str) -> u32 {
 /// 20), which forced spurious pruning. Without any backend report the figure
 /// falls back to summing per-turn content estimates (each turn counted once).
 ///
-/// Configure via `[memory] provider = "token_budget"` plus an optional
-/// `context_tokens` override (default: 8192).
+/// Configure via `[memory] provider = "token_budget"`. The budget is a
+/// construction-time value injected by the caller (Step 18.2, #247) with
+/// this precedence:
+///
+/// 1. explicit `[memory] context_tokens` (a deliberate user override),
+/// 2. capability-derived (`max_ok_input` else `safe_context` from the
+///    caller's probe cache — newt-core deliberately has no dependency on
+///    the probe types, mirroring the `with_summarizer` injection),
+/// 3. [`DEFAULT_CONTEXT_TOKENS`] when neither exists (fresh model).
+///
+/// The value is fixed for the provider's lifetime: budgets refresh per
+/// session; mid-session capability ratchets are tracked live by the
+/// agentic loop's own pre-send guard, not by this provider.
 pub struct TokenBudget {
     /// Maximum context tokens (model's `num_ctx`; can be overridden).
     max_tokens: u32,
@@ -537,14 +560,17 @@ impl TokenBudget {
         }
     }
 
-    /// Create from config, defaulting to 8 192 tokens and 80% threshold.
-    pub fn from_config() -> Self {
-        let max = crate::Config::resolve()
-            .ok()
-            .and_then(|c| c.memory)
-            .and_then(|m| m.context_tokens)
-            .unwrap_or(8_192);
-        Self::new(max, 0.80)
+    /// Inject a resolved token budget (builder form of the `max_tokens`
+    /// constructor argument, mirroring `Summarizing::with_summarizer`).
+    /// Same ≥512 clamp as [`TokenBudget::new`].
+    ///
+    /// Step 18.2 (#247): this replaces the deleted `from_config()` path,
+    /// whose silent 8,192 fallback ignored empirical capability data. The
+    /// caller resolves the budget (explicit config override → capability
+    /// cache → [`DEFAULT_CONTEXT_TOKENS`]) and injects the value here.
+    pub fn with_budget(mut self, tokens: u32) -> Self {
+        self.max_tokens = tokens.max(512);
+        self
     }
 
     fn budget_tokens(&self) -> u32 {
@@ -698,7 +724,13 @@ struct SumTurn {
 ///    new summary prompt so facts survive multiple compactions.
 /// 5. Anti-thrashing: skip compression if the last two attempts saved <10%.
 ///
-/// Configure: `[memory] provider = "summarizing"`, `context_tokens = 32768`.
+/// Configure: `[memory] provider = "summarizing"`, plus an optional explicit
+/// `context_tokens` override. The compression budget (`max_tokens`) is a
+/// construction-time value injected by the caller with the same precedence
+/// as [`TokenBudget`] (Step 18.2, #247): explicit config override →
+/// capability-derived (`max_ok_input` else `safe_context`) →
+/// [`DEFAULT_CONTEXT_TOKENS`]. Fixed per session; the loop's pre-send guard
+/// tracks mid-session capability ratchets live.
 pub struct Summarizing {
     max_tokens: u32,
     threshold_pct: f32,
@@ -732,6 +764,15 @@ impl Summarizing {
             last_prompt_tokens: None,
             delta_since_prompt: 0,
         }
+    }
+
+    /// Inject a resolved token budget (builder form of the `max_tokens`
+    /// constructor argument). Same ≥1 clamp as [`Summarizing::new`].
+    /// See [`TokenBudget::with_budget`] for the resolution precedence the
+    /// caller is expected to apply (Step 18.2, #247).
+    pub fn with_budget(mut self, tokens: u32) -> Self {
+        self.max_tokens = tokens.max(1);
+        self
     }
 
     /// Inject a summariser function (required for real use; tests can use a stub).
@@ -1328,6 +1369,67 @@ mod tests {
         );
         assert!(s.prev_summary.is_empty());
         assert_eq!(s.history.len(), 20);
+    }
+
+    // --- Budget injection (Step 18.2, #247) ---
+
+    /// The budget is a plain construction-time value: whatever number the
+    /// caller resolved (e.g. the TUI's capability-derived figure) is exactly
+    /// what governs pruning — `usage()` exposes it as the denominator.
+    #[test]
+    fn token_budget_construction_injects_budget() {
+        let tb = TokenBudget::new(24_000, 0.80);
+        let (label, _used, budget) = tb.usage().unwrap();
+        assert_eq!(label, "tokens");
+        assert_eq!(budget, 19_200); // 24_000 × 0.80
+    }
+
+    /// `with_budget` is the builder form of the same injection, mirroring
+    /// `with_summarizer` — it replaces the constructor value.
+    #[test]
+    fn token_budget_with_budget_overrides_constructor_value() {
+        let tb = TokenBudget::new(512, 0.80).with_budget(24_000);
+        assert_eq!(tb.usage().unwrap().2, 19_200);
+        // Same ≥512 clamp as the constructor.
+        let clamped = TokenBudget::new(4_096, 1.0).with_budget(0);
+        assert_eq!(clamped.max_tokens, 512);
+    }
+
+    #[test]
+    fn summarizing_construction_injects_budget() {
+        let s = Summarizing::new(32_768);
+        let (label, _used, budget) = s.usage().unwrap();
+        assert_eq!(label, "tokens");
+        assert_eq!(budget, 26_214); // 32_768 × 0.80
+    }
+
+    #[test]
+    fn summarizing_with_budget_overrides_constructor_value() {
+        let s = Summarizing::new(100).with_budget(32_768);
+        assert_eq!(s.usage().unwrap().2, 26_214);
+        // Same ≥1 clamp as the constructor.
+        let clamped = Summarizing::new(100).with_budget(0);
+        assert_eq!(clamped.max_tokens, 1);
+    }
+
+    /// The deleted `from_config()` path silently fell back to 8,192 even
+    /// when the caller had empirical capability data. Construction-time
+    /// injection means a capability-derived number flows through verbatim —
+    /// the provider must NOT sit at the static default.
+    #[test]
+    fn token_budget_does_not_sit_at_static_default_with_capability_data() {
+        // A capability-derived budget (e.g. max_ok_input = 24,000) injected
+        // at construction.
+        let capability_derived = 24_000;
+        let tb = TokenBudget::new(capability_derived, 0.80);
+        let static_default_budget = (DEFAULT_CONTEXT_TOKENS as f32 * 0.80) as usize;
+        assert_ne!(
+            tb.usage().unwrap().2,
+            static_default_budget,
+            "provider budget must reflect injected capability data, \
+             not the static default"
+        );
+        assert_eq!(tb.usage().unwrap().2, 19_200);
     }
 
     // --- NoteStore tests live in crate::notes (split out in Step 19.1) ---

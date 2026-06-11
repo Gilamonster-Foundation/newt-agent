@@ -1103,6 +1103,24 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
 
     // Pluggable memory manager — replaces the old conv Vec.
     let mem_cfg = cfg.memory.clone().unwrap_or_default();
+    // Memory/compression budget (Step 18.2, #247): the SAME empirical
+    // capability numbers that gate the loop's send_budget guard feed the
+    // memory providers, injected by value at construction (newt-core has no
+    // dependency on the probe types). Precedence: explicit `[memory]
+    // context_tokens` override → capability-derived (max_ok_input else
+    // safe_context) → DEFAULT_CONTEXT_TOKENS (fresh model, no probe data).
+    // Discovery runs here so construction and the first turn's guard resolve
+    // identical numbers; if the cache ratchets mid-session the providers
+    // keep their construction-time value — budgets refresh per session,
+    // while the loop's own guard tracks the live numbers.
+    let mem_budget = {
+        let entry = cap_cache.entry(inf_model.clone()).or_default();
+        let updated = probe::ensure_context_window(entry, &inf_url, &inf_model);
+        if updated {
+            probe::save_cache(&cap_cache);
+        }
+        probe::resolve_memory_budget(mem_cfg.context_tokens, &cap_cache, &inf_model)
+    };
     let mut memory = {
         let mut mgr = newt_core::MemoryManager::new();
         // Soul provider first — sets the frozen identity block.
@@ -1121,11 +1139,9 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
         // History provider based on config.
         match mem_cfg.provider {
             newt_core::MemoryProviderKind::TokenBudget => {
-                let max = mem_cfg.context_tokens.unwrap_or(8_192);
-                mgr.add_provider(newt_core::TokenBudget::new(max, 0.80));
+                mgr.add_provider(newt_core::TokenBudget::new(mem_budget, 0.80));
             }
             newt_core::MemoryProviderKind::Summarizing => {
-                let max = mem_cfg.context_tokens.unwrap_or(8_192);
                 // Wire the summariser to call the current model via the ACP loop.
                 // The closure captures inf_url/inf_model at session start — model
                 // switches mid-session will update on next session restart.
@@ -1133,7 +1149,7 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                 let model = inf_model.clone();
                 let kind = inf_kind;
                 let api_key = inf_key.clone();
-                let s = newt_core::Summarizing::new(max).with_summarizer(
+                let s = newt_core::Summarizing::new(mem_budget).with_summarizer(
                     move |prompt: &str| -> anyhow::Result<String> {
                         let openai = kind == newt_core::BackendKind::Openai;
                         // OpenAI-compatible and Ollama use different paths and
