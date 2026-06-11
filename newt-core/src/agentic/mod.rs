@@ -9,7 +9,9 @@
 //! [`McpTools`], which breaks the `newt-core` ← `newt-mcp-client` dependency
 //! cycle; see `mcp.rs`.
 
-mod compress;
+// pub(crate) since Step 18.5 (#247): the `Summarizing` memory provider
+// delegates to this same pipeline instead of keeping a duplicate one.
+pub(crate) mod compress;
 mod display;
 mod mcp;
 mod note_sink;
