@@ -4,6 +4,7 @@
 
 use super::display::{print_denied, print_tool_call, print_tool_output};
 use super::mcp::McpTools;
+use super::note_sink::{execute_save_note, save_note_tool_definition, NoteSink};
 
 pub fn tool_definitions() -> serde_json::Value {
     serde_json::json!([
@@ -124,11 +125,21 @@ pub fn tool_definitions() -> serde_json::Value {
 /// The built-in tool definitions plus every connected MCP server's tools
 /// (namespaced `server__tool`). This is what the agent loop advertises to the
 /// model so it can call remote MCP tools alongside the built-ins.
-pub(crate) fn merged_tool_definitions(mcp: &dyn McpTools) -> serde_json::Value {
+///
+/// `with_save_note` adds the `save_note` definition (Step 19.3) — true only
+/// when the caller supplied a `NoteSink`, so headless/eval sessions (which
+/// pass `note_sink: None`) never advertise a tool that can't be executed.
+pub(crate) fn merged_tool_definitions(
+    mcp: &dyn McpTools,
+    with_save_note: bool,
+) -> serde_json::Value {
     let mut defs = match tool_definitions() {
         serde_json::Value::Array(a) => a,
         other => vec![other],
     };
+    if with_save_note {
+        defs.push(save_note_tool_definition());
+    }
     defs.extend(mcp.tool_defs());
     serde_json::Value::Array(defs)
 }
@@ -166,6 +177,7 @@ pub(crate) fn is_hallucination(tool_name: &str, args: &serde_json::Value) -> boo
             | "edit_file"
             | "use_skill"
             | "web_fetch"
+            | "save_note"
     )
 }
 
@@ -367,6 +379,9 @@ fn envelope_denial_reason_with_guidance(envelope: &serde_json::Value) -> String 
 /// interceptor's `before_exec` / `before_open` gate). The fs tools
 /// (`read_file` / `write_file` / `list_dir`) keep enforcing the same `caveats`
 /// via `permits_*` — rerouting them is out of scope.
+///
+/// `note_sink` backs the `save_note` tool (Step 19.3). `None` ⇒ the tool was
+/// never advertised, so a call here is treated like any unknown tool.
 #[allow(clippy::too_many_arguments)]
 pub async fn execute_tool(
     name: &str,
@@ -377,6 +392,7 @@ pub async fn execute_tool(
     caveats: &crate::caveats::Caveats,
     mcp: &mut dyn McpTools,
     build_check_cmd: Option<&str>,
+    note_sink: Option<&mut dyn NoteSink>,
 ) -> String {
     // Remote MCP tools (namespaced `server__tool`) route to their server before
     // the built-in match. They carry no Caveats leash in this build.
@@ -388,6 +404,17 @@ pub async fn execute_tool(
     }
 
     match name {
+        // Model-curated memory (Step 19.3): routes add / replace / remove
+        // through the caller's NoteSink — the same MemoryManager → NoteStore
+        // path as `/remember`, so the 19.1 char-cap curator error and the
+        // 19.2 write-time security scan apply identically.
+        "save_note" => match note_sink {
+            Some(sink) => execute_save_note(args, sink, color, tool_output_lines),
+            // Without a sink the tool was never advertised — a call here is
+            // a model hallucination; answer like any unknown tool.
+            None => "unknown tool: save_note (no note store in this session)".to_string(),
+        },
+
         "run_command" => {
             let cmd = args["command"].as_str().unwrap_or("");
 
@@ -739,7 +766,7 @@ mod tests {
 
     #[test]
     fn merged_tool_definitions_with_empty_mcp_is_builtin_set() {
-        let merged = merged_tool_definitions(&NoMcp);
+        let merged = merged_tool_definitions(&NoMcp, false);
         let names: Vec<&str> = merged
             .as_array()
             .unwrap()
@@ -758,6 +785,29 @@ mod tests {
                 "web_fetch"
             ]
         );
+    }
+
+    /// `save_note` is sink-gated: absent from the base `tool_definitions`
+    /// (headless/eval callers see no memory tool) and from the merged set
+    /// without a sink; present in the merged set when a sink exists.
+    #[test]
+    fn save_note_advertised_only_with_a_sink() {
+        fn names(defs: &serde_json::Value) -> Vec<&str> {
+            defs.as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|d| d["function"]["name"].as_str())
+                .collect()
+        }
+        // Headless/eval callers see no memory tool in the base set …
+        let base = tool_definitions();
+        assert!(!names(&base).contains(&"save_note"), "got: {base}");
+        // … nor in the merged set without a sink …
+        let without = merged_tool_definitions(&NoMcp, false);
+        assert!(!names(&without).contains(&"save_note"));
+        // … but a sink advertises it.
+        let with = merged_tool_definitions(&NoMcp, true);
+        assert!(names(&with).contains(&"save_note"), "got: {with}");
     }
 
     /// `is_hallucination` correctly identifies tool-name-as-command and unknown
@@ -791,6 +841,7 @@ mod tests {
             "write_file",
             "use_skill",
             "web_fetch",
+            "save_note",
         ] {
             assert!(!is_hallucination(t, &serde_json::json!({"path": "."})));
         }
@@ -986,6 +1037,7 @@ mod execute_tool_branch_tests {
             caveats,
             &mut NoMcp,
             build_check,
+            None,
         )
         .await
     }
@@ -1233,5 +1285,48 @@ mod execute_tool_branch_tests {
         )
         .await;
         assert_eq!(out, "unknown tool: definitely_not_a_tool");
+    }
+
+    // -- save_note dispatch through execute_tool (Step 19.3) ----------------
+
+    #[tokio::test]
+    async fn save_note_without_sink_is_unknown_tool() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let caveats = caveats_rw(ws.path());
+        // run_tool passes note_sink: None — the no-sink (headless) shape.
+        let out = run_tool(
+            "save_note",
+            serde_json::json!({"action": "add", "text": "a fact"}),
+            ws.path(),
+            &caveats,
+            None,
+        )
+        .await;
+        assert!(out.starts_with("unknown tool: save_note"), "got: {out}");
+    }
+
+    #[tokio::test]
+    async fn save_note_with_sink_routes_through_execute_tool() {
+        use crate::agentic::note_sink::tests::MockSink;
+        let ws = tempfile::TempDir::new().unwrap();
+        let caveats = caveats_rw(ws.path());
+        let mut sink = MockSink::default();
+        let out = execute_tool(
+            "save_note",
+            &serde_json::json!({"action": "add", "text": "workspace builds with just check"}),
+            &ws.path().to_string_lossy(),
+            false,
+            20,
+            &caveats,
+            &mut NoMcp,
+            None,
+            Some(&mut sink),
+        )
+        .await;
+        assert_eq!(sink.calls, vec!["add:workspace builds with just check"]);
+        assert!(
+            out.starts_with("note saved: workspace builds"),
+            "got: {out}"
+        );
     }
 }
