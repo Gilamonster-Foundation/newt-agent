@@ -179,6 +179,29 @@ impl CompressState {
         self.notified = true;
     }
 
+    /// Read-only counters snapshot for display surfaces (`/memory`,
+    /// Step 18.6, #247). Pure projection of existing state — no new
+    /// accounting lives here.
+    pub fn counters(&self) -> CompressCounters {
+        // Strikes: how many of the most recent recorded compressions were
+        // consecutively ineffective (<10% reclaim) — 0, 1, or 2; two is the
+        // latch condition. The [1.0, 1.0] sentinel never counts because a
+        // slot only holds a real figure once an attempt recorded into it.
+        let strikes = if self.attempts == 0 || self.last_savings[1] >= THRASH_MIN_SAVINGS {
+            0
+        } else if self.attempts >= 2 && self.last_savings[0] < THRASH_MIN_SAVINGS {
+            2
+        } else {
+            1
+        };
+        CompressCounters {
+            compressions: self.attempts,
+            strikes,
+            disabled: self.disabled,
+            last_reclaim: (self.attempts > 0).then_some(self.last_savings[1]),
+        }
+    }
+
     /// One-time user-facing notice, produced when anti-thrash disables
     /// compression. Subsequent calls return `None`.
     fn take_notice(&mut self) -> Option<String> {
@@ -193,6 +216,25 @@ impl CompressState {
             None
         }
     }
+}
+
+/// Read-only snapshot of a session's compression accounting, surfaced by the
+/// TUI's `/memory` (Step 18.6, #247). Plain data so display code and its
+/// tests can build arbitrary states without driving the pipeline.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CompressCounters {
+    /// Compressions recorded this session: the loop's hard-budget passes
+    /// plus fired `/compress` runs (both feed [`CompressState`]).
+    pub compressions: usize,
+    /// Consecutive ineffective (<10% reclaim) recent compressions — 0, 1,
+    /// or 2. Two latches `disabled`.
+    pub strikes: usize,
+    /// Anti-thrash latch: auto-compression is disabled for the session.
+    /// `/new` (and `/conversation restore`) re-arm it — F4.
+    pub disabled: bool,
+    /// Reclaim fraction (0.0–1.0) of the most recent recorded compression;
+    /// `None` before any compression recorded.
+    pub last_reclaim: Option<f32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -297,6 +339,38 @@ pub(crate) struct CompressRequest<'a> {
     /// aim-to-halve budget must never latch the disable switch or convert a
     /// healthy session into a refused send.
     pub hard_budget: bool,
+    /// Optional user-supplied focus topic (`/compress <focus>`, Step 18.6):
+    /// threaded into the summary request as emphasis guidance. Redacted with
+    /// the same [`redact_secrets`] pass as the rendered middle — a user can
+    /// type a credential into the focus. The loop's automatic triggers pass
+    /// `None`.
+    pub focus: Option<&'a str>,
+}
+
+impl<'a> CompressRequest<'a> {
+    /// A user-initiated request (the TUI's `/compress`, Step 18.6). The user
+    /// asked for compression NOW, with or without token pressure, so the
+    /// budget is aim-to-halve in message-token space — the count trigger's
+    /// exact pricing (F1) — and `hard_budget` is false: like a count-only
+    /// firing, a manual run neither consults the anti-thrash latch (an
+    /// explicit ask still runs after auto-compression is disabled) nor lets
+    /// the pipeline's internal accounting treat it as the correctness guard.
+    /// Effectiveness accounting for fired manual runs is the caller's call —
+    /// [`compress_user_initiated`] records them.
+    pub(crate) fn user_initiated(
+        messages: &'a [Value],
+        task: &'a str,
+        focus: Option<&'a str>,
+    ) -> Self {
+        Self {
+            messages,
+            budget: estimate_tokens(messages) / 2,
+            max_messages: None,
+            task,
+            hard_budget: false,
+            focus,
+        }
+    }
 }
 
 /// What the pipeline did, in escalation order.
@@ -436,7 +510,8 @@ pub(crate) async fn compress(
                 // conversation will. Floored at 8 KiB so tight budgets still
                 // give the summarizer enough material to work with.
                 let middle_cap = req.budget.saturating_mul(4).max(8_192);
-                let request = redact_secrets(&summary_request(req.task, middle, middle_cap));
+                let request =
+                    redact_secrets(&summary_request(req.task, middle, middle_cap, req.focus));
                 match f(request).await {
                     Ok(s) if !s.trim().is_empty() => Some(s),
                     Ok(_) => None,
@@ -508,6 +583,85 @@ pub(crate) async fn compress(
         tokens_before,
         tokens_after,
         notice: state.take_notice(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// User-initiated compression (`/compress [focus]`, Step 18.6)
+// ---------------------------------------------------------------------------
+
+/// What a user-initiated [`compress_user_initiated`] run did — the public
+/// face of [`CompressOutcome`], with the message counts the honesty notice
+/// needs ("never claim savings that didn't happen").
+#[derive(Debug, Clone)]
+pub struct ManualCompressOutcome {
+    /// The assembled working set (equals the input when `fired` is false).
+    pub messages: Vec<Value>,
+    /// True when the pipeline actually changed the working set. False ⇒
+    /// "no compression possible" — the caller must not claim savings.
+    pub fired: bool,
+    pub messages_before: usize,
+    pub messages_after: usize,
+    /// chars/4 estimates over the message list (the pipeline's currency).
+    pub tokens_before: usize,
+    pub tokens_after: usize,
+    /// What the pipeline did, e.g. `"prune + summary"` (the LLM summarizer
+    /// ran) vs `"prune + static marker"` (no summarizer / it failed) vs
+    /// `"structural prune"` — [`CompressAction::describe`]'s wording, so the
+    /// manual notice and the loop's notice can never drift apart.
+    pub how: &'static str,
+    /// One-time anti-thrash notice, when this run just latched the disable.
+    pub notice: Option<String>,
+}
+
+/// Run the shared compression pipeline because the user asked (`/compress
+/// [focus]`, Step 18.6, #247) — the SAME prune → boundary → redacted summary
+/// → marker assembly the loop's triggers call, via
+/// [`CompressRequest::user_initiated`] (aim-to-halve, soft budget). No
+/// bespoke compression path.
+///
+/// Anti-thrash interplay: the soft request never *consults* the latch (an
+/// explicit ask still runs after auto-compression is disabled), but a fired
+/// run *records* its reclaim into `state` — hermes parity: manual passes
+/// feed effectiveness accounting, so `/memory`'s counters stay truthful and
+/// a genuinely useless summarizer still latches. A no-op run records
+/// nothing: an incompressible-because-tiny session must never strike out
+/// auto-compression for later.
+///
+/// The original-task anchor is derived from the working set itself (first
+/// real user message — a leading compaction message is not the task), the
+/// same rule the `Summarizing` provider applies.
+pub async fn compress_user_initiated(
+    messages: &[Value],
+    focus: Option<&str>,
+    summarizer: Option<&SummarizeFn>,
+    state: &mut CompressState,
+) -> ManualCompressOutcome {
+    let task = messages
+        .iter()
+        .find(|m| m["role"].as_str() == Some("user") && !is_compaction_message(m))
+        .and_then(|m| m["content"].as_str())
+        .unwrap_or_default()
+        .to_string();
+    let outcome = compress(
+        CompressRequest::user_initiated(messages, &task, focus),
+        summarizer,
+        state,
+    )
+    .await;
+    if outcome.fired {
+        state.record(outcome.tokens_before, outcome.tokens_after);
+    }
+    let notice = outcome.notice.or_else(|| state.take_notice());
+    ManualCompressOutcome {
+        messages_before: messages.len(),
+        messages_after: outcome.messages.len(),
+        fired: outcome.fired,
+        tokens_before: outcome.tokens_before,
+        tokens_after: outcome.tokens_after,
+        how: outcome.action.describe(),
+        notice,
+        messages: outcome.messages,
     }
 }
 
@@ -644,8 +798,16 @@ fn summary_message(body: &str) -> Value {
 /// dropped with an explicit omission line, F5), and the `Summarizing`
 /// provider's lean section template extended with the In-Progress slot and
 /// the verbatim-Active-Task rule (design doc §Phase 18 "Deliberately
-/// different from hermes").
-fn summary_request(task: &str, middle: &[Value], middle_cap_chars: usize) -> String {
+/// different from hermes"). An optional `focus` (`/compress <focus>`,
+/// Step 18.6) appends emphasis guidance; it is redacted here — the same
+/// pass the rendered middle gets — and again by the request-level
+/// [`redact_secrets`] at the call site.
+fn summary_request(
+    task: &str,
+    middle: &[Value],
+    middle_cap_chars: usize,
+    focus: Option<&str>,
+) -> String {
     // Keep the most recent suffix of the middle that fits the cap: the
     // recent middle is closest to the active work, and the verbatim task is
     // injected separately so nothing load-bearing rides on the oldest part.
@@ -684,6 +846,17 @@ fn summary_request(task: &str, middle: &[Value], middle_cap_chars: usize) -> Str
          NEVER include API keys, tokens, passwords, or other credentials — \
          write [REDACTED] instead.",
     );
+    if let Some(focus) = focus {
+        let focus = redact_secrets(focus);
+        let focus = focus.trim();
+        if !focus.is_empty() {
+            p.push_str(&format!(
+                "\nThe user asked for this compression and wants emphasis on \
+                 a topic: emphasize anything about {focus} — give it the bulk \
+                 of the summary's detail while keeping every section above."
+            ));
+        }
+    }
     p
 }
 
@@ -877,6 +1050,7 @@ mod tests {
                 max_messages,
                 task: "fix the failing test",
                 hard_budget: true,
+                focus: None,
             },
             summarizer,
             state,
@@ -900,6 +1074,7 @@ mod tests {
                 max_messages,
                 task: "fix the failing test",
                 hard_budget: false,
+                focus: None,
             },
             summarizer,
             state,
@@ -1004,6 +1179,7 @@ mod tests {
                 max_messages: None,
                 task,
                 hard_budget: true,
+                focus: None,
             },
             Some(&*s),
             &mut state,
@@ -1509,6 +1685,164 @@ mod tests {
         assert!(state.disabled);
     }
 
+    // -- user-initiated (`/compress`, Step 18.6) ------------------------------
+
+    /// Provider-shaped chat history (no tool messages): system, the task,
+    /// then `turns` user/assistant pairs of `chars` characters each.
+    fn chat_history(turns: usize, chars: usize) -> Vec<Value> {
+        let mut msgs = vec![sys("you are newt"), user("ORIGINAL TASK: port the parser")];
+        for i in 0..turns {
+            msgs.push(user(&format!("q{i} {}", "u".repeat(chars))));
+            msgs.push(json!({"role": "assistant",
+                             "content": format!("a{i} {}", "v".repeat(chars))}));
+        }
+        msgs
+    }
+
+    /// `/compress` compresses with NO token pressure (the user asked): the
+    /// soft aim-to-halve request fires, the message count shrinks, the
+    /// marked summary is present, and the run records into the counters.
+    #[tokio::test]
+    async fn user_initiated_compresses_without_token_pressure() {
+        let msgs = chat_history(10, 400);
+        let prompts = Arc::new(Mutex::new(Vec::new()));
+        let s = recording_summarizer(prompts.clone(), "## Active Task\nMANUAL SUMMARY");
+        let mut state = CompressState::new();
+        let out = compress_user_initiated(&msgs, None, Some(&*s), &mut state).await;
+
+        assert!(out.fired);
+        assert_eq!(out.how, CompressAction::Summarized.describe());
+        assert_eq!(out.messages_before, msgs.len());
+        assert_eq!(out.messages_after, out.messages.len());
+        assert!(
+            out.messages_after < out.messages_before,
+            "count must shrink"
+        );
+        assert!(out.tokens_after < out.tokens_before);
+        assert!(
+            out.messages.iter().any(|m| is_compaction_message(m)
+                && m["content"].as_str().unwrap().contains("MANUAL SUMMARY")),
+            "marked summary message must be present"
+        );
+        // The original-task anchor was derived from the working set itself.
+        let p = prompts.lock().unwrap();
+        assert!(p[0].contains("ORIGINAL TASK: port the parser"), "{}", p[0]);
+        // Fired manual runs feed the effectiveness counters.
+        let c = state.counters();
+        assert_eq!(c.compressions, 1);
+        assert_eq!(c.strikes, 0, "a good reclaim is not a strike");
+        assert!(c.last_reclaim.unwrap() > THRASH_MIN_SAVINGS);
+        assert!(!c.disabled);
+    }
+
+    /// The `/compress <focus>` topic reaches the summarizer as emphasis
+    /// guidance — with a credential typed into the focus REDACTED before the
+    /// request is assembled (the same pass the rendered middle gets).
+    #[tokio::test]
+    async fn user_initiated_focus_is_threaded_and_redacted() {
+        let msgs = chat_history(10, 400);
+        let prompts = Arc::new(Mutex::new(Vec::new()));
+        let s = recording_summarizer(prompts.clone(), "SUMMARY");
+        let mut state = CompressState::new();
+        let secret = "sk-aaaaaaaaaaaaaaaaaaaaaaaa1234";
+        let focus = format!("the auth flow around {secret} handling");
+        let out = compress_user_initiated(&msgs, Some(&focus), Some(&*s), &mut state).await;
+        assert!(out.fired);
+
+        let p = prompts.lock().unwrap();
+        assert_eq!(p.len(), 1);
+        assert!(
+            p[0].contains("emphasize anything about"),
+            "focus guidance line missing: {}",
+            p[0]
+        );
+        assert!(p[0].contains("the auth flow around"), "{}", p[0]);
+        assert!(
+            !p[0].contains(secret),
+            "a secret typed into the focus must never reach the summarizer"
+        );
+        assert!(p[0].contains("[REDACTED]"));
+    }
+
+    /// No focus ⇒ no emphasis guidance in the request (the loop's automatic
+    /// requests must be byte-identical to pre-18.6 ones).
+    #[tokio::test]
+    async fn no_focus_means_no_guidance_line() {
+        let msgs = chat_history(10, 400);
+        let prompts = Arc::new(Mutex::new(Vec::new()));
+        let s = recording_summarizer(prompts.clone(), "SUMMARY");
+        let mut state = CompressState::new();
+        compress_user_initiated(&msgs, None, Some(&*s), &mut state).await;
+        assert!(!prompts.lock().unwrap()[0].contains("emphasize anything about"));
+    }
+
+    /// An incompressible working set is a honest no-op: nothing fired,
+    /// nothing recorded — repeated `/compress` on a tiny session must never
+    /// strike out auto-compression for later.
+    #[tokio::test]
+    async fn user_initiated_noop_records_nothing() {
+        let msgs = vec![sys("you are newt"), user("task"), user("note")];
+        let mut state = CompressState::new();
+        for _ in 0..3 {
+            let out = compress_user_initiated(&msgs, None, None, &mut state).await;
+            assert!(!out.fired, "nothing to reclaim — must not fire");
+            assert_eq!(out.messages, msgs);
+            assert_eq!(out.tokens_before, out.tokens_after);
+            assert!(out.notice.is_none());
+        }
+        let c = state.counters();
+        assert_eq!(c.compressions, 0, "no-op runs never count");
+        assert_eq!(c.strikes, 0);
+        assert!(!c.disabled);
+        assert_eq!(c.last_reclaim, None);
+    }
+
+    /// `/compress` still runs after anti-thrash latched auto-compression off
+    /// — the latch gates the automatic hard-budget guard, not an explicit
+    /// user ask (the soft request never consults it).
+    #[tokio::test]
+    async fn user_initiated_runs_while_latched() {
+        let msgs = chat_history(10, 400);
+        let mut state = CompressState::new();
+        state.latch_disabled_for_tests();
+        let out = compress_user_initiated(&msgs, None, None, &mut state).await;
+        assert!(out.fired, "an explicit ask must bypass the latch");
+        assert_eq!(out.how, CompressAction::StaticFallback.describe());
+        assert!(state.is_disabled(), "the latch itself stays set");
+    }
+
+    /// Counters snapshot: a pure projection of the recorded state.
+    #[test]
+    fn counters_snapshot_projects_state() {
+        let mut state = CompressState::new();
+        let c = state.counters();
+        assert_eq!((c.compressions, c.strikes, c.disabled), (0, 0, false));
+        assert_eq!(c.last_reclaim, None);
+
+        state.record(1_000, 400); // good: 60% reclaim
+        let c = state.counters();
+        assert_eq!((c.compressions, c.strikes, c.disabled), (1, 0, false));
+        assert!((c.last_reclaim.unwrap() - 0.6).abs() < 0.01);
+
+        state.record(1_000, 990); // poor — one strike
+        let c = state.counters();
+        assert_eq!((c.compressions, c.strikes, c.disabled), (2, 1, false));
+
+        state.record(1_000, 950); // poor — two in a row latches
+        let c = state.counters();
+        assert_eq!((c.compressions, c.strikes, c.disabled), (3, 2, true));
+        assert!(c.last_reclaim.unwrap() < THRASH_MIN_SAVINGS);
+    }
+
+    /// A single poor FIRST attempt is one strike, not two: the [1.0, 1.0]
+    /// sentinel in the unused slot must never read as a recorded strike.
+    #[test]
+    fn counters_first_poor_attempt_is_one_strike() {
+        let mut state = CompressState::new();
+        state.record(1_000, 990);
+        assert_eq!(state.counters().strikes, 1);
+    }
+
     // -- trigger ------------------------------------------------------------------
 
     #[test]
@@ -1637,7 +1971,7 @@ mod tests {
         let middle = vec![tool_result(
             "config: api_key=9f8e7d6c5b4a32100ffee and more text",
         )];
-        let request = redact_secrets(&summary_request("the task", &middle, usize::MAX));
+        let request = redact_secrets(&summary_request("the task", &middle, usize::MAX, None));
         assert!(!request.contains("9f8e7d6c5b4a32100ffee"), "{request}");
         assert!(request.contains("api_key=[REDACTED]"), "{request}");
         assert!(request.contains("the task"), "task still present verbatim");
@@ -1692,7 +2026,7 @@ mod tests {
         let middle: Vec<Value> = (0..50)
             .map(|i| tool_result(&format!("MSG{i} {}", "m".repeat(1_900))))
             .collect();
-        let capped = summary_request("the task", &middle, 8_192);
+        let capped = summary_request("the task", &middle, 8_192, None);
         assert!(
             capped.chars().count() < 12_000,
             "total must be capped, got {}",
@@ -1704,7 +2038,7 @@ mod tests {
         assert!(capped.contains("the task"), "task always present");
 
         // Uncapped baseline for contrast: same middle, no cap.
-        let uncapped = summary_request("the task", &middle, usize::MAX);
+        let uncapped = summary_request("the task", &middle, usize::MAX, None);
         assert!(uncapped.chars().count() > 90_000);
         assert!(!uncapped.contains("older message(s) omitted"));
     }

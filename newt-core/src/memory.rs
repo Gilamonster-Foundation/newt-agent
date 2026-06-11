@@ -950,6 +950,7 @@ impl Summarizing {
                 max_messages: None,
                 task: &task,
                 hard_budget: true,
+                focus: None,
             },
             self.summarizer.as_deref(),
             &mut self.state,

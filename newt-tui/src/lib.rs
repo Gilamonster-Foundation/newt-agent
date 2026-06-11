@@ -1573,6 +1573,53 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                                 println!("  {label}: {cur}/{max}  ({pct}%)");
                             }
                         }
+                        // Anti-thrash visibility (Step 18.6, #247): read-only
+                        // surfacing of the session compression counters.
+                        print_newt("Compression:", color, verbose);
+                        println!("{}", memory_compress_section(&compress_state.counters()));
+                        println!();
+                        continue;
+                    }
+                    let slash_word = task.trim_start_matches('/');
+                    if slash_word == "compress" || slash_word.starts_with("compress ") {
+                        // Manual compression (Step 18.6, #247): the SAME
+                        // prune → boundary → redacted summary → marker
+                        // pipeline the loop's triggers call, run because the
+                        // user asked — through the session compress_state and
+                        // the same summarizer wiring the loop uses.
+                        let focus = parse_compress_command(&task).unwrap_or(None);
+                        let wire = session_wire_view(&memory, &system);
+                        let summarizer = make_loop_summarizer(
+                            inf_url.clone(),
+                            inf_model.clone(),
+                            inf_kind,
+                            inf_key.clone(),
+                            // Same capability-derived cap the Summarizing
+                            // provider injects — the summary request must not
+                            // be silently truncated (F5).
+                            Some(mem_budget),
+                        );
+                        let outcome = tokio::task::block_in_place(|| {
+                            rt.block_on(newt_core::compress_user_initiated(
+                                &wire,
+                                focus.as_deref(),
+                                Some(&*summarizer),
+                                &mut compress_state,
+                            ))
+                        });
+                        if outcome.fired {
+                            // Apply the compressed working set back through
+                            // the existing in-memory replace seam so the next
+                            // turn actually sends it — a notice claiming
+                            // savings that the session never sees would be a
+                            // false claim. The durable store keeps the raw
+                            // turn record untouched.
+                            memory.restore_turns(&wire_messages_to_turns(&outcome.messages));
+                        }
+                        if let Some(ref notice) = outcome.notice {
+                            print_newt(notice, color, verbose);
+                        }
+                        print_newt(&compress_feedback_message(&outcome), color, verbose);
                         println!();
                         continue;
                     }
@@ -3096,6 +3143,137 @@ fn recall_display_title(store: &newt_core::ConversationStore, id: &str, title: &
     "(untitled)".to_string()
 }
 
+// ---------------------------------------------------------------------------
+// /compress — manual context compression (Step 18.6, issue #247)
+// ---------------------------------------------------------------------------
+
+/// Parse `/compress [focus]`: `Ok(None)` for the bare command, `Ok(Some)`
+/// with the free-text focus topic otherwise. `/compressx` is some other
+/// (unknown) command, not `/compress x` — the `/recall` parsing contract.
+/// The focus is an opaque string here; redaction happens in the pipeline
+/// (a user can type a secret into the focus).
+fn parse_compress_command(input: &str) -> anyhow::Result<Option<String>> {
+    let body = input.trim().trim_start_matches('/').trim();
+    let Some(rest) = body.strip_prefix("compress") else {
+        anyhow::bail!("not a compress command");
+    };
+    if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+        anyhow::bail!("not a compress command");
+    }
+    let focus = rest.trim();
+    Ok((!focus.is_empty()).then(|| focus.to_string()))
+}
+
+/// The wire view of the current session history — exactly what the loop
+/// would send (system prompt + provider history), minus the trailing task
+/// slot `build_messages` appends: `/compress` is maintenance, not a turn.
+fn session_wire_view(memory: &newt_core::MemoryManager, system: &str) -> Vec<serde_json::Value> {
+    let mut wire: Vec<serde_json::Value> = memory
+        .build_messages(system, "")
+        .iter()
+        .map(|m| serde_json::json!({"role": m.role.as_str(), "content": m.content}))
+        .collect();
+    if wire
+        .last()
+        .is_some_and(|m| m["role"] == "user" && m["content"] == "")
+    {
+        wire.pop();
+    }
+    wire
+}
+
+/// Rebuild provider-shaped turns from the pipeline's assembled wire messages
+/// so the compressed working set can be applied back through the existing
+/// in-memory replace seam (`MemoryManager::restore_turns` — the same one
+/// `/conversation restore` uses). A compaction message (and any unpaired
+/// side) becomes a lone-sided turn; the system message is dropped — the TUI
+/// owns the system prompt and providers re-add it at build time. Token
+/// columns stay `None`: after compression these turns are no longer
+/// backend-measured (an estimate is never presented as a measurement).
+fn wire_messages_to_turns(messages: &[serde_json::Value]) -> Vec<newt_core::ConversationTurn> {
+    let mut out: Vec<newt_core::ConversationTurn> = Vec::new();
+    for m in messages {
+        let content = m["content"].as_str().unwrap_or_default();
+        match m["role"].as_str() {
+            Some("user") => out.push(newt_core::ConversationTurn::new(content, "")),
+            Some("assistant") => match out.last_mut() {
+                Some(last)
+                    if last.assistant.is_empty()
+                        && !last.user.is_empty()
+                        && !last.user.starts_with(newt_core::agentic::SUMMARY_PREFIX) =>
+                {
+                    last.assistant = content.to_string();
+                }
+                _ => out.push(newt_core::ConversationTurn::new("", content)),
+            },
+            // `system` is the TUI's own prompt; `tool` roles cannot occur in
+            // a provider wire view (text pairs only) — skip defensively.
+            _ => {}
+        }
+    }
+    out
+}
+
+/// The `/compress` honesty feedback (18.6): never claim savings that didn't
+/// happen. Unchanged pipeline output reports "no compression possible"; a
+/// fired run reports the REAL before → after counts and how (LLM summary vs
+/// static marker vs structural prune), with hermes's "fewer messages can
+/// still raise the estimate" note when token savings didn't materialize.
+fn compress_feedback_message(outcome: &newt_core::ManualCompressOutcome) -> String {
+    if !outcome.fired {
+        return format!(
+            "no compression possible — {} message(s), ~{} est. tokens are already \
+             protected head/tail or unprunable",
+            outcome.messages_before, outcome.tokens_before
+        );
+    }
+    let mut msg = format!(
+        "context compressed: {} → {} messages, ~{} → ~{} est. tokens ({})",
+        outcome.messages_before,
+        outcome.messages_after,
+        outcome.tokens_before,
+        outcome.tokens_after,
+        outcome.how
+    );
+    if outcome.tokens_after >= outcome.tokens_before {
+        msg.push_str(
+            "\nnote: no token savings — fewer messages can still raise the \
+             estimate (the transcript was rewritten into denser summaries)",
+        );
+    }
+    msg
+}
+
+/// The `/memory` anti-thrash section (18.6): read-only surfacing of the
+/// session [`newt_core::CompressCounters`]. The "/new resets it" hint shows
+/// only on the latched line — and it IS true: `handle_new_conversation`
+/// calls `CompressState::reset` (F4, #267).
+fn memory_compress_section(c: &newt_core::CompressCounters) -> String {
+    let mut line = format!("  compressions this session: {}", c.compressions);
+    if let Some(reclaim) = c.last_reclaim {
+        // A negative reclaim (the pass GREW the estimate) renders as what it
+        // is — clamping to "0%" would claim savings that didn't happen.
+        if reclaim >= 0.0 {
+            line.push_str(&format!(" (last reclaimed {:.0}%)", reclaim * 100.0));
+        } else {
+            line.push_str(&format!(
+                " (last pass grew the estimate {:.0}%)",
+                -reclaim * 100.0
+            ));
+        }
+    }
+    let strikes = format!(
+        "  ineffective-pass strikes: {}/2 (two latch the disable)",
+        c.strikes
+    );
+    let status = if c.disabled {
+        "  auto-compression: disabled — anti-thrash latched; /new resets it"
+    } else {
+        "  auto-compression: enabled"
+    };
+    format!("{line}\n{strikes}\n{status}")
+}
+
 /// The user-facing line for [`newt_core::ConversationStore::wal_fallback_notice`]
 /// (N7, #261 review): `None` when WAL is healthy, `Some(message)` when the
 /// store fell back to `journal_mode=DELETE` (typical for `~/.newt` on NFS).
@@ -3317,6 +3495,7 @@ fn help_lines() -> &'static [&'static str] {
         "  /model <name>            - switch model for this session",
         "  /probe [model|all]       - test tool conformance and cache the result",
         "  /memory                  - show context window / notes usage",
+        "  /compress [focus]        - compress context now, optionally focused on a topic",
         "  /remember <fact>         - add a fact to persistent NOTES.md",
         "  /new                     - start a fresh conversation",
         "  /conversation list       - list saved conversations",
@@ -5162,6 +5341,280 @@ mod skills_integration_tests {
         assert!(id.starts_with(short));
         // Shorter-than-prefix ids pass through whole.
         assert_eq!(short_conversation_id("abc"), "abc");
+    }
+
+    // -- /compress (Step 18.6, #247) ------------------------------------------
+
+    #[test]
+    fn compress_commands_parse_expected_focus() {
+        assert_eq!(parse_compress_command("/compress").unwrap(), None);
+        assert_eq!(parse_compress_command("/compress   ").unwrap(), None);
+        assert_eq!(
+            parse_compress_command("/compress auth token handling").unwrap(),
+            Some("auth token handling".into())
+        );
+        // The focus is opaque free text: FTS5-hostile operators and a
+        // secret-looking string parse fine — redaction is the pipeline's
+        // job, not the parser's.
+        assert_eq!(
+            parse_compress_command("/compress AND \"NEAR/2\" sk-aaaaaaaaaaaaaaaaaaaaaaaa1234")
+                .unwrap(),
+            Some("AND \"NEAR/2\" sk-aaaaaaaaaaaaaaaaaaaaaaaa1234".into())
+        );
+        // `/compressx` is some other (unknown) command, not `/compress x`.
+        assert!(parse_compress_command("/compressx").is_err());
+        assert!(parse_compress_command("/memory").is_err());
+    }
+
+    /// A session memory with `turns` fat user/assistant turns — enough
+    /// summarizable middle for the pipeline to fire without token pressure.
+    async fn compressible_memory(turns: usize) -> newt_core::MemoryManager {
+        let mut memory = newt_core::MemoryManager::new();
+        memory.add_provider(newt_core::RollingWindow::new(50));
+        memory
+            .sync_all(
+                "ORIGINAL TASK: port the parser",
+                "starting on it",
+                &newt_core::TurnMetrics::default(),
+            )
+            .await;
+        for i in 0..turns {
+            memory
+                .sync_all(
+                    &format!("question {i} {}", "u".repeat(300)),
+                    &format!("answer {i} {}", "v".repeat(300)),
+                    &newt_core::TurnMetrics::default(),
+                )
+                .await;
+        }
+        memory
+    }
+
+    /// The command's real parts end to end: wire view → shared pipeline →
+    /// honesty feedback whose numbers match the actual outcome → write-back,
+    /// so the NEXT turn really sends the compressed working set.
+    #[tokio::test]
+    async fn manual_compress_shrinks_session_and_notice_is_truthful() {
+        let mut memory = compressible_memory(12).await;
+        let system = "you are newt";
+        let wire = session_wire_view(&memory, system);
+        assert!(
+            wire.last().is_some_and(|m| m["role"] == "assistant"),
+            "the empty task slot must be popped from the wire view"
+        );
+        let before_len = wire.len();
+
+        let summarizer: newt_core::Summarizer =
+            Box::new(|_req: String| -> newt_core::SummarizeFuture {
+                Box::pin(async { Ok("## Active Task\nMANUAL SUMMARY".to_string()) })
+            });
+        let mut state = newt_core::CompressState::new();
+        let outcome =
+            newt_core::compress_user_initiated(&wire, None, Some(&*summarizer), &mut state).await;
+
+        assert!(outcome.fired);
+        assert_eq!(outcome.messages_before, before_len);
+        assert!(outcome.messages_after < outcome.messages_before);
+        assert!(outcome.tokens_after < outcome.tokens_before);
+
+        // The notice numbers are the outcome's numbers — no independent
+        // arithmetic that could drift from what actually happened.
+        let msg = compress_feedback_message(&outcome);
+        assert!(
+            msg.contains(&format!(
+                "context compressed: {} → {} messages, ~{} → ~{} est. tokens",
+                outcome.messages_before,
+                outcome.messages_after,
+                outcome.tokens_before,
+                outcome.tokens_after
+            )),
+            "got: {msg}"
+        );
+        assert!(msg.contains("prune + summary"), "got: {msg}");
+        assert!(!msg.contains("note: no token savings"), "got: {msg}");
+
+        // Write-back through the existing replace seam: the next build is
+        // the compressed set (marker included), not the raw history.
+        memory.restore_turns(&wire_messages_to_turns(&outcome.messages));
+        let next = memory.build_messages(system, "next task");
+        assert!(
+            next.len() < before_len,
+            "next turn must send the compressed set"
+        );
+        assert!(next.iter().any(
+            |m| m.content.starts_with(newt_core::agentic::SUMMARY_PREFIX)
+                && m.content.contains("MANUAL SUMMARY")
+        ));
+        // The fired manual run shows up in the /memory counters.
+        assert_eq!(state.counters().compressions, 1);
+    }
+
+    /// No-op honesty: an incompressible session reports "no compression
+    /// possible" and never claims savings.
+    #[tokio::test]
+    async fn manual_compress_noop_reports_no_compression_possible() {
+        let mut memory = newt_core::MemoryManager::new();
+        memory.add_provider(newt_core::RollingWindow::new(50));
+        memory
+            .sync_all("hi", "hello", &newt_core::TurnMetrics::default())
+            .await;
+        let wire = session_wire_view(&memory, "you are newt");
+        let mut state = newt_core::CompressState::new();
+        let outcome = newt_core::compress_user_initiated(&wire, None, None, &mut state).await;
+
+        assert!(!outcome.fired);
+        let msg = compress_feedback_message(&outcome);
+        assert!(msg.contains("no compression possible"), "got: {msg}");
+        assert!(
+            !msg.contains("context compressed"),
+            "must not claim savings that didn't happen: {msg}"
+        );
+        assert_eq!(state.counters().compressions, 0);
+    }
+
+    /// Fired-but-no-token-savings gets the explicit hermes honesty note
+    /// instead of an implied win.
+    #[test]
+    fn compress_feedback_flags_fired_without_token_savings() {
+        let outcome = newt_core::ManualCompressOutcome {
+            messages: Vec::new(),
+            fired: true,
+            messages_before: 10,
+            messages_after: 6,
+            tokens_before: 800,
+            tokens_after: 850,
+            how: "prune + summary",
+            notice: None,
+        };
+        let msg = compress_feedback_message(&outcome);
+        assert!(msg.contains("10 → 6 messages"), "got: {msg}");
+        assert!(msg.contains("note: no token savings"), "got: {msg}");
+    }
+
+    /// A secret typed into the focus never reaches the summarizer request —
+    /// the focus rides the same redaction the rendered middle gets.
+    #[tokio::test]
+    async fn compress_focus_secret_never_reaches_summarizer() {
+        let memory = compressible_memory(12).await;
+        let wire = session_wire_view(&memory, "you are newt");
+        let prompts = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen = prompts.clone();
+        let summarizer: newt_core::Summarizer =
+            Box::new(move |req: String| -> newt_core::SummarizeFuture {
+                let seen = seen.clone();
+                Box::pin(async move {
+                    seen.lock().unwrap().push(req);
+                    Ok("SUMMARY".to_string())
+                })
+            });
+        let mut state = newt_core::CompressState::new();
+        let secret = "sk-aaaaaaaaaaaaaaaaaaaaaaaa1234";
+        let focus = format!("the login flow around {secret}");
+        let outcome =
+            newt_core::compress_user_initiated(&wire, Some(&focus), Some(&*summarizer), &mut state)
+                .await;
+        assert!(outcome.fired, "the summarizer path must have run");
+
+        let prompts = prompts.lock().unwrap();
+        assert_eq!(prompts.len(), 1);
+        assert!(
+            prompts[0].contains("emphasize anything about"),
+            "{}",
+            prompts[0]
+        );
+        assert!(prompts[0].contains("the login flow"), "{}", prompts[0]);
+        assert!(
+            !prompts[0].contains(secret),
+            "focus secret leaked into the summarizer request"
+        );
+        assert!(prompts[0].contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn memory_compress_section_renders_states() {
+        // Fresh session: nothing recorded, enabled, no reclaim figure.
+        let fresh = memory_compress_section(&newt_core::CompressCounters {
+            compressions: 0,
+            strikes: 0,
+            disabled: false,
+            last_reclaim: None,
+        });
+        assert!(fresh.contains("compressions this session: 0"), "{fresh}");
+        assert!(!fresh.contains("last reclaimed"), "{fresh}");
+        assert!(fresh.contains("strikes: 0/2"), "{fresh}");
+        assert!(fresh.contains("auto-compression: enabled"), "{fresh}");
+        assert!(
+            !fresh.contains("/new resets it"),
+            "the reset hint shows only when latched: {fresh}"
+        );
+
+        // Post-compression: count + last reclaim percentage surface.
+        let post = memory_compress_section(&newt_core::CompressCounters {
+            compressions: 2,
+            strikes: 1,
+            disabled: false,
+            last_reclaim: Some(0.07),
+        });
+        assert!(post.contains("compressions this session: 2"), "{post}");
+        assert!(post.contains("(last reclaimed 7%)"), "{post}");
+        assert!(post.contains("strikes: 1/2"), "{post}");
+        assert!(post.contains("auto-compression: enabled"), "{post}");
+
+        // Latched: disabled status with the truthful "/new resets it" hint
+        // (true since #267's F4 — `handle_new_conversation` resets the state).
+        let latched = memory_compress_section(&newt_core::CompressCounters {
+            compressions: 3,
+            strikes: 2,
+            disabled: true,
+            last_reclaim: Some(0.04),
+        });
+        assert!(latched.contains("strikes: 2/2"), "{latched}");
+        assert!(latched.contains("auto-compression: disabled"), "{latched}");
+        assert!(latched.contains("/new resets it"), "{latched}");
+
+        // A negative reclaim (the pass GREW the estimate) is never clamped
+        // into a "0% reclaimed" savings claim.
+        let grew = memory_compress_section(&newt_core::CompressCounters {
+            compressions: 1,
+            strikes: 1,
+            disabled: false,
+            last_reclaim: Some(-0.06),
+        });
+        assert!(grew.contains("grew the estimate 6%"), "{grew}");
+        assert!(!grew.contains("last reclaimed"), "{grew}");
+    }
+
+    #[test]
+    fn wire_messages_to_turns_pairs_and_lone_sides() {
+        let compaction = format!("{}\nsummary body", newt_core::agentic::SUMMARY_PREFIX);
+        let wire = vec![
+            serde_json::json!({"role": "system", "content": "you are newt"}),
+            serde_json::json!({"role": "user", "content": "the task"}),
+            serde_json::json!({"role": "user", "content": compaction}),
+            serde_json::json!({"role": "user", "content": "q1"}),
+            serde_json::json!({"role": "assistant", "content": "a1"}),
+        ];
+        let turns = wire_messages_to_turns(&wire);
+        // System dropped; task and compaction stand alone; q1/a1 pair up —
+        // and the compaction is never mistaken for q-awaiting-reply.
+        assert_eq!(turns.len(), 3);
+        assert_eq!((&*turns[0].user, &*turns[0].assistant), ("the task", ""));
+        assert_eq!(
+            (&*turns[1].user, &*turns[1].assistant),
+            (compaction.as_str(), "")
+        );
+        assert_eq!((&*turns[2].user, &*turns[2].assistant), ("q1", "a1"));
+        // Token columns stay absent: these are no longer measured turns.
+        assert!(turns
+            .iter()
+            .all(|t| t.tokens_in.is_none() && t.tokens_out.is_none()));
+    }
+
+    #[test]
+    fn help_documents_compress_command() {
+        assert!(help_lines()
+            .iter()
+            .any(|line| line.contains("/compress [focus]")));
     }
 
     #[test]

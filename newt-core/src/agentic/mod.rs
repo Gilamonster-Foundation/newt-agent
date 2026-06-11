@@ -21,7 +21,8 @@ mod trim;
 mod warmup;
 
 pub use compress::{
-    CompressState, SummarizeFn, SummarizeFuture, Summarizer, SUMMARY_END_MARKER, SUMMARY_PREFIX,
+    compress_user_initiated, CompressCounters, CompressState, ManualCompressOutcome, SummarizeFn,
+    SummarizeFuture, Summarizer, SUMMARY_END_MARKER, SUMMARY_PREFIX,
 };
 pub use display::{print_newt, NEWT_ORANGE_CT};
 pub use mcp::{McpTools, NoMcp};
@@ -330,6 +331,7 @@ pub async fn chat_complete(
                         max_messages: trigger.max_messages,
                         task,
                         hard_budget: trigger.hard_budget,
+                        focus: None,
                     },
                     summarizer,
                     compress_state,
@@ -447,6 +449,7 @@ pub async fn chat_complete(
                                 max_messages: None,
                                 task,
                                 hard_budget: true,
+                                focus: None,
                             },
                             summarizer,
                             compress_state,
@@ -608,6 +611,7 @@ pub async fn chat_complete(
                                 max_messages: None,
                                 task,
                                 hard_budget: true,
+                                focus: None,
                             },
                             summarizer,
                             compress_state,
@@ -1056,6 +1060,7 @@ pub async fn openai_chat_complete(
                         max_messages: trigger.max_messages,
                         task,
                         hard_budget: trigger.hard_budget,
+                        focus: None,
                     },
                     summarizer,
                     compress_state,
@@ -1158,6 +1163,7 @@ pub async fn openai_chat_complete(
                                 max_messages: None,
                                 task,
                                 hard_budget: true,
+                                focus: None,
                             },
                             summarizer,
                             compress_state,
