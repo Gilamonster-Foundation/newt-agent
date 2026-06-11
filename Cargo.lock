@@ -1933,6 +1933,7 @@ dependencies = [
  "agent-mesh-protocol",
  "anyhow",
  "async-trait",
+ "blake3",
  "chrono",
  "crossterm",
  "newt-skills",
