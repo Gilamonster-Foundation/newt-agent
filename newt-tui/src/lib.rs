@@ -2472,6 +2472,7 @@ fn save_successful_conversation_turn(
 /// (`None`) and this is a no-op — no row created, no turn appended, no error.
 /// A compaction record (18.5) taken in an ephemeral session is dropped with
 /// the rest of the turn: nothing persists, so there is nothing to rehydrate.
+#[allow(clippy::too_many_arguments)] // mirrors save_successful_conversation_turn
 fn save_turn_if_persistent(
     store: Option<&newt_core::ConversationStore>,
     conversation_id: &str,
