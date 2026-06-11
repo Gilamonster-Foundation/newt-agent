@@ -172,12 +172,25 @@ pub trait MemoryProvider: Send + Sync {
         None
     }
 
-    /// Add a persistent note (only meaningful for `NoteStore`).
-    /// Default: return an error explaining the provider doesn't support notes.
+    /// Add a persistent note.
+    ///
+    /// Providers that persist notes (e.g. `NoteStore`) override this.
+    /// Default: return [`NotesUnsupported`], which `MemoryManager::add_note`
+    /// recognises and skips while looking for a note-capable provider.
     fn add_note(&mut self, _fact: &str) -> anyhow::Result<()> {
-        anyhow::bail!("this memory provider does not support persistent notes")
+        Err(NotesUnsupported.into())
     }
 }
+
+/// Error returned by the default [`MemoryProvider::add_note`] for providers
+/// that don't persist notes.
+///
+/// `MemoryManager::add_note` skips providers returning this and keeps
+/// looking; any *other* error (e.g. the over-budget curator error from
+/// `NoteStore`) is surfaced to the caller.
+#[derive(Debug, thiserror::Error)]
+#[error("this memory provider does not support persistent notes")]
+pub struct NotesUnsupported;
 
 // ---------------------------------------------------------------------------
 // MemoryManager — single integration point
@@ -301,22 +314,30 @@ impl MemoryManager {
         self.providers.iter().filter_map(|p| p.usage()).collect()
     }
 
-    /// Add a fact to the first `NoteStore` provider found.
-    /// Returns `Err` if no `NoteStore` is registered or the note is rejected.
+    /// Add a fact to the first provider that accepts it (first `Ok` wins).
+    ///
+    /// No name-based special-casing: every provider is offered the note via
+    /// the trait's `add_note`. Providers whose default returns
+    /// [`NotesUnsupported`] are skipped; the first *real* rejection (e.g.
+    /// `NoteStore`'s over-budget curator error) is surfaced if no provider
+    /// accepts the note.
     pub fn add_note(&mut self, fact: &str) -> anyhow::Result<()> {
+        let mut first_err: Option<anyhow::Error> = None;
         for p in &mut self.providers {
-            // Downcast attempt: NoteStore exposes its name.
-            if p.name() == "note_store" {
-                // Safe: we know it's a NoteStore because of the name match.
-                // Use Any downcasting for the actual mutation.
-                // Since we can't easily downcast Box<dyn MemoryProvider>,
-                // we use a dedicated add_note method on MemoryProvider.
-                return p.add_note(fact);
+            match p.add_note(fact) {
+                Ok(()) => return Ok(()),
+                Err(e) if e.is::<NotesUnsupported>() => continue,
+                Err(e) => {
+                    first_err.get_or_insert(e);
+                }
             }
         }
-        anyhow::bail!(
-            "no NoteStore registered — add [memory] provider = \"note_store\" to newt.toml"
-        )
+        match first_err {
+            Some(e) => Err(e),
+            None => anyhow::bail!(
+                "no note-capable memory provider registered — add [memory] provider = \"note_store\" to newt.toml"
+            ),
+        }
     }
 }
 
@@ -556,146 +577,14 @@ impl MemoryProvider for TokenBudget {
 }
 
 // ---------------------------------------------------------------------------
-// NoteStore — built-in provider #3 (closes #108)
+// NoteStore — built-in provider #3 (closes #108; v2 in Step 19.1 / #248)
 // ---------------------------------------------------------------------------
 
-/// Persistent agent notes at `~/.newt/NOTES.md`.
-///
-/// Notes are read once at session start and **frozen** into the system prompt
-/// so the model's prefix cache stays valid.  Mid-session writes (via
-/// `/remember <fact>`) update the file but NOT the system prompt block —
-/// changes take effect next session.
-///
-/// Modelled on hermes-agent's `MemoryStore` (MEMORY.md pattern).
-pub struct NoteStore {
-    path: std::path::PathBuf,
-    /// Content read at initialize — frozen for the system prompt.
-    snapshot: String,
-    /// Live content (may differ from snapshot mid-session).
-    live: String,
-    char_limit: usize,
-}
-
-impl NoteStore {
-    pub const DEFAULT_CHAR_LIMIT: usize = 2_200;
-
-    pub fn new(path: impl Into<std::path::PathBuf>, char_limit: usize) -> Self {
-        Self {
-            path: path.into(),
-            snapshot: String::new(),
-            live: String::new(),
-            char_limit: char_limit.max(10),
-        }
-    }
-
-    /// Create at the default location `~/.newt/NOTES.md`.
-    pub fn default_path() -> Self {
-        let path = crate::Config::user_config_path()
-            .map(|p| p.with_file_name("NOTES.md"))
-            .unwrap_or_else(|| std::path::PathBuf::from("NOTES.md"));
-        Self::new(path, Self::DEFAULT_CHAR_LIMIT)
-    }
-
-    /// Add a fact. Returns `Err` if it would exceed the char limit.
-    pub fn add(&mut self, fact: &str) -> anyhow::Result<()> {
-        let fact = fact.trim().to_string();
-        if fact.is_empty() {
-            return Ok(());
-        }
-        // Reject if already present (exact match).
-        if self.live.contains(&fact) {
-            return Ok(());
-        }
-        let separator = if self.live.is_empty() { "" } else { "\n" };
-        let candidate = format!("{}{}{}", self.live, separator, fact);
-        if candidate.len() > self.char_limit {
-            anyhow::bail!(
-                "NOTES.md would exceed {} char limit ({}/{} used)",
-                self.char_limit,
-                self.live.len(),
-                self.char_limit
-            );
-        }
-        self.live = candidate;
-        self.save()?;
-        Ok(())
-    }
-
-    /// Remove a fact by exact match.
-    pub fn remove(&mut self, fact: &str) -> anyhow::Result<bool> {
-        let before = self.live.len();
-        self.live = self
-            .live
-            .lines()
-            .filter(|l| l.trim() != fact.trim())
-            .collect::<Vec<_>>()
-            .join("\n");
-        let removed = self.live.len() != before;
-        if removed {
-            self.save()?;
-        }
-        Ok(removed)
-    }
-
-    fn save(&self) -> anyhow::Result<()> {
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(&self.path, &self.live)?;
-        Ok(())
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.live.trim().is_empty()
-    }
-
-    pub fn char_usage(&self) -> (usize, usize) {
-        (self.live.len(), self.char_limit)
-    }
-}
-
-#[async_trait]
-impl MemoryProvider for NoteStore {
-    fn name(&self) -> &str {
-        "note_store"
-    }
-
-    async fn initialize(&mut self, _ctx: &SessionContext) -> anyhow::Result<()> {
-        if self.path.exists() {
-            self.live = std::fs::read_to_string(&self.path).unwrap_or_default();
-        }
-        // Freeze the snapshot — this is what goes into the system prompt.
-        self.snapshot = self.live.clone();
-        Ok(())
-    }
-
-    fn system_prompt_block(&self) -> Option<String> {
-        if self.snapshot.trim().is_empty() {
-            return None;
-        }
-        Some(format!(
-            "## Agent Notes ({}/{})\n{}",
-            self.snapshot.len(),
-            self.char_limit,
-            self.snapshot.trim()
-        ))
-    }
-
-    fn build_messages(&self, _system_prompt: &str, _new_task: &str) -> Vec<MemMessage> {
-        // NoteStore is a system-prompt-only provider — it doesn't manage history.
-        Vec::new()
-    }
-
-    async fn sync_turn(&mut self, _user: &str, _assistant: &str, _metrics: &TurnMetrics) {}
-
-    fn usage(&self) -> Option<(String, usize, usize)> {
-        Some(("notes".into(), self.live.len(), self.char_limit))
-    }
-
-    fn add_note(&mut self, fact: &str) -> anyhow::Result<()> {
-        self.add(fact)
-    }
-}
+// NoteStore grew its own module in Step 19.1 (`§`-delimited entries,
+// substring addressing, curated cap, atomic writes + advisory lock).
+// Re-exported here so the public path `newt_core::memory::NoteStore`
+// stays stable.
+pub use crate::notes::NoteStore;
 
 // ---------------------------------------------------------------------------
 // Summarizing — built-in provider #4 (closes #107)
@@ -1244,58 +1133,7 @@ mod tests {
         assert_eq!(tb.used_tokens(), 50); // 30 + 20
     }
 
-    // --- NoteStore tests ---
-
-    #[tokio::test]
-    async fn note_store_add_and_system_prompt() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("NOTES.md");
-        let mut ns = NoteStore::new(path, 2200);
-        let ctx = SessionContext {
-            workspace: "/ws".into(),
-            session_id: "s1".into(),
-        };
-        ns.initialize(&ctx).await.unwrap();
-        assert!(ns.system_prompt_block().is_none()); // empty at start
-
-        ns.add("gemma4:e2b is the preferred model").unwrap();
-        assert!(ns.live.contains("gemma4:e2b"));
-    }
-
-    #[tokio::test]
-    async fn note_store_rejects_over_limit() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("NOTES.md");
-        let mut ns = NoteStore::new(path, 50);
-        ns.initialize(&SessionContext {
-            workspace: "/ws".into(),
-            session_id: "s".into(),
-        })
-        .await
-        .unwrap();
-        let long = "x".repeat(60);
-        assert!(ns.add(&long).is_err());
-    }
-
-    #[tokio::test]
-    async fn note_store_frozen_snapshot() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("NOTES.md");
-        let mut ns = NoteStore::new(path, 2200);
-        ns.initialize(&SessionContext {
-            workspace: "/ws".into(),
-            session_id: "s".into(),
-        })
-        .await
-        .unwrap();
-        // Snapshot is empty at init.
-        assert!(ns.system_prompt_block().is_none());
-        // Add a note mid-session.
-        ns.add("new fact").unwrap();
-        // Snapshot still empty — frozen.
-        assert!(ns.system_prompt_block().is_none());
-        assert!(ns.live.contains("new fact"));
-    }
+    // --- NoteStore tests live in crate::notes (split out in Step 19.1) ---
 
     // --- Summarizing tests ---
 
@@ -1485,75 +1323,11 @@ mod tests {
     async fn memory_manager_add_note_fails_with_no_note_store() {
         let mut mgr = MemoryManager::new();
         mgr.add_provider(RollingWindow::new(5));
-        assert!(mgr.add_note("fact").is_err());
-    }
-
-    // --- NoteStore additional coverage ---
-
-    #[tokio::test]
-    async fn note_store_remove() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("NOTES.md");
-        let mut ns = NoteStore::new(path, 2200);
-        ns.initialize(&SessionContext {
-            workspace: "/ws".into(),
-            session_id: "s".into(),
-        })
-        .await
-        .unwrap();
-        ns.add("fact one").unwrap();
-        ns.add("fact two").unwrap();
-        let removed = ns.remove("fact one").unwrap();
-        assert!(removed);
-        assert!(!ns.live.contains("fact one"));
-        assert!(ns.live.contains("fact two"));
-    }
-
-    #[tokio::test]
-    async fn note_store_remove_nonexistent_returns_false() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("NOTES.md");
-        let mut ns = NoteStore::new(path, 2200);
-        ns.initialize(&SessionContext {
-            workspace: "/ws".into(),
-            session_id: "s".into(),
-        })
-        .await
-        .unwrap();
-        let removed = ns.remove("not there").unwrap();
-        assert!(!removed);
-    }
-
-    #[tokio::test]
-    async fn note_store_is_empty() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("NOTES.md");
-        let mut ns = NoteStore::new(path, 2200);
-        ns.initialize(&SessionContext {
-            workspace: "/ws".into(),
-            session_id: "s".into(),
-        })
-        .await
-        .unwrap();
-        assert!(ns.is_empty());
-        ns.add("fact").unwrap();
-        assert!(!ns.is_empty());
-    }
-
-    #[tokio::test]
-    async fn note_store_char_usage() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("NOTES.md");
-        let mut ns = NoteStore::new(path, 100);
-        ns.initialize(&SessionContext {
-            workspace: "/ws".into(),
-            session_id: "s".into(),
-        })
-        .await
-        .unwrap();
-        let (cur, max) = ns.char_usage();
-        assert_eq!(cur, 0);
-        assert_eq!(max, 100);
+        let err = mgr.add_note("fact").unwrap_err().to_string();
+        assert!(
+            err.contains("no note-capable memory provider"),
+            "guidance error expected: {err}"
+        );
     }
 
     // --- TokenBudget additional coverage ---
@@ -1635,9 +1409,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rolling_window_add_note_returns_err() {
+    async fn rolling_window_add_note_returns_notes_unsupported() {
         let mut rw = RollingWindow::new(5);
-        assert!(rw.add_note("fact").is_err());
+        let err = rw.add_note("fact").unwrap_err();
+        assert!(err.is::<NotesUnsupported>());
     }
 
     #[tokio::test]
@@ -1646,13 +1421,68 @@ mod tests {
         let path = dir.path().join("NOTES.md");
         let mut mgr = MemoryManager::new();
         mgr.add_provider(RollingWindow::new(5));
-        mgr.add_provider(NoteStore::new(path, 2200));
+        mgr.add_provider(NoteStore::new(path.clone(), 2200));
         let ctx = SessionContext {
             workspace: "/ws".into(),
             session_id: "s".into(),
         };
         mgr.initialize_all(&ctx).await;
         mgr.add_note("the answer is 42").unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("the answer is 42"));
+    }
+
+    /// A provider with a non-`note_store` name that accepts notes — proves
+    /// the manager no longer special-cases `name() == "note_store"`.
+    struct CustomNotes {
+        notes: Vec<String>,
+    }
+
+    #[async_trait]
+    impl MemoryProvider for CustomNotes {
+        fn name(&self) -> &str {
+            "custom_notes"
+        }
+        fn build_messages(&self, _system_prompt: &str, _new_task: &str) -> Vec<MemMessage> {
+            Vec::new()
+        }
+        async fn sync_turn(&mut self, _user: &str, _assistant: &str, _metrics: &TurnMetrics) {}
+        fn add_note(&mut self, fact: &str) -> anyhow::Result<()> {
+            self.notes.push(fact.to_string());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn memory_manager_add_note_first_ok_wins_regardless_of_name() {
+        let mut mgr = MemoryManager::new();
+        mgr.add_provider(RollingWindow::new(5)); // unsupported — skipped
+        mgr.add_provider(CustomNotes { notes: Vec::new() });
+        mgr.add_note("routed by capability, not by name").unwrap();
+    }
+
+    #[tokio::test]
+    async fn memory_manager_add_note_surfaces_curator_error() {
+        // A real rejection from a note-capable provider (the over-budget
+        // curator error) must reach the caller, not be swallowed by the
+        // generic "no provider" message.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("NOTES.md");
+        let mut mgr = MemoryManager::new();
+        mgr.add_provider(RollingWindow::new(5));
+        mgr.add_provider(NoteStore::new(path, 40));
+        let ctx = SessionContext {
+            workspace: "/ws".into(),
+            session_id: "s".into(),
+        };
+        mgr.initialize_all(&ctx).await;
+        mgr.add_note("an entry that fits").unwrap();
+        let err = mgr.add_note(&"x".repeat(80)).unwrap_err().to_string();
+        assert!(
+            err.contains("Replace or remove existing entries first"),
+            "curator error must propagate: {err}"
+        );
+        assert!(err.contains("an entry that fits"), "{err}");
     }
 
     #[tokio::test]

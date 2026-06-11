@@ -1405,9 +1405,8 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                         continue;
                     }
                     if let Some(fact) = task.trim_start_matches('/').strip_prefix("remember ") {
-                        // Find NoteStore in the manager and add the fact.
-                        // We reach it via a best-effort downcast approach using a
-                        // dedicated add_note helper on MemoryManager.
+                        // Route the fact through MemoryManager::add_note —
+                        // the first note-capable provider (NoteStore) wins.
                         match memory.add_note(fact) {
                             Ok(()) => print_newt(&format!("Noted: {fact}"), color, verbose),
                             Err(e) => print_newt(&format!("error: {e}"), color, verbose),
