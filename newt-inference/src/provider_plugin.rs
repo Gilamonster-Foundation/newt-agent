@@ -463,8 +463,11 @@ mod tests {
         std::fs::write(
             &path,
             r#"#!/bin/sh
+IFS= read -r _request || exit 0
 printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"plugin_name":"env-probe","plugin_version":"0.0.0-test","supported_models":["gpt-test"]}}'
+IFS= read -r _request || exit 0
 printf '{"jsonrpc":"2.0","id":2,"result":{"content":"allowed=%s blocked=%s","model_id":"gpt-test","usage":null}}\n' "$NEWT_TEST_OPENAI_ALLOWED" "$NEWT_TEST_OPENAI_BLOCKED"
+IFS= read -r _request || exit 0
 printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{}}'
 "#,
         )
@@ -480,8 +483,11 @@ printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{}}'
             &path,
             concat!(
                 "@echo off\r\n",
+                "set /p _request=\r\n",
                 "echo {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"plugin_name\":\"env-probe\",\"plugin_version\":\"0.0.0-test\",\"supported_models\":[\"gpt-test\"]}}\r\n",
+                "set /p _request=\r\n",
                 "echo {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"content\":\"allowed=%NEWT_TEST_OPENAI_ALLOWED% blocked=%NEWT_TEST_OPENAI_BLOCKED%\",\"model_id\":\"gpt-test\",\"usage\":null}}\r\n",
+                "set /p _request=\r\n",
                 "echo {\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{}}\r\n"
             ),
         )
