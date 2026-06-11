@@ -298,6 +298,40 @@ pub fn save_cache(cache: &CapabilityCache) {
 }
 
 // ---------------------------------------------------------------------------
+// Memory-budget resolution (Step 18.2, #247)
+// ---------------------------------------------------------------------------
+
+/// Resolve the context-token budget injected into the memory providers
+/// (`TokenBudget` / `Summarizing`) at construction.
+///
+/// Precedence:
+/// 1. **Explicit `[memory] context_tokens`** — a deliberate user override;
+///    always honoured.
+/// 2. **Capability-derived** — the empirical probe cache entry for `model`:
+///    `max_ok_input` (highest input the backend actually accepted — the same
+///    number gating the loop's pre-send guard) else `safe_context` (the
+///    empirically-confirmed `num_ctx`). The declared `context_window` is
+///    deliberately NOT a source: it is a claim, not a measurement.
+/// 3. **Static default** — [`newt_core::DEFAULT_CONTEXT_TOKENS`] only when
+///    neither exists (fresh model, no probe data yet).
+///
+/// The resolved value is injected by value at provider construction —
+/// newt-core has no dependency on the probe types (crate-boundary note in
+/// the Phase 18 design). Budgets therefore refresh per session: if the
+/// capability cache ratchets mid-session, providers keep their
+/// construction-time value while the agentic loop's own guard tracks the
+/// live numbers.
+pub fn resolve_memory_budget(explicit: Option<u32>, cache: &CapabilityCache, model: &str) -> u32 {
+    explicit
+        .or_else(|| {
+            cache
+                .get(model)
+                .and_then(|e| e.max_ok_input.or(e.safe_context))
+        })
+        .unwrap_or(newt_core::DEFAULT_CONTEXT_TOKENS)
+}
+
+// ---------------------------------------------------------------------------
 // Model list (with metadata)
 // ---------------------------------------------------------------------------
 
@@ -989,6 +1023,95 @@ mod tests {
         let snapshot = serde_json::to_string(&cache).unwrap();
         assert!(!migrate_accounting(&mut cache), "second pass is a no-op");
         assert_eq!(serde_json::to_string(&cache).unwrap(), snapshot);
+    }
+
+    // --- resolve_memory_budget (Step 18.2, #247) ---
+
+    /// Fixture capability cache with one tuned entry for "tuned-model".
+    fn fixture_cache(max_ok_input: Option<u32>, safe_context: Option<u32>) -> CapabilityCache {
+        let mut cache = CapabilityCache::default();
+        cache.insert(
+            "tuned-model".into(),
+            CapabilityEntry {
+                conformance: ToolConformance::Native,
+                tested_date: "2026-06-10".into(),
+                context_window: Some(32_768),
+                safe_context,
+                max_ok_input,
+                ..Default::default()
+            },
+        );
+        cache
+    }
+
+    /// Tier 1: an explicit `[memory] context_tokens` is a deliberate user
+    /// override — it wins even when capability data exists.
+    #[test]
+    fn resolve_memory_budget_explicit_config_wins() {
+        let cache = fixture_cache(Some(24_000), Some(26_214));
+        assert_eq!(
+            resolve_memory_budget(Some(16_000), &cache, "tuned-model"),
+            16_000
+        );
+    }
+
+    /// Tier 2a: without an override, `max_ok_input` (the empirically
+    /// confirmed input ceiling — the same number the pre-send guard gates
+    /// on) is the budget.
+    #[test]
+    fn resolve_memory_budget_capability_max_ok_input_second() {
+        let cache = fixture_cache(Some(24_000), Some(6_553));
+        assert_eq!(resolve_memory_budget(None, &cache, "tuned-model"), 24_000);
+    }
+
+    /// Tier 2b: with no `max_ok_input` yet (e.g. freshly de-poisoned by the
+    /// 18.1 migration), `safe_context` is the capability-derived budget.
+    #[test]
+    fn resolve_memory_budget_falls_back_to_safe_context() {
+        let cache = fixture_cache(None, Some(6_553));
+        assert_eq!(resolve_memory_budget(None, &cache, "tuned-model"), 6_553);
+    }
+
+    /// Tier 3: the static default applies ONLY when neither an override nor
+    /// any empirical tuning exists — unknown model, or an entry with no
+    /// tuning data. The declared `context_window` alone is a claim, not a
+    /// measurement, and must not become a budget.
+    #[test]
+    fn resolve_memory_budget_static_default_last() {
+        // Model absent from the cache entirely (fresh model, never probed).
+        let empty = CapabilityCache::default();
+        assert_eq!(
+            resolve_memory_budget(None, &empty, "fresh-model"),
+            newt_core::DEFAULT_CONTEXT_TOKENS
+        );
+        // Entry exists (declared window known) but no empirical tuning.
+        let untuned = fixture_cache(None, None);
+        assert_eq!(
+            resolve_memory_budget(None, &untuned, "tuned-model"),
+            newt_core::DEFAULT_CONTEXT_TOKENS
+        );
+        // Some OTHER model's tuning must not leak onto this one.
+        let cache = fixture_cache(Some(24_000), Some(26_214));
+        assert_eq!(
+            resolve_memory_budget(None, &cache, "different-model"),
+            newt_core::DEFAULT_CONTEXT_TOKENS
+        );
+    }
+
+    /// Regression for the pre-18.2 parallel default: the TUI built providers
+    /// with `context_tokens.unwrap_or(8_192)`, silently ignoring probe data.
+    /// A session with capability data must NOT resolve to the static
+    /// default.
+    #[test]
+    fn resolve_memory_budget_never_ignores_probe_data() {
+        let cache = fixture_cache(Some(24_000), Some(26_214));
+        let budget = resolve_memory_budget(None, &cache, "tuned-model");
+        assert_ne!(
+            budget,
+            newt_core::DEFAULT_CONTEXT_TOKENS,
+            "capability data present — the static default must not win"
+        );
+        assert_eq!(budget, 24_000);
     }
 
     // --- parse_show_response ---

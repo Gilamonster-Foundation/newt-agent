@@ -55,7 +55,8 @@ pub use dgx::{DgxConfig, DgxFormation, DgxNode, DgxNotConfigured, EndpointKind};
 pub use error::NewtError;
 pub use memory::{
     MemMessage, MemoryManager, MemoryProvider, NoteStore, NotesUnsupported, Role, RollingWindow,
-    SessionContext, SoulProvider, SoulSource, Summarizing, TokenBudget, DEFAULT_SOUL,
+    SessionContext, SoulProvider, SoulSource, Summarizing, TokenBudget, DEFAULT_CONTEXT_TOKENS,
+    DEFAULT_SOUL,
 };
 pub use metrics::{TokenUsage, TurnMetrics};
 pub use model_id::ModelId;
