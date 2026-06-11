@@ -22,6 +22,7 @@ pub mod retry;
 pub mod role_profile;
 pub mod router;
 pub mod session;
+pub mod store;
 pub mod tuning;
 
 #[cfg(feature = "pyo3")]
@@ -39,8 +40,13 @@ pub use config::{
 };
 pub use conversation::{
     new_conversation_id, session_plan_dir, session_plan_path, ConversationRecord,
-    ConversationStore, ConversationSummary, ConversationTurn,
+    ConversationSummary, ConversationTurn,
 };
+// Step 17.1a (issue #246): the canonical `ConversationStore` is now the
+// SQLite backend (`store` module, §6 causal ordering) — same public API,
+// so the TUI is SQLite-backed with no call-site changes. The JSON backend
+// stays reachable at `conversation::ConversationStore` until 17.1b imports
+// from and deletes it.
 pub use dgx::{DgxConfig, DgxFormation, DgxNode, DgxNotConfigured, EndpointKind};
 pub use error::NewtError;
 pub use memory::{
@@ -53,3 +59,4 @@ pub use pricing::{ModelRate, PricingConfig};
 pub use role_profile::{CaveatProfile, RoleProfile, ScopeKeyword, ScopeSpec};
 pub use router::{Router, Tier};
 pub use session::SessionId;
+pub use store::ConversationStore;
