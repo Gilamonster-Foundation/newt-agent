@@ -1,0 +1,27 @@
+# BASELINE SCRATCH HARNESS — NOT part of the newt workspace, NOT wired into CI.
+#
+# This is the B1 (turn-write cost & store size) measurement bin for the
+# context/memory baseline (issue #245, docs/testing/context-memory-benchmark.md).
+# It deliberately avoids adding criterion (or anything else) as a workspace
+# dependency: it is a standalone crate with its own [workspace] table, built
+# ad hoc:
+#
+#   CARGO_TARGET_DIR=$HOME/.cache/newt-bench-target \
+#     cargo run --release --manifest-path docs/testing/results/scripts/b1-store-bench/Cargo.toml
+#
+[package]
+name = "b1-store-bench"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Standalone on purpose — keeps this scratch bin out of `cargo build --workspace`.
+[workspace]
+
+[dependencies]
+newt-core = { path = "../../../../../newt-core" }
+tempfile = "3"
+anyhow = "1"
+
+[profile.release]
+debug = false
