@@ -1550,6 +1550,15 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                     let mut note_sink = ManagerNoteSink {
                         memory: &mut memory,
                     };
+                    // Cross-session recall source (Step 17.5, #246): the
+                    // model's `recall` tool searches this workspace's PAST
+                    // conversations through the same store `/recall` reads —
+                    // minus the conversation we're in (that's what context
+                    // is for).
+                    let recall_source = newt_core::StoreRecallSource::new(
+                        &conversation_store,
+                        &active_conversation_id,
+                    );
                     // Compression summarizer (Step 18.4, #247): rebuilt per
                     // turn so a mid-session `/backend` or model switch takes
                     // effect immediately.
@@ -1593,6 +1602,8 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                                 recover_cw_400: Some(recover_context_window_400),
                                 note_sink: Some(&mut note_sink),
                                 note_nudge: Some(&mut note_nudge),
+                                // Recall over past conversations (Step 17.5).
+                                recall_source: Some(&recall_source),
                                 // Summarize-don't-discard (Step 18.4, #247).
                                 summarizer: Some(&*loop_summarizer),
                                 compress_state: Some(&mut compress_state),
@@ -3449,6 +3460,7 @@ mod run_command_confinement_tests {
             &mut Mcp::empty(),
             None,
             None,
+            None,
         )
         .await;
         assert!(
@@ -3476,6 +3488,7 @@ mod run_command_confinement_tests {
             20,
             &caveats,
             &mut Mcp::empty(),
+            None,
             None,
             None,
         )
@@ -3518,6 +3531,7 @@ mod run_command_confinement_tests {
             &mut Mcp::empty(),
             None,
             None,
+            None,
         )
         .await;
 
@@ -3555,6 +3569,7 @@ mod run_command_confinement_tests {
             &mut Mcp::empty(),
             None,
             None,
+            None,
         )
         .await;
         assert_eq!(out, "hello", "read_file must still return file contents");
@@ -3583,6 +3598,7 @@ mod run_command_confinement_tests {
             20,
             &caveats,
             &mut Mcp::empty(),
+            None,
             None,
             None,
         )
@@ -3620,6 +3636,7 @@ mod run_command_confinement_tests {
             20,
             &caveats,
             &mut Mcp::empty(),
+            None,
             None,
             None,
         )
@@ -4577,6 +4594,7 @@ mod tool_round_cap_tests {
                     recover_cw_400: Some(recover_context_window_400),
                     note_sink: None,
                     note_nudge: None,
+                    recall_source: None,
                     summarizer: None,
                     compress_state: None,
                 },
