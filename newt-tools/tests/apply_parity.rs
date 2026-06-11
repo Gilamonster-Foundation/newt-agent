@@ -88,6 +88,12 @@ fn run_git(dir: &Path, args: &[&str]) {
     Command::new("git")
         .args(args)
         .current_dir(dir)
+        // Same scrub as `git_apply_check` above: under a git hook (the
+        // pre-push gate runs `cargo test`), leaked GIT_DIR/GIT_WORK_TREE
+        // would aim this at the real repo instead of the tempdir.
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
