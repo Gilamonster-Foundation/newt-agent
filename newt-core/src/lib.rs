@@ -36,7 +36,7 @@ pub use agent_mesh_protocol::{Caveats, CountBound, Scope};
 // loop's injected compression summarizer) join the surface.
 pub use agentic::{
     chat_complete, execute_tool, openai_chat_complete, ChatCtx, CompressState, McpTools, NoMcp,
-    NoteNudge, NoteSink, SummarizeFn, SummarizeFuture, Summarizer,
+    NoteNudge, NoteSink, RecallSource, StoreRecallSource, SummarizeFn, SummarizeFuture, Summarizer,
 };
 pub use agents::AgentsProvider;
 pub use caveats::{CaveatsExt, CountBoundExt, ScopeExt};

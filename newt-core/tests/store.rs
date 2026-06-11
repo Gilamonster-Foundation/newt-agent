@@ -1785,3 +1785,71 @@ fn corrupt_identity_pem_falls_back_to_install_nonce() {
         "unparseable key file must fall back to the stable nonce identity"
     );
 }
+
+// =========================================================================
+// Part 4 — 17.5: StoreRecallSource, the `recall` model tool's store backend
+// (workspace-fenced by the store, current conversation excluded).
+// =========================================================================
+
+#[test]
+fn store_recall_source_excludes_the_current_conversation() {
+    use newt_core::{RecallSource as _, StoreRecallSource};
+
+    let root = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let store = ConversationStore::new(root.path(), workspace.path(), 100).unwrap();
+
+    // The conversation the model is "in" — its turns must never come back.
+    let current = store.create("current work", None).unwrap();
+    store
+        .append_turn(&current, "fix the tokio panic", "patched the tokio panic")
+        .unwrap();
+    // A past conversation on the same topic — this is what recall is for.
+    let past = store.create("past work", None).unwrap();
+    store
+        .append_turn(
+            &past,
+            "we hit a tokio panic in retry",
+            "bounded the retries",
+        )
+        .unwrap();
+
+    // The raw store search sees both conversations …
+    let raw = store.search("tokio panic", 10).unwrap();
+    assert!(raw.iter().any(|h| h.conversation_id == current));
+    assert!(raw.iter().any(|h| h.conversation_id == past));
+
+    // … the recall source sees only the past one.
+    let source = StoreRecallSource::new(&store, &current);
+    let hits = source.search("tokio panic", 5).unwrap();
+    assert!(!hits.is_empty(), "the past conversation must match");
+    assert!(
+        hits.iter().all(|h| h.conversation_id == past),
+        "current conversation leaked into recall: {hits:?}"
+    );
+}
+
+#[test]
+fn store_recall_source_truncates_to_limit_after_exclusion() {
+    use newt_core::{RecallSource as _, StoreRecallSource};
+
+    let root = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let store = ConversationStore::new(root.path(), workspace.path(), 100).unwrap();
+
+    let current = store.create("current", None).unwrap();
+    store
+        .append_turn(&current, "fts5 ranking question", "fts5 ranking answer")
+        .unwrap();
+    for i in 0..4 {
+        let id = store.create(&format!("past {i}"), None).unwrap();
+        store
+            .append_turn(&id, &format!("fts5 ranking case {i}"), "noted")
+            .unwrap();
+    }
+
+    let source = StoreRecallSource::new(&store, &current);
+    let hits = source.search("fts5 ranking", 2).unwrap();
+    assert_eq!(hits.len(), 2, "limit applies after exclusion: {hits:?}");
+    assert!(hits.iter().all(|h| h.conversation_id != current));
+}

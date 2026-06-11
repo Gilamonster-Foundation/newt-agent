@@ -5,6 +5,7 @@
 use super::display::{print_denied, print_tool_call, print_tool_output};
 use super::mcp::McpTools;
 use super::note_sink::{execute_save_note, save_note_tool_definition, NoteSink};
+use super::recall::{execute_recall, recall_tool_definition, RecallSource};
 
 pub fn tool_definitions() -> serde_json::Value {
     serde_json::json!([
@@ -129,9 +130,12 @@ pub fn tool_definitions() -> serde_json::Value {
 /// `with_save_note` adds the `save_note` definition (Step 19.3) — true only
 /// when the caller supplied a `NoteSink`, so headless/eval sessions (which
 /// pass `note_sink: None`) never advertise a tool that can't be executed.
+/// `with_recall` gates the `recall` definition (Step 17.5) the same way on
+/// a supplied `RecallSource`.
 pub(crate) fn merged_tool_definitions(
     mcp: &dyn McpTools,
     with_save_note: bool,
+    with_recall: bool,
 ) -> serde_json::Value {
     let mut defs = match tool_definitions() {
         serde_json::Value::Array(a) => a,
@@ -139,6 +143,9 @@ pub(crate) fn merged_tool_definitions(
     };
     if with_save_note {
         defs.push(save_note_tool_definition());
+    }
+    if with_recall {
+        defs.push(recall_tool_definition());
     }
     defs.extend(mcp.tool_defs());
     serde_json::Value::Array(defs)
@@ -178,6 +185,7 @@ pub(crate) fn is_hallucination(tool_name: &str, args: &serde_json::Value) -> boo
             | "use_skill"
             | "web_fetch"
             | "save_note"
+            | "recall"
     )
 }
 
@@ -380,8 +388,9 @@ fn envelope_denial_reason_with_guidance(envelope: &serde_json::Value) -> String 
 /// (`read_file` / `write_file` / `list_dir`) keep enforcing the same `caveats`
 /// via `permits_*` — rerouting them is out of scope.
 ///
-/// `note_sink` backs the `save_note` tool (Step 19.3). `None` ⇒ the tool was
-/// never advertised, so a call here is treated like any unknown tool.
+/// `note_sink` backs the `save_note` tool (Step 19.3) and `recall_source`
+/// the `recall` tool (Step 17.5). `None` ⇒ the tool was never advertised,
+/// so a call here is treated like any unknown tool.
 #[allow(clippy::too_many_arguments)]
 pub async fn execute_tool(
     name: &str,
@@ -393,6 +402,7 @@ pub async fn execute_tool(
     mcp: &mut dyn McpTools,
     build_check_cmd: Option<&str>,
     note_sink: Option<&mut dyn NoteSink>,
+    recall_source: Option<&dyn RecallSource>,
 ) -> String {
     // Remote MCP tools (namespaced `server__tool`) route to their server before
     // the built-in match. They carry no Caveats leash in this build.
@@ -413,6 +423,16 @@ pub async fn execute_tool(
             // Without a sink the tool was never advertised — a call here is
             // a model hallucination; answer like any unknown tool.
             None => "unknown tool: save_note (no note store in this session)".to_string(),
+        },
+
+        // Cross-session recall (Step 17.5): searches PAST conversations via
+        // the caller's RecallSource — workspace-fenced by the store, current
+        // conversation excluded by the source implementation.
+        "recall" => match recall_source {
+            Some(source) => execute_recall(args, source, color, tool_output_lines),
+            // Without a source the tool was never advertised — same
+            // unknown-tool answer as the sink-less save_note path.
+            None => "unknown tool: recall (no conversation store in this session)".to_string(),
         },
 
         "run_command" => {
@@ -766,7 +786,7 @@ mod tests {
 
     #[test]
     fn merged_tool_definitions_with_empty_mcp_is_builtin_set() {
-        let merged = merged_tool_definitions(&NoMcp, false);
+        let merged = merged_tool_definitions(&NoMcp, false, false);
         let names: Vec<&str> = merged
             .as_array()
             .unwrap()
@@ -803,11 +823,35 @@ mod tests {
         let base = tool_definitions();
         assert!(!names(&base).contains(&"save_note"), "got: {base}");
         // … nor in the merged set without a sink …
-        let without = merged_tool_definitions(&NoMcp, false);
+        let without = merged_tool_definitions(&NoMcp, false, false);
         assert!(!names(&without).contains(&"save_note"));
         // … but a sink advertises it.
-        let with = merged_tool_definitions(&NoMcp, true);
+        let with = merged_tool_definitions(&NoMcp, true, false);
         assert!(names(&with).contains(&"save_note"), "got: {with}");
+    }
+
+    /// `recall` is source-gated exactly like `save_note` is sink-gated
+    /// (Step 17.5): absent from the base set and from the merged set
+    /// without a source; present when one exists.
+    #[test]
+    fn recall_advertised_only_with_a_source() {
+        fn names(defs: &serde_json::Value) -> Vec<&str> {
+            defs.as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|d| d["function"]["name"].as_str())
+                .collect()
+        }
+        let base = tool_definitions();
+        assert!(!names(&base).contains(&"recall"), "got: {base}");
+        let without = merged_tool_definitions(&NoMcp, false, false);
+        assert!(!names(&without).contains(&"recall"));
+        let with = merged_tool_definitions(&NoMcp, false, true);
+        assert!(names(&with).contains(&"recall"), "got: {with}");
+        // The two gates are independent: both on advertises both.
+        let both = merged_tool_definitions(&NoMcp, true, true);
+        assert!(names(&both).contains(&"save_note"));
+        assert!(names(&both).contains(&"recall"));
     }
 
     /// `is_hallucination` correctly identifies tool-name-as-command and unknown
@@ -842,6 +886,7 @@ mod tests {
             "use_skill",
             "web_fetch",
             "save_note",
+            "recall",
         ] {
             assert!(!is_hallucination(t, &serde_json::json!({"path": "."})));
         }
@@ -1037,6 +1082,7 @@ mod execute_tool_branch_tests {
             caveats,
             &mut NoMcp,
             build_check,
+            None,
             None,
         )
         .await
@@ -1321,6 +1367,7 @@ mod execute_tool_branch_tests {
             &mut NoMcp,
             None,
             Some(&mut sink),
+            None,
         )
         .await;
         assert_eq!(sink.calls, vec!["add:workspace builds with just check"]);
@@ -1328,5 +1375,58 @@ mod execute_tool_branch_tests {
             out.starts_with("note saved: workspace builds"),
             "got: {out}"
         );
+    }
+
+    // -- recall dispatch through execute_tool (Step 17.5) -------------------
+
+    #[tokio::test]
+    async fn recall_without_source_is_unknown_tool() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let caveats = caveats_rw(ws.path());
+        // run_tool passes recall_source: None — the no-store (headless) shape.
+        let out = run_tool(
+            "recall",
+            serde_json::json!({"query": "tokio panic"}),
+            ws.path(),
+            &caveats,
+            None,
+        )
+        .await;
+        assert!(out.starts_with("unknown tool: recall"), "got: {out}");
+    }
+
+    #[tokio::test]
+    async fn recall_with_source_routes_through_execute_tool() {
+        use crate::agentic::recall::tests::{hit, MockSource};
+        let ws = tempfile::TempDir::new().unwrap();
+        let caveats = caveats_rw(ws.path());
+        let source = MockSource {
+            hits: vec![hit(
+                "123456789012-abcd",
+                "past work",
+                3,
+                ">>>tokio<<< panic",
+            )],
+            ..Default::default()
+        };
+        let out = execute_tool(
+            "recall",
+            &serde_json::json!({"query": "tokio panic"}),
+            &ws.path().to_string_lossy(),
+            false,
+            20,
+            &caveats,
+            &mut NoMcp,
+            None,
+            None,
+            Some(&source),
+        )
+        .await;
+        assert_eq!(
+            *source.calls.lock().unwrap(),
+            vec![("tokio panic".to_string(), 5)]
+        );
+        assert!(out.contains("«tokio» panic"), "got: {out}");
+        assert!(out.contains("past work"), "got: {out}");
     }
 }
