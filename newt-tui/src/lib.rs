@@ -1101,7 +1101,22 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
     // It is re-read (`Config::resolve`) only after a slash command, the one
     // intentional refresh point — config.toml may have changed on disk.
     let mut cfg = newt_core::Config::resolve().unwrap_or_default();
-    let mut conversation_store = conversation_store_for(workspace, &cfg)?;
+    // 17.7: how this session treats conversation persistence, resolved ONCE.
+    // Precedence: --ephemeral > NEWT_CONVERSATION_ID > [conversations] resume.
+    let session_start = resolve_session_start(
+        std::env::var("NEWT_EPHEMERAL").is_ok(),
+        std::env::var("NEWT_CONVERSATION_ID").ok(),
+        cfg.conversations.clone().unwrap_or_default().resume,
+    );
+    let ephemeral_session = session_start == SessionStart::Ephemeral;
+    // Ephemeral sessions get NO store handle at all (17.7): nothing to
+    // create rows, nothing to append turns, nothing to read past
+    // conversations from — the cleanest possible "no persistence" seam.
+    let mut conversation_store: Option<newt_core::ConversationStore> = if ephemeral_session {
+        None
+    } else {
+        Some(conversation_store_for(workspace, &cfg)?)
+    };
     // A session always has a conversation id, assigned up front so the
     // per-session plan path (`.newt/sessions/<id>/plan.md`, issue #220) is
     // stable from the first turn. The durable conversation record adopts this
@@ -1134,8 +1149,14 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
     // must actually reach the user. Shown ONCE, here at session start — the
     // store is re-created after slash commands (config refresh) but only this
     // construction reports it, so the warning never repeats mid-session.
-    if let Some(notice) = wal_fallback_startup_notice(conversation_store.wal_fallback_notice()) {
+    if let Some(notice) = conversation_store
+        .as_ref()
+        .and_then(|store| wal_fallback_startup_notice(store.wal_fallback_notice()))
+    {
         print_newt(&notice, color, verbose);
+    }
+    if ephemeral_session {
+        print_newt(EPHEMERAL_SESSION_NOTICE, color, verbose);
     }
 
     // Connect to discovered MCP servers ONCE for the session (newt config +
@@ -1305,6 +1326,53 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
         &active_conversation_id,
     );
 
+    // 17.7: `/new` opts the SESSION out of auto-resume. Every auto-resume
+    // consult goes through `should_auto_resume`, so an explicit /new is
+    // never undone — today the only resume point is the startup block
+    // below (necessarily before any /new), and the flag keeps that
+    // invariant load-bearing if a later refresh point is ever added.
+    let mut session_opted_fresh = false;
+
+    // 17.7 session-start resume. Both arms go through the SAME restore
+    // implementation `/conversation restore` uses — one restore path.
+    if let Some(store) = conversation_store.as_ref() {
+        let mut resume_ctx = ConversationCommandContext {
+            store,
+            persona_store: &persona_store,
+            workspace,
+            memory: &mut memory,
+            system: &mut system,
+            active_persona: &mut active_persona,
+            active_conversation_id: &mut active_conversation_id,
+            compress_state: &mut compress_state,
+        };
+        match &session_start {
+            // NEWT_CONVERSATION_ID: an explicit override — errors are hard
+            // (silently starting fresh would betray the operator's ask).
+            SessionStart::ResumeExact(id) => {
+                let banner = resume_exact_conversation(&mut resume_ctx, id)?;
+                print_newt(&banner, color, verbose);
+            }
+            // [conversations] resume = true: latest by §6 activity tick.
+            // Failure here degrades to a fresh conversation with a warning
+            // — a corrupt record must not lock the user out of their TUI.
+            SessionStart::ResumeLatest => {
+                if should_auto_resume(&session_start, session_opted_fresh) {
+                    match auto_resume_latest(&mut resume_ctx) {
+                        Ok(Some(banner)) => print_newt(&banner, color, verbose),
+                        Ok(None) => {} // no conversations yet — fresh, silent
+                        Err(e) => print_newt(
+                            &format!("warning: auto-resume failed ({e}) — starting fresh"),
+                            color,
+                            verbose,
+                        ),
+                    }
+                }
+            }
+            SessionStart::Ephemeral | SessionStart::Fresh => {}
+        }
+    }
+
     loop {
         // rustyline can panic (assertion `fd != -1`) when the terminal file
         // descriptor becomes invalid — most commonly from file-descriptor
@@ -1386,6 +1454,7 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                             active_persona.as_ref(),
                             &mut active_conversation_id,
                             &mut compress_state,
+                            &mut session_opted_fresh,
                         );
                         print_newt(&msg, color, verbose);
                         if let Some(ref hp) = history_path {
@@ -1396,19 +1465,24 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                     }
                     let slash_body = task.trim_start_matches('/');
                     if slash_body == "conversation" || slash_body.starts_with("conversation ") {
-                        let mut conversation_ctx = ConversationCommandContext {
-                            store: &conversation_store,
-                            persona_store: &persona_store,
-                            workspace,
-                            memory: &mut memory,
-                            system: &mut system,
-                            active_persona: &mut active_persona,
-                            active_conversation_id: &mut active_conversation_id,
-                            compress_state: &mut compress_state,
-                        };
-                        match handle_conversation_command(&task, &mut conversation_ctx) {
-                            Ok(msg) => print_newt(&msg, color, verbose),
-                            Err(e) => print_newt(&format!("error: {e}"), color, verbose),
+                        match conversation_store.as_ref() {
+                            Some(store) => {
+                                let mut conversation_ctx = ConversationCommandContext {
+                                    store,
+                                    persona_store: &persona_store,
+                                    workspace,
+                                    memory: &mut memory,
+                                    system: &mut system,
+                                    active_persona: &mut active_persona,
+                                    active_conversation_id: &mut active_conversation_id,
+                                    compress_state: &mut compress_state,
+                                };
+                                match handle_conversation_command(&task, &mut conversation_ctx) {
+                                    Ok(msg) => print_newt(&msg, color, verbose),
+                                    Err(e) => print_newt(&format!("error: {e}"), color, verbose),
+                                }
+                            }
+                            None => print_newt(EPHEMERAL_SESSION_NOTICE, color, verbose),
                         }
                         if let Some(ref hp) = history_path {
                             let _ = rl.save_history(hp);
@@ -1417,9 +1491,12 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                         continue;
                     }
                     if slash_body == "recall" || slash_body.starts_with("recall ") {
-                        match handle_recall_command(&task, &conversation_store) {
-                            Ok(msg) => print_newt(&msg, color, verbose),
-                            Err(e) => print_newt(&format!("error: {e}"), color, verbose),
+                        match conversation_store.as_ref() {
+                            Some(store) => match handle_recall_command(&task, store) {
+                                Ok(msg) => print_newt(&msg, color, verbose),
+                                Err(e) => print_newt(&format!("error: {e}"), color, verbose),
+                            },
+                            None => print_newt(EPHEMERAL_SESSION_NOTICE, color, verbose),
                         }
                         if let Some(ref hp) = history_path {
                             let _ = rl.save_history(hp);
@@ -1465,7 +1542,11 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                     // Permissions can only NARROW within a session; a widening
                     // request is clamped (restart to widen — see SessionCapability).
                     cfg = newt_core::Config::resolve().unwrap_or_default();
-                    conversation_store = conversation_store_for(workspace, &cfg)?;
+                    // Ephemeral is a session-wide decision (17.7): a config
+                    // refresh never re-grows a store handle mid-session.
+                    if !ephemeral_session {
+                        conversation_store = Some(conversation_store_for(workspace, &cfg)?);
+                    }
                     choice = resolve_backend_choice(&cfg);
                     inf_url = choice.url.clone();
                     inf_model = choice.model.clone();
@@ -1554,11 +1635,12 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                     // model's `recall` tool searches this workspace's PAST
                     // conversations through the same store `/recall` reads —
                     // minus the conversation we're in (that's what context
-                    // is for).
-                    let recall_source = newt_core::StoreRecallSource::new(
-                        &conversation_store,
-                        &active_conversation_id,
-                    );
+                    // is for). `None` in an ephemeral session (17.7): no
+                    // store handle means no reads either, so ambient
+                    // conversations can never leak into an ephemeral run.
+                    let recall_source = conversation_store.as_ref().map(|store| {
+                        newt_core::StoreRecallSource::new(store, &active_conversation_id)
+                    });
                     // Compression summarizer (Step 18.4, #247): rebuilt per
                     // turn so a mid-session `/backend` or model switch takes
                     // effect immediately.
@@ -1607,7 +1689,9 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                                 note_sink: Some(&mut note_sink),
                                 note_nudge: Some(&mut note_nudge),
                                 // Recall over past conversations (Step 17.5).
-                                recall_source: Some(&recall_source),
+                                recall_source: recall_source
+                                    .as_ref()
+                                    .map(|source| source as &dyn newt_core::RecallSource),
                                 // Summarize-don't-discard (Step 18.4, #247).
                                 summarizer: Some(&*loop_summarizer),
                                 compress_state: Some(&mut compress_state),
@@ -1638,8 +1722,8 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                             tokio::task::block_in_place(|| {
                                 rt.block_on(memory.sync_all(&task, &reply, &metrics));
                             });
-                            if let Err(e) = save_successful_conversation_turn(
-                                &conversation_store,
+                            if let Err(e) = save_turn_if_persistent(
+                                conversation_store.as_ref(),
                                 &active_conversation_id,
                                 active_persona.as_ref(),
                                 &task,
@@ -2253,6 +2337,7 @@ fn handle_new_conversation(
     active_persona: Option<&Persona>,
     conversation_id: &mut String,
     compress_state: &mut newt_core::CompressState,
+    session_opted_fresh: &mut bool,
 ) -> String {
     // A new conversation gets a fresh id, which rotates the per-session plan
     // path to a new `.newt/sessions/<id>/` dir (issue #220).
@@ -2260,8 +2345,73 @@ fn handle_new_conversation(
     // Re-arm compression anti-thrash (F4): the disable notice promises
     // "start a new conversation to reset" — this is what makes that true.
     compress_state.reset();
+    // 17.7: an explicit /new opts this session out of auto-resume for good
+    // (`should_auto_resume` consults the flag) — resume never undoes /new.
+    *session_opted_fresh = true;
     reset_conversation(workspace, memory, system, active_persona, conversation_id);
     new_conversation_message(active_persona)
+}
+
+// ---------------------------------------------------------------------------
+// Session-start conversation resolution (Step 17.7, issue #246)
+// ---------------------------------------------------------------------------
+
+/// What `/conversation` and `/recall` answer in an ephemeral session, and the
+/// one-time startup notice — same wording so the mode is unmistakable.
+const EPHEMERAL_SESSION_NOTICE: &str =
+    "ephemeral session — conversation persistence is off (nothing saved, nothing resumed)";
+
+/// How this session treats conversation persistence. Resolved ONCE at
+/// session start by [`resolve_session_start`]; precedence:
+/// `--ephemeral`/`NEWT_EPHEMERAL` > `NEWT_CONVERSATION_ID` >
+/// `[conversations] resume` (default true; `resume = false` is the
+/// off-switch).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SessionStart {
+    /// No persistence at all: no store handle is constructed, so no
+    /// conversation row can be created, no turn appended, and no past
+    /// conversation read.
+    Ephemeral,
+    /// Resume exactly this conversation id (`NEWT_CONVERSATION_ID`). The id
+    /// must exist in THIS workspace — the 17.1b workspace fence applies.
+    ResumeExact(String),
+    /// Auto-resume the workspace's most recently active conversation —
+    /// highest §6 activity tick, never a timestamp comparison.
+    ResumeLatest,
+    /// Persist turns as usual, but start a fresh conversation
+    /// (`[conversations] resume = false`).
+    Fresh,
+}
+
+/// Pure precedence chain (17.7): ephemeral wins outright, then an explicit
+/// conversation id, then the config default. A blank `NEWT_CONVERSATION_ID`
+/// reads as unset rather than as an id that can never exist.
+fn resolve_session_start(
+    ephemeral: bool,
+    forced_id: Option<String>,
+    resume_config: bool,
+) -> SessionStart {
+    if ephemeral {
+        return SessionStart::Ephemeral;
+    }
+    if let Some(id) = forced_id {
+        let id = id.trim().to_string();
+        if !id.is_empty() {
+            return SessionStart::ResumeExact(id);
+        }
+    }
+    if resume_config {
+        SessionStart::ResumeLatest
+    } else {
+        SessionStart::Fresh
+    }
+}
+
+/// The single gate every auto-resume consult goes through: config-driven
+/// resume happens only when the session has NOT explicitly opted fresh via
+/// `/new` — auto-resume never undoes an explicit /new (17.7).
+fn should_auto_resume(start: &SessionStart, session_opted_fresh: bool) -> bool {
+    matches!(start, SessionStart::ResumeLatest) && !session_opted_fresh
 }
 
 fn conversation_root_dir() -> std::path::PathBuf {
@@ -2330,6 +2480,32 @@ fn save_successful_conversation_turn(
         usage.map(|u| u.input_tokens),
         usage.map(|u| u.output_tokens),
     )
+}
+
+/// The run loop's per-turn save seam (17.7): persistent sessions route to
+/// [`save_successful_conversation_turn`]; an ephemeral session has no store
+/// (`None`) and this is a no-op — no row created, no turn appended, no error.
+fn save_turn_if_persistent(
+    store: Option<&newt_core::ConversationStore>,
+    conversation_id: &str,
+    active_persona: Option<&Persona>,
+    task: &str,
+    reply: &str,
+    events: &[newt_core::ToolEvent],
+    usage: Option<newt_core::TokenUsage>,
+) -> anyhow::Result<()> {
+    match store {
+        Some(store) => save_successful_conversation_turn(
+            store,
+            conversation_id,
+            active_persona,
+            task,
+            reply,
+            events,
+            usage,
+        ),
+        None => Ok(()),
+    }
 }
 
 fn conversation_list_message(store: &newt_core::ConversationStore) -> anyhow::Result<String> {
@@ -2401,33 +2577,7 @@ fn handle_conversation_command(
             Ok(conversation_show_message(&record))
         }
         ConversationCommand::Restore(id) => {
-            let record = ctx.store.load(&id)?;
-            ctx.memory.restore_turns(&record.turns);
-            let mut warning = None;
-            match record.persona.as_deref() {
-                Some(name) => match ctx.persona_store.load(name) {
-                    Ok(persona) => *ctx.active_persona = Some(persona),
-                    Err(e) => {
-                        *ctx.active_persona = None;
-                        warning = Some(format!("persona `{name}` unavailable: {e}"));
-                    }
-                },
-                None => *ctx.active_persona = None,
-            }
-            // A restore is a conversation boundary: re-arm compression
-            // anti-thrash exactly like /new does (F4).
-            ctx.compress_state.reset();
-            // Adopt the restored conversation's id BEFORE rebuilding so the
-            // system prompt names that conversation's plan file (issue #220):
-            // resuming a conversation resumes its plan.
-            *ctx.active_conversation_id = record.id.clone();
-            *ctx.system = rebuild_system_prompt(
-                ctx.workspace,
-                ctx.memory,
-                ctx.active_persona.as_ref(),
-                ctx.active_conversation_id,
-            );
-
+            let (record, warning) = restore_conversation_into_session(ctx, &id)?;
             let mut message = format!(
                 "Restored conversation `{}` ({} turns).",
                 record.title,
@@ -2452,6 +2602,104 @@ fn handle_conversation_command(
             Ok(format!("Deleted conversation `{resolved_id}`."))
         }
     }
+}
+
+/// THE restore implementation — `/conversation restore`, startup auto-resume
+/// (17.7), and the `NEWT_CONVERSATION_ID` override all run through here, so
+/// there is exactly one way a stored conversation becomes the live session:
+/// history turns replace the session history, the saved persona is restored
+/// (cleared with a warning when unavailable), compression anti-thrash
+/// re-arms (a restore is a conversation boundary like `/new`, F4), and the
+/// conversation's id is adopted BEFORE the system prompt rebuild so the
+/// prompt names that conversation's plan file (issue #220) — resuming a
+/// conversation resumes its plan.
+fn restore_conversation_into_session(
+    ctx: &mut ConversationCommandContext<'_>,
+    id: &str,
+) -> anyhow::Result<(newt_core::ConversationRecord, Option<String>)> {
+    let record = ctx.store.load(id)?;
+    ctx.memory.restore_turns(&record.turns);
+    let mut warning = None;
+    match record.persona.as_deref() {
+        Some(name) => match ctx.persona_store.load(name) {
+            Ok(persona) => *ctx.active_persona = Some(persona),
+            Err(e) => {
+                *ctx.active_persona = None;
+                warning = Some(format!("persona `{name}` unavailable: {e}"));
+            }
+        },
+        None => *ctx.active_persona = None,
+    }
+    ctx.compress_state.reset();
+    *ctx.active_conversation_id = record.id.clone();
+    *ctx.system = rebuild_system_prompt(
+        ctx.workspace,
+        ctx.memory,
+        ctx.active_persona.as_ref(),
+        ctx.active_conversation_id,
+    );
+    Ok((record, warning))
+}
+
+/// Resume `id` into the session and return the 17.7 resume banner.
+fn resume_session_conversation(
+    ctx: &mut ConversationCommandContext<'_>,
+    id: &str,
+) -> anyhow::Result<String> {
+    let (record, warning) = restore_conversation_into_session(ctx, id)?;
+    let title = recall_display_title(ctx.store, &record.id, &record.title);
+    Ok(auto_resume_banner(&record, &title, warning.as_deref()))
+}
+
+/// Auto-resume this workspace's most recently active conversation: highest
+/// §6 activity tick — `list()` is tick-ascending, so its LAST entry; never
+/// a timestamp comparison. `Ok(None)` when the workspace has no saved
+/// conversations yet (fresh start, no banner).
+fn auto_resume_latest(ctx: &mut ConversationCommandContext<'_>) -> anyhow::Result<Option<String>> {
+    let Some(latest) = ctx.store.list()?.pop() else {
+        return Ok(None);
+    };
+    resume_session_conversation(ctx, &latest.id).map(Some)
+}
+
+/// `NEWT_CONVERSATION_ID` exact resume (17.7). Exact means exact: no prefix
+/// resolution, and the id must belong to THIS workspace — `exists()` is
+/// workspace-fenced (17.1b), so a foreign workspace's conversation reads as
+/// absent here and can neither be inspected nor resumed across the fence.
+fn resume_exact_conversation(
+    ctx: &mut ConversationCommandContext<'_>,
+    id: &str,
+) -> anyhow::Result<String> {
+    if !ctx.store.exists(id)? {
+        anyhow::bail!(
+            "NEWT_CONVERSATION_ID: conversation `{id}` does not exist in this \
+             workspace (the workspace fence applies — a conversation belonging \
+             to another workspace cannot be resumed here)"
+        );
+    }
+    resume_session_conversation(ctx, id)
+}
+
+/// The 17.7 resume banner, printed through the startup notice path. The
+/// wall-clock "last active" renders as a display *claim* (`~`-prefixed,
+/// the 17.4 convention) — ordering came from the activity tick, never from
+/// this timestamp (§6).
+fn auto_resume_banner(
+    record: &newt_core::ConversationRecord,
+    display_title: &str,
+    warning: Option<&str>,
+) -> String {
+    let mut banner = format!(
+        "resumed conversation {}  {}  ({} turns, last active ~{}) — /new starts fresh",
+        short_conversation_id(&record.id),
+        display_title,
+        record.turns.len(),
+        claim_timestamp(record.updated_at_unix_nanos),
+    );
+    if let Some(warning) = warning {
+        banner.push_str(&format!("\nwarning: {warning}"));
+    }
+    banner
 }
 
 // ---------------------------------------------------------------------------
@@ -4129,6 +4377,7 @@ mod skills_integration_tests {
         let mut compress_state = newt_core::CompressState::new();
         compress_state.latch_disabled_for_tests();
 
+        let mut session_opted_fresh = false;
         let message = handle_new_conversation(
             workspace,
             &mut memory,
@@ -4136,11 +4385,18 @@ mod skills_integration_tests {
             active_persona.as_ref(),
             &mut active_conversation_id,
             &mut compress_state,
+            &mut session_opted_fresh,
         );
 
         assert!(
             !compress_state.is_disabled(),
             "/new must reset compression anti-thrash (F4)"
+        );
+        // 17.7: /new opts the session out of auto-resume — for good.
+        assert!(session_opted_fresh, "/new must set the session fresh flag");
+        assert!(
+            !should_auto_resume(&SessionStart::ResumeLatest, session_opted_fresh),
+            "auto-resume must never undo an explicit /new"
         );
         assert_eq!(message, "Started a new conversation with persona `terse`.");
         assert!(system.contains("Active persona: terse"));
@@ -4527,6 +4783,303 @@ mod skills_integration_tests {
         assert!(!messages.iter().any(|m| m.content == "old task"));
         assert!(messages.iter().any(|m| m.content == "saved task"));
         assert!(messages.iter().any(|m| m.content == "saved reply"));
+    }
+
+    // -- 17.7: auto-resume, --ephemeral, NEWT_CONVERSATION_ID (#246) ---------
+
+    #[test]
+    fn session_start_precedence_chain() {
+        // --ephemeral beats everything, including an explicit id.
+        assert_eq!(
+            resolve_session_start(true, Some("some-id".into()), true),
+            SessionStart::Ephemeral
+        );
+        // NEWT_CONVERSATION_ID beats the config key — on either setting.
+        assert_eq!(
+            resolve_session_start(false, Some("some-id".into()), true),
+            SessionStart::ResumeExact("some-id".into())
+        );
+        assert_eq!(
+            resolve_session_start(false, Some(" some-id ".into()), false),
+            SessionStart::ResumeExact("some-id".into())
+        );
+        // A blank env var reads as unset, not as an impossible id.
+        assert_eq!(
+            resolve_session_start(false, Some("   ".into()), true),
+            SessionStart::ResumeLatest
+        );
+        // [conversations] resume decides the rest: on → latest, off → fresh.
+        assert_eq!(
+            resolve_session_start(false, None, true),
+            SessionStart::ResumeLatest
+        );
+        assert_eq!(
+            resolve_session_start(false, None, false),
+            SessionStart::Fresh
+        );
+    }
+
+    #[test]
+    fn should_auto_resume_only_for_latest_and_never_after_new() {
+        // Config off / ephemeral / exact-id sessions never auto-resume.
+        assert!(should_auto_resume(&SessionStart::ResumeLatest, false));
+        assert!(!should_auto_resume(&SessionStart::Fresh, false));
+        assert!(!should_auto_resume(&SessionStart::Ephemeral, false));
+        assert!(!should_auto_resume(
+            &SessionStart::ResumeExact("id".into()),
+            false
+        ));
+        // /new opts the session out — auto-resume never undoes it.
+        assert!(!should_auto_resume(&SessionStart::ResumeLatest, true));
+    }
+
+    /// Everything a resume needs, on temp dirs — the borrow-heavy parts stay
+    /// in each test (ConversationCommandContext borrows them all mutably).
+    fn resume_fixture() -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        newt_core::ConversationStore,
+        PersonaStore,
+    ) {
+        let state = tempfile::TempDir::new().unwrap();
+        let workspace = tempfile::TempDir::new().unwrap();
+        let store = newt_core::ConversationStore::new(state.path(), workspace.path(), 100).unwrap();
+        let persona_dir = state.path().join("personas");
+        fs::create_dir_all(&persona_dir).unwrap();
+        (state, workspace, store, PersonaStore::new(persona_dir))
+    }
+
+    #[tokio::test]
+    async fn auto_resume_picks_latest_by_activity_tick_not_insertion_order() {
+        let (_state, workspace, store, persona_store) = resume_fixture();
+        // Two conversations; then the OLDER one gets a new turn, giving it
+        // the highest §6 activity tick. Insertion order would pick `newer`;
+        // the tick must pick `older`.
+        let older = store.create("Older task", None).unwrap();
+        store
+            .append_turn(&older, "older question", "older answer")
+            .unwrap();
+        let newer = store.create("Newer task", None).unwrap();
+        store
+            .append_turn(&newer, "newer question", "newer answer")
+            .unwrap();
+        store
+            .append_turn(&older, "older follow-up", "older again")
+            .unwrap();
+
+        let mut memory = newt_core::MemoryManager::new();
+        memory.add_provider(newt_core::RollingWindow::new(5));
+        let workspace_str = workspace.path().to_str().unwrap().to_string();
+        let mut system = rebuild_system_prompt(&workspace_str, &memory, None, "fresh-session");
+        let mut active_persona = None;
+        let mut active_conversation_id = newt_core::new_conversation_id();
+        let mut compress_state = newt_core::CompressState::new();
+        let mut ctx = ConversationCommandContext {
+            store: &store,
+            persona_store: &persona_store,
+            workspace: &workspace_str,
+            memory: &mut memory,
+            system: &mut system,
+            active_persona: &mut active_persona,
+            active_conversation_id: &mut active_conversation_id,
+            compress_state: &mut compress_state,
+        };
+
+        let banner = auto_resume_latest(&mut ctx).unwrap().expect("a banner");
+
+        assert_eq!(
+            active_conversation_id, older,
+            "latest = highest activity tick, never insertion order"
+        );
+        assert!(
+            banner.contains(short_conversation_id(&older)),
+            "got: {banner}"
+        );
+        assert!(banner.contains("Older task"), "got: {banner}");
+        assert!(banner.contains("(2 turns, last active ~"), "got: {banner}");
+        assert!(banner.ends_with("— /new starts fresh"), "got: {banner}");
+        // The resumed turns are the live session history now.
+        let messages = memory.build_messages(&system, "next");
+        assert!(messages.iter().any(|m| m.content == "older follow-up"));
+        assert!(!messages.iter().any(|m| m.content == "newer question"));
+    }
+
+    #[test]
+    fn auto_resume_empty_workspace_is_silent_fresh_start() {
+        let (_state, workspace, store, persona_store) = resume_fixture();
+        let mut memory = newt_core::MemoryManager::new();
+        memory.add_provider(newt_core::RollingWindow::new(5));
+        let workspace_str = workspace.path().to_str().unwrap().to_string();
+        let mut system = String::new();
+        let mut active_persona = None;
+        let mut active_conversation_id = newt_core::new_conversation_id();
+        let fresh_id = active_conversation_id.clone();
+        let mut compress_state = newt_core::CompressState::new();
+        let mut ctx = ConversationCommandContext {
+            store: &store,
+            persona_store: &persona_store,
+            workspace: &workspace_str,
+            memory: &mut memory,
+            system: &mut system,
+            active_persona: &mut active_persona,
+            active_conversation_id: &mut active_conversation_id,
+            compress_state: &mut compress_state,
+        };
+
+        assert_eq!(auto_resume_latest(&mut ctx).unwrap(), None);
+        assert_eq!(active_conversation_id, fresh_id, "fresh id untouched");
+    }
+
+    #[tokio::test]
+    async fn resume_exact_restores_that_conversation() {
+        let (_state, workspace, store, persona_store) = resume_fixture();
+        let target = store.create("Target work", None).unwrap();
+        store
+            .append_turn(&target, "target task", "target reply")
+            .unwrap();
+        // A more recently active conversation that exact-resume must ignore.
+        let other = store.create("Other work", None).unwrap();
+        store
+            .append_turn(&other, "other task", "other reply")
+            .unwrap();
+
+        let mut memory = newt_core::MemoryManager::new();
+        memory.add_provider(newt_core::RollingWindow::new(5));
+        let workspace_str = workspace.path().to_str().unwrap().to_string();
+        let mut system = rebuild_system_prompt(&workspace_str, &memory, None, "fresh-session");
+        let mut active_persona = None;
+        let mut active_conversation_id = newt_core::new_conversation_id();
+        let mut compress_state = newt_core::CompressState::new();
+        let mut ctx = ConversationCommandContext {
+            store: &store,
+            persona_store: &persona_store,
+            workspace: &workspace_str,
+            memory: &mut memory,
+            system: &mut system,
+            active_persona: &mut active_persona,
+            active_conversation_id: &mut active_conversation_id,
+            compress_state: &mut compress_state,
+        };
+
+        let banner = resume_exact_conversation(&mut ctx, &target).unwrap();
+
+        assert_eq!(active_conversation_id, target);
+        assert!(banner.contains("Target work"), "got: {banner}");
+        let messages = memory.build_messages(&system, "next");
+        assert!(messages.iter().any(|m| m.content == "target task"));
+        assert!(!messages.iter().any(|m| m.content == "other task"));
+    }
+
+    #[test]
+    fn resume_exact_errors_on_missing_and_foreign_workspace_ids() {
+        let (state, workspace, store, persona_store) = resume_fixture();
+        // A conversation that belongs to ANOTHER workspace on the same store
+        // root — the 17.1b fence must keep it invisible here.
+        let foreign_workspace = tempfile::TempDir::new().unwrap();
+        let foreign_store =
+            newt_core::ConversationStore::new(state.path(), foreign_workspace.path(), 100).unwrap();
+        let foreign_id = foreign_store.create("Foreign work", None).unwrap();
+        foreign_store
+            .append_turn(&foreign_id, "theirs", "not ours")
+            .unwrap();
+
+        let mut memory = newt_core::MemoryManager::new();
+        memory.add_provider(newt_core::RollingWindow::new(5));
+        let workspace_str = workspace.path().to_str().unwrap().to_string();
+        let mut system = String::new();
+        let mut active_persona = None;
+        let mut active_conversation_id = newt_core::new_conversation_id();
+        let mut compress_state = newt_core::CompressState::new();
+        let mut ctx = ConversationCommandContext {
+            store: &store,
+            persona_store: &persona_store,
+            workspace: &workspace_str,
+            memory: &mut memory,
+            system: &mut system,
+            active_persona: &mut active_persona,
+            active_conversation_id: &mut active_conversation_id,
+            compress_state: &mut compress_state,
+        };
+
+        for id in [newt_core::new_conversation_id(), foreign_id] {
+            let err = resume_exact_conversation(&mut ctx, &id).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("does not exist in this workspace"),
+                "got: {msg}"
+            );
+            assert!(msg.contains("workspace fence"), "got: {msg}");
+        }
+        // Nothing leaked into the session from the failed resumes.
+        let messages = memory.build_messages(&system, "next");
+        assert!(!messages.iter().any(|m| m.content == "theirs"));
+    }
+
+    #[test]
+    fn auto_resume_banner_renders_claims_and_fresh_hint() {
+        let record = newt_core::ConversationRecord {
+            id: "1781136000000000000-abcd".into(),
+            title: "Fix the parser".into(),
+            workspace: "/ws".into(),
+            workspace_id: "key".into(),
+            persona: None,
+            turns: Vec::new(),
+            created_at_unix_nanos: 0,
+            // 2026-06-11 00:00:00 UTC in nanos — must render ~-prefixed (§6:
+            // a display claim, never the ordering key).
+            updated_at_unix_nanos: 1_781_136_000 * 1_000_000_000,
+        };
+        let banner = auto_resume_banner(&record, "Fix the parser", None);
+        assert_eq!(
+            banner,
+            "resumed conversation 178113600000  Fix the parser  \
+             (0 turns, last active ~2026-06-11 00:00 UTC) — /new starts fresh"
+        );
+        // A persona warning rides the banner rather than vanishing.
+        let with_warning = auto_resume_banner(&record, "Fix the parser", Some("persona gone"));
+        assert!(with_warning.ends_with("\nwarning: persona gone"));
+    }
+
+    #[test]
+    fn ephemeral_session_saves_nothing() {
+        let (_state, _workspace, store, _persona_store) = resume_fixture();
+        // The ephemeral arm of the save seam: no store handle → no row, no
+        // turn, no error — asserted against a real store on the same root.
+        save_turn_if_persistent(
+            None,
+            &newt_core::new_conversation_id(),
+            None,
+            "ephemeral task",
+            "ephemeral reply",
+            &[],
+            None,
+        )
+        .unwrap();
+        assert!(
+            store.list().unwrap().is_empty(),
+            "--ephemeral must leave zero conversation rows"
+        );
+        // The persistent arm still writes (the seam routes, never drops).
+        let id = newt_core::new_conversation_id();
+        save_turn_if_persistent(
+            Some(&store),
+            &id,
+            None,
+            "kept task",
+            "kept reply",
+            &[],
+            None,
+        )
+        .unwrap();
+        assert_eq!(store.list().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn ephemeral_notice_names_both_halves() {
+        // The notice doubles as the /conversation + /recall answer in an
+        // ephemeral session: it must say nothing is saved AND nothing resumed.
+        assert!(EPHEMERAL_SESSION_NOTICE.contains("nothing saved"));
+        assert!(EPHEMERAL_SESSION_NOTICE.contains("nothing resumed"));
     }
 }
 
