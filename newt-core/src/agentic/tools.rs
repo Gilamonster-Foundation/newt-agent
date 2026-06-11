@@ -767,6 +767,20 @@ pub async fn execute_tool(
     }
 }
 
+/// Classify an [`execute_tool`] result string as success or failure for the
+/// turn's recorded tool events (Step 17.6, #246). Best-effort by necessity —
+/// tool results are plain strings fed back to the model — so this mirrors
+/// the failure prefixes this module (and `McpTools::call`) actually emit:
+/// `error:`, `capability denied:`, and `unknown tool`. A successful
+/// `run_command` whose *output* happens to start with one of these is
+/// misclassified; the recorded event is an outcome claim, not a gate.
+pub(crate) fn tool_result_ok(result: &str) -> bool {
+    let r = result.trim_start();
+    !(r.starts_with("error:")
+        || r.starts_with("capability denied:")
+        || r.starts_with("unknown tool"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

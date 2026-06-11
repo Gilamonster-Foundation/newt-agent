@@ -1572,6 +1572,10 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                         // at Ollama's default window (F5).
                         eff_num_ctx,
                     );
+                    // Per-turn tool-event recorder (Step 17.6, #246): the
+                    // loop pushes one event per tool call; the save site
+                    // persists them into the turn's `events` column.
+                    let mut turn_tool_events: Vec<newt_core::ToolEvent> = Vec::new();
                     let response = tokio::task::block_in_place(|| {
                         rt.block_on(chat_complete(
                             ChatCtx {
@@ -1607,6 +1611,7 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                                 // Summarize-don't-discard (Step 18.4, #247).
                                 summarizer: Some(&*loop_summarizer),
                                 compress_state: Some(&mut compress_state),
+                                tool_events: Some(&mut turn_tool_events),
                             },
                             &mut mcp,
                         ))
@@ -1639,6 +1644,12 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                                 active_persona.as_ref(),
                                 &task,
                                 &reply,
+                                // 17.6: the turn's recorded tool events plus the
+                                // backend-reported token actuals (None when the
+                                // backend reported nothing — stored as NULL,
+                                // never an estimate).
+                                &turn_tool_events,
+                                usage,
                             ) {
                                 print_newt(
                                     &format!("warning: conversation save failed: {e}"),
@@ -2293,6 +2304,8 @@ fn save_successful_conversation_turn(
     active_persona: Option<&Persona>,
     task: &str,
     reply: &str,
+    events: &[newt_core::ToolEvent],
+    usage: Option<newt_core::TokenUsage>,
 ) -> anyhow::Result<()> {
     // The id is pre-assigned for the whole session (issue #220), so the first
     // turn creates the record with that id; later turns just append.
@@ -2305,7 +2318,18 @@ fn save_successful_conversation_turn(
             active_persona.map(|p| p.name.as_str()),
         )?;
     }
-    store.append_turn(conversation_id, task, reply)
+    // 17.6: persist the turn's tool events and the backend-reported token
+    // actuals. `usage` is what `chat_complete` returned — input = largest
+    // single prompt of the turn, output = sum across rounds (Step 18.1
+    // semantics); `None` (backend reported nothing) is stored as NULL.
+    store.append_turn_full(
+        conversation_id,
+        task,
+        reply,
+        events,
+        usage.map(|u| u.input_tokens),
+        usage.map(|u| u.output_tokens),
+    )
 }
 
 fn conversation_list_message(store: &newt_core::ConversationStore) -> anyhow::Result<String> {
@@ -4397,20 +4421,35 @@ mod skills_integration_tests {
             tmp.path().join("personas").join("coder.md"),
         ));
 
+        // First turn: no tool activity, backend reported usage (17.6).
         save_successful_conversation_turn(
             &store,
             &active_id,
             persona.as_ref(),
             "first task",
             "first reply",
+            &[],
+            Some(newt_core::TokenUsage {
+                input_tokens: 120,
+                output_tokens: 45,
+            }),
         )
         .unwrap();
+        // Second turn: a recorded tool event, no usage (backend silent).
+        let events = vec![newt_core::ToolEvent::from_call(
+            "read_file",
+            &serde_json::json!({"path": "src/lib.rs"}),
+            true,
+            Some(3),
+        )];
         save_successful_conversation_turn(
             &store,
             &active_id,
             persona.as_ref(),
             "second task",
             "second reply",
+            &events,
+            None,
         )
         .unwrap();
 
@@ -4420,6 +4459,12 @@ mod skills_integration_tests {
         assert_eq!(record.title, "first task");
         assert_eq!(record.persona.as_deref(), Some("coder"));
         assert_eq!(record.turns.len(), 2);
+        // 17.6: token actuals and tool events ride the same save path.
+        assert_eq!(record.turns[0].tokens_in, Some(120));
+        assert_eq!(record.turns[0].tokens_out, Some(45));
+        assert!(record.turns[0].events.is_empty());
+        assert_eq!(record.turns[1].tokens_in, None, "no report → NULL, never 0");
+        assert_eq!(record.turns[1].events, events);
     }
 
     #[tokio::test]
@@ -4597,6 +4642,7 @@ mod tool_round_cap_tests {
                     recall_source: None,
                     summarizer: None,
                     compress_state: None,
+                    tool_events: None,
                 },
                 &mut Mcp::empty(),
             )
