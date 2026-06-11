@@ -1,0 +1,29 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "newt-provider-openai"
+description = "Opt-in OpenAI provider plugin for Newt-Agent"
+requires-python = ">=3.9"
+license = { text = "Apache-2.0" }
+authors = [
+    { name = "Shawn Hartsock", email = "hartsock@users.noreply.github.com" },
+]
+keywords = ["newt", "openai", "provider", "llm", "agent"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Rust",
+    "Topic :: Software Development :: Libraries :: Application Frameworks",
+]
+dynamic = ["version"]
+
+[project.urls]
+Homepage = "https://github.com/Gilamonster-Foundation/newt-agent"
+Repository = "https://github.com/Gilamonster-Foundation/newt-agent"
+
+[tool.maturin]
+manifest-path = "Cargo.toml"
+bindings = "bin"
