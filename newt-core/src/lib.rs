@@ -32,9 +32,11 @@ pub mod pyo3_module;
 
 pub use agent_mesh_protocol::{Caveats, CountBound, Scope};
 // Step 9.7: clean top-level import paths for the relocated agentic loop.
+// Step 18.4 (#247): CompressState (session anti-thrash) + Summarizer (the
+// loop's injected compression summarizer) join the surface.
 pub use agentic::{
-    chat_complete, execute_tool, openai_chat_complete, ChatCtx, McpTools, NoMcp, NoteNudge,
-    NoteSink,
+    chat_complete, execute_tool, openai_chat_complete, ChatCtx, CompressState, McpTools, NoMcp,
+    NoteNudge, NoteSink, SummarizeFn, SummarizeFuture, Summarizer,
 };
 pub use agents::AgentsProvider;
 pub use caveats::{CaveatsExt, CountBoundExt, ScopeExt};
