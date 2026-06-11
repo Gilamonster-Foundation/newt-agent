@@ -21,6 +21,23 @@ toml.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 
+# Step 9.7: the agentic loop (`agentic` module) moved here from `newt-tui`
+# so the same loop can serve the TUI and the ACP worker (Step 9.8). The
+# loop's dependency closure comes with it:
+#  - reqwest/tokio/chrono — the HTTP loop itself (and `retry`, also moved
+#    here from `newt-inference` to break a would-be dependency cycle),
+#  - crossterm — the inline progress the loop prints (tool calls, retries,
+#    trim notices); headless callers run with `color: false`,
+#  - newt-skills — the `use_skill` tool body loader,
+#  - agent-bridle — the Caveats-confined `shell` / `web_fetch` tools that
+#    `execute_tool` routes `run_command` / `web_fetch` through.
+chrono.workspace = true
+crossterm.workspace = true
+newt-skills.workspace = true
+reqwest.workspace = true
+tokio.workspace = true
+agent-bridle = { version = "0.1", features = ["shell", "web"] }
+
 # Issue #95: the `Caveats` / `CountBound` / `Scope` types are re-exported
 # straight from the published `agent-mesh-protocol` crate (registry pin,
 # not the path dep that keeps newt-mesh out of the default workspace).
@@ -48,6 +65,9 @@ pyo3 = ["dep:pyo3"]
 [dev-dependencies]
 tempfile = "3"
 tokio = { workspace = true }
+# HTTP mocking for the agentic-loop tests that moved here with the loop
+# (Step 9.7) — same pattern as newt-inference / the old newt-tui suites.
+wiremock.workspace = true
 
 [lints]
 workspace = true

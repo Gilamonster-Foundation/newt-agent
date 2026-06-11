@@ -119,6 +119,23 @@ impl Mcp {
     }
 }
 
+/// Bridge into the agentic loop (Step 9.7): `newt_core::agentic` cannot name
+/// this type without a `newt-core` ← `newt-mcp-client` dependency cycle, so
+/// the loop takes the minimal [`McpTools`] seam and the TUI forwards to the
+/// inherent methods above.
+#[async_trait::async_trait]
+impl newt_core::agentic::McpTools for Mcp {
+    fn handles(&self, name: &str) -> bool {
+        Self::handles(self, name)
+    }
+    fn tool_defs(&self) -> Vec<Value> {
+        Self::tool_defs(self)
+    }
+    async fn call(&mut self, name: &str, args: &Value) -> String {
+        Self::call(self, name, args).await
+    }
+}
+
 /// Flatten an MCP `tools/call` result (`{ content: [{type,text}], isError? }`)
 /// into agent-facing text. Falls back to raw JSON if there is no text content.
 fn format_result(result: &Value) -> String {
