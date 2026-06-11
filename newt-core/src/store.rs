@@ -30,8 +30,30 @@
 //! tamper-evident envelope covers the `turns` rows and the stored chain tip
 //! — nothing else. Conversation-row metadata (`title`, `activity_tick`, the
 //! `*_claim` columns, persona) can be edited in place undetectably with any
-//! SQLite client. Until 17.2 introduces real key material and signing, this
-//! integrity story is anti-naive-edit, not anti-adversary.
+//! SQLite client. 17.2 derives the writer fingerprint from real key material
+//! when it exists (below), but ticks are still not *signed* — so this
+//! integrity story remains anti-naive-edit, not anti-adversary, until a
+//! future step adds signatures.
+//!
+//! # Workspace identity v2 (17.2)
+//!
+//! The `workspace_key` scoping column is the v2 derivation
+//! ([`crate::workspace_key::workspace_key_v2`]): BLAKE3 hex of
+//! `(git origin URL, branch)` when the workspace is a git checkout with
+//! both, else BLAKE3 hex of the canonical path. Two clones of the same
+//! project on the same branch therefore *share* conversations — the
+//! decision doc's "folder = conversation across clones and containers"
+//! thesis — while non-git dirs keep per-path scoping.
+//!
+//! **Row migration:** on open, any conversation whose `workspace_key`
+//! equals THIS workspace's retired UUIDv5 key
+//! ([`ConversationStore::workspace_id_for_path`], kept for exactly this
+//! lookup) is re-keyed to the v2 key in one idempotent UPDATE. Other
+//! workspaces' rows are untouched — they migrate when their own workspace
+//! next opens, because only that open knows the path the UUIDv5 key was
+//! derived from (the hash is not reversible). The key is not part of the
+//! §6 turn encoding or genesis hash, so re-keying cannot disturb chain
+//! verification.
 //!
 //! # One-time JSON import (17.1b)
 //!
@@ -51,14 +73,32 @@
 //! legacy dir is renamed to `conversations.imported/` and kept as a backup,
 //! so a second open finds nothing to import.
 //!
-//! # Writer identity (17.1a scope)
+//! # Writer identity (17.2)
 //!
-//! `writer_fingerprint` is the BLAKE3 hex of a per-install nonce generated
-//! once at `<root>/install-nonce`. It is stable across sessions and distinct
-//! across installs, which is exactly what the single-machine Lamport clock
-//! needs today. Step 17.2 upgrades this to the agent's mesh-key fingerprint;
-//! the column is already shaped for that. Ticks are not yet *signed* — that
-//! also arrives with real key material in 17.2.
+//! `writer_fingerprint` is, in preference order:
+//!
+//! 1. **The operator's mesh-key fingerprint** — when `<root>/identity.pem`
+//!    exists and parses (the newt-identity `UserKey`; for the production
+//!    root `~/.newt` this is exactly `~/.newt/identity.pem`), the
+//!    fingerprint is [`agent_mesh_protocol::UserKey::fingerprint`] in full
+//!    hex: BLAKE3 of the ed25519 public key, stable per operator across
+//!    installs and machines. Dependency note: this comes straight from
+//!    `agent-mesh-protocol` (already a direct dep); it must NOT come from
+//!    `newt-identity`, which depends on newt-core — the inversion would be
+//!    a cycle.
+//! 2. **The 17.1a per-install nonce fallback** — BLAKE3 hex of a nonce
+//!    minted once at `<root>/install-nonce`: stable across sessions,
+//!    distinct across installs. Used when no identity exists yet, or when
+//!    `identity.pem` is unreadable/corrupt (logged; a broken key file must
+//!    never block the store).
+//!
+//! Rows written before an identity existed keep their recorded nonce-derived
+//! writer and still verify: chains are per-writer (genesis is keyed by
+//! `(conversation, writer)`), `verify_chain` follows each row's *recorded*
+//! writer, and the Lamport clock seeds from the global max tick — so a
+//! fingerprint upgrade mid-history reads as a writer handoff, which §6
+//! already supports. Ticks are still not *signed*; that needs a schema
+//! column and arrives with a later step.
 //!
 //! # NFS / concurrency
 //!
@@ -96,9 +136,14 @@ const LEGACY_JSON_DIR: &str = "conversations";
 const LEGACY_BACKUP_DIR: &str = "conversations.imported";
 
 /// Per-install nonce file under the store root; its BLAKE3 hex is the
-/// `writer_fingerprint` (see module docs — 17.2 replaces this with the
-/// mesh-key fingerprint).
+/// `writer_fingerprint` *fallback* when no identity key exists (see
+/// module docs — Writer identity).
 const NONCE_FILE: &str = "install-nonce";
+
+/// The operator's root identity key under the store root (`~/.newt` in
+/// production — the same `~/.newt/identity.pem` newt-identity mints). When
+/// present, its fingerprint IS the writer fingerprint.
+const IDENTITY_PEM_FILE: &str = "identity.pem";
 
 /// How long a writer waits on a locked database before erroring. Two newts
 /// sharing `~/.newt/conversations.db` serialize their write transactions
@@ -149,9 +194,9 @@ impl ConversationStore {
     ) -> anyhow::Result<Self> {
         let root = root.as_ref().to_path_buf();
         let workspace = std::fs::canonicalize(workspace.as_ref())?;
-        let workspace_id = Self::workspace_id_for_path(&workspace)?;
+        let workspace_id = crate::workspace_key::workspace_key_v2(&workspace)?;
         std::fs::create_dir_all(&root)?;
-        let writer_fingerprint = load_or_create_writer_fingerprint(&root)?;
+        let writer_fingerprint = resolve_writer_fingerprint(&root)?;
 
         let conn = Connection::open(root.join(DB_FILE))?;
         conn.busy_timeout(BUSY_TIMEOUT)?;
@@ -184,6 +229,9 @@ impl ConversationStore {
         };
 
         import_legacy_json(&conn, &root, &writer_fingerprint)?;
+        // 17.2: after the import (whose records carry UUIDv5 keys), re-key
+        // THIS workspace's rows from the retired UUIDv5 derivation to v2.
+        migrate_workspace_key(&conn, &workspace, &workspace_id)?;
 
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
@@ -196,9 +244,19 @@ impl ConversationStore {
         })
     }
 
-    /// Stable workspace key for a path. The same UUIDv5-of-canonical-path
-    /// derivation the JSON backend used (so legacy dir names keep matching);
-    /// step 17.2 replaces the derivation with `blake3(git remote + branch)`.
+    /// The RETIRED v1 workspace key: UUIDv5 of the canonical path — the
+    /// derivation the JSON backend used (its per-workspace dir names) and
+    /// 17.1a inherited for `workspace_key`. Kept for exactly two lookups:
+    /// the one-time legacy JSON import (dir names are UUIDv5) and the 17.2
+    /// open-time migration that re-keys this workspace's old rows to
+    /// [`crate::workspace_key::workspace_key_v2`]. Do not key anything new
+    /// with it.
+    #[deprecated(
+        since = "0.6.8",
+        note = "v1 keying is path-fragile; use `newt_core::workspace_key_v2` \
+                (17.2). This stays only for the UUIDv5→v2 row migration and \
+                legacy-import dir names."
+    )]
     pub fn workspace_id_for_path(path: impl AsRef<Path>) -> anyhow::Result<String> {
         let canonical = std::fs::canonicalize(path.as_ref())?;
         let normalized = canonical.to_string_lossy().replace('\\', "/");
@@ -889,7 +947,7 @@ fn create_schema(conn: &Connection) -> anyhow::Result<()> {
              id                 TEXT PRIMARY KEY,
              title              TEXT NOT NULL,
              workspace_path     TEXT NOT NULL,            -- display only
-             workspace_key      TEXT NOT NULL,            -- scoping key (17.2: blake3(remote+branch))
+             workspace_key      TEXT NOT NULL,            -- scoping key: workspace_key_v2 (17.2 — blake3 remote+branch, path fallback)
              persona            TEXT,
              end_reason         TEXT,                     -- set by 17.7
              writer_fingerprint TEXT NOT NULL,            -- §6 ordering key, half 1
@@ -1031,6 +1089,37 @@ fn import_legacy_json(
         "one-time import of legacy JSON conversations complete; \
          the original tree is kept as a backup"
     );
+    Ok(())
+}
+
+/// 17.2 one-shot row migration (see module docs — Workspace identity v2):
+/// re-key every conversation that carries THIS workspace's retired UUIDv5
+/// key to the v2 key, in one UPDATE inside an immediate transaction.
+///
+/// Idempotent by construction — once no rows carry the old key the UPDATE
+/// matches nothing. Scoped by construction — a UUIDv5 key is derived from
+/// one canonical path, so the WHERE clause can only ever select rows that
+/// belonged to this workspace; every other workspace's rows are left for
+/// their own open to migrate. Re-keying is metadata, not activity: no tick
+/// is allocated, and the §6 chain is untouched (`workspace_key` is not part
+/// of the turn encoding or the genesis hash).
+fn migrate_workspace_key(conn: &Connection, workspace: &Path, v2_key: &str) -> anyhow::Result<()> {
+    // The deprecated v1 derivation is retained exactly for this lookup.
+    #[allow(deprecated)]
+    let old_key = ConversationStore::workspace_id_for_path(workspace)?;
+    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    let migrated = tx.execute(
+        "UPDATE conversations SET workspace_key = ?2 WHERE workspace_key = ?1",
+        rusqlite::params![old_key, v2_key],
+    )?;
+    tx.commit()?;
+    if migrated > 0 {
+        tracing::info!(
+            migrated,
+            workspace = %workspace.display(),
+            "re-keyed conversations from the retired UUIDv5 workspace key to v2"
+        );
+    }
     Ok(())
 }
 
@@ -1213,9 +1302,40 @@ fn clamp_claim(nanos: u128) -> i64 {
     i64::try_from(nanos).unwrap_or(i64::MAX)
 }
 
+/// The §6 writer fingerprint, in preference order (module docs — Writer
+/// identity): the operator's mesh-key fingerprint from `<root>/identity.pem`
+/// when it exists and parses, else the 17.1a per-install nonce.
+///
+/// The key type comes from `agent-mesh-protocol` (already a direct dep of
+/// newt-core) — deliberately NOT from `newt-identity`, which depends on
+/// newt-core and would make the coupling a cycle. The path is rooted at the
+/// store root rather than resolved from `$HOME` so the derivation stays
+/// hermetic (tests, alternate roots); for the production root `~/.newt`
+/// the two spellings are the same file.
+fn resolve_writer_fingerprint(root: &Path) -> anyhow::Result<String> {
+    let pem = root.join(IDENTITY_PEM_FILE);
+    if pem.is_file() {
+        match agent_mesh_protocol::UserKey::load(&pem) {
+            Ok(user) => return Ok(user.fingerprint().hex()),
+            Err(e) => {
+                // A broken key file must never block the store; the nonce
+                // fallback keeps the Lamport clock running (and §6 chains
+                // tolerate the writer change as a handoff).
+                tracing::warn!(
+                    path = %pem.display(),
+                    error = %e,
+                    "identity.pem exists but did not parse; \
+                     falling back to the per-install nonce writer fingerprint"
+                );
+            }
+        }
+    }
+    load_or_create_writer_fingerprint(root)
+}
+
 /// Load (or mint, atomically) the per-install nonce and derive the writer
-/// fingerprint as its BLAKE3 hex. See module docs — 17.2 upgrades this to
-/// the agent's mesh-key fingerprint.
+/// fingerprint as its BLAKE3 hex — the fallback half of
+/// [`resolve_writer_fingerprint`].
 fn load_or_create_writer_fingerprint(root: &Path) -> anyhow::Result<String> {
     let path = root.join(NONCE_FILE);
     let nonce = match std::fs::read_to_string(&path) {
