@@ -1932,6 +1932,7 @@ dependencies = [
  "agent-mesh-protocol",
  "anyhow",
  "async-trait",
+ "blake3",
  "pyo3",
  "serde",
  "serde_json",
