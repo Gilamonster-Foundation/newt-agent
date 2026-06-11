@@ -614,6 +614,7 @@ fn read_only_caveats(workspace: &str) -> newt_core::caveats::Caveats {
         preset: newt_core::PermissionPreset::ReadOnly,
         extra_exec: Vec::new(),
         net: Vec::new(),
+        prompt: false,
     }
     .to_caveats(workspace)
 }
@@ -753,6 +754,774 @@ impl SessionCapability {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Prompted ocap grants — issue #263 (`--prompt-for-permissions`)
+// ---------------------------------------------------------------------------
+
+/// Is prompted-permission mode configured for this session? Pure in its
+/// inputs so it's unit-testable; the caller additionally requires stdin to
+/// be a real terminal — a piped/headless invocation must never block on a
+/// prompt even when the flag is set.
+fn permission_prompting_configured(env_flag: bool, tui: Option<&newt_core::TuiConfig>) -> bool {
+    env_flag || tui.is_some_and(|t| t.permissions.prompt)
+}
+
+/// One human choice at the permission prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PromptChoice {
+    AllowOnce,
+    AllowSession,
+    Deny,
+    DenyAlways,
+}
+
+/// Map a typed answer to a choice. Case-significant on purpose — `[d]eny`
+/// is the default and `[D]eny always` the escalation, per the #263 sketch.
+/// Anything unrecognized (including empty / EOF) is the safe default: deny.
+fn parse_permission_choice(input: &str) -> PromptChoice {
+    match input.trim() {
+        "a" => PromptChoice::AllowOnce,
+        "s" => PromptChoice::AllowSession,
+        "D" => PromptChoice::DenyAlways,
+        _ => PromptChoice::Deny,
+    }
+}
+
+/// Build the prompt shown for one denied capability (the #263 sketch shape).
+fn permission_prompt_text(req: &newt_core::PermissionRequest) -> String {
+    use newt_core::DenialKind;
+    let (verb, axis) = match req.kind {
+        DenialKind::Exec => ("run", "outside the granted exec allowlist"),
+        DenialKind::FsRead => ("read", "outside the granted fs_read scope"),
+        DenialKind::FsWrite => ("write", "outside the granted fs_write scope"),
+        DenialKind::Net => ("reach", "outside the granted net allowlist"),
+    };
+    let reason = if req.reason.is_empty() {
+        String::new()
+    } else {
+        format!("  ({})\n", req.reason)
+    };
+    format!(
+        "⊘ {} wants to {verb} `{}` — {axis}.\n{reason}  \
+         [a]llow once   [s]ession allow   [d]eny (default)   [D]eny always > ",
+        req.tool, req.target
+    )
+}
+
+/// Production prompt: print the question, read one line from stdin — the
+/// same blocking-confirm shape as `write_file`'s y/N. Any read error is a
+/// deny (never a hang, never an allow).
+fn prompt_permission_choice(prompt_text: &str) -> PromptChoice {
+    print!("{prompt_text}");
+    io::stdout().flush().ok();
+    let mut answer = String::new();
+    match io::stdin().read_line(&mut answer) {
+        Ok(_) => parse_permission_choice(&answer),
+        Err(_) => PromptChoice::Deny,
+    }
+}
+
+/// Session-owned prompted-permission state, lent to the gate each turn (the
+/// `note_nudge` ownership pattern). Session grants/denials live HERE — not
+/// in the session's operating key, which is never widened — and evaporate
+/// with the process: a restart starts from the configured policy again.
+#[derive(Default)]
+struct PermissionPromptState {
+    /// `(kind, target)` pairs the human allowed for the rest of the session.
+    session_grants: std::collections::BTreeSet<(newt_core::DenialKind, String)>,
+    /// `(kind, target)` pairs the human denied for the rest of the session
+    /// (`[D]eny always`) — auto-denied without re-prompting.
+    session_denials: std::collections::BTreeSet<(newt_core::DenialKind, String)>,
+    /// Every prompted decision this session, in prompt order — what
+    /// `/permissions` lists. Also appended to the durable log as made.
+    decisions: Vec<newt_core::PermissionRecord>,
+}
+
+/// The TUI's [`newt_core::PermissionGate`]: prompts the human on a denial,
+/// records each decision, and — on allow — RE-MINTS a fresh operating
+/// authority from the user root as (session baseline ∪ grants), per the
+/// #263 design. Attenuation-only is preserved: the session's live key and
+/// enforced baseline are never touched; the minted caveats exist only for
+/// the re-executed call (and are re-minted on demand for session grants).
+///
+/// `ask_human` is the interaction seam: production wires
+/// [`prompt_permission_choice`] (stdin); tests inject a scripted closure.
+struct PromptPermissionGate<'a, F: FnMut(&str) -> PromptChoice> {
+    state: &'a mut PermissionPromptState,
+    /// The session's enforced caveats at turn start — the re-mint baseline.
+    base: newt_core::Caveats,
+    /// Per-user root key path; `None` degrades the re-mint to a plain
+    /// caveats value (the same degradation as `SessionCapability`).
+    key_path: Option<std::path::PathBuf>,
+    /// Conversation id the decisions are recorded under.
+    conversation_id: String,
+    /// Durable decision log (`~/.newt/permission-log.jsonl`); `None` keeps
+    /// the in-session list only.
+    log_path: Option<std::path::PathBuf>,
+    color: bool,
+    verbose: bool,
+    ask_human: F,
+}
+
+impl<F: FnMut(&str) -> PromptChoice> PromptPermissionGate<'_, F> {
+    /// Record one decision: into the session list (for `/permissions`) and
+    /// appended to the durable log. A log-write failure is reported but
+    /// never blocks the decision — the record is a review artifact, not a
+    /// gate.
+    fn record(&mut self, req: &newt_core::PermissionRequest, decision: &str, scope: &str) {
+        let rec = newt_core::PermissionRecord::new(
+            &self.conversation_id,
+            &req.tool,
+            req.kind,
+            &req.target,
+            decision,
+            scope,
+        );
+        if let Some(path) = self.log_path.as_deref() {
+            if let Err(e) = rec.append_jsonl(path) {
+                print_newt(
+                    &format!("warning: permission log write failed: {e}"),
+                    self.color,
+                    self.verbose,
+                );
+            }
+        }
+        self.state.decisions.push(rec);
+    }
+
+    /// Mint the widened authority for an allow: policy = baseline ∪ every
+    /// session grant ∪ the once-grants of this consult, re-rooted from the
+    /// per-user key when available. The live operating key is NEVER widened
+    /// — this is a fresh, narrower-than-root delegation (issue #263's
+    /// "re-mint from root" rule). Without a usable key the value degrades
+    /// to the plain policy, mirroring `SessionCapability::establish`.
+    fn mint(&self, once_grants: &[(newt_core::DenialKind, String)]) -> newt_core::Caveats {
+        let mut grants: Vec<(newt_core::DenialKind, String)> =
+            self.state.session_grants.iter().cloned().collect();
+        grants.extend(once_grants.iter().cloned());
+        let policy = newt_core::widen_caveats(&self.base, &grants);
+        match self
+            .key_path
+            .as_deref()
+            .and_then(|p| mint_operating_key(p, &policy).ok())
+        {
+            Some(key) => newt_identity::enforced_caveats(&key).unwrap_or(policy),
+            None => policy,
+        }
+    }
+}
+
+impl<F: FnMut(&str) -> PromptChoice> newt_core::PermissionGate for PromptPermissionGate<'_, F> {
+    fn ask(&mut self, requests: &[newt_core::PermissionRequest]) -> newt_core::PermissionDecision {
+        use newt_core::PermissionDecision::{Allow, Deny};
+        if requests.is_empty() {
+            return Deny;
+        }
+        // `[D]eny always` short-circuits without re-prompting (and without
+        // re-recording — the session-scoped deny was recorded when chosen).
+        if requests.iter().any(|r| {
+            self.state
+                .session_denials
+                .contains(&(r.kind, r.target.clone()))
+        }) {
+            return Deny;
+        }
+        let mut once_grants: Vec<(newt_core::DenialKind, String)> = Vec::new();
+        for req in requests {
+            // A session grant covers this target: no re-prompt, no new
+            // record — the decision was recorded when the human made it.
+            if self
+                .state
+                .session_grants
+                .contains(&(req.kind, req.target.clone()))
+            {
+                continue;
+            }
+            match (self.ask_human)(&permission_prompt_text(req)) {
+                PromptChoice::AllowOnce => {
+                    self.record(req, "allow", "once");
+                    once_grants.push((req.kind, req.target.clone()));
+                }
+                PromptChoice::AllowSession => {
+                    self.record(req, "allow", "session");
+                    self.state
+                        .session_grants
+                        .insert((req.kind, req.target.clone()));
+                }
+                PromptChoice::Deny => {
+                    self.record(req, "deny", "once");
+                    return Deny;
+                }
+                PromptChoice::DenyAlways => {
+                    self.record(req, "deny", "session");
+                    self.state
+                        .session_denials
+                        .insert((req.kind, req.target.clone()));
+                    return Deny;
+                }
+            }
+        }
+        Allow(self.mint(&once_grants))
+    }
+}
+
+/// Render the `/permissions` listing: this session's prompted decisions (in
+/// prompt order) plus where the durable record lives. Promotion to a lasting
+/// grant is deliberately NOT offered here — that is a human editing
+/// `[tui.permissions]` in the config (see issues #263/#181).
+fn permissions_command_lines(
+    state: &PermissionPromptState,
+    enabled: bool,
+    log_path: Option<&std::path::Path>,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    if !enabled {
+        lines.push(
+            "permission prompting is OFF (start with --prompt-for-permissions or set \
+             [tui.permissions] prompt = true)"
+                .to_string(),
+        );
+    }
+    if state.decisions.is_empty() {
+        lines.push("no prompted permission decisions this session".to_string());
+    } else {
+        lines.push("prompted permission decisions this session:".to_string());
+        for d in &state.decisions {
+            lines.push(format!(
+                "  {:<5} {:<7}  {}:{}  via {}",
+                d.decision, d.scope, d.kind, d.target, d.tool
+            ));
+        }
+    }
+    if let Some(path) = log_path {
+        lines.push(format!("log: {}", path.display()));
+        lines.push(
+            "to make an allow permanent, edit [tui.permissions] in your newt config \
+             (extra_exec / net) — the log is a record, never authority"
+                .to_string(),
+        );
+    }
+    lines
+}
+
+#[cfg(test)]
+mod permission_prompt_tests {
+    use super::*;
+    use newt_core::caveats::{Caveats, CountBound, Scope};
+    use newt_core::{CaveatsExt as _, DenialKind, PermissionGate as _, PermissionRequest};
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    fn base_caveats(ws: &str) -> Caveats {
+        Caveats {
+            fs_read: Scope::only([ws.to_string()]),
+            fs_write: Scope::only([ws.to_string()]),
+            exec: Scope::only(["cargo".to_string()]),
+            net: Scope::none(),
+            max_calls: CountBound::Unlimited,
+            valid_for_generation: Scope::All,
+        }
+    }
+
+    fn exec_request(target: &str) -> PermissionRequest {
+        PermissionRequest {
+            tool: "run_command".to_string(),
+            kind: DenialKind::Exec,
+            target: target.to_string(),
+            reason: format!("exec of \"{target}\" is not within the granted authority"),
+        }
+    }
+
+    /// A gate whose "human" is a script of choices; counts every prompt.
+    fn scripted_gate<'a>(
+        state: &'a mut PermissionPromptState,
+        base: Caveats,
+        key_path: Option<std::path::PathBuf>,
+        log_path: Option<std::path::PathBuf>,
+        script: Vec<PromptChoice>,
+        prompts: Rc<Cell<usize>>,
+    ) -> PromptPermissionGate<'a, impl FnMut(&str) -> PromptChoice> {
+        let mut script = script.into_iter();
+        PromptPermissionGate {
+            state,
+            base,
+            key_path,
+            conversation_id: "conv-test".to_string(),
+            log_path,
+            color: false,
+            verbose: false,
+            ask_human: move |_prompt: &str| {
+                prompts.set(prompts.get() + 1);
+                script.next().expect("script exhausted — unexpected prompt")
+            },
+        }
+    }
+
+    #[test]
+    fn parse_choice_maps_the_sketch_keys_and_defaults_to_deny() {
+        assert_eq!(parse_permission_choice("a"), PromptChoice::AllowOnce);
+        assert_eq!(parse_permission_choice(" a \n"), PromptChoice::AllowOnce);
+        assert_eq!(parse_permission_choice("s"), PromptChoice::AllowSession);
+        assert_eq!(parse_permission_choice("d"), PromptChoice::Deny);
+        assert_eq!(parse_permission_choice("D"), PromptChoice::DenyAlways);
+        // Default = deny: empty (just Enter / EOF), garbage, near-misses.
+        assert_eq!(parse_permission_choice(""), PromptChoice::Deny);
+        assert_eq!(parse_permission_choice("yes"), PromptChoice::Deny);
+        assert_eq!(parse_permission_choice("A"), PromptChoice::Deny);
+        assert_eq!(parse_permission_choice("S"), PromptChoice::Deny);
+    }
+
+    #[test]
+    fn prompt_text_names_tool_target_axis_and_choices() {
+        let text = permission_prompt_text(&exec_request("npm"));
+        assert!(
+            text.contains("run_command wants to run `npm`"),
+            "got: {text}"
+        );
+        assert!(
+            text.contains("outside the granted exec allowlist"),
+            "got: {text}"
+        );
+        assert!(
+            text.contains("not within the granted authority"),
+            "reason shown: {text}"
+        );
+        assert!(
+            text.contains("[a]llow once   [s]ession allow   [d]eny (default)   [D]eny always"),
+            "got: {text}"
+        );
+        // Axis wording follows the kind; an empty reason adds no parens.
+        let read = permission_prompt_text(&PermissionRequest {
+            tool: "read_file".to_string(),
+            kind: DenialKind::FsRead,
+            target: "/etc/hosts".to_string(),
+            reason: String::new(),
+        });
+        assert!(read.contains("wants to read `/etc/hosts`"), "got: {read}");
+        assert!(read.contains("fs_read scope"), "got: {read}");
+        assert!(!read.contains("()"), "no empty reason parens: {read}");
+        let net = permission_prompt_text(&PermissionRequest {
+            tool: "web_fetch".to_string(),
+            kind: DenialKind::Net,
+            target: "docs.rs".to_string(),
+            reason: String::new(),
+        });
+        assert!(net.contains("wants to reach `docs.rs`"), "got: {net}");
+        let write = permission_prompt_text(&PermissionRequest {
+            tool: "edit_file".to_string(),
+            kind: DenialKind::FsWrite,
+            target: "/ws/f".to_string(),
+            reason: String::new(),
+        });
+        assert!(write.contains("wants to write `/ws/f`"), "got: {write}");
+    }
+
+    /// Allow-once: the minted caveats cover the target for THIS consult, but
+    /// nothing is remembered — the next identical ask prompts again.
+    #[test]
+    fn allow_once_grants_one_call_and_reprompts_next_time() {
+        let mut state = PermissionPromptState::default();
+        let prompts = Rc::new(Cell::new(0));
+        let base = base_caveats("/ws");
+        let mut gate = scripted_gate(
+            &mut state,
+            base.clone(),
+            None,
+            None,
+            vec![PromptChoice::AllowOnce, PromptChoice::AllowOnce],
+            prompts.clone(),
+        );
+        let req = [exec_request("npm")];
+        match gate.ask(&req) {
+            newt_core::PermissionDecision::Allow(c) => {
+                assert!(c.permits_exec("npm"), "the grant covers the target");
+                assert!(c.permits_exec("cargo"), "baseline grants kept");
+                assert!(!c.permits_exec("rm"), "nothing else widened");
+            }
+            newt_core::PermissionDecision::Deny => panic!("expected allow"),
+        }
+        assert_eq!(prompts.get(), 1);
+        // The same request again: allow-once left no session grant behind.
+        assert!(matches!(
+            gate.ask(&req),
+            newt_core::PermissionDecision::Allow(_)
+        ));
+        assert_eq!(prompts.get(), 2, "allow-once re-prompts on the next call");
+        drop(gate);
+        assert!(state.session_grants.is_empty());
+        assert_eq!(state.decisions.len(), 2);
+        assert_eq!(state.decisions[0].decision, "allow");
+        assert_eq!(state.decisions[0].scope, "once");
+    }
+
+    /// Session allow: one prompt, then every later ask for the same target
+    /// is allowed silently — and a FRESH state (a new session) prompts anew.
+    #[test]
+    fn allow_session_never_reprompts_until_restart() {
+        let prompts = Rc::new(Cell::new(0));
+        let base = base_caveats("/ws");
+        let mut state = PermissionPromptState::default();
+        {
+            let mut gate = scripted_gate(
+                &mut state,
+                base.clone(),
+                None,
+                None,
+                vec![PromptChoice::AllowSession],
+                prompts.clone(),
+            );
+            let req = [exec_request("npm")];
+            assert!(matches!(
+                gate.ask(&req),
+                newt_core::PermissionDecision::Allow(_)
+            ));
+            assert_eq!(prompts.get(), 1);
+            // Again within the same turn: no further prompt.
+            assert!(matches!(
+                gate.ask(&req),
+                newt_core::PermissionDecision::Allow(_)
+            ));
+        }
+        {
+            // A NEW gate over the same session state (a later turn).
+            let mut gate = scripted_gate(
+                &mut state,
+                base.clone(),
+                None,
+                None,
+                vec![],
+                prompts.clone(),
+            );
+            match gate.ask(&[exec_request("npm")]) {
+                newt_core::PermissionDecision::Allow(c) => assert!(c.permits_exec("npm")),
+                newt_core::PermissionDecision::Deny => panic!("session grant must hold"),
+            }
+        }
+        assert_eq!(prompts.get(), 1, "exactly one prompt for the whole session");
+        assert_eq!(state.decisions.len(), 1, "re-uses are not re-recorded");
+        // "Restart": session state is gone — a fresh state prompts again.
+        let mut fresh = PermissionPromptState::default();
+        let mut gate = scripted_gate(
+            &mut fresh,
+            base,
+            None,
+            None,
+            vec![PromptChoice::Deny],
+            prompts.clone(),
+        );
+        assert!(matches!(
+            gate.ask(&[exec_request("npm")]),
+            newt_core::PermissionDecision::Deny
+        ));
+        assert_eq!(prompts.get(), 2, "the grant did not survive the restart");
+    }
+
+    /// Deny-always auto-denies later asks without prompting or re-recording.
+    #[test]
+    fn deny_always_short_circuits_later_asks() {
+        let prompts = Rc::new(Cell::new(0));
+        let mut state = PermissionPromptState::default();
+        let mut gate = scripted_gate(
+            &mut state,
+            base_caveats("/ws"),
+            None,
+            None,
+            vec![PromptChoice::DenyAlways],
+            prompts.clone(),
+        );
+        let req = [exec_request("rm")];
+        assert!(matches!(
+            gate.ask(&req),
+            newt_core::PermissionDecision::Deny
+        ));
+        assert!(matches!(
+            gate.ask(&req),
+            newt_core::PermissionDecision::Deny
+        ));
+        assert_eq!(prompts.get(), 1, "second ask auto-denied without a prompt");
+        drop(gate);
+        assert_eq!(state.decisions.len(), 1);
+        assert_eq!(state.decisions[0].decision, "deny");
+        assert_eq!(state.decisions[0].scope, "session");
+    }
+
+    /// A batch (compound command): the first deny aborts — the whole call
+    /// keeps the standard denial; an empty batch is a deny by construction.
+    #[test]
+    fn batch_deny_and_empty_requests_deny() {
+        let prompts = Rc::new(Cell::new(0));
+        let mut state = PermissionPromptState::default();
+        let mut gate = scripted_gate(
+            &mut state,
+            base_caveats("/ws"),
+            None,
+            None,
+            vec![PromptChoice::AllowOnce, PromptChoice::Deny],
+            prompts.clone(),
+        );
+        let reqs = [exec_request("npm"), exec_request("rm")];
+        assert!(matches!(
+            gate.ask(&reqs),
+            newt_core::PermissionDecision::Deny
+        ));
+        assert_eq!(prompts.get(), 2, "asked per target until the deny");
+        assert!(matches!(gate.ask(&[]), newt_core::PermissionDecision::Deny));
+        assert_eq!(prompts.get(), 2, "empty batch never prompts");
+    }
+
+    /// Every prompted decision lands in the JSONL record, keyed by the
+    /// conversation id, with the issue's `(ts_claim, tool, kind, target,
+    /// decision, scope)` shape.
+    #[test]
+    fn decisions_are_recorded_to_the_session_log() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let log = dir.path().join("permission-log.jsonl");
+        let prompts = Rc::new(Cell::new(0));
+        let mut state = PermissionPromptState::default();
+        let mut gate = scripted_gate(
+            &mut state,
+            base_caveats("/ws"),
+            None,
+            Some(log.clone()),
+            vec![
+                PromptChoice::AllowOnce,
+                PromptChoice::AllowSession,
+                PromptChoice::Deny,
+            ],
+            prompts.clone(),
+        );
+        let _ = gate.ask(&[exec_request("npm")]);
+        let _ = gate.ask(&[PermissionRequest {
+            tool: "web_fetch".to_string(),
+            kind: DenialKind::Net,
+            target: "docs.rs".to_string(),
+            reason: String::new(),
+        }]);
+        let _ = gate.ask(&[exec_request("rm")]);
+        let body = std::fs::read_to_string(&log).unwrap();
+        let records: Vec<newt_core::PermissionRecord> = body
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(records.len(), 3);
+        assert!(records.iter().all(|r| r.conversation_id == "conv-test"));
+        assert_eq!(
+            (
+                records[0].tool.as_str(),
+                records[0].kind.as_str(),
+                records[0].target.as_str()
+            ),
+            ("run_command", "exec", "npm")
+        );
+        assert_eq!(
+            (records[0].decision.as_str(), records[0].scope.as_str()),
+            ("allow", "once")
+        );
+        assert_eq!(
+            (records[1].kind.as_str(), records[1].scope.as_str()),
+            ("net", "session")
+        );
+        assert_eq!(
+            (records[2].decision.as_str(), records[2].scope.as_str()),
+            ("deny", "once")
+        );
+        // The in-session list (the `/permissions` view) matches the file.
+        assert_eq!(state.decisions, records);
+    }
+
+    /// With a per-user key available, an allow re-mints THROUGH the signed
+    /// identity path: the returned caveats are the enforced caveats of a
+    /// fresh key rooted in the user key — and the baseline value the session
+    /// enforces is untouched (attenuation-only, #263).
+    #[test]
+    fn allow_remints_from_the_user_root_and_never_widens_the_baseline() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let key_path = dir.path().join("identity.pem");
+        let prompts = Rc::new(Cell::new(0));
+        let base = base_caveats("/ws");
+        let mut state = PermissionPromptState::default();
+        let mut gate = scripted_gate(
+            &mut state,
+            base.clone(),
+            Some(key_path.clone()),
+            None,
+            vec![PromptChoice::AllowSession],
+            prompts.clone(),
+        );
+        let minted = match gate.ask(&[exec_request("npm")]) {
+            newt_core::PermissionDecision::Allow(c) => c,
+            newt_core::PermissionDecision::Deny => panic!("expected allow"),
+        };
+        assert!(
+            key_path.exists(),
+            "the user root key was used for the re-mint"
+        );
+        assert!(minted.permits_exec("npm"));
+        assert!(minted.permits_exec("cargo"));
+        assert!(!minted.permits_exec("rm"));
+        // The gate's baseline (the session's enforced caveats) is unchanged:
+        // the grant lives in the minted value + session state only.
+        drop(gate);
+        assert_eq!(base, base_caveats("/ws"));
+        // And the mint provably round-trips the identity layer: minting the
+        // same policy from the same root yields the same enforced caveats.
+        let policy = newt_core::widen_caveats(&base, &[(DenialKind::Exec, "npm".to_string())]);
+        let key = mint_operating_key(&key_path, &policy).unwrap();
+        assert_eq!(newt_identity::enforced_caveats(&key).unwrap(), minted);
+    }
+
+    /// The full TUI seam: execute_tool consults the gate on an fs_read
+    /// denial. Allow-once reads the file exactly once and the next identical
+    /// call re-prompts; the decisions are in the session state.
+    #[tokio::test]
+    async fn execute_tool_with_tui_gate_allow_once_then_reprompt() {
+        let ws = tempfile::TempDir::new().unwrap();
+        std::fs::write(ws.path().join("outside.txt"), "gated contents").unwrap();
+        // fs_read scoped to a different root → reading in `ws` is denied.
+        let caveats = base_caveats("/elsewhere");
+        let prompts = Rc::new(Cell::new(0));
+        let mut state = PermissionPromptState::default();
+        let mut gate = scripted_gate(
+            &mut state,
+            caveats.clone(),
+            None,
+            None,
+            vec![PromptChoice::AllowOnce, PromptChoice::Deny],
+            prompts.clone(),
+        );
+        let args = serde_json::json!({"path": "outside.txt"});
+        let out = newt_core::agentic::execute_tool(
+            "read_file",
+            &args,
+            &ws.path().to_string_lossy(),
+            false,
+            20,
+            &caveats,
+            &mut Mcp::empty(),
+            None,
+            None,
+            None,
+            Some(&mut gate),
+        )
+        .await;
+        assert_eq!(out, "gated contents", "allow-once executed the real read");
+        assert_eq!(prompts.get(), 1);
+        // The identical call again: no session grant — prompts again, and
+        // this scripted human now denies → the standard denial.
+        let out = newt_core::agentic::execute_tool(
+            "read_file",
+            &args,
+            &ws.path().to_string_lossy(),
+            false,
+            20,
+            &caveats,
+            &mut Mcp::empty(),
+            None,
+            None,
+            None,
+            Some(&mut gate),
+        )
+        .await;
+        assert_eq!(
+            out,
+            "capability denied: fs_read does not permit 'outside.txt'"
+        );
+        assert_eq!(prompts.get(), 2, "allow-once does not stick");
+        drop(gate);
+        assert_eq!(state.decisions.len(), 2);
+    }
+
+    /// The full TUI seam, session scope: one prompt, then the same denial
+    /// auto-allows for the rest of the session (across gate rebuilds, i.e.
+    /// turns).
+    #[tokio::test]
+    async fn execute_tool_with_tui_gate_session_allow_holds_across_turns() {
+        let ws = tempfile::TempDir::new().unwrap();
+        std::fs::write(ws.path().join("outside.txt"), "gated contents").unwrap();
+        let caveats = base_caveats("/elsewhere");
+        let prompts = Rc::new(Cell::new(0));
+        let mut state = PermissionPromptState::default();
+        let args = serde_json::json!({"path": "outside.txt"});
+        for _turn in 0..2 {
+            // A fresh gate per turn over the SAME session state — exactly
+            // how the TUI loop builds it.
+            let mut gate = scripted_gate(
+                &mut state,
+                caveats.clone(),
+                None,
+                None,
+                vec![PromptChoice::AllowSession],
+                prompts.clone(),
+            );
+            let out = newt_core::agentic::execute_tool(
+                "read_file",
+                &args,
+                &ws.path().to_string_lossy(),
+                false,
+                20,
+                &caveats,
+                &mut Mcp::empty(),
+                None,
+                None,
+                None,
+                Some(&mut gate),
+            )
+            .await;
+            assert_eq!(out, "gated contents");
+        }
+        assert_eq!(prompts.get(), 1, "one prompt for the whole session");
+        assert_eq!(state.decisions.len(), 1);
+        assert_eq!(state.decisions[0].scope, "session");
+    }
+
+    #[test]
+    fn prompting_configured_from_flag_or_config_off_by_default() {
+        // Neither flag nor config: OFF — zero behavior change.
+        assert!(!permission_prompting_configured(false, None));
+        let mut tui = newt_core::TuiConfig::default();
+        assert!(!permission_prompting_configured(false, Some(&tui)));
+        // CLI flag (env) alone, config alone, or both.
+        assert!(permission_prompting_configured(true, None));
+        tui.permissions.prompt = true;
+        assert!(permission_prompting_configured(false, Some(&tui)));
+        assert!(permission_prompting_configured(true, Some(&tui)));
+    }
+
+    #[test]
+    fn permissions_command_lists_decisions_and_log_location() {
+        let mut state = PermissionPromptState::default();
+        // Disabled + empty: says how to enable, says there's nothing yet.
+        let lines = permissions_command_lines(&state, false, None);
+        assert!(lines[0].contains("OFF"), "got: {lines:?}");
+        assert!(lines
+            .iter()
+            .any(|l| l.contains("no prompted permission decisions")));
+        // With decisions + a log path: one row per decision, log named,
+        // promotion stays a human config edit.
+        state.decisions.push(newt_core::PermissionRecord::new(
+            "conv-1",
+            "run_command",
+            DenialKind::Exec,
+            "npm",
+            "allow",
+            "session",
+        ));
+        let log = std::path::PathBuf::from("/home/u/.newt/permission-log.jsonl");
+        let lines = permissions_command_lines(&state, true, Some(&log));
+        assert!(lines
+            .iter()
+            .any(|l| l.contains("exec:npm") && l.contains("run_command")));
+        assert!(lines.iter().any(|l| l.contains("permission-log.jsonl")));
+        assert!(lines.iter().any(|l| l.contains("never authority")));
+        assert!(!lines[0].contains("OFF"));
+    }
+
+    #[test]
+    fn help_lists_the_permissions_command() {
+        assert!(help_lines().iter().any(|l| l.contains("/permissions")));
+    }
+}
+
 /// Process-environment synchronization for tests.
 ///
 /// `cargo test` runs tests of this binary concurrently while the environment
@@ -798,6 +1567,7 @@ mod caveat_policy_tests {
                 preset,
                 extra_exec: Vec::new(),
                 net: Vec::new(),
+                prompt: false,
             },
             ..Default::default()
         }
@@ -1309,6 +2079,17 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
     let mut inf_key = choice.api_key.clone();
     let key_path = newt_identity::default_key_path().ok();
     let mut cap = SessionCapability::establish(resolve_tui(&cfg), key_path.as_deref(), workspace);
+    // Prompted ocap grants (issue #263), resolved ONCE per session: the flag
+    // (env, set by `--prompt-for-permissions`) or `[tui.permissions] prompt`,
+    // AND a real terminal on stdin — a piped/headless invocation must never
+    // block on a prompt no matter what the config says.
+    let prompt_permissions_enabled = permission_prompting_configured(
+        std::env::var("NEWT_PROMPT_FOR_PERMISSIONS").is_ok(),
+        resolve_tui(&cfg).as_ref(),
+    ) && io::stdin().is_terminal();
+    let mut permission_state = PermissionPromptState::default();
+    let permission_log_path =
+        newt_core::Config::user_config_path().map(|p| p.with_file_name("permission-log.jsonl"));
     print_newt(
         &format!("v{VERSION} ready — {inf_model} @ {inf_url}  (Ctrl-D or /exit to quit)"),
         color,
@@ -1326,6 +2107,14 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
     }
     if ephemeral_session {
         print_newt(EPHEMERAL_SESSION_NOTICE, color, verbose);
+    }
+    if prompt_permissions_enabled {
+        print_newt(
+            "prompted permissions ON — capability denials will ask: allow once / session / deny \
+             (decisions recorded; /permissions lists them)",
+            color,
+            verbose,
+        );
     }
 
     // Connect to discovered MCP servers ONCE for the session (newt config +
@@ -1585,6 +2374,25 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                         // surfacing of the session compression counters.
                         print_newt("Compression:", color, verbose);
                         println!("{}", memory_compress_section(&compress_state.counters()));
+                        println!();
+                        continue;
+                    }
+                    // #263: review surface for prompted permission decisions.
+                    // Read-only by design — promoting an allow to a durable
+                    // grant is a human editing [tui.permissions] in config.
+                    if task.trim_start_matches('/') == "permissions" {
+                        let mut lines = permissions_command_lines(
+                            &permission_state,
+                            prompt_permissions_enabled,
+                            permission_log_path.as_deref(),
+                        )
+                        .into_iter();
+                        if let Some(first) = lines.next() {
+                            print_newt(&first, color, verbose);
+                        }
+                        for line in lines {
+                            println!("{line}");
+                        }
                         println!();
                         continue;
                     }
@@ -1876,6 +2684,24 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                     // loop pushes one event per tool call; the save site
                     // persists them into the turn's `events` column.
                     let mut turn_tool_events: Vec<newt_core::ToolEvent> = Vec::new();
+                    // Prompted ocap grants (issue #263): only an interactive
+                    // session constructs a gate — headless paths (ACP worker,
+                    // newt-eval) never reach this code, so a denial there can
+                    // never block on a prompt. The gate's re-mint baseline is
+                    // the session's enforced caveats AT TURN START; session
+                    // grants/denials persist in `permission_state` across
+                    // turns and die with the process.
+                    let mut permission_gate =
+                        prompt_permissions_enabled.then(|| PromptPermissionGate {
+                            state: &mut permission_state,
+                            base: cap.caveats().clone(),
+                            key_path: key_path.clone(),
+                            conversation_id: active_conversation_id.clone(),
+                            log_path: permission_log_path.clone(),
+                            color,
+                            verbose,
+                            ask_human: prompt_permission_choice as fn(&str) -> PromptChoice,
+                        });
                     let response = tokio::task::block_in_place(|| {
                         rt.block_on(chat_complete(
                             ChatCtx {
@@ -1915,6 +2741,12 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                                 summarizer: Some(&*loop_summarizer),
                                 compress_state: Some(&mut compress_state),
                                 tool_events: Some(&mut turn_tool_events),
+                                // #263: present only when prompting is on —
+                                // the loop blocks on the prompt like a long
+                                // tool call; None keeps denials verbatim.
+                                permission_gate: permission_gate
+                                    .as_mut()
+                                    .map(|g| g as &mut dyn newt_core::PermissionGate),
                             },
                             &mut mcp,
                         ))
@@ -3523,6 +4355,7 @@ fn help_lines() -> &'static [&'static str] {
         "  /dgx warm [model]        - pre-load a model into VRAM",
         "  /dgx route <task>        - recommend a formation for a task",
         "  /dgx doctor              - probe every configured endpoint",
+        "  /permissions             - prompted permission decisions this session",
         "  /workspace               - show current workspace path",
         "  /version                 - print newt version",
         "  /help                    - this message",
@@ -4136,6 +4969,7 @@ mod run_command_confinement_tests {
             None,
             None,
             None,
+            None,
         )
         .await;
         assert!(
@@ -4163,6 +4997,7 @@ mod run_command_confinement_tests {
             20,
             &caveats,
             &mut Mcp::empty(),
+            None,
             None,
             None,
             None,
@@ -4207,6 +5042,7 @@ mod run_command_confinement_tests {
             None,
             None,
             None,
+            None,
         )
         .await;
 
@@ -4245,6 +5081,7 @@ mod run_command_confinement_tests {
             None,
             None,
             None,
+            None,
         )
         .await;
         assert_eq!(out, "hello", "read_file must still return file contents");
@@ -4273,6 +5110,7 @@ mod run_command_confinement_tests {
             20,
             &caveats,
             &mut Mcp::empty(),
+            None,
             None,
             None,
             None,
@@ -4311,6 +5149,7 @@ mod run_command_confinement_tests {
             20,
             &caveats,
             &mut Mcp::empty(),
+            None,
             None,
             None,
             None,
@@ -6269,6 +7108,7 @@ mod tool_round_cap_tests {
                     summarizer: None,
                     compress_state: None,
                     tool_events: None,
+                    permission_gate: None,
                 },
                 &mut Mcp::empty(),
             )
