@@ -15,10 +15,24 @@ use std::path::{Path, PathBuf};
 use newt_core::{workspace_key_v2, ConversationStore};
 
 /// Run `git` in `dir` with hermetic identity/config; panic on failure.
+///
+/// The `GIT_*` environment is scrubbed because these tests can run inside a
+/// git hook (the pre-push gate runs `cargo test`), and hooks export
+/// `GIT_DIR`/`GIT_WORK_TREE`/`GIT_INDEX_FILE` pointing at the REAL repo —
+/// which overrides `-C`, so the fixture's `add`/`commit` would land on the
+/// developer's actual branch (observed: a tree-wiping "seed commit" minted
+/// onto a feature branch during a worktree push; see issue #276's sibling
+/// finding). Scrubbing makes `-C` authoritative again.
 fn git(dir: &Path, args: &[&str]) {
     let out = std::process::Command::new("git")
         .arg("-C")
         .arg(dir)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_OBJECT_DIRECTORY")
+        .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_PREFIX")
         .args([
             "-c",
             "user.name=newt-test",
