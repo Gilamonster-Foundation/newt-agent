@@ -46,11 +46,10 @@ pub use conversation::{
     new_conversation_id, session_plan_dir, session_plan_path, ConversationRecord,
     ConversationSummary, ConversationTurn,
 };
-// Step 17.1a (issue #246): the canonical `ConversationStore` is now the
-// SQLite backend (`store` module, §6 causal ordering) — same public API,
-// so the TUI is SQLite-backed with no call-site changes. The JSON backend
-// stays reachable at `conversation::ConversationStore` until 17.1b imports
-// from and deletes it.
+// Steps 17.1a/17.1b (issue #246): `ConversationStore` is the SQLite backend
+// (`store` module, §6 causal ordering). The legacy JSON write path is gone;
+// any legacy tree is imported once on open. The `conversation` module keeps
+// the storage-agnostic shared types and free functions re-exported above.
 pub use dgx::{DgxConfig, DgxFormation, DgxNode, DgxNotConfigured, EndpointKind};
 pub use error::NewtError;
 pub use memory::{

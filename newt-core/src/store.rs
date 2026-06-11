@@ -1,12 +1,12 @@
-//! SQLite-backed conversation store — Phase 17.1a (issue #246).
+//! SQLite-backed conversation store — Phase 17.1a/17.1b (issue #246).
 //!
-//! Drop-in backend swap for [`crate::conversation::ConversationStore`]: the
-//! same public API (`create` / `create_with_id` / `exists` / `append_turn` /
+//! The only conversation backend: the same public API the JSON-file store
+//! established (`create` / `create_with_id` / `exists` / `append_turn` /
 //! `load` / `list` / `rename` / `delete` / `resolve_id`, prefix resolution,
-//! workspace scoping, create-time pruning) now backed by a single SQLite
-//! database at `<root>/conversations.db` instead of one pretty-printed JSON
-//! file per conversation. The JSON code path is untouched this PR — 17.1b
-//! performs the one-time import and deletes it.
+//! workspace scoping, create-time pruning) backed by a single SQLite
+//! database at `<root>/conversations.db`. The legacy per-conversation JSON
+//! tree (`<root>/conversations/<workspace-uuid>/<id>.json`) is imported once
+//! on open and kept as a backup — see [One-time JSON import](#one-time-json-import-171b).
 //!
 //! # §6 — ordering is causal, time is a claim (BINDING)
 //!
@@ -25,6 +25,31 @@
 //! * **Wall-clock columns** (`started_at_claim`, `updated_at_claim`,
 //!   `ts_claim`) are **display-only claims**. No query in this module orders,
 //!   prunes, or resolves by them.
+//!
+//! **Honesty note on the envelope (17.1b, review NIT N3 on #261):** the
+//! tamper-evident envelope covers the `turns` rows and the stored chain tip
+//! — nothing else. Conversation-row metadata (`title`, `activity_tick`, the
+//! `*_claim` columns, persona) can be edited in place undetectably with any
+//! SQLite client. Until 17.2 introduces real key material and signing, this
+//! integrity story is anti-naive-edit, not anti-adversary.
+//!
+//! # One-time JSON import (17.1b)
+//!
+//! On open, if the retired JSON backend's tree exists at
+//! `<root>/conversations/`, every readable record in every per-workspace
+//! UUID dir is imported into SQLite — all workspaces under the root, not
+//! just the opening store's (the files carry their workspace identity in
+//! the dir name and the record body). Turns get ticks through the normal
+//! `next_tick` path in legacy MRU order (ascending `updated_at`), so
+//! post-import MRU matches what the JSON backend would have shown; the
+//! legacy `unix_nanos` fields are ingested **only** as display claims
+//! (`*_claim` / `ts_claim` — §6). The chain is built turn by turn from the
+//! genesis hash, so [`ConversationStore::verify_chain`] passes on imported
+//! history. Corrupt records are skipped with a warning (the legacy store's
+//! own semantics). The import is idempotent and non-destructive: records
+//! whose id already exists are skipped, and after a successful pass the
+//! legacy dir is renamed to `conversations.imported/` and kept as a backup,
+//! so a second open finds nothing to import.
 //!
 //! # Writer identity (17.1a scope)
 //!
@@ -55,11 +80,20 @@ use std::time::Duration;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 
 use crate::conversation::{
-    self, session_plan_dir, ConversationRecord, ConversationSummary, ConversationTurn,
+    new_conversation_id, session_plan_dir, ConversationRecord, ConversationSummary,
+    ConversationTurn,
 };
 
 /// Database file name under the store root (`~/.newt/conversations.db`).
 const DB_FILE: &str = "conversations.db";
+
+/// The retired JSON backend's tree under the store root: one
+/// `<workspace-uuid>/<id>.json` per conversation. Imported once on open.
+const LEGACY_JSON_DIR: &str = "conversations";
+
+/// Where the legacy tree is moved after a successful import (kept as a
+/// backup, never deleted by newt).
+const LEGACY_BACKUP_DIR: &str = "conversations.imported";
 
 /// Per-install nonce file under the store root; its BLAKE3 hex is the
 /// `writer_fingerprint` (see module docs — 17.2 replaces this with the
@@ -71,9 +105,15 @@ const NONCE_FILE: &str = "install-nonce";
 /// behind this.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Domain-separation prefix for the canonical turn encoding (`prev_hash`
+/// Domain-separation prefix for the v1 canonical turn encoding (`prev_hash`
 /// chain). Versioned so a future encoding change cannot collide with v1.
-const TURN_ENCODING_VERSION: &[u8] = b"newt-turn:v1";
+const TURN_ENCODING_V1_PREFIX: &[u8] = b"newt-turn:v1";
+
+/// The turn encoding version this build writes, recorded per row in
+/// `turns.encoding_version` (review NIT N1 on #261). [`TurnRow::content_hash`]
+/// dispatches on the stored value; only v1 exists today, and a row carrying
+/// an unknown version errors clearly instead of hashing garbage.
+const TURN_ENCODING_VERSION_CURRENT: i64 = 1;
 
 /// Domain-separation prefix for the per-(conversation, writer) genesis hash.
 const GENESIS_PREFIX: &[u8] = b"newt-turn-chain-genesis:v1";
@@ -143,6 +183,8 @@ impl ConversationStore {
             }
         };
 
+        import_legacy_json(&conn, &root, &writer_fingerprint)?;
+
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             workspace,
@@ -154,11 +196,13 @@ impl ConversationStore {
         })
     }
 
-    /// Stable workspace key for a path. Today this is the same UUIDv5
-    /// derivation as the JSON backend (single-sourced from it); step 17.2
-    /// replaces the derivation with `blake3(git remote + branch)`.
+    /// Stable workspace key for a path. The same UUIDv5-of-canonical-path
+    /// derivation the JSON backend used (so legacy dir names keep matching);
+    /// step 17.2 replaces the derivation with `blake3(git remote + branch)`.
     pub fn workspace_id_for_path(path: impl AsRef<Path>) -> anyhow::Result<String> {
-        conversation::ConversationStore::workspace_id_for_path(path)
+        let canonical = std::fs::canonicalize(path.as_ref())?;
+        let normalized = canonical.to_string_lossy().replace('\\', "/");
+        Ok(uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_URL, normalized.as_bytes()).to_string())
     }
 
     /// `Some(error text)` when the database refused WAL and the store is
@@ -176,7 +220,7 @@ impl ConversationStore {
 
     /// Create a conversation with a freshly minted id; returns the id.
     pub fn create(&self, title: &str, persona: Option<&str>) -> anyhow::Result<String> {
-        let id = conversation::new_conversation_id();
+        let id = new_conversation_id();
         self.create_with_id(&id, title, persona)?;
         Ok(id)
     }
@@ -284,7 +328,7 @@ impl ConversationStore {
         // previous turn (re-derived from the row itself, so a drifted
         // `tip_hash` column can never poison the chain).
         let prev_hash = match last_turn(&tx, &id, &self.writer_fingerprint)? {
-            Some(prev) => prev.content_hash(),
+            Some(prev) => prev.content_hash()?,
             None => genesis_hash(&id, &self.writer_fingerprint),
         };
 
@@ -299,25 +343,9 @@ impl ConversationStore {
             tokens_in: None,
             tokens_out: None,
             ts_claim: now,
+            encoding_version: TURN_ENCODING_VERSION_CURRENT,
         };
-        tx.execute(
-            "INSERT INTO turns
-               (conversation_id, writer_fingerprint, seq, prev_hash, user, assistant,
-                events, tokens_in, tokens_out, ts_claim)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-            rusqlite::params![
-                row.conversation_id,
-                row.writer_fingerprint,
-                row.seq,
-                row.prev_hash,
-                row.user,
-                row.assistant,
-                row.events,
-                row.tokens_in,
-                row.tokens_out,
-                row.ts_claim,
-            ],
-        )?;
+        insert_turn_row(&tx, &row)?;
         // Activity tick + chain tip move together; updated_at_claim is a
         // display claim only (§6) — nothing orders by it.
         tx.execute(
@@ -325,7 +353,7 @@ impl ConversationStore {
                 SET writer_fingerprint = ?2, activity_tick = ?3, tip_hash = ?4,
                     updated_at_claim = ?5
               WHERE id = ?1",
-            rusqlite::params![id, self.writer_fingerprint, tick, row.content_hash(), now],
+            rusqlite::params![id, self.writer_fingerprint, tick, row.content_hash()?, now],
         )?;
         tx.commit()?;
         Ok(())
@@ -452,18 +480,20 @@ impl ConversationStore {
         if let Some(id) = exact {
             return Ok(id);
         }
-        // Ids are validated to alphanumeric + '-' above, so the prefix can
-        // never contain LIKE metacharacters.
+        // Byte-case-exact prefix match (review NIT N5 on #261): `LIKE` is
+        // ASCII-case-insensitive by default, which silently widened prefix
+        // resolution when the JSON backend's `starts_with` was ported.
+        // `substr` compares exactly; ids are validated ASCII above, so
+        // character positions and byte positions coincide.
         let mut stmt = conn.prepare(
             "SELECT id FROM conversations
-              WHERE workspace_key = ?1 AND id LIKE ?2
+              WHERE workspace_key = ?1 AND substr(id, 1, length(?2)) = ?2
               ORDER BY id ASC",
         )?;
         let matches = stmt
-            .query_map(
-                rusqlite::params![self.workspace_id, format!("{id_or_prefix}%")],
-                |row| row.get::<_, String>(0),
-            )?
+            .query_map(rusqlite::params![self.workspace_id, id_or_prefix], |row| {
+                row.get::<_, String>(0)
+            })?
             .collect::<Result<Vec<_>, _>>()?;
         match matches.as_slice() {
             [id] => Ok(id.clone()),
@@ -492,7 +522,7 @@ impl ConversationStore {
 
         let mut stmt = conn.prepare(
             "SELECT conversation_id, writer_fingerprint, seq, prev_hash, user, assistant,
-                    events, tokens_in, tokens_out, ts_claim
+                    events, tokens_in, tokens_out, ts_claim, encoding_version
                FROM turns
               WHERE conversation_id = ?1
               ORDER BY writer_fingerprint ASC, seq ASC",
@@ -513,7 +543,7 @@ impl ConversationStore {
                         p.seq
                     );
                 }
-                if row.prev_hash != p.content_hash() {
+                if row.prev_hash != p.content_hash()? {
                     anyhow::bail!(
                         "chain violation in `{id}`: turn seq {} does not link to seq {} \
                          (row tampered or out of order)",
@@ -541,10 +571,10 @@ impl ConversationStore {
         // verify_chain writer-agnostic: a store that authored no turns in a
         // migrated/foreign conversation still verifies it correctly
         // (adversarial-review finding N2 on #261).
-        let expected_tip = rows
-            .iter()
-            .rfind(|r| r.writer_fingerprint == tip_writer)
-            .map_or_else(|| genesis_hash(&id, &tip_writer), TurnRow::content_hash);
+        let expected_tip = match rows.iter().rfind(|r| r.writer_fingerprint == tip_writer) {
+            Some(row) => row.content_hash()?,
+            None => genesis_hash(&id, &tip_writer),
+        };
         if tip != expected_tip {
             anyhow::bail!("chain violation in `{id}`: stored tip_hash does not match the chain");
         }
@@ -620,22 +650,37 @@ struct TurnRow {
     tokens_in: Option<i64>,
     tokens_out: Option<i64>,
     ts_claim: i64,
+    /// Which canonical encoding hashed this row (`turns.encoding_version`,
+    /// review NIT N1 on #261). Only v1 exists today.
+    encoding_version: i64,
 }
 
 impl TurnRow {
     /// BLAKE3 hex of this row's canonical encoding — what the *next* turn's
-    /// `prev_hash` must equal.
-    fn content_hash(&self) -> String {
-        blake3::hash(&self.canonical_encoding())
-            .to_hex()
-            .to_string()
+    /// `prev_hash` must equal. Dispatches on the row's recorded
+    /// `encoding_version`; a version this build does not understand errors
+    /// clearly instead of hashing under the wrong rules (NIT N1 on #261).
+    fn content_hash(&self) -> anyhow::Result<String> {
+        match self.encoding_version {
+            1 => Ok(blake3::hash(&self.canonical_encoding_v1())
+                .to_hex()
+                .to_string()),
+            other => anyhow::bail!(
+                "turn (conversation `{}`, writer {}, seq {}) carries encoding_version {other}, \
+                 which this newt does not understand (known: 1) — upgrade newt to verify \
+                 or extend this chain",
+                self.conversation_id,
+                self.writer_fingerprint,
+                self.seq
+            ),
+        }
     }
 
-    /// Canonical byte encoding of a turn: version tag, then every field
+    /// Canonical v1 byte encoding of a turn: version tag, then every field
     /// length-prefixed (u64 LE) so adjacent fields can never be reparsed
     /// ambiguously (`("ab","c")` ≠ `("a","bc")`). Integers are 8-byte LE
     /// with a presence byte for the optional token counts.
-    fn canonical_encoding(&self) -> Vec<u8> {
+    fn canonical_encoding_v1(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(
             64 + self.conversation_id.len()
                 + self.writer_fingerprint.len()
@@ -644,7 +689,7 @@ impl TurnRow {
                 + self.assistant.len()
                 + self.events.len(),
         );
-        out.extend_from_slice(TURN_ENCODING_VERSION);
+        out.extend_from_slice(TURN_ENCODING_V1_PREFIX);
         for field in [
             self.conversation_id.as_bytes(),
             self.writer_fingerprint.as_bytes(),
@@ -683,7 +728,33 @@ fn turn_row_from_sql(row: &rusqlite::Row<'_>) -> rusqlite::Result<TurnRow> {
         tokens_in: row.get(7)?,
         tokens_out: row.get(8)?,
         ts_claim: row.get(9)?,
+        encoding_version: row.get(10)?,
     })
+}
+
+/// Insert one fully-populated turn row. Must run inside the caller's
+/// transaction (shared by the live append path and the one-time import).
+fn insert_turn_row(conn: &Connection, row: &TurnRow) -> anyhow::Result<()> {
+    conn.execute(
+        "INSERT INTO turns
+           (conversation_id, writer_fingerprint, seq, prev_hash, user, assistant,
+            events, tokens_in, tokens_out, ts_claim, encoding_version)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        rusqlite::params![
+            row.conversation_id,
+            row.writer_fingerprint,
+            row.seq,
+            row.prev_hash,
+            row.user,
+            row.assistant,
+            row.events,
+            row.tokens_in,
+            row.tokens_out,
+            row.ts_claim,
+            row.encoding_version,
+        ],
+    )?;
+    Ok(())
 }
 
 /// The §6 genesis hash anchoring a writer's chain within a conversation.
@@ -706,7 +777,7 @@ fn last_turn(
     Ok(conn
         .query_row(
             "SELECT conversation_id, writer_fingerprint, seq, prev_hash, user, assistant,
-                    events, tokens_in, tokens_out, ts_claim
+                    events, tokens_in, tokens_out, ts_claim, encoding_version
                FROM turns
               WHERE conversation_id = ?1 AND writer_fingerprint = ?2
               ORDER BY seq DESC
@@ -838,6 +909,7 @@ fn create_schema(conn: &Connection) -> anyhow::Result<()> {
              tokens_in          INTEGER,                  -- filled by 17.6, consumed by 18.x
              tokens_out         INTEGER,
              ts_claim           INTEGER NOT NULL,         -- DISPLAY ONLY (wall-clock claim, unix nanos)
+             encoding_version   INTEGER NOT NULL DEFAULT 1, -- canonical-encoding dispatch (N1 on #261)
              PRIMARY KEY (conversation_id, writer_fingerprint, seq)
          );
          -- The per-writer Lamport clock (§6 'each agent is its own clock').
@@ -884,6 +956,9 @@ const EXPECTED_COLUMNS: &[(&str, &[(&str, &str)])] = &[
             ("tokens_in", "INTEGER"),
             ("tokens_out", "INTEGER"),
             ("ts_claim", "INTEGER NOT NULL DEFAULT 0"),
+            // N1 on #261: rows written before this column exist only as v1,
+            // so DEFAULT 1 is the historically-true backfill.
+            ("encoding_version", "INTEGER NOT NULL DEFAULT 1"),
         ],
     ),
     (
@@ -916,6 +991,226 @@ fn reconcile_schema(conn: &Connection) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// One-time import of the retired JSON backend's tree (see the module docs).
+///
+/// Runs on every open and is a fast no-op when `<root>/conversations/` does
+/// not exist (i.e. always, after the first successful import renames it to
+/// the backup dir). Records are imported oldest-first by the legacy MRU
+/// ordering (`updated_at`, then `created_at`, then id — the JSON backend's
+/// own sort), so ticks assigned in import order reproduce the conversation
+/// ordering users saw before the migration.
+fn import_legacy_json(
+    conn: &Connection,
+    root: &Path,
+    writer_fingerprint: &str,
+) -> anyhow::Result<()> {
+    let legacy_root = root.join(LEGACY_JSON_DIR);
+    if !legacy_root.is_dir() {
+        return Ok(());
+    }
+    let mut records = collect_legacy_records(&legacy_root)?;
+    records.sort_by(|a, b| {
+        a.updated_at_unix_nanos
+            .cmp(&b.updated_at_unix_nanos)
+            .then_with(|| a.created_at_unix_nanos.cmp(&b.created_at_unix_nanos))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    let mut imported = 0usize;
+    for record in &records {
+        if import_one_record(conn, record, writer_fingerprint)? {
+            imported += 1;
+        }
+    }
+    let backup = retire_legacy_dir(root, &legacy_root)?;
+    tracing::info!(
+        imported,
+        found = records.len(),
+        backup = %backup.display(),
+        "one-time import of legacy JSON conversations complete; \
+         the original tree is kept as a backup"
+    );
+    Ok(())
+}
+
+/// Walk `<legacy_root>/<workspace-uuid>/<id>.json` and parse every readable
+/// record — all workspaces, not just the opening store's. Corrupt or
+/// unreadable records are skipped with a warning (the legacy store's own
+/// semantics); whatever is skipped survives untouched in the backup dir.
+fn collect_legacy_records(legacy_root: &Path) -> anyhow::Result<Vec<ConversationRecord>> {
+    let mut records = Vec::new();
+    for ws_entry in std::fs::read_dir(legacy_root)? {
+        let ws_dir = ws_entry?.path();
+        if !ws_dir.is_dir() {
+            // Stray file at the workspace level — not a record; the backup
+            // rename preserves it.
+            continue;
+        }
+        let dir_key = ws_dir
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        for entry in std::fs::read_dir(&ws_dir)? {
+            let path = entry?.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                // The legacy store only ever read `.json` (crash-leftover
+                // `.tmp` files were invisible to it).
+                continue;
+            }
+            let parsed = std::fs::read_to_string(&path)
+                .map_err(anyhow::Error::from)
+                .and_then(|text| Ok(serde_json::from_str::<ConversationRecord>(&text)?));
+            let record = match parsed {
+                Ok(record) => record,
+                Err(e) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "skipping unreadable legacy conversation record \
+                         (the file is kept in the import backup)"
+                    );
+                    continue;
+                }
+            };
+            // The legacy store only served records whose body workspace_id
+            // matched their dir name; a mismatched record was invisible to
+            // every workspace. Importing it would resurrect data no store
+            // could see — skip it (it stays in the backup).
+            if record.workspace_id != dir_key {
+                tracing::warn!(
+                    path = %path.display(),
+                    body_workspace = %record.workspace_id,
+                    dir_workspace = %dir_key,
+                    "skipping legacy record whose workspace id does not match its dir"
+                );
+                continue;
+            }
+            if let Err(e) = validate_record_id(&record.id) {
+                tracing::warn!(path = %path.display(), error = %e, "skipping legacy record");
+                continue;
+            }
+            records.push(record);
+        }
+    }
+    Ok(records)
+}
+
+/// Import one legacy record inside its own `BEGIN IMMEDIATE` transaction:
+/// conversation row first (one tick, genesis tip), then each turn through
+/// the normal tick + chain path, then the activity/tip update — exactly the
+/// shape the live write path produces, so `verify_chain` holds post-import.
+/// Returns `false` (and writes nothing) when the id already exists in the
+/// database — in any workspace: that means an earlier pass imported it (or
+/// the id collides), and the import never overwrites.
+fn import_one_record(
+    conn: &Connection,
+    record: &ConversationRecord,
+    writer_fingerprint: &str,
+) -> anyhow::Result<bool> {
+    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    let already: Option<i64> = tx
+        .query_row(
+            "SELECT 1 FROM conversations WHERE id = ?1",
+            [&record.id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if already.is_some() {
+        tracing::debug!(id = %record.id, "legacy conversation already in the db; skipping");
+        return Ok(false);
+    }
+
+    // §6: the legacy unix_nanos enter ONLY as display claims.
+    let started_claim = clamp_claim(record.created_at_unix_nanos);
+    let updated_claim = clamp_claim(record.updated_at_unix_nanos);
+    let create_tick = next_tick(&tx, writer_fingerprint)?;
+    tx.execute(
+        "INSERT INTO conversations
+           (id, title, workspace_path, workspace_key, persona, end_reason,
+            writer_fingerprint, activity_tick, tip_hash,
+            started_at_claim, updated_at_claim)
+         VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?8, ?9, ?10)",
+        rusqlite::params![
+            record.id,
+            record.title,
+            record.workspace,
+            record.workspace_id,
+            record.persona,
+            writer_fingerprint,
+            create_tick,
+            genesis_hash(&record.id, writer_fingerprint),
+            started_claim,
+            updated_claim,
+        ],
+    )?;
+
+    let mut prev_hash = genesis_hash(&record.id, writer_fingerprint);
+    let mut last_tick = create_tick;
+    for turn in &record.turns {
+        let seq = next_tick(&tx, writer_fingerprint)?;
+        let row = TurnRow {
+            conversation_id: record.id.clone(),
+            writer_fingerprint: writer_fingerprint.to_string(),
+            seq,
+            prev_hash,
+            user: turn.user.clone(),
+            assistant: turn.assistant.clone(),
+            events: "[]".to_string(),
+            tokens_in: None,
+            tokens_out: None,
+            // The legacy format recorded no per-turn time; the record-level
+            // updated_at is the only available claim (display only, §6).
+            ts_claim: updated_claim,
+            encoding_version: TURN_ENCODING_VERSION_CURRENT,
+        };
+        insert_turn_row(&tx, &row)?;
+        prev_hash = row.content_hash()?;
+        last_tick = seq;
+    }
+    if !record.turns.is_empty() {
+        tx.execute(
+            "UPDATE conversations SET activity_tick = ?2, tip_hash = ?3 WHERE id = ?1",
+            rusqlite::params![record.id, last_tick, prev_hash],
+        )?;
+    }
+    tx.commit()?;
+    Ok(true)
+}
+
+/// Move the legacy tree to the backup name (`conversations.imported/`,
+/// suffixed if that already exists). A concurrent opener may win the rename;
+/// finding the source already gone is success, not an error.
+fn retire_legacy_dir(root: &Path, legacy_root: &Path) -> anyhow::Result<PathBuf> {
+    for attempt in 0u32..100 {
+        let candidate = if attempt == 0 {
+            root.join(LEGACY_BACKUP_DIR)
+        } else {
+            root.join(format!("{LEGACY_BACKUP_DIR}.{attempt}"))
+        };
+        if candidate.exists() {
+            continue;
+        }
+        return match std::fs::rename(legacy_root, &candidate) {
+            Ok(()) => Ok(candidate),
+            Err(_) if !legacy_root.exists() => Ok(candidate),
+            Err(e) => Err(anyhow::Error::from(e).context(format!(
+                "imported legacy conversations but could not move {} aside to {}",
+                legacy_root.display(),
+                candidate.display()
+            ))),
+        };
+    }
+    anyhow::bail!(
+        "no free backup name for {} (conversations.imported* all taken)",
+        legacy_root.display()
+    )
+}
+
+/// Clamp a legacy u128 nanosecond claim into the store's i64 claim columns.
+/// Saturates at `i64::MAX` — claims are display-only (§6), never compared.
+fn clamp_claim(nanos: u128) -> i64 {
+    i64::try_from(nanos).unwrap_or(i64::MAX)
 }
 
 /// Load (or mint, atomically) the per-install nonce and derive the writer
@@ -981,9 +1276,10 @@ fn claim_to_u128(claim: i64) -> u128 {
     claim.max(0) as u128
 }
 
-/// Same id alphabet as the JSON backend (alphanumeric + '-'). SQL parameters
-/// make injection moot, but the shared alphabet keeps ids portable across
-/// both backends until 17.1b retires the JSON one.
+/// The conversation-id alphabet (ASCII alphanumeric + '-'), inherited from
+/// the JSON backend so every legacy id imports unchanged. SQL parameters
+/// make injection moot; the validation also guarantees ids are pure ASCII,
+/// which `resolve_id`'s byte-exact `substr` prefix match relies on.
 fn validate_record_id(id: &str) -> anyhow::Result<()> {
     if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
         anyhow::bail!("invalid conversation id `{id}`");
@@ -1020,6 +1316,7 @@ mod tests {
             tokens_in: None,
             tokens_out: None,
             ts_claim: 7,
+            encoding_version: 1,
         };
         let shifted = TurnRow {
             user: "a".into(),
@@ -1027,8 +1324,8 @@ mod tests {
             ..clone_row(&base)
         };
         assert_ne!(
-            base.canonical_encoding(),
-            shifted.canonical_encoding(),
+            base.canonical_encoding_v1(),
+            shifted.canonical_encoding_v1(),
             "length prefixes must prevent (ab,c) == (a,bc)"
         );
         // Every field participates in the hash — including the claims and
@@ -1037,12 +1334,50 @@ mod tests {
             ts_claim: 8,
             ..clone_row(&base)
         };
-        assert_ne!(base.content_hash(), skewed.content_hash());
+        assert_ne!(base.content_hash().unwrap(), skewed.content_hash().unwrap());
         let tokens = TurnRow {
             tokens_in: Some(5),
             ..clone_row(&base)
         };
-        assert_ne!(base.content_hash(), tokens.content_hash());
+        assert_ne!(base.content_hash().unwrap(), tokens.content_hash().unwrap());
+    }
+
+    /// N1 (#261): `content_hash` dispatches on the row's recorded encoding
+    /// version — v1 hashes, anything else errors clearly rather than hashing
+    /// under the wrong rules.
+    #[test]
+    fn content_hash_rejects_unknown_encoding_versions() {
+        let v1 = TurnRow {
+            conversation_id: "c".into(),
+            writer_fingerprint: "w".into(),
+            seq: 1,
+            prev_hash: "p".into(),
+            user: "u".into(),
+            assistant: "a".into(),
+            events: "[]".into(),
+            tokens_in: None,
+            tokens_out: None,
+            ts_claim: 7,
+            encoding_version: 1,
+        };
+        v1.content_hash().expect("v1 must hash");
+
+        let future = TurnRow {
+            encoding_version: 2,
+            ..clone_row(&v1)
+        };
+        let err = future.content_hash().unwrap_err().to_string();
+        assert!(
+            err.contains("encoding_version 2") && err.contains("known: 1"),
+            "unknown version must error clearly: {err}"
+        );
+    }
+
+    #[test]
+    fn clamp_claim_saturates_oversized_legacy_nanos() {
+        assert_eq!(clamp_claim(0), 0);
+        assert_eq!(clamp_claim(42), 42);
+        assert_eq!(clamp_claim(u128::MAX), i64::MAX);
     }
 
     #[test]
@@ -1100,6 +1435,7 @@ mod tests {
             tokens_in: row.tokens_in,
             tokens_out: row.tokens_out,
             ts_claim: row.ts_claim,
+            encoding_version: row.encoding_version,
         }
     }
 }
