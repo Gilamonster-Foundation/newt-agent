@@ -134,11 +134,32 @@ fn select_openai_backend(
         .find(|b| b.kind == newt_core::BackendKind::Openai)
 }
 
+fn select_provider_config(
+    cfg: &newt_core::Config,
+    ollama_override: bool,
+) -> Option<&newt_core::config::ProviderConfig> {
+    if ollama_override {
+        return None;
+    }
+    cfg.providers.first()
+}
+
 async fn resolve_backend() -> anyhow::Result<Arc<dyn newt_inference::InferenceBackend>> {
     use newt_core::Config;
 
     let ollama_override = std::env::var_os("OLLAMA_HOST").is_some();
     let cfg = Config::resolve().unwrap_or_default();
+    if let Some(provider) = select_provider_config(&cfg, ollama_override) {
+        tracing::info!(
+            name = %provider.name,
+            command = %provider.command,
+            model = %provider.model.as_deref().unwrap_or("(missing)"),
+            "worker: using configured provider plugin"
+        );
+        return Ok(Arc::new(
+            newt_inference::provider_plugin::ProviderPluginBackend::from_config(provider)?,
+        ));
+    }
     if let Some(openai) = select_openai_backend(&cfg, ollama_override) {
         tracing::info!(
             name = %openai.name,
@@ -161,6 +182,7 @@ async fn resolve_backend() -> anyhow::Result<Arc<dyn newt_inference::InferenceBa
 #[cfg(test)]
 mod backend_selection_tests {
     use super::select_openai_backend;
+    use newt_core::config::ProviderConfig;
     use newt_core::router::Tier;
     use newt_core::{BackendConfig, BackendKind, Config};
 
@@ -180,6 +202,16 @@ mod backend_selection_tests {
         Config {
             backends,
             ..Config::default()
+        }
+    }
+
+    fn provider(name: &str) -> ProviderConfig {
+        ProviderConfig {
+            name: name.into(),
+            command: "newt-provider-openai".into(),
+            model: Some("gpt-test".into()),
+            env_pass: vec!["OPENAI_API_KEY".into()],
+            tiers: vec![Tier::Complex],
         }
     }
 
@@ -224,5 +256,28 @@ mod backend_selection_tests {
         let chosen = select_openai_backend(&c, false).expect("openai backend");
         assert_eq!(chosen.name, "remote-a");
         assert_eq!(chosen.endpoint, "http://a");
+    }
+
+    #[test]
+    fn provider_config_wins_before_openai_compatible_backend() {
+        let c = Config {
+            providers: vec![provider("openai-provider")],
+            backends: vec![backend("remote", BackendKind::Openai)],
+            ..Config::default()
+        };
+
+        let chosen = super::select_provider_config(&c, false).expect("provider");
+
+        assert_eq!(chosen.name, "openai-provider");
+    }
+
+    #[test]
+    fn ollama_host_override_forces_ollama_path_even_with_provider_config() {
+        let c = Config {
+            providers: vec![provider("openai-provider")],
+            ..Config::default()
+        };
+
+        assert!(super::select_provider_config(&c, true).is_none());
     }
 }

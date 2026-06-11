@@ -12,9 +12,11 @@ keywords = ["newt", "agent", "plugin", "json-rpc", "llm"]
 categories = ["api-bindings"]
 
 [dependencies]
+async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
 
 [lints]
 workspace = true

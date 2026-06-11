@@ -159,7 +159,7 @@ Cloud APIs (OpenAI, Anthropic) require **opt-in provider plugins** installed
 separately:
 
 ```bash
-pip install newt-provider-openai      # registers an opt-in provider
+pip install newt-provider-openai      # installs the provider binary
 pip install newt-provider-anthropic   # registers an opt-in provider
 ```
 
@@ -167,6 +167,29 @@ Provider plugins run as subprocesses and speak the Newt-Provider JSON-RPC
 schema in [`plugins-protocol/`](./plugins-protocol/). No cloud client code is
 compiled into the default Newt binary — the opt-in is enforced at the build
 level, not by a runtime feature flag.
+
+During local development of the in-repo OpenAI provider:
+
+```bash
+pip install ./providers/openai
+newt-provider-openai --help
+```
+
+Then configure Newt explicitly. Keep the API key in your shell, secret manager,
+or ignored env file; do not put it in `newt.toml`.
+
+```toml
+[[providers]]
+name = "openai"
+command = "newt-provider-openai"
+model = "gpt-4.1-mini"
+tiers = ["FAST", "STANDARD", "COMPLEX", "REVIEW"]
+env_pass = ["OPENAI_API_KEY", "OPENAI_BASE_URL"]
+```
+
+`OPENAI_API_KEY` is required when the provider handles `complete` or
+`list_models`. `OPENAI_BASE_URL` is optional and defaults to
+`https://api.openai.com`.
 
 ## Evaluation
 

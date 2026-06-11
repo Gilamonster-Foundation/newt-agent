@@ -47,8 +47,8 @@ pub use agents::AgentsProvider;
 pub use caveats::{CaveatsExt, CountBoundExt, ScopeExt};
 pub use config::{
     AgentsConfig, BackendConfig, BackendKind, ChatStyle, Config, ConversationsConfig, EditMode,
-    LogConfig, MemoryConfig, MemoryProviderKind, PermissionPreset, SkillsConfig, ToolPermissions,
-    TuiConfig,
+    LogConfig, MemoryConfig, MemoryProviderKind, PermissionPreset, ProviderConfig, SkillsConfig,
+    ToolPermissions, TuiConfig,
 };
 pub use conversation::{
     new_conversation_id, session_plan_dir, session_plan_path, ConversationRecord,
