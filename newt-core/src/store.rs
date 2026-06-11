@@ -175,10 +175,31 @@ impl ConversationStore {
         {
             let conn = self.lock_conn();
             let tx = rusqlite::Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
+            // Workspace fence: `id` is a GLOBAL primary key and REPLACE fires
+            // `ON DELETE CASCADE` — without this check, re-creating an id that
+            // belongs to ANOTHER workspace would silently destroy that
+            // workspace's conversation and all its turns. Same-workspace
+            // REPLACE keeps JSON-backend parity (re-create = overwrite).
+            let foreign: Option<String> = tx
+                .query_row(
+                    "SELECT workspace_key FROM conversations WHERE id = ?1",
+                    rusqlite::params![id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(owner) = foreign {
+                if owner != self.workspace_id {
+                    anyhow::bail!(
+                        "conversation id `{id}` already exists in another workspace \
+                         (key {owner}); refusing to overwrite across the workspace fence"
+                    );
+                }
+            }
             let tick = next_tick(&tx, &self.writer_fingerprint)?;
             // INSERT OR REPLACE mirrors the JSON backend, where re-creating an
             // existing id overwrote the record (turns reset). The REPLACE
-            // deletes the old row, and `ON DELETE CASCADE` drops its turns.
+            // deletes the old row, and `ON DELETE CASCADE` drops its turns —
+            // safe only because of the fence above.
             tx.execute(
                 "INSERT OR REPLACE INTO conversations
                    (id, title, workspace_path, workspace_key, persona, end_reason,
@@ -206,16 +227,21 @@ impl ConversationStore {
     /// `true` if a record for exactly `id` exists in this workspace. Used by
     /// the save path to decide between [`create_with_id`](Self::create_with_id)
     /// (first turn) and [`append_turn`](Self::append_turn).
-    pub fn exists(&self, id: &str) -> bool {
+    ///
+    /// Errors propagate rather than read as "absent": a transient failure
+    /// (e.g. a busy reader past the timeout under the NFS DELETE fallback)
+    /// mistaken for "doesn't exist" would route the caller into
+    /// `create_with_id` and overwrite a live conversation.
+    pub fn exists(&self, id: &str) -> anyhow::Result<bool> {
         let conn = self.lock_conn();
-        conn.query_row(
-            "SELECT 1 FROM conversations WHERE id = ?1 AND workspace_key = ?2",
-            rusqlite::params![id, self.workspace_id],
-            |_| Ok(()),
-        )
-        .optional()
-        .map(|row| row.is_some())
-        .unwrap_or(false)
+        Ok(conn
+            .query_row(
+                "SELECT 1 FROM conversations WHERE id = ?1 AND workspace_key = ?2",
+                rusqlite::params![id, self.workspace_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
     }
 
     /// Append one `(user, assistant)` turn. `id` may be a unique prefix.
@@ -435,10 +461,10 @@ impl ConversationStore {
     pub fn verify_chain(&self, id: &str) -> anyhow::Result<()> {
         let id = self.resolve_id(id)?;
         let conn = self.lock_conn();
-        let tip: String = conn.query_row(
-            "SELECT tip_hash FROM conversations WHERE id = ?1",
+        let (tip, tip_writer): (String, String) = conn.query_row(
+            "SELECT tip_hash, writer_fingerprint FROM conversations WHERE id = ?1",
             [&id],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
 
         let mut stmt = conn.prepare(
@@ -486,15 +512,16 @@ impl ConversationStore {
             prev = Some(row);
         }
 
-        // The stored tip must match this store's writer chain: its last
-        // turn's hash, or the genesis hash when the writer has no turns.
+        // The stored tip must match the chain of the conversation row's
+        // RECORDED last writer (set at create, updated on every append in
+        // the same txn) — not whoever happens to be verifying. This keeps
+        // verify_chain writer-agnostic: a store that authored no turns in a
+        // migrated/foreign conversation still verifies it correctly
+        // (adversarial-review finding N2 on #261).
         let expected_tip = rows
             .iter()
-            .rfind(|r| r.writer_fingerprint == self.writer_fingerprint)
-            .map_or_else(
-                || genesis_hash(&id, &self.writer_fingerprint),
-                TurnRow::content_hash,
-            );
+            .rfind(|r| r.writer_fingerprint == tip_writer)
+            .map_or_else(|| genesis_hash(&id, &tip_writer), TurnRow::content_hash);
         if tip != expected_tip {
             anyhow::bail!("chain violation in `{id}`: stored tip_hash does not match the chain");
         }
@@ -690,6 +717,12 @@ fn next_tick(conn: &Connection, writer_fingerprint: &str) -> anyhow::Result<i64>
                  SELECT MAX(seq) AS t FROM turns
                  UNION ALL
                  SELECT MAX(activity_tick) AS t FROM conversations
+                 UNION ALL
+                 -- Other writers' issued ticks: keeps the seed at the true
+                 -- issued-max even when their rows were pruned (review
+                 -- finding N6 on #261 — Lamport receive rule over all
+                 -- observable evidence, not just surviving rows).
+                 SELECT MAX(last_tick) AS t FROM writer_clock
              )",
             [writer_fingerprint],
         )?;
@@ -718,9 +751,16 @@ fn apply_journal_mode(conn: &Connection) -> anyhow::Result<Option<String>> {
     let wal: Result<String, rusqlite::Error> =
         conn.pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get(0));
     match wal {
-        Ok(_) => {
+        // Assert the pragma actually took (it has documented silent-no-op
+        // cases) — NORMAL is only safe under WAL; any other mode keeps the
+        // compiled default of FULL (review finding N4 on #261).
+        Ok(mode) if mode.eq_ignore_ascii_case("wal") => {
             conn.pragma_update(None, "synchronous", "NORMAL")?;
             Ok(None)
+        }
+        Ok(mode) => {
+            tracing::warn!(%mode, "journal_mode=WAL did not take; keeping synchronous=FULL");
+            Ok(Some(format!("journal_mode pragma returned `{mode}`")))
         }
         Err(e) if wal_fallback_eligible(&e.to_string()) => {
             let captured = e.to_string();
@@ -863,14 +903,36 @@ fn load_or_create_writer_fingerprint(root: &Path) -> anyhow::Result<String> {
     let nonce = match std::fs::read_to_string(&path) {
         Ok(text) if !text.trim().is_empty() => text.trim().to_string(),
         _ => {
+            // Mint with O_EXCL (`create_new`) so two racing first-run
+            // processes converge on ONE nonce: exactly one create succeeds;
+            // the loser sees AlreadyExists and adopts the winner's nonce.
+            // (Write-then-rename is NOT safe here: rename replaces the file,
+            // so a slow racer could overwrite the winner's nonce after the
+            // winner already derived its fingerprint — permanently orphaning
+            // that writer's rows. The writer identity must mint exactly once.)
+            use std::io::Write as _;
             let minted = uuid::Uuid::new_v4().to_string();
-            // Write-then-rename so two racing first-run processes can never
-            // interleave a torn nonce; the loser's rename simply wins/loses
-            // whole-file and both re-read the survivor below.
-            let tmp = root.join(format!("{NONCE_FILE}.{}.tmp", std::process::id()));
-            std::fs::write(&tmp, &minted)?;
-            std::fs::rename(&tmp, &path)?;
-            std::fs::read_to_string(&path)?.trim().to_string()
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(mut f) => {
+                    f.write_all(minted.as_bytes())?;
+                    minted
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let adopted = std::fs::read_to_string(&path)?.trim().to_string();
+                    if adopted.is_empty() {
+                        anyhow::bail!(
+                            "install nonce at {} exists but is empty — remove it and retry",
+                            path.display()
+                        );
+                    }
+                    adopted
+                }
+                Err(e) => return Err(e.into()),
+            }
         }
     };
     Ok(blake3::hash(nonce.as_bytes()).to_hex().to_string())

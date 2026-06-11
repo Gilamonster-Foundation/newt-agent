@@ -33,11 +33,11 @@ fn create_with_id_adopts_the_supplied_id() {
     let store = ConversationStore::new(root.path(), workspace.path(), 100).unwrap();
 
     let id = new_conversation_id();
-    assert!(!store.exists(&id));
+    assert!(!store.exists(&id).unwrap());
     store
         .create_with_id(&id, "pre-assigned title", Some("coder"))
         .unwrap();
-    assert!(store.exists(&id));
+    assert!(store.exists(&id).unwrap());
 
     let record = store.load(&id).unwrap();
     assert_eq!(record.id, id);
@@ -604,6 +604,14 @@ fn opening_a_drifted_schema_adds_missing_columns() {
         .unwrap();
     assert!(max_seq > 7, "new ticks must continue past drifted data");
     store.load(&new_conv).unwrap();
+
+    // Chain verification works on the migrated conversation after the first
+    // post-migration append (review finding N2 on #261: the tip check is
+    // writer-agnostic — it follows the conversation row's recorded writer,
+    // so foreign/migrated history doesn't spuriously fail).
+    store
+        .verify_chain("legacy-conv")
+        .expect("migrated conversation must verify after a post-migration append");
 }
 
 /// On a healthy local filesystem WAL applies cleanly: no fallback notice.
@@ -667,4 +675,59 @@ fn common_prefix<'a>(a: &'a str, b: &str) -> &'a str {
         .count();
     assert!(len > 0, "test ids should share the unix timestamp prefix");
     &a[..len]
+}
+
+/// R2 (adversarial review of #261): `create_with_id` must refuse to overwrite
+/// a conversation that belongs to ANOTHER workspace — `id` is a global PK and
+/// REPLACE would cascade-delete the other workspace's turns.
+#[test]
+fn create_with_id_refuses_cross_workspace_overwrite() {
+    let root = tempfile::tempdir().unwrap();
+    let ws_a = tempfile::tempdir().unwrap();
+    let ws_b = tempfile::tempdir().unwrap();
+    let store_a = ConversationStore::new(root.path(), ws_a.path(), 100).unwrap();
+    let store_b = ConversationStore::new(root.path(), ws_b.path(), 100).unwrap();
+
+    let id = new_conversation_id();
+    store_a
+        .create_with_id(&id, "workspace A's conversation", None)
+        .unwrap();
+    store_a.append_turn(&id, "precious", "history").unwrap();
+
+    // Workspace B tries to create the same id: must bail, not REPLACE.
+    let err = store_b
+        .create_with_id(&id, "hijack", None)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("another workspace"), "got: {err}");
+
+    // A's conversation and its turns are intact.
+    let record = store_a.load(&id).unwrap();
+    assert_eq!(record.title, "workspace A's conversation");
+    assert_eq!(record.turns.len(), 1);
+    store_a.verify_chain(&id).unwrap();
+
+    // Same-workspace re-create keeps JSON-backend parity (overwrite allowed).
+    store_a.create_with_id(&id, "recreated", None).unwrap();
+    assert_eq!(store_a.load(&id).unwrap().turns.len(), 0);
+}
+
+/// R1 (adversarial review of #261): concurrent first-run nonce minting must
+/// converge every racer on ONE writer fingerprint.
+#[test]
+fn concurrent_nonce_mint_converges_on_one_fingerprint() {
+    let root = tempfile::tempdir().unwrap();
+    let ws = tempfile::tempdir().unwrap();
+    let mut handles = Vec::new();
+    for _ in 0..8 {
+        let root = root.path().to_path_buf();
+        let ws = ws.path().to_path_buf();
+        handles.push(std::thread::spawn(move || {
+            let store = ConversationStore::new(&root, &ws, 100).unwrap();
+            store.writer_fingerprint().to_string()
+        }));
+    }
+    let fps: std::collections::HashSet<String> =
+        handles.into_iter().map(|h| h.join().unwrap()).collect();
+    assert_eq!(fps.len(), 1, "all racers must adopt one identity: {fps:?}");
 }
