@@ -194,8 +194,10 @@ fn init_baseline_git(workspace: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Spawn `newt worker` with the configured Ollama endpoint.
-fn spawn_worker(config: &RunnerConfig) -> anyhow::Result<Child> {
+/// Build the `newt worker` command (env + args) without spawning it.
+/// Split from [`spawn_worker`] so the eval harness's environment contract
+/// — notably the ephemeral default — is unit-testable.
+fn worker_command(config: &RunnerConfig) -> Command {
     let mut cmd = Command::new(&config.worker_bin);
     cmd.arg("worker")
         .stdin(Stdio::piped())
@@ -220,13 +222,29 @@ fn spawn_worker(config: &RunnerConfig) -> anyhow::Result<Child> {
         cmd.env("NEWT_DEFAULT_MODEL", model);
     }
 
+    // Eval runs are ALWAYS ephemeral (Step 17.7; the conversation-context
+    // decision doc's own requirement): a graded run must never create or
+    // resume conversation rows, or ambient journals would leak into the
+    // grade and eval runs would pollute real workspaces — the eval gate
+    // stays honest. Today's worker has no conversation store at all, so
+    // this is defense-in-depth: if persistence ever reaches the ACP
+    // worker, it must honor NEWT_EPHEMERAL, and this line already opts
+    // every eval run out.
+    cmd.env("NEWT_EPHEMERAL", "1");
+
     // The worker's tracing_subscriber writes to STDOUT, which is also
     // the ACP wire — any log line would corrupt JSON-RPC parsing. So
     // we silence the worker entirely. (Live-mode users who want logs
     // can run the worker by hand outside the eval harness.)
     cmd.env("RUST_LOG", "off");
 
-    cmd.spawn()
+    cmd
+}
+
+/// Spawn `newt worker` with the configured Ollama endpoint.
+fn spawn_worker(config: &RunnerConfig) -> anyhow::Result<Child> {
+    worker_command(config)
+        .spawn()
         .map_err(|e| anyhow::anyhow!("spawn {}: {e}", config.worker_bin.display()))
 }
 
@@ -358,6 +376,22 @@ mod tests {
         assert_eq!(cfg.mock_endpoint.as_deref(), Some("http://127.0.0.1:8080"));
         assert_eq!(cfg.model_override.as_deref(), Some("llama3.1:8b"));
         assert_eq!(cfg.timeout, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn worker_runs_ephemeral_by_default() {
+        // 17.7: every eval-spawned worker carries NEWT_EPHEMERAL=1 — no
+        // conversation rows from graded runs, ever (the eval gate stays
+        // honest). Asserted on the built command so the contract holds
+        // without spawning anything.
+        let cfg = RunnerConfig::new("/tmp/newt");
+        let cmd = worker_command(&cfg);
+        let envs: Vec<_> = cmd.as_std().get_envs().collect();
+        assert!(
+            envs.iter()
+                .any(|(k, v)| *k == "NEWT_EPHEMERAL" && *v == Some("1".as_ref())),
+            "eval worker must default ephemeral, got env: {envs:?}"
+        );
     }
 
     #[test]
