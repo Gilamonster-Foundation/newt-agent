@@ -9,6 +9,7 @@
 //! [`McpTools`], which breaks the `newt-core` ← `newt-mcp-client` dependency
 //! cycle; see `mcp.rs`.
 
+mod compress;
 mod display;
 mod mcp;
 mod note_sink;
@@ -16,6 +17,9 @@ mod tools;
 mod trim;
 mod warmup;
 
+pub use compress::{
+    CompressState, SummarizeFn, SummarizeFuture, Summarizer, SUMMARY_END_MARKER, SUMMARY_PREFIX,
+};
 pub use display::{print_newt, NEWT_ORANGE_CT};
 pub use mcp::{McpTools, NoMcp};
 pub use note_sink::{save_note_tool_definition, NoteNudge, NoteSink};
@@ -23,16 +27,17 @@ pub use tools::{execute_tool, tool_definitions, venv_cmd_prefix};
 pub use warmup::warmup_if_cold;
 
 use crate::retry::{with_backoff_notify, RetryPolicy};
+use compress::{compress, compression_trigger, CompressAction, CompressRequest};
 use crossterm::{
     execute,
     style::{Color as CtColor, Print, ResetColor, SetForegroundColor},
 };
-use display::{emit_overflow_notice, print_debug, print_retry_indicator};
+use display::{emit_compression_notice, emit_overflow_notice, print_debug, print_retry_indicator};
 use std::io::{self, Write as _};
 use tools::{is_hallucination, merged_tool_definitions};
 use trim::{
-    estimate_tokens, estimate_value_tokens, merge_round_usage, mid_loop_trim, ollama_usage,
-    openai_usage, trim_for_summary, trim_to_token_budget, PromptTracker,
+    estimate_tokens, estimate_value_tokens, merge_round_usage, ollama_usage, openai_usage,
+    trim_for_summary, PromptTracker,
 };
 
 /// Retry policy for TUI inference calls: more patient than the hosted-API
@@ -121,6 +126,17 @@ pub struct ChatCtx<'a> {
     /// across user turns and lent to the loop per call. Consulted only when
     /// `note_sink` is present; `None` disables the nudge.
     pub note_nudge: Option<&'a mut NoteNudge>,
+    /// Compression summarizer (Step 18.4, #247): given the redacted summary
+    /// request, returns the summary text — typically one tools-disabled
+    /// completion against the same backend (the TUI wires this, mirroring
+    /// the `Summarizing` provider's `with_summarizer` injection). `None`
+    /// (eval / headless) ⇒ the compression pipeline degrades to the static
+    /// "Summary generation was unavailable" marker instead of an LLM summary.
+    pub summarizer: Option<&'a SummarizeFn>,
+    /// Session-scoped compression anti-thrash state ([`CompressState`]),
+    /// owned by the caller across user turns and lent per call (the
+    /// `note_nudge` pattern). `None` ⇒ a fresh per-turn state.
+    pub compress_state: Option<&'a mut CompressState>,
 }
 
 /// Main agentic loop: call model → execute tool calls → feed results back → repeat.
@@ -148,7 +164,7 @@ pub async fn chat_complete(
         kind: _,
         api_key: _,
         messages: mem_messages,
-        task: _task,
+        task,
         workspace,
         color,
         caveats,
@@ -166,7 +182,16 @@ pub async fn chat_complete(
         recover_cw_400,
         mut note_sink,
         mut note_nudge,
+        summarizer,
+        compress_state,
     } = ctx;
+    // Headless callers may pass no session state — compression still works,
+    // with per-turn anti-thrash accounting.
+    let mut local_compress_state = CompressState::new();
+    let compress_state = match compress_state {
+        Some(s) => s,
+        None => &mut local_compress_state,
+    };
     let client = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(connect_timeout_secs))
         .timeout(std::time::Duration::from_secs(inference_timeout_secs))
@@ -251,60 +276,82 @@ pub async fn chat_complete(
             read_only_rounds = 0;
         }
 
-        // Mid-loop context trim: prevent VRAM exhaustion on long tool-call
-        // sessions by dropping old middle messages when the list grows large
-        // by message count OR by current token count (issue #223). The token
-        // figure is prompt-tokens-preferred (Step 18.1).
+        // Context compression (Step 18.4, #247): one shared pipeline —
+        // structural prune → boundary → redacted LLM summary → marker
+        // assembly — serves both the mid-loop trigger (message count OR
+        // current tokens: the VRAM guard and issue #223's token guard) and
+        // the pre-send budget guard (`max_ok_input`/`safe_context`). The
+        // current-token figure is prompt-tokens-preferred (Step 18.1). The
+        // old amputation trim survives only as the pipeline's no-summarizer
+        // static-marker path.
         {
-            let before = messages.len();
             let current = prompt_tracker.current(&messages, Some(&tools));
-            let (trimmed, fired) = mid_loop_trim(
-                &messages,
+            // The count-only budget is priced in message-token space — the
+            // same chars/4 currency the pipeline compares its budget against
+            // (F1); `current` (schema/template-inclusive) still drives the
+            // token triggers.
+            let message_tokens = estimate_tokens(&messages);
+            if let Some(trigger) = compression_trigger(
+                messages.len(),
+                current,
+                message_tokens,
                 mid_loop_trim_threshold,
                 mid_loop_trim_tokens,
-                current,
-            );
-            if fired {
-                messages = trimmed;
-                prompt_tracker.invalidate();
-                if debug {
-                    print_debug(
-                        &format!(
-                            "mid-loop trim: {before} → {} messages (count_threshold={}, ~{} tokens)",
-                            messages.len(),
-                            mid_loop_trim_threshold,
-                            estimate_tokens(&messages),
-                        ),
-                        color,
+                send_budget,
+                tool_tokens,
+            ) {
+                let outcome = compress(
+                    CompressRequest {
+                        messages: &messages,
+                        budget: trigger.budget,
+                        max_messages: trigger.max_messages,
+                        task,
+                        hard_budget: trigger.hard_budget,
+                    },
+                    summarizer,
+                    compress_state,
+                )
+                .await;
+                if let Some(notice) = outcome.notice {
+                    print_newt(&notice, color, false);
+                }
+                if outcome.action == CompressAction::Refused {
+                    // Anti-thrash disabled compression and the context still
+                    // exceeds the budget: refuse the send rather than let the
+                    // backend silently truncate the task away (baseline B6).
+                    anyhow::bail!(
+                        "context (~{current} tokens) exceeds the model's input budget and \
+                         auto-compression is disabled after repeated ineffective passes — \
+                         start a new conversation or ask a more focused question"
                     );
                 }
-            }
-        }
-
-        // Pre-send token budget guard: when the current context size — the
-        // backend's last-reported prompt tokens plus the estimate of what was
-        // appended since (or the full request estimate including tool schemas
-        // when no report exists) — exceeds the model's confirmed input
-        // ceiling, trim BEFORE dispatch so a huge single round can't trigger
-        // a non-retryable 400 (issue #223, accounting fixed in Step 18.1).
-        if let Some(budget) = send_budget {
-            let current = prompt_tracker.current(&messages, Some(&tools));
-            if current > budget {
-                // The schemas ride along in every request body, so the
-                // message list gets what's left of the budget after them.
-                let (trimmed, fired) =
-                    trim_to_token_budget(&messages, budget.saturating_sub(tool_tokens), 2);
-                if fired {
+                if outcome.fired {
+                    // N2: a hard-budget compression whose assembled result is
+                    // still over budget says so — the dispatch proceeds (the
+                    // cw-400/overflow recovery bounds it), but visibly.
+                    let mut how = outcome.action.describe().to_string();
+                    if trigger.hard_budget && outcome.tokens_after > trigger.budget {
+                        how.push_str(", still over budget");
+                    }
+                    emit_compression_notice(
+                        color,
+                        outcome.tokens_before,
+                        outcome.tokens_after,
+                        &how,
+                    );
                     if debug {
                         print_debug(
                             &format!(
-                                "pre-send trim: ~{current} tokens → fit budget {budget} \
-                                 (incl. ~{tool_tokens} tool-schema tokens)",
+                                "compression: {} → {} messages (budget ~{} tokens, \
+                                 +~{tool_tokens} tool-schema tokens ride along)",
+                                messages.len(),
+                                outcome.messages.len(),
+                                trigger.budget,
                             ),
                             color,
                         );
                     }
-                    messages = trimmed;
+                    messages = outcome.messages;
                     prompt_tracker.invalidate();
                 }
             }
@@ -358,7 +405,8 @@ pub async fn chat_complete(
             Ok(j) => j,
             Err(e) => {
                 // Graceful context-window 400 recovery: parse the model's real
-                // limit, tighten the budget, trim, and retry once (issue #223).
+                // limit, tighten the budget, compress, and retry once (#223;
+                // compress-not-trim since Step 18.4).
                 if cw_retries < 2 {
                     if let Some(new_cap) = recover_cw_400.and_then(|f| f(&e, model, &today)) {
                         emit_overflow_notice(
@@ -369,13 +417,29 @@ pub async fn chat_complete(
                             cw_retries + 1,
                         );
                         send_budget = Some(new_cap as usize);
-                        messages = trim_to_token_budget(
-                            &messages,
-                            (new_cap as usize).saturating_sub(tool_tokens),
-                            2,
+                        let outcome = compress(
+                            CompressRequest {
+                                messages: &messages,
+                                budget: (new_cap as usize).saturating_sub(tool_tokens),
+                                max_messages: None,
+                                task,
+                                hard_budget: true,
+                            },
+                            summarizer,
+                            compress_state,
                         )
-                        .0;
-                        prompt_tracker.invalidate();
+                        .await;
+                        if let Some(notice) = outcome.notice {
+                            print_newt(&notice, color, false);
+                        }
+                        if outcome.action == CompressAction::Refused {
+                            // Refuse the resend; surface the endpoint's 400.
+                            return Err(e);
+                        }
+                        if outcome.fired {
+                            messages = outcome.messages;
+                            prompt_tracker.invalidate();
+                        }
                         cw_retries += 1;
                         continue 'round_loop;
                     }
@@ -506,9 +570,49 @@ pub async fn chat_complete(
                             model,
                             overflow_retries + 1,
                         );
-                        // Trim aggressively: keep system + first 2 + last N/4 messages.
-                        messages = trim_for_summary(&messages, 2, max_tool_rounds / 4);
-                        prompt_tracker.invalidate();
+                        // Compress toward 3/4 of the safe window — comfortably
+                        // under the 85% trigger (was a blunt count trim before
+                        // Step 18.4). The retry happens regardless: it is
+                        // already bounded by `overflow_retries`.
+                        let target = safe_context
+                            .map(|s| (s as usize).saturating_mul(3) / 4)
+                            .unwrap_or(0)
+                            .saturating_sub(tool_tokens);
+                        let outcome = compress(
+                            CompressRequest {
+                                messages: &messages,
+                                budget: target,
+                                max_messages: None,
+                                task,
+                                hard_budget: true,
+                            },
+                            summarizer,
+                            compress_state,
+                        )
+                        .await;
+                        if let Some(notice) = outcome.notice {
+                            print_newt(&notice, color, false);
+                        }
+                        if outcome.fired {
+                            messages = outcome.messages;
+                            prompt_tracker.invalidate();
+                        } else {
+                            // N1: the retry must differ from the request that
+                            // just returned empty — when compress was a no-op
+                            // (Fit / nothing reclaimable), fall back to one
+                            // structural prune with a tight protected tail.
+                            let fallback = crate::prune::prune(
+                                &messages,
+                                &crate::prune::PruneConfig {
+                                    keep_last: 2,
+                                    ..Default::default()
+                                },
+                            );
+                            if fallback.chars_reclaimed > 0 {
+                                messages = fallback.messages;
+                                prompt_tracker.invalidate();
+                            }
+                        }
                         accumulated_usage = merged;
                         overflow_retries += 1;
                         continue 'round_loop;
@@ -815,7 +919,7 @@ pub async fn openai_chat_complete(
         kind: _,
         api_key,
         messages: mem_messages,
-        task: _task,
+        task,
         workspace,
         color,
         caveats,
@@ -833,7 +937,15 @@ pub async fn openai_chat_complete(
         recover_cw_400,
         mut note_sink,
         mut note_nudge,
+        summarizer,
+        compress_state,
     } = ctx;
+    // Headless callers may pass no session state (mirrors the Ollama path).
+    let mut local_compress_state = CompressState::new();
+    let compress_state = match compress_state {
+        Some(s) => s,
+        None => &mut local_compress_state,
+    };
     let client = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(connect_timeout_secs))
         .timeout(std::time::Duration::from_secs(inference_timeout_secs))
@@ -880,55 +992,71 @@ pub async fn openai_chat_complete(
             .ok();
         }
 
-        // Mid-loop context trim (mirrors Ollama path): fire on message count OR
-        // current token count (issue #223; prompt-tokens-preferred, Step 18.1).
+        // Context compression (Step 18.4, #247 — mirrors the Ollama path):
+        // the shared prune → boundary → redacted summary → marker pipeline
+        // serves the mid-loop trigger and the pre-send budget guard.
         {
-            let before = messages.len();
             let current = prompt_tracker.current(&messages, Some(&tools));
-            let (trimmed, fired) = mid_loop_trim(
-                &messages,
+            // Count-only budget priced in message-token space (F1) — mirrors
+            // the Ollama path.
+            let message_tokens = estimate_tokens(&messages);
+            if let Some(trigger) = compression_trigger(
+                messages.len(),
+                current,
+                message_tokens,
                 mid_loop_trim_threshold,
                 mid_loop_trim_tokens,
-                current,
-            );
-            if fired {
-                messages = trimmed;
-                prompt_tracker.invalidate();
-                if debug {
-                    print_debug(
-                        &format!(
-                            "mid-loop trim: {before} → {} messages (count_threshold={}, ~{} tokens)",
-                            messages.len(),
-                            mid_loop_trim_threshold,
-                            estimate_tokens(&messages),
-                        ),
-                        color,
+                send_budget,
+                tool_tokens,
+            ) {
+                let outcome = compress(
+                    CompressRequest {
+                        messages: &messages,
+                        budget: trigger.budget,
+                        max_messages: trigger.max_messages,
+                        task,
+                        hard_budget: trigger.hard_budget,
+                    },
+                    summarizer,
+                    compress_state,
+                )
+                .await;
+                if let Some(notice) = outcome.notice {
+                    print_newt(&notice, color, false);
+                }
+                if outcome.action == CompressAction::Refused {
+                    anyhow::bail!(
+                        "context (~{current} tokens) exceeds the model's input budget and \
+                         auto-compression is disabled after repeated ineffective passes — \
+                         start a new conversation or ask a more focused question"
                     );
                 }
-            }
-        }
-
-        // Pre-send token budget guard (mirrors Ollama path): when the current
-        // context size — backend-reported prompt tokens preferred, request
-        // estimate including tool schemas as fallback — exceeds the confirmed
-        // input ceiling, trim before dispatch so a huge single round can't
-        // trigger the non-retryable 400 that crashed issue #223.
-        if let Some(budget) = send_budget {
-            let current = prompt_tracker.current(&messages, Some(&tools));
-            if current > budget {
-                let (trimmed, fired) =
-                    trim_to_token_budget(&messages, budget.saturating_sub(tool_tokens), 2);
-                if fired {
+                if outcome.fired {
+                    // N2 (mirrors the Ollama path): flag a still-over-budget
+                    // assembly in the notice.
+                    let mut how = outcome.action.describe().to_string();
+                    if trigger.hard_budget && outcome.tokens_after > trigger.budget {
+                        how.push_str(", still over budget");
+                    }
+                    emit_compression_notice(
+                        color,
+                        outcome.tokens_before,
+                        outcome.tokens_after,
+                        &how,
+                    );
                     if debug {
                         print_debug(
                             &format!(
-                                "pre-send trim: ~{current} tokens → fit budget {budget} \
-                                 (incl. ~{tool_tokens} tool-schema tokens)",
+                                "compression: {} → {} messages (budget ~{} tokens, \
+                                 +~{tool_tokens} tool-schema tokens ride along)",
+                                messages.len(),
+                                outcome.messages.len(),
+                                trigger.budget,
                             ),
                             color,
                         );
                     }
-                    messages = trimmed;
+                    messages = outcome.messages;
                     prompt_tracker.invalidate();
                 }
             }
@@ -971,7 +1099,8 @@ pub async fn openai_chat_complete(
             Ok(j) => j,
             Err(e) => {
                 // Graceful context-window 400 recovery: parse the model's real
-                // limit, tighten the budget, trim, and retry once (issue #223).
+                // limit, tighten the budget, compress, and retry once (#223;
+                // compress-not-trim since Step 18.4).
                 if cw_retries < 2 {
                     if let Some(new_cap) = recover_cw_400.and_then(|f| f(&e, model, &today)) {
                         emit_overflow_notice(
@@ -982,13 +1111,29 @@ pub async fn openai_chat_complete(
                             cw_retries + 1,
                         );
                         send_budget = Some(new_cap as usize);
-                        messages = trim_to_token_budget(
-                            &messages,
-                            (new_cap as usize).saturating_sub(tool_tokens),
-                            2,
+                        let outcome = compress(
+                            CompressRequest {
+                                messages: &messages,
+                                budget: (new_cap as usize).saturating_sub(tool_tokens),
+                                max_messages: None,
+                                task,
+                                hard_budget: true,
+                            },
+                            summarizer,
+                            compress_state,
                         )
-                        .0;
-                        prompt_tracker.invalidate();
+                        .await;
+                        if let Some(notice) = outcome.notice {
+                            print_newt(&notice, color, false);
+                        }
+                        if outcome.action == CompressAction::Refused {
+                            // Refuse the resend; surface the endpoint's 400.
+                            return Err(e);
+                        }
+                        if outcome.fired {
+                            messages = outcome.messages;
+                            prompt_tracker.invalidate();
+                        }
                         cw_retries += 1;
                         continue 'round_loop;
                     }
@@ -1352,6 +1497,8 @@ mod tool_round_cap_tests {
                 recover_cw_400: None,
                 note_sink: None,
                 note_nudge: None,
+                summarizer: None,
+                compress_state: None,
             },
             &mut NoMcp,
         )
@@ -1408,6 +1555,8 @@ mod tool_round_cap_tests {
                 recover_cw_400: None,
                 note_sink: None,
                 note_nudge: None,
+                summarizer: None,
+                compress_state: None,
             },
             &mut NoMcp,
         )
@@ -1481,6 +1630,8 @@ mod tool_round_cap_tests {
                 recover_cw_400: None,
                 note_sink: None,
                 note_nudge: None,
+                summarizer: None,
+                compress_state: None,
             },
             &mut NoMcp,
         )
@@ -1590,6 +1741,8 @@ mod tool_round_cap_tests {
                 recover_cw_400: None,
                 note_sink: None,
                 note_nudge: None,
+                summarizer: None,
+                compress_state: None,
             },
             &mut NoMcp,
         )
@@ -1719,6 +1872,8 @@ mod tool_round_cap_tests {
                 recover_cw_400: None,
                 note_sink: None,
                 note_nudge: None,
+                summarizer: None,
+                compress_state: None,
             },
             &mut NoMcp,
         )
@@ -1787,6 +1942,8 @@ mod http_loop_tests {
             recover_cw_400: None,
             note_sink: None,
             note_nudge: None,
+            summarizer: None,
+            compress_state: None,
         }
     }
 
@@ -2014,27 +2171,35 @@ mod http_loop_tests {
         );
     }
 
-    /// Tool calls every round with a tiny trim threshold: the mid-loop trim
-    /// must fire (observable as the omission placeholder reaching the model).
+    /// Tool calls every round with a tiny trim threshold: the mid-loop
+    /// compression must fire — observable as the compaction marker (NOT the
+    /// old amputation placeholder) reaching the model. With no summarizer
+    /// injected, this is the static-fallback path (Step 18.4).
     struct TrimObservingResponder {
-        trim_seen: Arc<AtomicBool>,
+        marker_seen: Arc<AtomicBool>,
+        old_placeholder_seen: Arc<AtomicBool>,
     }
     impl Respond for TrimObservingResponder {
         fn respond(&self, req: &Request) -> ResponseTemplate {
             let body = body_json(req);
-            let placeholder_present = body["messages"]
-                .as_array()
-                .map(|m| {
-                    m.iter().any(|msg| {
-                        msg["content"]
-                            .as_str()
-                            .map(|c| c.contains("earlier tool-call messages omitted"))
-                            .unwrap_or(false)
+            let contains = |needle: &str| {
+                body["messages"]
+                    .as_array()
+                    .map(|m| {
+                        m.iter().any(|msg| {
+                            msg["content"]
+                                .as_str()
+                                .map(|c| c.contains(needle))
+                                .unwrap_or(false)
+                        })
                     })
-                })
-                .unwrap_or(false);
-            if placeholder_present {
-                self.trim_seen.store(true, Ordering::SeqCst);
+                    .unwrap_or(false)
+            };
+            if contains(SUMMARY_PREFIX) && contains("Summary generation was unavailable.") {
+                self.marker_seen.store(true, Ordering::SeqCst);
+            }
+            if contains("earlier tool-call messages omitted") {
+                self.old_placeholder_seen.store(true, Ordering::SeqCst);
             }
             if body.get("tools").is_some() {
                 ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -2050,13 +2215,15 @@ mod http_loop_tests {
     }
 
     #[tokio::test]
-    async fn mid_loop_trim_fires_when_message_list_grows() {
+    async fn mid_loop_compression_fires_when_message_list_grows() {
         let server = MockServer::start().await;
-        let trim_seen = Arc::new(AtomicBool::new(false));
+        let marker_seen = Arc::new(AtomicBool::new(false));
+        let old_placeholder_seen = Arc::new(AtomicBool::new(false));
         Mock::given(method("POST"))
             .and(path("/api/chat"))
             .respond_with(TrimObservingResponder {
-                trim_seen: trim_seen.clone(),
+                marker_seen: marker_seen.clone(),
+                old_placeholder_seen: old_placeholder_seen.clone(),
             })
             .mount(&server)
             .await;
@@ -2072,8 +2239,12 @@ mod http_loop_tests {
             .expect("chat_complete should succeed");
 
         assert!(
-            trim_seen.load(Ordering::SeqCst),
-            "the omission placeholder must have reached the model mid-loop"
+            marker_seen.load(Ordering::SeqCst),
+            "the static compaction marker must have reached the model mid-loop"
+        );
+        assert!(
+            !old_placeholder_seen.load(Ordering::SeqCst),
+            "the pre-18.4 amputation placeholder must never be emitted"
         );
         assert_eq!(reply, "final after trim");
     }
@@ -2279,6 +2450,8 @@ mod save_note_loop_tests {
             recover_cw_400: None,
             note_sink: None,
             note_nudge: None,
+            summarizer: None,
+            compress_state: None,
         }
     }
 
@@ -2674,6 +2847,673 @@ mod save_note_loop_tests {
         assert!(
             error_seen.load(Ordering::SeqCst),
             "the curator error (full entry list + instruction) must reach the model verbatim"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Compression v2 — summarize, don't discard (Step 18.4, #247)
+// ---------------------------------------------------------------------------
+//
+// End-to-end wiremock tests for the compression pipeline wired into both
+// loops. The headline property is B5's acceptance criterion from the context
+// baseline (docs/testing/results/context-baseline-f0f4f6e.md): a long
+// tool-heavy conversation crosses the token budget, compression fires, and
+// the ORIGINAL TASK still reaches the next request — where the baseline
+// measured 9/10 silently wrong answers because truncation discarded it (B6).
+#[cfg(test)]
+mod compression_loop_tests {
+    use super::*;
+    use crate::caveats::Caveats;
+    use crate::{BackendKind, MemMessage};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+    const TASK: &str =
+        "ACTIVE TASK GAUNTLET-7f3d9c: read big.txt until told to stop, then restate this marker";
+    const CANNED_SUMMARY: &str =
+        "## Active Task\nACTIVE TASK GAUNTLET-7f3d9c (canned summary)\n## Completed Actions\n1. read big.txt";
+
+    fn msgs() -> Vec<MemMessage> {
+        vec![MemMessage::system("you are a test"), MemMessage::user(TASK)]
+    }
+
+    fn ctx<'a>(
+        server_uri: &'a str,
+        messages: &'a [MemMessage],
+        caveats: &'a Caveats,
+        workspace: &'a str,
+    ) -> ChatCtx<'a> {
+        ChatCtx {
+            url: server_uri,
+            model: "test-model",
+            kind: BackendKind::Ollama,
+            api_key: None,
+            messages,
+            task: TASK,
+            workspace,
+            color: false,
+            caveats,
+            max_tool_rounds: 12,
+            tool_output_lines: 2,
+            debug: false,
+            num_ctx: None,
+            connect_timeout_secs: 5,
+            inference_timeout_secs: 30,
+            mid_loop_trim_threshold: 40,
+            // The token trigger under test: well below what a few 4 KB
+            // tool results accumulate to.
+            mid_loop_trim_tokens: Some(5_000),
+            max_ok_input: None,
+            build_check_cmd: None,
+            safe_context: None,
+            recover_cw_400: None,
+            note_sink: None,
+            note_nudge: None,
+            summarizer: None,
+            compress_state: None,
+        }
+    }
+
+    /// Workspace with one ~4 KB file the mock model reads over and over.
+    fn gauntlet_workspace() -> tempfile::TempDir {
+        let ws = tempfile::TempDir::new().unwrap();
+        let line = "the quick brown newt compresses context without discarding it\n";
+        std::fs::write(ws.path().join("big.txt"), line.repeat(64)).unwrap();
+        ws
+    }
+
+    fn body_json(req: &Request) -> serde_json::Value {
+        serde_json::from_slice(&req.body).unwrap_or_default()
+    }
+
+    fn messages_contain(body: &serde_json::Value, needle: &str) -> bool {
+        body["messages"]
+            .as_array()
+            .map(|msgs| {
+                msgs.iter().any(|m| {
+                    m["content"]
+                        .as_str()
+                        .map(|c| c.contains(needle))
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false)
+    }
+
+    /// chars/4 estimate of a request's message list (mirrors the loop's
+    /// fallback estimator) — used to measure the reclaim across requests.
+    fn body_message_tokens(body: &serde_json::Value) -> usize {
+        body["messages"]
+            .as_array()
+            .map(|msgs| {
+                msgs.iter()
+                    .map(|m| m.to_string().chars().count().div_ceil(4))
+                    .sum()
+            })
+            .unwrap_or(0)
+    }
+
+    /// A summarizer that records every request it receives and returns the
+    /// canned summary.
+    fn canned_summarizer(prompts: Arc<Mutex<Vec<String>>>) -> Summarizer {
+        Box::new(move |prompt: String| {
+            let prompts = prompts.clone();
+            Box::pin(async move {
+                prompts.lock().unwrap().push(prompt);
+                Ok(CANNED_SUMMARY.to_string())
+            })
+        })
+    }
+
+    /// Ollama-shaped gauntlet responder: keeps demanding `read_file` of the
+    /// big fixture until the compaction marker shows up in the request, then
+    /// answers. Records per-request observations the assertions need.
+    struct GauntletResponder {
+        final_answer: String,
+        /// `(had_marker, est_message_tokens)` per non-streaming request.
+        log: Arc<Mutex<Vec<(bool, usize)>>>,
+        task_in_marker_request: Arc<AtomicBool>,
+        summary_in_marker_request: Arc<AtomicBool>,
+        old_placeholder_seen: Arc<AtomicBool>,
+        static_marker_instead: bool,
+    }
+
+    impl Respond for GauntletResponder {
+        fn respond(&self, req: &Request) -> ResponseTemplate {
+            let body = body_json(req);
+            let has_marker = messages_contain(&body, SUMMARY_PREFIX);
+            if !body["stream"].as_bool().unwrap_or(false) {
+                self.log
+                    .lock()
+                    .unwrap()
+                    .push((has_marker, body_message_tokens(&body)));
+            }
+            if messages_contain(&body, "earlier tool-call messages omitted") {
+                self.old_placeholder_seen.store(true, Ordering::SeqCst);
+            }
+            if has_marker {
+                if messages_contain(&body, TASK) {
+                    self.task_in_marker_request.store(true, Ordering::SeqCst);
+                }
+                let summary_needle = if self.static_marker_instead {
+                    "Summary generation was unavailable."
+                } else {
+                    CANNED_SUMMARY
+                };
+                if messages_contain(&body, summary_needle) {
+                    self.summary_in_marker_request.store(true, Ordering::SeqCst);
+                }
+                return ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "message": { "content": self.final_answer }
+                }));
+            }
+            if body.get("tools").is_some() {
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "message": { "content": "", "tool_calls": [{
+                        "function": { "name": "read_file", "arguments": { "path": "big.txt" } }
+                    }]}
+                }))
+            } else {
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "message": { "content": "cap exit" } }))
+            }
+        }
+    }
+
+    /// THE B5 acceptance property: compression fires on a long tool-heavy
+    /// conversation and the original task text still reaches the next
+    /// request — summarized, not discarded.
+    #[tokio::test]
+    async fn active_task_survives_compression() {
+        let server = MockServer::start().await;
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let task_in_marker = Arc::new(AtomicBool::new(false));
+        let summary_in_marker = Arc::new(AtomicBool::new(false));
+        let old_placeholder = Arc::new(AtomicBool::new(false));
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(GauntletResponder {
+                final_answer: "the marker is GAUNTLET-7f3d9c".into(),
+                log: log.clone(),
+                task_in_marker_request: task_in_marker.clone(),
+                summary_in_marker_request: summary_in_marker.clone(),
+                old_placeholder_seen: old_placeholder.clone(),
+                static_marker_instead: false,
+            })
+            .mount(&server)
+            .await;
+
+        let ws = gauntlet_workspace();
+        let workspace = ws.path().to_string_lossy().to_string();
+        let messages = msgs();
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let prompts = Arc::new(Mutex::new(Vec::new()));
+        let summarizer = canned_summarizer(prompts.clone());
+        let mut compress_state = CompressState::new();
+        let mut c = ctx(&uri, &messages, &caveats, &workspace);
+        c.summarizer = Some(&*summarizer);
+        c.compress_state = Some(&mut compress_state);
+        let (reply, _streamed, _usage, hallu) = chat_complete(c, &mut NoMcp)
+            .await
+            .expect("chat_complete should succeed");
+
+        // The turn completed with a real answer, not a cap/diagnostic exit.
+        assert_eq!(reply, "the marker is GAUNTLET-7f3d9c");
+        assert_eq!(hallu, 0);
+
+        // The summarizer ran exactly once and its request carried the
+        // original task verbatim (the verbatim-Active-Task anchor).
+        let prompts = prompts.lock().unwrap();
+        assert_eq!(prompts.len(), 1, "one compression, one summary request");
+        assert!(
+            prompts[0].contains(TASK),
+            "summary request must quote the task verbatim"
+        );
+
+        // The post-compression request still carried the task AND the
+        // summary, wrapped in the marker — summarize, don't discard.
+        assert!(task_in_marker.load(Ordering::SeqCst), "B5 property");
+        assert!(summary_in_marker.load(Ordering::SeqCst));
+        assert!(
+            !old_placeholder.load(Ordering::SeqCst),
+            "the old amputation placeholder must never be dispatched"
+        );
+
+        // Reclaim numbers: the compressed request must be materially smaller
+        // than the largest pre-compression request.
+        let log = log.lock().unwrap();
+        let before = log
+            .iter()
+            .filter(|(m, _)| !m)
+            .map(|&(_, t)| t)
+            .max()
+            .expect("pre-compression requests were dispatched");
+        let after = log
+            .iter()
+            .find(|(m, _)| *m)
+            .map(|&(_, t)| t)
+            .expect("a compressed request was dispatched");
+        println!("e2e reclaim: ~{before} -> ~{after} est. message tokens");
+        assert!(
+            after < before * 6 / 10,
+            "compression must reclaim >40% here (got {before} -> {after})"
+        );
+    }
+
+    /// Summarizer endpoint returns 500 → the static marker is dispatched
+    /// instead and the turn still completes (never aborts).
+    #[tokio::test]
+    async fn summarizer_500_degrades_to_static_marker_and_turn_completes() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/summarize"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&server)
+            .await;
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let task_in_marker = Arc::new(AtomicBool::new(false));
+        let static_in_marker = Arc::new(AtomicBool::new(false));
+        let old_placeholder = Arc::new(AtomicBool::new(false));
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(GauntletResponder {
+                final_answer: "completed despite summarizer outage".into(),
+                log: log.clone(),
+                task_in_marker_request: task_in_marker.clone(),
+                summary_in_marker_request: static_in_marker.clone(),
+                old_placeholder_seen: old_placeholder.clone(),
+                static_marker_instead: true,
+            })
+            .mount(&server)
+            .await;
+
+        // A summarizer that really performs the HTTP call — and gets a 500.
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let summarize_url = format!("{}/summarize", server.uri());
+        let attempts_in = attempts.clone();
+        let summarizer: Summarizer = Box::new(move |prompt: String| {
+            let url = summarize_url.clone();
+            let attempts = attempts_in.clone();
+            Box::pin(async move {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                let resp = reqwest::Client::new()
+                    .post(&url)
+                    .body(prompt)
+                    .send()
+                    .await?;
+                if !resp.status().is_success() {
+                    anyhow::bail!("summarizer endpoint {}", resp.status());
+                }
+                Ok(resp.text().await?)
+            })
+        });
+
+        let ws = gauntlet_workspace();
+        let workspace = ws.path().to_string_lossy().to_string();
+        let messages = msgs();
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut compress_state = CompressState::new();
+        let mut c = ctx(&uri, &messages, &caveats, &workspace);
+        c.summarizer = Some(&*summarizer);
+        c.compress_state = Some(&mut compress_state);
+        let (reply, _, _, _) = chat_complete(c, &mut NoMcp)
+            .await
+            .expect("a summarizer failure must never abort the turn");
+
+        assert_eq!(reply, "completed despite summarizer outage");
+        assert!(
+            attempts.load(Ordering::SeqCst) >= 1,
+            "the summarizer endpoint must have been attempted"
+        );
+        assert!(
+            static_in_marker.load(Ordering::SeqCst),
+            "the static fallback marker must reach the model"
+        );
+        assert!(task_in_marker.load(Ordering::SeqCst), "task still anchored");
+        assert!(!old_placeholder.load(Ordering::SeqCst));
+    }
+
+    /// OpenAI-path mirror: the same pipeline serves the second loop — the
+    /// marker + anchored task reach the post-compression request.
+    struct OpenAiGauntletResponder {
+        final_answer: String,
+        task_in_marker_request: Arc<AtomicBool>,
+        summary_in_marker_request: Arc<AtomicBool>,
+    }
+
+    impl Respond for OpenAiGauntletResponder {
+        fn respond(&self, req: &Request) -> ResponseTemplate {
+            let body = body_json(req);
+            if messages_contain(&body, SUMMARY_PREFIX) {
+                if messages_contain(&body, TASK) {
+                    self.task_in_marker_request.store(true, Ordering::SeqCst);
+                }
+                if messages_contain(&body, CANNED_SUMMARY) {
+                    self.summary_in_marker_request.store(true, Ordering::SeqCst);
+                }
+                return ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "choices": [{ "message": { "content": self.final_answer } }]
+                }));
+            }
+            if body.get("tools").is_some() {
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "choices": [{ "message": {
+                        "content": null,
+                        "tool_calls": [{
+                            "id": "call_1",
+                            "type": "function",
+                            "function": { "name": "read_file", "arguments": "{\"path\":\"big.txt\"}" }
+                        }]
+                    }}]
+                }))
+            } else {
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "choices": [{ "message": { "content": "cap exit" } }]
+                }))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn openai_loop_compresses_with_the_same_pipeline() {
+        let server = MockServer::start().await;
+        let task_in_marker = Arc::new(AtomicBool::new(false));
+        let summary_in_marker = Arc::new(AtomicBool::new(false));
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(OpenAiGauntletResponder {
+                final_answer: "openai: marker is GAUNTLET-7f3d9c".into(),
+                task_in_marker_request: task_in_marker.clone(),
+                summary_in_marker_request: summary_in_marker.clone(),
+            })
+            .mount(&server)
+            .await;
+
+        let ws = gauntlet_workspace();
+        let workspace = ws.path().to_string_lossy().to_string();
+        let messages = msgs();
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let prompts = Arc::new(Mutex::new(Vec::new()));
+        let summarizer = canned_summarizer(prompts.clone());
+        let mut compress_state = CompressState::new();
+        let mut c = ctx(&uri, &messages, &caveats, &workspace);
+        c.kind = BackendKind::Openai;
+        c.api_key = Some("sk-test");
+        c.summarizer = Some(&*summarizer);
+        c.compress_state = Some(&mut compress_state);
+        let (reply, _, _, _) = chat_complete(c, &mut NoMcp)
+            .await
+            .expect("openai loop should succeed");
+
+        assert_eq!(reply, "openai: marker is GAUNTLET-7f3d9c");
+        assert!(!prompts.lock().unwrap().is_empty(), "summarizer engaged");
+        assert!(task_in_marker.load(Ordering::SeqCst));
+        assert!(summary_in_marker.load(Ordering::SeqCst));
+    }
+
+    // -----------------------------------------------------------------------
+    // Multi-compression long-haul regressions (review of PR #267, F1/F2/N3):
+    // the original suite never exercised a SECOND compression — the gap that
+    // let the self-poisoning boundary bug through.
+    // -----------------------------------------------------------------------
+
+    /// Per-request long-haul observations: `(dispatched message count,
+    /// length of the last tool-role message — the freshest result)`.
+    type HaulLog = Arc<Mutex<Vec<(usize, Option<usize>)>>>;
+
+    /// Endless-work responder: each round calls a (hallucinated) write-ish
+    /// tool and then `read_file` of `path` while tools are offered (the loop
+    /// runs to its round cap), answering only the cap-exit tools-disabled
+    /// completion. The non-read-only call keeps the loop's read-only nudge
+    /// quiet — no intervening user messages, the regime the reviewer's F1
+    /// traces locked up in (a periodic nudge would hand the boundary a fresh
+    /// anchor and mask the bug). Logs, per tool-offering request, the
+    /// dispatched message count and the length of the LAST tool-role message
+    /// — the freshest result the model is about to read.
+    struct LongHaulResponder {
+        path: &'static str,
+        log: HaulLog,
+    }
+
+    impl Respond for LongHaulResponder {
+        fn respond(&self, req: &Request) -> ResponseTemplate {
+            let body = body_json(req);
+            if body.get("tools").is_some() {
+                let empty = Vec::new();
+                let msgs = body["messages"].as_array().unwrap_or(&empty);
+                let last_tool_len = msgs
+                    .iter()
+                    .rev()
+                    .find(|m| m["role"].as_str() == Some("tool"))
+                    .and_then(|m| m["content"].as_str())
+                    .map(|c| c.chars().count());
+                self.log.lock().unwrap().push((msgs.len(), last_tool_len));
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "message": { "content": "", "tool_calls": [
+                        { "function": { "name": "apply_patch", "arguments": {} } },
+                        { "function": { "name": "read_file", "arguments": { "path": self.path } } }
+                    ]}
+                }))
+            } else {
+                ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({ "message": { "content": "long haul done" } }),
+                )
+            }
+        }
+    }
+
+    /// Three prior turns, then the active task — the reviewer's multi-turn
+    /// shape (the last REAL user message sits deep before the tool rounds).
+    fn multi_turn_msgs() -> Vec<MemMessage> {
+        vec![
+            MemMessage::system("you are a test"),
+            MemMessage::user("prior turn: inspect the workspace"),
+            MemMessage::assistant("inspected — looks healthy"),
+            MemMessage::user("prior turn: run the linters"),
+            MemMessage::assistant("linters are green"),
+            MemMessage::user("prior turn: sketch a fix"),
+            MemMessage::assistant("sketched in my head"),
+            MemMessage::user(TASK),
+        ]
+    }
+
+    /// Drive `rounds` tool rounds under count-only compression pressure.
+    /// Returns `(per-request log, summarizer invocations, reply, latched)`.
+    async fn run_long_haul(
+        mem_messages: Vec<MemMessage>,
+        rounds: usize,
+        threshold: usize,
+        file: &'static str,
+        content: &str,
+    ) -> (Vec<(usize, Option<usize>)>, usize, String, bool) {
+        let server = MockServer::start().await;
+        let log = Arc::new(Mutex::new(Vec::new()));
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(LongHaulResponder {
+                path: file,
+                log: log.clone(),
+            })
+            .mount(&server)
+            .await;
+        let ws = tempfile::TempDir::new().unwrap();
+        std::fs::write(ws.path().join(file), content).unwrap();
+        let workspace = ws.path().to_string_lossy().to_string();
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let prompts = Arc::new(Mutex::new(Vec::new()));
+        let summarizer = canned_summarizer(prompts.clone());
+        let mut compress_state = CompressState::new();
+        let mut c = ctx(&uri, &mem_messages, &caveats, &workspace);
+        c.max_tool_rounds = rounds;
+        c.mid_loop_trim_threshold = threshold;
+        c.mid_loop_trim_tokens = None; // count-only: the F1/F2 regime
+        c.summarizer = Some(&*summarizer);
+        c.compress_state = Some(&mut compress_state);
+        let (reply, _, _, _) = chat_complete(c, &mut NoMcp)
+            .await
+            .expect("the long haul must complete");
+        let log = log.lock().unwrap().clone();
+        let calls = prompts.lock().unwrap().len();
+        (log, calls, reply, compress_state.is_disabled())
+    }
+
+    /// F1 regression (i) — the reviewer's single-turn trace: 4 KB read_file
+    /// results to round 40 under the count-only trigger. Pre-fix, the second
+    /// compression anchored on its own summary: the count never shrank again
+    /// (65 messages at round 40), the summarizer re-fired per round, and the
+    /// fresh 4 KB result was one-lined before every dispatch from round ~20
+    /// — the model could never read anything for the rest of the turn.
+    #[tokio::test]
+    async fn forty_rounds_single_turn_stay_bounded_with_fresh_results_intact() {
+        let line = "the quick brown newt compresses context without discarding it\n";
+        let threshold = 15usize;
+        let (log, summarizer_calls, reply, latched) =
+            run_long_haul(msgs(), 40, threshold, "big.txt", &line.repeat(64)).await;
+
+        assert_eq!(reply, "long haul done");
+        assert!(!latched, "count-only pressure must never latch anti-thrash");
+        assert_eq!(log.len(), 40, "all 40 tool rounds dispatched");
+        for (round, (len, last_tool)) in log.iter().enumerate() {
+            assert!(
+                *len <= threshold + 6,
+                "round {round}: dispatched {len} messages — the count must stay \
+                 bounded after every compression (threshold {threshold} + slack)"
+            );
+            if let Some(n) = last_tool {
+                assert!(
+                    *n > 1_000,
+                    "round {round}: the fresh tool result was destroyed before \
+                     dispatch ({n} chars — a one-liner)"
+                );
+            }
+        }
+        assert!(summarizer_calls >= 2, "the long haul compresses repeatedly");
+        assert!(
+            summarizer_calls <= 16,
+            "summarizer invocations must be bounded, not per-round \
+             (got {summarizer_calls} in 40 rounds)"
+        );
+        let max_len = log.iter().map(|(l, _)| *l).max().unwrap();
+        println!(
+            "forty-round trace: max dispatched len {max_len}, \
+             summarizer calls {summarizer_calls}"
+        );
+    }
+
+    /// F1 regression (ii) — the reviewer's multi-turn trace: 3 prior turns,
+    /// then 30 tool rounds. Pre-fix the regime locked in at round ~9 (the
+    /// anchor pinned the current task, the middle shrank to the previous
+    /// summary alone, nothing could ever shrink) and the summarizer re-ran
+    /// almost every round (71 invocations in 80 rounds).
+    #[tokio::test]
+    async fn thirty_rounds_multi_turn_stay_bounded_with_fresh_results_intact() {
+        let line = "the quick brown newt compresses context without discarding it\n";
+        let threshold = 15usize;
+        let (log, summarizer_calls, reply, latched) = run_long_haul(
+            multi_turn_msgs(),
+            30,
+            threshold,
+            "big.txt",
+            &line.repeat(64),
+        )
+        .await;
+
+        assert_eq!(reply, "long haul done");
+        assert!(!latched, "count-only pressure must never latch anti-thrash");
+        assert_eq!(log.len(), 30, "all 30 tool rounds dispatched");
+        for (round, (len, last_tool)) in log.iter().enumerate() {
+            assert!(
+                *len <= threshold + 6,
+                "round {round}: dispatched {len} messages — bounded"
+            );
+            if let Some(n) = last_tool {
+                assert!(
+                    *n > 1_000,
+                    "round {round}: fresh tool result destroyed pre-dispatch ({n} chars)"
+                );
+            }
+        }
+        assert!(summarizer_calls >= 2);
+        assert!(
+            summarizer_calls <= 14,
+            "summarizer invocations must be bounded, not per-round \
+             (got {summarizer_calls} in 30 rounds)"
+        );
+        let max_len = log.iter().map(|(l, _)| *l).max().unwrap();
+        println!(
+            "thirty-round multi-turn trace: max dispatched len {max_len}, \
+             summarizer calls {summarizer_calls}"
+        );
+    }
+
+    /// F2 regression — the reviewer's 600-char-results multi-turn shape:
+    /// count-only compressions whose per-pass reclaim is small must neither
+    /// latch anti-thrash (silently killing the VRAM guard) nor escalate to
+    /// the Refused bail — pre-fix this errored the whole turn at round 25
+    /// with "context exceeds the model's input budget" while the actual
+    /// context was ~3-5k tokens and NO token threshold was configured.
+    #[tokio::test]
+    async fn count_only_low_reclaim_never_latches_or_bails() {
+        let (log, _calls, reply, latched) =
+            run_long_haul(multi_turn_msgs(), 30, 15, "small.txt", &"x".repeat(600)).await;
+        assert_eq!(reply, "long haul done", "the turn must complete — no bail");
+        assert!(
+            !latched,
+            "count-only passes must never latch the disable switch"
+        );
+        assert_eq!(log.len(), 30, "all 30 rounds ran (no Refused early-exit)");
+    }
+
+    /// N3 — the loop-level refusal path end-to-end: a HARD token trigger
+    /// (`mid_loop_trim_tokens`) over a genuinely incompressible context
+    /// records two poor passes, latches anti-thrash, and the next
+    /// over-budget round refuses the dispatch: `chat_complete` errors with
+    /// the named message. Post-F2 only token-over-budget sessions can reach
+    /// this — the bail text is now truthful.
+    #[tokio::test]
+    async fn hard_budget_thrash_latches_then_bails_with_named_error() {
+        let server = MockServer::start().await;
+        let log = Arc::new(Mutex::new(Vec::new()));
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(LongHaulResponder {
+                path: "tiny.txt",
+                log: log.clone(),
+            })
+            .mount(&server)
+            .await;
+        let ws = tempfile::TempDir::new().unwrap();
+        std::fs::write(ws.path().join("tiny.txt"), "ok").unwrap();
+        let workspace = ws.path().to_string_lossy().to_string();
+        // Incompressible: the system prompt dominates and no structural
+        // pass or boundary can reduce it.
+        let messages = vec![
+            MemMessage::system(format!("you are a test. {}", "rule. ".repeat(700))),
+            MemMessage::user(TASK),
+        ];
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut compress_state = CompressState::new();
+        let mut c = ctx(&uri, &messages, &caveats, &workspace);
+        c.mid_loop_trim_tokens = Some(50); // hard trigger, unreachable budget
+        c.compress_state = Some(&mut compress_state);
+        let err = chat_complete(c, &mut NoMcp)
+            .await
+            .expect_err("the post-latch over-budget round must refuse the send");
+        let msg = err.to_string();
+        assert!(msg.contains("exceeds the model's input budget"), "{msg}");
+        assert!(msg.contains("auto-compression is disabled"), "{msg}");
+        assert!(compress_state.is_disabled(), "anti-thrash latched first");
+        assert!(
+            log.lock().unwrap().len() <= 3,
+            "the refusal must stop the loop within a round or two"
         );
     }
 }

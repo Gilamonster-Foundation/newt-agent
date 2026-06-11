@@ -1001,6 +1001,76 @@ impl newt_core::NoteSink for ManagerNoteSink<'_> {
     }
 }
 
+/// Build the agentic loop's compression summarizer (Step 18.4, #247): one
+/// tools-disabled completion against the active backend, mirroring the
+/// `Summarizing` provider's `with_summarizer` wiring below — but async,
+/// because the loop invokes it mid-turn from inside its own async context.
+/// A non-2xx status or empty content is an error so the loop falls back to
+/// the static compaction marker instead of injecting garbage.
+///
+/// `num_ctx` is the same effective context cap the main loop sends
+/// (`options.num_ctx` on Ollama): the summary request is typically the
+/// largest single message of the session, and without the cap Ollama
+/// silently truncates it at the model's default window (F5).
+/// OpenAI-compatible endpoints configure context server-side — ignored.
+fn make_loop_summarizer(
+    url: String,
+    model: String,
+    kind: newt_core::BackendKind,
+    api_key: Option<String>,
+    num_ctx: Option<u32>,
+) -> newt_core::Summarizer {
+    Box::new(move |prompt: String| {
+        let url = url.clone();
+        let model = model.clone();
+        let api_key = api_key.clone();
+        let openai = kind == newt_core::BackendKind::Openai;
+        Box::pin(async move {
+            let chat_url = if openai {
+                format!("{}/v1/chat/completions", url.trim_end_matches('/'))
+            } else {
+                format!("{}/api/chat", url.trim_end_matches('/'))
+            };
+            // No `tools` key => the model cannot emit tool calls.
+            let body = match num_ctx {
+                Some(ctx_size) if !openai => serde_json::json!({
+                    "model": model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "stream": false,
+                    "options": { "num_ctx": ctx_size },
+                }),
+                _ => serde_json::json!({
+                    "model": model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "stream": false,
+                }),
+            };
+            let mut req = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(60))
+                .build()?
+                .post(&chat_url)
+                .json(&body);
+            if let Some(key) = api_key {
+                req = req.bearer_auth(key);
+            }
+            let resp = req.send().await?;
+            if !resp.status().is_success() {
+                anyhow::bail!("summarizer endpoint {}", resp.status());
+            }
+            let json: serde_json::Value = resp.json().await?;
+            let content = if openai {
+                json["choices"][0]["message"]["content"].as_str()
+            } else {
+                json["message"]["content"].as_str()
+            };
+            match content {
+                Some(s) if !s.trim().is_empty() => Ok(s.to_string()),
+                _ => anyhow::bail!("summarizer returned empty content"),
+            }
+        })
+    })
+}
+
 fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Result<()> {
     let verbose = verbose_mode();
 
@@ -1211,6 +1281,10 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
     // Turn-counted memory nudge (Step 19.3, #248): owned per session, lent to
     // the loop each turn. `[memory] note_nudge_interval` (default 10, 0 = off).
     let mut note_nudge = newt_core::NoteNudge::new(mem_cfg.note_nudge_interval);
+    // Compression anti-thrash state (Step 18.4, #247): owned per session,
+    // lent to the loop each turn (same pattern as `note_nudge`). Two
+    // consecutive <10% reclaims disable auto-compression until restart.
+    let mut compress_state = newt_core::CompressState::new();
     let ctx = newt_core::SessionContext {
         workspace: workspace.to_string(),
         session_id: format!(
@@ -1311,6 +1385,7 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                             &mut system,
                             active_persona.as_ref(),
                             &mut active_conversation_id,
+                            &mut compress_state,
                         );
                         print_newt(&msg, color, verbose);
                         if let Some(ref hp) = history_path {
@@ -1329,6 +1404,7 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                             system: &mut system,
                             active_persona: &mut active_persona,
                             active_conversation_id: &mut active_conversation_id,
+                            compress_state: &mut compress_state,
                         };
                         match handle_conversation_command(&task, &mut conversation_ctx) {
                             Ok(msg) => print_newt(&msg, color, verbose),
@@ -1435,10 +1511,12 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                         .unwrap_or_else(|| mid_loop_trim_threshold(&cfg))
                         .min(eff_max_tool_rounds.saturating_sub(3));
                     // Token-based trim trigger (issue #223): per-model override, else
-                    // the global `[tui].mid_loop_trim_tokens` (None disables).
-                    let eff_mid_loop_trim_tokens = model_tune
-                        .and_then(|t| t.mid_loop_trim_tokens)
-                        .or_else(|| cfg.tui.as_ref().and_then(|t| t.mid_loop_trim_tokens));
+                    // the global `[tui].mid_loop_trim_tokens`. None OR zero disables
+                    // (the zero-is-noop contract, F3).
+                    let eff_mid_loop_trim_tokens = effective_mid_loop_trim_tokens(
+                        model_tune.and_then(|t| t.mid_loop_trim_tokens),
+                        cfg.tui.as_ref().and_then(|t| t.mid_loop_trim_tokens),
+                    );
 
                     // Lazy context-window discovery: queries /api/show once per model
                     // per session, then caches the result for the lifetime of the process.
@@ -1472,6 +1550,19 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                     let mut note_sink = ManagerNoteSink {
                         memory: &mut memory,
                     };
+                    // Compression summarizer (Step 18.4, #247): rebuilt per
+                    // turn so a mid-session `/backend` or model switch takes
+                    // effect immediately.
+                    let loop_summarizer = make_loop_summarizer(
+                        inf_url.clone(),
+                        inf_model.clone(),
+                        inf_kind,
+                        inf_key.clone(),
+                        // The same effective context cap the main loop sends —
+                        // the summary request must not be silently truncated
+                        // at Ollama's default window (F5).
+                        eff_num_ctx,
+                    );
                     let response = tokio::task::block_in_place(|| {
                         rt.block_on(chat_complete(
                             ChatCtx {
@@ -1502,6 +1593,9 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                                 recover_cw_400: Some(recover_context_window_400),
                                 note_sink: Some(&mut note_sink),
                                 note_nudge: Some(&mut note_nudge),
+                                // Summarize-don't-discard (Step 18.4, #247).
+                                summarizer: Some(&*loop_summarizer),
+                                compress_state: Some(&mut compress_state),
                             },
                             &mut mcp,
                         ))
@@ -2136,10 +2230,14 @@ fn handle_new_conversation(
     system: &mut String,
     active_persona: Option<&Persona>,
     conversation_id: &mut String,
+    compress_state: &mut newt_core::CompressState,
 ) -> String {
     // A new conversation gets a fresh id, which rotates the per-session plan
     // path to a new `.newt/sessions/<id>/` dir (issue #220).
     *conversation_id = newt_core::new_conversation_id();
+    // Re-arm compression anti-thrash (F4): the disable notice promises
+    // "start a new conversation to reset" — this is what makes that true.
+    compress_state.reset();
     reset_conversation(workspace, memory, system, active_persona, conversation_id);
     new_conversation_message(active_persona)
 }
@@ -2252,6 +2350,9 @@ struct ConversationCommandContext<'a> {
     system: &'a mut String,
     active_persona: &'a mut Option<Persona>,
     active_conversation_id: &'a mut String,
+    /// Session compression anti-thrash state — reset on `/conversation
+    /// restore`, which is a conversation boundary like `/new` (F4).
+    compress_state: &'a mut newt_core::CompressState,
 }
 
 fn handle_conversation_command(
@@ -2278,6 +2379,9 @@ fn handle_conversation_command(
                 },
                 None => *ctx.active_persona = None,
             }
+            // A restore is a conversation boundary: re-arm compression
+            // anti-thrash exactly like /new does (F4).
+            ctx.compress_state.reset();
             // Adopt the restored conversation's id BEFORE rebuilding so the
             // system prompt names that conversation's plan file (issue #220):
             // resuming a conversation resumes its plan.
@@ -2589,6 +2693,17 @@ fn recover_context_window_400(err: &anyhow::Error, model: &str, today: &str) -> 
     let new_cap = entry.max_ok_input;
     probe::save_cache(&cache);
     new_cap
+}
+
+/// Resolve the token-based mid-loop trim trigger (issue #223): the per-model
+/// override wins over the global `[tui].mid_loop_trim_tokens`. A configured
+/// ZERO (from either source) means DISABLED — the old `trim_to_token_budget`
+/// zero-is-noop contract, enforced both here and in the trigger itself (F3).
+fn effective_mid_loop_trim_tokens(
+    model_override: Option<usize>,
+    global: Option<usize>,
+) -> Option<usize> {
+    model_override.or(global).filter(|&t| t > 0)
 }
 
 /// Read the tool-output line limit from config (default 20, 0 = unlimited).
@@ -3968,14 +4083,24 @@ mod skills_integration_tests {
             rebuild_system_prompt(workspace, &memory, active_persona.as_ref(), "test-session");
         let mut active_conversation_id = String::from("test-session");
 
+        // A latched anti-thrash switch must be re-armed by /new (F4): the
+        // disable notice promises "start a new conversation to reset".
+        let mut compress_state = newt_core::CompressState::new();
+        compress_state.latch_disabled_for_tests();
+
         let message = handle_new_conversation(
             workspace,
             &mut memory,
             &mut system,
             active_persona.as_ref(),
             &mut active_conversation_id,
+            &mut compress_state,
         );
 
+        assert!(
+            !compress_state.is_disabled(),
+            "/new must reset compression anti-thrash (F4)"
+        );
         assert_eq!(message, "Started a new conversation with persona `terse`.");
         assert!(system.contains("Active persona: terse"));
         assert!(system.contains("Keep replies short."));
@@ -4304,6 +4429,10 @@ mod skills_integration_tests {
         let mut system = rebuild_system_prompt(workspace_str, &memory, None, "test-session");
         let mut active_persona = None;
         let mut active_conversation_id = newt_core::new_conversation_id();
+        // A latched anti-thrash switch must be re-armed by restore too (F4):
+        // restoring is a conversation boundary exactly like /new.
+        let mut compress_state = newt_core::CompressState::new();
+        compress_state.latch_disabled_for_tests();
         let mut conversation_ctx = ConversationCommandContext {
             store: &store,
             persona_store: &persona_store,
@@ -4312,6 +4441,7 @@ mod skills_integration_tests {
             system: &mut system,
             active_persona: &mut active_persona,
             active_conversation_id: &mut active_conversation_id,
+            compress_state: &mut compress_state,
         };
 
         let message = handle_conversation_command(
@@ -4320,6 +4450,10 @@ mod skills_integration_tests {
         )
         .unwrap();
 
+        assert!(
+            !compress_state.is_disabled(),
+            "/conversation restore must reset compression anti-thrash (F4)"
+        );
         assert!(message.contains("Restored conversation"));
         assert_eq!(active_conversation_id, id);
         assert_eq!(
@@ -4443,6 +4577,8 @@ mod tool_round_cap_tests {
                     recover_cw_400: Some(recover_context_window_400),
                     note_sink: None,
                     note_nudge: None,
+                    summarizer: None,
+                    compress_state: None,
                 },
                 &mut Mcp::empty(),
             )
@@ -4595,6 +4731,28 @@ mod fd_exhaustion_tests {
 #[cfg(test)]
 mod helper_fn_tests {
     use super::*;
+
+    /// Re-homed `trim_to_token_budget_zero_is_noop` at the passthrough (F3):
+    /// a configured zero — per-model or global — disables the token trigger
+    /// instead of reaching the loop as "budget 0, fire every round".
+    #[test]
+    fn zero_mid_loop_trim_tokens_is_disabled() {
+        // Global zero → disabled.
+        assert_eq!(effective_mid_loop_trim_tokens(None, Some(0)), None);
+        // Per-model zero overrides a real global → disabled for this model.
+        assert_eq!(effective_mid_loop_trim_tokens(Some(0), Some(5_000)), None);
+        // Real values pass through, override winning.
+        assert_eq!(
+            effective_mid_loop_trim_tokens(None, Some(5_000)),
+            Some(5_000)
+        );
+        assert_eq!(
+            effective_mid_loop_trim_tokens(Some(3_000), Some(5_000)),
+            Some(3_000)
+        );
+        // Nothing configured → disabled.
+        assert_eq!(effective_mid_loop_trim_tokens(None, None), None);
+    }
 
     #[test]
     fn today_date_matches_utc_calendar() {
@@ -5324,5 +5482,108 @@ mod http_loop_tests {
             .await;
         let err = fetch_openai_models(&err_server.uri(), None).unwrap_err();
         assert!(err.to_string().contains("HTTP 401"), "got: {err}");
+    }
+
+    /// F5: the loop summarizer's Ollama request must carry the same
+    /// `options.num_ctx` the main loop sends — without it Ollama silently
+    /// truncates the (typically largest-of-session) summary request at the
+    /// model's default window.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn loop_summarizer_sends_num_ctx_to_ollama() {
+        use std::sync::{Arc, Mutex};
+        use wiremock::{Request, Respond};
+
+        struct Capture {
+            body: Arc<Mutex<Option<serde_json::Value>>>,
+        }
+        impl Respond for Capture {
+            fn respond(&self, req: &Request) -> ResponseTemplate {
+                *self.body.lock().unwrap() = serde_json::from_slice(&req.body).ok();
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"message": {"content": "SUM"}}))
+            }
+        }
+
+        let server = MockServer::start().await;
+        let body = Arc::new(Mutex::new(None));
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(Capture { body: body.clone() })
+            .mount(&server)
+            .await;
+
+        let s = make_loop_summarizer(
+            server.uri(),
+            "test-model".into(),
+            newt_core::BackendKind::Ollama,
+            None,
+            Some(4_096),
+        );
+        let out = s("summarize the middle".into()).await.unwrap();
+        assert_eq!(out, "SUM");
+        let captured = body.lock().unwrap().clone().expect("request captured");
+        assert_eq!(
+            captured["options"]["num_ctx"], 4_096,
+            "the summarizer request must cap Ollama's window like the main loop"
+        );
+        assert!(
+            captured.get("tools").is_none(),
+            "summarizer stays tools-disabled"
+        );
+
+        // No cap configured → no options key (model default, as before).
+        let s_none = make_loop_summarizer(
+            server.uri(),
+            "test-model".into(),
+            newt_core::BackendKind::Ollama,
+            None,
+            None,
+        );
+        s_none("summarize".into()).await.unwrap();
+        let captured = body.lock().unwrap().clone().unwrap();
+        assert!(captured.get("options").is_none());
+    }
+
+    /// F5 mirror: OpenAI-compatible endpoints configure context server-side
+    /// — `num_ctx` must NOT leak into their request body.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn loop_summarizer_omits_num_ctx_on_openai() {
+        use std::sync::{Arc, Mutex};
+        use wiremock::{Request, Respond};
+
+        struct Capture {
+            body: Arc<Mutex<Option<serde_json::Value>>>,
+        }
+        impl Respond for Capture {
+            fn respond(&self, req: &Request) -> ResponseTemplate {
+                *self.body.lock().unwrap() = serde_json::from_slice(&req.body).ok();
+                ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({"choices": [{"message": {"content": "SUM"}}]}),
+                )
+            }
+        }
+
+        let server = MockServer::start().await;
+        let body = Arc::new(Mutex::new(None));
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(Capture { body: body.clone() })
+            .mount(&server)
+            .await;
+
+        let s = make_loop_summarizer(
+            server.uri(),
+            "test-model".into(),
+            newt_core::BackendKind::Openai,
+            Some("sk-test".into()),
+            Some(4_096),
+        );
+        let out = s("summarize the middle".into()).await.unwrap();
+        assert_eq!(out, "SUM");
+        let captured = body.lock().unwrap().clone().expect("request captured");
+        assert!(
+            captured.get("options").is_none(),
+            "num_ctx is Ollama-only; OpenAI windows are server-side"
+        );
     }
 }

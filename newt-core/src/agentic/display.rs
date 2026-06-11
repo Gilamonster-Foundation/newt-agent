@@ -99,6 +99,29 @@ pub(crate) fn emit_overflow_notice(
     io::stdout().flush().ok();
 }
 
+/// Print a one-line compression notice (Step 18.4, #247). Always visible —
+/// the B6 baseline's failure mode was context loss with *no event anywhere*;
+/// "visibly degrades" is the acceptance bar.
+pub(crate) fn emit_compression_notice(color: bool, before: usize, after: usize, how: &str) {
+    let msg = format!(
+        "⧉  context compressed: ~{} → ~{} est. tokens ({how})",
+        fmt_tokens(before.min(u32::MAX as usize) as u32),
+        fmt_tokens(after.min(u32::MAX as usize) as u32),
+    );
+    if color {
+        execute!(
+            io::stdout(),
+            SetForegroundColor(CtColor::DarkYellow),
+            Print(format!("{msg}\n")),
+            ResetColor,
+        )
+        .ok();
+    } else {
+        println!("{msg}");
+    }
+    io::stdout().flush().ok();
+}
+
 /// Print a visible retry indicator to the TUI so the user knows why there's
 /// a pause rather than seeing a silent hang.
 pub(crate) fn print_retry_indicator(attempt: u32, delay: std::time::Duration, color: bool) {
