@@ -25,6 +25,7 @@ pub mod router;
 pub mod session;
 pub mod store;
 pub mod tuning;
+pub mod workspace_key;
 
 #[cfg(feature = "pyo3")]
 pub mod pyo3_module;
@@ -64,3 +65,4 @@ pub use role_profile::{CaveatProfile, RoleProfile, ScopeKeyword, ScopeSpec};
 pub use router::{Router, Tier};
 pub use session::SessionId;
 pub use store::ConversationStore;
+pub use workspace_key::workspace_key_v2;
