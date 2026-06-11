@@ -180,6 +180,20 @@ pub trait MemoryProvider: Send + Sync {
     fn add_note(&mut self, _fact: &str) -> anyhow::Result<()> {
         Err(NotesUnsupported.into())
     }
+
+    /// Replace the single persisted note containing `old_substring` with
+    /// `new_text` (Step 19.3 — the `save_note` tool's replace action).
+    /// Default: [`NotesUnsupported`], same routing contract as `add_note`.
+    fn replace_note(&mut self, _old_substring: &str, _new_text: &str) -> anyhow::Result<()> {
+        Err(NotesUnsupported.into())
+    }
+
+    /// Remove the single persisted note containing `substring` (Step 19.3 —
+    /// the `save_note` tool's remove action).
+    /// Default: [`NotesUnsupported`], same routing contract as `add_note`.
+    fn remove_note(&mut self, _substring: &str) -> anyhow::Result<()> {
+        Err(NotesUnsupported.into())
+    }
 }
 
 /// Error returned by the default [`MemoryProvider::add_note`] for providers
@@ -322,9 +336,33 @@ impl MemoryManager {
     /// `NoteStore`'s over-budget curator error) is surfaced if no provider
     /// accepts the note.
     pub fn add_note(&mut self, fact: &str) -> anyhow::Result<()> {
+        self.route_note_op(|p| p.add_note(fact))
+    }
+
+    /// Replace the single persisted note containing `old_substring` —
+    /// same first-note-capable-provider routing as [`Self::add_note`].
+    pub fn replace_note(&mut self, old_substring: &str, new_text: &str) -> anyhow::Result<()> {
+        self.route_note_op(|p| p.replace_note(old_substring, new_text))
+    }
+
+    /// Remove the single persisted note containing `substring` —
+    /// same first-note-capable-provider routing as [`Self::add_note`].
+    pub fn remove_note(&mut self, substring: &str) -> anyhow::Result<()> {
+        self.route_note_op(|p| p.remove_note(substring))
+    }
+
+    /// Shared routing for note mutations: offer the operation to every
+    /// provider in registration order; first `Ok` wins, [`NotesUnsupported`]
+    /// is skipped, and the first *real* rejection (over-budget curator error,
+    /// scan rejection, ambiguous-substring error) is surfaced if no provider
+    /// accepts.
+    fn route_note_op(
+        &mut self,
+        mut op: impl FnMut(&mut dyn MemoryProvider) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
         let mut first_err: Option<anyhow::Error> = None;
         for p in &mut self.providers {
-            match p.add_note(fact) {
+            match op(p.as_mut()) {
                 Ok(()) => return Ok(()),
                 Err(e) if e.is::<NotesUnsupported>() => continue,
                 Err(e) => {
@@ -1579,6 +1617,61 @@ mod tests {
         let mut rw = RollingWindow::new(5);
         let err = rw.add_note("fact").unwrap_err();
         assert!(err.is::<NotesUnsupported>());
+    }
+
+    #[tokio::test]
+    async fn rolling_window_replace_and_remove_note_return_notes_unsupported() {
+        // The trait defaults (Step 19.3) mirror add_note so the manager's
+        // routing can skip note-less providers for every mutation kind.
+        let mut rw = RollingWindow::new(5);
+        assert!(rw
+            .replace_note("old", "new")
+            .unwrap_err()
+            .is::<NotesUnsupported>());
+        assert!(rw.remove_note("old").unwrap_err().is::<NotesUnsupported>());
+    }
+
+    #[tokio::test]
+    async fn memory_manager_replace_and_remove_route_to_note_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("NOTES.md");
+        let mut mgr = MemoryManager::new();
+        // A note-less provider first — routing must skip it (NotesUnsupported).
+        mgr.add_provider(RollingWindow::new(5));
+        mgr.add_provider(NoteStore::new(path.clone(), 2200));
+        let ctx = SessionContext {
+            workspace: "/ws".into(),
+            session_id: "s".into(),
+        };
+        mgr.initialize_all(&ctx).await;
+
+        mgr.add_note("model alpha is the fast tier").unwrap();
+        mgr.add_note("workspace uses just check").unwrap();
+
+        mgr.replace_note("alpha", "model beta is the fast tier")
+            .unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("model beta"), "{raw}");
+        assert!(!raw.contains("model alpha"), "{raw}");
+
+        mgr.remove_note("just check").unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("just check"), "{raw}");
+        assert!(raw.contains("model beta"), "other entry untouched: {raw}");
+
+        // Real rejections surface: ambiguity / zero-match errors come back.
+        let err = mgr.remove_note("nonexistent").unwrap_err().to_string();
+        assert!(err.contains("no entry contains"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn memory_manager_replace_and_remove_fail_with_no_note_store() {
+        let mut mgr = MemoryManager::new();
+        mgr.add_provider(RollingWindow::new(5));
+        let err = mgr.replace_note("a", "b").unwrap_err().to_string();
+        assert!(err.contains("no note-capable memory provider"), "{err}");
+        let err = mgr.remove_note("a").unwrap_err().to_string();
+        assert!(err.contains("no note-capable memory provider"), "{err}");
     }
 
     #[tokio::test]

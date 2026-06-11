@@ -11,12 +11,14 @@
 
 mod display;
 mod mcp;
+mod note_sink;
 mod tools;
 mod trim;
 mod warmup;
 
 pub use display::{print_newt, NEWT_ORANGE_CT};
 pub use mcp::{McpTools, NoMcp};
+pub use note_sink::{save_note_tool_definition, NoteNudge, NoteSink};
 pub use tools::{execute_tool, tool_definitions, venv_cmd_prefix};
 pub use warmup::warmup_if_cold;
 
@@ -109,6 +111,16 @@ pub struct ChatCtx<'a> {
     /// TUI-side with the probe module). `None` disables recovery: the error
     /// propagates exactly as it did when no limit could be parsed. See #223.
     pub recover_cw_400: Option<RecoverCw400>,
+    /// Model-writable note store behind the `save_note` tool (Step 19.3,
+    /// #248). `None` ⇒ the tool is not advertised and the loop never writes
+    /// memory (eval / headless callers unaffected). The TUI passes a sink
+    /// over its session `MemoryManager`, so `save_note` and `/remember`
+    /// share one store, one security scan, one char budget.
+    pub note_sink: Option<&'a mut dyn NoteSink>,
+    /// Turn-counted memory-nudge state ([`NoteNudge`]), owned by the caller
+    /// across user turns and lent to the loop per call. Consulted only when
+    /// `note_sink` is present; `None` disables the nudge.
+    pub note_nudge: Option<&'a mut NoteNudge>,
 }
 
 /// Main agentic loop: call model → execute tool calls → feed results back → repeat.
@@ -152,6 +164,8 @@ pub async fn chat_complete(
         build_check_cmd,
         safe_context,
         recover_cw_400,
+        mut note_sink,
+        mut note_nudge,
     } = ctx;
     let client = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(connect_timeout_secs))
@@ -159,6 +173,8 @@ pub async fn chat_complete(
         .build()?;
     let chat_url = format!("{}/api/chat", url.trim_end_matches('/'));
     let retry = tui_retry_policy();
+    // The save_note tool is advertised only when a sink exists (Step 19.3).
+    let advertise_save_note = note_sink.is_some();
 
     // Convert MemMessage list to Ollama JSON format.
     // The memory manager already included the current task as the last user message.
@@ -166,6 +182,16 @@ pub async fn chat_complete(
         .iter()
         .map(|m| serde_json::json!({"role": m.role.as_str(), "content": m.content}))
         .collect();
+
+    // In-band memory nudge (Step 19.3): after `[memory] note_nudge_interval`
+    // user turns with zero organic save_note use, append a one-line reminder
+    // to this turn's user message. Only when a sink exists — without one the
+    // save_note tool isn't even advertised.
+    if note_sink.is_some() {
+        if let Some(line) = note_nudge.as_deref_mut().and_then(NoteNudge::begin_turn) {
+            append_nudge_line(&mut messages, &line);
+        }
+    }
 
     let mut accumulated_usage: Option<crate::TokenUsage> = None;
     let mut hallucination_count: u32 = 0;
@@ -179,7 +205,7 @@ pub async fn chat_complete(
     // Tool schemas ride along in every request body; count them once (18.1).
     // Stable for the whole turn: the builtin + MCP tool set doesn't change
     // mid-turn, so hoisting out of the round loop is safe.
-    let tools = merged_tool_definitions(mcp);
+    let tools = merged_tool_definitions(mcp, advertise_save_note);
     let tool_tokens = estimate_value_tokens(&tools);
     // Truthful context-size tracker: anchors on the backend's last-reported
     // prompt token count, chars/4 + schema estimate as fallback (Step 18.1).
@@ -524,6 +550,13 @@ pub async fn chat_complete(
             if !is_read_only_tool(name) {
                 round_wrote = true;
             }
+            // Organic save_note use resets the memory-nudge counter (the
+            // read-only-rounds reset pattern) — active curators never see it.
+            if name == "save_note" && note_sink.is_some() {
+                if let Some(n) = note_nudge.as_deref_mut() {
+                    n.note_saved();
+                }
+            }
             let result = execute_tool(
                 name,
                 &args,
@@ -533,6 +566,12 @@ pub async fn chat_complete(
                 caveats,
                 mcp,
                 build_check_cmd.as_deref(),
+                // Reborrow + re-coerce: shortens the trait-object lifetime to
+                // this call (Option<&mut dyn _> is invariant, so the longer
+                // ChatCtx lifetime can't unify directly).
+                note_sink
+                    .as_deref_mut()
+                    .map(|s| &mut *s as &mut dyn NoteSink),
             )
             .await;
             messages.push(serde_json::json!({
@@ -563,13 +602,29 @@ pub async fn chat_complete(
     Ok((text, streamed, usage, hallucination_count))
 }
 
-/// Returns `true` when `name` is a pure read tool that doesn't modify the workspace.
+/// Returns `true` when `name` is a tool that doesn't modify the workspace.
 /// Used to count consecutive read-only rounds and inject a write-nudge.
+/// `save_note` writes *memory*, not the workspace — a round that only saved
+/// a note must not suppress the stop-exploring-start-writing nudge.
 fn is_read_only_tool(name: &str) -> bool {
     matches!(
         name,
-        "list_dir" | "read_file" | "search" | "web_fetch" | "use_skill"
+        "list_dir" | "read_file" | "search" | "web_fetch" | "use_skill" | "save_note"
     )
+}
+
+/// Append the memory-nudge line to the current user message — the last
+/// message in the list per the memory-manager contract. Defensive fallback:
+/// if the last message somehow isn't a user turn, push a standalone user
+/// message instead (mirrors the read-only-rounds nudge injection).
+fn append_nudge_line(messages: &mut Vec<serde_json::Value>, line: &str) {
+    match messages.last_mut() {
+        Some(last) if last["role"] == "user" => {
+            let cur = last["content"].as_str().unwrap_or_default();
+            last["content"] = serde_json::Value::String(format!("{cur}\n\n{line}"));
+        }
+        _ => messages.push(serde_json::json!({"role": "user", "content": line})),
+    }
 }
 
 /// Build the nudge appended to the message list when the tool-round cap is hit.
@@ -776,6 +831,8 @@ pub async fn openai_chat_complete(
         build_check_cmd,
         safe_context,
         recover_cw_400,
+        mut note_sink,
+        mut note_nudge,
     } = ctx;
     let client = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(connect_timeout_secs))
@@ -783,11 +840,20 @@ pub async fn openai_chat_complete(
         .build()?;
     let chat_url = format!("{}/v1/chat/completions", url.trim_end_matches('/'));
     let retry = tui_retry_policy();
+    // The save_note tool is advertised only when a sink exists (Step 19.3).
+    let advertise_save_note = note_sink.is_some();
 
     let mut messages: Vec<serde_json::Value> = mem_messages
         .iter()
         .map(|m| serde_json::json!({"role": m.role.as_str(), "content": m.content}))
         .collect();
+
+    // In-band memory nudge (Step 19.3) — mirrors the Ollama path.
+    if note_sink.is_some() {
+        if let Some(line) = note_nudge.as_deref_mut().and_then(NoteNudge::begin_turn) {
+            append_nudge_line(&mut messages, &line);
+        }
+    }
 
     let mut accumulated_usage: Option<crate::TokenUsage> = None;
     let mut hallucination_count: u32 = 0;
@@ -796,7 +862,7 @@ pub async fn openai_chat_complete(
     // Pre-send token budget gate; tightened mid-turn by a recovered 400 (#223).
     let mut send_budget: Option<usize> = max_ok_input.or(safe_context).map(|c| c as usize);
     // Tool schemas ride along in every request body; count them once (18.1).
-    let tools = merged_tool_definitions(mcp);
+    let tools = merged_tool_definitions(mcp, advertise_save_note);
     let tool_tokens = estimate_value_tokens(&tools);
     // Truthful context-size tracker (prompt-tokens-preferred, Step 18.1).
     let mut prompt_tracker = PromptTracker::new();
@@ -990,6 +1056,13 @@ pub async fn openai_chat_complete(
             if is_hallucination(name, &args) {
                 hallucination_count += 1;
             }
+            // Organic save_note use resets the memory-nudge counter (mirrors
+            // the Ollama path).
+            if name == "save_note" && note_sink.is_some() {
+                if let Some(n) = note_nudge.as_deref_mut() {
+                    n.note_saved();
+                }
+            }
             let result = execute_tool(
                 name,
                 &args,
@@ -999,6 +1072,12 @@ pub async fn openai_chat_complete(
                 caveats,
                 mcp,
                 build_check_cmd.as_deref(),
+                // Reborrow + re-coerce: shortens the trait-object lifetime to
+                // this call (Option<&mut dyn _> is invariant, so the longer
+                // ChatCtx lifetime can't unify directly).
+                note_sink
+                    .as_deref_mut()
+                    .map(|s| &mut *s as &mut dyn NoteSink),
             )
             .await;
             messages.push(serde_json::json!({
@@ -1114,7 +1193,16 @@ mod cap_exit_unit_tests {
 
     #[test]
     fn read_only_tools_classified_correctly() {
-        for name in &["list_dir", "read_file", "search", "web_fetch", "use_skill"] {
+        // save_note writes memory, not the workspace: a round that only
+        // saved a note must still count toward the read-only write-nudge.
+        for name in &[
+            "list_dir",
+            "read_file",
+            "search",
+            "web_fetch",
+            "use_skill",
+            "save_note",
+        ] {
             assert!(is_read_only_tool(name), "{name} should be read-only");
         }
     }
@@ -1262,6 +1350,8 @@ mod tool_round_cap_tests {
                 build_check_cmd: None,
                 safe_context: None,
                 recover_cw_400: None,
+                note_sink: None,
+                note_nudge: None,
             },
             &mut NoMcp,
         )
@@ -1316,6 +1406,8 @@ mod tool_round_cap_tests {
                 build_check_cmd: None,
                 safe_context: None,
                 recover_cw_400: None,
+                note_sink: None,
+                note_nudge: None,
             },
             &mut NoMcp,
         )
@@ -1387,6 +1479,8 @@ mod tool_round_cap_tests {
                 build_check_cmd: None,
                 safe_context: None,
                 recover_cw_400: None,
+                note_sink: None,
+                note_nudge: None,
             },
             &mut NoMcp,
         )
@@ -1421,6 +1515,7 @@ mod tool_round_cap_tests {
                 20,
                 &caveats,
                 &mut NoMcp,
+                None,
                 None,
             )
             .await;
@@ -1493,6 +1588,8 @@ mod tool_round_cap_tests {
                 build_check_cmd: None,
                 safe_context: None,
                 recover_cw_400: None,
+                note_sink: None,
+                note_nudge: None,
             },
             &mut NoMcp,
         )
@@ -1620,6 +1717,8 @@ mod tool_round_cap_tests {
                 build_check_cmd: None,
                 safe_context: None,
                 recover_cw_400: None,
+                note_sink: None,
+                note_nudge: None,
             },
             &mut NoMcp,
         )
@@ -1686,6 +1785,8 @@ mod http_loop_tests {
             build_check_cmd: None,
             safe_context: None,
             recover_cw_400: None,
+            note_sink: None,
+            note_nudge: None,
         }
     }
 
@@ -2117,5 +2218,462 @@ mod http_loop_tests {
             .expect("must succeed even when the summary errors");
         assert!(reply.contains("tool-call limit of 2"), "got: {reply}");
         assert!(reply.contains("max_tool_rounds"));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// save_note tool + memory nudge — loop integration (Step 19.3, #248)
+// ---------------------------------------------------------------------------
+//
+// Wiremock-backed tests against both agentic loops, pinning:
+//   (1) save_note is advertised iff a NoteSink is present, and a save_note
+//       tool call routes through the sink with the result fed back;
+//   (2) the in-band memory nudge is appended to the user message when due —
+//       and ONLY when a sink exists;
+//   (3) organic save_note use resets the nudge counter (the read-only-rounds
+//       reset pattern, hermes's reset-on-memory-write).
+#[cfg(test)]
+mod save_note_loop_tests {
+    use super::note_sink::tests::MockSink;
+    use super::*;
+    use crate::caveats::Caveats;
+    use crate::{BackendKind, MemMessage};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+    fn msgs() -> Vec<MemMessage> {
+        vec![
+            MemMessage::system("you are a test"),
+            MemMessage::user("do the thing"),
+        ]
+    }
+
+    fn ctx<'a>(
+        server_uri: &'a str,
+        messages: &'a [MemMessage],
+        caveats: &'a Caveats,
+    ) -> ChatCtx<'a> {
+        ChatCtx {
+            url: server_uri,
+            model: "test-model",
+            kind: BackendKind::Ollama,
+            api_key: None,
+            messages,
+            task: "do the thing",
+            workspace: ".",
+            color: false,
+            caveats,
+            max_tool_rounds: 6,
+            tool_output_lines: 20,
+            debug: false,
+            num_ctx: None,
+            connect_timeout_secs: 5,
+            inference_timeout_secs: 30,
+            mid_loop_trim_threshold: 40,
+            mid_loop_trim_tokens: None,
+            max_ok_input: None,
+            build_check_cmd: None,
+            safe_context: None,
+            recover_cw_400: None,
+            note_sink: None,
+            note_nudge: None,
+        }
+    }
+
+    fn body_json(req: &Request) -> serde_json::Value {
+        serde_json::from_slice(&req.body).unwrap_or_default()
+    }
+
+    fn advertised_tool_names(body: &serde_json::Value) -> Vec<String> {
+        body["tools"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|d| d["function"]["name"].as_str())
+                    .map(String::from)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn messages_contain(body: &serde_json::Value, needle: &str) -> bool {
+        body["messages"]
+            .as_array()
+            .map(|msgs| {
+                msgs.iter().any(|m| {
+                    m["content"]
+                        .as_str()
+                        .map(|c| c.contains(needle))
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false)
+    }
+
+    /// Ollama-shaped responder: issues one save_note tool call, then a final
+    /// text answer once the "note saved:" tool result is visible in history.
+    /// Also records whether save_note was advertised and whether the memory
+    /// nudge line reached the model.
+    struct SaveNoteResponder {
+        save_note_advertised: Arc<AtomicBool>,
+        nudge_seen: Arc<AtomicBool>,
+        final_answer: String,
+    }
+
+    impl Respond for SaveNoteResponder {
+        fn respond(&self, req: &Request) -> ResponseTemplate {
+            let body = body_json(req);
+            if advertised_tool_names(&body).contains(&"save_note".to_string()) {
+                self.save_note_advertised.store(true, Ordering::SeqCst);
+            }
+            if messages_contain(&body, "[system reminder:")
+                && messages_contain(&body, "without a saved note")
+            {
+                self.nudge_seen.store(true, Ordering::SeqCst);
+            }
+            if messages_contain(&body, "note saved:") {
+                // The tool result round-tripped — answer for real now.
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "message": { "content": self.final_answer }
+                }))
+            } else if body.get("tools").is_some() {
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "message": {
+                        "content": "",
+                        "tool_calls": [{ "function": {
+                            "name": "save_note",
+                            "arguments": {
+                                "action": "add",
+                                "text": "user prefers vi keybindings"
+                            }
+                        }}]
+                    }
+                }))
+            } else {
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "message": { "content": "final summary" }
+                }))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn ollama_save_note_routes_to_sink_and_result_feeds_back() {
+        let server = MockServer::start().await;
+        let advertised = Arc::new(AtomicBool::new(false));
+        let nudge_seen = Arc::new(AtomicBool::new(false));
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(SaveNoteResponder {
+                save_note_advertised: advertised.clone(),
+                nudge_seen: nudge_seen.clone(),
+                final_answer: "noted, moving on".into(),
+            })
+            .mount(&server)
+            .await;
+
+        let messages = msgs();
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut sink = MockSink::default();
+        let mut c = ctx(&uri, &messages, &caveats);
+        c.note_sink = Some(&mut sink);
+        let (reply, _streamed, _usage, hallu) = chat_complete(c, &mut NoMcp)
+            .await
+            .expect("chat_complete should succeed");
+
+        assert!(
+            advertised.load(Ordering::SeqCst),
+            "save_note must be advertised when a sink is present"
+        );
+        assert_eq!(
+            sink.calls,
+            vec!["add:user prefers vi keybindings"],
+            "the tool call must route through the sink"
+        );
+        assert_eq!(reply, "noted, moving on");
+        assert_eq!(hallu, 0, "save_note is a real tool, not a hallucination");
+        assert!(
+            !nudge_seen.load(Ordering::SeqCst),
+            "no nudge configured — none may be injected"
+        );
+    }
+
+    /// Without a sink the tool must be absent from the advertised set, and a
+    /// configured nudge must NOT be appended (absent-without-sink).
+    struct NoSinkObserver {
+        save_note_advertised: Arc<AtomicBool>,
+        nudge_seen: Arc<AtomicBool>,
+    }
+
+    impl Respond for NoSinkObserver {
+        fn respond(&self, req: &Request) -> ResponseTemplate {
+            let body = body_json(req);
+            if advertised_tool_names(&body).contains(&"save_note".to_string()) {
+                self.save_note_advertised.store(true, Ordering::SeqCst);
+            }
+            if messages_contain(&body, "[system reminder:") {
+                self.nudge_seen.store(true, Ordering::SeqCst);
+            }
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "message": { "content": "plain answer" }
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn without_sink_no_tool_and_no_nudge_even_when_due() {
+        let server = MockServer::start().await;
+        let advertised = Arc::new(AtomicBool::new(false));
+        let nudge_seen = Arc::new(AtomicBool::new(false));
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(NoSinkObserver {
+                save_note_advertised: advertised.clone(),
+                nudge_seen: nudge_seen.clone(),
+            })
+            .mount(&server)
+            .await;
+
+        let messages = msgs();
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        // A nudge that is overdue (interval 1, one quiet turn already counted)…
+        let mut nudge = NoteNudge::new(1);
+        let _ = nudge.begin_turn();
+        let mut c = ctx(&uri, &messages, &caveats);
+        // …but NO sink: the loop must neither advertise nor nudge.
+        c.note_nudge = Some(&mut nudge);
+        let (reply, _, _, _) = chat_complete(c, &mut NoMcp)
+            .await
+            .expect("chat_complete should succeed");
+
+        assert_eq!(reply, "plain answer");
+        assert!(
+            !advertised.load(Ordering::SeqCst),
+            "save_note advertised without a sink"
+        );
+        assert!(
+            !nudge_seen.load(Ordering::SeqCst),
+            "nudge injected without a sink"
+        );
+    }
+
+    #[tokio::test]
+    async fn nudge_appended_to_user_message_when_due() {
+        let server = MockServer::start().await;
+        let advertised = Arc::new(AtomicBool::new(false));
+        let nudge_seen = Arc::new(AtomicBool::new(false));
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(NoSinkObserver {
+                save_note_advertised: advertised.clone(),
+                nudge_seen: nudge_seen.clone(),
+            })
+            .mount(&server)
+            .await;
+
+        let messages = msgs();
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut sink = MockSink::default();
+        // One quiet turn already elapsed → due on this (the next) turn.
+        let mut nudge = NoteNudge::new(1);
+        let _ = nudge.begin_turn();
+        let mut c = ctx(&uri, &messages, &caveats);
+        c.note_sink = Some(&mut sink);
+        c.note_nudge = Some(&mut nudge);
+        let (reply, _, _, _) = chat_complete(c, &mut NoMcp)
+            .await
+            .expect("chat_complete should succeed");
+
+        assert_eq!(reply, "plain answer");
+        assert!(
+            nudge_seen.load(Ordering::SeqCst),
+            "the reminder line must reach the model on the due turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn organic_save_resets_the_nudge_counter() {
+        let server = MockServer::start().await;
+        let advertised = Arc::new(AtomicBool::new(false));
+        let nudge_seen = Arc::new(AtomicBool::new(false));
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(SaveNoteResponder {
+                save_note_advertised: advertised.clone(),
+                nudge_seen: nudge_seen.clone(),
+                final_answer: "done".into(),
+            })
+            .mount(&server)
+            .await;
+
+        let messages = msgs();
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut sink = MockSink::default();
+        let mut nudge = NoteNudge::new(1);
+        let mut c = ctx(&uri, &messages, &caveats);
+        c.note_sink = Some(&mut sink);
+        c.note_nudge = Some(&mut nudge);
+        let (reply, _, _, _) = chat_complete(c, &mut NoMcp)
+            .await
+            .expect("chat_complete should succeed");
+        assert_eq!(reply, "done");
+        assert_eq!(sink.calls.len(), 1, "the model saved organically");
+
+        // The turn included an organic save → the counter restarted, so the
+        // next turn must NOT be nudged (without the save, interval=1 would
+        // have made it due).
+        assert!(
+            nudge.begin_turn().is_none(),
+            "organic save_note use must reset the nudge counter"
+        );
+    }
+
+    /// OpenAI-shaped mirror: save_note advertised + routed, nudge appended.
+    struct OpenAiSaveNoteResponder {
+        save_note_advertised: Arc<AtomicBool>,
+        nudge_seen: Arc<AtomicBool>,
+    }
+
+    impl Respond for OpenAiSaveNoteResponder {
+        fn respond(&self, req: &Request) -> ResponseTemplate {
+            let body = body_json(req);
+            if advertised_tool_names(&body).contains(&"save_note".to_string()) {
+                self.save_note_advertised.store(true, Ordering::SeqCst);
+            }
+            if messages_contain(&body, "[system reminder:") {
+                self.nudge_seen.store(true, Ordering::SeqCst);
+            }
+            if messages_contain(&body, "note saved:") {
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "choices": [{ "message": { "content": "openai noted" } }]
+                }))
+            } else {
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "choices": [{ "message": {
+                        "content": null,
+                        "tool_calls": [{
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "save_note",
+                                "arguments": "{\"action\":\"add\",\"text\":\"CI gate is just check\"}"
+                            }
+                        }]
+                    }}]
+                }))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn openai_save_note_routes_and_nudge_appends() {
+        let server = MockServer::start().await;
+        let advertised = Arc::new(AtomicBool::new(false));
+        let nudge_seen = Arc::new(AtomicBool::new(false));
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(OpenAiSaveNoteResponder {
+                save_note_advertised: advertised.clone(),
+                nudge_seen: nudge_seen.clone(),
+            })
+            .mount(&server)
+            .await;
+
+        let messages = msgs();
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut sink = MockSink::default();
+        let mut nudge = NoteNudge::new(1);
+        let _ = nudge.begin_turn(); // due on this turn
+        let mut c = ctx(&uri, &messages, &caveats);
+        c.kind = BackendKind::Openai;
+        c.note_sink = Some(&mut sink);
+        c.note_nudge = Some(&mut nudge);
+        let (reply, _, _, hallu) = chat_complete(c, &mut NoMcp)
+            .await
+            .expect("openai loop should succeed");
+
+        assert_eq!(reply, "openai noted");
+        assert_eq!(sink.calls, vec!["add:CI gate is just check"]);
+        assert!(advertised.load(Ordering::SeqCst));
+        assert!(nudge_seen.load(Ordering::SeqCst));
+        assert_eq!(hallu, 0);
+    }
+
+    /// A sink error (here: the 19.1 over-budget curator error) must round-trip
+    /// to the model verbatim as the tool result so it can replace/remove and
+    /// retry — pinned end-to-end through the loop.
+    struct ErrorEchoResponder {
+        error_seen_by_model: Arc<AtomicBool>,
+    }
+
+    impl Respond for ErrorEchoResponder {
+        fn respond(&self, req: &Request) -> ResponseTemplate {
+            let body = body_json(req);
+            if messages_contain(&body, "Replace or remove existing entries first")
+                && messages_contain(&body, "1. an existing entry")
+            {
+                self.error_seen_by_model.store(true, Ordering::SeqCst);
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "message": { "content": "I will curate first" }
+                }))
+            } else if body.get("tools").is_some() {
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "message": {
+                        "content": "",
+                        "tool_calls": [{ "function": {
+                            "name": "save_note",
+                            "arguments": { "action": "add", "text": "too big" }
+                        }}]
+                    }
+                }))
+            } else {
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "message": { "content": "final summary" }
+                }))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn over_budget_error_round_trips_to_the_model() {
+        let server = MockServer::start().await;
+        let error_seen = Arc::new(AtomicBool::new(false));
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(ErrorEchoResponder {
+                error_seen_by_model: error_seen.clone(),
+            })
+            .mount(&server)
+            .await;
+
+        let messages = msgs();
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut sink = MockSink {
+            fail_with: Some(
+                "NOTES.md is full: this write needs 99/50 chars. \
+                 Replace or remove existing entries first.\nCurrent entries:\n  1. an existing entry"
+                    .into(),
+            ),
+            ..Default::default()
+        };
+        let mut c = ctx(&uri, &messages, &caveats);
+        c.note_sink = Some(&mut sink);
+        let (reply, _, _, _) = chat_complete(c, &mut NoMcp)
+            .await
+            .expect("chat_complete should succeed");
+
+        assert_eq!(reply, "I will curate first");
+        assert!(
+            error_seen.load(Ordering::SeqCst),
+            "the curator error (full entry list + instruction) must reach the model verbatim"
+        );
     }
 }

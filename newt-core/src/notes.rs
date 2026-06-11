@@ -463,6 +463,14 @@ impl MemoryProvider for NoteStore {
     fn add_note(&mut self, fact: &str) -> anyhow::Result<()> {
         self.add(fact)
     }
+
+    fn replace_note(&mut self, old_substring: &str, new_text: &str) -> anyhow::Result<()> {
+        self.replace(old_substring, new_text)
+    }
+
+    fn remove_note(&mut self, substring: &str) -> anyhow::Result<()> {
+        self.remove(substring)
+    }
 }
 
 impl std::fmt::Debug for NoteStore {

@@ -283,10 +283,20 @@ pub struct MemoryConfig {
     /// Default: auto-resolve from `.newt/soul.md` → `~/.newt/soul.md`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub soul_file: Option<String>,
+
+    /// User turns without an organic `save_note` call before the in-band
+    /// memory nudge is appended to the next user message (Step 19.3, #248).
+    /// `0` disables the nudge. Default: 10.
+    #[serde(default = "default_note_nudge_interval")]
+    pub note_nudge_interval: usize,
 }
 
 fn default_memory_window() -> usize {
     20
+}
+
+fn default_note_nudge_interval() -> usize {
+    10
 }
 
 impl Default for MemoryConfig {
@@ -296,6 +306,7 @@ impl Default for MemoryConfig {
             window: 20,
             context_tokens: None,
             soul_file: None,
+            note_nudge_interval: 10,
         }
     }
 }
@@ -1199,6 +1210,17 @@ mod tests {
     // upstream `agent-mesh-protocol::Caveats` ships algebra only).
     use crate::caveats::CaveatsExt;
     use std::io::Write;
+
+    #[test]
+    fn memory_note_nudge_interval_defaults_and_parses() {
+        // Default: 10 — via Default and when `[memory]` omits the key.
+        assert_eq!(MemoryConfig::default().note_nudge_interval, 10);
+        let cfg: MemoryConfig = toml::from_str("provider = \"rolling_window\"").unwrap();
+        assert_eq!(cfg.note_nudge_interval, 10);
+        // 0 = nudge off.
+        let cfg: MemoryConfig = toml::from_str("note_nudge_interval = 0").unwrap();
+        assert_eq!(cfg.note_nudge_interval, 0);
+    }
 
     #[test]
     fn skill_search_dirs_defaults_to_single_newt_dir() {
