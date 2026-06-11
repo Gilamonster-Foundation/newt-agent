@@ -65,6 +65,17 @@ regex = "1"
 # Pinned to 0.4: diffy 0.5 raises its MSRV to 1.85, above our 1.75.
 diffy = "0.4"
 
+# SQLite for the durable conversation store (Phase 17.1a, issue #246).
+# `bundled` compiles SQLite from source so newt has zero system deps
+# (local-first; no libsqlite3-dev requirement). The `fts5` feature is
+# deliberately NOT enabled here — recall/FTS lands in step 17.3; each PR
+# adds the smallest surface it needs.
+# Pinned to 0.31: it is the newest rusqlite that compiles at our MSRV
+# (rust-version 1.75). Verified empirically: 0.32+ use post-1.75 language
+# features and 0.40 pulls edition-2024 hashlink (requires Cargo 1.85+).
+# Same MSRV-pin pattern as diffy 0.4 above.
+rusqlite = { version = "0.31", features = ["bundled"] }
+
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 rustyline = { version = "14", default-features = false, features = ["with-file-history"] }
