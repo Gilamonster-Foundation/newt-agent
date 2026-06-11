@@ -44,7 +44,7 @@ where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
 {
-    let registry = build_default_registry().await;
+    let registry = build_default_registry().await?;
     let router = Arc::new(Router::new());
     let mut server = server::McpServer::new();
     handlers::register_handlers(&mut server, registry, router);
@@ -57,7 +57,17 @@ where
 /// If discovery fails the registry stays empty — `goal_run` will then
 /// surface `NoBackendForTier` as a clean JSON-RPC error rather than
 /// crashing the whole server (the other tools still work fine).
-async fn build_default_registry() -> Arc<BackendRegistry> {
+async fn build_default_registry() -> anyhow::Result<Arc<BackendRegistry>> {
+    let cfg = newt_core::Config::resolve().unwrap_or_default();
+    let registry = registry_from_config(&cfg)?;
+    if !registry.is_empty() {
+        tracing::info!(
+            providers = registry.len(),
+            "MCP server: using configured provider plugin registry"
+        );
+        return Ok(Arc::new(registry));
+    }
+
     let mut registry = BackendRegistry::new();
     match newt_inference::local::LocalOllamaBackend::discover(DEFAULT_OLLAMA_MODEL).await {
         Ok(backend) => {
@@ -75,5 +85,38 @@ async fn build_default_registry() -> Arc<BackendRegistry> {
             );
         }
     }
-    Arc::new(registry)
+    Ok(Arc::new(registry))
+}
+
+fn registry_from_config(cfg: &newt_core::Config) -> anyhow::Result<BackendRegistry> {
+    BackendRegistry::load_from_config(cfg)
+}
+
+#[cfg(test)]
+mod tests {
+    use newt_core::config::ProviderConfig;
+    use newt_core::{Config, Tier};
+
+    fn provider(name: &str) -> ProviderConfig {
+        ProviderConfig {
+            name: name.into(),
+            command: "newt-provider-openai".into(),
+            model: Some("gpt-test".into()),
+            env_pass: vec!["OPENAI_API_KEY".into()],
+            tiers: vec![Tier::Complex],
+        }
+    }
+
+    #[test]
+    fn registry_from_config_registers_provider_plugins() {
+        let cfg = Config {
+            providers: vec![provider("openai-provider")],
+            ..Config::default()
+        };
+
+        let registry = super::registry_from_config(&cfg).unwrap();
+
+        assert_eq!(registry.names(), vec!["openai-provider"]);
+        assert!(registry.pick(Tier::Complex).is_ok());
+    }
 }

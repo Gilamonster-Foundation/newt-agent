@@ -1,0 +1,46 @@
+# BENCH SCRATCH HARNESS — NOT part of the newt workspace, NOT wired into CI.
+#
+# This is the B1 (turn-write cost & store size) measurement bin for the
+# context/memory benchmarks (issue #245, docs/testing/context-memory-benchmark.md).
+# The baseline run (context-baseline-f0f4f6e.md) measured the JSON store; the
+# current version measures the SQLite store (17.1a) plus the §6 tick+chain
+# isolation (Phase C) and ships a B7 store seeder (`b7_seed`).
+# It deliberately avoids adding criterion (or anything else) as a workspace
+# dependency: it is a standalone crate with its own [workspace] table, built
+# ad hoc:
+#
+#   CARGO_TARGET_DIR=$HOME/.cache/newt-bench-target \
+#     cargo run --release --manifest-path docs/testing/results/scripts/b1-store-bench/Cargo.toml
+#   CARGO_TARGET_DIR=$HOME/.cache/newt-bench-target \
+#     cargo run --release --manifest-path docs/testing/results/scripts/b1-store-bench/Cargo.toml \
+#     --bin b7_seed -- --home <sandbox> --workspace <ws> --count 1000
+#
+[package]
+name = "b1-store-bench"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Standalone on purpose — keeps this scratch bin out of `cargo build --workspace`.
+[workspace]
+
+[dependencies]
+newt-core = { path = "../../../../../newt-core" }
+tempfile = "3"
+anyhow = "1"
+# Same major as the workspace's rusqlite (0.31 bundled) so the Phase C
+# replica runs the same SQLite build the store does.
+rusqlite = { version = "0.31", features = ["bundled"] }
+blake3 = "1"
+
+# Mirror of the workspace's [patch.crates-io] (agent-bridle is not on
+# crates.io yet — see agent-bridle#20). This crate has its own [workspace]
+# table, so it must repeat the patch to resolve newt-core's dependency.
+[patch.crates-io]
+agent-bridle           = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", branch = "feat/stub-shell" }
+agent-bridle-core      = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", branch = "feat/stub-shell" }
+agent-bridle-tool-shell = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", branch = "feat/stub-shell" }
+agent-bridle-tool-web  = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", branch = "feat/stub-shell" }
+
+[profile.release]
+debug = false

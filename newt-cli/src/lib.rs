@@ -68,6 +68,13 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "NAME")]
     pub persona: Option<String>,
 
+    /// Run with NO conversation persistence: nothing is auto-resumed, no
+    /// conversation row is created, and no turn is saved. Equivalent to
+    /// setting `NEWT_EPHEMERAL=1`. Takes precedence over
+    /// `NEWT_CONVERSATION_ID` and `[conversations] resume` (Step 17.7).
+    #[arg(long, global = true, default_value_t = false)]
+    pub ephemeral: bool,
+
     /// Cap the Ollama context window (KV-cache) to this many tokens.
     /// Prevents VRAM exhaustion on large models by limiting how much memory
     /// Ollama allocates for the attention cache. Equivalent to setting
@@ -229,6 +236,11 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             }
             if let Some(n) = cli.num_ctx {
                 unsafe { std::env::set_var("NEWT_NUM_CTX", n.to_string()) };
+            }
+            // --ephemeral threads to the TUI the same way (Step 17.7): the
+            // session start resolution reads NEWT_EPHEMERAL once.
+            if cli.ephemeral {
+                unsafe { std::env::set_var("NEWT_EPHEMERAL", "1") };
             }
             // --no-agents-file / --agents-file thread to the TUI via env vars.
             if cli.no_agents_file {
@@ -452,6 +464,17 @@ mod tests {
         let cli = Cli::try_parse_from(["newt", "--trace"]).unwrap();
 
         assert!(cli.trace);
+    }
+
+    #[test]
+    fn parses_ephemeral_global() {
+        // 17.7: works bare (default `code` command) and explicit; off by default.
+        let cli = Cli::try_parse_from(["newt", "--ephemeral"]).unwrap();
+        assert!(cli.ephemeral);
+        let cli = Cli::try_parse_from(["newt", "code", "--ephemeral"]).unwrap();
+        assert!(cli.ephemeral);
+        let cli = Cli::try_parse_from(["newt"]).unwrap();
+        assert!(!cli.ephemeral);
     }
 
     #[test]

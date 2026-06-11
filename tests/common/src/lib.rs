@@ -95,9 +95,9 @@ impl InferenceBackend for MockBackend {
 
 /// Write a script into `dir` that echoes canned JSON-RPC responses.
 ///
-/// Each entry in `replies` is emitted line-by-line on stdout whenever the
-/// script is invoked. This is useful for testing the provider-plugin host
-/// without a real subprocess.
+/// Each entry in `replies` is emitted on stdout after the script reads one
+/// request line from stdin. This is useful for testing the provider-plugin host
+/// without a real provider implementation.
 ///
 /// Returns the path to the created executable.
 pub fn mock_plugin_binary(dir: &Path, replies: &[&str]) -> PathBuf {
@@ -106,7 +106,12 @@ pub fn mock_plugin_binary(dir: &Path, replies: &[&str]) -> PathBuf {
         let script_path = dir.join("mock-plugin");
         let body: String = replies
             .iter()
-            .map(|r| format!("echo '{r}'"))
+            .map(|r| {
+                format!(
+                    "IFS= read -r _request || exit 0\nprintf '%s\\n' {}",
+                    sh_single_quote_arg(r)
+                )
+            })
             .collect::<Vec<_>>()
             .join("\n");
 
@@ -123,7 +128,7 @@ pub fn mock_plugin_binary(dir: &Path, replies: &[&str]) -> PathBuf {
         let script_path = dir.join("mock-plugin.cmd");
         let body: String = replies
             .iter()
-            .map(|r| format!("echo {}", escape_cmd_echo_arg(r)))
+            .map(|r| format!("set /p _request=\r\necho {}", escape_cmd_echo_arg(r)))
             .collect::<Vec<_>>()
             .join("\r\n");
 
@@ -131,6 +136,11 @@ pub fn mock_plugin_binary(dir: &Path, replies: &[&str]) -> PathBuf {
         fs::write(&script_path, script).expect("failed to write mock plugin script");
         script_path
     }
+}
+
+#[cfg(unix)]
+fn sh_single_quote_arg(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
 #[cfg(windows)]
@@ -206,14 +216,22 @@ mod tests {
 
     #[test]
     fn mock_plugin_binary_produces_expected_output() {
+        use std::io::Write;
+
         let dir = tempdir();
         let r1 = r#"{"jsonrpc":"2.0","id":1,"result":"init"}"#;
         let r2 = r#"{"jsonrpc":"2.0","id":2,"result":"done"}"#;
         let path = mock_plugin_binary(dir.path(), &[r1, r2]);
 
-        let output = std::process::Command::new(&path)
-            .output()
+        let mut child = std::process::Command::new(&path)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
             .expect("failed to run mock plugin");
+        let mut stdin = child.stdin.take().expect("stdin piped");
+        stdin.write_all(b"{}\n{}\n").expect("write mock input");
+        drop(stdin);
+        let output = child.wait_with_output().expect("mock plugin output");
         let stdout = String::from_utf8(output.stdout).unwrap();
         let lines: Vec<&str> = stdout.trim().lines().collect();
         assert_eq!(lines.len(), 2);

@@ -158,16 +158,38 @@ pub struct ConversationsConfig {
     /// Maximum saved conversations per workspace. Default: 100. 0 = no pruning.
     #[serde(default = "default_conversations_max_per_workspace")]
     pub max_per_workspace: usize,
+
+    /// Auto-resume this workspace's most recently active conversation at TUI
+    /// session start (Step 17.7, issue #246). "Most recently active" means
+    /// the highest §6 activity tick — never a wall-clock comparison.
+    ///
+    /// **Default: true.** The off-switch:
+    ///
+    /// ```toml
+    /// [conversations]
+    /// resume = false      # always start fresh
+    /// ```
+    ///
+    /// Per-session overrides win over this key either way: `--ephemeral`
+    /// (no persistence at all) and `NEWT_CONVERSATION_ID=<id>` (resume
+    /// exactly that conversation).
+    #[serde(default = "default_conversations_resume")]
+    pub resume: bool,
 }
 
 fn default_conversations_max_per_workspace() -> usize {
     100
 }
 
+fn default_conversations_resume() -> bool {
+    true
+}
+
 impl Default for ConversationsConfig {
     fn default() -> Self {
         Self {
             max_per_workspace: default_conversations_max_per_workspace(),
+            resume: default_conversations_resume(),
         }
     }
 }
@@ -274,8 +296,12 @@ pub struct MemoryConfig {
     /// Turns retained by `RollingWindow`. Default: 20.
     #[serde(default = "default_memory_window")]
     pub window: usize,
-    /// Model context length for `TokenBudget` (overrides Ollama's reported value).
-    /// Default: 8192.
+    /// Explicit context-token budget for `TokenBudget` / `Summarizing` — a
+    /// deliberate user override that wins over everything else (Step 18.2,
+    /// #247). When unset, the budget derives from the empirical capability
+    /// cache (`max_ok_input` else `safe_context` in
+    /// `model-capabilities.json`); the static default
+    /// (`DEFAULT_CONTEXT_TOKENS`, 8,192) applies only when neither exists.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_tokens: Option<u32>,
 
@@ -283,10 +309,28 @@ pub struct MemoryConfig {
     /// Default: auto-resolve from `.newt/soul.md` → `~/.newt/soul.md`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub soul_file: Option<String>,
+
+    /// User turns without an organic `save_note` call before the in-band
+    /// memory nudge is appended to the next user message (Step 19.3, #248).
+    /// `0` disables the nudge. Default: 10.
+    #[serde(default = "default_note_nudge_interval")]
+    pub note_nudge_interval: usize,
+
+    /// End-of-conversation note extraction (Step 19.4, #248): when `true`,
+    /// closing a conversation (`/new` or a clean exit) runs ONE synchronous
+    /// tools-disabled completion that distills at most 3 durable facts into
+    /// NOTES.md through the scanned `save_note` write path. Default: `false`
+    /// — the pass is optional and costs one completion per close.
+    #[serde(default)]
+    pub extract_notes_on_close: bool,
 }
 
 fn default_memory_window() -> usize {
     20
+}
+
+fn default_note_nudge_interval() -> usize {
+    10
 }
 
 impl Default for MemoryConfig {
@@ -296,6 +340,8 @@ impl Default for MemoryConfig {
             window: 20,
             context_tokens: None,
             soul_file: None,
+            note_nudge_interval: 10,
+            extract_notes_on_close: false,
         }
     }
 }
@@ -923,6 +969,8 @@ impl BackendConfig {
 pub struct ProviderConfig {
     pub name: String,
     pub command: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     #[serde(default)]
     pub env_pass: Vec<String>,
     pub tiers: Vec<Tier>,
@@ -1207,6 +1255,29 @@ mod tests {
     use std::io::Write;
 
     #[test]
+    fn memory_note_nudge_interval_defaults_and_parses() {
+        // Default: 10 — via Default and when `[memory]` omits the key.
+        assert_eq!(MemoryConfig::default().note_nudge_interval, 10);
+        let cfg: MemoryConfig = toml::from_str("provider = \"rolling_window\"").unwrap();
+        assert_eq!(cfg.note_nudge_interval, 10);
+        // 0 = nudge off.
+        let cfg: MemoryConfig = toml::from_str("note_nudge_interval = 0").unwrap();
+        assert_eq!(cfg.note_nudge_interval, 0);
+    }
+
+    #[test]
+    fn memory_extract_notes_on_close_defaults_off_and_parses() {
+        // Default OFF (Step 19.4, #248): the close-time extraction pass is
+        // optional and costs a completion — nobody pays for it unasked.
+        assert!(!MemoryConfig::default().extract_notes_on_close);
+        let cfg: MemoryConfig = toml::from_str("provider = \"rolling_window\"").unwrap();
+        assert!(!cfg.extract_notes_on_close);
+        // `[memory] extract_notes_on_close = true` is the opt-in.
+        let cfg: MemoryConfig = toml::from_str("extract_notes_on_close = true").unwrap();
+        assert!(cfg.extract_notes_on_close);
+    }
+
+    #[test]
     fn skill_search_dirs_defaults_to_single_newt_dir() {
         let cfg = Config::default();
         let dirs = cfg.skill_search_dirs();
@@ -1278,6 +1349,8 @@ mod tests {
         let cfg = Config::default();
         let conversations = cfg.conversations.unwrap_or_default();
         assert_eq!(conversations.max_per_workspace, 100);
+        // 17.7: auto-resume defaults ON; `resume = false` is the off-switch.
+        assert!(conversations.resume);
     }
 
     #[test]
@@ -1290,7 +1363,23 @@ max_per_workspace = 25
         )
         .unwrap();
 
-        assert_eq!(cfg.conversations.unwrap_or_default().max_per_workspace, 25);
+        let conversations = cfg.conversations.unwrap_or_default();
+        assert_eq!(conversations.max_per_workspace, 25);
+        // Partial [conversations] table: unset keys keep their defaults.
+        assert!(conversations.resume);
+    }
+
+    #[test]
+    fn conversations_resume_off_switch_parses() {
+        let cfg: Config = toml::from_str(
+            r#"
+[conversations]
+resume = false
+"#,
+        )
+        .unwrap();
+
+        assert!(!cfg.conversations.unwrap_or_default().resume);
     }
 
     #[test]
@@ -1344,6 +1433,7 @@ tiers = ["FAST", "STANDARD"]
 [[providers]]
 name = "cloud"
 command = "newt-cloud-shim"
+model = "gpt-4.1-mini"
 env_pass = ["CLOUD_TOKEN"]
 tiers = ["COMPLEX", "REVIEW"]
 
@@ -1360,7 +1450,25 @@ default_tier_order = ["FAST", "STANDARD", "COMPLEX", "REVIEW"]
         assert_eq!(cfg.backends[0].tiers, vec![Tier::Fast, Tier::Standard]);
         assert_eq!(cfg.providers.len(), 1);
         assert_eq!(cfg.providers[0].name, "cloud");
+        assert_eq!(cfg.providers[0].model.as_deref(), Some("gpt-4.1-mini"));
         assert_eq!(cfg.providers[0].env_pass, vec!["CLOUD_TOKEN".to_string()]);
+    }
+
+    #[test]
+    fn provider_model_is_optional_for_legacy_configs() {
+        let cfg: Config = toml::from_str(
+            r#"
+[[providers]]
+name = "legacy-cloud"
+command = "newt-cloud-shim"
+env_pass = ["CLOUD_TOKEN"]
+tiers = ["COMPLEX"]
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(cfg.providers.len(), 1);
+        assert_eq!(cfg.providers[0].model, None);
     }
 
     #[test]

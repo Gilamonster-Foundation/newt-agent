@@ -56,7 +56,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use newt_core::router::Tier;
 use newt_identity::{AgentKey, AgentMetadata};
-use plugins_protocol::AGENT_KEY_ENV;
+use plugins_protocol::{InitializeRequest, PluginClient, AGENT_KEY_ENV, PROTOCOL_VERSION};
 use tokio::process::Command;
 
 use crate::backend::{ChatReply, ChatRequest, InferenceBackend};
@@ -65,6 +65,7 @@ pub struct ProviderPluginBackend {
     name: String,
     command: String,
     model_id: String,
+    env_pass: Vec<String>,
     tiers: Vec<Tier>,
     /// Base64-encoded JSON [`CertChain`] for this plugin's attenuated
     /// authority. Opaque at this layer; the plugin process decodes and
@@ -102,11 +103,33 @@ impl ProviderPluginBackend {
             name: name.into(),
             command: command.into(),
             model_id: model_id.into(),
+            env_pass: Vec::new(),
             tiers,
             agent_key_envelope: None,
             parent_key: None,
             child_metadata: None,
         }
+    }
+
+    pub fn from_config(cfg: &newt_core::config::ProviderConfig) -> anyhow::Result<Self> {
+        let model = cfg
+            .model
+            .as_deref()
+            .filter(|m| !m.trim().is_empty())
+            .ok_or_else(|| anyhow::anyhow!("provider '{}' is missing required model", cfg.name))?;
+        Ok(Self::new(
+            cfg.name.clone(),
+            cfg.command.clone(),
+            model.to_string(),
+            cfg.tiers.clone(),
+        )
+        .with_env_pass(cfg.env_pass.clone()))
+    }
+
+    #[must_use]
+    pub fn with_env_pass(mut self, env_pass: Vec<String>) -> Self {
+        self.env_pass = env_pass;
+        self
     }
 
     /// Builder: attach an attenuated agent-key envelope that will be set
@@ -235,9 +258,23 @@ impl ProviderPluginBackend {
     #[must_use]
     pub fn spawn_command(&self) -> Command {
         let mut cmd = Command::new(&self.command);
-        cmd.stdin(Stdio::piped())
+        cmd.env_clear()
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
+
+        for name in &self.env_pass {
+            if let Ok(value) = std::env::var(name) {
+                cmd.env(name, value);
+            }
+        }
+
+        #[cfg(windows)]
+        for name in ["ComSpec", "SystemRoot", "PATHEXT"] {
+            if let Ok(value) = std::env::var(name) {
+                cmd.env(name, value);
+            }
+        }
 
         // Precedence: parent_key (issue #93) → agent_key_envelope → strip.
         if let Some(minted) = self.mint_plugin_envelope() {
@@ -289,11 +326,40 @@ impl InferenceBackend for ProviderPluginBackend {
         self.tiers.contains(&tier)
     }
 
-    async fn complete(&self, _req: ChatRequest) -> anyhow::Result<ChatReply> {
-        anyhow::bail!(
-            "ProviderPluginBackend.complete not yet implemented (command={})",
-            self.command
-        )
+    async fn complete(&self, req: ChatRequest) -> anyhow::Result<ChatReply> {
+        let mut client = PluginClient::spawn_command(self.spawn_command())?;
+        client
+            .initialize(InitializeRequest {
+                protocol_version: PROTOCOL_VERSION,
+                client_name: "newt-agent".to_string(),
+                client_version: env!("CARGO_PKG_VERSION").to_string(),
+            })
+            .await?;
+
+        let response = client
+            .complete(plugins_protocol::CompleteRequest {
+                model: self.model_id.clone(),
+                messages: req
+                    .messages
+                    .into_iter()
+                    .map(|m| plugins_protocol::Message {
+                        role: m.role,
+                        content: m.content,
+                    })
+                    .collect(),
+                max_tokens: req.max_tokens,
+            })
+            .await?;
+        let _ = client.shutdown().await;
+
+        Ok(ChatReply {
+            content: response.content,
+            model_id: response.model_id,
+            usage: response.usage.map(|usage| newt_core::TokenUsage {
+                input_tokens: usage.input_tokens,
+                output_tokens: usage.output_tokens,
+            }),
+        })
     }
 }
 
@@ -302,6 +368,7 @@ mod tests {
     use super::*;
     use newt_core::Caveats;
     use newt_identity::{load_or_generate, plugin_child_metadata, session_root};
+    use std::path::{Path, PathBuf};
     use tempfile::TempDir;
 
     #[test]
@@ -334,6 +401,98 @@ mod tests {
         assert!(b.supports_tier(Tier::Fast));
         assert!(b.supports_tier(Tier::Complex));
         assert!(!b.supports_tier(Tier::Standard));
+    }
+
+    #[tokio::test]
+    async fn complete_round_trips_through_mock_plugin() {
+        let dir = tests_common::tempdir();
+        let init = r#"{"jsonrpc":"2.0","id":1,"result":{"plugin_name":"mock-openai","plugin_version":"0.0.0-test","supported_models":["gpt-test"]}}"#;
+        let completion = r#"{"jsonrpc":"2.0","id":2,"result":{"content":"mocked reply","model_id":"gpt-test","usage":{"input_tokens":7,"output_tokens":11}}}"#;
+        let shutdown = r#"{"jsonrpc":"2.0","id":3,"result":{}}"#;
+        let plugin = tests_common::mock_plugin_binary(dir.path(), &[init, completion, shutdown]);
+
+        let backend = ProviderPluginBackend::new(
+            "openai",
+            plugin.to_string_lossy(),
+            "gpt-test",
+            vec![Tier::Complex],
+        );
+
+        let reply = backend
+            .complete(ChatRequest::new().user("hello").max_tokens(32))
+            .await
+            .unwrap();
+
+        assert_eq!(reply.content, "mocked reply");
+        assert_eq!(reply.model_id, "gpt-test");
+        let usage = reply.usage.expect("usage propagated");
+        assert_eq!(usage.input_tokens, 7);
+        assert_eq!(usage.output_tokens, 11);
+    }
+
+    #[tokio::test]
+    async fn complete_passes_only_whitelisted_environment_variables() {
+        let dir = tests_common::tempdir();
+        let plugin = env_probe_plugin(dir.path());
+        std::env::set_var("NEWT_TEST_OPENAI_ALLOWED", "allowed");
+        std::env::set_var("NEWT_TEST_OPENAI_BLOCKED", "blocked");
+
+        let backend = ProviderPluginBackend::new(
+            "openai",
+            plugin.to_string_lossy(),
+            "gpt-test",
+            vec![Tier::Complex],
+        )
+        .with_env_pass(vec!["NEWT_TEST_OPENAI_ALLOWED".into()]);
+
+        let reply = backend
+            .complete(ChatRequest::new().user("hello"))
+            .await
+            .unwrap();
+
+        std::env::remove_var("NEWT_TEST_OPENAI_ALLOWED");
+        std::env::remove_var("NEWT_TEST_OPENAI_BLOCKED");
+        assert_eq!(reply.content, "allowed=allowed blocked=");
+    }
+
+    #[cfg(unix)]
+    fn env_probe_plugin(dir: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = dir.join("env-probe");
+        std::fs::write(
+            &path,
+            r#"#!/bin/sh
+IFS= read -r _request || exit 0
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"plugin_name":"env-probe","plugin_version":"0.0.0-test","supported_models":["gpt-test"]}}'
+IFS= read -r _request || exit 0
+printf '{"jsonrpc":"2.0","id":2,"result":{"content":"allowed=%s blocked=%s","model_id":"gpt-test","usage":null}}\n' "$NEWT_TEST_OPENAI_ALLOWED" "$NEWT_TEST_OPENAI_BLOCKED"
+IFS= read -r _request || exit 0
+printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{}}'
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    #[cfg(windows)]
+    fn env_probe_plugin(dir: &Path) -> PathBuf {
+        let path = dir.join("env-probe.cmd");
+        std::fs::write(
+            &path,
+            concat!(
+                "@echo off\r\n",
+                "set /p _request=\r\n",
+                "echo {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"plugin_name\":\"env-probe\",\"plugin_version\":\"0.0.0-test\",\"supported_models\":[\"gpt-test\"]}}\r\n",
+                "set /p _request=\r\n",
+                "echo {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"content\":\"allowed=%NEWT_TEST_OPENAI_ALLOWED% blocked=%NEWT_TEST_OPENAI_BLOCKED%\",\"model_id\":\"gpt-test\",\"usage\":null}}\r\n",
+                "set /p _request=\r\n",
+                "echo {\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{}}\r\n"
+            ),
+        )
+        .unwrap();
+        path
     }
 
     // ── Issue #93: chain-rooting from operator key ────────────────────
