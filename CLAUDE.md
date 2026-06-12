@@ -22,6 +22,12 @@ gate. The gates must be honest. Do not game them.
   is sized for one drake flight / one focused PR.
 - **Acceptable PR shape:** branch name `step-NN.M-short-kebab-name`,
   body must list "What this PR does" / "Test plan" / "Out of scope".
+- **TUI scope:** `docs/decisions/plain_scroller_tui.md` — newt is
+  amphibious (human CLI + headless swarm) and the chat surface is
+  deliberately a plain scroller. Do NOT add alternate-screen, ratatui,
+  or widget surfaces to the chat path; advanced TUI belongs in
+  gilamonster-agent / monitor repos, and the headless flight tier
+  (wyvern-agent) strips the TUI entirely.
 
 ## Build commands
 

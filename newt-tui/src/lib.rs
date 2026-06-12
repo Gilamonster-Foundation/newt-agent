@@ -390,6 +390,11 @@ fn splash_key_action(ev: &Event) -> bool {
 // No alternate screen, no custom scroll. The terminal's own scrollback
 // buffer handles history. Works identically over SSH and inside tmux.
 //
+// This is a standing design decision, not a stopgap — newt is amphibious
+// (human CLI + headless swarm) and the chat surface stays a plain scroller.
+// Advanced TUI belongs in gilamonster-agent / monitor repos. Before adding
+// any screen control here, read docs/decisions/plain_scroller_tui.md.
+//
 // NEWT_CHAT_STYLE=verbose  — show "newt" / "you" labels before the caret
 // (default is compact: just the colored caret / symbol)
 // ---------------------------------------------------------------------------
