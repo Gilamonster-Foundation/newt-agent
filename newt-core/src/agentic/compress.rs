@@ -1460,7 +1460,9 @@ mod tests {
         assert_eq!(trailing_tool_group_len(&msgs), 3);
         // The #270 repro: the read-only nudge lands AFTER the fresh results,
         // immediately before the compression call site.
-        msgs.push(user("[3 consecutive read-only rounds with no file writes.]"));
+        msgs.push(user(
+            "[3 consecutive read-only rounds with no file writes.]",
+        ));
         assert_eq!(trailing_tool_group_len(&msgs), 4);
         // A trailing compaction notice doesn't truncate the group either.
         msgs.push(summary_message("reference summary"));
@@ -1540,12 +1542,9 @@ mod tests {
             "UNSEEN2 must survive too"
         );
         // The nudge itself still reaches the model (nothing silently drops).
-        assert!(out
-            .messages
-            .iter()
-            .any(|m| m["content"]
-                .as_str()
-                .is_some_and(|c| c.contains("read-only rounds"))));
+        assert!(out.messages.iter().any(|m| m["content"]
+            .as_str()
+            .is_some_and(|c| c.contains("read-only rounds"))));
         println!(
             "#270 repro trace: {} -> {} est. tokens (target {}), group intact",
             out.tokens_before, out.tokens_after, 2_000
