@@ -93,43 +93,48 @@ pub fn run_code(
     let workspace = resolve_workspace(path);
 
     // `no_splash` is already resolved by the caller (CLI flags + config).
-    // Print a compact inline header and go straight to chat — no alt screen,
-    // no raw mode, scrolls naturally into history. Safe for SSH/tmux/pipes.
     let inline = no_splash;
 
-    if inline {
-        print_inline_header(&workspace, color);
-        return run_chat(&workspace, color, persona);
+    if !inline {
+        // Default: full ANSI splash in alt screen — blinks off on Enter.
+        enable_raw_mode()?;
+        let mut stdout = io::stdout();
+        execute!(
+            stdout,
+            EnterAlternateScreen,
+            Hide,
+            Clear(ClearType::All),
+            MoveTo(0, 0)
+        )?;
+        let cont = show_splash(&mut stdout, &workspace, color)?;
+        let _ = disable_raw_mode();
+        let _ = execute!(io::stdout(), Show, LeaveAlternateScreen);
+        if !cont {
+            return Ok(());
+        }
     }
 
-    // Default: full ANSI splash in alt screen — blinks off on Enter.
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(
-        stdout,
-        EnterAlternateScreen,
-        Hide,
-        Clear(ClearType::All),
-        MoveTo(0, 0)
-    )?;
-    let cont = show_splash(&mut stdout, &workspace, color)?;
-    let _ = disable_raw_mode();
-    let _ = execute!(io::stdout(), Show, LeaveAlternateScreen);
-
-    if cont {
-        run_chat(&workspace, color, persona)?;
-    }
-    Ok(())
+    // The preamble always shows. The splash lives in the alternate screen
+    // and vanishes with it, so the inline header is printed into normal
+    // scrollback in BOTH modes before chat starts.
+    print_inline_header(&workspace, color);
+    run_chat(&workspace, color, persona)
 }
 
-/// Compact inline header for `--no-splash` mode.
+/// Compact inline header — the session preamble.
 /// Prints LOGO_20 with text to the right using ANSI column-move escapes,
 /// then scrolls naturally into history. No alt screen, no raw mode.
+/// Printed in BOTH splash and no-splash modes (see `run_code`).
 fn print_inline_header(workspace: &str, color: bool) {
+    print!("{}", render_inline_header(workspace, color));
+}
+
+/// Render the inline header to a string. Pure — unit-testable.
+fn render_inline_header(workspace: &str, color: bool) -> String {
+    use std::fmt::Write as _;
+
     if !color {
-        println!("newt v{VERSION}  ·  {workspace}");
-        println!();
-        return;
+        return format!("newt v{VERSION}  ·  {workspace}\n\n");
     }
 
     // Place text at column 23 (just past the 20-col logo).
@@ -150,9 +155,10 @@ fn print_inline_header(workspace: &str, color: bool) {
     ];
     let text_start = mid.saturating_sub(1);
 
+    let mut out = String::new();
     for (i, logo_line) in logo_lines.iter().enumerate() {
-        // Print logo line (already contains ANSI color codes).
-        print!("{logo_line}");
+        // Logo line already contains ANSI color codes.
+        out.push_str(logo_line);
         // Move cursor to column text_col on this row, print text if scheduled.
         let ti = i.wrapping_sub(text_start);
         if let Some((msg, dim)) = text.get(ti) {
@@ -160,12 +166,13 @@ fn print_inline_header(workspace: &str, color: bool) {
                 // \x1b[{col}G moves cursor to absolute column (1-indexed).
                 let style_on = if *dim { "\x1b[38;2;100;100;100m" } else { "" };
                 let style_off = if *dim { "\x1b[0m" } else { "" };
-                print!("\x1b[{text_col}G{style_on}{msg}{style_off}");
+                let _ = write!(out, "\x1b[{text_col}G{style_on}{msg}{style_off}");
             }
         }
-        println!();
+        out.push('\n');
     }
-    println!();
+    out.push('\n');
+    out
 }
 
 pub fn run_pilot(_flight_id: &str) -> anyhow::Result<()> {
@@ -4886,6 +4893,38 @@ mod tests {
     #[test]
     fn version_constant_is_populated() {
         assert!(!VERSION.is_empty());
+    }
+
+    // Regression tests for "the preamble always shows" (splash mode used to
+    // greet only inside the alternate screen, which vanishes on continue —
+    // leaving no preamble in scrollback). The header is now rendered by a
+    // pure function and printed in BOTH modes before chat starts.
+
+    #[test]
+    fn inline_header_color_contains_brand_and_ready_lines() {
+        let s = render_inline_header("/w", true);
+        assert!(s.contains("Small, fast, local-first agentic coder"));
+        assert!(s.contains(concat!("v", env!("CARGO_PKG_VERSION"))));
+        assert!(s.contains("ready — type a task, /help for commands, /exit to quit"));
+        // Text is placed just past the 20-col logo via absolute column moves.
+        assert!(s.contains("\x1b[23G"));
+    }
+
+    #[test]
+    fn inline_header_plain_names_version_and_workspace() {
+        let s = render_inline_header("/some/workspace", false);
+        assert!(s.contains(&format!("newt v{VERSION}")));
+        assert!(s.contains("/some/workspace"));
+        // Plain mode must stay safe for dumb terminals and pipes: no ANSI.
+        assert!(!s.contains('\x1b'));
+    }
+
+    #[test]
+    fn inline_header_ends_with_blank_line_before_chat() {
+        for color in [true, false] {
+            let s = render_inline_header("/w", color);
+            assert!(s.ends_with("\n\n"), "header must end with a blank line");
+        }
     }
 
     #[test]
