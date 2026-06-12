@@ -4514,6 +4514,18 @@ mod compression_loop_tests {
         // Never a silent wrong answer: the model answered from real data.
         assert_eq!(reply, "the three files are summarized");
 
+        // THE #285 property: no dispatch ships over the window. The newest
+        // result alone fits the ceiling here, so there is no truthful
+        // still-over residual to excuse an oversized request — pre-fix the
+        // round-1 dispatch went out at ~5.5k est tokens against 3,276.
+        for (i, &(tokens, ..)) in log.iter().enumerate() {
+            assert!(
+                tokens <= 3_276,
+                "request {i} dispatched over the window: ~{tokens} est. \
+                 message tokens > 3,276 (the pre-#285 B6 residual)"
+            );
+        }
+
         let (tokens, _, b_onelined, c_intact, task_present) = *log
             .iter()
             .find(|(_, a, ..)| *a)
