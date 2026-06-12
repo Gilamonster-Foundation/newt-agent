@@ -84,6 +84,17 @@ pub struct Cli {
     #[arg(long, global = true, default_value_t = false)]
     pub prompt_for_permissions: bool,
 
+    /// INTERIM (#297): disable the ocap confined shell for THIS invocation —
+    /// run_command executes unconfined on the plain host shell (same venv/PATH
+    /// handling, same output shape). fs tools keep the workspace fence and
+    /// web_fetch keeps its leash: this is unconfined exec, not authority-off.
+    /// Equivalent to NEWT_DISABLE_OCAP=1; deliberately NO config-file key, so
+    /// the bypass must be asserted per invocation. Removed (or demoted to a
+    /// debug flag) once brush upstreams CommandInterceptor and agent-bridle's
+    /// real confined shell works everywhere (agent-bridle#20).
+    #[arg(long, visible_alias = "yolo", global = true, default_value_t = false)]
+    pub disable_ocap: bool,
+
     /// Cap the Ollama context window (KV-cache) to this many tokens.
     /// Prevents VRAM exhaustion on large models by limiting how much memory
     /// Ollama allocates for the attention cache. Equivalent to setting
@@ -255,6 +266,14 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             // only the interactive TUI reads it — worker/eval never prompt.
             if cli.prompt_for_permissions {
                 unsafe { std::env::set_var("NEWT_PROMPT_FOR_PERMISSIONS", "1") };
+            }
+            // INTERIM (#297): --disable-ocap / --yolo threads the same way.
+            // The run_command dispatch in newt-core reads NEWT_DISABLE_OCAP
+            // per call; the TUI reads it once at session start for the loud
+            // banner + the permission-log session record. Env-only on
+            // purpose — no config key, no silent persistence.
+            if cli.disable_ocap {
+                unsafe { std::env::set_var("NEWT_DISABLE_OCAP", "1") };
             }
             // --no-agents-file / --agents-file thread to the TUI via env vars.
             if cli.no_agents_file {
@@ -501,6 +520,22 @@ mod tests {
         assert!(cli.prompt_for_permissions);
         let cli = Cli::try_parse_from(["newt"]).unwrap();
         assert!(!cli.prompt_for_permissions);
+    }
+
+    #[test]
+    fn parses_disable_ocap_and_yolo_alias() {
+        // #297: works bare (default `code` command) and explicit, and the
+        // --yolo alias maps to the same field; OFF by default — no flag
+        // means the confined dispatch is unchanged.
+        let cli = Cli::try_parse_from(["newt", "--disable-ocap"]).unwrap();
+        assert!(cli.disable_ocap);
+        let cli = Cli::try_parse_from(["newt", "--yolo"]).unwrap();
+        assert!(cli.disable_ocap);
+        let cli = Cli::try_parse_from(["newt", "code", "--yolo"]).unwrap();
+        assert!(cli.disable_ocap);
+        assert!(matches!(cli.command, Some(Command::Code { .. })));
+        let cli = Cli::try_parse_from(["newt"]).unwrap();
+        assert!(!cli.disable_ocap);
     }
 
     #[test]
