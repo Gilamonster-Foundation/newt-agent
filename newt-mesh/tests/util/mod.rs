@@ -17,6 +17,21 @@
 //! resolver error) once the deadline is exhausted, and every *other*
 //! error — wire-shape mismatch, handler failure, request timeout —
 //! propagates immediately, never retried.
+//!
+//! Grace is necessary but not sufficient (issue #305): every `Bus`
+//! spawns its own mDNS `ServiceDaemon`s, so concurrently-running
+//! tests put many daemons in one process — all members of the same
+//! port-5353 SO_REUSEPORT group. Multicast re-announces reach every
+//! member, but *unicast* mDNS responses are delivered to ONE socket
+//! in the group, so a specific browser can stay blind to a specific
+//! peer for the full [`ANNOUNCE_DEADLINE`] while its in-process
+//! siblings resolve instantly — and retrying on the same bus retries
+//! the same blind daemon. The mesh-binding tests therefore carry
+//! `#[serial_test::serial(mesh_mdns)]`: one client/responder pair at
+//! a time, which is also the topology the contract actually models.
+//! If a *serialized* run still reports "not announced within …" for
+//! the whole deadline, do not widen the deadline — that is a real
+//! agent-mesh discovery bug; take it upstream.
 
 use std::future::Future;
 use std::time::{Duration, Instant};
