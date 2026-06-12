@@ -1004,6 +1004,38 @@ fn permissions_command_lines(
     lines
 }
 
+// ---------------------------------------------------------------------------
+// INTERIM (#297): --disable-ocap / --yolo session surfacing. Removed with the
+// bypass when brush upstreams CommandInterceptor (agent-bridle#20).
+// ---------------------------------------------------------------------------
+
+/// INTERIM (#297): the unmissable session-start banner shown when the ocap
+/// exec bypass is asserted (`--disable-ocap` / `--yolo` /
+/// `NEWT_DISABLE_OCAP=1`). The bypass itself lives at the `run_command`
+/// dispatch in newt-core; this is the loud surfacing half of the contract.
+fn ocap_disabled_banner() -> String {
+    "⚠ ocap DISABLED (--disable-ocap): commands run unconfined on the host shell — \
+     fs tools keep the workspace fence; drop the flag to restore confinement (#297)"
+        .to_string()
+}
+
+/// INTERIM (#297): the ONE `ocap-disabled` line written to the #263
+/// permission log at session start, so the audit trail shows this session
+/// ran with unconfined exec. `decision: "ocap-disabled"`, `scope:
+/// "session"` per the issue; the `*` target means every exec — the bypass
+/// is per-session, never per-command. A record, not authority: nothing
+/// reads it back.
+fn ocap_disabled_record(conversation_id: &str) -> newt_core::PermissionRecord {
+    newt_core::PermissionRecord::new(
+        conversation_id,
+        "run_command",
+        newt_core::DenialKind::Exec,
+        "*",
+        "ocap-disabled",
+        "session",
+    )
+}
+
 #[cfg(test)]
 mod permission_prompt_tests {
     use super::*;
@@ -1552,6 +1584,16 @@ pub(crate) mod test_env_guard {
     /// Exclusive guard for tests that mutate the process environment.
     pub(crate) fn env_write_guard() -> RwLockWriteGuard<'static, ()> {
         ENV_RW.blocking_write()
+    }
+
+    /// Exclusive guard for `#[tokio::test]` tests that mutate the process
+    /// environment — async-aware, safe to hold across await points. Gated
+    /// like `env_read_guard_async`: its only callers are the `#[cfg(unix)]`
+    /// #297 disable-ocap tests, so Windows would trip `-D warnings` on dead
+    /// code otherwise.
+    #[cfg(unix)]
+    pub(crate) async fn env_write_guard_async() -> RwLockWriteGuard<'static, ()> {
+        ENV_RW.write().await
     }
 }
 
@@ -2115,6 +2157,25 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
             color,
             verbose,
         );
+    }
+    // INTERIM (#297): --disable-ocap / --yolo / NEWT_DISABLE_OCAP=1 — surface
+    // the open session loudly: an unmissable banner plus ONE `ocap-disabled`
+    // line in the #263 permission log. The bypass itself lives at the
+    // run_command dispatch (newt-core); exec never prompts under it
+    // (--disable-ocap > --prompt-for-permissions for exec), while fs fencing
+    // and fs prompting are unaffected. A log-write failure is reported but
+    // never blocks the session — the record is a review artifact, not a gate.
+    if newt_core::agentic::ocap_disabled() {
+        print_newt(&ocap_disabled_banner(), color, verbose);
+        if let Some(path) = permission_log_path.as_deref() {
+            if let Err(e) = ocap_disabled_record(&active_conversation_id).append_jsonl(path) {
+                print_newt(
+                    &format!("warning: permission log write failed: {e}"),
+                    color,
+                    verbose,
+                );
+            }
+        }
     }
 
     // Connect to discovered MCP servers ONCE for the session (newt config +
@@ -5156,6 +5217,233 @@ mod run_command_confinement_tests {
         )
         .await;
         assert!(out.contains("one.txt") && out.contains("two.txt"));
+    }
+}
+
+/// INTERIM (#297) `--disable-ocap` / `--yolo` session-surfacing + bypass
+/// tests — the TUI half of the escape hatch: the loud banner, the
+/// `ocap-disabled` permission-log record, and the run_command bypass under
+/// the same caveat shapes the confinement tests above pin for flag-off.
+/// Removed with the bypass when brush upstreams CommandInterceptor
+/// (agent-bridle#20).
+#[cfg(test)]
+mod disable_ocap_session_tests {
+    use super::*;
+    #[cfg(unix)]
+    use newt_core::agentic::execute_tool;
+    #[cfg(unix)]
+    use newt_core::caveats::{Caveats, CountBound, Scope};
+
+    /// RAII env override (the run_command bypass and `ocap_disabled` read
+    /// the process env): restore the previous value on drop, including on a
+    /// failed assertion, so yolo never leaks into a neighboring test. Used
+    /// only under the exclusive `env_write_guard_async`.
+    #[cfg(unix)]
+    struct EnvVar {
+        key: &'static str,
+        saved: Option<String>,
+    }
+
+    #[cfg(unix)]
+    impl EnvVar {
+        fn set(key: &'static str, value: &str) -> Self {
+            let saved = std::env::var(key).ok();
+            std::env::set_var(key, value);
+            Self { key, saved }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for EnvVar {
+        fn drop(&mut self) {
+            match self.saved.take() {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    /// The banner is unmissable and names the mechanism: the issue's text,
+    /// the flag, and the host-shell consequence.
+    #[test]
+    fn banner_names_the_flag_and_the_consequence() {
+        let banner = ocap_disabled_banner();
+        assert!(banner.contains("⚠ ocap DISABLED"), "got: {banner}");
+        assert!(banner.contains("--disable-ocap"), "got: {banner}");
+        assert!(
+            banner.contains("commands run unconfined on the host shell"),
+            "got: {banner}"
+        );
+    }
+
+    /// The session record carries the issue's shape — `decision:
+    /// "ocap-disabled"`, `scope: "session"` — and lands in the same #263
+    /// jsonl log as prompted decisions, one line, lossless round-trip.
+    #[test]
+    fn ocap_disabled_record_is_the_issue_shape_and_appends() {
+        let rec = ocap_disabled_record("conv-297");
+        assert_eq!(rec.conversation_id, "conv-297");
+        assert_eq!(rec.tool, "run_command");
+        assert_eq!(rec.kind, "exec");
+        assert_eq!(rec.target, "*");
+        assert_eq!(rec.decision, "ocap-disabled");
+        assert_eq!(rec.scope, "session");
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("permission-log.jsonl");
+        rec.append_jsonl(&path).unwrap();
+        let body = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = body.lines().collect();
+        assert_eq!(lines.len(), 1);
+        let parsed: newt_core::PermissionRecord = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(parsed, rec);
+    }
+
+    /// Exec-none caveats, workspace-fenced fs — the shape under which the
+    /// flag-off confinement tests above pin the fail-closed stub dispatch.
+    #[cfg(unix)]
+    fn caveats_no_exec(ws: &std::path::Path) -> Caveats {
+        Caveats {
+            fs_read: Scope::only([ws.to_string_lossy().into_owned()]),
+            fs_write: Scope::only([ws.to_string_lossy().into_owned()]),
+            exec: Scope::none(),
+            net: Scope::none(),
+            max_calls: CountBound::Unlimited,
+            valid_for_generation: Scope::All,
+        }
+    }
+
+    /// FLAG ON: the command the stub shell fails closed on (see
+    /// `run_command_out_of_scope_is_denied` above for the flag-off pin) runs
+    /// on the host shell and returns real output — while a workspace-escape
+    /// write is STILL denied: yolo is unconfined exec, fenced fs.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn yolo_runs_exec_unconfined_but_keeps_the_fs_fence() {
+        let _env = crate::test_env_guard::env_write_guard_async().await;
+        let _on = EnvVar::set("NEWT_DISABLE_OCAP", "1");
+        let ws = tempfile::TempDir::new().unwrap();
+        let caveats = caveats_no_exec(ws.path());
+
+        let out = execute_tool(
+            "run_command",
+            &serde_json::json!({ "command": "echo yolo-through" }),
+            &ws.path().to_string_lossy(),
+            false,
+            20,
+            &caveats,
+            &mut Mcp::empty(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(out, "yolo-through\n");
+
+        let escape = "/definitely-outside-the-fence/escape.txt";
+        let out = execute_tool(
+            "write_file",
+            &serde_json::json!({ "path": escape, "content": "nope" }),
+            &ws.path().to_string_lossy(),
+            false,
+            20,
+            &caveats,
+            &mut Mcp::empty(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(
+            out,
+            format!("capability denied: fs_write does not permit '{escape}'")
+        );
+        assert!(!std::path::Path::new(escape).exists());
+    }
+
+    /// Precedence (#297): yolo + a #263 gate — exec never prompts (the gate
+    /// would record an ask; it must stay empty), while an fs denial still
+    /// prompts exactly as before. `--disable-ocap` >
+    /// `--prompt-for-permissions` for exec; fs prompting unaffected.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn yolo_exec_never_prompts_but_fs_prompting_still_works() {
+        let _env = crate::test_env_guard::env_write_guard_async().await;
+        let _on = EnvVar::set("NEWT_DISABLE_OCAP", "1");
+        let ws = tempfile::TempDir::new().unwrap();
+        let caveats = caveats_no_exec(ws.path());
+
+        let mut state = PermissionPromptState::default();
+        let outside = tempfile::TempDir::new().unwrap();
+        let secret = outside.path().join("secret.txt");
+        std::fs::write(&secret, "gated contents").unwrap();
+
+        // Every human consult leaves one record in `state.decisions`, so the
+        // record count IS the prompt count — zero after the exec call proves
+        // the gate was never reached.
+        let mut gate = PromptPermissionGate {
+            state: &mut state,
+            base: caveats.clone(),
+            key_path: None,
+            conversation_id: "conv-297".to_string(),
+            log_path: None,
+            color: false,
+            verbose: false,
+            ask_human: |_prompt: &str| PromptChoice::AllowOnce,
+        };
+
+        let out = execute_tool(
+            "run_command",
+            &serde_json::json!({ "command": "echo no-prompt" }),
+            &ws.path().to_string_lossy(),
+            false,
+            20,
+            &caveats,
+            &mut Mcp::empty(),
+            None,
+            None,
+            None,
+            Some(&mut gate),
+        )
+        .await;
+        assert_eq!(out, "no-prompt\n");
+        assert!(
+            state.decisions.is_empty(),
+            "exec under yolo must never reach the gate, got: {:?}",
+            state.decisions
+        );
+
+        // fs prompting is unaffected: an out-of-fence read consults the gate
+        // and the allow-once answer turns the denial into the real contents.
+        let mut gate = PromptPermissionGate {
+            state: &mut state,
+            base: caveats.clone(),
+            key_path: None,
+            conversation_id: "conv-297".to_string(),
+            log_path: None,
+            color: false,
+            verbose: false,
+            ask_human: |_prompt: &str| PromptChoice::AllowOnce,
+        };
+        let out = execute_tool(
+            "read_file",
+            &serde_json::json!({ "path": secret.to_string_lossy() }),
+            &ws.path().to_string_lossy(),
+            false,
+            20,
+            &caveats,
+            &mut Mcp::empty(),
+            None,
+            None,
+            None,
+            Some(&mut gate),
+        )
+        .await;
+        assert_eq!(out, "gated contents");
+        assert_eq!(state.decisions.len(), 1, "the fs denial prompted once");
+        assert_eq!(state.decisions[0].kind, "fs_read");
     }
 }
 

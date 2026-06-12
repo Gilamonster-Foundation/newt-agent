@@ -242,6 +242,86 @@ pub fn venv_cmd_prefix() -> Option<String> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// INTERIM (#297): the --disable-ocap / --yolo exec escape hatch
+// ---------------------------------------------------------------------------
+
+/// INTERIM (#297): is the ocap exec bypass asserted for this invocation?
+///
+/// True only when `NEWT_DISABLE_OCAP=1` — set by the CLI's `--disable-ocap`
+/// flag (alias `--yolo`) or exported directly for harness/pod use. The value
+/// must be exactly `"1"`: a security bypass reads fail-closed, so anything
+/// else (including `true`) leaves confinement on. Deliberately env-only —
+/// there is NO config-file key, so the bypass can never silently persist; it
+/// must be asserted per invocation.
+///
+/// Scope: `run_command` only. On stub-shell builds (the only crates.io-
+/// publishable configuration) agent-bridle's `shell` tool fails closed on
+/// every command, which makes agentic coding impossible without the brush
+/// `CommandInterceptor` patch underneath. `web_fetch` is NOT bypassed: the
+/// stub-shell branch stubs only the shell tool — `agent-bridle-tool-web`
+/// ships the real leash-enforcing implementation (verified at agent-bridle
+/// rev `2129c91`), so it does not fail closed. The fs tools keep the
+/// newt-native workspace fence untouched: yolo is unconfined exec, fenced fs
+/// — never a global authority-off switch.
+///
+/// Remove (or demote to a debug flag) when brush upstreams the
+/// `CommandInterceptor` hook (reubeno/brush#1184) and agent-bridle's real
+/// confined shell becomes the default everywhere — see agent-bridle#20 and
+/// the `[patch.crates-io]` note in the workspace Cargo.toml.
+pub fn ocap_disabled() -> bool {
+    std::env::var("NEWT_DISABLE_OCAP").is_ok_and(|v| v == "1")
+}
+
+/// INTERIM (#297): run `cmd` on the PLAIN host shell — no leash, no
+/// interceptor, no sandbox — and wrap the outcome in an envelope structurally
+/// identical to the confined shell's (`{ exit_code, stdout, stderr,
+/// sandbox_kind }`, with `denied` / `denials` omitted exactly as the bridle
+/// envelope omits them when nothing was denied). [`envelope_denied`] and
+/// [`shell_envelope_output`] — and therefore the loop's truncation / denial /
+/// exit-code handling — apply to it unchanged.
+///
+/// A spawn failure surfaces as `Err`, which the caller formats as the same
+/// `error: …` string a bridle dispatch failure produces.
+async fn host_shell_dispatch(cmd: &str, cwd: &str) -> std::io::Result<serde_json::Value> {
+    let output = host_shell_output(cmd, cwd).await?;
+    Ok(serde_json::json!({
+        "exit_code": output.status.code().unwrap_or(-1),
+        "stdout": String::from_utf8_lossy(&output.stdout),
+        "stderr": String::from_utf8_lossy(&output.stderr),
+        // Honest provenance, same field the bridle envelope always carries:
+        // nothing sandboxed this run.
+        "sandbox_kind": "none",
+    }))
+}
+
+/// INTERIM (#297) host shell selection: `bash -c` with an `sh -c` fallback
+/// when bash is absent — the same sh-compatible free-form mode the confined
+/// shell ran, so [`venv_cmd_prefix`]'s `export …;` prefix works unchanged.
+#[cfg(not(windows))]
+async fn host_shell_output(cmd: &str, cwd: &str) -> std::io::Result<std::process::Output> {
+    fn shell(program: &str, cmd: &str, cwd: &str) -> tokio::process::Command {
+        let mut c = tokio::process::Command::new(program);
+        c.arg("-c").arg(cmd).current_dir(cwd);
+        c
+    }
+    match shell("bash", cmd, cwd).output().await {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => shell("sh", cmd, cwd).output().await,
+        other => other,
+    }
+}
+
+/// INTERIM (#297) host shell selection on Windows: `cmd /C`, the same shape
+/// as [`build_check_shell`].
+#[cfg(windows)]
+async fn host_shell_output(cmd: &str, cwd: &str) -> std::io::Result<std::process::Output> {
+    tokio::process::Command::new("cmd")
+        .args(["/C", cmd])
+        .current_dir(cwd)
+        .output()
+        .await
+}
+
 /// Returns true if `full_path` is permitted by `scope`, using prefix matching
 /// against the stored workspace-root strings.
 ///
@@ -514,6 +594,14 @@ pub(crate) fn host_of_url(url: &str) -> Option<String> {
 /// before failing; an allow re-executes the denied call under the gate's
 /// freshly minted caveats. `None` (the default, and every headless caller)
 /// keeps every denial exactly as it was — bit-for-bit.
+///
+/// INTERIM (#297): when [`ocap_disabled`] is asserted (`--disable-ocap` /
+/// `--yolo` / `NEWT_DISABLE_OCAP=1`), `run_command` skips the confined shell
+/// and runs on the plain host shell with the same venv/PATH prefix and an
+/// envelope of the same shape — nothing is denied, so the #263 gate is never
+/// consulted for exec. Every other tool (fs fence, `web_fetch` leash) is
+/// unaffected. Removed when brush upstreams `CommandInterceptor`
+/// (agent-bridle#20).
 #[allow(clippy::too_many_arguments)]
 pub async fn execute_tool(
     name: &str,
@@ -590,6 +678,22 @@ pub async fn execute_tool(
                 Some(prefix) => format!("{prefix}{cmd}"),
                 None => cmd.to_string(),
             };
+
+            // INTERIM (#297): --disable-ocap / --yolo / NEWT_DISABLE_OCAP=1 —
+            // run the command UNCONFINED on the host shell instead of the
+            // bridle's confined shell. Same venv/PATH prefix, same envelope
+            // shape, same output formatting. Nothing is denied here, so the
+            // #263 permission gate below is never consulted — the issue's
+            // precedence rule (`--disable-ocap` > `--prompt-for-permissions`
+            // for exec) falls out structurally. The fs tools below are NOT
+            // bypassed: yolo is unconfined exec, fenced fs.
+            if ocap_disabled() {
+                return match host_shell_dispatch(&cmd_with_venv, workspace).await {
+                    Ok(envelope) => shell_envelope_output(&envelope, tool_output_lines, color),
+                    Err(e) => format!("error: {e}"),
+                };
+            }
+
             let dispatch_args = serde_json::json!({
                 "cmd": cmd_with_venv,
                 "cwd": workspace,
@@ -2019,5 +2123,319 @@ mod execute_tool_branch_tests {
         );
         assert!(out.contains("«tokio» panic"), "got: {out}");
         assert!(out.contains("past work"), "got: {out}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// INTERIM (#297) --disable-ocap / --yolo tests — the exec escape hatch.
+// Removed with the bypass when brush upstreams CommandInterceptor
+// (agent-bridle#20).
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod disable_ocap_tests {
+    use super::super::NoMcp;
+    use super::*;
+    use crate::caveats::{Caveats, CountBound, Scope};
+    use tokio::sync::{Mutex, MutexGuard};
+
+    /// Serializes every test that reads or writes `NEWT_DISABLE_OCAP` (and
+    /// the venv vars the bypass forwards): the process environment is shared
+    /// across the parallel test runner. Async-aware (tokio) so the guard may
+    /// be held across the `execute_tool` awaits; no poisoning — the `EnvVar`
+    /// guards below restore the environment even on panic.
+    static ENV_LOCK: Mutex<()> = Mutex::const_new(());
+
+    async fn env_lock() -> MutexGuard<'static, ()> {
+        ENV_LOCK.lock().await
+    }
+
+    /// RAII env override: set/unset `key` for the test body, restore the
+    /// previous value on drop — including on a failed assertion, so yolo can
+    /// never leak into a neighboring test.
+    struct EnvVar {
+        key: &'static str,
+        saved: Option<String>,
+    }
+
+    impl EnvVar {
+        fn set(key: &'static str, value: &str) -> Self {
+            let saved = std::env::var(key).ok();
+            std::env::set_var(key, value);
+            Self { key, saved }
+        }
+
+        fn unset(key: &'static str) -> Self {
+            let saved = std::env::var(key).ok();
+            std::env::remove_var(key);
+            Self { key, saved }
+        }
+    }
+
+    impl Drop for EnvVar {
+        fn drop(&mut self) {
+            match self.saved.take() {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    /// Workspace-fenced fs, NO exec, NO net — the shape under which the
+    /// confined shell denies (real build) or fails closed (stub build).
+    fn caveats_no_exec(ws: &std::path::Path) -> Caveats {
+        Caveats {
+            fs_read: Scope::only([ws.to_string_lossy().into_owned()]),
+            fs_write: Scope::only([ws.to_string_lossy().into_owned()]),
+            exec: Scope::none(),
+            net: Scope::none(),
+            max_calls: CountBound::Unlimited,
+            valid_for_generation: Scope::All,
+        }
+    }
+
+    async fn run_tool(
+        name: &str,
+        args: serde_json::Value,
+        ws: &std::path::Path,
+        caveats: &Caveats,
+    ) -> String {
+        execute_tool(
+            name,
+            &args,
+            &ws.to_string_lossy(),
+            false,
+            20,
+            caveats,
+            &mut NoMcp,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+    }
+
+    /// The switch reads fail-closed: ONLY the exact value `1` (the value the
+    /// CLI exports and the issue documents) asserts the bypass. This is also
+    /// the env-var-equivalence half of the #297 test list — the flag and the
+    /// env var are one mechanism (`--disable-ocap` just exports the var).
+    #[test]
+    fn ocap_disabled_requires_exactly_1() {
+        let _l = ENV_LOCK.blocking_lock();
+        {
+            let _unset = EnvVar::unset("NEWT_DISABLE_OCAP");
+            assert!(!ocap_disabled(), "absent ⇒ confinement stays on");
+        }
+        for (value, expected) in [
+            ("1", true),
+            ("0", false),
+            ("", false),
+            ("true", false),
+            ("yes", false),
+            ("YOLO", false),
+        ] {
+            let _set = EnvVar::set("NEWT_DISABLE_OCAP", value);
+            assert_eq!(
+                ocap_disabled(),
+                expected,
+                "NEWT_DISABLE_OCAP={value:?} must read as {expected}"
+            );
+        }
+    }
+
+    /// FLAG OFF = bit-for-bit current behavior, pinned. On this stub-shell
+    /// build (the publishable configuration, see the [patch.crates-io] note)
+    /// the bridle dispatch fails closed with the tracking-issue error for
+    /// EVERY command — exactly the operator-reported breakage #297 hatches
+    /// around. Restore-from-history note: like the newt-tui confinement
+    /// tests, this assertion changes when the real brush shell returns.
+    #[tokio::test]
+    async fn flag_off_run_command_keeps_the_confined_dispatch_verbatim() {
+        let _l = env_lock().await;
+        let _off = EnvVar::unset("NEWT_DISABLE_OCAP");
+        let ws = tempfile::TempDir::new().unwrap();
+        let caveats = caveats_no_exec(ws.path());
+        let out = run_tool(
+            "run_command",
+            serde_json::json!({"command": "echo hi"}),
+            ws.path(),
+            &caveats,
+        )
+        .await;
+        assert!(out.starts_with("error:"), "got: {out}");
+        assert!(
+            out.contains("reubeno/brush/pull/1184"),
+            "the stub dispatch error must surface unchanged, got: {out}"
+        );
+    }
+
+    /// FLAG ON: a command the confined shell fails closed on now runs on the
+    /// host shell and returns its real output through the SAME envelope
+    /// formatter (`shell_envelope_output`).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn yolo_runs_the_denied_command_on_the_host_shell() {
+        let _l = env_lock().await;
+        let _on = EnvVar::set("NEWT_DISABLE_OCAP", "1");
+        let ws = tempfile::TempDir::new().unwrap();
+        let caveats = caveats_no_exec(ws.path());
+        let out = run_tool(
+            "run_command",
+            serde_json::json!({"command": "echo yolo-ok"}),
+            ws.path(),
+            &caveats,
+        )
+        .await;
+        assert_eq!(out, "yolo-ok\n");
+
+        // No output ⇒ the same `(exit N)` shape the bridle path produces.
+        let out = run_tool(
+            "run_command",
+            serde_json::json!({"command": "exit 3"}),
+            ws.path(),
+            &caveats,
+        )
+        .await;
+        assert_eq!(out, "(exit 3)");
+    }
+
+    /// Envelope parity (#297): the host-shell envelope is structurally
+    /// identical to the bridle one — `exit_code` / `stdout` / `stderr` /
+    /// `sandbox_kind`, `denied`/`denials` omitted (⇒ not denied) — so the
+    /// existing envelope readers apply unchanged.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn host_shell_envelope_matches_the_bridle_shape() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let envelope = host_shell_dispatch(
+            "echo out; echo err >&2; exit 3",
+            &ws.path().to_string_lossy(),
+        )
+        .await
+        .expect("host shell runs");
+        assert_eq!(envelope["exit_code"], 3);
+        assert_eq!(envelope["stdout"], "out\n");
+        assert_eq!(envelope["stderr"], "err\n");
+        assert_eq!(envelope["sandbox_kind"], "none");
+        // Omitted exactly as the bridle envelope omits them on the
+        // nothing-was-denied path — `envelope_denied` reads it natively.
+        assert!(envelope.get("denied").is_none(), "got: {envelope}");
+        assert!(envelope.get("denials").is_none(), "got: {envelope}");
+        assert!(!envelope_denied(&envelope));
+        // And the shared formatter renders it like any confined result.
+        assert_eq!(shell_envelope_output(&envelope, 20, false), "out\nerr\n");
+    }
+
+    /// The venv/PATH prefix logic rides the host shell unchanged: the same
+    /// `export VIRTUAL_ENV=…; export PATH=…;` prefix the confined shell got
+    /// is prepended to the bypassed command.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn yolo_keeps_the_venv_prefix_logic() {
+        let _l = env_lock().await;
+        let _on = EnvVar::set("NEWT_DISABLE_OCAP", "1");
+        let _venv = EnvVar::set("NEWT_VENV", "/opt/fake-venv");
+        let _virtual = EnvVar::unset("VIRTUAL_ENV");
+        let _paths = EnvVar::unset("NEWT_EXEC_PATHS");
+        let ws = tempfile::TempDir::new().unwrap();
+        let caveats = caveats_no_exec(ws.path());
+        let out = run_tool(
+            "run_command",
+            serde_json::json!({"command": "echo \"$VIRTUAL_ENV\""}),
+            ws.path(),
+            &caveats,
+        )
+        .await;
+        assert_eq!(out, "/opt/fake-venv\n");
+    }
+
+    /// fs fence under yolo (#297): the newt-native workspace fence is NOT
+    /// bypassed — a write/read outside the granted scope keeps the standard
+    /// denial bit-for-bit. Yolo is unconfined exec, never authority-off.
+    #[tokio::test]
+    async fn yolo_keeps_the_fs_workspace_fence() {
+        let _l = env_lock().await;
+        let _on = EnvVar::set("NEWT_DISABLE_OCAP", "1");
+        let ws = tempfile::TempDir::new().unwrap();
+        let caveats = caveats_no_exec(ws.path());
+        let escape = "/definitely-outside-the-fence/escape.txt";
+        let out = run_tool(
+            "write_file",
+            serde_json::json!({"path": escape, "content": "nope"}),
+            ws.path(),
+            &caveats,
+        )
+        .await;
+        assert_eq!(
+            out,
+            format!("capability denied: fs_write does not permit '{escape}'")
+        );
+        assert!(!std::path::Path::new(escape).exists());
+
+        let out = run_tool(
+            "read_file",
+            serde_json::json!({"path": "/etc/hostname"}),
+            ws.path(),
+            &caveats,
+        )
+        .await;
+        assert_eq!(
+            out,
+            "capability denied: fs_read does not permit '/etc/hostname'"
+        );
+    }
+
+    /// Precedence (#297): with both `--disable-ocap` and a #263 gate present,
+    /// exec never prompts — nothing is denied, so the gate is structurally
+    /// unreachable for run_command. (fs prompting stays live; the fs-fence
+    /// test above and the #263 suite cover that axis.)
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn yolo_never_consults_the_permission_gate_for_exec() {
+        struct PanicGate;
+        impl super::PermissionGate for PanicGate {
+            fn ask(&mut self, requests: &[super::PermissionRequest]) -> super::PermissionDecision {
+                panic!("yolo exec must never prompt, but the gate was asked: {requests:?}");
+            }
+        }
+        let _l = env_lock().await;
+        let _on = EnvVar::set("NEWT_DISABLE_OCAP", "1");
+        let ws = tempfile::TempDir::new().unwrap();
+        let caveats = caveats_no_exec(ws.path());
+        let mut gate = PanicGate;
+        let out = execute_tool(
+            "run_command",
+            &serde_json::json!({"command": "echo no-prompt"}),
+            &ws.path().to_string_lossy(),
+            false,
+            20,
+            &caveats,
+            &mut NoMcp,
+            None,
+            None,
+            None,
+            Some(&mut gate),
+        )
+        .await;
+        assert_eq!(out, "no-prompt\n");
+    }
+
+    /// The corrective tool-name guard still answers BEFORE the bypass: yolo
+    /// changes where commands run, not what counts as a command.
+    #[tokio::test]
+    async fn yolo_keeps_the_tool_name_corrective_guard() {
+        let _l = env_lock().await;
+        let _on = EnvVar::set("NEWT_DISABLE_OCAP", "1");
+        let ws = tempfile::TempDir::new().unwrap();
+        let caveats = caveats_no_exec(ws.path());
+        let out = run_tool(
+            "run_command",
+            serde_json::json!({"command": "read_file foo.txt"}),
+            ws.path(),
+            &caveats,
+        )
+        .await;
+        assert!(out.contains("is a tool, not a shell command"), "got: {out}");
     }
 }
