@@ -5,7 +5,9 @@
 use super::display::{print_denied, print_tool_call, print_tool_output};
 use super::mcp::McpTools;
 use super::note_sink::{execute_save_note, save_note_tool_definition, NoteSink};
+use super::permissions::{DenialKind, PermissionDecision, PermissionGate, PermissionRequest};
 use super::recall::{execute_recall, recall_tool_definition, RecallSource};
+use crate::caveats::CaveatsExt as _;
 
 pub fn tool_definitions() -> serde_json::Value {
     serde_json::json!([
@@ -379,6 +381,121 @@ fn envelope_denial_reason_with_guidance(envelope: &serde_json::Value) -> String 
     }
 }
 
+/// The standard `run_command` capability-denial result — the exact text the
+/// model has always received. Factored so the #263 prompt path can fall back
+/// to it bit-for-bit on deny (and on a second denial after a re-execution).
+fn denied_run_command_result(envelope: &serde_json::Value, color: bool) -> String {
+    let reason = envelope_denial_reason_with_guidance(envelope);
+    print_denied("exec", &reason, color);
+    format!("capability denied: {reason}")
+}
+
+/// The standard `run_command` success path: print + return stdout/stderr,
+/// or `(exit N)` when the command produced no output. Factored verbatim so
+/// the #263 re-execution path shares one formatter with the first dispatch.
+fn shell_envelope_output(
+    envelope: &serde_json::Value,
+    tool_output_lines: usize,
+    color: bool,
+) -> String {
+    let stdout = envelope
+        .get("stdout")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let stderr = envelope
+        .get("stderr")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let out = format!("{stdout}{stderr}");
+    print_tool_output(&out, tool_output_lines, color);
+    if out.trim().is_empty() {
+        let code = envelope
+            .get("exit_code")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(-1);
+        format!("(exit {code})")
+    } else {
+        out
+    }
+}
+
+/// Lift a confined-shell denial envelope into promptable #263 requests.
+///
+/// Returns `Some` only when EVERY structured denial entry is an `exec` kind
+/// with a non-empty target — the case the human can meaningfully grant (the
+/// allowlist name, same basename rule as the config hint). Any other kind
+/// (e.g. an `open` refused inside the shell) keeps the standard denial:
+/// guessing which fs axis an opaque `open` maps to would over-grant.
+fn exec_denial_requests(envelope: &serde_json::Value) -> Option<Vec<PermissionRequest>> {
+    let denials = envelope.get("denials")?.as_array()?;
+    if denials.is_empty() {
+        return None;
+    }
+    let mut requests = Vec::with_capacity(denials.len());
+    for d in denials {
+        if d.get("kind")?.as_str()? != "exec" {
+            return None;
+        }
+        let target = d.get("target")?.as_str().filter(|t| !t.is_empty())?;
+        requests.push(PermissionRequest {
+            tool: "run_command".to_string(),
+            kind: DenialKind::Exec,
+            target: exec_allowlist_name(target).to_string(),
+            reason: d
+                .get("reason")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        });
+    }
+    Some(requests)
+}
+
+/// Consult the #263 gate for one denied fs path. Returns `true` only when
+/// the human allowed it AND the re-minted caveats actually permit the path —
+/// the widened authority is re-checked, never assumed.
+fn fs_gate_allows(
+    gate: &mut dyn PermissionGate,
+    tool: &str,
+    kind: DenialKind,
+    full_path: &str,
+    axis: impl Fn(&crate::caveats::Caveats) -> &crate::caveats::Scope<String>,
+) -> bool {
+    let request = PermissionRequest {
+        tool: tool.to_string(),
+        kind,
+        target: full_path.to_string(),
+        reason: format!("{} does not permit '{full_path}'", kind.as_str()),
+    };
+    match gate.ask(std::slice::from_ref(&request)) {
+        PermissionDecision::Allow(widened) => tui_permits_path(axis(&widened), full_path),
+        PermissionDecision::Deny => false,
+    }
+}
+
+/// Best-effort host extraction for the #263 net pre-check. This only gates
+/// whether to PROMPT — reachability enforcement stays with the bridle's
+/// leash (host allowlist + SSRF screen). `None` (unparseable / non-http URL)
+/// skips the pre-check entirely, leaving today's dispatch path untouched.
+pub(crate) fn host_of_url(url: &str) -> Option<String> {
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))?;
+    let authority = rest.split(['/', '?', '#']).next()?;
+    let host_port = authority.rsplit('@').next()?;
+    // IPv6 literal `[::1]:8080` — the host is the bracketed part.
+    let host = if let Some(stripped) = host_port.strip_prefix('[') {
+        stripped.split(']').next()?
+    } else {
+        host_port.split(':').next()?
+    };
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_ascii_lowercase())
+    }
+}
+
 /// Execute a single tool call and return the result string sent back to the model.
 ///
 /// `run_command` is routed through agent-bridle's Caveats-confined, brush-backed
@@ -391,6 +508,12 @@ fn envelope_denial_reason_with_guidance(envelope: &serde_json::Value) -> String 
 /// `note_sink` backs the `save_note` tool (Step 19.3) and `recall_source`
 /// the `recall` tool (Step 17.5). `None` ⇒ the tool was never advertised,
 /// so a call here is treated like any unknown tool.
+///
+/// `permission_gate` is the #263 prompted-grant seam: when present, a
+/// capability denial consults the human (allow once / session allow / deny)
+/// before failing; an allow re-executes the denied call under the gate's
+/// freshly minted caveats. `None` (the default, and every headless caller)
+/// keeps every denial exactly as it was — bit-for-bit.
 #[allow(clippy::too_many_arguments)]
 pub async fn execute_tool(
     name: &str,
@@ -403,6 +526,7 @@ pub async fn execute_tool(
     build_check_cmd: Option<&str>,
     note_sink: Option<&mut dyn NoteSink>,
     recall_source: Option<&dyn RecallSource>,
+    permission_gate: Option<&mut dyn PermissionGate>,
 ) -> String {
     // Remote MCP tools (namespaced `server__tool`) route to their server before
     // the built-in match. They carry no Caveats leash in this build.
@@ -471,7 +595,7 @@ pub async fn execute_tool(
                 "cwd": workspace,
             });
             match agent_bridle::registry()
-                .dispatch("shell", dispatch_args, caveats)
+                .dispatch("shell", dispatch_args.clone(), caveats)
                 .await
             {
                 // The confined shell ran. Its envelope carries
@@ -483,31 +607,32 @@ pub async fn execute_tool(
                 // run); we lift that to the existing capability-denied UX by
                 // reading the structured `denied` field — NEVER a stderr grep.
                 Ok(envelope) if envelope_denied(&envelope) => {
-                    let reason = envelope_denial_reason_with_guidance(&envelope);
-                    print_denied("exec", &reason, color);
-                    format!("capability denied: {reason}")
-                }
-                Ok(envelope) => {
-                    let stdout = envelope
-                        .get("stdout")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("");
-                    let stderr = envelope
-                        .get("stderr")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("");
-                    let out = format!("{stdout}{stderr}");
-                    print_tool_output(&out, tool_output_lines, color);
-                    if out.trim().is_empty() {
-                        let code = envelope
-                            .get("exit_code")
-                            .and_then(serde_json::Value::as_i64)
-                            .unwrap_or(-1);
-                        format!("(exit {code})")
-                    } else {
-                        out
+                    // #263: an interactive gate may turn this denial into a
+                    // human grant. ONE consult + ONE re-execution per call: a
+                    // second denial (a different target reached on the re-run)
+                    // surfaces as the standard envelope — the model can retry,
+                    // which prompts afresh for the new target.
+                    if let Some(gate) = permission_gate {
+                        if let Some(requests) = exec_denial_requests(&envelope) {
+                            if let PermissionDecision::Allow(widened) = gate.ask(&requests) {
+                                return match agent_bridle::registry()
+                                    .dispatch("shell", dispatch_args, &widened)
+                                    .await
+                                {
+                                    Ok(env2) if envelope_denied(&env2) => {
+                                        denied_run_command_result(&env2, color)
+                                    }
+                                    Ok(env2) => {
+                                        shell_envelope_output(&env2, tool_output_lines, color)
+                                    }
+                                    Err(e) => format!("error: {e}"),
+                                };
+                            }
+                        }
                     }
+                    denied_run_command_result(&envelope, color)
                 }
+                Ok(envelope) => shell_envelope_output(&envelope, tool_output_lines, color),
                 // An argv-mode leash denial, or an error from inside the tool —
                 // surface the reason; the dispatch error Display is safe to show.
                 Err(e) => format!("error: {e}"),
@@ -519,9 +644,18 @@ pub async fn execute_tool(
             let full = std::path::Path::new(workspace).join(path);
             let full_str = full.to_string_lossy();
             if !tui_permits_path(&caveats.fs_read, &full_str) {
-                let msg = format!("capability denied: fs_read does not permit '{path}'");
-                print_denied("fs_read", path, color);
-                return msg;
+                // #263: the gate may grant the read; deny (or no gate) keeps
+                // the standard denial text bit-for-bit.
+                let allowed = permission_gate.is_some_and(|gate| {
+                    fs_gate_allows(gate, "read_file", DenialKind::FsRead, &full_str, |c| {
+                        &c.fs_read
+                    })
+                });
+                if !allowed {
+                    let msg = format!("capability denied: fs_read does not permit '{path}'");
+                    print_denied("fs_read", path, color);
+                    return msg;
+                }
             }
             print_tool_call("read_file", path, color);
             match std::fs::read_to_string(&full) {
@@ -539,9 +673,20 @@ pub async fn execute_tool(
             let full = std::path::Path::new(workspace).join(path);
             let full_str = full.to_string_lossy();
             if !tui_permits_path(&caveats.fs_write, &full_str) {
-                let msg = format!("capability denied: fs_write does not permit '{path}'");
-                print_denied("fs_write", path, color);
-                return msg;
+                // #263: the gate may grant the write (the human's choice at
+                // the prompt is the consent — the y/N confirm below stays
+                // governed by the original scope shape, which a denial here
+                // proves is `Only`, i.e. no second confirm).
+                let allowed = permission_gate.is_some_and(|gate| {
+                    fs_gate_allows(gate, "write_file", DenialKind::FsWrite, &full_str, |c| {
+                        &c.fs_write
+                    })
+                });
+                if !allowed {
+                    let msg = format!("capability denied: fs_write does not permit '{path}'");
+                    print_denied("fs_write", path, color);
+                    return msg;
+                }
             }
 
             // Shrink guard: refuse if the proposed write removes > 30% of
@@ -624,9 +769,17 @@ pub async fn execute_tool(
             let full = std::path::Path::new(workspace).join(path);
             let full_str = full.to_string_lossy();
             if !tui_permits_path(&caveats.fs_write, &full_str) {
-                let msg = format!("capability denied: fs_write does not permit '{path}'");
-                print_denied("fs_write", path, color);
-                return msg;
+                // #263: same prompted-grant path as write_file.
+                let allowed = permission_gate.is_some_and(|gate| {
+                    fs_gate_allows(gate, "edit_file", DenialKind::FsWrite, &full_str, |c| {
+                        &c.fs_write
+                    })
+                });
+                if !allowed {
+                    let msg = format!("capability denied: fs_write does not permit '{path}'");
+                    print_denied("fs_write", path, color);
+                    return msg;
+                }
             }
             if old_string.is_empty() {
                 return "error: old_string must not be empty — use write_file to create new files"
@@ -676,9 +829,17 @@ pub async fn execute_tool(
             let full = std::path::Path::new(workspace).join(path);
             let full_str = full.to_string_lossy();
             if !tui_permits_path(&caveats.fs_read, &full_str) {
-                let msg = format!("capability denied: fs_read does not permit '{path}'");
-                print_denied("fs_read", path, color);
-                return msg;
+                // #263: same prompted-grant path as read_file.
+                let allowed = permission_gate.is_some_and(|gate| {
+                    fs_gate_allows(gate, "list_dir", DenialKind::FsRead, &full_str, |c| {
+                        &c.fs_read
+                    })
+                });
+                if !allowed {
+                    let msg = format!("capability denied: fs_read does not permit '{path}'");
+                    print_denied("fs_read", path, color);
+                    return msg;
+                }
             }
             print_tool_call("list_dir", path, color);
             match std::fs::read_dir(&full) {
@@ -732,8 +893,29 @@ pub async fn execute_tool(
             if let Some(max_bytes) = args.get("max_bytes").and_then(serde_json::Value::as_u64) {
                 fetch_args["max_bytes"] = serde_json::json!(max_bytes);
             }
+            // #263: with a gate present, pre-check the host against the `net`
+            // axis so an out-of-allowlist host becomes a prompt instead of a
+            // leash error. Allow ⇒ dispatch under the gate's minted caveats;
+            // deny (or no gate, or an unparseable URL) ⇒ dispatch under the
+            // ORIGINAL caveats — the leash produces today's denial verbatim.
+            let widened_for_net = match (permission_gate, host_of_url(url)) {
+                (Some(gate), Some(host)) if !caveats.permits_net(&host) => {
+                    let request = PermissionRequest {
+                        tool: "web_fetch".to_string(),
+                        kind: DenialKind::Net,
+                        target: host.clone(),
+                        reason: format!("net does not permit '{host}'"),
+                    };
+                    match gate.ask(std::slice::from_ref(&request)) {
+                        PermissionDecision::Allow(widened) => Some(widened),
+                        PermissionDecision::Deny => None,
+                    }
+                }
+                _ => None,
+            };
+            let effective_caveats = widened_for_net.as_ref().unwrap_or(caveats);
             match agent_bridle::registry()
-                .dispatch("web_fetch", fetch_args, caveats)
+                .dispatch("web_fetch", fetch_args, effective_caveats)
                 .await
             {
                 Ok(result) => {
@@ -1031,6 +1213,67 @@ mod tests {
     }
 
     #[test]
+    fn host_of_url_extracts_hosts_conservatively() {
+        assert_eq!(host_of_url("https://docs.rs/serde"), Some("docs.rs".into()));
+        assert_eq!(host_of_url("http://Docs.RS"), Some("docs.rs".into()));
+        assert_eq!(
+            host_of_url("https://user:pw@example.com:8443/p?q#f"),
+            Some("example.com".into())
+        );
+        assert_eq!(host_of_url("https://[::1]:8080/x"), Some("::1".into()));
+        // Unparseable / non-http inputs skip the pre-check (None) rather
+        // than guessing — enforcement stays with the leash either way.
+        assert_eq!(host_of_url("not a url"), None);
+        assert_eq!(host_of_url("ftp://example.com"), None);
+        assert_eq!(host_of_url("https:///path-only"), None);
+    }
+
+    #[test]
+    fn exec_denial_requests_lifts_only_pure_exec_envelopes() {
+        // The promptable case: every entry is an exec denial with a target;
+        // the request target is the allowlist basename (the grantable name).
+        let exec_only = serde_json::json!({
+            "denied": true,
+            "denials": [
+                {"kind": "exec", "target": "/usr/bin/npm", "reason": "exec npm denied"},
+                {"kind": "exec", "target": "node", "reason": "exec node denied"}
+            ]
+        });
+        let reqs = exec_denial_requests(&exec_only).expect("promptable");
+        assert_eq!(reqs.len(), 2);
+        assert_eq!(reqs[0].tool, "run_command");
+        assert_eq!(reqs[0].kind, DenialKind::Exec);
+        assert_eq!(
+            reqs[0].target, "npm",
+            "basename, same rule as the config hint"
+        );
+        assert_eq!(reqs[0].reason, "exec npm denied");
+        assert_eq!(reqs[1].target, "node");
+
+        // A non-exec entry anywhere keeps the standard denial: mapping an
+        // opaque `open` onto an fs axis would over-grant.
+        let mixed = serde_json::json!({
+            "denials": [
+                {"kind": "exec", "target": "npm", "reason": "r"},
+                {"kind": "open", "target": "/etc/shadow", "reason": "r"}
+            ]
+        });
+        assert!(exec_denial_requests(&mixed).is_none());
+
+        // Missing/empty pieces are never promptable.
+        assert!(exec_denial_requests(&serde_json::json!({})).is_none());
+        assert!(exec_denial_requests(&serde_json::json!({"denials": []})).is_none());
+        let empty_target = serde_json::json!({
+            "denials": [{"kind": "exec", "target": "", "reason": "r"}]
+        });
+        assert!(exec_denial_requests(&empty_target).is_none());
+        let no_target = serde_json::json!({
+            "denials": [{"kind": "exec", "reason": "r"}]
+        });
+        assert!(exec_denial_requests(&no_target).is_none());
+    }
+
+    #[test]
     fn tui_permits_path_prefix_semantics() {
         use crate::caveats::Scope;
         assert!(tui_permits_path(&Scope::All, "/anything/at/all"));
@@ -1096,6 +1339,7 @@ mod execute_tool_branch_tests {
             caveats,
             &mut NoMcp,
             build_check,
+            None,
             None,
             None,
         )
@@ -1347,6 +1591,337 @@ mod execute_tool_branch_tests {
         assert_eq!(out, "unknown tool: definitely_not_a_tool");
     }
 
+    // -- #263 prompted permission grants through execute_tool ---------------
+
+    /// Scripted gate: records every request it is asked about and answers
+    /// allow (with caveats widened by exactly the requested grants) or deny.
+    struct MockGate {
+        allow: bool,
+        base: Caveats,
+        asks: Vec<(String, String)>,
+    }
+
+    impl MockGate {
+        fn new(allow: bool, base: &Caveats) -> Self {
+            Self {
+                allow,
+                base: base.clone(),
+                asks: Vec::new(),
+            }
+        }
+    }
+
+    impl super::PermissionGate for MockGate {
+        fn ask(&mut self, requests: &[super::PermissionRequest]) -> super::PermissionDecision {
+            for r in requests {
+                self.asks
+                    .push((r.tool.clone(), format!("{}:{}", r.kind.as_str(), r.target)));
+            }
+            if self.allow {
+                let grants: Vec<_> = requests
+                    .iter()
+                    .map(|r| (r.kind, r.target.clone()))
+                    .collect();
+                super::PermissionDecision::Allow(crate::agentic::widen_caveats(&self.base, &grants))
+            } else {
+                super::PermissionDecision::Deny
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn run_tool_gated(
+        name: &str,
+        args: serde_json::Value,
+        ws: &std::path::Path,
+        caveats: &Caveats,
+        gate: &mut MockGate,
+    ) -> String {
+        execute_tool(
+            name,
+            &args,
+            &ws.to_string_lossy(),
+            false,
+            20,
+            caveats,
+            &mut NoMcp,
+            None,
+            None,
+            None,
+            Some(gate),
+        )
+        .await
+    }
+
+    /// FLAG OFF (no gate): the denial text is the exact string the model has
+    /// always received — regression-pinned bit-for-bit (#263 acceptance).
+    #[tokio::test]
+    async fn no_gate_denials_are_bit_for_bit_unchanged() {
+        let ws = tempfile::TempDir::new().unwrap();
+        std::fs::write(ws.path().join("secret.txt"), "x").unwrap();
+        let denied = Caveats {
+            fs_read: Scope::none(),
+            fs_write: Scope::none(),
+            ..caveats_rw(ws.path())
+        };
+        let out = run_tool(
+            "read_file",
+            serde_json::json!({"path": "secret.txt"}),
+            ws.path(),
+            &denied,
+            None,
+        )
+        .await;
+        assert_eq!(
+            out,
+            "capability denied: fs_read does not permit 'secret.txt'"
+        );
+        let out = run_tool(
+            "list_dir",
+            serde_json::json!({"path": "."}),
+            ws.path(),
+            &denied,
+            None,
+        )
+        .await;
+        assert_eq!(out, "capability denied: fs_read does not permit '.'");
+        let out = run_tool(
+            "write_file",
+            serde_json::json!({"path": "a.txt", "content": "c"}),
+            ws.path(),
+            &denied,
+            None,
+        )
+        .await;
+        assert_eq!(out, "capability denied: fs_write does not permit 'a.txt'");
+        let out = run_tool(
+            "edit_file",
+            serde_json::json!({"path": "a.txt", "old_string": "a", "new_string": "b"}),
+            ws.path(),
+            &denied,
+            None,
+        )
+        .await;
+        assert_eq!(out, "capability denied: fs_write does not permit 'a.txt'");
+    }
+
+    /// Gate allows an fs_read denial → the read proceeds and returns the
+    /// real contents; the gate was consulted with the tool + axis + full
+    /// path it would be granting.
+    #[tokio::test]
+    async fn gate_allow_turns_fs_read_denial_into_the_real_result() {
+        let ws = tempfile::TempDir::new().unwrap();
+        std::fs::write(ws.path().join("secret.txt"), "the contents").unwrap();
+        let denied = Caveats {
+            fs_read: Scope::none(),
+            ..caveats_rw(ws.path())
+        };
+        let mut gate = MockGate::new(true, &denied);
+        let out = run_tool_gated(
+            "read_file",
+            serde_json::json!({"path": "secret.txt"}),
+            ws.path(),
+            &denied,
+            &mut gate,
+        )
+        .await;
+        assert_eq!(out, "the contents");
+        let full = ws.path().join("secret.txt").to_string_lossy().into_owned();
+        assert_eq!(
+            gate.asks,
+            vec![("read_file".to_string(), format!("fs_read:{full}"))]
+        );
+    }
+
+    /// Gate denies → the result is the standard denial, bit-for-bit equal to
+    /// the no-gate path (#263: deny = the current denial result).
+    #[tokio::test]
+    async fn gate_deny_keeps_the_standard_denial_bit_for_bit() {
+        let ws = tempfile::TempDir::new().unwrap();
+        std::fs::write(ws.path().join("secret.txt"), "x").unwrap();
+        let denied = Caveats {
+            fs_read: Scope::none(),
+            ..caveats_rw(ws.path())
+        };
+        let mut gate = MockGate::new(false, &denied);
+        let gated = run_tool_gated(
+            "read_file",
+            serde_json::json!({"path": "secret.txt"}),
+            ws.path(),
+            &denied,
+            &mut gate,
+        )
+        .await;
+        let ungated = run_tool(
+            "read_file",
+            serde_json::json!({"path": "secret.txt"}),
+            ws.path(),
+            &denied,
+            None,
+        )
+        .await;
+        assert_eq!(gated, ungated);
+        assert_eq!(
+            gated,
+            "capability denied: fs_read does not permit 'secret.txt'"
+        );
+        assert_eq!(gate.asks.len(), 1, "the human was asked exactly once");
+    }
+
+    /// Gate allows fs_write denials → write_file and edit_file proceed.
+    #[tokio::test]
+    async fn gate_allow_turns_fs_write_denials_into_real_writes() {
+        let ws = tempfile::TempDir::new().unwrap();
+        std::fs::write(ws.path().join("f.txt"), "old\n").unwrap();
+        let denied = Caveats {
+            fs_write: Scope::none(),
+            ..caveats_rw(ws.path())
+        };
+        let mut gate = MockGate::new(true, &denied);
+        let out = run_tool_gated(
+            "write_file",
+            serde_json::json!({"path": "new.txt", "content": "fresh"}),
+            ws.path(),
+            &denied,
+            &mut gate,
+        )
+        .await;
+        assert!(out.starts_with("wrote new.txt"), "got: {out}");
+        assert_eq!(
+            std::fs::read_to_string(ws.path().join("new.txt")).unwrap(),
+            "fresh"
+        );
+        let out = run_tool_gated(
+            "edit_file",
+            serde_json::json!({"path": "f.txt", "old_string": "old", "new_string": "new"}),
+            ws.path(),
+            &denied,
+            &mut gate,
+        )
+        .await;
+        assert!(out.starts_with("edited f.txt"), "got: {out}");
+        assert_eq!(gate.asks.len(), 2);
+        assert_eq!(gate.asks[0].0, "write_file");
+        assert!(
+            gate.asks[1].1.starts_with("fs_write:"),
+            "got: {:?}",
+            gate.asks[1]
+        );
+    }
+
+    /// list_dir consults the gate on an fs_read denial like read_file does.
+    #[tokio::test]
+    async fn gate_allow_turns_list_dir_denial_into_the_listing() {
+        let ws = tempfile::TempDir::new().unwrap();
+        std::fs::write(ws.path().join("seen.txt"), "x").unwrap();
+        let denied = Caveats {
+            fs_read: Scope::none(),
+            ..caveats_rw(ws.path())
+        };
+        let mut gate = MockGate::new(true, &denied);
+        let out = run_tool_gated(
+            "list_dir",
+            serde_json::json!({"path": "."}),
+            ws.path(),
+            &denied,
+            &mut gate,
+        )
+        .await;
+        assert!(out.contains("seen.txt"), "got: {out}");
+    }
+
+    /// A buggy/hostile gate answering Allow with caveats that STILL don't
+    /// cover the path must not bypass enforcement: the widened authority is
+    /// re-checked, never assumed (fs_gate_allows' re-check).
+    #[tokio::test]
+    async fn gate_allow_without_real_coverage_is_still_denied() {
+        struct LyingGate;
+        impl super::PermissionGate for LyingGate {
+            fn ask(&mut self, _requests: &[super::PermissionRequest]) -> super::PermissionDecision {
+                // "Allow", but the caveats grant nothing at all.
+                super::PermissionDecision::Allow(Caveats {
+                    fs_read: Scope::none(),
+                    fs_write: Scope::none(),
+                    exec: Scope::none(),
+                    net: Scope::none(),
+                    max_calls: CountBound::Unlimited,
+                    valid_for_generation: Scope::All,
+                })
+            }
+        }
+        let ws = tempfile::TempDir::new().unwrap();
+        std::fs::write(ws.path().join("secret.txt"), "x").unwrap();
+        let denied = Caveats {
+            fs_read: Scope::none(),
+            ..caveats_rw(ws.path())
+        };
+        let mut gate = LyingGate;
+        let out = execute_tool(
+            "read_file",
+            &serde_json::json!({"path": "secret.txt"}),
+            &ws.path().to_string_lossy(),
+            false,
+            20,
+            &denied,
+            &mut NoMcp,
+            None,
+            None,
+            None,
+            Some(&mut gate),
+        )
+        .await;
+        assert_eq!(
+            out,
+            "capability denied: fs_read does not permit 'secret.txt'"
+        );
+    }
+
+    /// web_fetch with a gate: an out-of-allowlist host consults the gate
+    /// with the parsed host; on deny the dispatch runs under the ORIGINAL
+    /// caveats, so the leash produces today's denial (an `error:` result —
+    /// nothing is fetched).
+    #[tokio::test]
+    async fn web_fetch_gate_deny_dispatches_under_original_caveats() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let caveats = caveats_rw(ws.path()); // net: Scope::none()
+        let mut gate = MockGate::new(false, &caveats);
+        let out = run_tool_gated(
+            "web_fetch",
+            serde_json::json!({"url": "https://denied.example.com:8443/page"}),
+            ws.path(),
+            &caveats,
+            &mut gate,
+        )
+        .await;
+        assert!(out.starts_with("error:"), "leash denial surfaces: {out}");
+        assert_eq!(
+            gate.asks,
+            vec![(
+                "web_fetch".to_string(),
+                "net:denied.example.com".to_string()
+            )]
+        );
+    }
+
+    /// An unparseable URL skips the net pre-check entirely — the gate is
+    /// never consulted and the dispatch (with the original caveats) answers.
+    #[tokio::test]
+    async fn web_fetch_unparseable_url_never_prompts() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let caveats = caveats_rw(ws.path());
+        let mut gate = MockGate::new(true, &caveats);
+        let out = run_tool_gated(
+            "web_fetch",
+            serde_json::json!({"url": "not-a-url"}),
+            ws.path(),
+            &caveats,
+            &mut gate,
+        )
+        .await;
+        assert!(out.starts_with("error:"), "got: {out}");
+        assert!(gate.asks.is_empty(), "no prompt for an unparseable URL");
+    }
+
     // -- save_note dispatch through execute_tool (Step 19.3) ----------------
 
     #[tokio::test]
@@ -1381,6 +1956,7 @@ mod execute_tool_branch_tests {
             &mut NoMcp,
             None,
             Some(&mut sink),
+            None,
             None,
         )
         .await;
@@ -1434,6 +2010,7 @@ mod execute_tool_branch_tests {
             None,
             None,
             Some(&source),
+            None,
         )
         .await;
         assert_eq!(

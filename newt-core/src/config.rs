@@ -678,6 +678,16 @@ pub struct ToolPermissions {
     /// except `FullAccess` (which is already unrestricted).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub net: Vec<String>,
+
+    /// Prompt the human when a tool call is denied by the session's caveats
+    /// (issue #263): allow once / allow for this session / deny. Default
+    /// **false** — a denial fails the call exactly as before (deny-by-default
+    /// stays the posture). Interactive TUI only; headless paths (ACP worker,
+    /// `newt-eval`) never prompt regardless. Also enabled per-run via the
+    /// `--prompt-for-permissions` CLI flag. Every prompted decision is
+    /// recorded to `~/.newt/permission-log.jsonl` for later review.
+    #[serde(default)]
+    pub prompt: bool,
 }
 
 impl Default for ToolPermissions {
@@ -686,6 +696,7 @@ impl Default for ToolPermissions {
             preset: PermissionPreset::WorkspaceDev,
             extra_exec: Vec::new(),
             net: Vec::new(),
+            prompt: false,
         }
     }
 }
@@ -1747,6 +1758,7 @@ max_tool_rounds = 25
             preset: PermissionPreset::WorkspaceDev,
             extra_exec: vec!["bacon".into(), "make".into()],
             net: vec![],
+            prompt: false,
         };
         let cav = perms.to_caveats("/workspace");
         assert!(cav.permits_exec("bacon"));
@@ -1760,6 +1772,7 @@ max_tool_rounds = 25
             preset: PermissionPreset::ReadOnly,
             extra_exec: vec![],
             net: vec![],
+            prompt: false,
         };
         let cav = perms.to_caveats("/workspace");
         assert!(!cav.permits_fs_write("/workspace/src/main.rs"));
@@ -1773,6 +1786,7 @@ max_tool_rounds = 25
             preset: PermissionPreset::WorkspaceEdit,
             extra_exec: vec![],
             net: vec![],
+            prompt: false,
         };
         let cav = perms.to_caveats("/workspace");
         assert!(!cav.permits_exec("cargo"));
@@ -1788,6 +1802,7 @@ max_tool_rounds = 25
             preset: PermissionPreset::FullAccess,
             extra_exec: vec![],
             net: vec![],
+            prompt: false,
         };
         let cav = perms.to_caveats("/workspace");
         assert_eq!(cav, crate::caveats::Caveats::top());
@@ -1810,6 +1825,7 @@ max_tool_rounds = 25
             preset: PermissionPreset::ReadOnly,
             extra_exec: vec![],
             net: vec!["docs.rs".into(), "github.com".into()],
+            prompt: false,
         }
         .to_caveats("/ws");
         assert!(
@@ -1822,6 +1838,7 @@ max_tool_rounds = 25
             preset: PermissionPreset::WorkspaceDev,
             extra_exec: vec![],
             net: vec!["*".into()],
+            prompt: false,
         }
         .to_caveats("/ws");
         assert!(
@@ -1840,6 +1857,7 @@ max_tool_rounds = 25
             preset: PermissionPreset::Custom,
             extra_exec: vec!["bacon".into()],
             net: vec![],
+            prompt: false,
         }
         .to_caveats("/workspace");
         assert_ne!(
@@ -1855,6 +1873,7 @@ max_tool_rounds = 25
             preset: PermissionPreset::WorkspaceDev,
             extra_exec: vec!["bacon".into()],
             net: vec![],
+            prompt: false,
         }
         .to_caveats("/workspace");
         assert_eq!(
@@ -1889,6 +1908,7 @@ max_tool_rounds = 25
             preset: PermissionPreset::WorkspaceDev,
             extra_exec: vec!["bacon".into()],
             net: vec![],
+            prompt: false,
         };
         let toml = toml::to_string(&perms).unwrap();
         assert!(toml.contains("workspace_dev"));
