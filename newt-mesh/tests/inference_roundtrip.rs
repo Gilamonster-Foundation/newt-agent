@@ -11,8 +11,17 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agent_mesh_core::{AgentKey, AgentMetadata, Caveats, UserKey};
-use newt_mesh::{InferenceRequest, MeshAsker, NewtMeshService};
+use newt_mesh::{InferenceRequest, MeshAsker, MeshIntegrationError, NewtMeshService};
 use tests_common::MockBackend;
+
+mod util;
+
+/// `true` iff the ask failed only because the responder's mDNS
+/// announce hasn't propagated yet — the one transient first-contact
+/// error [`util::with_announce_grace`] is allowed to retry (#274).
+fn ask_unannounced(e: &MeshIntegrationError) -> bool {
+    matches!(e, MeshIntegrationError::Bus(b) if util::bus_unannounced(b))
+}
 
 fn agent(user: &UserKey, role: &str, caps: Vec<String>) -> AgentKey {
     AgentKey::issue(
@@ -50,21 +59,26 @@ async fn ask_receives_inference_reply() {
         .await
         .expect("bind asker");
 
-    // Give mDNS a moment to settle so the asker's bus can resolve the
-    // responder by fingerprint.
-    tokio::time::sleep(Duration::from_millis(750)).await;
-
-    let req = InferenceRequest {
-        prompt: "rename foo to bar".into(),
-        tier: None,
-        model: None,
-        max_tokens: Some(256),
-    };
-
-    let reply = asker
-        .ask(responder_fp, req, Duration::from_secs(10))
-        .await
-        .expect("ask round-trip");
+    // First contact: poll-with-deadline instead of a fixed mDNS-settle
+    // sleep (#274) — passes the moment the responder's announce lands,
+    // still fails if it never does.
+    let reply = util::with_announce_grace(
+        || {
+            asker.ask(
+                responder_fp,
+                InferenceRequest {
+                    prompt: "rename foo to bar".into(),
+                    tier: None,
+                    model: None,
+                    max_tokens: Some(256),
+                },
+                Duration::from_secs(10),
+            )
+        },
+        ask_unannounced,
+    )
+    .await
+    .expect("ask round-trip");
 
     assert!(
         !reply.is_error(),
@@ -99,19 +113,24 @@ async fn ask_surfaces_responder_error_for_bad_model_pin() {
         .await
         .expect("bind asker");
 
-    tokio::time::sleep(Duration::from_millis(750)).await;
-
-    let req = InferenceRequest {
-        prompt: "irrelevant".into(),
-        tier: None,
-        model: Some("model-that-does-not-exist".into()),
-        max_tokens: None,
-    };
-
-    let reply = asker
-        .ask(responder_fp, req, Duration::from_secs(10))
-        .await
-        .expect("ask round-trip");
+    // First contact via poll-with-deadline — see #274 note above.
+    let reply = util::with_announce_grace(
+        || {
+            asker.ask(
+                responder_fp,
+                InferenceRequest {
+                    prompt: "irrelevant".into(),
+                    tier: None,
+                    model: Some("model-that-does-not-exist".into()),
+                    max_tokens: None,
+                },
+                Duration::from_secs(10),
+            )
+        },
+        ask_unannounced,
+    )
+    .await
+    .expect("ask round-trip");
 
     assert!(
         reply.is_error(),

@@ -457,12 +457,18 @@ mod tests {
 
     #[cfg(unix)]
     fn env_probe_plugin(dir: &Path) -> PathBuf {
+        use std::io::Write;
         use std::os::unix::fs::PermissionsExt;
 
         let path = dir.join("env-probe");
-        std::fs::write(
-            &path,
-            r#"#!/bin/sh
+        // Write-then-exec safety (issue #288): create/write/sync/drop
+        // explicitly so the write fd is closed before the test spawns
+        // this script. Paired with the bounded ETXTBSY-only spawn retry
+        // in `PluginClient::spawn_command` — see
+        // `tests_common::mock_plugin_binary` for the full rationale.
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.write_all(
+            br#"#!/bin/sh
 IFS= read -r _request || exit 0
 printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"plugin_name":"env-probe","plugin_version":"0.0.0-test","supported_models":["gpt-test"]}}'
 IFS= read -r _request || exit 0
@@ -472,6 +478,8 @@ printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{}}'
 "#,
         )
         .unwrap();
+        file.sync_all().unwrap();
+        drop(file);
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         path
     }
