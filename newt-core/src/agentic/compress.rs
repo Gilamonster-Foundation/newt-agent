@@ -787,24 +787,24 @@ fn head_len(messages: &[Value]) -> usize {
 // ---------------------------------------------------------------------------
 
 /// Length of the suffix the aggressive fit pass protects: from the LAST
-/// assistant message carrying `tool_calls` through the end of the list —
-/// that assistant turn, its fresh (unseen) results, and anything interleaved
-/// after them. `0` when no assistant in the list ever called a tool.
+/// message carrying `tool_calls` (the assistant turn that issued the calls)
+/// through the end of the list — that turn, its fresh (unseen) results, and
+/// anything interleaved after them. `0` when nothing in the list ever
+/// called a tool.
 ///
 /// Deriving the group by counting trailing `role == "tool"` messages was the
 /// #270 gap: the read-only-round nudge injects a `user` message immediately
 /// before the compression call site, the trailing count read zero,
 /// `keep_last` fell to its floor of 2, and every older unseen result in the
 /// fresh group was one-lined pre-dispatch for a round. Anchoring on the
-/// assistant turn that ISSUED the calls makes the group immune to whatever
-/// lands after it (a nudge, a compaction notice).
+/// turn that ISSUED the calls makes the group immune to whatever lands
+/// after it (a nudge, a compaction notice). Only `tool_calls` is consulted
+/// — the loop appends the backend's `message` object verbatim, and a `role`
+/// field is not guaranteed on every wire dialect.
 fn trailing_tool_group_len(messages: &[Value]) -> usize {
     messages
         .iter()
-        .rposition(|m| {
-            m["role"].as_str() == Some("assistant")
-                && m["tool_calls"].as_array().is_some_and(|t| !t.is_empty())
-        })
+        .rposition(|m| m["tool_calls"].as_array().is_some_and(|t| !t.is_empty()))
         .map_or(0, |i| messages.len() - i)
 }
 
@@ -1470,6 +1470,15 @@ mod tests {
         assert_eq!(trailing_tool_group_len(&msgs), 6);
         // No assistant ever called a tool → no group.
         assert_eq!(trailing_tool_group_len(&[sys("s"), user("t")]), 0);
+        // The loop appends the backend's `message` verbatim and some
+        // dialects omit `role` on it — `tool_calls` alone anchors the group.
+        let roleless = vec![
+            user("task"),
+            json!({"content": "", "tool_calls": [
+                {"function": {"name": "read_file", "arguments": {"path": "a"}}}]}),
+            tool_result("result a"),
+        ];
+        assert_eq!(trailing_tool_group_len(&roleless), 2);
     }
 
     /// The #270 repro through the whole pipeline: an over-budget session

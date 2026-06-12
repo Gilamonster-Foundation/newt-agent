@@ -4239,6 +4239,307 @@ mod compression_loop_tests {
         assert_eq!(log.len(), 30, "all 30 rounds ran (no Refused early-exit)");
     }
 
+    // -----------------------------------------------------------------------
+    // Trailing-group long-hauls (#270 / #285): the read-only-nudge regime the
+    // #267 re-verifier flagged as untested, and the oversized-single-round
+    // residual #284's gauntlet measured.
+    // -----------------------------------------------------------------------
+
+    /// Per-request observations for the nudged haul: `(message count, nudge
+    /// text present, per-result content lengths of the trailing tool group)`.
+    type NudgedLog = Arc<Mutex<Vec<(usize, bool, Vec<usize>)>>>;
+
+    /// Read-only-only responder: every round reads big1 + big2 + small (three
+    /// read-only calls, no writes), so the loop's read-only nudge fires every
+    /// few rounds — the regime #270's probe ran in. The #267 long-haul
+    /// responder deliberately added a write-ish call to keep that nudge quiet
+    /// and hand the boundary no fresh anchors; this one deliberately does the
+    /// opposite. Logs, per tool-offering request, the content length of every
+    /// tool result in the trailing group (everything after the last
+    /// assistant-with-`tool_calls`).
+    struct NudgedHaulResponder {
+        log: NudgedLog,
+    }
+
+    impl Respond for NudgedHaulResponder {
+        fn respond(&self, req: &Request) -> ResponseTemplate {
+            let body = body_json(req);
+            if body.get("tools").is_some() {
+                let empty = Vec::new();
+                let msgs = body["messages"].as_array().unwrap_or(&empty);
+                let group_start = msgs
+                    .iter()
+                    .rposition(|m| m["tool_calls"].as_array().is_some_and(|t| !t.is_empty()))
+                    .map(|i| i + 1)
+                    .unwrap_or(msgs.len());
+                let group_lens: Vec<usize> = msgs[group_start..]
+                    .iter()
+                    .filter(|m| m["role"].as_str() == Some("tool"))
+                    .filter_map(|m| m["content"].as_str())
+                    .map(|c| c.chars().count())
+                    .collect();
+                let nudged = messages_contain(&body, "consecutive read-only rounds");
+                self.log
+                    .lock()
+                    .unwrap()
+                    .push((msgs.len(), nudged, group_lens));
+                // `role` present like a real Ollama reply — the loop appends
+                // this object verbatim and the prune pairing reads the role.
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "message": { "role": "assistant", "content": "", "tool_calls": [
+                        { "function": { "name": "read_file", "arguments": { "path": "big1.txt" } } },
+                        { "function": { "name": "read_file", "arguments": { "path": "big2.txt" } } },
+                        { "function": { "name": "read_file", "arguments": { "path": "small.txt" } } }
+                    ]}
+                }))
+            } else {
+                ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({ "message": { "content": "nudged haul done" } }),
+                )
+            }
+        }
+    }
+
+    /// #270 e2e — the test the #267 re-verifier said was missing: a
+    /// nudge-active long session (read-only rounds only, so the loop injects
+    /// its stop-exploring user message right before the compression call
+    /// site every few rounds) under a hard token trigger. Pre-fix, the
+    /// nudge zeroed the trailing `role == "tool"` count, `keep_last`
+    /// floored at 2, and BOTH big fresh results were one-lined pre-dispatch
+    /// on every nudge round. Post-fix the group derives from the assistant
+    /// turn that issued the calls: the newest member is always whole and
+    /// the middle member survives every round (#285's within-group reclaim
+    /// may one-line only the oldest, oldest-first, and only while over
+    /// budget).
+    #[tokio::test]
+    async fn nudged_long_haul_keeps_fresh_group_results_intact() {
+        let server = MockServer::start().await;
+        let log: NudgedLog = Arc::new(Mutex::new(Vec::new()));
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(NudgedHaulResponder { log: log.clone() })
+            .mount(&server)
+            .await;
+        // Distinct contents per file: identical results would engage the
+        // dedupe pass, which is not what this test pins.
+        let ws = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            ws.path().join("big1.txt"),
+            "the first big fixture keeps unseen results intact\n".repeat(200),
+        )
+        .unwrap();
+        std::fs::write(
+            ws.path().join("big2.txt"),
+            "the second big fixture must survive every nudge round\n".repeat(200),
+        )
+        .unwrap();
+        std::fs::write(
+            ws.path().join("small.txt"),
+            "the small newest fixture stays whole\n".repeat(5),
+        )
+        .unwrap();
+        let workspace = ws.path().to_string_lossy().to_string();
+        let messages = msgs();
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let prompts = Arc::new(Mutex::new(Vec::new()));
+        let summarizer = canned_summarizer(prompts.clone());
+        let mut compress_state = CompressState::new();
+        let mut c = ctx(&uri, &messages, &caveats, &workspace);
+        c.max_tool_rounds = 12;
+        c.mid_loop_trim_tokens = Some(4_000); // hard trigger, fires most rounds
+        c.summarizer = Some(&*summarizer);
+        c.compress_state = Some(&mut compress_state);
+        let (reply, _, _, _) = chat_complete(c, &mut NoMcp)
+            .await
+            .expect("the nudged haul must complete");
+
+        assert_eq!(reply, "nudged haul done");
+        assert!(
+            !compress_state.is_disabled(),
+            "real reclaims every round must never latch anti-thrash"
+        );
+        let log = log.lock().unwrap();
+        for (round, entry) in log.iter().enumerate() {
+            println!("nudged haul round {round}: {entry:?}");
+        }
+        assert_eq!(log.len(), 12, "all 12 tool rounds dispatched");
+        let nudged_rounds = log.iter().filter(|(_, n, _)| *n).count();
+        assert!(
+            nudged_rounds >= 2,
+            "the read-only nudge regime must actually be active \
+             (got {nudged_rounds} nudged requests)"
+        );
+        for (round, (len, nudged, group_lens)) in log.iter().enumerate() {
+            if group_lens.is_empty() {
+                continue; // round 0: no tool group yet
+            }
+            assert_eq!(group_lens.len(), 3, "round {round}: pairing intact");
+            // The newest member is ALWAYS whole.
+            assert!(
+                group_lens[2] > 150,
+                "round {round} (nudged={nudged}): the newest fresh result \
+                 was destroyed pre-dispatch ({} chars)",
+                group_lens[2]
+            );
+            // The middle member survives too: within-group reclaim is
+            // oldest-first and stops at the budget — pre-#270 every nudge
+            // round one-lined it ({len} msgs dispatched).
+            assert!(
+                group_lens[1] > 1_000,
+                "round {round} (nudged={nudged}, {len} msgs): the middle \
+                 fresh result was destroyed pre-dispatch ({} chars)",
+                group_lens[1]
+            );
+        }
+        let max_tokens = log.iter().map(|(l, _, _)| *l).max().unwrap();
+        println!(
+            "nudged haul trace: {nudged_rounds} nudged rounds, \
+             max dispatched len {max_tokens}, group lens e.g. {:?}",
+            log.last().unwrap().2
+        );
+    }
+
+    /// Per-request observations for the oversized-round haul: `(est message
+    /// tokens, a one-lined, b one-lined, c payload intact, task present)`.
+    type OversizedLog = Arc<Mutex<Vec<(usize, bool, bool, bool, bool)>>>;
+
+    /// One round reads three files whose results TOGETHER exceed the model
+    /// window; answers as soon as the dispatch shows a.txt one-lined.
+    struct OversizedRoundResponder {
+        log: OversizedLog,
+    }
+
+    impl Respond for OversizedRoundResponder {
+        fn respond(&self, req: &Request) -> ResponseTemplate {
+            let body = body_json(req);
+            let a_onelined = messages_contain(&body, "[read_file] read 'a.txt'");
+            if !body["stream"].as_bool().unwrap_or(false) {
+                self.log.lock().unwrap().push((
+                    body_message_tokens(&body),
+                    a_onelined,
+                    messages_contain(&body, "[read_file] read 'b.txt'"),
+                    messages_contain(&body, "NEWEST-PAYLOAD-C-INTACT"),
+                    messages_contain(&body, TASK),
+                ));
+            }
+            if a_onelined {
+                return ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "message": { "content": "the three files are summarized" }
+                }));
+            }
+            if body.get("tools").is_some() {
+                // `role` present like a real Ollama reply — the prune
+                // pairing needs it to name the file in each one-liner.
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "message": { "role": "assistant", "content": "", "tool_calls": [
+                        { "function": { "name": "read_file", "arguments": { "path": "a.txt" } } },
+                        { "function": { "name": "read_file", "arguments": { "path": "b.txt" } } },
+                        { "function": { "name": "read_file", "arguments": { "path": "c.txt" } } }
+                    ]}
+                }))
+            } else {
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "message": { "content": "cap exit" } }))
+            }
+        }
+    }
+
+    /// #285 e2e — the B6 residual measured in #284's gauntlet: ONE round's
+    /// tool group alone exceeds the `num_ctx` ceiling (the only budget in
+    /// play on a fresh capability cache, #282/#284 wiring untouched).
+    /// Pre-fix the F1c protection made the group unreclaimable: compression
+    /// honestly reported "still over budget" and the dispatch shipped
+    /// over-window into a silent backend truncation. Post-fix the dispatch
+    /// fits the ceiling: a.txt / b.txt one-lined (each naming its file for
+    /// re-read), c.txt — the newest — intact, the task still present, and
+    /// the model returns the real answer.
+    #[tokio::test]
+    async fn oversized_single_round_dispatches_within_the_window() {
+        let server = MockServer::start().await;
+        let log: OversizedLog = Arc::new(Mutex::new(Vec::new()));
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(OversizedRoundResponder { log: log.clone() })
+            .mount(&server)
+            .await;
+        // Three ~7 KB results: together ~5.3k est tokens against a 4,096
+        // num_ctx (3,276-token input ceiling) — the trailing group ALONE
+        // exceeds the window; no boundary can split it (B6's shape).
+        // Distinct contents per file: identical results would engage the
+        // dedupe pass, which is not what this test pins.
+        let ws = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            ws.path().join("a.txt"),
+            "fixture a arrives first in the one giant trailing group\n".repeat(125),
+        )
+        .unwrap();
+        std::fs::write(
+            ws.path().join("b.txt"),
+            "fixture b arrives second and is older than the newest\n".repeat(130),
+        )
+        .unwrap();
+        std::fs::write(
+            ws.path().join("c.txt"),
+            format!(
+                "{}NEWEST-PAYLOAD-C-INTACT\n",
+                "fixture c arrives last and must reach the model whole\n".repeat(130)
+            ),
+        )
+        .unwrap();
+        let workspace = ws.path().to_string_lossy().to_string();
+        let messages = msgs();
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let prompts = Arc::new(Mutex::new(Vec::new()));
+        let summarizer = canned_summarizer(prompts.clone());
+        let mut compress_state = CompressState::new();
+        let mut c = ctx(&uri, &messages, &caveats, &workspace);
+        // Fresh capability cache, no token threshold: the num_ctx the loop
+        // itself sends is the only ceiling (#284's regime, untouched).
+        c.max_ok_input = None;
+        c.safe_context = None;
+        c.mid_loop_trim_tokens = None;
+        c.num_ctx = Some(4_096);
+        c.summarizer = Some(&*summarizer);
+        c.compress_state = Some(&mut compress_state);
+        let (reply, _, _, _) = chat_complete(c, &mut NoMcp)
+            .await
+            .expect("the oversized round must complete");
+
+        let log = log.lock().unwrap();
+        for (i, entry) in log.iter().enumerate() {
+            println!("oversized round request {i}: {entry:?}");
+        }
+        // Never a silent wrong answer: the model answered from real data.
+        assert_eq!(reply, "the three files are summarized");
+
+        let (tokens, _, b_onelined, c_intact, task_present) = *log
+            .iter()
+            .find(|(_, a, ..)| *a)
+            .expect("a dispatch with a.txt one-lined must have happened");
+        assert!(
+            b_onelined,
+            "older members one-lined in order: b.txt one-liner missing"
+        );
+        assert!(
+            c_intact,
+            "#285: the NEWEST result must reach the model whole"
+        );
+        assert!(task_present, "the task survives the within-group reclaim");
+        // The dispatch fits the same input ceiling the #284 test pins:
+        // 80% of 4,096 = 3,276 estimated message tokens.
+        assert!(
+            tokens <= 3_276,
+            "#285: the reclaimed dispatch must fit the window \
+             (got ~{tokens} est. message tokens > 3,276)"
+        );
+        println!(
+            "#285 e2e trace: reclaimed dispatch ~{tokens} est. tokens \
+             (ceiling 3,276), a/b one-lined, c intact"
+        );
+    }
+
     /// N3 — the loop-level refusal path end-to-end: a HARD token trigger
     /// (`mid_loop_trim_tokens`) over a genuinely incompressible context
     /// records two poor passes, latches anti-thrash, and the next
