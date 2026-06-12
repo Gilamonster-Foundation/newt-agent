@@ -38,6 +38,7 @@ fn agent(user: &UserKey, role: &str, caps: Vec<String>) -> AgentKey {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(mesh_mdns)]
 async fn ask_receives_inference_reply() {
     let _ = tracing_subscriber::fmt().with_test_writer().try_init();
 
@@ -93,6 +94,7 @@ async fn ask_receives_inference_reply() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(mesh_mdns)]
 async fn ask_surfaces_responder_error_for_bad_model_pin() {
     let _ = tracing_subscriber::fmt().with_test_writer().try_init();
 
@@ -148,6 +150,7 @@ async fn ask_surfaces_responder_error_for_bad_model_pin() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial(mesh_mdns)]
 async fn service_reports_backend_metadata() {
     // Exercise the public getter surface so changes to NewtMeshService's
     // accessor shape stay backwards compatible.
