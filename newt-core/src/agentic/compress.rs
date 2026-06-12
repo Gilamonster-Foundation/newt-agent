@@ -544,21 +544,20 @@ pub(crate) async fn compress(
     // budget (B6's shape — one giant tool round), one-line the AGED part
     // rather than letting the backend silently truncate the head (and the
     // task) away. The trailing tool group — results the model has not seen
-    // yet — is NEVER pruned (F1c): the old `keep_last: 0` destroyed every
-    // fresh result from the second compression of a session on, leaving the
-    // model unable to read anything. An over-budget dispatch is recoverable
-    // (cw-400 recovery / overflow retry); a destroyed fresh result is not.
+    // yet — is NEVER pruned here (F1c): the old `keep_last: 0` destroyed
+    // every fresh result from the second compression of a session on,
+    // leaving the model unable to read anything. An over-budget dispatch is
+    // recoverable (cw-400 recovery / overflow retry); a destroyed fresh
+    // result is not. The group is derived from the last assistant message
+    // carrying `tool_calls` — NOT by counting trailing `role == "tool"`
+    // messages, which any interleaved user message (the read-only nudge, a
+    // compaction notice) zeroed, flooring `keep_last` at 2 and one-lining
+    // older unseen results for a round (#270).
     if estimate_tokens(&assembled) > req.budget {
-        let trailing_group = assembled
-            .iter()
-            .rev()
-            .take_while(|m| m["role"].as_str() == Some("tool"))
-            .count()
-            + 1; // + the assistant turn carrying the tool_calls
         let aggressive = prune(
             &assembled,
             &PruneConfig {
-                keep_last: trailing_group.max(2),
+                keep_last: trailing_tool_group_len(&assembled).max(2),
                 ..PruneConfig::default()
             },
         );
@@ -567,6 +566,22 @@ pub(crate) async fn compress(
             if action == CompressAction::Fit {
                 action = CompressAction::Pruned;
             }
+        }
+        // #285: under a HARD budget (the window-correctness guard), the
+        // F1c protection and the window are in direct tension when the
+        // trailing group BY ITSELF exceeds what is left of the budget after
+        // the (already maximally pruned) head + summary. Reclaim WITHIN the
+        // group — newest result kept whole, older members one-lined oldest
+        // first — instead of always shipping over-window into a silent
+        // backend truncation. Soft (count-only / `/compress`) budgets never
+        // reach this: missing an aim-to-halve target is not a correctness
+        // problem, so the F1c protection stays absolute there.
+        if req.hard_budget
+            && estimate_tokens(&assembled) > req.budget
+            && reclaim_within_trailing_group(&mut assembled, req.budget)
+            && action == CompressAction::Fit
+        {
+            action = CompressAction::Pruned;
         }
     }
 
@@ -765,6 +780,86 @@ fn head_len(messages: &[Value]) -> usize {
         head += 1;
     }
     head
+}
+
+// ---------------------------------------------------------------------------
+// Trailing-group protection (#270 / #285)
+// ---------------------------------------------------------------------------
+
+/// Length of the suffix the aggressive fit pass protects: from the LAST
+/// message carrying `tool_calls` (the assistant turn that issued the calls)
+/// through the end of the list — that turn, its fresh (unseen) results, and
+/// anything interleaved after them. `0` when nothing in the list ever
+/// called a tool.
+///
+/// Deriving the group by counting trailing `role == "tool"` messages was the
+/// #270 gap: the read-only-round nudge injects a `user` message immediately
+/// before the compression call site, the trailing count read zero,
+/// `keep_last` fell to its floor of 2, and every older unseen result in the
+/// fresh group was one-lined pre-dispatch for a round. Anchoring on the
+/// turn that ISSUED the calls makes the group immune to whatever lands
+/// after it (a nudge, a compaction notice). Only `tool_calls` is consulted
+/// — the loop appends the backend's `message` object verbatim, and a `role`
+/// field is not guaranteed on every wire dialect.
+fn trailing_tool_group_len(messages: &[Value]) -> usize {
+    messages
+        .iter()
+        .rposition(|m| m["tool_calls"].as_array().is_some_and(|t| !t.is_empty()))
+        .map_or(0, |i| messages.len() - i)
+}
+
+/// #285 escape hatch for the F1c trailing-group protection: when the fresh
+/// trailing group BY ITSELF exceeds the budget remaining after everything
+/// before it (head + summary + already-one-lined aged remnants), no amount
+/// of out-of-group reclaim can fit the window — compression honestly reports
+/// "still over budget" and the backend then truncates the dispatch silently
+/// (B6's wrong-answer shape, measured in #284's gauntlet). Reclaim WITHIN
+/// the group instead: keep the NEWEST result whole, one-line older members
+/// oldest-first via the prune pass-2 machinery (the one-liner names the tool
+/// and file, so the model can re-read), stopping as soon as the list fits.
+///
+/// If even the newest result alone exceeds the budget the list stays over —
+/// the dispatch proceeds truthfully over budget (the loop's N2 notice
+/// reports real numbers); clipping inside a single result is out of scope.
+/// Returns true when any member was rewritten.
+fn reclaim_within_trailing_group(assembled: &mut Vec<Value>, budget: usize) -> bool {
+    let group_len = trailing_tool_group_len(assembled);
+    if group_len == 0 {
+        return false;
+    }
+    let group_start = assembled.len() - group_len;
+    let outside = estimate_tokens(&assembled[..group_start]);
+    let group_tokens = estimate_tokens(&assembled[group_start..]);
+    if group_tokens <= budget.saturating_sub(outside) {
+        // The group fits in its share of the budget — the overage is not
+        // the group's, so the F1c protection holds unconditionally.
+        return false;
+    }
+    // Every group result EXCEPT the newest is a candidate, oldest first.
+    let result_idxs: Vec<usize> = (group_start..assembled.len())
+        .filter(|&i| assembled[i]["role"].as_str() == Some("tool"))
+        .collect();
+    let mut changed = false;
+    for &i in result_idxs.iter().take(result_idxs.len().saturating_sub(1)) {
+        // `keep_last` shields everything after index `i`, so exactly the
+        // members up to and including `i` are exposed to the one-liner pass;
+        // earlier iterations' rewrites are idempotent under re-pruning.
+        let pass = prune(
+            assembled,
+            &PruneConfig {
+                keep_last: assembled.len() - i - 1,
+                ..PruneConfig::default()
+            },
+        );
+        if pass.chars_reclaimed > 0 {
+            *assembled = pass.messages;
+            changed = true;
+        }
+        if estimate_tokens(assembled) <= budget {
+            break;
+        }
+    }
+    changed
 }
 
 // ---------------------------------------------------------------------------
@@ -1303,11 +1398,14 @@ mod tests {
         );
     }
 
-    /// F1c: the trailing tool group — the fresh results the model has not
-    /// seen yet — is NEVER pruned, even when protecting it means the
-    /// assembled list ships over budget. (The old `keep_last: 0` fit pass
-    /// one-lined the freshest results pre-dispatch from the second
-    /// compression of a session on — the model could never read anything.)
+    /// F1c: under SOFT (count-only / `/compress`) pressure the trailing tool
+    /// group — the fresh results the model has not seen yet — is NEVER
+    /// pruned, even when protecting it means the assembled list misses the
+    /// aim-to-halve target. (The old `keep_last: 0` fit pass one-lined the
+    /// freshest results pre-dispatch from the second compression of a
+    /// session on — the model could never read anything.) The HARD-budget
+    /// variant of this exact shape is #285's within-group reclaim, pinned by
+    /// `oversized_group_reclaims_within_keeping_newest_whole` below.
     #[tokio::test]
     async fn fresh_trailing_tool_group_survives_the_aggressive_pass() {
         let task = "ACTIVE TASK GAUNTLET-7f3d9c: summarize the three files";
@@ -1322,10 +1420,10 @@ mod tests {
             msgs.push(tool_result(&big));
         }
         let mut state = CompressState::new();
-        let out = run(&msgs, 3_000, None, None, &mut state).await;
+        let out = run_count_only(&msgs, 3_000, None, None, &mut state).await;
         // All three fresh results reach the model byte-identical; the
-        // over-budget dispatch is the accepted trade (recoverable via the
-        // cw-400 / overflow paths, and flagged by the N2 notice suffix).
+        // over-target result is the accepted trade for a soft budget (a
+        // missed aim-to-halve is not a correctness problem).
         let results: Vec<&str> = out
             .messages
             .iter()
@@ -1340,6 +1438,333 @@ mod tests {
             out.tokens_after > 3_000,
             "this shape is genuinely incompressible without destroying fresh results"
         );
+    }
+
+    // -- trailing-group protection (#270 / #285) -------------------------------
+
+    /// #270's root cause, pinned at the derivation: the protected suffix is
+    /// anchored on the last assistant-with-`tool_calls`, so an interleaved
+    /// user message (the read-only nudge) or a trailing compaction notice
+    /// can never truncate it. The old `take_while(role == "tool")` from the
+    /// end read 0 in both interleaved shapes.
+    #[test]
+    fn trailing_group_derivation_survives_interleaved_messages() {
+        let mut msgs = vec![sys("you are newt"), user("task")];
+        msgs.push(json!({"role": "assistant", "content": "", "tool_calls": [
+            {"function": {"name": "read_file", "arguments": {"path": "a.rs"}}},
+            {"function": {"name": "read_file", "arguments": {"path": "b.rs"}}},
+        ]}));
+        msgs.push(tool_result("result a"));
+        msgs.push(tool_result("result b"));
+        // Normal case: assistant turn + its two results.
+        assert_eq!(trailing_tool_group_len(&msgs), 3);
+        // The #270 repro: the read-only nudge lands AFTER the fresh results,
+        // immediately before the compression call site.
+        msgs.push(user(
+            "[3 consecutive read-only rounds with no file writes.]",
+        ));
+        assert_eq!(trailing_tool_group_len(&msgs), 4);
+        // A trailing compaction notice doesn't truncate the group either.
+        msgs.push(summary_message("reference summary"));
+        assert_eq!(trailing_tool_group_len(&msgs), 5);
+        // A plain assistant reply (no tool_calls) does not re-anchor.
+        msgs.push(json!({"role": "assistant", "content": "thinking…"}));
+        assert_eq!(trailing_tool_group_len(&msgs), 6);
+        // No assistant ever called a tool → no group.
+        assert_eq!(trailing_tool_group_len(&[sys("s"), user("t")]), 0);
+        // The loop appends the backend's `message` verbatim and some
+        // dialects omit `role` on it — `tool_calls` alone anchors the group.
+        let roleless = vec![
+            user("task"),
+            json!({"content": "", "tool_calls": [
+                {"function": {"name": "read_file", "arguments": {"path": "a"}}}]}),
+            tool_result("result a"),
+        ];
+        assert_eq!(trailing_tool_group_len(&roleless), 2);
+    }
+
+    /// The #270 repro through the whole pipeline: an over-budget session
+    /// whose fresh trailing group (two unseen results) is followed by the
+    /// read-only nudge's user message. Pre-fix the aggressive pass saw zero
+    /// trailing tools, floored `keep_last` at 2 ([UNSEEN2, nudge]), and
+    /// one-lined UNSEEN1 pre-dispatch — the probe measured 7,213 → 2,207
+    /// tokens with UNSEEN1 (8 KB) destroyed. Post-fix the whole group
+    /// survives byte-identical.
+    #[tokio::test]
+    async fn nudge_after_fresh_group_does_not_defeat_the_protection() {
+        let task = "ACTIVE TASK GAUNTLET-7f3d9c: read both files then report";
+        let unseen1 = format!("1:{}", "u".repeat(8_000));
+        let unseen2 = format!("2:{}", "v".repeat(8_000));
+        let mut msgs = vec![sys("you are newt"), user(task)];
+        // Aged mass for the earlier passes to reclaim.
+        for i in 0..6 {
+            msgs.push(assistant_call(
+                "read_file",
+                json!({"path": format!("aged_{i}.rs")}),
+            ));
+            msgs.push(tool_result(&format!("{i}:{}", "a".repeat(8_000))));
+        }
+        // The fresh group: one assistant turn, two unseen results…
+        msgs.push(json!({"role": "assistant", "content": "", "tool_calls": [
+            {"function": {"name": "read_file", "arguments": {"path": "unseen1.rs"}}},
+            {"function": {"name": "read_file", "arguments": {"path": "unseen2.rs"}}},
+        ]}));
+        msgs.push(tool_result(&unseen1));
+        msgs.push(tool_result(&unseen2));
+        // …then the read-only nudge, exactly where the loop injects it.
+        msgs.push(user(
+            "[3 consecutive read-only rounds with no file writes. \
+             Stop exploring. Call edit_file or write_file now.]",
+        ));
+        let mut state = CompressState::new();
+        // Soft (count-only) pressure: the F1c protection is absolute here —
+        // the assembled list stays over the aim-to-halve target rather than
+        // destroy an unseen result.
+        let out = run_count_only(&msgs, 2_000, None, None, &mut state).await;
+        assert!(out.fired);
+        let tool_contents: Vec<&str> = out
+            .messages
+            .iter()
+            .filter(|m| m["role"].as_str() == Some("tool"))
+            .map(|m| m["content"].as_str().unwrap())
+            .collect();
+        assert!(
+            tool_contents.contains(&unseen1.as_str()),
+            "#270: UNSEEN1 must survive the nudge-truncated derivation \
+             (got tool contents {:?})",
+            tool_contents
+                .iter()
+                .map(|c| c.chars().take(40).collect::<String>())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            tool_contents.contains(&unseen2.as_str()),
+            "UNSEEN2 must survive too"
+        );
+        // The nudge itself still reaches the model (nothing silently drops).
+        assert!(out.messages.iter().any(|m| m["content"]
+            .as_str()
+            .is_some_and(|c| c.contains("read-only rounds"))));
+        println!(
+            "#270 repro trace: {} -> {} est. tokens (target {}), group intact",
+            out.tokens_before, out.tokens_after, 2_000
+        );
+    }
+
+    /// Same shape with a trailing compaction notice instead of the nudge —
+    /// the other interleaved-message family `is_compaction_message` covers.
+    #[tokio::test]
+    async fn compaction_notice_after_fresh_group_does_not_defeat_the_protection() {
+        let task = "ACTIVE TASK GAUNTLET-7f3d9c: read both files then report";
+        let unseen1 = format!("1:{}", "u".repeat(8_000));
+        let unseen2 = format!("2:{}", "v".repeat(8_000));
+        let mut msgs = vec![sys("you are newt"), user(task)];
+        for i in 0..6 {
+            msgs.push(assistant_call(
+                "read_file",
+                json!({"path": format!("aged_{i}.rs")}),
+            ));
+            msgs.push(tool_result(&format!("{i}:{}", "a".repeat(8_000))));
+        }
+        msgs.push(json!({"role": "assistant", "content": "", "tool_calls": [
+            {"function": {"name": "read_file", "arguments": {"path": "unseen1.rs"}}},
+            {"function": {"name": "read_file", "arguments": {"path": "unseen2.rs"}}},
+        ]}));
+        msgs.push(tool_result(&unseen1));
+        msgs.push(tool_result(&unseen2));
+        msgs.push(summary_message("## Active Task\nreference summary"));
+        let mut state = CompressState::new();
+        let out = run_count_only(&msgs, 2_000, None, None, &mut state).await;
+        let tool_contents: Vec<&str> = out
+            .messages
+            .iter()
+            .filter(|m| m["role"].as_str() == Some("tool"))
+            .map(|m| m["content"].as_str().unwrap())
+            .collect();
+        assert!(tool_contents.contains(&unseen1.as_str()), "UNSEEN1 intact");
+        assert!(tool_contents.contains(&unseen2.as_str()), "UNSEEN2 intact");
+    }
+
+    /// #285 mechanism, pinned at the helper: within-group reclaim fires ONLY
+    /// when the group by itself exceeds the budget left after everything
+    /// before it; one-lines oldest-first; stops as soon as the list fits;
+    /// the newest member is never a candidate.
+    #[test]
+    fn within_group_reclaim_fires_only_when_group_alone_exceeds() {
+        let big = "z".repeat(20_000); // ~5k tokens
+        let small = "s".repeat(1_200); // ~300 tokens
+        let group = |contents: &[&str]| -> Vec<Value> {
+            let mut msgs = vec![sys("you are newt"), user("task")];
+            msgs.push(json!({"role": "assistant", "content": "", "tool_calls":
+                contents.iter().enumerate().map(|(i, _)| json!(
+                    {"function": {"name": "read_file",
+                                  "arguments": {"path": format!("f{i}.txt")}}}
+                )).collect::<Vec<_>>()
+            }));
+            msgs.extend(contents.iter().map(|c| tool_result(c)));
+            msgs
+        };
+
+        // Under-budget group: untouched, returns false (the F1c property).
+        let mut fits = group(&[&small, &small, &small]);
+        let before = fits.clone();
+        assert!(!reclaim_within_trailing_group(&mut fits, 10_000));
+        assert_eq!(fits, before, "a group within its share is never touched");
+
+        // No group at all: no-op.
+        let mut no_group = vec![sys("s"), user(&big)];
+        assert!(!reclaim_within_trailing_group(&mut no_group, 100));
+
+        // Single-member group over budget: the newest IS the only member —
+        // untouched, truthful over-budget residual (clipping inside one
+        // result is out of scope).
+        let mut single = group(&[&big]);
+        let before = single.clone();
+        assert!(!reclaim_within_trailing_group(&mut single, 1_000));
+        assert_eq!(single, before);
+
+        // Oversized group, early stop: one-lining the OLDEST member alone
+        // fits the budget — the middle and newest members stay whole.
+        let mut early = group(&[&big, &small, &small]);
+        assert!(reclaim_within_trailing_group(&mut early, 1_500));
+        let results: Vec<&str> = early
+            .iter()
+            .filter(|m| m["role"].as_str() == Some("tool"))
+            .map(|m| m["content"].as_str().unwrap())
+            .collect();
+        assert!(
+            results[0].starts_with("[read_file] read 'f0.txt'"),
+            "oldest one-lined with the re-read affordance: {}",
+            results[0]
+        );
+        assert_eq!(results[1], small, "middle untouched after early stop");
+        assert_eq!(results[2], small, "newest untouched");
+        assert!(estimate_tokens(&early) <= 1_500, "the list now fits");
+
+        // Newest alone exceeds the budget: all older members one-lined, the
+        // newest still whole, the list honestly stays over.
+        let mut residual = group(&[&small, &small, &big]);
+        assert!(reclaim_within_trailing_group(&mut residual, 1_000));
+        let results: Vec<&str> = residual
+            .iter()
+            .filter(|m| m["role"].as_str() == Some("tool"))
+            .map(|m| m["content"].as_str().unwrap())
+            .collect();
+        assert!(results[0].starts_with("[read_file] read 'f0.txt'"));
+        assert!(results[1].starts_with("[read_file] read 'f1.txt'"));
+        assert_eq!(results[2], big, "the newest member is never a candidate");
+        assert!(
+            estimate_tokens(&residual) > 1_000,
+            "single-result-too-big: truthfully still over budget"
+        );
+    }
+
+    /// #285 through the whole pipeline (the B6 residual measured in #284's
+    /// gauntlet): ONE round's tool group alone exceeds a HARD budget. The
+    /// F1c protection yields within the group: a.txt / b.txt one-lined
+    /// (each naming its file for re-read), c.txt — the newest — byte-
+    /// identical. Here even c.txt alone exceeds the budget, so the outcome
+    /// honestly stays over (the loop's notice reports real numbers) rather
+    /// than clipping inside the result.
+    #[tokio::test]
+    async fn oversized_group_reclaims_within_keeping_newest_whole() {
+        let task = "ACTIVE TASK GAUNTLET-7f3d9c: summarize the three files";
+        let big = "z".repeat(50_000); // ~12.5k tokens each
+        let mut msgs = vec![sys("you are newt"), user(task)];
+        msgs.push(json!({"role": "assistant", "content": "", "tool_calls": [
+            {"function": {"name": "read_file", "arguments": {"path": "a.txt"}}},
+            {"function": {"name": "read_file", "arguments": {"path": "b.txt"}}},
+            {"function": {"name": "read_file", "arguments": {"path": "c.txt"}}},
+        ]}));
+        for _ in 0..3 {
+            msgs.push(tool_result(&big));
+        }
+        let mut state = CompressState::new();
+        let out = run(&msgs, 3_000, None, None, &mut state).await;
+        assert!(out.fired);
+        let results: Vec<&str> = out
+            .messages
+            .iter()
+            .filter(|m| m["role"].as_str() == Some("tool"))
+            .map(|m| m["content"].as_str().unwrap())
+            .collect();
+        assert_eq!(results.len(), 3, "pairing intact — nothing dropped");
+        assert!(
+            results[0].starts_with("[read_file] read 'a.txt'"),
+            "oldest one-lined, file named for re-read: {}",
+            results[0]
+        );
+        assert!(
+            results[1].starts_with("[read_file] read 'b.txt'"),
+            "older one-lined in order: {}",
+            results[1]
+        );
+        assert_eq!(results[2], big, "newest result reaches the model whole");
+        // The task survives verbatim (the property B6 measured the loss of).
+        assert!(out
+            .messages
+            .iter()
+            .any(|m| m["content"].as_str() == Some(task)));
+        // Honesty: the newest alone is ~12.5k tokens against a 3k budget —
+        // the outcome reports genuinely over, never a silent fit claim.
+        assert!(out.tokens_after > 3_000);
+        assert!(
+            out.tokens_after < out.tokens_before / 2,
+            "but the reclaim was real: {} -> {}",
+            out.tokens_before,
+            out.tokens_after
+        );
+        println!(
+            "#285 scenario trace: {} -> {} est. tokens (budget 3000), \
+             a/b one-lined, c whole",
+            out.tokens_before, out.tokens_after
+        );
+    }
+
+    /// #285 boundary: when the group fits a HARD budget once everything
+    /// outside it is reclaimed, within-group reclaim must NOT fire — the
+    /// dispatch lands under budget with every fresh result intact.
+    #[tokio::test]
+    async fn under_budget_group_is_untouched_under_hard_pressure() {
+        let task = "ACTIVE TASK GAUNTLET-7f3d9c: read both files then report";
+        let unseen1 = format!("1:{}", "u".repeat(8_000)); // ~2k tokens
+        let unseen2 = format!("2:{}", "v".repeat(8_000));
+        let mut msgs = vec![sys("you are newt"), user(task)];
+        for i in 0..6 {
+            msgs.push(assistant_call(
+                "read_file",
+                json!({"path": format!("aged_{i}.rs")}),
+            ));
+            msgs.push(tool_result(&format!("{i}:{}", "a".repeat(8_000))));
+        }
+        msgs.push(json!({"role": "assistant", "content": "", "tool_calls": [
+            {"function": {"name": "read_file", "arguments": {"path": "unseen1.rs"}}},
+            {"function": {"name": "read_file", "arguments": {"path": "unseen2.rs"}}},
+        ]}));
+        msgs.push(tool_result(&unseen1));
+        msgs.push(tool_result(&unseen2));
+        msgs.push(user(
+            "[3 consecutive read-only rounds with no file writes.]",
+        ));
+        let mut state = CompressState::new();
+        // 6,000-token hard budget: the ~4.2k-token group fits once the aged
+        // middle is summarized away.
+        let out = run(&msgs, 6_000, None, None, &mut state).await;
+        assert!(out.fired);
+        assert!(
+            out.tokens_after <= 6_000,
+            "must land under the hard budget ({} -> {})",
+            out.tokens_before,
+            out.tokens_after
+        );
+        let tool_contents: Vec<&str> = out
+            .messages
+            .iter()
+            .filter(|m| m["role"].as_str() == Some("tool"))
+            .map(|m| m["content"].as_str().unwrap())
+            .collect();
+        assert!(tool_contents.contains(&unseen1.as_str()), "UNSEEN1 whole");
+        assert!(tool_contents.contains(&unseen2.as_str()), "UNSEEN2 whole");
     }
 
     /// The count trigger (`max_messages`) forces the summary stage even when
