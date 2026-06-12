@@ -27,11 +27,12 @@ belong in the **gilamonster-agent** and **monitor-agent** repos, not here.
 The Foundation agent designs form a spectrum, and newt sits deliberately in
 the middle of it:
 
-| Tier | Agent | Surface |
-|------|-------|---------|
-| Flight (headless swarm) | **wyvern-agent** | None. A very stripped-down version of this same agent design, built for "flight": no TUI creature comforts at all, very light, fully headless. |
-| Amphibious (human + headless) | **newt-agent** | Plain scroller. One code path that works identically for a human over SSH/tmux *and* piped/headless in swarm contexts. |
-| Human-facing rich UI | **gilamonster-agent**, monitor agents | Advanced TUI: panes, live status, dashboards, the feature matrix. |
+| Tier | Agent | Surface | Authority (ocap) |
+|------|-------|---------|------------------|
+| Flight (headless swarm) | **wyvern-agent** | None. A very stripped-down version of this same agent design, built for "flight": no TUI creature comforts at all, very light, fully headless. Communicates **only via agent-mesh**. | **Locked into the embedded brush.** No escape hatch, no mechanism to ask for privileges — there is no human on the other end to ask. |
+| Amphibious (human + headless) | **newt-agent** | Plain scroller. One code path that works identically for a human over SSH/tmux *and* piped/headless in swarm contexts. | ocap by default, with a deliberate escape hatch (`--disable-ocap` / `--yolo`, #297) **for usability testing** — a human-in-the-loop affordance only. |
+| Swarm control | **drake-agent** | The interface point for wyvern-agent meshes: like newt-agent, but built specifically for controlling agentic swarms of wyvern-agents organized into flights. | Human-side control plane (its own decision doc when built). |
+| Human-facing rich UI | **gilamonster-agent**, monitor agents | Advanced TUI: panes, live status, dashboards, the feature matrix. | n/a here. |
 
 newt is built amphibious **on purpose**: it is the hands-on testing ground
 for the same agent design that flies in wyvern. A human can sit in the loop,
@@ -41,6 +42,15 @@ headless behavior. Every TUI creature comfort newt grows is something wyvern
 has to strip back out, and something that makes "what the human tested" and
 "what the swarm runs" diverge. Keeping the scroller plain keeps the
 amphibian honest.
+
+The authority column follows the same amphibious logic as the surface
+column. newt may escape ocap *because* it is the usability-testing ground —
+the hatch exists for a human at the keyboard, never for unattended runs.
+wyvern flies headless in a swarm, speaks only agent-mesh, and therefore has
+no hatch and no privilege-request path at all: the embedded brush is the
+whole world. The pairing is the point — the agent design gets its hands-on
+testing in newt with the hatch available, and flies in wyvern with the
+hatch welded shut.
 
 The practical wins compound with the architectural one:
 
