@@ -100,9 +100,22 @@ impl InferenceBackend for MockBackend {
 /// without a real provider implementation.
 ///
 /// Returns the path to the created executable.
+///
+/// # Write-then-exec safety (issue #288)
+///
+/// The script is about to be `exec`'d by the calling test. The write
+/// handle is explicitly `sync_all`'d and dropped before this function
+/// returns, so *our* fd can never be the one holding the executable
+/// open across a concurrent `fork`/`exec` (the classic `ETXTBSY`
+/// race). This closes only half the window — another test thread's
+/// `fork` can still inherit a transiently-open fd — so the spawn side
+/// (`plugins_protocol::PluginClient::spawn_command`) pairs this with a
+/// bounded `ETXTBSY`-only retry.
 pub fn mock_plugin_binary(dir: &Path, replies: &[&str]) -> PathBuf {
     #[cfg(unix)]
     {
+        use std::io::Write;
+
         let script_path = dir.join("mock-plugin");
         let body: String = replies
             .iter()
@@ -116,7 +129,14 @@ pub fn mock_plugin_binary(dir: &Path, replies: &[&str]) -> PathBuf {
             .join("\n");
 
         let script = format!("#!/usr/bin/env bash\n{body}\n");
-        fs::write(&script_path, script).expect("failed to write mock plugin script");
+        // Explicit create/write/sync/drop instead of `fs::write` so the
+        // write fd is provably closed (and the bytes durable) before any
+        // caller spawns the script — see the doc comment above.
+        let mut file = fs::File::create(&script_path).expect("failed to create mock plugin script");
+        file.write_all(script.as_bytes())
+            .expect("failed to write mock plugin script");
+        file.sync_all().expect("failed to sync mock plugin script");
+        drop(file);
         // Already inside the `#[cfg(unix)]` block — no inner attribute needed.
         fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755))
             .expect("failed to chmod mock plugin");

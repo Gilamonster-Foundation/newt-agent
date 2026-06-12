@@ -29,6 +29,8 @@ use async_trait::async_trait;
 use newt_inference::backend::{ChatReply, ChatRequest, InferenceBackend};
 use newt_mesh::NewtMeshService;
 
+mod util;
+
 /// The wire topic — spelled out by hand on purpose. If
 /// `newt_mesh::INFERENCE_TOPIC` ever drifts from this string, the
 /// responder will never see these requests and the tests time out:
@@ -98,6 +100,11 @@ async fn bind_echo_responder(user: &UserKey) -> (NewtMeshService, Fingerprint) {
 
 /// Send one hand-built `InferenceRequest` JSON over a raw bus and
 /// parse the reply JSON by hand.
+///
+/// mDNS first contact uses poll-with-deadline (#274): only the
+/// "peer not announced within …" resolve failure is retried, so the
+/// wire-contract regressions this file pins (renamed fields, drifted
+/// topic ⇒ handler timeout) still fail loudly on the first attempt.
 async fn raw_ask(bus: &Bus, responder_fp: Fingerprint, prompt: &str) -> serde_json::Value {
     let topic = Topic::new(bus.user_fingerprint(), WIRE_TOPIC);
     let body = serde_json::json!({
@@ -106,15 +113,20 @@ async fn raw_ask(bus: &Bus, responder_fp: Fingerprint, prompt: &str) -> serde_js
         "model": null,
         "max_tokens": 64,
     });
-    let reply_bytes = bus
-        .request(
-            responder_fp,
-            &topic,
-            serde_json::to_vec(&body).unwrap(),
-            Duration::from_secs(10),
-        )
-        .await
-        .expect("bus request");
+    let payload = serde_json::to_vec(&body).unwrap();
+    let reply_bytes = util::with_announce_grace(
+        || {
+            bus.request(
+                responder_fp,
+                &topic,
+                payload.clone(),
+                Duration::from_secs(10),
+            )
+        },
+        util::bus_unannounced,
+    )
+    .await
+    .expect("bus request");
     serde_json::from_slice(&reply_bytes).expect("reply must be JSON")
 }
 
@@ -127,9 +139,8 @@ async fn raw_bus_client_round_trips_the_wire_contract() {
     let client = Bus::bind(&user, agent(&user, "raw-client"), 0)
         .await
         .expect("bind client");
-    // Give mDNS a moment so the client can resolve the responder.
-    tokio::time::sleep(Duration::from_millis(750)).await;
-
+    // No fixed mDNS-settle sleep: `raw_ask` polls with a deadline on
+    // first contact (#274).
     let reply = raw_ask(&client, responder_fp, "hello mesh").await;
 
     // Pin the reply shape field-by-field.
@@ -154,7 +165,6 @@ async fn raw_bus_client_holds_a_threaded_conversation() {
     let client = Bus::bind(&user, agent(&user, "conversing-client"), 0)
         .await
         .expect("bind client");
-    tokio::time::sleep(Duration::from_millis(750)).await;
 
     // The responder is stateless: the client threads the transcript.
     let mut transcript = String::new();
@@ -198,7 +208,6 @@ async fn quiet_client_gets_replies_via_dial_back() {
     )
     .await
     .expect("bind quiet client");
-    tokio::time::sleep(Duration::from_millis(750)).await;
 
     let reply = raw_ask(&client, responder_fp, "quiet hello").await;
     assert_eq!(reply["content"], "turns=0 last=quiet hello");
