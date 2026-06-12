@@ -33,7 +33,7 @@ pub use permissions::{
     PermissionRequest,
 };
 pub use recall::{recall_tool_definition, RecallSource, StoreRecallSource};
-pub use tools::{execute_tool, tool_definitions, venv_cmd_prefix};
+pub use tools::{execute_tool, ocap_disabled, tool_definitions, venv_cmd_prefix};
 pub use trim::trim_for_summary;
 pub use warmup::warmup_if_cold;
 
