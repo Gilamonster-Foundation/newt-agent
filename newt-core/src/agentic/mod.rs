@@ -15,6 +15,7 @@ pub(crate) mod compress;
 mod display;
 mod mcp;
 mod note_sink;
+mod permissions;
 mod recall;
 mod tools;
 mod trim;
@@ -27,6 +28,10 @@ pub use compress::{
 pub use display::{print_newt, NEWT_ORANGE_CT};
 pub use mcp::{McpTools, NoMcp};
 pub use note_sink::{save_note_tool_definition, NoteNudge, NoteSink};
+pub use permissions::{
+    widen_caveats, DenialKind, PermissionDecision, PermissionGate, PermissionRecord,
+    PermissionRequest,
+};
 pub use recall::{recall_tool_definition, RecallSource, StoreRecallSource};
 pub use tools::{execute_tool, tool_definitions, venv_cmd_prefix};
 pub use trim::trim_for_summary;
@@ -283,6 +288,13 @@ pub struct ChatCtx<'a> {
     /// it into the turn's `events` column. `None` (eval / headless) ⇒
     /// nothing is recorded.
     pub tool_events: Option<&'a mut Vec<crate::ToolEvent>>,
+    /// Prompted ocap grants (issue #263): when present, a capability denial
+    /// inside `execute_tool` consults the human — allow once / session allow
+    /// / deny — instead of failing outright; the loop blocks like a long
+    /// tool call while the prompt is pending. `None` (the default — every
+    /// headless caller: ACP worker, `newt-eval`) keeps each denial exactly
+    /// as before, so nothing non-interactive can ever hang on a prompt.
+    pub permission_gate: Option<&'a mut dyn PermissionGate>,
 }
 
 /// Main agentic loop: call model → execute tool calls → feed results back → repeat.
@@ -333,6 +345,7 @@ pub async fn chat_complete(
         summarizer,
         compress_state,
         mut tool_events,
+        mut permission_gate,
     } = ctx;
     // Headless callers may pass no session state — compression still works,
     // with per-turn anti-thrash accounting.
@@ -886,6 +899,10 @@ pub async fn chat_complete(
                     .as_deref_mut()
                     .map(|s| &mut *s as &mut dyn NoteSink),
                 recall_source,
+                // #263 prompted grants — same reborrow pattern as note_sink.
+                permission_gate
+                    .as_deref_mut()
+                    .map(|g| &mut *g as &mut dyn PermissionGate),
             )
             .await;
             // 17.6: record the call for the turn's events column — args are
@@ -1219,6 +1236,7 @@ pub async fn openai_chat_complete(
         summarizer,
         compress_state,
         mut tool_events,
+        mut permission_gate,
     } = ctx;
     // Headless callers may pass no session state (mirrors the Ollama path).
     let mut local_compress_state = CompressState::new();
@@ -1514,6 +1532,10 @@ pub async fn openai_chat_complete(
                     .as_deref_mut()
                     .map(|s| &mut *s as &mut dyn NoteSink),
                 recall_source,
+                // #263 prompted grants — same reborrow pattern as note_sink.
+                permission_gate
+                    .as_deref_mut()
+                    .map(|g| &mut *g as &mut dyn PermissionGate),
             )
             .await;
             // 17.6: record the call for the turn's events column (mirrors
@@ -1803,6 +1825,7 @@ mod tool_round_cap_tests {
                 summarizer: None,
                 compress_state: None,
                 tool_events: None,
+                permission_gate: None,
             },
             &mut NoMcp,
         )
@@ -1864,6 +1887,7 @@ mod tool_round_cap_tests {
                 summarizer: None,
                 compress_state: None,
                 tool_events: None,
+                permission_gate: None,
             },
             &mut NoMcp,
         )
@@ -1943,6 +1967,7 @@ mod tool_round_cap_tests {
                 summarizer: None,
                 compress_state: None,
                 tool_events: Some(&mut events),
+                permission_gate: None,
             },
             &mut NoMcp,
         )
@@ -2034,6 +2059,7 @@ mod tool_round_cap_tests {
                 summarizer: None,
                 compress_state: None,
                 tool_events: Some(&mut events),
+                permission_gate: None,
             },
             &mut NoMcp,
         )
@@ -2117,6 +2143,7 @@ mod tool_round_cap_tests {
                 summarizer: None,
                 compress_state: None,
                 tool_events: None,
+                permission_gate: None,
             },
             &mut NoMcp,
         )
@@ -2151,6 +2178,7 @@ mod tool_round_cap_tests {
                 20,
                 &caveats,
                 &mut NoMcp,
+                None,
                 None,
                 None,
                 None,
@@ -2232,6 +2260,7 @@ mod tool_round_cap_tests {
                 summarizer: None,
                 compress_state: None,
                 tool_events: None,
+                permission_gate: None,
             },
             &mut NoMcp,
         )
@@ -2366,6 +2395,7 @@ mod tool_round_cap_tests {
                 summarizer: None,
                 compress_state: None,
                 tool_events: None,
+                permission_gate: None,
             },
             &mut NoMcp,
         )
@@ -2439,6 +2469,7 @@ mod http_loop_tests {
             summarizer: None,
             compress_state: None,
             tool_events: None,
+            permission_gate: None,
         }
     }
 
@@ -3090,6 +3121,7 @@ mod save_note_loop_tests {
             summarizer: None,
             compress_state: None,
             tool_events: None,
+            permission_gate: None,
         }
     }
 
@@ -3555,6 +3587,7 @@ mod compression_loop_tests {
             summarizer: None,
             compress_state: None,
             tool_events: None,
+            permission_gate: None,
         }
     }
 

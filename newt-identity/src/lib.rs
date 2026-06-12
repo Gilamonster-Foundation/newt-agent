@@ -256,6 +256,7 @@ mod tests {
             preset: p,
             extra_exec: Vec::new(),
             net: Vec::new(),
+            prompt: false,
         }
         .to_caveats("/ws")
     }

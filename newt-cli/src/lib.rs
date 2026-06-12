@@ -75,6 +75,15 @@ pub struct Cli {
     #[arg(long, global = true, default_value_t = false)]
     pub ephemeral: bool,
 
+    /// When a tool call is denied by the session's permission caveats, ask
+    /// interactively — allow once / allow for this session / deny — instead
+    /// of failing the call outright (issue #263). Decisions are recorded to
+    /// `~/.newt/permission-log.jsonl` for later review (`/permissions` lists
+    /// them). Equivalent to `[tui.permissions] prompt = true`. Interactive
+    /// TUI only: headless runs (worker / eval) always keep the plain denial.
+    #[arg(long, global = true, default_value_t = false)]
+    pub prompt_for_permissions: bool,
+
     /// Cap the Ollama context window (KV-cache) to this many tokens.
     /// Prevents VRAM exhaustion on large models by limiting how much memory
     /// Ollama allocates for the attention cache. Equivalent to setting
@@ -241,6 +250,11 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             // session start resolution reads NEWT_EPHEMERAL once.
             if cli.ephemeral {
                 unsafe { std::env::set_var("NEWT_EPHEMERAL", "1") };
+            }
+            // --prompt-for-permissions threads the same way (issue #263);
+            // only the interactive TUI reads it — worker/eval never prompt.
+            if cli.prompt_for_permissions {
+                unsafe { std::env::set_var("NEWT_PROMPT_FOR_PERMISSIONS", "1") };
             }
             // --no-agents-file / --agents-file thread to the TUI via env vars.
             if cli.no_agents_file {
@@ -475,6 +489,18 @@ mod tests {
         assert!(cli.ephemeral);
         let cli = Cli::try_parse_from(["newt"]).unwrap();
         assert!(!cli.ephemeral);
+    }
+
+    #[test]
+    fn parses_prompt_for_permissions_global() {
+        // #263: works bare (default `code` command) and explicit; OFF by
+        // default — no flag means denial behavior is unchanged.
+        let cli = Cli::try_parse_from(["newt", "--prompt-for-permissions"]).unwrap();
+        assert!(cli.prompt_for_permissions);
+        let cli = Cli::try_parse_from(["newt", "code", "--prompt-for-permissions"]).unwrap();
+        assert!(cli.prompt_for_permissions);
+        let cli = Cli::try_parse_from(["newt"]).unwrap();
+        assert!(!cli.prompt_for_permissions);
     }
 
     #[test]
