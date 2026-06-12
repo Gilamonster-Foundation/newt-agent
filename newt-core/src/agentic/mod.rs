@@ -13,11 +13,18 @@
 // delegates to this same pipeline instead of keeping a duplicate one.
 pub(crate) mod compress;
 mod display;
+// Issue #308 — the cowork foundation: a non-blocking turn driver around
+// `chat_complete` (driver), a renderer-agnostic transcript render (transcript),
+// and the redaction-gated ShellObservation seam (observation). All additive;
+// they wrap/precede `chat_complete` and never touch its internals.
+mod driver;
 mod mcp;
 mod note_sink;
+mod observation;
 mod permissions;
 mod recall;
 mod tools;
+mod transcript;
 mod trim;
 mod warmup;
 
@@ -26,14 +33,22 @@ pub use compress::{
     SummarizeFuture, Summarizer, SUMMARY_END_MARKER, SUMMARY_PREFIX,
 };
 pub use display::{print_newt, NEWT_ORANGE_CT};
+pub use driver::{
+    TurnDriver, TurnDriverConfig, TurnDriverError, TurnOutcome, TurnStatus,
+    VISIBLE_TRANSCRIPT_ROLES,
+};
 pub use mcp::{McpTools, NoMcp};
 pub use note_sink::{save_note_tool_definition, NoteNudge, NoteSink};
+pub use observation::{ShellObservation, SHELL_OBSERVATION_PREFIX};
 pub use permissions::{
     widen_caveats, DenialKind, PermissionDecision, PermissionGate, PermissionRecord,
     PermissionRequest,
 };
 pub use recall::{recall_tool_definition, RecallSource, StoreRecallSource};
 pub use tools::{execute_tool, ocap_disabled, tool_definitions, venv_cmd_prefix};
+pub use transcript::{
+    transcript_lines, transcript_lines_styled, TranscriptLine, TranscriptRole, TranscriptStyle,
+};
 pub use trim::trim_for_summary;
 pub use warmup::warmup_if_cold;
 

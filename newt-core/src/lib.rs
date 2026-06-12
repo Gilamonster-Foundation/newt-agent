@@ -41,10 +41,13 @@ pub use agent_mesh_protocol::{Caveats, CountBound, Scope};
 // Issue #263: the prompted-ocap-grant seam (PermissionGate + friends) joins
 // the surface — the TUI implements the gate; headless callers pass None.
 pub use agentic::{
-    chat_complete, compress_user_initiated, execute_tool, openai_chat_complete, trim_for_summary,
-    widen_caveats, ChatCtx, CompressCounters, CompressState, DenialKind, ManualCompressOutcome,
-    McpTools, NoMcp, NoteNudge, NoteSink, PermissionDecision, PermissionGate, PermissionRecord,
-    PermissionRequest, RecallSource, StoreRecallSource, SummarizeFn, SummarizeFuture, Summarizer,
+    chat_complete, compress_user_initiated, execute_tool, openai_chat_complete, transcript_lines,
+    transcript_lines_styled, trim_for_summary, widen_caveats, ChatCtx, CompressCounters,
+    CompressState, DenialKind, ManualCompressOutcome, McpTools, NoMcp, NoteNudge, NoteSink,
+    PermissionDecision, PermissionGate, PermissionRecord, PermissionRequest, RecallSource,
+    ShellObservation, StoreRecallSource, SummarizeFn, SummarizeFuture, Summarizer, TranscriptLine,
+    TranscriptRole, TranscriptStyle, TurnDriver, TurnDriverConfig, TurnDriverError, TurnOutcome,
+    TurnStatus,
 };
 pub use agents::AgentsProvider;
 pub use caveats::{CaveatsExt, CountBoundExt, ScopeExt};
