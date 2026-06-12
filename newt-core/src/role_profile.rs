@@ -220,6 +220,145 @@ impl CaveatProfile {
     }
 }
 
+/// A **named permission preset** (issue #307): a config-declared authority
+/// *clamp* that maps onto the same [`CaveatProfile`] / [`Caveats`] lattice a
+/// role profile uses. It is deliberately a thin, human-friendly surface over
+/// [`CaveatProfile`] — the existing caveat-profile mechanism — rather than a
+/// parallel type, so the same `to_scope` / `to_caveats` lowering is reused.
+///
+/// ## Config shape (`[permission_presets.<name>]`)
+///
+/// ```toml
+/// [permission_presets.readonly-triage]
+/// readonly   = true            # read anything; deny all writes
+/// exec_allow = ["git", "gh"]   # a small exec allowlist
+/// deny       = ["*"]           # everything else (net) denied
+/// max_calls  = 40              # optional tool-call ceiling
+/// ```
+///
+/// ## Semantics — a clamp, never a grant
+///
+/// The clamp is consumed via [`NamedPermissionPreset::clamp`], which lowers to a
+/// [`Caveats`] **ceiling**. The session's effective authority is the
+/// *intersection* (`meet`) of the session's base caveats and this ceiling — a
+/// preset can only ever **attenuate**, never widen. This is the load-bearing
+/// property: the ceiling wins over `--disable-ocap` / `--yolo` and over
+/// interactive session-grants, because it is `meet`-ed into the authority the
+/// enforcement site consults (and re-`meet`-ed over any re-minted grant).
+///
+/// Each field maps onto a [`CaveatProfile`] axis:
+/// - `readonly = true` ⇒ `fs_write = none`, `exec = none` (the floor a triage
+///   mode wants). `false`/omitted leaves those axes unconstrained (`all`).
+/// - `exec_allow = [..]` ⇒ `exec = Only({..})`. Overrides `readonly`'s
+///   exec clamp with the explicit allowlist (so a triage mode can permit a few
+///   read-only commands).
+/// - `deny = ["*"]` ⇒ clamp `net` to `none` (the remaining "everything else"
+///   axis once fs/exec are pinned). A non-`*` `deny` list is recorded but does
+///   not subtract from an allowlist here — the lattice is allow-list shaped, so
+///   "deny everything else" is the expressible clamp.
+/// - `max_calls` ⇒ the [`CountBound`] ceiling, as on a role profile.
+///
+/// A preset with no fields set is the identity clamp (`Caveats::top()`), so an
+/// empty `[permission_presets.x]` block leaves authority unchanged.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct NamedPermissionPreset {
+    /// `true` ⇒ deny all writes and (unless `exec_allow` overrides) all exec.
+    #[serde(default)]
+    pub readonly: bool,
+    /// Explicit exec allowlist. Non-empty ⇒ `exec = Only({..})`, overriding the
+    /// `readonly` exec clamp. Empty + `readonly` ⇒ `exec = none`.
+    #[serde(default)]
+    pub exec_allow: Vec<String>,
+    /// "Deny everything else" marker. `["*"]` clamps the `net` axis to `none`
+    /// (writes/exec are pinned by `readonly`/`exec_allow`). Other entries are
+    /// accepted for forward-compat but the allow-list lattice expresses denial
+    /// as "not in the allowlist", so they do not subtract here.
+    #[serde(default)]
+    pub deny: Vec<String>,
+    /// Optional tool-call ceiling. `None` ⇒ no extra bound.
+    #[serde(default)]
+    pub max_calls: Option<u64>,
+}
+
+impl NamedPermissionPreset {
+    /// `true` when `deny` asks to deny everything else (`["*"]`).
+    fn denies_all(&self) -> bool {
+        self.deny.iter().any(|d| d == "*")
+    }
+
+    /// Lower this named preset into the equivalent [`CaveatProfile`] — reusing
+    /// the SAME serde-shaped caveat mechanism a role profile carries, rather
+    /// than a parallel lowering. Axes the preset does not constrain stay at the
+    /// top of their axis (`all`) so `clamp` is the identity on them.
+    #[must_use]
+    pub fn to_caveat_profile(&self) -> CaveatProfile {
+        // fs_write: readonly pins it to none; otherwise unconstrained.
+        let fs_write = if self.readonly {
+            ScopeSpec::Keyword(ScopeKeyword::None)
+        } else {
+            ScopeSpec::default()
+        };
+        // exec: an explicit allowlist wins; else readonly pins it to none; else
+        // unconstrained.
+        let exec = if !self.exec_allow.is_empty() {
+            ScopeSpec::Items(self.exec_allow.clone())
+        } else if self.readonly {
+            ScopeSpec::Keyword(ScopeKeyword::None)
+        } else {
+            ScopeSpec::default()
+        };
+        // net: `deny = ["*"]` clamps the remaining axis to none.
+        let net = if self.denies_all() {
+            ScopeSpec::Keyword(ScopeKeyword::None)
+        } else {
+            ScopeSpec::default()
+        };
+        CaveatProfile {
+            // fs_read is never clamped by a preset (a read-only triage mode
+            // still reads); it stays at the top of its axis.
+            fs_read: ScopeSpec::default(),
+            fs_write,
+            exec,
+            net,
+            max_calls: self.max_calls,
+        }
+    }
+
+    /// The authority **ceiling** this preset imposes, as a [`Caveats`]. The
+    /// session's effective authority is `base.meet(&preset.clamp())` — the
+    /// clamp can only attenuate, never widen. Reuses [`CaveatProfile::to_caveats`].
+    #[must_use]
+    pub fn clamp(&self) -> Caveats {
+        self.to_caveat_profile().to_caveats()
+    }
+
+    /// One-line human summary for `/permissions` and `/mode` reporting, e.g.
+    /// `readonly exec=[git, gh] deny=* max_calls=40`.
+    #[must_use]
+    pub fn summary(&self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        if self.readonly {
+            parts.push("readonly".to_string());
+        }
+        if !self.exec_allow.is_empty() {
+            parts.push(format!("exec=[{}]", self.exec_allow.join(", ")));
+        } else if self.readonly {
+            parts.push("exec=none".to_string());
+        }
+        if self.denies_all() {
+            parts.push("deny=*".to_string());
+        }
+        if let Some(n) = self.max_calls {
+            parts.push(format!("max_calls={n}"));
+        }
+        if parts.is_empty() {
+            "unconstrained".to_string()
+        } else {
+            parts.join(" ")
+        }
+    }
+}
+
 /// The fence marker for TOML front-matter (must be on its own line at the very
 /// top of the file).
 const FENCE: &str = "+++";
@@ -518,5 +657,103 @@ body
             summary.ends_with("max_calls=unlimited"),
             "omitted max_calls renders as unlimited, got: {summary}"
         );
+    }
+
+    // --- #307 named permission presets ----------------------------------
+
+    #[test]
+    fn empty_preset_is_identity_clamp() {
+        // An empty `[permission_presets.x]` block leaves authority unchanged:
+        // its clamp is `top()`, so `base.meet(clamp) == base`.
+        let p = NamedPermissionPreset::default();
+        assert_eq!(p.clamp(), Caveats::top());
+    }
+
+    #[test]
+    fn readonly_preset_denies_writes_and_exec() {
+        // `readonly = true` ⇒ fs_write=none, exec=none; fs_read/net untouched.
+        let p = NamedPermissionPreset {
+            readonly: true,
+            ..NamedPermissionPreset::default()
+        };
+        let c = p.clamp();
+        assert_eq!(c.fs_read, Scope::All, "read-only still reads everything");
+        assert_eq!(c.fs_write, Scope::none());
+        assert_eq!(c.exec, Scope::none());
+        assert_eq!(c.net, Scope::All, "net untouched without deny=*");
+    }
+
+    #[test]
+    fn exec_allow_overrides_readonly_exec_clamp() {
+        // A readonly triage mode may still permit a few read-only commands.
+        let p = NamedPermissionPreset {
+            readonly: true,
+            exec_allow: vec!["git".to_string(), "gh".to_string()],
+            ..NamedPermissionPreset::default()
+        };
+        let c = p.clamp();
+        assert_eq!(c.fs_write, Scope::none(), "readonly still pins writes");
+        assert_eq!(
+            c.exec,
+            Scope::only(["git".to_string(), "gh".to_string()]),
+            "explicit allowlist wins over readonly's exec=none"
+        );
+    }
+
+    #[test]
+    fn deny_star_clamps_net_to_none() {
+        let p = NamedPermissionPreset {
+            readonly: true,
+            exec_allow: vec!["git".to_string()],
+            deny: vec!["*".to_string()],
+            max_calls: Some(40),
+        };
+        let c = p.clamp();
+        assert_eq!(c.net, Scope::none(), "deny=* clamps the net axis");
+        assert_eq!(c.max_calls, CountBound::AtMost(40));
+    }
+
+    #[test]
+    fn preset_clamp_only_attenuates_a_full_base() {
+        // The load-bearing property: meeting a fully-authorized base with a
+        // readonly clamp yields exactly the clamp's restrictions — never wider.
+        let p = NamedPermissionPreset {
+            readonly: true,
+            exec_allow: vec!["git".to_string()],
+            deny: vec!["*".to_string()],
+            ..NamedPermissionPreset::default()
+        };
+        let clamp = p.clamp();
+        let effective = Caveats::top().meet(&clamp);
+        assert_eq!(effective, clamp, "meet(top, clamp) == clamp");
+        assert!(effective.leq(&Caveats::top()), "clamp ⊑ top (attenuation)");
+    }
+
+    #[test]
+    fn preset_parses_from_config_toml_shape() {
+        // The exact `[permission_presets.<name>]` shape from the issue.
+        let toml = "\
+readonly = true
+exec_allow = [\"git\", \"gh\"]
+deny = [\"*\"]
+max_calls = 40
+";
+        let p: NamedPermissionPreset = toml::from_str(toml).unwrap();
+        assert!(p.readonly);
+        assert_eq!(p.exec_allow, vec!["git".to_string(), "gh".to_string()]);
+        assert_eq!(p.deny, vec!["*".to_string()]);
+        assert_eq!(p.max_calls, Some(40));
+    }
+
+    #[test]
+    fn preset_summary_renders_each_clamp() {
+        let p = NamedPermissionPreset {
+            readonly: true,
+            exec_allow: vec!["git".to_string(), "gh".to_string()],
+            deny: vec!["*".to_string()],
+            max_calls: Some(40),
+        };
+        assert_eq!(p.summary(), "readonly exec=[git, gh] deny=* max_calls=40");
+        assert_eq!(NamedPermissionPreset::default().summary(), "unconstrained");
     }
 }
