@@ -1022,6 +1022,28 @@ Benchmarks with a captured baseline gate every phase:
 
 ---
 
+# Phase 21 — Centaur Data Scientist
+
+**Canonical design: [`docs/design/centaur-data-scientist.md`](design/centaur-data-scientist.md).**
+A *Centaur* helper (human-on-top data science: pandas/numpy/EDA), delivered as
+an MCP peer so newt stays lean and gilamonster/hermes inherit it unchanged —
+engine (`newt-data`) + thin MCP adapter (`newt-mcp-data`) + optional in-notebook
+PyO3 submodule. This entry is deliberately thin; the design doc owns the tool
+tables. Steps:
+
+- **21.1** `newt-data` skeleton + `DataStore` trait + SQLite ingest/query/summarize. *(in progress)*
+- **21.2** `newt-mcp-data` stdio server with the SQL tools (first shippable Centaur slice).
+- **21.3** `KernelClient` trait + REST/websocket client + `kernel_attach` / `run_cell`.
+- **21.4** notebook read / insert / persist-executed-cell + `run_cell(persist_to=…)`.
+- **21.5** dataframe introspection (`list_dataframes`, `inspect_dataframe`).
+- **21.6** PyO3 `newt_data` submodule + umbrella/release wiring.
+- **21.7** interrupt / restart + reconnect hardening.
+- **21.8** DuckDB backend behind `DataStore`.
+- **21.9** optional raw-ZMQ kernel client.
+- **21.10** `docs/decisions/centaur_data_scientist.md` + README config snippet.
+
+---
+
 # Cross-cutting notes
 
 - **drake-foreman dispatch:** each step's branch is the unit of work. The
