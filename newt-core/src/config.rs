@@ -1231,7 +1231,7 @@ impl Config {
 // ---------------------------------------------------------------------------
 
 /// Best-effort home directory lookup without pulling in the `dirs` crate.
-fn home_dir() -> Option<PathBuf> {
+pub(crate) fn home_dir() -> Option<PathBuf> {
     std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
         .ok()
@@ -1244,7 +1244,7 @@ fn home_dir() -> Option<PathBuf> {
 /// concatenates (base entries first). Scalars are always replaced by the
 /// overlay. Used to layer a project-local `.newt/config.toml` over the global
 /// config. See issue #222.
-fn merge_toml(base: &mut toml::Value, overlay: toml::Value, arrays: ArrayMergeStrategy) {
+pub(crate) fn merge_toml(base: &mut toml::Value, overlay: toml::Value, arrays: ArrayMergeStrategy) {
     match (base, overlay) {
         (toml::Value::Table(base_tbl), toml::Value::Table(overlay_tbl)) => {
             for (key, val) in overlay_tbl {
@@ -1292,7 +1292,7 @@ fn read_array_strategy(value: &toml::Value) -> Option<ArrayMergeStrategy> {
 ///
 /// Split out from [`Config::project_config_path`] so it can be unit-tested
 /// against temp directories without mutating the process environment.
-fn find_project_config_from(start: &Path, home: Option<&Path>) -> Option<PathBuf> {
+pub(crate) fn find_project_config_from(start: &Path, home: Option<&Path>) -> Option<PathBuf> {
     let mut dir = Some(start);
     while let Some(current) = dir {
         // Never treat the home directory's `.newt` as a project override.
@@ -1310,7 +1310,7 @@ fn find_project_config_from(start: &Path, home: Option<&Path>) -> Option<PathBuf
 
 /// Expand a leading `~/` (or a bare `~`) to the home directory. Paths
 /// without a leading tilde are returned unchanged.
-fn expand_tilde(path: &str) -> PathBuf {
+pub(crate) fn expand_tilde(path: &str) -> PathBuf {
     if let Some(rest) = path.strip_prefix("~/") {
         if let Some(home) = home_dir() {
             return home.join(rest);

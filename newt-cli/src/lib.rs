@@ -1,7 +1,7 @@
 //! Newt CLI dispatch surface.
 //!
-//! Subcommands: `code`, `pilot`, `worker`, `mcp`, `doctor`, `config`, `dgx`,
-//! `tunings`.
+//! Subcommands: `code`, `pilot`, `worker`, `mcp`, `doctor`, `config`,
+//! `identity`, `dgx`, `tunings`.
 //!
 //! The mesh subcommands (`announce`, `ask`) live in a sibling binary,
 //! `newt-mesh-cli`, inside the out-of-workspace `newt-mesh/` crate.
@@ -11,6 +11,7 @@
 mod config_cmd;
 mod dgx;
 mod doctor;
+mod identity_cmd;
 mod skills;
 pub mod stdio_guard;
 mod tuning_cmd;
@@ -179,6 +180,11 @@ pub enum Command {
     Doctor,
     /// Print resolved config.
     Config,
+    /// Print the resolved agent commit identity (`.newt/agent-identity.toml`):
+    /// name, email, the layer it resolved from, the signing-key path +
+    /// fingerprint (if it loads), the GitHub App's public coordinates, and the
+    /// configured token NAMES. Never prints a secret value.
+    Identity,
     /// Run (or re-run) the setup wizard: probe Ollama + write ~/.newt/config.toml.
     /// Edit that file directly for everything else — newt has no settings UI.
     Init,
@@ -301,6 +307,7 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         Command::Mcp => run_mcp().await,
         Command::Doctor => doctor::run(cli.config.as_deref()).await,
         Command::Config => config_cmd::run(cli.config.as_deref()),
+        Command::Identity => identity_cmd::run(cli.config.as_deref()),
         Command::Init => newt_tui::run_init(newt_tui::color_supported()),
         Command::Setup => newt_tui::run_setup(newt_tui::color_supported()),
         Command::Skills { cmd } => skills::run(cmd, cli.config.as_deref()),
