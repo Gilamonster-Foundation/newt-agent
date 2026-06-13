@@ -4905,7 +4905,8 @@ fn help_lines() -> &'static [&'static str] {
         "  /models                  - list models on the active endpoint",
         "  /models capabilities     - tool-conformance matrix (cached)",
         "  /model <name>            - switch model for this session",
-        "  /probe [model|all]       - test tool conformance and cache the result",
+        "  /probe [model|all]       - cheap discovery: tool conformance, context window, thinking, calibration",
+        "  /probe window [model]    - empirical input-boundary search (records max input at High confidence)",
         "  /memory                  - show context window / notes usage",
         "  /compress [focus]        - compress context now, optionally focused on a topic",
         "  /remember <fact>         - add a fact to persistent NOTES.md",
@@ -5046,8 +5047,16 @@ fn dispatch_slash(
                 let endpoint = &choice.url;
                 let mut cache = probe::load_cache();
 
+                // Step 20.2 (docs/design/model-self-tuning.md §4.1): `/probe
+                // window [model]` runs the expensive empirical boundary search
+                // for one model; `/probe [model|all]` runs the cheap discovery
+                // pass. `window` is consumed here so the rest of the selection
+                // logic sees the model name in the right slot.
+                let do_window = arg1 == "window";
+                let model_arg = if do_window { arg2 } else { arg1 };
+
                 // Decide which models to probe.
-                let targets: Vec<String> = if arg1 == "all" {
+                let targets: Vec<String> = if !do_window && model_arg == "all" {
                     match probe::fetch_ollama_models(endpoint) {
                         Ok(models) => models
                             .into_iter()
@@ -5059,10 +5068,10 @@ fn dispatch_slash(
                             vec![]
                         }
                     }
-                } else if arg1.is_empty() {
+                } else if model_arg.is_empty() {
                     vec![choice.model.clone()]
                 } else {
-                    vec![arg1.to_string()]
+                    vec![model_arg.to_string()]
                 };
 
                 if targets.is_empty() {
@@ -5075,38 +5084,80 @@ fn dispatch_slash(
 
                 for model in &targets {
                     // Warm up before probing so load time doesn't count as a timeout.
-                    print_newt(&format!("Probing {model}…"), color, verbose);
+                    if do_window {
+                        print_newt(&format!("Probing {model} (window search)…"), color, verbose);
+                    } else {
+                        print_newt(&format!("Probing {model}…"), color, verbose);
+                    }
                     warmup_if_cold(endpoint, model, &keep_alive_str(&cfg), color, verbose);
 
-                    let result = tokio::task::block_in_place(|| {
-                        tokio::runtime::Handle::current()
-                            .block_on(probe::probe_tool_conformance(endpoint, model))
-                    });
-                    match result {
-                        Ok(conformance) => {
-                            let today = today_date();
-                            let symbol = conformance.symbol();
-                            print_newt(
-                                &format!("{model}  →  {symbol}  (tested {today})"),
+                    let today = today_date();
+                    // Mutate the cache entry in place so the 20.1 fields
+                    // (estimate_ratio, emits_thinking, max_ok_input, tune_*)
+                    // are preserved and the refreshed window / quirk / ratio
+                    // that full_probe writes are kept too (§4.1, item 12).
+                    let mut entry = cache.remove(model.as_str()).unwrap_or_default();
+                    let report = probe::full_probe(
+                        endpoint,
+                        model,
+                        &mut entry,
+                        do_window,
+                        &today,
+                        |line: &str| print_newt(line, color, verbose),
+                    );
+                    cache.insert(model.clone(), entry);
+                    probe::save_cache(&cache);
+
+                    // Rich report (§4.1): conformance symbol PLUS the window,
+                    // thinking quirk, and calibration ratio; window mode adds
+                    // the empirically-confirmed max input at High confidence.
+                    print_newt(
+                        &format!(
+                            "{model}  →  {}  (tested {today})",
+                            report.conformance.symbol()
+                        ),
+                        color,
+                        verbose,
+                    );
+                    if let Some(w) = report.context_window {
+                        print_newt(&format!("  context window: {w}"), color, verbose);
+                    }
+                    if report.emits_thinking {
+                        print_newt("  quirk: emits thinking-only responses", color, verbose);
+                    }
+                    if let Some(r) = report.estimate_ratio {
+                        print_newt(
+                            &format!("  estimate calibration: x{r:.2} (chars/4 → real)"),
+                            color,
+                            verbose,
+                        );
+                    }
+                    if let Some(outcome) = &report.boundary {
+                        match outcome.highest_accepted {
+                            Some(max) => print_newt(
+                                &format!(
+                                    "  max input (empirical): {max} — High confidence \
+                                     ({} steps)",
+                                    outcome.steps
+                                ),
                                 color,
                                 verbose,
-                            );
-                            // Preserve existing context-window tuning if the
-                            // model was already in the cache.
-                            let existing = cache.remove(model.as_str()).unwrap_or_default();
-                            cache.insert(
-                                model.clone(),
-                                probe::CapabilityEntry {
-                                    conformance,
-                                    tested_date: today,
-                                    ..existing
-                                },
-                            );
-                            probe::save_cache(&cache);
+                            ),
+                            None => print_newt(
+                                &format!(
+                                    "  no input accepted in {} steps (bounds {:?})",
+                                    outcome.steps, outcome.final_bounds
+                                ),
+                                color,
+                                verbose,
+                            ),
                         }
-                        Err(e) => {
-                            print_newt(&format!("{model}  →  error: {e}"), color, verbose);
+                        if let Some(err) = &outcome.error {
+                            print_newt(&format!("  note: {err}"), color, verbose);
                         }
+                    }
+                    for note in &report.notes {
+                        print_newt(&format!("  note: {note}"), color, verbose);
                     }
                 }
             }

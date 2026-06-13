@@ -94,6 +94,9 @@ fn fmt_k(n: u32) -> String {
 fn cmd_show(model: Option<&str>) -> anyhow::Result<()> {
     let caps = load_caps_raw();
     let community = load_community_tunings();
+    // Step 20.2 §4.6: today's date for the staleness markers, shared with the
+    // TUI probe handler via newt-tui (newt-cli has no chrono dependency).
+    let today = newt_tui::probe::today_local_date();
 
     let caps_obj = caps.as_object();
     let has_caps = caps_obj.map(|o| !o.is_empty()).unwrap_or(false);
@@ -180,6 +183,27 @@ fn cmd_show(model: Option<&str>) -> anyhow::Result<()> {
             .unwrap_or(false)
         {
             println!("    quirk: emits thinking-only responses");
+        }
+
+        // Step 20.2 (docs/design/model-self-tuning.md §4.6): point stale or
+        // not-empirically-probed entries at `/probe window`. Staleness is
+        // 30-day `tune_date` math; "unprobed" means the window was never
+        // confirmed by the boundary search (tune_confidence below High).
+        // Community-only rows have no empirical tuning to be stale, so the
+        // markers are gated on an empirical cap entry.
+        if cap_entry.is_some() {
+            let tune_date = cap_entry
+                .and_then(|e| e.get("tune_date"))
+                .and_then(|v| v.as_str());
+            if newt_tui::probe::is_tuning_stale(tune_date, &today, 30) {
+                if let Some(days) = newt_tui::probe::tuning_age_days(tune_date, &today) {
+                    println!("    (tuning {days} days old — run /probe window)");
+                } else {
+                    println!("    (tuning never dated — run /probe window)");
+                }
+            } else if conf != "high" {
+                println!("    (window not empirically probed — run /probe window)");
+            }
         }
     }
 

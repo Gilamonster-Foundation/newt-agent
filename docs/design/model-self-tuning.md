@@ -1,6 +1,6 @@
 # Phase 20 — Model self-tuning: learning from observed usage
 
-**Status:** Step 20.1 in progress; Step 20.2 planned.
+**Status:** Step 20.1 complete (PR #313); Step 20.2 in progress.
 **Motivating failure:** a live nemotron3:33b session (2026-06-12, v0.6.7)
 died with `context (~8704 tokens) exceeds the model's input budget and
 auto-compression is disabled after repeated ineffective passes` — while the
@@ -142,23 +142,99 @@ ratchet (it only raises on larger observations).
   community tuning TOML round-trips `estimate_ratio` (additive optional
   field, format version unchanged).
 
-## 4. Step 20.2 — active discovery (`/probe` extension, follow-up)
+## 4. Step 20.2 — active discovery (`/probe` extension)
 
-The passive path learns from traffic; a fresh model deserves day-zero
-correctness. Extend the `/probe` suite from tool conformance to a full
-capability discovery pass:
+The passive path (20.1) learns from real traffic. A *fresh* model deserves
+day-zero correctness, so `/probe` is extended from tool conformance to a full
+capability-discovery pass. Cost is the design tension: the cheap probes run on
+every `/probe`; the expensive empirical window search is its own opt-in
+sub-command.
 
-- context window: `/api/show` (with staleness refresh — a re-pulled model can
-  change its Modelfile `num_ctx`), then an empirical padded-prompt binary
-  search between `safe_context` and the declared window to find the real
-  acceptance boundary, recording `max_ok_input` with `High` confidence;
-- thinking probe: one tiny request inspecting response shape; persist
-  `emits_thinking`, and for models that support it, probe Ollama's `think`
-  option as a candidate mitigation;
-- calibration bootstrap: derive an initial `estimate_ratio` from the probe
-  requests' own `prompt_eval_count` vs chars/4;
-- consume `tune_date` for staleness (re-probe nudge after N days / model
-  re-pull).
+### 4.1 Command surface (Ollama-only, as today)
+
+- `/probe [model]` — **cheap discovery** (3 small requests): tool conformance
+  (unchanged), context-window refresh, thinking probe, and a calibration
+  bootstrap derived from those same requests. Default arg = the active model.
+- `/probe all` — cheap discovery over every *untested* model (unchanged
+  selection rule).
+- `/probe window [model]` — **active boundary search** (the expensive empirical
+  pass); records `max_ok_input` at `High` confidence. Prints per-step progress.
+
+`newt tunings show` gains a staleness marker and points stale/unprobed models
+at `/probe window`. No `newt probe` CLI subcommand — probing is interactive
+(warm-up, per-step timing) and stays TUI-only.
+
+### 4.2 Context-window refresh
+
+A new `refresh_context_window(entry, endpoint, model)` is the staleness-aware
+sibling of 20.1's `ensure_context_window`: it **always** calls `/api/show`
+(`/probe` is the explicit re-discover command) and updates `context_window`,
+catching a re-pulled model whose Modelfile `num_ctx` changed. It re-bootstraps
+`safe_context` to 80% of the declared window **only when `safe_context` is
+unset** — never auto-raises it (the VRAM rule from 20.1 §2.1). The passive
+session path keeps using `ensure_context_window` (fetch-once); only `/probe`
+forces the refresh.
+
+### 4.3 Thinking probe
+
+One tiny request ("reply with the single word: ok", `stream:false`). If
+`message.content` is empty/whitespace while a non-empty `thinking` /
+`reasoning` / `reasoning_content` field is present, set
+`emits_thinking = Some(true)` (sticky; matches 20.1's `record_thinking_only`).
+A clean content response leaves the field untouched (absence ≠ proven-false).
+Probing Ollama's `think` *option* as a mitigation is explicitly out of scope
+(see §5) — 20.2 only records the quirk.
+
+### 4.4 Calibration bootstrap
+
+Every probe request above returns `prompt_eval_count` (real tokens) and was
+built from a known chars/4 estimate. Each pair feeds 20.1's
+`record_estimate_sample(observed, estimated)` (same EMA, same `< 0.5×` cache-hit
+skip), so `estimate_ratio` is seeded before the first real turn instead of
+converging over early traffic. The boundary-search requests (§4.5) feed it too.
+
+### 4.5 Empirical input-boundary search (`/probe window`)
+
+Goal: find the largest input the model genuinely accepts at a matching
+`num_ctx`, recorded as `max_ok_input` with `High` confidence — exactly the
+number 20.1's `initial_send_budget` trusts as the proven floor.
+
+- **Bounds.** Low = current `safe_context` (or a 2,048 floor); high = declared
+  `context_window` (from §4.2). If the window is unknown, probe upward by
+  doubling from the low bound until the first rejection, then binary-search the
+  bracket. High is hard-capped at the declared window — never probe a larger
+  `num_ctx` than the model declares (VRAM safety; the model was pulled to run
+  at that window).
+- **One probe at candidate N.** Build a padded user prompt of ≈ N real tokens
+  (filler sized by chars, corrected by the current `estimate_ratio` so the
+  observed `prompt_eval_count` lands near N), send with `options.num_ctx = N +
+  reply_margin` and a minimal `num_predict` (we test *acceptance*, not output).
+- **Classification** (pure fn `classify_boundary_probe`, unit-tested without
+  HTTP), given the result and the sent estimate:
+  - **Accepted** — HTTP 200, non-empty/usable completion, and
+    `prompt_eval_count ≥ 0.9 × N` (the model evaluated essentially the whole
+    prompt). Record the observed `prompt_eval_count` via
+    `record_accepted_prompt`; raise the low bound.
+  - **Truncated** — HTTP 200 but `prompt_eval_count` well below N (Ollama
+    silently dropped the head): treat as rejected, lower the high bound. This
+    is the silent-overflow signal 20.1 can only infer after the fact.
+  - **CtxWindow400** — parse the endpoint's hard limit, feed
+    `record_context_window_400`, lower the high bound to it.
+  - **Inconclusive** — any other transport/5xx error or OOM: stop raising,
+    keep the last accepted value, surface the error (do not record a false
+    boundary).
+- **Convergence.** Binary-search until `high − low` is within the larger of
+  1,024 tokens or 5% of high, bounded by a step cap (~12). On completion set
+  `max_ok_input` to the highest accepted `prompt_eval_count`,
+  `tune_confidence = High`, `tune_date = today`, and persist once.
+
+### 4.6 Staleness
+
+`is_tuning_stale(tune_date, today, max_age_days)` (chrono date math, default
+30 days). `newt tunings show` renders `(tuning N days old — run /probe window)`
+for stale entries and `(window not empirically probed — run /probe window)`
+when `tune_confidence < High`. No automatic re-probe — discovery stays an
+explicit, user-initiated action.
 
 ## 5. Out of scope (both steps)
 
