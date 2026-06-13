@@ -37,7 +37,10 @@
 
 use std::path::{Path, PathBuf};
 
-use agent_mesh_protocol::{MeshError, UserKey};
+use agent_mesh_protocol::MeshError;
+/// Re-exported so callers can load a configured signing key and read its
+/// fingerprint without a direct `agent-mesh-protocol` dependency.
+pub use agent_mesh_protocol::UserKey;
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use newt_core::Caveats;
 
@@ -103,6 +106,24 @@ pub fn load_or_generate(path: &Path) -> Result<UserKey, IdentityError> {
         key.save(path)?;
         Ok(key)
     }
+}
+
+/// Load a [`UserKey`] from an **explicitly-configured** path — load-only,
+/// never minting.
+///
+/// Unlike [`load_or_generate`], this errors if the file is missing instead of
+/// generating a fresh key. That distinction is load-bearing: a signing-key
+/// path the operator named in `agent-identity.toml` points at a vault secret;
+/// newt must never silently create a key there. Minting is reserved for the
+/// implicit `~/.newt/identity.pem` operator key via [`load_or_generate`].
+pub fn load_user_key(path: &Path) -> Result<UserKey, IdentityError> {
+    if !path.exists() {
+        return Err(IdentityError::Key(format!(
+            "signing key not found at {} (newt never mints a key at a configured path)",
+            path.display()
+        )));
+    }
+    Ok(UserKey::load(path)?)
 }
 
 /// Mint the session root: an [`AgentKey`] carrying the user's full authority

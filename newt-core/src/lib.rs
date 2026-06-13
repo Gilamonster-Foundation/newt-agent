@@ -4,6 +4,7 @@
 //! into a `Tier` (FAST / STANDARD / COMPLEX / REVIEW), and asks the
 //! configured backends which can serve that tier.
 
+pub mod agent_identity;
 pub mod agentic;
 pub mod agents;
 pub mod caveats;
@@ -30,6 +31,10 @@ pub mod workspace_key;
 #[cfg(feature = "pyo3")]
 pub mod pyo3_module;
 
+pub use agent_identity::{
+    AgentIdentity, GithubApp, IdentitySource, Secret, SecretRef, DEFAULT_AGENT_EMAIL,
+    DEFAULT_AGENT_NAME,
+};
 pub use agent_mesh_protocol::{Caveats, CountBound, Scope};
 // Step 9.7: clean top-level import paths for the relocated agentic loop.
 // Step 18.4 (#247): CompressState (session anti-thrash) + Summarizer (the
