@@ -20,6 +20,24 @@ rusqlite.workspace = true
 csv.workspace = true
 tracing.workspace = true
 
+# Optional PyO3 bindings — opt in only via the umbrella `newt-agent-py`
+# crate; default builds stay Python-free.
+pyo3 = { workspace = true, optional = true }
+
+[features]
+default = []
+pyo3 = ["dep:pyo3"]
+# Opt-in gate for the embedded-interpreter unit tests in `pyo3_module.rs`.
+# Kept SEPARATE from `pyo3` on purpose: those tests call the CPython C API
+# (`Python::attach`) and so must link libpython, which only works when
+# `newt-data` is built standalone. The umbrella `newt-agent-py` enables
+# `newt-data/pyo3` with pyo3's `extension-module` (no libpython linked), under
+# which an embedded-interpreter test binary cannot link. `cargo test
+# --workspace` therefore must NOT compile these; run them explicitly with:
+#   cargo test -p newt-data --features pyo3,embed-tests
+# (`PYO3_PYTHON` must point at a Python with a shared libpython.)
+embed-tests = ["pyo3"]
+
 [dev-dependencies]
 tempfile.workspace = true
 

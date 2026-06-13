@@ -58,6 +58,9 @@ pub mod ingest;
 pub mod store;
 pub mod summary;
 
+#[cfg(feature = "pyo3")]
+pub mod pyo3_module;
+
 pub use error::{DataError, Result};
 pub use store::sqlite::SqliteBackend;
 pub use store::{
