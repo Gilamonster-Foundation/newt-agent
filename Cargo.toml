@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "newt-core",
+    "newt-data",
     "newt-inference",
     "newt-tools",
     "newt-skills",
@@ -83,6 +84,11 @@ diffy = "0.4"
 # Same MSRV-pin pattern as diffy 0.4 above.
 rusqlite = { version = "0.31", features = ["bundled"] }
 
+# CSV ingest for the Phase 21 `newt-data` engine (docs/design/centaur-data-scientist.md).
+# csv 1.3+ compiles on MSRV 1.75 (pure-Rust, no C deps; the resolved 1.4 declares
+# rust-version 1.73) — verified with cargo build.
+csv = "1.3"
+
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 rustyline = { version = "14", default-features = false, features = ["with-file-history"] }
@@ -136,6 +142,7 @@ agent-mesh-protocol = "0.6"
 
 # Internal crates — pinned with = for lock-step publishing
 newt-core         = { path = "newt-core",         version = "=0.6.7" }
+newt-data         = { path = "newt-data",         version = "=0.6.7" }
 newt-inference    = { path = "newt-inference",    version = "=0.6.7" }
 newt-tools        = { path = "newt-tools",        version = "=0.6.7" }
 newt-skills       = { path = "newt-skills",       version = "=0.6.7" }

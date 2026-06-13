@@ -1,0 +1,27 @@
+[package]
+name = "newt-data"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "Newt-Agent Phase 21 Centaur data-science engine — headless SQLite DataStore: CSV ingest, SQL query, pandas-style summarize"
+keywords = ["newt", "agent", "data-science", "sqlite", "csv"]
+categories = ["database", "science"]
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rusqlite.workspace = true
+csv.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true
