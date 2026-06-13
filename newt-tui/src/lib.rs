@@ -861,6 +861,8 @@ struct PermissionPromptState {
 struct PromptPermissionGate<'a, F: FnMut(&str) -> PromptChoice> {
     state: &'a mut PermissionPromptState,
     /// The session's enforced caveats at turn start — the re-mint baseline.
+    /// When a `/mode` preset is active this is ALREADY the clamped (base ∩
+    /// preset) value, so `widen_caveats` starts below the preset ceiling.
     base: newt_core::Caveats,
     /// Per-user root key path; `None` degrades the re-mint to a plain
     /// caveats value (the same degradation as `SessionCapability`).
@@ -870,6 +872,13 @@ struct PromptPermissionGate<'a, F: FnMut(&str) -> PromptChoice> {
     /// Durable decision log (`~/.newt/permission-log.jsonl`); `None` keeps
     /// the in-session list only.
     log_path: Option<std::path::PathBuf>,
+    /// #307 FLOOR: the active named-permission-preset clamp, if any. The minted
+    /// authority is re-`meet`-ed with this ceiling so a session-grant can NEVER
+    /// re-add a target the preset denied — `widen_caveats` adds to `Only` sets,
+    /// including ones the preset emptied, so the post-mint clamp is the
+    /// load-bearing point that keeps the floor honest against grants. `None`
+    /// (no active preset) leaves the #263 mint bit-for-bit.
+    preset_clamp: Option<newt_core::Caveats>,
     color: bool,
     verbose: bool,
     ask_human: F,
@@ -911,7 +920,16 @@ impl<F: FnMut(&str) -> PromptChoice> PromptPermissionGate<'_, F> {
         let mut grants: Vec<(newt_core::DenialKind, String)> =
             self.state.session_grants.iter().cloned().collect();
         grants.extend(once_grants.iter().cloned());
-        let policy = newt_core::widen_caveats(&self.base, &grants);
+        let mut policy = newt_core::widen_caveats(&self.base, &grants);
+        // #307 FLOOR: re-clamp the widened policy under the active preset. This
+        // is the load-bearing intersection — `widen_caveats` can re-populate an
+        // `Only` set the preset emptied (e.g. add `rm` to an exec scope the
+        // readonly preset pinned to none), so without this `meet` a session
+        // grant would silently raise authority above the preset. With it, a
+        // grant can never exceed the preset ceiling.
+        if let Some(clamp) = &self.preset_clamp {
+            policy = policy.meet(clamp);
+        }
         match self
             .key_path
             .as_deref()
@@ -977,16 +995,155 @@ impl<F: FnMut(&str) -> PromptChoice> newt_core::PermissionGate for PromptPermiss
     }
 }
 
+// ---------------------------------------------------------------------------
+// Named permission presets + the `/mode` command (issue #307).
+// ---------------------------------------------------------------------------
+
+/// The session's active `/mode` (issue #307): the named-permission-preset clamp
+/// applied as an authority FLOOR plus the binding that produced it. Held by the
+/// session next to `SessionCapability`; the clamp is `meet`-ed into the
+/// effective caveats for every turn (and into the #263 gate's re-mint), so it
+/// wins over both `--disable-ocap` and any interactive session-grant.
+///
+/// `None` (no mode active) ⇒ behavior is exactly today's: the effective caveats
+/// are the session base, the gate has no clamp, and the exec floor is absent.
+#[derive(Debug, Clone)]
+struct ActiveMode {
+    /// The mode name (the `<name>` in `/mode <name>`), for `/permissions`.
+    name: String,
+    /// The preset name that supplied the clamp (for reporting).
+    preset_name: String,
+    /// The authority ceiling (`NamedPermissionPreset::clamp`). The session's
+    /// effective authority is `base.meet(&clamp)`.
+    clamp: newt_core::Caveats,
+    /// One-line human summary of the clamp (for `/permissions`).
+    clamp_summary: String,
+}
+
+/// Outcome of applying `/mode <name>`: the skill body to print, the new active
+/// mode, and the framing to inject into the system prompt. Built by
+/// [`build_mode`] (pure, unit-testable) and applied by the command handler.
+#[derive(Debug)]
+struct ModeApplication {
+    /// The new active mode (the clamp + names).
+    mode: ActiveMode,
+    /// The preloaded skill body, if the mode named a skill. Printed to the
+    /// transcript so the model sees it (same payload as `use_skill`).
+    skill_body: Option<String>,
+    /// The one-line framing to inject into the system prompt, if any.
+    framing: Option<String>,
+}
+
+/// Resolve and validate a `/mode <name>` invocation against config + skills,
+/// WITHOUT mutating anything — the atomic-or-nothing core of the command. A
+/// missing mode, a missing preset, or an unloadable skill is an `Err`: a mode
+/// that silently skipped its clamp or its skill would be a false claim. On
+/// success the caller applies all three effects together.
+///
+/// `load_skill` is the skill-body loader seam (production wires the same
+/// `use_skill` / `newt_skills::load_body_from` path; tests inject a closure
+/// over a mock skills dir) — so skill loading is NOT reimplemented here.
+fn build_mode(
+    name: &str,
+    cfg: &newt_core::Config,
+    mut load_skill: impl FnMut(&str) -> anyhow::Result<String>,
+) -> anyhow::Result<ModeApplication> {
+    let mode_cfg = cfg
+        .modes
+        .get(name)
+        .ok_or_else(|| anyhow::anyhow!("unknown mode: '{name}' (no [modes.{name}] in config)"))?;
+
+    // Resolve the preset clamp (if the mode names one). A named-but-missing
+    // preset is a hard error — never a silent no-clamp.
+    let (preset_name, clamp, clamp_summary) = match &mode_cfg.preset {
+        Some(preset_name) => {
+            let preset = cfg.permission_presets.get(preset_name).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "mode '{name}' names preset '{preset_name}' but no \
+                     [permission_presets.{preset_name}] is defined"
+                )
+            })?;
+            (preset_name.clone(), preset.clamp(), preset.summary())
+        }
+        // A mode with no preset imposes no clamp (identity) — still a valid
+        // mode (e.g. skill + framing only).
+        None => (
+            String::new(),
+            newt_core::Caveats::top(),
+            "unconstrained".to_string(),
+        ),
+    };
+
+    // Preload the skill body (if named) through the injected loader. A
+    // named-but-unloadable skill is a hard error.
+    let skill_body = match &mode_cfg.skill {
+        Some(skill_name) => Some(
+            load_skill(skill_name)
+                .map_err(|e| anyhow::anyhow!("mode '{name}' skill '{skill_name}': {e}"))?,
+        ),
+        None => None,
+    };
+
+    Ok(ModeApplication {
+        mode: ActiveMode {
+            name: name.to_string(),
+            preset_name,
+            clamp,
+            clamp_summary,
+        },
+        skill_body,
+        framing: mode_cfg.framing.clone(),
+    })
+}
+
+/// The system-prompt framing line injected when a mode is active (issue #307).
+/// Kept distinct from the persona overlay so a mode and a persona compose.
+fn mode_framing_line(mode: &ActiveMode) -> String {
+    format!("Active mode: {} — {}", mode.name, mode.clamp_summary)
+}
+
+/// The session's EFFECTIVE authority for this turn: the session base
+/// (`SessionCapability::caveats`) intersected with the active mode's preset
+/// clamp, if any. This is the single intersection point the enforcement path
+/// consults — `meet` is the greatest lower bound, so the result can never
+/// exceed EITHER the base or the preset. With no active mode it is the base
+/// unchanged (a clone), so the no-preset path is bit-for-bit.
+fn effective_caveats(base: &newt_core::Caveats, mode: Option<&ActiveMode>) -> newt_core::Caveats {
+    match mode {
+        Some(m) => base.meet(&m.clamp),
+        None => base.clone(),
+    }
+}
+
 /// Render the `/permissions` listing: this session's prompted decisions (in
 /// prompt order) plus where the durable record lives. Promotion to a lasting
 /// grant is deliberately NOT offered here — that is a human editing
 /// `[tui.permissions]` in the config (see issues #263/#181).
+///
+/// `active_mode` (issue #307) reflects an applied `/mode` preset as an authority
+/// floor at the top of the listing — so the user can always see the clamp in
+/// force, even when permission prompting is off.
 fn permissions_command_lines(
     state: &PermissionPromptState,
     enabled: bool,
     log_path: Option<&std::path::Path>,
+    active_mode: Option<&ActiveMode>,
 ) -> Vec<String> {
     let mut lines = Vec::new();
+    if let Some(mode) = active_mode {
+        if mode.preset_name.is_empty() {
+            lines.push(format!("active mode: {} (no permission clamp)", mode.name));
+        } else {
+            lines.push(format!(
+                "active mode: {} — preset '{}' clamps authority (floor): {}",
+                mode.name, mode.preset_name, mode.clamp_summary
+            ));
+            lines.push(
+                "this clamp WINS over --disable-ocap/--yolo and over session grants (#307)"
+                    .to_string(),
+            );
+        }
+    }
     if !enabled {
         lines.push(
             "permission prompting is OFF (start with --prompt-for-permissions or set \
@@ -1092,6 +1249,36 @@ mod permission_prompt_tests {
             key_path,
             conversation_id: "conv-test".to_string(),
             log_path,
+            preset_clamp: None,
+            color: false,
+            verbose: false,
+            ask_human: move |_prompt: &str| {
+                prompts.set(prompts.get() + 1);
+                script.next().expect("script exhausted — unexpected prompt")
+            },
+        }
+    }
+
+    /// #307: a scripted gate carrying an active preset clamp (the floor). Same
+    /// as [`scripted_gate`] but with `preset_clamp` set, for the floor tests.
+    #[allow(clippy::too_many_arguments)]
+    fn scripted_gate_with_clamp<'a>(
+        state: &'a mut PermissionPromptState,
+        base: Caveats,
+        key_path: Option<std::path::PathBuf>,
+        log_path: Option<std::path::PathBuf>,
+        preset_clamp: Caveats,
+        script: Vec<PromptChoice>,
+        prompts: Rc<Cell<usize>>,
+    ) -> PromptPermissionGate<'a, impl FnMut(&str) -> PromptChoice> {
+        let mut script = script.into_iter();
+        PromptPermissionGate {
+            state,
+            base,
+            key_path,
+            conversation_id: "conv-test".to_string(),
+            log_path,
+            preset_clamp: Some(preset_clamp),
             color: false,
             verbose: false,
             ask_human: move |_prompt: &str| {
@@ -1196,6 +1383,69 @@ mod permission_prompt_tests {
         assert_eq!(state.decisions.len(), 2);
         assert_eq!(state.decisions[0].decision, "allow");
         assert_eq!(state.decisions[0].scope, "once");
+    }
+
+    /// #307 FLOOR TEST (b) — the security contract: a session-grant CANNOT
+    /// grant authority the active preset denies. The human answers "allow
+    /// once" (and "allow session") for `rm`, but the readonly-triage preset
+    /// clamps exec to none — so the minted caveats must NOT permit `rm`. The
+    /// re-mint is re-`meet`-ed under the preset clamp (the load-bearing point
+    /// in `mint`), so `widen_caveats` re-adding `rm` to the exec set is undone.
+    #[test]
+    fn session_grant_cannot_pierce_the_preset_floor() {
+        let mut state = PermissionPromptState::default();
+        let prompts = Rc::new(Cell::new(0));
+        // A readonly-triage preset: exec denied entirely.
+        let clamp = newt_core::NamedPermissionPreset {
+            readonly: true,
+            ..Default::default()
+        }
+        .clamp();
+        // The effective (already-clamped) base the gate runs against.
+        let base = base_caveats("/ws").meet(&clamp);
+        assert!(
+            !base.permits_exec("cargo"),
+            "the preset clamped exec to none"
+        );
+
+        // Allow-once for `rm`: the human says yes, the preset says no.
+        let mut gate = scripted_gate_with_clamp(
+            &mut state,
+            base.clone(),
+            None,
+            None,
+            clamp.clone(),
+            vec![PromptChoice::AllowOnce, PromptChoice::AllowSession],
+            prompts.clone(),
+        );
+        match gate.ask(&[exec_request("rm")]) {
+            newt_core::PermissionDecision::Allow(c) => {
+                assert!(
+                    !c.permits_exec("rm"),
+                    "a once-grant must not pierce the preset floor: {c:?}"
+                );
+                assert!(!c.permits_exec("cargo"), "floor keeps exec denied");
+            }
+            newt_core::PermissionDecision::Deny => panic!("the gate allowed-once"),
+        }
+        // Now "allow session" for `rm`: the grant is remembered, but the next
+        // re-mint is STILL re-clamped — the floor wins across the session.
+        match gate.ask(&[exec_request("rm")]) {
+            newt_core::PermissionDecision::Allow(c) => {
+                assert!(
+                    !c.permits_exec("rm"),
+                    "a SESSION grant must not pierce the floor either: {c:?}"
+                );
+            }
+            newt_core::PermissionDecision::Deny => panic!("the gate allowed-session"),
+        }
+        drop(gate);
+        // The grant WAS remembered (the human's choice is recorded), but it is
+        // powerless against the clamp — proving the floor, not the prompt, is
+        // the authority ceiling.
+        assert!(state
+            .session_grants
+            .contains(&(DenialKind::Exec, "rm".to_string())));
     }
 
     /// Session allow: one prompt, then every later ask for the same target
@@ -1446,6 +1696,7 @@ mod permission_prompt_tests {
             None,
             None,
             Some(&mut gate),
+            None,
         )
         .await;
         assert_eq!(out, "gated contents", "allow-once executed the real read");
@@ -1464,6 +1715,7 @@ mod permission_prompt_tests {
             None,
             None,
             Some(&mut gate),
+            None,
         )
         .await;
         assert_eq!(
@@ -1509,6 +1761,7 @@ mod permission_prompt_tests {
                 None,
                 None,
                 Some(&mut gate),
+                None,
             )
             .await;
             assert_eq!(out, "gated contents");
@@ -1535,7 +1788,8 @@ mod permission_prompt_tests {
     fn permissions_command_lists_decisions_and_log_location() {
         let mut state = PermissionPromptState::default();
         // Disabled + empty: says how to enable, says there's nothing yet.
-        let lines = permissions_command_lines(&state, false, None);
+        // No active mode ⇒ no preset line; behavior is the pre-#307 listing.
+        let lines = permissions_command_lines(&state, false, None, None);
         assert!(lines[0].contains("OFF"), "got: {lines:?}");
         assert!(lines
             .iter()
@@ -1551,7 +1805,7 @@ mod permission_prompt_tests {
             "session",
         ));
         let log = std::path::PathBuf::from("/home/u/.newt/permission-log.jsonl");
-        let lines = permissions_command_lines(&state, true, Some(&log));
+        let lines = permissions_command_lines(&state, true, Some(&log), None);
         assert!(lines
             .iter()
             .any(|l| l.contains("exec:npm") && l.contains("run_command")));
@@ -1560,9 +1814,44 @@ mod permission_prompt_tests {
         assert!(!lines[0].contains("OFF"));
     }
 
+    /// #307: an active mode is reflected at the top of `/permissions`, even
+    /// with prompting OFF — the clamp in force is always visible.
+    #[test]
+    fn permissions_command_reflects_the_active_mode() {
+        let state = PermissionPromptState::default();
+        let preset = newt_core::NamedPermissionPreset {
+            readonly: true,
+            exec_allow: vec!["git".to_string()],
+            deny: vec!["*".to_string()],
+            max_calls: Some(40),
+        };
+        let mode = ActiveMode {
+            name: "triage".to_string(),
+            preset_name: "readonly-triage".to_string(),
+            clamp: preset.clamp(),
+            clamp_summary: preset.summary(),
+        };
+        let lines = permissions_command_lines(&state, false, None, Some(&mode));
+        assert!(
+            lines[0].contains("active mode: triage")
+                && lines[0].contains("readonly-triage")
+                && lines[0].contains("readonly"),
+            "got: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("WINS over --disable-ocap")),
+            "the floor property is surfaced: {lines:?}"
+        );
+    }
+
     #[test]
     fn help_lists_the_permissions_command() {
         assert!(help_lines().iter().any(|l| l.contains("/permissions")));
+    }
+
+    #[test]
+    fn help_lists_the_mode_command() {
+        assert!(help_lines().iter().any(|l| l.contains("/mode")));
     }
 }
 
@@ -2139,6 +2428,10 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
     let mut inf_key = choice.api_key.clone();
     let key_path = newt_identity::default_key_path().ok();
     let mut cap = SessionCapability::establish(resolve_tui(&cfg), key_path.as_deref(), workspace);
+    // #307: the active `/mode` preset clamp (an authority FLOOR), if any. `None`
+    // ⇒ no mode active ⇒ effective authority is the session base, exactly as
+    // before. Set by `/mode <name>`; lives for the rest of the session.
+    let mut active_mode: Option<ActiveMode> = None;
     // Prompted ocap grants (issue #263), resolved ONCE per session: the flag
     // (env, set by `--prompt-for-permissions`) or `[tui.permissions] prompt`,
     // AND a real terminal on stdin — a piped/headless invocation must never
@@ -2467,6 +2760,8 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                             &permission_state,
                             prompt_permissions_enabled,
                             permission_log_path.as_deref(),
+                            // #307: surface the active mode's preset clamp.
+                            active_mode.as_ref(),
                         )
                         .into_iter();
                         if let Some(first) = lines.next() {
@@ -2474,6 +2769,26 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                         }
                         for line in lines {
                             println!("{line}");
+                        }
+                        println!();
+                        continue;
+                    }
+                    // #307: `/mode <name>` — atomically preload a skill body,
+                    // apply a named permission preset (an authority floor), and
+                    // inject a one-line system-prompt framing. All three or none.
+                    let slash_mode = task.trim_start_matches('/');
+                    if slash_mode == "mode" || slash_mode.starts_with("mode ") {
+                        let arg = slash_mode.strip_prefix("mode").unwrap_or("").trim();
+                        handle_mode_command(
+                            arg,
+                            &cfg,
+                            &mut active_mode,
+                            &mut system,
+                            color,
+                            verbose,
+                        );
+                        if let Some(ref hp) = history_path {
+                            let _ = rl.save_history(hp);
                         }
                         println!();
                         continue;
@@ -2773,20 +3088,36 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                     // loop pushes one event per tool call; the save site
                     // persists them into the turn's `events` column.
                     let mut turn_tool_events: Vec<newt_core::ToolEvent> = Vec::new();
+                    // #307: the EFFECTIVE caveats for this turn — the session
+                    // base intersected with the active mode's preset clamp (a
+                    // FLOOR). This single `meet` is what the gate base, the
+                    // ChatCtx dispatch, and (via the preset clamp + exec_floor)
+                    // the --disable-ocap bypass all enforce, so authority can
+                    // never exceed the preset. With no mode it is the base
+                    // unchanged. Computed once so all three consult one value.
+                    let turn_caveats = effective_caveats(cap.caveats(), active_mode.as_ref());
+                    // The active preset clamp threaded to the gate (re-clamps
+                    // any session grant) and the exec floor threaded to the
+                    // bypass. Both `None` when no mode is active.
+                    let preset_clamp = active_mode.as_ref().map(|m| m.clamp.clone());
+                    let exec_floor = active_mode.as_ref().map(|m| m.clamp.exec.clone());
                     // Prompted ocap grants (issue #263): only an interactive
                     // session constructs a gate — headless paths (ACP worker,
                     // newt-eval) never reach this code, so a denial there can
                     // never block on a prompt. The gate's re-mint baseline is
                     // the session's enforced caveats AT TURN START; session
                     // grants/denials persist in `permission_state` across
-                    // turns and die with the process.
+                    // turns and die with the process. #307: the baseline is the
+                    // already-clamped effective caveats, and `preset_clamp`
+                    // re-clamps the re-mint so a grant cannot pierce the floor.
                     let mut permission_gate =
                         prompt_permissions_enabled.then(|| PromptPermissionGate {
                             state: &mut permission_state,
-                            base: cap.caveats().clone(),
+                            base: turn_caveats.clone(),
                             key_path: key_path.clone(),
                             conversation_id: active_conversation_id.clone(),
                             log_path: permission_log_path.clone(),
+                            preset_clamp: preset_clamp.clone(),
                             color,
                             verbose,
                             ask_human: prompt_permission_choice as fn(&str) -> PromptChoice,
@@ -2828,7 +3159,10 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                                 task: &task,
                                 workspace,
                                 color,
-                                caveats: cap.caveats(),
+                                // #307: the clamped effective caveats (base ∩
+                                // preset). Identical to `cap.caveats()` when no
+                                // mode is active.
+                                caveats: &turn_caveats,
                                 max_tool_rounds: eff_max_tool_rounds,
                                 tool_output_lines: tool_output_lines(&cfg),
                                 debug: debug_mode(&cfg),
@@ -2866,6 +3200,10 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                                 // the learned estimate calibration.
                                 on_round_usage: Some(&mut on_obs),
                                 estimate_ratio: eff_estimate_ratio,
+                                // #307: the active preset's exec floor — the
+                                // ceiling the --disable-ocap bypass cannot
+                                // cross. None when no mode is active.
+                                exec_floor: exec_floor.as_ref(),
                             },
                             &mut mcp,
                         ))
@@ -3479,6 +3817,113 @@ fn rebuild_system_prompt(
     // Per-session plan path, keyed on the durable conversation id (issue #220).
     let plan_path = newt_core::session_plan_path(conversation_id);
     build_system_prompt_with_persona(workspace, soul_text, persona, &plan_path.to_string_lossy())
+}
+
+/// #307: handle `/mode <name>` (and bare `/mode` = show). Atomically preloads
+/// the named skill body, applies the named permission preset as an authority
+/// FLOOR, and injects a one-line framing into the system prompt — all three or
+/// none. Mutates `active_mode` and `system` only on success; on any error
+/// (unknown mode/preset/skill) nothing changes and the error is printed, so a
+/// mode can never half-apply (a clamp without its skill, or vice versa).
+fn handle_mode_command(
+    arg: &str,
+    cfg: &newt_core::Config,
+    active_mode: &mut Option<ActiveMode>,
+    system: &mut String,
+    color: bool,
+    verbose: bool,
+) {
+    // Bare `/mode` (or `/mode show`): report the current mode.
+    if arg.is_empty() || arg == "show" {
+        match active_mode.as_ref() {
+            Some(m) if m.preset_name.is_empty() => {
+                print_newt(
+                    &format!("active mode: {} (no clamp)", m.name),
+                    color,
+                    verbose,
+                );
+            }
+            Some(m) => print_newt(
+                &format!(
+                    "active mode: {} — preset '{}' floor: {}",
+                    m.name, m.preset_name, m.clamp_summary
+                ),
+                color,
+                verbose,
+            ),
+            None => {
+                let names: Vec<&str> = cfg.modes.keys().map(String::as_str).collect();
+                let avail = if names.is_empty() {
+                    "(none configured — define [modes.<name>] in your newt config)".to_string()
+                } else {
+                    format!("available: {}", names.join(", "))
+                };
+                print_newt(&format!("no active mode. {avail}"), color, verbose);
+            }
+        }
+        return;
+    }
+
+    // `/mode off` / `/mode clear`: drop the clamp for the rest of the session.
+    if arg == "off" || arg == "clear" {
+        if active_mode.take().is_some() {
+            print_newt(
+                "mode cleared — authority returns to the session base",
+                color,
+                verbose,
+            );
+        } else {
+            print_newt("no active mode to clear", color, verbose);
+        }
+        return;
+    }
+
+    // Resolve + validate WITHOUT mutating. The skill loader reuses the SAME
+    // `use_skill` path (`load_body_from` over the configured search dirs) —
+    // skill dirs are config-rooted, exactly as the `use_skill` tool resolves.
+    let skills_dirs = cfg.skill_search_dirs();
+    let application = build_mode(arg, cfg, |skill_name| {
+        newt_skills::load_body_from(&skills_dirs, skill_name)
+    });
+    let application = match application {
+        Ok(a) => a,
+        Err(e) => {
+            print_newt(&format!("error: {e}"), color, verbose);
+            return;
+        }
+    };
+
+    // Commit all three effects together.
+    if let Some(body) = &application.skill_body {
+        // Same payload the model gets from `use_skill`, printed to the
+        // transcript so the guidance is in context for the next turn.
+        print_newt(
+            &format!("loaded skill for mode '{arg}':\n{body}"),
+            color,
+            verbose,
+        );
+    }
+    if let Some(framing) = &application.framing {
+        // Inject the one-line framing into the live system prompt.
+        system.push_str("\n\n");
+        system.push_str(framing);
+        system.push('\n');
+    }
+    let mode = application.mode;
+    let report = if mode.preset_name.is_empty() {
+        format!("mode '{}' active (no permission clamp)", mode.name)
+    } else {
+        format!(
+            "mode '{}' active — preset '{}' clamps authority (floor): {}",
+            mode.name, mode.preset_name, mode.clamp_summary
+        )
+    };
+    // Also append the clamp framing so the model knows its reduced authority.
+    system.push_str("\n\n");
+    system.push_str(&mode_framing_line(&mode));
+    system.push('\n');
+    *active_mode = Some(mode);
+    print_newt(&report, color, verbose);
 }
 
 fn persona_status(active: Option<&Persona>) -> String {
@@ -4481,7 +4926,9 @@ fn help_lines() -> &'static [&'static str] {
         "  /dgx warm [model]        - pre-load a model into VRAM",
         "  /dgx route <task>        - recommend a formation for a task",
         "  /dgx doctor              - probe every configured endpoint",
-        "  /permissions             - prompted permission decisions this session",
+        "  /permissions             - prompted permission decisions + active mode clamp",
+        "  /mode <name>             - enter a named mode: load skill + clamp authority (floor)",
+        "  /mode                    - show the active mode; /mode off clears it",
         "  /workspace               - show current workspace path",
         "  /version                 - print newt version",
         "  /help                    - this message",
@@ -5128,6 +5575,7 @@ mod run_command_confinement_tests {
             None,
             None,
             None,
+            None,
         )
         .await;
         assert!(
@@ -5155,6 +5603,7 @@ mod run_command_confinement_tests {
             20,
             &caveats,
             &mut Mcp::empty(),
+            None,
             None,
             None,
             None,
@@ -5201,6 +5650,7 @@ mod run_command_confinement_tests {
             None,
             None,
             None,
+            None,
         )
         .await;
 
@@ -5240,6 +5690,7 @@ mod run_command_confinement_tests {
             None,
             None,
             None,
+            None,
         )
         .await;
         assert_eq!(out, "hello", "read_file must still return file contents");
@@ -5268,6 +5719,7 @@ mod run_command_confinement_tests {
             20,
             &caveats,
             &mut Mcp::empty(),
+            None,
             None,
             None,
             None,
@@ -5307,6 +5759,7 @@ mod run_command_confinement_tests {
             20,
             &caveats,
             &mut Mcp::empty(),
+            None,
             None,
             None,
             None,
@@ -5434,6 +5887,7 @@ mod disable_ocap_session_tests {
             None,
             None,
             None,
+            None,
         )
         .await;
         assert_eq!(out, "yolo-through\n");
@@ -5447,6 +5901,7 @@ mod disable_ocap_session_tests {
             20,
             &caveats,
             &mut Mcp::empty(),
+            None,
             None,
             None,
             None,
@@ -5486,6 +5941,7 @@ mod disable_ocap_session_tests {
             key_path: None,
             conversation_id: "conv-297".to_string(),
             log_path: None,
+            preset_clamp: None,
             color: false,
             verbose: false,
             ask_human: |_prompt: &str| PromptChoice::AllowOnce,
@@ -5503,6 +5959,7 @@ mod disable_ocap_session_tests {
             None,
             None,
             Some(&mut gate),
+            None,
         )
         .await;
         assert_eq!(out, "no-prompt\n");
@@ -5520,6 +5977,7 @@ mod disable_ocap_session_tests {
             key_path: None,
             conversation_id: "conv-297".to_string(),
             log_path: None,
+            preset_clamp: None,
             color: false,
             verbose: false,
             ask_human: |_prompt: &str| PromptChoice::AllowOnce,
@@ -5536,11 +5994,55 @@ mod disable_ocap_session_tests {
             None,
             None,
             Some(&mut gate),
+            None,
         )
         .await;
         assert_eq!(out, "gated contents");
         assert_eq!(state.decisions.len(), 1, "the fs denial prompted once");
         assert_eq!(state.decisions[0].kind, "fs_read");
+    }
+
+    /// #307 FLOOR TEST (a) at the TUI seam: with `--disable-ocap` set, a `/mode`
+    /// readonly preset clamp STOPS the unconfined bypass for a denied exec. The
+    /// preset's exec floor is threaded as `exec_floor`; `echo` is outside it, so
+    /// the command does NOT run unconfined — it falls to the confined dispatch
+    /// (stub-shell ⇒ error). A triage mode is NOT un-clamped by `--yolo`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn floor_wins_over_disable_ocap_at_the_tui_seam() {
+        let _env = crate::test_env_guard::env_write_guard_async().await;
+        let _on = EnvVar::set("NEWT_DISABLE_OCAP", "1");
+        let ws = tempfile::TempDir::new().unwrap();
+        let base = caveats_no_exec(ws.path());
+        // The readonly-triage preset clamp the active mode supplies.
+        let clamp = newt_core::NamedPermissionPreset {
+            readonly: true,
+            ..Default::default()
+        }
+        .clamp();
+        // Effective caveats = base ∩ clamp (already read-only on exec here).
+        let effective = base.meet(&clamp);
+        let out = execute_tool(
+            "run_command",
+            &serde_json::json!({ "command": "echo should-not-run" }),
+            &ws.path().to_string_lossy(),
+            false,
+            20,
+            &effective,
+            &mut Mcp::empty(),
+            None,
+            None,
+            None,
+            None,
+            // The active preset's exec floor — the bypass ceiling.
+            Some(&clamp.exec),
+        )
+        .await;
+        assert_ne!(out, "should-not-run\n", "the floor must block --yolo");
+        assert!(
+            out.starts_with("error:"),
+            "fell to confined dispatch: {out}"
+        );
     }
 }
 
@@ -7380,6 +7882,159 @@ mod skills_integration_tests {
 }
 
 // ---------------------------------------------------------------------------
+// Named permission presets + `/mode` (issue #307). The `build_mode` core is
+// pure (config + an injected skill loader), so the atomic preload-skill +
+// apply-preset + framing contract is exercised here without a live session.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod mode_command_tests {
+    use super::*;
+    use newt_core::CaveatsExt as _;
+    use std::fs;
+
+    fn write_skill(root: &std::path::Path, name: &str, body: &str) {
+        let dir = root.join(name);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: triage guidance\n---\n{body}\n"),
+        )
+        .unwrap();
+    }
+
+    /// A config wiring `[modes.triage]` → skill + preset, and a matching
+    /// `[permission_presets.readonly-triage]`. The skills dir is the temp dir.
+    fn triage_config(skills_dir: &std::path::Path) -> newt_core::Config {
+        let mut cfg = newt_core::Config {
+            skills: Some(newt_core::SkillsConfig {
+                search: vec![skills_dir.to_string_lossy().into_owned()],
+            }),
+            ..newt_core::Config::default()
+        };
+        cfg.permission_presets.insert(
+            "readonly-triage".to_string(),
+            newt_core::NamedPermissionPreset {
+                readonly: true,
+                exec_allow: vec!["git".to_string()],
+                deny: vec!["*".to_string()],
+                max_calls: Some(40),
+            },
+        );
+        cfg.modes.insert(
+            "triage".to_string(),
+            newt_core::config::ModeConfig {
+                skill: Some("oncall-triage".to_string()),
+                preset: Some("readonly-triage".to_string()),
+                framing: Some("On-call triage: investigate, do not change prod.".to_string()),
+            },
+        );
+        cfg
+    }
+
+    /// The acceptance criterion: `/mode <name>` loads the skill body AND
+    /// applies the preset clamp in ONE invocation. Uses the real `use_skill`
+    /// loader (`load_body_from`) over a mock skills dir — no reimplementation.
+    #[test]
+    fn build_mode_loads_skill_body_and_applies_preset_atomically() {
+        let skills = tempfile::TempDir::new().unwrap();
+        write_skill(skills.path(), "oncall-triage", "Read logs. Do not deploy.");
+        let cfg = triage_config(skills.path());
+        let dirs = cfg.skill_search_dirs();
+
+        let app = build_mode("triage", &cfg, |name| {
+            newt_skills::load_body_from(&dirs, name)
+        })
+        .expect("the mode resolves");
+
+        // (a) the skill body was preloaded (same payload as use_skill).
+        let body = app.skill_body.expect("skill body");
+        assert!(body.contains("Read logs. Do not deploy."), "got: {body}");
+        // (b) the preset clamp is applied as a floor.
+        assert_eq!(app.mode.preset_name, "readonly-triage");
+        assert!(!app.mode.clamp.permits_fs_write("/anything"), "readonly");
+        assert!(app.mode.clamp.permits_exec("git"), "allow-listed exec");
+        assert!(!app.mode.clamp.permits_exec("rm"), "deny everything else");
+        assert!(!app.mode.clamp.permits_net("evil.example.com"), "deny=*");
+        // (c) the framing is carried for system-prompt injection.
+        assert_eq!(
+            app.framing.as_deref(),
+            Some("On-call triage: investigate, do not change prod.")
+        );
+    }
+
+    /// Atomic-or-nothing: a mode naming a missing preset is an ERROR — never a
+    /// silent skill-load without the clamp (that would be a false claim).
+    #[test]
+    fn build_mode_errors_when_the_preset_is_missing() {
+        let skills = tempfile::TempDir::new().unwrap();
+        write_skill(skills.path(), "oncall-triage", "body");
+        let mut cfg = triage_config(skills.path());
+        cfg.permission_presets.clear(); // preset gone, mode still references it
+        let dirs = cfg.skill_search_dirs();
+        let err = build_mode("triage", &cfg, |name| {
+            newt_skills::load_body_from(&dirs, name)
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("readonly-triage"),
+            "names the missing preset: {err}"
+        );
+    }
+
+    /// A mode naming a missing skill is an ERROR for the same reason — the
+    /// clamp must not apply without the guidance the mode promised.
+    #[test]
+    fn build_mode_errors_when_the_skill_is_missing() {
+        let skills = tempfile::TempDir::new().unwrap(); // empty — no skill
+        let cfg = triage_config(skills.path());
+        let dirs = cfg.skill_search_dirs();
+        let err = build_mode("triage", &cfg, |name| {
+            newt_skills::load_body_from(&dirs, name)
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("oncall-triage"),
+            "names the missing skill: {err}"
+        );
+    }
+
+    /// An unknown mode name is an error (no `[modes.<name>]`).
+    #[test]
+    fn build_mode_errors_on_unknown_mode() {
+        let cfg = newt_core::Config::default();
+        let err = build_mode("nope", &cfg, |_| Ok(String::new()))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown mode"), "got: {err}");
+    }
+
+    /// The applied mode's effective caveats are base ∩ clamp — strictly
+    /// attenuated, the floor property at the wiring level.
+    #[test]
+    fn effective_caveats_intersect_base_with_the_mode_clamp() {
+        let clamp = newt_core::NamedPermissionPreset {
+            readonly: true,
+            ..Default::default()
+        }
+        .clamp();
+        let mode = ActiveMode {
+            name: "triage".to_string(),
+            preset_name: "readonly-triage".to_string(),
+            clamp_summary: "readonly".to_string(),
+            clamp,
+        };
+        let base = newt_core::Caveats::top();
+        let eff = effective_caveats(&base, Some(&mode));
+        assert!(eff.leq(&base), "the mode can only attenuate");
+        assert!(!eff.permits_fs_write("/x"), "readonly clamp applied");
+        // No mode ⇒ base unchanged (bit-for-bit).
+        assert_eq!(effective_caveats(&base, None), base);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Context-window 400 recovery (issue #223) — the one agentic-loop test that
 // stays TUI-side after Step 9.7 moved the loop suites to newt-core::agentic:
 // it exercises the TUI's `recover_cw_400` hook (`recover_context_window_400`),
@@ -7496,6 +8151,7 @@ mod tool_round_cap_tests {
                     permission_gate: None,
                     on_round_usage: None,
                     estimate_ratio: None,
+                    exec_floor: None,
                 },
                 &mut Mcp::empty(),
             )

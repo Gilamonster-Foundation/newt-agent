@@ -387,6 +387,10 @@ async fn run_one_turn(
         // applied, preserving today's behavior exactly.
         on_round_usage: None,
         estimate_ratio: None,
+        // #307: the headless driver carries no preset clamp — exec authority is
+        // whatever `config.caveats` already grants, exactly like the ACP worker
+        // / newt-eval callers. A consumer enforcing a mode clamps `caveats` itself.
+        exec_floor: None,
     };
     // NoMcp: the cowork driver advertises only the built-in tools. A consumer
     // that wants live MCP tools assembles its own ChatCtx.
