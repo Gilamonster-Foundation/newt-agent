@@ -273,6 +273,47 @@ pub fn ocap_disabled() -> bool {
     std::env::var("NEWT_DISABLE_OCAP").is_ok_and(|v| v == "1")
 }
 
+/// #307: does the named-permission-preset exec FLOOR permit running `cmd` on
+/// the UNCONFINED host shell?
+///
+/// `None` ⇒ no preset is active; the floor imposes nothing, so the answer is
+/// `true` (the `--disable-ocap` bypass behaves exactly as it did pre-#307).
+///
+/// `Some(scope)` ⇒ the bypass may proceed ONLY for a single, simple command
+/// whose program (leading token) the scope authorizes. This is deliberately
+/// conservative on TWO counts, because the host shell runs `cmd` verbatim with
+/// no per-spawn interceptor:
+///
+/// 1. A **compound** command (containing a shell metacharacter that could chain
+///    another program — `&&`, `||`, `;`, `|`, `` ` ``, `$(`, newline, `&`, `>`,
+///    `<`) is NOT allowed to bypass. `echo ok && rm -rf /` would otherwise
+///    smuggle `rm` past an `echo` grant. It falls through to the confined
+///    shell, which gates every spawn.
+/// 2. Only the leading token is matched, so a bare allow-listed program runs;
+///    anything else is denied.
+///
+/// The denied command isn't refused outright — it falls to the confined-shell
+/// path, which enforces the (already preset-clamped) `caveats`. So a restricted
+/// triage/on-call mode keeps its ceiling even under `--yolo`.
+fn exec_floor_permits(floor: Option<&crate::caveats::Scope<String>>, cmd: &str) -> bool {
+    use crate::caveats::ScopeExt as _;
+    let Some(scope) = floor else {
+        return true; // no preset ⇒ bypass unchanged (bit-for-bit)
+    };
+    // Conservative: any shell control/redirection metacharacter that could
+    // introduce a second program defeats leading-token matching, so refuse the
+    // bypass and let the confined shell gate each spawn.
+    const SHELL_META: &[char] = &['&', '|', ';', '`', '$', '\n', '>', '<', '(', ')'];
+    if cmd.contains(SHELL_META) {
+        return false;
+    }
+    match cmd.split_ascii_whitespace().next() {
+        // An empty command runs nothing; let it through to the normal path.
+        None => true,
+        Some(prog) => scope.permits(&prog.to_string()),
+    }
+}
+
 /// INTERIM (#297): run `cmd` on the PLAIN host shell — no leash, no
 /// interceptor, no sandbox — and wrap the outcome in an envelope structurally
 /// identical to the confined shell's (`{ exit_code, stdout, stderr,
@@ -602,6 +643,16 @@ pub(crate) fn host_of_url(url: &str) -> Option<String> {
 /// consulted for exec. Every other tool (fs fence, `web_fetch` leash) is
 /// unaffected. Removed when brush upstreams `CommandInterceptor`
 /// (agent-bridle#20).
+///
+/// `exec_floor` (issue #307) is the **named-permission-preset clamp** acting as
+/// a hard authority FLOOR over exec. `None` (every existing caller, and the
+/// no-preset case) leaves the `--disable-ocap` bypass exactly as it was —
+/// bit-for-bit. `Some(scope)` makes the bypass conditional: an out-of-floor
+/// command does NOT take the unconfined host path, it falls through to the
+/// confined shell, which enforces the already-clamped `caveats` and denies it.
+/// This is what makes a deliberately-restricted on-call/triage mode win over a
+/// `--yolo` flag — the preset clamp is consulted as a ceiling the bypass
+/// cannot cross.
 #[allow(clippy::too_many_arguments)]
 pub async fn execute_tool(
     name: &str,
@@ -615,6 +666,7 @@ pub async fn execute_tool(
     note_sink: Option<&mut dyn NoteSink>,
     recall_source: Option<&dyn RecallSource>,
     permission_gate: Option<&mut dyn PermissionGate>,
+    exec_floor: Option<&crate::caveats::Scope<String>>,
 ) -> String {
     // Remote MCP tools (namespaced `server__tool`) route to their server before
     // the built-in match. They carry no Caveats leash in this build.
@@ -687,7 +739,16 @@ pub async fn execute_tool(
             // precedence rule (`--disable-ocap` > `--prompt-for-permissions`
             // for exec) falls out structurally. The fs tools below are NOT
             // bypassed: yolo is unconfined exec, fenced fs.
-            if ocap_disabled() {
+            //
+            // #307 FLOOR: a named-permission-preset clamp WINS over the bypass.
+            // When `exec_floor` is `Some`, the unconfined host path is taken
+            // ONLY if the floor permits this command's leading token. An
+            // out-of-floor command (e.g. `rm` under a readonly triage preset)
+            // falls through to the confined shell below, which enforces the
+            // already-clamped `caveats` and denies it — so `--yolo` can never
+            // raise authority above the active preset. `None` (no preset) keeps
+            // the bypass bit-for-bit.
+            if ocap_disabled() && exec_floor_permits(exec_floor, cmd) {
                 return match host_shell_dispatch(&cmd_with_venv, workspace).await {
                     Ok(envelope) => shell_envelope_output(&envelope, tool_output_lines, color),
                     Err(e) => format!("error: {e}"),
@@ -1446,6 +1507,7 @@ mod execute_tool_branch_tests {
             None,
             None,
             None,
+            None,
         )
         .await
     }
@@ -1753,6 +1815,7 @@ mod execute_tool_branch_tests {
             None,
             None,
             Some(gate),
+            None,
         )
         .await
     }
@@ -1972,6 +2035,7 @@ mod execute_tool_branch_tests {
             None,
             None,
             Some(&mut gate),
+            None,
         )
         .await;
         assert_eq!(
@@ -2062,6 +2126,7 @@ mod execute_tool_branch_tests {
             Some(&mut sink),
             None,
             None,
+            None,
         )
         .await;
         assert_eq!(sink.calls, vec!["add:workspace builds with just check"]);
@@ -2114,6 +2179,7 @@ mod execute_tool_branch_tests {
             None,
             None,
             Some(&source),
+            None,
             None,
         )
         .await;
@@ -2200,6 +2266,20 @@ mod disable_ocap_tests {
         ws: &std::path::Path,
         caveats: &Caveats,
     ) -> String {
+        run_tool_with_floor(name, args, ws, caveats, None).await
+    }
+
+    /// #307: like [`run_tool`] but with an explicit exec FLOOR (the active
+    /// named-permission-preset clamp). `Some(scope)` makes the `--disable-ocap`
+    /// bypass conditional on the floor permitting the command; `None` is the
+    /// pre-#307 behavior.
+    async fn run_tool_with_floor(
+        name: &str,
+        args: serde_json::Value,
+        ws: &std::path::Path,
+        caveats: &Caveats,
+        exec_floor: Option<&Scope<String>>,
+    ) -> String {
         execute_tool(
             name,
             &args,
@@ -2212,6 +2292,7 @@ mod disable_ocap_tests {
             None,
             None,
             None,
+            exec_floor,
         )
         .await
     }
@@ -2298,6 +2379,208 @@ mod disable_ocap_tests {
         )
         .await;
         assert_eq!(out, "(exit 3)");
+    }
+
+    // --- #307 floor property: preset clamp WINS over --disable-ocap -------
+
+    /// Unit-cover every branch of the bypass-floor predicate.
+    #[test]
+    fn exec_floor_permits_covers_each_branch() {
+        use crate::caveats::Scope;
+        // No floor ⇒ always permit (bit-for-bit pre-#307).
+        assert!(exec_floor_permits(None, "rm -rf /"));
+        // Empty command ⇒ let it through to the normal path.
+        let only_echo = Scope::only(["echo".to_string()]);
+        assert!(exec_floor_permits(Some(&only_echo), ""));
+        // In-floor simple command ⇒ permitted.
+        assert!(exec_floor_permits(Some(&only_echo), "echo hi"));
+        // Out-of-floor program ⇒ refused.
+        assert!(!exec_floor_permits(Some(&only_echo), "rm hi"));
+        // Compound command ⇒ refused even with an allow-listed leading token.
+        assert!(!exec_floor_permits(Some(&only_echo), "echo hi && rm x"));
+        assert!(!exec_floor_permits(Some(&only_echo), "echo a | tee b"));
+        assert!(!exec_floor_permits(Some(&only_echo), "echo $(rm x)"));
+        // `Scope::All` floor permits any simple command.
+        let all: Scope<String> = Scope::All;
+        assert!(exec_floor_permits(Some(&all), "anything goes"));
+        assert!(!exec_floor_permits(Some(&all), "anything; sneaky"));
+    }
+
+    /// ADVERSARIAL PROBE (review #312): exhaustively attack `exec_floor_permits`
+    /// with EVERY shell injection / compound form so the floor is proven against
+    /// more than just `&&`. An `echo`-only floor must refuse to bypass for any
+    /// form that could chain or substitute a second program.
+    #[test]
+    fn exec_floor_refuses_every_metacharacter_form() {
+        use crate::caveats::Scope;
+        let echo = Scope::only(["echo".to_string()]);
+        // Each of these begins with the allow-listed `echo` but smuggles or
+        // could smuggle a second program. None may bypass.
+        let attacks = [
+            "echo ok && rm -rf /tmp/x", // && and
+            "echo ok || rm -rf /tmp/x", // || or
+            "echo ok ; rm -rf /tmp/x",  // ; sequence
+            "echo ok | sh",             // | pipe
+            "echo ok|sh",               // | no spaces
+            "echo $(rm x)",             // $() command substitution
+            "echo ${IFS}rm",            // ${} parameter expansion
+            "echo `rm x`",              // backtick substitution
+            "echo ok & rm x",           // & background
+            "echo ok > /etc/passwd",    // > redirect out
+            "echo ok >> /etc/passwd",   // >> append
+            "echo < /etc/shadow",       // < redirect in
+            "echo ok 2> err",           // 2> fd redirect (contains >)
+            "(rm x)",                   // ( subshell
+            "echo ok\nrm -rf /tmp/x",   // newline-separated
+            "echo ok\nrm x\n",          // trailing newline
+        ];
+        for a in attacks {
+            assert!(
+                !exec_floor_permits(Some(&echo), a),
+                "metacharacter form must NOT bypass the floor: {a:?}"
+            );
+        }
+        // Forms with NO shell metacharacter that should still be refused because
+        // the LEADING TOKEN is not the allow-listed program:
+        let leading_token_attacks = [
+            "rm -rf /tmp/x", // plain out-of-floor program
+            "FOO=bar rm x",  // env-prefix: leading token `FOO=bar` ∉ floor
+            "/bin/echo ok",  // path form: `/bin/echo` ≠ `echo` (exact match)
+            "  rm x",        // leading whitespace, still `rm`
+            "env rm x",      // `env` wrapper, leading token `env` ∉ floor
+            "bash -c rm",    // `bash` ∉ floor
+        ];
+        for a in leading_token_attacks {
+            assert!(
+                !exec_floor_permits(Some(&echo), a),
+                "out-of-floor leading token must be refused: {a:?}"
+            );
+        }
+        // Sanity: a bare in-floor command with only a benign arg DOES bypass —
+        // the floor is a ceiling, not a blanket off-switch. (A dangerous arg to
+        // a permitted program is the user's accepted risk: they allow-listed it.)
+        assert!(exec_floor_permits(Some(&echo), "echo hello world"));
+        assert!(exec_floor_permits(Some(&echo), "echo -n trailing"));
+    }
+
+    /// FLOOR TEST (a) — the security contract: with `--disable-ocap` asserted,
+    /// an exec FLOOR that denies the command must STOP the unconfined bypass.
+    /// `echo` is outside a readonly floor (`exec = none`), so even with yolo on
+    /// it does NOT run on the host shell — it falls through to the confined
+    /// dispatch, which on this stub-shell build fails closed. A deliberately
+    /// restricted triage mode is NOT un-clamped by `--yolo`.
+    #[tokio::test]
+    async fn floor_blocks_disable_ocap_for_a_denied_exec() {
+        let _l = env_lock().await;
+        let _on = EnvVar::set("NEWT_DISABLE_OCAP", "1");
+        let ws = tempfile::TempDir::new().unwrap();
+        let caveats = caveats_no_exec(ws.path());
+        // A readonly-triage preset clamp: exec denies everything.
+        let floor = crate::NamedPermissionPreset {
+            readonly: true,
+            ..Default::default()
+        }
+        .clamp();
+        let out = run_tool_with_floor(
+            "run_command",
+            serde_json::json!({"command": "echo should-not-run"}),
+            ws.path(),
+            &caveats,
+            Some(&floor.exec),
+        )
+        .await;
+        // The bypass did NOT fire: the command never reached the host shell, so
+        // we see the confined-dispatch error, not `should-not-run\n`.
+        assert_ne!(out, "should-not-run\n", "the floor must block the bypass");
+        assert!(
+            out.starts_with("error:"),
+            "fell to confined dispatch: {out}"
+        );
+        assert!(
+            out.contains("reubeno/brush/pull/1184"),
+            "confined stub error surfaces, got: {out}"
+        );
+    }
+
+    /// FLOOR TEST (a, positive) — a command INSIDE the floor still takes the
+    /// fast unconfined path under `--disable-ocap`. The floor is a ceiling, not
+    /// a blanket off-switch: an explicitly allow-listed command runs.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn floor_allows_disable_ocap_for_an_in_floor_exec() {
+        let _l = env_lock().await;
+        let _on = EnvVar::set("NEWT_DISABLE_OCAP", "1");
+        let ws = tempfile::TempDir::new().unwrap();
+        let caveats = caveats_no_exec(ws.path());
+        // A triage preset that allow-lists `echo`.
+        let floor = crate::NamedPermissionPreset {
+            readonly: true,
+            exec_allow: vec!["echo".to_string()],
+            ..Default::default()
+        }
+        .clamp();
+        let out = run_tool_with_floor(
+            "run_command",
+            serde_json::json!({"command": "echo in-floor-ok"}),
+            ws.path(),
+            &caveats,
+            Some(&floor.exec),
+        )
+        .await;
+        assert_eq!(out, "in-floor-ok\n", "in-floor command runs unconfined");
+    }
+
+    /// FLOOR conservatism — a COMPOUND command never bypasses under an active
+    /// floor, even if its leading token is allow-listed: `echo ok && rm -rf /`
+    /// must not smuggle `rm` past an `echo` grant. It falls to the confined
+    /// shell (stub ⇒ error), which gates each spawn.
+    #[tokio::test]
+    async fn floor_refuses_bypass_for_a_compound_command() {
+        let _l = env_lock().await;
+        let _on = EnvVar::set("NEWT_DISABLE_OCAP", "1");
+        let ws = tempfile::TempDir::new().unwrap();
+        let caveats = caveats_no_exec(ws.path());
+        // `echo` is allow-listed, but the `&&` chains an unlisted `rm`.
+        let floor = crate::NamedPermissionPreset {
+            readonly: true,
+            exec_allow: vec!["echo".to_string()],
+            ..Default::default()
+        }
+        .clamp();
+        let out = run_tool_with_floor(
+            "run_command",
+            serde_json::json!({"command": "echo ok && rm -rf /tmp/x"}),
+            ws.path(),
+            &caveats,
+            Some(&floor.exec),
+        )
+        .await;
+        assert_ne!(out, "ok\n", "a compound command must not bypass the floor");
+        assert!(
+            out.starts_with("error:"),
+            "fell to confined dispatch: {out}"
+        );
+    }
+
+    /// FLOOR TEST (c) — `None` floor is bit-for-bit the pre-#307 bypass: a
+    /// denied-by-caveats command still runs unconfined under `--disable-ocap`,
+    /// proving the floor is opt-in and the no-preset case is unchanged.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn no_floor_keeps_disable_ocap_bit_for_bit() {
+        let _l = env_lock().await;
+        let _on = EnvVar::set("NEWT_DISABLE_OCAP", "1");
+        let ws = tempfile::TempDir::new().unwrap();
+        let caveats = caveats_no_exec(ws.path());
+        let out = run_tool_with_floor(
+            "run_command",
+            serde_json::json!({"command": "echo no-floor-ok"}),
+            ws.path(),
+            &caveats,
+            None,
+        )
+        .await;
+        assert_eq!(out, "no-floor-ok\n", "no floor ⇒ bypass unchanged");
     }
 
     /// Envelope parity (#297): the host-shell envelope is structurally
@@ -2416,6 +2699,7 @@ mod disable_ocap_tests {
             None,
             None,
             Some(&mut gate),
+            None,
         )
         .await;
         assert_eq!(out, "no-prompt\n");
