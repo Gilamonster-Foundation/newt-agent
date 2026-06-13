@@ -2406,6 +2406,63 @@ mod disable_ocap_tests {
         assert!(!exec_floor_permits(Some(&all), "anything; sneaky"));
     }
 
+    /// ADVERSARIAL PROBE (review #312): exhaustively attack `exec_floor_permits`
+    /// with EVERY shell injection / compound form so the floor is proven against
+    /// more than just `&&`. An `echo`-only floor must refuse to bypass for any
+    /// form that could chain or substitute a second program.
+    #[test]
+    fn exec_floor_refuses_every_metacharacter_form() {
+        use crate::caveats::Scope;
+        let echo = Scope::only(["echo".to_string()]);
+        // Each of these begins with the allow-listed `echo` but smuggles or
+        // could smuggle a second program. None may bypass.
+        let attacks = [
+            "echo ok && rm -rf /tmp/x", // && and
+            "echo ok || rm -rf /tmp/x", // || or
+            "echo ok ; rm -rf /tmp/x",  // ; sequence
+            "echo ok | sh",             // | pipe
+            "echo ok|sh",               // | no spaces
+            "echo $(rm x)",             // $() command substitution
+            "echo ${IFS}rm",            // ${} parameter expansion
+            "echo `rm x`",              // backtick substitution
+            "echo ok & rm x",           // & background
+            "echo ok > /etc/passwd",    // > redirect out
+            "echo ok >> /etc/passwd",   // >> append
+            "echo < /etc/shadow",       // < redirect in
+            "echo ok 2> err",           // 2> fd redirect (contains >)
+            "(rm x)",                   // ( subshell
+            "echo ok\nrm -rf /tmp/x",   // newline-separated
+            "echo ok\nrm x\n",          // trailing newline
+        ];
+        for a in attacks {
+            assert!(
+                !exec_floor_permits(Some(&echo), a),
+                "metacharacter form must NOT bypass the floor: {a:?}"
+            );
+        }
+        // Forms with NO shell metacharacter that should still be refused because
+        // the LEADING TOKEN is not the allow-listed program:
+        let leading_token_attacks = [
+            "rm -rf /tmp/x", // plain out-of-floor program
+            "FOO=bar rm x",  // env-prefix: leading token `FOO=bar` ∉ floor
+            "/bin/echo ok",  // path form: `/bin/echo` ≠ `echo` (exact match)
+            "  rm x",        // leading whitespace, still `rm`
+            "env rm x",      // `env` wrapper, leading token `env` ∉ floor
+            "bash -c rm",    // `bash` ∉ floor
+        ];
+        for a in leading_token_attacks {
+            assert!(
+                !exec_floor_permits(Some(&echo), a),
+                "out-of-floor leading token must be refused: {a:?}"
+            );
+        }
+        // Sanity: a bare in-floor command with only a benign arg DOES bypass —
+        // the floor is a ceiling, not a blanket off-switch. (A dangerous arg to
+        // a permitted program is the user's accepted risk: they allow-listed it.)
+        assert!(exec_floor_permits(Some(&echo), "echo hello world"));
+        assert!(exec_floor_permits(Some(&echo), "echo -n trailing"));
+    }
+
     /// FLOOR TEST (a) — the security contract: with `--disable-ocap` asserted,
     /// an exec FLOOR that denies the command must STOP the unconfined bypass.
     /// `echo` is outside a readonly floor (`exec = none`), so even with yolo on

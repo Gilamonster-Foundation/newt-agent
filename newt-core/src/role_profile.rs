@@ -260,6 +260,12 @@ impl CaveatProfile {
 ///
 /// A preset with no fields set is the identity clamp (`Caveats::top()`), so an
 /// empty `[permission_presets.x]` block leaves authority unchanged.
+///
+/// **Footgun (review #312):** omitted axes stay at `TOP`. A preset that sets
+/// only `exec_allow = ["git"]` clamps *exec* but leaves `fs_write` and `net`
+/// wide open — it is NOT "locked down" despite reading that way. For a true
+/// read-only triage clamp, set `readonly = true` (denies writes + exec) and
+/// add `exec_allow` only for the few programs the mode genuinely needs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct NamedPermissionPreset {
     /// `true` ⇒ deny all writes and (unless `exec_allow` overrides) all exec.
