@@ -382,6 +382,11 @@ async fn run_one_turn(
         compress_state: None,
         tool_events: None,
         permission_gate: None,
+        // Phase 20 (spec §5): headless surfaces neither read nor write the
+        // capability cache — the hook stays absent and no calibration is
+        // applied, preserving today's behavior exactly.
+        on_round_usage: None,
+        estimate_ratio: None,
         // #307: the headless driver carries no preset clamp — exec authority is
         // whatever `config.caveats` already grants, exactly like the ACP worker
         // / newt-eval callers. A consumer enforcing a mode clamps `caveats` itself.

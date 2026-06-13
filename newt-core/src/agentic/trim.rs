@@ -110,21 +110,29 @@ impl PromptTracker {
         self.anchor = None;
     }
 
-    /// Current context size in tokens: backend-reported prompt tokens plus an
-    /// estimate of messages appended since, or [`estimate_request_tokens`]
-    /// (messages + serialized tool schemas) when no valid anchor exists. The
-    /// schemas are NOT added on the anchored path — the backend's report
-    /// already includes them.
+    /// Current context size in REAL tokens: backend-reported prompt tokens
+    /// plus an estimate of messages appended since, or
+    /// [`estimate_request_tokens`] (messages + serialized tool schemas) when
+    /// no valid anchor exists. The schemas are NOT added on the anchored
+    /// path — the backend's report already includes them.
+    ///
+    /// `ratio` is the per-model estimate calibration (Phase 20,
+    /// `docs/design/model-self-tuning.md` §2.3): every chars/4 leg is scaled
+    /// estimate→real so the figure compares honestly against backend-derived
+    /// budgets. The anchored backend report is already real tokens and is
+    /// never rescaled. At `ratio == 1.0` behavior is identical to the
+    /// pre-Phase-20 contract.
     pub(crate) fn current(
         &self,
         messages: &[serde_json::Value],
         tools: Option<&serde_json::Value>,
+        ratio: f32,
     ) -> usize {
         match self.anchor {
             Some((tokens, count)) if count <= messages.len() => {
-                tokens as usize + estimate_tokens(&messages[count..])
+                tokens as usize + super::calibrate_up(estimate_tokens(&messages[count..]), ratio)
             }
-            _ => estimate_request_tokens(messages, tools),
+            _ => super::calibrate_up(estimate_request_tokens(messages, tools), ratio),
         }
     }
 }
@@ -564,7 +572,7 @@ mod tests {
         let tools = fixture_tools();
         let tracker = PromptTracker::new();
         assert_eq!(
-            tracker.current(&msgs, Some(&tools)),
+            tracker.current(&msgs, Some(&tools), 1.0),
             estimate_request_tokens(&msgs, Some(&tools)),
             "no report yet → chars/4 of messages + tool-schema tokens"
         );
@@ -582,7 +590,7 @@ mod tests {
         // (schemas + template included — far above any chars/4 guess).
         tracker.record(1_000, msgs.len());
         assert_eq!(
-            tracker.current(&msgs, Some(&tools)),
+            tracker.current(&msgs, Some(&tools), 1.0),
             1_000,
             "anchored: schema tokens NOT re-added — the report includes them"
         );
@@ -590,7 +598,41 @@ mod tests {
         msgs.push(serde_json::json!({"role": "assistant", "content": "a".repeat(400)}));
         msgs.push(serde_json::json!({"role": "tool", "content": "b".repeat(400)}));
         let appended = estimate_tokens(&msgs[2..]);
-        assert_eq!(tracker.current(&msgs, Some(&tools)), 1_000 + appended);
+        assert_eq!(tracker.current(&msgs, Some(&tools), 1.0), 1_000 + appended);
+    }
+
+    /// Phase 20 §2.3: a non-1.0 calibration ratio scales only the chars/4
+    /// legs — the anchored backend report is already real tokens. Both the
+    /// anchored and unanchored paths must apply it.
+    #[test]
+    fn prompt_tracker_calibrates_estimate_legs_with_ratio() {
+        let mut msgs = vec![
+            serde_json::json!({"role": "system", "content": "sys"}),
+            serde_json::json!({"role": "user", "content": "task"}),
+        ];
+        let tools = fixture_tools();
+        let ratio = 1.3_f32;
+        // Unanchored: the whole request estimate scales up.
+        let tracker = PromptTracker::new();
+        assert_eq!(
+            tracker.current(&msgs, Some(&tools), ratio),
+            super::super::calibrate_up(estimate_request_tokens(&msgs, Some(&tools)), ratio)
+        );
+        // Anchored: the 1,000-token report stays as-is; only the appended
+        // messages' estimate scales.
+        let mut tracker = PromptTracker::new();
+        tracker.record(1_000, msgs.len());
+        assert_eq!(
+            tracker.current(&msgs, Some(&tools), ratio),
+            1_000,
+            "no appended messages → the real-token anchor alone, unscaled"
+        );
+        msgs.push(serde_json::json!({"role": "tool", "content": "b".repeat(400)}));
+        let appended = estimate_tokens(&msgs[2..]);
+        assert_eq!(
+            tracker.current(&msgs, Some(&tools), ratio),
+            1_000 + super::super::calibrate_up(appended, ratio)
+        );
     }
 
     #[test]
@@ -600,14 +642,14 @@ mod tests {
         tracker.record(1_000, 1);
         tracker.invalidate();
         assert_eq!(
-            tracker.current(&msgs, None),
+            tracker.current(&msgs, None, 1.0),
             estimate_tokens(&msgs),
             "invalidated anchor → fallback estimate"
         );
         // A stale anchor (more messages at report time than exist now — a trim
         // shrank the list) must also fall back, never index out of bounds.
         tracker.record(1_000, 5);
-        assert_eq!(tracker.current(&msgs, None), estimate_tokens(&msgs));
+        assert_eq!(tracker.current(&msgs, None, 1.0), estimate_tokens(&msgs));
     }
 
     #[test]

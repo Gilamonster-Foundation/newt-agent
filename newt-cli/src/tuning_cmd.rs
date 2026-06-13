@@ -160,6 +160,27 @@ fn cmd_show(model: Option<&str>) -> anyhow::Result<()> {
         let safe_str = safe_ctx.map(fmt_k).unwrap_or_else(|| "—".to_string());
 
         println!("{name:<30}  {ctx_str:>8}  {safe_str:>8}  {conf:>6}  {source}");
+
+        // Phase 20 (docs/design/model-self-tuning.md): learned calibration
+        // and quirks, rendered as indented detail lines under the row.
+        let estimate_ratio = cap_entry
+            .and_then(|e| e.get("estimate_ratio"))
+            .and_then(|v| v.as_f64())
+            .or_else(|| {
+                community_entry
+                    .and_then(|p| p.estimate_ratio)
+                    .map(f64::from)
+            });
+        if let Some(ratio) = estimate_ratio {
+            println!("    estimate calibration: x{ratio:.2} (chars/4 -> real)");
+        }
+        if cap_entry
+            .and_then(|e| e.get("emits_thinking"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            println!("    quirk: emits thinking-only responses");
+        }
     }
 
     println!();
@@ -206,6 +227,12 @@ fn cmd_export(output: Option<&std::path::Path>) -> anyhow::Result<()> {
                 .get("consecutive_ok")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0) as u32;
+            // Phase 20: the learned chars/4 calibration is shareable tuning
+            // data too (additive optional field; format version stays "1").
+            let estimate_ratio = entry
+                .get("estimate_ratio")
+                .and_then(|v| v.as_f64())
+                .map(|v| v as f32);
 
             ct.profiles.push(TuningProfile {
                 model: model.clone(),
@@ -213,6 +240,7 @@ fn cmd_export(output: Option<&std::path::Path>) -> anyhow::Result<()> {
                 safe_context,
                 mid_loop_trim_threshold: None,
                 max_tool_rounds: None,
+                estimate_ratio,
                 tune_source: TuneSource::Empirical,
                 confidence,
                 data_points,
@@ -295,6 +323,11 @@ fn cmd_reset(model: Option<&str>) -> anyhow::Result<()> {
         "consecutive_ok",
         "tune_confidence",
         "tune_date",
+        // Phase 20: the Refused bail points users here when a learned
+        // budget looks wrong — the reset must clear the new learned fields
+        // (a poisoned calibration ratio) along with the ratchets.
+        "estimate_ratio",
+        "emits_thinking",
     ];
 
     let obj = json
