@@ -5954,6 +5954,7 @@ mod disable_ocap_session_tests {
     /// preset's exec floor is threaded as `exec_floor`; `echo` is outside it, so
     /// the command does NOT run unconfined — it falls to the confined dispatch
     /// (stub-shell ⇒ error). A triage mode is NOT un-clamped by `--yolo`.
+    #[cfg(unix)]
     #[tokio::test]
     async fn floor_wins_over_disable_ocap_at_the_tui_seam() {
         let _env = crate::test_env_guard::env_write_guard_async().await;
