@@ -584,6 +584,594 @@ pub fn ensure_context_window(entry: &mut CapabilityEntry, endpoint: &str, model:
 }
 
 // ---------------------------------------------------------------------------
+// Active discovery (Step 20.2 — docs/design/model-self-tuning.md §4)
+// ---------------------------------------------------------------------------
+
+/// Today's date as `YYYY-MM-DD` in local time — the stamp the active probes
+/// write into `tested_date` / `tune_date`. Lives here so both the TUI handler
+/// and the `newt tunings` staleness surface (newt-cli, which has no chrono
+/// dependency) share one source of truth.
+pub fn today_local_date() -> String {
+    chrono::Local::now().format("%Y-%m-%d").to_string()
+}
+
+/// Staleness-aware sibling of [`ensure_context_window`] (Step 20.2 §4.2).
+///
+/// `/probe` is the explicit re-discover command, so this **always** calls
+/// [`fetch_context_window`] (no early return on a known window) and updates
+/// `entry.context_window` whenever the fetch succeeds — catching a re-pulled
+/// model whose Modelfile `num_ctx` changed since the last probe. It
+/// re-bootstraps `safe_context` to 80 % of the declared window **only when
+/// `safe_context.is_none()`**, and never auto-raises an existing value (the
+/// VRAM rule, §2.1 / §4.2): a larger declared window does not free more KV
+/// cache. Returns `true` when `context_window` actually changed (caller
+/// saves); a fetch failure leaves the entry untouched and returns `false`.
+///
+/// The passive session path keeps using [`ensure_context_window`]
+/// (fetch-once, negative-cached); only `/probe` forces this refresh.
+pub fn refresh_context_window(entry: &mut CapabilityEntry, endpoint: &str, model: &str) -> bool {
+    let Some(window) = fetch_context_window(endpoint, model) else {
+        return false;
+    };
+    let changed = entry.context_window != Some(window);
+    entry.context_window = Some(window);
+    // Bootstrap (never auto-raise) safe_context at 80 % of declared max.
+    if entry.safe_context.is_none() {
+        entry.safe_context = Some(window * 80 / 100);
+    }
+    changed
+}
+
+/// Local, content-free re-detection of the thinking-only response quirk
+/// (Step 20.2 §4.3): `true` when `message.content` is empty/whitespace AND
+/// any of `thinking` / `reasoning` / `reasoning_content` is a non-empty
+/// string. Deliberately NOT a dependency on newt-core's private
+/// `ollama_non_content_fields` (the crate boundary forbids it, and the logic
+/// is tiny) — kept in lock-step with §2.1's `record_thinking_only` semantics.
+pub fn message_thinking_fields(message: &serde_json::Value) -> bool {
+    let content_empty = message["content"]
+        .as_str()
+        .map(|c| c.trim().is_empty())
+        .unwrap_or(true);
+    if !content_empty {
+        return false;
+    }
+    ["thinking", "reasoning", "reasoning_content"]
+        .iter()
+        .any(|field| {
+            message[*field]
+                .as_str()
+                .map(|v| !v.trim().is_empty())
+                .unwrap_or(false)
+        })
+}
+
+/// Outcome of the cheap thinking probe (Step 20.2 §4.3 / §4.4).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProbeThinking {
+    /// The model returned a thinking-only response (empty content + a
+    /// non-empty `thinking`/`reasoning` field) to the tiny probe.
+    pub emits_thinking: bool,
+    /// `(estimated_tokens, observed prompt_eval_count)` for the probe request,
+    /// `Some` only when the response carried `prompt_eval_count` — a
+    /// calibration sample for [`CapabilityEntry::record_estimate_sample`]
+    /// (§4.4). `estimated_tokens` is the request body's chars/4 figure.
+    pub calibration: Option<(u32, usize)>,
+}
+
+/// Send one tiny `stream:false` `/api/chat` request and classify the thinking
+/// quirk (Step 20.2 §4.3), harvesting a calibration sample (§4.4) from the
+/// same request. 60 s timeout; the model must already be warm. Mirrors
+/// [`fetch_context_window`]'s `block_in_place` + `Handle::block_on` pattern so
+/// it runs from inside the synchronous slash dispatcher.
+pub fn probe_thinking(endpoint: &str, model: &str) -> anyhow::Result<ProbeThinking> {
+    let url = format!("{}/api/chat", endpoint.trim_end_matches('/'));
+    let prompt = "Reply with the single word: ok";
+    let body = serde_json::json!({
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "stream": false,
+    });
+    // chars/4 estimate of the serialized request body (same currency the
+    // agentic loop estimates in) — paired with the backend's real count.
+    let estimated = serde_json::to_string(&body)
+        .map(|s| s.chars().count() / 4)
+        .unwrap_or(prompt.chars().count() / 4);
+
+    let json: serde_json::Value = tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(async {
+            let resp = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(60))
+                .build()?
+                .post(&url)
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| anyhow::anyhow!("request failed: {e}"))?;
+            if !resp.status().is_success() {
+                anyhow::bail!("Ollama returned {}", resp.status());
+            }
+            resp.json::<serde_json::Value>()
+                .await
+                .map_err(anyhow::Error::from)
+        })
+    })?;
+
+    let emits_thinking = message_thinking_fields(&json["message"]);
+    // calibration = (observed real prompt tokens, our chars/4 estimate) —
+    // the (observed, estimated) order record_estimate_sample expects.
+    let calibration = json["prompt_eval_count"]
+        .as_u64()
+        .map(|observed| (observed as u32, estimated));
+
+    Ok(ProbeThinking {
+        emits_thinking,
+        calibration,
+    })
+}
+
+/// Sanitize a learned `estimate_ratio` for use as a multiplier (Step 20.1
+/// hygiene, reused by §4.5): a non-finite or out-of-band value falls back to
+/// `1.0`; otherwise it is clamped to the same `[0.5, 3.0]` band the EMA
+/// stores in.
+fn sanitize_ratio(ratio: f32) -> f32 {
+    if ratio.is_finite() && (0.5..=3.0).contains(&ratio) {
+        ratio
+    } else {
+        1.0
+    }
+}
+
+/// Build a deterministic filler prompt whose chars/4 estimate, scaled by the
+/// model's `estimate_ratio`, lands near `target_real_tokens` (Step 20.2 §4.5).
+///
+/// No RNG (and none is available in this environment): the filler is a short
+/// clause repeated to the needed length. The chars/4 estimator counts ~4
+/// chars per token, and the learned `ratio` converts estimate→real, so to make
+/// the backend evaluate ≈ `target_real_tokens` real tokens we need
+/// `chars ≈ target / ratio * 4`. Sanitized like 20.1 (finite, `[0.5, 3.0]`,
+/// else `1.0`).
+pub fn build_padded_prompt(target_real_tokens: u32, ratio: f32) -> String {
+    let ratio = sanitize_ratio(ratio);
+    // estimate_tokens * ratio ≈ real_tokens  ⇒  estimate_tokens ≈ target / ratio
+    // chars ≈ estimate_tokens * 4.
+    let target_estimate = (target_real_tokens as f32 / ratio).round().max(1.0);
+    let target_chars = (target_estimate * 4.0).round() as usize;
+    // A short, space-terminated clause; repeating it lands within one clause
+    // length of the target, i.e. well within the ±10 % unit-test tolerance.
+    const CLAUSE: &str = "lorem ipsum dolor sit amet ";
+    let mut s = String::with_capacity(target_chars + CLAUSE.len());
+    while s.chars().count() < target_chars {
+        s.push_str(CLAUSE);
+    }
+    s
+}
+
+/// Classification of one boundary probe (Step 20.2 §4.5) — the pure decision,
+/// split from the HTTP so every arm is unit-testable without a server.
+#[derive(Debug, Clone, PartialEq)]
+pub enum BoundaryClass {
+    /// HTTP 200, a usable completion, and the backend evaluated ≥ 90 % of the
+    /// sent estimate: the model genuinely accepted the prompt.
+    Accepted { prompt_tokens: u32 },
+    /// HTTP 200 but `prompt_eval_count` well below the sent estimate — Ollama
+    /// silently dropped the head of the prompt. Treated as rejected.
+    Truncated,
+    /// A hard context-window 400 whose body parsed to a real `limit`.
+    CtxWindow400 { limit: u32 },
+    /// Any other transport/5xx/OOM error: stop raising, keep the last
+    /// accepted value, do not record a false boundary.
+    Inconclusive,
+}
+
+/// Classify a boundary probe result (Step 20.2 §4.5). `http` is the parsed
+/// `/api/chat` body on success or the transport error on failure;
+/// `sent_real_estimate` is the candidate `N` (the real-token target the
+/// padded prompt was sized for). Pure: no I/O.
+///
+/// - HTTP 200 + usable (non-empty content OR a tool call OR `eval_count > 0`)
+///   plus `prompt_eval_count >= 90% x N` => [`BoundaryClass::Accepted`]
+///   carrying the observed `prompt_eval_count`.
+/// - HTTP 200 but `prompt_eval_count < 90% x N` => [`BoundaryClass::Truncated`].
+/// - An `Err` whose message parses via [`parse_context_window_error`] =>
+///   [`BoundaryClass::CtxWindow400`].
+/// - Any other `Err` => [`BoundaryClass::Inconclusive`].
+pub fn classify_boundary_probe(
+    http: Result<&serde_json::Value, &anyhow::Error>,
+    sent_real_estimate: u32,
+) -> BoundaryClass {
+    match http {
+        Ok(json) => {
+            let message = &json["message"];
+            let content_nonempty = message["content"]
+                .as_str()
+                .map(|c| !c.trim().is_empty())
+                .unwrap_or(false);
+            let has_tool_call = message["tool_calls"]
+                .as_array()
+                .map(|a| !a.is_empty())
+                .unwrap_or(false);
+            let eval_count = json["eval_count"].as_u64().unwrap_or(0);
+            let usable = content_nonempty || has_tool_call || eval_count > 0;
+
+            let prompt_eval = json["prompt_eval_count"].as_u64().unwrap_or(0) as u32;
+            // 90 % of the sent estimate, computed without overflow.
+            let threshold = (sent_real_estimate as u64 * 90 / 100) as u32;
+            if usable && prompt_eval >= threshold {
+                BoundaryClass::Accepted {
+                    prompt_tokens: prompt_eval,
+                }
+            } else {
+                // 200 but the model evaluated far fewer tokens than we sent
+                // (head silently dropped) — or produced nothing usable.
+                BoundaryClass::Truncated
+            }
+        }
+        Err(e) => match parse_context_window_error(&e.to_string()) {
+            Some((_, limit)) => BoundaryClass::CtxWindow400 {
+                limit: limit as u32,
+            },
+            None => BoundaryClass::Inconclusive,
+        },
+    }
+}
+
+/// One HTTP boundary probe at candidate `n` real tokens (Step 20.2 §4.5).
+/// Sends a padded prompt with `options.num_ctx = n + reply_margin` and a
+/// minimal `num_predict` (we test acceptance, not output). Returns the parsed
+/// body on a 2xx, or an error (carrying any context-window-400 body) so the
+/// caller can [`classify_boundary_probe`]. 120 s timeout — large prompt eval
+/// is slow. Returns the sent chars/4 estimate alongside for calibration.
+fn boundary_probe_request(
+    endpoint: &str,
+    model: &str,
+    prompt: &str,
+    num_ctx: u32,
+) -> (anyhow::Result<serde_json::Value>, usize) {
+    let url = format!("{}/api/chat", endpoint.trim_end_matches('/'));
+    let body = serde_json::json!({
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "stream": false,
+        "options": {"num_ctx": num_ctx, "num_predict": 8},
+    });
+    let sent_chars4 = serde_json::to_string(&body)
+        .map(|s| s.chars().count() / 4)
+        .unwrap_or(prompt.chars().count() / 4);
+
+    let result = tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(async {
+            let resp = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(120))
+                .build()?
+                .post(&url)
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| anyhow::anyhow!("request failed: {e}"))?;
+            let status = resp.status();
+            // Capture the body either way: a 400's body carries the hard limit.
+            let text = resp.text().await.unwrap_or_default();
+            if !status.is_success() {
+                anyhow::bail!("inference endpoint {status}: {text}");
+            }
+            serde_json::from_str::<serde_json::Value>(&text)
+                .map_err(|e| anyhow::anyhow!("bad JSON from /api/chat: {e}"))
+        })
+    });
+    (result, sent_chars4)
+}
+
+/// Result of the empirical input-boundary search (Step 20.2 §4.5).
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoundarySearchOutcome {
+    /// Highest `prompt_eval_count` the backend confirmed it accepted, if any.
+    pub highest_accepted: Option<u32>,
+    /// Number of probe steps performed.
+    pub steps: u32,
+    /// Final search bounds `(low, high)` when the loop terminated.
+    pub final_bounds: (u32, u32),
+    /// A surfaced error message when the search stopped on an inconclusive
+    /// transport failure (the last accepted value is still kept).
+    pub error: Option<String>,
+}
+
+/// Active binary search for the largest input the model genuinely accepts at a
+/// matching `num_ctx` (Step 20.2 §4.5). Records `max_ok_input` at `High`
+/// confidence on completion.
+///
+/// `low` starts at `entry.safe_context` (or a 2,048 floor); `high` at the
+/// declared `entry.context_window`. When the window is unknown, `high` is
+/// found by doubling from `low` until the first non-`Accepted` probe (capped),
+/// to bracket the boundary. **Never** probes `num_ctx` above a known declared
+/// window (VRAM safety — the model was pulled to run at that window).
+///
+/// Per candidate `N`: build a padded prompt of ≈ N real tokens (sized by the
+/// learned `estimate_ratio`), send with `options.num_ctx = N + reply_margin`,
+/// classify, and:
+/// - **Accepted** → [`CapabilityEntry::record_accepted_prompt`] +
+///   [`CapabilityEntry::record_estimate_sample`]; raise `low`.
+/// - **Truncated** → lower `high`.
+/// - **CtxWindow400** → [`CapabilityEntry::record_context_window_400`]; set
+///   `high = limit`.
+/// - **Inconclusive** → break, keeping the last accepted value, surface the
+///   error.
+///
+/// Converges until `high − low ≤ max(1024, high·5%)` or the step cap (12).
+/// On any acceptance, sets `tune_confidence = High` and `tune_date = today`.
+/// `progress` is called once per step with a one-line status. The entry is
+/// mutated in place; the caller persists.
+pub fn probe_input_boundary(
+    endpoint: &str,
+    model: &str,
+    entry: &mut CapabilityEntry,
+    mut progress: impl FnMut(&str),
+    today: &str,
+) -> anyhow::Result<BoundarySearchOutcome> {
+    const STEP_CAP: u32 = 12;
+    const REPLY_MARGIN: u32 = 256;
+    const LOW_FLOOR: u32 = 2_048;
+    const DOUBLE_CAP: u32 = 1_000_000;
+
+    let ratio = entry.estimate_ratio.map(sanitize_ratio).unwrap_or(1.0);
+    let mut low = entry.safe_context.unwrap_or(LOW_FLOOR).max(LOW_FLOOR);
+    let declared = entry.context_window;
+    let mut highest_accepted: Option<u32> = None;
+    let mut steps = 0u32;
+    let mut error: Option<String> = None;
+
+    // One probe at candidate `n`, with the matching num_ctx, classified.
+    let run_probe =
+        |n: u32, entry: &mut CapabilityEntry, progress: &mut dyn FnMut(&str)| -> BoundaryClass {
+            // VRAM safety: never request num_ctx above a known declared window.
+            let num_ctx = match declared {
+                Some(w) => (n + REPLY_MARGIN).min(w),
+                None => n + REPLY_MARGIN,
+            };
+            let prompt = build_padded_prompt(n, ratio);
+            let (http, sent_chars4) = boundary_probe_request(endpoint, model, &prompt, num_ctx);
+            let class = classify_boundary_probe(http.as_ref(), n);
+            match &class {
+                BoundaryClass::Accepted { prompt_tokens } => {
+                    entry.record_accepted_prompt(*prompt_tokens, today);
+                    entry.record_estimate_sample(*prompt_tokens, sent_chars4);
+                    progress(&format!(
+                        "  num_ctx={num_ctx}: accepted (prompt_eval={prompt_tokens})"
+                    ));
+                }
+                BoundaryClass::Truncated => {
+                    progress(&format!("  num_ctx={num_ctx}: truncated/rejected"));
+                }
+                BoundaryClass::CtxWindow400 { limit } => {
+                    progress(&format!(
+                        "  num_ctx={num_ctx}: context-window 400 (limit {limit})"
+                    ));
+                }
+                BoundaryClass::Inconclusive => {
+                    progress(&format!(
+                        "  num_ctx={num_ctx}: inconclusive — {}",
+                        http.err()
+                            .map(|e| e.to_string())
+                            .unwrap_or_else(|| "transport error".into())
+                    ));
+                }
+            }
+            class
+        };
+
+    // Establish `high`. Known window → use it (hard cap). Unknown → double
+    // from `low` until the first non-Accepted probe brackets the boundary.
+    let mut high = match declared {
+        Some(w) => w.max(low + 1),
+        None => {
+            let mut candidate = low.saturating_mul(2).max(low + 1024).min(DOUBLE_CAP);
+            let mut bracket_high = DOUBLE_CAP;
+            loop {
+                if steps >= STEP_CAP {
+                    break;
+                }
+                steps += 1;
+                match run_probe(candidate, entry, &mut progress) {
+                    BoundaryClass::Accepted { prompt_tokens } => {
+                        highest_accepted =
+                            Some(highest_accepted.map_or(prompt_tokens, |h| h.max(prompt_tokens)));
+                        low = low.max(candidate);
+                        if candidate >= DOUBLE_CAP {
+                            bracket_high = DOUBLE_CAP;
+                            break;
+                        }
+                        candidate = candidate.saturating_mul(2).min(DOUBLE_CAP);
+                    }
+                    BoundaryClass::CtxWindow400 { limit } => {
+                        entry.record_context_window_400(limit, today);
+                        bracket_high = limit;
+                        break;
+                    }
+                    BoundaryClass::Truncated => {
+                        bracket_high = candidate;
+                        break;
+                    }
+                    BoundaryClass::Inconclusive => {
+                        error = Some("boundary search stopped: inconclusive probe".into());
+                        bracket_high = candidate;
+                        break;
+                    }
+                }
+            }
+            bracket_high
+        }
+    };
+
+    // Binary search the bracket [low, high].
+    while error.is_none() && steps < STEP_CAP {
+        let tolerance = 1_024u32.max((high as u64 * 5 / 100) as u32);
+        if high.saturating_sub(low) <= tolerance {
+            break;
+        }
+        let mid = low + (high - low) / 2;
+        steps += 1;
+        match run_probe(mid, entry, &mut progress) {
+            BoundaryClass::Accepted { prompt_tokens } => {
+                highest_accepted =
+                    Some(highest_accepted.map_or(prompt_tokens, |h| h.max(prompt_tokens)));
+                low = mid;
+            }
+            BoundaryClass::Truncated => {
+                high = mid;
+            }
+            BoundaryClass::CtxWindow400 { limit } => {
+                entry.record_context_window_400(limit, today);
+                high = limit.min(high);
+                if limit < low {
+                    low = limit;
+                }
+            }
+            BoundaryClass::Inconclusive => {
+                error = Some("boundary search stopped: inconclusive probe".into());
+                break;
+            }
+        }
+    }
+
+    if highest_accepted.is_some() {
+        // record_accepted_prompt already raised max_ok_input to the highest
+        // accepted value; stamp the High-confidence discovery (§4.5).
+        entry.tune_confidence = TuneConfidence::High;
+        entry.tune_date = Some(today.to_string());
+    }
+
+    Ok(BoundarySearchOutcome {
+        highest_accepted,
+        steps,
+        final_bounds: (low, high),
+        error,
+    })
+}
+
+/// Tuning-staleness predicate (Step 20.2 §4.6): `true` when `tune_date` is
+/// `None`, unparseable, or older than `max_age_days` relative to `today`.
+/// Dates are `YYYY-MM-DD` parsed via [`chrono::NaiveDate`]; an unparseable
+/// stored date is treated as stale (re-probe rather than trust a bad stamp).
+pub fn is_tuning_stale(tune_date: Option<&str>, today: &str, max_age_days: i64) -> bool {
+    let Some(stamp) = tune_date else {
+        return true;
+    };
+    let (Ok(then), Ok(now)) = (
+        chrono::NaiveDate::parse_from_str(stamp, "%Y-%m-%d"),
+        chrono::NaiveDate::parse_from_str(today, "%Y-%m-%d"),
+    ) else {
+        return true;
+    };
+    (now - then).num_days() > max_age_days
+}
+
+/// Age in days of a `YYYY-MM-DD` tuning stamp relative to `today` (Step 20.2
+/// §4.6 — the human-readable figure behind [`is_tuning_stale`]'s yes/no).
+/// `None` when either date is absent or unparseable. Shared with newt-cli's
+/// `newt tunings show`, which has no chrono dependency of its own.
+pub fn tuning_age_days(tune_date: Option<&str>, today: &str) -> Option<i64> {
+    let then = chrono::NaiveDate::parse_from_str(tune_date?, "%Y-%m-%d").ok()?;
+    let now = chrono::NaiveDate::parse_from_str(today, "%Y-%m-%d").ok()?;
+    Some((now - then).num_days())
+}
+
+/// The report [`full_probe`] returns for the TUI to print (Step 20.2 §4.1).
+#[derive(Debug, Clone, PartialEq)]
+pub struct FullProbeReport {
+    pub conformance: ToolConformance,
+    pub context_window: Option<u32>,
+    pub emits_thinking: bool,
+    pub estimate_ratio: Option<f32>,
+    /// `Some` only in `/probe window` mode (the expensive pass ran).
+    pub boundary: Option<BoundarySearchOutcome>,
+    /// Any non-fatal error surfaced by a cheap sub-probe (e.g. the thinking
+    /// probe failed but conformance and the window refresh succeeded).
+    pub notes: Vec<String>,
+}
+
+/// Thin orchestrator (Step 20.2 §4.1) tying the discovery passes together so
+/// the TUI handler stays a printer. Runs tool conformance (via
+/// [`probe_tool_conformance_calibrated`], which also harvests the §4.4
+/// calibration sample from the tool-schema-bearing request),
+/// [`refresh_context_window`], [`probe_thinking`] and — when `do_window` —
+/// [`probe_input_boundary`]. Feeds every calibration
+/// sample into [`CapabilityEntry::record_estimate_sample`], records the
+/// thinking quirk, updates `conformance` / `tested_date`, and **mutates
+/// `entry` in place** so the caller's `..existing` 20.1 fields are preserved.
+/// Persisting is the caller's job; the report is for display.
+pub fn full_probe(
+    endpoint: &str,
+    model: &str,
+    entry: &mut CapabilityEntry,
+    do_window: bool,
+    today: &str,
+    mut progress: impl FnMut(&str),
+) -> FullProbeReport {
+    let mut notes = Vec::new();
+
+    // 1. Tool conformance (unchanged classification) + calibration bootstrap
+    //    (§4.4): the conformance request carries the tool schema, so its
+    //    prompt_eval_count is the most informative of the cheap-probe samples.
+    let conformance = match tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current()
+            .block_on(probe_tool_conformance_calibrated(endpoint, model))
+    }) {
+        Ok(pc) => {
+            if let Some((observed, estimated)) = pc.calibration {
+                entry.record_estimate_sample(observed, estimated);
+            }
+            pc.conformance
+        }
+        Err(e) => {
+            notes.push(format!("conformance probe failed: {e}"));
+            entry.conformance.clone()
+        }
+    };
+    entry.conformance = conformance.clone();
+    entry.tested_date = today.to_string();
+
+    // 2. Context-window refresh (§4.2) — always re-queries /api/show.
+    refresh_context_window(entry, endpoint, model);
+
+    // 3. Thinking probe + calibration bootstrap (§4.3 / §4.4).
+    let mut emits_thinking = entry.emits_thinking.unwrap_or(false);
+    match probe_thinking(endpoint, model) {
+        Ok(pt) => {
+            if pt.emits_thinking {
+                entry.record_thinking_only();
+                emits_thinking = true;
+            }
+            if let Some((observed, estimated)) = pt.calibration {
+                entry.record_estimate_sample(observed, estimated);
+            }
+        }
+        Err(e) => notes.push(format!("thinking probe failed: {e}")),
+    }
+
+    // 4. Optional empirical boundary search (§4.5).
+    let boundary = if do_window {
+        match probe_input_boundary(endpoint, model, entry, &mut progress, today) {
+            Ok(outcome) => Some(outcome),
+            Err(e) => {
+                notes.push(format!("boundary search failed: {e}"));
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    FullProbeReport {
+        conformance,
+        context_window: entry.context_window,
+        emits_thinking,
+        estimate_ratio: entry.estimate_ratio,
+        boundary,
+        notes,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Probe
 // ---------------------------------------------------------------------------
 
@@ -665,12 +1253,53 @@ pub fn looks_like_tool_call_json(content: &str) -> bool {
     false
 }
 
-/// Send a minimal one-tool prompt and classify how the model responds.
-/// Uses a 120 s timeout — the model must already be warm.
-pub async fn probe_tool_conformance(
+/// Outcome of the cheap tool-conformance probe (Step 20.2 §4.1/§4.4):
+/// the classification plus a calibration sample harvested from the same
+/// request, mirroring [`ProbeThinking`]'s shape.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProbeConformance {
+    /// How the model handled the one-tool request.
+    pub conformance: ToolConformance,
+    /// `(observed prompt_eval_count, estimated chars/4 tokens)` for the
+    /// conformance request, `Some` only when the response carried
+    /// `prompt_eval_count` — a calibration sample for
+    /// [`CapabilityEntry::record_estimate_sample`] (§4.4). This is the
+    /// largest of the three cheap-probe requests (it carries the tool
+    /// schema), so harvesting it is the most informative of the bootstrap
+    /// samples; dropping it (as the un-calibrated wrapper does) wastes the
+    /// only request whose token count spans realistic tool-schema overhead.
+    pub calibration: Option<(u32, usize)>,
+}
+
+/// Classify a parsed `/api/chat` `message` value into a [`ToolConformance`]
+/// (Step 20.2 §4.1) — the pure decision, split from the HTTP so both the
+/// public wrapper and the calibrated variant share one classifier.
+fn classify_conformance(message: &serde_json::Value) -> ToolConformance {
+    // Native: non-empty tool_calls array.
+    if let Some(tcs) = message["tool_calls"].as_array() {
+        if !tcs.is_empty() {
+            return ToolConformance::Native;
+        }
+    }
+    // TextMode: content parses as tool-call JSON.
+    let content = message["content"].as_str().unwrap_or("");
+    if looks_like_tool_call_json(content) {
+        return ToolConformance::TextMode;
+    }
+    ToolConformance::NoTools
+}
+
+/// Send the minimal one-tool prompt, classify the response, and harvest a
+/// calibration sample (Step 20.2 §4.1/§4.4) from the same request's
+/// `prompt_eval_count` vs the request body's chars/4 estimate. 120 s timeout —
+/// the model must already be warm. The conformance request is one of the
+/// "those same requests" §4.4 names as a calibration source; this is the
+/// variant [`full_probe`] uses so the tool-schema-bearing request is not
+/// wasted. [`probe_tool_conformance`] stays the conformance-only public API.
+pub async fn probe_tool_conformance_calibrated(
     endpoint: &str,
     model: &str,
-) -> anyhow::Result<ToolConformance> {
+) -> anyhow::Result<ProbeConformance> {
     let url = format!("{}/api/chat", endpoint.trim_end_matches('/'));
     let body = serde_json::json!({
         "model": model,
@@ -682,6 +1311,11 @@ pub async fn probe_tool_conformance(
         "tools": probe_tool_schema(),
         "stream": false,
     });
+    // chars/4 estimate of the serialized request body (same currency the
+    // agentic loop estimates in) — paired with the backend's real count.
+    let estimated = serde_json::to_string(&body)
+        .map(|s| s.chars().count() / 4)
+        .unwrap_or(0);
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(120))
         .build()?;
@@ -695,22 +1329,31 @@ pub async fn probe_tool_conformance(
         anyhow::bail!("Ollama returned {}", resp.status());
     }
     let json: serde_json::Value = resp.json().await?;
-    let message = &json["message"];
+    let conformance = classify_conformance(&json["message"]);
+    // (observed real prompt tokens, our chars/4 estimate) — the
+    // (observed, estimated) order record_estimate_sample expects.
+    let calibration = json["prompt_eval_count"]
+        .as_u64()
+        .map(|observed| (observed as u32, estimated));
+    Ok(ProbeConformance {
+        conformance,
+        calibration,
+    })
+}
 
-    // Native: non-empty tool_calls array.
-    if let Some(tcs) = message["tool_calls"].as_array() {
-        if !tcs.is_empty() {
-            return Ok(ToolConformance::Native);
-        }
-    }
-
-    // TextMode: content parses as tool-call JSON.
-    let content = message["content"].as_str().unwrap_or("");
-    if looks_like_tool_call_json(content) {
-        return Ok(ToolConformance::TextMode);
-    }
-
-    Ok(ToolConformance::NoTools)
+/// Send a minimal one-tool prompt and classify how the model responds.
+/// Uses a 120 s timeout — the model must already be warm.
+///
+/// Conformance-only public API; [`probe_tool_conformance_calibrated`] is the
+/// richer sibling [`full_probe`] uses to also harvest a §4.4 calibration
+/// sample from the same request.
+pub async fn probe_tool_conformance(
+    endpoint: &str,
+    model: &str,
+) -> anyhow::Result<ToolConformance> {
+    probe_tool_conformance_calibrated(endpoint, model)
+        .await
+        .map(|p| p.conformance)
 }
 
 // ---------------------------------------------------------------------------
@@ -831,8 +1474,9 @@ pub fn print_capabilities_table(
     println!("  Safe Ctx  num_ctx sent to Ollama (auto-tuned; human-overridable in config)");
     println!("  Conf      tuning confidence: None | Low | Med | High");
     println!();
-    println!("Run /probe <model> to test a model (warm-up included).");
-    println!("Run /probe all    to test every untested model in sequence.");
+    println!("Run /probe <model>       to test a model (warm-up included).");
+    println!("Run /probe all           to test every untested model in sequence.");
+    println!("Run /probe window <model> for an empirical input-boundary search (High confidence).");
 }
 
 /// Format a token count as a human-readable kilo string (e.g. 32768 → "32k").
@@ -1450,6 +2094,199 @@ mod tests {
             "capability data present — the static default must not win"
         );
         assert_eq!(budget, 26_214);
+    }
+
+    // -----------------------------------------------------------------------
+    // Step 20.2 active discovery (docs/design/model-self-tuning.md §4)
+    // -----------------------------------------------------------------------
+
+    // --- refresh_context_window (§4.2) ---
+    //
+    // refresh_context_window's HTTP path (always-fetches, re-bootstrap only
+    // when safe_context is unset, never auto-raises) needs a Tokio reactor
+    // for the `/api/show` call, so it is covered end-to-end in
+    // `tests/probe_integration.rs` — mirroring how `ensure_context_window`
+    // is tested there rather than in this `#[cfg(test)]` block.
+
+    // --- message_thinking_fields (§4.3) truth table ---
+
+    #[test]
+    fn message_thinking_fields_truth_table() {
+        // Empty content + non-empty thinking → true.
+        assert!(message_thinking_fields(&serde_json::json!({
+            "content": "", "thinking": "reasoning here"
+        })));
+        // Whitespace content + non-empty reasoning → true.
+        assert!(message_thinking_fields(&serde_json::json!({
+            "content": "   \n", "reasoning": "x"
+        })));
+        // reasoning_content variant → true.
+        assert!(message_thinking_fields(&serde_json::json!({
+            "content": "", "reasoning_content": "y"
+        })));
+        // Missing content key (treated as empty) + thinking → true.
+        assert!(message_thinking_fields(&serde_json::json!({
+            "thinking": "z"
+        })));
+        // Non-empty content → false even with a thinking field.
+        assert!(!message_thinking_fields(&serde_json::json!({
+            "content": "ok", "thinking": "z"
+        })));
+        // Empty content but no/empty thinking fields → false.
+        assert!(!message_thinking_fields(&serde_json::json!({
+            "content": "", "thinking": "  "
+        })));
+        assert!(!message_thinking_fields(
+            &serde_json::json!({"content": ""})
+        ));
+    }
+
+    // --- build_padded_prompt (§4.5) sizing ---
+
+    #[test]
+    fn build_padded_prompt_sizes_near_target_across_ratios() {
+        for &(target, ratio) in &[
+            (512u32, 1.0f32),
+            (2_048, 1.0),
+            (8_000, 1.3),
+            (4_096, 0.8),
+            (16_000, 2.5),
+        ] {
+            let s = build_padded_prompt(target, ratio);
+            let est = s.chars().count() as f32 / 4.0;
+            let predicted_real = est * sanitize_ratio(ratio);
+            let rel = (predicted_real - target as f32).abs() / target as f32;
+            assert!(
+                rel <= 0.10,
+                "target={target} ratio={ratio}: chars/4*ratio={predicted_real} ({:.1}% off)",
+                rel * 100.0
+            );
+        }
+    }
+
+    #[test]
+    fn build_padded_prompt_sanitizes_bad_ratio_to_one() {
+        // NaN / out-of-band ratios fall back to 1.0 (same as estimate-space).
+        let s = build_padded_prompt(4_000, f32::NAN);
+        let est = s.chars().count() as f32 / 4.0;
+        assert!((est - 4_000.0).abs() / 4_000.0 <= 0.10);
+        let s2 = build_padded_prompt(4_000, 99.0);
+        let est2 = s2.chars().count() as f32 / 4.0;
+        assert!((est2 - 4_000.0).abs() / 4_000.0 <= 0.10);
+    }
+
+    // --- classify_boundary_probe (§4.5) every arm ---
+
+    #[test]
+    fn classify_boundary_probe_accepted_when_eval_meets_threshold() {
+        let json = serde_json::json!({
+            "message": {"content": "ok"},
+            "prompt_eval_count": 9_500,
+            "eval_count": 3
+        });
+        // sent 10_000; 9_500 ≥ 90% → Accepted carrying the observed count.
+        assert_eq!(
+            classify_boundary_probe(Ok(&json), 10_000),
+            BoundaryClass::Accepted {
+                prompt_tokens: 9_500
+            }
+        );
+    }
+
+    #[test]
+    fn classify_boundary_probe_accepted_via_tool_call_or_eval_count() {
+        // Empty content but a tool call is still usable.
+        let tc = serde_json::json!({
+            "message": {"content": "", "tool_calls": [{"function": {"name": "x"}}]},
+            "prompt_eval_count": 9_900
+        });
+        assert!(matches!(
+            classify_boundary_probe(Ok(&tc), 10_000),
+            BoundaryClass::Accepted { .. }
+        ));
+        // Empty content, no tool call, but eval_count > 0 → usable.
+        let ec = serde_json::json!({
+            "message": {"content": ""},
+            "prompt_eval_count": 9_900,
+            "eval_count": 5
+        });
+        assert!(matches!(
+            classify_boundary_probe(Ok(&ec), 10_000),
+            BoundaryClass::Accepted { .. }
+        ));
+    }
+
+    #[test]
+    fn classify_boundary_probe_truncated_when_eval_below_threshold() {
+        // 200 but only 4_000 of 10_000 evaluated (head dropped) → Truncated.
+        let json = serde_json::json!({
+            "message": {"content": "ok"},
+            "prompt_eval_count": 4_000,
+            "eval_count": 2
+        });
+        assert_eq!(
+            classify_boundary_probe(Ok(&json), 10_000),
+            BoundaryClass::Truncated
+        );
+        // 200 with a usable body but no prompt_eval_count at all → Truncated
+        // (we cannot confirm the prompt was evaluated).
+        let no_count = serde_json::json!({"message": {"content": "ok"}, "eval_count": 1});
+        assert_eq!(
+            classify_boundary_probe(Ok(&no_count), 10_000),
+            BoundaryClass::Truncated
+        );
+    }
+
+    #[test]
+    fn classify_boundary_probe_ctx_window_400() {
+        let err = anyhow::anyhow!(
+            "inference endpoint 400: litellm.ContextWindowExceededError: \
+             prompt is too long: 12000 tokens > 8192 maximum"
+        );
+        assert_eq!(
+            classify_boundary_probe(Err(&err), 12_000),
+            BoundaryClass::CtxWindow400 { limit: 8_192 }
+        );
+    }
+
+    #[test]
+    fn classify_boundary_probe_inconclusive_for_other_errors() {
+        let err = anyhow::anyhow!("request failed: connection reset");
+        assert_eq!(
+            classify_boundary_probe(Err(&err), 10_000),
+            BoundaryClass::Inconclusive
+        );
+    }
+
+    // --- is_tuning_stale (§4.6) boundaries ---
+
+    #[test]
+    fn is_tuning_stale_boundaries() {
+        // None → stale.
+        assert!(is_tuning_stale(None, "2026-06-13", 30));
+        // Exactly max_age days old → NOT stale (strictly greater is stale).
+        assert!(!is_tuning_stale(Some("2026-05-14"), "2026-06-13", 30));
+        // One day over max_age → stale.
+        assert!(is_tuning_stale(Some("2026-05-13"), "2026-06-13", 30));
+        // Same day → fresh.
+        assert!(!is_tuning_stale(Some("2026-06-13"), "2026-06-13", 30));
+        // Unparseable stored date → treat as stale.
+        assert!(is_tuning_stale(Some("not-a-date"), "2026-06-13", 30));
+        // Unparseable `today` is also stale (defensive).
+        assert!(is_tuning_stale(Some("2026-06-13"), "garbage", 30));
+    }
+
+    // --- sanitize_ratio ---
+
+    #[test]
+    fn sanitize_ratio_clamps_and_defaults() {
+        assert_eq!(sanitize_ratio(1.3), 1.3);
+        assert_eq!(sanitize_ratio(0.5), 0.5);
+        assert_eq!(sanitize_ratio(3.0), 3.0);
+        assert_eq!(sanitize_ratio(0.4), 1.0); // below band → default
+        assert_eq!(sanitize_ratio(3.1), 1.0); // above band → default
+        assert_eq!(sanitize_ratio(f32::NAN), 1.0);
+        assert_eq!(sanitize_ratio(f32::INFINITY), 1.0);
     }
 
     // --- parse_show_response ---

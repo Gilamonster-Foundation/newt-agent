@@ -1035,7 +1035,7 @@ skips.
 | Step | One line | Umbrella issue |
 |---|---|---|
 | **20.1** | Passive feedback: per-round `RoundObservation` hook, `max(proven, believed)` send budget, EMA chars/4 calibration, observation-gated epilogue | — |
-| **20.2** | Active discovery: `/probe` extension — empirical window binary search, thinking probe, calibration bootstrap, `tune_date` staleness re-probe | — |
+| **20.2** | Active discovery (shipped): `/probe window` empirical input-boundary binary search → `max_ok_input` at High confidence; cheap `/probe` adds context-window refresh + thinking probe + chars/4 calibration bootstrap; `newt tunings show` staleness markers point stale/unprobed models at `/probe window` | — |
 
 ---
 
