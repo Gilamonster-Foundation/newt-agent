@@ -4,6 +4,7 @@
 
 use super::display::{print_denied, print_tool_call, print_tool_output};
 use super::mcp::McpTools;
+use super::memory_fetch::{execute_memory_fetch, memory_fetch_tool_definition, MemorySource};
 use super::note_sink::{execute_save_note, save_note_tool_definition, NoteSink};
 use super::permissions::{DenialKind, PermissionDecision, PermissionGate, PermissionRequest};
 use super::recall::{execute_recall, recall_tool_definition, RecallSource};
@@ -133,11 +134,15 @@ pub fn tool_definitions() -> serde_json::Value {
 /// when the caller supplied a `NoteSink`, so headless/eval sessions (which
 /// pass `note_sink: None`) never advertise a tool that can't be executed.
 /// `with_recall` gates the `recall` definition (Step 17.5) the same way on
-/// a supplied `RecallSource`.
+/// a supplied `RecallSource`. `with_memory_fetch` gates the `memory_fetch`
+/// definition (progressive-disclosure memory, Workstream A MVP, #319) the same
+/// way on a supplied `MemorySource` — `None` ⇒ the tool is never advertised,
+/// so eval / headless / ACP sessions are unaffected bit-for-bit.
 pub(crate) fn merged_tool_definitions(
     mcp: &dyn McpTools,
     with_save_note: bool,
     with_recall: bool,
+    with_memory_fetch: bool,
 ) -> serde_json::Value {
     let mut defs = match tool_definitions() {
         serde_json::Value::Array(a) => a,
@@ -148,6 +153,9 @@ pub(crate) fn merged_tool_definitions(
     }
     if with_recall {
         defs.push(recall_tool_definition());
+    }
+    if with_memory_fetch {
+        defs.push(memory_fetch_tool_definition());
     }
     defs.extend(mcp.tool_defs());
     serde_json::Value::Array(defs)
@@ -188,6 +196,7 @@ pub(crate) fn is_hallucination(tool_name: &str, args: &serde_json::Value) -> boo
             | "web_fetch"
             | "save_note"
             | "recall"
+            | "memory_fetch"
     )
 }
 
@@ -626,9 +635,10 @@ pub(crate) fn host_of_url(url: &str) -> Option<String> {
 /// (`read_file` / `write_file` / `list_dir`) keep enforcing the same `caveats`
 /// via `permits_*` — rerouting them is out of scope.
 ///
-/// `note_sink` backs the `save_note` tool (Step 19.3) and `recall_source`
-/// the `recall` tool (Step 17.5). `None` ⇒ the tool was never advertised,
-/// so a call here is treated like any unknown tool.
+/// `note_sink` backs the `save_note` tool (Step 19.3), `recall_source` the
+/// `recall` tool (Step 17.5), and `memory_source` the `memory_fetch` tool
+/// (progressive-disclosure memory, #319). `None` ⇒ the tool was never
+/// advertised, so a call here is treated like any unknown tool.
 ///
 /// `permission_gate` is the #263 prompted-grant seam: when present, a
 /// capability denial consults the human (allow once / session allow / deny)
@@ -665,6 +675,7 @@ pub async fn execute_tool(
     build_check_cmd: Option<&str>,
     note_sink: Option<&mut dyn NoteSink>,
     recall_source: Option<&dyn RecallSource>,
+    memory_source: Option<&dyn MemorySource>,
     permission_gate: Option<&mut dyn PermissionGate>,
     exec_floor: Option<&crate::caveats::Scope<String>>,
 ) -> String {
@@ -697,6 +708,17 @@ pub async fn execute_tool(
             // Without a source the tool was never advertised — same
             // unknown-tool answer as the sink-less save_note path.
             None => "unknown tool: recall (no conversation store in this session)".to_string(),
+        },
+
+        // Progressive-disclosure memory (Workstream A MVP, #319): pulls the
+        // verbatim body of one ADDRESSED item (`note:<id>` / `turn:<conv>#<seq>`)
+        // via the caller's MemorySource — workspace-fenced by the underlying
+        // NoteStore / ConversationStore. Same presence-gating as `recall`.
+        "memory_fetch" => match memory_source {
+            Some(source) => execute_memory_fetch(args, source, color, tool_output_lines),
+            // Without a source the tool was never advertised — same
+            // unknown-tool answer as the source-less recall path.
+            None => "unknown tool: memory_fetch (no memory source in this session)".to_string(),
         },
 
         "run_command" => {
@@ -1147,7 +1169,7 @@ mod tests {
 
     #[test]
     fn merged_tool_definitions_with_empty_mcp_is_builtin_set() {
-        let merged = merged_tool_definitions(&NoMcp, false, false);
+        let merged = merged_tool_definitions(&NoMcp, false, false, false);
         let names: Vec<&str> = merged
             .as_array()
             .unwrap()
@@ -1184,10 +1206,10 @@ mod tests {
         let base = tool_definitions();
         assert!(!names(&base).contains(&"save_note"), "got: {base}");
         // … nor in the merged set without a sink …
-        let without = merged_tool_definitions(&NoMcp, false, false);
+        let without = merged_tool_definitions(&NoMcp, false, false, false);
         assert!(!names(&without).contains(&"save_note"));
         // … but a sink advertises it.
-        let with = merged_tool_definitions(&NoMcp, true, false);
+        let with = merged_tool_definitions(&NoMcp, true, false, false);
         assert!(names(&with).contains(&"save_note"), "got: {with}");
     }
 
@@ -1205,14 +1227,41 @@ mod tests {
         }
         let base = tool_definitions();
         assert!(!names(&base).contains(&"recall"), "got: {base}");
-        let without = merged_tool_definitions(&NoMcp, false, false);
+        let without = merged_tool_definitions(&NoMcp, false, false, false);
         assert!(!names(&without).contains(&"recall"));
-        let with = merged_tool_definitions(&NoMcp, false, true);
+        let with = merged_tool_definitions(&NoMcp, false, true, false);
         assert!(names(&with).contains(&"recall"), "got: {with}");
         // The two gates are independent: both on advertises both.
-        let both = merged_tool_definitions(&NoMcp, true, true);
+        let both = merged_tool_definitions(&NoMcp, true, true, false);
         assert!(names(&both).contains(&"save_note"));
         assert!(names(&both).contains(&"recall"));
+    }
+
+    /// `memory_fetch` is source-gated exactly like `recall` (#319): absent
+    /// from the base set and from the merged set without a `MemorySource`;
+    /// present when one exists. The flag is independent of the others.
+    #[test]
+    fn memory_fetch_advertised_only_with_a_source() {
+        fn names(defs: &serde_json::Value) -> Vec<&str> {
+            defs.as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|d| d["function"]["name"].as_str())
+                .collect()
+        }
+        let base = tool_definitions();
+        assert!(!names(&base).contains(&"memory_fetch"), "got: {base}");
+        // Flag off (every existing caller, the inert default) → not advertised.
+        let without = merged_tool_definitions(&NoMcp, false, false, false);
+        assert!(!names(&without).contains(&"memory_fetch"));
+        // Flag on → advertised.
+        let with = merged_tool_definitions(&NoMcp, false, false, true);
+        assert!(names(&with).contains(&"memory_fetch"), "got: {with}");
+        // Independent of the save_note / recall gates: all three on lists all.
+        let all = merged_tool_definitions(&NoMcp, true, true, true);
+        assert!(names(&all).contains(&"save_note"));
+        assert!(names(&all).contains(&"recall"));
+        assert!(names(&all).contains(&"memory_fetch"));
     }
 
     /// `is_hallucination` correctly identifies tool-name-as-command and unknown
@@ -1506,6 +1555,7 @@ mod execute_tool_branch_tests {
             build_check,
             None,
             None,
+            None, // memory_source
             None,
             None,
         )
@@ -1814,6 +1864,7 @@ mod execute_tool_branch_tests {
             None,
             None,
             None,
+            None, // memory_source
             Some(gate),
             None,
         )
@@ -2034,6 +2085,7 @@ mod execute_tool_branch_tests {
             None,
             None,
             None,
+            None, // memory_source
             Some(&mut gate),
             None,
         )
@@ -2125,6 +2177,7 @@ mod execute_tool_branch_tests {
             None,
             Some(&mut sink),
             None,
+            None, // memory_source
             None,
             None,
         )
@@ -2179,6 +2232,7 @@ mod execute_tool_branch_tests {
             None,
             None,
             Some(&source),
+            None, // memory_source
             None,
             None,
         )
@@ -2189,6 +2243,63 @@ mod execute_tool_branch_tests {
         );
         assert!(out.contains("«tokio» panic"), "got: {out}");
         assert!(out.contains("past work"), "got: {out}");
+    }
+
+    // -- memory_fetch dispatch through execute_tool (#319) ------------------
+
+    /// FLAG OFF (no source): a `memory_fetch` call is treated like any unknown
+    /// tool — the inert-by-default shape (the tool was never advertised, so a
+    /// call here is a hallucination). Mirrors `recall_without_source`.
+    #[tokio::test]
+    async fn memory_fetch_without_source_is_unknown_tool() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let caveats = caveats_rw(ws.path());
+        // run_tool passes memory_source: None — the no-source (headless) shape.
+        let out = run_tool(
+            "memory_fetch",
+            serde_json::json!({"address": "note:1"}),
+            ws.path(),
+            &caveats,
+            None,
+        )
+        .await;
+        assert!(out.starts_with("unknown tool: memory_fetch"), "got: {out}");
+    }
+
+    /// FLAG ON (source present): a `memory_fetch` call routes through the
+    /// injected `MemorySource` and returns its body. Mirrors
+    /// `recall_with_source_routes_through_execute_tool`.
+    #[tokio::test]
+    async fn memory_fetch_with_source_routes_through_execute_tool() {
+        use crate::agentic::memory_fetch::tests::MockSource;
+        use crate::agentic::MemAddr;
+        let ws = tempfile::TempDir::new().unwrap();
+        let caveats = caveats_rw(ws.path());
+        let source = MockSource {
+            body: Some("the exact note body".to_string()),
+            ..Default::default()
+        };
+        let out = execute_tool(
+            "memory_fetch",
+            &serde_json::json!({"address": "note:1"}),
+            &ws.path().to_string_lossy(),
+            false,
+            20,
+            &caveats,
+            &mut NoMcp,
+            None,
+            None,
+            None,
+            Some(&source),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(out, "the exact note body");
+        assert_eq!(
+            *source.calls.lock().unwrap(),
+            vec![MemAddr::Note { id: "1".into() }]
+        );
     }
 }
 
@@ -2291,6 +2402,7 @@ mod disable_ocap_tests {
             None,
             None,
             None,
+            None, // memory_source
             None,
             exec_floor,
         )
@@ -2698,6 +2810,7 @@ mod disable_ocap_tests {
             None,
             None,
             None,
+            None, // memory_source
             Some(&mut gate),
             None,
         )

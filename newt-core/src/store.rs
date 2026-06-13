@@ -577,6 +577,65 @@ impl ConversationStore {
         Ok(record)
     }
 
+    /// Read ONE past turn by its `(conversation, seq)` address — the by-id
+    /// read the `memory_fetch` tool's `turn:<conv>#<seq>` resolver needs
+    /// (progressive-disclosure memory, Workstream A MVP, #319). `id` may be a
+    /// unique prefix (same `resolve_id` discipline as [`Self::load`]); `seq`
+    /// is the §6 per-writer tick the model was shown by a `recall` hit
+    /// (`SearchHit::seq`).
+    ///
+    /// Workspace-fenced: the `conversations` join carries `workspace_key`, so
+    /// a `seq` from another workspace's conversation resolves to `None`, never
+    /// a cross-workspace leak (§7 fencing). Returns `Ok(None)` when no turn at
+    /// that `(conversation, seq)` exists — labelled absence, never an error —
+    /// so the tool executor can answer "no such memory item" rather than
+    /// aborting the loop.
+    pub fn load_turn(&self, id: &str, seq: i64) -> anyhow::Result<Option<ConversationTurn>> {
+        // An unknown conversation id is absence, not an error — the tool
+        // result must be friendly text, never a loop-aborting backend failure.
+        let id = match self.resolve_id(id) {
+            Ok(id) => id,
+            Err(_) => return Ok(None),
+        };
+        let conn = self.lock_conn();
+        let row = conn
+            .query_row(
+                "SELECT t.user, t.assistant, t.events, t.tokens_in, t.tokens_out
+                   FROM turns t
+                   JOIN conversations c
+                     ON c.id = t.conversation_id AND c.workspace_key = ?3
+                  WHERE t.conversation_id = ?1 AND t.seq = ?2",
+                rusqlite::params![id, seq, self.workspace_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                        row.get::<_, Option<i64>>(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((user, assistant, events_json, tokens_in, tokens_out)) = row else {
+            return Ok(None);
+        };
+        // Same strict events decode as `load`: never hand back garbage.
+        let events: Vec<crate::ToolEvent> = serde_json::from_str(&events_json).map_err(|e| {
+            anyhow::anyhow!(
+                "conversation `{id}`: turn events column is not valid tool-event \
+                 JSON ({e}); refusing to load garbage"
+            )
+        })?;
+        Ok(Some(ConversationTurn {
+            user,
+            assistant,
+            events,
+            tokens_in: tokens_from_sql(tokens_in)?,
+            tokens_out: tokens_from_sql(tokens_out)?,
+        }))
+    }
+
     /// All conversations in this workspace, least-recently-active first —
     /// "active" meaning the §6 activity tick, never a timestamp. The
     /// summaries' `updated_at_unix_nanos` is the display claim.
@@ -1981,6 +2040,36 @@ mod tests {
         assert!(now > 0);
         assert_eq!(claim_to_u128(-5), 0);
         assert_eq!(claim_to_u128(42), 42);
+    }
+
+    // --- load_turn: the by-(conv, seq) read for memory_fetch (#319) --------
+
+    /// `load_turn` returns one past turn verbatim, addressed by the §6 seq the
+    /// model saw in a recall hit; an unknown seq / conversation is `Ok(None)`
+    /// (labelled absence, never an error — the `memory_fetch` tool contract).
+    #[test]
+    fn load_turn_reads_one_turn_by_seq_and_misses_are_none() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let store = ConversationStore::new(root.path(), workspace.path(), 100).unwrap();
+        let conv = store.create("t", None).unwrap();
+        store
+            .append_turn(&conv, "the question", "the answer")
+            .unwrap();
+
+        // The seq the model would paste comes from a recall hit.
+        let hits = store.search("question", 5).unwrap();
+        assert_eq!(hits.len(), 1);
+        let seq = hits[0].seq;
+
+        let turn = store.load_turn(&conv, seq).unwrap().expect("turn exists");
+        assert_eq!(turn.user, "the question");
+        assert_eq!(turn.assistant, "the answer");
+
+        // Unknown seq → None, not an error.
+        assert!(store.load_turn(&conv, seq + 9_999).unwrap().is_none());
+        // Unknown conversation id → None, not an error (no cross-ws leak path).
+        assert!(store.load_turn("no-such-conv", seq).unwrap().is_none());
     }
 
     // --- 17.3: the query-sanitizer adversarial matrix ---------------------
