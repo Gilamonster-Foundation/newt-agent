@@ -1,21 +1,30 @@
-//! # newt-mcp-data — the Phase 21 Centaur SQL EDA MCP server
+//! # newt-mcp-data — the Phase 21 Centaur data-science MCP server
 //!
 //! A **thin stdio MCP server** that exposes the headless [`newt_data`] SQLite
-//! engine as four MCP tools — the first shippable slice of the
+//! engine — and, since Phase 21.3, the human's live Jupyter kernel — as MCP
+//! tools, the shippable slices of the
 //! [Centaur Data Scientist](../../../docs/design/centaur-data-scientist.md)
-//! capability (§4.1). All the logic lives in `newt-data`; this crate is a
+//! capability. All the logic lives in `newt-data`; this crate is a
 //! dependency-light JSON-RPC adapter (no inference, no confined shell, no
-//! capability leash — pure data).
+//! capability leash — pure data, plus a websocket to the human's own kernel).
 //!
-//! ## Tool surface (§4.1)
+//! ## Tool surface
 //!
-//! The four tools are registered with bare names; the MCP client namespaces
-//! them as `data__*` when this server is configured under the name `"data"`:
+//! Tools are registered with bare names; the MCP client namespaces them as
+//! `data__*` when this server is configured under the name `"data"`. The SQL EDA
+//! tools (21.2):
 //!
 //! - `sql_ingest_csv` — ingest a CSV into a dtype-inferred SQLite table.
 //! - `sql_query` — run a read-or-write SQL statement (honest `truncated` flag).
 //! - `sql_summarize` — schema / dtypes / null+distinct counts / pandas describe.
 //! - `sql_list_tables` — list ingested tables with row counts and CSV sources.
+//!
+//! Plus the Phase 21.3 live-kernel co-pilot (`docs/design/centaur-data-scientist.md`):
+//!
+//! - `kernel_attach` — attach to the human's already-running Jupyter server.
+//! - `run_cell` — run a cell, reading back stdout/stderr, rich results, and PNG
+//!   plots (written to `<data-dir>/.newt-data/plots/`, reported as a path + an
+//!   honest size summary — never inlined).
 //!
 //! Every tool returns the MCP content envelope; **any** failure (bad SQL, no
 //! such table, a missing argument) comes back as an in-band MCP tool error
@@ -40,6 +49,7 @@
 //! `<workspace>/.newt-data/data.db` (override with the `NEWT_DATA_DB`
 //! environment variable), separate from the conversation store.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use newt_data::SqliteBackend;
@@ -58,12 +68,37 @@ const DB_PATH_ENV: &str = "NEWT_DATA_DB";
 /// Resolves the data-database path — `NEWT_DATA_DB` if set, else
 /// [`SqliteBackend::default_db_path`] under the current working directory —
 /// opens the [`SqliteBackend`], builds an [`server::McpServer`], registers the
-/// SQL handlers over the shared store, and serves the JSON-RPC wire on stdio.
+/// SQL **and** live-kernel handlers (over the shared store + a fresh, empty
+/// kernel session), and serves the JSON-RPC wire on stdio.
 pub async fn run_stdio() -> anyhow::Result<()> {
     let store = open_store()?;
+    let plots_dir = resolve_plots_dir();
+    let session = handlers::new_kernel_session();
     let mut server = server::McpServer::new();
-    handlers::register_handlers(&mut server, store);
+    handlers::register_handlers(&mut server, store, session, plots_dir);
     server.run_stdio().await
+}
+
+/// The directory the data database lives in (`NEWT_DATA_DB`'s parent, else
+/// `<cwd>/.newt-data`) — the data engine's home and the parent of `plots/`.
+/// Pulled out so the policy is unit-testable.
+fn data_dir() -> PathBuf {
+    match std::env::var_os(DB_PATH_ENV) {
+        Some(path) => PathBuf::from(path)
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from(".")),
+        None => std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(".newt-data"),
+    }
+}
+
+/// The directory `run_cell` writes decoded PNG plots into: `<data-dir>/plots`
+/// (Phase 21.3). With `NEWT_DATA_DB=/x/.newt-data/data.db` that is
+/// `/x/.newt-data/plots`; with no override it is `<cwd>/.newt-data/plots`.
+fn resolve_plots_dir() -> PathBuf {
+    newt_data::kernel::plots_dir(&data_dir())
 }
 
 /// Open the [`SqliteBackend`] at the resolved data-database path.

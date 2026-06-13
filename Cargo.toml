@@ -106,6 +106,17 @@ tokio-stream = "0.1"
 # the system store and rejects such certs with "error sending request".
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "json", "stream"] }
 
+# Websocket client for the Phase 21.3 live-kernel co-pilot (Jupyter kernel
+# channels). Optional — only newt-data's `kernel` feature pulls it in, so the
+# default engine build and the PyO3 wheel stay lean (no TLS/websocket stack).
+# Pinned to 0.24: it is the newest tokio-tungstenite whose transitive tree
+# compiles on MSRV 1.75 and shares reqwest 0.12's `rustls 0.23` stack (no
+# duplicate TLS). 0.26+ pulls a transitive tree that needs a newer toolchain;
+# same MSRV-pin discipline as rusqlite 0.31 / diffy 0.4. The `rustls-tls-native-roots`
+# feature matches reqwest's so a `wss://` Jupyter server with a home-lab CA
+# validates the same way the inference HTTP client does.
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-native-roots"] }
+
 # CLI
 clap = { version = "4", features = ["derive", "env"] }
 

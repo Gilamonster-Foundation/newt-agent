@@ -45,8 +45,15 @@ clean:
 # --- Test ---
 
 # Run every test in the workspace.
+#
+# `--features newt-data/kernel` turns on the Phase 21.3 live-kernel transport so
+# newt-data's kernel tests (the pure iopub accumulator + the mock-websocket
+# `rest.rs` suite) actually run. The feature is off by default (it pulls a
+# websocket/TLS stack), so without this flag those tests are silently skipped.
+# A workspace-level feature flag only affects crates that declare it; the rest
+# build unchanged.
 test:
-    cargo test --workspace
+    cargo test --workspace --features newt-data/kernel
 
 # --- Lint & format ---
 
@@ -55,8 +62,9 @@ fmt:
     cargo fmt --all
 
 # Lint with the workspace's clippy config; zero-warnings gate.
+# `--features newt-data/kernel` so the Phase 21.3 kernel code + tests are linted.
 lint:
-    cargo clippy --workspace --all-targets -- -D warnings
+    cargo clippy --workspace --all-targets --features newt-data/kernel -- -D warnings
 
 # Regenerate Cargo.lock from scratch (authoritative resolution).
 # Run this after adding or changing dependencies so the lock file matches
@@ -74,13 +82,13 @@ check:
     set -uo pipefail
     rc=0
     cargo fmt --all -- --check || rc=1
-    cargo clippy --workspace --all-targets -- -D warnings || rc=1
-    cargo test --workspace || rc=1
+    cargo clippy --workspace --all-targets --features newt-data/kernel -- -D warnings || rc=1
+    cargo test --workspace --features newt-data/kernel || rc=1
     exit $rc
 
 [windows]
 check:
-    $rc = 0; cargo fmt --all -- --check; if ($LASTEXITCODE -ne 0) { $rc = 1 }; cargo clippy --workspace --all-targets -- -D warnings; if ($LASTEXITCODE -ne 0) { $rc = 1 }; cargo test --workspace; if ($LASTEXITCODE -ne 0) { $rc = 1 }; exit $rc
+    $rc = 0; cargo fmt --all -- --check; if ($LASTEXITCODE -ne 0) { $rc = 1 }; cargo clippy --workspace --all-targets --features newt-data/kernel -- -D warnings; if ($LASTEXITCODE -ne 0) { $rc = 1 }; cargo test --workspace --features newt-data/kernel; if ($LASTEXITCODE -ne 0) { $rc = 1 }; exit $rc
 
 # Build + test the out-of-workspace newt-mesh crate. Requires the
 # sibling `../agent-mesh/` checkout. Not run by `just check` /
@@ -97,8 +105,11 @@ check-mesh:
 # target/llvm-cov/html/index.html); `cov-ci` is what the pipeline runs.
 
 # Generate an HTML coverage report for human review.
+# `--features newt-data/kernel` so the Phase 21.3 kernel module + its tests are
+# instrumented (otherwise the kernel code is built — via newt-mcp-data — but its
+# own tests never run, falsely tanking the kernel files' coverage).
 cov:
-    cargo llvm-cov --workspace --html
+    cargo llvm-cov --workspace --features newt-data/kernel --html
     @echo "HTML report at target/llvm-cov/html/index.html"
 
 # CI-mode coverage: emit lcov + enforce the current floor.
@@ -130,7 +141,7 @@ cov-ci:
     #!/usr/bin/env bash
     set -euo pipefail
     floor=80
-    cargo llvm-cov --workspace --no-report
+    cargo llvm-cov --workspace --features newt-data/kernel --no-report
     cargo llvm-cov report --lcov --output-path lcov.info --ignore-filename-regex 'pyo3_module\.rs$'
     summary=$(cargo llvm-cov report --summary-only --ignore-filename-regex 'pyo3_module\.rs$')
     echo "$summary"
@@ -150,7 +161,7 @@ cov-ci:
 
 [windows]
 cov-ci:
-    $floor = 80; cargo llvm-cov --workspace --no-report; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; cargo llvm-cov report --lcov --output-path lcov.info --ignore-filename-regex 'pyo3_module\.rs$'; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; $summary = cargo llvm-cov report --summary-only --ignore-filename-regex 'pyo3_module\.rs$'; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; $summary; $total = $summary | Where-Object { $_ -match '^TOTAL\s+' } | Select-Object -First 1; if (-not $total) { Write-Error 'ERROR: could not parse line coverage from cargo-llvm-cov summary'; exit 1 }; $cols = $total -split '\s+'; $line_cov = [double]($cols[9].TrimEnd('%')); Write-Output "measured line coverage: $line_cov% (floor: $floor%)"; if ($line_cov -lt $floor) { Write-Error "ERROR: workspace line coverage $line_cov% is below the $floor% floor"; exit 1 }; Write-Output "coverage gate OK: $line_cov% >= $floor%"
+    $floor = 80; cargo llvm-cov --workspace --features newt-data/kernel --no-report; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; cargo llvm-cov report --lcov --output-path lcov.info --ignore-filename-regex 'pyo3_module\.rs$'; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; $summary = cargo llvm-cov report --summary-only --ignore-filename-regex 'pyo3_module\.rs$'; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; $summary; $total = $summary | Where-Object { $_ -match '^TOTAL\s+' } | Select-Object -First 1; if (-not $total) { Write-Error 'ERROR: could not parse line coverage from cargo-llvm-cov summary'; exit 1 }; $cols = $total -split '\s+'; $line_cov = [double]($cols[9].TrimEnd('%')); Write-Output "measured line coverage: $line_cov% (floor: $floor%)"; if ($line_cov -lt $floor) { Write-Error "ERROR: workspace line coverage $line_cov% is below the $floor% floor"; exit 1 }; Write-Output "coverage gate OK: $line_cov% >= $floor%"
 
 # --- agent-bridle shell toggle (publishable stub vs. real confined shell) ---
 #

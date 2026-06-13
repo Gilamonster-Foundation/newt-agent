@@ -58,6 +58,16 @@ pub mod ingest;
 pub mod store;
 pub mod summary;
 
+/// Live-kernel co-pilot transport (Phase 21.3): the Jupyter [`KernelClient`]
+/// trait, the pure iopub accumulator, and the REST + websocket client. Gated on
+/// the `kernel` feature so the default engine build and the PyO3 wheel stay lean
+/// (no TLS/websocket/HTTP stack). See
+/// [`docs/design/centaur-data-scientist.md`](../../../docs/design/centaur-data-scientist.md).
+///
+/// [`KernelClient`]: kernel::KernelClient
+#[cfg(feature = "kernel")]
+pub mod kernel;
+
 #[cfg(feature = "pyo3")]
 pub mod pyo3_module;
 
