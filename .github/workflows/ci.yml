@@ -52,8 +52,10 @@ jobs:
         # steps fail independently, surfacing both in one run instead of forcing
         # a fmt fix before the clippy error is ever shown. (Mirrored by the
         # `check` recipe in the justfile, which runs both before failing.)
+        # `--features newt-data/kernel` lints the Phase 21.3 live-kernel code +
+        # tests (off by default; mirrored in the justfile `lint`/`check`).
         if: always()
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --features newt-data/kernel -- -D warnings
 
   test:
     name: Rust tests
@@ -69,7 +71,10 @@ jobs:
         # regenerated on Linux after every dependency change. Lock file
         # staleness is caught locally by `just check` (cargo generate-lockfile
         # + git diff) before pushing.
-        run: cargo test --workspace
+        # `--features newt-data/kernel` runs the Phase 21.3 live-kernel tests
+        # (the pure accumulator + the mock-websocket rest.rs suite), which are
+        # off by default; mirrored in the justfile `test`/`check` recipes.
+        run: cargo test --workspace --features newt-data/kernel
 
   coverage:
     name: Workspace coverage (cargo-llvm-cov)
@@ -108,7 +113,11 @@ jobs:
       # `report --summary-only` and gate in shell — deterministic,
       # version-independent, and the percentage is visible in the log.
       - name: Generate coverage data (no report yet)
-        run: cargo llvm-cov --workspace --no-report
+        # `--features newt-data/kernel` instruments the Phase 21.3 live-kernel
+        # module and runs its tests, so the kernel files are honestly covered
+        # (otherwise the code builds via newt-mcp-data but its own tests never
+        # run). Mirrored by `just cov-ci`. PIPELINE PARITY.
+        run: cargo llvm-cov --workspace --features newt-data/kernel --no-report
 
       - name: Export lcov
         run: cargo llvm-cov report --lcov --output-path lcov.info --ignore-filename-regex 'pyo3_module\.rs$'
@@ -169,9 +178,11 @@ jobs:
         with:
           key: windows
       - name: clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --features newt-data/kernel -- -D warnings
       - name: cargo test
         # `if: always()` so a clippy failure can't mask a test failure — both
         # surface in one run (same rationale as the Linux lint job).
+        # `--features newt-data/kernel` exercises the Phase 21.3 live-kernel
+        # tests on Windows too (the websocket/TLS stack must build there).
         if: always()
-        run: cargo test --workspace
+        run: cargo test --workspace --features newt-data/kernel

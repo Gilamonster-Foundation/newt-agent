@@ -1,11 +1,14 @@
 # Phase 21 — Centaur Data Scientist
 
-**Status:** Step 21.1 done (the headless `newt-data` engine ships); step 21.2 in
-progress — `newt-mcp-data`, the thin stdio MCP server over that engine, is the
-**first usable Centaur slice**: net-new SQL EDA reachable from newt chat via one
-`[[mcp_servers]]` line (see [Wiring it in](#wiring-it-in-21.2) below). Step 21.6
-done — the same SQLite primitives are now importable into a human notebook as the
-`newt_agent.data` PyO3 submodule of the umbrella wheel (see
+**Status:** Steps 21.1 and 21.2 done — the headless `newt-data` engine ships, and
+`newt-mcp-data`, the thin stdio MCP server over it, is the **first usable Centaur
+slice**: net-new SQL EDA reachable from newt chat via one `[[mcp_servers]]` line
+(see [Wiring it in](#wiring-it-in-21.2) below). Step 21.3 done — the live-kernel
+co-pilot: the agent now attaches to the human's running Jupyter server and runs
+cells (`kernel_attach` + `run_cell`), reading back stdout/stderr, rich results,
+and PNG plots written to disk (see [Live-kernel co-pilot](#live-kernel-co-pilot-21.3)
+below). Step 21.6 done — the same SQLite primitives are importable into a human
+notebook as the `newt_agent.data` PyO3 submodule of the umbrella wheel (see
 [In the notebook](#in-the-notebook-21.6) below).
 
 ## Purpose
@@ -77,10 +80,17 @@ never entangled with the conversation store.
   MCP tool error (`isError: true`) the model can read and recover from — never a
   `-32603` transport fault. The bare tool names are namespaced `data__*` by the
   client. See [Wiring it in](#wiring-it-in-21.2).
-- **Kernel co-pilot (21.3):** `kernel_attach`, `run_cell` (proposed code visible
-  before it runs; PNG written to `.newt-data/plots/…` and reported as path +
-  honest text summary — never inline; rich render deferred to gilamonster),
-  `interrupt_kernel` / `restart_kernel` (21.7).
+- **Kernel co-pilot (21.3, *shipped*):** `kernel_attach` (attach to a running
+  Jupyter server, reuse-or-start a kernel, report kernel id + server url),
+  `run_cell` (proposed code visible before it runs; stdout/stderr + rich
+  `execute_result`/`display_data` text + any `ename`/`evalue`; PNG written to
+  `<data-dir>/.newt-data/plots/cell-<n>-<uuid>.png` and reported as path +
+  honest size summary — never inlined; rich render deferred to gilamonster).
+  Pure-Rust transport (Option A1): Jupyter Server REST + kernel channels
+  websocket, no embedded libpython. Every failure (unreachable server, wrong
+  token, no kernel attached, transport drop) is an in-band MCP tool error the
+  model can read; a cell that *raises* is a successful run with `error` set.
+  `interrupt_kernel` / `restart_kernel` arrive in 21.7.
 - **Notebook artifact (21.4):** `notebook_read`, `notebook_insert_cell`
   (proposes; does not execute), `notebook_persist_executed_cell` — so
   `run_cell(persist_to=…)` leaves a faithful, reviewable, git-diffable record.
@@ -89,8 +99,8 @@ never entangled with the conversation store.
 ## Roadmap (Drake-flight-sized; one PR each; full acceptance contract)
 
 - **21.1** `newt-data` skeleton + `DataStore` trait + SQLite ingest/query/summarize. *(done)*
-- **21.2** `newt-mcp-data` server with the SQL tools (first shippable Centaur slice). *(in progress — shipping)*
-- **21.3** `KernelClient` trait + REST/websocket client + `kernel_attach`/`run_cell`.
+- **21.2** `newt-mcp-data` server with the SQL tools (first shippable Centaur slice). *(done)*
+- **21.3** `KernelClient` trait + REST/websocket client + `kernel_attach`/`run_cell`. *(done)*
 - **21.4** notebook read/insert/persist-executed-cell + `run_cell(persist_to=…)`.
 - **21.5** dataframe introspection · **21.6** PyO3 `newt_data` submodule + umbrella/release wiring *(done)* ·
   **21.7** interrupt/restart + reconnect hardening · **21.8** DuckDB backend behind `DataStore` ·
@@ -114,6 +124,55 @@ agentic-loop changes. The data database lives at
 `<workspace>/.newt-data/data.db` (override with the `NEWT_DATA_DB` environment
 variable), separate from the conversation store. The server routes all tracing
 to stderr because stdout is the JSON-RPC wire.
+
+## Live-kernel co-pilot (21.3)
+
+The same `newt-mcp-data` server now also exposes `data__kernel_attach` and
+`data__run_cell`, so the agent can run cells on the human's **already-running**
+JupyterLab and read the outputs back into chat.
+
+```text
+1. data__kernel_attach { "url": "http://127.0.0.1:8888", "token": "<tok>" }
+   → { "status": "attached", "kernel_id": "…", "server_url": "…" }
+2. data__run_cell { "code": "import matplotlib.pyplot as plt; plt.plot([1,2,3]); plt.show()" }
+   → { "stdout": "", "stderr": "", "results": [...],
+       "images": [{ "path": "…/.newt-data/plots/cell-3-<uuid>.png",
+                    "summary": "640x480 PNG saved: …/cell-3-<uuid>.png" }],
+       "error": null, "execution_count": 3 }
+```
+
+**Transport (Option A1, pure-Rust — no libpython).** `kernel_attach` uses
+`reqwest` to hit the Jupyter Server REST API (`GET /api/kernels`, reusing the
+first running kernel or `POST`ing to start one; the token rides an
+`Authorization: token <tok>` header). `run_cell` opens the per-kernel **channels
+websocket** (`tokio-tungstenite`, `ws(s)://…/api/kernels/<id>/channels?token=…`),
+sends one Jupyter `execute_request`, and folds the reply iopub stream — filtered
+to replies whose `parent_header.msg_id` matches our request — into a `CellRun`,
+stopping at the terminating `status: idle`. No ZMQ, no HMAC, no embedded
+interpreter: the server stays a lean Rust binary (the rejected Option B linked
+libpython at runtime). The websocket/HTTP stack is gated behind the `newt-data`
+`kernel` cargo feature, so the default engine build and the PyO3 wheel stay lean.
+
+**PNG to disk, never inlined.** An `image/png` output bundle is base64-decoded
+and written to `<data-dir>/.newt-data/plots/cell-<n>-<uuid>.png`; only the path
+and an honest size summary (`"640x480 PNG saved: …"`) travel back to the model.
+Rich rendering is gilamonster's job.
+
+**In-band errors (the Centaur contract).** Every failure — an unreachable
+server, a wrong token, "no kernel attached", a dropped socket — is an in-band MCP
+tool error (`isError: true`) the model can read and recover from, never a
+`-32603` transport fault. A cell that *raises* a Python exception is **not** a
+failure: it is a successful run whose `error` field (`ename`/`evalue`/`traceback`)
+is populated.
+
+**The testable heart.** All the output-folding logic lives in a pure
+`Accumulator` (in `newt-data/src/kernel/mod.rs`) that folds a sequence of iopub
+`serde_json::Value`s into a `CellRun` with a single injected PNG sink — unit-tested
+against captured message fixtures with no live kernel. The REST + websocket
+client (`rest.rs`) is covered by an in-process mock Jupyter (wiremock for REST,
+a `tokio-tungstenite` server replaying a canned iopub sequence); a real-kernel
+integration test is `#[ignore]` by default (set `JUPYTER_URL`) so CI never needs
+a live kernel and the coverage gate never depends on one.
 
 ## In the notebook (21.6)
 
