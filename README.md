@@ -207,6 +207,33 @@ just eval                                 # live mode (real Ollama)
 See [`newt-eval/README.md`](./newt-eval/README.md) for how to add a
 new case.
 
+## Learnings from this experiment
+
+Newt is a local-first coding-agent prototype, but the more durable output
+is what building it teaches about how LLMs actually behave inside a harness.
+The standout so far:
+
+- **[Summarization-induced hallucination](./docs/notes/2026-06-13-summarization-induced-hallucination.md)**
+  — a context-compression harness that *summarizes* a coding session can make
+  the model **hallucinate APIs it had already read**. The insight is epistemic,
+  not about bytes: **a confident summary is worse than a labelled absence** —
+  absence routes the model to re-read; a summary that asserts "the file is
+  known" suppresses recovery and induces plausible-but-wrong completion. A
+  harness's lossy transform silently edits the model's *beliefs*. (#319)
+
+More field notes from the build:
+
+- [Coder-driving sweet spots](./docs/notes/2026-05-31-newt-coder-driving-sweet-spots.md)
+  — where small local models are and aren't reliable at agentic coding.
+- [Truncation honesty (baseline B6)](./docs/testing/results/context-baseline-f0f4f6e.md)
+  — the measurement that showed silent context truncation yields *silently
+  wrong* answers, motivating "summarize, don't discard" (which in turn produced
+  the finding above — a reminder that every fix moves the failure, it doesn't
+  always remove it).
+- [Causal ordering, not wall-clock](./docs/design/context-memory-hermes-learnings.md)
+  — why the conversation store treats timestamps as display *claims* and orders
+  on signed per-writer ticks + content hashes.
+
 ## Status
 
 v0.x — workspace scaffold landed; building toward v0.1 (`newt worker` +
