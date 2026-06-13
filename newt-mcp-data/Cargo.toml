@@ -22,16 +22,23 @@ path = "src/lib.rs"
 [dependencies]
 # The headless Phase 21 engine — all the logic lives here; this crate is a
 # thin JSON-RPC adapter. See docs/design/centaur-data-scientist.md.
-newt-data.workspace = true
+# The `kernel` feature pulls in the live-kernel co-pilot transport (21.3:
+# kernel_attach / run_cell over the Jupyter REST + websocket); all the transport
+# logic stays in newt-data, this crate only adds the two MCP tool surfaces.
+newt-data = { workspace = true, features = ["kernel"] }
 anyhow.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+# The shared kernel session state is a `Box<dyn KernelClient>`; the trait is
+# `async_trait`, so the crate that names it needs the same attribute macro.
+async-trait.workspace = true
 
 # NOTE: deliberately NO agent-bridle / newt-inference / newt-core / caveats.
 # This server is pure data: no confined shell, no inference, no leash — every
-# tool is a read-or-write SQL statement over a local SQLite file.
+# tool is a read-or-write SQL statement over a local SQLite file, or a cell run
+# against the human's own already-running Jupyter kernel.
 
 [dev-dependencies]
 tempfile.workspace = true

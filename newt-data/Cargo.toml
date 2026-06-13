@@ -24,9 +24,37 @@ tracing.workspace = true
 # crate; default builds stay Python-free.
 pyo3 = { workspace = true, optional = true }
 
+# Optional live-kernel co-pilot transport (Phase 21.3 — kernel_attach / run_cell).
+# All gated behind the `kernel` feature so the default engine build and the
+# PyO3 wheel never pull a TLS/websocket/HTTP stack. See
+# docs/design/centaur-data-scientist.md (Option A, pure-Rust REST + websocket).
+reqwest = { workspace = true, optional = true }
+tokio-tungstenite = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+futures-util = { version = "0.3", optional = true }
+async-trait = { workspace = true, optional = true }
+uuid = { workspace = true, optional = true }
+base64 = { workspace = true, optional = true }
+url = { version = "2", optional = true }
+
 [features]
 default = []
 pyo3 = ["dep:pyo3"]
+# Live-kernel co-pilot (Phase 21.3): the Jupyter `KernelClient` trait, the pure
+# iopub-message accumulator, and the REST + websocket `RestKernelClient`. Off by
+# default so the headless engine and the PyO3 wheel stay lean — only
+# `newt-mcp-data` (and an explicit `--features kernel`) turn it on. See
+# docs/design/centaur-data-scientist.md (Option A1: pure-Rust REST + websocket).
+kernel = [
+    "dep:reqwest",
+    "dep:tokio-tungstenite",
+    "dep:tokio",
+    "dep:futures-util",
+    "dep:async-trait",
+    "dep:uuid",
+    "dep:base64",
+    "dep:url",
+]
 # Opt-in gate for the embedded-interpreter unit tests in `pyo3_module.rs`.
 # Kept SEPARATE from `pyo3` on purpose: those tests call the CPython C API
 # (`Python::attach`) and so must link libpython, which only works when
@@ -40,6 +68,15 @@ embed-tests = ["pyo3"]
 
 [dev-dependencies]
 tempfile.workspace = true
+# Kernel-transport tests (Phase 21.3): an in-process mock Jupyter REST endpoint
+# (wiremock) + a mock kernel-channels websocket server (tokio-tungstenite server
+# side, driven over a tokio runtime) so `rest.rs` is covered without a live
+# Jupyter kernel. These are only compiled when the `kernel` feature is on (the
+# tests are `#[cfg(feature = "kernel")]`); a default `cargo test` skips them.
+tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }
+futures-util = "0.3"
+wiremock.workspace = true
 
 [lints]
 workspace = true

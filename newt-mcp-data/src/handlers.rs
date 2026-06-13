@@ -23,11 +23,14 @@
 //! [`serde_json::Value`] directly (the `tools/call` arm wraps it in `Ok`) and
 //! never bubbles a [`newt_data::DataError`] up the transport.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use newt_data::kernel::rest::RestKernelClient;
+use newt_data::kernel::KernelClient;
 use newt_data::{DataStore, SqliteBackend};
 use serde_json::Value;
+use tokio::sync::Mutex;
 
 use crate::server::McpServer;
 
@@ -38,17 +41,39 @@ use crate::server::McpServer;
 /// sets the honest `truncated` flag). See [`parse_row_cap`].
 const DEFAULT_ROW_CAP: usize = 1000;
 
-/// Register the SQL EDA MCP handlers on `server`, wiring in the shared data
-/// `store`.
+/// The live-kernel session state (Phase 21.3): the currently-attached
+/// [`KernelClient`], if any.
 ///
-/// `store` is the single piece of runtime state — an [`SqliteBackend`] opened
-/// over the workspace's `.newt-data/data.db` (or an in-memory one in tests). It
-/// is shared (via `Arc`) into the `tools/call` closure so each invocation gets
-/// its own clone (the outer closure is `Fn`, not `FnOnce`).
-pub fn register_handlers(server: &mut McpServer, store: Arc<SqliteBackend>) {
+/// `None` until `kernel_attach` succeeds. Behind a `tokio::Mutex` (not a
+/// `std::Mutex`) because `run_cell` awaits the kernel websocket while holding it,
+/// serializing concurrent cell runs over one kernel — which is exactly the
+/// semantics a single Jupyter kernel has (one execution at a time). `Arc` so the
+/// `tools/call` closure (an `Fn`) can clone it per invocation, mirroring the
+/// shared-store pattern.
+pub type KernelSession = Arc<Mutex<Option<Box<dyn KernelClient>>>>;
+
+/// A fresh, empty kernel session (no kernel attached yet).
+pub fn new_kernel_session() -> KernelSession {
+    Arc::new(Mutex::new(None))
+}
+
+/// Register every MCP handler on `server`: the four SQL EDA tools plus the two
+/// Phase 21.3 live-kernel tools (`kernel_attach`, `run_cell`).
+///
+/// `store` is the shared [`SqliteBackend`]; `session` is the (initially empty)
+/// kernel session a successful `kernel_attach` fills; `plots_dir` is where
+/// `run_cell` writes decoded PNG plots (`<data-dir>/plots`). All three are shared
+/// (via `Arc`) into the `tools/call` closure so each invocation gets its own
+/// clone (the outer closure is `Fn`, not `FnOnce`).
+pub fn register_handlers(
+    server: &mut McpServer,
+    store: Arc<SqliteBackend>,
+    session: KernelSession,
+    plots_dir: PathBuf,
+) {
     register_initialize(server);
     register_tools_list(server);
-    register_tools_call(server, store);
+    register_tools_call(server, store, session, plots_dir);
 }
 
 // ── initialize ─────────────────────────────────────────────────────────────
@@ -140,6 +165,42 @@ fn tool_definitions() -> Value {
                 "properties": {}
             }
         }),
+        serde_json::json!({
+            "name": "kernel_attach",
+            "description": "Attach to the human's already-running Jupyter server so `run_cell` can execute code on a live kernel. Reuses a running kernel (or starts one) and returns the kernel id + server URL. Call this once before `run_cell`.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "Jupyter Server base URL (e.g. http://127.0.0.1:8888)"
+                    },
+                    "token": {
+                        "type": "string",
+                        "description": "Jupyter token, if the server requires one"
+                    },
+                    "kernel_id": {
+                        "type": "string",
+                        "description": "Adopt a specific kernel id; omit to reuse the first running kernel (or start one)"
+                    }
+                },
+                "required": ["url"]
+            }
+        }),
+        serde_json::json!({
+            "name": "run_cell",
+            "description": "Run a code cell on the attached Jupyter kernel (call kernel_attach first). Returns stdout/stderr, rich text results, and any error. PNG plots are written to <data-dir>/.newt-data/plots/ and reported as a file path + honest size summary — never inlined. The exact code is shown in chat before it runs.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "code": {
+                        "type": "string",
+                        "description": "The Python (or kernel-language) code to execute in one cell"
+                    }
+                },
+                "required": ["code"]
+            }
+        }),
     ];
 
     Value::Array(tools)
@@ -147,11 +208,18 @@ fn tool_definitions() -> Value {
 
 // ── tools/call ─────────────────────────────────────────────────────────────
 
-fn register_tools_call(server: &mut McpServer, store: Arc<SqliteBackend>) {
+fn register_tools_call(
+    server: &mut McpServer,
+    store: Arc<SqliteBackend>,
+    session: KernelSession,
+    plots_dir: PathBuf,
+) {
     server.register("tools/call", move |params| {
-        // Move a clone into the async block so each invocation owns its own
-        // Arc (the outer closure is `Fn`, not `FnOnce`).
+        // Move clones into the async block so each invocation owns its own
+        // Arc / PathBuf (the outer closure is `Fn`, not `FnOnce`).
         let store = store.clone();
+        let session = session.clone();
+        let plots_dir = plots_dir.clone();
         async move {
             let name = params
                 .get("name")
@@ -168,9 +236,12 @@ fn register_tools_call(server: &mut McpServer, store: Arc<SqliteBackend>) {
                 "sql_query" => Ok(handle_sql_query(&arguments, &store)),
                 "sql_summarize" => Ok(handle_sql_summarize(&arguments, &store)),
                 "sql_list_tables" => Ok(handle_sql_list_tables(&store)),
+                "kernel_attach" => Ok(handle_kernel_attach(&arguments, &session, &plots_dir).await),
+                "run_cell" => Ok(handle_run_cell(&arguments, &session).await),
                 // An unknown tool name is a transport-level `-32603`, matching
                 // `newt-mcp-server`'s `other =>` arm. A *known* tool failing for
-                // its own reasons (bad SQL, missing arg) stays in-band, above.
+                // its own reasons (bad SQL, missing arg, no kernel attached)
+                // stays in-band, above.
                 other => anyhow::bail!("unknown tool: {other}"),
             }
         }
@@ -229,6 +300,116 @@ fn handle_sql_list_tables(store: &SqliteBackend) -> Value {
         Ok(tables) => pretty_or_error(serde_json::to_string_pretty(&tables)),
         Err(e) => mcp_error_content(&e.to_string()),
     }
+}
+
+// ── Live-kernel tools (Phase 21.3) ──────────────────────────────────────────
+//
+// Like the SQL tools, every failure is an in-band MCP tool error (isError:true),
+// never a -32603 transport fault: an unreachable Jupyter server, a wrong token,
+// or "no kernel attached" must all be readable by the model so it can recover
+// (the Centaur in-band-error discipline). A cell that *raises* a Python
+// exception is NOT a failure here — it is a successful run whose `error` field
+// is populated, surfaced as normal content.
+
+/// `kernel_attach`: connect to the human's running Jupyter server and store the
+/// resulting [`KernelClient`] in the session. Returns the kernel id + server URL
+/// as text on success; an in-band error (server unreachable, bad token, missing
+/// `url`) on failure.
+async fn handle_kernel_attach(args: &Value, session: &KernelSession, plots_dir: &Path) -> Value {
+    let url = match required_str(args, "url") {
+        Ok(u) => u,
+        Err(e) => return e,
+    };
+    let token = args.get("token").and_then(Value::as_str);
+    let kernel_id = args.get("kernel_id").and_then(Value::as_str);
+
+    match RestKernelClient::connect(url, token, kernel_id, plots_dir.to_path_buf()).await {
+        Ok(client) => {
+            let summary = serde_json::json!({
+                "status": "attached",
+                "kernel_id": client.kernel_id(),
+                "server_url": client.base_url(),
+            });
+            // Store the live client for subsequent `run_cell` calls.
+            *session.lock().await = Some(Box::new(client));
+            pretty_or_error(serde_json::to_string_pretty(&summary))
+        }
+        Err(e) => mcp_error_content(&format!("kernel_attach failed: {e}")),
+    }
+}
+
+/// `run_cell`: execute `code` on the attached kernel and summarize the run.
+///
+/// In-band error if no kernel is attached (tells the model to call
+/// `kernel_attach` first) or if the transport fails. A successful run — even one
+/// where the cell raised — returns a [`CellRun`](newt_data::kernel::CellRun)
+/// summary as pretty JSON: stdout/stderr, text results, image **paths** + honest
+/// size summaries (never inlined bytes), and any `ename`/`evalue`.
+async fn handle_run_cell(args: &Value, session: &KernelSession) -> Value {
+    let code = match required_str(args, "code") {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
+
+    let guard = session.lock().await;
+    let client = match guard.as_ref() {
+        Some(c) => c,
+        None => {
+            return mcp_error_content(
+                "no kernel attached — call kernel_attach with your Jupyter server url first",
+            )
+        }
+    };
+
+    match client.run_cell(code).await {
+        Ok(run) => pretty_or_error(serde_json::to_string(&run_summary(&run))),
+        Err(e) => mcp_error_content(&format!("run_cell failed: {e}")),
+    }
+}
+
+/// Build the honest, model-facing JSON summary of a [`CellRun`](newt_data::kernel::CellRun).
+///
+/// Images are reported as `{ path, summary }` where `summary` is a human string
+/// like `"640x480 PNG saved: <path>"` (size omitted when the kernel did not
+/// report dimensions) — the bytes are **never** inlined (Centaur principle; rich
+/// render is gilamonster's job). stdout/stderr/results/error/execution_count are
+/// passed through faithfully.
+fn run_summary(run: &newt_data::kernel::CellRun) -> Value {
+    let images: Vec<Value> = run
+        .images
+        .iter()
+        .map(|img| {
+            let path = img.path.display().to_string();
+            let summary = match (img.width, img.height) {
+                (Some(w), Some(h)) => format!("{w}x{h} PNG saved: {path}"),
+                _ => format!("PNG saved: {path}"),
+            };
+            serde_json::json!({ "path": path, "summary": summary })
+        })
+        .collect();
+
+    let results: Vec<Value> = run
+        .results
+        .iter()
+        .map(|d| serde_json::json!({ "mime": d.mime, "text": d.text }))
+        .collect();
+
+    let error = run.error.as_ref().map(|e| {
+        serde_json::json!({
+            "ename": e.ename,
+            "evalue": e.evalue,
+            "traceback": e.traceback,
+        })
+    });
+
+    serde_json::json!({
+        "stdout": run.stdout,
+        "stderr": run.stderr,
+        "results": results,
+        "images": images,
+        "error": error,
+        "execution_count": run.execution_count,
+    })
 }
 
 // ── Argument + result helpers ──────────────────────────────────────────────
@@ -338,16 +519,62 @@ mod tests {
     }
 
     /// Like [`rpc`], but with a caller-supplied store so a multi-step flow
-    /// (ingest → query → summarize → list) can share one database.
+    /// (ingest → query → summarize → list) can share one database. The kernel
+    /// session starts empty (no kernel attached).
     async fn rpc_with(store: Arc<SqliteBackend>, request: &Value) -> Value {
+        rpc_full(store, new_kernel_session(), request).await
+    }
+
+    /// The fully-parameterized harness: a caller-supplied store **and** kernel
+    /// session, so the live-kernel tests can pre-attach a [`MockKernel`] (or
+    /// assert the empty-session error) and the SQL tests can share a database.
+    async fn rpc_full(store: Arc<SqliteBackend>, session: KernelSession, request: &Value) -> Value {
+        // A throwaway plots dir; the MockKernel never writes there (it returns a
+        // canned CellRun), so the path only needs to be syntactically valid.
+        let plots_dir = std::env::temp_dir().join("newt-mcp-data-test-plots");
         let mut server = McpServer::new();
-        register_handlers(&mut server, store);
+        register_handlers(&mut server, store, session, plots_dir);
 
         let input = format!("{}\n", serde_json::to_string(request).unwrap());
         let mut output: Vec<u8> = Vec::new();
         server.run(input.as_bytes(), &mut output).await.unwrap();
         let text = String::from_utf8(output).unwrap();
         serde_json::from_str(text.trim()).unwrap()
+    }
+
+    /// A canned [`KernelClient`] for the tool-logic tests: it returns a fixed
+    /// [`CellRun`] (or a fixed transport error) without any websocket — so the
+    /// `run_cell` / `kernel_attach` MCP envelope logic (PNG path reporting, the
+    /// no-kernel error, the in-band error discipline) is exercised hermetically,
+    /// no live Jupyter kernel required.
+    struct MockKernel {
+        run: newt_data::kernel::CellRun,
+        fail: Option<String>,
+    }
+
+    #[async_trait::async_trait]
+    impl KernelClient for MockKernel {
+        async fn run_cell(&self, _code: &str) -> anyhow::Result<newt_data::kernel::CellRun> {
+            match &self.fail {
+                Some(msg) => anyhow::bail!("{msg}"),
+                None => Ok(self.run.clone()),
+            }
+        }
+    }
+
+    /// A session with a pre-attached [`MockKernel`] returning `run`.
+    fn session_with(run: newt_data::kernel::CellRun) -> KernelSession {
+        Arc::new(Mutex::new(Some(
+            Box::new(MockKernel { run, fail: None }) as Box<dyn KernelClient>
+        )))
+    }
+
+    /// A session with a pre-attached [`MockKernel`] whose `run_cell` errors.
+    fn session_failing(msg: &str) -> KernelSession {
+        Arc::new(Mutex::new(Some(Box::new(MockKernel {
+            run: newt_data::kernel::CellRun::default(),
+            fail: Some(msg.to_string()),
+        }) as Box<dyn KernelClient>)))
     }
 
     /// Helper: a `tools/call` request body.
@@ -378,25 +605,26 @@ mod tests {
     // ── tools/list ──────────────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn tools_list_returns_exactly_the_four_sql_tools() {
+    async fn tools_list_returns_the_sql_and_kernel_tools() {
         let resp = rpc(&serde_json::json!({
             "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}
         }))
         .await;
 
         let tools = resp["result"]["tools"].as_array().unwrap();
-        assert_eq!(
-            tools.len(),
-            4,
-            "expected exactly 4 tools, got {}",
-            tools.len()
-        );
-
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-        assert!(names.contains(&"sql_ingest_csv"));
-        assert!(names.contains(&"sql_query"));
-        assert!(names.contains(&"sql_summarize"));
-        assert!(names.contains(&"sql_list_tables"));
+        // The four SQL tools (21.2) plus the two live-kernel tools (21.3).
+        for expected in [
+            "sql_ingest_csv",
+            "sql_query",
+            "sql_summarize",
+            "sql_list_tables",
+            "kernel_attach",
+            "run_cell",
+        ] {
+            assert!(names.contains(&expected), "tools/list missing {expected}");
+        }
+        assert_eq!(tools.len(), 6, "expected exactly 6 tools, got {names:?}");
 
         // Every tool carries an inputSchema object.
         for tool in tools {
@@ -406,6 +634,14 @@ mod tests {
                 tool["name"]
             );
         }
+        // kernel_attach requires `url`; run_cell requires `code`.
+        let attach = tools.iter().find(|t| t["name"] == "kernel_attach").unwrap();
+        assert_eq!(
+            attach["inputSchema"]["required"],
+            serde_json::json!(["url"])
+        );
+        let run = tools.iter().find(|t| t["name"] == "run_cell").unwrap();
+        assert_eq!(run["inputSchema"]["required"], serde_json::json!(["code"]));
     }
 
     // ── happy-path flow: ingest → query → summarize → list ──────────────────
@@ -691,5 +927,206 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("missing required argument: b"));
+    }
+
+    // ── live-kernel tools (21.3) — driven by a MockKernel ────────────────────
+
+    use newt_data::kernel::{CellRun, DisplayItem, ImageOutput, KernelError};
+
+    /// A canned CellRun with stdout, a text result, a PNG image, and an
+    /// execution_count — the happy path `run_cell` must summarize.
+    fn canned_run() -> CellRun {
+        CellRun {
+            stdout: "hello from kernel\n".into(),
+            stderr: String::new(),
+            results: vec![DisplayItem {
+                mime: "text/plain".into(),
+                text: "42".into(),
+            }],
+            images: vec![ImageOutput {
+                path: std::path::PathBuf::from("/ws/.newt-data/plots/cell-5-abc.png"),
+                mime: "image/png".into(),
+                width: Some(640),
+                height: Some(480),
+            }],
+            error: None,
+            execution_count: Some(5),
+        }
+    }
+
+    /// `run_cell` with no kernel attached is an in-band error telling the model
+    /// to call `kernel_attach` first — never a transport fault.
+    #[tokio::test]
+    async fn run_cell_without_attach_is_in_band_error() {
+        let resp = rpc(&call(50, "run_cell", serde_json::json!({ "code": "1+1" }))).await;
+        assert!(resp["error"].is_null(), "must be in-band: {resp}");
+        assert_eq!(resp["result"]["isError"], true);
+        assert!(resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("kernel_attach"));
+    }
+
+    /// `run_cell` against an attached MockKernel returns the CellRun summary:
+    /// stdout, text results, and the PNG reported as a path + honest size string
+    /// — never the image bytes inlined.
+    #[tokio::test]
+    async fn run_cell_summarizes_run_with_png_path_not_bytes() {
+        let store = Arc::new(SqliteBackend::open_in_memory().unwrap());
+        let session = session_with(canned_run());
+        let resp = rpc_full(
+            store,
+            session,
+            &call(51, "run_cell", serde_json::json!({ "code": "plt.show()" })),
+        )
+        .await;
+        assert!(resp["error"].is_null(), "must be in-band: {resp}");
+        assert!(
+            resp["result"]["isError"].is_null(),
+            "should succeed: {resp}"
+        );
+
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        let summary: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(summary["stdout"], "hello from kernel\n");
+        assert_eq!(summary["execution_count"], 5);
+        assert_eq!(summary["results"][0]["mime"], "text/plain");
+        assert_eq!(summary["results"][0]["text"], "42");
+        // The image is a path + size summary — and the raw bytes never appear.
+        let img = &summary["images"][0];
+        assert_eq!(img["path"], "/ws/.newt-data/plots/cell-5-abc.png");
+        assert_eq!(
+            img["summary"],
+            "640x480 PNG saved: /ws/.newt-data/plots/cell-5-abc.png"
+        );
+        assert!(
+            !text.contains("image/png"),
+            "must not inline the PNG bytes/mime blob"
+        );
+        assert!(summary["error"].is_null());
+    }
+
+    /// A cell that *raised* is a successful run whose `error` field is populated
+    /// — NOT an in-band tool error (the exception is data the model reads).
+    #[tokio::test]
+    async fn run_cell_with_cell_exception_is_success_with_error_field() {
+        let run = CellRun {
+            error: Some(KernelError {
+                ename: "NameError".into(),
+                evalue: "name 'foo' is not defined".into(),
+                traceback: vec!["Traceback...".into()],
+            }),
+            ..Default::default()
+        };
+        let resp = rpc_full(
+            Arc::new(SqliteBackend::open_in_memory().unwrap()),
+            session_with(run),
+            &call(52, "run_cell", serde_json::json!({ "code": "foo" })),
+        )
+        .await;
+        // The MCP call itself succeeded (no isError); the exception is in the body.
+        assert!(
+            resp["result"]["isError"].is_null(),
+            "cell raise is not a tool error: {resp}"
+        );
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        let summary: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(summary["error"]["ename"], "NameError");
+        assert_eq!(summary["error"]["evalue"], "name 'foo' is not defined");
+    }
+
+    /// A transport failure inside `run_cell` (kernel died, socket dropped) is an
+    /// in-band tool error, never a -32603.
+    #[tokio::test]
+    async fn run_cell_transport_failure_is_in_band_error() {
+        let resp = rpc_full(
+            Arc::new(SqliteBackend::open_in_memory().unwrap()),
+            session_failing("websocket closed unexpectedly"),
+            &call(53, "run_cell", serde_json::json!({ "code": "1+1" })),
+        )
+        .await;
+        assert!(resp["error"].is_null(), "must be in-band: {resp}");
+        assert_eq!(resp["result"]["isError"], true);
+        assert!(resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("run_cell failed"));
+    }
+
+    /// `run_cell` with a missing `code` argument is an in-band error.
+    #[tokio::test]
+    async fn run_cell_missing_code_arg_is_in_band_error() {
+        let resp = rpc_full(
+            Arc::new(SqliteBackend::open_in_memory().unwrap()),
+            session_with(canned_run()),
+            &call(54, "run_cell", serde_json::json!({})),
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], true);
+        assert!(resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("missing required argument: code"));
+    }
+
+    /// `kernel_attach` with a missing `url` argument is an in-band error.
+    #[tokio::test]
+    async fn kernel_attach_missing_url_is_in_band_error() {
+        let resp = rpc(&call(55, "kernel_attach", serde_json::json!({}))).await;
+        assert!(resp["error"].is_null(), "must be in-band: {resp}");
+        assert_eq!(resp["result"]["isError"], true);
+        assert!(resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("missing required argument: url"));
+    }
+
+    /// `kernel_attach` to an unreachable server is an in-band error (not a
+    /// transport fault) the model can read and recover from.
+    #[tokio::test]
+    async fn kernel_attach_unreachable_server_is_in_band_error() {
+        // Port 1 on localhost: nothing listens → connect() fails.
+        let resp = rpc(&call(
+            56,
+            "kernel_attach",
+            serde_json::json!({ "url": "http://127.0.0.1:1" }),
+        ))
+        .await;
+        assert!(resp["error"].is_null(), "must be in-band: {resp}");
+        assert_eq!(resp["result"]["isError"], true);
+        assert!(resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("kernel_attach failed"));
+    }
+
+    /// The honest run summary: dimensions absent → no "WxH" prefix; the bytes are
+    /// never present. A direct unit test of [`run_summary`].
+    #[test]
+    fn run_summary_reports_paths_and_honest_sizes() {
+        let run = CellRun {
+            images: vec![
+                ImageOutput {
+                    path: std::path::PathBuf::from("/p/a.png"),
+                    mime: "image/png".into(),
+                    width: Some(800),
+                    height: Some(600),
+                },
+                ImageOutput {
+                    path: std::path::PathBuf::from("/p/b.png"),
+                    mime: "image/png".into(),
+                    width: None,
+                    height: None,
+                },
+            ],
+            ..Default::default()
+        };
+        let summary = run_summary(&run);
+        assert_eq!(
+            summary["images"][0]["summary"],
+            "800x600 PNG saved: /p/a.png"
+        );
+        // No dimensions → no size prefix, just the path.
+        assert_eq!(summary["images"][1]["summary"], "PNG saved: /p/b.png");
     }
 }

@@ -4,8 +4,9 @@
 //! tempfile (so it never touches the real `~/.newt-data` home), drives two
 //! newline-delimited JSON-RPC requests (`initialize`, then `tools/list`) over
 //! stdin, closes stdin, and parses the two newline-delimited response lines from
-//! stdout. Asserts the `serverInfo.name` is `newt-mcp-data` and that all four
-//! SQL tool names are advertised — the end-to-end wiring the agent relies on.
+//! stdout. Asserts the `serverInfo.name` is `newt-mcp-data` and that all six
+//! tool names (four SQL EDA + the two Phase 21.3 live-kernel tools) are
+//! advertised — the end-to-end wiring the agent relies on.
 //!
 //! Mirrors the newt CLI test conventions (`assert_cmd` + `predicates`).
 
@@ -70,7 +71,7 @@ fn initialize_and_tools_list_over_stdio() {
     );
     assert_eq!(init["result"]["protocolVersion"], "2024-11-05");
 
-    // tools/list → all four SQL tool names present.
+    // tools/list → the four SQL tools (21.2) plus the two live-kernel tools (21.3).
     assert_eq!(list["id"], 2);
     let tools = list["result"]["tools"].as_array().expect("tools array");
     let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
@@ -79,11 +80,13 @@ fn initialize_and_tools_list_over_stdio() {
         "sql_query",
         "sql_summarize",
         "sql_list_tables",
+        "kernel_attach",
+        "run_cell",
     ] {
         assert!(
             names.contains(&expected),
             "tools/list missing {expected}: {names:?}"
         );
     }
-    assert_eq!(names.len(), 4, "expected exactly 4 tools, got {names:?}");
+    assert_eq!(names.len(), 6, "expected exactly 6 tools, got {names:?}");
 }
