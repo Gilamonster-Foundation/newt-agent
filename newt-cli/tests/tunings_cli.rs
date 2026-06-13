@@ -191,6 +191,97 @@ fn show_small_context_window_is_not_abbreviated() {
         .stdout(predicate::str::contains("384"));
 }
 
+/// Phase 20 (docs/design/model-self-tuning.md): the learned calibration
+/// ratio and the thinking-only quirk render as detail lines under the row —
+/// and stay absent for models that never learned them.
+#[test]
+fn show_renders_calibration_ratio_and_thinking_quirk() {
+    let home = fake_home();
+    write_caps(
+        &home,
+        &serde_json::json!({
+            "nemotron3:33b": {
+                "context_window": 32768,
+                "safe_context": 26214,
+                "tune_confidence": "medium",
+                "estimate_ratio": 1.29,
+                "emits_thinking": true
+            },
+            "plain:7b": {
+                "context_window": 8192,
+                "safe_context": 6553
+            }
+        }),
+    );
+
+    newt(&home)
+        .args(["tunings", "show"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "estimate calibration: x1.29 (chars/4 -> real)",
+        ))
+        .stdout(predicate::str::contains(
+            "quirk: emits thinking-only responses",
+        ))
+        // Exactly one model carries each detail line.
+        .stdout(predicate::str::contains("estimate calibration").count(1))
+        .stdout(predicate::str::contains("quirk:").count(1));
+}
+
+/// Phase 20: reset clears the new learned fields too — the Refused bail
+/// sends users here when a learned budget (or calibration) is poisoned.
+#[test]
+fn reset_clears_estimate_ratio_and_emits_thinking() {
+    let home = fake_home();
+    write_caps(
+        &home,
+        &serde_json::json!({
+            "m:7b": {
+                "conformance": "full",
+                "safe_context": 6553,
+                "estimate_ratio": 2.9,
+                "emits_thinking": true
+            }
+        }),
+    );
+
+    newt(&home)
+        .args(["tunings", "reset", "m:7b"])
+        .assert()
+        .success();
+
+    let caps = read_caps(&home);
+    assert!(caps["m:7b"].get("estimate_ratio").is_none());
+    assert!(caps["m:7b"].get("emits_thinking").is_none());
+    assert_eq!(caps["m:7b"]["conformance"], "full");
+}
+
+/// Phase 20: export carries the learned calibration ratio (additive v1 key).
+#[test]
+fn export_includes_estimate_ratio_when_learned() {
+    let home = fake_home();
+    write_caps(
+        &home,
+        &serde_json::json!({
+            "calibrated:33b": {
+                "context_window": 32768,
+                "safe_context": 26214,
+                "tune_confidence": "medium",
+                "consecutive_ok": 2,
+                "estimate_ratio": 1.25
+            }
+        }),
+    );
+
+    newt(&home)
+        .args(["tunings", "export"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("model = \"calibrated:33b\""))
+        .stdout(predicate::str::contains("estimate_ratio = 1.25"));
+}
+
 #[test]
 fn show_prints_dash_for_missing_values() {
     let home = fake_home();

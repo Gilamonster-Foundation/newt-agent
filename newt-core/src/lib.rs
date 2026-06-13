@@ -45,9 +45,9 @@ pub use agentic::{
     transcript_lines_styled, trim_for_summary, widen_caveats, ChatCtx, CompressCounters,
     CompressState, DenialKind, ManualCompressOutcome, McpTools, NoMcp, NoteNudge, NoteSink,
     PermissionDecision, PermissionGate, PermissionRecord, PermissionRequest, RecallSource,
-    ShellObservation, StoreRecallSource, SummarizeFn, SummarizeFuture, Summarizer, TranscriptLine,
-    TranscriptRole, TranscriptStyle, TurnDriver, TurnDriverConfig, TurnDriverError, TurnOutcome,
-    TurnStatus,
+    RoundObservation, ShellObservation, StoreRecallSource, SummarizeFn, SummarizeFuture,
+    Summarizer, TranscriptLine, TranscriptRole, TranscriptStyle, TurnDriver, TurnDriverConfig,
+    TurnDriverError, TurnOutcome, TurnStatus,
 };
 pub use agents::AgentsProvider;
 pub use caveats::{CaveatsExt, CountBoundExt, ScopeExt};
