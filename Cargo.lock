@@ -1967,6 +1967,7 @@ dependencies = [
  "newt-acp-worker",
  "newt-coder",
  "newt-core",
+ "newt-data",
  "newt-eval",
  "newt-inference",
  "newt-mcp-server",
@@ -2032,6 +2033,7 @@ version = "0.6.7"
 dependencies = [
  "anyhow",
  "csv",
+ "pyo3",
  "rusqlite",
  "serde",
  "serde_json",

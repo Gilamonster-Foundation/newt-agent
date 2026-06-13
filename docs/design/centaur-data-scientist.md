@@ -3,7 +3,10 @@
 **Status:** Step 21.1 done (the headless `newt-data` engine ships); step 21.2 in
 progress — `newt-mcp-data`, the thin stdio MCP server over that engine, is the
 **first usable Centaur slice**: net-new SQL EDA reachable from newt chat via one
-`[[mcp_servers]]` line (see [Wiring it in](#wiring-it-in-21.2) below).
+`[[mcp_servers]]` line (see [Wiring it in](#wiring-it-in-21.2) below). Step 21.6
+done — the same SQLite primitives are now importable into a human notebook as the
+`newt_agent.data` PyO3 submodule of the umbrella wheel (see
+[In the notebook](#in-the-notebook-21.6) below).
 
 ## Purpose
 
@@ -35,7 +38,11 @@ carries the PyO3 / maturin / release / coverage template):
    newt-tui / agentic-loop changes**, one `[[mcp_servers]]` config line.
 3. **`newt_data` PyO3 submodule** — registered through the existing
    `newt-agent-py` umbrella; exposes the same Rust primitives into notebook
-   cells (the thesis). Wired in step 21.6.
+   cells (the thesis). Wired in step 21.6 — *shipped*: `load_csv_to_sqlite`,
+   `query` (returns `list[dict]`, honest int/float/None typing), and `summarize`
+   (returns a dict with the pandas-faithful `describe`), plus a `DataError`
+   exception. The wrappers are thin; all logic stays in `newt-data` (21.1). See
+   [In the notebook](#in-the-notebook-21.6).
 
 **Why MCP-server delivery.** The family rule (`docs/decisions/plain_scroller_tui.md`,
 gilamonster's `scrybe-markdown-surface.md`) is *extend via a separate binary or
@@ -85,7 +92,7 @@ never entangled with the conversation store.
 - **21.2** `newt-mcp-data` server with the SQL tools (first shippable Centaur slice). *(in progress — shipping)*
 - **21.3** `KernelClient` trait + REST/websocket client + `kernel_attach`/`run_cell`.
 - **21.4** notebook read/insert/persist-executed-cell + `run_cell(persist_to=…)`.
-- **21.5** dataframe introspection · **21.6** PyO3 `newt_data` submodule + umbrella/release wiring ·
+- **21.5** dataframe introspection · **21.6** PyO3 `newt_data` submodule + umbrella/release wiring *(done)* ·
   **21.7** interrupt/restart + reconnect hardening · **21.8** DuckDB backend behind `DataStore` ·
   **21.9** optional raw-ZMQ kernel client · **21.10** `docs/decisions/centaur_data_scientist.md` + README config snippet.
 
@@ -107,6 +114,31 @@ agentic-loop changes. The data database lives at
 `<workspace>/.newt-data/data.db` (override with the `NEWT_DATA_DB` environment
 variable), separate from the conversation store. The server routes all tracing
 to stderr because stdout is the JSON-RPC wire.
+
+## In the notebook (21.6)
+
+The same SQLite primitives are importable into the human's own notebook through
+the `newt-agent-py` umbrella wheel (the "use PyO3 to create data-science tools"
+thesis). Build it with `maturin develop` (or `pip install newt-agent-py`), then:
+
+```python
+import newt_agent.data as nd
+
+# Load a CSV into a SQLite DB and inspect the inferred schema.
+report = nd.load_csv_to_sqlite("sales.csv", "data.db", "sales")
+print(report.row_count, [(c.name, c.dtype) for c in report.columns])
+
+# Query it back — rows come as list[dict] with honest int/float/None typing.
+rows = nd.query("data.db", "SELECT region, amount FROM sales WHERE amount > 100")
+
+# pandas-faithful describe (sample std, linear-interpolation quartiles).
+summary = nd.summarize("data.db", "sales")
+print(summary["columns"][1]["describe"]["mean"])
+```
+
+Errors surface as `nd.DataError` (bad SQL, no such table, …). The submodule is a
+thin PyO3 wrapper over `newt-data`; the engine logic and its tests live in that
+crate (21.1).
 
 ## Long-term: gilabot → family migration
 

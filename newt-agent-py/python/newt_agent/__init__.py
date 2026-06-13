@@ -3,6 +3,7 @@
 Submodules
 ----------
 - ``newt_agent.core``        Tier router, config, session/model ids, errors
+- ``newt_agent.data``        load_csv_to_sqlite / query / summarize (SQLite EDA)
 - ``newt_agent.tools``       read / edit / search / apply_patch / apply_whole_files
 - ``newt_agent.coder``       prompt builder + emission normalizer
 - ``newt_agent.eval``        TestCase + evaluators + scorecard
@@ -49,6 +50,7 @@ from . import _newt_agent as _native  # type: ignore[attr-defined]
 # them into ``sys.modules`` so ``import newt_agent.core`` works (Python's
 # import system needs the submodule entries to resolve dotted imports).
 core = _native.core
+data = _native.data
 tools = _native.tools
 coder = _native.coder
 eval = _native.eval  # noqa: A001 — shadows builtin `eval`; deliberate parity
@@ -57,6 +59,7 @@ acp_worker = _native.acp_worker
 mcp = _native.mcp
 
 _sys.modules["newt_agent.core"] = core
+_sys.modules["newt_agent.data"] = data
 _sys.modules["newt_agent.tools"] = tools
 _sys.modules["newt_agent.coder"] = coder
 _sys.modules["newt_agent.eval"] = eval
@@ -66,6 +69,7 @@ _sys.modules["newt_agent.mcp"] = mcp
 
 __all__ = [
     "core",
+    "data",
     "tools",
     "coder",
     "eval",

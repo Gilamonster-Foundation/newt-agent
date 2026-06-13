@@ -259,6 +259,8 @@ jobs:
           - newt-skills       # (no internal deps)
           - plugins-protocol  # (no internal deps)
           - newt-core         # newt-skills
+          - newt-data         # (no internal deps) — Phase 21 SQLite engine; must
+                              #   precede newt-mcp-data, which depends on it
           - newt-identity     # newt-core
           - newt-tools        # newt-core
           - newt-mcp-client   # newt-core
