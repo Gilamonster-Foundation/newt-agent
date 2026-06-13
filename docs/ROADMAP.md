@@ -1051,7 +1051,7 @@ tables. Steps:
 - **21.3** `KernelClient` trait + REST/websocket client + `kernel_attach` / `run_cell`.
 - **21.4** notebook read / insert / persist-executed-cell + `run_cell(persist_to=…)`.
 - **21.5** dataframe introspection (`list_dataframes`, `inspect_dataframe`).
-- **21.6** PyO3 `newt_data` submodule + umbrella/release wiring.
+- **21.6** PyO3 `newt_data` submodule + umbrella/release wiring. *(done)*
 - **21.7** interrupt / restart + reconnect hardening.
 - **21.8** DuckDB backend behind `DataStore`.
 - **21.9** optional raw-ZMQ kernel client.
