@@ -1022,6 +1022,21 @@ Benchmarks with a captured baseline gate every phase:
 
 ---
 
+# Phase 20 — Model self-tuning (capability feedback loop)
+
+**Canonical spec: [`docs/design/model-self-tuning.md`](design/model-self-tuning.md)**
+— field semantics, the per-round observation hook, calibration currencies, and
+the out-of-scope fences. A live session refused its own sends over a cached
+6,068-token cap while the backend was accepting 8,734-token prompts in the
+same transcript — the system held proof its budget was wrong and discarded it,
+because the only capability write-back lived in a turn epilogue that an error
+skips.
+
+| Step | One line | Umbrella issue |
+|---|---|---|
+| **20.1** | Passive feedback: per-round `RoundObservation` hook, `max(proven, believed)` send budget, EMA chars/4 calibration, observation-gated epilogue | — |
+| **20.2** | Active discovery: `/probe` extension — empirical window binary search, thinking probe, calibration bootstrap, `tune_date` staleness re-probe | — |
+
 # Phase 21 — Centaur Data Scientist
 
 **Canonical design: [`docs/design/centaur-data-scientist.md`](design/centaur-data-scientist.md).**

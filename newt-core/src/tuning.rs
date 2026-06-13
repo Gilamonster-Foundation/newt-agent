@@ -72,6 +72,14 @@ pub struct TuningProfile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tool_rounds: Option<usize>,
 
+    /// Learned observed/estimated prompt-token calibration ratio (Phase 20,
+    /// `docs/design/model-self-tuning.md` §2.3): how far the chars/4
+    /// estimator under/over-counts this model's chat template. Additive
+    /// optional field — format version stays "1"; files written by older
+    /// versions parse unchanged and older versions ignore the key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimate_ratio: Option<f32>,
+
     /// How these values were derived.
     #[serde(default)]
     pub tune_source: TuneSource,
@@ -204,6 +212,8 @@ mod tests {
             safe_context: Some(24576),
             mid_loop_trim_threshold: Some(12),
             max_tool_rounds: Some(20),
+            // Phase 20: the learned chars/4 calibration rides along.
+            estimate_ratio: Some(1.29),
             tune_source: TuneSource::Empirical,
             confidence: "high".to_string(),
             data_points: 15,
@@ -215,6 +225,28 @@ mod tests {
         assert_eq!(back.profiles[0].model, "nemotron3:33b");
         assert_eq!(back.profiles[0].safe_context, Some(24576));
         assert_eq!(back.profiles[0].confidence, "high");
+        assert_eq!(back.profiles[0].estimate_ratio, Some(1.29));
+    }
+
+    /// Phase 20: `estimate_ratio` is ADDITIVE — format version stays "1",
+    /// and a v1 file without the key parses with the field absent.
+    #[test]
+    fn estimate_ratio_is_optional_in_v1_files() {
+        let toml_text = r#"
+[format]
+version = "1"
+
+[[profiles]]
+model = "old:7b"
+safe_context = 4096
+confidence = "low"
+"#;
+        let ct: CommunityTunings = toml::from_str(toml_text).unwrap();
+        assert_eq!(ct.format.version, "1");
+        assert_eq!(ct.profiles[0].estimate_ratio, None);
+        // And serializing it back does not invent the key.
+        let out = toml::to_string_pretty(&ct).unwrap();
+        assert!(!out.contains("estimate_ratio"), "{out}");
     }
 
     #[test]
@@ -227,6 +259,7 @@ mod tests {
                     safe_context: None,
                     mid_loop_trim_threshold: None,
                     max_tool_rounds: None,
+                    estimate_ratio: None,
                     tune_source: TuneSource::Manual,
                     confidence: "medium".to_string(),
                     data_points: 0,
@@ -238,6 +271,7 @@ mod tests {
                     safe_context: Some(6553),
                     mid_loop_trim_threshold: None,
                     max_tool_rounds: None,
+                    estimate_ratio: None,
                     tune_source: TuneSource::OllamaShow,
                     confidence: "low".to_string(),
                     data_points: 1,
@@ -261,6 +295,7 @@ mod tests {
                 context_window: None,
                 mid_loop_trim_threshold: None,
                 max_tool_rounds: None,
+                estimate_ratio: None,
                 tune_source: TuneSource::Community,
                 data_points: 1,
                 notes: None,
@@ -275,6 +310,7 @@ mod tests {
                 context_window: None,
                 mid_loop_trim_threshold: None,
                 max_tool_rounds: None,
+                estimate_ratio: None,
                 tune_source: TuneSource::Empirical,
                 data_points: 10,
                 notes: None,
@@ -297,6 +333,7 @@ mod tests {
                 context_window: None,
                 mid_loop_trim_threshold: None,
                 max_tool_rounds: None,
+                estimate_ratio: None,
                 tune_source: TuneSource::Empirical,
                 data_points: 10,
                 notes: None,
@@ -311,6 +348,7 @@ mod tests {
                 context_window: None,
                 mid_loop_trim_threshold: None,
                 max_tool_rounds: None,
+                estimate_ratio: None,
                 tune_source: TuneSource::Community,
                 data_points: 1,
                 notes: None,
