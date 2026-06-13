@@ -310,6 +310,15 @@ pub struct ChatCtx<'a> {
     /// headless caller: ACP worker, `newt-eval`) keeps each denial exactly
     /// as before, so nothing non-interactive can ever hang on a prompt.
     pub permission_gate: Option<&'a mut dyn PermissionGate>,
+    /// #307 named-permission-preset exec FLOOR. When a `/mode` preset is active
+    /// its exec clamp is threaded here so the `--disable-ocap` / `--yolo`
+    /// bypass in `execute_tool` cannot raise exec authority above the preset:
+    /// an out-of-floor command falls through to the confined shell and is
+    /// denied. `None` (no active preset, and every headless caller) leaves the
+    /// bypass bit-for-bit. The floor is also already `meet`-ed into `caveats`,
+    /// so the confined-shell and gate paths enforce it too; this field is the
+    /// one extra place the otherwise caveats-blind bypass must consult.
+    pub exec_floor: Option<&'a crate::caveats::Scope<String>>,
 }
 
 /// Main agentic loop: call model → execute tool calls → feed results back → repeat.
@@ -361,6 +370,7 @@ pub async fn chat_complete(
         compress_state,
         mut tool_events,
         mut permission_gate,
+        exec_floor,
     } = ctx;
     // Headless callers may pass no session state — compression still works,
     // with per-turn anti-thrash accounting.
@@ -918,6 +928,8 @@ pub async fn chat_complete(
                 permission_gate
                     .as_deref_mut()
                     .map(|g| &mut *g as &mut dyn PermissionGate),
+                // #307: the active preset's exec floor (the bypass ceiling).
+                exec_floor,
             )
             .await;
             // 17.6: record the call for the turn's events column — args are
@@ -1252,6 +1264,7 @@ pub async fn openai_chat_complete(
         compress_state,
         mut tool_events,
         mut permission_gate,
+        exec_floor,
     } = ctx;
     // Headless callers may pass no session state (mirrors the Ollama path).
     let mut local_compress_state = CompressState::new();
@@ -1551,6 +1564,8 @@ pub async fn openai_chat_complete(
                 permission_gate
                     .as_deref_mut()
                     .map(|g| &mut *g as &mut dyn PermissionGate),
+                // #307: the active preset's exec floor (the bypass ceiling).
+                exec_floor,
             )
             .await;
             // 17.6: record the call for the turn's events column (mirrors
@@ -1841,6 +1856,7 @@ mod tool_round_cap_tests {
                 compress_state: None,
                 tool_events: None,
                 permission_gate: None,
+                exec_floor: None,
             },
             &mut NoMcp,
         )
@@ -1903,6 +1919,7 @@ mod tool_round_cap_tests {
                 compress_state: None,
                 tool_events: None,
                 permission_gate: None,
+                exec_floor: None,
             },
             &mut NoMcp,
         )
@@ -1983,6 +2000,7 @@ mod tool_round_cap_tests {
                 compress_state: None,
                 tool_events: Some(&mut events),
                 permission_gate: None,
+                exec_floor: None,
             },
             &mut NoMcp,
         )
@@ -2075,6 +2093,7 @@ mod tool_round_cap_tests {
                 compress_state: None,
                 tool_events: Some(&mut events),
                 permission_gate: None,
+                exec_floor: None,
             },
             &mut NoMcp,
         )
@@ -2159,6 +2178,7 @@ mod tool_round_cap_tests {
                 compress_state: None,
                 tool_events: None,
                 permission_gate: None,
+                exec_floor: None,
             },
             &mut NoMcp,
         )
@@ -2193,6 +2213,7 @@ mod tool_round_cap_tests {
                 20,
                 &caveats,
                 &mut NoMcp,
+                None,
                 None,
                 None,
                 None,
@@ -2276,6 +2297,7 @@ mod tool_round_cap_tests {
                 compress_state: None,
                 tool_events: None,
                 permission_gate: None,
+                exec_floor: None,
             },
             &mut NoMcp,
         )
@@ -2411,6 +2433,7 @@ mod tool_round_cap_tests {
                 compress_state: None,
                 tool_events: None,
                 permission_gate: None,
+                exec_floor: None,
             },
             &mut NoMcp,
         )
@@ -2485,6 +2508,7 @@ mod http_loop_tests {
             compress_state: None,
             tool_events: None,
             permission_gate: None,
+            exec_floor: None,
         }
     }
 
@@ -3137,6 +3161,7 @@ mod save_note_loop_tests {
             compress_state: None,
             tool_events: None,
             permission_gate: None,
+            exec_floor: None,
         }
     }
 
@@ -3603,6 +3628,7 @@ mod compression_loop_tests {
             compress_state: None,
             tool_events: None,
             permission_gate: None,
+            exec_floor: None,
         }
     }
 

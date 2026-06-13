@@ -104,6 +104,50 @@ pub struct Config {
     /// config (issue #222). `None` → built-in default (arrays replace).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub merge: Option<MergeConfig>,
+
+    /// Named permission presets (`[permission_presets.<name>]`, issue #307).
+    /// Each maps onto the role-profile caveat mechanism (a
+    /// [`crate::NamedPermissionPreset`]) and, when applied via `/mode`, clamps
+    /// the session's authority as a hard floor. Empty by default — no preset,
+    /// behavior unchanged.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub permission_presets: std::collections::BTreeMap<String, crate::NamedPermissionPreset>,
+
+    /// Named modes (`[modes.<name>]`, issue #307) for the `/mode` command. Each
+    /// mode atomically binds a skill body to preload, a permission preset to
+    /// apply as an authority floor, and a one-line system-prompt framing. Empty
+    /// by default. See [`ModeConfig`].
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub modes: std::collections::BTreeMap<String, ModeConfig>,
+}
+
+/// One named mode (`[modes.<name>]`, issue #307): the atomic binding the
+/// `/mode <name>` command applies in a single invocation.
+///
+/// ```toml
+/// [modes.triage]
+/// skill   = "oncall-triage"        # skill body to preload (use_skill path)
+/// preset  = "readonly-triage"      # [permission_presets.<name>] to clamp to
+/// framing = "On-call triage: investigate, do not change production."
+/// ```
+///
+/// Every field is optional so a mode can do any subset (e.g. preset-only, or
+/// framing-only). A `skill`/`preset` that names a missing entry is reported as
+/// an error by the command rather than silently ignored — a mode that claims a
+/// clamp it never applied would be a false security claim.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ModeConfig {
+    /// Skill name to preload (the same `use_skill` / `load_body_from` path).
+    /// `None` ⇒ no skill is loaded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill: Option<String>,
+    /// `[permission_presets.<name>]` to apply as the session authority floor.
+    /// `None` ⇒ authority unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preset: Option<String>,
+    /// One-line framing injected into the system prompt. `None` ⇒ no framing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub framing: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1016,6 +1060,8 @@ impl Default for Config {
             model_tuning: Vec::new(),
             conversations: None,
             merge: None,
+            permission_presets: std::collections::BTreeMap::new(),
+            modes: std::collections::BTreeMap::new(),
         }
     }
 }
