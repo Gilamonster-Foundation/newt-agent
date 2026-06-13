@@ -161,9 +161,21 @@ impl RestKernelClient {
         let read = async {
             while let Some(frame) = ws.next().await {
                 let frame = frame.context("reading kernel websocket frame")?;
+                // A Close frame is the kernel ending the channels socket. Break
+                // on it directly rather than waiting for the *subsequent*
+                // `ws.next()` to return `None`: an abruptly-closed socket
+                // surfaces that follow-up read differently across platforms
+                // (clean `None` vs a `ConnectionReset` error vs a stall on
+                // Windows), which made the closed-before-idle path
+                // non-deterministic. The Close frame itself is delivered
+                // identically everywhere; the post-loop `is_idle` check then
+                // bails if the run was truncated.
+                if frame.is_close() {
+                    break;
+                }
                 let text = match message_text(frame) {
                     Some(t) => t,
-                    // Non-text frames (ping/pong/binary/close) carry no iopub.
+                    // Non-text frames (ping/pong/binary) carry no iopub.
                     None => continue,
                 };
                 let msg: Value = match serde_json::from_str(&text) {
