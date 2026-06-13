@@ -382,6 +382,11 @@ async fn run_one_turn(
         compress_state: None,
         tool_events: None,
         permission_gate: None,
+        // Phase 20 (spec §5): headless surfaces neither read nor write the
+        // capability cache — the hook stays absent and no calibration is
+        // applied, preserving today's behavior exactly.
+        on_round_usage: None,
+        estimate_ratio: None,
     };
     // NoMcp: the cowork driver advertises only the built-in tools. A consumer
     // that wants live MCP tools assembles its own ChatCtx.

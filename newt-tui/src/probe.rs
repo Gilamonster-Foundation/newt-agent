@@ -106,6 +106,21 @@ pub struct CapabilityEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tune_date: Option<String>,
 
+    /// Observed/estimated prompt-token ratio for this model (Phase 20,
+    /// `docs/design/model-self-tuning.md` §2.1/§2.3): an EMA of per-round
+    /// `prompt_eval_count / chars-4-estimate` samples, clamped [0.5, 3.0].
+    /// Converts estimate-space figures into honest token space wherever the
+    /// two currencies meet (compression triggers and targets).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimate_ratio: Option<f32>,
+
+    /// Model returned thinking-only responses (empty content, non-empty
+    /// `thinking`/`reasoning` field) at least once (Phase 20 §2.1). Observed
+    /// once, persisted so the quirk isn't re-discovered — at the cost of a
+    /// prompt-inflating corrective retry — every session. Manual reset only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub emits_thinking: Option<bool>,
+
     /// Token-accounting regime this entry's tuning values were recorded
     /// under. `0` (the serde default for entries that predate the field)
     /// means the pre-18.1 double-counting regime, whose per-turn "input"
@@ -136,6 +151,8 @@ impl Default for CapabilityEntry {
             consecutive_ok: 0,
             tune_confidence: TuneConfidence::None,
             tune_date: None,
+            estimate_ratio: None,
+            emits_thinking: None,
             // New entries are recorded under the current (truthful) regime.
             accounting_version: ACCOUNTING_VERSION,
         }
@@ -194,6 +211,12 @@ impl CapabilityEntry {
     /// Record an overflow (empty response at `input_tokens` tokens).
     /// Reduces `safe_context` to 75 % of the overflow point.
     /// Returns `true` if state changed (caller should save cache).
+    ///
+    /// Phase 20 (`docs/design/model-self-tuning.md` §2.1): ALSO reins
+    /// `max_ok_input` down to the same cap when it sits higher — both budget
+    /// resolvers prefer the larger of the two figures, so lowering only
+    /// `safe_context` left overflow learning inert (the audit's compounding
+    /// defect: `record_overflow` was effectively dead code).
     pub fn record_overflow(&mut self, input_tokens: u32, today: &str) -> bool {
         let new_safe = input_tokens * 75 / 100;
         self.overflow_at = Some(input_tokens);
@@ -204,7 +227,95 @@ impl CapabilityEntry {
         if changed {
             self.safe_context = Some(new_safe);
         }
+        if self.max_ok_input.map(|m| new_safe < m).unwrap_or(false) {
+            // Never SET an absent max_ok_input here — an overflow proves no
+            // acceptance; it only reins an existing (now disproven) ratchet.
+            self.max_ok_input = Some(new_safe);
+        }
         true // always dirty after overflow
+    }
+
+    /// Record one backend-ACCEPTED prompt of `prompt_tokens` (Phase 20 §2.2:
+    /// per-round evidence, applied at the moment of observation). Pure
+    /// high-water ratchet: raises `max_ok_input` only when strictly higher
+    /// and stamps `tune_date`; deliberately does NOT touch `consecutive_ok`
+    /// or `tune_confidence` — those belong to the turn-level
+    /// [`record_success`] accounting (one turn is one data point, however
+    /// many rounds it ran). Returns `true` when dirty (caller should save).
+    pub fn record_accepted_prompt(&mut self, prompt_tokens: u32, today: &str) -> bool {
+        if self.max_ok_input.map(|m| prompt_tokens > m).unwrap_or(true) {
+            self.max_ok_input = Some(prompt_tokens);
+            self.tune_date = Some(today.to_string());
+            return true;
+        }
+        false
+    }
+
+    /// Record one calibration sample: the backend evaluated `observed` real
+    /// prompt tokens where the loop's chars/4 figure was `estimated`
+    /// (Phase 20 §2.3). EMA `0.75·old + 0.25·sample`, clamped [0.5, 3.0].
+    ///
+    /// Samples with `observed < 0.5 × estimated` are SKIPPED: an Ollama
+    /// prompt-cache hit reports only newly-evaluated tokens and would poison
+    /// the ratio downward (spec §2.3). Returns `true` only when the stored
+    /// value moved by more than 0.01 — the value itself is stored as-is, the
+    /// threshold just avoids a disk write per round (save thrash).
+    pub fn record_estimate_sample(&mut self, observed: u32, estimated: usize) -> bool {
+        if estimated == 0 {
+            return false;
+        }
+        let raw = observed as f32 / estimated as f32;
+        if raw < 0.5 {
+            return false;
+        }
+        let sample = raw.clamp(0.5, 3.0);
+        let new = match self.estimate_ratio {
+            None => sample,
+            Some(old) => (0.75 * old + 0.25 * sample).clamp(0.5, 3.0),
+        };
+        let dirty = match self.estimate_ratio {
+            None => true,
+            Some(old) => (new - old).abs() > 0.01,
+        };
+        self.estimate_ratio = Some(new);
+        dirty
+    }
+
+    /// Record the thinking-only response quirk (Phase 20 §2.1): empty
+    /// content with a non-empty `thinking`/`reasoning` field. Sticky once
+    /// observed (manual reset only); dirty only on the first observation.
+    pub fn record_thinking_only(&mut self) -> bool {
+        if self.emits_thinking == Some(true) {
+            return false;
+        }
+        self.emits_thinking = Some(true);
+        true
+    }
+}
+
+/// Apply one loop-reported [`newt_core::RoundObservation`] to a capability
+/// entry (Phase 20 §2.2) — the unit-testable seam behind the TUI's
+/// `on_round_usage` closure, which stays a one-liner over this. Returns
+/// `true` when the entry changed (caller should save the cache).
+pub fn apply_observation(
+    entry: &mut CapabilityEntry,
+    obs: &newt_core::RoundObservation,
+    today: &str,
+) -> bool {
+    match *obs {
+        newt_core::RoundObservation::Accepted {
+            prompt_tokens,
+            estimated_tokens,
+        } => {
+            // Bitwise OR, not `||`: both records must run — short-circuiting
+            // would drop the calibration sample whenever the ratchet moved.
+            entry.record_accepted_prompt(prompt_tokens, today)
+                | entry.record_estimate_sample(prompt_tokens, estimated_tokens)
+        }
+        newt_core::RoundObservation::SuspectedOverflow { prompt_tokens } => {
+            entry.record_overflow(prompt_tokens, today)
+        }
+        newt_core::RoundObservation::ThinkingOnly => entry.record_thinking_only(),
     }
 }
 
@@ -308,10 +419,15 @@ pub fn save_cache(cache: &CapabilityCache) {
 /// 1. **Explicit `[memory] context_tokens`** — a deliberate user override;
 ///    always honoured.
 /// 2. **Capability-derived** — the empirical probe cache entry for `model`:
-///    `max_ok_input` (highest input the backend actually accepted — the same
-///    number gating the loop's pre-send guard) else `safe_context` (the
-///    empirically-confirmed `num_ctx`). The declared `context_window` is
-///    deliberately NOT a source: it is a claim, not a measurement.
+///    `max(max_ok_input, safe_context)` when both exist, else whichever
+///    exists (Phase 20, `docs/design/model-self-tuning.md` §2.1 — the table
+///    is the contract). `max_ok_input` is a high-water mark of PROVEN-good
+///    input — a floor, not a ceiling — so it must never pull the budget
+///    below the believed-safe window; conversely a prompt proven beyond the
+///    claim outranks it. The cw-400 path reins `safe_context` to its
+///    authoritative cap, so `max()` still lands on the authoritative number
+///    after a hard 400. The declared `context_window` is deliberately NOT a
+///    source: it is a claim, not a measurement.
 /// 3. **Static default** — [`newt_core::DEFAULT_CONTEXT_TOKENS`] only when
 ///    neither exists (fresh model, no probe data yet).
 ///
@@ -326,7 +442,10 @@ pub fn resolve_memory_budget(explicit: Option<u32>, cache: &CapabilityCache, mod
         .or_else(|| {
             cache
                 .get(model)
-                .and_then(|e| e.max_ok_input.or(e.safe_context))
+                .and_then(|e| match (e.max_ok_input, e.safe_context) {
+                    (Some(m), Some(s)) => Some(m.max(s)),
+                    (m, s) => m.or(s),
+                })
         })
         .unwrap_or(newt_core::DEFAULT_CONTEXT_TOKENS)
 }
@@ -823,6 +942,208 @@ mod tests {
         assert_eq!(e.overflow_at, Some(30_000));
     }
 
+    /// Phase 20 (§2.1): overflow learning was inert because both budget
+    /// resolvers prefer the larger figure and only `safe_context` was
+    /// lowered — `record_overflow` must now rein `max_ok_input` too.
+    #[test]
+    fn record_overflow_reins_max_ok_input_down() {
+        let mut e = make_entry();
+        e.max_ok_input = Some(28_000);
+        e.record_overflow(20_000, "2026-06-12");
+        // 20_000 * 75% = 15_000 — both figures reined to the same cap.
+        assert_eq!(e.safe_context, Some(15_000));
+        assert_eq!(e.max_ok_input, Some(15_000));
+        // A LOWER existing ratchet is untouched (never raised by overflow).
+        let mut e2 = make_entry();
+        e2.max_ok_input = Some(10_000);
+        e2.record_overflow(20_000, "2026-06-12");
+        assert_eq!(e2.max_ok_input, Some(10_000));
+        // An absent ratchet stays absent — overflow proves no acceptance.
+        let mut e3 = make_entry();
+        e3.record_overflow(20_000, "2026-06-12");
+        assert_eq!(e3.max_ok_input, None);
+    }
+
+    // --- record_accepted_prompt (Phase 20 §2.2) ---
+
+    #[test]
+    fn record_accepted_prompt_is_a_pure_high_water_ratchet() {
+        let mut e = make_entry();
+        e.consecutive_ok = 3;
+        e.tune_confidence = TuneConfidence::Medium;
+        assert!(
+            e.record_accepted_prompt(8_734, "2026-06-12"),
+            "first: dirty"
+        );
+        assert_eq!(e.max_ok_input, Some(8_734));
+        assert_eq!(e.tune_date.as_deref(), Some("2026-06-12"), "date stamped");
+        // Confidence accounting is the turn-level record_success's job — a
+        // multi-round turn must not inflate it per round.
+        assert_eq!(e.consecutive_ok, 3, "untouched");
+        assert_eq!(e.tune_confidence, TuneConfidence::Medium, "untouched");
+        // Equal or lower observations are not dirty and do not lower.
+        assert!(
+            !e.record_accepted_prompt(8_734, "2026-06-13"),
+            "equal: clean"
+        );
+        assert!(
+            !e.record_accepted_prompt(4_000, "2026-06-13"),
+            "lower: clean"
+        );
+        assert_eq!(e.max_ok_input, Some(8_734), "HWM only raises");
+        assert_eq!(e.tune_date.as_deref(), Some("2026-06-12"), "no re-stamp");
+        // Strictly higher raises again.
+        assert!(e.record_accepted_prompt(9_000, "2026-06-13"));
+        assert_eq!(e.max_ok_input, Some(9_000));
+        assert_eq!(e.tune_date.as_deref(), Some("2026-06-13"));
+    }
+
+    // --- record_estimate_sample (Phase 20 §2.3) ---
+
+    #[test]
+    fn record_estimate_sample_initializes_then_emas() {
+        let mut e = make_entry();
+        // Init: first sample is stored verbatim. 8_734 / 6_600 ≈ 1.3233…
+        assert!(e.record_estimate_sample(8_734, 6_600));
+        let first = e.estimate_ratio.unwrap();
+        assert!((first - 8_734.0 / 6_600.0).abs() < 1e-6, "got {first}");
+        // EMA: 0.75·old + 0.25·sample (sample 2.0 here).
+        assert!(e.record_estimate_sample(2_000, 1_000));
+        let second = e.estimate_ratio.unwrap();
+        assert!(
+            (second - (0.75 * first + 0.25 * 2.0)).abs() < 1e-6,
+            "got {second}"
+        );
+    }
+
+    #[test]
+    fn record_estimate_sample_clamps_both_ends() {
+        // A wild over-report clamps the SAMPLE to 3.0 before the EMA.
+        let mut e = make_entry();
+        assert!(e.record_estimate_sample(10_000, 1_000)); // raw 10.0
+        assert_eq!(e.estimate_ratio, Some(3.0), "init clamped to 3.0");
+        // A 0.5 raw sample is the under-report boundary: NOT skipped
+        // (cache-hit skip is strictly below 0.5) and clamps to 0.5.
+        let mut e2 = make_entry();
+        assert!(e2.record_estimate_sample(500, 1_000));
+        assert_eq!(e2.estimate_ratio, Some(0.5));
+        // The EMA result is clamped too: stored value can never escape
+        // [0.5, 3.0] no matter the history.
+        assert!(!e.record_estimate_sample(10_000, 1_000), "3.0 → 3.0: clean");
+        assert_eq!(e.estimate_ratio, Some(3.0));
+    }
+
+    #[test]
+    fn record_estimate_sample_skips_cache_hits_and_zero_estimates() {
+        let mut e = make_entry();
+        // Ollama prompt-cache hit: observed < 0.5 × estimated — would poison
+        // the ratio downward (spec §2.3). Skipped, nothing stored.
+        assert!(!e.record_estimate_sample(400, 1_000));
+        assert_eq!(e.estimate_ratio, None);
+        // Zero estimate: no honest ratio exists.
+        assert!(!e.record_estimate_sample(400, 0));
+        assert_eq!(e.estimate_ratio, None);
+        // And a skip never disturbs an already-learned ratio.
+        e.estimate_ratio = Some(1.3);
+        assert!(!e.record_estimate_sample(100, 1_000));
+        assert_eq!(e.estimate_ratio, Some(1.3));
+    }
+
+    #[test]
+    fn record_estimate_sample_dirty_only_above_threshold() {
+        let mut e = make_entry();
+        assert!(e.record_estimate_sample(1_300, 1_000)); // ratio 1.3
+        let stored = e.estimate_ratio.unwrap();
+        // A near-identical sample moves the EMA by ≪ 0.01: value updates
+        // in memory but the call reports CLEAN (no save thrash).
+        assert!(!e.record_estimate_sample(1_301, 1_000));
+        let drifted = e.estimate_ratio.unwrap();
+        assert!((drifted - stored).abs() < 0.01, "stored as-is, tiny drift");
+        // A materially different sample (raw 2.0) moves the EMA by ~0.17.
+        assert!(e.record_estimate_sample(2_000, 1_000));
+    }
+
+    // --- record_thinking_only (Phase 20 §2.1) ---
+
+    #[test]
+    fn record_thinking_only_is_sticky_and_dirty_once() {
+        let mut e = make_entry();
+        assert_eq!(e.emits_thinking, None);
+        assert!(e.record_thinking_only(), "first observation: dirty");
+        assert_eq!(e.emits_thinking, Some(true));
+        assert!(!e.record_thinking_only(), "repeat: clean");
+        assert_eq!(e.emits_thinking, Some(true));
+    }
+
+    // --- apply_observation (Phase 20 §2.2 dispatch seam) ---
+
+    #[test]
+    fn apply_observation_dispatches_each_variant() {
+        let today = "2026-06-12";
+        // Accepted → ratchet AND calibration sample (OR of both flags).
+        let mut e = make_entry();
+        let obs = newt_core::RoundObservation::Accepted {
+            prompt_tokens: 8_734,
+            estimated_tokens: 6_600,
+        };
+        assert!(apply_observation(&mut e, &obs, today));
+        assert_eq!(e.max_ok_input, Some(8_734));
+        assert!(e.estimate_ratio.is_some());
+        // Same observation again: ratchet clean AND ratio drift below the
+        // save threshold → overall clean.
+        assert!(!apply_observation(&mut e, &obs, today));
+        // Ratchet clean but the calibration sample materially different →
+        // still dirty (the OR must not short-circuit the second record).
+        let recal = newt_core::RoundObservation::Accepted {
+            prompt_tokens: 8_000,
+            estimated_tokens: 3_000,
+        };
+        assert!(apply_observation(&mut e, &recal, today));
+        assert_eq!(e.max_ok_input, Some(8_734), "lower prompt: no ratchet");
+
+        // SuspectedOverflow → record_overflow (always dirty, reins both).
+        let mut e = make_entry();
+        e.max_ok_input = Some(28_000);
+        let obs = newt_core::RoundObservation::SuspectedOverflow {
+            prompt_tokens: 20_000,
+        };
+        assert!(apply_observation(&mut e, &obs, today));
+        assert_eq!(e.safe_context, Some(15_000));
+        assert_eq!(e.max_ok_input, Some(15_000));
+        assert_eq!(e.overflow_at, Some(20_000));
+
+        // ThinkingOnly → sticky quirk.
+        let mut e = make_entry();
+        assert!(apply_observation(
+            &mut e,
+            &newt_core::RoundObservation::ThinkingOnly,
+            today
+        ));
+        assert_eq!(e.emits_thinking, Some(true));
+        assert!(!apply_observation(
+            &mut e,
+            &newt_core::RoundObservation::ThinkingOnly,
+            today
+        ));
+    }
+
+    /// New fields round-trip through JSON and stay absent (not `null`) when
+    /// unset — additive format change, old caches parse unchanged.
+    #[test]
+    fn estimate_ratio_and_emits_thinking_roundtrip_json() {
+        let mut e = make_entry();
+        e.estimate_ratio = Some(1.29);
+        e.emits_thinking = Some(true);
+        let json = serde_json::to_string(&e).unwrap();
+        let back: CapabilityEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.estimate_ratio, Some(1.29));
+        assert_eq!(back.emits_thinking, Some(true));
+        // Unset → keys skipped entirely.
+        let bare = serde_json::to_string(&make_entry()).unwrap();
+        assert!(!bare.contains("estimate_ratio"), "{bare}");
+        assert!(!bare.contains("emits_thinking"), "{bare}");
+    }
+
     #[test]
     fn record_overflow_does_not_increase_safe_context() {
         let mut e = make_entry();
@@ -950,6 +1271,8 @@ mod tests {
                 consecutive_ok: 3,
                 tune_confidence: TuneConfidence::High,
                 tune_date: Some("2026-06-08".into()),
+                estimate_ratio: None,
+                emits_thinking: None,
                 accounting_version: 0, // pre-18.1 (missing in the JSON)
             },
         );
@@ -1055,13 +1378,23 @@ mod tests {
         );
     }
 
-    /// Tier 2a: without an override, `max_ok_input` (the empirically
-    /// confirmed input ceiling — the same number the pre-send guard gates
-    /// on) is the budget.
+    /// Tier 2a: without an override, the capability-derived budget is
+    /// `max(max_ok_input, safe_context)` (Phase 20 §2.1) — here the proven
+    /// figure exceeds the claim-derived one and wins.
     #[test]
     fn resolve_memory_budget_capability_max_ok_input_second() {
         let cache = fixture_cache(Some(24_000), Some(6_553));
         assert_eq!(resolve_memory_budget(None, &cache, "tuned-model"), 24_000);
+    }
+
+    /// Phase 20 §2.1: the high-water mark is a floor of proven-good, not a
+    /// ceiling — when it sits BELOW the believed-safe window, `max()` keeps
+    /// the budget at the window instead of shrinking it to the largest
+    /// prompt merely seen so far (the motivating 6,068-vs-8,734 failure).
+    #[test]
+    fn resolve_memory_budget_max_keeps_safe_context_over_low_hwm() {
+        let cache = fixture_cache(Some(6_068), Some(26_214));
+        assert_eq!(resolve_memory_budget(None, &cache, "tuned-model"), 26_214);
     }
 
     /// Tier 2b: with no `max_ok_input` yet (e.g. freshly de-poisoned by the
@@ -1070,6 +1403,10 @@ mod tests {
     fn resolve_memory_budget_falls_back_to_safe_context() {
         let cache = fixture_cache(None, Some(6_553));
         assert_eq!(resolve_memory_budget(None, &cache, "tuned-model"), 6_553);
+        // And the mirror: max_ok_input alone serves when safe_context is
+        // absent (hosted endpoints discovered via cw-400 have no num_ctx).
+        let cache = fixture_cache(Some(24_000), None);
+        assert_eq!(resolve_memory_budget(None, &cache, "tuned-model"), 24_000);
     }
 
     /// Tier 3: the static default applies ONLY when neither an override nor
@@ -1101,7 +1438,8 @@ mod tests {
     /// Regression for the pre-18.2 parallel default: the TUI built providers
     /// with `context_tokens.unwrap_or(8_192)`, silently ignoring probe data.
     /// A session with capability data must NOT resolve to the static
-    /// default.
+    /// default. (Phase 20 §2.1 updated the expected figure: the budget is
+    /// now `max(max_ok_input, safe_context)` = 26,214, not the HWM alone.)
     #[test]
     fn resolve_memory_budget_never_ignores_probe_data() {
         let cache = fixture_cache(Some(24_000), Some(26_214));
@@ -1111,7 +1449,7 @@ mod tests {
             newt_core::DEFAULT_CONTEXT_TOKENS,
             "capability data present — the static default must not win"
         );
-        assert_eq!(budget, 24_000);
+        assert_eq!(budget, 26_214);
     }
 
     // --- parse_show_response ---

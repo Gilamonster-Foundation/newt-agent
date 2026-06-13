@@ -64,8 +64,8 @@ use display::{
 use std::io::{self, Write as _};
 use tools::{is_hallucination, merged_tool_definitions};
 use trim::{
-    estimate_tokens, estimate_value_tokens, merge_round_usage, ollama_usage, openai_usage,
-    PromptTracker,
+    estimate_request_tokens, estimate_tokens, estimate_value_tokens, merge_round_usage,
+    ollama_usage, openai_usage, PromptTracker,
 };
 
 /// Retry policy for TUI inference calls: more patient than the hosted-API
@@ -80,6 +80,32 @@ fn tui_retry_policy() -> RetryPolicy {
 /// `(error, model, today) → new input-token cap`. See [`ChatCtx::recover_cw_400`].
 pub type RecoverCw400 = fn(&anyhow::Error, &str, &str) -> Option<u32>;
 
+/// One per-round capability observation, reported through
+/// [`ChatCtx::on_round_usage`] at the moment it is observed (Phase 20,
+/// `docs/design/model-self-tuning.md` §2.2 — the `recover_cw_400` pattern,
+/// generalized to the success direction). Evidence must not wait for a turn
+/// epilogue an error can skip: the motivating failure discarded a backend-
+/// accepted 8,734-token prompt because the turn later ended in `Err`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoundObservation {
+    /// Backend evaluated `prompt_tokens` and the round produced a usable
+    /// response (tool calls or non-empty content). `estimated_tokens` is the
+    /// loop's chars/4 estimate of the same request, for calibration.
+    /// Quality-gated AND truncation-gated at the emission sites: never
+    /// emitted when the prompt was within 5% of the request's `num_ctx`
+    /// (Ollama may have silently dropped the head of the prompt).
+    Accepted {
+        prompt_tokens: u32,
+        estimated_tokens: usize,
+    },
+    /// Persistent empty responses at `prompt_tokens` after retries (the
+    /// 85%-of-safe-context silent-overflow exit).
+    SuspectedOverflow { prompt_tokens: u32 },
+    /// Response carried only non-content fields (thinking/reasoning) with
+    /// empty content.
+    ThinkingOnly,
+}
+
 /// Input-token ceiling implied by the `num_ctx` THIS request will carry
 /// (issue #282, the B6 hole): `num_ctx` caps the backend's whole KV window —
 /// input *plus* reply — so the input budget is 80 % of it, the same reply/
@@ -92,24 +118,86 @@ fn num_ctx_input_ceiling(num_ctx: Option<u32>) -> Option<usize> {
     num_ctx.map(|c| (c as usize) * 80 / 100).filter(|&c| c > 0)
 }
 
-/// Initial pre-send budget for one turn (issue #282): the empirically-cached
-/// cap (`max_ok_input` ∥ `safe_context`) composed, via `min`, with the
+/// Initial pre-send budget for one turn (issue #282; Phase 20 semantics per
+/// `docs/design/model-self-tuning.md` §2.1): the empirically-cached figure is
+/// `max(max_ok_input, safe_context)` composed, via `min`, with the
 /// [`num_ctx_input_ceiling`] of the `num_ctx` the loop is about to send.
-/// Before this, the budget was the cached numbers alone — unset on a fresh
-/// capability cache until the turn ENDS, so the first turn of a session had
-/// no effective ceiling and a 41k-token request sailed into a forced 4,096
-/// window with zero compression events (the measured B6 failure: 8/10
-/// silently wrong). The ceiling is a real token budget: when it fires the
-/// trigger, `hard_budget` semantics apply (consults + feeds anti-thrash).
+///
+/// `max_ok_input` is a high-water mark of PROVEN-good input — a floor, not a
+/// ceiling. Preferring it over `safe_context` (the pre-Phase-20 contract)
+/// turned "largest prompt seen so far" into a cap, which is the motivating
+/// failure: a stale 6,068 ratchet refused sends the backend was accepting at
+/// 8,734 tokens. `max()` lets whichever of proven-good and believed-safe is
+/// larger drive the budget. The cw-400 path already reins `safe_context`
+/// down to its authoritative cap, so after a hard 400 `max()` still lands on
+/// the authoritative number.
+///
+/// The `num_ctx` ceiling composition is unchanged: before #282 the budget
+/// was the cached numbers alone — unset on a fresh capability cache until
+/// the turn ENDS, so the first turn of a session had no effective ceiling
+/// and a 41k-token request sailed into a forced 4,096 window with zero
+/// compression events (the measured B6 failure: 8/10 silently wrong). The
+/// ceiling is a real token budget: when it fires the trigger, `hard_budget`
+/// semantics apply (consults + feeds anti-thrash).
 fn initial_send_budget(
     max_ok_input: Option<u32>,
     safe_context: Option<u32>,
     num_ctx: Option<u32>,
 ) -> Option<usize> {
-    let cached = max_ok_input.or(safe_context).map(|c| c as usize);
+    let cached = match (max_ok_input, safe_context) {
+        (Some(m), Some(s)) => Some(m.max(s) as usize),
+        (m, s) => m.or(s).map(|c| c as usize),
+    };
     match (cached, num_ctx_input_ceiling(num_ctx)) {
         (Some(budget), Some(ceiling)) => Some(budget.min(ceiling)),
         (budget, ceiling) => budget.or(ceiling),
+    }
+}
+
+/// Convert a chars/4 estimate into real (backend-reported) token space using
+/// the learned per-model `estimate_ratio` (Phase 20,
+/// `docs/design/model-self-tuning.md` §2.3). Ceiling: estimates must err on
+/// the side of counting, never undercounting — the 18.1 rule.
+fn calibrate_up(est: usize, ratio: f32) -> usize {
+    (est as f32 * ratio).ceil() as usize
+}
+
+/// Convert a real-token budget into estimate (chars/4) space — the currency
+/// the compression pipeline measures and reclaims in (Phase 20 §2.3).
+/// Floor: a tighter target is safer than a looser one.
+fn calibrate_down(real: usize, ratio: f32) -> usize {
+    (real as f32 / ratio).floor() as usize
+}
+
+/// Sanitize a per-model `estimate_ratio` for one turn (Phase 20 §2.3): only
+/// finite values inside the learning clamp [0.5, 3.0] are trusted; anything
+/// else (absent, NaN, a corrupted cache entry) degrades to 1.0 — the
+/// identity, i.e. exactly the pre-calibration behavior.
+fn sanitize_estimate_ratio(estimate_ratio: Option<f32>) -> f32 {
+    estimate_ratio
+        .filter(|r| r.is_finite() && (0.5..=3.0).contains(r))
+        .unwrap_or(1.0)
+}
+
+/// Report one quality-gated [`RoundObservation::Accepted`] (Phase 20 §2.2).
+/// Called only from usable-output control paths (tool calls or non-empty
+/// content — the quality gate); skips when the prompt was truncation-suspect
+/// (≥95% of the request's `num_ctx`, where Ollama may have silently dropped
+/// the head) or when the backend reported no usage for the round.
+fn emit_accepted(
+    hook: &mut Option<&mut dyn FnMut(RoundObservation)>,
+    round_usage: Option<crate::TokenUsage>,
+    truncation_suspect: bool,
+    estimated_tokens: usize,
+) {
+    if truncation_suspect {
+        return;
+    }
+    if let (Some(hook), Some(u)) = (hook.as_deref_mut(), round_usage) {
+        hook(RoundObservation::Accepted {
+            prompt_tokens: u.input_tokens,
+            estimated_tokens,
+        });
     }
 }
 
@@ -144,7 +232,11 @@ mod send_budget_tests {
         assert_eq!(trigger.max_messages, None, "no count firing here");
     }
 
-    /// Absent `num_ctx` → exactly the pre-#282 budget (no behavior change).
+    /// Absent `num_ctx` → exactly the cached-numbers budget (no ceiling).
+    /// CONTRACT CHANGED in Phase 20 (docs/design/model-self-tuning.md §2.1):
+    /// the cached figure is now `max(max_ok_input, safe_context)` — the
+    /// high-water mark is a floor of proven-good, not a ceiling, so it must
+    /// never pull the budget BELOW the believed-safe window.
     #[test]
     fn absent_num_ctx_leaves_the_budget_unchanged() {
         assert_eq!(initial_send_budget(None, None, None), None);
@@ -152,13 +244,109 @@ mod send_budget_tests {
         assert_eq!(initial_send_budget(None, Some(5_000), None), Some(5_000));
         assert_eq!(
             initial_send_budget(Some(2_000), Some(5_000), None),
-            Some(2_000),
-            "max_ok_input still wins over safe_context"
+            Some(5_000),
+            "an HWM below safe_context is a floor, not a cap — safe_context wins"
         );
         // And with no budget at all, the trigger stays silent regardless of size.
         assert_eq!(
             compression_trigger(3, 41_355, 39_900, 40, None, None, 1_432),
             None
+        );
+    }
+
+    /// Phase 20 §2.1 — the max(proven, believed) contract, all three shapes:
+    /// HWM below the claim, HWM above the claim (proven beyond it), and the
+    /// post-cw-400 shape where `safe_context` was reined to the authoritative
+    /// cap so `max()` still lands on the authoritative number.
+    #[test]
+    fn cached_budget_is_max_of_proven_and_believed() {
+        // The motivating failure: max_ok_input ratcheted to 6,068 (largest
+        // prompt SEEN) while safe_context believed 80% of a 32k window safe.
+        // Pre-fix the 6,068 won and refused sends the backend accepted.
+        assert_eq!(
+            initial_send_budget(Some(6_068), Some(26_214), None),
+            Some(26_214),
+            "HWM below safe_context → safe_context"
+        );
+        // Proven beyond the claim: an accepted 8,734-token prompt outranks a
+        // conservative claim-derived window.
+        assert_eq!(
+            initial_send_budget(Some(8_734), Some(6_553), None),
+            Some(8_734),
+            "HWM above safe_context (proven beyond the claim) → HWM"
+        );
+        // cw-400-reined shape (#223): the 400 set max_ok_input to 80% of the
+        // endpoint's reported hard limit (authoritative, may be HIGH) and
+        // reined safe_context down to equal-or-lower — max() must land on
+        // the authoritative cap, not regress to the VRAM-capped figure.
+        assert_eq!(
+            initial_send_budget(Some(800_000), Some(64_000), None),
+            Some(800_000),
+            "post-cw-400: max_ok_input is the authoritative cap"
+        );
+        assert_eq!(
+            initial_send_budget(Some(800_000), Some(800_000), None),
+            Some(800_000)
+        );
+    }
+
+    /// Phase 20 §2.3 — the calibration converters: ratio 1.0 is the identity,
+    /// estimate→real rounds UP (must-err-on-counting, the 18.1 rule),
+    /// real→estimate rounds DOWN (a tighter compression target is safer).
+    #[test]
+    fn calibration_helpers_round_in_the_safe_direction() {
+        use super::{calibrate_down, calibrate_up, sanitize_estimate_ratio};
+        // Identity at 1.0 — the no-calibration baseline is exact.
+        assert_eq!(calibrate_up(6_068, 1.0), 6_068);
+        assert_eq!(calibrate_down(6_068, 1.0), 6_068);
+        // The measured nemotron3 shape: chars/4 undercounts ~30% (×1.3).
+        assert_eq!(calibrate_up(1_000, 1.3), 1_300);
+        assert_eq!(calibrate_down(1_000, 1.3), 769, "floor, never round up");
+        // Fractional results: up ceils, down floors.
+        assert_eq!(calibrate_up(3, 1.5), 5, "4.5 ceils to 5");
+        assert_eq!(calibrate_down(3, 2.0), 1, "1.5 floors to 1");
+        // Sanitizer: absent / NaN / out-of-clamp all degrade to identity.
+        assert_eq!(sanitize_estimate_ratio(None), 1.0);
+        assert_eq!(sanitize_estimate_ratio(Some(f32::NAN)), 1.0);
+        assert_eq!(sanitize_estimate_ratio(Some(0.1)), 1.0);
+        assert_eq!(sanitize_estimate_ratio(Some(5.0)), 1.0);
+        assert_eq!(sanitize_estimate_ratio(Some(1.29)), 1.29);
+        assert_eq!(sanitize_estimate_ratio(Some(0.5)), 0.5, "clamp inclusive");
+        assert_eq!(sanitize_estimate_ratio(Some(3.0)), 3.0, "clamp inclusive");
+    }
+
+    /// Phase 20 §2.3 — currency composition at the trigger boundary: a
+    /// real-token send budget minus calibrated-up tool tokens, fired through
+    /// the trigger, then calibrated DOWN into the pipeline's chars/4 space,
+    /// must equal converting each leg separately (the e2e wiring in both
+    /// loops relies on this composition).
+    #[test]
+    fn calibration_composes_across_the_trigger_boundary() {
+        use super::{calibrate_down, calibrate_up};
+        let cal = 1.3_f32;
+        let send_budget = 8_734_usize; // real tokens
+        let tool_tokens_est = 1_000_usize; // chars/4 estimate
+        let tool_tokens_real = calibrate_up(tool_tokens_est, cal); // 1,300
+        let current_real = calibrate_up(9_000, cal); // estimate → real
+        let trigger = compression_trigger(
+            3,
+            current_real,
+            9_000,
+            40,
+            None,
+            Some(send_budget),
+            tool_tokens_real,
+        )
+        .expect("over-budget context fires the guard");
+        assert!(trigger.hard_budget);
+        // trigger.budget is real space (send budget minus real tool tokens);
+        // the pipeline target converts it back to estimate space.
+        assert_eq!(trigger.budget, send_budget - tool_tokens_real);
+        let pipeline_budget = calibrate_down(trigger.budget, cal);
+        assert_eq!(pipeline_budget, calibrate_down(8_734 - 1_300, cal));
+        assert!(
+            pipeline_budget < trigger.budget,
+            "ratio > 1: the estimate-space target is tighter than the real one"
         );
     }
 
@@ -310,6 +498,23 @@ pub struct ChatCtx<'a> {
     /// headless caller: ACP worker, `newt-eval`) keeps each denial exactly
     /// as before, so nothing non-interactive can ever hang on a prompt.
     pub permission_gate: Option<&'a mut dyn PermissionGate>,
+    /// Per-round capability observation hook (Phase 20,
+    /// `docs/design/model-self-tuning.md` §2.2): the loop reports each
+    /// round's evidence — accepted prompt sizes (with the matching chars/4
+    /// estimate for calibration), persistent-empty suspected overflows, the
+    /// thinking-only response quirk — at the moment of observation, so the
+    /// caller can persist it even when the turn later bails or errors (the
+    /// motivating failure discarded an accepted 8,734-token prompt because
+    /// the only write-back lived in the TUI's `Ok`-arm epilogue). `None`
+    /// (ACP worker, eval, cowork driver) preserves today's behavior exactly
+    /// (spec §5).
+    pub on_round_usage: Option<&'a mut dyn FnMut(RoundObservation)>,
+    /// Learned observed/estimated prompt-token ratio for this model
+    /// (Phase 20 §2.3), applied wherever chars/4 estimates meet
+    /// backend-reported token budgets — compression triggers, targets, and
+    /// the tool-schema overhead. `None` or out-of-clamp values degrade to
+    /// 1.0 (no calibration; pre-Phase-20 behavior).
+    pub estimate_ratio: Option<f32>,
 }
 
 /// Main agentic loop: call model → execute tool calls → feed results back → repeat.
@@ -361,6 +566,8 @@ pub async fn chat_complete(
         compress_state,
         mut tool_events,
         mut permission_gate,
+        mut on_round_usage,
+        estimate_ratio,
     } = ctx;
     // Headless callers may pass no session state — compression still works,
     // with per-turn anti-thrash accounting.
@@ -417,6 +624,12 @@ pub async fn chat_complete(
     // mid-turn, so hoisting out of the round loop is safe.
     let tools = merged_tool_definitions(mcp, advertise_save_note, advertise_recall);
     let tool_tokens = estimate_value_tokens(&tools);
+    // Phase 20 §2.3: one sanitized calibration ratio per turn. The
+    // tool-schema overhead converts to real-token space once — the schema
+    // set is stable for the whole turn, and the send budget it is subtracted
+    // from is real-token currency.
+    let cal = sanitize_estimate_ratio(estimate_ratio);
+    let tool_tokens_real = calibrate_up(tool_tokens, cal);
     // Truthful context-size tracker: anchors on the backend's last-reported
     // prompt token count, chars/4 + schema estimate as fallback (Step 18.1).
     let mut prompt_tracker = PromptTracker::new();
@@ -425,6 +638,9 @@ pub async fn chat_complete(
     // When this hits READ_ONLY_NUDGE_AFTER, a brief injected message tells the
     // model to stop exploring and start writing.
     let mut read_only_rounds: usize = 0;
+    // Phase 20 §2.2: the thinking-only quirk is reported at most once per
+    // turn — re-detection adds no information and would thrash the cache.
+    let mut thinking_only_reported = false;
 
     // Agentic loop — up to `max_tool_rounds` tool-call rounds.
     'round_loop: for round in 0..max_tool_rounds {
@@ -470,7 +686,10 @@ pub async fn chat_complete(
         // old amputation trim survives only as the pipeline's no-summarizer
         // static-marker path.
         {
-            let current = prompt_tracker.current(&messages, Some(&tools));
+            // Phase 20 §2.3: `current` is calibrated into real-token space —
+            // the same currency as the (backend-derived) send budget and the
+            // configured token threshold it is compared against.
+            let current = prompt_tracker.current(&messages, Some(&tools), cal);
             // The count-only budget is priced in message-token space — the
             // same chars/4 currency the pipeline compares its budget against
             // (F1); `current` (schema/template-inclusive) still drives the
@@ -483,12 +702,21 @@ pub async fn chat_complete(
                 mid_loop_trim_threshold,
                 mid_loop_trim_tokens,
                 send_budget,
-                tool_tokens,
+                tool_tokens_real,
             ) {
+                // A hard trigger's budget is real-token currency; the
+                // pipeline measures and reclaims in chars/4 — convert once
+                // (Phase 20 §2.3). Count-only budgets are already priced in
+                // message-token space (F1) and pass through unconverted.
+                let pipeline_budget = if trigger.hard_budget {
+                    calibrate_down(trigger.budget, cal)
+                } else {
+                    trigger.budget
+                };
                 let outcome = compress(
                     CompressRequest {
                         messages: &messages,
-                        budget: trigger.budget,
+                        budget: pipeline_budget,
                         max_messages: trigger.max_messages,
                         task,
                         hard_budget: trigger.hard_budget,
@@ -505,18 +733,23 @@ pub async fn chat_complete(
                     // Anti-thrash disabled compression and the context still
                     // exceeds the budget: refuse the send rather than let the
                     // backend silently truncate the task away (baseline B6).
+                    // Phase 20: name the model and the reset escape hatch —
+                    // a poisoned learned budget is a known cause of this bail.
                     anyhow::bail!(
                         "context (~{current} tokens) exceeds the model's input budget and \
                          auto-compression is disabled after repeated ineffective passes — \
-                         start a new conversation or ask a more focused question"
+                         start a new conversation or ask a more focused question, or run \
+                         `newt tunings reset {model}` if this model's learned budget looks wrong"
                     );
                 }
                 if outcome.fired {
                     // N2: a hard-budget compression whose assembled result is
                     // still over budget says so — the dispatch proceeds (the
-                    // cw-400/overflow recovery bounds it), but visibly.
+                    // cw-400/overflow recovery bounds it), but visibly. The
+                    // comparison is in the SAME (chars/4) currency the
+                    // pipeline measured `tokens_after` in (Phase 20 §2.3).
                     let mut how = outcome.action.describe().to_string();
-                    if trigger.hard_budget && outcome.tokens_after > trigger.budget {
+                    if trigger.hard_budget && outcome.tokens_after > pipeline_budget {
                         how.push_str(", still over budget");
                     }
                     emit_compression_notice(
@@ -532,7 +765,7 @@ pub async fn chat_complete(
                                  +~{tool_tokens} tool-schema tokens ride along)",
                                 messages.len(),
                                 outcome.messages.len(),
-                                trigger.budget,
+                                pipeline_budget,
                             ),
                             color,
                         );
@@ -542,6 +775,12 @@ pub async fn chat_complete(
                 }
             }
         }
+
+        // Phase 20 §2.2: chars/4 estimate of EXACTLY the request about to be
+        // dispatched (the message list as sent, plus tool schemas) — paired
+        // with the backend's reported prompt size in the `Accepted`
+        // observation so the caller can learn the calibration ratio.
+        let round_est_raw = estimate_request_tokens(&messages, Some(&tools));
 
         // Tool-call rounds: stream:false (fast, just JSON).
         // Final text round: stream:true so the user sees tokens arrive.
@@ -609,8 +848,14 @@ pub async fn chat_complete(
                         send_budget = Some(new_budget);
                         let outcome = compress(
                             CompressRequest {
+                                // Real-token budget minus real-token schema
+                                // overhead, converted into the pipeline's
+                                // chars/4 currency (Phase 20 §2.3).
                                 messages: &messages,
-                                budget: new_budget.saturating_sub(tool_tokens),
+                                budget: calibrate_down(
+                                    new_budget.saturating_sub(tool_tokens_real),
+                                    cal,
+                                ),
                                 max_messages: None,
                                 task,
                                 hard_budget: true,
@@ -647,6 +892,34 @@ pub async fn chat_complete(
             prompt_tracker.record(u.input_tokens, messages.len());
         }
         accumulated_usage = merge_round_usage(accumulated_usage, round_usage);
+
+        // Phase 20 §2.2: a prompt within 5% of the request's `num_ctx` may
+        // have been silently head-truncated by Ollama — such a round is
+        // window evidence of NOTHING and must neither raise the budget nor
+        // emit an `Accepted` observation.
+        let truncation_suspect = round_usage
+            .is_some_and(|u| num_ctx.is_some_and(|c| u.input_tokens >= c.saturating_mul(95) / 100));
+        // Mid-turn budget raise on window evidence alone: the backend just
+        // evaluated this many prompt tokens inside the `num_ctx` it was sent,
+        // so one over-budget acceptance stops the compress-every-round thrash
+        // within the same turn (Phase 20 §2.2). Never lowers; stays under the
+        // per-request input ceiling.
+        if let (Some(u), Some(budget), false) = (round_usage, send_budget, truncation_suspect) {
+            let raised = (u.input_tokens as usize).min(num_ctx_ceiling.unwrap_or(usize::MAX));
+            if raised > budget {
+                send_budget = Some(raised);
+                if debug {
+                    print_debug(
+                        &format!(
+                            "send budget raised to ~{raised} tokens (backend accepted \
+                             {}-token prompt)",
+                            u.input_tokens
+                        ),
+                        color,
+                    );
+                }
+            }
+        }
 
         let message = &json["message"];
         // Capture the probe content now — it may be our only copy of the
@@ -725,6 +998,16 @@ pub async fn chat_complete(
                 if debug {
                     print_debug("stream request non-2xx — using probe content", color);
                 }
+                // Phase 20 §2.2: the probe round produced usable content —
+                // quality gate met, report it before returning.
+                if !probe_content.is_empty() {
+                    emit_accepted(
+                        &mut on_round_usage,
+                        round_usage,
+                        truncation_suspect,
+                        round_est_raw,
+                    );
+                }
                 return Ok((probe_content, false, accumulated_usage, hallucination_count));
             }
             let (streamed, stream_usage) = stream_response(sresp, color).await?;
@@ -767,6 +1050,17 @@ pub async fn chat_complete(
                                 color,
                             );
                         }
+                        // Phase 20 §2.2: empty content carrying non-content
+                        // fields is the thinking-only quirk — report it at
+                        // detection (at most once per turn) so the prompt-
+                        // inflating corrective retry isn't re-learned from
+                        // scratch every session.
+                        if !thinking_only_reported && !ollama_non_content_fields(&json).is_empty() {
+                            thinking_only_reported = true;
+                            if let Some(hook) = on_round_usage.as_deref_mut() {
+                                hook(RoundObservation::ThinkingOnly);
+                            }
+                        }
                         messages.push(serde_json::json!({
                             "role": "user",
                             "content": "Your previous response produced generated tokens but no assistant-visible content and no tool call. Reply with either a tool call or final assistant content."
@@ -797,11 +1091,18 @@ pub async fn chat_complete(
                         // Compress toward 3/4 of the safe window — comfortably
                         // under the 85% trigger (was a blunt count trim before
                         // Step 18.4). The retry happens regardless: it is
-                        // already bounded by `overflow_retries`.
-                        let target = safe_context
-                            .map(|s| (s as usize).saturating_mul(3) / 4)
-                            .unwrap_or(0)
-                            .saturating_sub(tool_tokens);
+                        // already bounded by `overflow_retries`. The target
+                        // arithmetic stays in real-token space (`safe_context`
+                        // and the schema overhead are real-token figures),
+                        // then converts once into the pipeline's chars/4
+                        // currency (Phase 20 §2.3).
+                        let target = calibrate_down(
+                            safe_context
+                                .map(|s| (s as usize).saturating_mul(3) / 4)
+                                .unwrap_or(0)
+                                .saturating_sub(tool_tokens_real),
+                            cal,
+                        );
                         let outcome = compress(
                             CompressRequest {
                                 messages: &messages,
@@ -842,9 +1143,31 @@ pub async fn chat_complete(
                         overflow_retries += 1;
                         continue 'round_loop;
                     }
+                    // Phase 20 §2.2: persistent empties past the retry budget
+                    // at ≥85% of the safe window are silent-overflow evidence
+                    // — reported at the exit, with the merged prompt figure,
+                    // before either return below.
+                    if overflow_likely {
+                        if let (Some(hook), Some(u)) =
+                            (on_round_usage.as_deref_mut(), merged.as_ref())
+                        {
+                            hook(RoundObservation::SuspectedOverflow {
+                                prompt_tokens: u.input_tokens,
+                            });
+                        }
+                    }
                     if generated_unusable_output {
                         if trace {
                             print_trace(&ollama_response_shape(&json), color);
+                        }
+                        // Phase 20 §2.2: the diagnostic exit is also a
+                        // thinking-only detection site (at most once per
+                        // turn; the function returns right after, so the
+                        // turn-local flag needs no update here).
+                        if !thinking_only_reported && !ollama_non_content_fields(&json).is_empty() {
+                            if let Some(hook) = on_round_usage.as_deref_mut() {
+                                hook(RoundObservation::ThinkingOnly);
+                            }
                         }
                         return Ok((
                             suspicious_empty_ollama_diagnostic(&json),
@@ -857,6 +1180,13 @@ pub async fn chat_complete(
                     return Ok((msg.to_string(), false, merged, hallucination_count));
                 }
                 // Use probe content; print it since it was never streamed.
+                // Phase 20 §2.2: non-empty probe content is usable output.
+                emit_accepted(
+                    &mut on_round_usage,
+                    round_usage,
+                    truncation_suspect,
+                    round_est_raw,
+                );
                 return Ok((
                     probe_content,
                     false,
@@ -865,6 +1195,13 @@ pub async fn chat_complete(
                 ));
             }
 
+            // Phase 20 §2.2: a non-empty streamed answer is usable output.
+            emit_accepted(
+                &mut on_round_usage,
+                round_usage,
+                truncation_suspect,
+                round_est_raw,
+            );
             return Ok((
                 streamed,
                 true,
@@ -874,6 +1211,14 @@ pub async fn chat_complete(
         }
 
         // Has tool calls — add assistant turn and execute them.
+        // Phase 20 §2.2: tool calls are usable output — the dispatched prompt
+        // is proven accepted regardless of how the turn later ends.
+        emit_accepted(
+            &mut on_round_usage,
+            round_usage,
+            truncation_suspect,
+            round_est_raw,
+        );
         messages.push(message.clone());
         let mut round_wrote = false;
         for tc in tool_calls.unwrap() {
@@ -1252,6 +1597,8 @@ pub async fn openai_chat_complete(
         compress_state,
         mut tool_events,
         mut permission_gate,
+        mut on_round_usage,
+        estimate_ratio,
     } = ctx;
     // Headless callers may pass no session state (mirrors the Ollama path).
     let mut local_compress_state = CompressState::new();
@@ -1286,11 +1633,18 @@ pub async fn openai_chat_complete(
     let mut hallucination_count: u32 = 0;
     // Hard context-window 400s recovered (parse limit → trim → retry). See #223.
     let mut cw_retries: u32 = 0;
-    // Pre-send token budget gate; tightened mid-turn by a recovered 400 (#223).
-    let mut send_budget: Option<usize> = max_ok_input.or(safe_context).map(|c| c as usize);
+    // Pre-send token budget gate; tightened mid-turn by a recovered 400
+    // (#223). Phase 20 §2.1 max(proven, believed) semantics — no `num_ctx`
+    // ceiling on this wire (limits are server-side, e.g. vLLM
+    // --max-model-len), so the ceiling leg is `None`.
+    let mut send_budget: Option<usize> = initial_send_budget(max_ok_input, safe_context, None);
     // Tool schemas ride along in every request body; count them once (18.1).
     let tools = merged_tool_definitions(mcp, advertise_save_note, advertise_recall);
     let tool_tokens = estimate_value_tokens(&tools);
+    // Phase 20 §2.3: per-turn calibration ratio + real-token schema overhead
+    // (mirrors the Ollama path).
+    let cal = sanitize_estimate_ratio(estimate_ratio);
+    let tool_tokens_real = calibrate_up(tool_tokens, cal);
     // Truthful context-size tracker (prompt-tokens-preferred, Step 18.1).
     let mut prompt_tracker = PromptTracker::new();
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
@@ -1311,7 +1665,9 @@ pub async fn openai_chat_complete(
         // the shared prune → boundary → redacted summary → marker pipeline
         // serves the mid-loop trigger and the pre-send budget guard.
         {
-            let current = prompt_tracker.current(&messages, Some(&tools));
+            // Phase 20 §2.3: calibrated `current` (real-token space) —
+            // mirrors the Ollama path.
+            let current = prompt_tracker.current(&messages, Some(&tools), cal);
             // Count-only budget priced in message-token space (F1) — mirrors
             // the Ollama path.
             let message_tokens = estimate_tokens(&messages);
@@ -1322,12 +1678,19 @@ pub async fn openai_chat_complete(
                 mid_loop_trim_threshold,
                 mid_loop_trim_tokens,
                 send_budget,
-                tool_tokens,
+                tool_tokens_real,
             ) {
+                // Hard budgets are real-token currency → pipeline chars/4
+                // (Phase 20 §2.3); count-only budgets pass through (F1).
+                let pipeline_budget = if trigger.hard_budget {
+                    calibrate_down(trigger.budget, cal)
+                } else {
+                    trigger.budget
+                };
                 let outcome = compress(
                     CompressRequest {
                         messages: &messages,
-                        budget: trigger.budget,
+                        budget: pipeline_budget,
                         max_messages: trigger.max_messages,
                         task,
                         hard_budget: trigger.hard_budget,
@@ -1344,14 +1707,16 @@ pub async fn openai_chat_complete(
                     anyhow::bail!(
                         "context (~{current} tokens) exceeds the model's input budget and \
                          auto-compression is disabled after repeated ineffective passes — \
-                         start a new conversation or ask a more focused question"
+                         start a new conversation or ask a more focused question, or run \
+                         `newt tunings reset {model}` if this model's learned budget looks wrong"
                     );
                 }
                 if outcome.fired {
                     // N2 (mirrors the Ollama path): flag a still-over-budget
-                    // assembly in the notice.
+                    // assembly in the notice — compared in the pipeline's
+                    // own chars/4 currency (Phase 20 §2.3).
                     let mut how = outcome.action.describe().to_string();
-                    if trigger.hard_budget && outcome.tokens_after > trigger.budget {
+                    if trigger.hard_budget && outcome.tokens_after > pipeline_budget {
                         how.push_str(", still over budget");
                     }
                     emit_compression_notice(
@@ -1367,7 +1732,7 @@ pub async fn openai_chat_complete(
                                  +~{tool_tokens} tool-schema tokens ride along)",
                                 messages.len(),
                                 outcome.messages.len(),
-                                trigger.budget,
+                                pipeline_budget,
                             ),
                             color,
                         );
@@ -1377,6 +1742,10 @@ pub async fn openai_chat_complete(
                 }
             }
         }
+
+        // Phase 20 §2.2: chars/4 estimate of exactly the request about to be
+        // dispatched — mirrors the Ollama path.
+        let round_est_raw = estimate_request_tokens(&messages, Some(&tools));
 
         // OpenAI-compatible endpoints don't use Ollama's `options.num_ctx` —
         // context limits are configured server-side (vLLM --max-model-len).
@@ -1434,8 +1803,14 @@ pub async fn openai_chat_complete(
                         send_budget = Some(new_cap as usize);
                         let outcome = compress(
                             CompressRequest {
+                                // Real-token cap minus real-token schema
+                                // overhead → pipeline chars/4 currency
+                                // (Phase 20 §2.3; mirrors the Ollama path).
                                 messages: &messages,
-                                budget: (new_cap as usize).saturating_sub(tool_tokens),
+                                budget: calibrate_down(
+                                    (new_cap as usize).saturating_sub(tool_tokens_real),
+                                    cal,
+                                ),
                                 max_messages: None,
                                 task,
                                 hard_budget: true,
@@ -1471,6 +1846,27 @@ pub async fn openai_chat_complete(
         }
         accumulated_usage = merge_round_usage(accumulated_usage, round_usage);
 
+        // Phase 20 §2.2: no `num_ctx` on this wire, so there is no silent
+        // head-truncation mode to suspect (oversize requests get a parseable
+        // 400 instead) and no per-request ceiling on the mid-turn raise.
+        let truncation_suspect = false;
+        if let (Some(u), Some(budget), false) = (round_usage, send_budget, truncation_suspect) {
+            let raised = u.input_tokens as usize;
+            if raised > budget {
+                send_budget = Some(raised);
+                if debug {
+                    print_debug(
+                        &format!(
+                            "send budget raised to ~{raised} tokens (backend accepted \
+                             {}-token prompt)",
+                            u.input_tokens
+                        ),
+                        color,
+                    );
+                }
+            }
+        }
+
         let message = &json["choices"][0]["message"];
 
         let tool_calls = message["tool_calls"].as_array();
@@ -1500,6 +1896,16 @@ pub async fn openai_chat_complete(
                     color,
                 );
             }
+            // Phase 20 §2.2: non-empty final content is usable output —
+            // report the accepted prompt before returning.
+            if !content.is_empty() {
+                emit_accepted(
+                    &mut on_round_usage,
+                    round_usage,
+                    truncation_suspect,
+                    round_est_raw,
+                );
+            }
             let out = if content.is_empty() {
                 "(model returned an empty response — try rephrasing, or check the model with `newt doctor`)".to_string()
             } else {
@@ -1510,6 +1916,13 @@ pub async fn openai_chat_complete(
 
         // Record the assistant turn verbatim (it carries the tool_calls), then
         // run each call and feed the result back keyed by its tool_call_id.
+        // Phase 20 §2.2: tool calls are usable output (mirrors the Ollama path).
+        emit_accepted(
+            &mut on_round_usage,
+            round_usage,
+            truncation_suspect,
+            round_est_raw,
+        );
         messages.push(message.clone());
         for tc in tool_calls.unwrap() {
             let id = tc["id"].as_str().unwrap_or("");
@@ -1841,6 +2254,8 @@ mod tool_round_cap_tests {
                 compress_state: None,
                 tool_events: None,
                 permission_gate: None,
+                on_round_usage: None,
+                estimate_ratio: None,
             },
             &mut NoMcp,
         )
@@ -1903,6 +2318,8 @@ mod tool_round_cap_tests {
                 compress_state: None,
                 tool_events: None,
                 permission_gate: None,
+                on_round_usage: None,
+                estimate_ratio: None,
             },
             &mut NoMcp,
         )
@@ -1983,6 +2400,8 @@ mod tool_round_cap_tests {
                 compress_state: None,
                 tool_events: Some(&mut events),
                 permission_gate: None,
+                on_round_usage: None,
+                estimate_ratio: None,
             },
             &mut NoMcp,
         )
@@ -2075,6 +2494,8 @@ mod tool_round_cap_tests {
                 compress_state: None,
                 tool_events: Some(&mut events),
                 permission_gate: None,
+                on_round_usage: None,
+                estimate_ratio: None,
             },
             &mut NoMcp,
         )
@@ -2159,6 +2580,8 @@ mod tool_round_cap_tests {
                 compress_state: None,
                 tool_events: None,
                 permission_gate: None,
+                on_round_usage: None,
+                estimate_ratio: None,
             },
             &mut NoMcp,
         )
@@ -2276,6 +2699,8 @@ mod tool_round_cap_tests {
                 compress_state: None,
                 tool_events: None,
                 permission_gate: None,
+                on_round_usage: None,
+                estimate_ratio: None,
             },
             &mut NoMcp,
         )
@@ -2411,6 +2836,8 @@ mod tool_round_cap_tests {
                 compress_state: None,
                 tool_events: None,
                 permission_gate: None,
+                on_round_usage: None,
+                estimate_ratio: None,
             },
             &mut NoMcp,
         )
@@ -2485,6 +2912,8 @@ mod http_loop_tests {
             compress_state: None,
             tool_events: None,
             permission_gate: None,
+            on_round_usage: None,
+            estimate_ratio: None,
         }
     }
 
@@ -3137,6 +3566,8 @@ mod save_note_loop_tests {
             compress_state: None,
             tool_events: None,
             permission_gate: None,
+            on_round_usage: None,
+            estimate_ratio: None,
         }
     }
 
@@ -3603,6 +4034,8 @@ mod compression_loop_tests {
             compress_state: None,
             tool_events: None,
             permission_gate: None,
+            on_round_usage: None,
+            estimate_ratio: None,
         }
     }
 
@@ -4610,6 +5043,542 @@ mod compression_loop_tests {
         assert!(
             log.lock().unwrap().len() <= 3,
             "the refusal must stop the loop within a round or two"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-round observation hook + mid-turn budget raise (Phase 20,
+// docs/design/model-self-tuning.md §2.2) — wiremock e2e against both gates.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod observation_hook_tests {
+    use super::*;
+    use crate::caveats::Caveats;
+    use crate::{BackendKind, MemMessage};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+    fn ctx<'a>(
+        server_uri: &'a str,
+        messages: &'a [MemMessage],
+        caveats: &'a Caveats,
+    ) -> ChatCtx<'a> {
+        ChatCtx {
+            url: server_uri,
+            model: "test-model",
+            kind: BackendKind::Ollama,
+            api_key: None,
+            messages,
+            task: "do the thing",
+            workspace: ".",
+            color: false,
+            caveats,
+            max_tool_rounds: 8,
+            tool_output_lines: 20,
+            debug: false,
+            trace: false,
+            num_ctx: None,
+            connect_timeout_secs: 5,
+            inference_timeout_secs: 30,
+            mid_loop_trim_threshold: 40,
+            mid_loop_trim_tokens: None,
+            max_ok_input: None,
+            build_check_cmd: None,
+            safe_context: None,
+            recover_cw_400: None,
+            note_sink: None,
+            note_nudge: None,
+            recall_source: None,
+            summarizer: None,
+            compress_state: None,
+            tool_events: None,
+            permission_gate: None,
+            on_round_usage: None,
+            estimate_ratio: None,
+        }
+    }
+
+    fn body_json(req: &Request) -> serde_json::Value {
+        serde_json::from_slice(&req.body).unwrap_or_default()
+    }
+
+    fn is_stream(req: &Request) -> bool {
+        body_json(req)["stream"].as_bool().unwrap_or(false)
+    }
+
+    fn ndjson(lines: &[serde_json::Value]) -> ResponseTemplate {
+        let body: String = lines
+            .iter()
+            .map(|l| format!("{l}\n"))
+            .collect::<Vec<_>>()
+            .join("");
+        ResponseTemplate::new(200).set_body_raw(body.into_bytes(), "application/x-ndjson")
+    }
+
+    /// Tool calls for the first two tools-offering requests (each reporting
+    /// the backend ACCEPTED an 8,734-token prompt), then a final answer.
+    struct AcceptsLargePrompts {
+        tools_rounds: Arc<AtomicUsize>,
+    }
+    impl Respond for AcceptsLargePrompts {
+        fn respond(&self, req: &Request) -> ResponseTemplate {
+            if is_stream(req) {
+                return ndjson(&[serde_json::json!({
+                    "message": {"content": "budget raised, here is the answer"},
+                    "done": true, "prompt_eval_count": 8_700, "eval_count": 12
+                })]);
+            }
+            let n = self.tools_rounds.fetch_add(1, Ordering::SeqCst);
+            if n < 2 {
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "message": {"content": "", "tool_calls": [{
+                        "function": {"name": "definitely_not_a_real_tool", "arguments": {}}
+                    }]},
+                    "prompt_eval_count": 8_734, "eval_count": 10,
+                }))
+            } else {
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "message": {"content": "budget raised, here is the answer"},
+                    "prompt_eval_count": 8_700, "eval_count": 12,
+                }))
+            }
+        }
+    }
+
+    /// THE trace-class regression (the motivating failure): a poisoned-low
+    /// `max_ok_input` (the largest prompt SEEN, not accepted) used to refuse
+    /// sends the backend was happily evaluating. Now: the over-budget
+    /// acceptance (a) reaches the caller as an `Accepted` observation with
+    /// the backend's real prompt size, and (b) raises the in-turn send
+    /// budget, so the turn completes instead of latching anti-thrash into
+    /// the Refused bail across the following rounds.
+    #[tokio::test]
+    async fn poisoned_low_budget_recovers_via_accepted_observation_and_raise() {
+        let server = MockServer::start().await;
+        let tools_rounds = Arc::new(AtomicUsize::new(0));
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(AcceptsLargePrompts {
+                tools_rounds: tools_rounds.clone(),
+            })
+            .mount(&server)
+            .await;
+
+        // A task big enough (~12k chars ≈ 3k est. tokens) to sit over the
+        // poisoned 2,000-token budget but far under what the backend accepts.
+        let big_task = "study the workspace and report. ".repeat(380);
+        let messages = vec![
+            MemMessage::system("you are a test"),
+            MemMessage::user(&big_task),
+        ];
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut observations: Vec<RoundObservation> = Vec::new();
+        let mut hook = |obs: RoundObservation| observations.push(obs);
+        let mut c = ctx(&uri, &messages, &caveats);
+        c.max_ok_input = Some(2_000); // the poisoned ratchet
+        c.on_round_usage = Some(&mut hook);
+        let (reply, _streamed, _usage, _hallu) = chat_complete(c, &mut NoMcp)
+            .await
+            .expect("the turn must complete — no Refused bail after the raise");
+
+        assert_eq!(reply, "budget raised, here is the answer");
+        assert!(
+            observations.iter().any(|o| matches!(
+                o,
+                RoundObservation::Accepted {
+                    prompt_tokens: 8_734,
+                    ..
+                }
+            )),
+            "the accepted 8,734-token prompt must reach the hook: {observations:?}"
+        );
+        // Every accepted round carried a non-zero chars/4 estimate for
+        // calibration pairing.
+        for o in &observations {
+            if let RoundObservation::Accepted {
+                estimated_tokens, ..
+            } = o
+            {
+                assert!(*estimated_tokens > 0, "estimate rides along: {o:?}");
+            }
+        }
+    }
+
+    /// Always tool calls (with usage) — drives the anti-thrash latch under an
+    /// unreachable hard token budget so the turn ends in the Refused Err.
+    struct ToolCallsWithUsage;
+    impl Respond for ToolCallsWithUsage {
+        fn respond(&self, req: &Request) -> ResponseTemplate {
+            if body_json(req).get("tools").is_some() {
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "message": {"content": "", "tool_calls": [{
+                        "function": {"name": "definitely_not_a_real_tool", "arguments": {}}
+                    }]},
+                    "prompt_eval_count": 100, "eval_count": 5,
+                }))
+            } else {
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"message": {"content": "cap exit"}}))
+            }
+        }
+    }
+
+    /// A turn that ends `Err` (the Refused bail) STILL delivered the earlier
+    /// rounds' `Accepted` observations first — evidence at the moment of
+    /// observation, not in an epilogue the error skips (the spec's headline
+    /// property). Also pins the bail's new tail: it names the model and the
+    /// `newt tunings reset` escape hatch.
+    #[tokio::test]
+    async fn err_turn_still_delivered_accepted_observations_first() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(ToolCallsWithUsage)
+            .mount(&server)
+            .await;
+
+        // Incompressible context + unreachable hard token budget → two poor
+        // passes latch anti-thrash, the next round refuses the send.
+        let messages = vec![
+            MemMessage::system(format!("you are a test. {}", "rule. ".repeat(700))),
+            MemMessage::user("do the thing"),
+        ];
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut compress_state = CompressState::new();
+        let mut observations: Vec<RoundObservation> = Vec::new();
+        let mut hook = |obs: RoundObservation| observations.push(obs);
+        let mut c = ctx(&uri, &messages, &caveats);
+        c.mid_loop_trim_tokens = Some(50);
+        c.compress_state = Some(&mut compress_state);
+        c.on_round_usage = Some(&mut hook);
+        let err = chat_complete(c, &mut NoMcp)
+            .await
+            .expect_err("the post-latch over-budget round must refuse the send");
+
+        let msg = err.to_string();
+        assert!(msg.contains("exceeds the model's input budget"), "{msg}");
+        assert!(
+            msg.contains("newt tunings reset test-model"),
+            "the bail must name the model's reset command: {msg}"
+        );
+        assert!(
+            observations.iter().any(|o| matches!(
+                o,
+                RoundObservation::Accepted {
+                    prompt_tokens: 100,
+                    ..
+                }
+            )),
+            "accepted rounds before the bail must have been reported: {observations:?}"
+        );
+    }
+
+    /// Probe 1: thinking-only (empty content, non-empty `thinking`, generated
+    /// tokens); the corrective retry then recovers. The hook must see exactly
+    /// one `ThinkingOnly` (once per turn) plus the recovery's `Accepted`.
+    struct ThinkingOnlyThenRecover {
+        probes: Arc<AtomicUsize>,
+    }
+    impl Respond for ThinkingOnlyThenRecover {
+        fn respond(&self, req: &Request) -> ResponseTemplate {
+            if is_stream(req) {
+                if self.probes.load(Ordering::SeqCst) <= 1 {
+                    ndjson(&[serde_json::json!({
+                        "message": {"content": ""}, "done": true,
+                        "prompt_eval_count": 9, "eval_count": 4
+                    })])
+                } else {
+                    ndjson(&[serde_json::json!({
+                        "message": {"content": "recovered after thinking-only"},
+                        "done": true, "prompt_eval_count": 12, "eval_count": 3
+                    })])
+                }
+            } else {
+                let n = self.probes.fetch_add(1, Ordering::SeqCst) + 1;
+                if n == 1 {
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "message": {
+                            "content": "",
+                            "thinking": "all reasoning, no final text"
+                        },
+                        "prompt_eval_count": 10, "eval_count": 2559,
+                    }))
+                } else {
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "message": {"content": "recovered after thinking-only"},
+                        "prompt_eval_count": 12, "eval_count": 3,
+                    }))
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn thinking_only_response_emits_one_thinking_only_observation() {
+        let server = MockServer::start().await;
+        let probes = Arc::new(AtomicUsize::new(0));
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(ThinkingOnlyThenRecover {
+                probes: probes.clone(),
+            })
+            .mount(&server)
+            .await;
+
+        let messages = vec![
+            MemMessage::system("you are a test"),
+            MemMessage::user("do the thing"),
+        ];
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut observations: Vec<RoundObservation> = Vec::new();
+        let mut hook = |obs: RoundObservation| observations.push(obs);
+        let mut c = ctx(&uri, &messages, &caveats);
+        c.on_round_usage = Some(&mut hook);
+        let (reply, _, _, _) = chat_complete(c, &mut NoMcp)
+            .await
+            .expect("the corrective retry recovers the turn");
+
+        assert_eq!(reply, "recovered after thinking-only");
+        let thinking = observations
+            .iter()
+            .filter(|o| matches!(o, RoundObservation::ThinkingOnly))
+            .count();
+        assert_eq!(thinking, 1, "exactly once per turn: {observations:?}");
+        assert!(
+            observations
+                .iter()
+                .any(|o| matches!(o, RoundObservation::Accepted { .. })),
+            "the recovered round is usable output: {observations:?}"
+        );
+    }
+
+    /// Tool round + final round both reporting a prompt at ≥95% of the
+    /// request's `num_ctx` — Ollama may have silently dropped the head, so
+    /// the rounds are window evidence of NOTHING: no `Accepted` observation,
+    /// no budget raise.
+    struct TruncationSuspectResponder {
+        tools_rounds: Arc<AtomicUsize>,
+    }
+    impl Respond for TruncationSuspectResponder {
+        fn respond(&self, req: &Request) -> ResponseTemplate {
+            if is_stream(req) {
+                return ndjson(&[serde_json::json!({
+                    "message": {"content": "suspect answer"}, "done": true,
+                    "prompt_eval_count": 4_000, "eval_count": 5
+                })]);
+            }
+            let n = self.tools_rounds.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "message": {"content": "", "tool_calls": [{
+                        "function": {"name": "definitely_not_a_real_tool", "arguments": {}}
+                    }]},
+                    // 4,000 ≥ 95% of 4,096 (3,891) — truncation suspect.
+                    "prompt_eval_count": 4_000, "eval_count": 5,
+                }))
+            } else {
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "message": {"content": "suspect answer"},
+                    "prompt_eval_count": 4_000, "eval_count": 5,
+                }))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn truncation_suspect_rounds_emit_nothing() {
+        let server = MockServer::start().await;
+        let tools_rounds = Arc::new(AtomicUsize::new(0));
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(TruncationSuspectResponder {
+                tools_rounds: tools_rounds.clone(),
+            })
+            .mount(&server)
+            .await;
+
+        let messages = vec![
+            MemMessage::system("you are a test"),
+            MemMessage::user("do the thing"),
+        ];
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut observations: Vec<RoundObservation> = Vec::new();
+        let mut hook = |obs: RoundObservation| observations.push(obs);
+        let mut c = ctx(&uri, &messages, &caveats);
+        c.num_ctx = Some(4_096);
+        c.on_round_usage = Some(&mut hook);
+        let (reply, _, _, _) = chat_complete(c, &mut NoMcp)
+            .await
+            .expect("suspect rounds still complete the turn");
+
+        assert_eq!(reply, "suspect answer");
+        assert!(
+            observations.is_empty(),
+            "a possibly head-truncated prompt is evidence of nothing: \
+             {observations:?}"
+        );
+    }
+
+    /// OpenAI-path mirror: tool round then final content, both with usage —
+    /// the hook receives `Accepted` for both (no `num_ctx` on this wire, so
+    /// no truncation gate), and an absent hook stays a no-op.
+    struct OpenAiAcceptsResponder;
+    impl Respond for OpenAiAcceptsResponder {
+        fn respond(&self, req: &Request) -> ResponseTemplate {
+            if body_json(req).get("tools").is_some()
+                && !body_json(req)["messages"]
+                    .as_array()
+                    .map(|m| m.iter().any(|x| x["role"] == "tool"))
+                    .unwrap_or(false)
+            {
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "choices": [{"message": {
+                        "content": null,
+                        "tool_calls": [{
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "definitely_not_a_real_tool", "arguments": "{}"}
+                        }]
+                    }}],
+                    "usage": {"prompt_tokens": 5_120, "completion_tokens": 9},
+                }))
+            } else {
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "choices": [{"message": {"content": "openai accepted"}}],
+                    "usage": {"prompt_tokens": 5_200, "completion_tokens": 11},
+                }))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn openai_loop_reports_accepted_rounds() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(OpenAiAcceptsResponder)
+            .mount(&server)
+            .await;
+
+        let messages = vec![
+            MemMessage::system("you are a test"),
+            MemMessage::user("do the thing"),
+        ];
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut observations: Vec<RoundObservation> = Vec::new();
+        let mut hook = |obs: RoundObservation| observations.push(obs);
+        let mut c = ctx(&uri, &messages, &caveats);
+        c.kind = BackendKind::Openai;
+        c.api_key = Some("sk-test");
+        c.on_round_usage = Some(&mut hook);
+        let (reply, _, _, _) = chat_complete(c, &mut NoMcp)
+            .await
+            .expect("openai loop should succeed");
+
+        assert_eq!(reply, "openai accepted");
+        let accepted: Vec<u32> = observations
+            .iter()
+            .filter_map(|o| match o {
+                RoundObservation::Accepted { prompt_tokens, .. } => Some(*prompt_tokens),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            accepted,
+            vec![5_120, 5_200],
+            "both usable rounds reported, in order: {observations:?}"
+        );
+    }
+
+    /// Persistent empties (probe AND stream return empty content, no tool
+    /// calls) at a prompt ≥85% of the configured `safe_context`, with no
+    /// generated tokens — so the suspicious-empty corrective retry is NOT
+    /// taken (that path needs `eval_count > 0`). The loop exhausts its two
+    /// `overflow_retries`, then on the next persistent empty falls through to
+    /// the silent-overflow exit and must emit exactly one
+    /// `SuspectedOverflow { prompt_tokens }` carrying the merged (largest
+    /// single) prompt size — the loop-emission seam that the dispatch-seam
+    /// `record_overflow` tests at probe.rs cannot reach.
+    struct PersistentEmptyOverflow;
+    impl Respond for PersistentEmptyOverflow {
+        fn respond(&self, _req: &Request) -> ResponseTemplate {
+            if is_stream(_req) {
+                // Stream re-issue: empty content, no tokens generated, but the
+                // round still reports a large evaluated prompt.
+                return ndjson(&[serde_json::json!({
+                    "message": {"content": ""}, "done": true,
+                    "prompt_eval_count": 8_734, "eval_count": 0
+                })]);
+            }
+            // Probe (non-stream): empty content, no tool calls, no generated
+            // tokens, large evaluated prompt.
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "message": {"content": ""},
+                "prompt_eval_count": 8_734, "eval_count": 0,
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn persistent_empty_over_safe_context_emits_suspected_overflow() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(PersistentEmptyOverflow)
+            .mount(&server)
+            .await;
+
+        let messages = vec![
+            MemMessage::system("you are a test"),
+            MemMessage::user("do the thing"),
+        ];
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut observations: Vec<RoundObservation> = Vec::new();
+        let mut hook = |obs: RoundObservation| observations.push(obs);
+        let mut c = ctx(&uri, &messages, &caveats);
+        // 8_734 ≥ 85% of 4_000 (3_400) → the silent-overflow gate fires.
+        c.safe_context = Some(4_000);
+        c.on_round_usage = Some(&mut hook);
+        let (_reply, streamed, _usage, _hallu) = chat_complete(c, &mut NoMcp)
+            .await
+            .expect("persistent empties return the empty-response message, not Err");
+
+        // Diagnostic exit returns non-streamed placeholder text.
+        assert!(
+            !streamed,
+            "the silent-overflow exit is not a streamed reply"
+        );
+        // Exactly one SuspectedOverflow, carrying the merged (largest single)
+        // prompt size — emitted once at the exit, never per retry.
+        let overflow: Vec<u32> = observations
+            .iter()
+            .filter_map(|o| match o {
+                RoundObservation::SuspectedOverflow { prompt_tokens } => Some(*prompt_tokens),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            overflow,
+            vec![8_734],
+            "one SuspectedOverflow at the merged prompt size: {observations:?}"
+        );
+        // No Accepted: empty content is never usable output, so the window
+        // evidence must not ratchet a success.
+        assert!(
+            !observations
+                .iter()
+                .any(|o| matches!(o, RoundObservation::Accepted { .. })),
+            "empty rounds are not Accepted evidence: {observations:?}"
         );
     }
 }

@@ -2119,6 +2119,12 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
     // Capability cache: loaded once per session, written back after each turn
     // that updates tuning state (context window discovery, success/overflow).
     let mut cap_cache = probe::load_cache();
+    // Negative cache for /api/show (Phase 20,
+    // docs/design/model-self-tuning.md §3): models whose context-window
+    // fetch has been ATTEMPTED this session — successful or not. Without it,
+    // an endpoint that reports no context length was re-queried every single
+    // turn (`ensure_context_window` only early-outs on success).
+    let mut ctx_window_probed: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     // Resolve the inference backend and permission caveats once at session
     // start.  Both are re-read after each slash command (config.toml on disk).
@@ -2244,7 +2250,10 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
     // while the loop's own guard tracks the live numbers.
     let mem_budget = {
         let entry = cap_cache.entry(inf_model.clone()).or_default();
-        let updated = probe::ensure_context_window(entry, &inf_url, &inf_model);
+        // Once per model per session, even on failure (Phase 20): the set
+        // insert returning true means this is the first attempt.
+        let updated = ctx_window_probed.insert(inf_model.clone())
+            && probe::ensure_context_window(entry, &inf_url, &inf_model);
         if updated {
             probe::save_cache(&cap_cache);
         }
@@ -2698,19 +2707,26 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                         cfg.tui.as_ref().and_then(|t| t.mid_loop_trim_tokens),
                     );
 
-                    // Lazy context-window discovery: queries /api/show once per model
-                    // per session, then caches the result for the lifetime of the process.
-                    // Also reads the empirically-confirmed max input (max_ok_input)
-                    // used as the pre-send budget gate (issue #223).
-                    let (eff_safe_context, eff_max_ok_input) = {
+                    // Lazy context-window discovery: /api/show is attempted at
+                    // most ONCE per model per session — even when the fetch
+                    // fails or the endpoint reports no context length, the
+                    // `ctx_window_probed` negative cache prevents the
+                    // every-turn refetch (Phase 20; `ensure_context_window`
+                    // alone only early-outs on success). Also reads the
+                    // empirically-confirmed max input (max_ok_input) used as
+                    // the pre-send budget gate (issue #223) and the learned
+                    // estimate-calibration ratio (Phase 20 §2.3).
+                    let (eff_safe_context, eff_max_ok_input, eff_estimate_ratio) = {
                         let entry = cap_cache.entry(inf_model.clone()).or_default();
-                        let updated = probe::ensure_context_window(entry, &inf_url, &inf_model);
+                        let updated = ctx_window_probed.insert(inf_model.clone())
+                            && probe::ensure_context_window(entry, &inf_url, &inf_model);
                         let sc = entry.safe_context;
                         let moi = entry.max_ok_input;
+                        let ratio = entry.estimate_ratio;
                         if updated {
                             probe::save_cache(&cap_cache);
                         }
-                        (sc, moi)
+                        (sc, moi, ratio)
                     };
 
                     // num_ctx resolution: explicit config > safe_context > model default.
@@ -2775,6 +2791,32 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                             verbose,
                             ask_human: prompt_permission_choice as fn(&str) -> PromptChoice,
                         });
+                    // Per-round observation hook (Phase 20,
+                    // docs/design/model-self-tuning.md §2.2): evidence is
+                    // applied to the capability cache and saved AT THE MOMENT
+                    // OF OBSERVATION, so an accepted prompt survives a turn
+                    // that later bails, errors, or hits the round cap — the
+                    // motivating failure discarded a backend-accepted
+                    // 8,734-token prompt because the only write-back lived in
+                    // the Ok-arm epilogue below. `turn_saw_accepted` is a Cell
+                    // so the epilogue can read it without contending with the
+                    // closure's captures.
+                    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+                    let turn_saw_accepted = std::cell::Cell::new(false);
+                    let mut on_obs = |obs: newt_core::RoundObservation| {
+                        if matches!(obs, newt_core::RoundObservation::Accepted { .. }) {
+                            turn_saw_accepted.set(true);
+                        }
+                        // Inner block: the `entry` borrow must end before
+                        // `save_cache` takes its shared borrow of the map.
+                        let dirty = {
+                            let entry = cap_cache.entry(inf_model.clone()).or_default();
+                            probe::apply_observation(entry, &obs, &today)
+                        };
+                        if dirty {
+                            probe::save_cache(&cap_cache);
+                        }
+                    };
                     let response = tokio::task::block_in_place(|| {
                         rt.block_on(chat_complete(
                             ChatCtx {
@@ -2820,6 +2862,10 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                                 permission_gate: permission_gate
                                     .as_mut()
                                     .map(|g| g as &mut dyn newt_core::PermissionGate),
+                                // Phase 20: per-round capability evidence +
+                                // the learned estimate calibration.
+                                on_round_usage: Some(&mut on_obs),
+                                estimate_ratio: eff_estimate_ratio,
                             },
                             &mut mcp,
                         ))
@@ -2827,7 +2873,6 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
 
                     let elapsed = t0.elapsed();
                     erase_line();
-                    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
                     match response {
                         Ok((reply, was_streamed, usage, hallucinations)) => {
                             if !was_streamed {
@@ -2881,16 +2926,24 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                                 let policy = cfg.logs.as_ref().cloned().unwrap_or_default();
                                 metrics.append_to_log_with_policy(&log, &policy);
                             }
-                            // Update tuning state and persist if anything changed.
+                            // Turn-level tuning accounting (Phase 20,
+                            // docs/design/model-self-tuning.md §3): success
+                            // is gated on the turn having produced at least
+                            // one quality-gated Accepted observation. The old
+                            // `reply.is_empty()` keying was wrong twice over:
+                            // every loop failure path returns non-empty
+                            // placeholder text, so failed turns ratcheted
+                            // confidence via record_success, and the overflow
+                            // branch was dead code — overflow is now recorded
+                            // at detection by the observation hook, with the
+                            // truthful per-round number.
                             if let Some(input_tokens) = usage.map(|u| u.input_tokens) {
-                                let entry = cap_cache.entry(inf_model.clone()).or_default();
-                                let dirty = if reply.is_empty() {
-                                    entry.record_overflow(input_tokens, &today)
-                                } else {
-                                    entry.record_success(input_tokens, &today)
-                                };
-                                if dirty {
-                                    probe::save_cache(&cap_cache);
+                                if turn_saw_accepted.get() {
+                                    let entry = cap_cache.entry(inf_model.clone()).or_default();
+                                    let dirty = entry.record_success(input_tokens, &today);
+                                    if dirty {
+                                        probe::save_cache(&cap_cache);
+                                    }
                                 }
                             }
                         }
@@ -7441,6 +7494,8 @@ mod tool_round_cap_tests {
                     compress_state: None,
                     tool_events: None,
                     permission_gate: None,
+                    on_round_usage: None,
+                    estimate_ratio: None,
                 },
                 &mut Mcp::empty(),
             )
