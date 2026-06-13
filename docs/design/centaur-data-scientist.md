@@ -1,6 +1,9 @@
 # Phase 21 — Centaur Data Scientist
 
-**Status:** Step 21.1 in progress.
+**Status:** Step 21.1 done (the headless `newt-data` engine ships); step 21.2 in
+progress — `newt-mcp-data`, the thin stdio MCP server over that engine, is the
+**first usable Centaur slice**: net-new SQL EDA reachable from newt chat via one
+`[[mcp_servers]]` line (see [Wiring it in](#wiring-it-in-21.2) below).
 
 ## Purpose
 
@@ -58,10 +61,15 @@ never entangled with the conversation store.
 
 ## Tool surface (delivered incrementally; all namespaced `data__*`)
 
-- **SQL EDA (21.2, no kernel needed — ships first):** `sql_ingest_csv`,
-  `sql_query` (exact SQL shown before run; honest `truncated` flag),
-  `sql_summarize` (schema / dtypes / null-count / pandas-style `describe`),
-  `sql_list_tables`.
+- **SQL EDA (21.2, no kernel needed — *shipped*, the first usable slice):**
+  `sql_ingest_csv`, `sql_query` (exact SQL shown before run; honest `truncated`
+  flag), `sql_summarize` (schema / dtypes / null-count / pandas-style
+  `describe`), `sql_list_tables`. Delivered by the `newt-mcp-data` binary
+  (mirrors `newt-mcp-server`); every tool returns the MCP content envelope and
+  surfaces any failure (bad SQL, no such table, missing arg) as an **in-band**
+  MCP tool error (`isError: true`) the model can read and recover from — never a
+  `-32603` transport fault. The bare tool names are namespaced `data__*` by the
+  client. See [Wiring it in](#wiring-it-in-21.2).
 - **Kernel co-pilot (21.3):** `kernel_attach`, `run_cell` (proposed code visible
   before it runs; PNG written to `.newt-data/plots/…` and reported as path +
   honest text summary — never inline; rich render deferred to gilamonster),
@@ -73,13 +81,32 @@ never entangled with the conversation store.
 
 ## Roadmap (Drake-flight-sized; one PR each; full acceptance contract)
 
-- **21.1** `newt-data` skeleton + `DataStore` trait + SQLite ingest/query/summarize.
-- **21.2** `newt-mcp-data` server with the SQL tools (first shippable Centaur slice).
+- **21.1** `newt-data` skeleton + `DataStore` trait + SQLite ingest/query/summarize. *(done)*
+- **21.2** `newt-mcp-data` server with the SQL tools (first shippable Centaur slice). *(in progress — shipping)*
 - **21.3** `KernelClient` trait + REST/websocket client + `kernel_attach`/`run_cell`.
 - **21.4** notebook read/insert/persist-executed-cell + `run_cell(persist_to=…)`.
 - **21.5** dataframe introspection · **21.6** PyO3 `newt_data` submodule + umbrella/release wiring ·
   **21.7** interrupt/restart + reconnect hardening · **21.8** DuckDB backend behind `DataStore` ·
   **21.9** optional raw-ZMQ kernel client · **21.10** `docs/decisions/centaur_data_scientist.md` + README config snippet.
+
+## Wiring it in (21.2)
+
+The SQL EDA slice is delivered as the `newt-mcp-data` binary. Add one
+`[[mcp_servers]]` entry to `~/.newt/config.toml`:
+
+```toml
+[[mcp_servers]]
+name = "data"
+command = "newt-mcp-data"
+```
+
+The agent then discovers and routes to `data__sql_ingest_csv`,
+`data__sql_query`, `data__sql_summarize`, and `data__sql_list_tables` through
+the existing MCP discovery→connect→route chain — **zero** newt-core / newt-tui /
+agentic-loop changes. The data database lives at
+`<workspace>/.newt-data/data.db` (override with the `NEWT_DATA_DB` environment
+variable), separate from the conversation store. The server routes all tracing
+to stderr because stdout is the JSON-RPC wire.
 
 ## Long-term: gilabot → family migration
 

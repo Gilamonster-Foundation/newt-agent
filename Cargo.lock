@@ -2120,6 +2120,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "newt-mcp-data"
+version = "0.6.7"
+dependencies = [
+ "anyhow",
+ "assert_cmd",
+ "newt-data",
+ "predicates",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "newt-mcp-server"
 version = "0.6.7"
 dependencies = [
