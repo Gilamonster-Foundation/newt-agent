@@ -41,11 +41,12 @@ pub use agent_mesh_protocol::{Caveats, CountBound, Scope};
 // Issue #263: the prompted-ocap-grant seam (PermissionGate + friends) joins
 // the surface — the TUI implements the gate; headless callers pass None.
 pub use agentic::{
-    chat_complete, compress_user_initiated, execute_tool, openai_chat_complete, transcript_lines,
-    transcript_lines_styled, trim_for_summary, widen_caveats, ChatCtx, CompressCounters,
-    CompressState, DenialKind, ManualCompressOutcome, McpTools, NoMcp, NoteNudge, NoteSink,
-    PermissionDecision, PermissionGate, PermissionRecord, PermissionRequest, RecallSource,
-    RoundObservation, ShellObservation, StoreRecallSource, SummarizeFn, SummarizeFuture,
+    chat_complete, compress_user_initiated, execute_tool, memory_fetch_tool_definition,
+    openai_chat_complete, transcript_lines, transcript_lines_styled, trim_for_summary,
+    widen_caveats, ChatCtx, CompressCounters, CompressState, DenialKind, ManualCompressOutcome,
+    McpTools, MemAddr, MemPayload, MemorySource, NoMcp, NoteNudge, NoteSink, PermissionDecision,
+    PermissionGate, PermissionRecord, PermissionRequest, RecallSource, RoundObservation,
+    ShellObservation, StoreMemorySource, StoreRecallSource, SummarizeFn, SummarizeFuture,
     Summarizer, TranscriptLine, TranscriptRole, TranscriptStyle, TurnDriver, TurnDriverConfig,
     TurnDriverError, TurnOutcome, TurnStatus,
 };
@@ -53,8 +54,8 @@ pub use agents::AgentsProvider;
 pub use caveats::{CaveatsExt, CountBoundExt, ScopeExt};
 pub use config::{
     AgentsConfig, BackendConfig, BackendKind, ChatStyle, Config, ConversationsConfig, EditMode,
-    LogConfig, MemoryConfig, MemoryProviderKind, PermissionPreset, ProviderConfig, SkillsConfig,
-    ToolPermissions, TuiConfig,
+    LogConfig, MemoryConfig, MemoryDisclosure, MemoryProviderKind, PermissionPreset,
+    ProviderConfig, SkillsConfig, ToolPermissions, TuiConfig,
 };
 pub use conversation::{
     new_conversation_id, session_plan_dir, session_plan_path, ConversationRecord,
@@ -67,9 +68,9 @@ pub use conversation::{
 pub use dgx::{DgxConfig, DgxFormation, DgxNode, DgxNotConfigured, EndpointKind};
 pub use error::NewtError;
 pub use memory::{
-    MemMessage, MemoryManager, MemoryProvider, NoteStore, NotesUnsupported, Role, RollingWindow,
-    SessionContext, SoulProvider, SoulSource, Summarizing, TokenBudget, DEFAULT_CONTEXT_TOKENS,
-    DEFAULT_SOUL,
+    MemMessage, MemoryIndex, MemoryManager, MemoryProvider, NoteStore, NotesUnsupported, Role,
+    RollingWindow, SessionContext, SoulProvider, SoulSource, Summarizing, TokenBudget,
+    DEFAULT_CONTEXT_TOKENS, DEFAULT_SOUL, MEMORY_INDEX_BUDGET,
 };
 pub use metrics::{TokenUsage, TurnMetrics};
 pub use model_id::ModelId;

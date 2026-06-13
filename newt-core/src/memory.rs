@@ -749,6 +749,138 @@ impl MemoryProvider for TokenBudget {
 pub use crate::notes::NoteStore;
 
 // ---------------------------------------------------------------------------
+// MemoryIndex — budgeted progressive-disclosure index (Workstream A MVP, #319)
+// ---------------------------------------------------------------------------
+
+/// The memory index budget: the maximum number of items the frozen memory
+/// INDEX may list, **pinned by CI** (the modulex `DEFAULT_TOOL_BUDGET = 12`
+/// pattern — progressive-disclosure memory design §2.3/§3.3). The index is
+/// the cheap layer that rides in every request; the verbatim bodies are pulled
+/// on demand via `memory_fetch`. Growing this is a deliberate edit to this
+/// constant with its own justification, asserted by a test — never a side
+/// effect of a feature. Starts small (≈ the `DEFAULT_TOOL_BUDGET` order of
+/// magnitude); tune empirically against probe data, never down silently.
+pub const MEMORY_INDEX_BUDGET: usize = 12;
+
+/// A budgeted, frozen INDEX of memory the model can navigate (#319).
+///
+/// Instead of freezing every NOTE body verbatim into the system prompt (what
+/// [`NoteStore::system_prompt_block`] does today), this provider surfaces a
+/// SMALL index — note ids + first-line titles — capped at
+/// [`MEMORY_INDEX_BUDGET`] items. The bodies are pulled on demand via the
+/// `memory_fetch` tool (`note:<id>`). This is `use_skill`'s index-then-fetch
+/// shape applied to memory.
+///
+/// **Additive and opt-in.** It is registered only under
+/// `[memory] disclosure = "index"` (default `frozen`), so with the default
+/// config it is never constructed and behavior is bit-for-bit unchanged. Like
+/// [`NoteStore`] and [`SoulProvider`] it is system-prompt-only —
+/// `build_messages` returns `Vec::new()` so it never competes for the
+/// "first non-empty `build_messages`" slot in [`MemoryManager::build_messages`].
+///
+/// The index is frozen at session start (KV-cache-safe). Notes created
+/// mid-session don't appear until next session — the same accepted limitation
+/// `NoteStore`'s frozen snapshot has today; `memory_fetch` by a known id still
+/// works mid-session even when the index hasn't refreshed (the index is a
+/// convenience surface, the fetch is the capability — design §8.7).
+///
+/// Past-turn keywords are deliberately NOT duplicated here: that is exactly
+/// what `recall` provides (snippet search over the store). The index points at
+/// recall for that axis rather than competing with it (design §3.1/§8.5).
+pub struct MemoryIndex {
+    /// `(id, title)` rows captured at `initialize`, capped at the budget.
+    rows: Vec<(usize, String)>,
+    /// True when more notes existed than the budget could list — the overflow
+    /// line tells the model the tail is reachable via `recall`.
+    truncated: bool,
+    /// Source NOTES path (read once at `initialize`, like `NoteStore`).
+    notes_path: std::path::PathBuf,
+}
+
+impl MemoryIndex {
+    /// Build an index over the NOTES file at `notes_path` (the same file
+    /// [`NoteStore`] reads). The bodies are fetched via `memory_fetch`; this
+    /// provider only ever surfaces ids + titles.
+    pub fn new(notes_path: impl Into<std::path::PathBuf>) -> Self {
+        Self {
+            rows: Vec::new(),
+            truncated: false,
+            notes_path: notes_path.into(),
+        }
+    }
+
+    /// Construct over the default NOTES location (`~/.newt/NOTES.md`), mirroring
+    /// [`NoteStore::default_path`].
+    pub fn default_path() -> Self {
+        let path = crate::Config::user_config_path()
+            .map(|p| p.with_file_name("NOTES.md"))
+            .unwrap_or_else(|| std::path::PathBuf::from("NOTES.md"));
+        Self::new(path)
+    }
+
+    /// Rows currently listed in the index (test introspection).
+    pub fn rows(&self) -> &[(usize, String)] {
+        &self.rows
+    }
+
+    /// Capture the index from a fresh [`NoteStore`] read, capping at
+    /// [`MEMORY_INDEX_BUDGET`]. Shared by `initialize` and tests.
+    fn capture_from(&mut self, notes: &NoteStore) {
+        let all = notes.index_entries();
+        self.truncated = all.len() > MEMORY_INDEX_BUDGET;
+        self.rows = all
+            .into_iter()
+            .take(MEMORY_INDEX_BUDGET)
+            .map(|(id, title)| (id, title.to_string()))
+            .collect();
+    }
+}
+
+#[async_trait]
+impl MemoryProvider for MemoryIndex {
+    fn name(&self) -> &str {
+        "memory_index"
+    }
+
+    async fn initialize(&mut self, ctx: &SessionContext) -> anyhow::Result<()> {
+        // Read the same NOTES file NoteStore reads, once, and freeze the index.
+        let mut notes = NoteStore::new(self.notes_path.clone(), NoteStore::DEFAULT_CHAR_LIMIT);
+        notes.initialize(ctx).await?;
+        self.capture_from(&notes);
+        Ok(())
+    }
+
+    fn system_prompt_block(&self) -> Option<String> {
+        if self.rows.is_empty() {
+            return None;
+        }
+        let mut block =
+            String::from("## Memory index (call `memory_fetch` with an id to read a body)\n");
+        for (id, title) in &self.rows {
+            let title = if title.is_empty() {
+                "(untitled)"
+            } else {
+                title
+            };
+            block.push_str(&format!("- note:{id}  {title}\n"));
+        }
+        if self.truncated {
+            block
+                .push_str("(more notes exist than are listed — use `recall` to search the rest)\n");
+        }
+        Some(block.trim_end().to_string())
+    }
+
+    fn build_messages(&self, _system_prompt: &str, _new_task: &str) -> Vec<MemMessage> {
+        // System-prompt-only (like NoteStore / SoulProvider) — never competes
+        // for the first-non-empty build_messages slot.
+        Vec::new()
+    }
+
+    async fn sync_turn(&mut self, _user: &str, _assistant: &str, _metrics: &TurnMetrics) {}
+}
+
+// ---------------------------------------------------------------------------
 // Summarizing — built-in provider #4 (closes #107)
 // ---------------------------------------------------------------------------
 
@@ -2384,5 +2516,148 @@ mod tests {
         let mgr = MemoryManager::new();
         let msgs = mgr.build_messages("sys", "task");
         assert_eq!(msgs.len(), 2);
+    }
+
+    // -- MemoryIndex (progressive-disclosure memory, Workstream A MVP, #319) --
+
+    fn index_ctx(dir: &std::path::Path) -> SessionContext {
+        SessionContext {
+            workspace: dir.to_string_lossy().into(),
+            session_id: "s".into(),
+        }
+    }
+
+    /// Seed a NOTES file with `n` entries (using NoteStore's own write path so
+    /// the §-delimited on-disk format is exactly what `MemoryIndex` reads).
+    async fn seed_notes(path: &std::path::Path, n: usize) {
+        let mut ns = NoteStore::new(path, NoteStore::DEFAULT_CHAR_LIMIT);
+        ns.initialize(&index_ctx(path.parent().unwrap()))
+            .await
+            .unwrap();
+        for i in 0..n {
+            ns.add(&format!("note number {i}\nbody line for {i}"))
+                .unwrap();
+        }
+    }
+
+    /// CI-PINNED BUDGET (the modulex `DEFAULT_TOOL_BUDGET` pattern, design
+    /// §2.3/§3.3): the frozen memory index lists at most `MEMORY_INDEX_BUDGET`
+    /// items, no matter how many notes exist. Growing the budget is a
+    /// deliberate edit to the constant — this test fails if a feature grows the
+    /// default surface as a side effect.
+    #[tokio::test]
+    async fn memory_index_stays_under_pinned_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("NOTES.md");
+        // Seed MANY more notes than the budget.
+        seed_notes(&path, MEMORY_INDEX_BUDGET + 25).await;
+
+        let mut idx = MemoryIndex::new(&path);
+        idx.initialize(&index_ctx(dir.path())).await.unwrap();
+
+        assert!(
+            idx.rows().len() <= MEMORY_INDEX_BUDGET,
+            "index surface ({}) exceeds the pinned budget ({MEMORY_INDEX_BUDGET})",
+            idx.rows().len()
+        );
+        assert_eq!(idx.rows().len(), MEMORY_INDEX_BUDGET, "fills to the cap");
+        // The block names the overflow recovery (recall), never silently drops.
+        let block = idx.system_prompt_block().unwrap();
+        assert!(block.contains("use `recall`"), "overflow hint: {block}");
+    }
+
+    #[tokio::test]
+    async fn memory_index_lists_ids_and_titles_not_bodies() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("NOTES.md");
+        seed_notes(&path, 2).await;
+
+        let mut idx = MemoryIndex::new(&path);
+        idx.initialize(&index_ctx(dir.path())).await.unwrap();
+        let block = idx.system_prompt_block().unwrap();
+
+        // Ids + first-line titles are listed …
+        assert!(block.contains("note:1  note number 0"), "got: {block}");
+        assert!(block.contains("note:2  note number 1"), "got: {block}");
+        // … but NOT the bodies (those are fetched via memory_fetch).
+        assert!(!block.contains("body line for 0"), "body leaked: {block}");
+        assert!(
+            block.contains("call `memory_fetch`"),
+            "names the fetch tool: {block}"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_index_is_system_prompt_only() {
+        // Like NoteStore / SoulProvider — never competes for the
+        // first-non-empty build_messages slot.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("NOTES.md");
+        seed_notes(&path, 1).await;
+        let mut idx = MemoryIndex::new(&path);
+        idx.initialize(&index_ctx(dir.path())).await.unwrap();
+        assert!(idx.build_messages("sys", "task").is_empty());
+    }
+
+    #[tokio::test]
+    async fn memory_index_empty_notes_contributes_no_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("NOTES.md");
+        let mut idx = MemoryIndex::new(&path); // no notes file at all
+        idx.initialize(&index_ctx(dir.path())).await.unwrap();
+        assert!(idx.system_prompt_block().is_none());
+    }
+
+    /// INERT BY DEFAULT (#319 acceptance): with no MemoryIndex registered (the
+    /// `disclosure = "frozen"` default), the manager's system-prompt additions
+    /// and messages are byte-identical to a manager that also omits it — and
+    /// crucially they carry NO "Memory index" block. Opting in (index mode)
+    /// ADDS the block, proving the frozen path is genuinely the no-op branch.
+    /// The MVP changes nothing unless opted in.
+    #[tokio::test]
+    async fn disclosure_frozen_default_is_bit_for_bit_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("NOTES.md");
+        seed_notes(&path, 3).await;
+
+        // Today's shape: RollingWindow + NoteStore, NO MemoryIndex (frozen).
+        async fn build(
+            path: &std::path::Path,
+            ws: &std::path::Path,
+            with_index: bool,
+        ) -> (String, Vec<MemMessage>) {
+            let mut mgr = MemoryManager::new();
+            mgr.add_provider(RollingWindow::new(20));
+            mgr.add_provider(NoteStore::new(path, NoteStore::DEFAULT_CHAR_LIMIT));
+            if with_index {
+                mgr.add_provider(MemoryIndex::new(path));
+            }
+            mgr.initialize_all(&SessionContext {
+                workspace: ws.to_string_lossy().into(),
+                session_id: "s".into(),
+            })
+            .await;
+            (
+                mgr.build_system_prompt_additions(),
+                mgr.build_messages("sys", "task"),
+            )
+        }
+
+        let (frozen_sys, frozen_msgs) = build(&path, dir.path(), false).await;
+        // Registration is the only difference; omitting MemoryIndex is a no-op.
+        let (frozen_sys2, frozen_msgs2) = build(&path, dir.path(), false).await;
+        assert_eq!(frozen_sys, frozen_sys2);
+        assert_eq!(frozen_msgs, frozen_msgs2);
+        assert!(
+            !frozen_sys.contains("Memory index"),
+            "frozen mode must NOT add the block: {frozen_sys}"
+        );
+
+        // Opting in (index mode) ADDS the index block.
+        let (index_sys, _index_msgs) = build(&path, dir.path(), true).await;
+        assert!(
+            index_sys.contains("Memory index"),
+            "index mode adds the block: {index_sys}"
+        );
     }
 }

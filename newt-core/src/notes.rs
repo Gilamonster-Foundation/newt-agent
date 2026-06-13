@@ -203,6 +203,41 @@ impl NoteStore {
         self.entries.is_empty()
     }
 
+    /// The verbatim body of the note addressed by `id` — the by-id read the
+    /// `memory_fetch` tool's `note:<id>` resolver needs (progressive-disclosure
+    /// memory, Workstream A MVP, #319). `id` is the 1-based entry number the
+    /// memory index renders (the same numbering [`Self::numbered_listing`] and
+    /// the curator error already show, so the model fetches an id it was
+    /// shown). Returns `None` for a non-positive, non-numeric, or
+    /// out-of-range id — labelled absence, never an error.
+    pub fn body_by_id(&self, id: &str) -> Option<&str> {
+        let n: usize = id.trim().parse().ok()?;
+        if n == 0 {
+            return None;
+        }
+        self.entries.get(n - 1).map(String::as_str)
+    }
+
+    /// `(id, first-line title)` for every note entry, in order — what the
+    /// budgeted memory index lists (titles/ids, never bodies). `id` is the
+    /// 1-based entry number [`Self::body_by_id`] resolves; the title is the
+    /// entry's first non-empty line, the human-readable hint the model uses to
+    /// decide whether to `memory_fetch` the body.
+    pub fn index_entries(&self) -> Vec<(usize, &str)> {
+        self.entries
+            .iter()
+            .enumerate()
+            .map(|(i, e)| {
+                let title = e
+                    .lines()
+                    .find(|l| !l.trim().is_empty())
+                    .unwrap_or("")
+                    .trim();
+                (i + 1, title)
+            })
+            .collect()
+    }
+
     pub fn char_usage(&self) -> (usize, usize) {
         (self.rendered().len(), self.char_limit)
     }
@@ -601,6 +636,37 @@ mod tests {
     }
 
     // -- add ---------------------------------------------------------------
+
+    // -- by-id read + index entries (progressive-disclosure memory, #319) ----
+
+    #[tokio::test]
+    async fn body_by_id_resolves_the_1_based_entry_or_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ns = store_at(&dir.path().join("NOTES.md"), 2_200).await;
+        ns.add("first body").unwrap();
+        ns.add("second\nmulti-line body").unwrap();
+
+        assert_eq!(ns.body_by_id("1"), Some("first body"));
+        assert_eq!(ns.body_by_id("2"), Some("second\nmulti-line body"));
+        // Out of range, zero, and non-numeric all resolve to None (the
+        // memory_fetch tool turns None into labelled absence).
+        assert_eq!(ns.body_by_id("3"), None);
+        assert_eq!(ns.body_by_id("0"), None);
+        assert_eq!(ns.body_by_id("abc"), None);
+    }
+
+    #[tokio::test]
+    async fn index_entries_gives_id_and_first_line_title_not_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ns = store_at(&dir.path().join("NOTES.md"), 2_200).await;
+        ns.add("title one\nbody continues here").unwrap();
+        ns.add("title two").unwrap();
+
+        let idx = ns.index_entries();
+        assert_eq!(idx, vec![(1, "title one"), (2, "title two")]);
+        // The title is the FIRST line only — the body never appears in the index.
+        assert!(!idx.iter().any(|(_, t)| t.contains("body continues")));
+    }
 
     #[tokio::test]
     async fn add_trims_and_ignores_empty() {
