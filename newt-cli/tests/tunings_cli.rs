@@ -229,6 +229,85 @@ fn show_renders_calibration_ratio_and_thinking_quirk() {
         .stdout(predicate::str::contains("quirk:").count(1));
 }
 
+/// Step 20.2 (docs/design/model-self-tuning.md §4.6): `newt tunings show`
+/// flags stale and not-empirically-probed entries and points them at
+/// `/probe window`.
+///
+/// - `stale:7b` has an ancient `tune_date` (well over 30 days) → the
+///   "tuning N days old" hint.
+/// - `undated:7b` has empirical tuning but no `tune_date` → also stale
+///   (None ⇒ re-probe) → the "never dated" hint.
+/// - `unprobed:7b` is freshly dated but below High confidence → the
+///   "window not empirically probed" hint.
+/// - `solid:7b` is freshly dated AND High confidence → no hint at all.
+#[test]
+fn show_flags_stale_and_unprobed_entries_with_probe_window_hint() {
+    let home = fake_home();
+    write_caps(
+        &home,
+        &serde_json::json!({
+            "stale:7b": {
+                "context_window": 8192,
+                "safe_context": 6144,
+                "tune_confidence": "high",
+                "tune_date": "2020-01-01"
+            },
+            "undated:7b": {
+                "context_window": 8192,
+                "safe_context": 6144,
+                "tune_confidence": "high"
+            },
+            "unprobed:7b": {
+                "context_window": 8192,
+                "safe_context": 6144,
+                "tune_confidence": "low",
+                "tune_date": "2099-01-01"
+            },
+            "solid:7b": {
+                "context_window": 8192,
+                "safe_context": 6144,
+                "tune_confidence": "high",
+                "tune_date": "2099-01-01"
+            }
+        }),
+    );
+
+    newt(&home)
+        .args(["tunings", "show"])
+        .assert()
+        .success()
+        // Stale (old date) and undated entries both point at /probe window.
+        .stdout(predicate::str::contains("days old — run /probe window"))
+        .stdout(predicate::str::contains("never dated — run /probe window"))
+        // Below-High confidence on a fresh date → the unprobed hint.
+        .stdout(predicate::str::contains(
+            "window not empirically probed — run /probe window",
+        ));
+}
+
+/// A freshly-dated High-confidence entry shows no staleness hint at all.
+#[test]
+fn show_omits_hint_for_fresh_high_confidence_entry() {
+    let home = fake_home();
+    write_caps(
+        &home,
+        &serde_json::json!({
+            "solid:7b": {
+                "context_window": 8192,
+                "safe_context": 6144,
+                "tune_confidence": "high",
+                "tune_date": "2099-01-01"
+            }
+        }),
+    );
+
+    newt(&home)
+        .args(["tunings", "show"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("/probe window").not());
+}
+
 /// Phase 20: reset clears the new learned fields too — the Refused bail
 /// sends users here when a learned budget (or calibration) is poisoned.
 #[test]

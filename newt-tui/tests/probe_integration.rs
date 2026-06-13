@@ -11,8 +11,9 @@ use std::sync::Mutex;
 
 use newt_tui::probe::{
     ensure_context_window, fetch_context_window, fetch_ollama_models, load_cache,
-    probe_tool_conformance, save_cache, CapabilityCache, CapabilityEntry, ToolConformance,
-    TuneConfidence,
+    probe_input_boundary, probe_thinking, probe_tool_conformance,
+    probe_tool_conformance_calibrated, refresh_context_window, save_cache, CapabilityCache,
+    CapabilityEntry, ToolConformance, TuneConfidence,
 };
 use wiremock::matchers::{body_partial_json, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -228,6 +229,291 @@ async fn ensure_context_window_false_when_fetch_fails() {
 }
 
 // ---------------------------------------------------------------------------
+// refresh_context_window  (Step 20.2 §4.2 — always re-queries /api/show)
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refresh_context_window_updates_changed_window_and_bootstraps_when_unset() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/show"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "model_info": {"llama.context_length": 16384}
+        })))
+        // Unlike ensure_*, refresh always calls /api/show even when the window
+        // is already known — so it sees the re-pulled Modelfile change.
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut e = entry_with(ToolConformance::Native);
+    e.context_window = Some(32768); // stale, larger
+    e.safe_context = None; // unset → eligible for re-bootstrap
+    assert!(
+        refresh_context_window(&mut e, &server.uri(), "m"),
+        "a changed window must report dirty"
+    );
+    assert_eq!(e.context_window, Some(16384), "window updated to fetched");
+    assert_eq!(
+        e.safe_context,
+        Some(16384 * 80 / 100),
+        "safe_context bootstrapped at 80% because it was unset"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refresh_context_window_never_raises_existing_safe_context() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/show"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "model_info": {"llama.context_length": 32768}
+        })))
+        .mount(&server)
+        .await;
+
+    let mut e = entry_with(ToolConformance::Native);
+    e.context_window = Some(32768); // unchanged
+    e.safe_context = Some(4096); // tuned down after an overflow — must survive
+                                 // Window did not change → not dirty; safe_context never auto-raised.
+    assert!(
+        !refresh_context_window(&mut e, &server.uri(), "m"),
+        "unchanged window is not dirty"
+    );
+    assert_eq!(e.context_window, Some(32768));
+    assert_eq!(
+        e.safe_context,
+        Some(4096),
+        "VRAM rule: a known safe_context is never auto-raised"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// probe_thinking  (Step 20.2 §4.3/§4.4 — quirk + calibration sample)
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn probe_thinking_detects_thinking_only_and_returns_calibration() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .and(body_partial_json(serde_json::json!({"stream": false})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "message": {"role": "assistant", "content": "", "thinking": "I should say ok"},
+            "prompt_eval_count": 19
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let pt = probe_thinking(&server.uri(), "thinker").expect("probe should succeed");
+    assert!(
+        pt.emits_thinking,
+        "empty content + thinking → quirk detected"
+    );
+    let (observed, estimated) = pt.calibration.expect("prompt_eval_count present");
+    assert_eq!(observed, 19, "observed real prompt tokens echoed");
+    assert!(estimated > 0, "a chars/4 estimate of the request body");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn probe_thinking_clean_content_leaves_quirk_false() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "message": {"role": "assistant", "content": "ok"}
+            // No prompt_eval_count → calibration absent.
+        })))
+        .mount(&server)
+        .await;
+
+    let pt = probe_thinking(&server.uri(), "clean").unwrap();
+    assert!(!pt.emits_thinking);
+    assert!(pt.calibration.is_none(), "no prompt_eval_count → no sample");
+}
+
+// ---------------------------------------------------------------------------
+// probe_input_boundary  (Step 20.2 §4.5 — empirical binary search)
+// ---------------------------------------------------------------------------
+
+/// A mock `/api/chat` that accepts a prompt (echoing the sent num_ctx as
+/// `prompt_eval_count`) while `num_ctx <= threshold`, and returns an Ollama
+/// context-window 400 above it. This is the boundary the binary search must
+/// converge on.
+struct BoundaryResponder {
+    threshold: u32,
+    limit: u32,
+}
+
+impl wiremock::Respond for BoundaryResponder {
+    fn respond(&self, req: &wiremock::Request) -> ResponseTemplate {
+        let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
+        let num_ctx = body["options"]["num_ctx"].as_u64().unwrap_or(0) as u32;
+        if num_ctx <= self.threshold {
+            // Accept: report prompt_eval_count = num_ctx - reply_margin so it
+            // lands ≥ 90% of the candidate N the search sized the prompt for.
+            let prompt_eval = num_ctx.saturating_sub(256);
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "message": {"role": "assistant", "content": "ok"},
+                "prompt_eval_count": prompt_eval,
+                "eval_count": 3
+            }))
+        } else {
+            ResponseTemplate::new(400).set_body_string(format!(
+                "litellm.ContextWindowExceededError: prompt is too long: \
+                 {num_ctx} tokens > {} maximum",
+                self.limit
+            ))
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn probe_input_boundary_converges_near_threshold_and_marks_high() {
+    let server = MockServer::start().await;
+    // Accept up to num_ctx 24_000; 400 above with a 24_000 hard limit.
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .respond_with(BoundaryResponder {
+            threshold: 24_000,
+            limit: 24_000,
+        })
+        .mount(&server)
+        .await;
+
+    let mut e = entry_with(ToolConformance::Native);
+    e.context_window = Some(32_768); // declared — caps the search (VRAM)
+    e.safe_context = Some(8_192); // low bound start
+
+    let outcome = probe_input_boundary(&server.uri(), "m", &mut e, |_s| {}, "2026-06-13")
+        .expect("boundary search runs");
+
+    // Highest accepted should be just under the threshold (within the
+    // reply_margin + tolerance), and recorded as max_ok_input. The lower
+    // bound is tightened to 22_000: the very first binary-search accept is
+    // 20_480, so a stop-after-first-accept or records-the-high-bound bug
+    // would still satisfy a 20_000 floor. Requiring ≥ 22_000 forces the
+    // search to actually keep climbing toward the boundary.
+    let max_ok = e.max_ok_input.expect("an acceptance was recorded");
+    assert!(
+        (22_000..=24_000).contains(&max_ok),
+        "max_ok_input {max_ok} should converge near the 24k boundary, \
+         not stall at the first accept"
+    );
+    assert_eq!(outcome.highest_accepted, Some(max_ok));
+    assert_eq!(e.tune_confidence, TuneConfidence::High, "High on success");
+    assert_eq!(e.tune_date.as_deref(), Some("2026-06-13"), "date stamped");
+    assert!(outcome.steps >= 1 && outcome.steps <= 12, "bounded steps");
+    // Convergence proof: the loop terminated because the bracket closed to
+    // within tolerance (max(1024, 5% of high)), not because it gave up early.
+    let (low, high) = outcome.final_bounds;
+    let tolerance = 1_024u32.max(high / 20);
+    assert!(
+        high.saturating_sub(low) <= tolerance,
+        "final bracket [{low}, {high}] must close to within tolerance \
+         {tolerance} — proves convergence, not an early stop"
+    );
+    assert!(
+        low >= 22_000 && high <= 24_000,
+        "both bounds must hug the 24k boundary (low {low}, high {high})"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn probe_input_boundary_doubles_to_bracket_when_window_unknown() {
+    // §4.5 "If the window is unknown, probe upward by doubling from the low
+    // bound until the first rejection, then binary-search the bracket." With
+    // context_window None there is no declared cap, so `high` must be found
+    // by the doubling phase — a path neither other test exercises (both pin a
+    // Some(32768) window that short-circuits straight to binary search).
+    let server = MockServer::start().await;
+    // Accept up to num_ctx 40_000 (several doublings above the 4_096 floor),
+    // then a hard 400 with a 40_000 limit. The doubling phase must climb
+    // 8_192 → 16_384 → 32_768 (all accepted) before the 65_536 candidate's
+    // num_ctx overshoots and brackets `high` at the reported limit.
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .respond_with(BoundaryResponder {
+            threshold: 40_000,
+            limit: 40_000,
+        })
+        .mount(&server)
+        .await;
+
+    let mut e = entry_with(ToolConformance::Native);
+    e.context_window = None; // unknown → forces the doubling-bracket path
+    e.safe_context = Some(4_096); // low-bound start
+
+    let outcome = probe_input_boundary(&server.uri(), "m", &mut e, |_s| {}, "2026-06-13")
+        .expect("boundary search runs without a declared window");
+
+    // It must have climbed well past the first doubling candidate (8_192) by
+    // doubling, then converged near the 40k boundary via binary search — not
+    // stalled at the bracket-opening accept.
+    let max_ok = e.max_ok_input.expect("an acceptance was recorded");
+    assert!(
+        (36_000..=40_000).contains(&max_ok),
+        "max_ok_input {max_ok} should converge near the 40k boundary after \
+         doubling past the floor"
+    );
+    assert_eq!(outcome.highest_accepted, Some(max_ok));
+    assert_eq!(e.tune_confidence, TuneConfidence::High, "High on success");
+    assert_eq!(e.tune_date.as_deref(), Some("2026-06-13"), "date stamped");
+    // The cw-400 hit during doubling reins, but a later acceptance must lift
+    // max_ok_input back above the 80%-of-limit (32_000) cw-400 cap.
+    assert!(
+        max_ok > 40_000 * 80 / 100,
+        "a post-400 acceptance must override the cw-400 cap of 32_000"
+    );
+    // Convergence: bracket closed to within tolerance, bounds hug 40k.
+    let (low, high) = outcome.final_bounds;
+    let tolerance = 1_024u32.max(high / 20);
+    assert!(
+        high.saturating_sub(low) <= tolerance,
+        "final bracket [{low}, {high}] must close within tolerance {tolerance}"
+    );
+    assert!(low >= 36_000 && high <= 40_000, "bounds hug 40k boundary");
+    assert!(
+        outcome.steps >= 4,
+        "must take ≥ doublings + a binary step or two"
+    );
+    assert!(outcome.steps <= 12, "step-capped");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn probe_input_boundary_truncation_lowers_high_bound() {
+    // Always 200 but report a prompt_eval_count far below the sent estimate
+    // (silent head-drop). Every probe classifies Truncated → high collapses
+    // toward low and NO acceptance is recorded.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "message": {"role": "assistant", "content": "ok"},
+            "prompt_eval_count": 100, // ≪ any candidate N → Truncated
+            "eval_count": 1
+        })))
+        .mount(&server)
+        .await;
+
+    let mut e = entry_with(ToolConformance::Native);
+    e.context_window = Some(32_768);
+    e.safe_context = Some(8_192);
+
+    let outcome = probe_input_boundary(&server.uri(), "m", &mut e, |_s| {}, "2026-06-13").unwrap();
+
+    assert_eq!(outcome.highest_accepted, None, "nothing was accepted");
+    assert_eq!(e.max_ok_input, None, "no false boundary recorded");
+    // The high bound was driven down from the declared 32_768.
+    let (low, high) = outcome.final_bounds;
+    assert!(high < 32_768, "high {high} lowered by truncation");
+    assert!(high >= low, "bounds stay ordered");
+    // Confidence is untouched (still the entry default) since nothing passed.
+    assert_ne!(e.tune_confidence, TuneConfidence::High);
+}
+
+// ---------------------------------------------------------------------------
 // probe_tool_conformance  (/api/chat)
 // ---------------------------------------------------------------------------
 
@@ -260,6 +546,63 @@ async fn probe_classifies_native_tool_calls() {
         .await
         .unwrap();
     assert_eq!(c, ToolConformance::Native);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn probe_conformance_calibrated_harvests_prompt_eval_count() {
+    // §4.4: the tool-schema-bearing conformance request is one of the cheap
+    // calibration sources. The calibrated variant must echo its
+    // prompt_eval_count alongside the classification (the plain wrapper
+    // discards it).
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"function": {"name": "list_dir", "arguments": {"path": "."}}}
+                ]
+            },
+            "prompt_eval_count": 142
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let pc = probe_tool_conformance_calibrated(&server.uri(), "good-model")
+        .await
+        .expect("probe should succeed");
+    assert_eq!(pc.conformance, ToolConformance::Native);
+    let (observed, estimated) = pc
+        .calibration
+        .expect("prompt_eval_count present → calibration sample harvested");
+    assert_eq!(observed, 142, "observed real prompt tokens echoed");
+    assert!(
+        estimated > 0,
+        "a chars/4 estimate of the tool-schema request body"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn probe_conformance_calibrated_absent_when_no_prompt_eval_count() {
+    // No prompt_eval_count in the response → no calibration sample, but the
+    // conformance classification still lands.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "message": {"role": "assistant", "content": "I cannot run tools."}
+        })))
+        .mount(&server)
+        .await;
+
+    let pc = probe_tool_conformance_calibrated(&server.uri(), "m")
+        .await
+        .unwrap();
+    assert_eq!(pc.conformance, ToolConformance::NoTools);
+    assert!(pc.calibration.is_none(), "no prompt_eval_count → no sample");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
