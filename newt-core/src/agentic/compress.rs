@@ -528,7 +528,16 @@ pub(crate) async fn compress(
         } else {
             CompressAction::StaticFallback
         };
-        let body = body.unwrap_or_else(|| static_fallback_text(middle.len()));
+        let mut body = body.unwrap_or_else(|| static_fallback_text(middle.len()));
+        // #319: the summary is prose and does NOT preserve verbatim file
+        // contents. A coding model that recalls an API/signature from the
+        // summary will hallucinate it. Name the files read in the compacted
+        // span with an explicit re-read directive so the model treats its
+        // memory of them as stale and re-reads instead of inventing.
+        if let Some(crumb) = reread_breadcrumb(middle) {
+            body.push_str("\n\n");
+            body.push_str(&crumb);
+        }
         // (4) Assembly with the REFERENCE-ONLY prefix + end marker.
         let mut out = Vec::with_capacity(boundary.head + 1 + (pruned.len() - boundary.tail_start));
         out.extend_from_slice(&pruned[..boundary.head]);
@@ -873,6 +882,61 @@ fn static_fallback_text(removed: usize) -> String {
 }
 
 /// Wrap a summary body in the compaction markers as a `user` message.
+/// #319: list the files read or edited in the summarized span, with a re-read
+/// directive. The middle is replaced by a PROSE summary that does not preserve
+/// verbatim signatures/types/lines; a coding model recalling an API from that
+/// prose hallucinates it (the nemotron-3 incident). Naming the touched files
+/// and instructing a re-read turns a confident hallucination into a re-read and
+/// keeps the harness honest about what it dropped. Deterministic — independent
+/// of whatever the summarizer LLM chose to mention.
+fn reread_breadcrumb(middle: &[Value]) -> Option<String> {
+    let mut paths: Vec<String> = Vec::new();
+    for m in middle {
+        if m["role"].as_str() != Some("assistant") {
+            continue;
+        }
+        let Some(calls) = m["tool_calls"].as_array() else {
+            continue;
+        };
+        for call in calls {
+            let func = &call["function"];
+            // File-content tools whose result was just summarized to prose.
+            if !matches!(
+                func["name"].as_str(),
+                Some("read_file") | Some("edit_file") | Some("write_file")
+            ) {
+                continue;
+            }
+            // `arguments` may be a JSON object (Ollama) or a JSON string (OpenAI).
+            let args = &func["arguments"];
+            let path = args["path"].as_str().map(str::to_string).or_else(|| {
+                args.as_str()
+                    .and_then(|s| serde_json::from_str::<Value>(s).ok())
+                    .and_then(|v| v["path"].as_str().map(str::to_string))
+            });
+            if let Some(p) = path {
+                if !paths.contains(&p) {
+                    paths.push(p);
+                }
+            }
+        }
+    }
+    if paths.is_empty() {
+        return None;
+    }
+    let list = paths
+        .iter()
+        .map(|p| format!("- {p}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    Some(format!(
+        "Files read or edited in the compacted span — their FULL CONTENTS are \
+         NOT preserved in the summary above. RE-READ any you rely on before \
+         using their exact signatures, types, or line contents; do NOT recall \
+         them from this summary (it is prose, not the file):\n{list}"
+    ))
+}
+
 fn summary_message(body: &str) -> Value {
     serde_json::json!({
         "role": "user",
@@ -1253,6 +1317,75 @@ mod tests {
                 .as_str()
                 .is_some_and(|c| c.contains("earlier tool-call messages omitted"))),
             "the old placeholder-discard line must not appear"
+        );
+    }
+
+    /// #319 REGRESSION GUARD: an API surface read EARLY then needed LATER is
+    /// summarized out of the middle (the freshest trailing group + ~budget/4
+    /// token tail are protected; an older read is not). The summary is prose,
+    /// so the verbatim signature is gone — but the fix appends a re-read
+    /// breadcrumb naming the dropped file, so the model is told to RE-READ it
+    /// rather than hallucinate. This guards that the breadcrumb names the file
+    /// and carries the directive.
+    #[tokio::test]
+    async fn summarized_file_reads_get_a_reread_breadcrumb() {
+        let sig = "pub fn connect(&self, url: &str, timeout: Duration) -> Result<Session, ConnErr>";
+        let api_body = format!(
+            "pub struct ApiClient;\nimpl ApiClient {{\n    {sig} {{ todo!() }}\n}}\n{}",
+            "// detail line\n".repeat(200)
+        );
+        let mut msgs = vec![
+            sys("you are newt, a coding agent"),
+            user("ACTIVE TASK: implement reconnect() on ApiClient using its connect() method"),
+            assistant_call("read_file", json!({ "path": "src/api.rs" })),
+            tool_result(&api_body), // the API surface, read EARLY
+        ];
+        // ...then several more rounds of OTHER reads, pushing src/api.rs out of
+        // both the freshest trailing group and the token-budgeted tail.
+        for i in 0..8 {
+            msgs.push(assistant_call(
+                "read_file",
+                json!({ "path": format!("src/other_{i}.rs") }),
+            ));
+            msgs.push(tool_result(&format!(
+                "// other file {i}\n{}",
+                "filler line\n".repeat(150)
+            )));
+        }
+        let before = estimate_tokens(&msgs);
+        let prompts = Arc::new(Mutex::new(Vec::new()));
+        // The real summarizer returns PROSE, never code — model that.
+        let s = recording_summarizer(
+            prompts.clone(),
+            "## Active Task\nImplement reconnect(). The agent earlier read src/api.rs \
+             (defines ApiClient) and several other files.",
+        );
+        let mut state = CompressState::new();
+        let out = run(&msgs, before / 2, None, Some(&*s), &mut state).await;
+
+        let assembled: String = out
+            .messages
+            .iter()
+            .filter_map(|m| m["content"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        eprintln!(
+            "#319: fired={} action={:?}\n{}",
+            out.fired,
+            out.action,
+            &assembled[..assembled.len().min(1200)]
+        );
+        // The summary fired (the early read did land in the compacted middle).
+        assert!(out.fired && out.action == CompressAction::Summarized);
+        // The fix: the model is TOLD the file is stale and must be re-read,
+        // by name — not left to recall a fabricated signature from prose.
+        assert!(
+            assembled.contains("src/api.rs"),
+            "the dropped file must be named so the model knows to re-read it"
+        );
+        assert!(
+            assembled.contains("RE-READ") && assembled.contains("do NOT recall"),
+            "the breadcrumb must carry the re-read / don't-recall directive"
         );
     }
 
