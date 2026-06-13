@@ -9,6 +9,7 @@ members = [
     "newt-tui",
     "newt-acp-worker",
     "newt-mcp-server",
+    "newt-mcp-data",
     "newt-mcp-client",
     "newt-cli",
     "newt-coder",
@@ -149,6 +150,7 @@ newt-skills       = { path = "newt-skills",       version = "=0.6.7" }
 newt-tui          = { path = "newt-tui",          version = "=0.6.7" }
 newt-acp-worker   = { path = "newt-acp-worker",   version = "=0.6.7" }
 newt-mcp-server   = { path = "newt-mcp-server",   version = "=0.6.7" }
+newt-mcp-data     = { path = "newt-mcp-data",     version = "=0.6.7" }
 newt-mcp-client   = { path = "newt-mcp-client",   version = "=0.6.7" }
 newt-coder        = { path = "newt-coder",        version = "=0.6.7" }
 newt-identity     = { path = "newt-identity",     version = "=0.6.7" }
