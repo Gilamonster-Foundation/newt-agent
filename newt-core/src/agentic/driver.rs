@@ -378,6 +378,7 @@ async fn run_one_turn(
         note_sink: None,
         note_nudge: None,
         recall_source: None,
+        memory_source: None,
         summarizer: None,
         compress_state: None,
         tool_events: None,

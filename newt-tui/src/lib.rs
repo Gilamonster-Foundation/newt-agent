@@ -1695,6 +1695,7 @@ mod permission_prompt_tests {
             None,
             None,
             None,
+            None, // memory_source
             Some(&mut gate),
             None,
         )
@@ -1714,6 +1715,7 @@ mod permission_prompt_tests {
             None,
             None,
             None,
+            None, // memory_source
             Some(&mut gate),
             None,
         )
@@ -1760,6 +1762,7 @@ mod permission_prompt_tests {
                 None,
                 None,
                 None,
+                None, // memory_source
                 Some(&mut gate),
                 None,
             )
@@ -2598,6 +2601,15 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
         }
         // NoteStore is always active — manages system-prompt injection only.
         mgr.add_provider(newt_core::NoteStore::default_path());
+        // Progressive-disclosure memory (Workstream A MVP, #319): under
+        // `[memory] disclosure = "index"` ONLY, add the budgeted MemoryIndex
+        // provider (note ids/titles in the prompt; bodies fetched on demand via
+        // `memory_fetch`). Default (`frozen`) registers nothing — bit-for-bit
+        // unchanged. System-prompt-only, so it never competes for the
+        // build_messages slot.
+        if mem_cfg.disclosure == newt_core::MemoryDisclosure::Index {
+            mgr.add_provider(newt_core::MemoryIndex::default_path());
+        }
         mgr
     };
     // Turn-counted memory nudge (Step 19.3, #248): owned per session, lent to
@@ -3071,6 +3083,39 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                     let recall_source = conversation_store.as_ref().map(|store| {
                         newt_core::StoreRecallSource::new(store, &active_conversation_id)
                     });
+                    // Progressive-disclosure memory (Workstream A MVP, #319):
+                    // wired ONLY under `[memory] disclosure = "index"`. Default
+                    // (`frozen`) leaves `memory_source: None` so the loop is
+                    // bit-for-bit unchanged — the `memory_fetch` tool is never
+                    // advertised. The source reads `note:` bodies from an
+                    // independent read-only NoteStore over the same NOTES file
+                    // the MemoryManager froze (the `note_sink` holds the only
+                    // &mut to the manager), and `turn:` bodies from the session
+                    // ConversationStore (workspace-fenced). Both surfaces
+                    // already exist — no new persistence.
+                    let memory_disclosure_index = cfg
+                        .memory
+                        .as_ref()
+                        .map(|m| m.disclosure == newt_core::MemoryDisclosure::Index)
+                        .unwrap_or(false);
+                    let mem_fetch_notes = if memory_disclosure_index {
+                        use newt_core::MemoryProvider as _;
+                        let mut ns = newt_core::NoteStore::default_path();
+                        let _ = rt.block_on(ns.initialize(&newt_core::SessionContext {
+                            workspace: workspace.to_string(),
+                            session_id: active_conversation_id.clone(),
+                        }));
+                        Some(ns)
+                    } else {
+                        None
+                    };
+                    let memory_source =
+                        match (mem_fetch_notes.as_ref(), conversation_store.as_ref()) {
+                            (Some(notes), Some(store)) => {
+                                Some(newt_core::StoreMemorySource::new(notes, store))
+                            }
+                            _ => None,
+                        };
                     // Compression summarizer (Step 18.4, #247): rebuilt per
                     // turn so a mid-session `/backend` or model switch takes
                     // effect immediately.
@@ -3186,6 +3231,12 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                                 recall_source: recall_source
                                     .as_ref()
                                     .map(|source| source as &dyn newt_core::RecallSource),
+                                // Progressive-disclosure memory_fetch (#319):
+                                // present only under disclosure = "index"; None
+                                // (the default) keeps the loop bit-for-bit.
+                                memory_source: memory_source
+                                    .as_ref()
+                                    .map(|s| s as &dyn newt_core::MemorySource),
                                 // Summarize-don't-discard (Step 18.4, #247).
                                 summarizer: Some(&*loop_summarizer),
                                 compress_state: Some(&mut compress_state),
@@ -5625,6 +5676,7 @@ mod run_command_confinement_tests {
             None,
             None,
             None,
+            None, // memory_source
             None,
             None,
         )
@@ -5657,6 +5709,7 @@ mod run_command_confinement_tests {
             None,
             None,
             None,
+            None, // memory_source
             None,
             None,
         )
@@ -5700,6 +5753,7 @@ mod run_command_confinement_tests {
             None,
             None,
             None,
+            None, // memory_source
             None,
             None,
         )
@@ -5740,6 +5794,7 @@ mod run_command_confinement_tests {
             None,
             None,
             None,
+            None, // memory_source
             None,
             None,
         )
@@ -5773,6 +5828,7 @@ mod run_command_confinement_tests {
             None,
             None,
             None,
+            None, // memory_source
             None,
             None,
         )
@@ -5813,6 +5869,7 @@ mod run_command_confinement_tests {
             None,
             None,
             None,
+            None, // memory_source
             None,
             None,
         )
@@ -5937,6 +5994,7 @@ mod disable_ocap_session_tests {
             None,
             None,
             None,
+            None, // memory_source
             None,
             None,
         )
@@ -5955,6 +6013,7 @@ mod disable_ocap_session_tests {
             None,
             None,
             None,
+            None, // memory_source
             None,
             None,
         )
@@ -6009,6 +6068,7 @@ mod disable_ocap_session_tests {
             None,
             None,
             None,
+            None, // memory_source
             Some(&mut gate),
             None,
         )
@@ -6044,6 +6104,7 @@ mod disable_ocap_session_tests {
             None,
             None,
             None,
+            None, // memory_source
             Some(&mut gate),
             None,
         )
@@ -6084,6 +6145,7 @@ mod disable_ocap_session_tests {
             None,
             None,
             None,
+            None, // memory_source
             None,
             // The active preset's exec floor — the bypass ceiling.
             Some(&clamp.exec),
@@ -8196,6 +8258,7 @@ mod tool_round_cap_tests {
                     note_sink: None,
                     note_nudge: None,
                     recall_source: None,
+                    memory_source: None,
                     summarizer: None,
                     compress_state: None,
                     tool_events: None,

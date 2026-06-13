@@ -367,6 +367,29 @@ pub struct MemoryConfig {
     /// — the pass is optional and costs one completion per close.
     #[serde(default)]
     pub extract_notes_on_close: bool,
+
+    /// How memory is disclosed to the model (progressive-disclosure memory,
+    /// Workstream A MVP, #319). `Frozen` (the default) is today's behavior
+    /// exactly: NOTES are frozen verbatim into the system prompt and the
+    /// `memory_fetch` tool is not wired. `Index` opts in to the budgeted
+    /// memory INDEX (note titles/ids instead of full bodies) plus the
+    /// `memory_fetch` tool that pulls a body on demand. This is a context-cost
+    /// facet, never an authorization knob.
+    #[serde(default)]
+    pub disclosure: MemoryDisclosure,
+}
+
+/// Memory disclosure mode — the `[memory] disclosure` key (#319).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryDisclosure {
+    /// Today's behavior: NOTES frozen verbatim into the system prompt, no
+    /// `memory_fetch` tool. The MVP default — inert unless opted in.
+    #[default]
+    Frozen,
+    /// Progressive disclosure: a budgeted memory INDEX in the prompt plus the
+    /// `memory_fetch` tool to pull bodies on demand.
+    Index,
 }
 
 fn default_memory_window() -> usize {
@@ -386,6 +409,7 @@ impl Default for MemoryConfig {
             soul_file: None,
             note_nudge_interval: 10,
             extract_notes_on_close: false,
+            disclosure: MemoryDisclosure::Frozen,
         }
     }
 }
@@ -1332,6 +1356,20 @@ mod tests {
         // `[memory] extract_notes_on_close = true` is the opt-in.
         let cfg: MemoryConfig = toml::from_str("extract_notes_on_close = true").unwrap();
         assert!(cfg.extract_notes_on_close);
+    }
+
+    #[test]
+    fn memory_disclosure_defaults_to_frozen_and_parses_index() {
+        // INERT BY DEFAULT (#319): the disclosure facet defaults to Frozen —
+        // today's behavior, the memory_fetch tool unwired — and only `index`
+        // opts in to progressive disclosure.
+        assert_eq!(MemoryConfig::default().disclosure, MemoryDisclosure::Frozen);
+        let cfg: MemoryConfig = toml::from_str("provider = \"rolling_window\"").unwrap();
+        assert_eq!(cfg.disclosure, MemoryDisclosure::Frozen);
+        let cfg: MemoryConfig = toml::from_str("disclosure = \"index\"").unwrap();
+        assert_eq!(cfg.disclosure, MemoryDisclosure::Index);
+        let cfg: MemoryConfig = toml::from_str("disclosure = \"frozen\"").unwrap();
+        assert_eq!(cfg.disclosure, MemoryDisclosure::Frozen);
     }
 
     #[test]
