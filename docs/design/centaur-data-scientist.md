@@ -12,9 +12,21 @@ below). Step 21.4 done — the notebook artifact: `notebook_read` /
 `run_cell(persist_to=…)` now appends each executed cell (source + outputs, plots
 inlined so the notebook renders) to a real `.ipynb`, leaving a faithful,
 reviewable, git-diffable record (see [Notebook artifact](#notebook-artifact-21.4)
-below). Step 21.6 done — the same SQLite primitives are importable into a human
-notebook as the `newt_agent.data` PyO3 submodule of the umbrella wheel (see
+below). Step 21.5 done — read-only dataframe introspection over the attached live
+kernel: `list_dataframes` enumerates the human's live pandas DataFrames (name /
+rows / cols / in-memory bytes) and `inspect_dataframe` returns one frame's shape,
+per-column dtype + null count, head rows, and numeric `describe()` — the Centaur
+*sees* the human's working DataFrames without ever mutating them (see
+[Dataframe introspection](#dataframe-introspection-21.5) below). Step 21.6 done —
+the same SQLite primitives are importable into a human notebook as the
+`newt_agent.data` PyO3 submodule of the umbrella wheel (see
 [In the notebook](#in-the-notebook-21.6) below).
+
+**With 21.1–21.6 all shipped, the Phase 21 Centaur MVP is complete:** the headless
+engine, the SQL EDA slice, the live-kernel co-pilot, the notebook artifact, the
+read-only dataframe introspection, and the in-notebook PyO3 submodule. Remaining
+steps (21.7 interrupt/restart hardening, 21.8 DuckDB backend, 21.9 raw-ZMQ client,
+21.10 the decision record) are post-MVP hardening and extensions.
 
 ## Purpose
 
@@ -110,7 +122,21 @@ never entangled with the conversation store.
   is pure `serde_json` JSON manipulation (no new dependency); a missing/corrupt/
   non-nbformat-4 file is an honest in-band error. See
   [Notebook artifact](#notebook-artifact-21.4).
-- **Dataframe introspection (21.5):** `list_dataframes`, `inspect_dataframe`.
+- **Dataframe introspection (21.5, *shipped*):** `list_dataframes` (enumerate the
+  live pandas DataFrames in the attached kernel's `globals()` → name / rows / cols
+  / in-memory bytes), `inspect_dataframe` (one named frame → shape, per-column
+  dtype + null count, head rows (default 5), and a numeric `describe()`). **Strictly
+  read-only** — the Centaur sees the human's working DataFrames without mutating
+  them. Each tool runs a defensive Python snippet over the session `run_cell` that
+  imports json + pandas inside itself, never touches the namespace, and PRINTS one
+  JSON line the Rust side parses robustly (no fragile text scraping); on a problem
+  the snippet emits `{"error": ...}` rather than raising. The DataFrame `name` is
+  validated as a plain Python identifier (`[A-Za-z_][A-Za-z0-9_]*`) **before** it is
+  interpolated into the snippet, so a hostile name can never inject code — a bad
+  name is rejected in-band before the kernel is ever touched. Requires
+  `kernel_attach`; every failure (no kernel, undefined name, kernel error,
+  unparseable output) is an in-band MCP tool error. See
+  [Dataframe introspection](#dataframe-introspection-21.5).
 
 ## Roadmap (Drake-flight-sized; one PR each; full acceptance contract)
 
@@ -118,9 +144,12 @@ never entangled with the conversation store.
 - **21.2** `newt-mcp-data` server with the SQL tools (first shippable Centaur slice). *(done)*
 - **21.3** `KernelClient` trait + REST/websocket client + `kernel_attach`/`run_cell`. *(done)*
 - **21.4** notebook read/insert/persist-executed-cell + `run_cell(persist_to=…)`. *(done)*
-- **21.5** dataframe introspection · **21.6** PyO3 `newt_data` submodule + umbrella/release wiring *(done)* ·
+- **21.5** dataframe introspection *(done)* · **21.6** PyO3 `newt_data` submodule + umbrella/release wiring *(done)* ·
   **21.7** interrupt/restart + reconnect hardening · **21.8** DuckDB backend behind `DataStore` ·
   **21.9** optional raw-ZMQ kernel client · **21.10** `docs/decisions/centaur_data_scientist.md` + README config snippet.
+
+With **21.1–21.6** done the Phase 21 Centaur MVP is complete; 21.7–21.10 are
+post-MVP hardening + extensions.
 
 ## Wiring it in (21.2)
 
@@ -238,6 +267,59 @@ engine lives in `newt-data/src/notebook.rs` (a *normal* module — no kernel/HTT
 deps), unit-tested over tempfile `.ipynb` fixtures; the `CellRun` → nbformat-output
 bridge (`cell_run_to_nb_outputs`) lives beside the accumulator in
 `newt-data/src/kernel/mod.rs`.
+
+## Dataframe introspection (21.5)
+
+The live-kernel co-pilot (21.3) runs the agent's *own* cells; 21.5 lets the agent
+**look at the human's** pandas DataFrames — the ones already sitting in the
+notebook's namespace — **without mutating them**. Two read-only tools, both over
+the attached kernel:
+
+```text
+1. data__list_dataframes { }
+   → [ { "name": "df",    "rows": 1000, "cols": 8, "memory_bytes": 412345 },
+       { "name": "sales", "rows": 42,   "cols": 5, "memory_bytes":   3360 } ]
+
+2. data__inspect_dataframe { "name": "sales", "head": 5 }
+   → { "name": "sales",
+       "shape": [42, 5],
+       "columns": [ { "name": "region", "dtype": "object",  "null_count": 0 },
+                    { "name": "amount", "dtype": "float64", "null_count": 2 }, … ],
+       "head": [ { "region": "west", "amount": 100.0 }, … up to N rows … ],
+       "describe": { "amount": { "count": 40.0, "mean": …, "std": …, "min": …,
+                                 "25%": …, "50%": …, "75%": …, "max": … } } }
+```
+
+- **`list_dataframes`** enumerates `globals()` in the attached kernel for
+  `pandas.DataFrame` instances and reports each one's variable name, row/column
+  counts, and deep in-memory size in bytes.
+- **`inspect_dataframe`** returns one named frame's `shape`, per-column
+  `dtype` + `null_count`, the first `head` rows (default 5) as records, and a
+  pandas `describe()` over the numeric columns (`{}` when the frame has none).
+
+**How it works — a crafted snippet, robust JSON, no scraping.** Each tool runs a
+defensive Python snippet through the session `run_cell` and parses **one JSON
+line** out of `CellRun.stdout` (it takes the last non-empty line, so an incidental
+`print` above it never breaks the parse). The snippet imports `json` + `pandas`
+*inside itself* (a kernel without pandas yields a clean `{"error": ...}`, not a
+raised `NameError`), iterates a *snapshot* of `globals()` so it **never mutates
+the namespace**, and wraps everything in a `try/except` that prints
+`{"error": ...}` rather than raising. The tool surfaces that `error` (or a kernel
+fault, or unparseable output, or "no kernel attached") as an in-band MCP tool
+error the model can read and recover from.
+
+**Injection-proof name interpolation.** `inspect_dataframe` interpolates the
+caller-supplied DataFrame `name` into the snippet, so the name is validated as a
+plain Python identifier (`[A-Za-z_][A-Za-z0-9_]*`) **before** any kernel call — a
+hostile name like `"df; import os"` is rejected in-band and the kernel is never
+touched (the test asserts `run_cell` was not invoked). `list_dataframes` takes no
+arguments and carries no interpolation at all.
+
+**Read-only, by design.** Nothing here writes to the human's session: the snippets
+only *read* `globals()` and call non-mutating DataFrame methods (`shape`,
+`dtypes`, `isnull`, `head`, `describe`, `memory_usage`). This is the Centaur
+contract — the agent sees what the human is working with and makes them faster,
+without surprising them by changing their data underfoot.
 
 ## In the notebook (21.6)
 
