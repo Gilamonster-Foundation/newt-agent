@@ -162,6 +162,19 @@ impl FfiManifest {
         out
     }
 
+    /// The set of known module paths (every import path plus its dotted
+    /// ancestors) — the project surface the verify gate resolves against.
+    #[must_use]
+    pub fn known_modules(&self) -> std::collections::BTreeSet<String> {
+        let mut set = std::collections::BTreeSet::new();
+        for m in &self.modules {
+            for ancestor in dotted_ancestors(&m.import_path) {
+                set.insert(ancestor);
+            }
+        }
+        set
+    }
+
     /// Build the authoritative [`SymbolIndex`] the verify oracle resolves against:
     /// every import path (and its dotted ancestors — `newt_agent`,
     /// `newt_agent._newt_agent`, …, all real packages) is a known module, and each

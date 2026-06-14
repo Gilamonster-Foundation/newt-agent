@@ -54,6 +54,12 @@ enum Command {
     /// `nemotron` profile injects so the model imports real paths instead of
     /// guessing `newt_core` from the crate name.
     Manifest(ManifestArgs),
+
+    /// Verify-gate (#73, R2): resolve a produced workspace's Python imports
+    /// against the authoritative surface and print the *revert set* — the files
+    /// with fabricated imports that R2 reverts and retries. Exit 2 if any file
+    /// fabricates (an honest gate signal), 0 if the turn is accepted.
+    Verify(VerifyArgs),
 }
 
 /// Arguments for the `manifest` subcommand.
@@ -62,6 +68,19 @@ struct ManifestArgs {
     /// Workspace root to scan for `<crate>/src/pyo3_module.rs` bindings.
     #[arg(long)]
     workspace: PathBuf,
+}
+
+/// Arguments for the `verify` subcommand.
+#[derive(Args, Debug)]
+struct VerifyArgs {
+    /// The produced workspace to gate (the tree the model wrote into).
+    #[arg(long)]
+    workspace: PathBuf,
+    /// Source of the authoritative surface: a workspace whose
+    /// `<crate>/src/pyo3_module.rs` bindings declare the real import paths (the
+    /// R1 manifest). The gate resolves the produced imports against it.
+    #[arg(long)]
+    manifest_from: PathBuf,
 }
 
 /// Arguments for the `score` subcommand.
@@ -194,6 +213,43 @@ async fn real_main() -> Result<RunOutcomeStatus> {
         Command::Run(args) => run_command(args).await,
         Command::Score(args) => score_command(args),
         Command::Manifest(args) => manifest_command(args),
+        Command::Verify(args) => verify_command(args),
+    }
+}
+
+/// `verify` — the R2 gate as a CLI. Build the surface from the R1 manifest, gate
+/// the produced workspace, print the revert set, and exit non-zero if any file
+/// fabricated.
+fn verify_command(args: VerifyArgs) -> Result<RunOutcomeStatus> {
+    let surface = newt_core::ffi_manifest::FfiManifest::from_workspace(&args.manifest_from)?;
+    if surface.is_empty() {
+        anyhow::bail!(
+            "no PyO3 bindings under {} to build a surface from",
+            args.manifest_from.display()
+        );
+    }
+    let report =
+        newt_core::verify_gate::gate_python_workspace(&args.workspace, &surface.known_modules())?;
+    let revert = report.revert_set();
+    if report.accept() {
+        println!(
+            "verify: ACCEPT — {} file(s), no fabricated imports",
+            report.files.len()
+        );
+        Ok(RunOutcomeStatus::AllPassed)
+    } else {
+        println!(
+            "verify: REVERT {} file(s), {} fabricated import(s):",
+            revert.len(),
+            report.fabrication_count()
+        );
+        for f in &report.files {
+            if !f.is_clean() {
+                let mods: Vec<&str> = f.fabrications.iter().map(|x| x.module.as_str()).collect();
+                println!("  {}  [{}]", f.path.display(), mods.join(", "));
+            }
+        }
+        Ok(RunOutcomeStatus::CaseFailed)
     }
 }
 

@@ -246,6 +246,62 @@ fn module_root(module: &str) -> &str {
     module.split(['.', ':']).next().unwrap_or(module)
 }
 
+/// A module is **known** if it — or any of its dotted prefixes — is in `known`
+/// (so a declared `newt_agent` covers `newt_agent.core`, and `os` covers
+/// `os.path`). The module-level resolution shared by the verify oracle (scoring)
+/// and the verify gate (control), so the two never drift.
+#[must_use]
+pub fn module_is_known(module: &str, known: &BTreeSet<String>) -> bool {
+    let parts: Vec<&str> = module.split('.').collect();
+    (1..=parts.len()).any(|i| known.contains(&parts[..i].join(".")))
+}
+
+/// A focused allowlist of common Python standard-library top-level modules, so a
+/// generated example's `import os` / `from dataclasses import dataclass` is not
+/// mistaken for a fabrication. Not exhaustive — errs toward false-negatives (miss
+/// a stdlib edge) over false-positives (flag real stdlib).
+#[must_use]
+pub fn python_stdlib_modules() -> BTreeSet<String> {
+    [
+        "abc",
+        "argparse",
+        "asyncio",
+        "base64",
+        "collections",
+        "contextlib",
+        "copy",
+        "csv",
+        "dataclasses",
+        "datetime",
+        "decimal",
+        "enum",
+        "functools",
+        "glob",
+        "hashlib",
+        "io",
+        "itertools",
+        "json",
+        "logging",
+        "math",
+        "os",
+        "pathlib",
+        "random",
+        "re",
+        "shutil",
+        "subprocess",
+        "sys",
+        "tempfile",
+        "time",
+        "typing",
+        "unittest",
+        "uuid",
+        "warnings",
+    ]
+    .iter()
+    .map(|s| (*s).to_string())
+    .collect()
+}
+
 /// Extract the references (imports/uses) a source file makes.
 #[must_use]
 pub fn extract_references(source: &str, lang: Lang) -> Vec<Reference> {
