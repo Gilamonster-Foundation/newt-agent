@@ -1049,7 +1049,7 @@ tables. Steps:
 - **21.1** `newt-data` skeleton + `DataStore` trait + SQLite ingest/query/summarize. *(done)*
 - **21.2** `newt-mcp-data` stdio server with the SQL tools (first shippable Centaur slice). *(done)*
 - **21.3** `KernelClient` trait + REST/websocket client + `kernel_attach` / `run_cell`. *(done)*
-- **21.4** notebook read / insert / persist-executed-cell + `run_cell(persist_to=…)`.
+- **21.4** notebook read / insert / persist-executed-cell + `run_cell(persist_to=…)`. *(done)*
 - **21.5** dataframe introspection (`list_dataframes`, `inspect_dataframe`).
 - **21.6** PyO3 `newt_data` submodule + umbrella/release wiring. *(done)*
 - **21.7** interrupt / restart + reconnect hardening.
