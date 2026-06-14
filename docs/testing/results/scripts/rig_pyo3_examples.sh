@@ -36,15 +36,18 @@ die() { echo "rig: $*" >&2; exit 1; }
 # ── parse args ──────────────────────────────────────────────────────
 [ $# -ge 1 ] || die "usage: $0 dry-run|live --out DIR [...]; see header"
 MODE=$1; shift
-OUT="" CORPUS="" SURFACE="" MODEL="" URL="" NUM_CTX=""
+OUT="" CORPUS="" SURFACE="" MODEL="" URL="" NUM_CTX="" PREAMBLE=""
 while [ $# -gt 0 ]; do
   case "$1" in
-    --out)     OUT=$2; shift 2 ;;
-    --corpus)  CORPUS=$2; shift 2 ;;
-    --surface) SURFACE=$2; shift 2 ;;
-    --model)   MODEL=$2; shift 2 ;;
-    --url)     URL=$2; shift 2 ;;
-    --num-ctx) NUM_CTX=$2; shift 2 ;;
+    --out)      OUT=$2; shift 2 ;;
+    --corpus)   CORPUS=$2; shift 2 ;;
+    --surface)  SURFACE=$2; shift 2 ;;
+    --model)    MODEL=$2; shift 2 ;;
+    --url)      URL=$2; shift 2 ;;
+    --num-ctx)  NUM_CTX=$2; shift 2 ;;
+    --preamble) PREAMBLE=$2; shift 2 ;;  # FILE prepended to the prompt — inject a
+                                         # support part (e.g. the FFI manifest) to
+                                         # measure its lift vs the bare baseline (#74)
     *) die "unknown arg: $1" ;;
   esac
 done
@@ -94,7 +97,15 @@ JSON
     DRIVE="live:$MODEL"
     cp -r "$CORPUS"/. "$WS"/
     cp "$SURFACE" "$OUT/python_surface.json"
-    printf '%s\nexit\n' "$INCIDENT_PROMPT" > "$PROMPTS"
+    # The injected support part (if any) leads the prompt as an authoritative
+    # fact, then the unchanged incident task. Absent --preamble this is bit-for-bit
+    # the bare baseline.
+    if [ -n "$PREAMBLE" ]; then
+      [ -f "$PREAMBLE" ] || die "--preamble file not found: $PREAMBLE"
+      printf '%s\n\n%s\nexit\n' "$(cat "$PREAMBLE")" "$INCIDENT_PROMPT" > "$PROMPTS"
+    else
+      printf '%s\nexit\n' "$INCIDENT_PROMPT" > "$PROMPTS"
+    fi
     echo "rig: driving newt against $MODEL @ $URL ..." >&2
     # Explicit sandbox under --out (7th arg) so we don't depend on a pre-seeded
     # /tmp/newt-bench/ existing (run_newt_session.sh's mktemp default).

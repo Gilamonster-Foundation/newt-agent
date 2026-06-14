@@ -24,6 +24,7 @@
 
 use crate::symbols::SymbolIndex;
 use regex::Regex;
+use std::path::Path;
 
 /// One PyO3-bound crate's Python import surface, extracted from its binding source.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,6 +99,28 @@ impl FfiManifest {
             .filter_map(|(label, src)| FfiModule::from_source(label, src))
             .collect();
         Self { modules }
+    }
+
+    /// Build a manifest by discovering `<crate>/src/pyo3_module.rs` under a
+    /// workspace root — each top-level subdirectory is a crate, named by its
+    /// directory. Crates without a readable binding are skipped; the result is
+    /// deterministic (crates in sorted directory order).
+    pub fn from_workspace(root: &Path) -> std::io::Result<Self> {
+        let mut found: Vec<(String, String)> = Vec::new();
+        for entry in std::fs::read_dir(root)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let binding = entry.path().join("src").join("pyo3_module.rs");
+            if let Ok(src) = std::fs::read_to_string(&binding) {
+                found.push((entry.file_name().to_string_lossy().into_owned(), src));
+            }
+        }
+        found.sort();
+        Ok(Self::from_sources(
+            found.iter().map(|(l, s)| (l.as_str(), s.as_str())),
+        ))
     }
 
     /// Number of bound crates in the manifest.
@@ -241,6 +264,30 @@ pub struct PyDataStore;
             paths,
             vec!["newt_agent._newt_agent.core", "newt_agent._newt_agent.data"]
         );
+    }
+
+    #[test]
+    fn from_workspace_discovers_bindings() {
+        let tmp = tempfile::tempdir().unwrap();
+        // <root>/newt-core/src/pyo3_module.rs and <root>/newt-data/src/...
+        for (crate_dir, src) in [("newt-core", NEWT_CORE_SRC), ("newt-data", NEWT_DATA_SRC)] {
+            let dir = tmp.path().join(crate_dir).join("src");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("pyo3_module.rs"), src).unwrap();
+        }
+        // a non-crate dir and a crate without a binding are both ignored
+        std::fs::create_dir_all(tmp.path().join("docs")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("newt-empty").join("src")).unwrap();
+
+        let manifest = FfiManifest::from_workspace(tmp.path()).unwrap();
+        assert_eq!(manifest.len(), 2);
+        // deterministic (sorted) order: newt-core before newt-data
+        assert_eq!(manifest.modules[0].source, "newt-core");
+        assert_eq!(
+            manifest.modules[0].import_path,
+            "newt_agent._newt_agent.core"
+        );
+        assert_eq!(manifest.modules[1].source, "newt-data");
     }
 
     #[test]
