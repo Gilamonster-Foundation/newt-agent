@@ -42,6 +42,26 @@ nemotron3 had in the first incident) overflows around 5 crates.
 It also emits `python_surface.json` — the **real** importable surface (the
 umbrella `newt_agent` + its eight submodules), which the oracle scores against.
 
+### Survey scope — tool-supporting models
+
+The agentic loop runs on tool calls, so the active survey targets **tool-capable
+models only**. `survey_models.sh` detects support with a cheap `/api/show`
+metadata probe (the `tools` capability — no model load):
+
+- `--require-tools` skips any model lacking the `tools` capability, recording it
+  as `no-tool (excluded)` without spending a rig run.
+- `--models auto` discovers every model on the endpoint, then `--require-tools`
+  narrows to the tool-capable set. **This is how new models join the survey**:
+  pull a model, re-run, and it's picked up automatically.
+
+No-tool models (reasoners like `deepseek-r1`, older coders without tool support)
+are **kept on disk, not evicted** — they are staged for the swarm milestone as
+the *planning* tier (a reasoner plans; tool-capable coders execute), so a
+"no-tool" result here marks a future planner, not a dead model. (Note: a model
+*advertising* `tools` may still emit a dialect newt doesn't yet parse — e.g. the
+`qwen2.5-coder` family's JSON-in-content; those stay in the survey as the
+0.6.9 parser targets.)
+
 ### Task — fixed prompt
 
 > *create an examples folder and write one python script as an example for each
@@ -96,13 +116,13 @@ CARGO_TARGET_DIR=~/.cache/newt-target cargo build --release -p newt-agent -p new
 # pack the overflow corpus
 docs/testing/results/scripts/pack_pyo3_corpus.sh --repo . --out /tmp/corpus8 --crates 8
 
-# sweep a model list on one endpoint
+# sweep every tool-capable model on one endpoint (auto-discovered)
 NEWT_BIN=~/.cache/newt-target/release/newt \
 NEWT_EVAL_BIN=~/.cache/newt-target/release/newt-eval \
 docs/testing/results/scripts/survey_models.sh \
   --endpoint https://REDACTED-HOST --hardware "gnuc 4060 Ti" \
   --corpus /tmp/corpus8/corpus --surface /tmp/corpus8/python_surface.json \
-  --out /tmp/survey-gnuc --models "nemotron-3-nano:4b qwen3-coder:30b ..." --timeout 900
+  --out /tmp/survey-gnuc --models auto --require-tools --timeout 900
 ```
 
 ## Caveats / threats to validity
