@@ -45,6 +45,17 @@ pub enum DataError {
     /// The CSV had no header row, so no columns could be created.
     #[error("empty csv: no header row")]
     EmptyCsv,
+
+    /// An `.ipynb` notebook (Phase 21.4 — [`crate::notebook`]) could not be
+    /// read, parsed, or validated: the file is not valid JSON, its top-level
+    /// value is not an object, its `nbformat` is not `4`, or it is otherwise not
+    /// a well-formed nbformat-4 document. The message names the offending file
+    /// and the specific reason so the MCP adapter surfaces an honest, in-band
+    /// tool error the model can read (never a panic). See
+    /// [`docs/design/centaur-data-scientist.md`](../../../docs/design/centaur-data-scientist.md)
+    /// §4.1, the notebook-artifact bullet.
+    #[error("invalid notebook: {0}")]
+    InvalidNotebook(String),
 }
 
 /// Crate-wide result alias over [`DataError`].

@@ -55,6 +55,14 @@
 
 pub mod error;
 pub mod ingest;
+/// nbformat `.ipynb` notebook persistence (Phase 21.4): pure `serde_json`
+/// read/insert/persist over the human's reviewable, git-diffable notebook
+/// artifact. A **normal** module (no kernel/HTTP deps) — it manipulates JSON, it
+/// does not run cells. `run_cell(persist_to=…)` calls [`notebook::persist_cell`]
+/// to append each executed cell. See
+/// [`docs/design/centaur-data-scientist.md`](../../../docs/design/centaur-data-scientist.md)
+/// §4.1, the notebook-artifact bullet.
+pub mod notebook;
 pub mod store;
 pub mod summary;
 

@@ -189,16 +189,83 @@ fn tool_definitions() -> Value {
         }),
         serde_json::json!({
             "name": "run_cell",
-            "description": "Run a code cell on the attached Jupyter kernel (call kernel_attach first). Returns stdout/stderr, rich text results, and any error. PNG plots are written to <data-dir>/.newt-data/plots/ and reported as a file path + honest size summary — never inlined. The exact code is shown in chat before it runs.",
+            "description": "Run a code cell on the attached Jupyter kernel (call kernel_attach first). Returns stdout/stderr, rich text results, and any error. PNG plots are written to <data-dir>/.newt-data/plots/ and reported as a file path + honest size summary — never inlined. The exact code is shown in chat before it runs. Pass `persist_to` to also append this executed cell (source + outputs, plots inlined so the notebook renders) to a .ipynb on disk — a faithful, reviewable, git-diffable record.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "code": {
                         "type": "string",
                         "description": "The Python (or kernel-language) code to execute in one cell"
+                    },
+                    "persist_to": {
+                        "type": "string",
+                        "description": "Optional path to a .ipynb notebook; after a successful run, append this cell (source + outputs) to it (created if missing). The run result is returned regardless — a persist failure is reported but does not discard it."
                     }
                 },
                 "required": ["code"]
+            }
+        }),
+        serde_json::json!({
+            "name": "notebook_read",
+            "description": "Read an .ipynb notebook and return a reviewable summary of every cell: index, cell_type (code/markdown/raw), source (joined), and whether a code cell has outputs. A missing, corrupt, or non-nbformat-4 file is an in-band error.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Filesystem path to the .ipynb notebook to read"
+                    }
+                },
+                "required": ["path"]
+            }
+        }),
+        serde_json::json!({
+            "name": "notebook_insert_cell",
+            "description": "PROPOSE a cell in an .ipynb notebook without executing it (a code cell goes in with execution_count:null and no outputs). Inserts at `index` (or appends when omitted); creates the notebook if it does not exist. Returns the inserted index. To run AND record a cell, use run_cell with persist_to instead.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Filesystem path to the .ipynb notebook (created if missing)"
+                    },
+                    "source": {
+                        "type": "string",
+                        "description": "The cell source (code or markdown text)"
+                    },
+                    "index": {
+                        "type": "integer",
+                        "description": "Zero-based position to insert at; omit to append. An out-of-range index appends."
+                    },
+                    "cell_type": {
+                        "type": "string",
+                        "description": "Cell kind: code (default), markdown, or raw"
+                    }
+                },
+                "required": ["path", "source"]
+            }
+        }),
+        serde_json::json!({
+            "name": "notebook_persist_executed_cell",
+            "description": "Append a CODE cell carrying `source` and caller-supplied nbformat `outputs` (already nbformat-shaped Values) to an .ipynb notebook, atomically; creates the notebook if missing. Returns the appended index. This is the low-level primitive run_cell(persist_to) uses; prefer run_cell(persist_to) to run and record in one step.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Filesystem path to the .ipynb notebook (created if missing)"
+                    },
+                    "source": {
+                        "type": "string",
+                        "description": "The executed cell's source"
+                    },
+                    "outputs": {
+                        "type": "array",
+                        "description": "nbformat-shaped output Values (stream / execute_result / display_data / error) to attach to the cell",
+                        "items": { "type": "object" }
+                    }
+                },
+                "required": ["path", "source", "outputs"]
             }
         }),
     ];
@@ -238,6 +305,11 @@ fn register_tools_call(
                 "sql_list_tables" => Ok(handle_sql_list_tables(&store)),
                 "kernel_attach" => Ok(handle_kernel_attach(&arguments, &session, &plots_dir).await),
                 "run_cell" => Ok(handle_run_cell(&arguments, &session).await),
+                "notebook_read" => Ok(handle_notebook_read(&arguments)),
+                "notebook_insert_cell" => Ok(handle_notebook_insert_cell(&arguments)),
+                "notebook_persist_executed_cell" => {
+                    Ok(handle_notebook_persist_executed_cell(&arguments))
+                }
                 // An unknown tool name is a transport-level `-32603`, matching
                 // `newt-mcp-server`'s `other =>` arm. A *known* tool failing for
                 // its own reasons (bad SQL, missing arg, no kernel attached)
@@ -345,11 +417,24 @@ async fn handle_kernel_attach(args: &Value, session: &KernelSession, plots_dir: 
 /// where the cell raised — returns a [`CellRun`](newt_data::kernel::CellRun)
 /// summary as pretty JSON: stdout/stderr, text results, image **paths** + honest
 /// size summaries (never inlined bytes), and any `ename`/`evalue`.
+///
+/// ## `persist_to` (Phase 21.4)
+///
+/// When the caller passes `persist_to: <notebook.ipynb>`, the executed cell is
+/// appended to that notebook after a successful run: the [`CellRun`] is converted
+/// to nbformat outputs (PNG plots **re-read and inlined** so the notebook
+/// renders) and appended via [`newt_data::notebook::persist_cell`], leaving a
+/// faithful, git-diffable record. The persist is reported in the summary's
+/// `persisted` field. Crucially, **a persist failure does not discard the run
+/// result** — the cell already ran; the failure is reported (`persisted.error`)
+/// alongside the run so the model still sees the output and can retry the write.
 async fn handle_run_cell(args: &Value, session: &KernelSession) -> Value {
     let code = match required_str(args, "code") {
         Ok(c) => c,
         Err(e) => return e,
     };
+    // `persist_to` is optional; absent → no persistence.
+    let persist_to = args.get("persist_to").and_then(Value::as_str);
 
     let guard = session.lock().await;
     let client = match guard.as_ref() {
@@ -361,9 +446,28 @@ async fn handle_run_cell(args: &Value, session: &KernelSession) -> Value {
         }
     };
 
-    match client.run_cell(code).await {
-        Ok(run) => pretty_or_error(serde_json::to_string(&run_summary(&run))),
-        Err(e) => mcp_error_content(&format!("run_cell failed: {e}")),
+    let run = match client.run_cell(code).await {
+        Ok(run) => run,
+        Err(e) => return mcp_error_content(&format!("run_cell failed: {e}")),
+    };
+
+    // After a successful run, optionally persist the executed cell. A persist
+    // failure is reported in the summary but never discards the run result.
+    let persisted = persist_to.map(|path| persist_run(path, code, &run));
+
+    pretty_or_error(serde_json::to_string(&run_summary(&run, persisted)))
+}
+
+/// Append a just-executed cell to a notebook, returning the model-facing
+/// `persisted` summary object (`{ path, index }` on success, `{ path, error }`
+/// on failure). Converts the [`CellRun`] to nbformat outputs (Phase 21.4 bridge)
+/// and calls [`newt_data::notebook::persist_cell`]; the run result is reported by
+/// the caller regardless of this outcome.
+fn persist_run(path: &str, code: &str, run: &newt_data::kernel::CellRun) -> Value {
+    let outputs = newt_data::kernel::cell_run_to_nb_outputs(run);
+    match newt_data::notebook::persist_cell(Path::new(path), code, outputs) {
+        Ok(index) => serde_json::json!({ "path": path, "index": index }),
+        Err(e) => serde_json::json!({ "path": path, "error": e.to_string() }),
     }
 }
 
@@ -374,7 +478,12 @@ async fn handle_run_cell(args: &Value, session: &KernelSession) -> Value {
 /// report dimensions) — the bytes are **never** inlined (Centaur principle; rich
 /// render is gilamonster's job). stdout/stderr/results/error/execution_count are
 /// passed through faithfully.
-fn run_summary(run: &newt_data::kernel::CellRun) -> Value {
+///
+/// `persisted` (Phase 21.4) carries the `run_cell(persist_to=…)` outcome when the
+/// caller asked to record the cell: `{ path, index }` on success, `{ path, error
+/// }` if the write failed (the run result is reported either way). It is `null`
+/// when no `persist_to` was given.
+fn run_summary(run: &newt_data::kernel::CellRun, persisted: Option<Value>) -> Value {
     let images: Vec<Value> = run
         .images
         .iter()
@@ -409,7 +518,82 @@ fn run_summary(run: &newt_data::kernel::CellRun) -> Value {
         "images": images,
         "error": error,
         "execution_count": run.execution_count,
+        "persisted": persisted,
     })
+}
+
+// ── Notebook tools (Phase 21.4) ─────────────────────────────────────────────
+//
+// The on-disk counterpart to the live-kernel tools: read / propose / persist
+// cells in a human-reviewable .ipynb artifact (docs/design/centaur-data-scientist.md
+// §4.1, the notebook-artifact bullet). Same in-band-error discipline — a missing
+// file, a corrupt notebook, or a missing argument is an in-band MCP tool error
+// the model can read, never a -32603 transport fault. These are pure calls into
+// the headless `newt_data::notebook` engine (no kernel needed), so they work
+// even before `kernel_attach`.
+
+/// `notebook_read`: summarize every cell of an `.ipynb` as pretty JSON. A
+/// missing, corrupt, or non-nbformat-4 file is an in-band error.
+fn handle_notebook_read(args: &Value) -> Value {
+    let path = match required_str(args, "path") {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    match newt_data::notebook::read_notebook(Path::new(path)) {
+        Ok(cells) => pretty_or_error(serde_json::to_string_pretty(&cells)),
+        Err(e) => mcp_error_content(&e.to_string()),
+    }
+}
+
+/// `notebook_insert_cell`: PROPOSE a cell (does not execute it). Inserts at
+/// `index` (or appends), creating the notebook if missing; returns the inserted
+/// index. `cell_type` defaults to `code`.
+fn handle_notebook_insert_cell(args: &Value) -> Value {
+    let path = match required_str(args, "path") {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let source = match required_str(args, "source") {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    // `index` is optional; a non-integer or absent value → append (None).
+    let index = args
+        .get("index")
+        .and_then(Value::as_u64)
+        .map(|n| n as usize);
+    // `cell_type` defaults to code; an unrecognized value also folds to code.
+    let cell_type = newt_data::notebook::CellType::from_str_lenient(
+        args.get("cell_type").and_then(Value::as_str).unwrap_or(""),
+    );
+
+    match newt_data::notebook::insert_cell(Path::new(path), source, index, cell_type) {
+        Ok(at) => mcp_text_content(&serde_json::json!({ "inserted_index": at }).to_string()),
+        Err(e) => mcp_error_content(&e.to_string()),
+    }
+}
+
+/// `notebook_persist_executed_cell`: append a code cell with caller-supplied
+/// nbformat `outputs`. The low-level primitive `run_cell(persist_to)` uses;
+/// returns the appended index. A missing/non-array `outputs` is an in-band error.
+fn handle_notebook_persist_executed_cell(args: &Value) -> Value {
+    let path = match required_str(args, "path") {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let source = match required_str(args, "source") {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    let outputs = match args.get("outputs").and_then(Value::as_array) {
+        Some(arr) => arr.clone(),
+        None => return mcp_error_content("missing required argument: outputs (must be an array)"),
+    };
+
+    match newt_data::notebook::persist_cell(Path::new(path), source, outputs) {
+        Ok(at) => mcp_text_content(&serde_json::json!({ "appended_index": at }).to_string()),
+        Err(e) => mcp_error_content(&e.to_string()),
+    }
 }
 
 // ── Argument + result helpers ──────────────────────────────────────────────
@@ -613,7 +797,8 @@ mod tests {
 
         let tools = resp["result"]["tools"].as_array().unwrap();
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-        // The four SQL tools (21.2) plus the two live-kernel tools (21.3).
+        // The four SQL tools (21.2), the two live-kernel tools (21.3), and the
+        // three notebook tools (21.4).
         for expected in [
             "sql_ingest_csv",
             "sql_query",
@@ -621,10 +806,13 @@ mod tests {
             "sql_list_tables",
             "kernel_attach",
             "run_cell",
+            "notebook_read",
+            "notebook_insert_cell",
+            "notebook_persist_executed_cell",
         ] {
             assert!(names.contains(&expected), "tools/list missing {expected}");
         }
-        assert_eq!(tools.len(), 6, "expected exactly 6 tools, got {names:?}");
+        assert_eq!(tools.len(), 9, "expected exactly 9 tools, got {names:?}");
 
         // Every tool carries an inputSchema object.
         for tool in tools {
@@ -634,7 +822,8 @@ mod tests {
                 tool["name"]
             );
         }
-        // kernel_attach requires `url`; run_cell requires `code`.
+        // kernel_attach requires `url`; run_cell requires `code` (persist_to is
+        // optional, so it must NOT be in `required`).
         let attach = tools.iter().find(|t| t["name"] == "kernel_attach").unwrap();
         assert_eq!(
             attach["inputSchema"]["required"],
@@ -642,6 +831,28 @@ mod tests {
         );
         let run = tools.iter().find(|t| t["name"] == "run_cell").unwrap();
         assert_eq!(run["inputSchema"]["required"], serde_json::json!(["code"]));
+        // run_cell advertises the optional persist_to property.
+        assert!(
+            run["inputSchema"]["properties"]["persist_to"].is_object(),
+            "run_cell must advertise the optional persist_to argument"
+        );
+        // notebook_insert_cell requires path + source; persist requires outputs too.
+        let insert = tools
+            .iter()
+            .find(|t| t["name"] == "notebook_insert_cell")
+            .unwrap();
+        assert_eq!(
+            insert["inputSchema"]["required"],
+            serde_json::json!(["path", "source"])
+        );
+        let persist = tools
+            .iter()
+            .find(|t| t["name"] == "notebook_persist_executed_cell")
+            .unwrap();
+        assert_eq!(
+            persist["inputSchema"]["required"],
+            serde_json::json!(["path", "source", "outputs"])
+        );
     }
 
     // ── happy-path flow: ingest → query → summarize → list ──────────────────
@@ -1121,12 +1332,339 @@ mod tests {
             ],
             ..Default::default()
         };
-        let summary = run_summary(&run);
+        let summary = run_summary(&run, None);
         assert_eq!(
             summary["images"][0]["summary"],
             "800x600 PNG saved: /p/a.png"
         );
         // No dimensions → no size prefix, just the path.
         assert_eq!(summary["images"][1]["summary"], "PNG saved: /p/b.png");
+        // No persist requested → persisted is null.
+        assert!(summary["persisted"].is_null());
+    }
+
+    // ── notebook tools (Phase 21.4) — over a tempfile .ipynb ─────────────────
+
+    /// A throwaway `.ipynb` path under a fresh tempdir. Returns the dir (kept
+    /// alive by the caller) and the path string.
+    fn nb_path() -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("work.ipynb").display().to_string();
+        (dir, path)
+    }
+
+    /// notebook_insert_cell proposes a cell, notebook_read shows it, and
+    /// notebook_persist_executed_cell appends a cell with outputs — the three
+    /// 21.4 tools over one tempfile notebook.
+    #[tokio::test]
+    async fn notebook_insert_read_persist_round_trip() {
+        let (_dir, path) = nb_path();
+
+        // 1. Insert a code cell (creates the notebook). Returns inserted_index 0.
+        let resp = rpc(&call(
+            60,
+            "notebook_insert_cell",
+            serde_json::json!({ "path": path, "source": "import pandas as pd" }),
+        ))
+        .await;
+        assert!(resp["error"].is_null(), "must be in-band: {resp}");
+        assert!(
+            resp["result"]["isError"].is_null(),
+            "should succeed: {resp}"
+        );
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        let out: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(out["inserted_index"], 0);
+
+        // 2. Read it back — one cell, code, the source we inserted, no outputs.
+        let resp = rpc(&call(
+            61,
+            "notebook_read",
+            serde_json::json!({ "path": path }),
+        ))
+        .await;
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        let cells: Value = serde_json::from_str(text).unwrap();
+        let cells = cells.as_array().unwrap();
+        assert_eq!(cells.len(), 1);
+        assert_eq!(cells[0]["cell_type"], "code");
+        assert_eq!(cells[0]["source"], "import pandas as pd");
+        assert_eq!(cells[0]["has_output"], false);
+
+        // 3. Persist an executed cell with nbformat outputs → appended at index 1.
+        let resp = rpc(&call(
+            62,
+            "notebook_persist_executed_cell",
+            serde_json::json!({
+                "path": path,
+                "source": "df.head()",
+                "outputs": [
+                    { "output_type": "stream", "name": "stdout", "text": "ok\n" }
+                ]
+            }),
+        ))
+        .await;
+        assert!(
+            resp["result"]["isError"].is_null(),
+            "should succeed: {resp}"
+        );
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        let out: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(out["appended_index"], 1);
+
+        // 4. Read again — two cells; the appended one carries an output.
+        let resp = rpc(&call(
+            63,
+            "notebook_read",
+            serde_json::json!({ "path": path }),
+        ))
+        .await;
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        let cells: Value = serde_json::from_str(text).unwrap();
+        let cells = cells.as_array().unwrap();
+        assert_eq!(cells.len(), 2);
+        assert_eq!(cells[1]["source"], "df.head()");
+        assert_eq!(cells[1]["has_output"], true);
+    }
+
+    /// notebook_read on a missing file is an in-band error (not a transport fault).
+    #[tokio::test]
+    async fn notebook_read_missing_file_is_in_band_error() {
+        let (_dir, path) = nb_path(); // path does not exist yet
+        let resp = rpc(&call(
+            64,
+            "notebook_read",
+            serde_json::json!({ "path": path }),
+        ))
+        .await;
+        assert!(resp["error"].is_null(), "must be in-band: {resp}");
+        assert_eq!(resp["result"]["isError"], true);
+    }
+
+    /// notebook_read on a corrupt notebook is an in-band "invalid notebook" error.
+    #[tokio::test]
+    async fn notebook_read_corrupt_file_is_in_band_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.ipynb");
+        std::fs::write(&path, "{ not json").unwrap();
+        let resp = rpc(&call(
+            65,
+            "notebook_read",
+            serde_json::json!({ "path": path.display().to_string() }),
+        ))
+        .await;
+        assert_eq!(resp["result"]["isError"], true);
+        assert!(resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("invalid notebook"));
+    }
+
+    /// notebook_insert_cell with a missing `source` is an in-band error.
+    #[tokio::test]
+    async fn notebook_insert_missing_source_is_in_band_error() {
+        let (_dir, path) = nb_path();
+        let resp = rpc(&call(
+            66,
+            "notebook_insert_cell",
+            serde_json::json!({ "path": path }),
+        ))
+        .await;
+        assert_eq!(resp["result"]["isError"], true);
+        assert!(resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("missing required argument: source"));
+    }
+
+    /// notebook_persist_executed_cell with a missing `outputs` array is an
+    /// in-band error.
+    #[tokio::test]
+    async fn notebook_persist_missing_outputs_is_in_band_error() {
+        let (_dir, path) = nb_path();
+        let resp = rpc(&call(
+            67,
+            "notebook_persist_executed_cell",
+            serde_json::json!({ "path": path, "source": "x = 1" }),
+        ))
+        .await;
+        assert_eq!(resp["result"]["isError"], true);
+        assert!(resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("missing required argument: outputs"));
+    }
+
+    /// run_cell(persist_to=…) against an attached MockKernel appends the executed
+    /// cell — source + converted nbformat outputs, INCLUDING an image
+    /// `display_data` whose base64 is re-read from the on-disk PNG — to the
+    /// `.ipynb`, and reports the persisted path + index in the run summary.
+    #[tokio::test]
+    async fn run_cell_persist_to_appends_executed_cell_with_image_to_notebook() {
+        let dir = tempfile::tempdir().unwrap();
+        // A real PNG on disk that the ImageOutput points at, so the conversion
+        // re-reads and base64-encodes its exact bytes into the notebook.
+        let png_path = dir.path().join("cell-5-plot.png");
+        let raw_png = vec![0x89u8, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+        std::fs::write(&png_path, &raw_png).unwrap();
+        let nb = dir.path().join("session.ipynb").display().to_string();
+
+        let run = CellRun {
+            stdout: "plotting\n".into(),
+            stderr: String::new(),
+            results: vec![DisplayItem {
+                mime: "text/plain".into(),
+                text: "<Figure>".into(),
+            }],
+            images: vec![ImageOutput {
+                path: png_path,
+                mime: "image/png".into(),
+                width: Some(640),
+                height: Some(480),
+            }],
+            error: None,
+            execution_count: Some(5),
+        };
+
+        let resp = rpc_full(
+            Arc::new(SqliteBackend::open_in_memory().unwrap()),
+            session_with(run),
+            &call(
+                70,
+                "run_cell",
+                serde_json::json!({
+                    "code": "plt.plot([1,2,3]); plt.show()",
+                    "persist_to": nb,
+                }),
+            ),
+        )
+        .await;
+        assert!(resp["error"].is_null(), "must be in-band: {resp}");
+        assert!(
+            resp["result"]["isError"].is_null(),
+            "should succeed: {resp}"
+        );
+
+        // The run summary reports the persist: path + appended index 0.
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        let summary: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(summary["persisted"]["path"], nb);
+        assert_eq!(summary["persisted"]["index"], 0);
+        assert!(
+            summary["persisted"]["error"].is_null(),
+            "persist must have succeeded: {summary}"
+        );
+
+        // The notebook on disk now holds the executed cell: source + outputs.
+        let raw: Value = serde_json::from_slice(&std::fs::read(&nb).unwrap()).unwrap();
+        let cell = &raw["cells"][0];
+        assert_eq!(cell["cell_type"], "code");
+        assert_eq!(cell["source"], "plt.plot([1,2,3]); plt.show()");
+        let outputs = cell["outputs"].as_array().unwrap();
+        // stream(stdout), execute_result(text/plain), display_data(image/png).
+        assert_eq!(outputs.len(), 3);
+        assert_eq!(outputs[0]["output_type"], "stream");
+        assert_eq!(outputs[0]["text"], "plotting\n");
+        assert_eq!(outputs[1]["output_type"], "execute_result");
+        assert_eq!(outputs[1]["data"]["text/plain"], "<Figure>");
+        let display = &outputs[2];
+        assert_eq!(display["output_type"], "display_data");
+        // The PNG was re-read and base64-encoded so the notebook RENDERS it.
+        let b64 = display["data"]["image/png"].as_str().unwrap();
+        // Decode the stored base64 and confirm it is the exact on-disk PNG bytes.
+        let decoded = base64_decode_for_test(b64);
+        assert_eq!(
+            decoded, raw_png,
+            "the persisted notebook embeds the real plot bytes"
+        );
+        assert_eq!(display["metadata"]["image/png"]["width"], 640);
+        assert_eq!(display["metadata"]["image/png"]["height"], 480);
+    }
+
+    /// A persist failure (an unwritable notebook path) is REPORTED in the summary
+    /// but does NOT discard the run result — the cell already ran.
+    #[tokio::test]
+    async fn run_cell_persist_failure_does_not_discard_run() {
+        // Point persist_to at a path whose parent is a FILE, so the write fails.
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("not-a-dir");
+        std::fs::write(&blocker, b"i am a file").unwrap();
+        let bad_nb = blocker.join("nested.ipynb").display().to_string();
+
+        let resp = rpc_full(
+            Arc::new(SqliteBackend::open_in_memory().unwrap()),
+            session_with(canned_run()),
+            &call(
+                71,
+                "run_cell",
+                serde_json::json!({ "code": "1+1", "persist_to": bad_nb }),
+            ),
+        )
+        .await;
+        // The MCP call itself succeeded — the run result is intact.
+        assert!(resp["error"].is_null(), "must be in-band: {resp}");
+        assert!(
+            resp["result"]["isError"].is_null(),
+            "a persist failure must not turn the successful run into a tool error: {resp}"
+        );
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        let summary: Value = serde_json::from_str(text).unwrap();
+        // The run output is still reported …
+        assert_eq!(summary["stdout"], "hello from kernel\n");
+        assert_eq!(summary["execution_count"], 5);
+        // … and the persist failure is reported alongside it.
+        assert_eq!(summary["persisted"]["path"], bad_nb);
+        assert!(
+            summary["persisted"]["error"].is_string(),
+            "the persist error must be reported: {summary}"
+        );
+        assert!(summary["persisted"]["index"].is_null());
+    }
+
+    /// run_cell WITHOUT persist_to leaves `persisted` null (no notebook touched).
+    #[tokio::test]
+    async fn run_cell_without_persist_to_has_null_persisted() {
+        let resp = rpc_full(
+            Arc::new(SqliteBackend::open_in_memory().unwrap()),
+            session_with(canned_run()),
+            &call(72, "run_cell", serde_json::json!({ "code": "1+1" })),
+        )
+        .await;
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        let summary: Value = serde_json::from_str(text).unwrap();
+        assert!(summary["persisted"].is_null());
+    }
+
+    /// A tiny RFC 4648 base64 decoder for the test assertion above (the prod
+    /// decoder lives in newt-data behind the kernel feature; this keeps the
+    /// adapter test self-contained).
+    fn base64_decode_for_test(s: &str) -> Vec<u8> {
+        fn val(c: u8) -> u8 {
+            match c {
+                b'A'..=b'Z' => c - b'A',
+                b'a'..=b'z' => c - b'a' + 26,
+                b'0'..=b'9' => c - b'0' + 52,
+                b'+' => 62,
+                b'/' => 63,
+                _ => 0,
+            }
+        }
+        let bytes: Vec<u8> = s.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
+        let mut out = Vec::new();
+        for chunk in bytes.chunks(4) {
+            let pad = chunk.iter().rev().take_while(|&&b| b == b'=').count();
+            let b0 = val(chunk[0]);
+            let b1 = val(chunk[1]);
+            let b2 = if pad >= 2 { 0 } else { val(chunk[2]) };
+            let b3 = if pad >= 1 { 0 } else { val(chunk[3]) };
+            out.push((b0 << 2) | (b1 >> 4));
+            if pad < 2 {
+                out.push((b1 << 4) | (b2 >> 2));
+            }
+            if pad < 1 {
+                out.push((b2 << 6) | b3);
+            }
+        }
+        out
     }
 }

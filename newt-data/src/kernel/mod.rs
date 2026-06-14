@@ -379,9 +379,9 @@ fn decode_png_base64(b64: &str) -> anyhow::Result<Vec<u8>> {
 
 /// Standard base64 (RFC 4648) decode. A tiny self-contained decoder mirroring the
 /// engine's `base64_encode` so the pure accumulator carries no base64 dependency
-/// of its own at the *parse* layer (the `base64` crate is only enabled under the
-/// `kernel` feature for the transport; keeping the decode here self-contained
-/// keeps the accumulator's unit tests buildable on the same minimal surface).
+/// of its own at the *parse* layer (this crate deliberately does **not** depend on
+/// the `base64` crate at all — keeping the decode here self-contained keeps the
+/// accumulator's unit tests buildable on the same minimal surface).
 fn base64_decode(s: &str) -> Result<Vec<u8>, String> {
     fn val(c: u8) -> Result<u8, String> {
         match c {
@@ -443,6 +443,134 @@ pub trait KernelClient: Send {
 /// plots alongside the data store. Pulled out so the path policy is one place.
 pub fn plots_dir(data_dir: &Path) -> PathBuf {
     data_dir.join("plots")
+}
+
+/// Convert a [`CellRun`] into the [nbformat](https://nbformat.readthedocs.io)
+/// `outputs` array a persisted code cell carries (Phase 21.4).
+///
+/// This is the bridge between the live-kernel transport (21.3) and the on-disk
+/// notebook artifact (21.4): `run_cell(persist_to=…)` runs a cell, folds the
+/// iopub stream into a [`CellRun`], then hands that `CellRun` here to produce the
+/// `Vec<serde_json::Value>` outputs that [`crate::notebook::persist_cell`] appends.
+/// The persisted notebook then renders **exactly** what the cell produced — a
+/// faithful, reviewable artifact (see
+/// [`docs/design/centaur-data-scientist.md`](../../../../docs/design/centaur-data-scientist.md)
+/// §4.1, the notebook-artifact bullet).
+///
+/// The mapping follows the nbformat v4 output-type schema:
+///
+/// - `stdout` / `stderr` → one `stream` output each (`{ output_type, name, text }`),
+///   emitted only when non-empty so an output-free cell stays clean.
+/// - each text [`DisplayItem`] → an `execute_result`
+///   (`{ output_type, data: { <mime>: text }, metadata: {}, execution_count }`).
+/// - each [`ImageOutput`] → a `display_data` carrying the PNG **re-read from disk
+///   and base64-encoded** into `data["image/png"]` (with `metadata["image/png"]`
+///   width/height when known), so the notebook actually renders the plot rather
+///   than pointing at a path. A PNG that cannot be read is **skipped** with a
+///   `tracing::warn` — the persist is still total (no panic, no aborted write).
+/// - a [`KernelError`] → one `error` output (`{ output_type, ename, evalue,
+///   traceback }`).
+///
+/// Output ordering is stdout, stderr, text results, images, then error — a
+/// natural reading order for a reviewer scanning the cell.
+pub fn cell_run_to_nb_outputs(run: &CellRun) -> Vec<serde_json::Value> {
+    let mut outputs = Vec::new();
+
+    if !run.stdout.is_empty() {
+        outputs.push(serde_json::json!({
+            "output_type": "stream",
+            "name": "stdout",
+            "text": run.stdout,
+        }));
+    }
+    if !run.stderr.is_empty() {
+        outputs.push(serde_json::json!({
+            "output_type": "stream",
+            "name": "stderr",
+            "text": run.stderr,
+        }));
+    }
+
+    for item in &run.results {
+        outputs.push(serde_json::json!({
+            "output_type": "execute_result",
+            "data": { item.mime.clone(): item.text },
+            "metadata": {},
+            "execution_count": run.execution_count,
+        }));
+    }
+
+    for img in &run.images {
+        match std::fs::read(&img.path) {
+            Ok(bytes) => {
+                let mut data = serde_json::Map::new();
+                data.insert(
+                    MIME_PNG.to_string(),
+                    serde_json::json!(base64_encode(&bytes)),
+                );
+                let mut png_meta = serde_json::Map::new();
+                if let Some(w) = img.width {
+                    png_meta.insert("width".to_string(), serde_json::json!(w));
+                }
+                if let Some(h) = img.height {
+                    png_meta.insert("height".to_string(), serde_json::json!(h));
+                }
+                outputs.push(serde_json::json!({
+                    "output_type": "display_data",
+                    "data": serde_json::Value::Object(data),
+                    "metadata": { MIME_PNG: serde_json::Value::Object(png_meta) },
+                }));
+            }
+            // Total, not fatal: a missing/unreadable plot file is skipped (the
+            // run already happened; the notebook stays writable) and logged so
+            // the gap is visible rather than silent.
+            Err(e) => {
+                tracing::warn!(
+                    path = %img.path.display(),
+                    error = %e,
+                    "cell_run_to_nb_outputs: skipping unreadable PNG plot when persisting cell"
+                );
+            }
+        }
+    }
+
+    if let Some(err) = &run.error {
+        outputs.push(serde_json::json!({
+            "output_type": "error",
+            "ename": err.ename,
+            "evalue": err.evalue,
+            "traceback": err.traceback,
+        }));
+    }
+
+    outputs
+}
+
+/// Standard base64 (RFC 4648, with `=` padding) of `bytes` — the inverse of the
+/// accumulator's [`base64_decode`]. Kept self-contained (mirroring the engine's
+/// `sqlite::base64_encode`) so the nbformat `image/png` re-encode carries no new
+/// dependency at this layer.
+fn base64_encode(bytes: &[u8]) -> String {
+    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = chunk.get(1).copied().unwrap_or(0);
+        let b2 = chunk.get(2).copied().unwrap_or(0);
+        out.push(A[(b0 >> 2) as usize] as char);
+        out.push(A[(((b0 & 0b11) << 4) | (b1 >> 4)) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            A[(((b1 & 0b1111) << 2) | (b2 >> 6)) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            A[(b2 & 0b111111) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
 }
 
 #[cfg(test)]
@@ -811,5 +939,150 @@ mod tests {
         let written = sink.last.unwrap();
         assert!(written.exists());
         assert_eq!(std::fs::read(&written).unwrap(), raw);
+    }
+
+    // ── cell_run_to_nb_outputs (Phase 21.4 bridge to the notebook artifact) ──
+
+    #[test]
+    fn base64_encode_matches_rfc_vectors_and_round_trips() {
+        // The encoder is the inverse of the accumulator's base64_decode.
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
+        assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+        // Round-trips with the decoder for arbitrary bytes.
+        let bytes = vec![0x89u8, b'P', b'N', b'G', 0x00, 0xff, 0x10];
+        assert_eq!(base64_decode(&base64_encode(&bytes)).unwrap(), bytes);
+    }
+
+    #[test]
+    fn cell_run_to_nb_outputs_maps_streams_results_and_error() {
+        let run = CellRun {
+            stdout: "out\n".into(),
+            stderr: "warn\n".into(),
+            results: vec![DisplayItem {
+                mime: "text/plain".into(),
+                text: "42".into(),
+            }],
+            images: vec![],
+            error: Some(KernelError {
+                ename: "ValueError".into(),
+                evalue: "bad".into(),
+                traceback: vec!["Traceback...".into(), "ValueError: bad".into()],
+            }),
+            execution_count: Some(9),
+        };
+        let outputs = cell_run_to_nb_outputs(&run);
+        // stdout, stderr, one execute_result, one error → 4 outputs in order.
+        assert_eq!(outputs.len(), 4);
+        assert_eq!(outputs[0]["output_type"], "stream");
+        assert_eq!(outputs[0]["name"], "stdout");
+        assert_eq!(outputs[0]["text"], "out\n");
+        assert_eq!(outputs[1]["name"], "stderr");
+        assert_eq!(outputs[2]["output_type"], "execute_result");
+        assert_eq!(outputs[2]["data"]["text/plain"], "42");
+        assert_eq!(outputs[2]["execution_count"], 9);
+        assert_eq!(outputs[2]["metadata"], serde_json::json!({}));
+        assert_eq!(outputs[3]["output_type"], "error");
+        assert_eq!(outputs[3]["ename"], "ValueError");
+        assert_eq!(outputs[3]["evalue"], "bad");
+        assert_eq!(outputs[3]["traceback"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn cell_run_to_nb_outputs_skips_empty_streams() {
+        // A cell with only a result emits exactly one output (no empty streams).
+        let run = CellRun {
+            results: vec![DisplayItem {
+                mime: "text/html".into(),
+                text: "<b>1</b>".into(),
+            }],
+            execution_count: Some(1),
+            ..Default::default()
+        };
+        let outputs = cell_run_to_nb_outputs(&run);
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0]["output_type"], "execute_result");
+        assert_eq!(outputs[0]["data"]["text/html"], "<b>1</b>");
+    }
+
+    #[test]
+    fn cell_run_to_nb_outputs_rereads_png_into_display_data_base64() {
+        // Write a real (sentinel) PNG to disk, point an ImageOutput at it, and
+        // assert the display_data carries the base64 of those exact bytes so the
+        // persisted notebook RENDERS the plot (faithful artifact).
+        let dir = tempfile::tempdir().unwrap();
+        let png_path = dir.path().join("cell-5-x.png");
+        let raw = vec![0x89u8, b'P', b'N', b'G', 0x0d, 0x0a];
+        std::fs::write(&png_path, &raw).unwrap();
+
+        let run = CellRun {
+            images: vec![ImageOutput {
+                path: png_path,
+                mime: MIME_PNG.into(),
+                width: Some(640),
+                height: Some(480),
+            }],
+            execution_count: Some(5),
+            ..Default::default()
+        };
+        let outputs = cell_run_to_nb_outputs(&run);
+        assert_eq!(outputs.len(), 1);
+        let out = &outputs[0];
+        assert_eq!(out["output_type"], "display_data");
+        // The bytes were re-read and base64-encoded — decoding gives them back.
+        let b64 = out["data"][MIME_PNG].as_str().unwrap();
+        assert_eq!(base64_decode(b64).unwrap(), raw);
+        // Size metadata travels under metadata["image/png"].
+        assert_eq!(out["metadata"][MIME_PNG]["width"], 640);
+        assert_eq!(out["metadata"][MIME_PNG]["height"], 480);
+    }
+
+    #[test]
+    fn cell_run_to_nb_outputs_skips_missing_png_without_panic() {
+        // A plot whose file is gone is skipped (total, not fatal) — no panic, no
+        // output emitted for it.
+        let run = CellRun {
+            images: vec![ImageOutput {
+                path: PathBuf::from("/no/such/plot/cell-1-gone.png"),
+                mime: MIME_PNG.into(),
+                width: None,
+                height: None,
+            }],
+            ..Default::default()
+        };
+        let outputs = cell_run_to_nb_outputs(&run);
+        assert!(
+            outputs.is_empty(),
+            "an unreadable PNG is skipped, not panicked on"
+        );
+    }
+
+    #[test]
+    fn cell_run_to_nb_outputs_png_without_dimensions_omits_size_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let png_path = dir.path().join("p.png");
+        std::fs::write(&png_path, b"\x89PNG").unwrap();
+        let run = CellRun {
+            images: vec![ImageOutput {
+                path: png_path,
+                mime: MIME_PNG.into(),
+                width: None,
+                height: None,
+            }],
+            ..Default::default()
+        };
+        let outputs = cell_run_to_nb_outputs(&run);
+        assert_eq!(outputs.len(), 1);
+        // metadata["image/png"] is present but empty (no width/height keys).
+        assert_eq!(outputs[0]["metadata"][MIME_PNG], serde_json::json!({}));
+    }
+
+    #[test]
+    fn cell_run_to_nb_outputs_empty_run_is_empty() {
+        assert!(cell_run_to_nb_outputs(&CellRun::default()).is_empty());
     }
 }
