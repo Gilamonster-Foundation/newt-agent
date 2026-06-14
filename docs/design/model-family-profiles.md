@@ -25,6 +25,27 @@ the suite is **open-ended**: new profiles join as the sweep finds families that
 need distinct tooling. `default` is **today's harness, unchanged** — the safe
 baseline.
 
+## Naming — discovered, not declared
+
+A profile is named for its **target** (`nemotron`), not its behavior — on
+purpose. Naming it for what it *does* (`self-grounding`, `knowledge-base`,
+`ast-support`) presumes the diagnosis before the sweep returns it; `nemotron`
+names the model we're tuning *for* and stays honest about the rest. The
+discipline: **name the target now, measure what it needs, then name the things it
+needs** — names follow measurement, the same ethos as discovered-not-guessed
+profile *values*.
+
+The capability vocabulary will emerge from the schema's knobs, because the names
+that feel right already map onto them: **knowledge-base** ≈ the FFI manifest (R1,
+a KB of the real import surface that survives compression); **self-grounding** ≈
+forced re-ground-after-compression (R4); **ast-support / symbol-tree** ≈ the
+symbol-level oracle (#74); **python-ide / rust-ide** ≈ the per-language verify
+adapters. The destination — not yet, and not a commitment here — is a profile
+**composed** from named capabilities (`nemotron = knowledge-base + self-grounding
++ ast-support`), where any model selects the capabilities its failure mode needs.
+Until the sweep tells us which knobs Nemotron actually needs, the profile keeps
+its target name and the suite stays open.
+
 ## Motivation — why per family
 
 Two findings make this concrete and force the design.
