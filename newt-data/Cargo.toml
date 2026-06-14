@@ -19,6 +19,16 @@ serde_json.workspace = true
 rusqlite.workspace = true
 csv.workspace = true
 tracing.workspace = true
+# nbformat `.ipynb` persistence (Phase 21.4 — src/notebook.rs). Pure JSON
+# manipulation, so these stay outside the `kernel` feature:
+#  - `uuid` mints nbformat-4.5 cell ids (it was already pulled in optionally by
+#    the kernel feature for plot filenames; the notebook module needs it in the
+#    default build too, so it is promoted to a non-optional dependency here).
+#  - `tempfile` backs the atomic same-dir write+rename (same durable-write
+#    discipline as the conversation store); previously dev-only, now a runtime
+#    dep because the notebook writer uses it in non-test code.
+uuid.workspace = true
+tempfile.workspace = true
 
 # Optional PyO3 bindings — opt in only via the umbrella `newt-agent-py`
 # crate; default builds stay Python-free.
@@ -33,8 +43,13 @@ tokio-tungstenite = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
 futures-util = { version = "0.3", optional = true }
 async-trait = { workspace = true, optional = true }
-uuid = { workspace = true, optional = true }
-base64 = { workspace = true, optional = true }
+# `uuid` is a non-optional dependency (declared above) since Phase 21.4 — the
+# notebook module mints cell ids in the default build — so the kernel feature
+# no longer needs to pull it.
+# `base64` is intentionally NOT a dependency: this crate carries its own
+# self-contained RFC 4648 encode/decode in `kernel/mod.rs` (Phase 21.4 keeps the
+# notebook PNG re-encode and the accumulator's decode on one minimal surface), so
+# nothing here references the `base64` crate even under the `kernel` feature.
 url = { version = "2", optional = true }
 
 [features]
@@ -51,8 +66,6 @@ kernel = [
     "dep:tokio",
     "dep:futures-util",
     "dep:async-trait",
-    "dep:uuid",
-    "dep:base64",
     "dep:url",
 ]
 # Opt-in gate for the embedded-interpreter unit tests in `pyo3_module.rs`.
@@ -67,7 +80,9 @@ kernel = [
 embed-tests = ["pyo3"]
 
 [dev-dependencies]
-tempfile.workspace = true
+# NOTE: `tempfile` is a runtime dependency as of Phase 21.4 (the notebook
+# writer's atomic same-dir write), so it is declared under `[dependencies]`
+# above; tests use it from there.
 # Kernel-transport tests (Phase 21.3): an in-process mock Jupyter REST endpoint
 # (wiremock) + a mock kernel-channels websocket server (tokio-tungstenite server
 # side, driven over a tokio runtime) so `rest.rs` is covered without a live

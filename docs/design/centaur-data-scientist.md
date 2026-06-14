@@ -7,6 +7,11 @@ slice**: net-new SQL EDA reachable from newt chat via one `[[mcp_servers]]` line
 co-pilot: the agent now attaches to the human's running Jupyter server and runs
 cells (`kernel_attach` + `run_cell`), reading back stdout/stderr, rich results,
 and PNG plots written to disk (see [Live-kernel co-pilot](#live-kernel-co-pilot-21.3)
+below). Step 21.4 done — the notebook artifact: `notebook_read` /
+`notebook_insert_cell` / `notebook_persist_executed_cell`, and
+`run_cell(persist_to=…)` now appends each executed cell (source + outputs, plots
+inlined so the notebook renders) to a real `.ipynb`, leaving a faithful,
+reviewable, git-diffable record (see [Notebook artifact](#notebook-artifact-21.4)
 below). Step 21.6 done — the same SQLite primitives are importable into a human
 notebook as the `newt_agent.data` PyO3 submodule of the umbrella wheel (see
 [In the notebook](#in-the-notebook-21.6) below).
@@ -91,9 +96,20 @@ never entangled with the conversation store.
   token, no kernel attached, transport drop) is an in-band MCP tool error the
   model can read; a cell that *raises* is a successful run with `error` set.
   `interrupt_kernel` / `restart_kernel` arrive in 21.7.
-- **Notebook artifact (21.4):** `notebook_read`, `notebook_insert_cell`
-  (proposes; does not execute), `notebook_persist_executed_cell` — so
-  `run_cell(persist_to=…)` leaves a faithful, reviewable, git-diffable record.
+- **Notebook artifact (21.4, *shipped*):** `notebook_read` (a reviewable
+  per-cell summary of an `.ipynb`), `notebook_insert_cell` (**proposes** a cell;
+  does not execute it — a code cell goes in with `execution_count: null`,
+  `outputs: []`), `notebook_persist_executed_cell` (appends a code cell with
+  caller-supplied nbformat outputs). `run_cell` gains an optional
+  `persist_to: <notebook.ipynb>`: after a successful run it converts the
+  `CellRun` to nbformat outputs (PNG plots **re-read from disk and base64-inlined**
+  so the notebook actually renders the plot) and appends the executed cell, so the
+  human notebook stays a faithful, reviewable, git-diffable record. All writes are
+  atomic (temp file in the same dir + rename, like the conversation store); a
+  persist failure is reported but never discards an already-completed run. nbformat
+  is pure `serde_json` JSON manipulation (no new dependency); a missing/corrupt/
+  non-nbformat-4 file is an honest in-band error. See
+  [Notebook artifact](#notebook-artifact-21.4).
 - **Dataframe introspection (21.5):** `list_dataframes`, `inspect_dataframe`.
 
 ## Roadmap (Drake-flight-sized; one PR each; full acceptance contract)
@@ -101,7 +117,7 @@ never entangled with the conversation store.
 - **21.1** `newt-data` skeleton + `DataStore` trait + SQLite ingest/query/summarize. *(done)*
 - **21.2** `newt-mcp-data` server with the SQL tools (first shippable Centaur slice). *(done)*
 - **21.3** `KernelClient` trait + REST/websocket client + `kernel_attach`/`run_cell`. *(done)*
-- **21.4** notebook read/insert/persist-executed-cell + `run_cell(persist_to=…)`.
+- **21.4** notebook read/insert/persist-executed-cell + `run_cell(persist_to=…)`. *(done)*
 - **21.5** dataframe introspection · **21.6** PyO3 `newt_data` submodule + umbrella/release wiring *(done)* ·
   **21.7** interrupt/restart + reconnect hardening · **21.8** DuckDB backend behind `DataStore` ·
   **21.9** optional raw-ZMQ kernel client · **21.10** `docs/decisions/centaur_data_scientist.md` + README config snippet.
@@ -173,6 +189,55 @@ client (`rest.rs`) is covered by an in-process mock Jupyter (wiremock for REST,
 a `tokio-tungstenite` server replaying a canned iopub sequence); a real-kernel
 integration test is `#[ignore]` by default (set `JUPYTER_URL`) so CI never needs
 a live kernel and the coverage gate never depends on one.
+
+## Notebook artifact (21.4)
+
+Running a cell on a live kernel (21.3) shows the output *in chat*; 21.4 leaves a
+durable record *on disk*, so the human notebook stays a **faithful, reviewable,
+git-diffable artifact** of what the agent did. Three tools manipulate an
+`.ipynb`, plus a `persist_to` knob on `run_cell`:
+
+```text
+1. data__notebook_insert_cell { "path": "eda.ipynb", "source": "import pandas as pd" }
+   → { "inserted_index": 0 }          # PROPOSES a cell; does NOT execute it
+2. data__notebook_read { "path": "eda.ipynb" }
+   → [ { "index": 0, "cell_type": "code", "source": "import pandas as pd",
+         "has_output": false } ]
+3. data__run_cell { "code": "df.describe().plot()", "persist_to": "eda.ipynb" }
+   → { …run summary…,
+       "persisted": { "path": "eda.ipynb", "index": 1 } }   # cell + outputs appended
+```
+
+- **`notebook_read`** returns a per-cell summary (`index`, `cell_type`,
+  joined `source`, `has_output`) — a human-scannable view of the notebook.
+- **`notebook_insert_cell`** *proposes* a cell without running it: a code cell
+  goes in with `execution_count: null` and `outputs: []`, so a reviewer can tell
+  at a glance it has not executed. `index` inserts at a position (out-of-range
+  appends); `cell_type` defaults to `code`.
+- **`notebook_persist_executed_cell`** appends a code cell carrying `source` and
+  caller-supplied nbformat `outputs`. It is the low-level primitive
+  `run_cell(persist_to)` calls; callers normally use `run_cell(persist_to)`.
+- **`run_cell(persist_to=…)`** runs the cell, then converts the `CellRun` to
+  nbformat outputs and appends it. `stdout`/`stderr` → `stream`; text results →
+  `execute_result`; a raised exception → `error`; and each PNG plot is
+  **re-read from `<plots>/cell-<n>-<uuid>.png` and base64-inlined** into a
+  `display_data` output so the persisted notebook *renders the plot* (the chat
+  summary still only carries the path — the inline lives in the artifact, not the
+  conversation). The `persisted` field reports `{ path, index }` on success or
+  `{ path, error }` on failure; **a persist failure never discards the run
+  result** — the cell already ran.
+
+**Atomic, dependency-light, honest errors.** Every write goes through a temp file
+in the *same directory* + `rename` (intra-filesystem, so atomic) — the same
+durable-write discipline as the conversation store; a reader (JupyterLab, a `git
+diff`) never sees a half-written `.ipynb`, and a corrupt existing target is never
+clobbered. nbformat is just `serde_json` JSON manipulation, so this needs **no new
+dependency**. A missing, corrupt, or non-nbformat-4 file is a clean in-band MCP
+tool error the model can read (never a panic). The pure read/insert/persist
+engine lives in `newt-data/src/notebook.rs` (a *normal* module — no kernel/HTTP
+deps), unit-tested over tempfile `.ipynb` fixtures; the `CellRun` → nbformat-output
+bridge (`cell_run_to_nb_outputs`) lives beside the accumulator in
+`newt-data/src/kernel/mod.rs`.
 
 ## In the notebook (21.6)
 

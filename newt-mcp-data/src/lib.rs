@@ -24,7 +24,15 @@
 //! - `kernel_attach` — attach to the human's already-running Jupyter server.
 //! - `run_cell` — run a cell, reading back stdout/stderr, rich results, and PNG
 //!   plots (written to `<data-dir>/.newt-data/plots/`, reported as a path + an
-//!   honest size summary — never inlined).
+//!   honest size summary — never inlined). Pass `persist_to` to also append the
+//!   executed cell to a `.ipynb` (Phase 21.4).
+//!
+//! Plus the Phase 21.4 notebook artifact (the on-disk, reviewable record):
+//!
+//! - `notebook_read` — summarize every cell of an `.ipynb`.
+//! - `notebook_insert_cell` — **propose** a cell (does not execute it).
+//! - `notebook_persist_executed_cell` — append a code cell with nbformat outputs
+//!   (the low-level primitive `run_cell(persist_to)` uses).
 //!
 //! Every tool returns the MCP content envelope; **any** failure (bad SQL, no
 //! such table, a missing argument) comes back as an in-band MCP tool error
