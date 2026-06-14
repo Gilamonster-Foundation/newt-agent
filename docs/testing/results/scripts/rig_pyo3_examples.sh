@@ -96,8 +96,11 @@ JSON
     cp "$SURFACE" "$OUT/python_surface.json"
     printf '%s\nexit\n' "$INCIDENT_PROMPT" > "$PROMPTS"
     echo "rig: driving newt against $MODEL @ $URL ..." >&2
+    # Explicit sandbox under --out (7th arg) so we don't depend on a pre-seeded
+    # /tmp/newt-bench/ existing (run_newt_session.sh's mktemp default).
+    mkdir -p "$OUT/sandbox"
     SANDBOX=$(NEWT_BIN="${NEWT_BIN:-}" "$SCRIPT_DIR/run_newt_session.sh" \
-      "$MODEL" "$URL" "$WS" "$PROMPTS" "$OUT/session.log" "$NUM_CTX")
+      "$MODEL" "$URL" "$WS" "$PROMPTS" "$OUT/session.log" "$NUM_CTX" "$OUT/sandbox")
     echo "rig: session sandbox = $SANDBOX" >&2
     ;;
   *) die "mode must be dry-run or live (got: $MODE)" ;;
