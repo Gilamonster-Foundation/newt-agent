@@ -2,12 +2,17 @@
 
 **Status:** design note (no implementation). Workstream B of the
 disclosure-at-three-scales agenda (plan: *Disclosure at three scales —
-memory, coder-symbols, workflows*).
+memory, coder-symbols, workflows*). **The symbol index has a second consumer:
+it is the verify oracle for the S1 build-check gate (§6A) — one extraction
+primitive, two consumers (disclosure + verification).**
 **Crates touched (when built):** `newt-coder` (symbol extractor + `[SYMBOLS]`
-render seam), `newt-core` (the `on_pre_compress` distillation hook;
-optionally a §6 turn-record column).
+render seam), `newt-core` (the `on_pre_compress` distillation hook; the verify
+oracle the gate consults; optionally a §6 turn-record column).
 **Related:** `#319` / PR `#321` (the summarization-induced-hallucination fix
 and its re-read breadcrumb — `docs/notes/2026-06-13-summarization-induced-hallucination.md`);
+the **second nemotron confabulation** (post-`#321`) root-caused on the
+knowledge board and tracked as `#332` (umbrella remediation) / `#334`
+(collaborative `/plan`) — §6A is B's contribution to that remediation;
 Workstream A (`docs/design/progressive-disclosure-memory.md`, sibling note —
 B is A's index *specialized for code* and reuses A's fetch tool);
 the 18.4 compression pipeline (`newt-core/src/agentic/compress.rs`).
@@ -41,6 +46,17 @@ budgeted INDEX, made code-aware.
 The principle generalizes the `#319` note's lesson: *never present a paraphrase
 as if it were the file.* A symbol is not a paraphrase — it is a verbatim
 fragment of the file, and a fragment the model can trust.
+
+**Second consumer (added after the post-`#321` incident).** The *same* index
+that retains signatures for disclosure is also a **verify oracle**: a query
+"does the symbol this code references actually exist?" The second nemotron
+confabulation wrote `from newt_core import classify, Caveats` when the real
+surface is `from newt_agent.core import Router, Tier` — a *reference* to symbols
+that do not exist. An index of real definitions answers that in microseconds,
+with no build, and is the cheap tier of the S1 verify gate (§6A). The extractor
+is therefore designed **general-first** (one tree-sitter spine, language adapters
+derived from it — Rust and Python both), because the oracle must resolve
+references in whatever language the model wrote.
 
 ---
 
@@ -354,6 +370,125 @@ duplication.
 
 ---
 
+## 6A. Second consumer: the symbol index as the S1 verify oracle
+
+Workstream B was scoped as a *memory/disclosure* feature. The second nemotron
+confabulation (post-`#321`, root-caused on the knowledge board, tracked in
+`#332`) shows the same primitive answers a *verification* question, and the two
+uses share one index. This section records that second consumer and the design
+decisions taken with the operator on 2026-06-14.
+
+### 6A.1 The reframe — extraction is the oracle
+
+`#319` was a *signature* loss (the model forgot a real signature and fabricated
+one). The new incident is a *reference* error: the model wrote
+`from newt_core import classify, Caveats` / `from newt_data import DataStore`
+against modules and names that **do not exist** — the real surface is one
+umbrella module `newt_agent` with submodules (`newt_agent.core` exposing
+`Router`/`Tier`, etc.). `python -m py_compile` — the check newt's own config
+*recommends* for Python (`newt-core/src/config.rs:518-535`) — is **import-blind**
+(it checks syntax, not import resolution) and caught 1 of the 5 broken files.
+
+A symbol index of **real definitions** answers "does referenced symbol `X`
+resolve?" directly. So the same `[SYMBOLS]` extraction that retains signatures
+for disclosure is the **cheap, build-free tier** of the S1 verify gate: parse the
+written file's references (imports / call targets), look each up in the
+workspace's extracted definitions, and a miss is the confabulation signal. This
+is the tier that catches the 4 files `py_compile` missed, in microseconds, with
+no compiler invoked.
+
+> **One primitive, two consumers.** Disclosure asks "what does this file
+> *define*, compactly?" Verification asks "do the symbols this file *references*
+> exist?" Both read the same definition index. B builds the index once; §4 is the
+> disclosure consumer, §6A.3 is the verification consumer.
+
+### 6A.2 General-first spine (the operator's call)
+
+The extractor is built **general-first**: one tree-sitter spine (§3), with
+per-language adapters *derived from it* — **not** a Python special case that Rust
+is later retrofitted into. Rationale: the oracle must resolve references in
+whatever language the model emitted, so a Rust example calling a fabricated Rust
+symbol and a Python example importing a fabricated module are the *same* query
+against the *same* index shape. Python and Rust are the first two adapters; both
+descend from the general extractor. (This generalizes §5's "Rust-first, others
+incremental" — the *extraction shape* is general from B0; the language *adapters*
+land incrementally, Rust then Python, because the oracle's first regression test
+is the Python incident and the workspace's own code is Rust.)
+
+### 6A.3 Definition side vs. reference side
+
+§4's `extract_symbols` is the **definition side**: what a file *declares*. The
+oracle adds a thin **reference side**: extract a file's outbound references
+(import statements, qualified call targets) and resolve them against the
+workspace definition index. Two new pieces, both small and both on the same
+tree-sitter spine:
+
+- `extract_references(path, source) -> Vec<Reference>` — the imports/calls a file
+  makes (mirror of `extract_symbols`).
+- A workspace **definition index** (a map from fully-qualified symbol → defining
+  `file:line`) built by running `extract_symbols` across the workspace once and
+  caching it. A `resolve(reference) -> Resolved | NotFound` query is the oracle.
+
+A `NotFound` on a reference the model just wrote is the fabrication signal. This
+is strictly additive to §4 — same extractor, one more query.
+
+### 6A.4 The FFI boundary — where static analysis can't see, and the fix
+
+There is exactly one place a static tree-sitter index *alone* is insufficient:
+the **FFI boundary**, where *what one language defines* ≠ *what another imports*.
+The incident lives here. A `#[pyclass] struct Router` in Rust is projected into
+Python as `newt_agent.core.Router` by the `#[pymodule]` / `m.add_class::<…>()`
+macro (`newt-agent-py/src/lib.rs`); a tree-sitter scan of the Rust source sees
+`struct Router` but **not** that it surfaces under `newt_agent.core`. So the
+Python-visible surface cannot be derived from static Rust parsing without
+modelling the PyO3 macro.
+
+The fix is a second feeder into the same symbol store:
+
+- **Static extractor** (tree-sitter) — the cheap, **build-free**, *same-language*
+  oracle (Python→Python, Rust→Rust). Ships first; fits a CPU-constrained box.
+- **FFI-introspection adapter** — a **build-once** pass: build the extension
+  (maturin), `import newt_agent`, walk `dir()` across submodules, emit an **exact
+  manifest** (`symbols.json`) of the real Python-visible surface. It is ground
+  truth from the *actual built module*, which is the "harness stamps, model never
+  asserts" rule applied to the symbol set: the manifest is the real surface, not a
+  parse-time guess. The `#[pymodule]` registration is the authoritative source;
+  runtime introspection is the exact reading of it.
+
+One symbol store, two feeders (static + FFI-introspection). The general spine
+handles the bulk; the adapter handles the single boundary static analysis can't
+cross.
+
+### 6A.5 Not-built vs. fabricated (the false-positive trap)
+
+A naïve `import newt_agent` collapses two very different failures into one
+`ModuleNotFoundError` (verified: `newt-agent-py/.../conftest.py` does a bare
+import with no classification). The oracle must discriminate, in two stages:
+
+1. **Built?** Probe the *umbrella* (`import newt_agent` / `_newt_agent*.so`
+   presence). Failure → **not-built = environment error** ("run maturin"), *not*
+   a model-confabulation signal and *not* a verify failure of the model's work.
+   This stage kills the false positive.
+2. **Resolve the name** (only if built) against the manifest / live import.
+   Umbrella imports fine but `newt_agent.<X>` / `from <mod> import Y` does not
+   resolve → **fabrication = the real signal**, fail the verify.
+
+### 6A.6 What lives here vs. in the gate (`#332` S1)
+
+This note owns the **oracle** (the index, the reference resolver, the FFI
+adapter, the not-built/fabricated discriminator). The **gate mechanics** — where
+the check fires (write-site cheap tier vs. subtask-close compile tier), how it
+blocks (stage-verify-promote: write to temp, verify, promote-or-revert), the
+`on_fail = "revert-retry"` (default) `| "keep-fix"` policy, and the honest
+cap-exit failure banner — live in `#332` S1 (grounded at
+`newt-core/src/agentic/tools.rs:393` advisory build-check, `:667` tool-result
+contract, `:1146` `tool_result_ok`, and `mod.rs:1324`/`2033` cap-exit). The
+division: **B provides the oracle; S1 enforces with it.** The cheap same-language
+oracle is the build-free first increment that fits a constrained box; the FFI
+adapter and the compile tier need a build and follow.
+
+---
+
 ## 7. Test plan & acceptance
 
 Deterministic, model-free — the `#319` discipline ("test compression
@@ -386,6 +521,15 @@ suites; ≥80% coverage floor (`just cov-ci`).
 5. **Honest fallback.** An unparseable / unwired-language file →
    `extract_symbols` returns `None` and the render path matches today's
    behaviour (no fabricated symbols).
+6. **Verify oracle (§6A), model-free, against the incident.** Build a workspace
+   definition index over a fixture mirroring the real surface
+   (`newt_agent.core` defines `Router`/`Tier`); assert `resolve` returns
+   `NotFound` for the fabricated references from the incident
+   (`from newt_core import classify`, `from newt_data import DataStore`) and
+   `Resolved` for the real ones (`from newt_agent.core import Router`). Assert
+   the not-built vs. fabricated discriminator (§6A.5) classifies a missing
+   umbrella as *environment* and a missing submodule name as *fabrication*. This
+   is the deterministic regression test for the second nemotron incident.
 
 **Acceptance (MVP):** the Rust extractor (regex floor → `tree-sitter-rust`) +
 the `[SYMBOLS]` header in `render_files_block` + the `on_pre_compress`
@@ -398,6 +542,7 @@ still passing. Call-graph and multi-language are **deferred**.
 |---|---|---|
 | B0 (spike) | regex-floor Rust extractor + golden (test 1, 2) | no new deps; proves extraction shape |
 | B1 (MVP) | `tree-sitter` (pinned `0.24`) + `tree-sitter-rust`; `[SYMBOLS]` header in `render_files_block`; budget degradation (tests 3, 4, 5) | the full `#319` win for Rust |
+| Bv (verify oracle, §6A) | `extract_references` + workspace definition index + `resolve`; `tree-sitter-python` adapter; the build-once FFI-introspection manifest + not-built/fabricated discriminator (test 6) | the S1 cheap (build-free) tier; first regression = the second nemotron incident |
 | B2 | `on_pre_compress` symbol distillation hardening; surface in `/memory` | continuity |
 | B3+ (deferred) | call/dependency graph; additional languages; §6 store column | one grammar / feature each |
 
