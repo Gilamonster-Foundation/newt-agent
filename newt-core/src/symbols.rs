@@ -33,11 +33,11 @@ use serde::{Deserialize, Serialize};
 /// A source language the oracle has an adapter for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Lang {
-    /// Python — the first wired adapter.
+    /// Python — `from`/`import` (`.`-separated modules).
     Python,
-    /// Rust — core is general; the Rust adapter is the next increment, so its
-    /// extractors honestly return nothing rather than fabricate symbols for a
-    /// language they cannot yet parse.
+    /// Rust — `use` paths (`::`-separated modules) + `fn`/`struct`/`enum`/`trait`
+    /// declarations. The second wired adapter: same general core, a different
+    /// grammar — the "language pack" shape made concrete.
     Rust,
 }
 
@@ -251,9 +251,7 @@ fn module_root(module: &str) -> &str {
 pub fn extract_references(source: &str, lang: Lang) -> Vec<Reference> {
     match lang {
         Lang::Python => extract_references_python(source),
-        // General-first: the Rust adapter is the next increment. Until it lands,
-        // be honest — extract nothing rather than fabricate.
-        Lang::Rust => Vec::new(),
+        Lang::Rust => extract_references_rust(source),
     }
 }
 
@@ -262,7 +260,7 @@ pub fn extract_references(source: &str, lang: Lang) -> Vec<Reference> {
 pub fn extract_definitions(source: &str, lang: Lang) -> Vec<Definition> {
     match lang {
         Lang::Python => extract_definitions_python(source),
-        Lang::Rust => Vec::new(),
+        Lang::Rust => extract_definitions_rust(source),
     }
 }
 
@@ -319,6 +317,93 @@ fn extract_definitions_python(source: &str) -> Vec<Definition> {
             defs.push(Definition {
                 name: caps[1].to_string(),
                 kind: DefKind::Class,
+                line: lineno,
+            });
+        }
+    }
+    defs
+}
+
+fn extract_references_rust(source: &str) -> Vec<Reference> {
+    // `[pub] use <path>;` — capture the path, then parse its shape. Line-based
+    // (the regex-floor sibling of the Python adapter): multi-line `use` blocks
+    // and deeply-nested groups are out of scope until the tree-sitter upgrade.
+    let use_re = Regex::new(r"^\s*(?:pub\s*(?:\([^)]*\)\s*)?)?use\s+(.+?)\s*;").unwrap();
+    let mut refs = Vec::new();
+    for (i, line) in source.lines().enumerate() {
+        let lineno = i + 1;
+        if let Some(caps) = use_re.captures(line) {
+            parse_rust_use(caps[1].trim(), lineno, &mut refs);
+        }
+    }
+    refs
+}
+
+/// Parse one Rust `use` path into references. Handles `a::b::c`, `a::b::{c, d as
+/// e, self, *}`, and `a::b::*`.
+fn parse_rust_use(path: &str, lineno: usize, refs: &mut Vec<Reference>) {
+    // Grouped: `a::b::{c, d as e, self, *}`.
+    if let Some(open) = path.find("::{") {
+        let module = &path[..open];
+        let inner = path[open + 3..].trim_end_matches('}');
+        for item in inner.split(',') {
+            // Take the first token so `d as e` becomes `d` (the imported name).
+            let item = item.split_whitespace().next().unwrap_or("");
+            if item.is_empty() || item == "*" || item == "self" {
+                // `*` (glob) and `self` (re-export the module) assert the module,
+                // not a specific name.
+                refs.push(Reference::import_module(module, lineno));
+            } else {
+                refs.push(Reference::import_from(module, item, lineno));
+            }
+        }
+        return;
+    }
+    // Glob: `a::b::*`.
+    if let Some(module) = path.strip_suffix("::*") {
+        refs.push(Reference::import_module(module, lineno));
+        return;
+    }
+    // Simple: `a::b::c` (optionally `as d`) → module `a::b`, name `c`.
+    let head = path.split_whitespace().next().unwrap_or(path);
+    if let Some(idx) = head.rfind("::") {
+        refs.push(Reference::import_from(
+            &head[..idx],
+            &head[idx + 2..],
+            lineno,
+        ));
+    } else {
+        // A single-ident `use foo;` names a module.
+        refs.push(Reference::import_module(head, lineno));
+    }
+}
+
+fn extract_definitions_rust(source: &str) -> Vec<Definition> {
+    // Optional visibility (`pub`, `pub(crate)`, `pub(in ...)`) then the keyword.
+    let vis = r"(?:pub\s*(?:\([^)]*\)\s*)?)?";
+    let fn_re = Regex::new(&format!(
+        r"^\s*{vis}(?:async\s+|unsafe\s+|const\s+|extern\s+(?:\x22[^\x22]*\x22\s+)?)*fn\s+(\w+)"
+    ))
+    .unwrap();
+    let struct_re = Regex::new(&format!(r"^\s*{vis}struct\s+(\w+)")).unwrap();
+    let enum_re = Regex::new(&format!(r"^\s*{vis}enum\s+(\w+)")).unwrap();
+    let trait_re = Regex::new(&format!(r"^\s*{vis}(?:unsafe\s+)?trait\s+(\w+)")).unwrap();
+
+    let mut defs = Vec::new();
+    for (i, line) in source.lines().enumerate() {
+        let lineno = i + 1;
+        let captured = [
+            (&fn_re, DefKind::Function),
+            (&struct_re, DefKind::Struct),
+            (&enum_re, DefKind::Enum),
+            (&trait_re, DefKind::Trait),
+        ]
+        .into_iter()
+        .find_map(|(re, kind)| re.captures(line).map(|c| (c[1].to_string(), kind)));
+        if let Some((name, kind)) = captured {
+            defs.push(Definition {
+                name,
+                kind,
                 line: lineno,
             });
         }
@@ -454,11 +539,62 @@ mod tests {
     }
 
     #[test]
-    fn rust_adapter_is_honestly_unwired() {
-        // General-first: the core is language-agnostic; until the Rust adapter
-        // lands it extracts nothing rather than fabricate.
-        assert!(extract_references("use a::b::c;", Lang::Rust).is_empty());
-        assert!(extract_definitions("pub fn f() {}", Lang::Rust).is_empty());
+    fn extracts_rust_use_statements() {
+        let src = "use a::b::Thing;\n\
+                   pub use c::d::{One, Two as T, self, *};\n\
+                   use crate::scope::*;\n\
+                   use std::collections::HashMap as Map;\n";
+        let refs = extract_references(src, Lang::Rust);
+        assert!(refs.contains(&Reference::import_from("a::b", "Thing", 1)));
+        assert!(refs.contains(&Reference::import_from("c::d", "One", 2)));
+        assert!(refs.contains(&Reference::import_from("c::d", "Two", 2))); // `as T` -> the item `Two`
+        assert!(refs.contains(&Reference::import_module("c::d", 2))); // `self` and `*`
+        assert!(refs.contains(&Reference::import_module("crate::scope", 3)));
+        assert!(refs.contains(&Reference::import_from("std::collections", "HashMap", 4)));
+    }
+
+    #[test]
+    fn extracts_rust_definitions() {
+        let src = "pub fn alpha() {}\n\
+                   async fn beta() {}\n\
+                   pub(crate) struct Gamma { x: u8 }\n\
+                   enum Delta { A, B }\n\
+                   pub trait Epsilon {}\n\
+                   const NOT_A_DEF: u8 = 0;\n";
+        let defs = extract_definitions(src, Lang::Rust);
+        assert!(defs
+            .iter()
+            .any(|d| d.name == "alpha" && d.kind == DefKind::Function));
+        assert!(defs
+            .iter()
+            .any(|d| d.name == "beta" && d.kind == DefKind::Function));
+        assert!(defs
+            .iter()
+            .any(|d| d.name == "Gamma" && d.kind == DefKind::Struct));
+        assert!(defs
+            .iter()
+            .any(|d| d.name == "Delta" && d.kind == DefKind::Enum));
+        assert!(defs
+            .iter()
+            .any(|d| d.name == "Epsilon" && d.kind == DefKind::Trait));
+        // `const` is not a floor def-kind — not extracted.
+        assert!(!defs.iter().any(|d| d.name == "NOT_A_DEF"));
+    }
+
+    #[test]
+    fn rust_references_resolve_against_the_same_general_core() {
+        // The language-pack payoff: the SAME SymbolIndex/resolve/classify core
+        // grades Rust via a different extractor — fabricated `use` paths are
+        // caught exactly as fabricated Python imports are.
+        let mut idx = SymbolIndex::new();
+        idx.add_symbol("crate::router", "Router");
+        let real = &extract_references("use crate::router::Router;", Lang::Rust)[0];
+        assert_eq!(idx.resolve(real), Resolution::Resolved);
+        let fab = &extract_references("use crate::nonsense::Widget;", Lang::Rust)[0];
+        assert!(matches!(
+            idx.classify(fab, &built()),
+            Verdict::Fabricated { .. }
+        ));
     }
 
     #[test]
