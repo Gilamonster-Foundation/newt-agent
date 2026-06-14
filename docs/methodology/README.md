@@ -122,12 +122,20 @@ NEWT_EVAL_BIN=~/.cache/newt-target/release/newt-eval \
 docs/testing/results/scripts/survey_models.sh \
   --endpoint https://gnuc-ollama.home.lab --hardware "gnuc 4060 Ti" \
   --corpus /tmp/corpus8/corpus --surface /tmp/corpus8/python_surface.json \
-  --out /tmp/survey-gnuc --models auto --require-tools --timeout 900
+  --out /tmp/survey-gnuc --models auto --require-tools --repeats 5 --timeout 900
 ```
+
+`--repeats K` runs each model K times and reports a **pass-rate** (pass/K)
+instead of a single ✅/❌. Per-run scorecards land in `results/<safe>/rN.json`;
+the aggregate in `results/<safe>.json`. Both the model-level card and a run
+within it are checkpointed, so an interrupted sweep resumes where it stopped.
 
 ## Caveats / threats to validity
 
-- **One run per cell.** No seed averaging yet; a future nightly sweep adds repeats.
+- **Repeats quantify stochasticity, not eliminate it.** `--repeats K` turns a
+  single ✅/❌ into pass/K, but K is finite — a 1/5 and a 2/5 are both "borderline,"
+  not a fine-grained probability. Pick K for the budget; the nightly sweep can
+  afford a larger K than an interactive run.
 - **Module-level scoring.** A real module with a fabricated *symbol* scores as a
   pass until the FFI manifest (#74) lands.
 - **Timeouts are hardware-bound.** A model that times out on the 4060 Ti may pass
