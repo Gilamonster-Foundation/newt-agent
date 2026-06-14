@@ -26,6 +26,7 @@ pub mod role_profile;
 pub mod router;
 pub mod session;
 pub mod store;
+pub mod symbols;
 pub mod tuning;
 pub mod workspace_key;
 
