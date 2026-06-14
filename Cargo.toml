@@ -33,13 +33,13 @@ members = [
 exclude = ["newt-mesh"]
 
 [workspace.package]
-# Semver — 0.6.7: adaptive context management (tuning write-back,
-# safe_context → num_ctx fallback, probe fixes), DGX telemetry module,
-# agentic-loop hardening (advisory-drift soul rules, read-only-round nudge),
-# durable TUI conversations (/conversation list/show/restore/rename/delete
-# with atomic per-turn persistence), coverage floor ratcheted 75% → 80%
-# (workspace at ~87%). Holding the 0.6.x line through June.
-version = "0.6.7"
+# Semver — 0.6.8: the honest, measurable, family-aware harness — verify oracle
+# + ground-truth rig (the cross-family confabulation finding,
+# docs/findings/), canonical Plan struct, agent commit identity,
+# progressive-disclosure memory, plus Phases 17–21 (conversation store, recall,
+# compression v2, self-tuning, data co-pilot). See CHANGELOG.md.
+# Holding the 0.6.x line through June.
+version = "0.6.8"
 edition = "2021"
 rust-version = "1.75"
 license = "Apache-2.0"
@@ -153,20 +153,20 @@ tests-common = { path = "tests/common" }
 agent-mesh-protocol = "0.6"
 
 # Internal crates — pinned with = for lock-step publishing
-newt-core         = { path = "newt-core",         version = "=0.6.7" }
-newt-data         = { path = "newt-data",         version = "=0.6.7" }
-newt-inference    = { path = "newt-inference",    version = "=0.6.7" }
-newt-tools        = { path = "newt-tools",        version = "=0.6.7" }
-newt-skills       = { path = "newt-skills",       version = "=0.6.7" }
-newt-tui          = { path = "newt-tui",          version = "=0.6.7" }
-newt-acp-worker   = { path = "newt-acp-worker",   version = "=0.6.7" }
-newt-mcp-server   = { path = "newt-mcp-server",   version = "=0.6.7" }
-newt-mcp-data     = { path = "newt-mcp-data",     version = "=0.6.7" }
-newt-mcp-client   = { path = "newt-mcp-client",   version = "=0.6.7" }
-newt-coder        = { path = "newt-coder",        version = "=0.6.7" }
-newt-identity     = { path = "newt-identity",     version = "=0.6.7" }
-newt-eval         = { path = "newt-eval",         version = "=0.6.7" }
-plugins-protocol  = { path = "plugins-protocol",  version = "=0.6.7" }
+newt-core         = { path = "newt-core",         version = "=0.6.8" }
+newt-data         = { path = "newt-data",         version = "=0.6.8" }
+newt-inference    = { path = "newt-inference",    version = "=0.6.8" }
+newt-tools        = { path = "newt-tools",        version = "=0.6.8" }
+newt-skills       = { path = "newt-skills",       version = "=0.6.8" }
+newt-tui          = { path = "newt-tui",          version = "=0.6.8" }
+newt-acp-worker   = { path = "newt-acp-worker",   version = "=0.6.8" }
+newt-mcp-server   = { path = "newt-mcp-server",   version = "=0.6.8" }
+newt-mcp-data     = { path = "newt-mcp-data",     version = "=0.6.8" }
+newt-mcp-client   = { path = "newt-mcp-client",   version = "=0.6.8" }
+newt-coder        = { path = "newt-coder",        version = "=0.6.8" }
+newt-identity     = { path = "newt-identity",     version = "=0.6.8" }
+newt-eval         = { path = "newt-eval",         version = "=0.6.8" }
+plugins-protocol  = { path = "plugins-protocol",  version = "=0.6.8" }
 
 # NOTE on agent-mesh / newt-mesh: see the `[workspace] exclude = [...]`
 # block above. Those deps are NOT declared as workspace-level

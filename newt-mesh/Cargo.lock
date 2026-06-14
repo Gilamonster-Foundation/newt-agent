@@ -2803,7 +2803,7 @@ checksum = "650eef8c711430f1a879fdd01d4745a7deea475becfb90269c06775983bbf086"
 
 [[package]]
 name = "newt-core"
-version = "0.6.7"
+version = "0.6.8"
 dependencies = [
  "agent-bridle",
  "agent-mesh-protocol 0.6.2",
@@ -2827,7 +2827,7 @@ dependencies = [
 
 [[package]]
 name = "newt-identity"
-version = "0.6.7"
+version = "0.6.8"
 dependencies = [
  "agent-mesh-protocol 0.6.2",
  "base64",
@@ -2839,7 +2839,7 @@ dependencies = [
 
 [[package]]
 name = "newt-inference"
-version = "0.6.7"
+version = "0.6.8"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2858,7 +2858,7 @@ dependencies = [
 
 [[package]]
 name = "newt-mesh"
-version = "0.6.7"
+version = "0.6.8"
 dependencies = [
  "agent-mesh-bus",
  "agent-mesh-discovery",
@@ -2885,7 +2885,7 @@ dependencies = [
 
 [[package]]
 name = "newt-skills"
-version = "0.6.7"
+version = "0.6.8"
 dependencies = [
  "anyhow",
  "serde",
@@ -3383,7 +3383,7 @@ dependencies = [
 
 [[package]]
 name = "plugins-protocol"
-version = "0.6.7"
+version = "0.6.8"
 dependencies = [
  "async-trait",
  "serde",
@@ -4618,7 +4618,7 @@ dependencies = [
 
 [[package]]
 name = "tests-common"
-version = "0.6.7"
+version = "0.6.8"
 dependencies = [
  "anyhow",
  "async-trait",
