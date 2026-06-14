@@ -84,12 +84,21 @@ The practical wins compound with the architectural one:
 
 ### Standing carve-outs (the full list — additions need a new decision)
 
-- **The startup splash** — the one alternate-screen surface. It lives in
-  the alt screen, vanishes before chat starts, and the inline preamble is
-  printed into real scrollback in both `--splash` and `--no-splash` modes
-  (PR #301 — the preamble always shows). ratatui is permitted as a
-  dependency *only* for this splash; if the splash ever drops it, drop the
-  dependency.
+- **The startup splash** — the first of two ephemeral alternate-screen
+  surfaces (see also the `/plan` editor below). It lives in the alt screen,
+  vanishes before chat starts, and the inline preamble is printed into real
+  scrollback in both `--splash` and `--no-splash` modes (PR #301 — the
+  preamble always shows). ratatui is permitted as a dependency *only* for the
+  alt-screen surfaces; if both ever drop it, drop the dependency.
+- **The `/plan` editor** — the second ephemeral alternate-screen surface,
+  opened **only on explicit human request** (`/plan edit`) to edit a
+  structured plan document as a form instead of hand-writing TOML. Like the
+  splash: feature-gated out of the headless/wyvern build, RAII-torn-down so it
+  cannot leak (see #302), and on close it prints the canonical plan into real
+  scrollback exactly as a headless run would. The plain-text plan document
+  stays the source of truth; the chat path stays a plain scroller. Full
+  rationale and the cross-tier (wyvern ingestion) boundary:
+  `docs/decisions/plan_editor_ephemeral_tui.md`.
 - **rustyline's internal raw mode** during a `readline` call (line editing,
   history navigation). Output remains scrolled text.
 - **ANSI color and column escapes in scrolled output** (header, prompts,
