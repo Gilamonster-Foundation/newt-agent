@@ -34,6 +34,7 @@ pub mod cases;
 pub mod evaluators;
 pub mod lint;
 pub mod runner;
+pub mod score;
 pub mod scorecard;
 pub mod worker_bin;
 

@@ -42,6 +42,27 @@ enum Command {
 
     /// Run cases against the configured backend.
     Run(RunArgs),
+
+    /// Score an arbitrary workspace's Python output with the verify oracle
+    /// (#339/#340) — the ground-truth rig's measurement tool. No fixture case
+    /// needed: point it at a directory of generated `.py` files plus a
+    /// `python_surface.json` declaring the real module surface.
+    Score(ScoreArgs),
+}
+
+/// Arguments for the `score` subcommand.
+#[derive(Args, Debug)]
+struct ScoreArgs {
+    /// Workspace directory to score (the tree the worker/model wrote into).
+    #[arg(long)]
+    workspace: PathBuf,
+    /// Directory holding `python_surface.json` (the real module surface).
+    /// Defaults to the workspace itself.
+    #[arg(long)]
+    surface_dir: Option<PathBuf>,
+    /// Emit the verdict as JSON instead of a one-line summary.
+    #[arg(long)]
+    json: bool,
 }
 
 /// Arguments for the `run` subcommand.
@@ -157,7 +178,31 @@ async fn real_main() -> Result<RunOutcomeStatus> {
             Ok(RunOutcomeStatus::AllPassed)
         }
         Command::Run(args) => run_command(args).await,
+        Command::Score(args) => score_command(args),
     }
+}
+
+/// `score` — run the Python verify oracle over an arbitrary workspace and print
+/// the verdict. The rig's measurement tool; no fixture case or backend needed.
+fn score_command(args: ScoreArgs) -> Result<RunOutcomeStatus> {
+    let surface_dir = args.surface_dir.unwrap_or_else(|| args.workspace.clone());
+    let result = newt_eval::score::score_python_workspace(&args.workspace, &surface_dir)?;
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+    } else {
+        println!(
+            "{}: {} (score {:.2})",
+            result.evaluator,
+            if result.passed { "PASS" } else { "FAIL" },
+            result.score
+        );
+        println!("  {}", result.details);
+    }
+    Ok(if result.passed {
+        RunOutcomeStatus::AllPassed
+    } else {
+        RunOutcomeStatus::CaseFailed
+    })
 }
 
 async fn run_command(args: RunArgs) -> Result<RunOutcomeStatus> {
