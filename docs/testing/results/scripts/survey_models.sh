@@ -90,7 +90,7 @@ for model in $MODELS; do
     continue
   fi
   runs_dir="$RESULTS/$safe"         # per-run scorecards r1.json … rK.json
-  mkdir -p "$runs_dir"
+  mkdir -p "$runs_dir" "$OUT/run-$safe"   # the latter so per-run rN.err has a parent
   for r in $(seq 1 "$REPEATS"); do
     runcard="$runs_dir/r$r.json"
     [ -f "$runcard" ] && { echo "survey: skip $model run $r (have run)" >&2; continue; }
