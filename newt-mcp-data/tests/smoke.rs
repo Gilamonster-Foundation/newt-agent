@@ -72,7 +72,8 @@ fn initialize_and_tools_list_over_stdio() {
     assert_eq!(init["result"]["protocolVersion"], "2024-11-05");
 
     // tools/list → the four SQL tools (21.2), the two live-kernel tools (21.3),
-    // and the three notebook tools (21.4).
+    // the three notebook tools (21.4), and the two dataframe-introspection tools
+    // (21.5).
     assert_eq!(list["id"], 2);
     let tools = list["result"]["tools"].as_array().expect("tools array");
     let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
@@ -86,11 +87,13 @@ fn initialize_and_tools_list_over_stdio() {
         "notebook_read",
         "notebook_insert_cell",
         "notebook_persist_executed_cell",
+        "list_dataframes",
+        "inspect_dataframe",
     ] {
         assert!(
             names.contains(&expected),
             "tools/list missing {expected}: {names:?}"
         );
     }
-    assert_eq!(names.len(), 9, "expected exactly 9 tools, got {names:?}");
+    assert_eq!(names.len(), 11, "expected exactly 11 tools, got {names:?}");
 }

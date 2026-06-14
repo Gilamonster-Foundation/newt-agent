@@ -34,6 +34,14 @@
 //! - `notebook_persist_executed_cell` — append a code cell with nbformat outputs
 //!   (the low-level primitive `run_cell(persist_to)` uses).
 //!
+//! Plus the Phase 21.5 read-only dataframe introspection (over the attached
+//! kernel; never mutates the human's session):
+//!
+//! - `list_dataframes` — list the live pandas DataFrames in the kernel
+//!   (name, rows, cols, in-memory bytes).
+//! - `inspect_dataframe` — for one named DataFrame: shape, per-column
+//!   dtype + null count, head rows, and a numeric `describe()`.
+//!
 //! Every tool returns the MCP content envelope; **any** failure (bad SQL, no
 //! such table, a missing argument) comes back as an in-band MCP tool error
 //! (`isError: true`) the model can read and recover from — never a `-32603`

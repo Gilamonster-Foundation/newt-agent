@@ -268,6 +268,32 @@ fn tool_definitions() -> Value {
                 "required": ["path", "source", "outputs"]
             }
         }),
+        serde_json::json!({
+            "name": "list_dataframes",
+            "description": "List the pandas DataFrames currently live in the attached Jupyter kernel's global namespace (READ-ONLY — never mutates the human's session). Requires kernel_attach first. Returns, for each DataFrame, its variable name, row and column counts, and in-memory size in bytes. The Centaur sees the human's working DataFrames without touching them.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {}
+            }
+        }),
+        serde_json::json!({
+            "name": "inspect_dataframe",
+            "description": "Inspect one named pandas DataFrame in the attached Jupyter kernel (READ-ONLY — never mutates it). Requires kernel_attach first. Returns the shape, per-column dtype + null count, the first N rows (head, default 5), and a pandas describe() over the numeric columns. The `name` must be a plain Python identifier; an undefined name or a non-DataFrame is an in-band error.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "The variable name of the DataFrame in the kernel's global namespace (a plain Python identifier)"
+                    },
+                    "head": {
+                        "type": "integer",
+                        "description": "How many leading rows to return under `head` (default 5)"
+                    }
+                },
+                "required": ["name"]
+            }
+        }),
     ];
 
     Value::Array(tools)
@@ -310,6 +336,8 @@ fn register_tools_call(
                 "notebook_persist_executed_cell" => {
                     Ok(handle_notebook_persist_executed_cell(&arguments))
                 }
+                "list_dataframes" => Ok(handle_list_dataframes(&session).await),
+                "inspect_dataframe" => Ok(handle_inspect_dataframe(&arguments, &session).await),
                 // An unknown tool name is a transport-level `-32603`, matching
                 // `newt-mcp-server`'s `other =>` arm. A *known* tool failing for
                 // its own reasons (bad SQL, missing arg, no kernel attached)
@@ -596,6 +624,258 @@ fn handle_notebook_persist_executed_cell(args: &Value) -> Value {
     }
 }
 
+// ── Dataframe introspection tools (Phase 21.5) ──────────────────────────────
+//
+// Read-only introspection of the human's live pandas DataFrames over the
+// attached kernel (docs/design/centaur-data-scientist.md §"Tool surface", the
+// dataframe-introspection bullet). The Centaur sees the human's working
+// DataFrames *without mutating them*: each tool runs a defensive Python snippet
+// via the session `KernelClient::run_cell` that imports json + pandas inside the
+// snippet, never touches the namespace, and PRINTS exactly one JSON line we
+// parse from `CellRun.stdout` — robust parsing, no fragile text scraping. On a
+// problem the snippet emits `{"error": "..."}` rather than raising, so the tool
+// surfaces it cleanly in-band (the Centaur in-band-error discipline). The
+// DataFrame `name` is validated as a plain Python identifier BEFORE it is
+// interpolated into the snippet, so a hostile name can never inject code.
+
+/// `true` iff `name` is a plain Python identifier (`[A-Za-z_][A-Za-z0-9_]*`).
+///
+/// The gate that makes [`inspect_snippet`] injection-proof: only a validated
+/// identifier is ever interpolated into the snippet (Phase 21.5). A leading
+/// digit, an embedded space, a quote, a semicolon, or any operator — anything a
+/// caller might use to break out of the `globals()[...]` lookup and run
+/// arbitrary code — is rejected here, before the kernel is ever touched.
+fn is_python_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c == '_' || c.is_ascii_alphabetic() => {}
+        _ => return false,
+    }
+    chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
+}
+
+/// The read-only snippet that enumerates pandas DataFrames in the kernel's
+/// `globals()` and prints one JSON line: a list of
+/// `{ name, rows, cols, memory_bytes }` (Phase 21.5).
+///
+/// Defensive by construction: it imports json + pandas *inside* the snippet (so
+/// a kernel without pandas yields a clean `{"error": ...}` rather than a raised
+/// `NameError`), iterates a snapshot of `globals().items()` so it never mutates
+/// the namespace, and wraps everything in a try/except that prints
+/// `{"error": ...}` instead of raising. Nothing in this snippet is
+/// caller-controlled, so it carries no interpolation.
+fn list_snippet() -> &'static str {
+    r#"
+import json as _json
+try:
+    import pandas as _pd
+    _frames = []
+    for _name, _val in list(globals().items()):
+        if isinstance(_val, _pd.DataFrame):
+            _frames.append({
+                "name": _name,
+                "rows": int(_val.shape[0]),
+                "cols": int(_val.shape[1]),
+                "memory_bytes": int(_val.memory_usage(deep=True).sum()),
+            })
+    print(_json.dumps(_frames))
+except Exception as _e:
+    print(_json.dumps({"error": "list_dataframes failed: " + repr(_e)}))
+"#
+}
+
+/// Build the read-only snippet that inspects the DataFrame named `name`, printing
+/// one JSON line: `{ name, shape:[rows,cols], columns:[{name,dtype,null_count}],
+/// head:[...records...], describe:{...} }` (Phase 21.5).
+///
+/// `name` MUST already be a validated Python identifier ([`is_python_identifier`]);
+/// the caller checks before calling, so the interpolation here is injection-safe.
+/// The snippet is defensive: it imports json + pandas inside itself, looks the
+/// name up in `globals()` without mutating anything, emits
+/// `{"error": "no DataFrame named <name>"}` when the name is undefined or not a
+/// DataFrame, guards `describe()` for an all-non-numeric frame (→ `{}`), and
+/// falls back to a printed `{"error": ...}` on any other exception rather than
+/// raising — `head(N)` uses `to_dict(orient="records")` so each row is a dict.
+///
+/// **Strict-JSON discipline.** A null in a numeric column makes `head()` /
+/// `describe()` carry `NaN` (and `±inf`), which Python's `json.dumps` emits as
+/// the bare tokens `NaN` / `Infinity` — **not** valid JSON, which the strict
+/// `serde_json` parser on the Rust side rejects. The snippet therefore runs the
+/// assembled payload through a small recursive `_clean` that maps every
+/// non-finite float to `None` (→ JSON `null`) before dumping, so the printed line
+/// is always strict, parseable JSON.
+fn inspect_snippet(name: &str, head: usize) -> String {
+    // `name` is a validated identifier and `head` is a plain usize, so the only
+    // interpolated text is `[A-Za-z_][A-Za-z0-9_]*` and a decimal integer — no
+    // quoting or escaping is required (and none would be safe to rely on).
+    format!(
+        r#"
+import json as _json
+import math as _math
+def _clean(_o):
+    if isinstance(_o, float):
+        return _o if _math.isfinite(_o) else None
+    if isinstance(_o, dict):
+        return {{_k: _clean(_v) for _k, _v in _o.items()}}
+    if isinstance(_o, (list, tuple)):
+        return [_clean(_v) for _v in _o]
+    return _o
+try:
+    import pandas as _pd
+    _df = globals().get("{name}")
+    if not isinstance(_df, _pd.DataFrame):
+        print(_json.dumps({{"error": "no DataFrame named {name}"}}))
+    else:
+        _cols = [
+            {{
+                "name": str(_c),
+                "dtype": str(_df[_c].dtype),
+                "null_count": int(_df[_c].isnull().sum()),
+            }}
+            for _c in _df.columns
+        ]
+        _head = _df.head({head}).to_dict(orient="records")
+        _num = _df.select_dtypes(include="number")
+        _describe = {{}} if _num.shape[1] == 0 else _num.describe().to_dict()
+        print(_json.dumps(_clean({{
+            "name": "{name}",
+            "shape": [int(_df.shape[0]), int(_df.shape[1])],
+            "columns": _cols,
+            "head": _head,
+            "describe": _describe,
+        }}), default=str))
+except Exception as _e:
+    print(_json.dumps({{"error": "inspect_dataframe failed: " + repr(_e)}}))
+"#
+    )
+}
+
+/// `list_dataframes`: run [`list_snippet`] on the attached kernel and return the
+/// parsed list of live DataFrames as pretty JSON (Phase 21.5).
+///
+/// In-band error if no kernel is attached, if the kernel errors / the run fails,
+/// or if the snippet printed an `{"error": ...}` object (e.g. pandas not
+/// importable) — all surfaced via [`run_snippet_json`].
+async fn handle_list_dataframes(session: &KernelSession) -> Value {
+    match run_snippet_json(session, list_snippet()).await {
+        Ok(value) => pretty_or_error(serde_json::to_string_pretty(&value)),
+        Err(envelope) => envelope,
+    }
+}
+
+/// `inspect_dataframe`: validate `name`, run [`inspect_snippet`] on the attached
+/// kernel, and return the structured introspection as pretty JSON (Phase 21.5).
+///
+/// `name` is validated as a Python identifier *before any kernel call* — a
+/// hostile name is an in-band error and the kernel is never touched. `head`
+/// defaults to 5 (a missing, negative, float, or otherwise non-integer value
+/// folds to the default). An undefined name, a non-DataFrame, a kernel error, or
+/// a snippet `{"error": ...}` all surface in-band via [`run_snippet_json`].
+async fn handle_inspect_dataframe(args: &Value, session: &KernelSession) -> Value {
+    let name = match required_str(args, "name") {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    if !is_python_identifier(name) {
+        return mcp_error_content(&format!(
+            "invalid DataFrame name {name:?}: must be a plain Python identifier ([A-Za-z_][A-Za-z0-9_]*)"
+        ));
+    }
+    let head = parse_head(args.get("head"));
+
+    match run_snippet_json(session, &inspect_snippet(name, head)).await {
+        Ok(value) => pretty_or_error(serde_json::to_string_pretty(&value)),
+        Err(envelope) => envelope,
+    }
+}
+
+/// The default `head` for `inspect_dataframe` when the caller omits one.
+const DEFAULT_HEAD: usize = 5;
+
+/// Parse the optional `head` argument into a [`usize`], folding anything that is
+/// not a representable non-negative integer (absent, null, negative, a float, a
+/// string, a bool) to [`DEFAULT_HEAD`] — mirroring [`parse_row_cap`]'s defensive
+/// posture for a model-supplied integer (Phase 21.5).
+fn parse_head(value: Option<&Value>) -> usize {
+    match value.and_then(Value::as_u64) {
+        Some(n) => n as usize,
+        None => DEFAULT_HEAD,
+    }
+}
+
+/// Run `snippet` on the attached kernel and parse one JSON value out of its
+/// stdout — the shared engine of the two dataframe-introspection tools
+/// (Phase 21.5), factored out so it is unit-testable.
+///
+/// Returns `Ok(value)` with the parsed `serde_json::Value` on success, or
+/// `Err(envelope)` where `envelope` is the ready-to-return in-band MCP tool
+/// error for every failure mode:
+///
+/// - **no kernel attached** → "attach a kernel first" (tells the model to call
+///   `kernel_attach`);
+/// - **transport failure** (`run_cell` errored) → the wrapped error;
+/// - **the cell raised** (`CellRun.error` set) → the `ename: evalue` surfaced;
+/// - **unparseable stdout** (no JSON line) → an honest parse error;
+/// - **the snippet printed `{"error": ...}`** → that message surfaced.
+///
+/// stdout may carry incidental prints, so the parser trims and takes the **last
+/// non-empty line** (the snippet's `json.dumps` is the final thing it prints).
+async fn run_snippet_json(session: &KernelSession, snippet: &str) -> Result<Value, Value> {
+    let guard = session.lock().await;
+    let client = match guard.as_ref() {
+        Some(c) => c,
+        None => {
+            return Err(mcp_error_content(
+                "attach a kernel first — call kernel_attach with your Jupyter server url before introspecting DataFrames",
+            ))
+        }
+    };
+
+    let run = match client.run_cell(snippet).await {
+        Ok(run) => run,
+        Err(e) => return Err(mcp_error_content(&format!("kernel run failed: {e}"))),
+    };
+
+    // A cell that raised is a kernel error here (unlike `run_cell`, where a raise
+    // is data): the snippet is ours and is written never to raise, so a raise
+    // means something went wrong below it — surface it in-band.
+    if let Some(err) = &run.error {
+        return Err(mcp_error_content(&format!(
+            "kernel error: {}: {}",
+            err.ename, err.evalue
+        )));
+    }
+
+    // Take the last non-empty stdout line — the snippet's terminating
+    // `print(json.dumps(...))` — so incidental prints above it don't break us.
+    let last_line = run.stdout.lines().map(str::trim).rfind(|l| !l.is_empty());
+    let json_line = match last_line {
+        Some(line) => line,
+        None => {
+            return Err(mcp_error_content(
+                "kernel produced no JSON output to parse (empty stdout)",
+            ))
+        }
+    };
+
+    let value: Value = match serde_json::from_str(json_line) {
+        Ok(v) => v,
+        Err(e) => {
+            return Err(mcp_error_content(&format!(
+                "could not parse JSON from kernel output: {e}"
+            )))
+        }
+    };
+
+    // The snippet reports its own problems (pandas missing, name undefined, …) as
+    // a JSON object carrying an `error` field; surface that in-band too.
+    if let Some(msg) = value.get("error").and_then(Value::as_str) {
+        return Err(mcp_error_content(msg));
+    }
+
+    Ok(value)
+}
+
 // ── Argument + result helpers ──────────────────────────────────────────────
 
 /// Extract a required string argument, or return the in-band tool error a
@@ -731,14 +1011,21 @@ mod tests {
     /// `run_cell` / `kernel_attach` MCP envelope logic (PNG path reporting, the
     /// no-kernel error, the in-band error discipline) is exercised hermetically,
     /// no live Jupyter kernel required.
+    ///
+    /// `seen_code` records the code of the last `run_cell` so a test can assert a
+    /// tool DID (or did NOT) reach the kernel — load-bearing for the
+    /// dataframe-introspection injection guard, which must reject a hostile name
+    /// *before* any kernel call (Phase 21.5).
     struct MockKernel {
         run: newt_data::kernel::CellRun,
         fail: Option<String>,
+        seen_code: Arc<std::sync::Mutex<Vec<String>>>,
     }
 
     #[async_trait::async_trait]
     impl KernelClient for MockKernel {
-        async fn run_cell(&self, _code: &str) -> anyhow::Result<newt_data::kernel::CellRun> {
+        async fn run_cell(&self, code: &str) -> anyhow::Result<newt_data::kernel::CellRun> {
+            self.seen_code.lock().unwrap().push(code.to_string());
             match &self.fail {
                 Some(msg) => anyhow::bail!("{msg}"),
                 None => Ok(self.run.clone()),
@@ -748,9 +1035,11 @@ mod tests {
 
     /// A session with a pre-attached [`MockKernel`] returning `run`.
     fn session_with(run: newt_data::kernel::CellRun) -> KernelSession {
-        Arc::new(Mutex::new(Some(
-            Box::new(MockKernel { run, fail: None }) as Box<dyn KernelClient>
-        )))
+        Arc::new(Mutex::new(Some(Box::new(MockKernel {
+            run,
+            fail: None,
+            seen_code: Arc::new(std::sync::Mutex::new(Vec::new())),
+        }) as Box<dyn KernelClient>)))
     }
 
     /// A session with a pre-attached [`MockKernel`] whose `run_cell` errors.
@@ -758,7 +1047,28 @@ mod tests {
         Arc::new(Mutex::new(Some(Box::new(MockKernel {
             run: newt_data::kernel::CellRun::default(),
             fail: Some(msg.to_string()),
+            seen_code: Arc::new(std::sync::Mutex::new(Vec::new())),
         }) as Box<dyn KernelClient>)))
+    }
+
+    /// A session pre-attached to a [`MockKernel`] that returns `stdout` verbatim
+    /// (no error), plus the shared `seen_code` log so a test can assert what code
+    /// — if any — actually reached the kernel. Used by the Phase 21.5
+    /// dataframe-introspection tests: program the canned JSON the snippet would
+    /// print, then assert the tool parses it (and, for the injection guard, that
+    /// the kernel was never invoked at all).
+    fn session_with_stdout(stdout: &str) -> (KernelSession, Arc<std::sync::Mutex<Vec<String>>>) {
+        let seen_code = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let run = newt_data::kernel::CellRun {
+            stdout: stdout.to_string(),
+            ..Default::default()
+        };
+        let session = Arc::new(Mutex::new(Some(Box::new(MockKernel {
+            run,
+            fail: None,
+            seen_code: seen_code.clone(),
+        }) as Box<dyn KernelClient>)));
+        (session, seen_code)
     }
 
     /// Helper: a `tools/call` request body.
@@ -797,8 +1107,8 @@ mod tests {
 
         let tools = resp["result"]["tools"].as_array().unwrap();
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-        // The four SQL tools (21.2), the two live-kernel tools (21.3), and the
-        // three notebook tools (21.4).
+        // The four SQL tools (21.2), the two live-kernel tools (21.3), the three
+        // notebook tools (21.4), and the two dataframe-introspection tools (21.5).
         for expected in [
             "sql_ingest_csv",
             "sql_query",
@@ -809,10 +1119,12 @@ mod tests {
             "notebook_read",
             "notebook_insert_cell",
             "notebook_persist_executed_cell",
+            "list_dataframes",
+            "inspect_dataframe",
         ] {
             assert!(names.contains(&expected), "tools/list missing {expected}");
         }
-        assert_eq!(tools.len(), 9, "expected exactly 9 tools, got {names:?}");
+        assert_eq!(tools.len(), 11, "expected exactly 11 tools, got {names:?}");
 
         // Every tool carries an inputSchema object.
         for tool in tools {
@@ -852,6 +1164,28 @@ mod tests {
         assert_eq!(
             persist["inputSchema"]["required"],
             serde_json::json!(["path", "source", "outputs"])
+        );
+        // list_dataframes requires nothing; inspect_dataframe requires `name`
+        // (head is optional, so it must NOT be in `required`).
+        let list_df = tools
+            .iter()
+            .find(|t| t["name"] == "list_dataframes")
+            .unwrap();
+        assert!(
+            list_df["inputSchema"]["required"].is_null(),
+            "list_dataframes must have no required args"
+        );
+        let inspect = tools
+            .iter()
+            .find(|t| t["name"] == "inspect_dataframe")
+            .unwrap();
+        assert_eq!(
+            inspect["inputSchema"]["required"],
+            serde_json::json!(["name"])
+        );
+        assert!(
+            inspect["inputSchema"]["properties"]["head"].is_object(),
+            "inspect_dataframe must advertise the optional head argument"
         );
     }
 
@@ -1341,6 +1675,341 @@ mod tests {
         assert_eq!(summary["images"][1]["summary"], "PNG saved: /p/b.png");
         // No persist requested → persisted is null.
         assert!(summary["persisted"].is_null());
+    }
+
+    // ── dataframe introspection (Phase 21.5) — driven by a MockKernel ────────
+    //
+    // No live kernel: the MockKernel returns the JSON the snippet *would* print,
+    // so the tool's parse + in-band-error logic is exercised hermetically.
+
+    /// `is_python_identifier` accepts plain identifiers and rejects anything that
+    /// could break out of the `globals()[...]` lookup — the injection guard.
+    #[test]
+    fn is_python_identifier_accepts_and_rejects() {
+        for ok in ["df", "_df", "df1", "my_frame", "A", "_", "X9_y"] {
+            assert!(
+                is_python_identifier(ok),
+                "{ok} should be a valid identifier"
+            );
+        }
+        for bad in [
+            "",
+            "1df",
+            "df df",
+            "df;import os",
+            "df.attr",
+            "df-1",
+            "df()",
+            "\"df\"",
+            "df\n",
+            "globals()['x']",
+        ] {
+            assert!(!is_python_identifier(bad), "{bad:?} must be rejected");
+        }
+    }
+
+    /// `parse_head` defaults to 5 and folds every mistyped value to the default,
+    /// taking a genuine non-negative integer as-is (mirrors `parse_row_cap`).
+    #[test]
+    fn parse_head_defaults_and_folds_mistypes() {
+        assert_eq!(parse_head(None), DEFAULT_HEAD);
+        assert_eq!(parse_head(Some(&serde_json::json!(null))), DEFAULT_HEAD);
+        assert_eq!(parse_head(Some(&serde_json::json!(0))), 0);
+        assert_eq!(parse_head(Some(&serde_json::json!(10))), 10);
+        assert_eq!(parse_head(Some(&serde_json::json!(-3))), DEFAULT_HEAD);
+        assert_eq!(parse_head(Some(&serde_json::json!(2.5))), DEFAULT_HEAD);
+        assert_eq!(parse_head(Some(&serde_json::json!("7"))), DEFAULT_HEAD);
+        assert_eq!(parse_head(Some(&serde_json::json!(true))), DEFAULT_HEAD);
+    }
+
+    /// `inspect_snippet` interpolates only a validated identifier and a decimal
+    /// head, and references neither outside `globals()` — a quick guard that the
+    /// crafted snippet has the shape the kernel test relies on.
+    #[test]
+    fn inspect_snippet_interpolates_name_and_head() {
+        let snippet = inspect_snippet("sales", 12);
+        assert!(snippet.contains(r#"globals().get("sales")"#));
+        assert!(snippet.contains(".head(12)"));
+        assert!(snippet.contains(r#""error": "no DataFrame named sales""#));
+        // It imports pandas + json inside itself (defensive) and never mutates.
+        assert!(snippet.contains("import pandas as _pd"));
+        assert!(snippet.contains("import json as _json"));
+        // It runs the payload through the strict-JSON sanitizer so a NaN in a
+        // numeric column (null → NaN) cannot emit the invalid `NaN` token.
+        assert!(snippet.contains("def _clean("));
+        assert!(snippet.contains("_json.dumps(_clean("));
+    }
+
+    /// `list_dataframes` parses a canned 2-DataFrame JSON stdout into the tool
+    /// result (the happy path) and reaches the kernel exactly once.
+    #[tokio::test]
+    async fn list_dataframes_parses_canned_json() {
+        let canned = r#"[{"name":"df","rows":100,"cols":4,"memory_bytes":3200},{"name":"sales","rows":7,"cols":3,"memory_bytes":840}]"#;
+        let (session, seen) = session_with_stdout(canned);
+        let resp = rpc_full(
+            Arc::new(SqliteBackend::open_in_memory().unwrap()),
+            session,
+            &call(80, "list_dataframes", serde_json::json!({})),
+        )
+        .await;
+        assert!(resp["error"].is_null(), "must be in-band: {resp}");
+        assert!(
+            resp["result"]["isError"].is_null(),
+            "should succeed: {resp}"
+        );
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        let frames: Value = serde_json::from_str(text).unwrap();
+        let arr = frames.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["name"], "df");
+        assert_eq!(arr[0]["rows"], 100);
+        assert_eq!(arr[1]["name"], "sales");
+        assert_eq!(arr[1]["memory_bytes"], 840);
+        // The list snippet ran once on the kernel.
+        assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
+    /// stdout with incidental prints above the JSON line still parses — the
+    /// parser takes the LAST non-empty line.
+    #[tokio::test]
+    async fn list_dataframes_takes_last_non_empty_stdout_line() {
+        let noisy = "some incidental print\n\n[{\"name\":\"df\",\"rows\":1,\"cols\":1,\"memory_bytes\":8}]\n";
+        let (session, _seen) = session_with_stdout(noisy);
+        let resp = rpc_full(
+            Arc::new(SqliteBackend::open_in_memory().unwrap()),
+            session,
+            &call(81, "list_dataframes", serde_json::json!({})),
+        )
+        .await;
+        assert!(
+            resp["result"]["isError"].is_null(),
+            "should succeed: {resp}"
+        );
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        let frames: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(frames.as_array().unwrap()[0]["name"], "df");
+    }
+
+    /// `inspect_dataframe` parses a canned columns/dtypes/describe/head JSON.
+    #[tokio::test]
+    async fn inspect_dataframe_parses_canned_json() {
+        let canned = r#"{"name":"df","shape":[5,2],"columns":[{"name":"id","dtype":"int64","null_count":0},{"name":"score","dtype":"float64","null_count":1}],"head":[{"id":1,"score":1.0},{"id":2,"score":2.0}],"describe":{"id":{"count":5.0,"mean":3.0},"score":{"count":4.0,"mean":2.5}}}"#;
+        let (session, seen) = session_with_stdout(canned);
+        let resp = rpc_full(
+            Arc::new(SqliteBackend::open_in_memory().unwrap()),
+            session,
+            &call(82, "inspect_dataframe", serde_json::json!({ "name": "df" })),
+        )
+        .await;
+        assert!(resp["error"].is_null(), "must be in-band: {resp}");
+        assert!(
+            resp["result"]["isError"].is_null(),
+            "should succeed: {resp}"
+        );
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        let inspect: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(inspect["name"], "df");
+        assert_eq!(inspect["shape"], serde_json::json!([5, 2]));
+        assert_eq!(inspect["columns"][1]["name"], "score");
+        assert_eq!(inspect["columns"][1]["dtype"], "float64");
+        assert_eq!(inspect["columns"][1]["null_count"], 1);
+        assert_eq!(inspect["head"].as_array().unwrap().len(), 2);
+        assert_eq!(inspect["describe"]["score"]["mean"], 2.5);
+        // The inspect snippet ran once, with the default head of 5.
+        let code = &seen.lock().unwrap()[0];
+        assert!(code.contains(".head(5)"), "default head must be 5: {code}");
+        assert!(code.contains(r#"globals().get("df")"#));
+    }
+
+    /// `inspect_dataframe` with an explicit `head` interpolates that N into the
+    /// snippet the kernel runs.
+    #[tokio::test]
+    async fn inspect_dataframe_honors_explicit_head() {
+        let (session, seen) = session_with_stdout(
+            r#"{"name":"df","shape":[0,0],"columns":[],"head":[],"describe":{}}"#,
+        );
+        let resp = rpc_full(
+            Arc::new(SqliteBackend::open_in_memory().unwrap()),
+            session,
+            &call(
+                83,
+                "inspect_dataframe",
+                serde_json::json!({ "name": "df", "head": 20 }),
+            ),
+        )
+        .await;
+        assert!(
+            resp["result"]["isError"].is_null(),
+            "should succeed: {resp}"
+        );
+        assert!(seen.lock().unwrap()[0].contains(".head(20)"));
+    }
+
+    /// No kernel attached → an in-band error telling the model to attach first
+    /// (resp["error"] null, result isError true). For both tools.
+    #[tokio::test]
+    async fn dataframe_tools_without_attach_are_in_band_errors() {
+        for (id, name, args) in [
+            (84, "list_dataframes", serde_json::json!({})),
+            (85, "inspect_dataframe", serde_json::json!({ "name": "df" })),
+        ] {
+            let resp = rpc(&call(id, name, args)).await;
+            assert!(resp["error"].is_null(), "{name} must be in-band: {resp}");
+            assert_eq!(resp["result"]["isError"], true, "{name}: {resp}");
+            assert!(resp["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("attach a kernel first"));
+        }
+    }
+
+    /// A snippet that prints `{"error": ...}` (e.g. pandas not importable, or an
+    /// undefined DataFrame name) is surfaced as an in-band tool error carrying
+    /// that message.
+    #[tokio::test]
+    async fn dataframe_tool_snippet_error_is_in_band() {
+        let (session, _seen) = session_with_stdout(r#"{"error": "no DataFrame named ghost"}"#);
+        let resp = rpc_full(
+            Arc::new(SqliteBackend::open_in_memory().unwrap()),
+            session,
+            &call(
+                86,
+                "inspect_dataframe",
+                serde_json::json!({ "name": "ghost" }),
+            ),
+        )
+        .await;
+        assert!(resp["error"].is_null(), "must be in-band: {resp}");
+        assert_eq!(resp["result"]["isError"], true);
+        assert!(resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("no DataFrame named ghost"));
+    }
+
+    /// A CellRun carrying a kernel error (the snippet itself somehow raised, or
+    /// the kernel faulted) is surfaced in-band, ename:evalue included.
+    #[tokio::test]
+    async fn dataframe_tool_kernel_error_is_in_band() {
+        let run = CellRun {
+            error: Some(KernelError {
+                ename: "RuntimeError".into(),
+                evalue: "kernel exploded".into(),
+                traceback: vec!["Traceback...".into()],
+            }),
+            ..Default::default()
+        };
+        let resp = rpc_full(
+            Arc::new(SqliteBackend::open_in_memory().unwrap()),
+            session_with(run),
+            &call(87, "list_dataframes", serde_json::json!({})),
+        )
+        .await;
+        assert!(resp["error"].is_null(), "must be in-band: {resp}");
+        assert_eq!(resp["result"]["isError"], true);
+        let msg = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(msg.contains("kernel error"));
+        assert!(msg.contains("RuntimeError"));
+        assert!(msg.contains("kernel exploded"));
+    }
+
+    /// A transport failure inside the snippet run is an in-band error.
+    #[tokio::test]
+    async fn dataframe_tool_transport_failure_is_in_band() {
+        let resp = rpc_full(
+            Arc::new(SqliteBackend::open_in_memory().unwrap()),
+            session_failing("websocket closed unexpectedly"),
+            &call(88, "list_dataframes", serde_json::json!({})),
+        )
+        .await;
+        assert!(resp["error"].is_null(), "must be in-band: {resp}");
+        assert_eq!(resp["result"]["isError"], true);
+        assert!(resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("kernel run failed"));
+    }
+
+    /// stdout with NO parseable JSON line is an honest in-band parse error.
+    #[tokio::test]
+    async fn dataframe_tool_unparseable_stdout_is_in_band() {
+        let (session, _seen) = session_with_stdout("not json at all\nstill not json\n");
+        let resp = rpc_full(
+            Arc::new(SqliteBackend::open_in_memory().unwrap()),
+            session,
+            &call(89, "list_dataframes", serde_json::json!({})),
+        )
+        .await;
+        assert!(resp["error"].is_null(), "must be in-band: {resp}");
+        assert_eq!(resp["result"]["isError"], true);
+        assert!(resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("could not parse JSON"));
+    }
+
+    /// Empty stdout is an honest in-band "no JSON output" error.
+    #[tokio::test]
+    async fn dataframe_tool_empty_stdout_is_in_band() {
+        let (session, _seen) = session_with_stdout("\n\n   \n");
+        let resp = rpc_full(
+            Arc::new(SqliteBackend::open_in_memory().unwrap()),
+            session,
+            &call(90, "list_dataframes", serde_json::json!({})),
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], true);
+        assert!(resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("no JSON output"));
+    }
+
+    /// `inspect_dataframe` with an INVALID name (`"df; import os"`) is an in-band
+    /// error BEFORE any kernel call — the injection guard. Assert the kernel was
+    /// never invoked.
+    #[tokio::test]
+    async fn inspect_dataframe_invalid_name_rejected_before_kernel_call() {
+        let (session, seen) = session_with_stdout(r#"{"name":"x"}"#);
+        let resp = rpc_full(
+            Arc::new(SqliteBackend::open_in_memory().unwrap()),
+            session,
+            &call(
+                91,
+                "inspect_dataframe",
+                serde_json::json!({ "name": "df; import os" }),
+            ),
+        )
+        .await;
+        assert!(resp["error"].is_null(), "must be in-band: {resp}");
+        assert_eq!(resp["result"]["isError"], true);
+        assert!(resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("must be a plain Python identifier"));
+        // The load-bearing assertion: the kernel was NEVER touched — the hostile
+        // name was rejected before any run_cell, so no code injection is possible.
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "a hostile name must be rejected BEFORE any kernel call"
+        );
+    }
+
+    /// `inspect_dataframe` with a missing `name` argument is an in-band error.
+    #[tokio::test]
+    async fn inspect_dataframe_missing_name_is_in_band_error() {
+        let (session, _seen) = session_with_stdout(r#"{"name":"x"}"#);
+        let resp = rpc_full(
+            Arc::new(SqliteBackend::open_in_memory().unwrap()),
+            session,
+            &call(92, "inspect_dataframe", serde_json::json!({})),
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], true);
+        assert!(resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("missing required argument: name"));
     }
 
     // ── notebook tools (Phase 21.4) — over a tempfile .ipynb ─────────────────
