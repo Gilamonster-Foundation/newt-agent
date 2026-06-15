@@ -13,6 +13,7 @@ pub mod conversation;
 pub mod dgx;
 pub mod error;
 pub mod ffi_manifest;
+pub mod ffi_surface;
 pub mod mcp;
 pub mod memory;
 pub mod metrics;
@@ -70,6 +71,7 @@ pub use conversation::{
     new_conversation_id, session_plan_dir, session_plan_path, ConversationRecord,
     ConversationSummary, ConversationTurn, ToolEvent,
 };
+pub use ffi_surface::FfiSurfaceProvider;
 // Steps 17.1a/17.1b (issue #246): `ConversationStore` is the SQLite backend
 // (`store` module, §6 causal ordering). The legacy JSON write path is gone;
 // any legacy tree is imported once on open. The `conversation` module keeps

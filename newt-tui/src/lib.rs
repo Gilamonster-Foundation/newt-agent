@@ -2593,7 +2593,7 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
     // technique — is a hard error; a `--profile` that silently did nothing would
     // be a false claim. The resolved profile is held for the loop to apply (the
     // technique-application wiring is the next increment).
-    let _active_profile = match std::env::var("NEWT_PROFILE") {
+    let active_profile = match std::env::var("NEWT_PROFILE") {
         Ok(name) if !name.is_empty() => {
             let profile = cfg
                 .resolve_profile(&name)
@@ -2804,6 +2804,16 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
             .ok()
             .or_else(|| cfg.agents.path.clone());
         mgr.add_provider(newt_core::AgentsProvider::new(agents_enabled, agents_path));
+        // Profile technique: knowledge_base (R1) — inject the authoritative PyO3
+        // import surface into the system prompt when the active profile lists it.
+        // Rides the provider seam (survives system-prompt rebuilds); a no-op on a
+        // non-PyO3 workspace. See docs/design/technique-library.md.
+        if active_profile
+            .as_ref()
+            .is_some_and(|p| p.enables("knowledge_base"))
+        {
+            mgr.add_provider(newt_core::FfiSurfaceProvider::new());
+        }
         // History provider based on config.
         match mem_cfg.provider {
             newt_core::MemoryProviderKind::TokenBudget => {
