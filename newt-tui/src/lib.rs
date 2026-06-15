@@ -106,7 +106,7 @@ use crossterm::{
     cursor::{Hide, MoveTo, Show},
     event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
     execute, queue,
-    style::{Color as CtColor, Print, ResetColor, SetForegroundColor},
+    style::{Color as CtColor, Print, ResetColor, SetBackgroundColor, SetForegroundColor},
     terminal::{
         self, disable_raw_mode, enable_raw_mode, Clear, ClearType, EnterAlternateScreen,
         LeaveAlternateScreen,
@@ -221,6 +221,87 @@ fn brand_plugins() -> Option<String> {
         .ok()
         .filter(|s| !s.trim().is_empty())
         .map(|s| format!("plugins:  {}", s.trim()))
+}
+
+/// Whether a brand logo override is active (the downstream pilot, not stock
+/// newt). Gates the blank-band splash layout so the default newt splash — which
+/// has no large blank bands to fill — is untouched.
+fn brand_active() -> bool {
+    std::env::var_os("NEWT_BRAND_LOGO_DIR").is_some_and(|d| !d.is_empty())
+}
+
+/// A logo art row is "blank" if no cell carries ink — every truecolor component
+/// stays near the dark fill. Half-block art paints `▄` in every cell with the
+/// picture in the colors, so a blank row can't be detected by glyphs; we scan
+/// the `..;2;r;g;b` SGR triples instead. A bright component means ink.
+fn row_is_blank(row: &str) -> bool {
+    const INK: u32 = 56;
+    let mut hay = row;
+    while let Some(i) = hay.find("8;2;") {
+        let mut nums = hay[i + 4..]
+            .split(|c: char| !c.is_ascii_digit())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.parse::<u32>().unwrap_or(0));
+        let r = nums.next().unwrap_or(0);
+        let g = nums.next().unwrap_or(0);
+        let b = nums.next().unwrap_or(0);
+        if r.max(g).max(b) >= INK {
+            return false;
+        }
+        hay = &hay[i + 4..];
+    }
+    true
+}
+
+/// Find a blank band — a run of all-blank rows at the top or bottom of the art
+/// — tall enough to hold `need` lines of text. Prefers the bottom (a title-card
+/// look under the logo). Returns the `[start, end)` row range to lay text into,
+/// or `None` when neither band fits (small logos → caller keeps the side layout).
+fn blank_band(rows: &[&str], need: usize) -> Option<(usize, usize)> {
+    if need == 0 || rows.is_empty() {
+        return None;
+    }
+    let n = rows.len();
+    let mut bottom = n;
+    while bottom > 0 && row_is_blank(rows[bottom - 1]) {
+        bottom -= 1;
+    }
+    let bottom_h = n - bottom;
+    let mut top = 0;
+    while top < n && row_is_blank(rows[top]) {
+        top += 1;
+    }
+    let top_h = top;
+    if bottom_h >= need && bottom_h >= top_h {
+        Some((bottom, n))
+    } else if top_h >= need {
+        Some((0, top))
+    } else if bottom_h >= need {
+        Some((bottom, n))
+    } else {
+        None
+    }
+}
+
+/// The splash text block: wordmark + tagline, version, optional plugins, and the
+/// action line. Each line is a list of (text, optional fg) spans; `None` fg
+/// means the terminal default. Used by the blank-band layout.
+fn splash_block() -> Vec<Vec<(String, Option<CtColor>)>> {
+    let mut block = vec![
+        vec![
+            (brand_name(), Some(NEWT_ORANGE_CT)),
+            (format!("  ·  {}", brand_tagline()), None),
+        ],
+        vec![(format!("v{VERSION}"), Some(CtColor::DarkGrey))],
+    ];
+    if let Some(plugins) = brand_plugins() {
+        block.push(vec![(plugins, Some(CtColor::DarkGrey))]);
+    }
+    block.push(vec![(
+        "Enter  start coder   ·   q quit".to_string(),
+        Some(CtColor::DarkGrey),
+    )]);
+    block
 }
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -435,11 +516,44 @@ fn show_splash(out: &mut io::Stdout, workspace: &str, color: bool) -> anyhow::Re
 fn show_splash_color(out: &mut io::Stdout, _workspace: &str) -> anyhow::Result<bool> {
     let (term_cols, term_rows) = terminal::size().unwrap_or((80, 24));
     let (logo, logo_cols) = logo_for_size(term_cols, term_rows);
-    let logo_rows = logo.lines().count() as u16;
+    let logo_lines: Vec<&str> = logo.lines().collect();
+    let logo_rows = logo_lines.len() as u16;
 
     // Print ANSI logo flush to top. In raw mode \n is LF only; \r\n resets column.
     write!(out, "{}", logo.replace('\n', "\r\n"))?;
     out.flush()?;
+
+    // A branded logo (e.g. gilamonster's wide half-block hero) leaves big blank
+    // bands above/below the subject; lay the splash text into one of them rather
+    // than off to the side. Stock newt has no such band → keeps the side layout.
+    let block = splash_block();
+    if let Some((start, end)) = brand_active()
+        .then(|| blank_band(&logo_lines, block.len()))
+        .flatten()
+    {
+        let dark = CtColor::Rgb {
+            r: 20,
+            g: 20,
+            b: 20,
+        };
+        let top = start + (end - start - block.len()) / 2;
+        for (k, line) in block.iter().enumerate() {
+            let width: usize = line.iter().map(|(t, _)| t.chars().count()).sum();
+            let col = (logo_cols as usize).saturating_sub(width) / 2;
+            queue!(
+                out,
+                MoveTo(col as u16, (top + k) as u16),
+                SetBackgroundColor(dark)
+            )?;
+            for (text, color) in line {
+                queue!(out, SetForegroundColor(color.unwrap_or(CtColor::Reset)))?;
+                queue!(out, Print(text))?;
+            }
+            queue!(out, ResetColor)?;
+        }
+        out.flush()?;
+        return splash_wait_for_continue();
+    }
 
     let brand_col = logo_cols + 2;
     let brand_row = logo_rows.saturating_sub(4) / 2;
@@ -6045,6 +6159,35 @@ mod tests {
             fmt(Some("mogul, diagram")),
             Some("plugins:  mogul, diagram".to_string())
         );
+    }
+
+    #[test]
+    fn row_is_blank_distinguishes_dark_fill_from_ink() {
+        // Half-block cell: glyph is always ▄; the picture is in the colors.
+        let dark = "\x1b[38;2;20;20;20m\x1b[48;2;18;18;18m▄\x1b[0m";
+        let gold = "\x1b[38;2;235;195;70m\x1b[48;2;20;20;20m▄\x1b[0m";
+        assert!(row_is_blank(dark), "all-dark row is blank");
+        assert!(!row_is_blank(gold), "a gold cell is ink");
+        assert!(row_is_blank(""), "empty row is blank");
+    }
+
+    #[test]
+    fn blank_band_prefers_bottom_and_respects_need() {
+        let dark = "\x1b[38;2;20;20;20m\x1b[48;2;20;20;20m▄";
+        let ink = "\x1b[38;2;235;195;70m▄";
+        // 2 blank rows on top, 3 on the bottom, subject in the middle.
+        let rows = [dark, dark, ink, ink, dark, dark, dark];
+        assert_eq!(blank_band(&rows, 3), Some((4, 7)), "bottom band fits 3");
+        assert_eq!(
+            blank_band(&rows, 2),
+            Some((4, 7)),
+            "bottom preferred over top"
+        );
+        assert_eq!(blank_band(&rows, 4), None, "neither band holds 4");
+        assert_eq!(blank_band(&rows, 0), None);
+        // Top-only band when the bottom is too small.
+        let top_heavy = [dark, dark, dark, ink, ink];
+        assert_eq!(blank_band(&top_heavy, 3), Some((0, 3)));
     }
 
     #[test]
