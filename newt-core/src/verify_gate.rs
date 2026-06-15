@@ -207,12 +207,48 @@ pub fn gate_python_workspace_with(
     Ok(GateReport { files })
 }
 
+/// Directory names never walked by the gate: dependency/build trees that are not
+/// the project's own source. Walking them gates thousands of installed `.py` (perf)
+/// and would let the gate *report* fabrications in code newt never wrote (noise).
+/// The `retry` revert is already fenced to newt's own writes by the ledger, but
+/// keeping these out of the walk is defense-in-depth and a real speedup.
+const SKIP_DIRS: &[&str] = &[
+    ".git",
+    ".venv",
+    "venv",
+    "site-packages",
+    "node_modules",
+    "target",
+    "__pycache__",
+    ".tox",
+    ".mypy_cache",
+];
+
 /// Recursively collect `*.py` paths under `dir`.
+///
+/// **Symlinks are not followed** — neither symlinked directories nor symlinked
+/// files are entered or collected. This is a hard safety boundary: a symlinked dir
+/// could otherwise pull external `.py` into the gate (and, were they ever reverted,
+/// let a write/delete escape the workspace). Vendored/build dirs ([`SKIP_DIRS`]) are
+/// skipped too.
 fn collect_py_files(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
     for entry in std::fs::read_dir(dir)? {
-        let path = entry?.path();
-        if path.is_dir() {
-            collect_py_files(&path, out)?;
+        let entry = entry?;
+        // `file_type()` does NOT traverse the final symlink, so a symlinked dir or
+        // file is identified as a symlink here and skipped before we ever follow it.
+        let ft = entry.file_type()?;
+        if ft.is_symlink() {
+            continue;
+        }
+        let path = entry.path();
+        if ft.is_dir() {
+            let skip = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| SKIP_DIRS.contains(&n));
+            if !skip {
+                collect_py_files(&path, out)?;
+            }
         } else if path.extension().is_some_and(|e| e == "py") {
             out.push(path);
         }
@@ -256,15 +292,25 @@ impl WriteLedger {
     }
 
     /// Record `path`'s pre-turn state the **first** time it is written this turn.
-    /// Call this *before* the write lands: it reads the current bytes from disk
-    /// (recording `None` when the path is absent). A no-op on any subsequent write
-    /// to the same path — the pre-turn snapshot is preserved.
+    /// Call this *before* the write lands. A no-op on any subsequent write to the
+    /// same path — the pre-turn snapshot is preserved.
+    ///
+    /// Only a genuine `NotFound` records the "did-not-exist" marker (`None`) that
+    /// makes revert *delete* the path. Any **other** read error (`EACCES`, a
+    /// transient NFS hiccup, the path being a directory) leaves the path
+    /// **untracked** — conflating "unreadable" with "absent" would let revert delete
+    /// a pre-existing file whose note-time read merely failed. Untracked ⇒ revert
+    /// returns `false` and refuses to touch it.
     pub fn note_before_write(&mut self, path: impl Into<PathBuf>) {
         let path = path.into();
         if self.entries.contains_key(&path) {
             return;
         }
-        let prior = std::fs::read(&path).ok();
+        let prior = match std::fs::read(&path) {
+            Ok(bytes) => Some(bytes),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(_) => return, // unreadable ≠ absent: never mark it delete-on-revert
+        };
         self.entries.insert(path, prior);
     }
 
@@ -407,6 +453,29 @@ pub struct RetrySurface<'a> {
     pub block: &'a str,
 }
 
+/// Is `abs` inside `ws_canon` (the canonicalized workspace root)? Conservative: a
+/// path that cannot be resolved relative to a known root is treated as **outside**.
+/// When the workspace root itself cannot be canonicalized (`None`), the check is
+/// skipped — the ledger fence remains the primary safety — and the path is allowed.
+fn path_within(abs: &Path, ws_canon: Option<&Path>) -> bool {
+    let Some(root) = ws_canon else {
+        return true;
+    };
+    // The file usually exists at revert time; canonicalize it directly when it does.
+    if let Ok(c) = abs.canonicalize() {
+        return c.starts_with(root);
+    }
+    // Otherwise resolve the parent (which must exist) and re-append the file name —
+    // this still defeats a `..`/symlink escape in the parent chain.
+    match (abs.parent(), abs.file_name()) {
+        (Some(parent), Some(name)) => match parent.canonicalize() {
+            Ok(pc) => pc.join(name).starts_with(root),
+            Err(_) => false,
+        },
+        _ => false,
+    }
+}
+
 /// Drive the verify-gated revert-retry loop: revert the gate's flagged set to its
 /// pre-turn state, re-prompt the model with the fabrications named, re-gate, and
 /// repeat up to `max_retries` — accepting as soon as the gate is clean, and giving
@@ -430,6 +499,10 @@ pub async fn apply_revert_retry(
     max_retries: u32,
     rerun: &mut dyn RetryRerun,
 ) -> anyhow::Result<RetryOutcome> {
+    // The workspace boundary, resolved once: nothing outside it is ever written or
+    // removed, even if a ledger path somehow resolves there (defence-in-depth on
+    // top of the ledger fence and the symlink-free walk).
+    let ws_canon = workspace.canonicalize().ok();
     let mut report = initial;
     let mut retries_used = 0u32;
     loop {
@@ -437,23 +510,31 @@ pub async fn apply_revert_retry(
             return Ok(RetryOutcome::accepted(retries_used));
         }
 
-        // Revert exactly the flagged set to its pre-turn bytes. A clean file the
-        // model wrote the same turn is never in `revert_set()`, so it is kept.
-        let reverted: Vec<PathBuf> = report
-            .revert_set()
-            .iter()
-            .map(|p| p.to_path_buf())
-            .collect();
+        // Revert the flagged set to its pre-turn state. The ledger fences this to
+        // files **newt itself wrote** this turn: a flagged path with no ledger entry
+        // (a pre-existing file, build output, or anything newt did not author) is
+        // skipped — never deleted. A clean file the model wrote the same turn is not
+        // in `revert_set()`, so it is kept. `reverted` records only what was actually
+        // acted on, so the outcome (and the caller's banner) is honest.
+        let mut reverted: Vec<PathBuf> = Vec::new();
         {
             let led = ledger.borrow();
-            for rel in &reverted {
+            for rel in report.revert_set() {
                 let abs = workspace.join(rel);
-                if !led.revert(&abs)? {
+                if !path_within(&abs, ws_canon.as_deref()) {
                     tracing::warn!(
                         path = %rel.display(),
-                        "retry: gate-flagged path not in the write ledger — skipping (will not \
-                         delete an untracked file)"
+                        "retry: refusing to revert a path outside the workspace"
                     );
+                    continue;
+                }
+                match led.revert(&abs)? {
+                    true => reverted.push(rel.to_path_buf()),
+                    false => tracing::warn!(
+                        path = %rel.display(),
+                        "retry: gate-flagged path not in the write ledger — skipping (will not \
+                         delete a file newt did not write)"
+                    ),
                 }
             }
         }
@@ -474,6 +555,31 @@ pub async fn apply_revert_retry(
         retries_used += 1;
         report = gate_python_workspace_with(workspace, surface.modules, surface.mode)?;
     }
+}
+
+/// The destructive arm **without** re-prompting: revert the gate's flagged set and
+/// return the outcome, never re-invoking the model. Equivalent to
+/// [`apply_revert_retry`] with `max_retries = 0` — the safety properties (ledger
+/// fence, workspace-boundary guard, honest `reverted` list) are inherited. This is
+/// the live loop's increment-2a path; bumping to a real `RetryRerun` + cap is the
+/// re-prompt increment.
+///
+/// # Errors
+/// Propagates a revert I/O error from [`apply_revert_retry`].
+pub async fn revert_only(
+    workspace: &Path,
+    surface: &RetrySurface<'_>,
+    ledger: &RefCell<WriteLedger>,
+    report: GateReport,
+) -> anyhow::Result<RetryOutcome> {
+    struct NoRerun;
+    #[async_trait(?Send)]
+    impl RetryRerun for NoRerun {
+        async fn rerun(&mut self, _prompt: String) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+    apply_revert_retry(workspace, surface, ledger, report, 0, &mut NoRerun).await
 }
 
 #[cfg(test)]
@@ -713,6 +819,24 @@ pub struct PyRouter;
     }
 
     #[test]
+    fn note_before_write_leaves_an_unreadable_path_untracked() {
+        // A directory at the path makes `std::fs::read` fail with a non-NotFound
+        // error. That must NOT be recorded as the absent-marker `Some(None)` (which
+        // would delete on revert) — the path is left untracked instead.
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("not_a_file");
+        std::fs::create_dir(&p).unwrap();
+        let mut led = WriteLedger::new();
+        led.note_before_write(&p);
+        assert_eq!(led.len(), 0, "an unreadable path is not recorded");
+        assert!(!led.revert(&p).unwrap(), "untracked ⇒ revert is a no-op");
+        assert!(
+            p.exists(),
+            "revert must never remove an unreadable pre-existing path"
+        );
+    }
+
+    #[test]
     fn corrective_prompt_names_files_modules_and_surface() {
         let report = GateReport {
             files: vec![FileVerdict {
@@ -882,5 +1006,64 @@ pub struct PyRouter;
         .unwrap();
         assert!(outcome.accepted);
         assert_eq!(outcome.retries_used, 0);
+    }
+
+    #[tokio::test]
+    async fn revert_only_touches_only_ledgered_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        // newt creates one fabricating file (recorded in the ledger)...
+        let ledger = RefCell::new(WriteLedger::new());
+        let mine = tmp.path().join("mine.py");
+        ledger.borrow_mut().note_before_write(&mine);
+        std::fs::write(&mine, "import newt_core\n").unwrap();
+        // ...and a fabricating file newt never wrote exists too (NOT in the ledger).
+        let theirs = tmp.path().join("theirs.py");
+        std::fs::write(&theirs, "import newt_core\n").unwrap();
+
+        let surf = surface();
+        let report = gate_python_workspace(tmp.path(), &surf).unwrap();
+        assert_eq!(report.revert_set().len(), 2, "both files fabricate");
+
+        let outcome = revert_only(
+            tmp.path(),
+            &RetrySurface {
+                modules: &surf,
+                mode: SurfaceMatch::Exact,
+                block: "",
+            },
+            &ledger,
+            report,
+        )
+        .await
+        .unwrap();
+
+        // Only newt's file is reverted (deleted); the other is left exactly as-is.
+        assert_eq!(outcome.reverted, vec![PathBuf::from("mine.py")]);
+        assert!(!mine.exists(), "newt's created fabrication is removed");
+        assert_eq!(
+            std::fs::read_to_string(&theirs).unwrap(),
+            "import newt_core\n",
+            "a file newt did not write is never touched"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gate_does_not_follow_symlinked_dirs() {
+        // A symlinked directory pointing OUTSIDE the workspace must not be walked —
+        // otherwise external `.py` enter the gate's blast radius.
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("external.py"), "import newt_core\n").unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::write(ws.path().join("own.py"), "import newt_core\n").unwrap();
+        std::os::unix::fs::symlink(outside.path(), ws.path().join("linked")).unwrap();
+
+        let report = gate_python_workspace(ws.path(), &surface()).unwrap();
+        let paths: Vec<_> = report.files.iter().map(|f| f.path.clone()).collect();
+        assert_eq!(
+            paths,
+            vec![PathBuf::from("own.py")],
+            "only the workspace's own .py is gated; the symlinked external file is skipped"
+        );
     }
 }

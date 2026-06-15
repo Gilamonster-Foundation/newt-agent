@@ -537,6 +537,119 @@ pub struct ChatCtx<'a> {
     /// so the confined-shell and gate paths enforce it too; this field is the
     /// one extra place the otherwise caveats-blind bypass must consult.
     pub exec_floor: Option<&'a crate::caveats::Scope<String>>,
+    /// `retry` technique (R2 action arm): a turn-scoped copy-on-first-write ledger
+    /// ([`crate::verify_gate::WriteLedger`]) the file-write tools record into before
+    /// each `write_file` / `edit_file`, so the caller can revert exactly the files
+    /// newt wrote this turn (and only those) after the gate runs. Shared via
+    /// [`RefCell`](std::cell::RefCell) so the loop records while the caller reads.
+    /// `None` (every headless caller, and any profile without `retry`) ⇒ nothing is
+    /// recorded and no file is ever reverted — bit-for-bit today's behavior.
+    pub write_ledger: Option<&'a std::cell::RefCell<crate::verify_gate::WriteLedger>>,
+}
+
+/// retry technique (R2 action arm): before a `write_file`/`edit_file` is dispatched,
+/// capture the target's pre-write bytes into the turn ledger. Recorded at the loop's
+/// dispatch site (not inside `execute_tool`) so the seam stays narrow and only the
+/// two file-writing tools are ever tracked. [`WriteLedger::note_before_write`] is
+/// idempotent on the turn's first write of a path, so the *pre-turn* state is what
+/// is preserved. A no-op when no ledger is lent — every headless caller and any
+/// profile without `retry` — so behavior is bit-for-bit unchanged there.
+fn ledger_note_write(
+    write_ledger: Option<&std::cell::RefCell<crate::verify_gate::WriteLedger>>,
+    name: &str,
+    args: &serde_json::Value,
+    workspace: &str,
+) {
+    let Some(led) = write_ledger else {
+        return;
+    };
+    if name != "write_file" && name != "edit_file" {
+        return;
+    }
+    if let Some(p) = args.get("path").and_then(|v| v.as_str()) {
+        // Key on the lexically-normalized path so a raw model path like
+        // `examples/../foo.py` matches the gate's filesystem-normalized `foo.py`
+        // and the revert lookup actually hits — otherwise a non-normalized path
+        // would silently evade revert (the fabrication persists, the gate is gamed).
+        let abs = lexical_normalize(&std::path::Path::new(workspace).join(p));
+        led.borrow_mut().note_before_write(abs);
+    }
+}
+
+/// Lexically normalize a path — collapse `.`, resolve `..`, drop empty components —
+/// **without** touching the filesystem, so a ledger key built from a raw
+/// model-supplied path matches the gate's `read_dir`-normalized path. Purely
+/// lexical: it deliberately does not resolve symlinks (the gate never follows them
+/// and revert is workspace-boundary-guarded), so it cannot itself escape the tree.
+fn lexical_normalize(path: &std::path::Path) -> std::path::PathBuf {
+    use std::path::Component;
+    let mut out = std::path::PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            Component::ParentDir => {
+                // Only pop a real path segment; never climb above a root/prefix.
+                if matches!(out.components().next_back(), Some(Component::Normal(_))) {
+                    out.pop();
+                } else {
+                    out.push("..");
+                }
+            }
+            Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod retry_ledger_tests {
+    use super::*;
+
+    #[test]
+    fn lexical_normalize_collapses_dot_and_parent() {
+        assert_eq!(
+            lexical_normalize(std::path::Path::new("/ws/examples/../foo.py")),
+            std::path::PathBuf::from("/ws/foo.py")
+        );
+        assert_eq!(
+            lexical_normalize(std::path::Path::new("/ws/./a//b/foo.py")),
+            std::path::PathBuf::from("/ws/a/b/foo.py")
+        );
+        // A leading `..` with no segment to pop is preserved, not climbed past root.
+        assert_eq!(
+            lexical_normalize(std::path::Path::new("../x.py")),
+            std::path::PathBuf::from("../x.py")
+        );
+    }
+
+    #[test]
+    fn ledger_note_write_keys_on_the_normalized_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("foo.py"), "real\n").unwrap();
+        let led = std::cell::RefCell::new(crate::verify_gate::WriteLedger::new());
+        // a raw, non-normalized model path
+        let args = serde_json::json!({ "path": "examples/../foo.py" });
+        ledger_note_write(
+            Some(&led),
+            "write_file",
+            &args,
+            tmp.path().to_str().unwrap(),
+        );
+        // the key normalized to <ws>/foo.py — the same path the gate would produce —
+        // so revert finds and restores it (returns true).
+        assert!(
+            led.borrow().revert(&tmp.path().join("foo.py")).unwrap(),
+            "the normalized key matches the gate's path"
+        );
+        // a read-only tool is never recorded
+        ledger_note_write(
+            Some(&led),
+            "read_file",
+            &serde_json::json!({ "path": "foo.py" }),
+            tmp.path().to_str().unwrap(),
+        );
+        assert_eq!(led.borrow().len(), 1, "only write tools are tracked");
+    }
 }
 
 /// Main agentic loop: call model → execute tool calls → feed results back → repeat.
@@ -592,6 +705,7 @@ pub async fn chat_complete(
         mut on_round_usage,
         estimate_ratio,
         exec_floor,
+        write_ledger,
     } = ctx;
     // Headless callers may pass no session state — compression still works,
     // with per-turn anti-thrash accounting.
@@ -1282,6 +1396,9 @@ pub async fn chat_complete(
                     n.note_saved();
                 }
             }
+            // retry technique: snapshot the file's pre-write bytes before the
+            // write tool runs, so the post-turn gate can revert exactly newt's writes.
+            ledger_note_write(write_ledger, name, &args, workspace);
             let tool_t0 = std::time::Instant::now();
             let result = execute_tool(
                 name,
@@ -1644,6 +1761,7 @@ pub async fn openai_chat_complete(
         mut on_round_usage,
         estimate_ratio,
         exec_floor,
+        write_ledger,
     } = ctx;
     // Headless callers may pass no session state (mirrors the Ollama path).
     let mut local_compress_state = CompressState::new();
@@ -2036,6 +2154,9 @@ pub async fn openai_chat_complete(
                     n.note_saved();
                 }
             }
+            // retry technique: snapshot the file's pre-write bytes before the
+            // write tool runs, so the post-turn gate can revert exactly newt's writes.
+            ledger_note_write(write_ledger, name, &args, workspace);
             let tool_t0 = std::time::Instant::now();
             let result = execute_tool(
                 name,
@@ -2358,6 +2479,7 @@ mod tool_round_cap_tests {
                 on_round_usage: None,
                 estimate_ratio: None,
                 exec_floor: None,
+                write_ledger: None,
             },
             &mut NoMcp,
         )
@@ -2424,6 +2546,7 @@ mod tool_round_cap_tests {
                 on_round_usage: None,
                 estimate_ratio: None,
                 exec_floor: None,
+                write_ledger: None,
             },
             &mut NoMcp,
         )
@@ -2508,6 +2631,7 @@ mod tool_round_cap_tests {
                 on_round_usage: None,
                 estimate_ratio: None,
                 exec_floor: None,
+                write_ledger: None,
             },
             &mut NoMcp,
         )
@@ -2604,6 +2728,7 @@ mod tool_round_cap_tests {
                 on_round_usage: None,
                 estimate_ratio: None,
                 exec_floor: None,
+                write_ledger: None,
             },
             &mut NoMcp,
         )
@@ -2692,6 +2817,7 @@ mod tool_round_cap_tests {
                 on_round_usage: None,
                 estimate_ratio: None,
                 exec_floor: None,
+                write_ledger: None,
             },
             &mut NoMcp,
         )
@@ -2815,6 +2941,7 @@ mod tool_round_cap_tests {
                 on_round_usage: None,
                 estimate_ratio: None,
                 exec_floor: None,
+                write_ledger: None,
             },
             &mut NoMcp,
         )
@@ -2954,6 +3081,7 @@ mod tool_round_cap_tests {
                 on_round_usage: None,
                 estimate_ratio: None,
                 exec_floor: None,
+                write_ledger: None,
             },
             &mut NoMcp,
         )
@@ -3032,6 +3160,7 @@ mod http_loop_tests {
             on_round_usage: None,
             estimate_ratio: None,
             exec_floor: None,
+            write_ledger: None,
         }
     }
 
@@ -3826,6 +3955,7 @@ mod save_note_loop_tests {
             on_round_usage: None,
             estimate_ratio: None,
             exec_floor: None,
+            write_ledger: None,
         }
     }
 
@@ -4296,6 +4426,7 @@ mod compression_loop_tests {
             on_round_usage: None,
             estimate_ratio: None,
             exec_floor: None,
+            write_ledger: None,
         }
     }
 
@@ -5362,6 +5493,7 @@ mod observation_hook_tests {
             estimate_ratio: None,
             // #307: test ChatCtx carries no preset exec floor (headless default).
             exec_floor: None,
+            write_ledger: None,
         }
     }
 
