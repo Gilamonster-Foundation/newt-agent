@@ -169,6 +169,55 @@ config technique name stays `"retry"` (user-facing), but the code symbol is
 5. **Live smoke** — nemotron on the PyO3 corpus: a fabricating turn reverts and
    grounds within the cap; confirm the honest banner on a forced-fail.
 
+## Implementation status
+
+Built in three increments rather than one PR, to keep the destructive/loop-altering
+work isolated and reviewable:
+
+- **Increment 1 — the pure mechanism (#371, merged).** `WriteLedger`,
+  `apply_revert_retry` (revert → corrective prompt → re-gate → accept/cap, re-run
+  behind a mockable `RetryRerun`), `corrective_prompt`, `RetrySurface`, in
+  `verify_gate.rs`. Fully unit-tested, no loop change.
+- **Increment 2a — capture + live revert (this PR).** Wires the destructive arm into
+  `run_chat`: a per-turn `WriteLedger` is lent to the loop (`ChatCtx.write_ledger`,
+  `Some` only under a `retry` profile); the loop records each `write_file`/`edit_file`
+  target's pre-write bytes at the dispatch seam (`ledger_note_write`, just before
+  `execute_tool`); after the turn the TUI gates and calls
+  [`revert_only`](../../newt-core/src/verify_gate.rs) (= `apply_revert_retry` with
+  `max_retries = 0`) to revert the flagged set, with an `↩ retry: reverted …` banner.
+  - **Per-write ledger, NOT a pre-turn snapshot.** An earlier draft populated the
+    ledger from a whole-workspace pre-turn `.py` snapshot and treated "absent from
+    snapshot ⇒ delete". An adversarial review proved that **unsafe**: a snapshot
+    cannot tell a file *newt wrote* from one that merely *appeared* (build output,
+    `run_command` codegen, files reached through a symlinked dir), so the delete rule
+    destroyed files newt never authored — including data **outside** the workspace via
+    symlinks. The per-write ledger records only newt's own writes, so revert restores/
+    deletes exactly those and **skips anything untracked** — the safety property
+    `apply_revert_retry` already had. Defence-in-depth added alongside: `collect_py_files`
+    no longer follows symlinks and skips vendored/build dirs (`.venv`, `site-packages`,
+    `node_modules`, `target`, …); `apply_revert_retry` refuses any path that resolves
+    outside the canonicalized workspace and reports only files actually reverted.
+- **Increment 2b — the re-prompt loop (next).** Upgrade revert-only to revert+re-run
+  so a fabricating turn becomes a grounded one within the cap. Either drive
+  `apply_revert_retry` live (extract a turn-runner so its `RetryRerun` re-invokes a
+  turn) or re-prompt via a `run_chat` task-queue + cap counter; the honest give-up
+  banner + `retry_exhausted` land here.
+
+## Known gaps (deferred, from the 2a adversarial review)
+
+These were confirmed at **low/nit** severity and are deferred deliberately — none is
+data-loss (the two data-loss blockers and the two mediums were fixed in 2a):
+
+- **Revert runs only on a successful turn.** A turn that *errors* after writing a
+  fabrication leaves it on disk (the `Ok` arm reverts; the `Err` arm drops the
+  ledger). Folds into **2b**, which restructures the post-turn path for the re-prompt
+  loop anyway.
+- **Full `.py` walk + parse each turn under `retry`.** Mitigated by the symlink-skip
+  + `SKIP_DIRS` exclusions; a large monorepo could still want an incremental gate.
+  Pre-existing in `verify_gate` (#368); a shared follow-up.
+- `retry` intentionally **supersedes** the `verify_gate` warning (it acts instead of
+  warning) — by design, not a regression.
+
 ## Out of scope
 
 - A git fast-path for revert (ledger is the contract; git is a later optimization).

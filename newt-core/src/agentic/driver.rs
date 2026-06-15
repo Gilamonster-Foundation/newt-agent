@@ -392,6 +392,7 @@ async fn run_one_turn(
         // whatever `config.caveats` already grants, exactly like the ACP worker
         // / newt-eval callers. A consumer enforcing a mode clamps `caveats` itself.
         exec_floor: None,
+        write_ledger: None,
     };
     // NoMcp: the cowork driver advertises only the built-in tools. A consumer
     // that wants live MCP tools assembles its own ChatCtx.
