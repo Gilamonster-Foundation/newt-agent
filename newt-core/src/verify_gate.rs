@@ -21,10 +21,13 @@
 //! control gate must be adversarially complete or the model games its blind
 //! spots. Symbol-level resolution still follows the FFI manifest (#74).
 
+use async_trait::async_trait;
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
+
 use crate::symbols::{extract_references, module_is_known, python_stdlib_modules, Lang};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
 
 /// One fabricated reference: the module imported and the line it sat on.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -217,6 +220,262 @@ fn collect_py_files(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
     Ok(())
 }
 
+// ── The `retry` technique (R2's action arm) ─────────────────────────────────
+//
+// `verify_gate` (above) *measures*; `retry` *acts* on the measurement: it reverts
+// exactly [`GateReport::revert_set`] to its pre-turn state and re-prompts the
+// model, up to a cap, then gives up honestly. Contract:
+// `docs/design/retry-technique.md`. This module is the pure mechanism (the live
+// loop wiring threads [`WriteLedger`] through the write-tool seam separately).
+//
+// NB: the technique is *named* `retry` in a profile's config, but lives here —
+// **not** in `crate::retry` (that is the unrelated HTTP backoff module).
+
+/// A turn-scoped copy-on-first-write ledger: the record that lets `retry` revert a
+/// fabricated file to the state it had **before the turn began**.
+///
+/// The first time a path is written during a turn, its prior bytes are captured
+/// (`Some` = the file existed; `None` = it did not). Later writes to the same path
+/// in the same turn do **not** overwrite that entry — the *pre-turn* state is the
+/// revert target, never an intermediate write. The rig instrument reverted with a
+/// bare `rm` (sound only because its corpus files never pre-existed); in the real
+/// loop a flagged file may be an *edit* of a tracked file, so the ledger restores
+/// bytes rather than deleting. Git-independent by design — newt gates non-git
+/// trees too (`docs/design/retry-technique.md`).
+#[derive(Debug, Default, Clone)]
+pub struct WriteLedger {
+    /// Absolute path → pre-turn content (`None` ⇒ the path did not exist pre-turn).
+    entries: BTreeMap<PathBuf, Option<Vec<u8>>>,
+}
+
+impl WriteLedger {
+    /// An empty ledger for a fresh turn.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record `path`'s pre-turn state the **first** time it is written this turn.
+    /// Call this *before* the write lands: it reads the current bytes from disk
+    /// (recording `None` when the path is absent). A no-op on any subsequent write
+    /// to the same path — the pre-turn snapshot is preserved.
+    pub fn note_before_write(&mut self, path: impl Into<PathBuf>) {
+        let path = path.into();
+        if self.entries.contains_key(&path) {
+            return;
+        }
+        let prior = std::fs::read(&path).ok();
+        self.entries.insert(path, prior);
+    }
+
+    /// Restore `path` to its recorded pre-turn state: write the captured bytes
+    /// back, or remove the file if it did not exist pre-turn. Returns `true` iff
+    /// the path had a ledger entry (so the caller can warn on a gate-flagged path
+    /// the ledger never saw — a bug, not a silent delete of an untracked file).
+    ///
+    /// # Errors
+    /// Propagates I/O errors from the restore write or remove (a `NotFound` on
+    /// remove is treated as already-reverted, not an error).
+    pub fn revert(&self, path: &Path) -> std::io::Result<bool> {
+        match self.entries.get(path) {
+            None => Ok(false),
+            Some(None) => match std::fs::remove_file(path) {
+                Ok(()) => Ok(true),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(true),
+                Err(e) => Err(e),
+            },
+            Some(Some(bytes)) => {
+                std::fs::write(path, bytes)?;
+                Ok(true)
+            }
+        }
+    }
+
+    /// Whether nothing has been written this turn.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// How many distinct paths were written this turn.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+/// One corrective model turn, abstracted so the loop is testable without a live
+/// backend. The implementor applies `corrective_prompt`, writes any produced files
+/// into the workspace, **and records each write in the shared [`WriteLedger`]** (so
+/// a file a retry newly creates can itself be reverted by the next iteration).
+///
+/// `?Send` because the live caller is the single-threaded TUI loop (`run_chat`
+/// drives each step through a discrete `block_on`); the future never crosses
+/// threads.
+#[async_trait(?Send)]
+pub trait RetryRerun {
+    /// Run one grounded re-attempt for the given corrective prompt.
+    ///
+    /// # Errors
+    /// Returns the backend/turn error; `apply_revert_retry` propagates it (a failed
+    /// re-attempt aborts the loop rather than masking the failure).
+    async fn rerun(&mut self, corrective_prompt: String) -> anyhow::Result<()>;
+}
+
+/// The result of a verify-gated revert-retry loop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetryOutcome {
+    /// `true` iff the workspace ended clean (the gate accepts) within the cap.
+    pub accepted: bool,
+    /// How many re-attempts were actually run (`0..=max_retries`).
+    pub retries_used: u32,
+    /// Files left reverted at give-up, relative to the workspace (empty iff
+    /// `accepted`).
+    pub reverted: Vec<PathBuf>,
+    /// The fabricated modules still outstanding at give-up, de-duplicated and
+    /// sorted (empty iff `accepted`).
+    pub outstanding_modules: Vec<String>,
+}
+
+impl RetryOutcome {
+    fn accepted(retries_used: u32) -> Self {
+        Self {
+            accepted: true,
+            retries_used,
+            reverted: Vec::new(),
+            outstanding_modules: Vec::new(),
+        }
+    }
+}
+
+/// The distinct fabricated modules across a report, de-duplicated and sorted.
+fn outstanding_modules(report: &GateReport) -> Vec<String> {
+    report
+        .files
+        .iter()
+        .flat_map(|f| f.fabrications.iter().map(|x| x.module.clone()))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+/// The grounded re-prompt: name every reverted file and the modules it fabricated,
+/// then hand the model the authoritative surface and forbid the bad imports. One
+/// message covers **all** reverted files — a single corrective turn, not a storm.
+/// `surface_block` is R1's rendered surface (`FfiManifest::render_block`), the same
+/// authority `knowledge_base` injects; `retry` composes with it but does not
+/// require it (the surface can ride this message alone).
+#[must_use]
+pub fn corrective_prompt(report: &GateReport, surface_block: &str) -> String {
+    let mut out = String::new();
+    out.push_str(
+        "Your previous attempt imported modules this project does not expose, so \
+         those files were reverted. Fix and rewrite them.\n\n",
+    );
+    for f in report.files.iter().filter(|f| !f.is_clean()) {
+        for fab in &f.fabrications {
+            out.push_str(&format!(
+                "- `{}` imported `{}` (line {}), which does not exist.\n",
+                f.path.display(),
+                fab.module,
+                fab.line
+            ));
+        }
+    }
+    if !surface_block.is_empty() {
+        out.push_str("\nThe authoritative import surface is:\n\n");
+        out.push_str(surface_block);
+        out.push('\n');
+    }
+    out.push_str(
+        "\nRewrite the reverted file(s) using only modules from that surface. Do \
+         not import the modules listed above.",
+    );
+    out
+}
+
+/// The authoritative surface the retry loop gates and grounds against — the three
+/// facets of "the project's real import surface", grouped so the loop's signature
+/// stays small.
+pub struct RetrySurface<'a> {
+    /// The module set the gate resolves imports against (R1's `known_modules()`).
+    pub modules: &'a BTreeSet<String>,
+    /// Strictness of the project-surface match (`Exact` default; see [`SurfaceMatch`]).
+    pub mode: SurfaceMatch,
+    /// R1's rendered surface block (`FfiManifest::render_block`), injected into the
+    /// corrective prompt to ground the re-attempt.
+    pub block: &'a str,
+}
+
+/// Drive the verify-gated revert-retry loop: revert the gate's flagged set to its
+/// pre-turn state, re-prompt the model with the fabrications named, re-gate, and
+/// repeat up to `max_retries` — accepting as soon as the gate is clean, and giving
+/// up **honestly** (files left reverted, modules reported) at the cap. `max_retries`
+/// is the sole termination authority; a turn runs at most `1 + max_retries` model
+/// calls.
+///
+/// `initial` is the report that already decided retry was needed (from the post-turn
+/// `verify_gate` pass). `ledger` is shared with `rerun` via [`RefCell`] so a file a
+/// retry creates is itself tracked for the next iteration. `surface` re-gates each
+/// attempt and grounds the re-prompt.
+///
+/// # Errors
+/// Propagates a re-gate I/O error or a `rerun` failure (a failed re-attempt aborts
+/// the loop rather than reporting a false accept).
+pub async fn apply_revert_retry(
+    workspace: &Path,
+    surface: &RetrySurface<'_>,
+    ledger: &RefCell<WriteLedger>,
+    initial: GateReport,
+    max_retries: u32,
+    rerun: &mut dyn RetryRerun,
+) -> anyhow::Result<RetryOutcome> {
+    let mut report = initial;
+    let mut retries_used = 0u32;
+    loop {
+        if report.accept() {
+            return Ok(RetryOutcome::accepted(retries_used));
+        }
+
+        // Revert exactly the flagged set to its pre-turn bytes. A clean file the
+        // model wrote the same turn is never in `revert_set()`, so it is kept.
+        let reverted: Vec<PathBuf> = report
+            .revert_set()
+            .iter()
+            .map(|p| p.to_path_buf())
+            .collect();
+        {
+            let led = ledger.borrow();
+            for rel in &reverted {
+                let abs = workspace.join(rel);
+                if !led.revert(&abs)? {
+                    tracing::warn!(
+                        path = %rel.display(),
+                        "retry: gate-flagged path not in the write ledger — skipping (will not \
+                         delete an untracked file)"
+                    );
+                }
+            }
+        }
+
+        if retries_used >= max_retries {
+            // Honest give-up: the labelled absence (files left reverted) beats a
+            // fabricated presence. The caller surfaces the banner + `retry_exhausted`.
+            return Ok(RetryOutcome {
+                accepted: false,
+                retries_used,
+                reverted,
+                outstanding_modules: outstanding_modules(&report),
+            });
+        }
+
+        let prompt = corrective_prompt(&report, surface.block);
+        rerun.rerun(prompt).await?;
+        retries_used += 1;
+        report = gate_python_workspace_with(workspace, surface.modules, surface.mode)?;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -397,5 +656,231 @@ pub struct PyRouter;
         assert_eq!(report.files.len(), 2);
         assert!(!report.accept());
         assert_eq!(report.revert_set(), vec![Path::new("examples/fab.py")]);
+    }
+
+    // ── the `retry` mechanism ───────────────────────────────────────────────
+
+    #[test]
+    fn ledger_restores_an_edited_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("edit.py");
+        std::fs::write(&f, "original\n").unwrap();
+        let mut led = WriteLedger::new();
+        led.note_before_write(&f); // captures "original"
+        std::fs::write(&f, "fabricated\n").unwrap();
+        assert!(led.revert(&f).unwrap());
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "original\n");
+    }
+
+    #[test]
+    fn ledger_deletes_a_newly_created_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("new.py");
+        let mut led = WriteLedger::new();
+        led.note_before_write(&f); // file absent → records None
+        std::fs::write(&f, "import newt_core\n").unwrap();
+        assert!(led.revert(&f).unwrap());
+        assert!(!f.exists(), "a file that did not exist pre-turn is removed");
+    }
+
+    #[test]
+    fn ledger_first_write_wins_across_a_turn() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("multi.py");
+        std::fs::write(&f, "pre-turn\n").unwrap();
+        let mut led = WriteLedger::new();
+        led.note_before_write(&f); // "pre-turn"
+        std::fs::write(&f, "intermediate\n").unwrap();
+        led.note_before_write(&f); // no-op — pre-turn state preserved
+        std::fs::write(&f, "final\n").unwrap();
+        led.revert(&f).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&f).unwrap(),
+            "pre-turn\n",
+            "revert restores the pre-turn state, not an intermediate write"
+        );
+        assert_eq!(led.len(), 1);
+    }
+
+    #[test]
+    fn ledger_revert_reports_untracked_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("untracked.py");
+        std::fs::write(&f, "x\n").unwrap();
+        let led = WriteLedger::new();
+        assert!(!led.revert(&f).unwrap(), "no entry → false, no delete");
+        assert!(f.exists(), "an untracked file is never silently removed");
+    }
+
+    #[test]
+    fn corrective_prompt_names_files_modules_and_surface() {
+        let report = GateReport {
+            files: vec![FileVerdict {
+                path: "examples/bad.py".into(),
+                fabrications: vec![Fabrication {
+                    module: "newt_core".into(),
+                    line: 3,
+                }],
+            }],
+        };
+        let p = corrective_prompt(&report, "SURFACE-BLOCK-HERE");
+        assert!(p.contains("examples/bad.py"));
+        assert!(p.contains("newt_core"));
+        assert!(p.contains("line 3"));
+        assert!(p.contains("SURFACE-BLOCK-HERE"));
+        assert!(p.contains("Do not import"));
+    }
+
+    /// A scripted re-run that mimics the live tool seam: each call writes the next
+    /// queued content to `file`, recording the write in the shared ledger first.
+    struct ScriptedRerun<'a> {
+        workspace: PathBuf,
+        file: PathBuf,
+        ledger: &'a RefCell<WriteLedger>,
+        contents: std::collections::VecDeque<String>,
+        calls: usize,
+    }
+
+    #[async_trait(?Send)]
+    impl RetryRerun for ScriptedRerun<'_> {
+        async fn rerun(&mut self, _prompt: String) -> anyhow::Result<()> {
+            self.calls += 1;
+            let content = self.contents.pop_front().unwrap_or_default();
+            let abs = self.workspace.join(&self.file);
+            self.ledger.borrow_mut().note_before_write(&abs);
+            std::fs::write(&abs, content)?;
+            Ok(())
+        }
+    }
+
+    /// Seed a one-file fabricating turn: record the pre-turn (absent) state, write
+    /// the bad file, and return the initial gate report.
+    fn seed_fabricating_turn(ws: &Path, file: &str, ledger: &RefCell<WriteLedger>) -> GateReport {
+        let abs = ws.join(file);
+        ledger.borrow_mut().note_before_write(&abs);
+        std::fs::write(&abs, "import newt_core\n").unwrap();
+        gate_python_workspace(ws, &surface()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn retry_accepts_when_a_reattempt_grounds_the_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ledger = RefCell::new(WriteLedger::new());
+        let initial = seed_fabricating_turn(tmp.path(), "bad.py", &ledger);
+        assert!(!initial.accept());
+
+        let mut rerun = ScriptedRerun {
+            workspace: tmp.path().to_path_buf(),
+            file: "bad.py".into(),
+            ledger: &ledger,
+            contents: ["from newt_agent._newt_agent.core import Router\n".to_string()].into(),
+            calls: 0,
+        };
+        let surf = surface();
+        let outcome = apply_revert_retry(
+            tmp.path(),
+            &RetrySurface {
+                modules: &surf,
+                mode: SurfaceMatch::Exact,
+                block: "SURFACE",
+            },
+            &ledger,
+            initial,
+            2,
+            &mut rerun,
+        )
+        .await
+        .unwrap();
+
+        assert!(outcome.accepted);
+        assert_eq!(outcome.retries_used, 1);
+        assert_eq!(rerun.calls, 1);
+        assert!(outcome.reverted.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("bad.py")).unwrap(),
+            "from newt_agent._newt_agent.core import Router\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_gives_up_honestly_at_the_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ledger = RefCell::new(WriteLedger::new());
+        let initial = seed_fabricating_turn(tmp.path(), "bad.py", &ledger);
+
+        // Every re-attempt keeps fabricating → never grounds.
+        let mut rerun = ScriptedRerun {
+            workspace: tmp.path().to_path_buf(),
+            file: "bad.py".into(),
+            ledger: &ledger,
+            contents: ["import newt_core\n".into(), "import newt_core\n".into()].into(),
+            calls: 0,
+        };
+        let surf = surface();
+        let outcome = apply_revert_retry(
+            tmp.path(),
+            &RetrySurface {
+                modules: &surf,
+                mode: SurfaceMatch::Exact,
+                block: "SURFACE",
+            },
+            &ledger,
+            initial,
+            2,
+            &mut rerun,
+        )
+        .await
+        .unwrap();
+
+        assert!(!outcome.accepted);
+        assert_eq!(
+            outcome.retries_used, 2,
+            "ran exactly 1 + max_retries calls' worth"
+        );
+        assert_eq!(rerun.calls, 2);
+        assert_eq!(outcome.reverted, vec![PathBuf::from("bad.py")]);
+        assert_eq!(outcome.outstanding_modules, vec!["newt_core".to_string()]);
+        assert!(
+            !tmp.path().join("bad.py").exists(),
+            "give-up leaves the file reverted, not the last fabrication"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_is_a_no_op_when_the_initial_report_is_clean() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ledger = RefCell::new(WriteLedger::new());
+
+        struct NeverRerun;
+        #[async_trait(?Send)]
+        impl RetryRerun for NeverRerun {
+            async fn rerun(&mut self, _p: String) -> anyhow::Result<()> {
+                panic!("rerun must not be called when the gate already accepts");
+            }
+        }
+
+        let clean = GateReport {
+            files: vec![FileVerdict {
+                path: "ok.py".into(),
+                fabrications: vec![],
+            }],
+        };
+        let surf = surface();
+        let outcome = apply_revert_retry(
+            tmp.path(),
+            &RetrySurface {
+                modules: &surf,
+                mode: SurfaceMatch::Exact,
+                block: "SURFACE",
+            },
+            &ledger,
+            clean,
+            2,
+            &mut NeverRerun,
+        )
+        .await
+        .unwrap();
+        assert!(outcome.accepted);
+        assert_eq!(outcome.retries_used, 0);
     }
 }
