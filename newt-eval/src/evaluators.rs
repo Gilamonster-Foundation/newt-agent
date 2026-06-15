@@ -420,7 +420,7 @@ impl Evaluator for PythonImportsEvaluator {
             }
         };
 
-        let mut known = stdlib_modules();
+        let mut known = newt_core::symbols::python_stdlib_modules();
         known.extend(surface.modules.iter().cloned());
 
         let files = collect_python_files(&ctx.workspace);
@@ -485,7 +485,7 @@ fn score_python_imports(known: &BTreeSet<String>, files: &[(String, String)]) ->
     for (path, source) in files {
         for r in extract_references(source, Lang::Python) {
             report.total += 1;
-            if module_is_known(&r.module, known) {
+            if newt_core::symbols::module_is_known(&r.module, known) {
                 report.resolved += 1;
             } else {
                 report.fabricated.push(Fabrication {
@@ -497,58 +497,6 @@ fn score_python_imports(known: &BTreeSet<String>, files: &[(String, String)]) ->
         }
     }
     report
-}
-
-/// A module is known if it, or any of its dotted prefixes, is in `known` (so a
-/// declared `newt_agent` covers `newt_agent.core`, and `os` covers `os.path`).
-fn module_is_known(module: &str, known: &BTreeSet<String>) -> bool {
-    let parts: Vec<&str> = module.split('.').collect();
-    (1..=parts.len()).any(|i| known.contains(&parts[..i].join(".")))
-}
-
-/// A focused allowlist of common Python standard-library top-level modules, so a
-/// generated example's `import os` / `from dataclasses import dataclass` is not
-/// mistaken for a fabrication. Not exhaustive — the crawl errs toward
-/// false-negatives (miss a stdlib edge) over false-positives (flag real stdlib).
-fn stdlib_modules() -> BTreeSet<String> {
-    [
-        "abc",
-        "argparse",
-        "asyncio",
-        "base64",
-        "collections",
-        "contextlib",
-        "copy",
-        "csv",
-        "dataclasses",
-        "datetime",
-        "decimal",
-        "enum",
-        "functools",
-        "glob",
-        "hashlib",
-        "io",
-        "itertools",
-        "json",
-        "logging",
-        "math",
-        "os",
-        "pathlib",
-        "random",
-        "re",
-        "shutil",
-        "subprocess",
-        "sys",
-        "tempfile",
-        "time",
-        "typing",
-        "unittest",
-        "uuid",
-        "warnings",
-    ]
-    .iter()
-    .map(|s| (*s).to_string())
-    .collect()
 }
 
 /// Recursively collect `*.py` files under `root` (skipping the usual noise
@@ -1032,6 +980,7 @@ mod tests {
         let known: BTreeSet<String> = ["newt_agent".to_string(), "os".to_string()]
             .into_iter()
             .collect();
+        use newt_core::symbols::module_is_known;
         assert!(module_is_known("newt_agent", &known));
         assert!(module_is_known("newt_agent.core", &known)); // submodule via prefix
         assert!(module_is_known("os.path", &known));
@@ -1042,7 +991,7 @@ mod tests {
     #[test]
     fn score_python_imports_catches_the_second_nemotron_incident() {
         // Real surface: the umbrella `newt_agent` with submodules, plus stdlib.
-        let mut known = stdlib_modules();
+        let mut known = newt_core::symbols::python_stdlib_modules();
         known.insert("newt_agent.core".to_string());
         known.insert("newt_agent.data".to_string());
 
