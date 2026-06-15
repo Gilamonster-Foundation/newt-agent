@@ -2679,8 +2679,14 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
     // to the agent's tool set, namespaced `server__tool`. `newt doctor` shows
     // the same discovery if a server is missing.
     let cfg_mcp_servers = cfg.mcp_servers.clone();
-    let mut mcp =
-        tokio::task::block_in_place(|| rt.block_on(Mcp::connect(workspace, &cfg_mcp_servers)));
+    let sanitize_mcp = cfg
+        .tui
+        .as_ref()
+        .map(|t| t.sanitize_mcp_server_names)
+        .unwrap_or(true);
+    let mut mcp = tokio::task::block_in_place(|| {
+        rt.block_on(Mcp::connect(workspace, &cfg_mcp_servers, sanitize_mcp))
+    });
     if !mcp.is_empty() {
         let summary = mcp
             .summary()

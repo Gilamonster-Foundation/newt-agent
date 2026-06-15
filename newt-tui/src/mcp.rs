@@ -17,6 +17,20 @@ use serde_json::{json, Value};
 /// The session's connected MCP servers.
 pub(crate) struct Mcp {
     servers: Vec<ConnectedServer>,
+    /// When `true`, hyphens in server names are replaced with underscores in
+    /// advertised tool names and routing lookups.  Matches the behaviour of
+    /// API proxies that normalise tool-name characters.  Controlled by
+    /// `[tui].sanitize_mcp_server_names` in the newt config (default: `true`).
+    sanitize_server_names: bool,
+}
+
+/// Apply or skip the hyphen→underscore normalisation for a server name.
+fn server_prefix(name: &str, sanitize: bool) -> String {
+    if sanitize {
+        name.replace('-', "_")
+    } else {
+        name.to_owned()
+    }
 }
 
 impl Mcp {
@@ -26,13 +40,18 @@ impl Mcp {
     pub(crate) fn empty() -> Self {
         Self {
             servers: Vec::new(),
+            sanitize_server_names: true,
         }
     }
 
     /// Discover (newt config + Claude Code config) and connect to every **stdio**
     /// MCP server. A server that fails to spawn/initialize is logged and skipped
     /// — one bad server never blocks the session or the others.
-    pub(crate) async fn connect(workspace: &str, cfg_servers: &[McpServerEntry]) -> Self {
+    pub(crate) async fn connect(
+        workspace: &str,
+        cfg_servers: &[McpServerEntry],
+        sanitize_server_names: bool,
+    ) -> Self {
         let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
         let entries = newt_core::mcp::discover(
             cfg_servers,
@@ -77,7 +96,10 @@ impl Mcp {
                 Err(e) => tracing::warn!("MCP server `{}` skipped: {e}", entry.name),
             }
         }
-        Self { servers }
+        Self {
+            servers,
+            sanitize_server_names,
+        }
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -94,6 +116,11 @@ impl Mcp {
 
     /// OpenAI-style function tool definitions for every remote tool, with names
     /// namespaced `server__tool` so two servers cannot collide.
+    ///
+    /// Server names are sanitized (hyphens → underscores) before advertising
+    /// because some API proxies (e.g. NVIDIA inference → Anthropic backend)
+    /// normalise hyphens in tool names to underscores.  Advertising the
+    /// sanitized form ensures the model's tool calls round-trip back unchanged.
     pub(crate) fn tool_defs(&self) -> Vec<Value> {
         let mut out = Vec::new();
         for server in &self.servers {
@@ -101,7 +128,7 @@ impl Mcp {
                 out.push(json!({
                     "type": "function",
                     "function": {
-                        "name": namespaced(&server.name, &tool.name),
+                        "name": namespaced(&server_prefix(&server.name, self.sanitize_server_names), &tool.name),
                         "description": tool.description,
                         "parameters": tool.input_schema,
                     }
@@ -112,9 +139,16 @@ impl Mcp {
     }
 
     /// Whether `name` is a namespaced tool belonging to a connected server.
+    ///
+    /// Matches the sanitized form (hyphens → underscores in the server prefix)
+    /// so that a tool advertised as `acme_server__X` routes to the server
+    /// stored as `acme-server`.
     pub(crate) fn handles(&self, name: &str) -> bool {
         match split_namespaced(name) {
-            Some((server, _)) => self.servers.iter().any(|s| s.name == server),
+            Some((server, _)) => self
+                .servers
+                .iter()
+                .any(|s| server_prefix(&s.name, self.sanitize_server_names) == server),
             None => false,
         }
     }
@@ -125,7 +159,11 @@ impl Mcp {
         let Some((server_name, tool)) = split_namespaced(name) else {
             return format!("error: `{name}` is not a namespaced MCP tool");
         };
-        let Some(server) = self.servers.iter_mut().find(|s| s.name == server_name) else {
+        let Some(server) = self
+            .servers
+            .iter_mut()
+            .find(|s| server_prefix(&s.name, self.sanitize_server_names) == server_name)
+        else {
             return format!("error: no connected MCP server `{server_name}`");
         };
         match server.conn.call_tool(tool, args.clone()).await {
@@ -190,6 +228,25 @@ mod tests {
         assert!(mcp.is_empty());
         assert!(!mcp.handles("git__status"));
         assert!(mcp.tool_defs().is_empty());
+    }
+
+    /// Some OpenAI-compatible API proxies normalise hyphens to underscores in
+    /// tool names.  Verify the `server_prefix` helper obeys the toggle.
+    #[test]
+    fn server_prefix_toggle() {
+        // sanitize=true: hyphens become underscores
+        assert_eq!(server_prefix("acme-server", true), "acme_server");
+        assert_eq!(server_prefix("multi-part-name", true), "multi_part_name");
+        assert_eq!(server_prefix("plainserver", true), "plainserver");
+
+        // sanitize=false: name is returned unchanged
+        assert_eq!(server_prefix("acme-server", false), "acme-server");
+        assert_eq!(server_prefix("multi-part-name", false), "multi-part-name");
+        assert_eq!(server_prefix("plainserver", false), "plainserver");
+
+        // Double-underscore separator is preserved after sanitization.
+        let tool = format!("{}__probe_tool", server_prefix("acme-server", true));
+        assert_eq!(tool, "acme_server__probe_tool");
     }
 
     #[test]

@@ -210,12 +210,12 @@ pub enum Command {
     /// Without arguments: lists all discovered HTTP MCP servers and their token
     /// status (valid / expired / needs-login / unregistered).
     ///
-    /// With a server name (e.g. `newt auth MaaS-Jira`): opens the browser for
-    /// the OAuth login flow, waits for the redirect, exchanges the code for
-    /// tokens, and saves them to `~/.hermes/mcp-tokens/`. Both newt and
-    /// hermes-agent share the same token store, so this authenticates both.
+    /// With a server name: opens the browser for the OAuth login flow, waits
+    /// for the redirect, exchanges the code for tokens, and saves them to
+    /// `~/.hermes/mcp-tokens/`. Both newt and hermes-agent share the same token
+    /// store, so this authenticates both.
     Auth {
-        /// Name of the MCP server to authenticate (e.g. MaaS-Jira).
+        /// Name of the MCP server to authenticate (e.g. `newt auth my-server`).
         /// Omit to list all servers and their current auth status.
         server: Option<String>,
     },

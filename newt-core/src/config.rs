@@ -584,6 +584,16 @@ pub struct TuiConfig {
     /// Default: `None` (message-count trimming only). See issue #223.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mid_loop_trim_tokens: Option<usize>,
+
+    /// Normalise hyphens to underscores in MCP server names when advertising
+    /// tool definitions and routing tool calls.  Some API proxies (e.g. those
+    /// that wrap the Anthropic backend) replace hyphens with underscores in
+    /// tool names; advertising the sanitised form ensures the model's tool
+    /// calls round-trip back unchanged and routes correctly.  Default: `true`.
+    /// Set to `false` only when every connected MCP server is behind a proxy
+    /// that preserves hyphens verbatim.
+    #[serde(default = "default_sanitize_mcp_server_names")]
+    pub sanitize_mcp_server_names: bool,
 }
 
 fn default_tool_output_lines() -> usize {
@@ -608,6 +618,10 @@ fn default_keep_alive() -> String {
 
 fn default_mid_loop_trim_threshold() -> usize {
     40
+}
+
+fn default_sanitize_mcp_server_names() -> bool {
+    true
 }
 
 // ---------------------------------------------------------------------------
@@ -943,6 +957,7 @@ impl Default for TuiConfig {
             keep_alive: default_keep_alive(),
             mid_loop_trim_threshold: default_mid_loop_trim_threshold(),
             mid_loop_trim_tokens: None,
+            sanitize_mcp_server_names: default_sanitize_mcp_server_names(),
         }
     }
 }
