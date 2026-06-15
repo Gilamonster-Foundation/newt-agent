@@ -169,6 +169,32 @@ config technique name stays `"retry"` (user-facing), but the code symbol is
 5. **Live smoke** — nemotron on the PyO3 corpus: a fabricating turn reverts and
    grounds within the cap; confirm the honest banner on a forced-fail.
 
+## Implementation status
+
+Built in three increments rather than one PR, to keep the destructive/loop-altering
+work isolated and reviewable:
+
+- **Increment 1 — the pure mechanism (#371, merged).** `WriteLedger`,
+  `apply_revert_retry` (revert → corrective prompt → re-gate → accept/cap, re-run
+  behind a mockable `RetryRerun`), `corrective_prompt`, `RetrySurface`, in
+  `verify_gate.rs`. Fully unit-tested, no loop change.
+- **Increment 2a — capture + live revert (this PR).** Wires the destructive arm into
+  `run_chat`: snapshot the workspace's pre-turn `.py` into a `WriteLedger`
+  (`snapshot_workspace_py`) *before* the turn, then after it revert the gate's
+  flagged set (`verify_gate_revert`) — restoring edited files, deleting created ones
+  — with an `↩ retry: reverted …` banner. **Capture choice:** the live TUI populates
+  the ledger from a pre-turn `.py` snapshot rather than per-write hooks threaded
+  through `execute_tool`. The revert *semantics are identical* (snapshot-populated ⇒
+  "no entry ⟺ created this turn", so the same restore-edit / delete-create split
+  holds), and it avoids threading a new field through the `ChatCtx` →
+  `chat_complete` → `execute_tool` hot path (≈14 `ChatCtx` literals). The per-write
+  ledger remains the headless contract; `apply_revert_retry` is the headless driver.
+- **Increment 2b — the re-prompt loop (next).** Upgrade revert-only to revert+re-run
+  so a fabricating turn becomes a grounded one within the cap. Either drive
+  `apply_revert_retry` live (extract a turn-runner so its `RetryRerun` re-invokes a
+  turn) or re-prompt via a `run_chat` task-queue + cap counter; the honest give-up
+  banner + `retry_exhausted` land here.
+
 ## Out of scope
 
 - A git fast-path for revert (ledger is the contract; git is a later optimization).

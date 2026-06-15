@@ -207,6 +207,24 @@ pub fn gate_python_workspace_with(
     Ok(GateReport { files })
 }
 
+/// Snapshot every `.py` file under `workspace` into a fresh [`WriteLedger`] — the
+/// pre-turn state the `retry` technique reverts to. Recording **every** pre-turn
+/// `.py` is what lets revert distinguish the two cases without per-write hooks: a
+/// gate-flagged path present in the ledger was *edited* (restore its bytes), while
+/// one **absent** from the ledger was necessarily *created* this turn (delete it).
+///
+/// # Errors
+/// Propagates I/O errors from walking the workspace tree.
+pub fn snapshot_workspace_py(workspace: &Path) -> std::io::Result<WriteLedger> {
+    let mut py_files = Vec::new();
+    collect_py_files(workspace, &mut py_files)?;
+    let mut ledger = WriteLedger::new();
+    for f in py_files {
+        ledger.note_before_write(f);
+    }
+    Ok(ledger)
+}
+
 /// Recursively collect `*.py` paths under `dir`.
 fn collect_py_files(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
     for entry in std::fs::read_dir(dir)? {
@@ -710,6 +728,27 @@ pub struct PyRouter;
         let led = WriteLedger::new();
         assert!(!led.revert(&f).unwrap(), "no entry → false, no delete");
         assert!(f.exists(), "an untracked file is never silently removed");
+    }
+
+    #[test]
+    fn snapshot_records_pre_turn_py_and_drives_the_two_revert_cases() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("kept.py"), "original\n").unwrap();
+        let ledger = snapshot_workspace_py(tmp.path()).unwrap();
+        assert_eq!(ledger.len(), 1, "the one pre-turn .py is snapshotted");
+
+        // Edit case: an existing file is restored to its pre-turn bytes.
+        std::fs::write(tmp.path().join("kept.py"), "fabricated\n").unwrap();
+        assert!(ledger.revert(&tmp.path().join("kept.py")).unwrap());
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("kept.py")).unwrap(),
+            "original\n"
+        );
+
+        // Create case: a file the turn produced is absent from the snapshot, so
+        // revert reports `false` — the caller deletes it.
+        std::fs::write(tmp.path().join("new.py"), "import newt_core\n").unwrap();
+        assert!(!ledger.revert(&tmp.path().join("new.py")).unwrap());
     }
 
     #[test]

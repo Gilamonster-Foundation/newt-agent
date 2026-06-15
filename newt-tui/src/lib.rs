@@ -2602,6 +2602,63 @@ fn verify_gate_summary(
     Some(s)
 }
 
+/// The `retry` technique's destructive arm (increment 2a): gate the produced `.py`
+/// files and **revert** the flagged set to its pre-turn state (`ledger`, the
+/// [`snapshot_workspace_py`](newt_core::verify_gate::snapshot_workspace_py) taken
+/// before the turn), returning a one-line banner naming what was reverted (`None`
+/// when clean / no surface). An edited file is restored to its pre-turn bytes; a
+/// file the turn *created* is absent from the snapshot — `revert` reports `false`
+/// — so it is deleted. Re-prompting the model is the next increment; here the
+/// fabrication is simply not allowed to persist.
+fn verify_gate_revert(
+    workspace: &str,
+    mode: newt_core::verify_gate::SurfaceMatch,
+    ledger: &newt_core::verify_gate::WriteLedger,
+) -> Option<String> {
+    let ws = std::path::Path::new(workspace);
+    let manifest = newt_core::ffi_manifest::FfiManifest::from_workspace(ws).ok()?;
+    if manifest.is_empty() {
+        return None; // no authoritative surface to gate against
+    }
+    let report =
+        newt_core::verify_gate::gate_python_workspace_with(ws, &manifest.known_modules(), mode)
+            .ok()?;
+    if report.accept() {
+        return None;
+    }
+    let mut reverted = 0usize;
+    let mut detail = String::new();
+    for f in &report.files {
+        if f.is_clean() {
+            continue;
+        }
+        let abs = ws.join(&f.path);
+        match ledger.revert(&abs) {
+            Ok(true) => {} // edited file → bytes restored
+            Ok(false) => {
+                let _ = std::fs::remove_file(&abs); // created this turn → delete
+            }
+            Err(e) => {
+                tracing::warn!(path = %f.path.display(), error = %e, "retry: revert failed");
+                continue;
+            }
+        }
+        reverted += 1;
+        let mods: Vec<&str> = f.fabrications.iter().map(|x| x.module.as_str()).collect();
+        detail.push_str(&format!(
+            "\n    {}  [{}]",
+            f.path.display(),
+            mods.join(", ")
+        ));
+    }
+    if reverted == 0 {
+        return None;
+    }
+    Some(format!(
+        "retry: reverted {reverted} fabricating file(s) to pre-turn state (re-prompt pending):{detail}"
+    ))
+}
+
 fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Result<()> {
     let verbose = verbose_mode();
 
@@ -3481,6 +3538,19 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                             probe::save_cache(&cap_cache);
                         }
                     };
+                    // Profile technique: retry (R2 action arm) — snapshot the
+                    // workspace's pre-turn `.py` state *before* the model writes,
+                    // so a fabricating file can be reverted to it after the turn.
+                    // Only taken when the profile enables `retry`.
+                    let retry_ledger = active_profile
+                        .as_ref()
+                        .filter(|p| p.enables("retry"))
+                        .and_then(|_| {
+                            newt_core::verify_gate::snapshot_workspace_py(std::path::Path::new(
+                                workspace,
+                            ))
+                            .ok()
+                        });
                     let response = tokio::task::block_in_place(|| {
                         rt.block_on(chat_complete(
                             ChatCtx {
@@ -3555,10 +3625,30 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                             if !was_streamed {
                                 print_newt(&reply, color, verbose);
                             }
-                            // Profile technique: verify_gate (R2) — after the turn,
-                            // resolve the produced Python imports against the FFI
-                            // surface and surface any fabrications (non-destructive).
-                            if let Some(p) =
+                            // Profile techniques, post-turn (R2). `retry` supersedes
+                            // `verify_gate`: it runs the same gate but *acts* —
+                            // reverting each fabricating file to its pre-turn state
+                            // (↩) — where bare `verify_gate` only warns (⚠). Re-
+                            // prompting the model is the next increment; here the
+                            // fabrication is simply not allowed to persist.
+                            if let Some(ledger) = retry_ledger.as_ref() {
+                                let mode = active_profile
+                                    .as_ref()
+                                    .map(|p| p.verify_gate_knobs().surface_match)
+                                    .unwrap_or_default();
+                                if let Some(msg) = verify_gate_revert(workspace, mode, ledger) {
+                                    if color {
+                                        let _ = execute!(
+                                            io::stdout(),
+                                            SetForegroundColor(CtColor::Yellow),
+                                            Print(format!("↩ {msg}\n")),
+                                            ResetColor,
+                                        );
+                                    } else {
+                                        println!("↩ {msg}");
+                                    }
+                                }
+                            } else if let Some(p) =
                                 active_profile.as_ref().filter(|p| p.enables("verify_gate"))
                             {
                                 if let Some(warn) = verify_gate_summary(
@@ -5780,6 +5870,44 @@ mod tests {
         std::fs::write(dir.path().join("thing.py"), "import newt_core\n").unwrap();
         // no bindings → no authoritative surface → no gating (None)
         assert!(verify_gate_summary(dir.path().to_str().unwrap(), SurfaceMatch::Exact).is_none());
+    }
+
+    #[test]
+    fn verify_gate_revert_deletes_new_and_restores_edited() {
+        use newt_core::verify_gate::{snapshot_workspace_py, SurfaceMatch};
+        let dir = tempfile::tempdir().unwrap();
+        write_pyo3_binding(dir.path(), "newt-core", "core");
+        let ws = dir.path().to_str().unwrap();
+        std::fs::create_dir_all(dir.path().join("examples")).unwrap();
+
+        // a pre-existing grounded file the turn will fabricate-edit
+        let edited = dir.path().join("examples/edited.py");
+        std::fs::write(&edited, "from newt_agent._newt_agent.core import X\n").unwrap();
+
+        // snapshot BEFORE the turn writes anything
+        let ledger = snapshot_workspace_py(dir.path()).unwrap();
+
+        // the turn: fabricate-edits the existing file AND creates a new bad one
+        std::fs::write(&edited, "import newt_core\n").unwrap();
+        let created = dir.path().join("examples/new.py");
+        std::fs::write(&created, "import newt_coder\n").unwrap();
+
+        let msg = verify_gate_revert(ws, SurfaceMatch::Exact, &ledger).expect("a revert banner");
+        assert!(msg.contains("retry: reverted"), "{msg}");
+
+        // edited file restored to its pre-turn grounded bytes
+        assert_eq!(
+            std::fs::read_to_string(&edited).unwrap(),
+            "from newt_agent._newt_agent.core import X\n"
+        );
+        // the file the turn created is deleted (absent from the snapshot)
+        assert!(
+            !created.exists(),
+            "a created fabrication is deleted on revert"
+        );
+
+        // workspace is clean now → None
+        assert!(verify_gate_revert(ws, SurfaceMatch::Exact, &ledger).is_none());
     }
 
     fn mock_env<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
