@@ -12,6 +12,7 @@ pub mod config;
 pub mod conversation;
 pub mod dgx;
 pub mod error;
+pub mod ffi_manifest;
 pub mod mcp;
 pub mod memory;
 pub mod metrics;
