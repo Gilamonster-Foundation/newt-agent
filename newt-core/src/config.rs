@@ -119,6 +119,14 @@ pub struct Config {
     /// by default. See [`ModeConfig`].
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub modes: std::collections::BTreeMap<String, ModeConfig>,
+
+    /// Named profiles (`[profiles.<name>]`) — a composition of harness
+    /// *techniques* plus each technique's tunable knob settings (the technique
+    /// library, `docs/design/technique-library.md`). A profile is selected by
+    /// `--profile <name>` and tunes the harness per model family / context.
+    /// Empty by default — no profile, behavior unchanged. See [`ProfileConfig`].
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub profiles: std::collections::BTreeMap<String, ProfileConfig>,
 }
 
 /// One named mode (`[modes.<name>]`, issue #307): the atomic binding the
@@ -148,6 +156,112 @@ pub struct ModeConfig {
     /// One-line framing injected into the system prompt. `None` ⇒ no framing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub framing: Option<String>,
+}
+
+/// The known harness techniques a profile may compose — the registry the
+/// validator checks against. A profile naming a technique outside this set is
+/// rejected (an unknown technique a profile claims but cannot apply would be a
+/// false claim). Extend this as techniques land (R3 `fact_preserving_compression`,
+/// R4 `self_grounding`, …).
+pub const KNOWN_TECHNIQUES: &[&str] = &[
+    "knowledge_base", // R1 — inject the authoritative import surface (#74)
+    "verify_gate",    // R2 — revert files with fabricated imports (#73)
+    "retry",          // revert-retry loop over the gate's revert set
+];
+
+/// One named profile (`[profiles.<name>]`): the harness techniques to compose for
+/// a model family / context, plus each technique's knob settings.
+///
+/// ```toml
+/// [profiles.nemotron]
+/// techniques = ["knowledge_base", "verify_gate", "retry"]
+///
+/// [profiles.nemotron.verify_gate]
+/// surface_match = "exact"        # SurfaceMatch — leaf-exact (the complete-gate default)
+///
+/// [profiles.nemotron.retry]
+/// max_retries = 2
+/// ```
+///
+/// A knob table only takes effect when its technique is enabled. An unknown
+/// technique name is an error ([`ProfileConfig::validate`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ProfileConfig {
+    /// The ordered set of techniques this profile composes. Empty ⇒ the profile
+    /// applies no techniques (equivalent to the `default`/light profile).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub techniques: Vec<String>,
+    /// Knobs for the `verify_gate` technique (applied iff it is enabled).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verify_gate: Option<VerifyGateKnobs>,
+    /// Knobs for the `retry` technique (applied iff it is enabled).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry: Option<RetryKnobs>,
+}
+
+/// Tunable knobs for the `verify_gate` technique.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct VerifyGateKnobs {
+    /// How strictly the project surface is matched. Default `Exact` — the
+    /// adversarially-complete setting (the retry-Goodhart finding).
+    #[serde(default)]
+    pub surface_match: crate::verify_gate::SurfaceMatch,
+}
+
+/// Tunable knobs for the `retry` technique.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetryKnobs {
+    /// Maximum revert-retry attempts. Default 2.
+    #[serde(default = "default_max_retries")]
+    pub max_retries: u32,
+}
+
+const fn default_max_retries() -> u32 {
+    2
+}
+
+impl Default for RetryKnobs {
+    fn default() -> Self {
+        Self {
+            max_retries: default_max_retries(),
+        }
+    }
+}
+
+impl ProfileConfig {
+    /// Validate the profile: every named technique must be in [`KNOWN_TECHNIQUES`].
+    ///
+    /// # Errors
+    /// Returns the first unknown technique name as an error message.
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        for t in &self.techniques {
+            if !KNOWN_TECHNIQUES.contains(&t.as_str()) {
+                return Err(format!(
+                    "unknown technique '{t}' in profile (known: {})",
+                    KNOWN_TECHNIQUES.join(", ")
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether this profile enables `technique`.
+    #[must_use]
+    pub fn enables(&self, technique: &str) -> bool {
+        self.techniques.iter().any(|t| t == technique)
+    }
+
+    /// The effective `verify_gate` knobs (defaults when unset).
+    #[must_use]
+    pub fn verify_gate_knobs(&self) -> VerifyGateKnobs {
+        self.verify_gate.unwrap_or_default()
+    }
+
+    /// The effective `retry` knobs (defaults when unset).
+    #[must_use]
+    pub fn retry_knobs(&self) -> RetryKnobs {
+        self.retry.unwrap_or_default()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1086,6 +1200,7 @@ impl Default for Config {
             merge: None,
             permission_presets: std::collections::BTreeMap::new(),
             modes: std::collections::BTreeMap::new(),
+            profiles: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -1334,6 +1449,65 @@ mod tests {
     // upstream `agent-mesh-protocol::Caveats` ships algebra only).
     use crate::caveats::CaveatsExt;
     use std::io::Write;
+
+    // ── profile composition (technique library) ────────────────────────
+
+    #[test]
+    fn profile_parses_techniques_and_knobs() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [profiles.nemotron]
+            techniques = ["knowledge_base", "verify_gate", "retry"]
+
+            [profiles.nemotron.verify_gate]
+            surface_match = "exact"
+
+            [profiles.nemotron.retry]
+            max_retries = 3
+            "#,
+        )
+        .unwrap();
+        let p = &cfg.profiles["nemotron"];
+        assert!(p.validate().is_ok());
+        assert!(p.enables("verify_gate") && p.enables("retry"));
+        assert_eq!(
+            p.verify_gate_knobs().surface_match,
+            crate::verify_gate::SurfaceMatch::Exact
+        );
+        assert_eq!(p.retry_knobs().max_retries, 3);
+    }
+
+    #[test]
+    fn profile_knobs_default_when_unset() {
+        // techniques named but no knob tables → defaults apply
+        let p: ProfileConfig = toml::from_str("techniques = [\"verify_gate\", \"retry\"]").unwrap();
+        assert_eq!(
+            p.verify_gate_knobs().surface_match,
+            crate::verify_gate::SurfaceMatch::Exact // the complete-gate default
+        );
+        assert_eq!(p.retry_knobs().max_retries, 2);
+    }
+
+    #[test]
+    fn profile_rejects_unknown_technique() {
+        let p: ProfileConfig =
+            toml::from_str("techniques = [\"knowledge_base\", \"teleport\"]").unwrap();
+        let err = p.validate().unwrap_err();
+        assert!(err.contains("teleport"), "err: {err}");
+    }
+
+    #[test]
+    fn empty_profiles_is_the_default() {
+        // no [profiles] table → empty map, behavior unchanged
+        let cfg: Config = toml::from_str("").unwrap();
+        assert!(cfg.profiles.is_empty());
+    }
+
+    #[test]
+    fn surface_match_round_trips_lowercase() {
+        let k: VerifyGateKnobs = toml::from_str("surface_match = \"prefix\"").unwrap();
+        assert_eq!(k.surface_match, crate::verify_gate::SurfaceMatch::Prefix);
+    }
 
     #[test]
     fn memory_note_nudge_interval_defaults_and_parses() {
