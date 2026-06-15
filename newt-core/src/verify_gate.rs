@@ -108,7 +108,7 @@ fn gate_with_known(
     source: &str,
     known: &BTreeSet<String>,
 ) -> FileVerdict {
-    let fabrications = extract_references(source, Lang::Python)
+    let mut fabrications: Vec<Fabrication> = extract_references(source, Lang::Python)
         .into_iter()
         .filter(|r| !module_is_known(&r.module, known))
         .map(|r| Fabrication {
@@ -116,6 +116,10 @@ fn gate_with_known(
             line: r.line,
         })
         .collect();
+    // One fabricated module imported as several symbols on one line is one
+    // fabrication, not one-per-symbol. References from a line are emitted
+    // consecutively, so a consecutive-dedup on (module, line) suffices.
+    fabrications.dedup_by(|a, b| a.module == b.module && a.line == b.line);
     FileVerdict {
         path: path.into(),
         fabrications,
@@ -209,6 +213,71 @@ pub struct PyRouter;
         let revert = report.revert_set();
         assert_eq!(revert.len(), 1);
         assert_eq!(revert[0], Path::new("fab.py"));
+    }
+
+    // ── adversarial regressions (false positives / negatives) ──────────
+
+    #[test]
+    fn relative_imports_are_not_fabrications() {
+        // intra-package; the gate must never revert these (BLOCKER if it does)
+        let v = gate_python_source(
+            "pkg.py",
+            "from . import config\nfrom .helpers import load\nfrom ..util import x\n",
+            &surface(),
+        );
+        assert!(
+            v.is_clean(),
+            "relative imports flagged: {:?}",
+            v.fabrications
+        );
+    }
+
+    #[test]
+    fn future_import_is_not_a_fabrication() {
+        let v = gate_python_source(
+            "typed.py",
+            "from __future__ import annotations\nimport os\n",
+            &surface(),
+        );
+        assert!(v.is_clean(), "__future__ flagged: {:?}", v.fabrications);
+    }
+
+    #[test]
+    fn realistic_clean_file_is_accepted() {
+        // the compound case: future + relative + stdlib + a real PyO3 import
+        let v = gate_python_source(
+            "real.py",
+            "from __future__ import annotations\n\
+             from . import config\n\
+             from .helpers import load\n\
+             import json\n\
+             from newt_agent._newt_agent.core import Router\n",
+            &surface(),
+        );
+        assert!(v.is_clean(), "clean file reverted: {:?}", v.fabrications);
+    }
+
+    #[test]
+    fn multiline_paren_fabricated_module_is_caught() {
+        // the black/isort open-paren form must not slip past the gate
+        let v = gate_python_source(
+            "evade.py",
+            "from newt_db import (\n    Alpha,\n    Beta,\n)\n",
+            &surface(),
+        );
+        assert_eq!(v.fabrications.len(), 1, "got: {:?}", v.fabrications);
+        assert_eq!(v.fabrications[0].module, "newt_db");
+    }
+
+    #[test]
+    fn one_fabricated_module_many_symbols_counts_once() {
+        // single-line parenthesized import of a fabricated module → one fabrication
+        let v = gate_python_source(
+            "multi.py",
+            "from newt_db import (Alpha, Beta, Gamma)\n",
+            &surface(),
+        );
+        assert_eq!(v.fabrications.len(), 1, "got: {:?}", v.fabrications);
     }
 
     #[test]

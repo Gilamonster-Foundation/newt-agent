@@ -263,6 +263,10 @@ pub fn module_is_known(module: &str, known: &BTreeSet<String>) -> bool {
 #[must_use]
 pub fn python_stdlib_modules() -> BTreeSet<String> {
     [
+        // Dunder modules CPython always provides — `from __future__ import
+        // annotations` is the single most common line in modern typed Python.
+        "__future__",
+        "__main__",
         "abc",
         "argparse",
         "asyncio",
@@ -331,8 +335,23 @@ fn extract_references_python(source: &str) -> Vec<Reference> {
         let lineno = i + 1;
         if let Some(caps) = from_re.captures(line) {
             let module = caps[1].to_string();
+            // Relative imports (`from . import x`, `from .sub import y`) are
+            // intra-package and always resolvable — never a fabrication. The
+            // regex captures the leading dots into `module`, so detect them here.
+            if module.starts_with('.') {
+                continue;
+            }
+            let names = caps[2].trim();
+            // `from <module> import (` with the names deferred to the following
+            // lines (the black/isort multi-line form). The names group is just
+            // the open paren; record the module-existence reference now —
+            // module-level resolution doesn't need the deferred symbol list.
+            if names == "(" {
+                refs.push(Reference::import_module(module, lineno));
+                continue;
+            }
             // Skip wildcard imports — they assert nothing about a specific name.
-            for item in caps[2].split(',') {
+            for item in names.split(',') {
                 let name = item
                     .split_whitespace()
                     .next()
