@@ -72,6 +72,69 @@ async fn complete_model_id_echoed_from_server() {
 }
 
 #[tokio::test]
+async fn complete_parses_usage_token_counts() {
+    // Regression for #247: when the vLLM server reports an OpenAI-compatible
+    // `usage` block, we must surface the exact prompt/completion token counts
+    // instead of leaving usage unset (which forces heuristic estimation).
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [
+                { "message": { "role": "assistant", "content": "hello" } }
+            ],
+            "model": "x",
+            "usage": {
+                "prompt_tokens": 11,
+                "completion_tokens": 7,
+                "total_tokens": 18
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let backend = LocalVllmBackend::new(server.uri(), "x");
+    let req = ChatRequest::new().user("hi");
+    let reply = backend.complete(req).await.unwrap();
+
+    let usage = reply
+        .usage
+        .expect("usage should be parsed from the response");
+    assert_eq!(usage.input_tokens, 11);
+    assert_eq!(usage.output_tokens, 7);
+}
+
+#[tokio::test]
+async fn complete_usage_absent_is_none() {
+    // A response without a `usage` block must yield `None`, not a zeroed
+    // TokenUsage — callers distinguish "no data" from "zero tokens".
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [
+                { "message": { "role": "assistant", "content": "hello" } }
+            ],
+            "model": "x"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let backend = LocalVllmBackend::new(server.uri(), "x");
+    let req = ChatRequest::new().user("hi");
+    let reply = backend.complete(req).await.unwrap();
+
+    assert!(
+        reply.usage.is_none(),
+        "usage should be None when the response omits the usage block"
+    );
+}
+
+#[tokio::test]
 async fn complete_4xx_fails_immediately() {
     let server = MockServer::start().await;
 
