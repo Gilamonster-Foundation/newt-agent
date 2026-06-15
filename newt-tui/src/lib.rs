@@ -16,6 +16,7 @@ use mcp::Mcp;
 // dependency closure) lives in `newt_core::agentic` now — the TUI is a thin
 // wrapper that resolves config + caveats per turn and threads them in.
 use newt_core::agentic::{chat_complete, print_newt, warmup_if_cold, ChatCtx, NEWT_ORANGE_CT};
+use std::borrow::Cow;
 
 /// Run the (non-interactive) setup wizard unconditionally — used by `newt init`.
 /// Probes Ollama and (re)writes `~/.newt/config.toml`; edit that file for
@@ -71,6 +72,88 @@ const LOGO_120_COLS: u16 = 126;
 const LOGO_160_COLS: u16 = 166;
 
 const LOGO_PLAIN: &str = include_str!("../../docs/logos/newt-ascii-40.txt");
+
+// ---------------------------------------------------------------------------
+// Brand seam
+// ---------------------------------------------------------------------------
+// The splash/inline art and wordmark are the compiled-in **newt** brand by
+// default, but a host that reuses this airframe (the downstream
+// `gilamonster-agent`) can override them at runtime — no recompile of this
+// crate:
+//   - `NEWT_BRAND_LOGO_DIR`    directory holding `<prefix>-<stem>.txt` art
+//   - `NEWT_BRAND_LOGO_PREFIX` art filename prefix (default "newt")
+//   - `NEWT_BRAND_NAME`        wordmark beside the logo (default "newt")
+//   - `NEWT_BRAND_TAGLINE`     one-line tagline (default below)
+// A missing/unreadable art file falls back to the compiled-in newt art, so a
+// partial override (or a wrong path) degrades gracefully rather than crashing.
+
+const DEFAULT_BRAND_NAME: &str = "newt";
+const DEFAULT_BRAND_TAGLINE: &str = "Small, fast, local-first agentic coder";
+
+/// Pure core of [`brand_logo`]: resolve a logo from explicit override inputs so
+/// it is testable without mutating process-wide env. A missing dir, empty dir,
+/// or unreadable file all fall back to the compiled-in `default`.
+fn resolve_brand_logo(
+    dir: Option<std::ffi::OsString>,
+    prefix: Option<String>,
+    default: &'static str,
+    stem: &str,
+) -> Cow<'static, str> {
+    let dir = match dir {
+        Some(d) if !d.is_empty() => std::path::PathBuf::from(d),
+        _ => return Cow::Borrowed(default),
+    };
+    let prefix = prefix
+        .filter(|p| !p.is_empty())
+        .unwrap_or_else(|| DEFAULT_BRAND_NAME.to_string());
+    match std::fs::read_to_string(dir.join(format!("{prefix}-{stem}.txt"))) {
+        Ok(art) => Cow::Owned(art),
+        Err(_) => Cow::Borrowed(default),
+    }
+}
+
+/// Resolve one logo by `stem` (e.g. `"ansi-20"`), preferring a runtime override
+/// file under `NEWT_BRAND_LOGO_DIR` and falling back to the compiled-in art.
+fn brand_logo(default: &'static str, stem: &str) -> Cow<'static, str> {
+    resolve_brand_logo(
+        std::env::var_os("NEWT_BRAND_LOGO_DIR"),
+        std::env::var("NEWT_BRAND_LOGO_PREFIX").ok(),
+        default,
+        stem,
+    )
+}
+
+/// Pure core of the wordmark/tagline resolution: a non-empty override wins,
+/// otherwise the compiled-in default.
+fn brand_or(value: Option<String>, default: &str) -> String {
+    value
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| default.to_string())
+}
+
+/// The wordmark printed beside the logo (`NEWT_BRAND_NAME`, default `newt`).
+fn brand_name() -> String {
+    brand_or(std::env::var("NEWT_BRAND_NAME").ok(), DEFAULT_BRAND_NAME)
+}
+
+/// The one-line tagline printed after the wordmark (`NEWT_BRAND_TAGLINE`).
+fn brand_tagline() -> String {
+    brand_or(
+        std::env::var("NEWT_BRAND_TAGLINE").ok(),
+        DEFAULT_BRAND_TAGLINE,
+    )
+}
+
+/// Optional splash line listing the host's mounted plugins/capabilities
+/// (`NEWT_BRAND_PLUGINS`, a pre-formatted list the host computes — e.g. the
+/// gilamonster pilot fills it from its configured MCP capabilities). `None`
+/// when unset/empty, so stock newt shows nothing.
+fn brand_plugins() -> Option<String> {
+    std::env::var("NEWT_BRAND_PLUGINS")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| format!("plugins:  {}", s.trim()))
+}
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -134,20 +217,26 @@ fn render_inline_header(workspace: &str, color: bool) -> String {
     use std::fmt::Write as _;
 
     if !color {
-        return format!("newt v{VERSION}  ·  {workspace}\n\n");
+        let plugins = brand_plugins()
+            .map(|p| format!("  ·  {p}"))
+            .unwrap_or_default();
+        return format!("{} v{VERSION}  ·  {workspace}{plugins}\n\n", brand_name());
     }
 
     // Place text at column 23 (just past the 20-col logo).
     let text_col = 23u16;
-    let logo_lines: Vec<&str> = LOGO_20.lines().collect();
+    let logo = brand_logo(LOGO_20, "ansi-20");
+    let logo_lines: Vec<&str> = logo.lines().collect();
     let n = logo_lines.len();
 
     // Text lines aligned to the middle-right of the logo.
     let mid = n / 2;
+    let header = format!("{}  ·  {}", brand_name(), brand_tagline());
+    let plugins = brand_plugins();
     let text: &[(&str, bool)] = &[
-        ("newt  ·  Small, fast, local-first agentic coder", false),
+        (header.as_str(), false),
         (std::concat!("v", env!("CARGO_PKG_VERSION")), true), // dim
-        ("", false),
+        (plugins.as_deref().unwrap_or(""), true),             // dim; empty row hides itself
         (
             "ready — type a task, /help for commands, /exit to quit",
             true,
@@ -211,47 +300,58 @@ fn color_supported_with(get_env: &dyn Fn(&str) -> Option<String>) -> bool {
 const STATUS_MIN_COLS: u16 = 44;
 const LOGO_160_MIN_TERM_COLS: u16 = 260;
 
-fn logo_for_size(cols: u16, rows: u16) -> (&'static str, u16) {
-    // Each entry: (art, display_cols, display_rows, min_term_cols).
+fn logo_for_size(cols: u16, rows: u16) -> (Cow<'static, str>, u16) {
+    // Each entry: (art, brand stem, display_cols, display_rows, min_term_cols).
     // A logo is only selected if both width AND height fit the terminal.
-    for (art, w, h, min_w) in [
-        (LOGO_160, LOGO_160_COLS, 81u16, LOGO_160_MIN_TERM_COLS),
+    for (art, stem, w, h, min_w) in [
+        (
+            LOGO_160,
+            "ansi-160",
+            LOGO_160_COLS,
+            81u16,
+            LOGO_160_MIN_TERM_COLS,
+        ),
         (
             LOGO_120,
+            "ansi-120",
             LOGO_120_COLS,
             61u16,
             LOGO_120_COLS + STATUS_MIN_COLS + 2,
         ),
         (
             LOGO_FULL,
+            "ansi-full",
             LOGO_FULL_COLS,
             40u16,
             LOGO_FULL_COLS + STATUS_MIN_COLS + 2,
         ),
         (
             LOGO_40,
+            "ansi-40",
             LOGO_40_COLS,
             20u16,
             LOGO_40_COLS + STATUS_MIN_COLS + 2,
         ),
         (
             LOGO_20,
+            "ansi-20",
             LOGO_20_COLS,
             10u16,
             LOGO_20_COLS + STATUS_MIN_COLS + 2,
         ),
         (
             LOGO_10,
+            "ansi-10",
             LOGO_10_COLS,
             5u16,
             LOGO_10_COLS + STATUS_MIN_COLS + 2,
         ),
     ] {
         if cols >= min_w && rows >= h + 4 {
-            return (art, w);
+            return (brand_logo(art, stem), w);
         }
     }
-    (LOGO_10, LOGO_10_COLS)
+    (brand_logo(LOGO_10, "ansi-10"), LOGO_10_COLS)
 }
 
 /// Render the splash. Returns `true` if the user pressed Enter (continue to
@@ -276,13 +376,14 @@ fn show_splash_color(out: &mut io::Stdout, _workspace: &str) -> anyhow::Result<b
     let brand_col = logo_cols + 2;
     let brand_row = logo_rows.saturating_sub(4) / 2;
 
+    let tagline = brand_tagline();
     queue!(out, MoveTo(brand_col, brand_row))?;
     queue!(
         out,
         SetForegroundColor(NEWT_ORANGE_CT),
-        Print("newt"),
+        Print(brand_name()),
         ResetColor,
-        Print("  ·  Small, fast, local-first agentic coder")
+        Print(format!("  ·  {tagline}"))
     )?;
     queue!(out, MoveTo(brand_col, brand_row + 1))?;
     queue!(
@@ -291,6 +392,15 @@ fn show_splash_color(out: &mut io::Stdout, _workspace: &str) -> anyhow::Result<b
         Print(format!("v{VERSION}")),
         ResetColor
     )?;
+    if let Some(plugins) = brand_plugins() {
+        queue!(out, MoveTo(brand_col, brand_row + 2))?;
+        queue!(
+            out,
+            SetForegroundColor(CtColor::DarkGrey),
+            Print(plugins),
+            ResetColor
+        )?;
+    }
     queue!(out, MoveTo(brand_col, brand_row + 3))?;
     queue!(
         out,
@@ -316,15 +426,19 @@ fn show_splash_plain(_out: &mut io::Stdout, workspace: &str) -> anyhow::Result<b
                 .add_modifier(Modifier::BOLD);
             let dim = Style::default().fg(Color::DarkGray);
             let mut lines: Vec<Line> = vec![Line::from("")];
-            for l in LOGO_PLAIN.lines() {
+            let logo = brand_logo(LOGO_PLAIN, "ascii-40");
+            for l in logo.lines() {
                 lines.push(Line::from(l.to_owned()));
             }
             lines.push(Line::from(""));
             lines.push(Line::from(vec![
-                Span::styled("newt", orange_bold),
-                Span::raw("  ·  Small, fast, local-first agentic coder"),
+                Span::styled(brand_name(), orange_bold),
+                Span::raw(format!("  ·  {}", brand_tagline())),
             ]));
             lines.push(Line::from(Span::styled(format!("v{VERSION}"), dim)));
+            if let Some(plugins) = brand_plugins() {
+                lines.push(Line::from(Span::styled(plugins, dim)));
+            }
             lines.push(Line::from(""));
             lines.push(Line::from(format!("Workspace:  {workspace}")));
             lines.push(Line::from(""));
@@ -5481,6 +5595,68 @@ mod tests {
     }
 
     #[test]
+    fn brand_logo_falls_back_to_compiled_default() {
+        // No override dir (the default newt build) → the compiled-in art.
+        let art = resolve_brand_logo(None, None, "NEWT-DEFAULT", "ansi-20");
+        assert_eq!(art.as_ref(), "NEWT-DEFAULT");
+        assert!(matches!(art, Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn brand_logo_reads_override_file() {
+        // A host (gilamonster) points the dir at its own `<prefix>-<stem>.txt`.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("gilamonster-ansi-20.txt"), "GILA-ART").unwrap();
+        let art = resolve_brand_logo(
+            Some(dir.path().as_os_str().to_owned()),
+            Some("gilamonster".to_string()),
+            "NEWT-DEFAULT",
+            "ansi-20",
+        );
+        assert_eq!(art.as_ref(), "GILA-ART");
+    }
+
+    #[test]
+    fn brand_logo_missing_override_falls_back() {
+        // Override dir set but the requested stem is absent → compiled default.
+        let dir = tempfile::tempdir().unwrap();
+        let art = resolve_brand_logo(
+            Some(dir.path().as_os_str().to_owned()),
+            Some("gilamonster".to_string()),
+            "NEWT-DEFAULT",
+            "ansi-99",
+        );
+        assert_eq!(art.as_ref(), "NEWT-DEFAULT");
+    }
+
+    #[test]
+    fn brand_text_prefers_nonempty_override() {
+        assert_eq!(brand_or(None, "newt"), "newt");
+        assert_eq!(brand_or(Some(String::new()), "newt"), "newt");
+        assert_eq!(
+            brand_or(Some("gilamonster".to_string()), "newt"),
+            "gilamonster"
+        );
+    }
+
+    #[test]
+    fn brand_plugins_label_guards_empty() {
+        // Mirror brand_plugins()'s pure formatting (env read aside): non-empty
+        // gets the "plugins:" label; empty/whitespace yields nothing.
+        let fmt = |v: Option<&str>| {
+            v.map(str::to_string)
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| format!("plugins:  {}", s.trim()))
+        };
+        assert_eq!(fmt(None), None);
+        assert_eq!(fmt(Some("   ")), None);
+        assert_eq!(
+            fmt(Some("mogul, diagram")),
+            Some("plugins:  mogul, diagram".to_string())
+        );
+    }
+
+    #[test]
     fn logo_widths_are_strictly_ordered() {
         // Verified at compile time — use const assert to satisfy clippy.
         const _: () = {
@@ -5519,6 +5695,20 @@ mod tests {
         assert!(s.contains("/some/workspace"));
         // Plain mode must stay safe for dumb terminals and pipes: no ANSI.
         assert!(!s.contains('\x1b'));
+    }
+
+    #[test]
+    fn inline_header_lists_plugins_when_brand_set() {
+        // SAFETY: single-threaded set/clear of a process var that no other test
+        // asserts against (the other header tests are contains-only + ANSI-safe).
+        unsafe { std::env::set_var("NEWT_BRAND_PLUGINS", "mogul, diagram") };
+        let color = render_inline_header("/w", true);
+        let plain = render_inline_header("/w", false);
+        unsafe { std::env::remove_var("NEWT_BRAND_PLUGINS") };
+        assert!(color.contains("plugins:  mogul, diagram"));
+        assert!(plain.contains("plugins:  mogul, diagram"));
+        // Unset → no plugins line at all.
+        assert!(!render_inline_header("/w", false).contains("plugins:"));
     }
 
     #[test]
