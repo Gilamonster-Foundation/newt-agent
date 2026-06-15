@@ -110,7 +110,6 @@ fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Option<T> {
 /// Write `data` to `path` with 0o600 permissions (owner-only). Uses an atomic
 /// rename via a temp file so a crash never leaves a half-written token file.
 fn write_token_file(path: &Path, data: &impl Serialize) -> anyhow::Result<()> {
-    use std::os::unix::fs::PermissionsExt as _;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -121,7 +120,14 @@ fn write_token_file(path: &Path, data: &impl Serialize) -> anyhow::Result<()> {
             .create(true)
             .truncate(true)
             .open(&tmp)?;
-        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        // Restrict the token file to owner-only on Unix. Windows has no
+        // equivalent mode bits, so the atomic-write semantics are kept but the
+        // permission tightening is skipped.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
         let json = serde_json::to_string_pretty(data)?;
         f.write_all(json.as_bytes())?;
     }
