@@ -197,21 +197,31 @@ work isolated and reviewable:
     no longer follows symlinks and skips vendored/build dirs (`.venv`, `site-packages`,
     `node_modules`, `target`, …); `apply_revert_retry` refuses any path that resolves
     outside the canonicalized workspace and reports only files actually reverted.
-- **Increment 2b — the re-prompt loop (next).** Upgrade revert-only to revert+re-run
-  so a fabricating turn becomes a grounded one within the cap. Either drive
-  `apply_revert_retry` live (extract a turn-runner so its `RetryRerun` re-invokes a
-  turn) or re-prompt via a `run_chat` task-queue + cap counter; the honest give-up
-  banner + `retry_exhausted` land here.
+- **Increment 2b — the re-prompt loop (done).** After a revert, `retry_revert`
+  returns the grounded `corrective_prompt` alongside the `↩` banner; `run_chat`
+  drives a **task-queue**: when the per-user-turn re-prompt budget
+  (`retry.max_retries`) allows, the corrective prompt is queued as the next loop
+  iteration's input (`pending_retry`), so the model re-attempts with full memory
+  context and the *same* permission/tool wiring — `↻` while budget remains, an honest
+  `✗ gave up after N re-prompt(s)` when spent. The cap/give-up decision is the pure,
+  unit-tested `retry_step`. **Integration note:** the interactive loop drives the
+  re-prompt itself (reusing the tested `revert_only` + `corrective_prompt`) rather
+  than `apply_revert_retry`'s internal `RetryRerun` loop — re-entering a full
+  `ChatCtx` from inside that callback would mean reconstructing ~20 borrowed fields,
+  whereas the task-queue reuses `run_chat`'s natural turn path and gives each retry
+  the correct context for free. `apply_revert_retry` remains the self-contained
+  **headless** driver (and the tested home of the accept/cap/give-up semantics).
 
 ## Known gaps (deferred, from the 2a adversarial review)
 
 These were confirmed at **low/nit** severity and are deferred deliberately — none is
 data-loss (the two data-loss blockers and the two mediums were fixed in 2a):
 
-- **Revert runs only on a successful turn.** A turn that *errors* after writing a
-  fabrication leaves it on disk (the `Ok` arm reverts; the `Err` arm drops the
-  ledger). Folds into **2b**, which restructures the post-turn path for the re-prompt
-  loop anyway.
+- **Revert/re-prompt run only on a successful turn.** Both live in the post-turn
+  `Ok` arm; a turn that *errors* after writing a fabrication leaves it on disk and
+  drops the ledger. Low-severity (a mid-turn backend error is rare and the next user
+  turn re-gates); a focused follow-up can move the revert ahead of the `Ok`/`Err`
+  split.
 - **Full `.py` walk + parse each turn under `retry`.** Mitigated by the symlink-skip
   + `SKIP_DIRS` exclusions; a large monorepo could still want an incremental gate.
   Pre-existing in `verify_gate` (#368); a shared follow-up.
