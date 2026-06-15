@@ -1,6 +1,6 @@
 # The model support kit
 
-**Status:** framing / umbrella note · **Unifies:** [`model-family-profiles.md`](model-family-profiles.md) (assembly per family), [`technique-library.md`](technique-library.md) (the parts + spec sheets), [`thinking-effort-and-plan-mode.md`](thinking-effort-and-plan-mode.md) (reasoning/structure parts), [`retry-technique.md`](retry-technique.md), [`model-self-tuning.md`](model-self-tuning.md) (the tuner) · **Fitness function:** the ground-truth rig (#75) + the `--profile` sweep (#350)
+**Status:** framing / umbrella note · **Composed by:** [`loadout-composition.md`](loadout-composition.md) (the `loadout` — the top-level `provider → model → kit → role → settings` selection; the kit/bundle/profile here are three of its axes) · **Unifies:** [`model-family-profiles.md`](model-family-profiles.md) (assembly per family), [`technique-library.md`](technique-library.md) (the parts + spec sheets), [`thinking-effort-and-plan-mode.md`](thinking-effort-and-plan-mode.md) (reasoning/structure parts), [`retry-technique.md`](retry-technique.md), [`model-self-tuning.md`](model-self-tuning.md) (the tuner) · **Fitness function:** the ground-truth rig (#75) + the `--profile` sweep (#350)
 
 ## The concept
 
