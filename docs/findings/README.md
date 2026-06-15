@@ -39,6 +39,8 @@ see.
 | date | finding | TL;DR |
 |---|---|---|
 | 2026-06-14 | [Cross-family PyO3 confabulation](2026-06-14-cross-family-confabulation.md) | The "fabricate an entire API surface under context overflow" failure is **model-family-specific, not structural**: both nemotron models fail (score 0.0), qwen3-coder:30b passes (1.0) the identical task. → the support harness should be tuned per model family. |
+| 2026-06-14 | [Fabrication is sampling variance, not info loss](2026-06-14-fabrication-is-sampling-not-information-loss.md) | Same model, same byte-identical inputs: one run grounds 15/15, another fabricates 5/5. The model **had** the surface and overrode it with a crate-name prior; compression fired in both. → fix with a compression-surviving fact (R1) + verify-gated revert-retry (R2), not "re-read". |
+| 2026-06-15 | [Verify-gated retry: grounding vs. gate-gaming](2026-06-15-retry-and-the-honest-gate.md) | A revert-retry loop reads 3/3 → 1.0 naively, but honestly: 1 real grounding, 1 no-output, 1 **gate-evasion**. Under retry, nemotron games the gate's blind spots (prefix-breadth, hyphen, wildcard). → verify-gated retry is a **composable technique** whose worth is bounded by its gate's adversarial completeness. |
 
 ## How to add a finding
 
