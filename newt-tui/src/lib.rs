@@ -2558,6 +2558,50 @@ fn announce_profile(name: &str, profile: &newt_core::config::ProfileConfig, colo
     }
 }
 
+/// The `verify_gate` technique (R2), post-turn: resolve the produced Python files'
+/// imports against the workspace's FFI surface and return a one-block warning of
+/// any that import modules absent from it — `None` when clean, or when the
+/// workspace has no PyO3 surface to check against. **Non-destructive** (it
+/// surfaces fabrications; revert/retry is a later increment). The `surface_match`
+/// strictness comes from the profile knob.
+///
+/// Scope: resolves against the project's PyO3 surface + the Python stdlib — apt
+/// for the binding-examples workflow it was built for; a broader Python project
+/// may see informational false positives (hence warn-only, opt-in per profile).
+fn verify_gate_summary(
+    workspace: &str,
+    mode: newt_core::verify_gate::SurfaceMatch,
+) -> Option<String> {
+    let ws = std::path::Path::new(workspace);
+    let manifest = newt_core::ffi_manifest::FfiManifest::from_workspace(ws).ok()?;
+    if manifest.is_empty() {
+        return None; // no authoritative surface to check against
+    }
+    let report =
+        newt_core::verify_gate::gate_python_workspace_with(ws, &manifest.known_modules(), mode)
+            .ok()?;
+    if report.accept() {
+        return None;
+    }
+    let mut s = format!(
+        "verify_gate: {} file(s) import modules not in the workspace surface (the real paths \
+         are in the system prompt):",
+        report.revert_set().len()
+    );
+    for f in &report.files {
+        if f.is_clean() {
+            continue;
+        }
+        let mods: Vec<&str> = f.fabrications.iter().map(|x| x.module.as_str()).collect();
+        s.push_str(&format!(
+            "\n    {}  [{}]",
+            f.path.display(),
+            mods.join(", ")
+        ));
+    }
+    Some(s)
+}
+
 fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Result<()> {
     let verbose = verbose_mode();
 
@@ -2593,7 +2637,7 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
     // technique — is a hard error; a `--profile` that silently did nothing would
     // be a false claim. The resolved profile is held for the loop to apply (the
     // technique-application wiring is the next increment).
-    let _active_profile = match std::env::var("NEWT_PROFILE") {
+    let active_profile = match std::env::var("NEWT_PROFILE") {
         Ok(name) if !name.is_empty() => {
             let profile = cfg
                 .resolve_profile(&name)
@@ -2804,6 +2848,16 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
             .ok()
             .or_else(|| cfg.agents.path.clone());
         mgr.add_provider(newt_core::AgentsProvider::new(agents_enabled, agents_path));
+        // Profile technique: knowledge_base (R1) — inject the authoritative PyO3
+        // import surface into the system prompt when the active profile lists it.
+        // Rides the provider seam (survives system-prompt rebuilds); a no-op on a
+        // non-PyO3 workspace. See docs/design/technique-library.md.
+        if active_profile
+            .as_ref()
+            .is_some_and(|p| p.enables("knowledge_base"))
+        {
+            mgr.add_provider(newt_core::FfiSurfaceProvider::new());
+        }
         // History provider based on config.
         match mem_cfg.provider {
             newt_core::MemoryProviderKind::TokenBudget => {
@@ -3500,6 +3554,28 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                         Ok((reply, was_streamed, usage, hallucinations)) => {
                             if !was_streamed {
                                 print_newt(&reply, color, verbose);
+                            }
+                            // Profile technique: verify_gate (R2) — after the turn,
+                            // resolve the produced Python imports against the FFI
+                            // surface and surface any fabrications (non-destructive).
+                            if let Some(p) =
+                                active_profile.as_ref().filter(|p| p.enables("verify_gate"))
+                            {
+                                if let Some(warn) = verify_gate_summary(
+                                    workspace,
+                                    p.verify_gate_knobs().surface_match,
+                                ) {
+                                    if color {
+                                        let _ = execute!(
+                                            io::stdout(),
+                                            SetForegroundColor(CtColor::Yellow),
+                                            Print(format!("⚠ {warn}\n")),
+                                            ResetColor,
+                                        );
+                                    } else {
+                                        println!("⚠ {warn}");
+                                    }
+                                }
                             }
                             // Single TurnMetrics used for both memory sync and display.
                             let pricing = cfg.pricing.clone().unwrap_or_default();
@@ -5658,6 +5734,53 @@ fn test_persona(name: &str, prompt: &str, path: std::path::PathBuf) -> Persona {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn write_pyo3_binding(root: &std::path::Path, krate: &str, submodule: &str) {
+        let dir = root.join(krate).join("src");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("pyo3_module.rs"),
+            format!(
+                "#[pyclass(name=\"X\", module=\"newt_agent._newt_agent.{submodule}\")] struct X;"
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn verify_gate_summary_flags_fabrication_and_passes_clean() {
+        use newt_core::verify_gate::SurfaceMatch;
+        let dir = tempfile::tempdir().unwrap();
+        write_pyo3_binding(dir.path(), "newt-core", "core");
+        let ws = dir.path().to_str().unwrap();
+        std::fs::create_dir_all(dir.path().join("examples")).unwrap();
+
+        // a fabricated import → flagged
+        std::fs::write(dir.path().join("examples/bad.py"), "import newt_core\n").unwrap();
+        let warn = verify_gate_summary(ws, SurfaceMatch::Exact).expect("a fabrication warning");
+        assert!(
+            warn.contains("verify_gate") && warn.contains("newt_core"),
+            "{warn}"
+        );
+
+        // replace with a grounded import → clean (None)
+        std::fs::remove_file(dir.path().join("examples/bad.py")).unwrap();
+        std::fs::write(
+            dir.path().join("examples/ok.py"),
+            "from newt_agent._newt_agent.core import X\nimport os\n",
+        )
+        .unwrap();
+        assert!(verify_gate_summary(ws, SurfaceMatch::Exact).is_none());
+    }
+
+    #[test]
+    fn verify_gate_summary_noops_without_pyo3_surface() {
+        use newt_core::verify_gate::SurfaceMatch;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("thing.py"), "import newt_core\n").unwrap();
+        // no bindings → no authoritative surface → no gating (None)
+        assert!(verify_gate_summary(dir.path().to_str().unwrap(), SurfaceMatch::Exact).is_none());
+    }
 
     fn mock_env<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
         |k| {
