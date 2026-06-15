@@ -29,6 +29,7 @@ pub mod session;
 pub mod store;
 pub mod symbols;
 pub mod tuning;
+pub mod verify_gate;
 pub mod workspace_key;
 
 #[cfg(feature = "pyo3")]

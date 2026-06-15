@@ -246,6 +246,66 @@ fn module_root(module: &str) -> &str {
     module.split(['.', ':']).next().unwrap_or(module)
 }
 
+/// A module is **known** if it — or any of its dotted prefixes — is in `known`
+/// (so a declared `newt_agent` covers `newt_agent.core`, and `os` covers
+/// `os.path`). The module-level resolution shared by the verify oracle (scoring)
+/// and the verify gate (control), so the two never drift.
+#[must_use]
+pub fn module_is_known(module: &str, known: &BTreeSet<String>) -> bool {
+    let parts: Vec<&str> = module.split('.').collect();
+    (1..=parts.len()).any(|i| known.contains(&parts[..i].join(".")))
+}
+
+/// A focused allowlist of common Python standard-library top-level modules, so a
+/// generated example's `import os` / `from dataclasses import dataclass` is not
+/// mistaken for a fabrication. Not exhaustive — errs toward false-negatives (miss
+/// a stdlib edge) over false-positives (flag real stdlib).
+#[must_use]
+pub fn python_stdlib_modules() -> BTreeSet<String> {
+    [
+        // Dunder modules CPython always provides — `from __future__ import
+        // annotations` is the single most common line in modern typed Python.
+        "__future__",
+        "__main__",
+        "abc",
+        "argparse",
+        "asyncio",
+        "base64",
+        "collections",
+        "contextlib",
+        "copy",
+        "csv",
+        "dataclasses",
+        "datetime",
+        "decimal",
+        "enum",
+        "functools",
+        "glob",
+        "hashlib",
+        "io",
+        "itertools",
+        "json",
+        "logging",
+        "math",
+        "os",
+        "pathlib",
+        "random",
+        "re",
+        "shutil",
+        "subprocess",
+        "sys",
+        "tempfile",
+        "time",
+        "typing",
+        "unittest",
+        "uuid",
+        "warnings",
+    ]
+    .iter()
+    .map(|s| (*s).to_string())
+    .collect()
+}
+
 /// Extract the references (imports/uses) a source file makes.
 #[must_use]
 pub fn extract_references(source: &str, lang: Lang) -> Vec<Reference> {
@@ -265,8 +325,10 @@ pub fn extract_definitions(source: &str, lang: Lang) -> Vec<Definition> {
 }
 
 fn extract_references_python(source: &str) -> Vec<Reference> {
-    // `from <module> import a, b as c, d`
-    let from_re = Regex::new(r"^\s*from\s+([\w.]+)\s+import\s+(.+?)\s*$").unwrap();
+    // `from <module> import a, b as c, d`. The module class includes `-` so a
+    // fabricated hyphenated crate name (`from newt-eval import …`) is captured
+    // and checked, not silently dropped — even though it is not legal Python.
+    let from_re = Regex::new(r"^\s*from\s+([\w.-]+)\s+import\s+(.+?)\s*$").unwrap();
     // `import <module>[ as x][, <module2>...]`
     let import_re = Regex::new(r"^\s*import\s+(.+?)\s*$").unwrap();
 
@@ -275,8 +337,23 @@ fn extract_references_python(source: &str) -> Vec<Reference> {
         let lineno = i + 1;
         if let Some(caps) = from_re.captures(line) {
             let module = caps[1].to_string();
-            // Skip wildcard imports — they assert nothing about a specific name.
-            for item in caps[2].split(',') {
+            // Relative imports (`from . import x`, `from .sub import y`) are
+            // intra-package and always resolvable — never a fabrication. The
+            // regex captures the leading dots into `module`, so detect them here.
+            if module.starts_with('.') {
+                continue;
+            }
+            let names = caps[2].trim();
+            // `from <module> import (` with the names deferred to the following
+            // lines (the black/isort multi-line form). The names group is just
+            // the open paren; record the module-existence reference now —
+            // module-level resolution doesn't need the deferred symbol list.
+            if names == "(" {
+                refs.push(Reference::import_module(module, lineno));
+                continue;
+            }
+            let before = refs.len();
+            for item in names.split(',') {
                 let name = item
                     .split_whitespace()
                     .next()
@@ -286,6 +363,12 @@ fn extract_references_python(source: &str) -> Vec<Reference> {
                     continue;
                 }
                 refs.push(Reference::import_from(module.clone(), name, lineno));
+            }
+            // `from <module> import *` (or any line naming no specific symbol)
+            // still asserts the module exists — record the module-existence
+            // reference so a fabricated module is caught even via a wildcard.
+            if refs.len() == before {
+                refs.push(Reference::import_module(module, lineno));
             }
         } else if let Some(caps) = import_re.captures(line) {
             for item in caps[1].split(',') {
