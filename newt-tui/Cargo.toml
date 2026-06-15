@@ -35,6 +35,8 @@ chrono.workspace = true
 ratatui.workspace = true
 crossterm.workspace = true
 tracing.workspace = true
+sha2.workspace = true
+base64.workspace = true
 
 # NOTE (Step 9.7): the direct agent-bridle dependency moved to newt-core with
 # `execute_tool` — the bridle leash now confines `run_command` / `web_fetch`
@@ -47,7 +49,6 @@ tempfile.workspace = true
 # chokepoint (issue #93): we decode the base64-JSON envelope back into
 # a CertChain so we can walk it to the operator UserKey.
 agent-mesh-protocol = { workspace = true }
-base64.workspace = true
 # HTTP mocking for the tool-call loop tests (cap honoured + graceful cap-exit
 # issuing a final tools-disabled completion). Mirrors newt-inference's pattern.
 wiremock.workspace = true

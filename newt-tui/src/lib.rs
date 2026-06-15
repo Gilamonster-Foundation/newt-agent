@@ -33,6 +33,74 @@ pub fn run_setup(color: bool) -> anyhow::Result<()> {
     setup::run(color)
 }
 
+/// Report auth status for every discovered HTTP MCP server, and optionally run
+/// the interactive OAuth 2.1 PKCE browser flow for a named server.
+///
+/// `server_name = None` → print a status table and exit.
+/// `server_name = Some(name)` → run the full browser-based flow for `name`.
+pub fn run_auth(server_name: Option<&str>) -> anyhow::Result<()> {
+    // Discover the HTTP MCP servers from ~/.claude.json and ~/.newt/config.toml.
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let workspace = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let cfg_servers: Vec<newt_core::mcp::McpServerEntry> = newt_core::Config::resolve()
+        .ok()
+        .map(|c| c.mcp_servers)
+        .unwrap_or_default();
+    let entries = newt_core::mcp::discover(&cfg_servers, home.as_deref(), &workspace);
+
+    // Collect HTTP-transport servers (the only ones that use OAuth).
+    let http_servers: Vec<(String, String)> = entries
+        .into_iter()
+        .filter(|e| e.transport == newt_core::mcp::TransportKind::Http)
+        .filter_map(|e| e.url.map(|u| (e.name, u)))
+        .collect();
+
+    let names: Vec<String> = http_servers.iter().map(|(n, _)| n.clone()).collect();
+    let statuses = mcp_token::auth_status(&names);
+
+    match server_name {
+        None => {
+            // List mode — print a table.
+            println!("\nMCP server auth status:\n");
+            for s in &statuses {
+                let icon = match s.state {
+                    mcp_token::AuthState::Valid => "✓",
+                    mcp_token::AuthState::Expired => "↺",
+                    mcp_token::AuthState::NeedsFlow => "○",
+                    mcp_token::AuthState::Unregistered => "✗",
+                };
+                let label = match s.state {
+                    mcp_token::AuthState::Valid => "authenticated",
+                    mcp_token::AuthState::Expired => "token expired (will refresh on connect)",
+                    mcp_token::AuthState::NeedsFlow => "needs login  →  newt auth",
+                    mcp_token::AuthState::Unregistered => "no client registration",
+                };
+                println!("  {icon}  {:<30}  {label}", s.name);
+            }
+            println!("\nRun `newt auth <server>` to authenticate a server.");
+            Ok(())
+        }
+        Some(name) => {
+            // Flow mode — find the URL and run the browser flow.
+            let url = http_servers
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, u)| u.clone())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Server `{name}` not found in discovered HTTP MCP servers.\n\
+                         Run `newt auth` (no argument) to list available servers."
+                    )
+                })?;
+
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current()
+                    .block_on(mcp_token::run_oauth_flow(name, &url))
+            })
+        }
+    }
+}
+
 use std::io::{self, IsTerminal, Write as _};
 
 use crossterm::{
