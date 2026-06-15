@@ -645,12 +645,22 @@ fn mark_fds_cloexec() {
 }
 
 /// Probe whether the fd table has at least one free slot by attempting to
-/// open `/dev/null`. Returns `false` when the process is at EMFILE — i.e.,
+/// open the platform null device. Returns `false` when the process is at EMFILE — i.e.,
 /// the next `open("/dev/tty")` by rustyline would fail and panic.
 ///
 /// Uses only `std::fs` (no libc dep) so it compiles on all platforms.
 fn terminal_fd_available() -> bool {
-    std::fs::File::open("/dev/null").is_ok()
+    std::fs::File::open(null_device_path()).is_ok()
+}
+
+#[cfg(windows)]
+fn null_device_path() -> &'static str {
+    "NUL"
+}
+
+#[cfg(not(windows))]
+fn null_device_path() -> &'static str {
+    "/dev/null"
 }
 
 /// Whether to show "newt" / "you" labels before the carets.
@@ -8880,6 +8890,17 @@ mod tool_round_cap_tests {
 // ---------------------------------------------------------------------------
 // fd_exhaustion_tests — verify O_CLOEXEC marking and EMFILE detection
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod terminal_probe_tests {
+    #[test]
+    fn terminal_fd_available_uses_platform_null_device() {
+        assert!(
+            super::terminal_fd_available(),
+            "terminal probe should open the platform null device on a healthy process"
+        );
+    }
+}
 
 #[cfg(all(test, unix))]
 mod fd_exhaustion_tests {
