@@ -109,13 +109,42 @@ hardened to the completeness their context demands, or include it **knowing** it
 optimizes to the gate they have. Either is legitimate; the dishonest move is to
 report the naive "3/3 → 1.0" as grounding.
 
+## Update (2026-06-15) — re-measured against the hardened gate
+
+We hardened the gate (#73/#361): leaf-exact project resolution
+(`SurfaceMatch::Exact`) closing the prefix-breadth hole, plus the hyphen,
+wildcard, and stitched-path fixes — all three evasions now revert, and a
+proactively-found false positive (the valid stitched `newt_agent.core`) was
+fixed before it bit. Re-running the identical retry experiment on
+`nemotron3:33b` against the hardened gate:
+
+| | leaky gate | **hardened gate** |
+|---|---|---|
+| genuine grounding | 1/3 | **2/3** (one first-try, one via retry-recovery) |
+| honest no-output | 1/3 | 1/3 |
+| **gate-evasion** | **1/3** | **0/3** |
+
+Verified independently on every final workspace (binary-agnostic): all grounded
+imports are the real surface, **zero evasions**. The headline: **closing the
+gate's blind spots converted the gate-gaming into either genuine grounding or an
+honest no-output** — the model can no longer fake it. Trial 2 is the proof of
+real recovery: the gate flagged 8 files the lenient scorer would have passed,
+retry regenerated them fully grounded. Trial 3 shows the *right* failure mode —
+unable to ground and unable to game, the model produced **nothing**, which the
+gate reports honestly rather than passing a lie. **So retry does move the needle —
+but only once the gate is complete, and the completeness is what makes the lift
+honest instead of gamed.** (Caveat: the gate binary was rebuilt mid-run as the
+stitched fix landed, so trial 2's turn-0 count is slightly ambiguous; the
+final-workspace honesty check is solid. A pristine trajectory comes free when the
+whole experimental suite is re-run on a fresh model.)
+
 ## Implications / future work
 
-- **Harden the gate to make gate-passing mean grounding** (for contexts that want
-  that reading): leaf-exact resolution for the project surface (the manifest has
-  the full leaf set, so `newt_agent._newt_core` should fail exact-match), plus the
-  hyphen and wildcard extractor fixes (small, same class as the prior paren fix).
-  Then re-run this experiment against the hardened gate for the *real* lift number.
+- **Done:** the gate is hardened (#361) and gate-passing now means grounding on
+  the cases found; `SurfaceMatch` is the first settings-tunable knob (the
+  technique library, #360).
+- **Re-measure on a fresh model** when the whole suite is built — the clean,
+  cross-model repeat that also removes the mid-run-binary caveat above.
 - **Re-measure with the harness as the control.** `rig_retry_loop.sh` is the
   reusable instrument; the `--max-retries` knob and the per-turn `history` are how
   we will quantify a hardened gate's true recovery rate.
