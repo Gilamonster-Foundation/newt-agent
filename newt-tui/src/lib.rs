@@ -2603,59 +2603,60 @@ fn verify_gate_summary(
 }
 
 /// The `retry` technique's destructive arm (increment 2a): gate the produced `.py`
-/// files and **revert** the flagged set to its pre-turn state (`ledger`, the
-/// [`snapshot_workspace_py`](newt_core::verify_gate::snapshot_workspace_py) taken
-/// before the turn), returning a one-line banner naming what was reverted (`None`
-/// when clean / no surface). An edited file is restored to its pre-turn bytes; a
-/// file the turn *created* is absent from the snapshot — `revert` reports `false`
-/// — so it is deleted. Re-prompting the model is the next increment; here the
-/// fabrication is simply not allowed to persist.
-fn verify_gate_revert(
+/// files and **revert** the flagged set to its pre-turn state via the per-turn write
+/// `ledger`, returning a one-line banner naming what was reverted (`None` when clean
+/// / no surface / nothing newt wrote was flagged).
+///
+/// The ledger records only newt's own `write_file`/`edit_file` writes this turn, so
+/// [`revert_only`](newt_core::verify_gate::revert_only) restores edited files and
+/// removes created ones **without ever touching a file newt did not write** (build
+/// output, pre-existing fabrications, anything reached via a symlink). Re-prompting
+/// the model is the next increment; here the fabrication is simply not allowed to
+/// persist.
+async fn retry_revert(
     workspace: &str,
     mode: newt_core::verify_gate::SurfaceMatch,
-    ledger: &newt_core::verify_gate::WriteLedger,
+    ledger: &std::cell::RefCell<newt_core::verify_gate::WriteLedger>,
 ) -> Option<String> {
+    use newt_core::verify_gate::{gate_python_workspace_with, revert_only, RetrySurface};
     let ws = std::path::Path::new(workspace);
     let manifest = newt_core::ffi_manifest::FfiManifest::from_workspace(ws).ok()?;
     if manifest.is_empty() {
         return None; // no authoritative surface to gate against
     }
-    let report =
-        newt_core::verify_gate::gate_python_workspace_with(ws, &manifest.known_modules(), mode)
-            .ok()?;
+    let modules = manifest.known_modules();
+    let report = gate_python_workspace_with(ws, &modules, mode).ok()?;
     if report.accept() {
         return None;
     }
-    let mut reverted = 0usize;
-    let mut detail = String::new();
-    for f in &report.files {
-        if f.is_clean() {
-            continue;
-        }
-        let abs = ws.join(&f.path);
-        match ledger.revert(&abs) {
-            Ok(true) => {} // edited file → bytes restored
-            Ok(false) => {
-                let _ = std::fs::remove_file(&abs); // created this turn → delete
-            }
-            Err(e) => {
-                tracing::warn!(path = %f.path.display(), error = %e, "retry: revert failed");
-                continue;
-            }
-        }
-        reverted += 1;
-        let mods: Vec<&str> = f.fabrications.iter().map(|x| x.module.as_str()).collect();
-        detail.push_str(&format!(
-            "\n    {}  [{}]",
-            f.path.display(),
-            mods.join(", ")
-        ));
+    // Per-file fabricated modules for the banner, captured before the report moves.
+    let mods_by_path: std::collections::BTreeMap<std::path::PathBuf, String> = report
+        .files
+        .iter()
+        .filter(|f| !f.is_clean())
+        .map(|f| {
+            let mods: Vec<&str> = f.fabrications.iter().map(|x| x.module.as_str()).collect();
+            (f.path.clone(), mods.join(", "))
+        })
+        .collect();
+    let block = manifest.render_block();
+    let surface = RetrySurface {
+        modules: &modules,
+        mode,
+        block: &block,
+    };
+    let outcome = revert_only(ws, &surface, ledger, report).await.ok()?;
+    if outcome.reverted.is_empty() {
+        return None; // every flagged file was something newt did not write — left as-is
     }
-    if reverted == 0 {
-        return None;
+    let mut detail = String::new();
+    for p in &outcome.reverted {
+        let mods = mods_by_path.get(p).map(String::as_str).unwrap_or("");
+        detail.push_str(&format!("\n    {}  [{}]", p.display(), mods));
     }
     Some(format!(
-        "retry: reverted {reverted} fabricating file(s) to pre-turn state (re-prompt pending):{detail}"
+        "retry: reverted {} file(s) newt wrote this turn to pre-turn state (re-prompt pending):{detail}",
+        outcome.reverted.len()
     ))
 }
 
@@ -3538,19 +3539,18 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                             probe::save_cache(&cap_cache);
                         }
                     };
-                    // Profile technique: retry (R2 action arm) — snapshot the
-                    // workspace's pre-turn `.py` state *before* the model writes,
-                    // so a fabricating file can be reverted to it after the turn.
-                    // Only taken when the profile enables `retry`.
-                    let retry_ledger = active_profile
-                        .as_ref()
-                        .filter(|p| p.enables("retry"))
-                        .and_then(|_| {
-                            newt_core::verify_gate::snapshot_workspace_py(std::path::Path::new(
-                                workspace,
-                            ))
-                            .ok()
-                        });
+                    // Profile technique: retry (R2 action arm) — when the profile
+                    // enables `retry`, lend the loop a per-turn write ledger so the
+                    // file-write tools record newt's OWN writes; the post-turn gate
+                    // then reverts exactly those files (and only those — a file newt
+                    // did not write is never touched).
+                    let retry_ledger =
+                        active_profile
+                            .as_ref()
+                            .filter(|p| p.enables("retry"))
+                            .map(|_| {
+                                std::cell::RefCell::new(newt_core::verify_gate::WriteLedger::new())
+                            });
                     let response = tokio::task::block_in_place(|| {
                         rt.block_on(chat_complete(
                             ChatCtx {
@@ -3613,6 +3613,10 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                                 // ceiling the --disable-ocap bypass cannot
                                 // cross. None when no mode is active.
                                 exec_floor: exec_floor.as_ref(),
+                                // retry technique: the per-turn write ledger (Some
+                                // only under a `retry` profile). The write tools
+                                // record into it; the post-turn gate reverts from it.
+                                write_ledger: retry_ledger.as_ref(),
                             },
                             &mut mcp,
                         ))
@@ -3636,7 +3640,10 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                                     .as_ref()
                                     .map(|p| p.verify_gate_knobs().surface_match)
                                     .unwrap_or_default();
-                                if let Some(msg) = verify_gate_revert(workspace, mode, ledger) {
+                                let revert_msg = tokio::task::block_in_place(|| {
+                                    rt.block_on(retry_revert(workspace, mode, ledger))
+                                });
+                                if let Some(msg) = revert_msg {
                                     if color {
                                         let _ = execute!(
                                             io::stdout(),
@@ -5872,42 +5879,55 @@ mod tests {
         assert!(verify_gate_summary(dir.path().to_str().unwrap(), SurfaceMatch::Exact).is_none());
     }
 
-    #[test]
-    fn verify_gate_revert_deletes_new_and_restores_edited() {
-        use newt_core::verify_gate::{snapshot_workspace_py, SurfaceMatch};
+    #[tokio::test]
+    async fn retry_revert_undoes_only_newts_writes() {
+        use newt_core::verify_gate::{SurfaceMatch, WriteLedger};
         let dir = tempfile::tempdir().unwrap();
         write_pyo3_binding(dir.path(), "newt-core", "core");
         let ws = dir.path().to_str().unwrap();
         std::fs::create_dir_all(dir.path().join("examples")).unwrap();
 
-        // a pre-existing grounded file the turn will fabricate-edit
+        // a pre-existing grounded file newt will fabricate-edit
         let edited = dir.path().join("examples/edited.py");
         std::fs::write(&edited, "from newt_agent._newt_agent.core import X\n").unwrap();
+        // a pre-existing FABRICATING file newt never touches — must be left alone
+        let untouched = dir.path().join("examples/untouched.py");
+        std::fs::write(&untouched, "import newt_core\n").unwrap();
 
-        // snapshot BEFORE the turn writes anything
-        let ledger = snapshot_workspace_py(dir.path()).unwrap();
-
-        // the turn: fabricate-edits the existing file AND creates a new bad one
-        std::fs::write(&edited, "import newt_core\n").unwrap();
+        // the per-turn ledger records ONLY newt's own writes (the write-tool seam)
+        let ledger = std::cell::RefCell::new(WriteLedger::new());
+        ledger.borrow_mut().note_before_write(&edited);
+        std::fs::write(&edited, "import newt_core\n").unwrap(); // newt fabricate-edits it
         let created = dir.path().join("examples/new.py");
-        std::fs::write(&created, "import newt_coder\n").unwrap();
+        ledger.borrow_mut().note_before_write(&created);
+        std::fs::write(&created, "import newt_coder\n").unwrap(); // newt creates a bad file
 
-        let msg = verify_gate_revert(ws, SurfaceMatch::Exact, &ledger).expect("a revert banner");
+        let msg = retry_revert(ws, SurfaceMatch::Exact, &ledger)
+            .await
+            .expect("a revert banner");
         assert!(msg.contains("retry: reverted"), "{msg}");
 
-        // edited file restored to its pre-turn grounded bytes
+        // newt's edit restored to pre-turn bytes; newt's created file deleted
         assert_eq!(
             std::fs::read_to_string(&edited).unwrap(),
             "from newt_agent._newt_agent.core import X\n"
         );
-        // the file the turn created is deleted (absent from the snapshot)
-        assert!(
-            !created.exists(),
-            "a created fabrication is deleted on revert"
+        assert!(!created.exists(), "newt's created fabrication is deleted");
+        // the fabricating file newt NEVER wrote is left completely untouched
+        assert_eq!(
+            std::fs::read_to_string(&untouched).unwrap(),
+            "import newt_core\n",
+            "a file newt did not write must never be reverted or deleted"
         );
 
-        // workspace is clean now → None
-        assert!(verify_gate_revert(ws, SurfaceMatch::Exact, &ledger).is_none());
+        // re-gate: only `untouched` still fabricates, and newt did not write it,
+        // so the revert acts on nothing and reports None.
+        assert!(
+            retry_revert(ws, SurfaceMatch::Exact, &ledger)
+                .await
+                .is_none(),
+            "nothing newt wrote remains flagged"
+        );
     }
 
     fn mock_env<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
@@ -8827,6 +8847,7 @@ mod tool_round_cap_tests {
                     on_round_usage: None,
                     estimate_ratio: None,
                     exec_floor: None,
+                    write_ledger: None,
                 },
                 &mut Mcp::empty(),
             )

@@ -179,16 +179,24 @@ work isolated and reviewable:
   behind a mockable `RetryRerun`), `corrective_prompt`, `RetrySurface`, in
   `verify_gate.rs`. Fully unit-tested, no loop change.
 - **Increment 2a — capture + live revert (this PR).** Wires the destructive arm into
-  `run_chat`: snapshot the workspace's pre-turn `.py` into a `WriteLedger`
-  (`snapshot_workspace_py`) *before* the turn, then after it revert the gate's
-  flagged set (`verify_gate_revert`) — restoring edited files, deleting created ones
-  — with an `↩ retry: reverted …` banner. **Capture choice:** the live TUI populates
-  the ledger from a pre-turn `.py` snapshot rather than per-write hooks threaded
-  through `execute_tool`. The revert *semantics are identical* (snapshot-populated ⇒
-  "no entry ⟺ created this turn", so the same restore-edit / delete-create split
-  holds), and it avoids threading a new field through the `ChatCtx` →
-  `chat_complete` → `execute_tool` hot path (≈14 `ChatCtx` literals). The per-write
-  ledger remains the headless contract; `apply_revert_retry` is the headless driver.
+  `run_chat`: a per-turn `WriteLedger` is lent to the loop (`ChatCtx.write_ledger`,
+  `Some` only under a `retry` profile); the loop records each `write_file`/`edit_file`
+  target's pre-write bytes at the dispatch seam (`ledger_note_write`, just before
+  `execute_tool`); after the turn the TUI gates and calls
+  [`revert_only`](../../newt-core/src/verify_gate.rs) (= `apply_revert_retry` with
+  `max_retries = 0`) to revert the flagged set, with an `↩ retry: reverted …` banner.
+  - **Per-write ledger, NOT a pre-turn snapshot.** An earlier draft populated the
+    ledger from a whole-workspace pre-turn `.py` snapshot and treated "absent from
+    snapshot ⇒ delete". An adversarial review proved that **unsafe**: a snapshot
+    cannot tell a file *newt wrote* from one that merely *appeared* (build output,
+    `run_command` codegen, files reached through a symlinked dir), so the delete rule
+    destroyed files newt never authored — including data **outside** the workspace via
+    symlinks. The per-write ledger records only newt's own writes, so revert restores/
+    deletes exactly those and **skips anything untracked** — the safety property
+    `apply_revert_retry` already had. Defence-in-depth added alongside: `collect_py_files`
+    no longer follows symlinks and skips vendored/build dirs (`.venv`, `site-packages`,
+    `node_modules`, `target`, …); `apply_revert_retry` refuses any path that resolves
+    outside the canonicalized workspace and reports only files actually reverted.
 - **Increment 2b — the re-prompt loop (next).** Upgrade revert-only to revert+re-run
   so a fabricating turn becomes a grounded one within the cap. Either drive
   `apply_revert_retry` live (extract a turn-runner so its `RetryRerun` re-invokes a
