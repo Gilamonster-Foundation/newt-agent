@@ -162,6 +162,28 @@ impl FfiManifest {
         out
     }
 
+    /// The set of known module paths — the project surface the verify gate
+    /// resolves against. For each bound crate this is every dotted ancestor of
+    /// the native `pkg._ext.sub` path **and** of the stitched public `pkg.sub`
+    /// path the umbrella re-exports: both are valid imports, so a leaf-exact gate
+    /// must accept either and only reject genuinely-absent modules.
+    #[must_use]
+    pub fn known_modules(&self) -> std::collections::BTreeSet<String> {
+        let mut set = std::collections::BTreeSet::new();
+        for m in &self.modules {
+            for ancestor in dotted_ancestors(&m.import_path) {
+                set.insert(ancestor);
+            }
+            let stitched = public_stitched_path(&m.import_path);
+            if !stitched.is_empty() && stitched != m.import_path {
+                for ancestor in dotted_ancestors(&stitched) {
+                    set.insert(ancestor);
+                }
+            }
+        }
+        set
+    }
+
     /// Build the authoritative [`SymbolIndex`] the verify oracle resolves against:
     /// every import path (and its dotted ancestors — `newt_agent`,
     /// `newt_agent._newt_agent`, …, all real packages) is a known module, and each
@@ -179,6 +201,17 @@ impl FfiManifest {
         }
         index
     }
+}
+
+/// The public "stitched" form of a native extension path: drop the dotted
+/// segments that start with `_` (the private compiled-extension layer the
+/// umbrella package re-exports over). `"newt_agent._newt_agent.core"` →
+/// `"newt_agent.core"`; a path with no private segment is returned unchanged.
+fn public_stitched_path(path: &str) -> String {
+    path.split('.')
+        .filter(|seg| !seg.starts_with('_'))
+        .collect::<Vec<_>>()
+        .join(".")
 }
 
 /// Every dotted prefix of a module path, longest last:
@@ -329,6 +362,29 @@ pub struct PyDataStore;
             index.resolve(&Reference::import_module("newt_core", 1)),
             Resolution::UnknownModule
         );
+    }
+
+    #[test]
+    fn known_modules_covers_native_and_stitched_paths() {
+        // both the native `pkg._ext.sub` and the stitched public `pkg.sub` are
+        // valid imports, so a leaf-exact gate must not revert either.
+        let known = FfiManifest::from_sources([("newt-core", NEWT_CORE_SRC)]).known_modules();
+        assert!(known.contains("newt_agent._newt_agent.core"), "native path");
+        assert!(known.contains("newt_agent.core"), "stitched public path");
+        assert!(known.contains("newt_agent"), "umbrella root");
+        // a genuinely-absent module is still NOT known
+        assert!(!known.contains("newt_agent._newt_core"));
+        assert!(!known.contains("newt_core"));
+    }
+
+    #[test]
+    fn public_stitched_path_drops_private_segments() {
+        assert_eq!(
+            public_stitched_path("newt_agent._newt_agent.core"),
+            "newt_agent.core"
+        );
+        // no private segment → unchanged
+        assert_eq!(public_stitched_path("a.b.c"), "a.b.c");
     }
 
     #[test]
