@@ -46,7 +46,24 @@ impl Mcp {
             // servers use streamable-HTTP (`type: "http"`).
             let result = match entry.transport {
                 TransportKind::Stdio => connect_stdio(entry).await,
-                TransportKind::Http => connect_http(entry).await,
+                TransportKind::Http => {
+                    // If no Authorization header is configured, check
+                    // ~/.hermes/mcp-tokens/ for a stored OAuth token and inject
+                    // it so newt can share the same auth as hermes-agent.
+                    let mut enriched = entry.clone();
+                    if !enriched.headers.contains_key("Authorization")
+                        && !enriched.headers.contains_key("authorization")
+                    {
+                        if let Some(token) =
+                            crate::mcp_token::load_bearer_token(&entry.name).await
+                        {
+                            enriched
+                                .headers
+                                .insert("Authorization".into(), format!("Bearer {token}"));
+                        }
+                    }
+                    connect_http(&enriched).await
+                }
                 TransportKind::Sse => {
                     tracing::warn!(
                         "MCP server `{}`: legacy SSE transport is not supported \

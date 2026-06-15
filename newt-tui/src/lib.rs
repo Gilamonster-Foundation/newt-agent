@@ -7,6 +7,7 @@
 
 pub mod dgx_probe;
 mod mcp;
+mod mcp_token;
 pub mod probe;
 mod setup;
 mod wizard;
