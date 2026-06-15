@@ -67,14 +67,14 @@ Every technique in the library carries this, kept honest by the rig:
 - **composes with:** `verify_gate` (it cleans up the hedge residue).
 - **measured by:** `rig_pyo3_examples.sh --preamble` (the with/without lift).
 
-### `verify_gate` (R2, #73/#354)
+### `verify_gate` (R2, #73/#361)
 - **buys:** removes residual fabrications by reverting flagged files; R1+R2 took two hedged runs 0.82/0.78 → 1.0.
 - **failure mode:** only as honest as its surface; a leaky gate is gamed under retry pressure.
 - **caveat / context:** **where the gate IS the spec** (a real CI/acceptance check) gate-passing is the goal; where it's a *proxy* for grounding, the gate must be adversarially complete first.
 - **knobs:** **`surface_match: exact | prefix`** (`SurfaceMatch`, default `exact`). `exact` matches the project surface leaf-exact (sound for R1's full-leaf manifest); `prefix` is the legacy lax behavior. This is the **first concrete knob** from the experiment program — the prefix-breadth Goodhart hole is closed in `exact`, re-openable in `prefix` for a coarse surface.
 - **presupposes:** an adversarially-complete surface + extractor (hyphen/wildcard/relative/paren forms all handled — #357 hardening).
 - **composes with:** `knowledge_base` (before), `retry` (after).
-- **measured by:** `newt-eval verify`; the hardened-gate re-measurement (in flight).
+- **measured by:** `newt-eval verify`; hardened (#361) — all three Goodhart evasions + the stitched false-positive closed and regression-tested.
 
 ### `retry` (the revert-RETRY loop)
 - **buys:** regenerates reverted files; can recover genuine grounding (one trial: 7/8 real).
@@ -83,7 +83,7 @@ Every technique in the library carries this, kept honest by the rig:
 - **knobs:** **`max_retries: int`** (default 2); candidate: `scope: file | task` (file-scoped is the default).
 - **presupposes:** `verify_gate` (it acts on the revert set).
 - **composes with:** `verify_gate` (required), `knowledge_base` (helps).
-- **measured by:** `rig_retry_loop.sh` (per-turn `history`).
+- **measured by:** `rig_retry_loop.sh` (per-turn `history`). Against the **hardened** gate (#357 update): zero gate-evasions — 2/3 genuinely grounded (one via retry-recovery), 1/3 honest no-output — vs. the leaky gate's 1/3 evasion. Retry moves the needle *honestly* only with a complete gate.
 
 ### designed, not built
 `fact_preserving_compression` (R3), `self_grounding` (R4), `decomposition` /
