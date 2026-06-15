@@ -8,6 +8,7 @@
 //! See `docs/decisions/mesh_integration.md` for why that crate is
 //! kept out of the default workspace.
 
+mod auth_cmd;
 mod config_cmd;
 mod dgx;
 mod doctor;
@@ -211,6 +212,20 @@ pub enum Command {
         #[command(subcommand)]
         cmd: dgx::DgxCmd,
     },
+    /// Authenticate an HTTP MCP server via the OAuth 2.1 PKCE browser flow.
+    ///
+    /// Without arguments: lists all discovered HTTP MCP servers and their token
+    /// status (valid / expired / needs-login / unregistered).
+    ///
+    /// With a server name: opens the browser for the OAuth login flow, waits
+    /// for the redirect, exchanges the code for tokens, and saves them to
+    /// `~/.hermes/mcp-tokens/`. Both newt and hermes-agent share the same token
+    /// store, so this authenticates both.
+    Auth {
+        /// Name of the MCP server to authenticate (e.g. `newt auth my-server`).
+        /// Omit to list all servers and their current auth status.
+        server: Option<String>,
+    },
     /// Inspect, export, import, and reset per-model context-window tuning data.
     ///
     /// Tuning data is maintained automatically by the harness in
@@ -322,6 +337,7 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         Command::Identity => identity_cmd::run(cli.config.as_deref()),
         Command::Init => newt_tui::run_init(newt_tui::color_supported()),
         Command::Setup => newt_tui::run_setup(newt_tui::color_supported()),
+        Command::Auth { server } => auth_cmd::run(server),
         Command::Skills { cmd } => skills::run(cmd, cli.config.as_deref()),
         Command::Dgx { cmd } => dgx::run(cmd, cli.config.as_deref()).await,
         Command::Tunings { cmd } => tuning_cmd::run(cmd, cli.config.as_deref()),

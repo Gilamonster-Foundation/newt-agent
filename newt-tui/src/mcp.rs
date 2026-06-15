@@ -17,6 +17,100 @@ use serde_json::{json, Value};
 /// The session's connected MCP servers.
 pub(crate) struct Mcp {
     servers: Vec<ConnectedServer>,
+    /// When `true`, hyphens in server names are replaced with underscores in
+    /// advertised tool names and routing lookups.  Matches the behaviour of
+    /// API proxies that normalise tool-name characters.  Controlled by
+    /// `[tui].sanitize_mcp_server_names` in the newt config (default: `true`).
+    sanitize_server_names: bool,
+}
+
+/// Apply or skip the hyphen→underscore normalisation for a server name.
+fn server_prefix(name: &str, sanitize: bool) -> String {
+    if sanitize {
+        name.replace('-', "_")
+    } else {
+        name.to_owned()
+    }
+}
+
+/// Best-effort `(scheme, host)` from a URL — lowercased, port/userinfo/path
+/// stripped, IPv6 brackets removed. Empty strings when absent/unparseable (which
+/// the policy treats as insecure → no token). Manual parse to avoid a url dep;
+/// good enough for the scheme+host decision below.
+fn parse_scheme_host(url: Option<&str>) -> (String, String) {
+    let Some(url) = url else {
+        return (String::new(), String::new());
+    };
+    let (scheme, rest) = url.split_once("://").unwrap_or(("", url));
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    let authority = authority.rsplit_once('@').map_or(authority, |(_, h)| h); // drop userinfo
+    let host = if let Some(v6) = authority.strip_prefix('[') {
+        v6.split(']').next().unwrap_or(v6) // [::1]:port → ::1
+    } else {
+        authority.split(':').next().unwrap_or(authority) // host:port → host
+    };
+    (scheme.to_ascii_lowercase(), host.to_ascii_lowercase())
+}
+
+/// A loopback host — the dev exception that needs no https and emits no warning.
+fn host_is_loopback(host: &str) -> bool {
+    host == "localhost" || host == "::1" || host.starts_with("127.")
+}
+
+/// Whether an OAuth Bearer may be sent to `url` under the secure-by-default
+/// transport policy (`docs/decisions/mcp_transport_security.md`): always over
+/// `https` or to loopback; over a non-loopback `http://` host only when that host
+/// is in `allow_insecure_hosts`. Unparseable/missing URL ⇒ withhold (fail safe).
+fn bearer_allowed_for_url(url: Option<&str>, allow_insecure_hosts: &[String]) -> bool {
+    let (scheme, host) = parse_scheme_host(url);
+    if scheme == "https" || host_is_loopback(&host) {
+        return true;
+    }
+    !host.is_empty()
+        && allow_insecure_hosts
+            .iter()
+            .any(|h| h.eq_ignore_ascii_case(&host))
+}
+
+/// Inject the (optional) Bearer into `entry` per the transport policy, warning on
+/// every non-loopback unencrypted connection. Mutates `entry.headers`.
+fn apply_transport_security(
+    entry: &mut McpServerEntry,
+    token: Option<String>,
+    allow_insecure_hosts: &[String],
+) {
+    let (scheme, host) = parse_scheme_host(entry.url.as_deref());
+    let secure = scheme == "https" || host_is_loopback(&host);
+    let allowed = bearer_allowed_for_url(entry.url.as_deref(), allow_insecure_hosts);
+    if !secure {
+        // Policy: warn on every unencrypted (non-https, non-loopback) connection.
+        match &token {
+            Some(_) if allowed => tracing::warn!(
+                "MCP server `{}`: UNENCRYPTED connection to `{}` (no TLS) — sending the \
+                 OAuth Bearer anyway ([tui].mcp_allow_insecure_hosts opt-in)",
+                entry.name,
+                host
+            ),
+            Some(_) => tracing::warn!(
+                "MCP server `{}`: UNENCRYPTED connection to `{}` (no TLS) — WITHHOLDING the \
+                 OAuth Bearer token. Use https, or add `{}` to [tui].mcp_allow_insecure_hosts \
+                 to override.",
+                entry.name,
+                host,
+                host
+            ),
+            None => tracing::warn!(
+                "MCP server `{}`: UNENCRYPTED connection to `{}` (no TLS).",
+                entry.name,
+                host
+            ),
+        }
+    }
+    if let (Some(token), true) = (token, allowed) {
+        entry
+            .headers
+            .insert("Authorization".into(), format!("Bearer {token}"));
+    }
 }
 
 impl Mcp {
@@ -26,13 +120,19 @@ impl Mcp {
     pub(crate) fn empty() -> Self {
         Self {
             servers: Vec::new(),
+            sanitize_server_names: true,
         }
     }
 
     /// Discover (newt config + Claude Code config) and connect to every **stdio**
     /// MCP server. A server that fails to spawn/initialize is logged and skipped
     /// — one bad server never blocks the session or the others.
-    pub(crate) async fn connect(workspace: &str, cfg_servers: &[McpServerEntry]) -> Self {
+    pub(crate) async fn connect(
+        workspace: &str,
+        cfg_servers: &[McpServerEntry],
+        sanitize_server_names: bool,
+        allow_insecure_hosts: &[String],
+    ) -> Self {
         let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
         let entries = newt_core::mcp::discover(
             cfg_servers,
@@ -46,7 +146,24 @@ impl Mcp {
             // servers use streamable-HTTP (`type: "http"`).
             let result = match entry.transport {
                 TransportKind::Stdio => connect_stdio(entry).await,
-                TransportKind::Http => connect_http(entry).await,
+                TransportKind::Http => {
+                    let mut enriched = entry.clone();
+                    // Load the stored hermes OAuth token only when the operator
+                    // hasn't already configured an explicit Authorization header.
+                    let already_authed = enriched.headers.contains_key("Authorization")
+                        || enriched.headers.contains_key("authorization");
+                    let token = if already_authed {
+                        None
+                    } else {
+                        crate::mcp_token::load_bearer_token(&entry.name).await
+                    };
+                    // Secure-by-default transport policy: WARN on any non-loopback
+                    // unencrypted connection, and only inject the OAuth Bearer over
+                    // https / loopback / an explicitly allow-listed host
+                    // (docs/decisions/mcp_transport_security.md).
+                    apply_transport_security(&mut enriched, token, allow_insecure_hosts);
+                    connect_http(&enriched).await
+                }
                 TransportKind::Sse => {
                     tracing::warn!(
                         "MCP server `{}`: legacy SSE transport is not supported \
@@ -61,7 +178,10 @@ impl Mcp {
                 Err(e) => tracing::warn!("MCP server `{}` skipped: {e}", entry.name),
             }
         }
-        Self { servers }
+        Self {
+            servers,
+            sanitize_server_names,
+        }
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -78,6 +198,11 @@ impl Mcp {
 
     /// OpenAI-style function tool definitions for every remote tool, with names
     /// namespaced `server__tool` so two servers cannot collide.
+    ///
+    /// Server names are sanitized (hyphens → underscores) before advertising
+    /// because some API proxies (e.g. NVIDIA inference → Anthropic backend)
+    /// normalise hyphens in tool names to underscores.  Advertising the
+    /// sanitized form ensures the model's tool calls round-trip back unchanged.
     pub(crate) fn tool_defs(&self) -> Vec<Value> {
         let mut out = Vec::new();
         for server in &self.servers {
@@ -85,7 +210,7 @@ impl Mcp {
                 out.push(json!({
                     "type": "function",
                     "function": {
-                        "name": namespaced(&server.name, &tool.name),
+                        "name": namespaced(&server_prefix(&server.name, self.sanitize_server_names), &tool.name),
                         "description": tool.description,
                         "parameters": tool.input_schema,
                     }
@@ -96,9 +221,16 @@ impl Mcp {
     }
 
     /// Whether `name` is a namespaced tool belonging to a connected server.
+    ///
+    /// Matches the sanitized form (hyphens → underscores in the server prefix)
+    /// so that a tool advertised as `acme_server__X` routes to the server
+    /// stored as `acme-server`.
     pub(crate) fn handles(&self, name: &str) -> bool {
         match split_namespaced(name) {
-            Some((server, _)) => self.servers.iter().any(|s| s.name == server),
+            Some((server, _)) => self
+                .servers
+                .iter()
+                .any(|s| server_prefix(&s.name, self.sanitize_server_names) == server),
             None => false,
         }
     }
@@ -109,7 +241,11 @@ impl Mcp {
         let Some((server_name, tool)) = split_namespaced(name) else {
             return format!("error: `{name}` is not a namespaced MCP tool");
         };
-        let Some(server) = self.servers.iter_mut().find(|s| s.name == server_name) else {
+        let Some(server) = self
+            .servers
+            .iter_mut()
+            .find(|s| server_prefix(&s.name, self.sanitize_server_names) == server_name)
+        else {
             return format!("error: no connected MCP server `{server_name}`");
         };
         match server.conn.call_tool(tool, args.clone()).await {
@@ -174,6 +310,121 @@ mod tests {
         assert!(mcp.is_empty());
         assert!(!mcp.handles("git__status"));
         assert!(mcp.tool_defs().is_empty());
+    }
+
+    // ── transport security: the OAuth Bearer must never go over plaintext ──
+
+    fn http_entry(url: &str) -> McpServerEntry {
+        McpServerEntry {
+            name: "MaaS".into(),
+            transport: TransportKind::Http,
+            command: None,
+            args: Vec::new(),
+            env: std::collections::BTreeMap::new(),
+            url: Some(url.into()),
+            headers: std::collections::BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn parse_scheme_host_handles_common_shapes() {
+        assert_eq!(
+            parse_scheme_host(Some("https://a.b/c")),
+            ("https".into(), "a.b".into())
+        );
+        assert_eq!(
+            parse_scheme_host(Some("http://127.0.0.1:8080/x")),
+            ("http".into(), "127.0.0.1".into())
+        );
+        assert_eq!(
+            parse_scheme_host(Some("http://u@Host:9/x")),
+            ("http".into(), "host".into())
+        );
+        assert_eq!(
+            parse_scheme_host(Some("http://[::1]:7/x")),
+            ("http".into(), "::1".into())
+        );
+        assert_eq!(parse_scheme_host(None), (String::new(), String::new()));
+    }
+
+    #[test]
+    fn bearer_allowed_only_over_https_loopback_or_allowlist() {
+        let none: &[String] = &[];
+        assert!(bearer_allowed_for_url(
+            Some("https://api.maas.com/mcp"),
+            none
+        ));
+        assert!(bearer_allowed_for_url(Some("http://localhost:9/mcp"), none));
+        assert!(bearer_allowed_for_url(Some("http://127.0.0.1:9/mcp"), none));
+        assert!(bearer_allowed_for_url(Some("http://[::1]:9/mcp"), none));
+        // plain http to a real host: NOT allowed by default (the blocker)
+        assert!(!bearer_allowed_for_url(
+            Some("http://api.maas.com/mcp"),
+            none
+        ));
+        assert!(!bearer_allowed_for_url(None, none));
+        // …unless the host is explicitly allow-listed (case-insensitive)
+        let allow = vec!["api.maas.com".to_string()];
+        assert!(bearer_allowed_for_url(
+            Some("http://API.MaaS.com/mcp"),
+            &allow
+        ));
+    }
+
+    #[test]
+    fn apply_transport_security_withholds_token_over_plain_http() {
+        // the blocker: a stored Bearer must NOT be injected over plaintext http
+        let mut e = http_entry("http://api.maas.com/mcp");
+        apply_transport_security(&mut e, Some("SECRET".into()), &[]);
+        assert!(
+            !e.headers.contains_key("Authorization"),
+            "Bearer leaked over plaintext http: {:?}",
+            e.headers
+        );
+    }
+
+    #[test]
+    fn apply_transport_security_injects_over_https_and_allowlisted() {
+        let mut https = http_entry("https://api.maas.com/mcp");
+        apply_transport_security(&mut https, Some("SECRET".into()), &[]);
+        assert_eq!(
+            https.headers.get("Authorization").map(String::as_str),
+            Some("Bearer SECRET")
+        );
+
+        let mut allowed = http_entry("http://api.maas.com/mcp");
+        apply_transport_security(
+            &mut allowed,
+            Some("SECRET".into()),
+            &["api.maas.com".to_string()],
+        );
+        assert_eq!(
+            allowed.headers.get("Authorization").map(String::as_str),
+            Some("Bearer SECRET")
+        );
+
+        let mut loopback = http_entry("http://127.0.0.1:9/mcp");
+        apply_transport_security(&mut loopback, Some("SECRET".into()), &[]);
+        assert!(loopback.headers.contains_key("Authorization"));
+    }
+
+    /// Some OpenAI-compatible API proxies normalise hyphens to underscores in
+    /// tool names.  Verify the `server_prefix` helper obeys the toggle.
+    #[test]
+    fn server_prefix_toggle() {
+        // sanitize=true: hyphens become underscores
+        assert_eq!(server_prefix("acme-server", true), "acme_server");
+        assert_eq!(server_prefix("multi-part-name", true), "multi_part_name");
+        assert_eq!(server_prefix("plainserver", true), "plainserver");
+
+        // sanitize=false: name is returned unchanged
+        assert_eq!(server_prefix("acme-server", false), "acme-server");
+        assert_eq!(server_prefix("multi-part-name", false), "multi-part-name");
+        assert_eq!(server_prefix("plainserver", false), "plainserver");
+
+        // Double-underscore separator is preserved after sanitization.
+        let tool = format!("{}__probe_tool", server_prefix("acme-server", true));
+        assert_eq!(tool, "acme_server__probe_tool");
     }
 
     #[test]

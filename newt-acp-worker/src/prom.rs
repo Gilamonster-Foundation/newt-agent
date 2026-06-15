@@ -165,12 +165,29 @@ pub async fn serve(port: u16, metrics: Arc<NewtMetrics>) {
         };
         let metrics = metrics.clone();
         tokio::spawn(async move {
+            // Read until we have the full HTTP header block (\r\n\r\n) or
+            // the buffer fills up.  A single read() can return only the
+            // first TCP segment — e.g. just "GET " — when the client's
+            // write! macro issues multiple write_all calls that arrive in
+            // separate segments under Nagle's algorithm.  Parsing a partial
+            // first line falls through to the 404 default path.
             let mut buf = vec![0u8; 2048];
-            let n = match socket.read(&mut buf).await {
-                Ok(n) => n,
-                Err(_) => return,
-            };
-            let req = std::str::from_utf8(&buf[..n]).unwrap_or("");
+            let mut pos = 0usize;
+            loop {
+                match socket.read(&mut buf[pos..]).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => {
+                        pos += n;
+                        if pos >= 4 && buf[..pos].windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                        if pos >= buf.len() {
+                            break;
+                        }
+                    }
+                }
+            }
+            let req = std::str::from_utf8(&buf[..pos]).unwrap_or("");
             let path = req
                 .lines()
                 .next()
