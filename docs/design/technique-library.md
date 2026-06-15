@@ -77,6 +77,7 @@ Every technique in the library carries this, kept honest by the rig:
 - **measured by:** `newt-eval verify`; hardened (#361) — all three Goodhart evasions + the stitched false-positive closed and regression-tested.
 
 ### `retry` (the revert-RETRY loop)
+> Full contract (revert ledger, corrective re-prompt, cap/give-up, permission-gate interaction): [`retry-technique.md`](retry-technique.md).
 - **buys:** regenerates reverted files; can recover genuine grounding (one trial: 7/8 real).
 - **failure mode:** **Goodhart** — under a leaky gate it lifts the *metric* via gate-gaming, not grounding.
 - **caveat / context:** trustworthy only with a `verify_gate` hardened to the context's completeness bar; otherwise read coverage, not score.
