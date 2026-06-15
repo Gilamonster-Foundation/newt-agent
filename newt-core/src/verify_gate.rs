@@ -22,6 +22,7 @@
 //! spots. Symbol-level resolution still follows the FFI manifest (#74).
 
 use crate::symbols::{extract_references, module_is_known, python_stdlib_modules, Lang};
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
@@ -93,7 +94,8 @@ impl GateReport {
 /// default) requires the import to be a module the surface actually declares —
 /// sound because R1's manifest carries the full leaf+ancestor set. A coarse,
 /// hand-written surface that lists only roots may still want `Prefix`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum SurfaceMatch {
     /// The module must be an exact member of the project surface.
     #[default]
