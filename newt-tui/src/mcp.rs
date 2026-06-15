@@ -54,8 +54,7 @@ impl Mcp {
                     if !enriched.headers.contains_key("Authorization")
                         && !enriched.headers.contains_key("authorization")
                     {
-                        if let Some(token) =
-                            crate::mcp_token::load_bearer_token(&entry.name).await
+                        if let Some(token) = crate::mcp_token::load_bearer_token(&entry.name).await
                         {
                             enriched
                                 .headers

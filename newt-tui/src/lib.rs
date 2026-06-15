@@ -94,8 +94,7 @@ pub fn run_auth(server_name: Option<&str>) -> anyhow::Result<()> {
                 })?;
 
             tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current()
-                    .block_on(mcp_token::run_oauth_flow(name, &url))
+                tokio::runtime::Handle::current().block_on(mcp_token::run_oauth_flow(name, &url))
             })
         }
     }

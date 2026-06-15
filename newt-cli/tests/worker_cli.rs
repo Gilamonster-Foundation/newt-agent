@@ -108,7 +108,13 @@ fn worker_ignores_invalid_metrics_port() {
 fn http_get(port: u16, path: &str) -> std::io::Result<String> {
     let mut stream = std::net::TcpStream::connect(("127.0.0.1", port))?;
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-    write!(stream, "GET {path} HTTP/1.0\r\nHost: localhost\r\n\r\n")?;
+    // Build the full request as a single string so write_all issues one
+    // syscall → one TCP segment.  The write! macro splits across the
+    // format argument boundary and can produce two segments under Nagle,
+    // causing the server's single read() to see only "GET " (n=4) and
+    // fall through to the 404 default path.
+    let req = format!("GET {path} HTTP/1.0\r\nHost: localhost\r\n\r\n");
+    stream.write_all(req.as_bytes())?;
     let mut resp = String::new();
     stream.read_to_string(&mut resp)?;
     Ok(resp)
@@ -160,14 +166,21 @@ fn worker_metrics_server_serves_healthz_and_metrics() {
         .spawn()
         .expect("spawn newt worker");
 
-    // Poll until the metrics endpoint answers (the server task starts
-    // concurrently with the worker's stdio loop).
+    // Poll until the metrics endpoint answers with 200 OK (the server task
+    // starts concurrently with the worker's stdio loop). Accept only a
+    // genuine 200 — the server returns 404 for connections where the client
+    // closes before sending data (n=0 from socket.read), so we must not
+    // treat those as a successful startup signal.
     let deadline = Instant::now() + Duration::from_secs(15);
     let healthz = loop {
         match http_get(port, "/healthz") {
-            Ok(resp) => break resp,
-            Err(_) if Instant::now() < deadline => {
+            Ok(resp) if resp.contains("200 OK") => break resp,
+            Ok(_) | Err(_) if Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(100));
+            }
+            Ok(resp) => {
+                let _ = child.kill();
+                panic!("healthz never returned 200 on port {port}; last: {resp}");
             }
             Err(e) => {
                 let _ = child.kill();

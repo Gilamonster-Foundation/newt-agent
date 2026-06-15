@@ -88,7 +88,11 @@ struct OAuthMeta {
 fn hermes_token_dir() -> Option<PathBuf> {
     let home = std::env::var_os("HOME")?;
     let dir = PathBuf::from(home).join(".hermes").join("mcp-tokens");
-    if dir.is_dir() { Some(dir) } else { None }
+    if dir.is_dir() {
+        Some(dir)
+    } else {
+        None
+    }
 }
 
 fn unix_now() -> f64 {
@@ -135,13 +139,22 @@ fn persist_tokens(
     existing_extra: &BTreeMap<String, serde_json::Value>,
 ) {
     let mut out = existing_extra.clone();
-    out.insert("access_token".into(), serde_json::Value::String(access_token.to_owned()));
+    out.insert(
+        "access_token".into(),
+        serde_json::Value::String(access_token.to_owned()),
+    );
     if let Some(rt) = refresh_token {
-        out.insert("refresh_token".into(), serde_json::Value::String(rt.to_owned()));
+        out.insert(
+            "refresh_token".into(),
+            serde_json::Value::String(rt.to_owned()),
+        );
     }
     if let Some(ei) = expires_in {
         out.insert("expires_in".into(), serde_json::Value::from(ei));
-        out.insert("expires_at".into(), serde_json::Value::from(unix_now() + ei));
+        out.insert(
+            "expires_at".into(),
+            serde_json::Value::from(unix_now() + ei),
+        );
     }
     if let Err(e) = write_token_file(path, &out) {
         tracing::warn!("failed to write token file {}: {e}", path.display());
@@ -174,7 +187,10 @@ async fn try_refresh(name: &str, tok: &TokenFile, token_dir: &Path) -> Option<St
         .ok()?;
 
     if !resp.status().is_success() {
-        tracing::warn!("MCP OAuth refresh for `{name}` failed: HTTP {}", resp.status());
+        tracing::warn!(
+            "MCP OAuth refresh for `{name}` failed: HTTP {}",
+            resp.status()
+        );
         return None;
     }
 
@@ -209,7 +225,10 @@ pub async fn load_bearer_token(server_name: &str) -> Option<String> {
     let dir = hermes_token_dir()?;
     let tok: TokenFile = read_json(&dir.join(format!("{server_name}.json")))?;
 
-    let is_valid = tok.expires_at.map(|ea| ea - unix_now() > 30.0).unwrap_or(false);
+    let is_valid = tok
+        .expires_at
+        .map(|ea| ea - unix_now() > 30.0)
+        .unwrap_or(false);
     if is_valid {
         tracing::debug!("MCP OAuth token for `{server_name}` is current");
         return Some(tok.access_token.clone());
@@ -250,7 +269,10 @@ pub fn auth_status(server_names: &[String]) -> Vec<AuthStatus> {
         None => {
             return server_names
                 .iter()
-                .map(|n| AuthStatus { name: n.clone(), state: AuthState::Unregistered })
+                .map(|n| AuthStatus {
+                    name: n.clone(),
+                    state: AuthState::Unregistered,
+                })
                 .collect();
         }
     };
@@ -263,7 +285,11 @@ pub fn auth_status(server_names: &[String]) -> Vec<AuthStatus> {
             let state = if tok_path.exists() {
                 let tok: Option<TokenFile> = read_json(&tok_path);
                 match tok {
-                    Some(t) if t.expires_at.map(|ea| ea - unix_now() > 30.0).unwrap_or(true) => {
+                    Some(t)
+                        if t.expires_at
+                            .map(|ea| ea - unix_now() > 30.0)
+                            .unwrap_or(true) =>
+                    {
                         AuthState::Valid
                     }
                     _ => AuthState::Expired,
@@ -273,7 +299,10 @@ pub fn auth_status(server_names: &[String]) -> Vec<AuthStatus> {
             } else {
                 AuthState::Unregistered
             };
-            AuthStatus { name: name.clone(), state }
+            AuthStatus {
+                name: name.clone(),
+                state,
+            }
         })
         .collect()
 }
@@ -299,7 +328,10 @@ fn gen_pkce() -> anyhow::Result<PkceChallenge> {
     let digest = Sha256::digest(verifier.as_bytes());
     let challenge = engine.encode(digest);
 
-    Ok(PkceChallenge { verifier, challenge })
+    Ok(PkceChallenge {
+        verifier,
+        challenge,
+    })
 }
 
 /// Discover OAuth metadata from `<server_url>/.well-known/oauth-authorization-server`.
@@ -346,10 +378,9 @@ fn urlencoding_decode(s: &str) -> String {
         if b == b'%' {
             let h1 = chars.next().unwrap_or(b'0');
             let h2 = chars.next().unwrap_or(b'0');
-            if let Ok(decoded) = u8::from_str_radix(
-                std::str::from_utf8(&[h1, h2]).unwrap_or("00"),
-                16,
-            ) {
+            if let Ok(decoded) =
+                u8::from_str_radix(std::str::from_utf8(&[h1, h2]).unwrap_or("00"), 16)
+            {
                 out.push(decoded as char);
                 continue;
             }
@@ -388,22 +419,21 @@ pub async fn run_oauth_flow(server_name: &str, server_url: &str) -> anyhow::Resu
 
     // ── 1. OAuth server metadata ──────────────────────────────────────────
     let meta_path = dir.join(format!("{server_name}.meta.json"));
-    let (auth_endpoint, token_endpoint, meta_extra) = if let Some(m) =
-        read_json::<OAuthMeta>(&meta_path)
-    {
-        // Already discovered — reuse.
-        (m.authorization_endpoint, m.token_endpoint, m.extra)
-    } else {
-        // Discover and cache for next time.
-        let m = discover_oauth_meta(&http, server_url).await?;
-        let me = OAuthMeta {
-            authorization_endpoint: m.authorization_endpoint.clone(),
-            token_endpoint: m.token_endpoint.clone(),
-            extra: m.extra.clone(),
+    let (auth_endpoint, token_endpoint, meta_extra) =
+        if let Some(m) = read_json::<OAuthMeta>(&meta_path) {
+            // Already discovered — reuse.
+            (m.authorization_endpoint, m.token_endpoint, m.extra)
+        } else {
+            // Discover and cache for next time.
+            let m = discover_oauth_meta(&http, server_url).await?;
+            let me = OAuthMeta {
+                authorization_endpoint: m.authorization_endpoint.clone(),
+                token_endpoint: m.token_endpoint.clone(),
+                extra: m.extra.clone(),
+            };
+            let _ = write_token_file(&meta_path, &me);
+            (m.authorization_endpoint, m.token_endpoint, m.extra)
         };
-        let _ = write_token_file(&meta_path, &me);
-        (m.authorization_endpoint, m.token_endpoint, m.extra)
-    };
     let _ = meta_extra; // kept for future use (e.g. registration endpoint)
 
     // ── 2. Client registration ────────────────────────────────────────────
@@ -592,8 +622,7 @@ mod tests {
 
     #[test]
     fn parse_callback_extracts_code_and_state() {
-        let (code, state) =
-            parse_callback("/callback?code=AUTH_CODE_HERE&state=abc123");
+        let (code, state) = parse_callback("/callback?code=AUTH_CODE_HERE&state=abc123");
         assert_eq!(code.as_deref(), Some("AUTH_CODE_HERE"));
         assert_eq!(state.as_deref(), Some("abc123"));
     }
