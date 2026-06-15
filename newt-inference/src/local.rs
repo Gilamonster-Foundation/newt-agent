@@ -376,10 +376,25 @@ impl LocalVllmBackend {
             .map(|s| s.to_string())
             .unwrap_or_else(|| self.model.clone());
 
+        // Extract exact token counts from the OpenAI-compatible `usage`
+        // object when present. Preferring the server's reported counts
+        // over heuristic estimation directly addresses #247 (token
+        // estimator error) on the vLLM path.
+        let usage = {
+            let input = json["usage"]["prompt_tokens"].as_u64().map(|n| n as u32);
+            let output = json["usage"]["completion_tokens"]
+                .as_u64()
+                .map(|n| n as u32);
+            input.zip(output).map(|(i, o)| newt_core::TokenUsage {
+                input_tokens: i,
+                output_tokens: o,
+            })
+        };
+
         Ok(ChatReply {
             content,
             model_id,
-            usage: None,
+            usage,
         })
     }
 
