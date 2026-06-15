@@ -2602,23 +2602,53 @@ fn verify_gate_summary(
     Some(s)
 }
 
-/// The `retry` technique's destructive arm (increment 2a): gate the produced `.py`
-/// files and **revert** the flagged set to its pre-turn state via the per-turn write
-/// `ledger`, returning a one-line banner naming what was reverted (`None` when clean
-/// / no surface / nothing newt wrote was flagged).
+/// The result of the `retry` technique's post-turn pass: what was reverted (for the
+/// `↩` banner) and the grounded corrective re-prompt to feed the model if the
+/// re-prompt budget allows (increment 2b).
+struct RevertAction {
+    banner: String,
+    corrective: String,
+}
+
+/// What the loop should do after a revert, given the remaining re-prompt budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetryStep {
+    /// Re-prompt the model (the loop queues the corrective turn); budget decremented.
+    Reprompt,
+    /// The cap is spent — leave the files reverted and report honestly.
+    GiveUp,
+}
+
+/// Pure decision: with `budget` re-prompts left after a revert, do we re-prompt or
+/// give up? Split out so the cap/give-up logic is unit-tested independently of the
+/// interactive loop (the headless equivalent is [`apply_revert_retry`]'s own loop).
+fn retry_step(budget: u32) -> RetryStep {
+    if budget > 0 {
+        RetryStep::Reprompt
+    } else {
+        RetryStep::GiveUp
+    }
+}
+
+/// The `retry` technique's post-turn pass: gate the produced `.py` files, **revert**
+/// the flagged set to its pre-turn state via the per-turn write `ledger`, and return
+/// the banner + the grounded corrective re-prompt (`None` when clean / no surface /
+/// nothing newt wrote was flagged).
 ///
 /// The ledger records only newt's own `write_file`/`edit_file` writes this turn, so
 /// [`revert_only`](newt_core::verify_gate::revert_only) restores edited files and
 /// removes created ones **without ever touching a file newt did not write** (build
-/// output, pre-existing fabrications, anything reached via a symlink). Re-prompting
-/// the model is the next increment; here the fabrication is simply not allowed to
-/// persist.
+/// output, pre-existing fabrications, anything reached via a symlink). The caller
+/// decides whether to act on `corrective` based on the re-prompt budget
+/// ([`retry_step`]).
 async fn retry_revert(
     workspace: &str,
     mode: newt_core::verify_gate::SurfaceMatch,
     ledger: &std::cell::RefCell<newt_core::verify_gate::WriteLedger>,
-) -> Option<String> {
-    use newt_core::verify_gate::{gate_python_workspace_with, revert_only, RetrySurface};
+) -> Option<RevertAction> {
+    use newt_core::verify_gate::{
+        corrective_prompt, gate_python_workspace_with, revert_only, RetrySurface,
+    };
     let ws = std::path::Path::new(workspace);
     let manifest = newt_core::ffi_manifest::FfiManifest::from_workspace(ws).ok()?;
     if manifest.is_empty() {
@@ -2640,6 +2670,8 @@ async fn retry_revert(
         })
         .collect();
     let block = manifest.render_block();
+    // The grounded re-prompt, built before the report is consumed by revert_only.
+    let corrective = corrective_prompt(&report, &block);
     let surface = RetrySurface {
         modules: &modules,
         mode,
@@ -2654,10 +2686,11 @@ async fn retry_revert(
         let mods = mods_by_path.get(p).map(String::as_str).unwrap_or("");
         detail.push_str(&format!("\n    {}  [{}]", p.display(), mods));
     }
-    Some(format!(
-        "retry: reverted {} file(s) newt wrote this turn to pre-turn state (re-prompt pending):{detail}",
+    let banner = format!(
+        "retry: reverted {} file(s) newt wrote this turn to pre-turn state:{detail}",
         outcome.reverted.len()
-    ))
+    );
+    Some(RevertAction { banner, corrective })
 }
 
 fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Result<()> {
@@ -3043,6 +3076,20 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
         }
     }
 
+    // retry technique (increment 2b): the re-prompt budget for the *current* user
+    // turn, and a queued corrective re-prompt. When `pending_retry` is `Some`, the
+    // next loop iteration runs it instead of reading user input — so a fabricating
+    // turn is reverted (2a) and then re-prompted up to `max_retries` times before an
+    // honest give-up. `retry_max` is 0 when the profile does not enable `retry`, so
+    // the queue is never primed and behavior is unchanged.
+    let retry_max = active_profile
+        .as_ref()
+        .filter(|p| p.enables("retry"))
+        .map(|p| p.retry_knobs().max_retries)
+        .unwrap_or(0);
+    let mut pending_retry: Option<String> = None;
+    let mut retry_budget: u32 = 0;
+
     loop {
         // rustyline can panic (assertion `fd != -1`) when the terminal file
         // descriptor becomes invalid — most commonly from file-descriptor
@@ -3060,25 +3107,35 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
         // Catching the panic (Layer 3 / PR #184) remains as a last resort, but
         // this check fires first and gives a cleaner message when the fd table
         // is already full before readline even starts.
-        if !terminal_fd_available() {
-            let _ = disable_raw_mode();
-            eprintln!("\nnewt: EMFILE — file descriptor table is full.");
-            eprintln!("      Too many subprocesses (e.g. cargo test workers) inherited fds.");
-            eprintln!(
-                "      Restart newt. The O_CLOEXEC fix prevents recurrence on rebuilt binaries."
-            );
-            break;
-        }
-
-        let readline_result =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rl.readline(&prompt)));
-        let readline_result = match readline_result {
-            Ok(r) => r,
-            Err(_panic) => {
+        let readline_result = if let Some(corrective) = pending_retry.take() {
+            // retry technique (2b): run the queued corrective re-prompt as this
+            // turn's input instead of reading from the user. The budget was already
+            // decremented when it was queued.
+            Ok(corrective)
+        } else {
+            // A fresh user turn: reset the re-prompt budget for it.
+            retry_budget = retry_max;
+            if !terminal_fd_available() {
                 let _ = disable_raw_mode();
-                eprintln!("\nnewt: terminal error — readline panicked (likely fd exhaustion).");
-                eprintln!("      Restart newt. If this recurs, reduce concurrent subprocesses.");
+                eprintln!("\nnewt: EMFILE — file descriptor table is full.");
+                eprintln!("      Too many subprocesses (e.g. cargo test workers) inherited fds.");
+                eprintln!(
+                    "      Restart newt. The O_CLOEXEC fix prevents recurrence on rebuilt binaries."
+                );
                 break;
+            }
+            let readline_result =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rl.readline(&prompt)));
+            match readline_result {
+                Ok(r) => r,
+                Err(_panic) => {
+                    let _ = disable_raw_mode();
+                    eprintln!("\nnewt: terminal error — readline panicked (likely fd exhaustion).");
+                    eprintln!(
+                        "      Restart newt. If this recurs, reduce concurrent subprocesses."
+                    );
+                    break;
+                }
             }
         };
         match readline_result {
@@ -3632,27 +3689,42 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                             // Profile techniques, post-turn (R2). `retry` supersedes
                             // `verify_gate`: it runs the same gate but *acts* —
                             // reverting each fabricating file to its pre-turn state
-                            // (↩) — where bare `verify_gate` only warns (⚠). Re-
-                            // prompting the model is the next increment; here the
-                            // fabrication is simply not allowed to persist.
+                            // (↩), then re-prompting the model to ground the rewrite
+                            // up to `max_retries` (↻) before an honest give-up (✗) —
+                            // where bare `verify_gate` only warns (⚠).
                             if let Some(ledger) = retry_ledger.as_ref() {
                                 let mode = active_profile
                                     .as_ref()
                                     .map(|p| p.verify_gate_knobs().surface_match)
                                     .unwrap_or_default();
-                                let revert_msg = tokio::task::block_in_place(|| {
+                                let action = tokio::task::block_in_place(|| {
                                     rt.block_on(retry_revert(workspace, mode, ledger))
                                 });
-                                if let Some(msg) = revert_msg {
+                                if let Some(action) = action {
+                                    let extra = match retry_step(retry_budget) {
+                                        RetryStep::Reprompt => {
+                                            retry_budget -= 1;
+                                            // Queue the grounded corrective turn as the
+                                            // next loop iteration's input.
+                                            pending_retry = Some(action.corrective);
+                                            format!(
+                                                "\n↻ retry: re-prompting the model to ground the rewrite ({retry_budget} re-prompt(s) remaining)"
+                                            )
+                                        }
+                                        RetryStep::GiveUp => format!(
+                                            "\n✗ retry: gave up after {retry_max} re-prompt(s) — file(s) left reverted"
+                                        ),
+                                    };
+                                    let line = format!("↩ {}{extra}", action.banner);
                                     if color {
                                         let _ = execute!(
                                             io::stdout(),
                                             SetForegroundColor(CtColor::Yellow),
-                                            Print(format!("↩ {msg}\n")),
+                                            Print(format!("{line}\n")),
                                             ResetColor,
                                         );
                                     } else {
-                                        println!("↩ {msg}");
+                                        println!("{line}");
                                     }
                                 }
                             } else if let Some(p) =
@@ -5902,10 +5974,24 @@ mod tests {
         ledger.borrow_mut().note_before_write(&created);
         std::fs::write(&created, "import newt_coder\n").unwrap(); // newt creates a bad file
 
-        let msg = retry_revert(ws, SurfaceMatch::Exact, &ledger)
+        let action = retry_revert(ws, SurfaceMatch::Exact, &ledger)
             .await
-            .expect("a revert banner");
-        assert!(msg.contains("retry: reverted"), "{msg}");
+            .expect("a revert action");
+        assert!(
+            action.banner.contains("retry: reverted"),
+            "{}",
+            action.banner
+        );
+        // the corrective re-prompt names a fabricated module and the real surface
+        assert!(
+            action.corrective.contains("newt_core") || action.corrective.contains("newt_coder"),
+            "corrective names the bad import: {}",
+            action.corrective
+        );
+        assert!(
+            action.corrective.contains("newt_agent._newt_agent.core"),
+            "corrective carries the authoritative surface"
+        );
 
         // newt's edit restored to pre-turn bytes; newt's created file deleted
         assert_eq!(
@@ -5928,6 +6014,14 @@ mod tests {
                 .is_none(),
             "nothing newt wrote remains flagged"
         );
+    }
+
+    #[test]
+    fn retry_step_reprompts_until_the_budget_is_spent() {
+        // budget = the re-prompts still allowed this user turn
+        assert_eq!(retry_step(2), RetryStep::Reprompt);
+        assert_eq!(retry_step(1), RetryStep::Reprompt);
+        assert_eq!(retry_step(0), RetryStep::GiveUp);
     }
 
     fn mock_env<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
