@@ -104,6 +104,13 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "TOKENS")]
     pub num_ctx: Option<u32>,
 
+    /// Apply a named profile (`[profiles.<name>]` in newt.toml) — a composition
+    /// of harness techniques + their knob settings tuned for a model family /
+    /// context. Equivalent to `NEWT_PROFILE=<name>`. An unknown profile, or one
+    /// naming an unknown technique, is a hard error. Omit for default behavior.
+    #[arg(long, global = true, value_name = "NAME")]
+    pub profile: Option<String>,
+
     /// Directory to search for AGENTS.md/CLAUDE.md, or a specific instructions
     /// file. Default: the workspace (`./`). Also `[agents] path`.
     #[arg(long, global = true, value_name = "PATH")]
@@ -262,6 +269,11 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             }
             if let Some(n) = cli.num_ctx {
                 unsafe { std::env::set_var("NEWT_NUM_CTX", n.to_string()) };
+            }
+            if let Some(p) = cli.profile.as_deref().filter(|p| !p.is_empty()) {
+                // --profile threads to the TUI the same way; run_chat resolves +
+                // validates it against [profiles.<name>] once per session.
+                unsafe { std::env::set_var("NEWT_PROFILE", p) };
             }
             // --ephemeral threads to the TUI the same way (Step 17.7): the
             // session start resolution reads NEWT_EPHEMERAL once.

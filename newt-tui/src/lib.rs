@@ -2470,6 +2470,26 @@ async fn run_close_extraction(
     Some(close_extraction_notice(saved, rejected))
 }
 
+/// One-line banner naming the active profile and the techniques it composes —
+/// printed once at session start so the operator sees what the profile turned on.
+fn announce_profile(name: &str, profile: &newt_core::config::ProfileConfig, color: bool) {
+    let techs = if profile.techniques.is_empty() {
+        "no techniques".to_string()
+    } else {
+        profile.techniques.join(", ")
+    };
+    if color {
+        let _ = execute!(
+            io::stdout(),
+            SetForegroundColor(CtColor::DarkGrey),
+            Print(format!("▸ profile '{name}' — {techs}\n")),
+            ResetColor,
+        );
+    } else {
+        println!("▸ profile '{name}' — {techs}");
+    }
+}
+
 fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Result<()> {
     let verbose = verbose_mode();
 
@@ -2500,6 +2520,22 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
     // It is re-read (`Config::resolve`) only after a slash command, the one
     // intentional refresh point — config.toml may have changed on disk.
     let mut cfg = newt_core::Config::resolve().unwrap_or_default();
+    // Resolve + validate the active profile (`--profile` / NEWT_PROFILE) against
+    // config, and announce it. An unknown profile — or one naming an unknown
+    // technique — is a hard error; a `--profile` that silently did nothing would
+    // be a false claim. The resolved profile is held for the loop to apply (the
+    // technique-application wiring is the next increment).
+    let _active_profile = match std::env::var("NEWT_PROFILE") {
+        Ok(name) if !name.is_empty() => {
+            let profile = cfg
+                .resolve_profile(&name)
+                .map_err(|e| anyhow::anyhow!("profile '{name}': {e}"))?
+                .clone();
+            announce_profile(&name, &profile, color);
+            Some(profile)
+        }
+        _ => None,
+    };
     // 17.7: how this session treats conversation persistence, resolved ONCE.
     // Precedence: --ephemeral > NEWT_CONVERSATION_ID > [conversations] resume.
     let session_start = resolve_session_start(

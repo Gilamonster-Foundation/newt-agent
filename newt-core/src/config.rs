@@ -767,6 +767,26 @@ impl Config {
     pub fn find_model_tuning(&self, name: &str) -> Option<&ModelTuning> {
         self.model_tuning.iter().find(|t| t.model == name)
     }
+
+    /// Look up and validate a named profile (`[profiles.<name>]`). The caller
+    /// selects it via `--profile <name>` / `NEWT_PROFILE`.
+    ///
+    /// # Errors
+    /// `no such profile` when the name is undefined; the validation error when
+    /// the profile names an unknown technique — a `--profile` that silently did
+    /// nothing would be a false claim, so both fail loudly.
+    pub fn resolve_profile(&self, name: &str) -> std::result::Result<&ProfileConfig, String> {
+        let profile = self.profiles.get(name).ok_or_else(|| {
+            let known = if self.profiles.is_empty() {
+                "none defined".to_string()
+            } else {
+                self.profiles.keys().cloned().collect::<Vec<_>>().join(", ")
+            };
+            format!("no such profile (known: {known})")
+        })?;
+        profile.validate()?;
+        Ok(profile)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1507,6 +1527,32 @@ mod tests {
     fn surface_match_round_trips_lowercase() {
         let k: VerifyGateKnobs = toml::from_str("surface_match = \"prefix\"").unwrap();
         assert_eq!(k.surface_match, crate::verify_gate::SurfaceMatch::Prefix);
+    }
+
+    #[test]
+    fn resolve_profile_looks_up_validates_and_errors() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [profiles.nemotron]
+            techniques = ["verify_gate"]
+            [profiles.bad]
+            techniques = ["teleport"]
+            "#,
+        )
+        .unwrap();
+        // known + valid → the profile
+        assert!(cfg
+            .resolve_profile("nemotron")
+            .unwrap()
+            .enables("verify_gate"));
+        // known name but invalid technique → validation error
+        assert!(cfg.resolve_profile("bad").unwrap_err().contains("teleport"));
+        // unknown name → no-such-profile error, listing the known ones
+        let err = cfg.resolve_profile("ghost").unwrap_err();
+        assert!(
+            err.contains("no such profile") && err.contains("nemotron"),
+            "err: {err}"
+        );
     }
 
     #[test]
