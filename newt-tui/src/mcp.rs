@@ -33,6 +33,86 @@ fn server_prefix(name: &str, sanitize: bool) -> String {
     }
 }
 
+/// Best-effort `(scheme, host)` from a URL — lowercased, port/userinfo/path
+/// stripped, IPv6 brackets removed. Empty strings when absent/unparseable (which
+/// the policy treats as insecure → no token). Manual parse to avoid a url dep;
+/// good enough for the scheme+host decision below.
+fn parse_scheme_host(url: Option<&str>) -> (String, String) {
+    let Some(url) = url else {
+        return (String::new(), String::new());
+    };
+    let (scheme, rest) = url.split_once("://").unwrap_or(("", url));
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    let authority = authority.rsplit_once('@').map_or(authority, |(_, h)| h); // drop userinfo
+    let host = if let Some(v6) = authority.strip_prefix('[') {
+        v6.split(']').next().unwrap_or(v6) // [::1]:port → ::1
+    } else {
+        authority.split(':').next().unwrap_or(authority) // host:port → host
+    };
+    (scheme.to_ascii_lowercase(), host.to_ascii_lowercase())
+}
+
+/// A loopback host — the dev exception that needs no https and emits no warning.
+fn host_is_loopback(host: &str) -> bool {
+    host == "localhost" || host == "::1" || host.starts_with("127.")
+}
+
+/// Whether an OAuth Bearer may be sent to `url` under the secure-by-default
+/// transport policy (`docs/decisions/mcp_transport_security.md`): always over
+/// `https` or to loopback; over a non-loopback `http://` host only when that host
+/// is in `allow_insecure_hosts`. Unparseable/missing URL ⇒ withhold (fail safe).
+fn bearer_allowed_for_url(url: Option<&str>, allow_insecure_hosts: &[String]) -> bool {
+    let (scheme, host) = parse_scheme_host(url);
+    if scheme == "https" || host_is_loopback(&host) {
+        return true;
+    }
+    !host.is_empty()
+        && allow_insecure_hosts
+            .iter()
+            .any(|h| h.eq_ignore_ascii_case(&host))
+}
+
+/// Inject the (optional) Bearer into `entry` per the transport policy, warning on
+/// every non-loopback unencrypted connection. Mutates `entry.headers`.
+fn apply_transport_security(
+    entry: &mut McpServerEntry,
+    token: Option<String>,
+    allow_insecure_hosts: &[String],
+) {
+    let (scheme, host) = parse_scheme_host(entry.url.as_deref());
+    let secure = scheme == "https" || host_is_loopback(&host);
+    let allowed = bearer_allowed_for_url(entry.url.as_deref(), allow_insecure_hosts);
+    if !secure {
+        // Policy: warn on every unencrypted (non-https, non-loopback) connection.
+        match &token {
+            Some(_) if allowed => tracing::warn!(
+                "MCP server `{}`: UNENCRYPTED connection to `{}` (no TLS) — sending the \
+                 OAuth Bearer anyway ([tui].mcp_allow_insecure_hosts opt-in)",
+                entry.name,
+                host
+            ),
+            Some(_) => tracing::warn!(
+                "MCP server `{}`: UNENCRYPTED connection to `{}` (no TLS) — WITHHOLDING the \
+                 OAuth Bearer token. Use https, or add `{}` to [tui].mcp_allow_insecure_hosts \
+                 to override.",
+                entry.name,
+                host,
+                host
+            ),
+            None => tracing::warn!(
+                "MCP server `{}`: UNENCRYPTED connection to `{}` (no TLS).",
+                entry.name,
+                host
+            ),
+        }
+    }
+    if let (Some(token), true) = (token, allowed) {
+        entry
+            .headers
+            .insert("Authorization".into(), format!("Bearer {token}"));
+    }
+}
+
 impl Mcp {
     /// An empty set — connects to nothing. Used by tests (the live session
     /// always builds via [`Self::connect`]).
@@ -51,6 +131,7 @@ impl Mcp {
         workspace: &str,
         cfg_servers: &[McpServerEntry],
         sanitize_server_names: bool,
+        allow_insecure_hosts: &[String],
     ) -> Self {
         let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
         let entries = newt_core::mcp::discover(
@@ -66,20 +147,21 @@ impl Mcp {
             let result = match entry.transport {
                 TransportKind::Stdio => connect_stdio(entry).await,
                 TransportKind::Http => {
-                    // If no Authorization header is configured, check
-                    // ~/.hermes/mcp-tokens/ for a stored OAuth token and inject
-                    // it so newt can share the same auth as hermes-agent.
                     let mut enriched = entry.clone();
-                    if !enriched.headers.contains_key("Authorization")
-                        && !enriched.headers.contains_key("authorization")
-                    {
-                        if let Some(token) = crate::mcp_token::load_bearer_token(&entry.name).await
-                        {
-                            enriched
-                                .headers
-                                .insert("Authorization".into(), format!("Bearer {token}"));
-                        }
-                    }
+                    // Load the stored hermes OAuth token only when the operator
+                    // hasn't already configured an explicit Authorization header.
+                    let already_authed = enriched.headers.contains_key("Authorization")
+                        || enriched.headers.contains_key("authorization");
+                    let token = if already_authed {
+                        None
+                    } else {
+                        crate::mcp_token::load_bearer_token(&entry.name).await
+                    };
+                    // Secure-by-default transport policy: WARN on any non-loopback
+                    // unencrypted connection, and only inject the OAuth Bearer over
+                    // https / loopback / an explicitly allow-listed host
+                    // (docs/decisions/mcp_transport_security.md).
+                    apply_transport_security(&mut enriched, token, allow_insecure_hosts);
                     connect_http(&enriched).await
                 }
                 TransportKind::Sse => {
@@ -228,6 +310,102 @@ mod tests {
         assert!(mcp.is_empty());
         assert!(!mcp.handles("git__status"));
         assert!(mcp.tool_defs().is_empty());
+    }
+
+    // ── transport security: the OAuth Bearer must never go over plaintext ──
+
+    fn http_entry(url: &str) -> McpServerEntry {
+        McpServerEntry {
+            name: "MaaS".into(),
+            transport: TransportKind::Http,
+            command: None,
+            args: Vec::new(),
+            env: std::collections::BTreeMap::new(),
+            url: Some(url.into()),
+            headers: std::collections::BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn parse_scheme_host_handles_common_shapes() {
+        assert_eq!(
+            parse_scheme_host(Some("https://a.b/c")),
+            ("https".into(), "a.b".into())
+        );
+        assert_eq!(
+            parse_scheme_host(Some("http://127.0.0.1:8080/x")),
+            ("http".into(), "127.0.0.1".into())
+        );
+        assert_eq!(
+            parse_scheme_host(Some("http://u@Host:9/x")),
+            ("http".into(), "host".into())
+        );
+        assert_eq!(
+            parse_scheme_host(Some("http://[::1]:7/x")),
+            ("http".into(), "::1".into())
+        );
+        assert_eq!(parse_scheme_host(None), (String::new(), String::new()));
+    }
+
+    #[test]
+    fn bearer_allowed_only_over_https_loopback_or_allowlist() {
+        let none: &[String] = &[];
+        assert!(bearer_allowed_for_url(
+            Some("https://api.maas.com/mcp"),
+            none
+        ));
+        assert!(bearer_allowed_for_url(Some("http://localhost:9/mcp"), none));
+        assert!(bearer_allowed_for_url(Some("http://127.0.0.1:9/mcp"), none));
+        assert!(bearer_allowed_for_url(Some("http://[::1]:9/mcp"), none));
+        // plain http to a real host: NOT allowed by default (the blocker)
+        assert!(!bearer_allowed_for_url(
+            Some("http://api.maas.com/mcp"),
+            none
+        ));
+        assert!(!bearer_allowed_for_url(None, none));
+        // …unless the host is explicitly allow-listed (case-insensitive)
+        let allow = vec!["api.maas.com".to_string()];
+        assert!(bearer_allowed_for_url(
+            Some("http://API.MaaS.com/mcp"),
+            &allow
+        ));
+    }
+
+    #[test]
+    fn apply_transport_security_withholds_token_over_plain_http() {
+        // the blocker: a stored Bearer must NOT be injected over plaintext http
+        let mut e = http_entry("http://api.maas.com/mcp");
+        apply_transport_security(&mut e, Some("SECRET".into()), &[]);
+        assert!(
+            !e.headers.contains_key("Authorization"),
+            "Bearer leaked over plaintext http: {:?}",
+            e.headers
+        );
+    }
+
+    #[test]
+    fn apply_transport_security_injects_over_https_and_allowlisted() {
+        let mut https = http_entry("https://api.maas.com/mcp");
+        apply_transport_security(&mut https, Some("SECRET".into()), &[]);
+        assert_eq!(
+            https.headers.get("Authorization").map(String::as_str),
+            Some("Bearer SECRET")
+        );
+
+        let mut allowed = http_entry("http://api.maas.com/mcp");
+        apply_transport_security(
+            &mut allowed,
+            Some("SECRET".into()),
+            &["api.maas.com".to_string()],
+        );
+        assert_eq!(
+            allowed.headers.get("Authorization").map(String::as_str),
+            Some("Bearer SECRET")
+        );
+
+        let mut loopback = http_entry("http://127.0.0.1:9/mcp");
+        apply_transport_security(&mut loopback, Some("SECRET".into()), &[]);
+        assert!(loopback.headers.contains_key("Authorization"));
     }
 
     /// Some OpenAI-compatible API proxies normalise hyphens to underscores in

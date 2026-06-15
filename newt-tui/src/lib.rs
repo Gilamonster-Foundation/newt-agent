@@ -2684,8 +2684,18 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
         .as_ref()
         .map(|t| t.sanitize_mcp_server_names)
         .unwrap_or(true);
+    let allow_insecure_hosts = cfg
+        .tui
+        .as_ref()
+        .map(|t| t.mcp_allow_insecure_hosts.clone())
+        .unwrap_or_default();
     let mut mcp = tokio::task::block_in_place(|| {
-        rt.block_on(Mcp::connect(workspace, &cfg_mcp_servers, sanitize_mcp))
+        rt.block_on(Mcp::connect(
+            workspace,
+            &cfg_mcp_servers,
+            sanitize_mcp,
+            &allow_insecure_hosts,
+        ))
     });
     if !mcp.is_empty() {
         let summary = mcp

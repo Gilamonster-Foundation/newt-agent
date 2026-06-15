@@ -594,6 +594,16 @@ pub struct TuiConfig {
     /// that preserves hyphens verbatim.
     #[serde(default = "default_sanitize_mcp_server_names")]
     pub sanitize_mcp_server_names: bool,
+
+    /// Hosts (IP or hostname) for which newt may send an MCP OAuth Bearer token
+    /// over an UNENCRYPTED (non-`https`) connection. Empty by default: a stored
+    /// Bearer is sent only over `https` or to loopback (`localhost`/`127.0.0.1`/
+    /// `::1`). newt WARNs on every non-loopback unencrypted MCP connection
+    /// regardless; an allow-listed host still warns but the token is sent.
+    /// This is the explicit opt-out of the secure-by-default transport policy —
+    /// see `docs/decisions/mcp_transport_security.md`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mcp_allow_insecure_hosts: Vec<String>,
 }
 
 fn default_tool_output_lines() -> usize {
@@ -958,6 +968,7 @@ impl Default for TuiConfig {
             mid_loop_trim_threshold: default_mid_loop_trim_threshold(),
             mid_loop_trim_tokens: None,
             sanitize_mcp_server_names: default_sanitize_mcp_server_names(),
+            mcp_allow_insecure_hosts: Vec::new(),
         }
     }
 }
