@@ -48,6 +48,20 @@ enum Command {
     /// needed: point it at a directory of generated `.py` files plus a
     /// `python_surface.json` declaring the real module surface.
     Score(ScoreArgs),
+
+    /// Extract the authoritative PyO3 import surface (the knowledge-base part,
+    /// #74) from a workspace's bindings and print it — the structured fact the
+    /// `nemotron` profile injects so the model imports real paths instead of
+    /// guessing `newt_core` from the crate name.
+    Manifest(ManifestArgs),
+}
+
+/// Arguments for the `manifest` subcommand.
+#[derive(Args, Debug)]
+struct ManifestArgs {
+    /// Workspace root to scan for `<crate>/src/pyo3_module.rs` bindings.
+    #[arg(long)]
+    workspace: PathBuf,
 }
 
 /// Arguments for the `score` subcommand.
@@ -179,7 +193,23 @@ async fn real_main() -> Result<RunOutcomeStatus> {
         }
         Command::Run(args) => run_command(args).await,
         Command::Score(args) => score_command(args),
+        Command::Manifest(args) => manifest_command(args),
     }
+}
+
+/// `manifest` — extract and print the authoritative PyO3 import surface (the
+/// knowledge-base part, #74). The output is exactly the block the harness injects
+/// for the `nemotron` profile.
+fn manifest_command(args: ManifestArgs) -> Result<RunOutcomeStatus> {
+    let manifest = newt_core::ffi_manifest::FfiManifest::from_workspace(&args.workspace)?;
+    if manifest.is_empty() {
+        anyhow::bail!(
+            "no PyO3 bindings found under {} (looked for <crate>/src/pyo3_module.rs)",
+            args.workspace.display()
+        );
+    }
+    print!("{}", manifest.render_block());
+    Ok(RunOutcomeStatus::AllPassed)
 }
 
 /// `score` — run the Python verify oracle over an arbitrary workspace and print
