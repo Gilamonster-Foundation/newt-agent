@@ -325,8 +325,7 @@ struct PkceChallenge {
 fn gen_pkce() -> anyhow::Result<PkceChallenge> {
     // 32 random bytes → 43-char base64url string (within the 43-128 range).
     let mut buf = [0u8; 32];
-    // Use /dev/urandom directly — no extra dep, always available on Unix/macOS.
-    std::fs::File::open("/dev/urandom")?.read_exact(&mut buf)?;
+    fill_random(&mut buf)?;
 
     let engine = base64::engine::general_purpose::URL_SAFE_NO_PAD;
     let verifier = engine.encode(buf);
@@ -338,6 +337,10 @@ fn gen_pkce() -> anyhow::Result<PkceChallenge> {
         verifier,
         challenge,
     })
+}
+
+fn fill_random(buf: &mut [u8]) -> anyhow::Result<()> {
+    getrandom::getrandom(buf).map_err(|err| anyhow::anyhow!("failed to read OS randomness: {err}"))
 }
 
 /// Discover OAuth metadata from `<server_url>/.well-known/oauth-authorization-server`.
@@ -396,10 +399,10 @@ fn urlencoding_decode(s: &str) -> String {
     out
 }
 
-fn random_state() -> String {
+fn random_state() -> anyhow::Result<String> {
     let mut buf = [0u8; 16];
-    let _ = std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut buf));
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(buf)
+    fill_random(&mut buf)?;
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(buf))
 }
 
 /// Run the full MCP OAuth 2.1 authorization-code + PKCE flow for `server_name`.
@@ -481,7 +484,7 @@ pub async fn run_oauth_flow(server_name: &str, server_url: &str) -> anyhow::Resu
 
     // ── 3. PKCE ───────────────────────────────────────────────────────────
     let pkce = gen_pkce()?;
-    let state = random_state();
+    let state = random_state()?;
 
     // ── 4. Authorization URL ──────────────────────────────────────────────
     let auth_url = format!(

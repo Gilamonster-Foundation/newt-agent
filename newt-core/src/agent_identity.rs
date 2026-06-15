@@ -33,6 +33,7 @@
 //! > the compiled-in default.
 
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 
@@ -141,11 +142,7 @@ impl SecretRef {
             return Ok(None);
         }
         if let Some(cmd) = &self.cmd {
-            let output = std::process::Command::new("sh")
-                .arg("-c")
-                .arg(cmd)
-                .output()
-                .map_err(NewtError::Io)?;
+            let output = shell_command(cmd).output().map_err(NewtError::Io)?;
             if !output.status.success() {
                 return Err(NewtError::Config(format!(
                     "token command exited {}: {cmd}",
@@ -160,6 +157,21 @@ impl SecretRef {
         }
         Ok(None)
     }
+}
+
+#[cfg(windows)]
+fn shell_command(cmd: &str) -> Command {
+    let shell = std::env::var_os("COMSPEC").unwrap_or_else(|| "cmd.exe".into());
+    let mut command = Command::new(shell);
+    command.arg("/C").arg(cmd);
+    command
+}
+
+#[cfg(not(windows))]
+fn shell_command(cmd: &str) -> Command {
+    let mut command = Command::new("sh");
+    command.arg("-c").arg(cmd);
+    command
 }
 
 // ---------------------------------------------------------------------------
@@ -619,14 +631,19 @@ svc = {{ file = '{}' }}
 
     #[test]
     fn token_resolves_from_cmd() {
-        let id = AgentIdentity::from_toml_str(
+        let cmd = if cfg!(windows) {
+            "echo cmd-secret-value"
+        } else {
+            "printf 'cmd-secret-value\\n'"
+        };
+        let id = AgentIdentity::from_toml_str(&format!(
             r#"
 [agent-identity]
 name = "x[bot]"
 [agent-identity.tokens]
-svc = { cmd = "printf 'cmd-secret-value\n'" }
+svc = {{ cmd = "{cmd}" }}
 "#,
-        )
+        ))
         .unwrap();
         let tok = id.token("svc").unwrap().unwrap();
         assert_eq!(tok.expose(), "cmd-secret-value");
@@ -634,14 +651,15 @@ svc = { cmd = "printf 'cmd-secret-value\n'" }
 
     #[test]
     fn token_cmd_failure_is_error_not_panic() {
-        let id = AgentIdentity::from_toml_str(
+        let cmd = if cfg!(windows) { "exit /B 3" } else { "exit 3" };
+        let id = AgentIdentity::from_toml_str(&format!(
             r#"
 [agent-identity]
 name = "x[bot]"
 [agent-identity.tokens]
-svc = { cmd = "exit 3" }
+svc = {{ cmd = "{cmd}" }}
 "#,
-        )
+        ))
         .unwrap();
         let err = id.token("svc").unwrap_err();
         assert!(format!("{err}").contains("token command exited"));

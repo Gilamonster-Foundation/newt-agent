@@ -37,6 +37,7 @@ crossterm.workspace = true
 tracing.workspace = true
 sha2.workspace = true
 base64.workspace = true
+getrandom.workspace = true
 
 # NOTE (Step 9.7): the direct agent-bridle dependency moved to newt-core with
 # `execute_tool` — the bridle leash now confines `run_command` / `web_fetch`
