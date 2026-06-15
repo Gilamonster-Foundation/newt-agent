@@ -1,6 +1,6 @@
 # Technique library — composable harness techniques with spec sheets and tunable knobs
 
-**Status:** design note · **Composes with:** [`model-family-profiles.md`](model-family-profiles.md) (the profile = composition idea) · **Grounded by:** [`../findings/2026-06-15-retry-and-the-honest-gate.md`](../findings/2026-06-15-retry-and-the-honest-gate.md) (techniques need honest spec sheets) · **First knob:** `verify_gate.SurfaceMatch` (#73/#354)
+**Status:** design note · **Part of:** [`model-support-kit.md`](model-support-kit.md) (this is the kit's *parts catalog* — the techniques the kit composes) · **Composes with:** [`model-family-profiles.md`](model-family-profiles.md) (the profile = composition idea) · **Grounded by:** [`../findings/2026-06-15-retry-and-the-honest-gate.md`](../findings/2026-06-15-retry-and-the-honest-gate.md) (techniques need honest spec sheets) · **First knob:** `verify_gate.SurfaceMatch` (#73/#354)
 
 ## Abstract
 
