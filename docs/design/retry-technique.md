@@ -203,6 +203,21 @@ work isolated and reviewable:
   turn) or re-prompt via a `run_chat` task-queue + cap counter; the honest give-up
   banner + `retry_exhausted` land here.
 
+## Known gaps (deferred, from the 2a adversarial review)
+
+These were confirmed at **low/nit** severity and are deferred deliberately — none is
+data-loss (the two data-loss blockers and the two mediums were fixed in 2a):
+
+- **Revert runs only on a successful turn.** A turn that *errors* after writing a
+  fabrication leaves it on disk (the `Ok` arm reverts; the `Err` arm drops the
+  ledger). Folds into **2b**, which restructures the post-turn path for the re-prompt
+  loop anyway.
+- **Full `.py` walk + parse each turn under `retry`.** Mitigated by the symlink-skip
+  + `SKIP_DIRS` exclusions; a large monorepo could still want an incremental gate.
+  Pre-existing in `verify_gate` (#368); a shared follow-up.
+- `retry` intentionally **supersedes** the `verify_gate` warning (it acts instead of
+  warning) — by design, not a regression.
+
 ## Out of scope
 
 - A git fast-path for revert (ledger is the contract; git is a later optimization).

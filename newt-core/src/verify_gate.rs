@@ -292,15 +292,25 @@ impl WriteLedger {
     }
 
     /// Record `path`'s pre-turn state the **first** time it is written this turn.
-    /// Call this *before* the write lands: it reads the current bytes from disk
-    /// (recording `None` when the path is absent). A no-op on any subsequent write
-    /// to the same path — the pre-turn snapshot is preserved.
+    /// Call this *before* the write lands. A no-op on any subsequent write to the
+    /// same path — the pre-turn snapshot is preserved.
+    ///
+    /// Only a genuine `NotFound` records the "did-not-exist" marker (`None`) that
+    /// makes revert *delete* the path. Any **other** read error (`EACCES`, a
+    /// transient NFS hiccup, the path being a directory) leaves the path
+    /// **untracked** — conflating "unreadable" with "absent" would let revert delete
+    /// a pre-existing file whose note-time read merely failed. Untracked ⇒ revert
+    /// returns `false` and refuses to touch it.
     pub fn note_before_write(&mut self, path: impl Into<PathBuf>) {
         let path = path.into();
         if self.entries.contains_key(&path) {
             return;
         }
-        let prior = std::fs::read(&path).ok();
+        let prior = match std::fs::read(&path) {
+            Ok(bytes) => Some(bytes),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(_) => return, // unreadable ≠ absent: never mark it delete-on-revert
+        };
         self.entries.insert(path, prior);
     }
 
@@ -806,6 +816,24 @@ pub struct PyRouter;
         let led = WriteLedger::new();
         assert!(!led.revert(&f).unwrap(), "no entry → false, no delete");
         assert!(f.exists(), "an untracked file is never silently removed");
+    }
+
+    #[test]
+    fn note_before_write_leaves_an_unreadable_path_untracked() {
+        // A directory at the path makes `std::fs::read` fail with a non-NotFound
+        // error. That must NOT be recorded as the absent-marker `Some(None)` (which
+        // would delete on revert) — the path is left untracked instead.
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("not_a_file");
+        std::fs::create_dir(&p).unwrap();
+        let mut led = WriteLedger::new();
+        led.note_before_write(&p);
+        assert_eq!(led.len(), 0, "an unreadable path is not recorded");
+        assert!(!led.revert(&p).unwrap(), "untracked ⇒ revert is a no-op");
+        assert!(
+            p.exists(),
+            "revert must never remove an unreadable pre-existing path"
+        );
     }
 
     #[test]

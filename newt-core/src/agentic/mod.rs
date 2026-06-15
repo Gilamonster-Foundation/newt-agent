@@ -567,8 +567,88 @@ fn ledger_note_write(
         return;
     }
     if let Some(p) = args.get("path").and_then(|v| v.as_str()) {
-        led.borrow_mut()
-            .note_before_write(std::path::Path::new(workspace).join(p));
+        // Key on the lexically-normalized path so a raw model path like
+        // `examples/../foo.py` matches the gate's filesystem-normalized `foo.py`
+        // and the revert lookup actually hits — otherwise a non-normalized path
+        // would silently evade revert (the fabrication persists, the gate is gamed).
+        let abs = lexical_normalize(&std::path::Path::new(workspace).join(p));
+        led.borrow_mut().note_before_write(abs);
+    }
+}
+
+/// Lexically normalize a path — collapse `.`, resolve `..`, drop empty components —
+/// **without** touching the filesystem, so a ledger key built from a raw
+/// model-supplied path matches the gate's `read_dir`-normalized path. Purely
+/// lexical: it deliberately does not resolve symlinks (the gate never follows them
+/// and revert is workspace-boundary-guarded), so it cannot itself escape the tree.
+fn lexical_normalize(path: &std::path::Path) -> std::path::PathBuf {
+    use std::path::Component;
+    let mut out = std::path::PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            Component::ParentDir => {
+                // Only pop a real path segment; never climb above a root/prefix.
+                if matches!(out.components().next_back(), Some(Component::Normal(_))) {
+                    out.pop();
+                } else {
+                    out.push("..");
+                }
+            }
+            Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod retry_ledger_tests {
+    use super::*;
+
+    #[test]
+    fn lexical_normalize_collapses_dot_and_parent() {
+        assert_eq!(
+            lexical_normalize(std::path::Path::new("/ws/examples/../foo.py")),
+            std::path::PathBuf::from("/ws/foo.py")
+        );
+        assert_eq!(
+            lexical_normalize(std::path::Path::new("/ws/./a//b/foo.py")),
+            std::path::PathBuf::from("/ws/a/b/foo.py")
+        );
+        // A leading `..` with no segment to pop is preserved, not climbed past root.
+        assert_eq!(
+            lexical_normalize(std::path::Path::new("../x.py")),
+            std::path::PathBuf::from("../x.py")
+        );
+    }
+
+    #[test]
+    fn ledger_note_write_keys_on_the_normalized_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("foo.py"), "real\n").unwrap();
+        let led = std::cell::RefCell::new(crate::verify_gate::WriteLedger::new());
+        // a raw, non-normalized model path
+        let args = serde_json::json!({ "path": "examples/../foo.py" });
+        ledger_note_write(
+            Some(&led),
+            "write_file",
+            &args,
+            tmp.path().to_str().unwrap(),
+        );
+        // the key normalized to <ws>/foo.py — the same path the gate would produce —
+        // so revert finds and restores it (returns true).
+        assert!(
+            led.borrow().revert(&tmp.path().join("foo.py")).unwrap(),
+            "the normalized key matches the gate's path"
+        );
+        // a read-only tool is never recorded
+        ledger_note_write(
+            Some(&led),
+            "read_file",
+            &serde_json::json!({ "path": "foo.py" }),
+            tmp.path().to_str().unwrap(),
+        );
+        assert_eq!(led.borrow().len(), 1, "only write tools are tracked");
     }
 }
 
