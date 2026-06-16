@@ -203,10 +203,9 @@ impl LocalOllamaBackend {
         }
 
         let json: serde_json::Value = resp.json().await?;
-        let content = json["message"]["content"]
-            .as_str()
-            .unwrap_or("")
-            .to_string();
+        // #385: strip inline <think>…</think> reasoning from the content.
+        let (content, _reasoning) =
+            newt_core::split_reasoning(json["message"]["content"].as_str().unwrap_or(""));
 
         // Extract token counts from Ollama's response if present.
         let usage = {
@@ -365,10 +364,12 @@ impl LocalVllmBackend {
 
         let json: serde_json::Value = resp.json().await?;
         // OpenAI-compatible: choices[0].message.content
-        let content = json["choices"][0]["message"]["content"]
-            .as_str()
-            .unwrap_or("")
-            .to_string();
+        // #385: strip inline <think>…</think> reasoning from the content.
+        let (content, _reasoning) = newt_core::split_reasoning(
+            json["choices"][0]["message"]["content"]
+                .as_str()
+                .unwrap_or(""),
+        );
         // Prefer the model echoed back by the server (helps callers
         // distinguish aliases) but fall back to the configured id.
         let model_id = json["model"]
