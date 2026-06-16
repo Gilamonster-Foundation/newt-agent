@@ -2263,8 +2263,14 @@ pub async fn openai_chat_complete(
     Ok((text, streamed, usage, hallucination_count))
 }
 
-/// Whether `[tui] thinking` opts into the reasoning spinner (default on).
+/// Whether the reasoning spinner is enabled: `NEWT_THINKING` (set by
+/// `/thinking`) overrides `[tui] thinking`; default on.
 fn thinking_stream_enabled() -> bool {
+    match std::env::var("NEWT_THINKING").ok().as_deref() {
+        Some("off") => return false,
+        Some("on" | "stream") => return true,
+        _ => {}
+    }
     crate::Config::resolve()
         .ok()
         .and_then(|c| c.tui)
