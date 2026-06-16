@@ -979,6 +979,67 @@ impl rustyline::validate::Validator for FooterHelper {
 }
 impl rustyline::Helper for FooterHelper {}
 
+/// Install the footer helper on a freshly built editor. Multi-line entry is the
+/// trailing-`\` continuation (the `Validator`), which works in emacs and vi mode
+/// alike and in every terminal — no special-key detection. (A bound Alt+Enter
+/// would need rustyline's `custom-bindings` feature; deferred to avoid a dep
+/// change for a terminal-dependent bonus.)
+fn install_footer_helper(
+    rl: &mut rustyline::Editor<FooterHelper, rustyline::history::DefaultHistory>,
+) {
+    rl.set_helper(Some(FooterHelper));
+}
+
+/// Screen rows the footer block occupied: 2 (separator + status) + the input's
+/// wrapped rows (the `❯ ` prefix counts on the first visual line). Pure so the
+/// collapse math is testable without a terminal.
+fn footer_block_rows(line: &str, cols: usize) -> u16 {
+    let cols = cols.max(1);
+    let input_rows: usize = line
+        .split('\n')
+        .enumerate()
+        .map(|(i, seg)| {
+            let lead = if i == 0 { 2 } else { 0 };
+            (seg.chars().count() + lead) / cols + 1
+        })
+        .sum();
+    (2 + input_rows).try_into().unwrap_or(u16::MAX)
+}
+
+/// Collapse the transient footer block after submit: erase the separator +
+/// status (and the live input render) by moving up over the block and clearing
+/// downward, then re-echo a compact `❯ <input>` so the conversation record
+/// stays clean (the decoration does not pile up in scrollback). Empty input
+/// erases with no echo. Relative cursor motion → safe under terminal scroll.
+fn collapse_footer_block(line: &str, task: &str, color: bool) {
+    let cols = terminal::size().map(|(c, _)| c as usize).unwrap_or(80);
+    let rows = footer_block_rows(line, cols);
+    let mut out = io::stdout();
+    let _ = execute!(
+        out,
+        crossterm::cursor::MoveToPreviousLine(rows),
+        Clear(ClearType::FromCursorDown),
+    );
+    if task.is_empty() {
+        return;
+    }
+    let first = task.lines().next().unwrap_or("");
+    let more = if task.contains('\n') { " …" } else { "" };
+    if color {
+        let _ = execute!(
+            out,
+            SetForegroundColor(NEWT_ORANGE_CT),
+            Print("❯ "),
+            ResetColor,
+            Print(first),
+            Print(more),
+            Print("\n"),
+        );
+    } else {
+        println!("❯ {first}{more}");
+    }
+}
+
 #[cfg(test)]
 mod footer_tests {
     use super::*;
@@ -1017,6 +1078,18 @@ mod footer_tests {
         assert_eq!(footer_separator(3).chars().count(), 8, "floored at 8");
         assert_eq!(footer_separator(500).chars().count(), 80, "capped at 80");
         assert!(footer_separator(40).chars().all(|c| c == '─'));
+    }
+
+    #[test]
+    fn block_rows_counts_preamble_plus_wrapped_input() {
+        // sep + status + one input row.
+        assert_eq!(footer_block_rows("hello", 80), 3);
+        // Empty input still occupies the caret row.
+        assert_eq!(footer_block_rows("", 80), 3);
+        // A `\`-continued two-line entry → two input rows.
+        assert_eq!(footer_block_rows("foo\\\nbar", 80), 4);
+        // A long first line wraps: (100 + 2 for "❯ ") / 80 + 1 = 2 input rows.
+        assert_eq!(footer_block_rows(&"x".repeat(100), 80), 4);
     }
 
     #[test]
@@ -3177,7 +3250,7 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
     let mut rl: rustyline::Editor<FooterHelper, rustyline::history::DefaultHistory> =
         rustyline::Editor::with_config(build_rl_config())?;
     if footer_on {
-        rl.set_helper(Some(FooterHelper));
+        install_footer_helper(&mut rl);
     }
     if let Some(ref hp) = history_path {
         let _ = rl.load_history(hp);
@@ -3188,10 +3261,11 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
     #[cfg(unix)]
     mark_fds_cloexec();
 
-    let is_vi = build_rl_config().edit_mode() == rustyline::config::EditMode::Vi;
+    // `mut` so a runtime `/vi` / `/emacs` switch can flip the caret + status.
+    let mut is_vi = build_rl_config().edit_mode() == rustyline::config::EditMode::Vi;
     // With the footer on, the caret is the recognizable `❯` (vi-mode keeps the
     // `[i]` indicator); off, the configured PS1 prompt — bash-like.
-    let prompt = if footer_on {
+    let mut prompt = if footer_on {
         if is_vi {
             "[i] ❯ ".to_string()
         } else {
@@ -3416,6 +3490,9 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
         // Catching the panic (Layer 3 / PR #184) remains as a last resort, but
         // this check fires first and gives a cleaner message when the fd table
         // is already full before readline even starts.
+        // Did we draw the footer preamble this turn? (Only fresh user turns
+        // do; corrective re-prompts don't.) Gates the post-submit collapse.
+        let mut footer_drawn = false;
         let readline_result = if let Some(corrective) = pending_retry.take() {
             // retry technique (2b): run the queued corrective re-prompt as this
             // turn's input instead of reading from the user. The budget was already
@@ -3438,6 +3515,7 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
             // scrollback on submit — no pinned region).
             if footer_on {
                 print_footer_preamble(&footer_status(&inf_model, workspace, is_vi), color);
+                footer_drawn = true;
             }
             let readline_result =
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rl.readline(&prompt)));
@@ -3458,6 +3536,11 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                 // Rejoin `\`-continued lines (multi-line entry) into real
                 // newlines; a no-op for single-line input.
                 let task = line.replace("\\\n", "\n").trim().to_string();
+                // Collapse the transient footer block into a clean `❯ <input>`
+                // record so the separator + status don't pile up in scrollback.
+                if footer_on && footer_drawn {
+                    collapse_footer_block(&line, &task, color);
+                }
                 if task.is_empty() {
                     continue;
                 }
@@ -3718,11 +3801,24 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                     let fresh_cfg = build_rl_config();
                     rl = rustyline::Editor::with_config(fresh_cfg)?;
                     if footer_on {
-                        rl.set_helper(Some(FooterHelper));
+                        install_footer_helper(&mut rl);
                     }
                     if let Some(ref hp) = history_path {
                         let _ = rl.load_history(hp);
                     }
+                    // A `/vi` / `/emacs` switch sets NEWT_EDIT_MODE, which the
+                    // rebuilt editor above just read; keep is_vi + the caret in
+                    // sync so the next prompt reflects the new mode.
+                    is_vi = build_rl_config().edit_mode() == rustyline::config::EditMode::Vi;
+                    prompt = if footer_on {
+                        if is_vi {
+                            "[i] ❯ ".to_string()
+                        } else {
+                            "❯ ".to_string()
+                        }
+                    } else {
+                        prompt_str(workspace, verbose, is_vi)
+                    };
                 } else if matches!(task.as_str(), "exit" | "quit") {
                     clean_exit = true;
                     break;
@@ -5781,6 +5877,7 @@ fn help_lines() -> &'static [&'static str] {
         "  /mode <name>             - enter a named mode: load skill + clamp authority (floor)",
         "  /mode                    - show the active mode; /mode off clears it",
         "  /workspace               - show current workspace path",
+        "  /vi  /emacs              - switch line-editor key bindings for this session",
         "  /version                 - print newt version",
         "  /help                    - this message",
         "  /exit  /quit  exit  quit - leave the session",
@@ -5815,6 +5912,34 @@ fn dispatch_slash(
         "version" => print_newt(&format!("v{VERSION}"), color, verbose),
 
         "workspace" => print_newt(workspace, color, verbose),
+
+        "vi" | "emacs" | "edit-mode" => {
+            // Switch the line-editor key bindings for the rest of the session.
+            // Sets NEWT_EDIT_MODE; the editor rebuild + the is_vi/caret recompute
+            // back in `run_chat` (after every slash command) pick it up.
+            let want = match cmd {
+                "vi" => Some("vi"),
+                "emacs" => Some("emacs"),
+                _ => match arg1.to_lowercase().as_str() {
+                    "vi" | "vim" => Some("vi"),
+                    "emacs" => Some("emacs"),
+                    _ => None,
+                },
+            };
+            match want {
+                Some(m) => {
+                    // SAFETY: single-threaded REPL; the editor is rebuilt right
+                    // after this returns, before any further input is read.
+                    unsafe { std::env::set_var("NEWT_EDIT_MODE", m) };
+                    print_newt(&format!("edit mode: {m}"), color, verbose);
+                }
+                None => print_newt(
+                    "usage: /edit-mode <vi|emacs>  (or just /vi, /emacs)",
+                    color,
+                    verbose,
+                ),
+            }
+        }
 
         "models" => {
             let cfg = newt_core::Config::resolve().unwrap_or_default();
