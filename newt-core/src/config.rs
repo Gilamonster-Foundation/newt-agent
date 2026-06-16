@@ -229,17 +229,27 @@ impl Default for RetryKnobs {
 }
 
 impl ProfileConfig {
-    /// Validate the profile: every named technique must be in [`KNOWN_TECHNIQUES`].
+    /// Validate the profile against the [component registry](crate::kit): every
+    /// named technique must be a known component, and every component's
+    /// `presupposes` must also be enabled (e.g. `retry` presupposes `verify_gate`).
+    /// A presupposition gap is a **load-time** error, not a silent partial apply.
     ///
     /// # Errors
-    /// Returns the first unknown technique name as an error message.
+    /// Returns the first unknown-technique or unmet-presupposition as a message.
     pub fn validate(&self) -> std::result::Result<(), String> {
         for t in &self.techniques {
-            if !KNOWN_TECHNIQUES.contains(&t.as_str()) {
+            let Some(entry) = crate::kit::component(t) else {
                 return Err(format!(
                     "unknown technique '{t}' in profile (known: {})",
                     KNOWN_TECHNIQUES.join(", ")
                 ));
+            };
+            for pre in entry.presupposes {
+                if !self.techniques.iter().any(|x| x == pre) {
+                    return Err(format!(
+                        "technique '{t}' presupposes '{pre}', which the profile does not enable"
+                    ));
+                }
             }
         }
         Ok(())
@@ -1540,6 +1550,35 @@ mod tests {
             toml::from_str("techniques = [\"knowledge_base\", \"teleport\"]").unwrap();
         let err = p.validate().unwrap_err();
         assert!(err.contains("teleport"), "err: {err}");
+    }
+
+    #[test]
+    fn profile_rejects_unmet_presupposition() {
+        // retry presupposes verify_gate — listing retry alone is now a load-time error.
+        let p: ProfileConfig = toml::from_str("techniques = [\"retry\"]").unwrap();
+        let err = p.validate().unwrap_err();
+        assert!(
+            err.contains("retry") && err.contains("verify_gate") && err.contains("presupposes"),
+            "err: {err}"
+        );
+        // …and adding verify_gate satisfies it.
+        let ok: ProfileConfig =
+            toml::from_str("techniques = [\"verify_gate\", \"retry\"]").unwrap();
+        assert!(ok.validate().is_ok());
+    }
+
+    #[test]
+    fn registry_does_not_alter_the_resolved_technique_set() {
+        // Golden: validate() accepts the nemotron set and the resolved order/membership
+        // is byte-identical to the input — the registry adds checks, not behavior.
+        let p: ProfileConfig =
+            toml::from_str("techniques = [\"knowledge_base\", \"verify_gate\", \"retry\"]")
+                .unwrap();
+        assert!(p.validate().is_ok());
+        assert_eq!(p.techniques, vec!["knowledge_base", "verify_gate", "retry"]);
+        for t in ["knowledge_base", "verify_gate", "retry"] {
+            assert!(p.enables(t));
+        }
     }
 
     #[test]
