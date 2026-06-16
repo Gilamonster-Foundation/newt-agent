@@ -863,16 +863,244 @@ fn build_rl_config() -> rustyline::config::Config {
         .build()
 }
 
-/// Build the rustyline prompt string — plain text, PS1 tokens expanded.
+// ---------------------------------------------------------------------------
+// Input footer (the transient multi-line `❯` block — see
+// docs/decisions/plain_scroller_tui.md). It is NOT a pinned region: the
+// separator + status header are printed as ordinary scrolled lines just
+// before each `readline`, the `❯` caret is rustyline's prompt, and the whole
+// thing collapses into scrollback on submit while model output scrolls
+// plainly above it. Off a TTY it degrades to a plain bash-like prompt.
+// ---------------------------------------------------------------------------
+
+/// Resolve the configured footer mode: `NEWT_FOOTER` env > `[tui].footer` > `Auto`.
+fn footer_mode() -> newt_core::FooterMode {
+    use newt_core::FooterMode;
+    if let Ok(v) = std::env::var("NEWT_FOOTER") {
+        match v.to_lowercase().as_str() {
+            "off" | "plain" | "0" | "false" => return FooterMode::Off,
+            "on" | "stamp" | "bar" | "1" | "true" => return FooterMode::On,
+            "auto" => return FooterMode::Auto,
+            _ => {}
+        }
+    }
+    newt_core::Config::resolve()
+        .ok()
+        .and_then(|c| c.tui)
+        .map(|t| t.footer)
+        .unwrap_or_default()
+}
+
+/// Whether to use the rich default prompt (timestamp + status folded into the
+/// prompt line) versus the plain bare prompt, from the configured mode + a TTY
+/// probe. An explicit `[tui] prompt` overrides both. Pure for testing.
+fn footer_rich_enabled(mode: newt_core::FooterMode, is_tty: bool) -> bool {
+    use newt_core::FooterMode;
+    match mode {
+        FooterMode::Off => false,
+        FooterMode::On => true,
+        FooterMode::Auto => is_tty,
+    }
+}
+
+/// The built-in rich prompt template (used when `[tui] prompt` is unset and the
+/// prompt is rich). Expands via [`expand_prompt_tokens`] to e.g.
+/// `[2026-06-16 11:59:02] gpt-4.1 | emacs | newt-agent ❯ `. Written in the
+/// readable `$NAME` form so it self-documents when copied into a config.
+pub const DEFAULT_RICH_PROMPT: &str = "[$TIMESTAMP] $MODEL | $MODE | $WS ❯ ";
+
+/// The prompt-token reference — the single source of truth shared by the
+/// `/prompt` command, the scaffolded config comment, and the docs. Each entry
+/// is `($NAME, \x, description)`.
+pub const PROMPT_TOKENS: &[(&str, &str, &str)] = &[
+    ("$TIMESTAMP", "\\t", "date + time, e.g. 2026-06-16 10:34:55"),
+    ("$DATE", "", "date, e.g. 2026-06-16"),
+    ("$TIME", "", "time, e.g. 10:34:55"),
+    ("$MODEL", "\\m", "active model"),
+    ("$MODE", "\\M", "edit mode (vi / emacs)"),
+    ("$USER", "\\u", "username"),
+    ("$HOST", "\\h", "hostname"),
+    ("$WS", "\\w", "workspace basename"),
+    ("$PATH", "\\W", "full workspace path"),
+    ("$VERSION", "\\v", "newt version"),
+];
+
+/// Strip one matching pair of surrounding quotes (`"` or `'`), if present.
+/// Preserves everything inside, including trailing spaces. Pure for testing.
+fn strip_one_quote_pair(s: &str) -> &str {
+    let bytes = s.as_bytes();
+    if bytes.len() >= 2
+        && ((bytes[0] == b'"' && bytes[bytes.len() - 1] == b'"')
+            || (bytes[0] == b'\'' && bytes[bytes.len() - 1] == b'\''))
+    {
+        &s[1..s.len() - 1]
+    } else {
+        s
+    }
+}
+
+/// Render [`PROMPT_TOKENS`] as aligned help lines (for `/prompt`).
+fn prompt_token_help() -> Vec<String> {
+    PROMPT_TOKENS
+        .iter()
+        .map(|(name, slash, desc)| format!("  {name:<11} {slash:<3}  {desc}"))
+        .collect()
+}
+
+/// The active prompt template (`NEWT_PROMPT` > `[tui] prompt` > the built-in
+/// default) and its live expansion, for `/prompt`'s preview line. Resolving the
+/// model + edit mode here lets the preview show the *expanded* result so a
+/// backslash/TOML escaping mistake is visible at a glance.
+fn current_prompt_and_preview(workspace: &str) -> (String, String) {
+    let template = std::env::var("NEWT_PROMPT")
+        .ok()
+        .or_else(|| {
+            newt_core::Config::resolve()
+                .ok()
+                .and_then(|c| c.tui)
+                .and_then(|t| t.prompt)
+        })
+        .unwrap_or_else(|| DEFAULT_RICH_PROMPT.to_string());
+    let model = newt_core::Config::resolve()
+        .ok()
+        .map(|c| resolve_backend_choice(&c).model)
+        .unwrap_or_default();
+    let is_vi = build_rl_config().edit_mode() == rustyline::config::EditMode::Vi;
+    let preview = expand_prompt_tokens(&template, workspace, &model, is_vi);
+    (template, preview)
+}
+
+/// rustyline helper enabling multi-line entry: a line ending in `\` continues
+/// onto the next line (the shell/Python continuation idiom — portable across
+/// terminals, no special key detection). On submit the caller rejoins
+/// `"\\\n"` to `"\n"`. Installed only when the footer is on; off-mode keeps
+/// today's single-line behavior exactly.
+struct FooterHelper;
+
+/// Whether the input wants another line: a trailing `\` continues (the
+/// shell/Python idiom). Pure for testing — the `Validator` is a thin wrapper.
+fn footer_continues(input: &str) -> bool {
+    input.ends_with('\\')
+}
+
+impl rustyline::completion::Completer for FooterHelper {
+    type Candidate = String;
+}
+impl rustyline::hint::Hinter for FooterHelper {
+    type Hint = String;
+}
+impl rustyline::highlight::Highlighter for FooterHelper {}
+impl rustyline::validate::Validator for FooterHelper {
+    fn validate(
+        &self,
+        ctx: &mut rustyline::validate::ValidationContext,
+    ) -> rustyline::Result<rustyline::validate::ValidationResult> {
+        if footer_continues(ctx.input()) {
+            Ok(rustyline::validate::ValidationResult::Incomplete)
+        } else {
+            Ok(rustyline::validate::ValidationResult::Valid(None))
+        }
+    }
+}
+impl rustyline::Helper for FooterHelper {}
+
+/// Install the footer helper on a freshly built editor. Multi-line entry is the
+/// trailing-`\` continuation (the `Validator`), which works in emacs and vi mode
+/// alike and in every terminal — no special-key detection. (A bound Alt+Enter
+/// would need rustyline's `custom-bindings` feature; deferred to avoid a dep
+/// change for a terminal-dependent bonus.)
+fn install_footer_helper(
+    rl: &mut rustyline::Editor<FooterHelper, rustyline::history::DefaultHistory>,
+) {
+    rl.set_helper(Some(FooterHelper));
+}
+
+#[cfg(test)]
+mod footer_tests {
+    use super::*;
+    use newt_core::FooterMode;
+
+    #[test]
+    fn rich_follows_mode_and_tty() {
+        // Auto → rich on a TTY, plain otherwise (the amphibious default).
+        assert!(footer_rich_enabled(FooterMode::Auto, true));
+        assert!(!footer_rich_enabled(FooterMode::Auto, false));
+        // On forces rich even off a TTY; Off is always plain.
+        assert!(footer_rich_enabled(FooterMode::On, true));
+        assert!(footer_rich_enabled(FooterMode::On, false));
+        assert!(!footer_rich_enabled(FooterMode::Off, true));
+        assert!(!footer_rich_enabled(FooterMode::Off, false));
+    }
+
+    #[test]
+    fn prompt_tokens_expand() {
+        // The model + mode + workspace tokens fill in; `\t` is replaced (its
+        // exact value is the clock, so just assert the literal token is gone).
+        let p = expand_prompt_tokens("\\m · \\w · \\M", "/home/me/proj", "gpt-4.1", true);
+        assert!(p.starts_with("gpt-4.1 · proj · vi"));
+        let p = expand_prompt_tokens("[\\t] \\m", "/srv/x", "llama3", false);
+        assert!(!p.contains("\\t"), "timestamp token expanded: {p}");
+        assert!(p.ends_with("llama3"));
+    }
+
+    #[test]
+    fn rich_default_prompt_renders_the_status_line() {
+        // The built-in rich default expands to the `[ts · model · ws · mode ]`
+        // prompt-prefix shape.
+        let p = expand_prompt_tokens(DEFAULT_RICH_PROMPT, "/home/me/newt-agent", "gpt-4.1", false);
+        assert!(p.contains("] gpt-4.1 | emacs | newt-agent ❯ "), "{p}");
+        assert!(p.starts_with('['));
+    }
+
+    #[test]
+    fn strip_one_quote_pair_preserves_inner_spaces() {
+        assert_eq!(strip_one_quote_pair("\"[$TIME] ❯ \""), "[$TIME] ❯ ");
+        assert_eq!(strip_one_quote_pair("'hi'"), "hi");
+        // Unquoted, mismatched, or too-short input is returned unchanged.
+        assert_eq!(strip_one_quote_pair("bare"), "bare");
+        assert_eq!(strip_one_quote_pair("\"oops'"), "\"oops'");
+        assert_eq!(strip_one_quote_pair("\""), "\"");
+    }
+
+    #[test]
+    fn dollar_macros_expand_without_prefix_clobber() {
+        let p = expand_prompt_tokens("[$MODEL | $MODE | $WS]", "/home/me/proj", "gpt-4.1", true);
+        assert_eq!(p, "[gpt-4.1 | vi | proj]");
+        // $TIMESTAMP must win over its $TIME prefix; both tokens fully consumed.
+        let p = expand_prompt_tokens("$TIMESTAMP|$TIME|$DATE", "/x", "m", false);
+        assert!(
+            !p.contains("$TIME") && !p.contains("$DATE") && !p.contains("STAMP"),
+            "{p}"
+        );
+        // Every documented token has a working expansion (no literal left).
+        for (name, _slash, _desc) in PROMPT_TOKENS {
+            let out = expand_prompt_tokens(name, "/srv/work", "llama3", false);
+            assert!(!out.contains(name), "token {name} not expanded: {out}");
+        }
+    }
+
+    #[test]
+    fn continuation_triggers_on_trailing_backslash() {
+        // A trailing backslash means "keep typing" (multi-line continuation).
+        assert!(footer_continues("write a\\"));
+        // Balanced input submits.
+        assert!(!footer_continues("write a function"));
+        assert!(!footer_continues(""));
+        // The rejoin the REPL applies turns a `\`-break into a real newline.
+        assert_eq!("foo\\\nbar".replace("\\\n", "\n"), "foo\nbar");
+    }
+}
+
+/// Build the rustyline prompt string for this turn — PS1 tokens expanded, a
+/// fresh timestamp each call.
 ///
-/// Reads `[tui].prompt` from config (overridable via `NEWT_PROMPT`).
-/// Falls back to `\w $ ` (compact) or `you \w $ ` (verbose) if unset.
-/// Vi-mode prefixes `[i] ` so the user knows which mode is active.
+/// Precedence: `NEWT_PROMPT` env > `[tui] prompt` config > built-in default.
+/// The built-in default is the **rich** prompt ([`DEFAULT_RICH_PROMPT`] — the
+/// timestamped status line) when `rich` is set, else the plain `\w $ ` /
+/// `you \w $ ` (vi-mode prefixes `[i] `).
 ///
-/// Supported tokens: `\w` workspace basename, `\W` full path,
-/// `\h` hostname, `\v` newt version.
-fn prompt_str(workspace: &str, verbose: bool, is_vi: bool) -> String {
-    // Resolve template: NEWT_PROMPT env var > config > built-in default.
+/// Tokens: `\t` timestamp, `\m` model, `\M` edit mode, `\u` user, `\h` host,
+/// `\w` workspace basename, `\W` full path, `\v` newt version.
+fn prompt_str(workspace: &str, verbose: bool, is_vi: bool, model: &str, rich: bool) -> String {
     let template = std::env::var("NEWT_PROMPT").ok().or_else(|| {
         newt_core::Config::resolve()
             .ok()
@@ -880,34 +1108,29 @@ fn prompt_str(workspace: &str, verbose: bool, is_vi: bool) -> String {
             .and_then(|t| t.prompt)
     });
 
-    let expanded = if let Some(ref tmpl) = template {
-        expand_prompt_tokens(tmpl, workspace)
-    } else if verbose {
-        format!(
-            "you {} $ ",
-            std::path::Path::new(workspace)
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default()
-        )
+    if let Some(ref tmpl) = template {
+        return expand_prompt_tokens(tmpl, workspace, model, is_vi);
+    }
+    if rich {
+        return expand_prompt_tokens(DEFAULT_RICH_PROMPT, workspace, model, is_vi);
+    }
+    let base = std::path::Path::new(workspace)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let plain = if verbose {
+        format!("you {base} $ ")
     } else {
-        format!(
-            "{} $ ",
-            std::path::Path::new(workspace)
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default()
-        )
+        format!("{base} $ ")
     };
-
     if is_vi {
-        format!("[i] {expanded}")
+        format!("[i] {plain}")
     } else {
-        expanded
+        plain
     }
 }
 
-fn expand_prompt_tokens(template: &str, workspace: &str) -> String {
+fn expand_prompt_tokens(template: &str, workspace: &str, model: &str, is_vi: bool) -> String {
     let ws_base = std::path::Path::new(workspace)
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -918,11 +1141,38 @@ fn expand_prompt_tokens(template: &str, workspace: &str) -> String {
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|| "localhost".into());
+    let user = std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .unwrap_or_default();
+    let now = chrono::Local::now();
+    let timestamp = now.format("%Y-%m-%d %H:%M:%S").to_string();
+    let date = now.format("%Y-%m-%d").to_string();
+    let time = now.format("%H:%M:%S").to_string();
+    let mode = if is_vi { "vi" } else { "emacs" };
+    let version = env!("CARGO_PKG_VERSION");
     template
+        // Readable `$NAME` macros. Longer names BEFORE their prefixes
+        // (`$TIMESTAMP` before `$TIME`, `$MODEL` before `$MODE`) so a short
+        // name never clobbers a longer one.
+        .replace("$TIMESTAMP", &timestamp)
+        .replace("$DATE", &date)
+        .replace("$TIME", &time)
+        .replace("$MODEL", model)
+        .replace("$MODE", mode)
+        .replace("$USER", &user)
+        .replace("$HOST", &host)
+        .replace("$VERSION", version)
+        .replace("$PATH", workspace)
+        .replace("$WS", &ws_base)
+        // Terse `\x` PS1 tokens (bash-style; e.g. `\u@\h:\W`).
         .replace("\\W", workspace)
         .replace("\\w", &ws_base)
         .replace("\\h", &host)
-        .replace("\\v", env!("CARGO_PKG_VERSION"))
+        .replace("\\u", &user)
+        .replace("\\t", &timestamp)
+        .replace("\\m", model)
+        .replace("\\M", mode)
+        .replace("\\v", version)
 }
 
 /// Read-only enforcement caveats (read anything; no write/exec/net) — the safe
@@ -3025,7 +3275,16 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
     }
     println!();
 
-    let mut rl = rustyline::DefaultEditor::with_config(build_rl_config())?;
+    // Whether the built-in default prompt is the rich one (timestamp + status
+    // folded into the prompt line). An explicit `[tui] prompt` overrides it;
+    // `footer_on` also gates the multi-line helper. The prompt itself is built
+    // fresh each turn (below) so the timestamp is current.
+    let footer_on = footer_rich_enabled(footer_mode(), io::stdout().is_terminal());
+    let mut rl: rustyline::Editor<FooterHelper, rustyline::history::DefaultHistory> =
+        rustyline::Editor::with_config(build_rl_config())?;
+    if footer_on {
+        install_footer_helper(&mut rl);
+    }
     if let Some(ref hp) = history_path {
         let _ = rl.load_history(hp);
     }
@@ -3035,8 +3294,8 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
     #[cfg(unix)]
     mark_fds_cloexec();
 
-    let is_vi = build_rl_config().edit_mode() == rustyline::config::EditMode::Vi;
-    let prompt = prompt_str(workspace, verbose, is_vi);
+    // `mut` so a runtime `/vi` / `/emacs` switch is reflected in the next prompt.
+    let mut is_vi = build_rl_config().edit_mode() == rustyline::config::EditMode::Vi;
 
     // system prompt is built AFTER initialize_all (see below) so soul files are loaded.
     // Placeholder until then.
@@ -3270,6 +3529,11 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                 );
                 break;
             }
+            // Build the prompt FRESH for this turn so the rich default's
+            // timestamp is current; rustyline floats it at the bottom while
+            // idle and it stays in scrollback (the per-turn log marker) on
+            // submit — no region, no cursor games.
+            let prompt = prompt_str(workspace, verbose, is_vi, &inf_model, footer_on);
             let readline_result =
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rl.readline(&prompt)));
             match readline_result {
@@ -3286,7 +3550,9 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
         };
         match readline_result {
             Ok(line) => {
-                let task = line.trim().to_string();
+                // Rejoin `\`-continued lines (multi-line entry) into real
+                // newlines; a no-op for single-line input.
+                let task = line.replace("\\\n", "\n").trim().to_string();
                 if task.is_empty() {
                     continue;
                 }
@@ -3545,10 +3811,17 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                         );
                     }
                     let fresh_cfg = build_rl_config();
-                    rl = rustyline::DefaultEditor::with_config(fresh_cfg)?;
+                    rl = rustyline::Editor::with_config(fresh_cfg)?;
+                    if footer_on {
+                        install_footer_helper(&mut rl);
+                    }
                     if let Some(ref hp) = history_path {
                         let _ = rl.load_history(hp);
                     }
+                    // A `/vi` / `/emacs` switch sets NEWT_EDIT_MODE, which the
+                    // rebuilt editor above just read; keep is_vi in sync so the
+                    // next (freshly built) prompt reflects the new mode.
+                    is_vi = build_rl_config().edit_mode() == rustyline::config::EditMode::Vi;
                 } else if matches!(task.as_str(), "exit" | "quit") {
                     clean_exit = true;
                     break;
@@ -5607,6 +5880,9 @@ fn help_lines() -> &'static [&'static str] {
         "  /mode <name>             - enter a named mode: load skill + clamp authority (floor)",
         "  /mode                    - show the active mode; /mode off clears it",
         "  /workspace               - show current workspace path",
+        "  /prompt                  - list prompt tokens ($MODEL, $DATE, …) + current prompt",
+        "  /prompt set \"<template>\"  - set the prompt for this session; /prompt reset to revert",
+        "  /vi  /emacs              - switch line-editor key bindings for this session",
         "  /version                 - print newt version",
         "  /help                    - this message",
         "  /exit  /quit  exit  quit - leave the session",
@@ -5641,6 +5917,101 @@ fn dispatch_slash(
         "version" => print_newt(&format!("v{VERSION}"), color, verbose),
 
         "workspace" => print_newt(workspace, color, verbose),
+
+        "prompt" if arg1 == "set" => {
+            // Everything after "prompt set " is the literal template — taken
+            // from the RAW input so internal/trailing spaces survive, with one
+            // layer of surrounding quotes stripped. Applies for the session
+            // (via NEWT_PROMPT, which the per-turn prompt build reads first);
+            // put it in `[tui] prompt` to persist.
+            let template = input
+                .trim_start_matches('/')
+                .strip_prefix("prompt")
+                .and_then(|s| s.trim_start().strip_prefix("set"))
+                .map(|s| s.strip_prefix(' ').unwrap_or(s))
+                .map(strip_one_quote_pair)
+                .unwrap_or("");
+            if template.is_empty() {
+                print_newt(
+                    "usage: /prompt set \"<template>\"  (try /prompt for the token list)",
+                    color,
+                    verbose,
+                );
+            } else {
+                // SAFETY: single-threaded REPL; the next prompt is built right
+                // after this returns.
+                unsafe { std::env::set_var("NEWT_PROMPT", template) };
+                let (_t, preview) = current_prompt_and_preview(workspace);
+                print_newt(
+                    &format!("prompt set for this session — preview: {preview}"),
+                    color,
+                    verbose,
+                );
+                print_newt(
+                    "(add to [tui] prompt to persist — use $NAME macros there to avoid TOML escaping)",
+                    color,
+                    verbose,
+                );
+            }
+        }
+
+        "prompt" if matches!(arg1, "reset" | "default" | "clear") => {
+            // SAFETY: single-threaded REPL.
+            unsafe { std::env::remove_var("NEWT_PROMPT") };
+            print_newt(
+                "prompt reset to your [tui] prompt / the built-in default.",
+                color,
+                verbose,
+            );
+        }
+
+        "prompt" => {
+            print_newt(
+                "Prompt tokens — `/prompt set \"<template>\"` to change, or `[tui] prompt` to persist:",
+                color,
+                verbose,
+            );
+            for line in prompt_token_help() {
+                println!("{line}");
+            }
+            print_newt(
+                "In config.toml prefer the $NAME macros — the \\x forms are eaten by TOML \
+                 (use a 'literal string' or doubled \\\\).",
+                color,
+                verbose,
+            );
+            let (tmpl, preview) = current_prompt_and_preview(workspace);
+            print_newt(&format!("current: {tmpl:?}"), color, verbose);
+            print_newt(&format!("preview: {preview}"), color, verbose);
+        }
+
+        "vi" | "emacs" | "edit-mode" => {
+            // Switch the line-editor key bindings for the rest of the session.
+            // Sets NEWT_EDIT_MODE; the editor rebuild + the is_vi/caret recompute
+            // back in `run_chat` (after every slash command) pick it up.
+            let want = match cmd {
+                "vi" => Some("vi"),
+                "emacs" => Some("emacs"),
+                _ => match arg1.to_lowercase().as_str() {
+                    "vi" | "vim" => Some("vi"),
+                    "emacs" => Some("emacs"),
+                    _ => None,
+                },
+            };
+            match want {
+                Some(m) => {
+                    // SAFETY: single-threaded REPL; the editor is rebuilt right
+                    // after this returns, before any further input is read.
+                    unsafe { std::env::set_var("NEWT_EDIT_MODE", m) };
+                    print_newt(&format!("edit mode: {m}"), color, verbose);
+                }
+                None => print_newt(
+                    "usage: /edit-mode <vi|emacs>  (or just /vi, /emacs)",
+                    color,
+                    verbose,
+                ),
+            }
+        }
 
         "models" => {
             let cfg = newt_core::Config::resolve().unwrap_or_default();
@@ -9396,10 +9767,13 @@ mod helper_fn_tests {
 
     #[test]
     fn expand_prompt_tokens_replaces_all_tokens() {
-        let out = expand_prompt_tokens("\\w|\\W|\\v", "/tmp/proj");
-        assert_eq!(out, format!("proj|/tmp/proj|{}", env!("CARGO_PKG_VERSION")));
+        let out = expand_prompt_tokens("\\w|\\W|\\v|\\m|\\M", "/tmp/proj", "gpt-4.1", true);
+        assert_eq!(
+            out,
+            format!("proj|/tmp/proj|{}|gpt-4.1|vi", env!("CARGO_PKG_VERSION"))
+        );
         // \h expands to *some* hostname — the token itself must be gone.
-        let host = expand_prompt_tokens("on \\h!", "/tmp/proj");
+        let host = expand_prompt_tokens("on \\h!", "/tmp/proj", "m", false);
         assert!(!host.contains("\\h"), "got: {host}");
         assert!(host.starts_with("on ") && host.ends_with('!'));
     }
@@ -9983,12 +10357,15 @@ mod env_resolution_tests {
     }
 
     #[test]
-    fn prompt_str_expands_newt_prompt_template_and_vi_prefix() {
-        with_env_vars(&[("NEWT_PROMPT", "\\w \\v> ")], &[], || {
-            let p = prompt_str("/tmp/proj", false, false);
-            assert_eq!(p, format!("proj {}> ", env!("CARGO_PKG_VERSION")));
-            let vi = prompt_str("/tmp/proj", false, true);
-            assert_eq!(vi, format!("[i] proj {}> ", env!("CARGO_PKG_VERSION")));
+    fn prompt_str_expands_newt_prompt_template() {
+        // A user template (NEWT_PROMPT) is used verbatim — the user owns it, so
+        // no auto `[i]` prefix; `\M` surfaces the edit mode for those who want
+        // it, and the model/rich args don't interfere with an explicit template.
+        with_env_vars(&[("NEWT_PROMPT", "\\w \\M \\v> ")], &[], || {
+            let vi = prompt_str("/tmp/proj", false, true, "gpt-4.1", true);
+            assert_eq!(vi, format!("proj vi {}> ", env!("CARGO_PKG_VERSION")));
+            let em = prompt_str("/tmp/proj", false, false, "gpt-4.1", false);
+            assert_eq!(em, format!("proj emacs {}> ", env!("CARGO_PKG_VERSION")));
         });
     }
 }

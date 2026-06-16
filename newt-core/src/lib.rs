@@ -66,7 +66,7 @@ pub use agents::AgentsProvider;
 pub use caveats::{CaveatsExt, CountBoundExt, ScopeExt};
 pub use config::{
     AgentsConfig, BackendConfig, BackendKind, BundleConfig, ChatStyle, Config, ConversationsConfig,
-    EditMode, Loadout, LoadoutSettings, LogConfig, MemoryConfig, MemoryDisclosure,
+    EditMode, FooterMode, Loadout, LoadoutSettings, LogConfig, MemoryConfig, MemoryDisclosure,
     MemoryProviderKind, PermissionPreset, PickVia, ProfilePick, ProviderConfig, SkillsConfig,
     ToolPermissions, TuiConfig,
 };

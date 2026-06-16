@@ -1,15 +1,40 @@
-//! `newt config` — print the resolved configuration.
+//! `newt config` — print the resolved configuration as a documented starter
+//! (e.g. `newt config > ~/.newt/config.toml`).
 
 use newt_core::Config;
 use std::path::Path;
 
 pub fn run(config_path: Option<&Path>) -> anyhow::Result<()> {
-    let config = match config_path {
+    let mut config = match config_path {
         Some(p) => Config::load(p)?,
         None => Config::resolve()?,
     };
+
+    // Surface the prompt set to its built-in default (visible + editable) when
+    // the user hasn't set one, so the dump is a usable starter config.
+    let tui = config.tui.get_or_insert_with(Default::default);
+    if tui.prompt.is_none() {
+        tui.prompt = Some(newt_tui::DEFAULT_RICH_PROMPT.to_string());
+    }
+
+    println!("# Resolved Newt configuration  (Config::resolve() search order)");
+    println!("#");
+    println!("# [tui] edit_mode = \"emacs\" | \"vi\"     (shipped default: emacs)");
+    println!("# [tui] footer    = \"auto\" | \"on\" | \"off\"   (auto = rich prompt on a TTY)");
+    println!("#");
+    println!("# [tui] prompt — customize with these tokens (or run `/prompt` in a session).");
+    println!("#   Prefer the $NAME macros here: TOML eats backslashes, so the \\x forms need");
+    println!("#   a 'literal string' (single quotes) or doubled \\\\ (e.g. \"\\\\t\").");
+    for (name, slash, desc) in newt_tui::PROMPT_TOKENS {
+        if slash.is_empty() {
+            println!("#   {name:<11}       {desc}");
+        } else {
+            println!("#   {name:<11}  {slash:<3}  {desc}");
+        }
+    }
+    println!();
+
     let toml_str = toml::to_string_pretty(&config)?;
-    println!("# Resolved Newt configuration\n# Source: Config::resolve() search order\n");
     println!("{toml_str}");
     Ok(())
 }
