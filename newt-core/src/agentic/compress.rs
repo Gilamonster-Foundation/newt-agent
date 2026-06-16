@@ -124,6 +124,10 @@ pub struct CompressState {
     attempts: usize,
     disabled: bool,
     notified: bool,
+    /// One-time latch for the fail-open notice (Step 20.3), kept separate
+    /// from `notified` so the over-budget-dispatch message and the
+    /// compression-disabled message each surface at most once.
+    failopen_notified: bool,
 }
 
 impl Default for CompressState {
@@ -139,6 +143,7 @@ impl CompressState {
             attempts: 0,
             disabled: false,
             notified: false,
+            failopen_notified: false,
         }
     }
 
@@ -210,6 +215,26 @@ impl CompressState {
             Some(
                 "context compression reclaimed <10% twice in a row — auto-compression \
                  is disabled for this session; start a new conversation to reset"
+                    .to_string(),
+            )
+        } else {
+            None
+        }
+    }
+
+    /// One-time fail-open notice (Step 20.3): compression is latched off and
+    /// the context exceeds the budget, but that budget rests on the
+    /// proven-good high-water mark alone — no authoritative window is known
+    /// for this model. Rather than refuse (which would starve the very
+    /// acceptance evidence that raises the HWM), the send proceeds and the
+    /// backend rules. Surfaced once per session.
+    fn take_failopen_notice(&mut self) -> Option<String> {
+        if !self.failopen_notified {
+            self.failopen_notified = true;
+            Some(
+                "context exceeds the proven-good budget, but no authoritative window \
+                 limit is known for this model — dispatching over budget and letting \
+                 the backend decide; an accepted size raises the learned budget"
                     .to_string(),
             )
         } else {
@@ -332,6 +357,14 @@ pub(crate) struct CompressRequest<'a> {
     pub max_messages: Option<usize>,
     /// The original task — anchored verbatim into the summary request.
     pub task: &'a str,
+    /// True when `budget` rests on an authoritative ceiling (Step 20.3) — a
+    /// believed/declared window, the `num_ctx` ceiling, a configured token
+    /// threshold, or a cw-400 cap. False when it rests on the proven-good
+    /// high-water mark alone, in which case anti-thrash dispatches over budget
+    /// (`DispatchedOverBudget`) instead of refusing. `true` for every non-guard
+    /// caller (cw-400 recovery, overflow retry, `/compress`, memory) —
+    /// preserving today's refuse-on-exceed behavior there.
+    pub authoritative: bool,
     /// True when `budget` came from a token trigger (mid-loop token
     /// threshold, send-budget guard, cw-400 recovery, overflow retry) — the
     /// hard correctness guard that consults and feeds anti-thrash. Count-only
@@ -368,6 +401,9 @@ impl<'a> CompressRequest<'a> {
             max_messages: None,
             task,
             hard_budget: false,
+            // Moot for a soft (`hard_budget: false`) manual run — it never
+            // reaches the refuse branch — but kept truthful (Step 20.3).
+            authoritative: true,
             focus,
         }
     }
@@ -385,9 +421,17 @@ pub(crate) enum CompressAction {
     /// Middle replaced with the static fallback marker (no summarizer, or
     /// the summarizer failed).
     StaticFallback,
-    /// Anti-thrash disabled compression while the list exceeds the budget:
+    /// Anti-thrash disabled compression while the list exceeds an
+    /// *authoritative* budget (a believed/declared window or a cw-400 cap):
     /// the caller must refuse the send rather than silently truncate.
     Refused,
+    /// Anti-thrash disabled compression while the list exceeds a
+    /// *non-authoritative* budget — one resting on the proven-good
+    /// high-water mark alone, with no believed ceiling (Step 20.3). The HWM
+    /// is a floor of known-good, never a cap; refusing here would starve the
+    /// acceptance evidence that raises it. The caller dispatches over budget
+    /// and lets the backend be the authority (fail open).
+    DispatchedOverBudget,
 }
 
 impl CompressAction {
@@ -399,6 +443,7 @@ impl CompressAction {
             Self::Summarized => "prune + summary",
             Self::StaticFallback => "prune + static marker",
             Self::Refused => "refused",
+            Self::DispatchedOverBudget => "over budget — dispatched",
         }
     }
 }
@@ -446,15 +491,31 @@ pub(crate) async fn compress(
     }
     if state.disabled && req.hard_budget {
         if tokens_over_entry {
-            // The hard guard stays: better to refuse the send than let the
-            // backend silently truncate the head (B6's 9/10 failure mode).
+            if req.authoritative {
+                // The hard guard stays: better to refuse the send than let the
+                // backend silently truncate the head (B6's 9/10 failure mode).
+                return CompressOutcome {
+                    messages: req.messages.to_vec(),
+                    action: CompressAction::Refused,
+                    fired: false,
+                    tokens_before,
+                    tokens_after: tokens_before,
+                    notice: state.take_notice(),
+                };
+            }
+            // Step 20.3: the budget rests on the proven-good high-water mark
+            // alone — no authoritative window is known for this model (the
+            // cloud / no-`/api/show` case). The HWM is a floor of known-good,
+            // not a cap; refusing here is the death spiral — it discards the
+            // very acceptance evidence that would raise the HWM out of the
+            // hole. Fail OPEN: dispatch over budget and let the backend rule.
             return CompressOutcome {
                 messages: req.messages.to_vec(),
-                action: CompressAction::Refused,
+                action: CompressAction::DispatchedOverBudget,
                 fired: false,
                 tokens_before,
                 tokens_after: tokens_before,
-                notice: state.take_notice(),
+                notice: state.take_failopen_notice(),
             };
         }
         // A hard trigger fired but the message estimate fits its budget
@@ -1195,6 +1256,7 @@ mod tests {
     }
 
     /// Hard-budget invocation (token threshold / send-budget semantics).
+    /// Authoritative: the disabled-and-over case refuses (B6).
     async fn run(
         messages: &[Value],
         budget: usize,
@@ -1209,6 +1271,33 @@ mod tests {
                 max_messages,
                 task: "fix the failing test",
                 hard_budget: true,
+                authoritative: true,
+                focus: None,
+            },
+            summarizer,
+            state,
+        )
+        .await
+    }
+
+    /// Hard-budget invocation on a NON-authoritative budget (Step 20.3): the
+    /// proven-good HWM alone, no believed ceiling. The disabled-and-over case
+    /// fails open (`DispatchedOverBudget`) instead of refusing.
+    async fn run_non_authoritative(
+        messages: &[Value],
+        budget: usize,
+        max_messages: Option<usize>,
+        summarizer: Option<&SummarizeFn>,
+        state: &mut CompressState,
+    ) -> CompressOutcome {
+        compress(
+            CompressRequest {
+                messages,
+                budget,
+                max_messages,
+                task: "fix the failing test",
+                hard_budget: true,
+                authoritative: false,
                 focus: None,
             },
             summarizer,
@@ -1233,6 +1322,7 @@ mod tests {
                 max_messages,
                 task: "fix the failing test",
                 hard_budget: false,
+                authoritative: false,
                 focus: None,
             },
             summarizer,
@@ -1407,6 +1497,7 @@ mod tests {
                 max_messages: None,
                 task,
                 hard_budget: true,
+                authoritative: true,
                 focus: None,
             },
             Some(&*s),
@@ -2215,6 +2306,63 @@ mod tests {
         // Under-budget calls still pass through untouched while disabled.
         let ok = run(&msgs, 100_000, None, None, &mut state).await;
         assert_eq!(ok.action, CompressAction::Fit);
+    }
+
+    /// Step 20.3 — the fail-open path. With anti-thrash latched and the
+    /// context over a NON-authoritative budget (the proven-good HWM alone, no
+    /// believed window — the cloud / gpt-4.1 case), the send must NOT be
+    /// refused. Refusing there is the death spiral: it discards the very
+    /// acceptance evidence that would raise the HWM. Instead the messages pass
+    /// through unchanged as `DispatchedOverBudget` so the caller dispatches and
+    /// the backend rules.
+    #[tokio::test]
+    async fn non_authoritative_budget_fails_open_instead_of_refusing() {
+        let mut msgs = vec![sys(&"s".repeat(4_000)), user("task")];
+        for i in 0..3 {
+            msgs.push(user(&format!("note {i}")));
+        }
+        let mut state = CompressState::new();
+
+        // Two incompressible poor passes latch anti-thrash (same as the
+        // refuse test), but on a non-authoritative budget.
+        let first = run_non_authoritative(&msgs, 100, None, None, &mut state).await;
+        assert_ne!(first.action, CompressAction::Refused);
+        let _second = run_non_authoritative(&msgs, 100, None, None, &mut state).await;
+        assert!(state.disabled, "two poor passes must latch the breaker");
+
+        // The latched, over-budget third call FAILS OPEN — never Refused.
+        let third = run_non_authoritative(&msgs, 100, None, None, &mut state).await;
+        assert_eq!(third.action, CompressAction::DispatchedOverBudget);
+        assert!(!third.fired, "messages pass through unchanged");
+        assert_eq!(third.messages.len(), msgs.len(), "nothing dropped");
+        let notice = third.notice.expect("fail-open is surfaced once");
+        assert!(notice.contains("no authoritative window"), "{notice}");
+
+        // And the fail-open notice fires exactly once.
+        let fourth = run_non_authoritative(&msgs, 100, None, None, &mut state).await;
+        assert_eq!(fourth.action, CompressAction::DispatchedOverBudget);
+        assert!(fourth.notice.is_none(), "notice delivered exactly once");
+    }
+
+    /// Step 20.3 — the authoritative budget still refuses (B6 preserved): a
+    /// declared/believed window or cw-400 cap must stop a send the backend
+    /// would silently head-truncate. Only the lone HWM fails open.
+    #[tokio::test]
+    async fn authoritative_budget_still_refuses_when_latched() {
+        let mut msgs = vec![sys(&"s".repeat(4_000)), user("task")];
+        for i in 0..3 {
+            msgs.push(user(&format!("note {i}")));
+        }
+        let mut state = CompressState::new();
+        run(&msgs, 100, None, None, &mut state).await;
+        run(&msgs, 100, None, None, &mut state).await;
+        assert!(state.disabled);
+        let third = run(&msgs, 100, None, None, &mut state).await;
+        assert_eq!(
+            third.action,
+            CompressAction::Refused,
+            "an authoritative ceiling must still refuse, not truncate"
+        );
     }
 
     /// Effective compressions never trip the anti-thrash switch.

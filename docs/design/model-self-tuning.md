@@ -1,6 +1,7 @@
 # Phase 20 — Model self-tuning: learning from observed usage
 
-**Status:** Step 20.1 complete (PR #313); Step 20.2 in progress.
+**Status:** Step 20.1 complete (PR #313); Step 20.2 shipped; Step 20.3
+(fail-open for non-authoritative budgets) — this PR.
 **Motivating failure:** a live nemotron3:33b session (2026-06-12, v0.6.7)
 died with `context (~8704 tokens) exceeds the model's input budget and
 auto-compression is disabled after repeated ineffective passes` — while the
@@ -235,6 +236,76 @@ number 20.1's `initial_send_budget` trusts as the proven floor.
 for stale entries and `(window not empirically probed — run /probe window)`
 when `tune_confidence < High`. No automatic re-probe — discovery stays an
 explicit, user-initiated action.
+
+## 4b. Step 20.3 — the proven-good floor must never gate (fail open)
+
+**Motivating failure (round two):** a live `gpt-4.1` session
+(2026-06-16, v0.6.8) died with `context (~6046 tokens) exceeds the model's
+input budget and auto-compression is disabled after repeated ineffective
+passes` — the §1 nemotron failure, but on a cloud model that handles ~1M
+tokens. Resetting the tuning rebuilt the same collapse within a few turns.
+
+### 4b.1 Why 20.1's `max(proven, believed)` fix did not cover it
+
+The capability-discovery machinery (`/api/show` window seeding, `/probe`)
+is **Ollama-only** (§4.1, §4.2). A cloud OpenAI-compatible endpoint never
+seeds `safe_context`, so the "believed" leg of `max(max_ok_input,
+safe_context)` is always `None`. The send budget collapses to
+`max_ok_input` alone — and `initial_send_budget` feeds it to the pre-send
+guard as a *compression-under target*. The proven-good high-water mark
+("≥ this works") is thereby inverted into a ceiling ("never exceed this"),
+exactly the §2.1 warning. When the irreducible context (system prompt +
+tools + one message) already sits near the starved HWM, every compression
+pass reclaims <10%, anti-thrash latches, and the loop refuses its own
+send — discarding the acceptance evidence that would raise the HWM. A
+one-way ratchet with no floor and a fail-closed breaker.
+
+### 4b.2 Design: authority decides refusal, not the budget number
+
+The send-budget guard may still *fire* a best-effort compression on any
+over-budget context — that is free and sometimes helps. What it must not do
+is **refuse** on a budget that rests on the proven-good HWM alone. Refusal
+is reserved for *authoritative* ceilings:
+
+- a configured `mid_loop_trim_tokens` threshold that fired (user-authoritative),
+- a believed/declared window (`safe_context`),
+- the per-request `num_ctx` input ceiling,
+- a cw-400 cap parsed mid-turn (authoritative from that point on).
+
+`CompressRequest` carries an `authoritative: bool`. The loop computes it
+where budget provenance is actually known — `token_fired ||
+send_budget_authoritative`, the latter being `safe_context.is_some() ||
+num_ctx_ceiling.is_some()`, flipped `true` when a cw-400 reins the budget.
+In `compress()`, the disabled-and-over branch refuses **only** when
+`authoritative`; otherwise it returns the new `DispatchedOverBudget`
+outcome — messages unchanged — so the caller dispatches over budget and the
+backend rules. One over-budget acceptance then raises `max_ok_input`
+(20.1's `Accepted` observation) and the session climbs out of the hole.
+
+This preserves baseline B6 (a real declared/`num_ctx`/cw-400 ceiling still
+refuses rather than letting the backend silently head-truncate) while
+ending the death spiral for models with no authoritative window. The
+fail-open dispatch is surfaced once per session.
+
+### 4b.3 Step 20.3 — what this PR does
+
+- `CompressRequest.authoritative` + `CompressAction::DispatchedOverBudget`;
+  the `compress()` refuse branch fails open when non-authoritative.
+- `CompressState.take_failopen_notice` — the one-time fail-open notice.
+- Both inference loops compute `send_budget_authoritative` (`safe_context`
+  or `num_ctx` ceiling present) and set it true on a cw-400 recovery; the
+  per-request `authoritative` is `token_fired || send_budget_authoritative`.
+- Every non-guard `compress()` caller (cw-400 recovery, overflow retry,
+  `/compress`, memory compaction) passes `authoritative: true` — today's
+  refuse-on-exceed behavior is unchanged there.
+- Tests: `compress()` fails open on a latched non-authoritative budget and
+  still refuses on an authoritative one; a wiremock loop-level test proves a
+  lone-HWM (cloud) session dispatches past the latch instead of bailing.
+
+**Out of scope (deferred to a follow-up step):** seeding `safe_context` for
+non-Ollama endpoints from config or a community tuning profile (a generous
+cloud prior). That is a config-surface change; 20.3 is the safety net that
+makes the missing prior non-fatal.
 
 ## 5. Out of scope (both steps)
 
