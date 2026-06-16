@@ -124,6 +124,22 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "NAME")]
     pub profile: Option<String>,
 
+    /// Load a named bundle (`[bundles.<name>]`) — the loadable unit of the model
+    /// support kit. The bundle resolves to a profile for the active model (its
+    /// `families` map, else `default_profile`). `--profile` overrides it; with
+    /// neither, a bundle whose `applies_to` matches the model is auto-inferred.
+    /// Equivalent to `NEWT_BUNDLE=<name>`. An unknown bundle is a hard error.
+    #[arg(long, global = true, value_name = "NAME")]
+    pub bundle: Option<String>,
+
+    /// Load a named loadout (`[loadouts.<name>]`) — the full composition of
+    /// provider → model → kit → role → settings. Each axis is fed to its existing
+    /// selector; an explicit `--profile`/`--bundle`/`--num-ctx`/`--persona`
+    /// overrides the corresponding loadout field. Equivalent to `NEWT_LOADOUT=<name>`.
+    /// An unknown loadout or a dangling reference inside it is a hard error.
+    #[arg(long, global = true, value_name = "NAME")]
+    pub loadout: Option<String>,
+
     /// Directory to search for AGENTS.md/CLAUDE.md, or a specific instructions
     /// file. Default: the workspace (`./`). Also `[agents] path`.
     #[arg(long, global = true, value_name = "PATH")]
@@ -302,6 +318,68 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
                 // validates it against [profiles.<name>] once per session.
                 unsafe { std::env::set_var("NEWT_PROFILE", p) };
             }
+            if let Some(b) = cli.bundle.as_deref().filter(|b| !b.is_empty()) {
+                // --bundle threads the same way; run_chat resolves it → a profile
+                // for the active model, with --profile taking precedence.
+                unsafe { std::env::set_var("NEWT_BUNDLE", b) };
+            }
+            // --loadout (NEWT_LOADOUT): resolve the named composition and feed each
+            // axis's EXISTING selector — explicit --profile/--bundle/--num-ctx/
+            // --persona override it (a loadout is a default you can poke). This is
+            // the dispatcher-not-merger design: run_chat resolves each axis as usual.
+            let loadout_role: Option<String> = {
+                let name = cli
+                    .loadout
+                    .clone()
+                    .or_else(|| std::env::var("NEWT_LOADOUT").ok())
+                    .filter(|s| !s.is_empty());
+                if let Some(name) = name {
+                    let cfg = newt_core::Config::resolve()?;
+                    let loadout = cfg.loadouts.get(&name).ok_or_else(|| {
+                        let known = if cfg.loadouts.is_empty() {
+                            "none defined".to_string()
+                        } else {
+                            cfg.loadouts.keys().cloned().collect::<Vec<_>>().join(", ")
+                        };
+                        anyhow::anyhow!("no such loadout '{name}' (known: {known})")
+                    })?;
+                    loadout
+                        .validate(&cfg)
+                        .map_err(|e| anyhow::anyhow!("loadout '{name}': {e}"))?;
+                    // SAFETY: single-threaded before the TUI starts async work.
+                    unsafe {
+                        if cli.profile.is_none() {
+                            if let Some(p) = &loadout.profile {
+                                std::env::set_var("NEWT_PROFILE", p);
+                            }
+                        }
+                        if cli.bundle.is_none() {
+                            if let Some(k) = &loadout.kit {
+                                std::env::set_var("NEWT_BUNDLE", k);
+                            }
+                        }
+                        if cli.num_ctx.is_none() {
+                            if let Some(n) = loadout.settings.as_ref().and_then(|s| s.num_ctx) {
+                                std::env::set_var("NEWT_NUM_CTX", n.to_string());
+                            }
+                        }
+                        // Model selection: Slice 2 resolves `@variant` via the catalog;
+                        // here the bare model id feeds the existing selector.
+                        if std::env::var_os("NEWT_DGX_MODEL").is_none() {
+                            if let Some(m) = &loadout.model {
+                                let bare = m.split('@').next().unwrap_or(m);
+                                std::env::set_var("NEWT_DGX_MODEL", bare);
+                            }
+                        }
+                    }
+                    // role → persona, unless --persona was given explicitly.
+                    cli.persona
+                        .as_ref()
+                        .map_or_else(|| loadout.role.clone(), |_| None)
+                } else {
+                    None
+                }
+            };
             // --ephemeral threads to the TUI the same way (Step 17.7): the
             // session start resolution reads NEWT_EPHEMERAL once.
             if cli.ephemeral {
@@ -340,7 +418,9 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
                 .map(|t| t.no_splash)
                 .unwrap_or(false);
             let no_splash = (cli.no_splash || config_no_splash) && !cli.splash;
-            newt_tui::run_code(path.as_deref(), no_splash, cli.persona.as_deref())
+            // The loadout's `role` is the persona when `--persona` was not given.
+            let persona = cli.persona.as_deref().or(loadout_role.as_deref());
+            newt_tui::run_code(path.as_deref(), no_splash, persona)
         }
         Command::Pilot { flight_id } => newt_tui::run_pilot(&flight_id),
         Command::Worker {

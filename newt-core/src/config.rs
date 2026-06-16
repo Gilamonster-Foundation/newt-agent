@@ -127,6 +127,22 @@ pub struct Config {
     /// Empty by default — no profile, behavior unchanged. See [`ProfileConfig`].
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub profiles: std::collections::BTreeMap<String, ProfileConfig>,
+
+    /// Named bundles (`[bundles.<name>]`) — the loadable unit of the model support
+    /// kit (`docs/design/model-support-kit.md`). A bundle pins which model families
+    /// it applies to and which profile each resolves to. Selected by `--bundle
+    /// <name>` or inferred from the model via `applies_to`. Empty by default — no
+    /// bundle, behavior unchanged. See [`BundleConfig`].
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub bundles: std::collections::BTreeMap<String, BundleConfig>,
+
+    /// Named loadouts (`[loadouts.<name>]` or `~/.newt/loadouts/<name>.toml`) — the
+    /// top-level composition of `provider → model → kit → role → settings`
+    /// (`docs/design/loadout-composition.md`). Inert until the resolver is wired
+    /// (Slice 1): this carries the data model + reference validation + `/loadout`
+    /// show. Empty by default. See [`Loadout`].
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub loadouts: std::collections::BTreeMap<String, Loadout>,
 }
 
 /// One named mode (`[modes.<name>]`, issue #307): the atomic binding the
@@ -229,17 +245,27 @@ impl Default for RetryKnobs {
 }
 
 impl ProfileConfig {
-    /// Validate the profile: every named technique must be in [`KNOWN_TECHNIQUES`].
+    /// Validate the profile against the [component registry](crate::kit): every
+    /// named technique must be a known component, and every component's
+    /// `presupposes` must also be enabled (e.g. `retry` presupposes `verify_gate`).
+    /// A presupposition gap is a **load-time** error, not a silent partial apply.
     ///
     /// # Errors
-    /// Returns the first unknown technique name as an error message.
+    /// Returns the first unknown-technique or unmet-presupposition as a message.
     pub fn validate(&self) -> std::result::Result<(), String> {
         for t in &self.techniques {
-            if !KNOWN_TECHNIQUES.contains(&t.as_str()) {
+            let Some(entry) = crate::kit::component(t) else {
                 return Err(format!(
                     "unknown technique '{t}' in profile (known: {})",
                     KNOWN_TECHNIQUES.join(", ")
                 ));
+            };
+            for pre in entry.presupposes {
+                if !self.techniques.iter().any(|x| x == pre) {
+                    return Err(format!(
+                        "technique '{t}' presupposes '{pre}', which the profile does not enable"
+                    ));
+                }
             }
         }
         Ok(())
@@ -838,6 +864,226 @@ impl Config {
         profile.validate()?;
         Ok(profile)
     }
+
+    /// Look up a named bundle (`[bundles.<name>]`).
+    ///
+    /// # Errors
+    /// `no such bundle` when undefined — a `--bundle` that silently did nothing
+    /// would be a false claim.
+    pub fn resolve_bundle(&self, name: &str) -> std::result::Result<&BundleConfig, String> {
+        self.bundles.get(name).ok_or_else(|| {
+            let known = if self.bundles.is_empty() {
+                "none defined".to_string()
+            } else {
+                self.bundles.keys().cloned().collect::<Vec<_>>().join(", ")
+            };
+            format!("no such bundle (known: {known})")
+        })
+    }
+
+    /// The profile name `bundle` yields for `model`: the longest-prefix `families`
+    /// match, else `default_profile`. `None` ⇒ the bundle applies no profile here.
+    #[must_use]
+    pub fn bundle_profile_for_model<'a>(
+        &self,
+        bundle: &'a BundleConfig,
+        model: &str,
+    ) -> Option<&'a str> {
+        bundle
+            .families
+            .iter()
+            .filter(|(prefix, _)| model.starts_with(prefix.as_str()))
+            .max_by_key(|(prefix, _)| prefix.len()) // longest-prefix-wins
+            .map(|(_, p)| p.as_str())
+            .or(bundle.default_profile.as_deref())
+    }
+
+    /// Infer the bundle for `model` from `applies_to` (longest-prefix-wins). Only
+    /// bundles with a non-empty `applies_to` participate — a use-case bundle (empty
+    /// `applies_to`) is never auto-inferred, only chosen explicitly via `--bundle`.
+    #[must_use]
+    pub fn infer_bundle(&self, model: &str) -> Option<(&str, &BundleConfig)> {
+        self.bundles
+            .iter()
+            .filter_map(|(name, b)| {
+                b.applies_to
+                    .iter()
+                    .filter(|p| model.starts_with(p.as_str()))
+                    .map(String::len)
+                    .max()
+                    .map(|best| (best, name.as_str(), b))
+            })
+            .max_by_key(|(best, _, _)| *best)
+            .map(|(_, name, b)| (name, b))
+    }
+
+    /// Resolve the active profile from the selectors + the active `model`:
+    /// `--profile` (explicit) > `--bundle` (its profile for this model) > an
+    /// inferred bundle (`applies_to`) > `None` (today's no-profile behavior).
+    /// Returns the profile NAME + how it was chosen (for the banner).
+    ///
+    /// # Errors
+    /// An unknown explicit `--bundle` is a hard error. An unknown explicit
+    /// `--profile` is left for the caller's [`resolve_profile`](Self::resolve_profile)
+    /// so the message stays profile-specific.
+    pub fn pick_active_profile(
+        &self,
+        profile_flag: Option<&str>,
+        bundle_flag: Option<&str>,
+        model: &str,
+    ) -> std::result::Result<Option<ProfilePick>, String> {
+        if let Some(p) = profile_flag.filter(|s| !s.is_empty()) {
+            return Ok(Some(ProfilePick {
+                name: p.to_string(),
+                via: PickVia::Profile,
+            }));
+        }
+        if let Some(b) = bundle_flag.filter(|s| !s.is_empty()) {
+            let bundle = self.resolve_bundle(b)?;
+            return Ok(self
+                .bundle_profile_for_model(bundle, model)
+                .map(|p| ProfilePick {
+                    name: p.to_string(),
+                    via: PickVia::Bundle(b.to_string()),
+                }));
+        }
+        if let Some((name, bundle)) = self.infer_bundle(model) {
+            return Ok(self
+                .bundle_profile_for_model(bundle, model)
+                .map(|p| ProfilePick {
+                    name: p.to_string(),
+                    via: PickVia::InferredBundle(name.to_string()),
+                }));
+        }
+        Ok(None)
+    }
+}
+
+/// One named bundle (`[bundles.<name>]`) — the loadable unit of the model support
+/// kit. It pins which model families it applies to and which profile each resolves
+/// to, shipping the `[profiles.*]` it references.
+///
+/// ```toml
+/// [bundles.nemotron]
+/// about = "Support bundle for the nemotron family"
+/// applies_to = ["nemotron"]                 # longest-prefix-wins; "nemotron3:33b" matches
+/// default_profile = "nemotron"
+/// families = { "nemotron" = "nemotron", "qwen" = "qwen-coder" }
+/// ```
+///
+/// A bundle carries **no authority** — there is deliberately no caveats/preset
+/// field; it recombines vetted parts, it cannot grant (`docs/design/model-support-kit.md`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct BundleConfig {
+    /// One-line provenance, shown in the startup banner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub about: Option<String>,
+    /// Model-id prefixes this bundle auto-applies to (longest-prefix-wins). Empty ⇒
+    /// a use-case bundle: chosen only via explicit `--bundle`, never auto-inferred.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub applies_to: Vec<String>,
+    /// Profile applied when this bundle is selected and no `families` entry matches.
+    /// Must name a key in `[profiles.*]`. `None` ⇒ no profile (the light path).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_profile: Option<String>,
+    /// model-family-prefix → profile name (longest-prefix-wins over `default_profile`).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub families: std::collections::BTreeMap<String, String>,
+}
+
+/// The active-profile selection + how it was chosen (for honest banner output).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProfilePick {
+    /// The chosen profile name (to feed [`Config::resolve_profile`]).
+    pub name: String,
+    /// Which selector won.
+    pub via: PickVia,
+}
+
+/// How a [`ProfilePick`] was selected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PickVia {
+    /// An explicit `--profile` / `NEWT_PROFILE`.
+    Profile,
+    /// An explicit `--bundle <name>`.
+    Bundle(String),
+    /// A bundle inferred from the model via `applies_to`.
+    InferredBundle(String),
+}
+
+/// One named loadout (`[loadouts.<name>]` / `~/.newt/loadouts/<name>.toml`) — the
+/// top-level composition the user *loads* (`docs/design/loadout-composition.md`).
+/// Every field is optional and is a **name reference** into the surface that owns
+/// that axis; the loadout itself stores nothing but the selection + per-axis
+/// overrides. It carries **no authority** — `settings` cannot widen caveats.
+///
+/// ```toml
+/// [loadouts.dev-nemotron]
+/// provider = "dgx"          # → the catalog/provider card (#387)
+/// model    = "nemotron@deep"
+/// kit      = "nemotron"     # → a [bundles.<name>] (the loadable kit unit)
+/// profile  = "nemotron"     # → a [profiles.<name>] (optional; the bundle implies it)
+/// role     = "python-developer"   # → ~/.newt/personas/<name>.md
+///   [loadouts.dev-nemotron.settings]
+///   num_ctx = 24576
+///   framing = "Ship small, verify."
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct Loadout {
+    /// Provider id (→ the catalog/provider card). Resolution is Slice 2.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// Model id, optionally `model@variant`. Resolution is Slice 2.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Bundle name (the loadable kit unit) — must name a `[bundles.<name>]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kit: Option<String>,
+    /// Profile name — must name a `[profiles.<name>]`. Omitted ⇒ the bundle/model
+    /// implies it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+    /// Role/persona name (`~/.newt/personas/<name>.md`). Not validated against the
+    /// filesystem here — personas are resolved at session start.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    /// Per-axis overrides (parameters / prompt). Never authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settings: Option<LoadoutSettings>,
+}
+
+/// Per-axis overrides a loadout may pin. **No authority axis** — a loadout cannot
+/// widen caveats (`docs/design/loadout-composition.md` §Authority safety).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct LoadoutSettings {
+    /// Parameter axis: KV-cache window override (top of the `ModelTuning` chain).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub num_ctx: Option<u32>,
+    /// Prompt axis: a one-line system-prompt framing (the `ModeConfig.framing` shape).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub framing: Option<String>,
+}
+
+impl Loadout {
+    /// Validate the loadout's name references against `cfg`: a named `kit` must be a
+    /// known bundle and a named `profile` must be a known, valid profile. A dangling
+    /// reference is a hard error — a loadout that silently did nothing would be a
+    /// false claim. `provider`/`model`/`role` are resolved by their own surfaces
+    /// later (Slices 1–2) and are not checked here.
+    ///
+    /// # Errors
+    /// The first dangling `kit` or `profile` reference, as a message.
+    pub fn validate(&self, cfg: &Config) -> std::result::Result<(), String> {
+        if let Some(kit) = &self.kit {
+            cfg.resolve_bundle(kit)
+                .map_err(|e| format!("loadout kit '{kit}': {e}"))?;
+        }
+        if let Some(profile) = &self.profile {
+            cfg.resolve_profile(profile)
+                .map_err(|e| format!("loadout profile '{profile}': {e}"))?;
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1275,6 +1521,8 @@ impl Default for Config {
             permission_presets: std::collections::BTreeMap::new(),
             modes: std::collections::BTreeMap::new(),
             profiles: std::collections::BTreeMap::new(),
+            bundles: std::collections::BTreeMap::new(),
+            loadouts: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -1318,10 +1566,10 @@ impl Config {
         let project_path =
             Self::project_config_path().filter(|p| Some(p.as_path()) != base_path.as_deref());
 
-        match (&base_path, &project_path) {
+        let mut cfg = match (&base_path, &project_path) {
             // Fast path: no project override → exact legacy behavior.
-            (Some(p), None) => Self::load(p),
-            (None, None) => Ok(Self::default()),
+            (Some(p), None) => Self::load(p)?,
+            (None, None) => Self::default(),
             // Project override present → layer it over the base (or the default
             // config when there is no base file).
             (base, Some(proj)) => {
@@ -1338,7 +1586,55 @@ impl Config {
                 merge_toml(&mut merged, project_val, strategy);
                 merged
                     .try_into()
-                    .map_err(|e| NewtError::Config(e.to_string()))
+                    .map_err(|e| NewtError::Config(e.to_string()))?
+            }
+        };
+        // Per-file bundles (the model-support-kit control surface): drop a
+        // `~/.newt/bundles/<name>.toml` to add a bundle — no `config.toml` edit.
+        cfg.merge_disk_bundles();
+        Ok(cfg)
+    }
+
+    /// Merge per-file bundles from the well-known `bundles/` dirs next to the
+    /// config: `~/.newt/bundles/*.toml` first, then the project `.newt/bundles/`
+    /// (so project overrides home overrides inline `[bundles.*]`). The filename
+    /// stem is the bundle name. A malformed drop-in is skipped with a warning — it
+    /// must not break startup.
+    fn merge_disk_bundles(&mut self) {
+        if let Some(h) = home_dir() {
+            self.merge_bundles_from_dir(&h.join(".newt").join("bundles"));
+        }
+        if let Some(proj) = Self::project_config_path() {
+            if let Some(parent) = proj.parent() {
+                self.merge_bundles_from_dir(&parent.join("bundles"));
+            }
+        }
+    }
+
+    /// Load `<dir>/*.toml` as bundles (filename stem = name) into `self.bundles`,
+    /// last-wins on a name clash. A malformed file is skipped with a warning.
+    fn merge_bundles_from_dir(&mut self, dir: &Path) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return; // no bundles dir — fine
+        };
+        let mut paths: Vec<PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "toml"))
+            .collect();
+        paths.sort();
+        for path in paths {
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            match std::fs::read_to_string(&path).map(|t| toml::from_str::<BundleConfig>(&t)) {
+                Ok(Ok(bundle)) => {
+                    self.bundles.insert(stem.to_string(), bundle);
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!(path = %path.display(), error = %e, "skipping malformed bundle file");
+                }
+                Err(_) => {}
             }
         }
     }
@@ -1589,10 +1885,235 @@ mod tests {
     }
 
     #[test]
+    fn profile_rejects_unmet_presupposition() {
+        // retry presupposes verify_gate — listing retry alone is now a load-time error.
+        let p: ProfileConfig = toml::from_str("techniques = [\"retry\"]").unwrap();
+        let err = p.validate().unwrap_err();
+        assert!(
+            err.contains("retry") && err.contains("verify_gate") && err.contains("presupposes"),
+            "err: {err}"
+        );
+        // …and adding verify_gate satisfies it.
+        let ok: ProfileConfig =
+            toml::from_str("techniques = [\"verify_gate\", \"retry\"]").unwrap();
+        assert!(ok.validate().is_ok());
+    }
+
+    #[test]
+    fn registry_does_not_alter_the_resolved_technique_set() {
+        // Golden: validate() accepts the nemotron set and the resolved order/membership
+        // is byte-identical to the input — the registry adds checks, not behavior.
+        let p: ProfileConfig =
+            toml::from_str("techniques = [\"knowledge_base\", \"verify_gate\", \"retry\"]")
+                .unwrap();
+        assert!(p.validate().is_ok());
+        assert_eq!(p.techniques, vec!["knowledge_base", "verify_gate", "retry"]);
+        for t in ["knowledge_base", "verify_gate", "retry"] {
+            assert!(p.enables(t));
+        }
+    }
+
+    #[test]
     fn empty_profiles_is_the_default() {
         // no [profiles] table → empty map, behavior unchanged
         let cfg: Config = toml::from_str("").unwrap();
         assert!(cfg.profiles.is_empty());
+        assert!(cfg.bundles.is_empty());
+    }
+
+    // ── bundles (the loadable kit unit) ────────────────────────────────
+
+    fn bundle_cfg() -> Config {
+        toml::from_str(
+            r#"
+            [profiles.nemotron]
+            techniques = ["knowledge_base", "verify_gate", "retry"]
+            [profiles.qwen-coder]
+            techniques = []
+
+            [bundles.nemotron]
+            about = "nemotron family support"
+            applies_to = ["nemotron"]
+            default_profile = "nemotron"
+            families = { "nemotron" = "nemotron", "qwen" = "qwen-coder" }
+
+            [bundles.review-heavy]              # use-case bundle: no applies_to
+            default_profile = "nemotron"
+            "#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn resolve_bundle_errors_on_unknown() {
+        let cfg = bundle_cfg();
+        assert!(cfg.resolve_bundle("nemotron").is_ok());
+        let err = cfg.resolve_bundle("ghost").unwrap_err();
+        assert!(err.contains("no such bundle"), "{err}");
+    }
+
+    #[test]
+    fn bundle_profile_for_model_longest_prefix_then_default() {
+        let cfg = bundle_cfg();
+        let b = cfg.resolve_bundle("nemotron").unwrap();
+        // family-prefix match
+        assert_eq!(
+            cfg.bundle_profile_for_model(b, "nemotron3:33b"),
+            Some("nemotron")
+        );
+        assert_eq!(
+            cfg.bundle_profile_for_model(b, "qwen2.5-coder"),
+            Some("qwen-coder")
+        );
+        // no family match → default_profile
+        assert_eq!(
+            cfg.bundle_profile_for_model(b, "llama3.1:8b"),
+            Some("nemotron")
+        );
+    }
+
+    #[test]
+    fn infer_bundle_only_from_applies_to() {
+        let cfg = bundle_cfg();
+        // nemotron model → the nemotron bundle (applies_to match)
+        assert_eq!(
+            cfg.infer_bundle("nemotron3:33b").map(|(n, _)| n),
+            Some("nemotron")
+        );
+        // a model no applies_to matches → no inference (the use-case bundle is never inferred)
+        assert!(cfg.infer_bundle("gpt-4.1").is_none());
+    }
+
+    #[test]
+    fn pick_active_profile_precedence() {
+        let cfg = bundle_cfg();
+        // 1. explicit --profile wins over everything
+        let p = cfg
+            .pick_active_profile(Some("qwen-coder"), Some("nemotron"), "nemotron3:33b")
+            .unwrap()
+            .unwrap();
+        assert_eq!(p.name, "qwen-coder");
+        assert_eq!(p.via, PickVia::Profile);
+        // 2. --bundle resolves to its profile for the model
+        let p = cfg
+            .pick_active_profile(None, Some("nemotron"), "nemotron3:33b")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (p.name.as_str(), p.via),
+            ("nemotron", PickVia::Bundle("nemotron".into()))
+        );
+        // 3. inferred from the model when neither flag is set
+        let p = cfg
+            .pick_active_profile(None, None, "nemotron3:33b")
+            .unwrap()
+            .unwrap();
+        assert_eq!(p.via, PickVia::InferredBundle("nemotron".into()));
+        // 4. nothing matches → None (today's behavior)
+        assert!(cfg
+            .pick_active_profile(None, None, "gpt-4.1")
+            .unwrap()
+            .is_none());
+        // an unknown explicit bundle is a hard error
+        assert!(cfg.pick_active_profile(None, Some("ghost"), "x").is_err());
+    }
+
+    // ── loadouts (the top-level composition; inert until Slice 1) ───────
+
+    #[test]
+    fn loadout_parses_inline_and_validates_references() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [profiles.nemotron]
+            techniques = ["knowledge_base", "verify_gate", "retry"]
+            [bundles.nemotron]
+            default_profile = "nemotron"
+
+            [loadouts.dev-nemotron]
+            provider = "dgx"
+            model    = "nemotron@deep"
+            kit      = "nemotron"
+            profile  = "nemotron"
+            role     = "python-developer"
+            [loadouts.dev-nemotron.settings]
+            num_ctx = 24576
+            framing = "Ship small, verify."
+            "#,
+        )
+        .unwrap();
+        let l = &cfg.loadouts["dev-nemotron"];
+        assert_eq!(l.provider.as_deref(), Some("dgx"));
+        assert_eq!(l.model.as_deref(), Some("nemotron@deep"));
+        assert_eq!(l.role.as_deref(), Some("python-developer"));
+        assert_eq!(l.settings.as_ref().unwrap().num_ctx, Some(24576));
+        // references resolve
+        assert!(l.validate(&cfg).is_ok());
+    }
+
+    #[test]
+    fn loadout_rejects_dangling_references() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [profiles.nemotron]
+            techniques = ["verify_gate"]
+            "#,
+        )
+        .unwrap();
+        // dangling kit
+        let bad_kit = Loadout {
+            kit: Some("ghost-bundle".into()),
+            ..Default::default()
+        };
+        let e = bad_kit.validate(&cfg).unwrap_err();
+        assert!(
+            e.contains("kit 'ghost-bundle'") && e.contains("no such bundle"),
+            "{e}"
+        );
+        // dangling profile
+        let bad_profile = Loadout {
+            profile: Some("ghost-profile".into()),
+            ..Default::default()
+        };
+        let e = bad_profile.validate(&cfg).unwrap_err();
+        assert!(
+            e.contains("profile 'ghost-profile'") && e.contains("no such profile"),
+            "{e}"
+        );
+        // an empty loadout is valid (no references)
+        assert!(Loadout::default().validate(&cfg).is_ok());
+    }
+
+    #[test]
+    fn disk_bundles_load_per_file_by_stem() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("nemotron.toml"),
+            "applies_to = [\"nemotron\"]\ndefault_profile = \"nemotron\"\n",
+        )
+        .unwrap();
+        // a malformed drop-in must be skipped, not break loading
+        std::fs::write(
+            dir.path().join("broken.toml"),
+            "applies_to = \"not-a-list\"\n",
+        )
+        .unwrap();
+        // a non-toml file is ignored
+        std::fs::write(dir.path().join("README.md"), "not a bundle").unwrap();
+
+        let mut cfg = Config::default();
+        cfg.merge_bundles_from_dir(dir.path());
+        assert_eq!(cfg.bundles.len(), 1, "only the valid .toml loads");
+        let b = cfg
+            .bundles
+            .get("nemotron")
+            .expect("loaded by filename stem");
+        assert_eq!(b.applies_to, vec!["nemotron"]);
+        assert_eq!(b.default_profile.as_deref(), Some("nemotron"));
+        // a disk file overrides an inline bundle of the same name (last-wins)
+        cfg.bundles.insert("x".into(), BundleConfig::default());
+        std::fs::write(dir.path().join("x.toml"), "about = \"from disk\"\n").unwrap();
+        cfg.merge_bundles_from_dir(dir.path());
+        assert_eq!(cfg.bundles["x"].about.as_deref(), Some("from disk"));
     }
 
     #[test]

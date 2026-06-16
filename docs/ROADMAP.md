@@ -1036,6 +1036,7 @@ skips.
 |---|---|---|
 | **20.1** | Passive feedback: per-round `RoundObservation` hook, `max(proven, believed)` send budget, EMA chars/4 calibration, observation-gated epilogue | — |
 | **20.2** | Active discovery (shipped): `/probe window` empirical input-boundary binary search → `max_ok_input` at High confidence; cheap `/probe` adds context-window refresh + thinking probe + chars/4 calibration bootstrap; `newt tunings show` staleness markers point stale/unprobed models at `/probe window` | — |
+| **20.3** | Fail open for non-authoritative budgets: a send budget resting on the proven-good `max_ok_input` alone (cloud / no-`/api/show` models) may compress but must never *refuse* — anti-thrash dispatches over budget (`DispatchedOverBudget`) and lets the backend rule, so one acceptance raises the HWM out of the spiral. Authoritative ceilings (declared window / `num_ctx` / cw-400 cap / token threshold) still refuse (B6). Fixes the live `gpt-4.1` bail. | — |
 
 # Phase 21 — Centaur Data Scientist
 

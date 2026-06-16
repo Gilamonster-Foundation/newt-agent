@@ -1082,6 +1082,9 @@ impl Summarizing {
                 max_messages: None,
                 task: &task,
                 hard_budget: true,
+                // The memory budget is config-derived — authoritative, so
+                // refuse semantics are preserved here (Step 20.3).
+                authoritative: true,
                 focus: None,
             },
             self.summarizer.as_deref(),

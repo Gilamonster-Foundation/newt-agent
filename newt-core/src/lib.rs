@@ -14,6 +14,7 @@ pub mod dgx;
 pub mod error;
 pub mod ffi_manifest;
 pub mod ffi_surface;
+pub mod kit;
 pub mod mcp;
 pub mod memory;
 pub mod metrics;
@@ -64,15 +65,19 @@ pub use agentic::{
 pub use agents::AgentsProvider;
 pub use caveats::{CaveatsExt, CountBoundExt, ScopeExt};
 pub use config::{
-    AgentsConfig, BackendConfig, BackendKind, ChatStyle, Config, ConversationsConfig, EditMode,
-    FooterMode, LogConfig, MemoryConfig, MemoryDisclosure, MemoryProviderKind, PermissionPreset,
-    ProviderConfig, SkillsConfig, ToolPermissions, TuiConfig,
+    AgentsConfig, BackendConfig, BackendKind, BundleConfig, ChatStyle, Config, ConversationsConfig,
+    EditMode, FooterMode, Loadout, LoadoutSettings, LogConfig, MemoryConfig, MemoryDisclosure,
+    MemoryProviderKind, PermissionPreset, PickVia, ProfilePick, ProviderConfig, SkillsConfig,
+    ToolPermissions, TuiConfig,
 };
 pub use conversation::{
     new_conversation_id, session_plan_dir, session_plan_path, ConversationRecord,
     ConversationSummary, ConversationTurn, ToolEvent,
 };
 pub use ffi_surface::FfiSurfaceProvider;
+// `kit::Tier` (Headless|TuiOnly) is *not* re-exported here — it would collide with
+// the router's task-complexity `Tier`; reach it as `kit::Tier`.
+pub use kit::{Axis, MountKind, RegistryEntry, COMPONENT_REGISTRY};
 // Steps 17.1a/17.1b (issue #246): `ConversationStore` is the SQLite backend
 // (`store` module, §6 causal ordering). The legacy JSON write path is gone;
 // any legacy tree is imported once on open. The `conversation` module keeps
