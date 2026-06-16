@@ -139,6 +139,17 @@ The practical wins compound with the architectural one:
 - **Single-line, same-line indicators** — e.g. the `▸ thinking…` indicator
   erased with `\r` (`print_thinking` / `erase_line`). One line, erased in
   place, never a region.
+- **The `!` bang-escape** — a prompt line starting with `!` runs the remainder
+  as a host command (`bang_command` / `run_bang_escape`) with **inherited
+  stdio**, *between* readlines, so an interactive child (e.g. `! pa login`'s
+  browser SAML) owns the real TTY and its output scrolls live. No alternate
+  screen, no region — it extends rustyline's standing readline carve-out
+  (control is out of `readline` when the child runs; cooked mode already
+  restored). It is a **human action only**: the model has no channel to type at
+  the prompt, so it can never invoke `!`, and it deliberately runs with the
+  user's own host authority (no OCAP/Caveats leash — that governs only
+  *model*-initiated `run_command`). `wyvern-agent` (no interactive loop) has no
+  bang-escape.
 
 ## Consequences
 
