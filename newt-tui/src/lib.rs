@@ -878,8 +878,7 @@ fn footer_mode() -> newt_core::FooterMode {
     if let Ok(v) = std::env::var("NEWT_FOOTER") {
         match v.to_lowercase().as_str() {
             "off" | "plain" | "0" | "false" => return FooterMode::Off,
-            "bar" | "on" | "1" | "true" => return FooterMode::Bar,
-            "stamp" => return FooterMode::Stamp,
+            "stamp" | "on" | "1" | "true" => return FooterMode::Stamp,
             "auto" => return FooterMode::Auto,
             _ => {}
         }
@@ -896,10 +895,9 @@ fn footer_mode() -> newt_core::FooterMode {
 enum FooterRender {
     /// Bare prompt — no decoration.
     Off,
-    /// Plain status line stamped as scrolled text (resize-proof, no region).
+    /// Status stamped as scrolled text below each prompt (no region; it
+    /// clutters the scrollback naturally — the scroller-honest choice).
     Stamp,
-    /// Pinned bottom status bar via a scroll region (TTY only).
-    Bar,
 }
 
 /// Resolve the effective render tier from the configured mode + a TTY probe.
@@ -910,21 +908,12 @@ fn resolve_footer_render(mode: newt_core::FooterMode, is_tty: bool) -> FooterRen
     match mode {
         FooterMode::Off => FooterRender::Off,
         FooterMode::Stamp if is_tty => FooterRender::Stamp,
-        FooterMode::Bar if is_tty => FooterRender::Bar,
-        FooterMode::Auto if is_tty => FooterRender::Bar,
+        FooterMode::Auto if is_tty => FooterRender::Stamp,
         _ => FooterRender::Off,
     }
 }
 
-/// Truncate `s` to at most `max` display columns, ellipsizing if cut. Pure.
-fn truncate_cols(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        return s.to_string();
-    }
-    s.chars().take(max.saturating_sub(1)).collect::<String>() + "…"
-}
-
-/// The status header shown above the caret: `model · workspace · mode`. Empty
+/// The status line: `model · workspace · mode`. Empty
 /// fields are dropped. Pure for testing.
 fn footer_status(model: &str, workspace: &str, is_vi: bool) -> String {
     let ws = std::path::Path::new(workspace)
@@ -1058,101 +1047,6 @@ fn collapse_footer_block(line: &str, task: &str, status: &str, color: bool) {
     }
 }
 
-/// Rows the idle status bar reserves at the bottom (separator + status).
-const FOOTER_BAR_ROWS: u16 = 2;
-
-/// The idle status bar (`bar` mode): pins [`FOOTER_BAR_ROWS`] rows to the
-/// bottom of the screen via a DECSTBM scroll region, drawn once, and restores
-/// the full region + erases the bar on drop. The `Drop` impl is the mandatory
-/// RAII teardown (the #302 rule): it runs on the normal, error, and panic
-/// paths, so the terminal is never left with a broken scroll region. Re-created
-/// each idle, so it re-measures and survives a resize between turns. Never
-/// constructed off a TTY.
-struct IdleStatusBar {
-    rows: u16,
-    active: bool,
-}
-
-impl IdleStatusBar {
-    /// Reserve the bottom rows, draw the bar, and leave the cursor positioned
-    /// for the prompt. No-op (inactive) when the terminal is too short.
-    fn show(status: &str, color: bool) -> Self {
-        let (cols, rows) = terminal::size().unwrap_or((80, 24));
-        if rows < FOOTER_BAR_ROWS + 2 {
-            return Self {
-                rows,
-                active: false,
-            };
-        }
-        let mut out = io::stdout();
-        // Make room so the bar never hides output: if the cursor sits within
-        // the bottom rows, scroll the content up and keep it on its line.
-        let cur = crossterm::cursor::position().map(|(_, r)| r).unwrap_or(0);
-        let first_bar_row = rows - FOOTER_BAR_ROWS; // 0-indexed
-        let below = first_bar_row.saturating_sub(cur);
-        let scroll = FOOTER_BAR_ROWS.saturating_sub(below);
-        let input_row = if scroll > 0 {
-            let _ = execute!(out, MoveTo(0, rows - 1));
-            for _ in 0..scroll {
-                let _ = execute!(out, Print("\n"));
-            }
-            cur.saturating_sub(scroll)
-        } else {
-            cur
-        };
-        // Reserve the bottom rows (1-indexed DECSTBM). This homes the cursor,
-        // so we reposition explicitly afterwards.
-        let _ = execute!(out, Print(format!("\x1b[1;{}r", rows - FOOTER_BAR_ROWS)));
-        let sep = footer_separator(cols);
-        let line = truncate_cols(status, (cols as usize).saturating_sub(2));
-        if color {
-            let _ = execute!(
-                out,
-                MoveTo(0, rows - FOOTER_BAR_ROWS),
-                Clear(ClearType::CurrentLine),
-                SetForegroundColor(CtColor::DarkGrey),
-                Print(&sep),
-                MoveTo(0, rows - 1),
-                Clear(ClearType::CurrentLine),
-                Print("  "),
-                Print(&line),
-                ResetColor,
-            );
-        } else {
-            let _ = execute!(
-                out,
-                MoveTo(0, rows - FOOTER_BAR_ROWS),
-                Clear(ClearType::CurrentLine),
-                Print(&sep),
-                MoveTo(0, rows - 1),
-                Clear(ClearType::CurrentLine),
-                Print(format!("  {line}")),
-            );
-        }
-        let _ = execute!(out, MoveTo(0, input_row));
-        Self { rows, active: true }
-    }
-}
-
-impl Drop for IdleStatusBar {
-    fn drop(&mut self) {
-        if !self.active {
-            return;
-        }
-        let mut out = io::stdout();
-        // Reset the scroll region and erase the bar, keeping the logical cursor
-        // (after the submitted input) so output flows on naturally.
-        let _ = execute!(
-            out,
-            Print("\x1b[r"),
-            crossterm::cursor::SavePosition,
-            MoveTo(0, self.rows - FOOTER_BAR_ROWS),
-            Clear(ClearType::FromCursorDown),
-            crossterm::cursor::RestorePosition,
-        );
-    }
-}
-
 #[cfg(test)]
 mod footer_tests {
     use super::*;
@@ -1160,24 +1054,16 @@ mod footer_tests {
 
     #[test]
     fn render_tier_follows_mode_and_tty() {
-        // Auto → bar on a TTY, off otherwise (the amphibious default).
+        // Auto → stamp on a TTY, off otherwise (the amphibious default).
         assert_eq!(
             resolve_footer_render(FooterMode::Auto, true),
-            FooterRender::Bar
+            FooterRender::Stamp
         );
         assert_eq!(
             resolve_footer_render(FooterMode::Auto, false),
             FooterRender::Off
         );
-        // Explicit tiers still degrade to off when not a TTY.
-        assert_eq!(
-            resolve_footer_render(FooterMode::Bar, true),
-            FooterRender::Bar
-        );
-        assert_eq!(
-            resolve_footer_render(FooterMode::Bar, false),
-            FooterRender::Off
-        );
+        // Explicit stamp still degrades to off when not a TTY.
         assert_eq!(
             resolve_footer_render(FooterMode::Stamp, true),
             FooterRender::Stamp
@@ -1191,13 +1077,6 @@ mod footer_tests {
             resolve_footer_render(FooterMode::Off, true),
             FooterRender::Off
         );
-    }
-
-    #[test]
-    fn truncate_cols_ellipsizes_when_cut() {
-        assert_eq!(truncate_cols("hello", 10), "hello");
-        assert_eq!(truncate_cols("hello", 5), "hello");
-        assert_eq!(truncate_cols("hello world", 5), "hell…");
     }
 
     #[test]
@@ -3656,22 +3535,13 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
             // `bar`: pin the status bar to the bottom for the idle wait (the
             // guard tears it down on drop, below). `stamp`: nothing now — the
             // status renders as a scrolled line after submit (the collapse).
-            let idle_bar = match footer_render {
-                FooterRender::Bar => Some(IdleStatusBar::show(
-                    &footer_status(&inf_model, workspace, is_vi),
-                    color,
-                )),
-                FooterRender::Stamp => {
-                    footer_drawn = true;
-                    None
-                }
-                FooterRender::Off => None,
-            };
+            // `stamp`: the status renders below the prompt after submit (the
+            // collapse), where it clutters the scrollback naturally — no region.
+            if footer_render == FooterRender::Stamp {
+                footer_drawn = true;
+            }
             let readline_result =
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rl.readline(&prompt)));
-            // RAII teardown of the idle bar BEFORE any output: resets the
-            // scroll region + erases the bar (runs on the break path too).
-            drop(idle_bar);
             match readline_result {
                 Ok(r) => r,
                 Err(_panic) => {

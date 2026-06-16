@@ -101,31 +101,32 @@ The practical wins compound with the architectural one:
   `docs/decisions/plan_editor_ephemeral_tui.md`.
 - **rustyline's internal raw mode** during a `readline` call (line editing,
   history navigation). Output remains scrolled text.
-- **The idle status decoration** — the `model · workspace · mode` status that
-  sits at the **at-rest tail** of the scroll while waiting for input and is
-  **gone while busy** (model output scrolls plainly; the absence is itself the
-  "working" indicator). The `❯` caret is rustyline's prompt; multi-line entry
-  is rustyline's `Validator` (a trailing `\` continues, the shell/Python idiom).
+- **The status stamp** — the `model · workspace · mode` status printed as
+  ordinary **scrolled text** below each submitted prompt:
 
-  This is a **deliberate, scoped supersession** of the blanket "no persistent
-  status bars" rule above — a pragmatic compromise for newt's *interactive*
-  mode only. Two tiers, both gated by `[tui] footer` and TTY detection:
+  ```text
+  ❯ <input>
+  ────────────
+    model · workspace · mode
+  ▸ <output>…
+  ```
 
-  - **`bar`** — pinned to the bottom rows via a DECSTBM scroll region. Drawn
-    **once per idle period** (never refreshed per keystroke → no constant
-    retransmit) and **re-measured on each idle** so it survives a resize
-    between turns. Mandatory **RAII teardown** resets the scroll region and
-    erases the bar on the normal, error, and panic paths (the #302 rule — the
-    terminal must never be left with a broken scroll region).
-  - **`stamp`** — a plain status line printed as ordinary scrolled text, no
-    column-spanning rule, no region, no cursor games. Inherently resize-proof;
-    the no-refresh fallback.
+  It clutters the scrollback naturally and scrolls away with everything else —
+  **no region, no pinning, no cursor games**. The `❯` caret is rustyline's
+  prompt; multi-line entry is rustyline's `Validator` (a trailing `\`
+  continues, the shell/Python idiom). Gated by `[tui] footer`: `auto` (default)
+  → stamp on a TTY, `off` otherwise; `stamp` forces it; `off`/`--plain` is a
+  bare prompt. **Never** constructed off a TTY (pipes, `newt worker`); the
+  `wyvern-agent` deep-cut strips it entirely.
 
-  `off`/`--plain` is a bare prompt. `auto` (default) → `bar` on a TTY, `off`
-  otherwise. The decoration is **never** constructed off a TTY (pipes,
-  `newt worker`); the deep-cut `wyvern-agent` strips it entirely (draconian —
-  no decoration tier at all). The work transcript and every headless surface
-  stay a pure scroller.
+  > **Rejected: a pinned idle status bar.** A version that pinned the status to
+  > the bottom rows via a DECSTBM **scroll region** (visible while idle, gone
+  > while busy) was prototyped and **backed out** — it fought the terminal's
+  > natural scroll (content popped *up* into the region instead of cluttering
+  > down) and the region/cursor teardown corrupted output across turns. The
+  > "no scroll regions / no persistent status bars" rule above **stands**; the
+  > stamp is the scroller-honest way to surface status. A pinned bar, if ever
+  > wanted, belongs in `gilamonster-agent` where region UI lives.
 - **ANSI color and column escapes in scrolled output** (header, prompts,
   diff coloring), always behind `color_supported` degradation.
 - **Single-line, same-line indicators** — e.g. the `▸ thinking…` indicator

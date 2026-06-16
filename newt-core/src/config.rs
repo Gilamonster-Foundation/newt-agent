@@ -508,24 +508,20 @@ pub enum MemoryDisclosure {
 
 /// Input-footer mode — the `[tui] footer` key.
 ///
-/// The footer is the at-rest status decoration (`model · workspace · mode`)
-/// shown while waiting for input and gone while busy — a human-TUI affordance,
-/// never constructed off a TTY (see `docs/decisions/plain_scroller_tui.md`).
-/// Two render tiers plus the bare prompt.
+/// The footer is the status stamp (`model · workspace · mode`) printed as
+/// ordinary scrolled text below each submitted prompt — it clutters the
+/// scrollback naturally, never a pinned region (see
+/// `docs/decisions/plain_scroller_tui.md`). A human-TUI affordance, never
+/// constructed off a TTY.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum FooterMode {
-    /// `bar` on a TTY, `off` otherwise (the default). The amphibious choice:
-    /// rich on a human terminal, a bare prompt in pipes / `newt worker` / the
-    /// wyvern deep-cut.
+    /// `stamp` on a TTY, `off` otherwise (the default). The amphibious choice:
+    /// the status stamp on a human terminal, a bare prompt in pipes /
+    /// `newt worker` / the wyvern deep-cut.
     #[default]
     Auto,
-    /// The pinned bottom status bar (DECSTBM scroll region), drawn once per
-    /// idle and re-measured each turn so it survives a resize. TTY-only;
-    /// degrades to `off` when stdout is not a terminal.
-    Bar,
-    /// A plain status line stamped as ordinary scrolled text — no region, no
-    /// column-spanning rule, inherently resize-proof. The no-refresh fallback.
+    /// Always render the status stamp (even off a TTY — screenshots, tests).
     Stamp,
     /// No decoration — a bare bash-like prompt. Equivalent to `--plain`.
     Off,
@@ -1539,7 +1535,6 @@ mod tests {
         // Each variant parses from its snake_case key.
         for (key, want) in [
             ("auto", FooterMode::Auto),
-            ("bar", FooterMode::Bar),
             ("stamp", FooterMode::Stamp),
             ("off", FooterMode::Off),
         ] {
