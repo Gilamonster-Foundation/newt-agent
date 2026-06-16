@@ -42,6 +42,12 @@ Drove a real reasoning model under a PTY to validate two freshly-landed features
 
 ## 3. The three new architecture threads
 
+> **Top-level map:** [`design/centaur-swarm-architecture.md`](../design/centaur-swarm-architecture.md)
+> is the spine these three hang off — the three agent-mesh planes (control/data/authority),
+> the critical path, and the **OCAP deviation ratchet**
+> ([`security/ocap-deviations.md`](../security/ocap-deviations.md)) for taking practical
+> caveats while staying on a guided path back to the full OCAP vision.
+
 ### A. Crew loadout — [`design/crew-loadout.md`](../design/crew-loadout.md)
 The role-specialized sibling of the diversity panel: a **named ensemble of role-loadouts
 + a control program**. The three-model coding pattern (planner / navigator / triage) is a
