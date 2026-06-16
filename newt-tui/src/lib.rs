@@ -3274,6 +3274,11 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
         resolve_tui(&cfg).as_ref(),
     ) && io::stdin().is_terminal();
     let mut permission_state = PermissionPromptState::default();
+    // `[tui] allow_bang_escape` (default true): the human's `!` host shell-out.
+    // The model can never reach it regardless; this only governs the keyboard.
+    let bang_escape_enabled = resolve_tui(&cfg)
+        .map(|t| t.allow_bang_escape)
+        .unwrap_or(true);
     let permission_log_path =
         newt_core::Config::user_config_path().map(|p| p.with_file_name("permission-log.jsonl"));
     print_newt(
@@ -3641,9 +3646,19 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                 println!();
                 // `! <cmd>` — human-only host shell-escape (interactive, inherited
                 // stdio: prompts + browser SAML work). Intercepted before the
-                // slash/chat paths; the model can never reach this.
+                // slash/chat paths; the model can never reach this. When disabled
+                // via `[tui] allow_bang_escape = false`, the line is caught and
+                // refused with a notice — never silently sent to the model.
                 if let Some(rest) = bang_command(&task) {
-                    run_bang_escape(rest, color, verbose);
+                    if bang_escape_enabled {
+                        run_bang_escape(rest, color, verbose);
+                    } else {
+                        print_newt(
+                            "! bang-escape is disabled ([tui] allow_bang_escape = false)",
+                            color,
+                            verbose,
+                        );
+                    }
                     println!();
                     continue;
                 }

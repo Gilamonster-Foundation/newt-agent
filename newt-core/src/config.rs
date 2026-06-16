@@ -791,6 +791,15 @@ pub struct TuiConfig {
     /// see `docs/decisions/mcp_transport_security.md`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mcp_allow_insecure_hosts: Vec<String>,
+
+    /// Whether the interactive `!` bang-escape is available — typing `! <cmd>`
+    /// at the prompt runs a host command with the user's own authority (not the
+    /// agent's OCAP leash). Default: `true`. Set `false` for locked-down or
+    /// shared deployments where the human at the keyboard should not have an
+    /// unconfined host shell-out. The model can never invoke `!` either way;
+    /// this only governs the human. See `docs/decisions/plain_scroller_tui.md`.
+    #[serde(default = "default_allow_bang_escape")]
+    pub allow_bang_escape: bool,
 }
 
 fn default_tool_output_lines() -> usize {
@@ -818,6 +827,10 @@ fn default_mid_loop_trim_threshold() -> usize {
 }
 
 fn default_sanitize_mcp_server_names() -> bool {
+    true
+}
+
+fn default_allow_bang_escape() -> bool {
     true
 }
 
@@ -1415,6 +1428,7 @@ impl Default for TuiConfig {
             mid_loop_trim_tokens: None,
             sanitize_mcp_server_names: default_sanitize_mcp_server_names(),
             mcp_allow_insecure_hosts: Vec::new(),
+            allow_bang_escape: default_allow_bang_escape(),
         }
     }
 }
@@ -1951,6 +1965,16 @@ mod tests {
             let cfg: TuiConfig = toml::from_str(&format!("footer = \"{key}\"")).unwrap();
             assert_eq!(cfg.footer, want, "footer = {key}");
         }
+    }
+
+    #[test]
+    fn allow_bang_escape_defaults_to_true_and_round_trips() {
+        // Absent key → enabled (the human's host shell-out is on by default).
+        let cfg: TuiConfig = toml::from_str("").unwrap();
+        assert!(cfg.allow_bang_escape);
+        // Explicit opt-out parses.
+        let cfg: TuiConfig = toml::from_str("allow_bang_escape = false").unwrap();
+        assert!(!cfg.allow_bang_escape);
     }
 
     #[test]
