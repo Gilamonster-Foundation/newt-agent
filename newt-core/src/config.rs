@@ -127,6 +127,14 @@ pub struct Config {
     /// Empty by default — no profile, behavior unchanged. See [`ProfileConfig`].
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub profiles: std::collections::BTreeMap<String, ProfileConfig>,
+
+    /// Named bundles (`[bundles.<name>]`) — the loadable unit of the model support
+    /// kit (`docs/design/model-support-kit.md`). A bundle pins which model families
+    /// it applies to and which profile each resolves to. Selected by `--bundle
+    /// <name>` or inferred from the model via `applies_to`. Empty by default — no
+    /// bundle, behavior unchanged. See [`BundleConfig`].
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub bundles: std::collections::BTreeMap<String, BundleConfig>,
 }
 
 /// One named mode (`[modes.<name>]`, issue #307): the atomic binding the
@@ -821,6 +829,151 @@ impl Config {
         profile.validate()?;
         Ok(profile)
     }
+
+    /// Look up a named bundle (`[bundles.<name>]`).
+    ///
+    /// # Errors
+    /// `no such bundle` when undefined — a `--bundle` that silently did nothing
+    /// would be a false claim.
+    pub fn resolve_bundle(&self, name: &str) -> std::result::Result<&BundleConfig, String> {
+        self.bundles.get(name).ok_or_else(|| {
+            let known = if self.bundles.is_empty() {
+                "none defined".to_string()
+            } else {
+                self.bundles.keys().cloned().collect::<Vec<_>>().join(", ")
+            };
+            format!("no such bundle (known: {known})")
+        })
+    }
+
+    /// The profile name `bundle` yields for `model`: the longest-prefix `families`
+    /// match, else `default_profile`. `None` ⇒ the bundle applies no profile here.
+    #[must_use]
+    pub fn bundle_profile_for_model<'a>(
+        &self,
+        bundle: &'a BundleConfig,
+        model: &str,
+    ) -> Option<&'a str> {
+        bundle
+            .families
+            .iter()
+            .filter(|(prefix, _)| model.starts_with(prefix.as_str()))
+            .max_by_key(|(prefix, _)| prefix.len()) // longest-prefix-wins
+            .map(|(_, p)| p.as_str())
+            .or(bundle.default_profile.as_deref())
+    }
+
+    /// Infer the bundle for `model` from `applies_to` (longest-prefix-wins). Only
+    /// bundles with a non-empty `applies_to` participate — a use-case bundle (empty
+    /// `applies_to`) is never auto-inferred, only chosen explicitly via `--bundle`.
+    #[must_use]
+    pub fn infer_bundle(&self, model: &str) -> Option<(&str, &BundleConfig)> {
+        self.bundles
+            .iter()
+            .filter_map(|(name, b)| {
+                b.applies_to
+                    .iter()
+                    .filter(|p| model.starts_with(p.as_str()))
+                    .map(String::len)
+                    .max()
+                    .map(|best| (best, name.as_str(), b))
+            })
+            .max_by_key(|(best, _, _)| *best)
+            .map(|(_, name, b)| (name, b))
+    }
+
+    /// Resolve the active profile from the selectors + the active `model`:
+    /// `--profile` (explicit) > `--bundle` (its profile for this model) > an
+    /// inferred bundle (`applies_to`) > `None` (today's no-profile behavior).
+    /// Returns the profile NAME + how it was chosen (for the banner).
+    ///
+    /// # Errors
+    /// An unknown explicit `--bundle` is a hard error. An unknown explicit
+    /// `--profile` is left for the caller's [`resolve_profile`](Self::resolve_profile)
+    /// so the message stays profile-specific.
+    pub fn pick_active_profile(
+        &self,
+        profile_flag: Option<&str>,
+        bundle_flag: Option<&str>,
+        model: &str,
+    ) -> std::result::Result<Option<ProfilePick>, String> {
+        if let Some(p) = profile_flag.filter(|s| !s.is_empty()) {
+            return Ok(Some(ProfilePick {
+                name: p.to_string(),
+                via: PickVia::Profile,
+            }));
+        }
+        if let Some(b) = bundle_flag.filter(|s| !s.is_empty()) {
+            let bundle = self.resolve_bundle(b)?;
+            return Ok(self
+                .bundle_profile_for_model(bundle, model)
+                .map(|p| ProfilePick {
+                    name: p.to_string(),
+                    via: PickVia::Bundle(b.to_string()),
+                }));
+        }
+        if let Some((name, bundle)) = self.infer_bundle(model) {
+            return Ok(self
+                .bundle_profile_for_model(bundle, model)
+                .map(|p| ProfilePick {
+                    name: p.to_string(),
+                    via: PickVia::InferredBundle(name.to_string()),
+                }));
+        }
+        Ok(None)
+    }
+}
+
+/// One named bundle (`[bundles.<name>]`) — the loadable unit of the model support
+/// kit. It pins which model families it applies to and which profile each resolves
+/// to, shipping the `[profiles.*]` it references.
+///
+/// ```toml
+/// [bundles.nemotron]
+/// about = "Support bundle for the nemotron family"
+/// applies_to = ["nemotron"]                 # longest-prefix-wins; "nemotron3:33b" matches
+/// default_profile = "nemotron"
+/// families = { "nemotron" = "nemotron", "qwen" = "qwen-coder" }
+/// ```
+///
+/// A bundle carries **no authority** — there is deliberately no caveats/preset
+/// field; it recombines vetted parts, it cannot grant (`docs/design/model-support-kit.md`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct BundleConfig {
+    /// One-line provenance, shown in the startup banner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub about: Option<String>,
+    /// Model-id prefixes this bundle auto-applies to (longest-prefix-wins). Empty ⇒
+    /// a use-case bundle: chosen only via explicit `--bundle`, never auto-inferred.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub applies_to: Vec<String>,
+    /// Profile applied when this bundle is selected and no `families` entry matches.
+    /// Must name a key in `[profiles.*]`. `None` ⇒ no profile (the light path).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_profile: Option<String>,
+    /// model-family-prefix → profile name (longest-prefix-wins over `default_profile`).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub families: std::collections::BTreeMap<String, String>,
+}
+
+/// The active-profile selection + how it was chosen (for honest banner output).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProfilePick {
+    /// The chosen profile name (to feed [`Config::resolve_profile`]).
+    pub name: String,
+    /// Which selector won.
+    pub via: PickVia,
+}
+
+/// How a [`ProfilePick`] was selected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PickVia {
+    /// An explicit `--profile` / `NEWT_PROFILE`.
+    Profile,
+    /// An explicit `--bundle <name>`.
+    Bundle(String),
+    /// A bundle inferred from the model via `applies_to`.
+    InferredBundle(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -1257,6 +1410,7 @@ impl Default for Config {
             permission_presets: std::collections::BTreeMap::new(),
             modes: std::collections::BTreeMap::new(),
             profiles: std::collections::BTreeMap::new(),
+            bundles: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -1586,6 +1740,104 @@ mod tests {
         // no [profiles] table → empty map, behavior unchanged
         let cfg: Config = toml::from_str("").unwrap();
         assert!(cfg.profiles.is_empty());
+        assert!(cfg.bundles.is_empty());
+    }
+
+    // ── bundles (the loadable kit unit) ────────────────────────────────
+
+    fn bundle_cfg() -> Config {
+        toml::from_str(
+            r#"
+            [profiles.nemotron]
+            techniques = ["knowledge_base", "verify_gate", "retry"]
+            [profiles.qwen-coder]
+            techniques = []
+
+            [bundles.nemotron]
+            about = "nemotron family support"
+            applies_to = ["nemotron"]
+            default_profile = "nemotron"
+            families = { "nemotron" = "nemotron", "qwen" = "qwen-coder" }
+
+            [bundles.review-heavy]              # use-case bundle: no applies_to
+            default_profile = "nemotron"
+            "#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn resolve_bundle_errors_on_unknown() {
+        let cfg = bundle_cfg();
+        assert!(cfg.resolve_bundle("nemotron").is_ok());
+        let err = cfg.resolve_bundle("ghost").unwrap_err();
+        assert!(err.contains("no such bundle"), "{err}");
+    }
+
+    #[test]
+    fn bundle_profile_for_model_longest_prefix_then_default() {
+        let cfg = bundle_cfg();
+        let b = cfg.resolve_bundle("nemotron").unwrap();
+        // family-prefix match
+        assert_eq!(
+            cfg.bundle_profile_for_model(b, "nemotron3:33b"),
+            Some("nemotron")
+        );
+        assert_eq!(
+            cfg.bundle_profile_for_model(b, "qwen2.5-coder"),
+            Some("qwen-coder")
+        );
+        // no family match → default_profile
+        assert_eq!(
+            cfg.bundle_profile_for_model(b, "llama3.1:8b"),
+            Some("nemotron")
+        );
+    }
+
+    #[test]
+    fn infer_bundle_only_from_applies_to() {
+        let cfg = bundle_cfg();
+        // nemotron model → the nemotron bundle (applies_to match)
+        assert_eq!(
+            cfg.infer_bundle("nemotron3:33b").map(|(n, _)| n),
+            Some("nemotron")
+        );
+        // a model no applies_to matches → no inference (the use-case bundle is never inferred)
+        assert!(cfg.infer_bundle("gpt-4.1").is_none());
+    }
+
+    #[test]
+    fn pick_active_profile_precedence() {
+        let cfg = bundle_cfg();
+        // 1. explicit --profile wins over everything
+        let p = cfg
+            .pick_active_profile(Some("qwen-coder"), Some("nemotron"), "nemotron3:33b")
+            .unwrap()
+            .unwrap();
+        assert_eq!(p.name, "qwen-coder");
+        assert_eq!(p.via, PickVia::Profile);
+        // 2. --bundle resolves to its profile for the model
+        let p = cfg
+            .pick_active_profile(None, Some("nemotron"), "nemotron3:33b")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (p.name.as_str(), p.via),
+            ("nemotron", PickVia::Bundle("nemotron".into()))
+        );
+        // 3. inferred from the model when neither flag is set
+        let p = cfg
+            .pick_active_profile(None, None, "nemotron3:33b")
+            .unwrap()
+            .unwrap();
+        assert_eq!(p.via, PickVia::InferredBundle("nemotron".into()));
+        // 4. nothing matches → None (today's behavior)
+        assert!(cfg
+            .pick_active_profile(None, None, "gpt-4.1")
+            .unwrap()
+            .is_none());
+        // an unknown explicit bundle is a hard error
+        assert!(cfg.pick_active_profile(None, Some("ghost"), "x").is_err());
     }
 
     #[test]

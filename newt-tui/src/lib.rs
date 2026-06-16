@@ -2664,21 +2664,31 @@ async fn run_close_extraction(
 
 /// One-line banner naming the active profile and the techniques it composes —
 /// printed once at session start so the operator sees what the profile turned on.
-fn announce_profile(name: &str, profile: &newt_core::config::ProfileConfig, color: bool) {
+fn announce_profile(
+    name: &str,
+    profile: &newt_core::config::ProfileConfig,
+    via: &newt_core::config::PickVia,
+    color: bool,
+) {
     let techs = if profile.techniques.is_empty() {
         "no techniques".to_string()
     } else {
         profile.techniques.join(", ")
     };
+    let source = match via {
+        newt_core::config::PickVia::Profile => String::new(),
+        newt_core::config::PickVia::Bundle(b) => format!(" (via bundle '{b}')"),
+        newt_core::config::PickVia::InferredBundle(b) => format!(" (via bundle '{b}', inferred)"),
+    };
     if color {
         let _ = execute!(
             io::stdout(),
             SetForegroundColor(CtColor::DarkGrey),
-            Print(format!("▸ profile '{name}' — {techs}\n")),
+            Print(format!("▸ profile '{name}' — {techs}{source}\n")),
             ResetColor,
         );
     } else {
-        println!("▸ profile '{name}' — {techs}");
+        println!("▸ profile '{name}' — {techs}{source}");
     }
 }
 
@@ -2847,22 +2857,9 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
     // It is re-read (`Config::resolve`) only after a slash command, the one
     // intentional refresh point — config.toml may have changed on disk.
     let mut cfg = newt_core::Config::resolve().unwrap_or_default();
-    // Resolve + validate the active profile (`--profile` / NEWT_PROFILE) against
-    // config, and announce it. An unknown profile — or one naming an unknown
-    // technique — is a hard error; a `--profile` that silently did nothing would
-    // be a false claim. The resolved profile is held for the loop to apply (the
-    // technique-application wiring is the next increment).
-    let active_profile = match std::env::var("NEWT_PROFILE") {
-        Ok(name) if !name.is_empty() => {
-            let profile = cfg
-                .resolve_profile(&name)
-                .map_err(|e| anyhow::anyhow!("profile '{name}': {e}"))?
-                .clone();
-            announce_profile(&name, &profile, color);
-            Some(profile)
-        }
-        _ => None,
-    };
+    // The active profile is resolved just below, AFTER the model is known — a
+    // `--bundle`/inferred bundle picks its profile from the model id.
+
     // 17.7: how this session treats conversation persistence, resolved ONCE.
     // Precedence: --ephemeral > NEWT_CONVERSATION_ID > [conversations] resume.
     let session_start = resolve_session_start(
@@ -2899,6 +2896,31 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
     // start.  Both are re-read after each slash command (config.toml on disk).
     let mut choice = resolve_backend_choice(&cfg);
     let (mut inf_url, mut inf_model) = (choice.url.clone(), choice.model.clone());
+
+    // Resolve + validate the active profile against config, now that the model is
+    // known. Precedence: --profile (explicit) > --bundle > a bundle inferred from
+    // the model (`applies_to`) > none. An unknown bundle/profile — or a profile
+    // naming an unknown technique / unmet presupposition — is a hard error; a
+    // selector that silently did nothing would be a false claim. Held for the loop
+    // to apply.
+    let active_profile = {
+        let profile_env = std::env::var("NEWT_PROFILE").ok();
+        let bundle_env = std::env::var("NEWT_BUNDLE").ok();
+        let pick = cfg
+            .pick_active_profile(profile_env.as_deref(), bundle_env.as_deref(), &inf_model)
+            .map_err(|e| anyhow::anyhow!(e))?;
+        match pick {
+            Some(p) => {
+                let profile = cfg
+                    .resolve_profile(&p.name)
+                    .map_err(|e| anyhow::anyhow!("profile '{}': {e}", p.name))?
+                    .clone();
+                announce_profile(&p.name, &profile, &p.via, color);
+                Some(profile)
+            }
+            None => None,
+        }
+    };
 
     // Hardware telemetry: best-effort, None on non-DGX backends.
     // try_connect probes DCGM port 9400 on the same host as Ollama; returns
