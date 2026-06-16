@@ -923,28 +923,6 @@ fn footer_separator(cols: u16) -> String {
     "─".repeat((cols as usize).clamp(8, 80))
 }
 
-/// Print the footer preamble (separator + status header) as ordinary scrolled
-/// lines, immediately before `readline` draws the `❯` caret on the next line.
-fn print_footer_preamble(status: &str, color: bool) {
-    let cols = terminal::size().map(|(c, _)| c).unwrap_or(80);
-    let sep = footer_separator(cols);
-    if color {
-        execute!(
-            io::stdout(),
-            SetForegroundColor(CtColor::DarkGrey),
-            Print(&sep),
-            Print("\n  "),
-            Print(status),
-            ResetColor,
-            Print("\n"),
-        )
-        .ok();
-    } else {
-        println!("{sep}");
-        println!("  {status}");
-    }
-}
-
 /// rustyline helper enabling multi-line entry: a line ending in `\` continues
 /// onto the next line (the shell/Python continuation idiom — portable across
 /// terminals, no special key detection). On submit the caller rejoins
@@ -990,12 +968,12 @@ fn install_footer_helper(
     rl.set_helper(Some(FooterHelper));
 }
 
-/// Screen rows the footer block occupied: 2 (separator + status) + the input's
-/// wrapped rows (the `❯ ` prefix counts on the first visual line). Pure so the
-/// collapse math is testable without a terminal.
-fn footer_block_rows(line: &str, cols: usize) -> u16 {
+/// Screen rows the live `❯ <input>` occupied (wrapped), the `❯ ` prefix
+/// counting on the first visual line. Pure so the collapse math is testable
+/// without a terminal.
+fn footer_input_rows(line: &str, cols: usize) -> u16 {
     let cols = cols.max(1);
-    let input_rows: usize = line
+    let rows: usize = line
         .split('\n')
         .enumerate()
         .map(|(i, seg)| {
@@ -1003,17 +981,26 @@ fn footer_block_rows(line: &str, cols: usize) -> u16 {
             (seg.chars().count() + lead) / cols + 1
         })
         .sum();
-    (2 + input_rows).try_into().unwrap_or(u16::MAX)
+    rows.try_into().unwrap_or(u16::MAX)
 }
 
-/// Collapse the transient footer block after submit: erase the separator +
-/// status (and the live input render) by moving up over the block and clearing
-/// downward, then re-echo a compact `❯ <input>` so the conversation record
-/// stays clean (the decoration does not pile up in scrollback). Empty input
-/// erases with no echo. Relative cursor motion → safe under terminal scroll.
-fn collapse_footer_block(line: &str, task: &str, color: bool) {
+/// Collapse the live prompt into a clean, footer-below record after submit:
+/// erase the `❯ <input>` render (relative cursor motion → safe under terminal
+/// scroll) and re-emit it as
+///
+/// ```text
+/// ❯ <input>
+/// ────────────
+///   model · workspace · mode
+/// ```
+///
+/// i.e. caret on top, then the separator + status footer beneath it — the
+/// scroller-honest way to put the status *below* the input without a pinned
+/// region (it renders once, on submit, never live while typing). Empty input
+/// erases with no footer.
+fn collapse_footer_block(line: &str, task: &str, status: &str, color: bool) {
     let cols = terminal::size().map(|(c, _)| c as usize).unwrap_or(80);
-    let rows = footer_block_rows(line, cols);
+    let rows = footer_input_rows(line, cols);
     let mut out = io::stdout();
     let _ = execute!(
         out,
@@ -1025,6 +1012,7 @@ fn collapse_footer_block(line: &str, task: &str, color: bool) {
     }
     let first = task.lines().next().unwrap_or("");
     let more = if task.contains('\n') { " …" } else { "" };
+    let sep = footer_separator(cols.try_into().unwrap_or(u16::MAX));
     if color {
         let _ = execute!(
             out,
@@ -1034,9 +1022,17 @@ fn collapse_footer_block(line: &str, task: &str, color: bool) {
             Print(first),
             Print(more),
             Print("\n"),
+            SetForegroundColor(CtColor::DarkGrey),
+            Print(&sep),
+            Print("\n  "),
+            Print(status),
+            ResetColor,
+            Print("\n"),
         );
     } else {
         println!("❯ {first}{more}");
+        println!("{sep}");
+        println!("  {status}");
     }
 }
 
@@ -1081,15 +1077,14 @@ mod footer_tests {
     }
 
     #[test]
-    fn block_rows_counts_preamble_plus_wrapped_input() {
-        // sep + status + one input row.
-        assert_eq!(footer_block_rows("hello", 80), 3);
-        // Empty input still occupies the caret row.
-        assert_eq!(footer_block_rows("", 80), 3);
-        // A `\`-continued two-line entry → two input rows.
-        assert_eq!(footer_block_rows("foo\\\nbar", 80), 4);
-        // A long first line wraps: (100 + 2 for "❯ ") / 80 + 1 = 2 input rows.
-        assert_eq!(footer_block_rows(&"x".repeat(100), 80), 4);
+    fn input_rows_count_wrapped_caret_lines() {
+        // One caret row for a short line (incl. the empty caret).
+        assert_eq!(footer_input_rows("hello", 80), 1);
+        assert_eq!(footer_input_rows("", 80), 1);
+        // A `\`-continued two-line entry → two rows.
+        assert_eq!(footer_input_rows("foo\\\nbar", 80), 2);
+        // A long first line wraps: (100 + 2 for "❯ ") / 80 + 1 = 2 rows.
+        assert_eq!(footer_input_rows(&"x".repeat(100), 80), 2);
     }
 
     #[test]
@@ -3510,11 +3505,10 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                 );
                 break;
             }
-            // The transient footer: separator + status as scrolled lines,
-            // drawn fresh before the caret each turn (collapses into
-            // scrollback on submit — no pinned region).
+            // The live prompt is just the `❯` caret (clean while typing); the
+            // separator + status footer renders beneath it on submit (the
+            // collapse below). Mark this as a fresh user turn so that fires.
             if footer_on {
-                print_footer_preamble(&footer_status(&inf_model, workspace, is_vi), color);
                 footer_drawn = true;
             }
             let readline_result =
@@ -3536,10 +3530,15 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                 // Rejoin `\`-continued lines (multi-line entry) into real
                 // newlines; a no-op for single-line input.
                 let task = line.replace("\\\n", "\n").trim().to_string();
-                // Collapse the transient footer block into a clean `❯ <input>`
-                // record so the separator + status don't pile up in scrollback.
+                // Collapse the live prompt into a clean `❯ <input>` + footer
+                // record (caret on top, separator + status beneath).
                 if footer_on && footer_drawn {
-                    collapse_footer_block(&line, &task, color);
+                    collapse_footer_block(
+                        &line,
+                        &task,
+                        &footer_status(&inf_model, workspace, is_vi),
+                        color,
+                    );
                 }
                 if task.is_empty() {
                     continue;
