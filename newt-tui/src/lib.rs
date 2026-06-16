@@ -4043,11 +4043,40 @@ struct BackendChoice {
     api_key: Option<String>,
 }
 
-/// Resolve the backend for the TUI. An explicit `kind = "openai"` backend in
-/// the config (`~/.newt/config.toml`) wins — endpoint/model/auth come straight
-/// from it. Otherwise we fall back to the historical Ollama/DGX resolution
-/// ([`resolve_backend_config`]), which the rest of the TUI already understands.
+/// Resolve the backend for the TUI. Precedence:
+///
+/// 1. **`NEWT_PROVIDER`** names a `[backends]` entry — the loadout's `provider`
+///    axis (Slice 2). The named backend supplies endpoint/kind/auth; `NEWT_DGX_MODEL`
+///    (the loadout's `model`) overrides the backend's default model when set. A
+///    loadout-sourced provider is hard-error-validated upstream
+///    ([`newt_core::Loadout::validate`]); a directly-set `NEWT_PROVIDER` that names
+///    no backend falls through to the default resolution below.
+/// 2. An explicit `kind = "openai"` backend in the config wins next — endpoint/model/
+///    auth come straight from it.
+/// 3. Otherwise the historical Ollama/DGX resolution ([`resolve_backend_config`]).
 fn resolve_backend_choice(cfg: &newt_core::Config) -> BackendChoice {
+    // 1. A pinned provider (loadout `provider` axis → NEWT_PROVIDER) selects a
+    //    named [backends] entry by name, regardless of its wire protocol.
+    if let Some(name) = std::env::var("NEWT_PROVIDER")
+        .ok()
+        .filter(|s| !s.is_empty())
+    {
+        if let Some(b) = cfg.backends.iter().find(|b| b.name == name) {
+            let model = std::env::var("NEWT_DGX_MODEL")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| b.model.clone());
+            return BackendChoice {
+                url: b.endpoint.clone(),
+                model,
+                kind: b.kind,
+                api_key: b.resolve_api_key(),
+            };
+        }
+        // Unknown provider name: fall through. The loadout path validates the
+        // name before we get here, so this only happens for a hand-set env var.
+    }
+    // 2. Prefer an explicit OpenAI-compatible backend.
     if let Some(b) = cfg
         .backends
         .iter()
@@ -4060,6 +4089,7 @@ fn resolve_backend_choice(cfg: &newt_core::Config) -> BackendChoice {
             api_key: b.resolve_api_key(),
         };
     }
+    // 3. Historical Ollama/DGX resolution.
     let (url, model) = resolve_backend_config(cfg);
     BackendChoice {
         url,
@@ -9838,6 +9868,108 @@ mod env_resolution_tests {
             assert_eq!(choice.model, "llama3.1:8b");
             assert_eq!(choice.kind, newt_core::BackendKind::Ollama);
             assert!(choice.api_key.is_none());
+        });
+    }
+
+    /// Loadout provider/model axis (Slice 2). `NEWT_PROVIDER` selects a named
+    /// `[backends]` entry by name — regardless of wire protocol — over the
+    /// historical "prefer the first OpenAI backend" default.
+    fn backend(
+        name: &str,
+        endpoint: &str,
+        model: &str,
+        kind: newt_core::BackendKind,
+    ) -> newt_core::BackendConfig {
+        newt_core::BackendConfig {
+            name: name.into(),
+            endpoint: endpoint.into(),
+            model: model.into(),
+            tiers: vec![],
+            kind,
+            api_key_file: None,
+            api_key_env: None,
+        }
+    }
+
+    #[test]
+    fn resolve_backend_choice_honors_named_provider() {
+        let cfg = newt_core::Config {
+            backends: vec![
+                // An OpenAI backend that the historical default would pick first…
+                backend(
+                    "remote",
+                    "http://remote:8000",
+                    "qwen3:32b",
+                    newt_core::BackendKind::Openai,
+                ),
+                // …but NEWT_PROVIDER pins this Ollama one instead.
+                backend(
+                    "local-box",
+                    "http://local-box:11434",
+                    "nemotron-3:33b",
+                    newt_core::BackendKind::Ollama,
+                ),
+            ],
+            ..Default::default()
+        };
+        with_env_vars(
+            &[("NEWT_PROVIDER", "local-box")],
+            &["NEWT_DGX_MODEL"],
+            || {
+                let choice = resolve_backend_choice(&cfg);
+                assert_eq!(choice.url, "http://local-box:11434");
+                assert_eq!(choice.model, "nemotron-3:33b");
+                assert_eq!(choice.kind, newt_core::BackendKind::Ollama);
+            },
+        );
+    }
+
+    #[test]
+    fn resolve_backend_choice_named_provider_model_override() {
+        let cfg = newt_core::Config {
+            backends: vec![backend(
+                "dgx-prod",
+                "http://dgx:11434",
+                "nemotron-3:33b",
+                newt_core::BackendKind::Ollama,
+            )],
+            ..Default::default()
+        };
+        // The loadout's `model` (→ NEWT_DGX_MODEL) overrides the backend default.
+        with_env_vars(
+            &[
+                ("NEWT_PROVIDER", "dgx-prod"),
+                ("NEWT_DGX_MODEL", "nemotron-3:4b"),
+            ],
+            &[],
+            || {
+                let choice = resolve_backend_choice(&cfg);
+                assert_eq!(choice.url, "http://dgx:11434");
+                assert_eq!(
+                    choice.model, "nemotron-3:4b",
+                    "loadout model overrides backend default"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn resolve_backend_choice_unknown_provider_falls_through() {
+        let cfg = newt_core::Config {
+            backends: vec![backend(
+                "remote",
+                "http://remote:8000",
+                "qwen3:32b",
+                newt_core::BackendKind::Openai,
+            )],
+            ..Default::default()
+        };
+        // A directly-set provider that names no backend is not a hard error here
+        // (the loadout path validates upstream) — it falls through to prefer-openai.
+        with_env_vars(&[("NEWT_PROVIDER", "ghost")], &["NEWT_DGX_MODEL"], || {
+            let choice = resolve_backend_choice(&cfg);
+            assert_eq!(choice.url, "http://remote:8000");
+            assert_eq!(choice.kind, newt_core::BackendKind::Openai);
         });
     }
 

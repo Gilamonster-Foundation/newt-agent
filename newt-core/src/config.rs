@@ -1039,13 +1039,14 @@ pub struct LoadoutSettings {
 
 impl Loadout {
     /// Validate the loadout's name references against `cfg`: a named `kit` must be a
-    /// known bundle and a named `profile` must be a known, valid profile. A dangling
-    /// reference is a hard error — a loadout that silently did nothing would be a
-    /// false claim. `provider`/`model`/`role` are resolved by their own surfaces
-    /// later (Slices 1–2) and are not checked here.
+    /// known bundle, a named `profile` must be a known, valid profile, and a named
+    /// `provider` must name a `[backends]` entry (Slice 2 — the provider/model axis).
+    /// A dangling reference is a hard error — a loadout that silently did nothing
+    /// would be a false claim. The `@variant` half of `model` and `role` are resolved
+    /// by their own surfaces later and are not checked here.
     ///
     /// # Errors
-    /// The first dangling `kit` or `profile` reference, as a message.
+    /// The first dangling `kit`, `profile`, or `provider` reference, as a message.
     pub fn validate(&self, cfg: &Config) -> std::result::Result<(), String> {
         if let Some(kit) = &self.kit {
             cfg.resolve_bundle(kit)
@@ -1054,6 +1055,22 @@ impl Loadout {
         if let Some(profile) = &self.profile {
             cfg.resolve_profile(profile)
                 .map_err(|e| format!("loadout profile '{profile}': {e}"))?;
+        }
+        if let Some(provider) = &self.provider {
+            if !cfg.backends.iter().any(|b| &b.name == provider) {
+                let known = if cfg.backends.is_empty() {
+                    "none defined".to_string()
+                } else {
+                    cfg.backends
+                        .iter()
+                        .map(|b| b.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                return Err(format!(
+                    "loadout provider '{provider}': no [backends] entry named '{provider}' (known: {known})"
+                ));
+            }
         }
         Ok(())
     }
@@ -1978,6 +1995,12 @@ mod tests {
     fn loadout_parses_inline_and_validates_references() {
         let cfg: Config = toml::from_str(
             r#"
+            [[backends]]
+            name = "dgx"
+            endpoint = "http://dgx.local:11434"
+            model = "nemotron-3:33b"
+            tiers = []
+
             [profiles.nemotron]
             techniques = ["knowledge_base", "verify_gate", "retry"]
             [bundles.nemotron]
@@ -2031,6 +2054,19 @@ mod tests {
         let e = bad_profile.validate(&cfg).unwrap_err();
         assert!(
             e.contains("profile 'ghost-profile'") && e.contains("no such profile"),
+            "{e}"
+        );
+        // dangling provider — must name a [backends] entry (Slice 2). With no
+        // `[[backends]]` in this TOML, `cfg.backends` is the default `ollama`.
+        let bad_provider = Loadout {
+            provider: Some("ghost-provider".into()),
+            ..Default::default()
+        };
+        let e = bad_provider.validate(&cfg).unwrap_err();
+        assert!(
+            e.contains("provider 'ghost-provider'")
+                && e.contains("no [backends] entry")
+                && e.contains("ollama"),
             "{e}"
         );
         // an empty loadout is valid (no references)

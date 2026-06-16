@@ -351,8 +351,17 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
                                 std::env::set_var("NEWT_NUM_CTX", n.to_string());
                             }
                         }
-                        // Model selection: Slice 2 resolves `@variant` via the catalog;
-                        // here the bare model id feeds the existing selector.
+                        // Provider axis (Slice 2): the loadout's `provider` names a
+                        // [backends] entry; resolve_backend_choice honors NEWT_PROVIDER
+                        // to select it (endpoint/kind/auth). Validated above.
+                        if std::env::var_os("NEWT_PROVIDER").is_none() {
+                            if let Some(p) = &loadout.provider {
+                                std::env::set_var("NEWT_PROVIDER", p);
+                            }
+                        }
+                        // Model selection: the catalog resolves `@variant` (catalog
+                        // epic); here the bare model id feeds the existing selector and
+                        // overrides the chosen backend's default model.
                         if std::env::var_os("NEWT_DGX_MODEL").is_none() {
                             if let Some(m) = &loadout.model {
                                 let bare = m.split('@').next().unwrap_or(m);
