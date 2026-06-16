@@ -652,6 +652,15 @@ mod retry_ledger_tests {
     }
 }
 
+/// True when a backend 400 says the model can't accept a `tools` field.
+/// Ollama phrases it `"<model> does not support tools"`; OpenAI-compatible
+/// servers vary, so we also accept the looser `"not support tools"`. Used to
+/// drop tools and retry once, then keep them off for the session (deepseek-r1).
+fn is_tools_unsupported_error(e: &anyhow::Error) -> bool {
+    let s = e.to_string().to_lowercase();
+    s.contains("does not support tools") || s.contains("not support tools")
+}
+
 /// Main agentic loop: call model → execute tool calls → feed results back → repeat.
 /// Returns `(reply_text, was_streamed, token_usage, hallucination_count)`.
 /// When `was_streamed` is true the text was already printed token-by-token.
@@ -750,6 +759,11 @@ pub async fn chat_complete(
     let mut suspicious_empty_retries: u32 = 0;
     // Hard context-window 400s recovered (parse limit → trim → retry). See #223.
     let mut cw_retries: u32 = 0;
+    // Some models reject ANY request carrying a `tools` field (e.g.
+    // deepseek-r1). Once one 400s with "does not support tools", drop tools for
+    // the rest of the session so even a bare "hello" works; notice it once.
+    let mut tools_supported = true;
+    let mut tools_unsupported_notified = false;
     // Pre-send token budget gate: trim before dispatch when the current context
     // size exceeds the model's empirically-confirmed max input (or the safe
     // context) — capped by the `num_ctx` every request this turn will carry
@@ -944,7 +958,7 @@ pub async fn chat_complete(
         // Final text round: stream:true so the user sees tokens arrive.
         // We don't know which round is last, so we probe with stream:false first
         // and switch to streaming only when the model returns no tool calls.
-        let body_no_stream = if let Some(ctx_size) = num_ctx {
+        let mut body_no_stream = if let Some(ctx_size) = num_ctx {
             serde_json::json!({
                 "model": model,
                 "messages": messages,
@@ -960,6 +974,14 @@ pub async fn chat_complete(
                 "tools": tools.clone(),
             })
         };
+        // Drop tools entirely for a model that rejects them (set below on a
+        // "does not support tools" 400) — an empty array still trips strict
+        // models, so remove the key.
+        if !tools_supported {
+            if let Some(o) = body_no_stream.as_object_mut() {
+                o.remove("tools");
+            }
+        }
 
         // Retry the send+status+parse as one unit — a connection drop at any
         // of these steps is transient and worth retrying with backoff.
@@ -987,6 +1009,24 @@ pub async fn chat_complete(
         let json: serde_json::Value = match dispatch {
             Ok(j) => j,
             Err(e) => {
+                // No-tools recovery: a model that rejects the `tools` field
+                // (deepseek-r1) 400s even on "hello". Drop tools, notice once,
+                // and re-dispatch the same round — self-limiting (the rebuilt
+                // body omits tools) and session-persistent.
+                if tools_supported && is_tools_unsupported_error(&e) {
+                    tools_supported = false;
+                    if !tools_unsupported_notified {
+                        tools_unsupported_notified = true;
+                        print_newt(
+                            &format!(
+                                "{model} does not support tools — tools disabled for this session"
+                            ),
+                            color,
+                            false,
+                        );
+                    }
+                    continue 'round_loop;
+                }
                 // Graceful context-window 400 recovery: parse the model's real
                 // limit, tighten the budget, compress, and retry once (#223;
                 // compress-not-trim since Step 18.4).
@@ -1124,7 +1164,7 @@ pub async fn chat_complete(
             // from the same history; if it returns empty (non-determinism, context
             // pressure, or model quirk) we fall back to the probe content so the
             // user never sees a silent blank response.
-            let body_stream = if let Some(ctx_size) = num_ctx {
+            let mut body_stream = if let Some(ctx_size) = num_ctx {
                 serde_json::json!({
                     "model": model,
                     "messages": &messages,
@@ -1140,6 +1180,13 @@ pub async fn chat_complete(
                     "tools": tools.clone(),
                 })
             };
+            // A no-tools model (set on a prior "does not support tools" 400)
+            // must not see the key on the streaming round either.
+            if !tools_supported {
+                if let Some(o) = body_stream.as_object_mut() {
+                    o.remove("tools");
+                }
+            }
             // Retry the connection; if we connect successfully but the stream
             // drops mid-token, that's a separate (harder) failure mode.
             let sresp = with_backoff_notify(
@@ -1822,6 +1869,10 @@ pub async fn openai_chat_complete(
     let mut hallucination_count: u32 = 0;
     // Hard context-window 400s recovered (parse limit → trim → retry). See #223.
     let mut cw_retries: u32 = 0;
+    // No-tools recovery (mirrors the Ollama path): a model that rejects the
+    // `tools` field 400s even on "hello"; drop tools and retry, notice once.
+    let mut tools_supported = true;
+    let mut tools_unsupported_notified = false;
     // Pre-send token budget gate; tightened mid-turn by a recovered 400
     // (#223). Phase 20 §2.1 max(proven, believed) semantics — no `num_ctx`
     // ceiling on this wire (limits are server-side, e.g. vLLM
@@ -1954,13 +2005,21 @@ pub async fn openai_chat_complete(
 
         // OpenAI-compatible endpoints don't use Ollama's `options.num_ctx` —
         // context limits are configured server-side (vLLM --max-model-len).
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "model": model,
             "messages": messages,
             "tools": tools.clone(),
             "tool_choice": "auto",
             "stream": false,
         });
+        // Drop tools (and the now-meaningless tool_choice) for a model that
+        // rejected them on a prior "does not support tools" 400.
+        if !tools_supported {
+            if let Some(o) = body.as_object_mut() {
+                o.remove("tools");
+                o.remove("tool_choice");
+            }
+        }
         // No `num_ctx` is sent here, so #282's per-request input ceiling has
         // no value to key on either — the pre-send guard stays on the cached
         // `max_ok_input` ∥ `safe_context` numbers and the cw-400 recovery
@@ -1993,6 +2052,24 @@ pub async fn openai_chat_complete(
         let json: serde_json::Value = match dispatch {
             Ok(j) => j,
             Err(e) => {
+                // No-tools recovery: a model that rejects the `tools` field
+                // (deepseek-r1) 400s even on "hello". Drop tools, notice once,
+                // and re-dispatch the same round — self-limiting (the rebuilt
+                // body omits tools) and session-persistent.
+                if tools_supported && is_tools_unsupported_error(&e) {
+                    tools_supported = false;
+                    if !tools_unsupported_notified {
+                        tools_unsupported_notified = true;
+                        print_newt(
+                            &format!(
+                                "{model} does not support tools — tools disabled for this session"
+                            ),
+                            color,
+                            false,
+                        );
+                    }
+                    continue 'round_loop;
+                }
                 // Graceful context-window 400 recovery: parse the model's real
                 // limit, tighten the budget, compress, and retry once (#223;
                 // compress-not-trim since Step 18.4).
@@ -3284,6 +3361,86 @@ mod http_loop_tests {
         assert_eq!(u.input_tokens, 7, "max(5 probe, 7 stream), not the sum");
         assert_eq!(u.output_tokens, 5, "2 (probe) + 3 (stream)");
         assert_eq!(hallu, 0);
+    }
+
+    #[test]
+    fn detects_tools_unsupported_400_phrasings() {
+        assert!(is_tools_unsupported_error(&anyhow::anyhow!(
+            "Ollama 400 Bad Request: registry.ollama.ai/library/deepseek-r1:70b does not support tools"
+        )));
+        // Looser OpenAI-compatible phrasing.
+        assert!(is_tools_unsupported_error(&anyhow::anyhow!(
+            "this model does not support tools at this time"
+        )));
+        // Unrelated 400s must NOT trip the no-tools path.
+        assert!(!is_tools_unsupported_error(&anyhow::anyhow!(
+            "Ollama 400 Bad Request: context window exceeded"
+        )));
+    }
+
+    /// A model that rejects the `tools` field (deepseek-r1) 400s on the first
+    /// dispatch; newt must drop tools and re-dispatch, answering normally. The
+    /// tools-absent retry is the one that succeeds — no tools-400 loop.
+    struct NoToolsResponder {
+        rejections: Arc<AtomicUsize>,
+        served_without_tools: Arc<AtomicBool>,
+    }
+    impl Respond for NoToolsResponder {
+        fn respond(&self, req: &Request) -> ResponseTemplate {
+            let has_tools = body_json(req).get("tools").is_some();
+            if has_tools {
+                self.rejections.fetch_add(1, Ordering::SeqCst);
+                return ResponseTemplate::new(400).set_body_string(
+                    "registry.ollama.ai/library/deepseek-r1:70b does not support tools",
+                );
+            }
+            self.served_without_tools.store(true, Ordering::SeqCst);
+            if is_stream(req) {
+                ndjson(&[serde_json::json!({
+                    "message": {"content": "hello there"}, "done": true,
+                    "prompt_eval_count": 4, "eval_count": 2
+                })])
+            } else {
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "message": {"content": "probe answer"},
+                    "prompt_eval_count": 4, "eval_count": 2,
+                }))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn no_tools_model_recovers_by_dropping_tools() {
+        let server = MockServer::start().await;
+        let rejections = Arc::new(AtomicUsize::new(0));
+        let served_without_tools = Arc::new(AtomicBool::new(false));
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(NoToolsResponder {
+                rejections: rejections.clone(),
+                served_without_tools: served_without_tools.clone(),
+            })
+            .mount(&server)
+            .await;
+
+        let messages = msgs();
+        let caveats = Caveats::top();
+        let (reply, streamed, _usage, _) =
+            chat_complete(ctx(&server.uri(), &messages, &caveats), &mut NoMcp)
+                .await
+                .expect("a no-tools model still answers a bare prompt");
+
+        assert_eq!(reply, "hello there", "the tools-absent retry answered");
+        assert!(streamed);
+        assert!(
+            served_without_tools.load(Ordering::SeqCst),
+            "a request without the tools field was eventually served"
+        );
+        assert_eq!(
+            rejections.load(Ordering::SeqCst),
+            1,
+            "exactly one tools-bearing request 400s — the drop is self-limiting"
+        );
     }
 
     /// The streaming re-issue produces no tokens — the loop must fall back to
