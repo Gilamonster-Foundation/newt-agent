@@ -924,6 +924,20 @@ pub const PROMPT_TOKENS: &[(&str, &str, &str)] = &[
     ("$VERSION", "\\v", "newt version"),
 ];
 
+/// Strip one matching pair of surrounding quotes (`"` or `'`), if present.
+/// Preserves everything inside, including trailing spaces. Pure for testing.
+fn strip_one_quote_pair(s: &str) -> &str {
+    let bytes = s.as_bytes();
+    if bytes.len() >= 2
+        && ((bytes[0] == b'"' && bytes[bytes.len() - 1] == b'"')
+            || (bytes[0] == b'\'' && bytes[bytes.len() - 1] == b'\''))
+    {
+        &s[1..s.len() - 1]
+    } else {
+        s
+    }
+}
+
 /// Render [`PROMPT_TOKENS`] as aligned help lines (for `/prompt`).
 fn prompt_token_help() -> Vec<String> {
     PROMPT_TOKENS
@@ -1012,6 +1026,16 @@ mod footer_tests {
         let p = expand_prompt_tokens(DEFAULT_RICH_PROMPT, "/home/me/newt-agent", "gpt-4.1", false);
         assert!(p.contains("· gpt-4.1 · newt-agent · emacs ] ❯ "), "{p}");
         assert!(p.starts_with('['));
+    }
+
+    #[test]
+    fn strip_one_quote_pair_preserves_inner_spaces() {
+        assert_eq!(strip_one_quote_pair("\"[$TIME] ❯ \""), "[$TIME] ❯ ");
+        assert_eq!(strip_one_quote_pair("'hi'"), "hi");
+        // Unquoted, mismatched, or too-short input is returned unchanged.
+        assert_eq!(strip_one_quote_pair("bare"), "bare");
+        assert_eq!(strip_one_quote_pair("\"oops'"), "\"oops'");
+        assert_eq!(strip_one_quote_pair("\""), "\"");
     }
 
     #[test]
@@ -5812,6 +5836,7 @@ fn help_lines() -> &'static [&'static str] {
         "  /mode                    - show the active mode; /mode off clears it",
         "  /workspace               - show current workspace path",
         "  /prompt                  - list prompt tokens ($MODEL, $DATE, …) + current prompt",
+        "  /prompt set \"<template>\"  - set the prompt for this session; /prompt reset to revert",
         "  /vi  /emacs              - switch line-editor key bindings for this session",
         "  /version                 - print newt version",
         "  /help                    - this message",
@@ -5848,19 +5873,62 @@ fn dispatch_slash(
 
         "workspace" => print_newt(workspace, color, verbose),
 
+        "prompt" if arg1 == "set" => {
+            // Everything after "prompt set " is the literal template — taken
+            // from the RAW input so internal/trailing spaces survive, with one
+            // layer of surrounding quotes stripped. Applies for the session
+            // (via NEWT_PROMPT, which the per-turn prompt build reads first);
+            // put it in `[tui] prompt` to persist.
+            let template = input
+                .trim_start_matches('/')
+                .strip_prefix("prompt")
+                .and_then(|s| s.trim_start().strip_prefix("set"))
+                .map(|s| s.strip_prefix(' ').unwrap_or(s))
+                .map(strip_one_quote_pair)
+                .unwrap_or("");
+            if template.is_empty() {
+                print_newt(
+                    "usage: /prompt set \"<template>\"  (try /prompt for the token list)",
+                    color,
+                    verbose,
+                );
+            } else {
+                // SAFETY: single-threaded REPL; the next prompt is built right
+                // after this returns.
+                unsafe { std::env::set_var("NEWT_PROMPT", template) };
+                print_newt(
+                    &format!("prompt set for this session: {template:?}  (add to [tui] prompt to persist)"),
+                    color,
+                    verbose,
+                );
+            }
+        }
+
+        "prompt" if matches!(arg1, "reset" | "default" | "clear") => {
+            // SAFETY: single-threaded REPL.
+            unsafe { std::env::remove_var("NEWT_PROMPT") };
+            print_newt(
+                "prompt reset to your [tui] prompt / the built-in default.",
+                color,
+                verbose,
+            );
+        }
+
         "prompt" => {
             print_newt(
-                "Prompt tokens — set `[tui] prompt` (or NEWT_PROMPT) to customize:",
+                "Prompt tokens — `/prompt set \"<template>\"` to change, or `[tui] prompt` to persist:",
                 color,
                 verbose,
             );
             for line in prompt_token_help() {
                 println!("{line}");
             }
-            let cur = newt_core::Config::resolve()
-                .ok()
-                .and_then(|c| c.tui)
-                .and_then(|t| t.prompt);
+            let cur = std::env::var("NEWT_PROMPT").ok().or_else(|| {
+                newt_core::Config::resolve()
+                    .ok()
+                    .and_then(|c| c.tui)
+                    .and_then(|t| t.prompt)
+            });
             match cur {
                 Some(t) => print_newt(&format!("current: {t:?}"), color, verbose),
                 None => print_newt(
