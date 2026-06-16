@@ -23,6 +23,7 @@ pub mod notes_scan;
 pub mod plan;
 pub mod pricing;
 pub mod prune;
+pub mod reasoning;
 pub mod retry;
 pub mod role_profile;
 pub mod router;
@@ -86,6 +87,7 @@ pub use memory::{
 pub use metrics::{TokenUsage, TurnMetrics};
 pub use model_id::ModelId;
 pub use pricing::{ModelRate, PricingConfig};
+pub use reasoning::{split_reasoning, ThinkFilter};
 pub use role_profile::{
     CaveatProfile, NamedPermissionPreset, RoleProfile, ScopeKeyword, ScopeSpec,
 };
