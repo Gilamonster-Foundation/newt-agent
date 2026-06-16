@@ -52,6 +52,18 @@ pub struct Cli {
     )]
     pub splash: bool,
 
+    /// Disable the input footer (the transient multi-line `❯` block + status
+    /// header) and use a plain bash-like prompt. Equivalent to `NEWT_FOOTER=off`
+    /// or `[tui] footer = "off"`. By default the footer shows on a TTY and
+    /// auto-degrades to a plain scroller off one (pipes, `newt worker`).
+    #[arg(
+        long,
+        visible_alias = "no-footer",
+        global = true,
+        default_value_t = false
+    )]
+    pub plain: bool,
+
     /// Enable per-round agent-loop diagnostics: prints each round's content
     /// excerpt, tool-call count, and token usage. Also enables fallback
     /// messages when the model returns an empty reply. Equivalent to setting
@@ -299,6 +311,11 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             // only the interactive TUI reads it — worker/eval never prompt.
             if cli.prompt_for_permissions {
                 unsafe { std::env::set_var("NEWT_PROMPT_FOR_PERMISSIONS", "1") };
+            }
+            // --plain (alias --no-footer) forces the footer off; the TUI reads
+            // NEWT_FOOTER once. CLI > env > [tui] footer > default (auto).
+            if cli.plain {
+                unsafe { std::env::set_var("NEWT_FOOTER", "off") };
             }
             // INTERIM (#297): --disable-ocap / --yolo threads the same way.
             // The run_command dispatch in newt-core reads NEWT_DISABLE_OCAP

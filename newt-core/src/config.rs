@@ -506,6 +506,29 @@ pub enum MemoryDisclosure {
     Index,
 }
 
+/// Input-footer mode — the `[tui] footer` key.
+///
+/// The footer is the transient multi-line input block (a top separator, a
+/// status header, and the `❯` caret) rendered *only while the prompt is
+/// waiting for input* and collapsed into scrollback on submit — never a
+/// pinned region (see `docs/decisions/plain_scroller_tui.md`). It is purely a
+/// human-TUI affordance; headless consumers never construct it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum FooterMode {
+    /// Decorations iff stdout is a TTY (the default). Off a TTY — pipes,
+    /// `newt worker`, the wyvern deep-cut — the prompt degrades to a plain
+    /// bash-like scroller automatically.
+    #[default]
+    Auto,
+    /// Always render the footer decorations, even off a TTY. Useful for
+    /// screenshots and snapshot tests.
+    On,
+    /// Never render the footer — today's plain prompt, the bash-like
+    /// experience. Equivalent to the `--plain` CLI flag.
+    Off,
+}
+
 fn default_memory_window() -> usize {
     20
 }
@@ -594,6 +617,13 @@ pub struct TuiConfig {
     /// `"emacs"` (default) or `"vi"`. Also overridable via `NEWT_EDIT_MODE`.
     #[serde(default)]
     pub edit_mode: EditMode,
+
+    /// Input-footer mode: the transient multi-line `❯` input block with a
+    /// status header. `"auto"` (default) shows it on a TTY and degrades to a
+    /// plain scroller otherwise; `"on"` always shows it; `"off"` never does
+    /// (the `--plain` CLI flag, or `NEWT_FOOTER=off`).
+    #[serde(default)]
+    pub footer: FooterMode,
 
     /// Maximum lines of tool output shown inline before offering "show all?".
     /// Default: 20. Set to 0 to always show everything.
@@ -1089,6 +1119,7 @@ impl Default for TuiConfig {
             prompt: None,
             no_splash: false,
             edit_mode: EditMode::Emacs,
+            footer: FooterMode::Auto,
             tool_output_lines: default_tool_output_lines(),
             max_tool_rounds: default_max_tool_rounds(),
             permissions: ToolPermissions::default(),
@@ -1495,6 +1526,24 @@ mod tests {
     // upstream `agent-mesh-protocol::Caveats` ships algebra only).
     use crate::caveats::CaveatsExt;
     use std::io::Write;
+
+    // ── input-footer mode ──────────────────────────────────────────────
+
+    #[test]
+    fn footer_mode_defaults_to_auto_and_round_trips() {
+        // Absent key → Auto (the amphibious default).
+        let cfg: TuiConfig = toml::from_str("").unwrap();
+        assert_eq!(cfg.footer, FooterMode::Auto);
+        // Each variant parses from its snake_case key.
+        for (key, want) in [
+            ("auto", FooterMode::Auto),
+            ("on", FooterMode::On),
+            ("off", FooterMode::Off),
+        ] {
+            let cfg: TuiConfig = toml::from_str(&format!("footer = \"{key}\"")).unwrap();
+            assert_eq!(cfg.footer, want, "footer = {key}");
+        }
+    }
 
     // ── profile composition (technique library) ────────────────────────
 

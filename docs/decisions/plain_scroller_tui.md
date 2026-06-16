@@ -101,6 +101,17 @@ The practical wins compound with the architectural one:
   `docs/decisions/plan_editor_ephemeral_tui.md`.
 - **rustyline's internal raw mode** during a `readline` call (line editing,
   history navigation). Output remains scrolled text.
+- **The input footer** — the transient `❯` prompt block. Before each
+  `readline`, a separator rule and a one-line status header (`model · workspace
+  · mode`) are printed as ordinary **scrolled lines**; the `❯` caret is
+  rustyline's prompt; multi-line entry is rustyline's `Validator` (a trailing
+  `\` continues, the shell/Python idiom). It is **not** a pinned region: it
+  exists only while the prompt waits for input and collapses into scrollback on
+  submit, with model output scrolling plainly above it — an extension of the
+  rustyline carve-out above, not a new surface kind. Gated by `[tui] footer`
+  (`auto` default → on iff stdout is a TTY; `on`/`off` force it) and the
+  `--plain` flag, so it auto-degrades to a bare prompt off a TTY (pipes,
+  `newt worker`, wyvern) with zero terminal-state side effects.
 - **ANSI color and column escapes in scrolled output** (header, prompts,
   diff coloring), always behind `color_supported` degradation.
 - **Single-line, same-line indicators** — e.g. the `▸ thinking…` indicator

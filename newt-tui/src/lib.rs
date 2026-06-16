@@ -863,6 +863,174 @@ fn build_rl_config() -> rustyline::config::Config {
         .build()
 }
 
+// ---------------------------------------------------------------------------
+// Input footer (the transient multi-line `❯` block — see
+// docs/decisions/plain_scroller_tui.md). It is NOT a pinned region: the
+// separator + status header are printed as ordinary scrolled lines just
+// before each `readline`, the `❯` caret is rustyline's prompt, and the whole
+// thing collapses into scrollback on submit while model output scrolls
+// plainly above it. Off a TTY it degrades to a plain bash-like prompt.
+// ---------------------------------------------------------------------------
+
+/// Resolve the configured footer mode: `NEWT_FOOTER` env > `[tui].footer` > `Auto`.
+fn footer_mode() -> newt_core::FooterMode {
+    use newt_core::FooterMode;
+    if let Ok(v) = std::env::var("NEWT_FOOTER") {
+        match v.to_lowercase().as_str() {
+            "off" | "plain" | "0" | "false" => return FooterMode::Off,
+            "on" | "1" | "true" => return FooterMode::On,
+            "auto" => return FooterMode::Auto,
+            _ => {}
+        }
+    }
+    newt_core::Config::resolve()
+        .ok()
+        .and_then(|c| c.tui)
+        .map(|t| t.footer)
+        .unwrap_or_default()
+}
+
+/// Whether to render the footer decorations, given the mode and a TTY probe.
+/// `Auto` follows the TTY (the amphibious default); `On`/`Off` force it. Pure
+/// for testing — the caller injects the `is_tty` reading.
+fn footer_decorations_enabled(mode: newt_core::FooterMode, is_tty: bool) -> bool {
+    use newt_core::FooterMode;
+    match mode {
+        FooterMode::Off => false,
+        FooterMode::On => true,
+        FooterMode::Auto => is_tty,
+    }
+}
+
+/// The status header shown above the caret: `model · workspace · mode`. Empty
+/// fields are dropped. Pure for testing.
+fn footer_status(model: &str, workspace: &str, is_vi: bool) -> String {
+    let ws = std::path::Path::new(workspace)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| workspace.to_string());
+    let mode = if is_vi { "vi" } else { "emacs" };
+    [model.to_string(), ws, mode.to_string()]
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
+/// A horizontal rule sized to the terminal (clamped 8..=80) — the footer's top
+/// separator. Pure for testing.
+fn footer_separator(cols: u16) -> String {
+    "─".repeat((cols as usize).clamp(8, 80))
+}
+
+/// Print the footer preamble (separator + status header) as ordinary scrolled
+/// lines, immediately before `readline` draws the `❯` caret on the next line.
+fn print_footer_preamble(status: &str, color: bool) {
+    let cols = terminal::size().map(|(c, _)| c).unwrap_or(80);
+    let sep = footer_separator(cols);
+    if color {
+        execute!(
+            io::stdout(),
+            SetForegroundColor(CtColor::DarkGrey),
+            Print(&sep),
+            Print("\n  "),
+            Print(status),
+            ResetColor,
+            Print("\n"),
+        )
+        .ok();
+    } else {
+        println!("{sep}");
+        println!("  {status}");
+    }
+}
+
+/// rustyline helper enabling multi-line entry: a line ending in `\` continues
+/// onto the next line (the shell/Python continuation idiom — portable across
+/// terminals, no special key detection). On submit the caller rejoins
+/// `"\\\n"` to `"\n"`. Installed only when the footer is on; off-mode keeps
+/// today's single-line behavior exactly.
+struct FooterHelper;
+
+/// Whether the input wants another line: a trailing `\` continues (the
+/// shell/Python idiom). Pure for testing — the `Validator` is a thin wrapper.
+fn footer_continues(input: &str) -> bool {
+    input.ends_with('\\')
+}
+
+impl rustyline::completion::Completer for FooterHelper {
+    type Candidate = String;
+}
+impl rustyline::hint::Hinter for FooterHelper {
+    type Hint = String;
+}
+impl rustyline::highlight::Highlighter for FooterHelper {}
+impl rustyline::validate::Validator for FooterHelper {
+    fn validate(
+        &self,
+        ctx: &mut rustyline::validate::ValidationContext,
+    ) -> rustyline::Result<rustyline::validate::ValidationResult> {
+        if footer_continues(ctx.input()) {
+            Ok(rustyline::validate::ValidationResult::Incomplete)
+        } else {
+            Ok(rustyline::validate::ValidationResult::Valid(None))
+        }
+    }
+}
+impl rustyline::Helper for FooterHelper {}
+
+#[cfg(test)]
+mod footer_tests {
+    use super::*;
+    use newt_core::FooterMode;
+
+    #[test]
+    fn decorations_follow_mode_and_tty() {
+        // Auto follows the TTY — the amphibious default.
+        assert!(footer_decorations_enabled(FooterMode::Auto, true));
+        assert!(!footer_decorations_enabled(FooterMode::Auto, false));
+        // On forces it on even off a TTY (screenshots, snapshot tests).
+        assert!(footer_decorations_enabled(FooterMode::On, true));
+        assert!(footer_decorations_enabled(FooterMode::On, false));
+        // Off forces it off even on a TTY (--plain / bash-like).
+        assert!(!footer_decorations_enabled(FooterMode::Off, true));
+        assert!(!footer_decorations_enabled(FooterMode::Off, false));
+    }
+
+    #[test]
+    fn status_joins_present_fields_with_a_dot() {
+        assert_eq!(
+            footer_status("qwen2.5:7b", "/home/me/proj", false),
+            "qwen2.5:7b · proj · emacs"
+        );
+        assert_eq!(
+            footer_status("llama3", "/home/me/proj", true),
+            "llama3 · proj · vi"
+        );
+        // An empty model is dropped, not rendered as a leading separator.
+        assert_eq!(footer_status("", "/srv/work", false), "work · emacs");
+    }
+
+    #[test]
+    fn separator_is_clamped_to_a_sane_width() {
+        assert_eq!(footer_separator(40).chars().count(), 40);
+        assert_eq!(footer_separator(3).chars().count(), 8, "floored at 8");
+        assert_eq!(footer_separator(500).chars().count(), 80, "capped at 80");
+        assert!(footer_separator(40).chars().all(|c| c == '─'));
+    }
+
+    #[test]
+    fn continuation_triggers_on_trailing_backslash() {
+        // A trailing backslash means "keep typing" (multi-line continuation).
+        assert!(footer_continues("write a\\"));
+        // Balanced input submits.
+        assert!(!footer_continues("write a function"));
+        assert!(!footer_continues(""));
+        // The rejoin the REPL applies turns a `\`-break into a real newline.
+        assert_eq!("foo\\\nbar".replace("\\\n", "\n"), "foo\nbar");
+    }
+}
+
 /// Build the rustyline prompt string — plain text, PS1 tokens expanded.
 ///
 /// Reads `[tui].prompt` from config (overridable via `NEWT_PROMPT`).
@@ -3003,7 +3171,14 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
     }
     println!();
 
-    let mut rl = rustyline::DefaultEditor::with_config(build_rl_config())?;
+    // Footer on iff the mode says so (Auto follows the TTY). Drives the
+    // multi-line helper + the per-prompt separator/status preamble.
+    let footer_on = footer_decorations_enabled(footer_mode(), io::stdout().is_terminal());
+    let mut rl: rustyline::Editor<FooterHelper, rustyline::history::DefaultHistory> =
+        rustyline::Editor::with_config(build_rl_config())?;
+    if footer_on {
+        rl.set_helper(Some(FooterHelper));
+    }
     if let Some(ref hp) = history_path {
         let _ = rl.load_history(hp);
     }
@@ -3014,7 +3189,17 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
     mark_fds_cloexec();
 
     let is_vi = build_rl_config().edit_mode() == rustyline::config::EditMode::Vi;
-    let prompt = prompt_str(workspace, verbose, is_vi);
+    // With the footer on, the caret is the recognizable `❯` (vi-mode keeps the
+    // `[i]` indicator); off, the configured PS1 prompt — bash-like.
+    let prompt = if footer_on {
+        if is_vi {
+            "[i] ❯ ".to_string()
+        } else {
+            "❯ ".to_string()
+        }
+    } else {
+        prompt_str(workspace, verbose, is_vi)
+    };
 
     // system prompt is built AFTER initialize_all (see below) so soul files are loaded.
     // Placeholder until then.
@@ -3248,6 +3433,12 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                 );
                 break;
             }
+            // The transient footer: separator + status as scrolled lines,
+            // drawn fresh before the caret each turn (collapses into
+            // scrollback on submit — no pinned region).
+            if footer_on {
+                print_footer_preamble(&footer_status(&inf_model, workspace, is_vi), color);
+            }
             let readline_result =
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rl.readline(&prompt)));
             match readline_result {
@@ -3264,7 +3455,9 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
         };
         match readline_result {
             Ok(line) => {
-                let task = line.trim().to_string();
+                // Rejoin `\`-continued lines (multi-line entry) into real
+                // newlines; a no-op for single-line input.
+                let task = line.replace("\\\n", "\n").trim().to_string();
                 if task.is_empty() {
                     continue;
                 }
@@ -3523,7 +3716,10 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                         );
                     }
                     let fresh_cfg = build_rl_config();
-                    rl = rustyline::DefaultEditor::with_config(fresh_cfg)?;
+                    rl = rustyline::Editor::with_config(fresh_cfg)?;
+                    if footer_on {
+                        rl.set_helper(Some(FooterHelper));
+                    }
                     if let Some(ref hp) = history_path {
                         let _ = rl.load_history(hp);
                     }
