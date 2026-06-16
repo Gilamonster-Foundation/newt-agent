@@ -1060,6 +1060,29 @@ tables. Steps:
 - **21.9** optional raw-ZMQ kernel client.
 - **21.10** `docs/decisions/centaur_data_scientist.md` + README config snippet.
 
+# Phase 22 — Hierarchical context scheduler (one engine, many agents)
+
+**Canonical design: [`docs/design/context-scheduler.md`](design/context-scheduler.md).**
+Time-share one DGX across many logical agents the way an OS time-shares one CPU.
+Layer 1 (vLLM continuous batching + PagedAttention, or Ollama `NUM_PARALLEL`)
+already interleaves the GPU; Phase 22 builds Layer 2 — admission + cooperative
+scheduling of agent rounds. Two-level hierarchy (dry role names; codenames live
+in code comments during dev): **global-scheduler** · **kv-warden** (gate the KV
+budget, hold waiters, release on free) · **distributed-scheduler** ·
+**execution-worker** (reuses `wyvern-agent`). Tenants live above the scheduler:
+**tenant-context** (map-reduce-over-context job) and **per-model-strategy**
+(summary/paged/mapreduce, visible/silent). Composes 20.3 (never halt) + 20.4
+(swap = paged compaction). MVP co-locates the control tiers in one process over
+the serial (Ollama) engine; the concurrent (vLLM) engine and multi-engine split
+slot behind the same `Engine` seam later.
+
+- **22.1** `Engine` trait + serial (Ollama) impl; ACB; co-located global-scheduler/kv-warden/distributed-scheduler; cooperative round quantum; round-robin + priority inheritance.
+- **22.2** kv-warden KV-budget estimation + hold/release; swap-by-recompute with prefix caching (composes Step 20.4).
+- **22.3** tenant-context map-reduce job (carve → submit → reduce) + cross-chunk join pass.
+- **22.4** per-model `context_strategy`/`strategy_disclosure` + silent mode; deterministic scheduler mode + live trace.
+- **22.5** eval harness (single vs summary vs paged vs mapreduce); wire `auto` to the Phase-20 writeback.
+- **22.6** *(follow-on)* concurrent (vLLM) `Engine` impl; KV-offload swap; multi-engine distributed-scheduler split across the bus.
+
 ---
 
 # Cross-cutting notes
