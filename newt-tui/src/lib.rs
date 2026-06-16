@@ -6035,6 +6035,7 @@ fn help_lines() -> &'static [&'static str] {
         "  /mode                    - show the active mode; /mode off clears it",
         "  /loadout                 - show the active loadout: declared axes vs what resolved",
         "  /workspace               - show current workspace path",
+        "  /config                  - dump the resolved config (secrets redacted) for audit",
         "  /prompt                  - list prompt tokens ($MODEL, $DATE, …) + current prompt",
         "  /prompt set \"<template>\"  - set the prompt for this session; /prompt reset to revert",
         "  /vi  /emacs              - switch line-editor key bindings for this session",
@@ -6167,6 +6168,17 @@ fn dispatch_slash(
                 ),
             }
         }
+
+        "config" => match newt_core::Config::resolve() {
+            Ok(cfg) => match cfg.to_redacted_toml() {
+                Ok(toml_str) => {
+                    print_newt("Resolved config (secrets redacted):", color, verbose);
+                    println!("{toml_str}");
+                }
+                Err(e) => print_newt(&format!("error serializing config: {e}"), color, verbose),
+            },
+            Err(e) => print_newt(&format!("error resolving config: {e}"), color, verbose),
+        },
 
         "models" => {
             let cfg = newt_core::Config::resolve().unwrap_or_default();
@@ -7056,6 +7068,17 @@ mod tests {
         );
         // unset axes are explicit, not blank
         assert!(out.contains("profile") && out.contains("(none)"), "{out}");
+    }
+
+    #[test]
+    fn slash_config_returns_true() {
+        // Dumps the resolved config (secrets redacted) and keeps the session alive.
+        assert!(dispatch_slash("/config", "/ws", false, false).unwrap());
+    }
+
+    #[test]
+    fn help_lists_config_command() {
+        assert!(help_lines().iter().any(|l| l.contains("/config")));
     }
 
     #[test]
