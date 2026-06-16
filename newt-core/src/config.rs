@@ -1581,6 +1581,10 @@ impl Config {
         // Per-file bundles (the model-support-kit control surface): drop a
         // `~/.newt/bundles/<name>.toml` to add a bundle — no `config.toml` edit.
         cfg.merge_disk_bundles();
+        // Per-file loadouts (the shareable composition control surface): drop a
+        // `~/.newt/loadouts/<name>.toml` to add a loadout — no `config.toml` edit.
+        // Runs after bundles so a disk loadout may name a disk bundle.
+        cfg.merge_disk_loadouts();
         Ok(cfg)
     }
 
@@ -1622,6 +1626,52 @@ impl Config {
                 }
                 Ok(Err(e)) => {
                     tracing::warn!(path = %path.display(), error = %e, "skipping malformed bundle file");
+                }
+                Err(_) => {}
+            }
+        }
+    }
+
+    /// Merge per-file loadouts from the well-known `loadouts/` dirs next to the
+    /// config: `~/.newt/loadouts/*.toml` first, then the project `.newt/loadouts/`
+    /// (so project overrides home overrides inline `[loadouts.*]`). The filename
+    /// stem is the loadout name. A malformed drop-in is skipped with a warning — it
+    /// must not break startup. References *inside* a loadout are validated when it
+    /// is selected (`--loadout`), not at load, mirroring the inline `[loadouts.*]`
+    /// path.
+    fn merge_disk_loadouts(&mut self) {
+        if let Some(h) = home_dir() {
+            self.merge_loadouts_from_dir(&h.join(".newt").join("loadouts"));
+        }
+        if let Some(proj) = Self::project_config_path() {
+            if let Some(parent) = proj.parent() {
+                self.merge_loadouts_from_dir(&parent.join("loadouts"));
+            }
+        }
+    }
+
+    /// Load `<dir>/*.toml` as loadouts (filename stem = name) into `self.loadouts`,
+    /// last-wins on a name clash. A malformed file is skipped with a warning.
+    fn merge_loadouts_from_dir(&mut self, dir: &Path) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return; // no loadouts dir — fine
+        };
+        let mut paths: Vec<PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "toml"))
+            .collect();
+        paths.sort();
+        for path in paths {
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            match std::fs::read_to_string(&path).map(|t| toml::from_str::<Loadout>(&t)) {
+                Ok(Ok(loadout)) => {
+                    self.loadouts.insert(stem.to_string(), loadout);
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!(path = %path.display(), error = %e, "skipping malformed loadout file");
                 }
                 Err(_) => {}
             }
@@ -2104,6 +2154,40 @@ mod tests {
         std::fs::write(dir.path().join("x.toml"), "about = \"from disk\"\n").unwrap();
         cfg.merge_bundles_from_dir(dir.path());
         assert_eq!(cfg.bundles["x"].about.as_deref(), Some("from disk"));
+    }
+
+    #[test]
+    fn disk_loadouts_load_per_file_by_stem() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("dev-nemotron.toml"),
+            "provider = \"dgx\"\nmodel = \"nemotron@deep\"\nkit = \"nemotron\"\n",
+        )
+        .unwrap();
+        // a malformed drop-in must be skipped, not break loading
+        std::fs::write(
+            dir.path().join("broken.toml"),
+            "provider = [\"not-a-string\"]\n",
+        )
+        .unwrap();
+        // a non-toml file is ignored
+        std::fs::write(dir.path().join("README.md"), "not a loadout").unwrap();
+
+        let mut cfg = Config::default();
+        cfg.merge_loadouts_from_dir(dir.path());
+        assert_eq!(cfg.loadouts.len(), 1, "only the valid .toml loads");
+        let l = cfg
+            .loadouts
+            .get("dev-nemotron")
+            .expect("loaded by filename stem");
+        assert_eq!(l.provider.as_deref(), Some("dgx"));
+        assert_eq!(l.model.as_deref(), Some("nemotron@deep"));
+        assert_eq!(l.kit.as_deref(), Some("nemotron"));
+        // a disk file overrides an inline loadout of the same name (last-wins)
+        cfg.loadouts.insert("x".into(), Loadout::default());
+        std::fs::write(dir.path().join("x.toml"), "role = \"from-disk\"\n").unwrap();
+        cfg.merge_loadouts_from_dir(dir.path());
+        assert_eq!(cfg.loadouts["x"].role.as_deref(), Some("from-disk"));
     }
 
     #[test]
