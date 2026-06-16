@@ -163,6 +163,18 @@ cov-ci:
 cov-ci:
     $floor = 80; cargo llvm-cov --workspace --features newt-data/kernel --no-report; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; cargo llvm-cov report --lcov --output-path lcov.info --ignore-filename-regex 'pyo3_module\.rs$'; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; $summary = cargo llvm-cov report --summary-only --ignore-filename-regex 'pyo3_module\.rs$'; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; $summary; $total = $summary | Where-Object { $_ -match '^TOTAL\s+' } | Select-Object -First 1; if (-not $total) { Write-Error 'ERROR: could not parse line coverage from cargo-llvm-cov summary'; exit 1 }; $cols = $total -split '\s+'; $line_cov = [double]($cols[9].TrimEnd('%')); Write-Output "measured line coverage: $line_cov% (floor: $floor%)"; if ($line_cov -lt $floor) { Write-Error "ERROR: workspace line coverage $line_cov% is below the $floor% floor"; exit 1 }; Write-Output "coverage gate OK: $line_cov% >= $floor%"
 
+# `just ocap-check` — the OCAP deviation honesty gate (the authority-plane analog of
+# `cov-ci`). It ratchets DEVIATIONS CLOSED instead of coverage UP: validates the
+# deviation register (docs/security/ocap-deviations.md) is complete, and asserts every
+# `OCAP-DANGER:<id>` site in the tree carries its `OCAP-GATE:<id>` fail-closed gate
+# unless that deviation is CLOSED. So a dangerous capability cannot be added without
+# either closing its invariant or wiring its gate. See
+# docs/design/centaur-swarm-architecture.md and docs/security/ocap-deviations.md.
+# Hold this branch as the honesty reference; wire into the pre-push hook + CI once the
+# captured-shell / credential code begins to land.
+ocap-check:
+    python3 scripts/ocap_check.py
+
 # --- agent-bridle shell toggle (publishable stub vs. real confined shell) ---
 #
 # `main`/release MUST stay on agent-bridle's `feat/stub-shell` branch: it
