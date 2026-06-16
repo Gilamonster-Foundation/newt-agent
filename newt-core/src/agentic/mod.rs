@@ -759,6 +759,13 @@ pub async fn chat_complete(
     // it mid-turn. See #223.
     let num_ctx_ceiling = num_ctx_input_ceiling(num_ctx);
     let mut send_budget: Option<usize> = initial_send_budget(max_ok_input, safe_context, num_ctx);
+    // Step 20.3: is the send budget backed by an authoritative ceiling, or
+    // does it rest on the proven-good high-water mark (`max_ok_input`) alone?
+    // `safe_context` (a believed/declared window) and the per-request
+    // `num_ctx` ceiling are authoritative; a cw-400 recovery flips this true
+    // mid-turn. Cloud endpoints with no `/api/show` seed neither, so their
+    // guard is non-authoritative and fails open instead of refusing.
+    let mut send_budget_authoritative = safe_context.is_some() || num_ctx_ceiling.is_some();
     // Tool schemas ride along in every request body; count them once (18.1).
     // Stable for the whole turn: the builtin + MCP tool set doesn't change
     // mid-turn, so hoisting out of the round loop is safe.
@@ -858,6 +865,11 @@ pub async fn chat_complete(
                 } else {
                     trigger.budget
                 };
+                // Step 20.3: does this budget rest on an authoritative ceiling
+                // or the lone proven-good HWM? A fired token threshold is
+                // user-authoritative; otherwise the guard fired, authoritative
+                // only when the send budget is backed by a believed window.
+                let token_fired = mid_loop_trim_tokens.is_some_and(|t| t > 0 && current > t);
                 let outcome = compress(
                     CompressRequest {
                         messages: &messages,
@@ -865,6 +877,7 @@ pub async fn chat_complete(
                         max_messages: trigger.max_messages,
                         task,
                         hard_budget: trigger.hard_budget,
+                        authoritative: token_fired || send_budget_authoritative,
                         focus: None,
                     },
                     summarizer,
@@ -991,6 +1004,9 @@ pub async fn chat_complete(
                         let new_budget =
                             num_ctx_ceiling.map_or(new_cap as usize, |c| (new_cap as usize).min(c));
                         send_budget = Some(new_budget);
+                        // The endpoint's parsed hard limit is authoritative —
+                        // a refuse on it is correct from here on (Step 20.3).
+                        send_budget_authoritative = true;
                         let outcome = compress(
                             CompressRequest {
                                 // Real-token budget minus real-token schema
@@ -1004,6 +1020,7 @@ pub async fn chat_complete(
                                 max_messages: None,
                                 task,
                                 hard_budget: true,
+                                authoritative: true,
                                 focus: None,
                             },
                             summarizer,
@@ -1255,6 +1272,9 @@ pub async fn chat_complete(
                                 max_messages: None,
                                 task,
                                 hard_budget: true,
+                                // A suspected silent overflow is a real failure
+                                // signal — refuse semantics apply (Step 20.3).
+                                authoritative: true,
                                 focus: None,
                             },
                             summarizer,
@@ -1807,6 +1827,12 @@ pub async fn openai_chat_complete(
     // ceiling on this wire (limits are server-side, e.g. vLLM
     // --max-model-len), so the ceiling leg is `None`.
     let mut send_budget: Option<usize> = initial_send_budget(max_ok_input, safe_context, None);
+    // Step 20.3: on this wire there is no `num_ctx` ceiling, so the send
+    // budget is authoritative only when a believed window (`safe_context`)
+    // seeds it. Cloud OpenAI-compatible models have no `/api/show` to seed
+    // one, so their budget rests on the proven-good HWM alone — the guard
+    // fails open rather than refusing. A cw-400 flips this true mid-turn.
+    let mut send_budget_authoritative = safe_context.is_some();
     // Tool schemas ride along in every request body; count them once (18.1).
     let tools = merged_tool_definitions(
         mcp,
@@ -1861,6 +1887,10 @@ pub async fn openai_chat_complete(
                 } else {
                     trigger.budget
                 };
+                // Step 20.3: authoritative iff a token threshold fired or the
+                // send budget rests on a believed ceiling (mirrors the Ollama
+                // loop). A lone-HWM guard is non-authoritative → fails open.
+                let token_fired = mid_loop_trim_tokens.is_some_and(|t| t > 0 && current > t);
                 let outcome = compress(
                     CompressRequest {
                         messages: &messages,
@@ -1868,6 +1898,7 @@ pub async fn openai_chat_complete(
                         max_messages: trigger.max_messages,
                         task,
                         hard_budget: trigger.hard_budget,
+                        authoritative: token_fired || send_budget_authoritative,
                         focus: None,
                     },
                     summarizer,
@@ -1975,6 +2006,9 @@ pub async fn openai_chat_complete(
                             cw_retries + 1,
                         );
                         send_budget = Some(new_cap as usize);
+                        // The endpoint's parsed hard limit is authoritative
+                        // from here on (Step 20.3; mirrors the Ollama path).
+                        send_budget_authoritative = true;
                         let outcome = compress(
                             CompressRequest {
                                 // Real-token cap minus real-token schema
@@ -1988,6 +2022,7 @@ pub async fn openai_chat_complete(
                                 max_messages: None,
                                 task,
                                 hard_budget: true,
+                                authoritative: true,
                                 focus: None,
                             },
                             summarizer,
@@ -5455,6 +5490,62 @@ mod compression_loop_tests {
         assert!(
             log.lock().unwrap().len() <= 3,
             "the refusal must stop the loop within a round or two"
+        );
+    }
+
+    /// Step 20.3 — the loop-level fail-open path (the gpt-4.1 bug). Same
+    /// incompressible over-budget shape as the bail test, but the budget rests
+    /// on the proven-good high-water mark ALONE (`max_ok_input`, no
+    /// `safe_context`, no `num_ctx`, no token threshold) — the cloud /
+    /// no-`/api/show` case. Anti-thrash still latches, but the latched
+    /// over-budget rounds must NOT refuse: refusing here is the death spiral
+    /// the user hit. The loop keeps dispatching (fails open) and never bails
+    /// with the named error.
+    #[tokio::test]
+    async fn lone_hwm_budget_fails_open_and_does_not_bail() {
+        let server = MockServer::start().await;
+        let log = Arc::new(Mutex::new(Vec::new()));
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(LongHaulResponder {
+                path: "tiny.txt",
+                log: log.clone(),
+            })
+            .mount(&server)
+            .await;
+        let ws = tempfile::TempDir::new().unwrap();
+        std::fs::write(ws.path().join("tiny.txt"), "ok").unwrap();
+        let workspace = ws.path().to_string_lossy().to_string();
+        let messages = vec![
+            MemMessage::system(format!("you are a test. {}", "rule. ".repeat(700))),
+            MemMessage::user(TASK),
+        ];
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut compress_state = CompressState::new();
+        let mut c = ctx(&uri, &messages, &caveats, &workspace);
+        // The cloud shape: a starved proven-good HWM and NOTHING authoritative.
+        c.mid_loop_trim_tokens = None;
+        c.max_ok_input = Some(50); // largest prompt "seen" — a floor, not a cap
+        c.safe_context = None; // no /api/show seed
+        c.num_ctx = None; // no per-request window ceiling
+        c.compress_state = Some(&mut compress_state);
+        let result = chat_complete(c, &mut NoMcp).await;
+        // The session must NOT die on the budget bail — it fails open.
+        if let Err(e) = &result {
+            let msg = e.to_string();
+            assert!(
+                !msg.contains("exceeds the model's input budget"),
+                "a lone-HWM budget must never refuse the send: {msg}"
+            );
+        }
+        assert!(
+            compress_state.is_disabled(),
+            "anti-thrash still latches on the poor passes"
+        );
+        assert!(
+            log.lock().unwrap().len() > 3,
+            "the loop kept dispatching past the latch instead of bailing"
         );
     }
 }
