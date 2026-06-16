@@ -22,7 +22,9 @@ pub fn run(config_path: Option<&Path>) -> anyhow::Result<()> {
     println!("# [tui] edit_mode = \"emacs\" | \"vi\"     (shipped default: emacs)");
     println!("# [tui] footer    = \"auto\" | \"on\" | \"off\"   (auto = rich prompt on a TTY)");
     println!("#");
-    println!("# [tui] prompt — customize with these tokens (or run `/prompt` in a session):");
+    println!("# [tui] prompt — customize with these tokens (or run `/prompt` in a session).");
+    println!("#   Prefer the $NAME macros here: TOML eats backslashes, so the \\x forms need");
+    println!("#   a 'literal string' (single quotes) or doubled \\\\ (e.g. \"\\\\t\").");
     for (name, slash, desc) in newt_tui::PROMPT_TOKENS {
         if slash.is_empty() {
             println!("#   {name:<11}       {desc}");

@@ -946,6 +946,29 @@ fn prompt_token_help() -> Vec<String> {
         .collect()
 }
 
+/// The active prompt template (`NEWT_PROMPT` > `[tui] prompt` > the built-in
+/// default) and its live expansion, for `/prompt`'s preview line. Resolving the
+/// model + edit mode here lets the preview show the *expanded* result so a
+/// backslash/TOML escaping mistake is visible at a glance.
+fn current_prompt_and_preview(workspace: &str) -> (String, String) {
+    let template = std::env::var("NEWT_PROMPT")
+        .ok()
+        .or_else(|| {
+            newt_core::Config::resolve()
+                .ok()
+                .and_then(|c| c.tui)
+                .and_then(|t| t.prompt)
+        })
+        .unwrap_or_else(|| DEFAULT_RICH_PROMPT.to_string());
+    let model = newt_core::Config::resolve()
+        .ok()
+        .map(|c| resolve_backend_choice(&c).model)
+        .unwrap_or_default();
+    let is_vi = build_rl_config().edit_mode() == rustyline::config::EditMode::Vi;
+    let preview = expand_prompt_tokens(&template, workspace, &model, is_vi);
+    (template, preview)
+}
+
 /// rustyline helper enabling multi-line entry: a line ending in `\` continues
 /// onto the next line (the shell/Python continuation idiom — portable across
 /// terminals, no special key detection). On submit the caller rejoins
@@ -5896,8 +5919,14 @@ fn dispatch_slash(
                 // SAFETY: single-threaded REPL; the next prompt is built right
                 // after this returns.
                 unsafe { std::env::set_var("NEWT_PROMPT", template) };
+                let (_t, preview) = current_prompt_and_preview(workspace);
                 print_newt(
-                    &format!("prompt set for this session: {template:?}  (add to [tui] prompt to persist)"),
+                    &format!("prompt set for this session — preview: {preview}"),
+                    color,
+                    verbose,
+                );
+                print_newt(
+                    "(add to [tui] prompt to persist — use $NAME macros there to avoid TOML escaping)",
                     color,
                     verbose,
                 );
@@ -5923,20 +5952,15 @@ fn dispatch_slash(
             for line in prompt_token_help() {
                 println!("{line}");
             }
-            let cur = std::env::var("NEWT_PROMPT").ok().or_else(|| {
-                newt_core::Config::resolve()
-                    .ok()
-                    .and_then(|c| c.tui)
-                    .and_then(|t| t.prompt)
-            });
-            match cur {
-                Some(t) => print_newt(&format!("current: {t:?}"), color, verbose),
-                None => print_newt(
-                    &format!("current: built-in default ({DEFAULT_RICH_PROMPT:?})"),
-                    color,
-                    verbose,
-                ),
-            }
+            print_newt(
+                "In config.toml prefer the $NAME macros — the \\x forms are eaten by TOML \
+                 (use a 'literal string' or doubled \\\\).",
+                color,
+                verbose,
+            );
+            let (tmpl, preview) = current_prompt_and_preview(workspace);
+            print_newt(&format!("current: {tmpl:?}"), color, verbose);
+            print_newt(&format!("preview: {preview}"), color, verbose);
         }
 
         "vi" | "emacs" | "edit-mode" => {
