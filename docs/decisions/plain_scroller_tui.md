@@ -101,6 +101,39 @@ The practical wins compound with the architectural one:
   `docs/decisions/plan_editor_ephemeral_tui.md`.
 - **rustyline's internal raw mode** during a `readline` call (line editing,
   history navigation). Output remains scrolled text.
+- **The status in the prompt line** — the status (`<ts> · <model> · <ws> ·
+  <mode>`) is folded into the rustyline **prompt** itself, not a separate
+  surface:
+
+  ```text
+  [2026-06-16 11:59:02] gpt-4.1 | emacs | newt-agent ❯ <input>
+  ▸ <output>…
+  ```
+
+  This is the cargo-progress-bar trick done for free: **rustyline already
+  floats and redraws its prompt line at the bottom** (cursor, resize, redraw),
+  so the status sits at the at-rest tail while idle, scrolls away naturally as
+  output comes, and stays in scrollback as a greppable per-turn **log marker** —
+  **no region, no pinning, no cursor games, no width dependency**. Multi-line
+  entry is rustyline's `Validator` (a trailing `\` continues).
+
+  **Fully customizable** — it is just the default `[tui] prompt` template.
+  Tokens come in a readable `$NAME` form and a terse `\x` form: `$TIMESTAMP`/`\t`,
+  `$DATE`, `$TIME`, `$MODEL`/`\m`, `$MODE`/`\M`, `$USER`/`\u`, `$HOST`/`\h`,
+  `$WS`/`\w`, `$PATH`/`\W`, `$VERSION`/`\v`. An explicit `[tui] prompt` (or
+  `NEWT_PROMPT`) wins; e.g. `$USER@$HOST:$PATH # ` (or `\u@\h:\W # `) gives a
+  bash-like prompt. `/prompt` lists the tokens live; `newt config` emits a
+  documented starter with the default prompt + token comments. `[tui] footer =
+  auto` (default) uses the rich default on a TTY and a plain `\w $ ` off one;
+  `on` forces rich; `off`/`--plain` forces plain. **Never** rich off a TTY
+  (pipes, `newt worker`); `wyvern-agent` strips it.
+
+  > **Rejected: a pinned idle status bar.** A version that pinned the status to
+  > the bottom rows via a DECSTBM **scroll region** was prototyped and **backed
+  > out** — it fought the terminal's natural scroll (content popped *up* into
+  > the region) and the region/cursor teardown corrupted output across turns.
+  > The "no scroll regions / no persistent status bars" rule above **stands**.
+  > Anything fancier than rustyline belongs in `gilamonster-agent`.
 - **ANSI color and column escapes in scrolled output** (header, prompts,
   diff coloring), always behind `color_supported` degradation.
 - **Single-line, same-line indicators** — e.g. the `▸ thinking…` indicator
