@@ -928,10 +928,11 @@ fn footer_status(model: &str, workspace: &str, is_vi: bool) -> String {
         .join(" · ")
 }
 
-/// A horizontal rule sized to the terminal (clamped 8..=80) — the footer's top
-/// separator. Pure for testing.
-fn footer_separator(cols: u16) -> String {
-    "─".repeat((cols as usize).clamp(8, 80))
+/// The single-line status stamp: `===[<ts>][ <status> ]===`. Fixed format with
+/// no terminal-width dependency (resize-proof) — it doubles as a greppable log
+/// marker for the turn. Pure for testing; the caller supplies the timestamp.
+fn footer_stamp(timestamp: &str, status: &str) -> String {
+    format!("===[{timestamp}][ {status} ]===")
 }
 
 /// rustyline helper enabling multi-line entry: a line ending in `\` continues
@@ -995,20 +996,19 @@ fn footer_input_rows(line: &str, cols: usize) -> u16 {
     rows.try_into().unwrap_or(u16::MAX)
 }
 
-/// Collapse the live prompt into a clean, footer-below record after submit:
+/// Collapse the live prompt into a clean, single-line record after submit:
 /// erase the `❯ <input>` render (relative cursor motion → safe under terminal
 /// scroll) and re-emit it as
 ///
 /// ```text
 /// ❯ <input>
-/// ────────────
-///   model · workspace · mode
+/// ===[2026-06-16 14:30:00][ model · workspace · mode ]===
 /// ```
 ///
-/// i.e. caret on top, then the separator + status footer beneath it — the
-/// scroller-honest way to put the status *below* the input without a pinned
-/// region (it renders once, on submit, never live while typing). Empty input
-/// erases with no footer.
+/// caret on top, then a single timestamped status stamp beneath — the
+/// scroller-honest way to surface status (it renders once, on submit, never
+/// live while typing) that doubles as a greppable log marker. Empty input
+/// erases with no stamp.
 fn collapse_footer_block(line: &str, task: &str, status: &str, color: bool) {
     let cols = terminal::size().map(|(c, _)| c as usize).unwrap_or(80);
     let rows = footer_input_rows(line, cols);
@@ -1023,7 +1023,8 @@ fn collapse_footer_block(line: &str, task: &str, status: &str, color: bool) {
     }
     let first = task.lines().next().unwrap_or("");
     let more = if task.contains('\n') { " …" } else { "" };
-    let sep = footer_separator(cols.try_into().unwrap_or(u16::MAX));
+    let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let stamp = footer_stamp(&ts, status);
     if color {
         let _ = execute!(
             out,
@@ -1034,16 +1035,13 @@ fn collapse_footer_block(line: &str, task: &str, status: &str, color: bool) {
             Print(more),
             Print("\n"),
             SetForegroundColor(CtColor::DarkGrey),
-            Print(&sep),
-            Print("\n  "),
-            Print(status),
+            Print(&stamp),
             ResetColor,
             Print("\n"),
         );
     } else {
         println!("❯ {first}{more}");
-        println!("{sep}");
-        println!("  {status}");
+        println!("{stamp}");
     }
 }
 
@@ -1094,11 +1092,14 @@ mod footer_tests {
     }
 
     #[test]
-    fn separator_is_clamped_to_a_sane_width() {
-        assert_eq!(footer_separator(40).chars().count(), 40);
-        assert_eq!(footer_separator(3).chars().count(), 8, "floored at 8");
-        assert_eq!(footer_separator(500).chars().count(), 80, "capped at 80");
-        assert!(footer_separator(40).chars().all(|c| c == '─'));
+    fn stamp_is_a_fixed_log_marker() {
+        assert_eq!(
+            footer_stamp("2026-06-16 14:30:00", "gpt-4.1 · newt-agent · emacs"),
+            "===[2026-06-16 14:30:00][ gpt-4.1 · newt-agent · emacs ]==="
+        );
+        // Fixed format — no dependence on terminal width (resize-proof).
+        assert!(footer_stamp("t", "s").starts_with("===["));
+        assert!(footer_stamp("t", "s").ends_with("]==="));
     }
 
     #[test]

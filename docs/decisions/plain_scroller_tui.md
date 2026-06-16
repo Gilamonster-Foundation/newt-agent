@@ -106,12 +106,13 @@ The practical wins compound with the architectural one:
 
   ```text
   ❯ <input>
-  ────────────
-    model · workspace · mode
+  ===[2026-06-16 14:30:00][ model · workspace · mode ]===
   ▸ <output>…
   ```
 
-  It clutters the scrollback naturally and scrolls away with everything else —
+  A single fixed-format line — no terminal-width dependency (resize-proof) —
+  that doubles as a greppable per-turn **log marker**. It clutters the
+  scrollback naturally and scrolls away with everything else —
   **no region, no pinning, no cursor games**. The `❯` caret is rustyline's
   prompt; multi-line entry is rustyline's `Validator` (a trailing `\`
   continues, the shell/Python idiom). Gated by `[tui] footer`: `auto` (default)
