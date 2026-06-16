@@ -1619,10 +1619,12 @@ async fn final_summary_ollama(
     .await;
     match result {
         Ok(json) => {
-            let content = json["message"]["content"]
-                .as_str()
-                .unwrap_or("")
-                .to_string();
+            // #385: strip inline <think>…</think> reasoning Nemotron-style models emit
+            // in the content stream (the separate `thinking` field is handled elsewhere).
+            // All-reasoning content collapses to empty → the thinking-only recovery below.
+            let (content, _reasoning) = crate::reasoning::split_reasoning(
+                json["message"]["content"].as_str().unwrap_or(""),
+            );
             let total = merge_round_usage(accumulated, ollama_usage(&json));
             if content.is_empty() {
                 Ok((
@@ -1693,10 +1695,12 @@ async fn final_summary_openai(
     .await;
     match result {
         Ok(json) => {
-            let content = json["choices"][0]["message"]["content"]
-                .as_str()
-                .unwrap_or("")
-                .to_string();
+            // #385: strip inline <think>…</think> reasoning from the content.
+            let (content, _reasoning) = crate::reasoning::split_reasoning(
+                json["choices"][0]["message"]["content"]
+                    .as_str()
+                    .unwrap_or(""),
+            );
             let total = merge_round_usage(accumulated, openai_usage(&json["usage"]));
             if content.is_empty() {
                 Ok((
@@ -2231,6 +2235,9 @@ async fn stream_response(
     let mut full = String::new();
     let mut started = false;
     let mut usage: Option<crate::TokenUsage> = None;
+    // #385: suppress inline <think>…</think> reasoning from the live stream + the
+    // accumulated reply, even when a tag is split across token boundaries.
+    let mut think = crate::reasoning::ThinkFilter::new();
 
     let mut resp = resp;
     while let Some(chunk) = resp.chunk().await? {
@@ -2242,7 +2249,9 @@ async fn stream_response(
             let Ok(json) = serde_json::from_str::<serde_json::Value>(line) else {
                 continue;
             };
-            let token = json["message"]["content"].as_str().unwrap_or("");
+            let raw = json["message"]["content"].as_str().unwrap_or("");
+            let token = think.feed(raw);
+            let token = token.as_str();
             if !token.is_empty() {
                 if !started {
                     if color {
@@ -2273,6 +2282,18 @@ async fn stream_response(
                 break;
             }
         }
+    }
+    // #385: flush any clean tail the filter held back (a trailing run that turned out
+    // not to be the start of a `<think>` tag).
+    let tail = think.finish();
+    if !tail.is_empty() {
+        if !started {
+            print!("▸  ");
+            started = true;
+        }
+        print!("{tail}");
+        io::stdout().flush().ok();
+        full.push_str(&tail);
     }
     if started {
         println!();
