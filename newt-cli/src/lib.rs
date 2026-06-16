@@ -112,6 +112,14 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "NAME")]
     pub profile: Option<String>,
 
+    /// Load a named bundle (`[bundles.<name>]`) — the loadable unit of the model
+    /// support kit. The bundle resolves to a profile for the active model (its
+    /// `families` map, else `default_profile`). `--profile` overrides it; with
+    /// neither, a bundle whose `applies_to` matches the model is auto-inferred.
+    /// Equivalent to `NEWT_BUNDLE=<name>`. An unknown bundle is a hard error.
+    #[arg(long, global = true, value_name = "NAME")]
+    pub bundle: Option<String>,
+
     /// Directory to search for AGENTS.md/CLAUDE.md, or a specific instructions
     /// file. Default: the workspace (`./`). Also `[agents] path`.
     #[arg(long, global = true, value_name = "PATH")]
@@ -289,6 +297,11 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
                 // --profile threads to the TUI the same way; run_chat resolves +
                 // validates it against [profiles.<name>] once per session.
                 unsafe { std::env::set_var("NEWT_PROFILE", p) };
+            }
+            if let Some(b) = cli.bundle.as_deref().filter(|b| !b.is_empty()) {
+                // --bundle threads the same way; run_chat resolves it → a profile
+                // for the active model, with --profile taking precedence.
+                unsafe { std::env::set_var("NEWT_BUNDLE", b) };
             }
             // --ephemeral threads to the TUI the same way (Step 17.7): the
             // session start resolution reads NEWT_EPHEMERAL once.
