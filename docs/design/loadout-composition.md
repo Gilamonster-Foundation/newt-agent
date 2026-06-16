@@ -124,6 +124,46 @@ Three structural guarantees, all reusing existing mechanism:
 Net: on the authority axis a loadout is **isomorphic to today's `/mode` clamp** — same
 `meet`, same hard-error-on-missing-reference, same "ceiling wins over `--yolo`".
 
+## Control surfaces (the file topology)
+
+A control surface = a *concern × edit-cadence × **sharing profile***. Split the on-disk
+config along those seams, so each thing is edited where it's owned and **shareable
+things are one-file-per-name** (drop a file in to add one — the skills/personas
+pattern), while private things (prefs, secrets) stay together.
+
+```
+~/.newt/
+  config.toml              # your prefs + the default loadout + optional [paths] overrides   (private)
+  loadouts/<name>.toml     # one composition per file (filename = the loadout name)          (shareable)
+  personas/<name>.md       # roles — EXISTS today                                             (shareable)
+  catalog/                 # the inference fabric (#387): provider + model cards              (private; key refs)
+    <provider>/provider.toml         #   endpoint, kind, auth, owner
+      models/<slug>.toml             #   model card + @variants
+  model-capabilities.json  # the probe's learned calibration (folds into the catalog)         (machine)
+```
+
+Two rules keep this coherent:
+
+- **Reference by name; store by convention.** A loadout names `provider`/`model`/`kit`/
+  `profile`/`role` — it does not care *where* each is stored. So a thing can **graduate**
+  from inline (`[bundles.*]`/`[profiles.*]` in `config.toml`, Slice 0/1 simplicity) to
+  its own `bundles/<name>.toml` / `profiles/<name>.toml` (once it's worth sharing, or the
+  sweep writes it) **without touching the loadout surface**. Start inline; graduate to
+  per-file when shareable. The same holds for a loadout itself: inline `[loadouts.<name>]`
+  *or* `loadouts/<name>.toml` (filename = name) are the same content, two storage sites.
+- **"Points at" = convention + override**, both already house-precedented:
+  `~/.newt/loadouts/*.toml`, `catalog/`, `personas/` are well-known locations the loader
+  globs (exactly like `personas/` / `.newt/skills` today); `config.toml`'s `[paths]` may
+  relocate any of them (exactly like `soul_file` / `api_key_file` today). `config.toml` is
+  the **root of a known tree**, not a literal include list — adding a loadout is "drop a
+  file," never "edit `config.toml`."
+
+This **layers for free**: a project's `.newt/loadouts/foo.toml` overrides
+`~/.newt/loadouts/foo.toml` via the same project-merge `Config::resolve` already does
+(#222) — a repo can ship its own loadout. And the split is a **sharing boundary**: you
+can publish `loadouts/nemotron-dev.toml` (+ its `personas/`/`bundles/`) without leaking
+your `catalog/` key refs.
+
 ## Build roadmap (additive · behind `--loadout` · degrades when deps absent)
 
 Role **enforcement stays deferred** throughout — a loadout may *select* a role before
@@ -146,8 +186,9 @@ work).
 
 1. `kit` vs `profile` field redundancy — default `profile` to the bundle/model-implied one.
 2. Address-string grammar for omitted slots — recommend an explicit `-` placeholder.
-3. Where `[loadouts.*]` live — `config.toml` only vs a shareable pack (align with the
-   community-tuning format).
+3. ~~Where loadouts live~~ — **resolved** (see *Control surfaces*): per-file
+   `~/.newt/loadouts/<name>.toml` by convention, inline `[loadouts.*]` also valid;
+   reference-by-name decouples storage from the loadout surface.
 4. `model@variant` ownership — the catalog defines the variant set, the profile selects
    among them (needs the catalog epic's input).
 5. `/loadout` switch atomicity — recommend all-or-nothing (like `/mode`); does it force
