@@ -904,8 +904,33 @@ fn footer_rich_enabled(mode: newt_core::FooterMode, is_tty: bool) -> bool {
 
 /// The built-in rich prompt template (used when `[tui] prompt` is unset and the
 /// prompt is rich). Expands via [`expand_prompt_tokens`] to e.g.
-/// `[2026-06-16 10:34:55 · gpt-4.1 · newt-agent · emacs ] ❯ `.
-const DEFAULT_RICH_PROMPT: &str = "[\\t · \\m · \\w · \\M ] ❯ ";
+/// `[2026-06-16 10:34:55 · gpt-4.1 · newt-agent · emacs ] ❯ `. Written in the
+/// readable `$NAME` form so it self-documents when copied into a config.
+pub const DEFAULT_RICH_PROMPT: &str = "[$TIMESTAMP · $MODEL · $WS · $MODE ] ❯ ";
+
+/// The prompt-token reference — the single source of truth shared by the
+/// `/prompt` command, the scaffolded config comment, and the docs. Each entry
+/// is `($NAME, \x, description)`.
+pub const PROMPT_TOKENS: &[(&str, &str, &str)] = &[
+    ("$TIMESTAMP", "\\t", "date + time, e.g. 2026-06-16 10:34:55"),
+    ("$DATE", "", "date, e.g. 2026-06-16"),
+    ("$TIME", "", "time, e.g. 10:34:55"),
+    ("$MODEL", "\\m", "active model"),
+    ("$MODE", "\\M", "edit mode (vi / emacs)"),
+    ("$USER", "\\u", "username"),
+    ("$HOST", "\\h", "hostname"),
+    ("$WS", "\\w", "workspace basename"),
+    ("$PATH", "\\W", "full workspace path"),
+    ("$VERSION", "\\v", "newt version"),
+];
+
+/// Render [`PROMPT_TOKENS`] as aligned help lines (for `/prompt`).
+fn prompt_token_help() -> Vec<String> {
+    PROMPT_TOKENS
+        .iter()
+        .map(|(name, slash, desc)| format!("  {name:<11} {slash:<3}  {desc}"))
+        .collect()
+}
 
 /// rustyline helper enabling multi-line entry: a line ending in `\` continues
 /// onto the next line (the shell/Python continuation idiom — portable across
@@ -990,6 +1015,23 @@ mod footer_tests {
     }
 
     #[test]
+    fn dollar_macros_expand_without_prefix_clobber() {
+        let p = expand_prompt_tokens("[$MODEL | $MODE | $WS]", "/home/me/proj", "gpt-4.1", true);
+        assert_eq!(p, "[gpt-4.1 | vi | proj]");
+        // $TIMESTAMP must win over its $TIME prefix; both tokens fully consumed.
+        let p = expand_prompt_tokens("$TIMESTAMP|$TIME|$DATE", "/x", "m", false);
+        assert!(
+            !p.contains("$TIME") && !p.contains("$DATE") && !p.contains("STAMP"),
+            "{p}"
+        );
+        // Every documented token has a working expansion (no literal left).
+        for (name, _slash, _desc) in PROMPT_TOKENS {
+            let out = expand_prompt_tokens(name, "/srv/work", "llama3", false);
+            assert!(!out.contains(name), "token {name} not expanded: {out}");
+        }
+    }
+
+    #[test]
     fn continuation_triggers_on_trailing_backslash() {
         // A trailing backslash means "keep typing" (multi-line continuation).
         assert!(footer_continues("write a\\"));
@@ -1055,17 +1097,35 @@ fn expand_prompt_tokens(template: &str, workspace: &str, model: &str, is_vi: boo
     let user = std::env::var("USER")
         .or_else(|_| std::env::var("USERNAME"))
         .unwrap_or_default();
-    let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let now = chrono::Local::now();
+    let timestamp = now.format("%Y-%m-%d %H:%M:%S").to_string();
+    let date = now.format("%Y-%m-%d").to_string();
+    let time = now.format("%H:%M:%S").to_string();
     let mode = if is_vi { "vi" } else { "emacs" };
+    let version = env!("CARGO_PKG_VERSION");
     template
+        // Readable `$NAME` macros. Longer names BEFORE their prefixes
+        // (`$TIMESTAMP` before `$TIME`, `$MODEL` before `$MODE`) so a short
+        // name never clobbers a longer one.
+        .replace("$TIMESTAMP", &timestamp)
+        .replace("$DATE", &date)
+        .replace("$TIME", &time)
+        .replace("$MODEL", model)
+        .replace("$MODE", mode)
+        .replace("$USER", &user)
+        .replace("$HOST", &host)
+        .replace("$VERSION", version)
+        .replace("$PATH", workspace)
+        .replace("$WS", &ws_base)
+        // Terse `\x` PS1 tokens (bash-style; e.g. `\u@\h:\W`).
         .replace("\\W", workspace)
         .replace("\\w", &ws_base)
         .replace("\\h", &host)
         .replace("\\u", &user)
-        .replace("\\t", &ts)
+        .replace("\\t", &timestamp)
         .replace("\\m", model)
         .replace("\\M", mode)
-        .replace("\\v", env!("CARGO_PKG_VERSION"))
+        .replace("\\v", version)
 }
 
 /// Read-only enforcement caveats (read anything; no write/exec/net) — the safe
@@ -5751,6 +5811,7 @@ fn help_lines() -> &'static [&'static str] {
         "  /mode <name>             - enter a named mode: load skill + clamp authority (floor)",
         "  /mode                    - show the active mode; /mode off clears it",
         "  /workspace               - show current workspace path",
+        "  /prompt                  - list prompt tokens ($MODEL, $DATE, …) + current prompt",
         "  /vi  /emacs              - switch line-editor key bindings for this session",
         "  /version                 - print newt version",
         "  /help                    - this message",
@@ -5786,6 +5847,29 @@ fn dispatch_slash(
         "version" => print_newt(&format!("v{VERSION}"), color, verbose),
 
         "workspace" => print_newt(workspace, color, verbose),
+
+        "prompt" => {
+            print_newt(
+                "Prompt tokens — set `[tui] prompt` (or NEWT_PROMPT) to customize:",
+                color,
+                verbose,
+            );
+            for line in prompt_token_help() {
+                println!("{line}");
+            }
+            let cur = newt_core::Config::resolve()
+                .ok()
+                .and_then(|c| c.tui)
+                .and_then(|t| t.prompt);
+            match cur {
+                Some(t) => print_newt(&format!("current: {t:?}"), color, verbose),
+                None => print_newt(
+                    &format!("current: built-in default ({DEFAULT_RICH_PROMPT:?})"),
+                    color,
+                    verbose,
+                ),
+            }
+        }
 
         "vi" | "emacs" | "edit-mode" => {
             // Switch the line-editor key bindings for the rest of the session.

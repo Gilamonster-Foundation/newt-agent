@@ -118,12 +118,15 @@ The practical wins compound with the architectural one:
   entry is rustyline's `Validator` (a trailing `\` continues).
 
   **Fully customizable** — it is just the default `[tui] prompt` template.
-  Tokens: `\t` timestamp, `\m` model, `\M` edit mode, `\u` user, `\h` host,
-  `\w` workspace basename, `\W` full path, `\v` version. An explicit
-  `[tui] prompt` (or `NEWT_PROMPT`) wins; e.g. `\u@\h:\W # ` gives a bash-like
-  prompt. `[tui] footer = auto` (default) uses the rich default on a TTY and a
-  plain `\w $ ` off one; `on` forces rich; `off`/`--plain` forces plain.
-  **Never** rich off a TTY (pipes, `newt worker`); `wyvern-agent` strips it.
+  Tokens come in a readable `$NAME` form and a terse `\x` form: `$TIMESTAMP`/`\t`,
+  `$DATE`, `$TIME`, `$MODEL`/`\m`, `$MODE`/`\M`, `$USER`/`\u`, `$HOST`/`\h`,
+  `$WS`/`\w`, `$PATH`/`\W`, `$VERSION`/`\v`. An explicit `[tui] prompt` (or
+  `NEWT_PROMPT`) wins; e.g. `$USER@$HOST:$PATH # ` (or `\u@\h:\W # `) gives a
+  bash-like prompt. `/prompt` lists the tokens live; `newt config` emits a
+  documented starter with the default prompt + token comments. `[tui] footer =
+  auto` (default) uses the rich default on a TTY and a plain `\w $ ` off one;
+  `on` forces rich; `off`/`--plain` forces plain. **Never** rich off a TTY
+  (pipes, `newt worker`); `wyvern-agent` strips it.
 
   > **Rejected: a pinned idle status bar.** A version that pinned the status to
   > the bottom rows via a DECSTBM **scroll region** was prototyped and **backed
