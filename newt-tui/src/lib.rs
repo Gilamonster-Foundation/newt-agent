@@ -4440,17 +4440,31 @@ struct BackendChoice {
     api_key: Option<String>,
 }
 
-/// Resolve the backend for the TUI. Precedence:
+/// Whether to use the OpenAI backend, given a `NEWT_BACKEND` override and
+/// whether an OpenAI backend is configured. `openai`/`ollama` force the choice;
+/// otherwise the historical default (prefer OpenAI if present). Pure for testing.
+fn prefer_openai(force_backend: Option<&str>, has_openai: bool) -> bool {
+    match force_backend {
+        Some("openai") => true,
+        Some("ollama") => false,
+        _ => has_openai,
+    }
+}
+
+/// Resolve the backend for the TUI. Precedence (unifies the loadout provider
+/// axis with the `/backend` live toggle):
 ///
 /// 1. **`NEWT_PROVIDER`** names a `[backends]` entry — the loadout's `provider`
 ///    axis (Slice 2). The named backend supplies endpoint/kind/auth; `NEWT_DGX_MODEL`
-///    (the loadout's `model`) overrides the backend's default model when set. A
-///    loadout-sourced provider is hard-error-validated upstream
-///    ([`newt_core::Loadout::validate`]); a directly-set `NEWT_PROVIDER` that names
-///    no backend falls through to the default resolution below.
-/// 2. An explicit `kind = "openai"` backend in the config wins next — endpoint/model/
-///    auth come straight from it.
+///    (the loadout's `model`) overrides the backend's default model when set.
+/// 2. **`NEWT_BACKEND`** (set by `/backend`) forces the openai-vs-ollama *kind*;
+///    absent, the historical default prefers a configured OpenAI backend.
 /// 3. Otherwise the historical Ollama/DGX resolution ([`resolve_backend_config`]).
+///
+/// `NEWT_PROVIDER` is the most specific (a named entry); `NEWT_BACKEND` is the
+/// coarse kind toggle `/backend` uses. A loadout-sourced provider is hard-error-
+/// validated upstream ([`newt_core::Loadout::validate`]); a directly-set
+/// `NEWT_PROVIDER` naming no backend falls through to (2).
 fn resolve_backend_choice(cfg: &newt_core::Config) -> BackendChoice {
     // 1. A pinned provider (loadout `provider` axis → NEWT_PROVIDER) selects a
     //    named [backends] entry by name, regardless of its wire protocol.
@@ -4473,18 +4487,25 @@ fn resolve_backend_choice(cfg: &newt_core::Config) -> BackendChoice {
         // Unknown provider name: fall through. The loadout path validates the
         // name before we get here, so this only happens for a hand-set env var.
     }
-    // 2. Prefer an explicit OpenAI-compatible backend.
-    if let Some(b) = cfg
+    // 2. NEWT_BACKEND forces the openai-vs-ollama kind; else prefer openai if present.
+    let force = std::env::var("NEWT_BACKEND").ok();
+    let has_openai = cfg
         .backends
         .iter()
-        .find(|b| b.kind == newt_core::BackendKind::Openai)
-    {
-        return BackendChoice {
-            url: b.endpoint.clone(),
-            model: b.model.clone(),
-            kind: newt_core::BackendKind::Openai,
-            api_key: b.resolve_api_key(),
-        };
+        .any(|b| b.kind == newt_core::BackendKind::Openai);
+    if prefer_openai(force.as_deref(), has_openai) {
+        if let Some(b) = cfg
+            .backends
+            .iter()
+            .find(|b| b.kind == newt_core::BackendKind::Openai)
+        {
+            return BackendChoice {
+                url: b.endpoint.clone(),
+                model: b.model.clone(),
+                kind: newt_core::BackendKind::Openai,
+                api_key: b.resolve_api_key(),
+            };
+        }
     }
     // 3. Historical Ollama/DGX resolution.
     let (url, model) = resolve_backend_config(cfg);
@@ -6008,6 +6029,8 @@ fn help_lines() -> &'static [&'static str] {
         "  /models                  - list models on the active endpoint",
         "  /models capabilities     - tool-conformance matrix (cached)",
         "  /model <name>            - switch model for this session",
+        "  /backend <openai|ollama> [model] - switch backend (e.g. /backend ollama deepseek-r1)",
+        "  /thinking <on|off>       - toggle the reasoning spinner for this session",
         "  /probe [model|all]       - cheap discovery: tool conformance, context window, thinking, calibration",
         "  /probe window [model]    - empirical input-boundary search (records max input at High confidence)",
         "  /memory                  - show context window / notes usage",
@@ -6406,6 +6429,77 @@ fn dispatch_slash(
                 }
             }
         }
+
+        "backend" => {
+            let cfg = newt_core::Config::resolve().unwrap_or_default();
+            let has_openai = cfg
+                .backends
+                .iter()
+                .any(|b| b.kind == newt_core::BackendKind::Openai);
+            let kind_name = |c: &BackendChoice| match c.kind {
+                newt_core::BackendKind::Openai => "openai",
+                _ => "ollama",
+            };
+            if arg1.is_empty() {
+                let choice = resolve_backend_choice(&cfg);
+                print_newt(
+                    &format!(
+                        "active backend: {} · {} @ {}",
+                        kind_name(&choice),
+                        choice.model,
+                        choice.url
+                    ),
+                    color,
+                    verbose,
+                );
+                print_newt(
+                    &format!(
+                        "usage: /backend <{}> [model]   (e.g. /backend ollama deepseek-r1)",
+                        if has_openai {
+                            "openai|ollama"
+                        } else {
+                            "ollama"
+                        }
+                    ),
+                    color,
+                    verbose,
+                );
+            } else if matches!(arg1, "openai" | "ollama") {
+                // SAFETY: single-threaded REPL; the post-command re-resolve picks
+                // it up. Session-only — does NOT persist; use `/model` or edit
+                // `[backends]` to persist a choice.
+                unsafe { std::env::set_var("NEWT_BACKEND", arg1) };
+                // Optional model arg → session-only override on the same axis the
+                // loadout `model` feeds (NEWT_DGX_MODEL), consumed by the Ollama
+                // resolution. Avoids mutating saved config on a live A/B switch.
+                if arg1 == "ollama" && !arg2.is_empty() {
+                    unsafe { std::env::set_var("NEWT_DGX_MODEL", arg2) };
+                }
+                let choice =
+                    resolve_backend_choice(&newt_core::Config::resolve().unwrap_or_default());
+                print_newt(
+                    &format!(
+                        "switched to {} · {} @ {} — next message.",
+                        kind_name(&choice),
+                        choice.model,
+                        choice.url
+                    ),
+                    color,
+                    verbose,
+                );
+            } else {
+                print_newt("usage: /backend <openai|ollama> [model]", color, verbose);
+            }
+        }
+
+        "thinking" => match arg1 {
+            "on" | "off" => {
+                // SAFETY: single-threaded REPL.
+                unsafe { std::env::set_var("NEWT_THINKING", arg1) };
+                print_newt(&format!("thinking spinner: {arg1}"), color, verbose);
+            }
+            _ => print_newt("usage: /thinking <on|off>", color, verbose),
+        },
 
         "dgx" => {
             if arg1.is_empty() {
@@ -10024,6 +10118,18 @@ mod helper_fn_tests {
     }
 
     #[test]
+    fn prefer_openai_honors_the_backend_override() {
+        // Forced choices win regardless of what's configured.
+        assert!(prefer_openai(Some("openai"), false));
+        assert!(!prefer_openai(Some("ollama"), true));
+        // No override → historical default (prefer OpenAI iff one is configured).
+        assert!(prefer_openai(None, true));
+        assert!(!prefer_openai(None, false));
+        // An unknown value falls back to the default too.
+        assert!(prefer_openai(Some("weird"), true));
+    }
+
+    #[test]
     fn resolve_backend_choice_prefers_openai_backend() {
         let cfg = newt_core::Config {
             backends: vec![newt_core::BackendConfig {
@@ -10503,7 +10609,7 @@ mod env_resolution_tests {
         };
         with_env_vars(
             &[("NEWT_PROVIDER", "local-box")],
-            &["NEWT_DGX_MODEL"],
+            &["NEWT_DGX_MODEL", "NEWT_BACKEND"],
             || {
                 let choice = resolve_backend_choice(&cfg);
                 assert_eq!(choice.url, "http://local-box:11434");
@@ -10530,7 +10636,7 @@ mod env_resolution_tests {
                 ("NEWT_PROVIDER", "dgx-prod"),
                 ("NEWT_DGX_MODEL", "nemotron-3:4b"),
             ],
-            &[],
+            &["NEWT_BACKEND"],
             || {
                 let choice = resolve_backend_choice(&cfg);
                 assert_eq!(choice.url, "http://dgx:11434");
@@ -10555,11 +10661,15 @@ mod env_resolution_tests {
         };
         // A directly-set provider that names no backend is not a hard error here
         // (the loadout path validates upstream) — it falls through to prefer-openai.
-        with_env_vars(&[("NEWT_PROVIDER", "ghost")], &["NEWT_DGX_MODEL"], || {
-            let choice = resolve_backend_choice(&cfg);
-            assert_eq!(choice.url, "http://remote:8000");
-            assert_eq!(choice.kind, newt_core::BackendKind::Openai);
-        });
+        with_env_vars(
+            &[("NEWT_PROVIDER", "ghost")],
+            &["NEWT_DGX_MODEL", "NEWT_BACKEND"],
+            || {
+                let choice = resolve_backend_choice(&cfg);
+                assert_eq!(choice.url, "http://remote:8000");
+                assert_eq!(choice.kind, newt_core::BackendKind::Openai);
+            },
+        );
     }
 
     #[test]
