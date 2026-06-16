@@ -135,6 +135,14 @@ pub struct Config {
     /// bundle, behavior unchanged. See [`BundleConfig`].
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub bundles: std::collections::BTreeMap<String, BundleConfig>,
+
+    /// Named loadouts (`[loadouts.<name>]` or `~/.newt/loadouts/<name>.toml`) — the
+    /// top-level composition of `provider → model → kit → role → settings`
+    /// (`docs/design/loadout-composition.md`). Inert until the resolver is wired
+    /// (Slice 1): this carries the data model + reference validation + `/loadout`
+    /// show. Empty by default. See [`Loadout`].
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub loadouts: std::collections::BTreeMap<String, Loadout>,
 }
 
 /// One named mode (`[modes.<name>]`, issue #307): the atomic binding the
@@ -976,6 +984,81 @@ pub enum PickVia {
     InferredBundle(String),
 }
 
+/// One named loadout (`[loadouts.<name>]` / `~/.newt/loadouts/<name>.toml`) — the
+/// top-level composition the user *loads* (`docs/design/loadout-composition.md`).
+/// Every field is optional and is a **name reference** into the surface that owns
+/// that axis; the loadout itself stores nothing but the selection + per-axis
+/// overrides. It carries **no authority** — `settings` cannot widen caveats.
+///
+/// ```toml
+/// [loadouts.dev-nemotron]
+/// provider = "dgx"          # → the catalog/provider card (#387)
+/// model    = "nemotron@deep"
+/// kit      = "nemotron"     # → a [bundles.<name>] (the loadable kit unit)
+/// profile  = "nemotron"     # → a [profiles.<name>] (optional; the bundle implies it)
+/// role     = "python-developer"   # → ~/.newt/personas/<name>.md
+///   [loadouts.dev-nemotron.settings]
+///   num_ctx = 24576
+///   framing = "Ship small, verify."
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct Loadout {
+    /// Provider id (→ the catalog/provider card). Resolution is Slice 2.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// Model id, optionally `model@variant`. Resolution is Slice 2.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Bundle name (the loadable kit unit) — must name a `[bundles.<name>]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kit: Option<String>,
+    /// Profile name — must name a `[profiles.<name>]`. Omitted ⇒ the bundle/model
+    /// implies it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+    /// Role/persona name (`~/.newt/personas/<name>.md`). Not validated against the
+    /// filesystem here — personas are resolved at session start.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    /// Per-axis overrides (parameters / prompt). Never authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settings: Option<LoadoutSettings>,
+}
+
+/// Per-axis overrides a loadout may pin. **No authority axis** — a loadout cannot
+/// widen caveats (`docs/design/loadout-composition.md` §Authority safety).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct LoadoutSettings {
+    /// Parameter axis: KV-cache window override (top of the `ModelTuning` chain).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub num_ctx: Option<u32>,
+    /// Prompt axis: a one-line system-prompt framing (the `ModeConfig.framing` shape).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub framing: Option<String>,
+}
+
+impl Loadout {
+    /// Validate the loadout's name references against `cfg`: a named `kit` must be a
+    /// known bundle and a named `profile` must be a known, valid profile. A dangling
+    /// reference is a hard error — a loadout that silently did nothing would be a
+    /// false claim. `provider`/`model`/`role` are resolved by their own surfaces
+    /// later (Slices 1–2) and are not checked here.
+    ///
+    /// # Errors
+    /// The first dangling `kit` or `profile` reference, as a message.
+    pub fn validate(&self, cfg: &Config) -> std::result::Result<(), String> {
+        if let Some(kit) = &self.kit {
+            cfg.resolve_bundle(kit)
+                .map_err(|e| format!("loadout kit '{kit}': {e}"))?;
+        }
+        if let Some(profile) = &self.profile {
+            cfg.resolve_profile(profile)
+                .map_err(|e| format!("loadout profile '{profile}': {e}"))?;
+        }
+        Ok(())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tool permissions — preset policies, lowered to attenuated capabilities
 // ---------------------------------------------------------------------------
@@ -1411,6 +1494,7 @@ impl Default for Config {
             modes: std::collections::BTreeMap::new(),
             profiles: std::collections::BTreeMap::new(),
             bundles: std::collections::BTreeMap::new(),
+            loadouts: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -1838,6 +1922,71 @@ mod tests {
             .is_none());
         // an unknown explicit bundle is a hard error
         assert!(cfg.pick_active_profile(None, Some("ghost"), "x").is_err());
+    }
+
+    // ── loadouts (the top-level composition; inert until Slice 1) ───────
+
+    #[test]
+    fn loadout_parses_inline_and_validates_references() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [profiles.nemotron]
+            techniques = ["knowledge_base", "verify_gate", "retry"]
+            [bundles.nemotron]
+            default_profile = "nemotron"
+
+            [loadouts.dev-nemotron]
+            provider = "dgx"
+            model    = "nemotron@deep"
+            kit      = "nemotron"
+            profile  = "nemotron"
+            role     = "python-developer"
+            [loadouts.dev-nemotron.settings]
+            num_ctx = 24576
+            framing = "Ship small, verify."
+            "#,
+        )
+        .unwrap();
+        let l = &cfg.loadouts["dev-nemotron"];
+        assert_eq!(l.provider.as_deref(), Some("dgx"));
+        assert_eq!(l.model.as_deref(), Some("nemotron@deep"));
+        assert_eq!(l.role.as_deref(), Some("python-developer"));
+        assert_eq!(l.settings.as_ref().unwrap().num_ctx, Some(24576));
+        // references resolve
+        assert!(l.validate(&cfg).is_ok());
+    }
+
+    #[test]
+    fn loadout_rejects_dangling_references() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [profiles.nemotron]
+            techniques = ["verify_gate"]
+            "#,
+        )
+        .unwrap();
+        // dangling kit
+        let bad_kit = Loadout {
+            kit: Some("ghost-bundle".into()),
+            ..Default::default()
+        };
+        let e = bad_kit.validate(&cfg).unwrap_err();
+        assert!(
+            e.contains("kit 'ghost-bundle'") && e.contains("no such bundle"),
+            "{e}"
+        );
+        // dangling profile
+        let bad_profile = Loadout {
+            profile: Some("ghost-profile".into()),
+            ..Default::default()
+        };
+        let e = bad_profile.validate(&cfg).unwrap_err();
+        assert!(
+            e.contains("profile 'ghost-profile'") && e.contains("no such profile"),
+            "{e}"
+        );
+        // an empty loadout is valid (no references)
+        assert!(Loadout::default().validate(&cfg).is_ok());
     }
 
     #[test]
