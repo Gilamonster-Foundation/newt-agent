@@ -68,7 +68,7 @@ pub use config::{
     AgentsConfig, BackendConfig, BackendKind, BundleConfig, ChatStyle, Config, ConversationsConfig,
     EditMode, FooterMode, Loadout, LoadoutSettings, LogConfig, MemoryConfig, MemoryDisclosure,
     MemoryProviderKind, PermissionPreset, PickVia, ProfilePick, ProviderConfig, SkillsConfig,
-    ToolPermissions, TuiConfig,
+    ThinkingMode, ToolPermissions, TuiConfig,
 };
 pub use conversation::{
     new_conversation_id, session_plan_dir, session_plan_path, ConversationRecord,

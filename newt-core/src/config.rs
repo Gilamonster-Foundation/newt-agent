@@ -552,6 +552,21 @@ pub enum FooterMode {
     Off,
 }
 
+/// How a thinking model's streamed reasoning is surfaced — the `[tui] thinking`
+/// key. Newt strips `<think>…</think>` from the reply regardless (#385); this
+/// only controls the live human display.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ThinkingMode {
+    /// Cargo-style: reasoning streams as dim scrolled lines (kept in
+    /// scrollback) with an ephemeral spinner line pinned at the bottom. The
+    /// default — but only on a TTY; a pipe / `newt worker` shows nothing.
+    #[default]
+    Stream,
+    /// No reasoning display at all (the answer still streams normally).
+    Off,
+}
+
 fn default_memory_window() -> usize {
     20
 }
@@ -647,6 +662,11 @@ pub struct TuiConfig {
     /// (the `--plain` CLI flag, or `NEWT_FOOTER=off`).
     #[serde(default)]
     pub footer: FooterMode,
+
+    /// How a thinking model's streamed reasoning is shown: `"stream"` (default
+    /// — dim reasoning + a cargo-style spinner, TTY only) or `"off"`.
+    #[serde(default)]
+    pub thinking: ThinkingMode,
 
     /// Maximum lines of tool output shown inline before offering "show all?".
     /// Default: 20. Set to 0 to always show everything.
@@ -1380,6 +1400,7 @@ impl Default for TuiConfig {
             no_splash: false,
             edit_mode: EditMode::Emacs,
             footer: FooterMode::Auto,
+            thinking: ThinkingMode::Stream,
             tool_output_lines: default_tool_output_lines(),
             max_tool_rounds: default_max_tool_rounds(),
             permissions: ToolPermissions::default(),
@@ -1930,6 +1951,16 @@ mod tests {
             let cfg: TuiConfig = toml::from_str(&format!("footer = \"{key}\"")).unwrap();
             assert_eq!(cfg.footer, want, "footer = {key}");
         }
+    }
+
+    #[test]
+    fn thinking_mode_defaults_to_stream_and_round_trips() {
+        let cfg: TuiConfig = toml::from_str("").unwrap();
+        assert_eq!(cfg.thinking, ThinkingMode::Stream);
+        let cfg: TuiConfig = toml::from_str("thinking = \"off\"").unwrap();
+        assert_eq!(cfg.thinking, ThinkingMode::Off);
+        let cfg: TuiConfig = toml::from_str("thinking = \"stream\"").unwrap();
+        assert_eq!(cfg.thinking, ThinkingMode::Stream);
     }
 
     // ── profile composition (technique library) ────────────────────────
