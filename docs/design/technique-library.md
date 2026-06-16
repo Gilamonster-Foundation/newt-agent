@@ -1,6 +1,6 @@
 # Technique library — composable harness techniques with spec sheets and tunable knobs
 
-**Status:** design note · **Composes with:** [`model-family-profiles.md`](model-family-profiles.md) (the profile = composition idea) · **Grounded by:** [`../findings/2026-06-15-retry-and-the-honest-gate.md`](../findings/2026-06-15-retry-and-the-honest-gate.md) (techniques need honest spec sheets) · **First knob:** `verify_gate.SurfaceMatch` (#73/#354)
+**Status:** design note · **Part of:** [`model-support-kit.md`](model-support-kit.md) (this is the kit's *parts catalog* — the techniques the kit composes) · **Composes with:** [`model-family-profiles.md`](model-family-profiles.md) (the profile = composition idea) · **Grounded by:** [`../findings/2026-06-15-retry-and-the-honest-gate.md`](../findings/2026-06-15-retry-and-the-honest-gate.md) (techniques need honest spec sheets) · **First knob:** `verify_gate.SurfaceMatch` (#73/#354)
 
 ## Abstract
 
@@ -152,6 +152,7 @@ coverage floor holds; every technique ships its spec sheet or it doesn't ship.
 
 ## Cross-links
 
+- [`thinking-effort-and-plan-mode.md`](thinking-effort-and-plan-mode.md) — two planned techniques: `effort` (the reasoning dial, per-backend) + `plan_mode` (capture the reasoning as a canonical `Plan` and execute against it). Prereq: #385 (the `<think>` split). Tracks #381.
 - [`model-family-profiles.md`](model-family-profiles.md) — the profile = composition design this fills in.
 - [`../findings/2026-06-15-retry-and-the-honest-gate.md`](../findings/2026-06-15-retry-and-the-honest-gate.md) — why spec sheets + the gate-completeness caveat.
 - #73/#354 (`verify_gate` + `SurfaceMatch`), #74/#353 (`knowledge_base`), #350 (the sweep), Phase 20 (the tuner that discovers knob values).

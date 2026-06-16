@@ -1,6 +1,7 @@
 # Model-family profiles — a tuned harness per model family
 
-**Status:** design note · **Depends on:** the cross-family forensic (below) ·
+**Status:** design note · **Part of:** [`model-support-kit.md`](model-support-kit.md) (the umbrella — a profile is an *assembly* from the kit) ·
+**Depends on:** the cross-family forensic (below) ·
 **Composes with:** Phase 9.8 `AgenticConfig`, Phase 20 self-tuning ·
 **Roadmap slot:** Step 20.3 (the outer, family-wide layer of Phase 20) ·
 **Scope guardrail:** [`docs/decisions/plain_scroller_tui.md`](../decisions/plain_scroller_tui.md)
