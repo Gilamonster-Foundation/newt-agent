@@ -1172,7 +1172,10 @@ pub async fn chat_complete(
                 }
                 return Ok((probe_content, false, accumulated_usage, hallucination_count));
             }
-            let (streamed, stream_usage) = stream_response(sresp, color).await?;
+            // Cargo-style reasoning spinner: TTY-gated (`color`) and opt-out via
+            // `[tui] thinking = "off"`. Never in a pipe / `newt worker`.
+            let show_thinking = color && thinking_stream_enabled();
+            let (streamed, stream_usage) = stream_response(sresp, color, show_thinking).await?;
 
             if streamed.is_empty() {
                 // The streaming re-issue produced no tokens. Fall back to the
@@ -2260,13 +2263,133 @@ pub async fn openai_chat_complete(
     Ok((text, streamed, usage, hallucination_count))
 }
 
+/// Whether `[tui] thinking` opts into the reasoning spinner (default on).
+fn thinking_stream_enabled() -> bool {
+    crate::Config::resolve()
+        .ok()
+        .and_then(|c| c.tui)
+        .map(|t| t.thinking == crate::ThinkingMode::Stream)
+        .unwrap_or(true)
+}
+
+/// Spinner glyph frames (braille) for the thinking renderer.
+const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/// The ephemeral spinner line text. Pure for testing.
+fn format_spinner(frame: usize, secs: f32, chars: usize) -> String {
+    format!(
+        "{}  thinking… {secs:.1}s · {chars} chars",
+        SPINNER_FRAMES[frame % SPINNER_FRAMES.len()]
+    )
+}
+
+/// Cargo-style thinking renderer: a model's reasoning (#385 — normally
+/// suppressed) streams as DIM scrolled lines that stay in scrollback, with one
+/// **ephemeral** spinner line pinned at the bottom (`\r`-redrawn, cleared with
+/// `\x1b[K` — one line, never a region; the plain-scroller carve-out), showing
+/// elapsed + size. Erased the instant the answer begins. Constructed only when
+/// the caller opts in (TTY); headless never builds it.
+struct ThinkingSpinner {
+    color: bool,
+    frame: usize,
+    start: std::time::Instant,
+    chars: usize,
+    line_buf: String,
+    spinner_drawn: bool,
+}
+
+impl ThinkingSpinner {
+    fn new(color: bool) -> Self {
+        Self {
+            color,
+            frame: 0,
+            start: std::time::Instant::now(),
+            chars: 0,
+            line_buf: String::new(),
+            spinner_drawn: false,
+        }
+    }
+
+    /// Feed a reasoning chunk: flush completed lines as dim scrollback, then
+    /// redraw the bottom spinner.
+    fn reasoning(&mut self, chunk: &str) {
+        self.chars += chunk.chars().count();
+        self.line_buf.push_str(chunk);
+        while let Some(nl) = self.line_buf.find('\n') {
+            let line: String = self.line_buf.drain(..=nl).collect();
+            self.print_dim_line(line.trim_end_matches(['\n', '\r']));
+        }
+        self.redraw_spinner();
+    }
+
+    fn print_dim_line(&mut self, line: &str) {
+        self.erase_spinner();
+        if line.trim().is_empty() {
+            return;
+        }
+        let mut out = io::stdout();
+        if self.color {
+            let _ = execute!(
+                out,
+                SetForegroundColor(CtColor::DarkGrey),
+                Print("  "),
+                Print(line),
+                ResetColor,
+                Print("\n"),
+            );
+        } else {
+            let _ = writeln!(out, "  {line}");
+        }
+    }
+
+    fn redraw_spinner(&mut self) {
+        self.frame = self.frame.wrapping_add(1);
+        let line = format_spinner(self.frame, self.start.elapsed().as_secs_f32(), self.chars);
+        let mut out = io::stdout();
+        if self.color {
+            let _ = execute!(
+                out,
+                Print("\r\x1b[K"),
+                SetForegroundColor(CtColor::DarkGrey),
+                Print(&line),
+                ResetColor,
+            );
+        } else {
+            let _ = write!(out, "\r{line}");
+        }
+        let _ = out.flush();
+        self.spinner_drawn = true;
+    }
+
+    fn erase_spinner(&mut self) {
+        if self.spinner_drawn {
+            let _ = write!(io::stdout(), "\r\x1b[K");
+            let _ = io::stdout().flush();
+            self.spinner_drawn = false;
+        }
+    }
+
+    /// The answer is starting (or the stream ended): flush trailing reasoning
+    /// and erase the spinner so output flows on cleanly. Idempotent.
+    fn finish(&mut self) {
+        if !self.line_buf.is_empty() {
+            let tail = std::mem::take(&mut self.line_buf);
+            self.print_dim_line(tail.trim_end_matches(['\n', '\r']));
+        }
+        self.erase_spinner();
+    }
+}
+
 /// Stream an Ollama NDJSON response, printing tokens as they arrive.
 /// Returns `(accumulated_text, token_usage)`.
 /// Token usage is extracted from the final chunk (`done: true`).
+/// `show_thinking` opts into the cargo-style reasoning spinner (TTY only).
 async fn stream_response(
     resp: reqwest::Response,
     color: bool,
+    show_thinking: bool,
 ) -> anyhow::Result<(String, Option<crate::TokenUsage>)> {
+    let mut spinner = show_thinking.then(|| ThinkingSpinner::new(color));
     let mut full = String::new();
     let mut started = false;
     let mut usage: Option<crate::TokenUsage> = None;
@@ -2285,10 +2408,26 @@ async fn stream_response(
                 continue;
             };
             let raw = json["message"]["content"].as_str().unwrap_or("");
-            let token = think.feed(raw);
+            let (token, reasoning) = think.feed_split(raw);
+            // Surface reasoning live (cargo-style) — both the inline `<think>`
+            // span the filter just split out AND any separate `thinking` field.
+            if let Some(sp) = spinner.as_mut() {
+                if !reasoning.is_empty() {
+                    sp.reasoning(&reasoning);
+                }
+                if let Some(t) = json["message"]["thinking"].as_str() {
+                    if !t.is_empty() {
+                        sp.reasoning(t);
+                    }
+                }
+            }
             let token = token.as_str();
             if !token.is_empty() {
                 if !started {
+                    // The answer is starting — tear the spinner down first.
+                    if let Some(sp) = spinner.as_mut() {
+                        sp.finish();
+                    }
                     if color {
                         execute!(
                             io::stdout(),
@@ -2323,12 +2462,20 @@ async fn stream_response(
     let tail = think.finish();
     if !tail.is_empty() {
         if !started {
+            if let Some(sp) = spinner.as_mut() {
+                sp.finish();
+            }
             print!("▸  ");
             started = true;
         }
         print!("{tail}");
         io::stdout().flush().ok();
         full.push_str(&tail);
+    }
+    // All-reasoning response (no clean content): tear the spinner down anyway so
+    // the terminal isn't left mid-spinner.
+    if let Some(sp) = spinner.as_mut() {
+        sp.finish();
     }
     if started {
         println!();
@@ -2345,6 +2492,19 @@ mod cap_exit_unit_tests {
         let nudge = cap_exit_nudge(5);
         assert!(nudge.contains("5 rounds"), "got: {nudge}");
         assert!(nudge.contains("Do NOT call any more tools"));
+    }
+
+    #[test]
+    fn spinner_line_formats_and_frame_wraps() {
+        assert_eq!(
+            format_spinner(0, 1.23, 340),
+            "⠋  thinking… 1.2s · 340 chars"
+        );
+        // Frame index wraps over the glyph set.
+        assert_eq!(
+            &format_spinner(SPINNER_FRAMES.len(), 0.0, 0)[..SPINNER_FRAMES[0].len()],
+            SPINNER_FRAMES[0]
+        );
     }
 
     #[test]

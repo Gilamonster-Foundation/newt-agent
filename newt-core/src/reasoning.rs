@@ -101,18 +101,30 @@ impl ThinkFilter {
 
     /// Feed one streamed token; returns the clean text to emit now (may be empty).
     pub fn feed(&mut self, token: &str) -> String {
+        self.feed_split(token).0
+    }
+
+    /// Feed one streamed token; returns `(clean, reasoning)` for this feed — the
+    /// clean text to emit now AND the reasoning text suppressed from it (either
+    /// may be empty). Lets a caller *render* the live reasoning (the cargo-style
+    /// thinking spinner) instead of discarding it, while `feed` keeps the
+    /// suppress-only behavior for everyone else.
+    pub fn feed_split(&mut self, token: &str) -> (String, String) {
         self.buf.push_str(token);
-        let mut out = String::new();
+        let mut clean = String::new();
+        let mut reasoning = String::new();
         loop {
             if self.inside {
                 match self.buf.find(CLOSE) {
                     Some(i) => {
+                        reasoning.push_str(&self.buf[..i]);
                         self.buf.drain(..i + CLOSE.len());
                         self.inside = false; // continue: there may be clean text after
                     }
                     None => {
-                        // Discard reasoning, but keep a trailing partial `</think>`.
+                        // Suppress reasoning, but keep a trailing partial `</think>`.
                         let cut = safe_len(&self.buf, CLOSE);
+                        reasoning.push_str(&self.buf[..cut]);
                         self.buf.drain(..cut);
                         break;
                     }
@@ -120,21 +132,21 @@ impl ThinkFilter {
             } else {
                 match self.buf.find(OPEN) {
                     Some(i) => {
-                        out.push_str(&self.buf[..i]);
+                        clean.push_str(&self.buf[..i]);
                         self.buf.drain(..i + OPEN.len());
                         self.inside = true;
                     }
                     None => {
                         // Emit all but a trailing partial `<think>`.
                         let cut = safe_len(&self.buf, OPEN);
-                        out.push_str(&self.buf[..cut]);
+                        clean.push_str(&self.buf[..cut]);
                         self.buf.drain(..cut);
                         break;
                     }
                 }
             }
         }
-        out
+        (clean, reasoning)
     }
 
     /// Flush at end of stream: emits any buffered clean tail (an unterminated
@@ -250,6 +262,33 @@ mod tests {
     #[test]
     fn streaming_plain_text_is_verbatim() {
         assert_eq!(stream("", &["no ", "tags ", "here"]), "no tags here");
+    }
+
+    #[test]
+    fn feed_split_captures_reasoning_across_token_boundaries() {
+        let tokens = [
+            "Here",
+            " <thi",
+            "nk>my ",
+            "reason",
+            "ing</thi",
+            "nk> is the ",
+            "answer",
+        ];
+        let mut f = ThinkFilter::new();
+        let (mut clean, mut reasoning) = (String::new(), String::new());
+        for t in tokens {
+            let (c, r) = f.feed_split(t);
+            clean.push_str(&c);
+            reasoning.push_str(&r);
+        }
+        clean.push_str(&f.finish());
+        assert_eq!(clean, "Here  is the answer");
+        assert_eq!(reasoning, "my reasoning");
+        // `feed` still suppresses (delegates to feed_split's clean half).
+        let mut g = ThinkFilter::new();
+        assert_eq!(g.feed("a<think>b"), "a");
+        assert_eq!(g.feed("c</think>d"), "d");
     }
 
     #[test]

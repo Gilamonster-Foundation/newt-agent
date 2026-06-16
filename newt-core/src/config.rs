@@ -532,6 +532,7 @@ pub enum MemoryDisclosure {
     Index,
 }
 
+<<<<<<< HEAD
 /// Prompt richness — the `[tui] footer` key. Selects the *default* prompt
 /// template when `[tui] prompt` is unset; an explicit `[tui] prompt` always
 /// wins. The rich default folds a timestamp + status into the prompt line
@@ -549,6 +550,20 @@ pub enum FooterMode {
     /// Always use the rich default prompt (even off a TTY — screenshots, tests).
     On,
     /// Always use the plain bare prompt. Equivalent to `--plain`.
+=======
+/// How a thinking model's streamed reasoning is surfaced — the `[tui] thinking`
+/// key. Newt strips `<think>…</think>` from the reply regardless (#385); this
+/// only controls the live human display.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ThinkingMode {
+    /// Cargo-style: reasoning streams as dim scrolled lines (kept in
+    /// scrollback) with an ephemeral spinner line pinned at the bottom. The
+    /// default — but only on a TTY; a pipe / `newt worker` shows nothing.
+    #[default]
+    Stream,
+    /// No reasoning display at all (the answer still streams normally).
+>>>>>>> fbd4903 (feat(thinking): cargo-style reasoning spinner (prototype))
     Off,
 }
 
@@ -641,12 +656,19 @@ pub struct TuiConfig {
     #[serde(default)]
     pub edit_mode: EditMode,
 
+<<<<<<< HEAD
     /// Input-footer mode: the transient multi-line `❯` input block with a
     /// status header. `"auto"` (default) shows it on a TTY and degrades to a
     /// plain scroller otherwise; `"on"` always shows it; `"off"` never does
     /// (the `--plain` CLI flag, or `NEWT_FOOTER=off`).
     #[serde(default)]
     pub footer: FooterMode,
+=======
+    /// How a thinking model's streamed reasoning is shown: `"stream"` (default
+    /// — dim reasoning + a cargo-style spinner, TTY only) or `"off"`.
+    #[serde(default)]
+    pub thinking: ThinkingMode,
+>>>>>>> fbd4903 (feat(thinking): cargo-style reasoning spinner (prototype))
 
     /// Maximum lines of tool output shown inline before offering "show all?".
     /// Default: 20. Set to 0 to always show everything.
@@ -1379,7 +1401,11 @@ impl Default for TuiConfig {
             prompt: None,
             no_splash: false,
             edit_mode: EditMode::Emacs,
+<<<<<<< HEAD
             footer: FooterMode::Auto,
+=======
+            thinking: ThinkingMode::Stream,
+>>>>>>> fbd4903 (feat(thinking): cargo-style reasoning spinner (prototype))
             tool_output_lines: default_tool_output_lines(),
             max_tool_rounds: default_max_tool_rounds(),
             permissions: ToolPermissions::default(),
@@ -1914,6 +1940,7 @@ mod tests {
     use crate::caveats::CaveatsExt;
     use std::io::Write;
 
+<<<<<<< HEAD
     // ── input-footer mode ──────────────────────────────────────────────
 
     #[test]
@@ -1930,6 +1957,16 @@ mod tests {
             let cfg: TuiConfig = toml::from_str(&format!("footer = \"{key}\"")).unwrap();
             assert_eq!(cfg.footer, want, "footer = {key}");
         }
+=======
+    #[test]
+    fn thinking_mode_defaults_to_stream_and_round_trips() {
+        let cfg: TuiConfig = toml::from_str("").unwrap();
+        assert_eq!(cfg.thinking, ThinkingMode::Stream);
+        let cfg: TuiConfig = toml::from_str("thinking = \"off\"").unwrap();
+        assert_eq!(cfg.thinking, ThinkingMode::Off);
+        let cfg: TuiConfig = toml::from_str("thinking = \"stream\"").unwrap();
+        assert_eq!(cfg.thinking, ThinkingMode::Stream);
+>>>>>>> fbd4903 (feat(thinking): cargo-style reasoning spinner (prototype))
     }
 
     // ── profile composition (technique library) ────────────────────────
