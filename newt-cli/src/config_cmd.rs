@@ -17,7 +17,7 @@ pub fn run(config_path: Option<&Path>) -> anyhow::Result<()> {
         tui.prompt = Some(newt_tui::DEFAULT_RICH_PROMPT.to_string());
     }
 
-    println!("# Resolved Newt configuration  (Config::resolve() search order)");
+    println!("# Resolved Newt configuration  (Config::resolve() search order; secrets redacted)");
     println!("#");
     println!("# [tui] edit_mode = \"emacs\" | \"vi\"     (shipped default: emacs)");
     println!("# [tui] footer    = \"auto\" | \"on\" | \"off\"   (auto = rich prompt on a TTY)");
@@ -34,7 +34,7 @@ pub fn run(config_path: Option<&Path>) -> anyhow::Result<()> {
     }
     println!();
 
-    let toml_str = toml::to_string_pretty(&config)?;
+    let toml_str = config.to_redacted_toml()?;
     println!("{toml_str}");
     Ok(())
 }

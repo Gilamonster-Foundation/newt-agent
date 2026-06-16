@@ -1727,6 +1727,33 @@ impl Config {
         home_dir().map(|h| h.join(".newt").join("config.toml"))
     }
 
+    /// Serialize the config to pretty TOML for **audit**, with inline secret
+    /// material redacted. The values of every `[[mcp_servers]]` `env` and
+    /// `headers` entry are replaced with [`Self::REDACTED`] — those maps are the
+    /// only place `Config` can carry a raw secret inline (e.g. an
+    /// `Authorization: Bearer …` header or an `API_KEY=…` child env var). Keys
+    /// are kept so an auditor sees *which* variables/headers are set without the
+    /// values. Secret *references* (`api_key_file` / `api_key_env`) are left as-is
+    /// — they name where a secret lives, not the secret itself.
+    ///
+    /// # Errors
+    /// A TOML serialization failure (should not happen for a valid `Config`).
+    pub fn to_redacted_toml(&self) -> Result<String> {
+        let mut redacted = self.clone();
+        for server in &mut redacted.mcp_servers {
+            for v in server.env.values_mut() {
+                *v = Self::REDACTED.to_string();
+            }
+            for v in server.headers.values_mut() {
+                *v = Self::REDACTED.to_string();
+            }
+        }
+        toml::to_string_pretty(&redacted).map_err(|e| NewtError::Config(e.to_string()))
+    }
+
+    /// Placeholder substituted for redacted secret values in [`Self::to_redacted_toml`].
+    pub const REDACTED: &'static str = "<redacted>";
+
     /// The ordered skill-discovery search path, with `~/` expanded.
     ///
     /// Resolves `[skills].search` when configured; otherwise defaults to the
@@ -2715,6 +2742,54 @@ max_tool_rounds = 25
     #[test]
     fn config_default_has_no_dgx() {
         assert!(Config::default().dgx.is_none());
+    }
+
+    #[test]
+    fn to_redacted_toml_hides_mcp_secrets_but_keeps_shape() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [[backends]]
+            name = "remote"
+            endpoint = "http://remote:8000"
+            model = "qwen3:32b"
+            tiers = []
+            kind = "openai"
+            api_key_file = "~/.newt/openai.key"
+
+            [[mcp_servers]]
+            name = "gh"
+            type = "http"
+            url = "https://api.example/mcp"
+            [mcp_servers.headers]
+            Authorization = "Bearer sk-super-secret-token"
+            [mcp_servers.env]
+            GH_TOKEN = "ghp_rawsecretvalue"
+            RUST_LOG = "debug"
+            "#,
+        )
+        .unwrap();
+
+        let dump = cfg.to_redacted_toml().unwrap();
+        // The raw secret VALUES never appear…
+        assert!(
+            !dump.contains("sk-super-secret-token"),
+            "header secret leaked:\n{dump}"
+        );
+        assert!(
+            !dump.contains("ghp_rawsecretvalue"),
+            "env secret leaked:\n{dump}"
+        );
+        // …but the KEYS and the placeholder do, so the audit shows the shape.
+        assert!(dump.contains("Authorization"));
+        assert!(dump.contains("GH_TOKEN"));
+        assert!(dump.contains(Config::REDACTED));
+        // Secret *references* (a path) are kept — they name where a secret lives.
+        assert!(
+            dump.contains("~/.newt/openai.key"),
+            "api_key_file reference kept"
+        );
+        // Non-secret structure is intact.
+        assert!(dump.contains("http://remote:8000"));
     }
 
     #[test]
