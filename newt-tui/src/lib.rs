@@ -2942,6 +2942,87 @@ fn announce_profile(
     }
 }
 
+/// The session's resolved loadout state, rendered for `/loadout show` — the
+/// audit companion to `/config`. Separates what a named loadout *declares* (its
+/// `[loadouts.<name>]` axes) from what actually *resolved* this session
+/// (backend endpoint + model, the active profile and its provenance, the
+/// persona), so an operator can see at a glance whether an axis was overridden
+/// by an explicit flag. Pure (no I/O) so it can be unit-tested.
+struct LoadoutView<'a> {
+    /// Active loadout name (`NEWT_LOADOUT`), if one was selected.
+    name: Option<&'a str>,
+    /// The named loadout's declared composition, if it resolves in config.
+    loadout: Option<&'a newt_core::Loadout>,
+    /// Resolved backend endpoint + model in effect this session.
+    inf_url: &'a str,
+    inf_model: &'a str,
+    /// The active profile pick (name + provenance), if any.
+    profile_pick: Option<&'a newt_core::config::ProfilePick>,
+    /// The active persona/role name, if any.
+    persona: Option<&'a str>,
+}
+
+impl LoadoutView<'_> {
+    fn render(&self) -> String {
+        let mut lines: Vec<String> = Vec::new();
+        match self.name {
+            Some(n) => lines.push(format!("Active loadout: {n}")),
+            None => lines.push("No loadout active.".to_string()),
+        }
+        // What the named loadout declared (dispatcher inputs).
+        if let Some(l) = self.loadout {
+            lines.push("  declared:".to_string());
+            for (label, val) in [
+                ("provider", l.provider.as_deref()),
+                ("model", l.model.as_deref()),
+                ("kit", l.kit.as_deref()),
+                ("profile", l.profile.as_deref()),
+                ("role", l.role.as_deref()),
+            ] {
+                if let Some(v) = val {
+                    lines.push(format!("    {label:<9}{v}"));
+                }
+            }
+            if let Some(s) = &l.settings {
+                if let Some(n) = s.num_ctx {
+                    lines.push(format!("    {:<9}{n}", "num_ctx"));
+                }
+                if let Some(f) = &s.framing {
+                    lines.push(format!("    {:<9}{f}", "framing"));
+                }
+            }
+        } else if let Some(n) = self.name {
+            lines.push(format!("  (no [loadouts.{n}] in config)"));
+        }
+        // What actually resolved this session (the effect each axis had).
+        lines.push("  resolved:".to_string());
+        lines.push(format!(
+            "    {:<9}{} @ {}",
+            "backend", self.inf_model, self.inf_url
+        ));
+        let profile_line = match self.profile_pick {
+            Some(p) => {
+                let via = match &p.via {
+                    newt_core::config::PickVia::Profile => String::new(),
+                    newt_core::config::PickVia::Bundle(b) => format!(" (via bundle '{b}')"),
+                    newt_core::config::PickVia::InferredBundle(b) => {
+                        format!(" (via bundle '{b}', inferred)")
+                    }
+                };
+                format!("{}{}", p.name, via)
+            }
+            None => "(none)".to_string(),
+        };
+        lines.push(format!("    {:<9}{profile_line}", "profile"));
+        lines.push(format!(
+            "    {:<9}{}",
+            "persona",
+            self.persona.unwrap_or("(none)")
+        ));
+        lines.join("\n")
+    }
+}
+
 /// The `verify_gate` technique (R2), post-turn: resolve the produced Python files'
 /// imports against the workspace's FFI surface and return a one-block warning of
 /// any that import modules absent from it — `None` when clean, or when the
@@ -3768,6 +3849,49 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                         ) {
                             Ok(msg) => print_newt(&msg, color, verbose),
                             Err(e) => print_newt(&format!("error: {e}"), color, verbose),
+                        }
+                        if let Some(ref hp) = history_path {
+                            let _ = rl.save_history(hp);
+                        }
+                        println!();
+                        continue;
+                    }
+                    if slash_body == "loadout" || slash_body.starts_with("loadout ") {
+                        // The audit companion to `/config`: show the active loadout's
+                        // declared axes vs what actually resolved this session. Needs
+                        // live session state (resolved model/endpoint, active profile,
+                        // persona), so it lives here rather than in `dispatch_slash`.
+                        let arg = slash_body.strip_prefix("loadout").unwrap_or("").trim();
+                        if arg.is_empty() || arg == "show" {
+                            let loadout_name =
+                                std::env::var("NEWT_LOADOUT").ok().filter(|s| !s.is_empty());
+                            let loadout = loadout_name.as_deref().and_then(|n| cfg.loadouts.get(n));
+                            // Recompute the profile pick (pure) for its provenance.
+                            let profile_env = std::env::var("NEWT_PROFILE").ok();
+                            let bundle_env = std::env::var("NEWT_BUNDLE").ok();
+                            let pick = cfg
+                                .pick_active_profile(
+                                    profile_env.as_deref(),
+                                    bundle_env.as_deref(),
+                                    &inf_model,
+                                )
+                                .ok()
+                                .flatten();
+                            let view = LoadoutView {
+                                name: loadout_name.as_deref(),
+                                loadout,
+                                inf_url: &inf_url,
+                                inf_model: &inf_model,
+                                profile_pick: pick.as_ref(),
+                                persona: active_persona.as_ref().map(|p| p.name.as_str()),
+                            };
+                            print_newt(&view.render(), color, verbose);
+                        } else {
+                            print_newt(
+                                &format!("unknown /loadout subcommand '{arg}' — try /loadout show"),
+                                color,
+                                verbose,
+                            );
                         }
                         if let Some(ref hp) = history_path {
                             let _ = rl.save_history(hp);
@@ -5909,6 +6033,7 @@ fn help_lines() -> &'static [&'static str] {
         "  /permissions             - prompted permission decisions + active mode clamp",
         "  /mode <name>             - enter a named mode: load skill + clamp authority (floor)",
         "  /mode                    - show the active mode; /mode off clears it",
+        "  /loadout                 - show the active loadout: declared axes vs what resolved",
         "  /workspace               - show current workspace path",
         "  /prompt                  - list prompt tokens ($MODEL, $DATE, …) + current prompt",
         "  /prompt set \"<template>\"  - set the prompt for this session; /prompt reset to revert",
@@ -6864,6 +6989,73 @@ mod tests {
     #[test]
     fn slash_workspace_returns_true() {
         assert!(dispatch_slash("/workspace", "/ws", false, false).unwrap());
+    }
+
+    #[test]
+    fn help_lists_loadout_command() {
+        assert!(help_lines().iter().any(|l| l.contains("/loadout")));
+    }
+
+    #[test]
+    fn loadout_view_renders_declared_and_resolved() {
+        let l = newt_core::Loadout {
+            provider: Some("dgx".into()),
+            model: Some("nemotron@deep".into()),
+            kit: Some("nemotron".into()),
+            profile: Some("nemotron".into()),
+            role: Some("python-developer".into()),
+            settings: Some(newt_core::LoadoutSettings {
+                num_ctx: Some(24576),
+                framing: Some("Ship small.".into()),
+            }),
+        };
+        let pick = newt_core::config::ProfilePick {
+            name: "nemotron".into(),
+            via: newt_core::config::PickVia::Bundle("nemotron".into()),
+        };
+        let view = LoadoutView {
+            name: Some("dev"),
+            loadout: Some(&l),
+            inf_url: "http://dgx:11434",
+            inf_model: "nemotron-3:33b",
+            profile_pick: Some(&pick),
+            persona: Some("python-developer"),
+        };
+        let out = view.render();
+        assert!(out.contains("Active loadout: dev"), "{out}");
+        // declared axes
+        assert!(
+            out.contains("declared:") && out.contains("nemotron@deep"),
+            "{out}"
+        );
+        assert!(
+            out.contains("24576") && out.contains("Ship small."),
+            "{out}"
+        );
+        // resolved effect + profile provenance
+        assert!(out.contains("nemotron-3:33b @ http://dgx:11434"), "{out}");
+        assert!(out.contains("via bundle 'nemotron'"), "{out}");
+        assert!(out.contains("python-developer"), "{out}");
+    }
+
+    #[test]
+    fn loadout_view_renders_when_none_active() {
+        let view = LoadoutView {
+            name: None,
+            loadout: None,
+            inf_url: "http://localhost:11434",
+            inf_model: "llama3.1:8b",
+            profile_pick: None,
+            persona: None,
+        };
+        let out = view.render();
+        assert!(out.contains("No loadout active."), "{out}");
+        assert!(
+            out.contains("llama3.1:8b @ http://localhost:11434"),
+            "{out}"
+        );
+        // unset axes are explicit, not blank
+        assert!(out.contains("profile") && out.contains("(none)"), "{out}");
     }
 
     #[test]
