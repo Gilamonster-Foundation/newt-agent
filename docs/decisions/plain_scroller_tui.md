@@ -106,7 +106,7 @@ The practical wins compound with the architectural one:
   surface:
 
   ```text
-  [2026-06-16 10:34:55 · gpt-4.1 · newt-agent · emacs ] ❯ <input>
+  [2026-06-16 11:59:02] gpt-4.1 | emacs | newt-agent ❯ <input>
   ▸ <output>…
   ```
 

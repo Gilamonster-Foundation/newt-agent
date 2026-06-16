@@ -904,9 +904,9 @@ fn footer_rich_enabled(mode: newt_core::FooterMode, is_tty: bool) -> bool {
 
 /// The built-in rich prompt template (used when `[tui] prompt` is unset and the
 /// prompt is rich). Expands via [`expand_prompt_tokens`] to e.g.
-/// `[2026-06-16 10:34:55 · gpt-4.1 · newt-agent · emacs ] ❯ `. Written in the
+/// `[2026-06-16 11:59:02] gpt-4.1 | emacs | newt-agent ❯ `. Written in the
 /// readable `$NAME` form so it self-documents when copied into a config.
-pub const DEFAULT_RICH_PROMPT: &str = "[$TIMESTAMP · $MODEL · $WS · $MODE ] ❯ ";
+pub const DEFAULT_RICH_PROMPT: &str = "[$TIMESTAMP] $MODEL | $MODE | $WS ❯ ";
 
 /// The prompt-token reference — the single source of truth shared by the
 /// `/prompt` command, the scaffolded config comment, and the docs. Each entry
@@ -1047,7 +1047,7 @@ mod footer_tests {
         // The built-in rich default expands to the `[ts · model · ws · mode ]`
         // prompt-prefix shape.
         let p = expand_prompt_tokens(DEFAULT_RICH_PROMPT, "/home/me/newt-agent", "gpt-4.1", false);
-        assert!(p.contains("· gpt-4.1 · newt-agent · emacs ] ❯ "), "{p}");
+        assert!(p.contains("] gpt-4.1 | emacs | newt-agent ❯ "), "{p}");
         assert!(p.starts_with('['));
     }
 
