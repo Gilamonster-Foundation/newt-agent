@@ -7,10 +7,23 @@ comments during development — for traceability: `global-scheduler`≈Leviathan
 `tenant-context`≈Broodmother, `per-model-strategy`≈Dragonlord,
 `model-thread`≈snake.
 **Related:** [`model-self-tuning.md`](model-self-tuning.md) §4b (Step 20.3 —
-fail-open, *never halt*); [`paged-compaction.md`](paged-compaction.md)
-(Step 20.4 — *never lose*; the swap mechanism this scheduler invokes);
-`docs/decisions/mesh_integration.md` (the `newt-mesh` / `agent-mesh-bus`
-substrate the tiers talk over).
+fail-open, *never halt*);
+[`progressive-disclosure-compaction.md`](progressive-disclosure-compaction.md)
+(Step 20.4 — *never lose*; the disclosure/swap mechanism this scheduler invokes);
+[`workflow-swarm-harness.md`](workflow-swarm-harness.md) (the `newt-scheduler`
+crate + `BackendPool` + per-child attenuation this composes with);
+`docs/decisions/mesh_integration.md` (the mesh / `agent-mesh-bus` substrate the
+tiers talk over when a second engine appears).
+
+> **Reconciliation note (2026-06-16).** Cross-cut against the
+> model-support-kit / loadout / swarm-harness stack: (1) `per-model-strategy` is
+> **not** a new tier or a new `[[profiles]]` table — it is the existing
+> **profile knob** (`context_strategy`), see §3.1/§7; (2) the scheduler core
+> lives in **`newt-scheduler`** (default build), not `newt-mesh`, see §10;
+> (3) `execution-worker`s run under **per-child attenuated keys** (swarm-harness
+> §7), see §4.7; (4) `execution-worker` ≈ `TurnDriver`, `distributed-scheduler`
+> ≈ `BackendPool` — the *across-backends* axis composing with `kv-warden`'s
+> *within-one-engine* axis, not a second scheduler.
 
 ## 1. The problem
 
@@ -72,9 +85,16 @@ of the global-scheduler, not a scheduler tier (the Borg job/scheduler split):
 
 - **tenant-context** (the map-reduce job) — carves an oversized context into
   chunks, submits a set of execution-workers, and reduces their findings (§6).
-- **per-model-strategy** — picks the context strategy per model (summary /
-  paged / mapreduce, visible / silent) and feeds it to the global-scheduler as
-  policy (§7). The Phase-20 per-model eval writes the learned winner here.
+  This is the `Plan` / `Workflow` map-reduce of
+  [`workflow-swarm-harness.md`](workflow-swarm-harness.md) §3.2/§6 run at
+  `len()==1` (one engine), not a new component — `tenant-context` is the *name
+  for that Plan*, a client of the scheduler.
+- **per-model-strategy** — **not a new tier and not a new TOML table.** It is the
+  existing **profile knob** `context_strategy` (`model-family-profiles.md`); the
+  global-scheduler *reads* the resolved profile's value as admission policy. The
+  Phase-20 per-model eval writes the learned winner back to that profile (§7).
+  (#387 explicitly fences off the `[profiles.*]` table from setting-variants —
+  there is exactly one such table, the kit's.)
 
 ## 4. Mechanism
 
@@ -131,6 +151,19 @@ A tenant blocked on its workers must not stall the user. The worker a
 coordinator is blocked on **inherits the coordinator's priority** (textbook
 priority-inheritance), with aging to prevent starvation.
 
+### 4.7 Authority — execution-workers run under attenuated keys
+
+The scheduler dispatches agent rounds, so it **must** compose the per-child
+authority model from [`workflow-swarm-harness.md`](workflow-swarm-harness.md)
+§7: each `execution-worker` runs under a freshly-minted, signed **attenuated**
+`AgentKey`, provably `⊑` its parent (`attenuate` / `enforced_caveats`,
+re-verified before the round). A scheduler that places agent rounds *without*
+that minting is a Confused-Deputy regression — a diverse/foreign worker added
+for capacity could be steered past its grant. This doc does not re-spec the
+authority layer; it requires it. (See also the curated-context discipline —
+a worker is fed only its chunk + the handles it needs, nothing else — which is
+both a budget control and an information-leak control.)
+
 ## 5. Backend-tier abstraction (both tiers, one seam)
 
 The distributed-scheduler targets an `Engine` trait so the same scheduler serves
@@ -167,16 +200,18 @@ mitigate with overlapping windows + a tenant-context join / second-reduce pass.
 The eval (§8) must include cross-chunk tasks or the result will look better than
 it is.
 
-## 7. Per-model strategy — configurable, optionally silent
+## 7. Per-model strategy — a profile knob, not a new table
 
-Folds into the Phase-20 per-model tuning profile (`community-tunings.toml` /
-`CapabilityEntry`) — already per-model and already learnable:
+The strategy is a field on the **existing profile** (`model-family-profiles.md` /
+`ProfileConfig`), the one the loadout already selects — **not** a parallel
+`[[profiles]]` list (#387 fences that table off). The scheduler *reads* the
+resolved profile; the Phase-20 eval *writes* the learned winner back to it:
 
 ```toml
-[[profiles]]
-model = "qwen2.5:7b"
-context_strategy = "mapreduce"   # summary | paged | mapreduce | auto
-strategy_disclosure = "silent"   # visible | silent
+# In the kit's single [profiles.<name>] table (model-family-profiles.md):
+[profiles.qwen-7b]
+context_strategy    = "mapreduce"   # summary | disclosure | mapreduce | auto
+strategy_disclosure = "silent"      # visible | silent
 ```
 
 - **A major behavioural change must be opt-in and per-model** — some models
@@ -200,7 +235,7 @@ Compare arms on a fixed suite that *requires* recalling evicted detail and
 
 - **single-agent / no-compaction** (oracle ceiling, fits when it fits),
 - **summary** (today's destructive compaction),
-- **paged** (Step 20.4),
+- **disclosure** (Step 20.4 — progressive-disclosure compaction / paged eviction),
 - **mapreduce** (this scheduler).
 
 Metrics: task-success rate (mapreduce/paged should approach the oracle, beat
@@ -211,9 +246,9 @@ regression — otherwise it stays behind the flag.
 
 ## 9. Composition (the whole stack)
 
-**20.3** never halt → **20.4** never lose (page) → **Phase 22** interleave many
-paged contexts on one engine → **tenant-context** carve + fan out. Each layer is
-independently shippable and each makes the next cheaper.
+**20.3** never halt → **20.4** never lose (progressive disclosure) → **Phase 22**
+interleave many disclosed contexts on one engine → **tenant-context** carve + fan
+out. Each layer is independently shippable and each makes the next cheaper.
 
 ## 10. MVP scope & co-location
 
@@ -222,12 +257,15 @@ today. The Borg lesson: one master per cell — don't deploy the hierarchy until
 there are multiple cells.
 
 - **MVP co-locates global-scheduler + kv-warden + distributed-scheduler in one
-  process** over the single Ollama/vLLM engine; the four seams exist as traits +
-  `newt-mesh` messages but only split across the bus when a **second engine
-  appears**.
-- Lives in / beside `newt-mesh` (the workspace-excluded, feature-gated crate —
-  `mesh_integration.md`), not the default build. It is the natural home of the
-  planned "drake-on-mesh parallel dispatcher" (Phase 5).
+  process** over the single Ollama/vLLM engine; the four seams exist as traits
+  but only split across the bus when a **second engine appears**.
+- **Lives in `newt-scheduler` — a new default-workspace crate, fully built and
+  tested.** *Not* `newt-mesh`: that crate path-deps `../agent-mesh`, which cargo
+  validates eagerly even behind a feature flag, so default CI cannot carry it
+  (`mesh_integration.md`, and `workflow-swarm-harness.md` §6, which makes the
+  same call). The multi-*engine* / multi-*node* split is the `mesh`-feature
+  `RemoteDispatch` impl behind the `Engine` seam — the "drake-on-mesh
+  dispatcher" future, gated off by default.
 - Serial tier (Ollama) first — matches current hardware; the concurrent (vLLM)
   tier slots behind the same `Engine` seam later.
 

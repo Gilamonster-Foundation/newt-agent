@@ -1,10 +1,18 @@
-# Paged compaction — context compaction as paging, not destruction
+# Progressive-disclosure compaction — context compaction as disclosure, not destruction
 
 **Status:** Spec only (Step 20.4 not yet built). Design captured for review.
+**Naming (reconciliation, 2026-06-16):** the innovation is **progressive
+disclosure** — context is a budgeted, addressable resource the agent pulls on
+demand. "Paging" (window = RAM, store = disk, `memory_fetch` = page-fault) is the
+*mechanism metaphor* used below to explain it; the concept name is
+progressive-disclosure, and this is the compaction-path application of the same
+disclosure substrate as [`progressive-disclosure-memory.md`](progressive-disclosure-memory.md).
 **Related:** [`model-self-tuning.md`](model-self-tuning.md) §4b (Step 20.3 —
 fail-open, the *never-halt* safety net this feature complements);
 [`progressive-disclosure-memory.md`](progressive-disclosure-memory.md) (#319 —
-the `memory_fetch` index-then-fetch substrate this feature reuses).
+the `memory_fetch` index-then-fetch substrate this feature reuses);
+[`model-family-profiles.md`](model-family-profiles.md) (owns the *selector* — the
+`compaction_mode` profile knob this doc's mechanism is chosen by).
 
 ## 1. The problem with destructive compaction
 
@@ -58,15 +66,19 @@ to the model.
 
 ## 4. Design
 
-### 4.1 The flag
+### 4.1 The selector — a profile knob, not a standalone facet
 
-A new `[compaction] mode` config facet, default = today's behavior:
+The mode is a **profile knob** (`compaction_mode`), not a free-standing
+`[compaction]` table: it lives in `ProfileConfig` / `model-family-profiles.md`
+so it is per-model/per-family and selectable by a loadout — the kit owns the
+*selector*, this doc owns the *mechanism*. Default = today's behavior:
 
 - `summary` *(default)* — the current destructive prune+summary/marker path,
   bit-for-bit unchanged. Inert unless opted in (the `MemoryDisclosure`
   precedent).
-- `paged` — eviction emits a `memory_fetch`-handle index marker instead of a
-  lossy replacement, and ensures `memory_fetch` is wired for the session.
+- `disclosure` — eviction emits a `memory_fetch`-handle index marker instead of
+  a lossy replacement, and ensures `memory_fetch` is wired for the session. (The
+  *mechanism* is paging; `disclosure` names the innovation per the banner above.)
 
 ### 4.2 The eviction marker
 
@@ -159,12 +171,18 @@ smaller than the span it replaces.
 
 ## 7. Eval plan
 
+This is an **arm of the existing ground-truth rig (#75) + model sweep (#350)**
+feeding the Phase-20 writeback — not a standalone harness. The
+`compaction_mode` winner is written back to the model card / profile
+(`tune_source`-tagged so a swept value never clobbers a hand-authored one),
+the same fitness function `model-family-profiles.md` defines.
+
 Compare three arms on a fixed task suite that *requires* recalling evicted
 detail (read a large file early, use a fact from it many rounds later):
 
 - **no-compaction** (oracle ceiling — fits when it fits),
 - **summary** (today's destructive path),
-- **paged** (this feature).
+- **disclosure** (this feature — paged eviction).
 
 Metrics:
 
