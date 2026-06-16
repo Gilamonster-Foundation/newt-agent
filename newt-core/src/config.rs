@@ -800,6 +800,33 @@ pub struct TuiConfig {
     /// this only governs the human. See `docs/decisions/plain_scroller_tui.md`.
     #[serde(default = "default_allow_bang_escape")]
     pub allow_bang_escape: bool,
+
+    /// A small semantic color palette for the interactive prompt. Each slot is
+    /// an optional color spec — a named color (`orange`, `cyan`, `grey`, …) or a
+    /// `#rrggbb` hex — that overrides a built-in default. An unset slot keeps the
+    /// default; `NO_COLOR` / a non-TTY drops all color regardless. See
+    /// `docs/decisions/plain_scroller_tui.md`.
+    #[serde(default)]
+    pub colors: ColorsConfig,
+}
+
+/// `[tui.colors]` — a deliberately small set of semantic color slots. Kept
+/// minimal on purpose (no palette registry, no per-element theming): the
+/// interactive prompt is a plain scroller, so this exists to flag the `!`
+/// host-shell mode and tune the prompt accent, nothing more.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ColorsConfig {
+    /// Brand/prompt accent (default: newt orange). Used for the bold `!`
+    /// bang-mode sigil.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accent: Option<String>,
+    /// The `!` host-shell-escape line (default: newt orange). Colors the typed
+    /// command so it is unmistakably *not* a chat message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shell_mode: Option<String>,
+    /// Dim text — the prompt status line / log marker (default: grey).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dim: Option<String>,
 }
 
 fn default_tool_output_lines() -> usize {
@@ -1429,6 +1456,7 @@ impl Default for TuiConfig {
             sanitize_mcp_server_names: default_sanitize_mcp_server_names(),
             mcp_allow_insecure_hosts: Vec::new(),
             allow_bang_escape: default_allow_bang_escape(),
+            colors: ColorsConfig::default(),
         }
     }
 }
@@ -1965,6 +1993,21 @@ mod tests {
             let cfg: TuiConfig = toml::from_str(&format!("footer = \"{key}\"")).unwrap();
             assert_eq!(cfg.footer, want, "footer = {key}");
         }
+    }
+
+    #[test]
+    fn colors_config_defaults_empty_and_round_trips() {
+        // Absent table → all slots unset (each falls back to its built-in).
+        let cfg: TuiConfig = toml::from_str("").unwrap();
+        assert_eq!(cfg.colors, ColorsConfig::default());
+        // Named + hex specs parse into the slots.
+        let cfg: TuiConfig = toml::from_str(
+            "[colors]\naccent = \"#dc3c14\"\nshell_mode = \"orange\"\ndim = \"grey\"",
+        )
+        .unwrap();
+        assert_eq!(cfg.colors.accent.as_deref(), Some("#dc3c14"));
+        assert_eq!(cfg.colors.shell_mode.as_deref(), Some("orange"));
+        assert_eq!(cfg.colors.dim.as_deref(), Some("grey"));
     }
 
     #[test]

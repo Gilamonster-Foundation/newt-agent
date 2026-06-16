@@ -149,7 +149,12 @@ The practical wins compound with the architectural one:
   the prompt, so it can never invoke `!`, and it deliberately runs with the
   user's own host authority (no OCAP/Caveats leash — that governs only
   *model*-initiated `run_command`). `wyvern-agent` (no interactive loop) has no
-  bang-escape.
+  bang-escape. A `!` line is **recolored live** via rustyline's `Highlighter`
+  (bold accent `!` sigil + the command in the `shell_mode` color) so it reads as
+  obviously *not* a chat message — within rustyline's existing carve-out, no
+  region. Colors come from a small `[tui.colors]` palette (`accent` /
+  `shell_mode` / `dim`, named or `#rrggbb`), defaulting to today's values and
+  dropped entirely under `NO_COLOR` / non-TTY.
 
 ## Consequences
 

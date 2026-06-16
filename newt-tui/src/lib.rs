@@ -974,7 +974,75 @@ fn current_prompt_and_preview(workspace: &str) -> (String, String) {
 /// terminals, no special key detection). On submit the caller rejoins
 /// `"\\\n"` to `"\n"`. Installed only when the footer is on; off-mode keeps
 /// today's single-line behavior exactly.
-struct FooterHelper;
+struct FooterHelper {
+    palette: Palette,
+}
+
+const ANSI_RESET: &str = "\x1b[0m";
+const ANSI_BOLD: &str = "\x1b[1m";
+
+/// Parse a color spec — a named color or `#rrggbb` hex — into RGB. Returns
+/// `None` for an unrecognized name or malformed hex, so the caller falls back
+/// to the slot's built-in default.
+fn parse_color_rgb(spec: &str) -> Option<(u8, u8, u8)> {
+    let s = spec.trim();
+    if let Some(hex) = s.strip_prefix('#') {
+        if hex.len() != 6 {
+            return None;
+        }
+        let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+        let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+        let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+        return Some((r, g, b));
+    }
+    let rgb = match s.to_ascii_lowercase().as_str() {
+        "orange" => (220, 60, 20), // newt orange
+        "black" => (0, 0, 0),
+        "red" => (205, 49, 49),
+        "green" => (13, 188, 121),
+        "yellow" => (229, 229, 16),
+        "blue" => (36, 114, 200),
+        "magenta" | "purple" => (188, 63, 188),
+        "cyan" => (17, 168, 205),
+        "white" => (229, 229, 229),
+        "grey" | "gray" => (128, 128, 128),
+        "darkgrey" | "darkgray" => (85, 85, 85),
+        _ => return None,
+    };
+    Some(rgb)
+}
+
+/// An SGR truecolor foreground escape for `rgb`.
+fn fg_escape(rgb: (u8, u8, u8)) -> String {
+    format!("\x1b[38;2;{};{};{}m", rgb.0, rgb.1, rgb.2)
+}
+
+/// A resolved color palette: each field is a ready-to-print SGR foreground
+/// escape, or empty when color is disabled (`NO_COLOR` / non-TTY).
+#[derive(Clone, Default)]
+struct Palette {
+    accent: String,
+    shell_mode: String,
+    dim: String,
+}
+
+/// Resolve `[tui.colors]` into ready-to-print escapes. Unset/invalid slots fall
+/// back to the built-in defaults (accent + shell_mode = newt orange, dim =
+/// grey). With color disabled every slot is empty, so highlighting is inert.
+fn resolve_palette(colors: &newt_core::ColorsConfig, color_enabled: bool) -> Palette {
+    if !color_enabled {
+        return Palette::default();
+    }
+    let pick = |spec: &Option<String>, default: (u8, u8, u8)| {
+        let rgb = spec.as_deref().and_then(parse_color_rgb).unwrap_or(default);
+        fg_escape(rgb)
+    };
+    Palette {
+        accent: pick(&colors.accent, (220, 60, 20)),
+        shell_mode: pick(&colors.shell_mode, (220, 60, 20)),
+        dim: pick(&colors.dim, (128, 128, 128)),
+    }
+}
 
 /// Whether the input wants another line: a trailing `\` continues (the
 /// shell/Python idiom). Pure for testing — the `Validator` is a thin wrapper.
@@ -988,7 +1056,39 @@ impl rustyline::completion::Completer for FooterHelper {
 impl rustyline::hint::Hinter for FooterHelper {
     type Hint = String;
 }
-impl rustyline::highlight::Highlighter for FooterHelper {}
+impl rustyline::highlight::Highlighter for FooterHelper {
+    /// Color a `! …` host-shell line: a bold accent `!` sigil + the command in
+    /// the shell-mode color, so it is unmistakable from a chat message. Every
+    /// other line is returned unchanged.
+    fn highlight<'l>(&self, line: &'l str, _pos: usize) -> std::borrow::Cow<'l, str> {
+        if self.palette.shell_mode.is_empty() || !line.starts_with('!') {
+            return std::borrow::Cow::Borrowed(line);
+        }
+        let rest = &line[1..];
+        std::borrow::Cow::Owned(format!(
+            "{ANSI_BOLD}{accent}!{ANSI_RESET}{shell}{rest}{ANSI_RESET}",
+            accent = self.palette.accent,
+            shell = self.palette.shell_mode,
+        ))
+    }
+    /// Dim the prompt status line so the bright bang-mode line stands out and
+    /// the prompt reads as an at-rest log marker (the plain-scroller intent).
+    fn highlight_prompt<'b, 's: 'b, 'p: 'b>(
+        &'s self,
+        prompt: &'p str,
+        _default: bool,
+    ) -> std::borrow::Cow<'b, str> {
+        if self.palette.dim.is_empty() {
+            return std::borrow::Cow::Borrowed(prompt);
+        }
+        std::borrow::Cow::Owned(format!("{}{prompt}{ANSI_RESET}", self.palette.dim))
+    }
+    /// Re-highlight on each keystroke so the bang coloring appears/clears live
+    /// as `!` is typed or deleted. Inert when color is disabled.
+    fn highlight_char(&self, _line: &str, _pos: usize, _forced: bool) -> bool {
+        !self.palette.shell_mode.is_empty()
+    }
+}
 impl rustyline::validate::Validator for FooterHelper {
     fn validate(
         &self,
@@ -1010,14 +1110,74 @@ impl rustyline::Helper for FooterHelper {}
 /// change for a terminal-dependent bonus.)
 fn install_footer_helper(
     rl: &mut rustyline::Editor<FooterHelper, rustyline::history::DefaultHistory>,
+    palette: Palette,
 ) {
-    rl.set_helper(Some(FooterHelper));
+    rl.set_helper(Some(FooterHelper { palette }));
 }
 
 #[cfg(test)]
 mod footer_tests {
     use super::*;
     use newt_core::FooterMode;
+    use rustyline::highlight::Highlighter;
+
+    #[test]
+    fn parse_color_named_and_hex() {
+        assert_eq!(parse_color_rgb("orange"), Some((220, 60, 20)));
+        assert_eq!(
+            parse_color_rgb("Orange"),
+            Some((220, 60, 20)),
+            "case-insensitive"
+        );
+        assert_eq!(parse_color_rgb("grey"), Some((128, 128, 128)));
+        assert_eq!(parse_color_rgb("gray"), Some((128, 128, 128)), "alias");
+        assert_eq!(parse_color_rgb("#dc3c14"), Some((220, 60, 20)));
+        // Unrecognized name / malformed hex → None (caller uses the default).
+        assert_eq!(parse_color_rgb("chartreuse"), None);
+        assert_eq!(parse_color_rgb("#12"), None);
+        assert_eq!(parse_color_rgb("#gggggg"), None);
+    }
+
+    #[test]
+    fn resolve_palette_off_is_inert_and_on_uses_defaults() {
+        let colors = newt_core::ColorsConfig::default();
+        // Color disabled → every slot empty, so highlighting is a no-op.
+        let off = resolve_palette(&colors, false);
+        assert!(off.accent.is_empty() && off.shell_mode.is_empty() && off.dim.is_empty());
+        // Enabled with no overrides → built-in defaults (orange / orange / grey).
+        let on = resolve_palette(&colors, true);
+        assert_eq!(on.accent, fg_escape((220, 60, 20)));
+        assert_eq!(on.shell_mode, fg_escape((220, 60, 20)));
+        assert_eq!(on.dim, fg_escape((128, 128, 128)));
+        // An override wins; an invalid spec falls back to the default.
+        let overridden = newt_core::ColorsConfig {
+            shell_mode: Some("cyan".into()),
+            dim: Some("not-a-color".into()),
+            ..Default::default()
+        };
+        let p = resolve_palette(&overridden, true);
+        assert_eq!(p.shell_mode, fg_escape((17, 168, 205)), "cyan override");
+        assert_eq!(p.dim, fg_escape((128, 128, 128)), "invalid → default grey");
+    }
+
+    #[test]
+    fn highlight_colors_only_bang_lines() {
+        let helper = FooterHelper {
+            palette: resolve_palette(&newt_core::ColorsConfig::default(), true),
+        };
+        // A chat line is returned unchanged (borrowed, no escapes).
+        assert_eq!(helper.highlight("hello there", 0), "hello there");
+        // A bang line gains the bold sigil + shell-mode color + the command.
+        let bang = helper.highlight("! pa login", 0);
+        assert!(bang.contains(ANSI_BOLD), "bold ! sigil");
+        assert!(bang.contains("pa login"), "command preserved");
+        assert!(bang.contains(ANSI_RESET), "reset terminates the color");
+        // With color disabled the same line is untouched.
+        let plain = FooterHelper {
+            palette: resolve_palette(&newt_core::ColorsConfig::default(), false),
+        };
+        assert_eq!(plain.highlight("! pa login", 0), "! pa login");
+    }
 
     #[test]
     fn rich_follows_mode_and_tty() {
@@ -3369,7 +3529,8 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
     let mut rl: rustyline::Editor<FooterHelper, rustyline::history::DefaultHistory> =
         rustyline::Editor::with_config(build_rl_config())?;
     if footer_on {
-        install_footer_helper(&mut rl);
+        let colors = resolve_tui(&cfg).map(|t| t.colors).unwrap_or_default();
+        install_footer_helper(&mut rl, resolve_palette(&colors, color));
     }
     if let Some(ref hp) = history_path {
         let _ = rl.load_history(hp);
@@ -3960,7 +4121,8 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                     let fresh_cfg = build_rl_config();
                     rl = rustyline::Editor::with_config(fresh_cfg)?;
                     if footer_on {
-                        install_footer_helper(&mut rl);
+                        let colors = resolve_tui(&cfg).map(|t| t.colors).unwrap_or_default();
+                        install_footer_helper(&mut rl, resolve_palette(&colors, color));
                     }
                     if let Some(ref hp) = history_path {
                         let _ = rl.load_history(hp);
