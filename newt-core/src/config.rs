@@ -1454,10 +1454,10 @@ impl Config {
         let project_path =
             Self::project_config_path().filter(|p| Some(p.as_path()) != base_path.as_deref());
 
-        match (&base_path, &project_path) {
+        let mut cfg = match (&base_path, &project_path) {
             // Fast path: no project override → exact legacy behavior.
-            (Some(p), None) => Self::load(p),
-            (None, None) => Ok(Self::default()),
+            (Some(p), None) => Self::load(p)?,
+            (None, None) => Self::default(),
             // Project override present → layer it over the base (or the default
             // config when there is no base file).
             (base, Some(proj)) => {
@@ -1474,7 +1474,55 @@ impl Config {
                 merge_toml(&mut merged, project_val, strategy);
                 merged
                     .try_into()
-                    .map_err(|e| NewtError::Config(e.to_string()))
+                    .map_err(|e| NewtError::Config(e.to_string()))?
+            }
+        };
+        // Per-file bundles (the model-support-kit control surface): drop a
+        // `~/.newt/bundles/<name>.toml` to add a bundle — no `config.toml` edit.
+        cfg.merge_disk_bundles();
+        Ok(cfg)
+    }
+
+    /// Merge per-file bundles from the well-known `bundles/` dirs next to the
+    /// config: `~/.newt/bundles/*.toml` first, then the project `.newt/bundles/`
+    /// (so project overrides home overrides inline `[bundles.*]`). The filename
+    /// stem is the bundle name. A malformed drop-in is skipped with a warning — it
+    /// must not break startup.
+    fn merge_disk_bundles(&mut self) {
+        if let Some(h) = home_dir() {
+            self.merge_bundles_from_dir(&h.join(".newt").join("bundles"));
+        }
+        if let Some(proj) = Self::project_config_path() {
+            if let Some(parent) = proj.parent() {
+                self.merge_bundles_from_dir(&parent.join("bundles"));
+            }
+        }
+    }
+
+    /// Load `<dir>/*.toml` as bundles (filename stem = name) into `self.bundles`,
+    /// last-wins on a name clash. A malformed file is skipped with a warning.
+    fn merge_bundles_from_dir(&mut self, dir: &Path) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return; // no bundles dir — fine
+        };
+        let mut paths: Vec<PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "toml"))
+            .collect();
+        paths.sort();
+        for path in paths {
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            match std::fs::read_to_string(&path).map(|t| toml::from_str::<BundleConfig>(&t)) {
+                Ok(Ok(bundle)) => {
+                    self.bundles.insert(stem.to_string(), bundle);
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!(path = %path.display(), error = %e, "skipping malformed bundle file");
+                }
+                Err(_) => {}
             }
         }
     }
@@ -1838,6 +1886,39 @@ mod tests {
             .is_none());
         // an unknown explicit bundle is a hard error
         assert!(cfg.pick_active_profile(None, Some("ghost"), "x").is_err());
+    }
+
+    #[test]
+    fn disk_bundles_load_per_file_by_stem() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("nemotron.toml"),
+            "applies_to = [\"nemotron\"]\ndefault_profile = \"nemotron\"\n",
+        )
+        .unwrap();
+        // a malformed drop-in must be skipped, not break loading
+        std::fs::write(
+            dir.path().join("broken.toml"),
+            "applies_to = \"not-a-list\"\n",
+        )
+        .unwrap();
+        // a non-toml file is ignored
+        std::fs::write(dir.path().join("README.md"), "not a bundle").unwrap();
+
+        let mut cfg = Config::default();
+        cfg.merge_bundles_from_dir(dir.path());
+        assert_eq!(cfg.bundles.len(), 1, "only the valid .toml loads");
+        let b = cfg
+            .bundles
+            .get("nemotron")
+            .expect("loaded by filename stem");
+        assert_eq!(b.applies_to, vec!["nemotron"]);
+        assert_eq!(b.default_profile.as_deref(), Some("nemotron"));
+        // a disk file overrides an inline bundle of the same name (last-wins)
+        cfg.bundles.insert("x".into(), BundleConfig::default());
+        std::fs::write(dir.path().join("x.toml"), "about = \"from disk\"\n").unwrap();
+        cfg.merge_bundles_from_dir(dir.path());
+        assert_eq!(cfg.bundles["x"].about.as_deref(), Some("from disk"));
     }
 
     #[test]
