@@ -65,9 +65,9 @@ pub use agentic::{
 pub use agents::AgentsProvider;
 pub use caveats::{CaveatsExt, CountBoundExt, ScopeExt};
 pub use config::{
-    AgentsConfig, BackendConfig, BackendKind, ChatStyle, Config, ConversationsConfig, EditMode,
-    LogConfig, MemoryConfig, MemoryDisclosure, MemoryProviderKind, PermissionPreset,
-    ProviderConfig, SkillsConfig, ToolPermissions, TuiConfig,
+    AgentsConfig, BackendConfig, BackendKind, BundleConfig, ChatStyle, Config, ConversationsConfig,
+    EditMode, LogConfig, MemoryConfig, MemoryDisclosure, MemoryProviderKind, PermissionPreset,
+    PickVia, ProfilePick, ProviderConfig, SkillsConfig, ToolPermissions, TuiConfig,
 };
 pub use conversation::{
     new_conversation_id, session_plan_dir, session_plan_path, ConversationRecord,
