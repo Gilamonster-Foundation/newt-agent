@@ -6466,10 +6466,14 @@ fn dispatch_slash(
                 );
             } else if matches!(arg1, "openai" | "ollama") {
                 // SAFETY: single-threaded REPL; the post-command re-resolve picks
-                // it up. Session-only — set [backends] / `newt dgx use` to persist.
+                // it up. Session-only — does NOT persist; use `/model` or edit
+                // `[backends]` to persist a choice.
                 unsafe { std::env::set_var("NEWT_BACKEND", arg1) };
+                // Optional model arg → session-only override on the same axis the
+                // loadout `model` feeds (NEWT_DGX_MODEL), consumed by the Ollama
+                // resolution. Avoids mutating saved config on a live A/B switch.
                 if arg1 == "ollama" && !arg2.is_empty() {
-                    run_newt_subcmd(&["dgx", "use", arg2], color, verbose)?;
+                    unsafe { std::env::set_var("NEWT_DGX_MODEL", arg2) };
                 }
                 let choice =
                     resolve_backend_choice(&newt_core::Config::resolve().unwrap_or_default());
@@ -10605,7 +10609,7 @@ mod env_resolution_tests {
         };
         with_env_vars(
             &[("NEWT_PROVIDER", "local-box")],
-            &["NEWT_DGX_MODEL"],
+            &["NEWT_DGX_MODEL", "NEWT_BACKEND"],
             || {
                 let choice = resolve_backend_choice(&cfg);
                 assert_eq!(choice.url, "http://local-box:11434");
@@ -10632,7 +10636,7 @@ mod env_resolution_tests {
                 ("NEWT_PROVIDER", "dgx-prod"),
                 ("NEWT_DGX_MODEL", "nemotron-3:4b"),
             ],
-            &[],
+            &["NEWT_BACKEND"],
             || {
                 let choice = resolve_backend_choice(&cfg);
                 assert_eq!(choice.url, "http://dgx:11434");
@@ -10657,11 +10661,15 @@ mod env_resolution_tests {
         };
         // A directly-set provider that names no backend is not a hard error here
         // (the loadout path validates upstream) — it falls through to prefer-openai.
-        with_env_vars(&[("NEWT_PROVIDER", "ghost")], &["NEWT_DGX_MODEL"], || {
-            let choice = resolve_backend_choice(&cfg);
-            assert_eq!(choice.url, "http://remote:8000");
-            assert_eq!(choice.kind, newt_core::BackendKind::Openai);
-        });
+        with_env_vars(
+            &[("NEWT_PROVIDER", "ghost")],
+            &["NEWT_DGX_MODEL", "NEWT_BACKEND"],
+            || {
+                let choice = resolve_backend_choice(&cfg);
+                assert_eq!(choice.url, "http://remote:8000");
+                assert_eq!(choice.kind, newt_core::BackendKind::Openai);
+            },
+        );
     }
 
     #[test]
