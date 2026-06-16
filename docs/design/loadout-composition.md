@@ -164,6 +164,51 @@ This **layers for free**: a project's `.newt/loadouts/foo.toml` overrides
 can publish `loadouts/nemotron-dev.toml` (+ its `personas/`/`bundles/`) without leaking
 your `catalog/` key refs.
 
+## Plugins — the provider-axis distribution unit
+
+Each axis has its own independently-shareable distribution unit; a loadout is a set of
+references across them. A **plugin** is the *provider-axis* unit — how a provider ships
+**batteries-included**, installable by dropping its `catalog/<provider>/` (+ any
+`loadouts/` it ships) into the tree.
+
+| axis | distribution unit | who ships it |
+|---|---|---|
+| provider + model | **plugin** (provider card + model cards + template loadouts) | the vendor / a pack author |
+| kit | **bundle** (parts + profiles) | you / the sweep |
+| role | **persona** (`.md`) | you |
+| the whole composition | **loadout** | you (referencing all the above) |
+
+A plugin bundles everything **provider-specific and shareable**:
+
+- **the backend** — the provider card (endpoint, `kind`, `owner = "plugin:<x>"`, key
+  *reference*).
+- **the special rules about its models** — model cards carrying each model's
+  *authoritative* facts: context window, memory size, conformance, the effort dialect
+  (`reasoning_effort` vs `think`), the Ollama-only knobs to gate off (#383). newt can't
+  probe a hosted API, so the plugin **declares** the truth; the resolution honesty rule
+  (human > **foreign-supplied** > native-probed > default) makes that declaration outrank
+  a mis-probe.
+- **template loadout(s)** — the composition that *wires the components/settings to consume
+  those facts*, with the **role slot left open** (a partial loadout — which is exactly why
+  every loadout field is optional).
+
+It deliberately carries neither **secrets** (it references keys by name; you supply the
+value) nor **roles** (orthogonal — any of its models adopts any persona "without much
+alteration"). That exclusion is precisely what makes a plugin shareable.
+
+**Worked — the OpenAI plugin.** ChatGPT models have custom context windows + memory sizes
+(gpt-4.1's ~200K). Today that's a global `[memory] context_tokens` band-aid that mis-sizes
+every *other* model (#382/#387). The plugin fixes it properly: the **model card** declares
+gpt-4.1's window (foreign-supplied, authoritative), and the **loadout shipped with the
+plugin** wires the parameter axis to consume it (+ `reasoning_effort`, Ollama knobs gated
+off). Install the plugin → honest windows + a working loadout, no manual tuning, no global
+wart.
+
+This *extends* #383's `owner = "plugin:<x>"` — from "a foreign provider supplies its
+metadata" into "a provider ships its whole pack: cards **+ loadouts**." It subsumes the
+executable case: a provider needing an adapter also ships its `[[providers]]` subprocess;
+a plain HTTP endpoint ships only cards + loadouts.
+
 ## Build roadmap (additive · behind `--loadout` · degrades when deps absent)
 
 Role **enforcement stays deferred** throughout — a loadout may *select* a role before
