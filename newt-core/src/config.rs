@@ -506,24 +506,23 @@ pub enum MemoryDisclosure {
     Index,
 }
 
-/// Input-footer mode — the `[tui] footer` key.
-///
-/// The footer is the status stamp (`model · workspace · mode`) printed as
-/// ordinary scrolled text below each submitted prompt — it clutters the
-/// scrollback naturally, never a pinned region (see
-/// `docs/decisions/plain_scroller_tui.md`). A human-TUI affordance, never
-/// constructed off a TTY.
+/// Prompt richness — the `[tui] footer` key. Selects the *default* prompt
+/// template when `[tui] prompt` is unset; an explicit `[tui] prompt` always
+/// wins. The rich default folds a timestamp + status into the prompt line
+/// itself (`[<ts> · <model> · <ws> · <mode> ] ❯ `), so rustyline floats it at
+/// the bottom while idle (like cargo's progress line) and it doubles as a
+/// greppable per-turn log marker — no region, no cursor games.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum FooterMode {
-    /// `stamp` on a TTY, `off` otherwise (the default). The amphibious choice:
-    /// the status stamp on a human terminal, a bare prompt in pipes /
+    /// Rich default prompt on a TTY, plain `\w $ ` otherwise (the default).
+    /// The amphibious choice: decorated on a human terminal, bare in pipes /
     /// `newt worker` / the wyvern deep-cut.
     #[default]
     Auto,
-    /// Always render the status stamp (even off a TTY — screenshots, tests).
-    Stamp,
-    /// No decoration — a bare bash-like prompt. Equivalent to `--plain`.
+    /// Always use the rich default prompt (even off a TTY — screenshots, tests).
+    On,
+    /// Always use the plain bare prompt. Equivalent to `--plain`.
     Off,
 }
 
@@ -1535,7 +1534,7 @@ mod tests {
         // Each variant parses from its snake_case key.
         for (key, want) in [
             ("auto", FooterMode::Auto),
-            ("stamp", FooterMode::Stamp),
+            ("on", FooterMode::On),
             ("off", FooterMode::Off),
         ] {
             let cfg: TuiConfig = toml::from_str(&format!("footer = \"{key}\"")).unwrap();

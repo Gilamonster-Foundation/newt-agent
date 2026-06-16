@@ -101,33 +101,36 @@ The practical wins compound with the architectural one:
   `docs/decisions/plan_editor_ephemeral_tui.md`.
 - **rustyline's internal raw mode** during a `readline` call (line editing,
   history navigation). Output remains scrolled text.
-- **The status stamp** — the `model · workspace · mode` status printed as
-  ordinary **scrolled text** below each submitted prompt:
+- **The status in the prompt line** — the status (`<ts> · <model> · <ws> ·
+  <mode>`) is folded into the rustyline **prompt** itself, not a separate
+  surface:
 
   ```text
-  ❯ <input>
-  ===[2026-06-16 14:30:00][ model · workspace · mode ]===
+  [2026-06-16 10:34:55 · gpt-4.1 · newt-agent · emacs ] ❯ <input>
   ▸ <output>…
   ```
 
-  A single fixed-format line — no terminal-width dependency (resize-proof) —
-  that doubles as a greppable per-turn **log marker**. It clutters the
-  scrollback naturally and scrolls away with everything else —
-  **no region, no pinning, no cursor games**. The `❯` caret is rustyline's
-  prompt; multi-line entry is rustyline's `Validator` (a trailing `\`
-  continues, the shell/Python idiom). Gated by `[tui] footer`: `auto` (default)
-  → stamp on a TTY, `off` otherwise; `stamp` forces it; `off`/`--plain` is a
-  bare prompt. **Never** constructed off a TTY (pipes, `newt worker`); the
-  `wyvern-agent` deep-cut strips it entirely.
+  This is the cargo-progress-bar trick done for free: **rustyline already
+  floats and redraws its prompt line at the bottom** (cursor, resize, redraw),
+  so the status sits at the at-rest tail while idle, scrolls away naturally as
+  output comes, and stays in scrollback as a greppable per-turn **log marker** —
+  **no region, no pinning, no cursor games, no width dependency**. Multi-line
+  entry is rustyline's `Validator` (a trailing `\` continues).
+
+  **Fully customizable** — it is just the default `[tui] prompt` template.
+  Tokens: `\t` timestamp, `\m` model, `\M` edit mode, `\u` user, `\h` host,
+  `\w` workspace basename, `\W` full path, `\v` version. An explicit
+  `[tui] prompt` (or `NEWT_PROMPT`) wins; e.g. `\u@\h:\W # ` gives a bash-like
+  prompt. `[tui] footer = auto` (default) uses the rich default on a TTY and a
+  plain `\w $ ` off one; `on` forces rich; `off`/`--plain` forces plain.
+  **Never** rich off a TTY (pipes, `newt worker`); `wyvern-agent` strips it.
 
   > **Rejected: a pinned idle status bar.** A version that pinned the status to
-  > the bottom rows via a DECSTBM **scroll region** (visible while idle, gone
-  > while busy) was prototyped and **backed out** — it fought the terminal's
-  > natural scroll (content popped *up* into the region instead of cluttering
-  > down) and the region/cursor teardown corrupted output across turns. The
-  > "no scroll regions / no persistent status bars" rule above **stands**; the
-  > stamp is the scroller-honest way to surface status. A pinned bar, if ever
-  > wanted, belongs in `gilamonster-agent` where region UI lives.
+  > the bottom rows via a DECSTBM **scroll region** was prototyped and **backed
+  > out** — it fought the terminal's natural scroll (content popped *up* into
+  > the region) and the region/cursor teardown corrupted output across turns.
+  > The "no scroll regions / no persistent status bars" rule above **stands**.
+  > Anything fancier than rustyline belongs in `gilamonster-agent`.
 - **ANSI color and column escapes in scrolled output** (header, prompts,
   diff coloring), always behind `color_supported` degradation.
 - **Single-line, same-line indicators** — e.g. the `▸ thinking…` indicator

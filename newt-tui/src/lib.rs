@@ -878,7 +878,7 @@ fn footer_mode() -> newt_core::FooterMode {
     if let Ok(v) = std::env::var("NEWT_FOOTER") {
         match v.to_lowercase().as_str() {
             "off" | "plain" | "0" | "false" => return FooterMode::Off,
-            "stamp" | "on" | "1" | "true" => return FooterMode::Stamp,
+            "on" | "stamp" | "bar" | "1" | "true" => return FooterMode::On,
             "auto" => return FooterMode::Auto,
             _ => {}
         }
@@ -890,50 +890,22 @@ fn footer_mode() -> newt_core::FooterMode {
         .unwrap_or_default()
 }
 
-/// How the at-rest status decoration renders this session.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum FooterRender {
-    /// Bare prompt — no decoration.
-    Off,
-    /// Status stamped as scrolled text below each prompt (no region; it
-    /// clutters the scrollback naturally — the scroller-honest choice).
-    Stamp,
-}
-
-/// Resolve the effective render tier from the configured mode + a TTY probe.
-/// Off a TTY everything degrades to `Off` (pipes, `newt worker`, wyvern). Pure
-/// for testing — the caller injects the `is_tty` reading.
-fn resolve_footer_render(mode: newt_core::FooterMode, is_tty: bool) -> FooterRender {
+/// Whether to use the rich default prompt (timestamp + status folded into the
+/// prompt line) versus the plain bare prompt, from the configured mode + a TTY
+/// probe. An explicit `[tui] prompt` overrides both. Pure for testing.
+fn footer_rich_enabled(mode: newt_core::FooterMode, is_tty: bool) -> bool {
     use newt_core::FooterMode;
     match mode {
-        FooterMode::Off => FooterRender::Off,
-        FooterMode::Stamp if is_tty => FooterRender::Stamp,
-        FooterMode::Auto if is_tty => FooterRender::Stamp,
-        _ => FooterRender::Off,
+        FooterMode::Off => false,
+        FooterMode::On => true,
+        FooterMode::Auto => is_tty,
     }
 }
 
-/// The status line: `model · workspace · mode`. Empty
-/// fields are dropped. Pure for testing.
-fn footer_status(model: &str, workspace: &str, is_vi: bool) -> String {
-    let ws = std::path::Path::new(workspace)
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| workspace.to_string());
-    let mode = if is_vi { "vi" } else { "emacs" };
-    [model.to_string(), ws, mode.to_string()]
-        .into_iter()
-        .filter(|s| !s.is_empty())
-        .collect::<Vec<_>>()
-        .join(" · ")
-}
-
-/// The single-line status stamp: `===[<ts>][ <status> ]===`. Fixed format with
-/// no terminal-width dependency (resize-proof) — it doubles as a greppable log
-/// marker for the turn. Pure for testing; the caller supplies the timestamp.
-fn footer_stamp(timestamp: &str, status: &str) -> String {
-    format!("===[{timestamp}][ {status} ]===")
-}
+/// The built-in rich prompt template (used when `[tui] prompt` is unset and the
+/// prompt is rich). Expands via [`expand_prompt_tokens`] to e.g.
+/// `[2026-06-16 10:34:55 · gpt-4.1 · newt-agent · emacs ] ❯ `.
+const DEFAULT_RICH_PROMPT: &str = "[\\t · \\m · \\w · \\M ] ❯ ";
 
 /// rustyline helper enabling multi-line entry: a line ending in `\` continues
 /// onto the next line (the shell/Python continuation idiom — portable across
@@ -980,137 +952,41 @@ fn install_footer_helper(
     rl.set_helper(Some(FooterHelper));
 }
 
-/// Screen rows the live `❯ <input>` occupied (wrapped), the `❯ ` prefix
-/// counting on the first visual line. Pure so the collapse math is testable
-/// without a terminal.
-fn footer_input_rows(line: &str, cols: usize) -> u16 {
-    let cols = cols.max(1);
-    let rows: usize = line
-        .split('\n')
-        .enumerate()
-        .map(|(i, seg)| {
-            let lead = if i == 0 { 2 } else { 0 };
-            (seg.chars().count() + lead) / cols + 1
-        })
-        .sum();
-    rows.try_into().unwrap_or(u16::MAX)
-}
-
-/// Collapse the live prompt into a clean, single-line record after submit:
-/// erase the `❯ <input>` render (relative cursor motion → safe under terminal
-/// scroll) and re-emit it as
-///
-/// ```text
-/// ❯ <input>
-/// ===[2026-06-16 14:30:00][ model · workspace · mode ]===
-/// ```
-///
-/// caret on top, then a single timestamped status stamp beneath — the
-/// scroller-honest way to surface status (it renders once, on submit, never
-/// live while typing) that doubles as a greppable log marker. Empty input
-/// erases with no stamp.
-fn collapse_footer_block(line: &str, task: &str, status: &str, color: bool) {
-    let cols = terminal::size().map(|(c, _)| c as usize).unwrap_or(80);
-    let rows = footer_input_rows(line, cols);
-    let mut out = io::stdout();
-    let _ = execute!(
-        out,
-        crossterm::cursor::MoveToPreviousLine(rows),
-        Clear(ClearType::FromCursorDown),
-    );
-    if task.is_empty() {
-        return;
-    }
-    let first = task.lines().next().unwrap_or("");
-    let more = if task.contains('\n') { " …" } else { "" };
-    let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-    let stamp = footer_stamp(&ts, status);
-    if color {
-        let _ = execute!(
-            out,
-            SetForegroundColor(NEWT_ORANGE_CT),
-            Print("❯ "),
-            ResetColor,
-            Print(first),
-            Print(more),
-            Print("\n"),
-            SetForegroundColor(CtColor::DarkGrey),
-            Print(&stamp),
-            ResetColor,
-            Print("\n"),
-        );
-    } else {
-        println!("❯ {first}{more}");
-        println!("{stamp}");
-    }
-}
-
 #[cfg(test)]
 mod footer_tests {
     use super::*;
     use newt_core::FooterMode;
 
     #[test]
-    fn render_tier_follows_mode_and_tty() {
-        // Auto → stamp on a TTY, off otherwise (the amphibious default).
-        assert_eq!(
-            resolve_footer_render(FooterMode::Auto, true),
-            FooterRender::Stamp
-        );
-        assert_eq!(
-            resolve_footer_render(FooterMode::Auto, false),
-            FooterRender::Off
-        );
-        // Explicit stamp still degrades to off when not a TTY.
-        assert_eq!(
-            resolve_footer_render(FooterMode::Stamp, true),
-            FooterRender::Stamp
-        );
-        assert_eq!(
-            resolve_footer_render(FooterMode::Stamp, false),
-            FooterRender::Off
-        );
-        // Off is always off.
-        assert_eq!(
-            resolve_footer_render(FooterMode::Off, true),
-            FooterRender::Off
-        );
+    fn rich_follows_mode_and_tty() {
+        // Auto → rich on a TTY, plain otherwise (the amphibious default).
+        assert!(footer_rich_enabled(FooterMode::Auto, true));
+        assert!(!footer_rich_enabled(FooterMode::Auto, false));
+        // On forces rich even off a TTY; Off is always plain.
+        assert!(footer_rich_enabled(FooterMode::On, true));
+        assert!(footer_rich_enabled(FooterMode::On, false));
+        assert!(!footer_rich_enabled(FooterMode::Off, true));
+        assert!(!footer_rich_enabled(FooterMode::Off, false));
     }
 
     #[test]
-    fn status_joins_present_fields_with_a_dot() {
-        assert_eq!(
-            footer_status("qwen2.5:7b", "/home/me/proj", false),
-            "qwen2.5:7b · proj · emacs"
-        );
-        assert_eq!(
-            footer_status("llama3", "/home/me/proj", true),
-            "llama3 · proj · vi"
-        );
-        // An empty model is dropped, not rendered as a leading separator.
-        assert_eq!(footer_status("", "/srv/work", false), "work · emacs");
+    fn prompt_tokens_expand() {
+        // The model + mode + workspace tokens fill in; `\t` is replaced (its
+        // exact value is the clock, so just assert the literal token is gone).
+        let p = expand_prompt_tokens("\\m · \\w · \\M", "/home/me/proj", "gpt-4.1", true);
+        assert!(p.starts_with("gpt-4.1 · proj · vi"));
+        let p = expand_prompt_tokens("[\\t] \\m", "/srv/x", "llama3", false);
+        assert!(!p.contains("\\t"), "timestamp token expanded: {p}");
+        assert!(p.ends_with("llama3"));
     }
 
     #[test]
-    fn stamp_is_a_fixed_log_marker() {
-        assert_eq!(
-            footer_stamp("2026-06-16 14:30:00", "gpt-4.1 · newt-agent · emacs"),
-            "===[2026-06-16 14:30:00][ gpt-4.1 · newt-agent · emacs ]==="
-        );
-        // Fixed format — no dependence on terminal width (resize-proof).
-        assert!(footer_stamp("t", "s").starts_with("===["));
-        assert!(footer_stamp("t", "s").ends_with("]==="));
-    }
-
-    #[test]
-    fn input_rows_count_wrapped_caret_lines() {
-        // One caret row for a short line (incl. the empty caret).
-        assert_eq!(footer_input_rows("hello", 80), 1);
-        assert_eq!(footer_input_rows("", 80), 1);
-        // A `\`-continued two-line entry → two rows.
-        assert_eq!(footer_input_rows("foo\\\nbar", 80), 2);
-        // A long first line wraps: (100 + 2 for "❯ ") / 80 + 1 = 2 rows.
-        assert_eq!(footer_input_rows(&"x".repeat(100), 80), 2);
+    fn rich_default_prompt_renders_the_status_line() {
+        // The built-in rich default expands to the `[ts · model · ws · mode ]`
+        // prompt-prefix shape.
+        let p = expand_prompt_tokens(DEFAULT_RICH_PROMPT, "/home/me/newt-agent", "gpt-4.1", false);
+        assert!(p.contains("· gpt-4.1 · newt-agent · emacs ] ❯ "), "{p}");
+        assert!(p.starts_with('['));
     }
 
     #[test]
@@ -1125,16 +1001,17 @@ mod footer_tests {
     }
 }
 
-/// Build the rustyline prompt string — plain text, PS1 tokens expanded.
+/// Build the rustyline prompt string for this turn — PS1 tokens expanded, a
+/// fresh timestamp each call.
 ///
-/// Reads `[tui].prompt` from config (overridable via `NEWT_PROMPT`).
-/// Falls back to `\w $ ` (compact) or `you \w $ ` (verbose) if unset.
-/// Vi-mode prefixes `[i] ` so the user knows which mode is active.
+/// Precedence: `NEWT_PROMPT` env > `[tui] prompt` config > built-in default.
+/// The built-in default is the **rich** prompt ([`DEFAULT_RICH_PROMPT`] — the
+/// timestamped status line) when `rich` is set, else the plain `\w $ ` /
+/// `you \w $ ` (vi-mode prefixes `[i] `).
 ///
-/// Supported tokens: `\w` workspace basename, `\W` full path,
-/// `\h` hostname, `\v` newt version.
-fn prompt_str(workspace: &str, verbose: bool, is_vi: bool) -> String {
-    // Resolve template: NEWT_PROMPT env var > config > built-in default.
+/// Tokens: `\t` timestamp, `\m` model, `\M` edit mode, `\u` user, `\h` host,
+/// `\w` workspace basename, `\W` full path, `\v` newt version.
+fn prompt_str(workspace: &str, verbose: bool, is_vi: bool, model: &str, rich: bool) -> String {
     let template = std::env::var("NEWT_PROMPT").ok().or_else(|| {
         newt_core::Config::resolve()
             .ok()
@@ -1142,34 +1019,29 @@ fn prompt_str(workspace: &str, verbose: bool, is_vi: bool) -> String {
             .and_then(|t| t.prompt)
     });
 
-    let expanded = if let Some(ref tmpl) = template {
-        expand_prompt_tokens(tmpl, workspace)
-    } else if verbose {
-        format!(
-            "you {} $ ",
-            std::path::Path::new(workspace)
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default()
-        )
+    if let Some(ref tmpl) = template {
+        return expand_prompt_tokens(tmpl, workspace, model, is_vi);
+    }
+    if rich {
+        return expand_prompt_tokens(DEFAULT_RICH_PROMPT, workspace, model, is_vi);
+    }
+    let base = std::path::Path::new(workspace)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let plain = if verbose {
+        format!("you {base} $ ")
     } else {
-        format!(
-            "{} $ ",
-            std::path::Path::new(workspace)
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default()
-        )
+        format!("{base} $ ")
     };
-
     if is_vi {
-        format!("[i] {expanded}")
+        format!("[i] {plain}")
     } else {
-        expanded
+        plain
     }
 }
 
-fn expand_prompt_tokens(template: &str, workspace: &str) -> String {
+fn expand_prompt_tokens(template: &str, workspace: &str, model: &str, is_vi: bool) -> String {
     let ws_base = std::path::Path::new(workspace)
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -1180,10 +1052,19 @@ fn expand_prompt_tokens(template: &str, workspace: &str) -> String {
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|| "localhost".into());
+    let user = std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .unwrap_or_default();
+    let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let mode = if is_vi { "vi" } else { "emacs" };
     template
         .replace("\\W", workspace)
         .replace("\\w", &ws_base)
         .replace("\\h", &host)
+        .replace("\\u", &user)
+        .replace("\\t", &ts)
+        .replace("\\m", model)
+        .replace("\\M", mode)
         .replace("\\v", env!("CARGO_PKG_VERSION"))
 }
 
@@ -3265,11 +3146,11 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
     }
     println!();
 
-    // The at-rest status decoration tier (bar / stamp / off). `footer_on` gates
-    // the shared bits (multi-line helper + the `❯` caret); the tier selects the
-    // idle bar vs the post-submit stamp.
-    let footer_render = resolve_footer_render(footer_mode(), io::stdout().is_terminal());
-    let footer_on = footer_render != FooterRender::Off;
+    // Whether the built-in default prompt is the rich one (timestamp + status
+    // folded into the prompt line). An explicit `[tui] prompt` overrides it;
+    // `footer_on` also gates the multi-line helper. The prompt itself is built
+    // fresh each turn (below) so the timestamp is current.
+    let footer_on = footer_rich_enabled(footer_mode(), io::stdout().is_terminal());
     let mut rl: rustyline::Editor<FooterHelper, rustyline::history::DefaultHistory> =
         rustyline::Editor::with_config(build_rl_config())?;
     if footer_on {
@@ -3284,19 +3165,8 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
     #[cfg(unix)]
     mark_fds_cloexec();
 
-    // `mut` so a runtime `/vi` / `/emacs` switch can flip the caret + status.
+    // `mut` so a runtime `/vi` / `/emacs` switch is reflected in the next prompt.
     let mut is_vi = build_rl_config().edit_mode() == rustyline::config::EditMode::Vi;
-    // With the footer on, the caret is the recognizable `❯` (vi-mode keeps the
-    // `[i]` indicator); off, the configured PS1 prompt — bash-like.
-    let mut prompt = if footer_on {
-        if is_vi {
-            "[i] ❯ ".to_string()
-        } else {
-            "❯ ".to_string()
-        }
-    } else {
-        prompt_str(workspace, verbose, is_vi)
-    };
 
     // system prompt is built AFTER initialize_all (see below) so soul files are loaded.
     // Placeholder until then.
@@ -3513,9 +3383,6 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
         // Catching the panic (Layer 3 / PR #184) remains as a last resort, but
         // this check fires first and gives a cleaner message when the fd table
         // is already full before readline even starts.
-        // Did we draw the footer preamble this turn? (Only fresh user turns
-        // do; corrective re-prompts don't.) Gates the post-submit collapse.
-        let mut footer_drawn = false;
         let readline_result = if let Some(corrective) = pending_retry.take() {
             // retry technique (2b): run the queued corrective re-prompt as this
             // turn's input instead of reading from the user. The budget was already
@@ -3533,14 +3400,11 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                 );
                 break;
             }
-            // `bar`: pin the status bar to the bottom for the idle wait (the
-            // guard tears it down on drop, below). `stamp`: nothing now — the
-            // status renders as a scrolled line after submit (the collapse).
-            // `stamp`: the status renders below the prompt after submit (the
-            // collapse), where it clutters the scrollback naturally — no region.
-            if footer_render == FooterRender::Stamp {
-                footer_drawn = true;
-            }
+            // Build the prompt FRESH for this turn so the rich default's
+            // timestamp is current; rustyline floats it at the bottom while
+            // idle and it stays in scrollback (the per-turn log marker) on
+            // submit — no region, no cursor games.
+            let prompt = prompt_str(workspace, verbose, is_vi, &inf_model, footer_on);
             let readline_result =
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rl.readline(&prompt)));
             match readline_result {
@@ -3560,17 +3424,6 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                 // Rejoin `\`-continued lines (multi-line entry) into real
                 // newlines; a no-op for single-line input.
                 let task = line.replace("\\\n", "\n").trim().to_string();
-                // `stamp` tier only: collapse the live prompt into a clean
-                // `❯ <input>` + status stamp (the `bar` tier already showed its
-                // status while idle and tore it down on submit).
-                if footer_render == FooterRender::Stamp && footer_drawn {
-                    collapse_footer_block(
-                        &line,
-                        &task,
-                        &footer_status(&inf_model, workspace, is_vi),
-                        color,
-                    );
-                }
                 if task.is_empty() {
                     continue;
                 }
@@ -3837,18 +3690,9 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                         let _ = rl.load_history(hp);
                     }
                     // A `/vi` / `/emacs` switch sets NEWT_EDIT_MODE, which the
-                    // rebuilt editor above just read; keep is_vi + the caret in
-                    // sync so the next prompt reflects the new mode.
+                    // rebuilt editor above just read; keep is_vi in sync so the
+                    // next (freshly built) prompt reflects the new mode.
                     is_vi = build_rl_config().edit_mode() == rustyline::config::EditMode::Vi;
-                    prompt = if footer_on {
-                        if is_vi {
-                            "[i] ❯ ".to_string()
-                        } else {
-                            "❯ ".to_string()
-                        }
-                    } else {
-                        prompt_str(workspace, verbose, is_vi)
-                    };
                 } else if matches!(task.as_str(), "exit" | "quit") {
                     clean_exit = true;
                     break;
@@ -9725,10 +9569,13 @@ mod helper_fn_tests {
 
     #[test]
     fn expand_prompt_tokens_replaces_all_tokens() {
-        let out = expand_prompt_tokens("\\w|\\W|\\v", "/tmp/proj");
-        assert_eq!(out, format!("proj|/tmp/proj|{}", env!("CARGO_PKG_VERSION")));
+        let out = expand_prompt_tokens("\\w|\\W|\\v|\\m|\\M", "/tmp/proj", "gpt-4.1", true);
+        assert_eq!(
+            out,
+            format!("proj|/tmp/proj|{}|gpt-4.1|vi", env!("CARGO_PKG_VERSION"))
+        );
         // \h expands to *some* hostname — the token itself must be gone.
-        let host = expand_prompt_tokens("on \\h!", "/tmp/proj");
+        let host = expand_prompt_tokens("on \\h!", "/tmp/proj", "m", false);
         assert!(!host.contains("\\h"), "got: {host}");
         assert!(host.starts_with("on ") && host.ends_with('!'));
     }
@@ -10312,12 +10159,15 @@ mod env_resolution_tests {
     }
 
     #[test]
-    fn prompt_str_expands_newt_prompt_template_and_vi_prefix() {
-        with_env_vars(&[("NEWT_PROMPT", "\\w \\v> ")], &[], || {
-            let p = prompt_str("/tmp/proj", false, false);
-            assert_eq!(p, format!("proj {}> ", env!("CARGO_PKG_VERSION")));
-            let vi = prompt_str("/tmp/proj", false, true);
-            assert_eq!(vi, format!("[i] proj {}> ", env!("CARGO_PKG_VERSION")));
+    fn prompt_str_expands_newt_prompt_template() {
+        // A user template (NEWT_PROMPT) is used verbatim — the user owns it, so
+        // no auto `[i]` prefix; `\M` surfaces the edit mode for those who want
+        // it, and the model/rich args don't interfere with an explicit template.
+        with_env_vars(&[("NEWT_PROMPT", "\\w \\M \\v> ")], &[], || {
+            let vi = prompt_str("/tmp/proj", false, true, "gpt-4.1", true);
+            assert_eq!(vi, format!("proj vi {}> ", env!("CARGO_PKG_VERSION")));
+            let em = prompt_str("/tmp/proj", false, false, "gpt-4.1", false);
+            assert_eq!(em, format!("proj emacs {}> ", env!("CARGO_PKG_VERSION")));
         });
     }
 }
