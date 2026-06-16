@@ -3639,6 +3639,14 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                 }
                 let _ = rl.add_history_entry(&task);
                 println!();
+                // `! <cmd>` — human-only host shell-escape (interactive, inherited
+                // stdio: prompts + browser SAML work). Intercepted before the
+                // slash/chat paths; the model can never reach this.
+                if let Some(rest) = bang_command(&task) {
+                    run_bang_escape(rest, color, verbose);
+                    println!();
+                    continue;
+                }
                 if task.starts_with('/') {
                     // Commands that need direct access to `memory` are handled here
                     // before delegating to the generic slash dispatcher.
@@ -6064,6 +6072,7 @@ fn help_lines() -> &'static [&'static str] {
         "  /vi  /emacs              - switch line-editor key bindings for this session",
         "  /version                 - print newt version",
         "  /help                    - this message",
+        "  ! <command>              - run a host command interactively (e.g. ! pa login) — you, not the agent",
         "  /exit  /quit  exit  quit - leave the session",
     ]
 }
@@ -6643,6 +6652,62 @@ fn run_newt_subcmd(args: &[&str], color: bool, verbose: bool) -> anyhow::Result<
     Ok(())
 }
 
+/// Split a prompt line into the host command after a leading `!`, or `None`
+/// when the line is not a bang-escape (or is just `!` with no command).
+///
+/// The `!` bang-escape is a HUMAN action in the interactive readline loop — the
+/// model has no channel to type at the prompt, so it can never invoke this. It
+/// runs on the host with the user's own authority (no OCAP/Caveats leash, which
+/// governs only *model*-initiated `run_command`), like typing in a shell. Its
+/// purpose is interactive logins such as `! pa login` (browser SAML).
+fn bang_command(input: &str) -> Option<&str> {
+    let rest = input.strip_prefix('!')?.trim();
+    if rest.is_empty() {
+        None
+    } else {
+        Some(rest)
+    }
+}
+
+/// The user's interactive shell + its "run this string" flag, per platform.
+/// Honors `$SHELL` (unix) / `%COMSPEC%` (windows), falling back to the system
+/// default. Running through a shell (not bare-exec) gives pipes, redirects,
+/// `&&`, and env expansion — matching shell muscle memory.
+fn bang_shell() -> (String, &'static str) {
+    #[cfg(windows)]
+    {
+        let sh = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd".to_string());
+        (sh, "/C")
+    }
+    #[cfg(not(windows))]
+    {
+        let sh = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+        (sh, "-c")
+    }
+}
+
+/// Run a `!`-escaped host command interactively: stdio is **inherited** (the
+/// child gets the real TTY, so it can prompt and launch a browser — e.g. the
+/// `pa login` SAML flow), output scrolls live, and control returns to the
+/// prompt. Mirrors `run_newt_subcmd`'s inherited-stdio launch. A non-zero exit
+/// prints a thin status line; a spawn failure surfaces the error.
+fn run_bang_escape(cmd: &str, color: bool, verbose: bool) {
+    let (shell, flag) = bang_shell();
+    match std::process::Command::new(&shell)
+        .arg(flag)
+        .arg(cmd)
+        .status()
+    {
+        Ok(status) if status.success() => {}
+        Ok(status) => print_newt(
+            &format!("exit {}", status.code().unwrap_or(-1)),
+            color,
+            verbose,
+        ),
+        Err(e) => print_newt(&format!("! failed to run `{shell}`: {e}"), color, verbose),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Shared helpers
 // ---------------------------------------------------------------------------
@@ -6681,6 +6746,44 @@ fn test_persona(name: &str, prompt: &str, path: std::path::PathBuf) -> Persona {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bang_command_strips_and_trims_the_escape() {
+        assert_eq!(bang_command("!date"), Some("date"));
+        assert_eq!(bang_command("! date"), Some("date"));
+        assert_eq!(bang_command("!  pa login  "), Some("pa login"));
+        // A pipeline survives intact — it's handed to the shell verbatim.
+        assert_eq!(bang_command("! echo hi | wc -c"), Some("echo hi | wc -c"));
+    }
+
+    #[test]
+    fn bang_command_ignores_non_bang_and_bare_bang() {
+        assert_eq!(bang_command("date"), None, "no leading bang");
+        assert_eq!(bang_command("/help"), None, "slash is not a bang");
+        assert_eq!(bang_command("!"), None, "bare bang has no command");
+        assert_eq!(bang_command("!   "), None, "whitespace-only is empty");
+        assert_eq!(
+            bang_command("the ! is mid-line"),
+            None,
+            "bang must lead the line"
+        );
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn bang_shell_is_a_unix_shell_with_dash_c() {
+        let (shell, flag) = bang_shell();
+        assert_eq!(flag, "-c");
+        assert!(!shell.is_empty(), "a shell is always resolved");
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn bang_shell_is_a_windows_shell_with_slash_c() {
+        let (shell, flag) = bang_shell();
+        assert_eq!(flag, "/C");
+        assert!(!shell.is_empty(), "a shell is always resolved");
+    }
 
     fn write_pyo3_binding(root: &std::path::Path, krate: &str, submodule: &str) {
         let dir = root.join(krate).join("src");
