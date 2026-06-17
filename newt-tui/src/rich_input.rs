@@ -15,11 +15,21 @@
 //!   an open `"""`/`'''` block), in which case Enter adds a line. This reuses
 //!   the *exact* classifier the rustyline validator uses, so multi-line entry
 //!   behaves identically across both surfaces.
-//! - **Ctrl-O** / **Shift-Enter** always insert a newline (newt's existing
-//!   multi-line keys).
+//! - **Shift-Enter** inserts a newline in every mode (terminal permitting).
+//!   **Ctrl-O** inserts a newline only in the **modeless** modes (emacs/nano),
+//!   where it is idiomatic (emacs `open-line`). In **vi**, Ctrl-O is left free
+//!   for its real semantics (jumplist back in NORMAL, insert-normal in INSERT);
+//!   vi users open lines with `o`/`O`.
 //! - **Ctrl-C** interrupts; **Ctrl-D** on an empty buffer is EOF (both exit
 //!   cleanly, as in rustyline).
 //! - Vi mode adds `:w`/`:wq`/`:x` (submit) and `:q`/`:q!` (quit) ex-commands.
+//!
+//! ## Vi gaps (future faithful-keymap work, issue #416 follow-up)
+//! - **`.` repeat** (replay the last change, incl. insert sessions) — not yet.
+//! - **`df{c}` / `dt{c}`** (char-search as an operator target) — `f/F/t/T` work
+//!   as standalone motions, but not yet after an operator.
+//! - **`R` overwrite**, exact **`P`**, operator counts (`d2w`), big-word
+//!   distinction (`W`/`B`/`E` alias the small-word motions today).
 //!
 //! ## Not yet (documented limitations of v1)
 //! - No in-session history recall (Up/Down navigate the buffer, not history);
@@ -45,9 +55,9 @@ use ratatui::widgets::{Paragraph, Widget};
 use ratatui::{Frame, Terminal, TerminalOptions, Viewport};
 use tui_textarea::{CursorMove, TextArea};
 
-use crate::{build_rl_config, footer_continues, InputSurface, ReadOutcome};
+use crate::{footer_continues, InputSurface, ReadOutcome};
 
-const GUTTER_W: u16 = 20; // "[HH:MM:SS] NORMAL ❯ "
+const GUTTER_W: u16 = 24; // wide enough for "[HH:MM:SS] vi NORMAL ❯ "
 const MAX_INPUT_ROWS: u16 = 8;
 /// Auto-gutter threshold: use the left gutter only while it stays under this
 /// fraction of the terminal width; on a squished terminal, drop it and stack
@@ -58,6 +68,28 @@ type Term = Terminal<CrosstermBackend<Stdout>>;
 
 fn use_gutter(width: u16) -> bool {
     width > 0 && (GUTTER_W as f32) <= GUTTER_MAX_FRACTION * width as f32
+}
+
+/// Resolve the effective gutter / input-indent width (columns) from the
+/// `[tui] gutter` setting and the terminal width:
+/// - `None` (auto): a prompt-width gutter (`GUTTER_W`) when it stays under ~1/3
+///   of the width, else `0` (stacked prompt).
+/// - `Some(n)`: exactly `n`, clamped so it can't consume the whole line.
+///
+/// A result `>= GUTTER_W` is wide enough to hold the inline prompt; a smaller
+/// result (including `0`) stacks the prompt on its own row and indents the input
+/// that many columns.
+fn resolve_gutter(setting: Option<u16>, width: u16) -> u16 {
+    match setting {
+        None => {
+            if use_gutter(width) {
+                GUTTER_W
+            } else {
+                0
+            }
+        }
+        Some(n) => n.min(width.saturating_sub(1)),
+    }
 }
 
 /// One step of the editor: what the loop should do after handling a key.
@@ -85,17 +117,34 @@ enum Pending {
     Op(char),
     Replace,
     G,
+    /// Awaiting the target char of an `f`/`F`/`t`/`T` char-search (the stored
+    /// char is the search kind).
+    Find(char),
 }
 
 /// The vi state machine — a faithful subset of rustyline's `vi_command`, ported
 /// onto tui-textarea. NORMAL/INSERT · `h l j k w b e 0 ^ $ G gg` (counts) ·
-/// `i I a A o O` · `x X D C s S r{c} u Ctrl-R p` · `d/c/y{motion}` + `dd/cc/yy`.
+/// `f F t T` char-search + `; ,` repeat · `i I a A o O` ·
+/// `x X D C s S r{c} u Ctrl-R p J` · `d/c/y{motion}` + `dd/cc/yy` ·
+/// Ctrl-O/Ctrl-I jumplist + `:jumps` · i_CTRL-O insert-normal.
 struct Vi {
     mode: Mode,
     pending: Pending,
     count: usize,
     /// `:`-command line buffer (`:wq`, `:q`, …); `Some` while active.
     ex: Option<String>,
+    /// i_CTRL-O: run exactly one Normal command from INSERT, then resume INSERT.
+    insert_normal: bool,
+    /// Jumplist: positions we jumped *from*, older toward the front of `jback`;
+    /// `jfwd` holds positions undone by Ctrl-O so Ctrl-I can redo them. Browser
+    /// back/forward model. Each entry is a `(row, col)` cursor position.
+    jback: Vec<(usize, usize)>,
+    jfwd: Vec<(usize, usize)>,
+    /// A one-shot message to print to scrollback (e.g. `:jumps` output).
+    msg: Option<String>,
+    /// Last `f`/`F`/`t`/`T` search as `(kind, target)`, for `;` (repeat) and
+    /// `,` (repeat reversed).
+    last_find: Option<(char, char)>,
 }
 
 impl Vi {
@@ -105,6 +154,11 @@ impl Vi {
             pending: Pending::None,
             count: 0,
             ex: None,
+            insert_normal: false,
+            jback: Vec::new(),
+            jfwd: Vec::new(),
+            msg: None,
+            last_find: None,
         }
     }
 
@@ -114,6 +168,48 @@ impl Vi {
         n
     }
 
+    /// Record the current cursor position as a jump origin (and drop the forward
+    /// history) — called just before a "far" motion (`gg`, `G`).
+    fn record_jump(&mut self, ta: &TextArea) {
+        self.jback.push(ta.cursor());
+        self.jfwd.clear();
+    }
+
+    /// Ctrl-O — jump to an older position (jumplist back).
+    fn jump_back(&mut self, ta: &mut TextArea) {
+        if let Some(prev) = self.jback.pop() {
+            self.jfwd.push(ta.cursor());
+            ta.move_cursor(CursorMove::Jump(prev.0 as u16, prev.1 as u16));
+        }
+    }
+
+    /// Ctrl-I / Tab — jump to a newer position (jumplist forward).
+    fn jump_forward(&mut self, ta: &mut TextArea) {
+        if let Some(next) = self.jfwd.pop() {
+            self.jback.push(ta.cursor());
+            ta.move_cursor(CursorMove::Jump(next.0 as u16, next.1 as u16));
+        }
+    }
+
+    /// Render the jumplist for `:jumps` (1-based row:col, like vim's line:col).
+    fn format_jumps(&self) -> String {
+        let fmt = |v: &[(usize, usize)]| {
+            if v.is_empty() {
+                "—".to_string()
+            } else {
+                v.iter()
+                    .map(|(r, c)| format!("{}:{}", r + 1, c + 1))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            }
+        };
+        format!(
+            "jumps  back: {}  forward: {}",
+            fmt(&self.jback),
+            fmt(&self.jfwd)
+        )
+    }
+
     /// The `:`-command line: `:w`/`:wq`/`:x` submit, `:q`/`:q!` quit. Esc or
     /// backspacing past the `:` cancels.
     fn ex_input(&mut self, key: KeyEvent) -> Step {
@@ -121,11 +217,14 @@ impl Vi {
             KeyCode::Esc => self.ex = None,
             KeyCode::Enter => {
                 let cmd = self.ex.take().unwrap_or_default();
-                return match cmd.as_str() {
-                    "w" | "wq" | "x" | "wq!" | "x!" => Step::Submit,
-                    "q" | "q!" => Step::Eof,
-                    _ => Step::Continue, // unknown command just cancels
-                };
+                match cmd.as_str() {
+                    "w" | "wq" | "x" | "wq!" | "x!" => return Step::Submit,
+                    "q" | "q!" => return Step::Eof,
+                    "jumps" => self.msg = Some(self.format_jumps()),
+                    "help" | "h" => self.msg = Some(help_text(Edit::Vi)),
+                    _ => {} // unknown command just cancels
+                }
+                return Step::Continue;
             }
             KeyCode::Backspace => {
                 if let Some(ex) = self.ex.as_mut() {
@@ -148,15 +247,15 @@ impl Vi {
         if self.ex.is_some() {
             return self.ex_input(key);
         }
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('r') {
-            if self.mode == Mode::Normal {
-                ta.redo();
-            }
-            return Step::Continue;
-        }
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match self.mode {
             Mode::Insert => {
-                if key.code == KeyCode::Esc {
+                // i_CTRL-O: drop to NORMAL for exactly one command, then resume
+                // INSERT. Unlike Esc it does NOT shift the cursor back a char.
+                if ctrl && key.code == KeyCode::Char('o') {
+                    self.mode = Mode::Normal;
+                    self.insert_normal = true;
+                } else if key.code == KeyCode::Esc {
                     self.mode = Mode::Normal;
                     ta.move_cursor(CursorMove::Back);
                 } else {
@@ -164,7 +263,29 @@ impl Vi {
                 }
                 Step::Continue
             }
-            Mode::Normal => self.normal(key, ta),
+            Mode::Normal => {
+                if ctrl && key.code == KeyCode::Char('r') {
+                    ta.redo();
+                    return Step::Continue;
+                }
+                // Ctrl-O = jumplist back, Ctrl-I (Tab) = forward.
+                if ctrl && key.code == KeyCode::Char('o') {
+                    self.jump_back(ta);
+                    return Step::Continue;
+                }
+                if key.code == KeyCode::Tab || key.code == KeyCode::BackTab {
+                    self.jump_forward(ta);
+                    return Step::Continue;
+                }
+                let step = self.normal(key, ta);
+                // i_CTRL-O: once a full command has executed (no operator/count
+                // still pending), return to INSERT.
+                if self.insert_normal && self.pending == Pending::None && self.count == 0 {
+                    self.mode = Mode::Insert;
+                    self.insert_normal = false;
+                }
+                step
+            }
         }
     }
 
@@ -190,6 +311,7 @@ impl Vi {
             Pending::G => {
                 self.pending = Pending::None;
                 if c == 'g' {
+                    self.record_jump(ta); // gg is a jump
                     ta.move_cursor(CursorMove::Top);
                 }
                 return Step::Continue;
@@ -197,6 +319,13 @@ impl Vi {
             Pending::Op(op) => {
                 self.apply_operator(op, c, ta);
                 self.pending = Pending::None;
+                return Step::Continue;
+            }
+            Pending::Find(kind) => {
+                // `c` is the target char of an f/F/t/T search.
+                self.pending = Pending::None;
+                self.last_find = Some((kind, c));
+                char_search(ta, kind, c);
                 return Step::Continue;
             }
             Pending::None => {}
@@ -207,6 +336,9 @@ impl Vi {
         }
         if is_motion(c) {
             let n = self.take_count();
+            if c == 'G' {
+                self.record_jump(ta); // G is a jump
+            }
             apply_motion(ta, c, n);
             return Step::Continue;
         }
@@ -253,6 +385,20 @@ impl Vi {
                 ta.delete_line_by_end();
                 self.mode = Mode::Insert;
             }
+            'J' => {
+                // Join the line(s) below onto the current line with a single
+                // space. `{count}J` joins `count` lines (min effect: the one
+                // line below). No-op on the last line (nothing below to join).
+                let joins = n.saturating_sub(1).max(1);
+                for _ in 0..joins {
+                    if ta.cursor().0 + 1 >= ta.lines().len() {
+                        break;
+                    }
+                    ta.move_cursor(CursorMove::End);
+                    ta.insert_char(' ');
+                    ta.delete_next_char(); // remove the line break → pull next line up
+                }
+            }
             's' => {
                 for _ in 0..n {
                     ta.delete_next_char();
@@ -273,6 +419,19 @@ impl Vi {
             }
             'd' | 'c' | 'y' => self.pending = Pending::Op(c),
             'g' => self.pending = Pending::G,
+            // Char-search: `f`/`F`/`t`/`T` wait for a target char (Pending::Find).
+            'f' | 'F' | 't' | 'T' => self.pending = Pending::Find(c),
+            // `;` repeats the last f/F/t/T; `,` repeats it reversed.
+            ';' => {
+                if let Some((kind, target)) = self.last_find {
+                    char_search(ta, kind, target);
+                }
+            }
+            ',' => {
+                if let Some((kind, target)) = self.last_find {
+                    char_search(ta, reverse_find(kind), target);
+                }
+            }
             ':' => self.ex = Some(String::new()),
             _ => {}
         }
@@ -328,10 +487,12 @@ impl Vi {
         }
     }
 
+    /// Status label — `vi` lit up plus the mode, so a vi user always knows the
+    /// surface is modal and which mode they're in.
     fn mode_label(&self) -> &'static str {
         match self.mode {
-            Mode::Normal => "NORMAL",
-            Mode::Insert => "INSERT",
+            Mode::Normal => "vi NORMAL",
+            Mode::Insert => "vi INSERT",
         }
     }
 }
@@ -362,20 +523,84 @@ fn apply_motion(ta: &mut TextArea, c: char, n: usize) {
     }
 }
 
-/// The editor mode. **Default is Emacs** (tui-textarea's native, emacs/nano-ish
-/// bindings); Vi is opt-in via `[tui] edit_mode` / `/vi`. Read from the same
-/// source as the rustyline path ([`build_rl_config`]).
+/// Move the cursor by an `f`/`F`/`t`/`T` char-search on the current line:
+/// `f` lands on the next `target`, `t` just before it; `F` lands on the previous
+/// `target`, `T` just after it. No move if the target isn't found on the line.
+fn char_search(ta: &mut TextArea, kind: char, target: char) {
+    let (row, col) = ta.cursor();
+    let chars: Vec<char> = ta.lines()[row].chars().collect();
+    let dest = match kind {
+        'f' => (col + 1..chars.len()).find(|&i| chars[i] == target),
+        't' => (col + 1..chars.len())
+            .find(|&i| chars[i] == target)
+            .map(|i| i - 1),
+        'F' => (0..col).rev().find(|&i| chars[i] == target),
+        'T' => (0..col).rev().find(|&i| chars[i] == target).map(|i| i + 1),
+        _ => None,
+    };
+    if let Some(i) = dest {
+        ta.move_cursor(CursorMove::Jump(row as u16, i as u16));
+    }
+}
+
+/// The opposite search kind, for `,` (repeat reversed): `f`↔`F`, `t`↔`T`.
+fn reverse_find(kind: char) -> char {
+    match kind {
+        'f' => 'F',
+        'F' => 'f',
+        't' => 'T',
+        'T' => 't',
+        other => other,
+    }
+}
+
+/// A compact, mode-specific cheatsheet printed into scrollback by the
+/// mode-idiomatic help key (nano `^G`, emacs `Ctrl-h`, vi `:help`). Kept to a
+/// few short lines so it stays legible in narrow tmux/ssh panes — this is
+/// scrollback output, not a pager (a full scrollable help viewer is a separate
+/// surface decision).
+fn help_text(edit: Edit) -> String {
+    match edit {
+        Edit::Vi => [
+            "vi  Esc=NORMAL · i I a A o O=insert · :w :wq :q :jumps :help",
+            "    move: h j k l · w b e · 0 ^ $ · gg G · f F t T ; , · Ctrl-O/Ctrl-I jumps",
+            "    edit: x X · dd dw D C s S r · yy p · J join · u Ctrl-R · d/c/y+motion",
+        ]
+        .join("\n"),
+        Edit::Nano => {
+            "nano  Enter=submit · Ctrl-O or Shift-Enter=newline · Ctrl-C=quit · ^G=help".to_string()
+        }
+        Edit::Emacs => {
+            "emacs  Enter=submit · Ctrl-O or Shift-Enter=newline · Ctrl-C=quit · Ctrl-h=help"
+                .to_string()
+        }
+    }
+}
+
+/// The editor mode. **Default is Nano** (modeless, tui-textarea's native
+/// emacs-style bindings — the most approachable); Emacs is the same bindings
+/// under a different label, and Vi is opt-in via `[tui] edit_mode` / `/vi`. Read
+/// from the same source as the rustyline path ([`crate::resolve_edit_mode`]).
 #[derive(Clone, Copy, PartialEq)]
 enum Edit {
     Emacs,
+    Nano,
     Vi,
 }
 
+impl Edit {
+    /// Whether this mode uses tui-textarea's native (modeless, emacs-style)
+    /// bindings — true for both Emacs and Nano.
+    fn is_modeless(self) -> bool {
+        matches!(self, Self::Emacs | Self::Nano)
+    }
+}
+
 fn current_edit() -> Edit {
-    if build_rl_config().edit_mode() == rustyline::config::EditMode::Vi {
-        Edit::Vi
-    } else {
-        Edit::Emacs
+    match crate::resolve_edit_mode() {
+        newt_core::EditMode::Vi => Edit::Vi,
+        newt_core::EditMode::Nano => Edit::Nano,
+        newt_core::EditMode::Emacs => Edit::Emacs,
     }
 }
 
@@ -407,15 +632,40 @@ impl Editor {
                         Step::Submit
                     };
                 }
-                // Force a newline without submitting (newt's existing key).
-                KeyCode::Char('o') => {
+                // Ctrl-O inserts a newline ONLY in the modeless modes
+                // (emacs/nano) — in emacs this is idiomatic (`open-line`). In
+                // vi, Ctrl-O is the jumplist "jump back" command (Ctrl-I forward,
+                // `:jumps` to view), so we must NOT hijack it; vi users open
+                // lines with `o`/`O` (and Shift-Enter still works). The jumplist
+                // itself is a documented vi gap (TODO), so Ctrl-O is a no-op in
+                // vi for now rather than wrongly inserting a newline.
+                KeyCode::Char('o') if self.edit.is_modeless() => {
                     ta.insert_newline();
+                    return Step::Continue;
+                }
+                // Mode-idiomatic help → print a cheatsheet to scrollback. nano
+                // uses `^G`, emacs uses `Ctrl-h` (terminal permitting: some send
+                // Backspace for Ctrl-h, in which case the hint key just no-ops).
+                KeyCode::Char('g') if self.edit == Edit::Nano => {
+                    self.vi.msg = Some(help_text(self.edit));
+                    return Step::Continue;
+                }
+                KeyCode::Char('h') if self.edit == Edit::Emacs => {
+                    self.vi.msg = Some(help_text(self.edit));
                     return Step::Continue;
                 }
                 _ => {}
             }
         }
-        // Shift-Enter (terminal permitting) — explicit newline.
+        // Shift-Enter — explicit newline without submitting (terminal
+        // permitting: many terminals send a bare CR, indistinguishable from
+        // Enter, so Ctrl-O is the reliable fallback). Shared across all edit
+        // modes since this runs before the per-mode dispatch.
+        //
+        // Ctrl-Enter is deliberately NOT bound: on macOS terminals Ctrl-Return
+        // is intercepted at the terminal/OS layer (it opens a popup) and never
+        // reaches us cleanly, so it is unusable cross-platform. Ctrl-O is the
+        // portable newline key.
         if key.code == KeyCode::Enter && key.modifiers.contains(KeyModifiers::SHIFT) {
             ta.insert_newline();
             return Step::Continue;
@@ -430,19 +680,18 @@ impl Editor {
             }
             return Step::Submit;
         }
-        match self.edit {
-            // Emacs/nano: hand the key to tui-textarea's built-in bindings.
-            Edit::Emacs => {
-                ta.input(key);
-                Step::Continue
-            }
-            Edit::Vi => self.vi.input(key, ta),
+        if self.edit.is_modeless() {
+            // Emacs / nano: hand the key to tui-textarea's built-in bindings.
+            ta.input(key);
+            return Step::Continue;
         }
+        self.vi.input(key, ta)
     }
 
     fn label(&self) -> &'static str {
         match self.edit {
             Edit::Emacs => "emacs",
+            Edit::Nano => "nano",
             Edit::Vi => self.vi.mode_label(),
         }
     }
@@ -453,6 +702,11 @@ impl Editor {
         } else {
             None
         }
+    }
+
+    /// Take a one-shot message to print to scrollback (e.g. `:jumps` output).
+    fn take_msg(&mut self) -> Option<String> {
+        self.vi.msg.take()
     }
 }
 
@@ -469,9 +723,18 @@ fn make_terminal(height: u16) -> io::Result<Term> {
     )
 }
 
-fn new_textarea() -> TextArea<'static> {
+fn new_textarea(edit: Edit) -> TextArea<'static> {
     let mut ta = TextArea::default();
-    ta.set_placeholder_text("type…  (Enter submit · Ctrl-O newline · Ctrl-C quit)");
+    // Mode-aware hint, including the mode-idiomatic help key. In vi, Ctrl-O is
+    // reserved (jumplist / insert-normal), so we advertise vi-native `o`/`O`.
+    let hint = match edit {
+        Edit::Vi => "type…  (Esc=NORMAL · o/O open line · Enter submit · :help · Ctrl-C quit)",
+        Edit::Nano => "type…  (Enter submit · Ctrl-O/Shift-Enter newline · ^G help · Ctrl-C quit)",
+        Edit::Emacs => {
+            "type…  (Enter submit · Ctrl-O/Shift-Enter newline · Ctrl-h help · Ctrl-C quit)"
+        }
+    };
+    ta.set_placeholder_text(hint);
     // Block (reverse) cursor; no cursor-line underline.
     ta.set_cursor_style(Style::default().add_modifier(Modifier::REVERSED));
     ta.set_cursor_line_style(Style::default());
@@ -501,21 +764,25 @@ fn prompt_line(editor: &Editor) -> Line<'static> {
     ])
 }
 
-fn draw(f: &mut Frame, textarea: &TextArea, editor: &Editor) {
+fn draw(f: &mut Frame, textarea: &TextArea, editor: &Editor, gutter: Option<u16>) {
     let area = f.area();
     let prompt = prompt_line(editor);
-    if use_gutter(area.width) {
-        // Wide enough: single-line-by-default — prompt in a left gutter, input
+    let g = resolve_gutter(gutter, area.width);
+    if g >= GUTTER_W {
+        // Wide enough to hold the inline prompt: prompt in the left gutter, input
         // to its right (continuation lines align under the input).
-        let [gutter, input] =
-            Layout::horizontal([Constraint::Length(GUTTER_W), Constraint::Min(1)]).areas(area);
-        f.render_widget(Paragraph::new(prompt), gutter);
+        let [gutter_area, input] =
+            Layout::horizontal([Constraint::Length(g), Constraint::Min(1)]).areas(area);
+        f.render_widget(Paragraph::new(prompt), gutter_area);
         f.render_widget(textarea, input);
     } else {
-        // Squished: stack the prompt on its own row, input full-width.
-        let [prow, input] =
+        // Narrow (incl. 0): stack the prompt on its own row, then indent the
+        // input by `g` columns (0 = flush-left, the old squished behavior).
+        let [prow, rest] =
             Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(area);
         f.render_widget(Paragraph::new(prompt), prow);
+        let [_pad, input] =
+            Layout::horizontal([Constraint::Length(g), Constraint::Min(1)]).areas(rest);
         f.render_widget(textarea, input);
     }
 }
@@ -540,6 +807,25 @@ fn echo_submitted(terminal: &mut Term, body: &str) -> io::Result<()> {
     })
 }
 
+/// Print a note (one or more `\n`-separated lines, e.g. `:jumps`/`:help` output)
+/// into scrollback above the input region.
+fn echo_note(terminal: &mut Term, note: &str) -> io::Result<()> {
+    let rows: Vec<&str> = note.lines().collect();
+    let n = rows.len().max(1) as u16;
+    terminal.insert_before(n, |buf| {
+        let lines: Vec<Line> = rows
+            .iter()
+            .map(|r| {
+                Line::from(Span::styled(
+                    r.to_string(),
+                    Style::default().fg(Color::Gray),
+                ))
+            })
+            .collect();
+        Paragraph::new(lines).render(buf.area, buf);
+    })
+}
+
 /// The default input surface on a TTY when the `rich-tui` feature is compiled
 /// in: a ratatui inline editor implementing [`InputSurface`].
 pub(crate) struct RichSurface {
@@ -547,6 +833,9 @@ pub(crate) struct RichSurface {
     history_path: Option<PathBuf>,
     /// Entries submitted since the last `save_history`, appended on save.
     unsaved: Vec<String>,
+    /// `[tui] gutter` setting: `None` = auto, `Some(0)` = off, `Some(n)` = an
+    /// n-column input indent (see [`resolve_gutter`]).
+    gutter: Option<u16>,
 }
 
 impl RichSurface {
@@ -555,6 +844,7 @@ impl RichSurface {
             edit: current_edit(),
             history_path,
             unsaved: Vec::new(),
+            gutter: crate::resolve_gutter_setting(),
         })
     }
 
@@ -570,21 +860,32 @@ impl RichSurface {
 
     fn event_loop(&self) -> io::Result<ReadOutcome> {
         let mut cur_h = 1u16;
+        // A freshly built inline terminal has a blank back-buffer, so ratatui's
+        // frame diff won't rewrite cells the new frame doesn't touch — stale
+        // content from a prior turn (or the smaller pre-resize region) bleeds
+        // through. `clear()` forces a full repaint of the region so every turn /
+        // resize starts clean.
         let mut terminal = make_terminal(cur_h)?;
-        let mut textarea = new_textarea();
+        terminal.clear()?;
+        let mut textarea = new_textarea(self.edit);
         let mut editor = Editor::new(self.edit);
         loop {
-            // Grow/shrink the inline viewport to the input. In no-gutter mode the
-            // prompt needs its own row on top.
+            // Grow/shrink the inline viewport to the input. When the gutter is
+            // too narrow to hold the inline prompt, it needs its own row on top.
             let (cols, _) = crossterm::terminal::size()?;
-            let prompt_rows = if use_gutter(cols) { 0 } else { 1 };
+            let prompt_rows = if resolve_gutter(self.gutter, cols) >= GUTTER_W {
+                0
+            } else {
+                1
+            };
             let want = (textarea.lines().len() as u16 + prompt_rows)
                 .clamp(1, MAX_INPUT_ROWS + prompt_rows);
             if want != cur_h {
                 terminal = make_terminal(want)?;
+                terminal.clear()?;
                 cur_h = want;
             }
-            terminal.draw(|f| draw(f, &textarea, &editor))?;
+            terminal.draw(|f| draw(f, &textarea, &editor, self.gutter))?;
 
             // 250ms timeout drives the live clock when idle.
             if !event::poll(Duration::from_millis(250))? {
@@ -596,7 +897,13 @@ impl RichSurface {
             if key.kind != KeyEventKind::Press {
                 continue;
             }
-            match editor.input(key, &mut textarea) {
+            let step = editor.input(key, &mut textarea);
+            // A command (e.g. `:jumps`) may have queued a note to print above the
+            // input region, into real scrollback.
+            if let Some(note) = editor.take_msg() {
+                echo_note(&mut terminal, &note)?;
+            }
+            match step {
                 Step::Continue => {}
                 Step::Submit => {
                     let body = textarea.lines().join("\n");
@@ -647,8 +954,10 @@ impl InputSurface for RichSurface {
     }
 
     fn reload(&mut self) -> anyhow::Result<()> {
-        // A `/vi` · `/emacs` switch changed NEWT_EDIT_MODE; pick it up.
+        // A `/vi` · `/emacs` · `/nano` switch changed NEWT_EDIT_MODE; pick it up
+        // (and re-read the gutter setting in case it changed too).
         self.edit = current_edit();
+        self.gutter = crate::resolve_gutter_setting();
         Ok(())
     }
 }
@@ -681,13 +990,54 @@ mod tests {
         }
     }
 
+    fn nano_editor() -> Editor {
+        Editor::new(Edit::Nano)
+    }
+
+    #[test]
+    fn nano_is_modeless_and_labeled() {
+        let mut ed = nano_editor();
+        let mut ta = TextArea::default();
+        assert_eq!(ed.label(), "nano");
+        // Modeless like emacs: typing inserts text, no NORMAL mode.
+        type_chars(&mut ed, &mut ta, "plain text");
+        assert_eq!(ed.label(), "nano", "no mode flip");
+        assert_eq!(ta.lines(), &["plain text".to_string()]);
+        // Enter still submits; Ctrl-O still newlines (shared handling).
+        assert_eq!(ed.input(ctrl('o'), &mut ta), Step::Continue);
+        assert_eq!(ed.input(special(KeyCode::Enter), &mut ta), Step::Submit);
+        assert!(Edit::Nano.is_modeless() && Edit::Emacs.is_modeless());
+        assert!(!Edit::Vi.is_modeless());
+    }
+
+    #[test]
+    fn resolve_gutter_auto_off_and_fixed() {
+        // auto (None): prompt-width gutter when it fits, else 0.
+        assert_eq!(
+            resolve_gutter(None, 80),
+            GUTTER_W,
+            "auto wide → inline gutter"
+        );
+        assert_eq!(resolve_gutter(None, 50), 0, "auto squished → stacked (0)");
+        // off (Some(0)): always 0.
+        assert_eq!(resolve_gutter(Some(0), 80), 0);
+        // fixed N: exactly N, clamped to the usable width.
+        assert_eq!(resolve_gutter(Some(3), 80), 3, "3-space indent");
+        assert_eq!(
+            resolve_gutter(Some(25), 80),
+            25,
+            "wide enough to hold the prompt"
+        );
+        assert_eq!(resolve_gutter(Some(200), 80), 79, "clamped to width-1");
+    }
+
     #[test]
     fn use_gutter_drops_when_over_a_third() {
-        // Keep the gutter while 20 <= 0.33*width, i.e. width >= ~61 cols.
+        // Keep the gutter while GUTTER_W (24) <= 0.33*width, i.e. width >= ~73.
         assert!(use_gutter(80), "gutter fits at 80 cols");
-        assert!(use_gutter(61), "20 <= 0.33*61 (20.13) → gutter stays on");
-        assert!(!use_gutter(60), "20 > 0.33*60 (19.8) → drop the gutter");
-        assert!(!use_gutter(50), "20/50 == 0.40 → drop the gutter");
+        assert!(use_gutter(73), "24 <= 0.33*73 (24.09) → gutter stays on");
+        assert!(!use_gutter(72), "24 > 0.33*72 (23.76) → drop the gutter");
+        assert!(!use_gutter(50), "way too narrow → drop the gutter");
         assert!(!use_gutter(0), "zero width never uses a gutter");
     }
 
@@ -702,6 +1052,55 @@ mod tests {
         assert_eq!(ta.lines().len(), 2, "two lines after Ctrl-O");
         // Plain Enter submits.
         assert_eq!(ed.input(special(KeyCode::Enter), &mut ta), Step::Submit);
+    }
+
+    #[test]
+    fn shift_enter_inserts_newline_without_submitting() {
+        let nl = || KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT);
+        let mut ed = emacs_editor();
+        let mut ta = TextArea::default();
+        type_chars(&mut ed, &mut ta, "line one");
+        assert_eq!(
+            ed.input(nl(), &mut ta),
+            Step::Continue,
+            "Shift-Enter newline"
+        );
+        type_chars(&mut ed, &mut ta, "line two");
+        assert_eq!(ta.lines().len(), 2, "Shift-Enter added a line");
+
+        // Same in vi INSERT mode (shared handling runs before mode dispatch).
+        let mut ed = vi_editor();
+        let mut ta = TextArea::default();
+        type_chars(&mut ed, &mut ta, "vi line");
+        assert_eq!(ed.input(nl(), &mut ta), Step::Continue);
+        assert_eq!(ta.lines().len(), 2, "Shift-Enter newline in vi too");
+
+        // Ctrl-Enter is NOT bound (macOS intercepts it at the terminal layer);
+        // a plain Enter with no continuation still submits, unaffected.
+        let mut ed = emacs_editor();
+        let mut ta = TextArea::default();
+        type_chars(&mut ed, &mut ta, "x");
+        assert_eq!(ed.input(special(KeyCode::Enter), &mut ta), Step::Submit);
+    }
+
+    #[test]
+    fn ctrl_o_is_newline_in_modeless_but_reserved_in_vi() {
+        // Emacs / nano: Ctrl-O inserts a newline (idiomatic open-line).
+        for ed_factory in [emacs_editor as fn() -> Editor, nano_editor] {
+            let mut ed = ed_factory();
+            let mut ta = TextArea::default();
+            type_chars(&mut ed, &mut ta, "a");
+            assert_eq!(ed.input(ctrl('o'), &mut ta), Step::Continue);
+            assert_eq!(ta.lines().len(), 2, "Ctrl-O newline in modeless mode");
+        }
+        // Vi: Ctrl-O is reserved (jumplist / insert-normal) — it must NOT insert
+        // a newline. In INSERT it is currently a no-op (a documented gap), so the
+        // buffer stays a single line; vi users open lines with `o`/`O`.
+        let mut ed = vi_editor();
+        let mut ta = TextArea::default();
+        type_chars(&mut ed, &mut ta, "vi");
+        assert_eq!(ed.input(ctrl('o'), &mut ta), Step::Continue);
+        assert_eq!(ta.lines().len(), 1, "Ctrl-O does NOT newline in vi");
     }
 
     #[test]
@@ -736,10 +1135,10 @@ mod tests {
         // Start in INSERT (vi default), type, Esc to NORMAL.
         type_chars(&mut ed, &mut ta, "first");
         ed.input(special(KeyCode::Esc), &mut ta);
-        assert_eq!(ed.label(), "NORMAL");
+        assert_eq!(ed.label(), "vi NORMAL");
         // `o` opens a line below and returns to INSERT.
         ed.input(key('o'), &mut ta);
-        assert_eq!(ed.label(), "INSERT");
+        assert_eq!(ed.label(), "vi INSERT");
         type_chars(&mut ed, &mut ta, "second");
         assert_eq!(ta.lines(), &["first".to_string(), "second".to_string()]);
     }
@@ -797,6 +1196,187 @@ mod tests {
         ed.input(key(':'), &mut ta);
         ed.input(key('q'), &mut ta);
         assert_eq!(ed.input(special(KeyCode::Enter), &mut ta), Step::Eof);
+    }
+
+    /// Build a multi-line buffer in vi: type lines separated by Shift-Enter
+    /// (which inserts a newline in every mode), then Esc to NORMAL at the top.
+    fn vi_buffer(lines: &[&str]) -> (Editor, TextArea<'static>) {
+        let mut ed = vi_editor();
+        let mut ta = TextArea::default();
+        for (i, l) in lines.iter().enumerate() {
+            if i > 0 {
+                ed.input(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT), &mut ta);
+            }
+            type_chars(&mut ed, &mut ta, l);
+        }
+        ed.input(special(KeyCode::Esc), &mut ta); // NORMAL
+        ed.input(key('g'), &mut ta);
+        ed.input(key('g'), &mut ta); // top
+        (ed, ta)
+    }
+
+    #[test]
+    fn vi_uppercase_j_joins_line_below() {
+        let (mut ed, mut ta) = vi_buffer(&["foo", "bar"]);
+        ed.input(key('J'), &mut ta);
+        assert_eq!(ta.lines(), &["foo bar".to_string()], "J joins with a space");
+        // J on the only remaining line is a no-op (nothing below).
+        ed.input(key('J'), &mut ta);
+        assert_eq!(ta.lines(), &["foo bar".to_string()]);
+    }
+
+    #[test]
+    fn vi_count_j_joins_multiple_lines() {
+        let (mut ed, mut ta) = vi_buffer(&["a", "b", "c"]);
+        // 3J joins this line + 2 below → one line.
+        ed.input(key('3'), &mut ta);
+        ed.input(key('J'), &mut ta);
+        assert_eq!(ta.lines(), &["a b c".to_string()]);
+    }
+
+    #[test]
+    fn vi_insert_normal_ctrl_o_runs_one_command() {
+        let mut ed = vi_editor();
+        let mut ta = TextArea::default();
+        type_chars(&mut ed, &mut ta, "hello"); // INSERT, cursor at end
+                                               // i_CTRL-O: one Normal command (`0` → head) then back to INSERT.
+        ed.input(ctrl('o'), &mut ta);
+        assert_eq!(ed.label(), "vi NORMAL", "Ctrl-O drops to NORMAL");
+        ed.input(key('0'), &mut ta);
+        assert_eq!(ed.label(), "vi INSERT", "resumes INSERT after one command");
+        type_chars(&mut ed, &mut ta, "X");
+        assert_eq!(ta.lines(), &["Xhello".to_string()], "inserted at head");
+    }
+
+    #[test]
+    fn vi_jumplist_back_and_forward() {
+        let (mut ed, mut ta) = vi_buffer(&["one", "two", "three"]);
+        // We're at the top (gg recorded a jump from the bottom line).
+        assert_eq!(ta.cursor().0, 0, "gg → row 0");
+        // Ctrl-O jumps back to the pre-gg position (the last line).
+        ed.input(ctrl('o'), &mut ta);
+        assert_eq!(ta.cursor().0, 2, "Ctrl-O → back to row 2");
+        // Ctrl-I (Tab) jumps forward again to the top.
+        ed.input(special(KeyCode::Tab), &mut ta);
+        assert_eq!(ta.cursor().0, 0, "Ctrl-I → forward to row 0");
+    }
+
+    /// A single-line vi buffer at NORMAL, cursor at head.
+    fn vi_line(s: &str) -> (Editor, TextArea<'static>) {
+        let mut ed = vi_editor();
+        let mut ta = TextArea::default();
+        type_chars(&mut ed, &mut ta, s);
+        ed.input(special(KeyCode::Esc), &mut ta);
+        ed.input(key('0'), &mut ta); // head
+        (ed, ta)
+    }
+
+    #[test]
+    fn vi_f_and_semicolon_and_comma_char_search() {
+        let (mut ed, mut ta) = vi_line("a.b.c.d");
+        // f. → first dot (col 1).
+        ed.input(key('f'), &mut ta);
+        ed.input(key('.'), &mut ta);
+        assert_eq!(ta.cursor().1, 1, "f. → first dot");
+        // ; → next dot (col 3).
+        ed.input(key(';'), &mut ta);
+        assert_eq!(ta.cursor().1, 3, "; → next dot");
+        // , → previous dot (col 1).
+        ed.input(key(','), &mut ta);
+        assert_eq!(ta.cursor().1, 1, ", → previous dot");
+    }
+
+    #[test]
+    fn vi_t_and_capital_f_char_search() {
+        let (mut ed, mut ta) = vi_line("abcXdef");
+        // tX → just before X (col 2).
+        ed.input(key('t'), &mut ta);
+        ed.input(key('X'), &mut ta);
+        assert_eq!(ta.cursor().1, 2, "tX → col before X");
+        // Move to end, then FX → back onto X (col 3).
+        ed.input(key('$'), &mut ta);
+        ed.input(key('F'), &mut ta);
+        ed.input(key('X'), &mut ta);
+        assert_eq!(ta.cursor().1, 3, "FX → onto X");
+    }
+
+    #[test]
+    fn vi_operator_motions_dw_d_dollar_d0_yy() {
+        // dw deletes to the start of the next word.
+        let (mut ed, mut ta) = vi_line("foo bar baz");
+        ed.input(key('d'), &mut ta);
+        ed.input(key('w'), &mut ta);
+        assert_eq!(ta.lines(), &["bar baz".to_string()], "dw");
+
+        // d$ deletes to end of line.
+        let (mut ed, mut ta) = vi_line("keep DROP this");
+        ed.input(key('f'), &mut ta);
+        ed.input(key('D'), &mut ta); // f D → cursor on the 'D' of DROP
+        ed.input(key('d'), &mut ta);
+        ed.input(key('$'), &mut ta);
+        assert_eq!(ta.lines(), &["keep ".to_string()], "d$");
+
+        // d0 deletes from the cursor back to the beginning of the line.
+        let (mut ed, mut ta) = vi_line("alpha beta");
+        ed.input(key('f'), &mut ta);
+        ed.input(key('b'), &mut ta); // f b → col 6 ('b' of "beta")
+        ed.input(key('d'), &mut ta);
+        ed.input(key('0'), &mut ta);
+        assert_eq!(ta.lines(), &["beta".to_string()], "d0 deletes to BOL");
+
+        // yy then p duplicates the line.
+        let (mut ed, mut ta) = vi_line("dup");
+        ed.input(key('y'), &mut ta);
+        ed.input(key('y'), &mut ta);
+        ed.input(key('p'), &mut ta);
+        assert!(
+            ta.lines().iter().filter(|l| l.contains("dup")).count() >= 1,
+            "yy+p yanks and pastes the line"
+        );
+    }
+
+    #[test]
+    fn mode_idiomatic_help_keys_queue_a_cheatsheet() {
+        // nano: Ctrl-G.
+        let mut ed = nano_editor();
+        let mut ta = TextArea::default();
+        assert_eq!(ed.input(ctrl('g'), &mut ta), Step::Continue);
+        assert!(ed.take_msg().unwrap().starts_with("nano"));
+        // emacs: Ctrl-h.
+        let mut ed = emacs_editor();
+        let mut ta = TextArea::default();
+        assert_eq!(ed.input(ctrl('h'), &mut ta), Step::Continue);
+        assert!(ed.take_msg().unwrap().starts_with("emacs"));
+        // vi: `:help`.
+        let mut ed = vi_editor();
+        let mut ta = TextArea::default();
+        ed.input(special(KeyCode::Esc), &mut ta);
+        ed.input(key(':'), &mut ta);
+        for c in "help".chars() {
+            ed.input(key(c), &mut ta);
+        }
+        ed.input(special(KeyCode::Enter), &mut ta);
+        assert!(ed.take_msg().unwrap().starts_with("vi"));
+        // The help key in the wrong mode does nothing special: Ctrl-G in emacs
+        // is not help (no message queued).
+        let mut ed = emacs_editor();
+        let mut ta = TextArea::default();
+        ed.input(ctrl('g'), &mut ta);
+        assert!(ed.take_msg().is_none());
+    }
+
+    #[test]
+    fn vi_colon_jumps_queues_a_note() {
+        let mut ed = vi_editor();
+        let mut ta = TextArea::default();
+        ed.input(special(KeyCode::Esc), &mut ta);
+        ed.input(key(':'), &mut ta);
+        for c in "jumps".chars() {
+            ed.input(key(c), &mut ta);
+        }
+        ed.input(special(KeyCode::Enter), &mut ta);
+        assert!(ed.take_msg().is_some(), ":jumps queued a scrollback note");
+        assert!(ed.take_msg().is_none(), "note is one-shot");
     }
 
     #[test]
