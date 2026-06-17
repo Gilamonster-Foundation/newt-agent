@@ -1121,14 +1121,20 @@ impl rustyline::validate::Validator for FooterHelper {
 }
 impl rustyline::Helper for FooterHelper {}
 
-/// Install the footer helper on a freshly built editor and bind the multi-line
-/// entry keys. Three ways to add a line without submitting:
-/// - **Ctrl-O** — the vi-mode shortcut (works in emacs too).
-/// - **Shift-Enter** — the emacs-style shortcut, *terminal permitting*: many
-///   terminals send a bare CR for Shift-Enter (indistinguishable from Enter),
-///   so it only fires where the terminal emits a distinct sequence.
+/// Install the footer helper on a freshly built editor and bind newt's
+/// multi-line entry keys. These are **newt conventions, not canonical editor
+/// bindings** — three ways to add a line without submitting:
+/// - **Ctrl-O** — reliable in every terminal and in both emacs and vi mode.
+///   NB: this is *not* vi's open-line command. Real vi uses `o`/`O` (POSIX:
+///   "enter text input mode in a new line"), which rustyline's vi mode does not
+///   implement, and a `bind_sequence` cmd cannot enter vi insert mode — so we
+///   bind a free, reliable control key instead (tracked upstream: rustyline
+///   lacks native `o`/`O`). Ctrl-O itself is not a vi command.
+/// - **Shift-Enter** — same, *terminal permitting*: many terminals send a bare
+///   CR for Shift-Enter (indistinguishable from Enter), so it only fires where
+///   the terminal emits a distinct sequence.
 /// - **trailing `\`** — the universal fallback (the `Validator`), works in every
-///   terminal and mode with no special-key detection.
+///   terminal and mode with no special-key detection. Enter submits.
 fn install_footer_helper(
     rl: &mut rustyline::Editor<FooterHelper, rustyline::history::DefaultHistory>,
     palette: Palette,
