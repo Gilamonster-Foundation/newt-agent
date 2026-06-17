@@ -45,6 +45,13 @@ tracing-subscriber.workspace = true
 # require the agent-mesh sibling checkout for every `cargo metadata`
 # call, which breaks default CI.
 
+[features]
+# Forward the TTY rich inline input surface (issue #416) to the `newt` binary.
+# OFF by default — `cargo run -p newt-agent --features rich-tui` (then a TTY)
+# selects the ratatui inline surface; the default build / headless / wyvern keep
+# the rustyline surface. The `is_terminal()` runtime gate still applies.
+rich-tui = ["newt-tui/rich-tui"]
+
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
 

@@ -87,13 +87,16 @@ check:
     # rich-tui (issue #416): the TTY rich input surface is off by default. Lint +
     # test it under its feature so it can't rot, but keep it OUT of the coverage
     # run (its TTY event loop is unit-untestable and would drag the floor down).
+    # The `-p newt-agent` clippy proves the feature still unifies into the shipped
+    # binary (the forward from newt-cli), not just the leaf crate.
     cargo clippy -p newt-tui --features rich-tui --all-targets -- -D warnings || rc=1
     cargo test -p newt-tui --features rich-tui || rc=1
+    cargo clippy -p newt-agent --features rich-tui -- -D warnings || rc=1
     exit $rc
 
 [windows]
 check:
-    $rc = 0; cargo fmt --all -- --check; if ($LASTEXITCODE -ne 0) { $rc = 1 }; cargo clippy --workspace --all-targets --features newt-data/kernel -- -D warnings; if ($LASTEXITCODE -ne 0) { $rc = 1 }; cargo test --workspace --features newt-data/kernel; if ($LASTEXITCODE -ne 0) { $rc = 1 }; cargo clippy -p newt-tui --features rich-tui --all-targets -- -D warnings; if ($LASTEXITCODE -ne 0) { $rc = 1 }; cargo test -p newt-tui --features rich-tui; if ($LASTEXITCODE -ne 0) { $rc = 1 }; exit $rc
+    $rc = 0; cargo fmt --all -- --check; if ($LASTEXITCODE -ne 0) { $rc = 1 }; cargo clippy --workspace --all-targets --features newt-data/kernel -- -D warnings; if ($LASTEXITCODE -ne 0) { $rc = 1 }; cargo test --workspace --features newt-data/kernel; if ($LASTEXITCODE -ne 0) { $rc = 1 }; cargo clippy -p newt-tui --features rich-tui --all-targets -- -D warnings; if ($LASTEXITCODE -ne 0) { $rc = 1 }; cargo test -p newt-tui --features rich-tui; if ($LASTEXITCODE -ne 0) { $rc = 1 }; cargo clippy -p newt-agent --features rich-tui -- -D warnings; if ($LASTEXITCODE -ne 0) { $rc = 1 }; exit $rc
 
 # Build + test the out-of-workspace newt-mesh crate. Requires the
 # sibling `../agent-mesh/` checkout. Not run by `just check` /
