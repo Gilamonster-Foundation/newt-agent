@@ -221,6 +221,7 @@ impl Vi {
                     "w" | "wq" | "x" | "wq!" | "x!" => return Step::Submit,
                     "q" | "q!" => return Step::Eof,
                     "jumps" => self.msg = Some(self.format_jumps()),
+                    "help" | "h" => self.msg = Some(help_text(Edit::Vi)),
                     _ => {} // unknown command just cancels
                 }
                 return Step::Continue;
@@ -553,10 +554,33 @@ fn reverse_find(kind: char) -> char {
     }
 }
 
-/// The editor mode. **Default is Emacs** (tui-textarea's native, emacs/nano-ish
-/// bindings); Vi is opt-in via `[tui] edit_mode` / `/vi`. `Nano` is modeless and
-/// behaves like Emacs today — it differs only in label. Read from the same
-/// source as the rustyline path ([`crate::resolve_edit_mode`]).
+/// A compact, mode-specific cheatsheet printed into scrollback by the
+/// mode-idiomatic help key (nano `^G`, emacs `Ctrl-h`, vi `:help`). Kept to a
+/// few short lines so it stays legible in narrow tmux/ssh panes — this is
+/// scrollback output, not a pager (a full scrollable help viewer is a separate
+/// surface decision).
+fn help_text(edit: Edit) -> String {
+    match edit {
+        Edit::Vi => [
+            "vi  Esc=NORMAL · i I a A o O=insert · :w :wq :q :jumps :help",
+            "    move: h j k l · w b e · 0 ^ $ · gg G · f F t T ; , · Ctrl-O/Ctrl-I jumps",
+            "    edit: x X · dd dw D C s S r · yy p · J join · u Ctrl-R · d/c/y+motion",
+        ]
+        .join("\n"),
+        Edit::Nano => {
+            "nano  Enter=submit · Ctrl-O or Shift-Enter=newline · Ctrl-C=quit · ^G=help".to_string()
+        }
+        Edit::Emacs => {
+            "emacs  Enter=submit · Ctrl-O or Shift-Enter=newline · Ctrl-C=quit · Ctrl-h=help"
+                .to_string()
+        }
+    }
+}
+
+/// The editor mode. **Default is Nano** (modeless, tui-textarea's native
+/// emacs-style bindings — the most approachable); Emacs is the same bindings
+/// under a different label, and Vi is opt-in via `[tui] edit_mode` / `/vi`. Read
+/// from the same source as the rustyline path ([`crate::resolve_edit_mode`]).
 #[derive(Clone, Copy, PartialEq)]
 enum Edit {
     Emacs,
@@ -617,6 +641,17 @@ impl Editor {
                 // vi for now rather than wrongly inserting a newline.
                 KeyCode::Char('o') if self.edit.is_modeless() => {
                     ta.insert_newline();
+                    return Step::Continue;
+                }
+                // Mode-idiomatic help → print a cheatsheet to scrollback. nano
+                // uses `^G`, emacs uses `Ctrl-h` (terminal permitting: some send
+                // Backspace for Ctrl-h, in which case the hint key just no-ops).
+                KeyCode::Char('g') if self.edit == Edit::Nano => {
+                    self.vi.msg = Some(help_text(self.edit));
+                    return Step::Continue;
+                }
+                KeyCode::Char('h') if self.edit == Edit::Emacs => {
+                    self.vi.msg = Some(help_text(self.edit));
                     return Step::Continue;
                 }
                 _ => {}
@@ -690,12 +725,14 @@ fn make_terminal(height: u16) -> io::Result<Term> {
 
 fn new_textarea(edit: Edit) -> TextArea<'static> {
     let mut ta = TextArea::default();
-    // Mode-aware hint: in vi, Ctrl-O is reserved (jumplist / insert-normal), so
-    // we advertise the vi-native `o`/`O` for opening lines, not Ctrl-O.
-    let hint = if edit == Edit::Vi {
-        "type…  (Esc=NORMAL · o/O open line · Shift-Enter newline · Enter submit · Ctrl-C quit)"
-    } else {
-        "type…  (Enter submit · Ctrl-O / Shift-Enter newline · Ctrl-C quit)"
+    // Mode-aware hint, including the mode-idiomatic help key. In vi, Ctrl-O is
+    // reserved (jumplist / insert-normal), so we advertise vi-native `o`/`O`.
+    let hint = match edit {
+        Edit::Vi => "type…  (Esc=NORMAL · o/O open line · Enter submit · :help · Ctrl-C quit)",
+        Edit::Nano => "type…  (Enter submit · Ctrl-O/Shift-Enter newline · ^G help · Ctrl-C quit)",
+        Edit::Emacs => {
+            "type…  (Enter submit · Ctrl-O/Shift-Enter newline · Ctrl-h help · Ctrl-C quit)"
+        }
     };
     ta.set_placeholder_text(hint);
     // Block (reverse) cursor; no cursor-line underline.
@@ -770,14 +807,22 @@ fn echo_submitted(terminal: &mut Term, body: &str) -> io::Result<()> {
     })
 }
 
-/// Print a one-line note (e.g. `:jumps` output) into scrollback above the input.
+/// Print a note (one or more `\n`-separated lines, e.g. `:jumps`/`:help` output)
+/// into scrollback above the input region.
 fn echo_note(terminal: &mut Term, note: &str) -> io::Result<()> {
-    terminal.insert_before(1, |buf| {
-        Paragraph::new(Line::from(Span::styled(
-            note.to_string(),
-            Style::default().fg(Color::Gray),
-        )))
-        .render(buf.area, buf);
+    let rows: Vec<&str> = note.lines().collect();
+    let n = rows.len().max(1) as u16;
+    terminal.insert_before(n, |buf| {
+        let lines: Vec<Line> = rows
+            .iter()
+            .map(|r| {
+                Line::from(Span::styled(
+                    r.to_string(),
+                    Style::default().fg(Color::Gray),
+                ))
+            })
+            .collect();
+        Paragraph::new(lines).render(buf.area, buf);
     })
 }
 
@@ -1288,6 +1333,36 @@ mod tests {
             ta.lines().iter().filter(|l| l.contains("dup")).count() >= 1,
             "yy+p yanks and pastes the line"
         );
+    }
+
+    #[test]
+    fn mode_idiomatic_help_keys_queue_a_cheatsheet() {
+        // nano: Ctrl-G.
+        let mut ed = nano_editor();
+        let mut ta = TextArea::default();
+        assert_eq!(ed.input(ctrl('g'), &mut ta), Step::Continue);
+        assert!(ed.take_msg().unwrap().starts_with("nano"));
+        // emacs: Ctrl-h.
+        let mut ed = emacs_editor();
+        let mut ta = TextArea::default();
+        assert_eq!(ed.input(ctrl('h'), &mut ta), Step::Continue);
+        assert!(ed.take_msg().unwrap().starts_with("emacs"));
+        // vi: `:help`.
+        let mut ed = vi_editor();
+        let mut ta = TextArea::default();
+        ed.input(special(KeyCode::Esc), &mut ta);
+        ed.input(key(':'), &mut ta);
+        for c in "help".chars() {
+            ed.input(key(c), &mut ta);
+        }
+        ed.input(special(KeyCode::Enter), &mut ta);
+        assert!(ed.take_msg().unwrap().starts_with("vi"));
+        // The help key in the wrong mode does nothing special: Ctrl-G in emacs
+        // is not help (no message queued).
+        let mut ed = emacs_editor();
+        let mut ta = TextArea::default();
+        ed.input(ctrl('g'), &mut ta);
+        assert!(ed.take_msg().is_none());
     }
 
     #[test]

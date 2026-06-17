@@ -1420,15 +1420,15 @@ impl ToolPermissions {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum EditMode {
-    /// Readline / emacs-style bindings (default).
-    #[default]
+    /// Readline / emacs-style bindings.
     Emacs,
     /// Vi / vim-style bindings — Esc for normal mode, i for insert.
     Vi,
-    /// Nano-style: modeless, emacs-like bindings. Behaves like `Emacs` today
-    /// (rustyline has no nano mode); it is a distinct, selectable label so a
-    /// nano-accustomed user can ask for it. The rich-tui surface labels it
-    /// `nano`.
+    /// Nano-style: modeless, emacs-like bindings (the **default** — the most
+    /// broadly approachable). Behaves like `Emacs` today (rustyline has no nano
+    /// mode); it is a distinct, selectable label, and the rich-tui surface shows
+    /// the nano `^G` help hint for it.
+    #[default]
     Nano,
 }
 
@@ -1458,7 +1458,7 @@ impl Default for TuiConfig {
             chat_style: ChatStyle::Compact,
             prompt: None,
             no_splash: false,
-            edit_mode: EditMode::Emacs,
+            edit_mode: EditMode::Nano,
             gutter: None,
             footer: FooterMode::Auto,
             thinking: ThinkingMode::Stream,
