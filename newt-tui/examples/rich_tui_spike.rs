@@ -2,25 +2,23 @@
 //! emulate rustyline's vi (+ the `o`/`O` patch) EXACTLY on ratatui+tui-textarea.
 //! Throwaway examples/ binary — NOT production code.
 //!
-//! Substrate proven: ratatui `Viewport::Inline` (pinned bottom region, no alt
-//! screen — submitted lines scroll into real scrollback via `insert_before`);
-//! a live light-blue clock; the non-TTY gate (piped → exits to the "gills").
+//! This revision folds creature-test feedback:
+//! - **block (reverse) cursor**, not an underline;
+//! - status folded into a **single prompt line** `[HH:MM:SS] MODE ❯ ` (a left
+//!   gutter), input to its right, so the default is one line;
+//! - the inline viewport **grows** with the number of input lines (recreated
+//!   on change, clamped 1..8) — blank lines now have somewhere to go.
 //!
-//! Vi keymap mirrors rustyline's `vi_command` command-for-command:
-//!   modes: NORMAL / INSERT (Esc moves left, vi-style)
-//!   motions: h l j k  w W b B e E  0 ^ $  G  gg   (counts: 3w, 5j, 2x …)
-//!   enter insert: i I a A  o O
-//!   edits: x X  D C  s S  r{c}  u  Ctrl-R(redo)  p
-//!   operators: d{motion} c{motion} y{motion}  and doubled dd cc yy
-//! Submit: Ctrl-D (scrolls above)   Quit: Ctrl-C
+//! Substrate: ratatui `Viewport::Inline` (no alt screen — submitted lines go to
+//! real scrollback via `insert_before`); live light-blue clock; non-TTY gate.
 //!
-//! Known gaps to close in the production port (documented, not faithful yet):
-//!   f/F/t/T/;/, char-search · `.` repeat-change · `R` overwrite mode ·
-//!   exact `P` (before) · big-word vs word distinction · counts on operators.
+//! Vi mirrors rustyline `vi_command`: NORMAL/INSERT · h l j k w b e 0 ^ $ G gg
+//! (counts) · i I a A o O · x X D C s S r{c} u Ctrl-R p · d/c/y{motion} + dd/cc/yy.
+//! Gaps for the port: f/F/t/T/;/, · `.` · `R` · exact `P` · big-word · op counts.
 //!
 //! Run on a TTY:  cargo run -p newt-tui --example rich_tui_spike
 
-use std::io::{self, IsTerminal};
+use std::io::{self, IsTerminal, Stdout};
 use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -33,6 +31,11 @@ use ratatui::widgets::{Paragraph, Widget};
 use ratatui::{Frame, Terminal, TerminalOptions, Viewport};
 use tui_textarea::{CursorMove, TextArea};
 
+const GUTTER_W: u16 = 20; // "[HH:MM:SS] NORMAL ❯ "
+const MAX_INPUT_ROWS: u16 = 8;
+
+type Term = Terminal<CrosstermBackend<Stdout>>;
+
 #[derive(Clone, Copy, PartialEq)]
 enum Mode {
     Normal,
@@ -42,9 +45,9 @@ enum Mode {
 #[derive(Clone, Copy, PartialEq)]
 enum Pending {
     None,
-    Op(char), // d / c / y awaiting a motion
-    Replace,  // r awaiting the replacement char
-    G,        // g awaiting g (for `gg`)
+    Op(char),
+    Replace,
+    G,
 }
 
 enum Outcome {
@@ -56,7 +59,7 @@ enum Outcome {
 struct Vi {
     mode: Mode,
     pending: Pending,
-    count: usize, // 0 = none
+    count: usize,
 }
 
 impl Vi {
@@ -67,15 +70,12 @@ impl Vi {
             count: 0,
         }
     }
-
     fn take_count(&mut self) -> usize {
         let n = self.count.max(1);
         self.count = 0;
         n
     }
-
     fn input(&mut self, key: crossterm::event::KeyEvent, ta: &mut TextArea) -> Outcome {
-        // Global keys (both modes).
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
                 KeyCode::Char('c') => return Outcome::Quit,
@@ -87,12 +87,11 @@ impl Vi {
                 _ => {}
             }
         }
-
         match self.mode {
             Mode::Insert => {
                 if key.code == KeyCode::Esc {
                     self.mode = Mode::Normal;
-                    ta.move_cursor(CursorMove::Back); // vi leaves cursor on last char
+                    ta.move_cursor(CursorMove::Back);
                 } else {
                     ta.input(key);
                 }
@@ -101,10 +100,8 @@ impl Vi {
             Mode::Normal => self.normal(key, ta),
         }
     }
-
     fn normal(&mut self, key: crossterm::event::KeyEvent, ta: &mut TextArea) -> Outcome {
         let KeyCode::Char(c) = key.code else {
-            // map a few non-char keys to motions
             match key.code {
                 KeyCode::Left | KeyCode::Backspace => ta.move_cursor(CursorMove::Back),
                 KeyCode::Right => ta.move_cursor(CursorMove::Forward),
@@ -114,8 +111,6 @@ impl Vi {
             }
             return Outcome::Continue;
         };
-
-        // Multi-key state: replace-char, `gg`, operator-pending.
         match self.pending {
             Pending::Replace => {
                 ta.delete_next_char();
@@ -138,23 +133,17 @@ impl Vi {
             }
             Pending::None => {}
         }
-
-        // Count prefix (a leading 0 is the motion, later 0s are digits).
         if c.is_ascii_digit() && !(c == '0' && self.count == 0) {
             self.count = self.count.saturating_mul(10) + (c as usize - '0' as usize);
             return Outcome::Continue;
         }
-
-        // Motions move the cursor; counts repeat them.
         if is_motion(c) {
             let n = self.take_count();
             apply_motion(ta, c, n);
             return Outcome::Continue;
         }
-
         let n = self.take_count();
         match c {
-            // enter insert
             'i' => self.mode = Mode::Insert,
             'I' => {
                 ta.move_cursor(CursorMove::Head);
@@ -168,7 +157,6 @@ impl Vi {
                 ta.move_cursor(CursorMove::End);
                 self.mode = Mode::Insert;
             }
-            // the patch: open line below / above
             'o' => {
                 ta.move_cursor(CursorMove::End);
                 ta.insert_newline();
@@ -180,7 +168,6 @@ impl Vi {
                 ta.move_cursor(CursorMove::Up);
                 self.mode = Mode::Insert;
             }
-            // edits
             'x' => {
                 for _ in 0..n {
                     ta.delete_next_char();
@@ -216,18 +203,14 @@ impl Vi {
             'p' | 'P' => {
                 ta.paste();
             }
-            // operators + `g`
             'd' | 'c' | 'y' => self.pending = Pending::Op(c),
             'g' => self.pending = Pending::G,
             _ => {}
         }
         Outcome::Continue
     }
-
-    /// Resolve `d{motion}` / `c{motion}` / `y{motion}` and doubled `dd`/`cc`/`yy`.
     fn apply_operator(&mut self, op: char, target: char, ta: &mut TextArea) {
         if target == op {
-            // linewise
             match op {
                 'c' => {
                     ta.move_cursor(CursorMove::Head);
@@ -237,7 +220,7 @@ impl Vi {
                 'd' => {
                     ta.move_cursor(CursorMove::Head);
                     ta.delete_line_by_end();
-                    ta.delete_next_char(); // pull the next line up
+                    ta.delete_next_char();
                 }
                 'y' => {
                     let start = ta.cursor();
@@ -253,7 +236,7 @@ impl Vi {
             return;
         }
         if !is_motion(target) {
-            return; // invalid motion cancels the operator (vi-style)
+            return;
         }
         let start = ta.cursor();
         ta.start_selection();
@@ -274,24 +257,11 @@ impl Vi {
             _ => ta.cancel_selection(),
         }
     }
-
-    fn status(&self) -> String {
-        let m = match self.mode {
-            Mode::Normal => "-- NORMAL --",
-            Mode::Insert => "-- INSERT --",
-        };
-        let pend = match self.pending {
-            Pending::Op(c) => format!("  {c}"),
-            Pending::Replace => "  r".to_string(),
-            Pending::G => "  g".to_string(),
-            Pending::None => String::new(),
-        };
-        let cnt = if self.count > 0 {
-            format!("  {}", self.count)
-        } else {
-            String::new()
-        };
-        format!("{m}{pend}{cnt}")
+    fn mode_label(&self) -> &'static str {
+        match self.mode {
+            Mode::Normal => "NORMAL",
+            Mode::Insert => "INSERT",
+        }
     }
 }
 
@@ -301,7 +271,6 @@ fn is_motion(c: char) -> bool {
         'h' | 'l' | 'j' | 'k' | 'w' | 'W' | 'b' | 'B' | 'e' | 'E' | '0' | '^' | '$' | 'G'
     )
 }
-
 fn apply_motion(ta: &mut TextArea, c: char, n: usize) {
     let mv = match c {
         'h' => CursorMove::Back,
@@ -311,7 +280,7 @@ fn apply_motion(ta: &mut TextArea, c: char, n: usize) {
         'w' | 'W' => CursorMove::WordForward,
         'b' | 'B' => CursorMove::WordBack,
         'e' | 'E' => CursorMove::WordEnd,
-        '0' | '^' => CursorMove::Head, // ^ approximates first-non-blank
+        '0' | '^' => CursorMove::Head,
         '$' => CursorMove::End,
         'G' => CursorMove::Bottom,
         _ => return,
@@ -321,44 +290,115 @@ fn apply_motion(ta: &mut TextArea, c: char, n: usize) {
     }
 }
 
+/// The editor mode. **Default is Emacs** (tui-textarea's native, emacs/nano-ish
+/// bindings — what most people expect); Vi is opt-in. In the real port this maps
+/// to the existing `[tui] edit_mode` config + `/vi` `/emacs` toggle.
+#[derive(Clone, Copy, PartialEq)]
+enum Edit {
+    Emacs,
+    Vi,
+}
+
+struct Editor {
+    edit: Edit,
+    vi: Vi,
+}
+
+impl Editor {
+    fn new(edit: Edit) -> Self {
+        Editor {
+            edit,
+            vi: Vi::new(),
+        }
+    }
+    fn reset(&mut self) {
+        self.vi = Vi::new();
+    }
+    fn input(&mut self, key: crossterm::event::KeyEvent, ta: &mut TextArea) -> Outcome {
+        // Submit / quit are shared by both modes.
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            match key.code {
+                KeyCode::Char('c') => return Outcome::Quit,
+                KeyCode::Char('d') => return Outcome::Submit,
+                _ => {}
+            }
+        }
+        match self.edit {
+            // Emacs/nano: hand the key straight to tui-textarea's built-in
+            // (emacs-style) bindings — no modes, always inserting.
+            Edit::Emacs => {
+                ta.input(key);
+                Outcome::Continue
+            }
+            Edit::Vi => self.vi.input(key, ta),
+        }
+    }
+    fn label(&self) -> &'static str {
+        match self.edit {
+            Edit::Emacs => "emacs",
+            Edit::Vi => self.vi.mode_label(),
+        }
+    }
+}
+
 fn main() -> io::Result<()> {
     if !io::stdout().is_terminal() {
         eprintln!("rich_tui_spike: not a TTY — the plain (rustyline) path handles this. Exiting.");
         return Ok(());
     }
+    // Default emacs; `--`-free `vi` arg opts in (maps to [tui] edit_mode).
+    let edit = if std::env::args().skip(1).any(|a| a == "vi") {
+        Edit::Vi
+    } else {
+        Edit::Emacs
+    };
+
     enable_raw_mode()?;
-    let backend = CrosstermBackend::new(io::stdout());
-    let mut terminal = Terminal::with_options(
-        backend,
-        TerminalOptions {
-            viewport: Viewport::Inline(6),
-        },
-    )?;
-
+    let mut cur_h = 1u16;
+    let mut terminal = make_terminal(cur_h)?;
     let mut textarea = new_textarea();
-    let mut vi = Vi::new();
-    let result = run(&mut terminal, &mut textarea, &mut vi);
-
+    let mut editor = Editor::new(edit);
+    let result = run(&mut terminal, &mut cur_h, &mut textarea, &mut editor);
     disable_raw_mode()?;
     println!();
     result
 }
 
+fn make_terminal(height: u16) -> io::Result<Term> {
+    Terminal::with_options(
+        CrosstermBackend::new(io::stdout()),
+        TerminalOptions {
+            viewport: Viewport::Inline(height),
+        },
+    )
+}
+
 fn new_textarea() -> TextArea<'static> {
     let mut ta = TextArea::default();
-    ta.set_placeholder_text("type… (Ctrl-D submit · Ctrl-C quit · Esc → vi NORMAL · o/O open line)");
+    ta.set_placeholder_text("type…  (Esc → vi NORMAL · o/O open line · Ctrl-D submit · Ctrl-C quit)");
+    // block (reverse) cursor; no cursor-line underline.
+    ta.set_cursor_style(Style::default().add_modifier(Modifier::REVERSED));
+    ta.set_cursor_line_style(Style::default());
     ta
 }
 
 fn run(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    textarea: &mut TextArea<'static>,
-    vi: &mut Vi,
+    terminal: &mut Term,
+    cur_h: &mut u16,
+    textarea: &mut TextArea,
+    editor: &mut Editor,
 ) -> io::Result<()> {
     loop {
-        terminal.draw(|f| draw(f, textarea, vi))?;
+        // Grow/shrink the inline viewport to the input line count.
+        let want = (textarea.lines().len() as u16).clamp(1, MAX_INPUT_ROWS);
+        if want != *cur_h {
+            *terminal = make_terminal(want)?;
+            *cur_h = want;
+        }
+        terminal.draw(|f| draw(f, textarea, editor))?;
+
         if !event::poll(Duration::from_millis(250))? {
-            continue; // timeout → redraw (live clock)
+            continue; // live clock
         }
         let Event::Key(key) = event::read()? else {
             continue;
@@ -366,34 +406,31 @@ fn run(
         if key.kind != KeyEventKind::Press {
             continue;
         }
-        match vi.input(key, textarea) {
+        match editor.input(key, textarea) {
             Outcome::Quit => return Ok(()),
             Outcome::Submit => {
                 submit(terminal, textarea)?;
-                *vi = Vi::new();
+                editor.reset();
             }
             Outcome::Continue => {}
         }
     }
 }
 
-fn submit(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    textarea: &mut TextArea<'static>,
-) -> io::Result<()> {
+fn submit(terminal: &mut Term, textarea: &mut TextArea) -> io::Result<()> {
     let body = textarea.lines().join("\n");
     if body.trim().is_empty() {
         return Ok(());
     }
     let stamp = chrono::Local::now().format("%H:%M:%S").to_string();
-    let line_count = textarea.lines().len() as u16;
-    terminal.insert_before(line_count + 1, |buf| {
+    let n = textarea.lines().len() as u16;
+    terminal.insert_before(n + 1, |buf| {
         let mut lines: Vec<Line> = Vec::new();
         for (i, l) in body.lines().enumerate() {
             let prefix = if i == 0 {
                 Span::styled(format!("[{stamp}] ❯ "), Style::default().fg(Color::DarkGray))
             } else {
-                Span::raw("           ")
+                Span::raw("            ")
             };
             lines.push(Line::from(vec![prefix, Span::raw(l.to_string())]));
         }
@@ -403,21 +440,20 @@ fn submit(
     Ok(())
 }
 
-fn draw(f: &mut Frame, textarea: &TextArea, vi: &Vi) {
-    let [status, input] =
-        Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(f.area());
+fn draw(f: &mut Frame, textarea: &TextArea, editor: &Editor) {
+    // Single-line-by-default: a left gutter holds the live prompt; the textarea
+    // grows to its right.
+    let [gutter, input] =
+        Layout::horizontal([Constraint::Length(GUTTER_W), Constraint::Min(1)]).areas(f.area());
 
     let clock = chrono::Local::now().format("%H:%M:%S").to_string();
-    let status_line = Line::from(vec![
-        Span::styled(
-            vi.status(),
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("  ·  spike  ·  ", Style::default().fg(Color::DarkGray)),
-        Span::styled(clock, Style::default().fg(Color::LightBlue)),
+    let mode = editor.label();
+    // Prompt prefix only on the FIRST row; continuation rows blank (aligned).
+    let prompt = Line::from(vec![
+        Span::styled(format!("[{clock}] "), Style::default().fg(Color::LightBlue)),
+        Span::styled(mode, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        Span::styled(" ❯ ", Style::default().fg(Color::Rgb(220, 60, 20))),
     ]);
-    f.render_widget(Paragraph::new(status_line), status);
+    f.render_widget(Paragraph::new(prompt), gutter);
     f.render_widget(textarea, input);
 }
