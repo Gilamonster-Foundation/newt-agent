@@ -14,6 +14,7 @@ members = [
     "newt-cli",
     "newt-coder",
     "newt-identity",
+    "newt-scheduler",
     "newt-eval",
     "newt-agent-py",
     "plugins-protocol",
