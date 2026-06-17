@@ -1,6 +1,7 @@
 name: CI
 
-# HOOK PARITY: The lint/test/coverage jobs are mirrored by .githooks/pre-push.
+# HOOK PARITY: The lint/test/rich-tui/coverage jobs are mirrored by
+# .githooks/pre-push (via `just check` + `just cov-ci`).
 # When editing those, update the push hook to match.
 # EXCEPTION: the `windows` job is CI-only — it cannot be mirrored locally (no
 # Windows dev box), so it is deliberately outside hook parity.
@@ -75,6 +76,28 @@ jobs:
         # (the pure accumulator + the mock-websocket rest.rs suite), which are
         # off by default; mirrored in the justfile `test`/`check` recipes.
         run: cargo test --workspace --features newt-data/kernel
+
+  rich-tui:
+    name: rich-tui feature (lint + test)
+    runs-on: ubuntu-latest
+    # PIPELINE PARITY: mirrors the two `rich-tui` steps in the justfile `check`
+    # recipe (and the pre-push hook via `just check`). The TTY rich input
+    # surface (issue #416) is off by default; this job ensures the feature still
+    # builds, lints, and passes its unit tests so it can't rot. Kept OUT of the
+    # coverage job on purpose: its inline event loop is unit-untestable and would
+    # drag the floor down.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: clippy (rich-tui)
+        if: always()
+        run: cargo clippy -p newt-tui --features rich-tui --all-targets -- -D warnings
+      - name: test (rich-tui)
+        if: always()
+        run: cargo test -p newt-tui --features rich-tui
 
   coverage:
     name: Workspace coverage (cargo-llvm-cov)

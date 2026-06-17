@@ -1,11 +1,16 @@
 # Decision: newt's chat surface is a plain scroller (amphibious by design)
 
-**Status:** Accepted (decided by Shawn Hartsock, 2026-06-12)
-**Date:** 2026-06-12
+**Status:** Accepted (decided by Shawn Hartsock, 2026-06-12); **amended
+2026-06-17** by #416 — a two-mode deviation adds an opt-in rich inline input
+surface on a TTY (see the carve-out below). The plain-scroller rule still
+governs the piped/headless path and all output.
+**Date:** 2026-06-12 (amended 2026-06-17)
 **Related:** newt-agent#89 ("is a rich interactive TUI in-scope for newt's
 'sharp minimal binary' identity?" — closed by the newt / gilamonster-agent
 split; this doc records the standing answer), PR #301 (the preamble always
-shows), `docs/decisions/mesh_integration.md` (newt as a mesh worker).
+shows), #416 (two-mode rich inline input — the amendment), PR #419 (the
+`InputSurface` seam that makes it severable), `docs/decisions/mesh_integration.md`
+(newt as a mesh worker).
 
 ---
 
@@ -167,12 +172,36 @@ The practical wins compound with the architectural one:
   non-TTY. Multi-line entry uses the trailing-`\` continuation, and the bang line
   is handed to `$SHELL -c` with the `\` intact so the shell does its own
   line-joining.
+- **The rich inline input surface** (issue #416 — a deliberate **two-mode
+  amendment** to rule 2's "no ratatui in the chat path"). On a TTY, *and* only
+  when the `rich-tui` cargo feature is compiled in, newt's input moves from
+  rustyline to a ratatui **`Viewport::Inline`** editor (tui-textarea) with a
+  status row (live clock + vi/emacs mode) and real multi-line editing incl.
+  vi `o`/`O` — the things rustyline structurally cannot do (kkawakam/rustyline#946,
+  ruled out of scope upstream). Why this stays honest with the amphibian rule:
+  - **Inline, not alt-screen.** `Viewport::Inline` pins a bottom region with no
+    alternate screen; submitted turns and model output go to **real scrollback**
+    (`insert_before`), preserving the SSH/tmux/pipe/`script` parity above.
+  - **Off by default + `is_terminal`-gated.** The feature is absent from the
+    default and headless builds, and even when present it only activates on a
+    TTY with the rich footer. Piped/`newt worker`/headless and **wyvern-agent**
+    keep the rustyline surface unchanged — rustyline is also retained for the
+    `\r`-erased spinners.
+  - **Severable by construction.** Both surfaces implement the `InputSurface`
+    trait (PR #419); the rich one is a feature-gated module so wyvern strips it
+    at compile time. This is the "strippability is a requirement" rule (4)
+    satisfied, not bent.
+  The plain-scroller decision still governs **output** and the non-TTY path;
+  this carve-out is scoped to the *interactive TTY input widget* only.
 
 ## Consequences
 
 - PR review guidance: a diff that introduces `EnterAlternateScreen`,
-  ratatui, or raw-mode event loops anywhere outside the splash is rejected
-  or redirected to gilamonster-agent / monitor repos, citing this decision.
+  ratatui, or raw-mode event loops anywhere outside the splash, the `/plan`
+  editor, or the feature-gated `rich-tui` input surface (the three standing
+  carve-outs) is rejected or redirected to gilamonster-agent / monitor repos,
+  citing this decision. The rich surface is inline-only (no alt screen) and
+  must stay `is_terminal`-gated + behind the `rich-tui` feature.
 - No live progress panes in newt — long-running work reports by printing
   lines (which is also exactly what a headless flight wants in its logs).
 - The `run_pilot` stub in `newt-tui` stays a stub here: a full-screen
