@@ -447,15 +447,16 @@ impl Editor {
                 _ => {}
             }
         }
-        // Modifier-Enter — explicit newline without submitting (terminal
-        // permitting: many terminals send a bare CR for Shift/Ctrl-Enter, in
-        // which case it is indistinguishable from Enter and Ctrl-O is the
-        // reliable fallback). Shared across all edit modes (emacs / vi / a
-        // future nano), since this runs before the per-mode dispatch.
-        if key.code == KeyCode::Enter
-            && (key.modifiers.contains(KeyModifiers::SHIFT)
-                || key.modifiers.contains(KeyModifiers::CONTROL))
-        {
+        // Shift-Enter — explicit newline without submitting (terminal
+        // permitting: many terminals send a bare CR, indistinguishable from
+        // Enter, so Ctrl-O is the reliable fallback). Shared across all edit
+        // modes since this runs before the per-mode dispatch.
+        //
+        // Ctrl-Enter is deliberately NOT bound: on macOS terminals Ctrl-Return
+        // is intercepted at the terminal/OS layer (it opens a popup) and never
+        // reaches us cleanly, so it is unusable cross-platform. Ctrl-O is the
+        // portable newline key.
+        if key.code == KeyCode::Enter && key.modifiers.contains(KeyModifiers::SHIFT) {
             ta.insert_newline();
             return Step::Continue;
         }
@@ -509,9 +510,7 @@ fn make_terminal(height: u16) -> io::Result<Term> {
 
 fn new_textarea() -> TextArea<'static> {
     let mut ta = TextArea::default();
-    ta.set_placeholder_text(
-        "type…  (Enter submit · Ctrl-O / Shift-Enter / Ctrl-Enter newline · Ctrl-C quit)",
-    );
+    ta.set_placeholder_text("type…  (Enter submit · Ctrl-O / Shift-Enter newline · Ctrl-C quit)");
     // Block (reverse) cursor; no cursor-line underline.
     ta.set_cursor_style(Style::default().add_modifier(Modifier::REVERSED));
     ta.set_cursor_line_style(Style::default());
@@ -807,27 +806,32 @@ mod tests {
     }
 
     #[test]
-    fn modifier_enter_inserts_newline_without_submitting() {
-        for mods in [KeyModifiers::SHIFT, KeyModifiers::CONTROL] {
-            let mut ed = emacs_editor();
-            let mut ta = TextArea::default();
-            type_chars(&mut ed, &mut ta, "line one");
-            let nl = KeyEvent::new(KeyCode::Enter, mods);
-            assert_eq!(
-                ed.input(nl, &mut ta),
-                Step::Continue,
-                "{mods:?}-Enter newline"
-            );
-            type_chars(&mut ed, &mut ta, "line two");
-            assert_eq!(ta.lines().len(), 2, "{mods:?}-Enter added a line");
-        }
+    fn shift_enter_inserts_newline_without_submitting() {
+        let nl = || KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT);
+        let mut ed = emacs_editor();
+        let mut ta = TextArea::default();
+        type_chars(&mut ed, &mut ta, "line one");
+        assert_eq!(
+            ed.input(nl(), &mut ta),
+            Step::Continue,
+            "Shift-Enter newline"
+        );
+        type_chars(&mut ed, &mut ta, "line two");
+        assert_eq!(ta.lines().len(), 2, "Shift-Enter added a line");
+
         // Same in vi INSERT mode (shared handling runs before mode dispatch).
         let mut ed = vi_editor();
         let mut ta = TextArea::default();
         type_chars(&mut ed, &mut ta, "vi line");
-        let nl = KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL);
-        assert_eq!(ed.input(nl, &mut ta), Step::Continue);
-        assert_eq!(ta.lines().len(), 2, "Ctrl-Enter newline in vi too");
+        assert_eq!(ed.input(nl(), &mut ta), Step::Continue);
+        assert_eq!(ta.lines().len(), 2, "Shift-Enter newline in vi too");
+
+        // Ctrl-Enter is NOT bound (macOS intercepts it at the terminal layer);
+        // a plain Enter with no continuation still submits, unaffected.
+        let mut ed = emacs_editor();
+        let mut ta = TextArea::default();
+        type_chars(&mut ed, &mut ta, "x");
+        assert_eq!(ed.input(special(KeyCode::Enter), &mut ta), Step::Submit);
     }
 
     #[test]
