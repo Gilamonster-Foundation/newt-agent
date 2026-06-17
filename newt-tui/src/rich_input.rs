@@ -57,7 +57,7 @@ use tui_textarea::{CursorMove, TextArea};
 
 use crate::{footer_continues, InputSurface, ReadOutcome};
 
-const GUTTER_W: u16 = 20; // "[HH:MM:SS] NORMAL ❯ "
+const GUTTER_W: u16 = 24; // wide enough for "[HH:MM:SS] vi NORMAL ❯ "
 const MAX_INPUT_ROWS: u16 = 8;
 /// Auto-gutter threshold: use the left gutter only while it stays under this
 /// fraction of the terminal width; on a squished terminal, drop it and stack
@@ -121,13 +121,23 @@ enum Pending {
 
 /// The vi state machine — a faithful subset of rustyline's `vi_command`, ported
 /// onto tui-textarea. NORMAL/INSERT · `h l j k w b e 0 ^ $ G gg` (counts) ·
-/// `i I a A o O` · `x X D C s S r{c} u Ctrl-R p` · `d/c/y{motion}` + `dd/cc/yy`.
+/// `i I a A o O` · `x X D C s S r{c} u Ctrl-R p J` · `d/c/y{motion}` + `dd/cc/yy`
+/// · Ctrl-O/Ctrl-I jumplist + `:jumps` · i_CTRL-O insert-normal.
 struct Vi {
     mode: Mode,
     pending: Pending,
     count: usize,
     /// `:`-command line buffer (`:wq`, `:q`, …); `Some` while active.
     ex: Option<String>,
+    /// i_CTRL-O: run exactly one Normal command from INSERT, then resume INSERT.
+    insert_normal: bool,
+    /// Jumplist: positions we jumped *from*, older toward the front of `jback`;
+    /// `jfwd` holds positions undone by Ctrl-O so Ctrl-I can redo them. Browser
+    /// back/forward model. Each entry is a `(row, col)` cursor position.
+    jback: Vec<(usize, usize)>,
+    jfwd: Vec<(usize, usize)>,
+    /// A one-shot message to print to scrollback (e.g. `:jumps` output).
+    msg: Option<String>,
 }
 
 impl Vi {
@@ -137,6 +147,10 @@ impl Vi {
             pending: Pending::None,
             count: 0,
             ex: None,
+            insert_normal: false,
+            jback: Vec::new(),
+            jfwd: Vec::new(),
+            msg: None,
         }
     }
 
@@ -146,6 +160,48 @@ impl Vi {
         n
     }
 
+    /// Record the current cursor position as a jump origin (and drop the forward
+    /// history) — called just before a "far" motion (`gg`, `G`).
+    fn record_jump(&mut self, ta: &TextArea) {
+        self.jback.push(ta.cursor());
+        self.jfwd.clear();
+    }
+
+    /// Ctrl-O — jump to an older position (jumplist back).
+    fn jump_back(&mut self, ta: &mut TextArea) {
+        if let Some(prev) = self.jback.pop() {
+            self.jfwd.push(ta.cursor());
+            ta.move_cursor(CursorMove::Jump(prev.0 as u16, prev.1 as u16));
+        }
+    }
+
+    /// Ctrl-I / Tab — jump to a newer position (jumplist forward).
+    fn jump_forward(&mut self, ta: &mut TextArea) {
+        if let Some(next) = self.jfwd.pop() {
+            self.jback.push(ta.cursor());
+            ta.move_cursor(CursorMove::Jump(next.0 as u16, next.1 as u16));
+        }
+    }
+
+    /// Render the jumplist for `:jumps` (1-based row:col, like vim's line:col).
+    fn format_jumps(&self) -> String {
+        let fmt = |v: &[(usize, usize)]| {
+            if v.is_empty() {
+                "—".to_string()
+            } else {
+                v.iter()
+                    .map(|(r, c)| format!("{}:{}", r + 1, c + 1))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            }
+        };
+        format!(
+            "jumps  back: {}  forward: {}",
+            fmt(&self.jback),
+            fmt(&self.jfwd)
+        )
+    }
+
     /// The `:`-command line: `:w`/`:wq`/`:x` submit, `:q`/`:q!` quit. Esc or
     /// backspacing past the `:` cancels.
     fn ex_input(&mut self, key: KeyEvent) -> Step {
@@ -153,11 +209,13 @@ impl Vi {
             KeyCode::Esc => self.ex = None,
             KeyCode::Enter => {
                 let cmd = self.ex.take().unwrap_or_default();
-                return match cmd.as_str() {
-                    "w" | "wq" | "x" | "wq!" | "x!" => Step::Submit,
-                    "q" | "q!" => Step::Eof,
-                    _ => Step::Continue, // unknown command just cancels
-                };
+                match cmd.as_str() {
+                    "w" | "wq" | "x" | "wq!" | "x!" => return Step::Submit,
+                    "q" | "q!" => return Step::Eof,
+                    "jumps" => self.msg = Some(self.format_jumps()),
+                    _ => {} // unknown command just cancels
+                }
+                return Step::Continue;
             }
             KeyCode::Backspace => {
                 if let Some(ex) = self.ex.as_mut() {
@@ -180,15 +238,15 @@ impl Vi {
         if self.ex.is_some() {
             return self.ex_input(key);
         }
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('r') {
-            if self.mode == Mode::Normal {
-                ta.redo();
-            }
-            return Step::Continue;
-        }
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match self.mode {
             Mode::Insert => {
-                if key.code == KeyCode::Esc {
+                // i_CTRL-O: drop to NORMAL for exactly one command, then resume
+                // INSERT. Unlike Esc it does NOT shift the cursor back a char.
+                if ctrl && key.code == KeyCode::Char('o') {
+                    self.mode = Mode::Normal;
+                    self.insert_normal = true;
+                } else if key.code == KeyCode::Esc {
                     self.mode = Mode::Normal;
                     ta.move_cursor(CursorMove::Back);
                 } else {
@@ -196,7 +254,29 @@ impl Vi {
                 }
                 Step::Continue
             }
-            Mode::Normal => self.normal(key, ta),
+            Mode::Normal => {
+                if ctrl && key.code == KeyCode::Char('r') {
+                    ta.redo();
+                    return Step::Continue;
+                }
+                // Ctrl-O = jumplist back, Ctrl-I (Tab) = forward.
+                if ctrl && key.code == KeyCode::Char('o') {
+                    self.jump_back(ta);
+                    return Step::Continue;
+                }
+                if key.code == KeyCode::Tab || key.code == KeyCode::BackTab {
+                    self.jump_forward(ta);
+                    return Step::Continue;
+                }
+                let step = self.normal(key, ta);
+                // i_CTRL-O: once a full command has executed (no operator/count
+                // still pending), return to INSERT.
+                if self.insert_normal && self.pending == Pending::None && self.count == 0 {
+                    self.mode = Mode::Insert;
+                    self.insert_normal = false;
+                }
+                step
+            }
         }
     }
 
@@ -222,6 +302,7 @@ impl Vi {
             Pending::G => {
                 self.pending = Pending::None;
                 if c == 'g' {
+                    self.record_jump(ta); // gg is a jump
                     ta.move_cursor(CursorMove::Top);
                 }
                 return Step::Continue;
@@ -239,6 +320,9 @@ impl Vi {
         }
         if is_motion(c) {
             let n = self.take_count();
+            if c == 'G' {
+                self.record_jump(ta); // G is a jump
+            }
             apply_motion(ta, c, n);
             return Step::Continue;
         }
@@ -284,6 +368,20 @@ impl Vi {
             'C' => {
                 ta.delete_line_by_end();
                 self.mode = Mode::Insert;
+            }
+            'J' => {
+                // Join the line(s) below onto the current line with a single
+                // space. `{count}J` joins `count` lines (min effect: the one
+                // line below). No-op on the last line (nothing below to join).
+                let joins = n.saturating_sub(1).max(1);
+                for _ in 0..joins {
+                    if ta.cursor().0 + 1 >= ta.lines().len() {
+                        break;
+                    }
+                    ta.move_cursor(CursorMove::End);
+                    ta.insert_char(' ');
+                    ta.delete_next_char(); // remove the line break → pull next line up
+                }
             }
             's' => {
                 for _ in 0..n {
@@ -360,10 +458,12 @@ impl Vi {
         }
     }
 
+    /// Status label — `vi` lit up plus the mode, so a vi user always knows the
+    /// surface is modal and which mode they're in.
     fn mode_label(&self) -> &'static str {
         match self.mode {
-            Mode::Normal => "NORMAL",
-            Mode::Insert => "INSERT",
+            Mode::Normal => "vi NORMAL",
+            Mode::Insert => "vi INSERT",
         }
     }
 }
@@ -509,6 +609,11 @@ impl Editor {
             None
         }
     }
+
+    /// Take a one-shot message to print to scrollback (e.g. `:jumps` output).
+    fn take_msg(&mut self) -> Option<String> {
+        self.vi.msg.take()
+    }
 }
 
 fn buffer_is_empty(ta: &TextArea) -> bool {
@@ -606,6 +711,17 @@ fn echo_submitted(terminal: &mut Term, body: &str) -> io::Result<()> {
     })
 }
 
+/// Print a one-line note (e.g. `:jumps` output) into scrollback above the input.
+fn echo_note(terminal: &mut Term, note: &str) -> io::Result<()> {
+    terminal.insert_before(1, |buf| {
+        Paragraph::new(Line::from(Span::styled(
+            note.to_string(),
+            Style::default().fg(Color::Gray),
+        )))
+        .render(buf.area, buf);
+    })
+}
+
 /// The default input surface on a TTY when the `rich-tui` feature is compiled
 /// in: a ratatui inline editor implementing [`InputSurface`].
 pub(crate) struct RichSurface {
@@ -677,7 +793,13 @@ impl RichSurface {
             if key.kind != KeyEventKind::Press {
                 continue;
             }
-            match editor.input(key, &mut textarea) {
+            let step = editor.input(key, &mut textarea);
+            // A command (e.g. `:jumps`) may have queued a note to print above the
+            // input region, into real scrollback.
+            if let Some(note) = editor.take_msg() {
+                echo_note(&mut terminal, &note)?;
+            }
+            match step {
                 Step::Continue => {}
                 Step::Submit => {
                     let body = textarea.lines().join("\n");
@@ -807,11 +929,11 @@ mod tests {
 
     #[test]
     fn use_gutter_drops_when_over_a_third() {
-        // Keep the gutter while 20 <= 0.33*width, i.e. width >= ~61 cols.
+        // Keep the gutter while GUTTER_W (24) <= 0.33*width, i.e. width >= ~73.
         assert!(use_gutter(80), "gutter fits at 80 cols");
-        assert!(use_gutter(61), "20 <= 0.33*61 (20.13) → gutter stays on");
-        assert!(!use_gutter(60), "20 > 0.33*60 (19.8) → drop the gutter");
-        assert!(!use_gutter(50), "20/50 == 0.40 → drop the gutter");
+        assert!(use_gutter(73), "24 <= 0.33*73 (24.09) → gutter stays on");
+        assert!(!use_gutter(72), "24 > 0.33*72 (23.76) → drop the gutter");
+        assert!(!use_gutter(50), "way too narrow → drop the gutter");
         assert!(!use_gutter(0), "zero width never uses a gutter");
     }
 
@@ -909,10 +1031,10 @@ mod tests {
         // Start in INSERT (vi default), type, Esc to NORMAL.
         type_chars(&mut ed, &mut ta, "first");
         ed.input(special(KeyCode::Esc), &mut ta);
-        assert_eq!(ed.label(), "NORMAL");
+        assert_eq!(ed.label(), "vi NORMAL");
         // `o` opens a line below and returns to INSERT.
         ed.input(key('o'), &mut ta);
-        assert_eq!(ed.label(), "INSERT");
+        assert_eq!(ed.label(), "vi INSERT");
         type_chars(&mut ed, &mut ta, "second");
         assert_eq!(ta.lines(), &["first".to_string(), "second".to_string()]);
     }
@@ -970,6 +1092,83 @@ mod tests {
         ed.input(key(':'), &mut ta);
         ed.input(key('q'), &mut ta);
         assert_eq!(ed.input(special(KeyCode::Enter), &mut ta), Step::Eof);
+    }
+
+    /// Build a multi-line buffer in vi: type lines separated by Shift-Enter
+    /// (which inserts a newline in every mode), then Esc to NORMAL at the top.
+    fn vi_buffer(lines: &[&str]) -> (Editor, TextArea<'static>) {
+        let mut ed = vi_editor();
+        let mut ta = TextArea::default();
+        for (i, l) in lines.iter().enumerate() {
+            if i > 0 {
+                ed.input(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT), &mut ta);
+            }
+            type_chars(&mut ed, &mut ta, l);
+        }
+        ed.input(special(KeyCode::Esc), &mut ta); // NORMAL
+        ed.input(key('g'), &mut ta);
+        ed.input(key('g'), &mut ta); // top
+        (ed, ta)
+    }
+
+    #[test]
+    fn vi_uppercase_j_joins_line_below() {
+        let (mut ed, mut ta) = vi_buffer(&["foo", "bar"]);
+        ed.input(key('J'), &mut ta);
+        assert_eq!(ta.lines(), &["foo bar".to_string()], "J joins with a space");
+        // J on the only remaining line is a no-op (nothing below).
+        ed.input(key('J'), &mut ta);
+        assert_eq!(ta.lines(), &["foo bar".to_string()]);
+    }
+
+    #[test]
+    fn vi_count_j_joins_multiple_lines() {
+        let (mut ed, mut ta) = vi_buffer(&["a", "b", "c"]);
+        // 3J joins this line + 2 below → one line.
+        ed.input(key('3'), &mut ta);
+        ed.input(key('J'), &mut ta);
+        assert_eq!(ta.lines(), &["a b c".to_string()]);
+    }
+
+    #[test]
+    fn vi_insert_normal_ctrl_o_runs_one_command() {
+        let mut ed = vi_editor();
+        let mut ta = TextArea::default();
+        type_chars(&mut ed, &mut ta, "hello"); // INSERT, cursor at end
+                                               // i_CTRL-O: one Normal command (`0` → head) then back to INSERT.
+        ed.input(ctrl('o'), &mut ta);
+        assert_eq!(ed.label(), "vi NORMAL", "Ctrl-O drops to NORMAL");
+        ed.input(key('0'), &mut ta);
+        assert_eq!(ed.label(), "vi INSERT", "resumes INSERT after one command");
+        type_chars(&mut ed, &mut ta, "X");
+        assert_eq!(ta.lines(), &["Xhello".to_string()], "inserted at head");
+    }
+
+    #[test]
+    fn vi_jumplist_back_and_forward() {
+        let (mut ed, mut ta) = vi_buffer(&["one", "two", "three"]);
+        // We're at the top (gg recorded a jump from the bottom line).
+        assert_eq!(ta.cursor().0, 0, "gg → row 0");
+        // Ctrl-O jumps back to the pre-gg position (the last line).
+        ed.input(ctrl('o'), &mut ta);
+        assert_eq!(ta.cursor().0, 2, "Ctrl-O → back to row 2");
+        // Ctrl-I (Tab) jumps forward again to the top.
+        ed.input(special(KeyCode::Tab), &mut ta);
+        assert_eq!(ta.cursor().0, 0, "Ctrl-I → forward to row 0");
+    }
+
+    #[test]
+    fn vi_colon_jumps_queues_a_note() {
+        let mut ed = vi_editor();
+        let mut ta = TextArea::default();
+        ed.input(special(KeyCode::Esc), &mut ta);
+        ed.input(key(':'), &mut ta);
+        for c in "jumps".chars() {
+            ed.input(key(c), &mut ta);
+        }
+        ed.input(special(KeyCode::Enter), &mut ta);
+        assert!(ed.take_msg().is_some(), ":jumps queued a scrollback note");
+        assert!(ed.take_msg().is_none(), "note is one-shot");
     }
 
     #[test]
