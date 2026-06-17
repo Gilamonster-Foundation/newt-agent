@@ -25,11 +25,11 @@
 //! - Vi mode adds `:w`/`:wq`/`:x` (submit) and `:q`/`:q!` (quit) ex-commands.
 //!
 //! ## Vi gaps (future faithful-keymap work, issue #416 follow-up)
-//! - **Ctrl-O / Ctrl-I jumplist** (NORMAL: jump back/forward through cursor
-//!   history; `:jumps` to view) — currently a no-op in vi.
-//! - **i_CTRL-O insert-normal** (INSERT: run one Normal command then resume
-//!   INSERT, e.g. `Ctrl-O $`) — currently a no-op in vi.
-//! - Also: `f/F/t/T/;/,` char-search, `.` repeat, `R` overwrite, exact `P`.
+//! - **`.` repeat** (replay the last change, incl. insert sessions) — not yet.
+//! - **`df{c}` / `dt{c}`** (char-search as an operator target) — `f/F/t/T` work
+//!   as standalone motions, but not yet after an operator.
+//! - **`R` overwrite**, exact **`P`**, operator counts (`d2w`), big-word
+//!   distinction (`W`/`B`/`E` alias the small-word motions today).
 //!
 //! ## Not yet (documented limitations of v1)
 //! - No in-session history recall (Up/Down navigate the buffer, not history);
@@ -117,12 +117,16 @@ enum Pending {
     Op(char),
     Replace,
     G,
+    /// Awaiting the target char of an `f`/`F`/`t`/`T` char-search (the stored
+    /// char is the search kind).
+    Find(char),
 }
 
 /// The vi state machine — a faithful subset of rustyline's `vi_command`, ported
 /// onto tui-textarea. NORMAL/INSERT · `h l j k w b e 0 ^ $ G gg` (counts) ·
-/// `i I a A o O` · `x X D C s S r{c} u Ctrl-R p J` · `d/c/y{motion}` + `dd/cc/yy`
-/// · Ctrl-O/Ctrl-I jumplist + `:jumps` · i_CTRL-O insert-normal.
+/// `f F t T` char-search + `; ,` repeat · `i I a A o O` ·
+/// `x X D C s S r{c} u Ctrl-R p J` · `d/c/y{motion}` + `dd/cc/yy` ·
+/// Ctrl-O/Ctrl-I jumplist + `:jumps` · i_CTRL-O insert-normal.
 struct Vi {
     mode: Mode,
     pending: Pending,
@@ -138,6 +142,9 @@ struct Vi {
     jfwd: Vec<(usize, usize)>,
     /// A one-shot message to print to scrollback (e.g. `:jumps` output).
     msg: Option<String>,
+    /// Last `f`/`F`/`t`/`T` search as `(kind, target)`, for `;` (repeat) and
+    /// `,` (repeat reversed).
+    last_find: Option<(char, char)>,
 }
 
 impl Vi {
@@ -151,6 +158,7 @@ impl Vi {
             jback: Vec::new(),
             jfwd: Vec::new(),
             msg: None,
+            last_find: None,
         }
     }
 
@@ -312,6 +320,13 @@ impl Vi {
                 self.pending = Pending::None;
                 return Step::Continue;
             }
+            Pending::Find(kind) => {
+                // `c` is the target char of an f/F/t/T search.
+                self.pending = Pending::None;
+                self.last_find = Some((kind, c));
+                char_search(ta, kind, c);
+                return Step::Continue;
+            }
             Pending::None => {}
         }
         if c.is_ascii_digit() && !(c == '0' && self.count == 0) {
@@ -403,6 +418,19 @@ impl Vi {
             }
             'd' | 'c' | 'y' => self.pending = Pending::Op(c),
             'g' => self.pending = Pending::G,
+            // Char-search: `f`/`F`/`t`/`T` wait for a target char (Pending::Find).
+            'f' | 'F' | 't' | 'T' => self.pending = Pending::Find(c),
+            // `;` repeats the last f/F/t/T; `,` repeats it reversed.
+            ';' => {
+                if let Some((kind, target)) = self.last_find {
+                    char_search(ta, kind, target);
+                }
+            }
+            ',' => {
+                if let Some((kind, target)) = self.last_find {
+                    char_search(ta, reverse_find(kind), target);
+                }
+            }
             ':' => self.ex = Some(String::new()),
             _ => {}
         }
@@ -491,6 +519,37 @@ fn apply_motion(ta: &mut TextArea, c: char, n: usize) {
     };
     for _ in 0..n {
         ta.move_cursor(mv);
+    }
+}
+
+/// Move the cursor by an `f`/`F`/`t`/`T` char-search on the current line:
+/// `f` lands on the next `target`, `t` just before it; `F` lands on the previous
+/// `target`, `T` just after it. No move if the target isn't found on the line.
+fn char_search(ta: &mut TextArea, kind: char, target: char) {
+    let (row, col) = ta.cursor();
+    let chars: Vec<char> = ta.lines()[row].chars().collect();
+    let dest = match kind {
+        'f' => (col + 1..chars.len()).find(|&i| chars[i] == target),
+        't' => (col + 1..chars.len())
+            .find(|&i| chars[i] == target)
+            .map(|i| i - 1),
+        'F' => (0..col).rev().find(|&i| chars[i] == target),
+        'T' => (0..col).rev().find(|&i| chars[i] == target).map(|i| i + 1),
+        _ => None,
+    };
+    if let Some(i) = dest {
+        ta.move_cursor(CursorMove::Jump(row as u16, i as u16));
+    }
+}
+
+/// The opposite search kind, for `,` (repeat reversed): `f`↔`F`, `t`↔`T`.
+fn reverse_find(kind: char) -> char {
+    match kind {
+        'f' => 'F',
+        'F' => 'f',
+        't' => 'T',
+        'T' => 't',
+        other => other,
     }
 }
 
@@ -1155,6 +1214,80 @@ mod tests {
         // Ctrl-I (Tab) jumps forward again to the top.
         ed.input(special(KeyCode::Tab), &mut ta);
         assert_eq!(ta.cursor().0, 0, "Ctrl-I → forward to row 0");
+    }
+
+    /// A single-line vi buffer at NORMAL, cursor at head.
+    fn vi_line(s: &str) -> (Editor, TextArea<'static>) {
+        let mut ed = vi_editor();
+        let mut ta = TextArea::default();
+        type_chars(&mut ed, &mut ta, s);
+        ed.input(special(KeyCode::Esc), &mut ta);
+        ed.input(key('0'), &mut ta); // head
+        (ed, ta)
+    }
+
+    #[test]
+    fn vi_f_and_semicolon_and_comma_char_search() {
+        let (mut ed, mut ta) = vi_line("a.b.c.d");
+        // f. → first dot (col 1).
+        ed.input(key('f'), &mut ta);
+        ed.input(key('.'), &mut ta);
+        assert_eq!(ta.cursor().1, 1, "f. → first dot");
+        // ; → next dot (col 3).
+        ed.input(key(';'), &mut ta);
+        assert_eq!(ta.cursor().1, 3, "; → next dot");
+        // , → previous dot (col 1).
+        ed.input(key(','), &mut ta);
+        assert_eq!(ta.cursor().1, 1, ", → previous dot");
+    }
+
+    #[test]
+    fn vi_t_and_capital_f_char_search() {
+        let (mut ed, mut ta) = vi_line("abcXdef");
+        // tX → just before X (col 2).
+        ed.input(key('t'), &mut ta);
+        ed.input(key('X'), &mut ta);
+        assert_eq!(ta.cursor().1, 2, "tX → col before X");
+        // Move to end, then FX → back onto X (col 3).
+        ed.input(key('$'), &mut ta);
+        ed.input(key('F'), &mut ta);
+        ed.input(key('X'), &mut ta);
+        assert_eq!(ta.cursor().1, 3, "FX → onto X");
+    }
+
+    #[test]
+    fn vi_operator_motions_dw_d_dollar_d0_yy() {
+        // dw deletes to the start of the next word.
+        let (mut ed, mut ta) = vi_line("foo bar baz");
+        ed.input(key('d'), &mut ta);
+        ed.input(key('w'), &mut ta);
+        assert_eq!(ta.lines(), &["bar baz".to_string()], "dw");
+
+        // d$ deletes to end of line.
+        let (mut ed, mut ta) = vi_line("keep DROP this");
+        ed.input(key('f'), &mut ta);
+        ed.input(key('D'), &mut ta); // f D → cursor on the 'D' of DROP
+        ed.input(key('d'), &mut ta);
+        ed.input(key('$'), &mut ta);
+        assert_eq!(ta.lines(), &["keep ".to_string()], "d$");
+
+        // d0 deletes from the cursor back to the beginning of the line.
+        let (mut ed, mut ta) = vi_line("alpha beta");
+        ed.input(key('f'), &mut ta);
+        ed.input(key('b'), &mut ta); // f b → col 6 ('b' of "beta")
+        ed.input(key('d'), &mut ta);
+        ed.input(key('0'), &mut ta);
+        assert_eq!(ta.lines(), &["beta".to_string()], "d0 deletes to BOL");
+
+        // yy then p duplicates the line.
+        let (mut ed, mut ta) = vi_line("dup");
+        ed.input(key('y'), &mut ta);
+        ed.input(key('y'), &mut ta);
+        ed.input(key('p'), &mut ta);
+        assert!(
+            ta.lines().iter().filter(|l| l.contains("dup")).count() >= 1,
+            "yy+p yanks and pastes the line"
+        );
     }
 
     #[test]
