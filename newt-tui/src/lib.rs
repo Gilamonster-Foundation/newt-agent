@@ -3530,9 +3530,15 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
     };
 
     // Hardware telemetry: best-effort, None on non-DGX backends.
-    // try_connect probes DCGM port 9400 on the same host as Ollama; returns
-    // None silently when unreachable so non-DGX paths are unaffected.
-    let mut dgx = dgx_probe::DgxTelemetry::try_connect(&inf_url);
+    // GPU telemetry is a `--verbose`-only display, so set it up only then.
+    // `try_connect` probes DCGM port 9400 (blocking); on success it becomes a
+    // BACKGROUND sampler publishing snapshots on a `watch` channel, so the
+    // per-turn read is instant and never blocks the prompt (issue #414).
+    let mut dgx_rx = if verbose {
+        dgx_probe::DgxTelemetry::try_connect(&inf_url).map(|d| d.into_sampler(2))
+    } else {
+        None
+    };
     let mut inf_kind = choice.kind;
     let mut inf_key = choice.api_key.clone();
     let key_path = newt_identity::default_key_path().ok();
@@ -4231,12 +4237,18 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                     inf_model = choice.model.clone();
                     inf_kind = choice.kind;
                     inf_key = choice.api_key.clone();
-                    // Re-probe DCGM ONLY when the backend URL actually changed.
+                    // Re-probe DCGM ONLY when the backend URL actually changed
+                    // (and only in verbose mode, where the snapshot is shown).
                     // `try_connect` is a blocking ~3s network call (issue #412);
-                    // a `/vi`/`/emacs` toggle (and most slash commands) never
-                    // changes the URL, so it must not pay for a probe.
+                    // a `/vi`/`/emacs` toggle never changes the URL. Dropping the
+                    // old receiver stops the previous background sampler (#414).
                     if inf_url != prev_inf_url {
-                        dgx = dgx_probe::DgxTelemetry::try_connect(&inf_url);
+                        dgx_rx = if verbose {
+                            dgx_probe::DgxTelemetry::try_connect(&inf_url)
+                                .map(|d| d.into_sampler(2))
+                        } else {
+                            None
+                        };
                     }
                     if cap.reapply(resolve_tui(&cfg), workspace) {
                         print_newt(
@@ -4262,8 +4274,10 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                     clean_exit = true;
                     break;
                 } else {
-                    // Pre-turn hardware snapshot (best-effort; None when no DCGM).
-                    let hw_before = dgx.as_ref().map(|d| d.snapshot());
+                    // Pre-turn hardware snapshot: read the latest value the
+                    // background sampler published (instant, never blocks). None
+                    // unless verbose + a reachable DCGM (issue #414).
+                    let hw_before = dgx_rx.as_ref().map(|rx| rx.borrow().clone());
                     if verbose {
                         if let Some(ref snap) = hw_before {
                             if snap.has_data() {
