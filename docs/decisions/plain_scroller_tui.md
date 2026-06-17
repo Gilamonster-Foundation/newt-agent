@@ -121,7 +121,7 @@ The practical wins compound with the architectural one:
   universal `Validator` fallback; Enter submits. rustyline's vi mode does **not**
   implement vi's canonical `o`/`O` open-line, and a `bind_sequence` cmd cannot
   enter vi insert mode — so Ctrl-O is a newt convention, not vi (tracked
-  upstream).
+  upstream: kkawakam/rustyline#946).
 
   **Fully customizable** — it is just the default `[tui] prompt` template.
   Tokens come in a readable `$NAME` form and a terse `\x` form: `$TIMESTAMP`/`\t`,

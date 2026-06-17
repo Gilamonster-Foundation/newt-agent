@@ -1128,8 +1128,8 @@ impl rustyline::Helper for FooterHelper {}
 ///   NB: this is *not* vi's open-line command. Real vi uses `o`/`O` (POSIX:
 ///   "enter text input mode in a new line"), which rustyline's vi mode does not
 ///   implement, and a `bind_sequence` cmd cannot enter vi insert mode — so we
-///   bind a free, reliable control key instead (tracked upstream: rustyline
-///   lacks native `o`/`O`). Ctrl-O itself is not a vi command.
+///   bind a free, reliable control key instead (tracked upstream:
+///   kkawakam/rustyline#946). Ctrl-O itself is not a vi command.
 /// - **Shift-Enter** — same, *terminal permitting*: many terminals send a bare
 ///   CR for Shift-Enter (indistinguishable from Enter), so it only fires where
 ///   the terminal emits a distinct sequence.
