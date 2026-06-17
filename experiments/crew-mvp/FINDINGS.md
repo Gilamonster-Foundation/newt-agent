@@ -65,3 +65,27 @@ python3 experiments/crew-mvp/crew.py          # fib task
 python3 experiments/crew-mvp/crew.py roman    # harder task
 ```
 Prototype only (stdlib Python, hits Ollama `/api/chat` directly) — not production newt.
+
+## Walk step — real repo, real navigation (`crew_repo.py`)
+
+Targeted `newt-core/src/config.rs` (**3,211 lines**) with a real task (add
+`Loadout::is_empty`), verified by a **harness-authored** ground-truth test (the
+planner never sees it — no Goodhart) via `cargo test` against a shared warm target
+(~7s). **Succeeded first pass.**
+
+| signal | result |
+|---|---|
+| navigation on a real crate | ✅ devstral picked `config.rs` + `rg` patterns `^struct Loadout` / `^impl Loadout`, flagged real risks |
+| curated context (spans, not the file) | ✅ planner saw **63 lines vs 3,223** |
+| item-level edit (no full rewrite) | ✅ new `impl Loadout` block inserted after the located item; exact field names |
+| real Rust correctness | ✅ `cargo test loadout_is_empty` PASS (ground-truth, not model-authored) |
+
+**What this de-risks for the Rust build:** grep-driven navigation, span curation,
+item-level inserts, and ground-truth verification all hold on a real 3k-line file.
+The hard part (curation keeping context small + the planner producing valid Rust
+against real APIs) works. The triage→revise loop still hasn't fired (planner one-shots
+these); it needs a genuinely harder task to exercise convergence.
+
+**Verification design that matters:** the test is HARNESS-authored, not planner-authored
+— the planner cannot write a test that passes its own wrong code. That's the verify-gate
+principle (#319) applied to the crew loop.
