@@ -115,7 +115,16 @@ The practical wins compound with the architectural one:
   so the status sits at the at-rest tail while idle, scrolls away naturally as
   output comes, and stays in scrollback as a greppable per-turn **log marker** —
   **no region, no pinning, no cursor games, no width dependency**. Multi-line
-  entry is rustyline's `Validator` (a trailing `\` continues).
+  entry (newt conventions, not canonical editor bindings): **Ctrl-O** inserts a
+  newline (reliable, both modes); **Shift-Enter** does too where the terminal
+  emits a distinct sequence (many send a bare CR, so it often no-ops); a
+  **`"""`/`'''` fence** alone on the first line opens a markdown-style block
+  (Enter adds lines, a matching closing fence submits — terminal-independent);
+  and a trailing **`\`** continues **bang lines only** (multi-line `! …` shell
+  commands — a chat line ending in `\` is literal and submits). Enter submits.
+  rustyline's vi mode does **not** implement vi's canonical `o`/`O` open-line,
+  and a `bind_sequence` cmd cannot enter vi insert mode — so Ctrl-O is a newt
+  convention, not vi (tracked upstream: kkawakam/rustyline#946).
 
   **Fully customizable** — it is just the default `[tui] prompt` template.
   Tokens come in a readable `$NAME` form and a terse `\x` form: `$TIMESTAMP`/`\t`,
@@ -139,6 +148,25 @@ The practical wins compound with the architectural one:
 - **Single-line, same-line indicators** — e.g. the `▸ thinking…` indicator
   erased with `\r` (`print_thinking` / `erase_line`). One line, erased in
   place, never a region.
+- **The `!` bang-escape** — a prompt line starting with `!` runs the remainder
+  as a host command (`bang_command` / `run_bang_escape`) with **inherited
+  stdio**, *between* readlines, so an interactive child (e.g. `! pa login`'s
+  browser SAML) owns the real TTY and its output scrolls live. No alternate
+  screen, no region — it extends rustyline's standing readline carve-out
+  (control is out of `readline` when the child runs; cooked mode already
+  restored). It is a **human action only**: the model has no channel to type at
+  the prompt, so it can never invoke `!`, and it deliberately runs with the
+  user's own host authority (no OCAP/Caveats leash — that governs only
+  *model*-initiated `run_command`). `wyvern-agent` (no interactive loop) has no
+  bang-escape. A `!` line is **recolored live** via rustyline's `Highlighter`
+  (bold `accent` `!` sigil + the whole command in the `shell_mode` tint) so it
+  reads as obviously *not* a chat message — within rustyline's existing carve-out,
+  no region. Two independent slots from a small `[tui.colors]` palette (`accent` /
+  `shell_mode` / `dim`, each a named color or `#rrggbb`, or `"none"` to disable
+  that slot), defaulting to built-ins and dropped entirely under `NO_COLOR` /
+  non-TTY. Multi-line entry uses the trailing-`\` continuation, and the bang line
+  is handed to `$SHELL -c` with the `\` intact so the shell does its own
+  line-joining.
 
 ## Consequences
 
