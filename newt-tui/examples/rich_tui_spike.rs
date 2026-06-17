@@ -73,7 +73,7 @@ struct Vi {
 
 impl Vi {
     fn new() -> Self {
-        Vi {
+        Self {
             mode: Mode::Insert,
             pending: Pending::None,
             count: 0,
@@ -349,7 +349,7 @@ struct Editor {
 
 impl Editor {
     fn new(edit: Edit) -> Self {
-        Editor {
+        Self {
             edit,
             vi: Vi::new(),
         }
@@ -425,7 +425,9 @@ fn make_terminal(height: u16) -> io::Result<Term> {
 
 fn new_textarea() -> TextArea<'static> {
     let mut ta = TextArea::default();
-    ta.set_placeholder_text("type…  (Esc → vi NORMAL · o/O open line · Ctrl-D submit · Ctrl-C quit)");
+    ta.set_placeholder_text(
+        "type…  (Esc → vi NORMAL · o/O open line · Ctrl-D submit · Ctrl-C quit)",
+    );
     // block (reverse) cursor; no cursor-line underline.
     ta.set_cursor_style(Style::default().add_modifier(Modifier::REVERSED));
     ta.set_cursor_line_style(Style::default());
