@@ -9,6 +9,10 @@ pub mod dgx_probe;
 mod mcp;
 mod mcp_token;
 pub mod probe;
+// The TTY rich inline input surface (issue #416). Feature-gated so the default
+// and headless/wyvern builds never compile it in — newt stays amphibious.
+#[cfg(feature = "rich-tui")]
+mod rich_input;
 mod setup;
 mod wizard;
 
@@ -839,7 +843,7 @@ fn trace_mode(cfg: &newt_core::Config) -> bool {
 }
 
 /// Build a rustyline config reading edit mode from env then config file.
-fn build_rl_config() -> rustyline::config::Config {
+pub(crate) fn build_rl_config() -> rustyline::config::Config {
     let em = std::env::var("NEWT_EDIT_MODE")
         .ok()
         .and_then(|v| match v.to_lowercase().as_str() {
@@ -1075,7 +1079,7 @@ fn block_is_closed(input: &str, delim: &str) -> bool {
 /// - a **`! …` host-shell line** continues on a trailing `\` so multi-line shell
 ///   commands work. A chat line submits on Enter even if it ends with `\` (that
 ///   backslash is literal text) — `\`-continuation is bang-only.
-fn footer_continues(input: &str) -> bool {
+pub(crate) fn footer_continues(input: &str) -> bool {
     if let Some(delim) = block_open_delim(input) {
         return !block_is_closed(input, delim);
     }
@@ -1180,7 +1184,7 @@ fn install_footer_helper(
 /// `rustyline::ReadlineError` directly, so a second surface (the ratatui inline
 /// rich input, issue #416) can satisfy the same contract without leaking its own
 /// error types into `run_chat`.
-enum ReadOutcome {
+pub(crate) enum ReadOutcome {
     /// A submitted line. May contain `\`-continued newlines the loop rejoins.
     Line(String),
     /// Ctrl-C — interrupt; the loop exits cleanly.
@@ -1203,7 +1207,7 @@ enum ReadOutcome {
 ///   path, the headless/wyvern tier, and `\r`-erased spinners. Always built.
 /// - a ratatui inline **rich** surface — TTY multi-line input + status row,
 ///   behind a `rich-tui` cargo feature (issue #416, next PR).
-trait InputSurface {
+pub(crate) trait InputSurface {
     /// Read one turn, given the per-turn `prompt` (built fresh by the caller so
     /// the rich default's timestamp is current). Returns a [`ReadOutcome`];
     /// only an *unexpected* editor error propagates as `Err`.
@@ -3856,11 +3860,34 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
     // fresh each turn (below) so the timestamp is current.
     let footer_on = footer_rich_enabled(footer_mode(), io::stdout().is_terminal());
     // Input goes through the InputSurface seam so the chat dispatch below is
-    // widget-agnostic; today's only surface is rustyline. The palette is resolved
-    // unconditionally (it is pure) and only installed when the footer is on.
+    // widget-agnostic. Two-mode (issue #416): on a TTY with the rich footer and
+    // the `rich-tui` feature compiled in, use the ratatui inline rich surface;
+    // otherwise (piped / headless / wyvern / footer off, or the feature absent)
+    // the rustyline surface. The palette is resolved unconditionally (it is
+    // pure) and only installed by the rustyline surface when the footer is on.
     let colors = resolve_tui(&cfg).map(|t| t.colors).unwrap_or_default();
-    let mut surface =
-        RustylineSurface::new(footer_on, resolve_palette(&colors, color), history_path)?;
+    let mut surface: Box<dyn InputSurface> = {
+        #[cfg(feature = "rich-tui")]
+        {
+            if footer_on && io::stdout().is_terminal() {
+                Box::new(rich_input::RichSurface::new(history_path)?)
+            } else {
+                Box::new(RustylineSurface::new(
+                    footer_on,
+                    resolve_palette(&colors, color),
+                    history_path,
+                )?)
+            }
+        }
+        #[cfg(not(feature = "rich-tui"))]
+        {
+            Box::new(RustylineSurface::new(
+                footer_on,
+                resolve_palette(&colors, color),
+                history_path,
+            )?)
+        }
+    };
     // Mark all open fds (terminal, history file, sockets) as O_CLOEXEC so
     // subprocesses spawned by run_command don't inherit them. This is the
     // primary defence against EMFILE from cargo test / rustc worker floods.

@@ -38,6 +38,19 @@ tracing.workspace = true
 sha2.workspace = true
 base64.workspace = true
 getrandom.workspace = true
+# Multi-line editor widget for the rich inline TUI input surface (issue #416).
+# Optional + gated by the `rich-tui` feature so the headless / wyvern tier and
+# the default build never compile it in — newt stays amphibious. ratatui /
+# crossterm / chrono are already non-optional deps (code + pilot mode), so the
+# feature adds only this one crate.
+tui-textarea = { version = "0.7.0", optional = true }
+
+[features]
+# The TTY rich inline input surface (ratatui Viewport::Inline + tui-textarea):
+# status row, live clock, multi-line vi/emacs editing. OFF by default — the
+# rustyline surface is the only one compiled unless this is enabled, and the
+# `is_terminal()` runtime gate still applies on top of the feature.
+rich-tui = ["dep:tui-textarea"]
 
 # NOTE (Step 9.7): the direct agent-bridle dependency moved to newt-core with
 # `execute_tool` — the bridle leash now confines `run_command` / `web_fetch`
@@ -53,8 +66,12 @@ agent-mesh-protocol = { workspace = true }
 # HTTP mocking for the tool-call loop tests (cap honoured + graceful cap-exit
 # issuing a final tools-disabled completion). Mirrors newt-inference's pattern.
 wiremock.workspace = true
-tui-textarea = "0.7.0"
-chrono.workspace = true
 
 [lints]
 workspace = true
+
+# The rich-TUI spike demo + the production rich surface both need tui-textarea,
+# so the example only builds under the feature that provides it.
+[[example]]
+name = "rich_tui_spike"
+required-features = ["rich-tui"]
