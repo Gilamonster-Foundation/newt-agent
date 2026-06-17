@@ -115,13 +115,16 @@ The practical wins compound with the architectural one:
   so the status sits at the at-rest tail while idle, scrolls away naturally as
   output comes, and stays in scrollback as a greppable per-turn **log marker** —
   **no region, no pinning, no cursor games, no width dependency**. Multi-line
-  entry uses **newt's own keys, not canonical editor bindings**: **Ctrl-O**
-  (reliable, both modes) and **Shift-Enter** (terminal permitting — many send a
-  bare CR) insert a newline via a bound `Cmd`, and a trailing `\` is the
-  universal `Validator` fallback; Enter submits. rustyline's vi mode does **not**
-  implement vi's canonical `o`/`O` open-line, and a `bind_sequence` cmd cannot
-  enter vi insert mode — so Ctrl-O is a newt convention, not vi (tracked
-  upstream: kkawakam/rustyline#946).
+  entry (newt conventions, not canonical editor bindings): **Ctrl-O** inserts a
+  newline (reliable, both modes); **Shift-Enter** does too where the terminal
+  emits a distinct sequence (many send a bare CR, so it often no-ops); a
+  **`"""`/`'''` fence** alone on the first line opens a markdown-style block
+  (Enter adds lines, a matching closing fence submits — terminal-independent);
+  and a trailing **`\`** continues **bang lines only** (multi-line `! …` shell
+  commands — a chat line ending in `\` is literal and submits). Enter submits.
+  rustyline's vi mode does **not** implement vi's canonical `o`/`O` open-line,
+  and a `bind_sequence` cmd cannot enter vi insert mode — so Ctrl-O is a newt
+  convention, not vi (tracked upstream: kkawakam/rustyline#946).
 
   **Fully customizable** — it is just the default `[tui] prompt` template.
   Tokens come in a readable `$NAME` form and a terse `\x` form: `$TIMESTAMP`/`\t`,

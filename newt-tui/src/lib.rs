@@ -1052,10 +1052,34 @@ fn resolve_palette(colors: &newt_core::ColorsConfig, color_enabled: bool) -> Pal
     }
 }
 
-/// Whether the input wants another line: a trailing `\` continues (the
-/// shell/Python idiom). Pure for testing — the `Validator` is a thin wrapper.
+/// If the first line is a lone triple-quote fence (`"""` or `'''`), return it —
+/// the opener of a markdown-style multi-line block.
+fn block_open_delim(input: &str) -> Option<&'static str> {
+    match input.lines().next().unwrap_or("").trim() {
+        "\"\"\"" => Some("\"\"\""),
+        "'''" => Some("'''"),
+        _ => None,
+    }
+}
+
+/// Whether a `"""`/`'''` block opened on the first line has been closed by a
+/// matching fence on any later line.
+fn block_is_closed(input: &str, delim: &str) -> bool {
+    input.lines().skip(1).any(|l| l.trim() == delim)
+}
+
+/// Whether the input wants another line (the `Validator`'s pure core):
+/// - a **triple-quote block** (`"""`/`'''` alone on the first line) stays open
+///   until a matching closing fence — Enter adds lines, the closing fence
+///   submits. The fences are kept and flow to the model as a fenced block.
+/// - a **`! …` host-shell line** continues on a trailing `\` so multi-line shell
+///   commands work. A chat line submits on Enter even if it ends with `\` (that
+///   backslash is literal text) — `\`-continuation is bang-only.
 fn footer_continues(input: &str) -> bool {
-    input.ends_with('\\')
+    if let Some(delim) = block_open_delim(input) {
+        return !block_is_closed(input, delim);
+    }
+    input.trim_start().starts_with('!') && input.ends_with('\\')
 }
 
 impl rustyline::completion::Completer for FooterHelper {
@@ -1307,14 +1331,38 @@ mod footer_tests {
     }
 
     #[test]
-    fn continuation_triggers_on_trailing_backslash() {
-        // A trailing backslash means "keep typing" (multi-line continuation).
-        assert!(footer_continues("write a\\"));
+    fn backslash_continuation_is_bang_only() {
+        // A `! …` host-shell line continues on a trailing backslash.
+        assert!(footer_continues("! date \\"));
+        // A chat line submits on Enter even when it ends with `\` (literal).
+        assert!(!footer_continues("write a\\"));
         // Balanced input submits.
         assert!(!footer_continues("write a function"));
         assert!(!footer_continues(""));
         // The rejoin the REPL applies turns a `\`-break into a real newline.
         assert_eq!("foo\\\nbar".replace("\\\n", "\n"), "foo\nbar");
+    }
+
+    #[test]
+    fn triple_quote_block_stays_open_until_closed() {
+        // `"""`/`'''` alone on line 1 opens a block; it stays open until a
+        // matching closing fence appears on a later line.
+        assert!(footer_continues("\"\"\""));
+        assert!(footer_continues("\"\"\"\nline one"));
+        assert!(footer_continues("\"\"\"\nline one\nline two"));
+        assert!(
+            !footer_continues("\"\"\"\nline one\n\"\"\""),
+            "closing fence submits"
+        );
+        // `'''` works too, and mismatched fences don't close.
+        assert!(footer_continues("'''\nbody"));
+        assert!(!footer_continues("'''\nbody\n'''"));
+        assert!(
+            footer_continues("'''\nbody\n\"\"\""),
+            "mismatched fence stays open"
+        );
+        // A leading `"""` that is NOT alone on the first line is not a fence.
+        assert!(!footer_continues("\"\"\" inline text"));
     }
 }
 
