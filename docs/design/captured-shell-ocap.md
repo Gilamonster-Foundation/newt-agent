@@ -4,6 +4,16 @@
 `unsound-needs-rework`** — the authority *algebra* is sound; the *enforcement* is unbuilt.
 Read §4 before building anything that holds a live credential.
 
+> **Amended by [`captured-shell-cross-platform.md`](./captured-shell-cross-platform.md).**
+> This doc left two things implicit that that companion makes binding: (1) it
+> treats `brush` as the interception layer, but brush is **not wired** yet
+> (agent-bridle `stub-shell`); (2) its B1 ("Landlock + seccomp + netns + egress
+> proxy") is **Linux-only**, and newt is tri-platform. The companion grounds the
+> long-term **brush-as-portable-interpreter-gate** vision, specifies B1 **per OS**
+> (Linux / macOS Seatbelt / Windows AppContainer), and adds a deliberate native
+> `bash`/`zsh`/`powershell` carve-out for compatibility. Where this doc says
+> "B1," read "the **host platform's** B1" per that matrix.
+
 ## 1. The problem
 
 Real workflows need real short-lived scoped credentials. The motivating case: a corporate
