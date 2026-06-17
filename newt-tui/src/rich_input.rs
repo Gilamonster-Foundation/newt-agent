@@ -45,7 +45,7 @@ use ratatui::widgets::{Paragraph, Widget};
 use ratatui::{Frame, Terminal, TerminalOptions, Viewport};
 use tui_textarea::{CursorMove, TextArea};
 
-use crate::{build_rl_config, footer_continues, InputSurface, ReadOutcome};
+use crate::{footer_continues, InputSurface, ReadOutcome};
 
 const GUTTER_W: u16 = 20; // "[HH:MM:SS] NORMAL ❯ "
 const MAX_INPUT_ROWS: u16 = 8;
@@ -58,6 +58,28 @@ type Term = Terminal<CrosstermBackend<Stdout>>;
 
 fn use_gutter(width: u16) -> bool {
     width > 0 && (GUTTER_W as f32) <= GUTTER_MAX_FRACTION * width as f32
+}
+
+/// Resolve the effective gutter / input-indent width (columns) from the
+/// `[tui] gutter` setting and the terminal width:
+/// - `None` (auto): a prompt-width gutter (`GUTTER_W`) when it stays under ~1/3
+///   of the width, else `0` (stacked prompt).
+/// - `Some(n)`: exactly `n`, clamped so it can't consume the whole line.
+///
+/// A result `>= GUTTER_W` is wide enough to hold the inline prompt; a smaller
+/// result (including `0`) stacks the prompt on its own row and indents the input
+/// that many columns.
+fn resolve_gutter(setting: Option<u16>, width: u16) -> u16 {
+    match setting {
+        None => {
+            if use_gutter(width) {
+                GUTTER_W
+            } else {
+                0
+            }
+        }
+        Some(n) => n.min(width.saturating_sub(1)),
+    }
 }
 
 /// One step of the editor: what the loop should do after handling a key.
@@ -363,19 +385,29 @@ fn apply_motion(ta: &mut TextArea, c: char, n: usize) {
 }
 
 /// The editor mode. **Default is Emacs** (tui-textarea's native, emacs/nano-ish
-/// bindings); Vi is opt-in via `[tui] edit_mode` / `/vi`. Read from the same
-/// source as the rustyline path ([`build_rl_config`]).
+/// bindings); Vi is opt-in via `[tui] edit_mode` / `/vi`. `Nano` is modeless and
+/// behaves like Emacs today — it differs only in label. Read from the same
+/// source as the rustyline path ([`crate::resolve_edit_mode`]).
 #[derive(Clone, Copy, PartialEq)]
 enum Edit {
     Emacs,
+    Nano,
     Vi,
 }
 
+impl Edit {
+    /// Whether this mode uses tui-textarea's native (modeless, emacs-style)
+    /// bindings — true for both Emacs and Nano.
+    fn is_modeless(self) -> bool {
+        matches!(self, Self::Emacs | Self::Nano)
+    }
+}
+
 fn current_edit() -> Edit {
-    if build_rl_config().edit_mode() == rustyline::config::EditMode::Vi {
-        Edit::Vi
-    } else {
-        Edit::Emacs
+    match crate::resolve_edit_mode() {
+        newt_core::EditMode::Vi => Edit::Vi,
+        newt_core::EditMode::Nano => Edit::Nano,
+        newt_core::EditMode::Emacs => Edit::Emacs,
     }
 }
 
@@ -415,8 +447,15 @@ impl Editor {
                 _ => {}
             }
         }
-        // Shift-Enter (terminal permitting) — explicit newline.
-        if key.code == KeyCode::Enter && key.modifiers.contains(KeyModifiers::SHIFT) {
+        // Modifier-Enter — explicit newline without submitting (terminal
+        // permitting: many terminals send a bare CR for Shift/Ctrl-Enter, in
+        // which case it is indistinguishable from Enter and Ctrl-O is the
+        // reliable fallback). Shared across all edit modes (emacs / vi / a
+        // future nano), since this runs before the per-mode dispatch.
+        if key.code == KeyCode::Enter
+            && (key.modifiers.contains(KeyModifiers::SHIFT)
+                || key.modifiers.contains(KeyModifiers::CONTROL))
+        {
             ta.insert_newline();
             return Step::Continue;
         }
@@ -430,19 +469,18 @@ impl Editor {
             }
             return Step::Submit;
         }
-        match self.edit {
-            // Emacs/nano: hand the key to tui-textarea's built-in bindings.
-            Edit::Emacs => {
-                ta.input(key);
-                Step::Continue
-            }
-            Edit::Vi => self.vi.input(key, ta),
+        if self.edit.is_modeless() {
+            // Emacs / nano: hand the key to tui-textarea's built-in bindings.
+            ta.input(key);
+            return Step::Continue;
         }
+        self.vi.input(key, ta)
     }
 
     fn label(&self) -> &'static str {
         match self.edit {
             Edit::Emacs => "emacs",
+            Edit::Nano => "nano",
             Edit::Vi => self.vi.mode_label(),
         }
     }
@@ -471,7 +509,9 @@ fn make_terminal(height: u16) -> io::Result<Term> {
 
 fn new_textarea() -> TextArea<'static> {
     let mut ta = TextArea::default();
-    ta.set_placeholder_text("type…  (Enter submit · Ctrl-O newline · Ctrl-C quit)");
+    ta.set_placeholder_text(
+        "type…  (Enter submit · Ctrl-O / Shift-Enter / Ctrl-Enter newline · Ctrl-C quit)",
+    );
     // Block (reverse) cursor; no cursor-line underline.
     ta.set_cursor_style(Style::default().add_modifier(Modifier::REVERSED));
     ta.set_cursor_line_style(Style::default());
@@ -501,21 +541,25 @@ fn prompt_line(editor: &Editor) -> Line<'static> {
     ])
 }
 
-fn draw(f: &mut Frame, textarea: &TextArea, editor: &Editor) {
+fn draw(f: &mut Frame, textarea: &TextArea, editor: &Editor, gutter: Option<u16>) {
     let area = f.area();
     let prompt = prompt_line(editor);
-    if use_gutter(area.width) {
-        // Wide enough: single-line-by-default — prompt in a left gutter, input
+    let g = resolve_gutter(gutter, area.width);
+    if g >= GUTTER_W {
+        // Wide enough to hold the inline prompt: prompt in the left gutter, input
         // to its right (continuation lines align under the input).
-        let [gutter, input] =
-            Layout::horizontal([Constraint::Length(GUTTER_W), Constraint::Min(1)]).areas(area);
-        f.render_widget(Paragraph::new(prompt), gutter);
+        let [gutter_area, input] =
+            Layout::horizontal([Constraint::Length(g), Constraint::Min(1)]).areas(area);
+        f.render_widget(Paragraph::new(prompt), gutter_area);
         f.render_widget(textarea, input);
     } else {
-        // Squished: stack the prompt on its own row, input full-width.
-        let [prow, input] =
+        // Narrow (incl. 0): stack the prompt on its own row, then indent the
+        // input by `g` columns (0 = flush-left, the old squished behavior).
+        let [prow, rest] =
             Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(area);
         f.render_widget(Paragraph::new(prompt), prow);
+        let [_pad, input] =
+            Layout::horizontal([Constraint::Length(g), Constraint::Min(1)]).areas(rest);
         f.render_widget(textarea, input);
     }
 }
@@ -547,6 +591,9 @@ pub(crate) struct RichSurface {
     history_path: Option<PathBuf>,
     /// Entries submitted since the last `save_history`, appended on save.
     unsaved: Vec<String>,
+    /// `[tui] gutter` setting: `None` = auto, `Some(0)` = off, `Some(n)` = an
+    /// n-column input indent (see [`resolve_gutter`]).
+    gutter: Option<u16>,
 }
 
 impl RichSurface {
@@ -555,6 +602,7 @@ impl RichSurface {
             edit: current_edit(),
             history_path,
             unsaved: Vec::new(),
+            gutter: crate::resolve_gutter_setting(),
         })
     }
 
@@ -570,21 +618,32 @@ impl RichSurface {
 
     fn event_loop(&self) -> io::Result<ReadOutcome> {
         let mut cur_h = 1u16;
+        // A freshly built inline terminal has a blank back-buffer, so ratatui's
+        // frame diff won't rewrite cells the new frame doesn't touch — stale
+        // content from a prior turn (or the smaller pre-resize region) bleeds
+        // through. `clear()` forces a full repaint of the region so every turn /
+        // resize starts clean.
         let mut terminal = make_terminal(cur_h)?;
+        terminal.clear()?;
         let mut textarea = new_textarea();
         let mut editor = Editor::new(self.edit);
         loop {
-            // Grow/shrink the inline viewport to the input. In no-gutter mode the
-            // prompt needs its own row on top.
+            // Grow/shrink the inline viewport to the input. When the gutter is
+            // too narrow to hold the inline prompt, it needs its own row on top.
             let (cols, _) = crossterm::terminal::size()?;
-            let prompt_rows = if use_gutter(cols) { 0 } else { 1 };
+            let prompt_rows = if resolve_gutter(self.gutter, cols) >= GUTTER_W {
+                0
+            } else {
+                1
+            };
             let want = (textarea.lines().len() as u16 + prompt_rows)
                 .clamp(1, MAX_INPUT_ROWS + prompt_rows);
             if want != cur_h {
                 terminal = make_terminal(want)?;
+                terminal.clear()?;
                 cur_h = want;
             }
-            terminal.draw(|f| draw(f, &textarea, &editor))?;
+            terminal.draw(|f| draw(f, &textarea, &editor, self.gutter))?;
 
             // 250ms timeout drives the live clock when idle.
             if !event::poll(Duration::from_millis(250))? {
@@ -647,8 +706,10 @@ impl InputSurface for RichSurface {
     }
 
     fn reload(&mut self) -> anyhow::Result<()> {
-        // A `/vi` · `/emacs` switch changed NEWT_EDIT_MODE; pick it up.
+        // A `/vi` · `/emacs` · `/nano` switch changed NEWT_EDIT_MODE; pick it up
+        // (and re-read the gutter setting in case it changed too).
         self.edit = current_edit();
+        self.gutter = crate::resolve_gutter_setting();
         Ok(())
     }
 }
@@ -681,6 +742,47 @@ mod tests {
         }
     }
 
+    fn nano_editor() -> Editor {
+        Editor::new(Edit::Nano)
+    }
+
+    #[test]
+    fn nano_is_modeless_and_labeled() {
+        let mut ed = nano_editor();
+        let mut ta = TextArea::default();
+        assert_eq!(ed.label(), "nano");
+        // Modeless like emacs: typing inserts text, no NORMAL mode.
+        type_chars(&mut ed, &mut ta, "plain text");
+        assert_eq!(ed.label(), "nano", "no mode flip");
+        assert_eq!(ta.lines(), &["plain text".to_string()]);
+        // Enter still submits; Ctrl-O still newlines (shared handling).
+        assert_eq!(ed.input(ctrl('o'), &mut ta), Step::Continue);
+        assert_eq!(ed.input(special(KeyCode::Enter), &mut ta), Step::Submit);
+        assert!(Edit::Nano.is_modeless() && Edit::Emacs.is_modeless());
+        assert!(!Edit::Vi.is_modeless());
+    }
+
+    #[test]
+    fn resolve_gutter_auto_off_and_fixed() {
+        // auto (None): prompt-width gutter when it fits, else 0.
+        assert_eq!(
+            resolve_gutter(None, 80),
+            GUTTER_W,
+            "auto wide → inline gutter"
+        );
+        assert_eq!(resolve_gutter(None, 50), 0, "auto squished → stacked (0)");
+        // off (Some(0)): always 0.
+        assert_eq!(resolve_gutter(Some(0), 80), 0);
+        // fixed N: exactly N, clamped to the usable width.
+        assert_eq!(resolve_gutter(Some(3), 80), 3, "3-space indent");
+        assert_eq!(
+            resolve_gutter(Some(25), 80),
+            25,
+            "wide enough to hold the prompt"
+        );
+        assert_eq!(resolve_gutter(Some(200), 80), 79, "clamped to width-1");
+    }
+
     #[test]
     fn use_gutter_drops_when_over_a_third() {
         // Keep the gutter while 20 <= 0.33*width, i.e. width >= ~61 cols.
@@ -702,6 +804,30 @@ mod tests {
         assert_eq!(ta.lines().len(), 2, "two lines after Ctrl-O");
         // Plain Enter submits.
         assert_eq!(ed.input(special(KeyCode::Enter), &mut ta), Step::Submit);
+    }
+
+    #[test]
+    fn modifier_enter_inserts_newline_without_submitting() {
+        for mods in [KeyModifiers::SHIFT, KeyModifiers::CONTROL] {
+            let mut ed = emacs_editor();
+            let mut ta = TextArea::default();
+            type_chars(&mut ed, &mut ta, "line one");
+            let nl = KeyEvent::new(KeyCode::Enter, mods);
+            assert_eq!(
+                ed.input(nl, &mut ta),
+                Step::Continue,
+                "{mods:?}-Enter newline"
+            );
+            type_chars(&mut ed, &mut ta, "line two");
+            assert_eq!(ta.lines().len(), 2, "{mods:?}-Enter added a line");
+        }
+        // Same in vi INSERT mode (shared handling runs before mode dispatch).
+        let mut ed = vi_editor();
+        let mut ta = TextArea::default();
+        type_chars(&mut ed, &mut ta, "vi line");
+        let nl = KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL);
+        assert_eq!(ed.input(nl, &mut ta), Step::Continue);
+        assert_eq!(ta.lines().len(), 2, "Ctrl-Enter newline in vi too");
     }
 
     #[test]
