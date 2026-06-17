@@ -482,7 +482,7 @@ fn submit(terminal: &mut Term, textarea: &mut TextArea) -> io::Result<()> {
         let mut lines: Vec<Line> = Vec::new();
         for (i, l) in body.lines().enumerate() {
             let prefix = if i == 0 {
-                Span::styled(format!("[{stamp}] ❯ "), Style::default().fg(Color::DarkGray))
+                Span::styled(format!("[{stamp}] ❯ "), Style::default().fg(Color::Gray))
             } else {
                 Span::raw("            ")
             };
@@ -504,15 +504,17 @@ fn prompt_line(editor: &Editor) -> Line<'static> {
     }
     let clock = chrono::Local::now().format("%H:%M:%S").to_string();
     Line::from(vec![
-        // Dim timestamp (maps to `[tui.colors] dim`), not a loud blue.
-        Span::styled(format!("[{clock}] "), Style::default().fg(Color::DarkGray)),
+        // LIGHT timestamp — high luminance reads better than a deep/dark tone
+        // (accessibility default; maps to `[tui.colors] dim`).
+        Span::styled(format!("[{clock}] "), Style::default().fg(Color::Gray)),
         Span::styled(
             editor.label().to_string(),
             Style::default()
-                .fg(Color::Yellow)
+                .fg(Color::LightYellow)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(" ❯ ", Style::default().fg(Color::Rgb(220, 60, 20))),
+        // Lighter, warmer orange caret (not the deep brand red-orange).
+        Span::styled(" ❯ ", Style::default().fg(Color::Rgb(255, 165, 90))),
     ])
 }
 
