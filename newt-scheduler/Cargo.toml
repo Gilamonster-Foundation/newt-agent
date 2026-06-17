@@ -13,3 +13,9 @@ categories = ["development-tools"]
 
 [dependencies]
 newt-core.workspace = true
+newt-inference.workspace = true
+async-trait.workspace = true
+anyhow.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true }

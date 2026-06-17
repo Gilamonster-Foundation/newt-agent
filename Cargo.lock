@@ -2201,7 +2201,11 @@ dependencies = [
 name = "newt-scheduler"
 version = "0.6.8"
 dependencies = [
+ "anyhow",
+ "async-trait",
  "newt-core",
+ "newt-inference",
+ "tokio",
 ]
 
 [[package]]
