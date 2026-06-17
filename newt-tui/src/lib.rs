@@ -2920,10 +2920,11 @@ pub(crate) mod test_env_guard {
     }
 
     /// Read guard for `#[tokio::test]` tests — async-aware, safe to hold
-    /// across await points. Its only callers are the `#[cfg(unix)]`
-    /// run_command confinement tests, so gate it the same way or the
-    /// Windows build trips `-D warnings` on dead code.
-    #[cfg(unix)]
+    /// across await points (the sync `env_read_guard`'s `blocking_read`
+    /// panics inside a tokio runtime). Cross-platform, unlike
+    /// `env_write_guard_async`: the note-sink wiring tests read
+    /// HOME-dependent prompt state on every OS, so this must exist on
+    /// Windows too (and is used there, so no dead-code warning).
     pub(crate) async fn env_read_guard_async() -> RwLockReadGuard<'static, ()> {
         ENV_RW.read().await
     }
@@ -8365,6 +8366,11 @@ mod note_sink_wiring_tests {
 
     #[tokio::test]
     async fn remember_and_save_note_hit_the_same_store() {
+        // The note path is a tempdir, but the scan/curator + prompt assembly
+        // read HOME-dependent config; hold the async env read guard so the
+        // cw-400 test's HOME swap (write guard) can't race this. Async-aware:
+        // the sync `blocking_read` would panic inside this tokio runtime.
+        let _env = crate::test_env_guard::env_read_guard_async().await;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("NOTES.md");
         let mut memory = manager_with_store(&path).await;
@@ -8468,6 +8474,10 @@ mod note_sink_wiring_tests {
     async fn mid_session_save_does_not_change_the_frozen_prompt() {
         // Frozen-snapshot stays frozen (notes.rs contract): a save_note write
         // mid-session must not alter the system-prompt block this session.
+        // `build_system_prompt_additions` reads HOME-dependent state, so the
+        // before/after snapshots must see a stable HOME — hold the read guard
+        // against the cw-400 test's HOME swap.
+        let _env = crate::test_env_guard::env_read_guard_async().await;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("NOTES.md");
         std::fs::write(&path, "initial fact\n§\n").unwrap();
@@ -10231,6 +10241,11 @@ mod mode_command_tests {
     /// loader (`load_body_from`) over a mock skills dir — no reimplementation.
     #[test]
     fn build_mode_loads_skill_body_and_applies_preset_atomically() {
+        // `skill_search_dirs()` appends the HOME-relative `~/.newt/skills`, so
+        // hold the env read guard: the cw-400 test (this binary) swaps HOME
+        // under a write guard, and a mid-test swap would change what
+        // `load_body_from` resolves. Serializes against the writer only.
+        let _env = crate::test_env_guard::env_read_guard();
         let skills = tempfile::TempDir::new().unwrap();
         write_skill(skills.path(), "oncall-triage", "Read logs. Do not deploy.");
         let cfg = triage_config(skills.path());
@@ -10261,6 +10276,7 @@ mod mode_command_tests {
     /// silent skill-load without the clamp (that would be a false claim).
     #[test]
     fn build_mode_errors_when_the_preset_is_missing() {
+        let _env = crate::test_env_guard::env_read_guard(); // HOME-stable: see sibling above
         let skills = tempfile::TempDir::new().unwrap();
         write_skill(skills.path(), "oncall-triage", "body");
         let mut cfg = triage_config(skills.path());
@@ -10281,6 +10297,7 @@ mod mode_command_tests {
     /// clamp must not apply without the guidance the mode promised.
     #[test]
     fn build_mode_errors_when_the_skill_is_missing() {
+        let _env = crate::test_env_guard::env_read_guard(); // HOME-stable: see sibling above
         let skills = tempfile::TempDir::new().unwrap(); // empty — no skill
         let cfg = triage_config(skills.path());
         let dirs = cfg.skill_search_dirs();
