@@ -1174,6 +1174,213 @@ fn install_footer_helper(
     );
 }
 
+/// The result of reading one turn from an [`InputSurface`].
+///
+/// This is the widget-agnostic vocabulary the chat loop speaks: it never sees a
+/// `rustyline::ReadlineError` directly, so a second surface (the ratatui inline
+/// rich input, issue #416) can satisfy the same contract without leaking its own
+/// error types into `run_chat`.
+enum ReadOutcome {
+    /// A submitted line. May contain `\`-continued newlines the loop rejoins.
+    Line(String),
+    /// Ctrl-C — interrupt; the loop exits cleanly.
+    Interrupted,
+    /// Ctrl-D / EOF — end of input; the loop exits cleanly.
+    Eof,
+    /// The terminal degraded (EMFILE, or a readline panic from fd exhaustion).
+    /// Carries a ready-to-print, multi-line message; the loop prints it and
+    /// breaks **without** a clean exit (no close-time network round-trip on a
+    /// broken terminal). Raw mode is already disabled by the surface.
+    Fatal(String),
+}
+
+/// The severable input boundary between the chat loop and the editor widget.
+///
+/// `run_chat` drives the conversation through this trait so the *input widget*
+/// can change without the surrounding dispatch (bang-escape, slash commands,
+/// chat, history) changing with it. Planned impls:
+/// - [`RustylineSurface`] — today's readline path. Used for the non-TTY/piped
+///   path, the headless/wyvern tier, and `\r`-erased spinners. Always built.
+/// - a ratatui inline **rich** surface — TTY multi-line input + status row,
+///   behind a `rich-tui` cargo feature (issue #416, next PR).
+trait InputSurface {
+    /// Read one turn, given the per-turn `prompt` (built fresh by the caller so
+    /// the rich default's timestamp is current). Returns a [`ReadOutcome`];
+    /// only an *unexpected* editor error propagates as `Err`.
+    fn read_line(&mut self, prompt: &str) -> anyhow::Result<ReadOutcome>;
+    /// Record a submitted entry in history.
+    fn add_history(&mut self, entry: &str);
+    /// Persist history to disk (no-op when there is no history path).
+    fn save_history(&mut self);
+    /// Rebuild the editor from fresh config — used after a `/vi` · `/emacs`
+    /// edit-mode switch so the next read reflects the new mode.
+    fn reload(&mut self) -> anyhow::Result<()>;
+}
+
+/// The default input surface: a rustyline editor with newt's footer helper.
+///
+/// Owns its history path and (when the footer is on) the palette, so it can
+/// reinstall the helper on [`reload`](InputSurface::reload). The EMFILE probe
+/// and the `catch_unwind` around `readline` (PR #184) live here, behind the
+/// trait, as `ReadOutcome::Fatal`.
+struct RustylineSurface {
+    rl: rustyline::Editor<FooterHelper, rustyline::history::DefaultHistory>,
+    history_path: Option<std::path::PathBuf>,
+    /// `Some` when the footer is on — the palette to reinstall on `reload`.
+    palette: Option<Palette>,
+}
+
+impl RustylineSurface {
+    fn new(
+        footer_on: bool,
+        palette: Palette,
+        history_path: Option<std::path::PathBuf>,
+    ) -> anyhow::Result<Self> {
+        let mut rl = rustyline::Editor::with_config(build_rl_config())?;
+        let palette = if footer_on {
+            install_footer_helper(&mut rl, palette.clone());
+            Some(palette)
+        } else {
+            None
+        };
+        if let Some(ref hp) = history_path {
+            let _ = rl.load_history(hp);
+        }
+        Ok(Self {
+            rl,
+            history_path,
+            palette,
+        })
+    }
+}
+
+impl InputSurface for RustylineSurface {
+    fn read_line(&mut self, prompt: &str) -> anyhow::Result<ReadOutcome> {
+        // Layer 2: probe for EMFILE before rustyline tries to open /dev/tty, so
+        // we give a clean message when the fd table is already full.
+        if !terminal_fd_available() {
+            let _ = disable_raw_mode();
+            return Ok(ReadOutcome::Fatal(
+                "\nnewt: EMFILE — file descriptor table is full.\n      \
+                 Too many subprocesses (e.g. cargo test workers) inherited fds.\n      \
+                 Restart newt. The O_CLOEXEC fix prevents recurrence on rebuilt binaries."
+                    .to_string(),
+            ));
+        }
+        // Layer 3 (PR #184): rustyline can panic (`assert fd != -1`) when the
+        // tty fd becomes invalid. Catch it before it crosses the non-unwindable
+        // tokio boundary and convert it into a clean exit. `AssertUnwindSafe` is
+        // safe: editor state may be inconsistent after a panic, but we return
+        // immediately and drop it rather than reusing it.
+        let res =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.rl.readline(prompt)));
+        let line = match res {
+            Ok(r) => r,
+            Err(_panic) => {
+                let _ = disable_raw_mode();
+                return Ok(ReadOutcome::Fatal(
+                    "\nnewt: terminal error — readline panicked (likely fd exhaustion).\n      \
+                     Restart newt. If this recurs, reduce concurrent subprocesses."
+                        .to_string(),
+                ));
+            }
+        };
+        match line {
+            Ok(s) => Ok(ReadOutcome::Line(s)),
+            Err(rustyline::error::ReadlineError::Interrupted) => Ok(ReadOutcome::Interrupted),
+            Err(rustyline::error::ReadlineError::Eof) => Ok(ReadOutcome::Eof),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    fn add_history(&mut self, entry: &str) {
+        let _ = self.rl.add_history_entry(entry);
+    }
+
+    fn save_history(&mut self) {
+        if let Some(ref hp) = self.history_path {
+            let _ = self.rl.save_history(hp);
+        }
+    }
+
+    fn reload(&mut self) -> anyhow::Result<()> {
+        self.rl = rustyline::Editor::with_config(build_rl_config())?;
+        if let Some(ref pal) = self.palette {
+            install_footer_helper(&mut self.rl, pal.clone());
+        }
+        if let Some(ref hp) = self.history_path {
+            let _ = self.rl.load_history(hp);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod input_surface_tests {
+    use super::*;
+
+    fn off_palette() -> Palette {
+        Palette::default()
+    }
+
+    #[test]
+    fn builds_with_footer_off_and_on() {
+        // Footer off: no palette retained.
+        let s = RustylineSurface::new(false, off_palette(), None).expect("build off");
+        assert!(s.palette.is_none(), "footer off keeps no palette");
+        // Footer on: palette retained for reinstall on reload.
+        let s = RustylineSurface::new(true, off_palette(), None).expect("build on");
+        assert!(s.palette.is_some(), "footer on retains the palette");
+    }
+
+    #[test]
+    fn missing_history_file_is_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let hp = dir.path().join("does-not-exist-history");
+        // load_history on a missing path is swallowed; construction still succeeds.
+        let mut s = RustylineSurface::new(false, off_palette(), Some(hp.clone())).expect("build");
+        // save_history creates the file even if it did not exist.
+        s.add_history("alpha");
+        s.save_history();
+        assert!(hp.exists(), "save_history writes the history file");
+    }
+
+    #[test]
+    fn add_then_save_persists_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let hp = dir.path().join("history");
+        let mut s = RustylineSurface::new(false, off_palette(), Some(hp.clone())).expect("build");
+        s.add_history("first command");
+        s.add_history("second command");
+        s.save_history();
+        let contents = std::fs::read_to_string(&hp).expect("history file readable");
+        assert!(contents.contains("first command"), "first entry persisted");
+        assert!(
+            contents.contains("second command"),
+            "second entry persisted"
+        );
+    }
+
+    #[test]
+    fn save_history_without_path_is_a_noop() {
+        let mut s = RustylineSurface::new(false, off_palette(), None).expect("build");
+        s.add_history("ephemeral");
+        // No path, no panic, nothing to assert beyond "does not blow up".
+        s.save_history();
+    }
+
+    #[test]
+    fn reload_rebuilds_and_reloads_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let hp = dir.path().join("history");
+        std::fs::write(&hp, "earlier entry\n").unwrap();
+        let mut s = RustylineSurface::new(true, off_palette(), Some(hp)).expect("build");
+        // A `/vi` / `/emacs` switch triggers reload; it must rebuild cleanly.
+        s.reload().expect("reload succeeds");
+        assert!(s.palette.is_some(), "reload preserves the footer palette");
+    }
+}
+
 #[cfg(test)]
 mod footer_tests {
     use super::*;
@@ -3648,15 +3855,12 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
     // `footer_on` also gates the multi-line helper. The prompt itself is built
     // fresh each turn (below) so the timestamp is current.
     let footer_on = footer_rich_enabled(footer_mode(), io::stdout().is_terminal());
-    let mut rl: rustyline::Editor<FooterHelper, rustyline::history::DefaultHistory> =
-        rustyline::Editor::with_config(build_rl_config())?;
-    if footer_on {
-        let colors = resolve_tui(&cfg).map(|t| t.colors).unwrap_or_default();
-        install_footer_helper(&mut rl, resolve_palette(&colors, color));
-    }
-    if let Some(ref hp) = history_path {
-        let _ = rl.load_history(hp);
-    }
+    // Input goes through the InputSurface seam so the chat dispatch below is
+    // widget-agnostic; today's only surface is rustyline. The palette is resolved
+    // unconditionally (it is pure) and only installed when the footer is on.
+    let colors = resolve_tui(&cfg).map(|t| t.colors).unwrap_or_default();
+    let mut surface =
+        RustylineSurface::new(footer_on, resolve_palette(&colors, color), history_path)?;
     // Mark all open fds (terminal, history file, sockets) as O_CLOEXEC so
     // subprocesses spawned by run_command don't inherit them. This is the
     // primary defence against EMFILE from cargo test / rustc worker floods.
@@ -3881,51 +4085,31 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
         // Catching the panic (Layer 3 / PR #184) remains as a last resort, but
         // this check fires first and gives a cleaner message when the fd table
         // is already full before readline even starts.
-        let readline_result = if let Some(corrective) = pending_retry.take() {
+        let outcome = if let Some(corrective) = pending_retry.take() {
             // retry technique (2b): run the queued corrective re-prompt as this
             // turn's input instead of reading from the user. The budget was already
             // decremented when it was queued.
-            Ok(corrective)
+            ReadOutcome::Line(corrective)
         } else {
             // A fresh user turn: reset the re-prompt budget for it.
             retry_budget = retry_max;
-            if !terminal_fd_available() {
-                let _ = disable_raw_mode();
-                eprintln!("\nnewt: EMFILE — file descriptor table is full.");
-                eprintln!("      Too many subprocesses (e.g. cargo test workers) inherited fds.");
-                eprintln!(
-                    "      Restart newt. The O_CLOEXEC fix prevents recurrence on rebuilt binaries."
-                );
-                break;
-            }
             // Build the prompt FRESH for this turn so the rich default's
-            // timestamp is current; rustyline floats it at the bottom while
+            // timestamp is current; the surface floats it at the bottom while
             // idle and it stays in scrollback (the per-turn log marker) on
-            // submit — no region, no cursor games.
+            // submit — no region, no cursor games. The EMFILE probe and the
+            // panic guard now live inside the surface (returned as `Fatal`).
             let prompt = prompt_str(workspace, verbose, is_vi, &inf_model, footer_on);
-            let readline_result =
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rl.readline(&prompt)));
-            match readline_result {
-                Ok(r) => r,
-                Err(_panic) => {
-                    let _ = disable_raw_mode();
-                    eprintln!("\nnewt: terminal error — readline panicked (likely fd exhaustion).");
-                    eprintln!(
-                        "      Restart newt. If this recurs, reduce concurrent subprocesses."
-                    );
-                    break;
-                }
-            }
+            surface.read_line(&prompt)?
         };
-        match readline_result {
-            Ok(line) => {
+        match outcome {
+            ReadOutcome::Line(line) => {
                 // Rejoin `\`-continued lines (multi-line entry) into real
                 // newlines; a no-op for single-line input.
                 let task = line.replace("\\\n", "\n").trim().to_string();
                 if task.is_empty() {
                     continue;
                 }
-                let _ = rl.add_history_entry(&task);
+                surface.add_history(&task);
                 println!();
                 // `! <cmd>` — human-only host shell-escape (interactive, inherited
                 // stdio: prompts + browser SAML work). Intercepted before the
@@ -4006,9 +4190,7 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                             color,
                             verbose,
                         );
-                        if let Some(ref hp) = history_path {
-                            let _ = rl.save_history(hp);
-                        }
+                        surface.save_history();
                         println!();
                         continue;
                     }
@@ -4097,9 +4279,7 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                             &mut session_opted_fresh,
                         );
                         print_newt(&msg, color, verbose);
-                        if let Some(ref hp) = history_path {
-                            let _ = rl.save_history(hp);
-                        }
+                        surface.save_history();
                         println!();
                         continue;
                     }
@@ -4124,9 +4304,7 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                             }
                             None => print_newt(EPHEMERAL_SESSION_NOTICE, color, verbose),
                         }
-                        if let Some(ref hp) = history_path {
-                            let _ = rl.save_history(hp);
-                        }
+                        surface.save_history();
                         println!();
                         continue;
                     }
@@ -4138,9 +4316,7 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                             },
                             None => print_newt(EPHEMERAL_SESSION_NOTICE, color, verbose),
                         }
-                        if let Some(ref hp) = history_path {
-                            let _ = rl.save_history(hp);
-                        }
+                        surface.save_history();
                         println!();
                         continue;
                     }
@@ -4161,9 +4337,7 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                             Ok(msg) => print_newt(&msg, color, verbose),
                             Err(e) => print_newt(&format!("error: {e}"), color, verbose),
                         }
-                        if let Some(ref hp) = history_path {
-                            let _ = rl.save_history(hp);
-                        }
+                        surface.save_history();
                         println!();
                         continue;
                     }
@@ -4204,16 +4378,12 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                                 verbose,
                             );
                         }
-                        if let Some(ref hp) = history_path {
-                            let _ = rl.save_history(hp);
-                        }
+                        surface.save_history();
                         println!();
                         continue;
                     }
                     let cont = dispatch_slash(&task, workspace, color, verbose)?;
-                    if let Some(ref hp) = history_path {
-                        let _ = rl.save_history(hp);
-                    }
+                    surface.save_history();
                     // Skip config reload and terminal reinit when exiting — unnecessary
                     // work that can hang if the terminal is in a degraded state.
                     if !cont {
@@ -4257,18 +4427,10 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                             verbose,
                         );
                     }
-                    let fresh_cfg = build_rl_config();
-                    rl = rustyline::Editor::with_config(fresh_cfg)?;
-                    if footer_on {
-                        let colors = resolve_tui(&cfg).map(|t| t.colors).unwrap_or_default();
-                        install_footer_helper(&mut rl, resolve_palette(&colors, color));
-                    }
-                    if let Some(ref hp) = history_path {
-                        let _ = rl.load_history(hp);
-                    }
-                    // A `/vi` / `/emacs` switch sets NEWT_EDIT_MODE, which the
-                    // rebuilt editor above just read; keep is_vi in sync so the
-                    // next (freshly built) prompt reflects the new mode.
+                    // A `/vi` / `/emacs` switch set NEWT_EDIT_MODE; rebuild the
+                    // surface from fresh config so the next read uses the new
+                    // mode, then keep is_vi in sync for the next prompt.
+                    surface.reload()?;
                     is_vi = build_rl_config().edit_mode() == rustyline::config::EditMode::Vi;
                 } else if matches!(task.as_str(), "exit" | "quit") {
                     clean_exit = true;
@@ -4689,12 +4851,16 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                 }
                 println!();
             }
-            Err(rustyline::error::ReadlineError::Interrupted)
-            | Err(rustyline::error::ReadlineError::Eof) => {
+            ReadOutcome::Interrupted | ReadOutcome::Eof => {
                 clean_exit = true;
                 break;
             }
-            Err(e) => return Err(e.into()),
+            ReadOutcome::Fatal(msg) => {
+                // Raw mode already disabled by the surface; clean_exit stays
+                // false so the broken terminal skips the close-time round-trip.
+                eprintln!("{msg}");
+                break;
+            }
         }
     }
 
@@ -4722,9 +4888,7 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
         }
     }
 
-    if let Some(ref hp) = history_path {
-        let _ = rl.save_history(hp);
-    }
+    surface.save_history();
     Ok(())
 }
 
