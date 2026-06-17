@@ -22,6 +22,9 @@
 
 use newt_core::{BackendConfig, BackendKind, Tier};
 
+mod probe;
+pub use probe::{Prober, TcpProber};
+
 /// Liveness of a backend.
 ///
 /// `Busy` is distinct from `Down`: a busy backend (e.g. the DGX loading a 70b
@@ -126,6 +129,19 @@ pub enum DispatchStrategy {
     FanOut(usize),
 }
 
+/// The outcome of a successful [`BackendPool::dispatch_with_failover`]: which
+/// backend served it, the attempt's result, and the names that failed first (the
+/// caller marks those `Busy`/`Down`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Failover<T> {
+    /// The backend that succeeded.
+    pub chosen: String,
+    /// The successful attempt's value.
+    pub result: T,
+    /// Backends that failed before `chosen` succeeded, in the order tried.
+    pub failed: Vec<String>,
+}
+
 /// Populates a [`BackendPool`]. The pool is source-agnostic: `StaticSource` reads
 /// config today; a `MeshSource` (mDNS presence) is a later, feature-gated impl.
 pub trait PoolSource {
@@ -184,18 +200,54 @@ impl BackendPool {
             .collect()
     }
 
-    /// Pick one backend for `(tier, model_pin)` — **place-don't-pile-on**: prefer an
-    /// idle `Up` backend over a `Busy` one, then first match. `None` when nothing
-    /// live can serve it (the caller fails closed rather than picking a wrong model).
+    /// Live candidates for `(tier, model_pin)`, **best-first**: idle `Up` before
+    /// `Busy` (place-don't-pile-on). The failover order.
     #[must_use]
-    pub fn select(&self, tier: Tier, model_pin: Option<&str>) -> Option<&PoolBackend> {
+    pub fn ranked_candidates(&self, tier: Tier, model_pin: Option<&str>) -> Vec<&PoolBackend> {
         let mut c = self.candidates(tier, model_pin);
         c.sort_by_key(|b| match b.health {
             Health::Up => 0u8,
             Health::Busy => 1,
             Health::Down => 2,
         });
-        c.into_iter().next()
+        c
+    }
+
+    /// Pick one backend for `(tier, model_pin)` — the best-ranked candidate. `None`
+    /// when nothing live can serve it (the caller fails closed rather than picking a
+    /// wrong model).
+    #[must_use]
+    pub fn select(&self, tier: Tier, model_pin: Option<&str>) -> Option<&PoolBackend> {
+        self.ranked_candidates(tier, model_pin).into_iter().next()
+    }
+
+    /// Dispatch with **failover**: try `attempt` against each candidate best-first
+    /// until one succeeds. Returns the chosen backend + result and the names that
+    /// failed (so the caller can [`mark`](Self::mark) them `Busy`/`Down` — done
+    /// outside this borrow). `None` when no candidate succeeds (or none exist).
+    ///
+    /// The I/O is the injected closure, so this stays pure + testable — and it's the
+    /// answer to `MeshAsker` being single-peer today: re-select on a failed peer.
+    pub fn dispatch_with_failover<T, E>(
+        &self,
+        tier: Tier,
+        model_pin: Option<&str>,
+        mut attempt: impl FnMut(&PoolBackend) -> Result<T, E>,
+    ) -> Option<Failover<T>> {
+        let mut failed = Vec::new();
+        for b in self.ranked_candidates(tier, model_pin) {
+            match attempt(b) {
+                Ok(result) => {
+                    return Some(Failover {
+                        chosen: b.name.clone(),
+                        result,
+                        failed,
+                    })
+                }
+                Err(_) => failed.push(b.name.clone()),
+            }
+        }
+        None
     }
 
     /// The count-adaptive dispatch strategy for `(tier, model_pin)`.
@@ -357,6 +409,68 @@ mod tests {
         // StaticSource::from_configs round-trips a config slice.
         let src = StaticSource::from_configs([&cfg]);
         assert_eq!(BackendPool::from_source(&src).backends().len(), 1);
+    }
+
+    #[test]
+    fn dispatch_with_failover_skips_failed_then_succeeds() {
+        // dgx (Up) is tried first, fails; gnuc (Up) succeeds — both serve the small model.
+        let pool = BackendPool::from_source(&StaticSource {
+            backends: vec![dgx(), gnuc()],
+        });
+        let out = pool
+            .dispatch_with_failover(Tier::Fast, Some("qwen2.5-coder:3b"), |b| {
+                if b.name == "dgx" {
+                    Err("timeout")
+                } else {
+                    Ok(format!("served by {}", b.name))
+                }
+            })
+            .unwrap();
+        assert_eq!(out.chosen, "gnuc");
+        assert_eq!(out.result, "served by gnuc");
+        assert_eq!(
+            out.failed,
+            vec!["dgx".to_string()],
+            "dgx failed first, caller marks it"
+        );
+    }
+
+    #[test]
+    fn dispatch_with_failover_none_when_all_fail_or_none_serve() {
+        let pool = BackendPool::from_source(&StaticSource {
+            backends: vec![dgx(), gnuc()],
+        });
+        // every attempt errors → None, and the caller could mark all tried.
+        let all_fail: Option<Failover<()>> =
+            pool.dispatch_with_failover(Tier::Fast, Some("qwen2.5-coder:3b"), |_| Err(()));
+        assert!(all_fail.is_none());
+        // no candidate serves the model → None without any attempt.
+        let mut attempts = 0;
+        let none: Option<Failover<()>> =
+            pool.dispatch_with_failover(Tier::Fast, Some("ghost:1b"), |_| -> Result<(), ()> {
+                attempts += 1;
+                Ok(())
+            });
+        assert!(none.is_none());
+        assert_eq!(
+            attempts, 0,
+            "no candidates ⇒ the attempt closure never runs"
+        );
+    }
+
+    #[test]
+    fn ranked_candidates_orders_up_before_busy() {
+        let pool = BackendPool::from_source(&StaticSource {
+            backends: vec![
+                dgx().with_health(Health::Busy),
+                gnuc().with_health(Health::Up),
+            ],
+        });
+        let ranked = pool.ranked_candidates(Tier::Fast, Some("qwen2.5-coder:3b"));
+        assert_eq!(
+            ranked.iter().map(|b| b.name.as_str()).collect::<Vec<_>>(),
+            vec!["gnuc", "dgx"]
+        );
     }
 
     #[test]
