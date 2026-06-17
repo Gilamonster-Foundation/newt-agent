@@ -6967,17 +6967,18 @@ fn bang_command(input: &str) -> Option<&str> {
     }
 }
 
-/// The user's interactive shell + its "run this string" flag, per platform.
-/// Honors `$SHELL` (unix) / `%COMSPEC%` (windows), falling back to the system
-/// default. Running through a shell (not bare-exec) gives pipes, redirects,
-/// `&&`, and env expansion — matching shell muscle memory.
+/// The user's shell + its "run this string" flag, per platform. Honors `$SHELL`
+/// (unix) / `%COMSPEC%` (windows), falling back to the system default. Running
+/// through a shell (not bare-exec) gives pipes, redirects, `&&`, and env
+/// expansion — matching shell muscle memory.
 ///
-/// Unix uses `-ic` — an **interactive** shell that sources the user's rc
-/// (`.zshrc`/`.bashrc`), so `!` runs commands exactly as the user's own
-/// terminal would: aliases, shell functions (e.g. a `pa` that is a function,
-/// not a binary), PATH tweaks, and a real prompt for nested shells like
-/// `! bash`. Trade-off: rc is sourced every invocation, so a chatty rc can emit
-/// startup noise. Windows `cmd /C` has no rc-sourcing equivalent.
+/// Unix uses `-c` (**non-interactive**), NOT `-ic`. An interactive shell enables
+/// job control (monitor mode): it grabs the terminal's foreground process group
+/// via `tcsetpgrp` and does not reliably restore newt's on exit, leaving newt in
+/// the background → `SIGTTOU` on its next TTY write → "suspended (tty output)".
+/// `-c` avoids that entirely. PATH is still inherited from the shell that
+/// launched newt, so binaries (e.g. `pa`) resolve fine; only `.zshrc`/`.bashrc`
+/// aliases and shell *functions* are unavailable. Windows `cmd /C`.
 fn bang_shell() -> (String, &'static str) {
     #[cfg(windows)]
     {
@@ -6987,7 +6988,7 @@ fn bang_shell() -> (String, &'static str) {
     #[cfg(not(windows))]
     {
         let sh = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-        (sh, "-ic")
+        (sh, "-c")
     }
 }
 
@@ -7076,10 +7077,11 @@ mod tests {
 
     #[test]
     #[cfg(not(windows))]
-    fn bang_shell_is_an_interactive_unix_shell() {
+    fn bang_shell_is_a_noninteractive_unix_shell() {
         let (shell, flag) = bang_shell();
-        // Interactive (`-i`) so the user's rc is sourced; `-c` runs the string.
-        assert_eq!(flag, "-ic");
+        // `-c`, NOT `-ic`: an interactive shell's job control suspends newt
+        // (SIGTTOU). See bang_shell docs.
+        assert_eq!(flag, "-c");
         assert!(!shell.is_empty(), "a shell is always resolved");
     }
 
