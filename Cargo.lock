@@ -2205,6 +2205,8 @@ dependencies = [
  "async-trait",
  "newt-core",
  "newt-inference",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 
