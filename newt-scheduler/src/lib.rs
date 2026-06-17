@@ -22,7 +22,9 @@
 
 use newt_core::{BackendConfig, BackendKind, Tier};
 
+mod dispatch;
 mod probe;
+pub use dispatch::{ChatReply, ChatRequest, Dispatcher, LocalDispatcher};
 pub use probe::{Prober, TcpProber};
 
 /// Liveness of a backend.
