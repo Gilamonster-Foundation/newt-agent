@@ -15,11 +15,21 @@
 //!   an open `"""`/`'''` block), in which case Enter adds a line. This reuses
 //!   the *exact* classifier the rustyline validator uses, so multi-line entry
 //!   behaves identically across both surfaces.
-//! - **Ctrl-O** / **Shift-Enter** always insert a newline (newt's existing
-//!   multi-line keys).
+//! - **Shift-Enter** inserts a newline in every mode (terminal permitting).
+//!   **Ctrl-O** inserts a newline only in the **modeless** modes (emacs/nano),
+//!   where it is idiomatic (emacs `open-line`). In **vi**, Ctrl-O is left free
+//!   for its real semantics (jumplist back in NORMAL, insert-normal in INSERT);
+//!   vi users open lines with `o`/`O`.
 //! - **Ctrl-C** interrupts; **Ctrl-D** on an empty buffer is EOF (both exit
 //!   cleanly, as in rustyline).
 //! - Vi mode adds `:w`/`:wq`/`:x` (submit) and `:q`/`:q!` (quit) ex-commands.
+//!
+//! ## Vi gaps (future faithful-keymap work, issue #416 follow-up)
+//! - **Ctrl-O / Ctrl-I jumplist** (NORMAL: jump back/forward through cursor
+//!   history; `:jumps` to view) — currently a no-op in vi.
+//! - **i_CTRL-O insert-normal** (INSERT: run one Normal command then resume
+//!   INSERT, e.g. `Ctrl-O $`) — currently a no-op in vi.
+//! - Also: `f/F/t/T/;/,` char-search, `.` repeat, `R` overwrite, exact `P`.
 //!
 //! ## Not yet (documented limitations of v1)
 //! - No in-session history recall (Up/Down navigate the buffer, not history);
@@ -439,8 +449,14 @@ impl Editor {
                         Step::Submit
                     };
                 }
-                // Force a newline without submitting (newt's existing key).
-                KeyCode::Char('o') => {
+                // Ctrl-O inserts a newline ONLY in the modeless modes
+                // (emacs/nano) — in emacs this is idiomatic (`open-line`). In
+                // vi, Ctrl-O is the jumplist "jump back" command (Ctrl-I forward,
+                // `:jumps` to view), so we must NOT hijack it; vi users open
+                // lines with `o`/`O` (and Shift-Enter still works). The jumplist
+                // itself is a documented vi gap (TODO), so Ctrl-O is a no-op in
+                // vi for now rather than wrongly inserting a newline.
+                KeyCode::Char('o') if self.edit.is_modeless() => {
                     ta.insert_newline();
                     return Step::Continue;
                 }
@@ -508,9 +524,16 @@ fn make_terminal(height: u16) -> io::Result<Term> {
     )
 }
 
-fn new_textarea() -> TextArea<'static> {
+fn new_textarea(edit: Edit) -> TextArea<'static> {
     let mut ta = TextArea::default();
-    ta.set_placeholder_text("type…  (Enter submit · Ctrl-O / Shift-Enter newline · Ctrl-C quit)");
+    // Mode-aware hint: in vi, Ctrl-O is reserved (jumplist / insert-normal), so
+    // we advertise the vi-native `o`/`O` for opening lines, not Ctrl-O.
+    let hint = if edit == Edit::Vi {
+        "type…  (Esc=NORMAL · o/O open line · Shift-Enter newline · Enter submit · Ctrl-C quit)"
+    } else {
+        "type…  (Enter submit · Ctrl-O / Shift-Enter newline · Ctrl-C quit)"
+    };
+    ta.set_placeholder_text(hint);
     // Block (reverse) cursor; no cursor-line underline.
     ta.set_cursor_style(Style::default().add_modifier(Modifier::REVERSED));
     ta.set_cursor_line_style(Style::default());
@@ -624,7 +647,7 @@ impl RichSurface {
         // resize starts clean.
         let mut terminal = make_terminal(cur_h)?;
         terminal.clear()?;
-        let mut textarea = new_textarea();
+        let mut textarea = new_textarea(self.edit);
         let mut editor = Editor::new(self.edit);
         loop {
             // Grow/shrink the inline viewport to the input. When the gutter is
@@ -832,6 +855,26 @@ mod tests {
         let mut ta = TextArea::default();
         type_chars(&mut ed, &mut ta, "x");
         assert_eq!(ed.input(special(KeyCode::Enter), &mut ta), Step::Submit);
+    }
+
+    #[test]
+    fn ctrl_o_is_newline_in_modeless_but_reserved_in_vi() {
+        // Emacs / nano: Ctrl-O inserts a newline (idiomatic open-line).
+        for ed_factory in [emacs_editor as fn() -> Editor, nano_editor] {
+            let mut ed = ed_factory();
+            let mut ta = TextArea::default();
+            type_chars(&mut ed, &mut ta, "a");
+            assert_eq!(ed.input(ctrl('o'), &mut ta), Step::Continue);
+            assert_eq!(ta.lines().len(), 2, "Ctrl-O newline in modeless mode");
+        }
+        // Vi: Ctrl-O is reserved (jumplist / insert-normal) — it must NOT insert
+        // a newline. In INSERT it is currently a no-op (a documented gap), so the
+        // buffer stays a single line; vi users open lines with `o`/`O`.
+        let mut ed = vi_editor();
+        let mut ta = TextArea::default();
+        type_chars(&mut ed, &mut ta, "vi");
+        assert_eq!(ed.input(ctrl('o'), &mut ta), Step::Continue);
+        assert_eq!(ta.lines().len(), 1, "Ctrl-O does NOT newline in vi");
     }
 
     #[test]
