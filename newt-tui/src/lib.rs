@@ -1121,16 +1121,27 @@ impl rustyline::validate::Validator for FooterHelper {
 }
 impl rustyline::Helper for FooterHelper {}
 
-/// Install the footer helper on a freshly built editor. Multi-line entry is the
-/// trailing-`\` continuation (the `Validator`), which works in emacs and vi mode
-/// alike and in every terminal — no special-key detection. (A bound Alt+Enter
-/// would need rustyline's `custom-bindings` feature; deferred to avoid a dep
-/// change for a terminal-dependent bonus.)
+/// Install the footer helper on a freshly built editor and bind the multi-line
+/// entry keys. Three ways to add a line without submitting:
+/// - **Ctrl-O** — the vi-mode shortcut (works in emacs too).
+/// - **Shift-Enter** — the emacs-style shortcut, *terminal permitting*: many
+///   terminals send a bare CR for Shift-Enter (indistinguishable from Enter),
+///   so it only fires where the terminal emits a distinct sequence.
+/// - **trailing `\`** — the universal fallback (the `Validator`), works in every
+///   terminal and mode with no special-key detection.
 fn install_footer_helper(
     rl: &mut rustyline::Editor<FooterHelper, rustyline::history::DefaultHistory>,
     palette: Palette,
 ) {
+    use rustyline::{Cmd, KeyCode, KeyEvent, Modifiers};
     rl.set_helper(Some(FooterHelper { palette }));
+    // Insert a literal newline without accepting the line. `bind_sequence`
+    // normalizes the key, so `ctrl('o')` matches the incoming Ctrl-O event.
+    rl.bind_sequence(KeyEvent::ctrl('o'), Cmd::Insert(1, "\n".to_owned()));
+    rl.bind_sequence(
+        KeyEvent(KeyCode::Enter, Modifiers::SHIFT),
+        Cmd::Insert(1, "\n".to_owned()),
+    );
 }
 
 #[cfg(test)]

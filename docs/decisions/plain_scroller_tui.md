@@ -115,7 +115,9 @@ The practical wins compound with the architectural one:
   so the status sits at the at-rest tail while idle, scrolls away naturally as
   output comes, and stays in scrollback as a greppable per-turn **log marker** —
   **no region, no pinning, no cursor games, no width dependency**. Multi-line
-  entry is rustyline's `Validator` (a trailing `\` continues).
+  entry: **Ctrl-O** (vi) and **Shift-Enter** (emacs, terminal permitting — many
+  send a bare CR) insert a newline via bound `Cmd::Insert`, and a trailing `\`
+  is the universal `Validator` fallback. Enter submits.
 
   **Fully customizable** — it is just the default `[tui] prompt` template.
   Tokens come in a readable `$NAME` form and a terse `\x` form: `$TIMESTAMP`/`\t`,
