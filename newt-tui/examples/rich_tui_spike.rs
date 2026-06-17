@@ -33,6 +33,14 @@ use tui_textarea::{CursorMove, TextArea};
 
 const GUTTER_W: u16 = 20; // "[HH:MM:SS] NORMAL ❯ "
 const MAX_INPUT_ROWS: u16 = 8;
+/// In the port this is a setting (`[tui] gutter = auto|on|off`). Auto: use the
+/// left gutter only while it stays under this fraction of the terminal width;
+/// on a squished terminal, drop it and stack the prompt on its own line.
+const GUTTER_MAX_FRACTION: f32 = 0.33;
+
+fn use_gutter(width: u16) -> bool {
+    width > 0 && (GUTTER_W as f32) <= GUTTER_MAX_FRACTION * width as f32
+}
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
 
@@ -60,6 +68,7 @@ struct Vi {
     mode: Mode,
     pending: Pending,
     count: usize,
+    ex: Option<String>, // `:`-command line buffer (`:wq`, `:q`, …)
 }
 
 impl Vi {
@@ -68,6 +77,7 @@ impl Vi {
             mode: Mode::Insert,
             pending: Pending::None,
             count: 0,
+            ex: None,
         }
     }
     fn take_count(&mut self) -> usize {
@@ -75,7 +85,39 @@ impl Vi {
         self.count = 0;
         n
     }
+    /// The `:`-command line (a bonus beyond rustyline's vi): `:w`/`:wq`/`:x`
+    /// submit, `:q`/`:q!` quit. Esc or backspacing past `:` cancels.
+    fn ex_input(&mut self, key: crossterm::event::KeyEvent) -> Outcome {
+        match key.code {
+            KeyCode::Esc => self.ex = None,
+            KeyCode::Enter => {
+                let cmd = self.ex.take().unwrap_or_default();
+                return match cmd.as_str() {
+                    "w" | "wq" | "x" | "wq!" | "x!" => Outcome::Submit,
+                    "q" | "q!" => Outcome::Quit,
+                    _ => Outcome::Continue, // unknown command just cancels
+                };
+            }
+            KeyCode::Backspace => {
+                if let Some(ex) = self.ex.as_mut() {
+                    if ex.pop().is_none() {
+                        self.ex = None; // backspaced past the `:`
+                    }
+                }
+            }
+            KeyCode::Char(c) => {
+                if let Some(ex) = self.ex.as_mut() {
+                    ex.push(c);
+                }
+            }
+            _ => {}
+        }
+        Outcome::Continue
+    }
     fn input(&mut self, key: crossterm::event::KeyEvent, ta: &mut TextArea) -> Outcome {
+        if self.ex.is_some() {
+            return self.ex_input(key);
+        }
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
                 KeyCode::Char('c') => return Outcome::Quit,
@@ -205,6 +247,7 @@ impl Vi {
             }
             'd' | 'c' | 'y' => self.pending = Pending::Op(c),
             'g' => self.pending = Pending::G,
+            ':' => self.ex = Some(String::new()),
             _ => {}
         }
         Outcome::Continue
@@ -339,6 +382,13 @@ impl Editor {
             Edit::Vi => self.vi.mode_label(),
         }
     }
+    fn ex(&self) -> Option<&str> {
+        if self.edit == Edit::Vi {
+            self.vi.ex.as_deref()
+        } else {
+            None
+        }
+    }
 }
 
 fn main() -> io::Result<()> {
@@ -389,8 +439,12 @@ fn run(
     editor: &mut Editor,
 ) -> io::Result<()> {
     loop {
-        // Grow/shrink the inline viewport to the input line count.
-        let want = (textarea.lines().len() as u16).clamp(1, MAX_INPUT_ROWS);
+        // Grow/shrink the inline viewport to the input. In no-gutter mode the
+        // prompt needs its own row on top.
+        let (cols, _) = crossterm::terminal::size()?;
+        let prompt_rows = if use_gutter(cols) { 0 } else { 1 };
+        let want =
+            (textarea.lines().len() as u16 + prompt_rows).clamp(1, MAX_INPUT_ROWS + prompt_rows);
         if want != *cur_h {
             *terminal = make_terminal(want)?;
             *cur_h = want;
@@ -440,20 +494,44 @@ fn submit(terminal: &mut Term, textarea: &mut TextArea) -> io::Result<()> {
     Ok(())
 }
 
-fn draw(f: &mut Frame, textarea: &TextArea, editor: &Editor) {
-    // Single-line-by-default: a left gutter holds the live prompt; the textarea
-    // grows to its right.
-    let [gutter, input] =
-        Layout::horizontal([Constraint::Length(GUTTER_W), Constraint::Min(1)]).areas(f.area());
-
+fn prompt_line(editor: &Editor) -> Line<'static> {
+    // `:`-command line takes over the prompt while active.
+    if let Some(ex) = editor.ex() {
+        return Line::from(Span::styled(
+            format!(":{ex}"),
+            Style::default().fg(Color::White),
+        ));
+    }
     let clock = chrono::Local::now().format("%H:%M:%S").to_string();
-    let mode = editor.label();
-    // Prompt prefix only on the FIRST row; continuation rows blank (aligned).
-    let prompt = Line::from(vec![
-        Span::styled(format!("[{clock}] "), Style::default().fg(Color::LightBlue)),
-        Span::styled(mode, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+    Line::from(vec![
+        // Dim timestamp (maps to `[tui.colors] dim`), not a loud blue.
+        Span::styled(format!("[{clock}] "), Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            editor.label().to_string(),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled(" ❯ ", Style::default().fg(Color::Rgb(220, 60, 20))),
-    ]);
-    f.render_widget(Paragraph::new(prompt), gutter);
-    f.render_widget(textarea, input);
+    ])
+}
+
+fn draw(f: &mut Frame, textarea: &TextArea, editor: &Editor) {
+    let area = f.area();
+    let prompt = prompt_line(editor);
+    if use_gutter(area.width) {
+        // Wide enough: single-line-by-default — prompt in a left gutter, input
+        // to its right (continuation lines align under the input).
+        let [gutter, input] =
+            Layout::horizontal([Constraint::Length(GUTTER_W), Constraint::Min(1)]).areas(area);
+        f.render_widget(Paragraph::new(prompt), gutter);
+        f.render_widget(textarea, input);
+    } else {
+        // Squished (gutter would exceed ~33% width): stack the prompt on its own
+        // row, give the input the full width.
+        let [prow, input] =
+            Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(area);
+        f.render_widget(Paragraph::new(prompt), prow);
+        f.render_widget(textarea, input);
+    }
 }
