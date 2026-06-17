@@ -4225,13 +4225,19 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                     if !ephemeral_session {
                         conversation_store = Some(conversation_store_for(workspace, &cfg)?);
                     }
+                    let prev_inf_url = inf_url.clone();
                     choice = resolve_backend_choice(&cfg);
                     inf_url = choice.url.clone();
                     inf_model = choice.model.clone();
                     inf_kind = choice.kind;
                     inf_key = choice.api_key.clone();
-                    // Re-probe DCGM when the backend URL changes.
-                    dgx = dgx_probe::DgxTelemetry::try_connect(&inf_url);
+                    // Re-probe DCGM ONLY when the backend URL actually changed.
+                    // `try_connect` is a blocking ~3s network call (issue #412);
+                    // a `/vi`/`/emacs` toggle (and most slash commands) never
+                    // changes the URL, so it must not pay for a probe.
+                    if inf_url != prev_inf_url {
+                        dgx = dgx_probe::DgxTelemetry::try_connect(&inf_url);
+                    }
                     if cap.reapply(resolve_tui(&cfg), workspace) {
                         print_newt(
                             "permissions can only narrow within a session — restart newt to widen",
