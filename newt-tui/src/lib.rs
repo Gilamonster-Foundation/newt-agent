@@ -974,12 +974,112 @@ fn current_prompt_and_preview(workspace: &str) -> (String, String) {
 /// terminals, no special key detection). On submit the caller rejoins
 /// `"\\\n"` to `"\n"`. Installed only when the footer is on; off-mode keeps
 /// today's single-line behavior exactly.
-struct FooterHelper;
+struct FooterHelper {
+    palette: Palette,
+}
 
-/// Whether the input wants another line: a trailing `\` continues (the
-/// shell/Python idiom). Pure for testing — the `Validator` is a thin wrapper.
+const ANSI_RESET: &str = "\x1b[0m";
+const ANSI_BOLD: &str = "\x1b[1m";
+
+/// Parse a color spec — a named color or `#rrggbb` hex — into RGB. Returns
+/// `None` for an unrecognized name or malformed hex, so the caller falls back
+/// to the slot's built-in default.
+fn parse_color_rgb(spec: &str) -> Option<(u8, u8, u8)> {
+    let s = spec.trim();
+    if let Some(hex) = s.strip_prefix('#') {
+        if hex.len() != 6 {
+            return None;
+        }
+        let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+        let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+        let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+        return Some((r, g, b));
+    }
+    let rgb = match s.to_ascii_lowercase().as_str() {
+        "orange" => (220, 60, 20), // newt orange
+        "black" => (0, 0, 0),
+        "red" => (205, 49, 49),
+        "green" => (13, 188, 121),
+        "yellow" => (229, 229, 16),
+        "blue" => (36, 114, 200),
+        "magenta" | "purple" => (188, 63, 188),
+        "cyan" => (17, 168, 205),
+        "white" => (229, 229, 229),
+        "grey" | "gray" => (128, 128, 128),
+        "darkgrey" | "darkgray" => (85, 85, 85),
+        _ => return None,
+    };
+    Some(rgb)
+}
+
+/// An SGR truecolor foreground escape for `rgb`.
+fn fg_escape(rgb: (u8, u8, u8)) -> String {
+    format!("\x1b[38;2;{};{};{}m", rgb.0, rgb.1, rgb.2)
+}
+
+/// A resolved color palette: each field is a ready-to-print SGR foreground
+/// escape, or empty when color is disabled (`NO_COLOR` / non-TTY).
+#[derive(Clone, Default)]
+struct Palette {
+    accent: String,
+    shell_mode: String,
+    dim: String,
+}
+
+/// Resolve `[tui.colors]` into ready-to-print escapes. Each slot has a built-in
+/// default (accent = bold-orange `!` sigil, shell_mode = amber full-line tint,
+/// dim = grey prompt); an unset/invalid spec keeps the default, an explicit
+/// `"none"`/`"off"` disables that slot, and with color globally off every slot
+/// is empty (highlighting inert).
+fn resolve_palette(colors: &newt_core::ColorsConfig, color_enabled: bool) -> Palette {
+    if !color_enabled {
+        return Palette::default();
+    }
+    let slot = |spec: &Option<String>, default: (u8, u8, u8)| -> String {
+        match spec.as_deref() {
+            // Explicit opt-out of this slot.
+            Some(s) if s.eq_ignore_ascii_case("none") || s.eq_ignore_ascii_case("off") => {
+                String::new()
+            }
+            // A valid override, else (unset/invalid) the built-in default.
+            s => fg_escape(s.and_then(parse_color_rgb).unwrap_or(default)),
+        }
+    };
+    Palette {
+        accent: slot(&colors.accent, (220, 60, 20)),
+        shell_mode: slot(&colors.shell_mode, (200, 140, 60)),
+        dim: slot(&colors.dim, (128, 128, 128)),
+    }
+}
+
+/// If the first line is a lone triple-quote fence (`"""` or `'''`), return it —
+/// the opener of a markdown-style multi-line block.
+fn block_open_delim(input: &str) -> Option<&'static str> {
+    match input.lines().next().unwrap_or("").trim() {
+        "\"\"\"" => Some("\"\"\""),
+        "'''" => Some("'''"),
+        _ => None,
+    }
+}
+
+/// Whether a `"""`/`'''` block opened on the first line has been closed by a
+/// matching fence on any later line.
+fn block_is_closed(input: &str, delim: &str) -> bool {
+    input.lines().skip(1).any(|l| l.trim() == delim)
+}
+
+/// Whether the input wants another line (the `Validator`'s pure core):
+/// - a **triple-quote block** (`"""`/`'''` alone on the first line) stays open
+///   until a matching closing fence — Enter adds lines, the closing fence
+///   submits. The fences are kept and flow to the model as a fenced block.
+/// - a **`! …` host-shell line** continues on a trailing `\` so multi-line shell
+///   commands work. A chat line submits on Enter even if it ends with `\` (that
+///   backslash is literal text) — `\`-continuation is bang-only.
 fn footer_continues(input: &str) -> bool {
-    input.ends_with('\\')
+    if let Some(delim) = block_open_delim(input) {
+        return !block_is_closed(input, delim);
+    }
+    input.trim_start().starts_with('!') && input.ends_with('\\')
 }
 
 impl rustyline::completion::Completer for FooterHelper {
@@ -988,7 +1088,49 @@ impl rustyline::completion::Completer for FooterHelper {
 impl rustyline::hint::Hinter for FooterHelper {
     type Hint = String;
 }
-impl rustyline::highlight::Highlighter for FooterHelper {}
+impl rustyline::highlight::Highlighter for FooterHelper {
+    /// Color a `! …` host-shell line with two independent slots: a bold `accent`
+    /// `!` sigil and a `shell_mode` tint over the whole command, so the line
+    /// visibly changes when you escape to the shell. Either slot can be disabled
+    /// (`"none"`) for sigil-only or tint-only; if both are off the line is
+    /// returned unchanged, as is any non-`!` line.
+    fn highlight<'l>(&self, line: &'l str, _pos: usize) -> std::borrow::Cow<'l, str> {
+        let (accent, shell) = (&self.palette.accent, &self.palette.shell_mode);
+        if (accent.is_empty() && shell.is_empty()) || !line.starts_with('!') {
+            return std::borrow::Cow::Borrowed(line);
+        }
+        let rest = &line[1..];
+        let sigil = if accent.is_empty() {
+            "!".to_string()
+        } else {
+            format!("{ANSI_BOLD}{accent}!{ANSI_RESET}")
+        };
+        let body = if shell.is_empty() {
+            rest.to_string()
+        } else {
+            format!("{shell}{rest}{ANSI_RESET}")
+        };
+        std::borrow::Cow::Owned(format!("{sigil}{body}"))
+    }
+    /// Dim the prompt status line so the bright bang-mode line stands out and
+    /// the prompt reads as an at-rest log marker (the plain-scroller intent).
+    fn highlight_prompt<'b, 's: 'b, 'p: 'b>(
+        &'s self,
+        prompt: &'p str,
+        _default: bool,
+    ) -> std::borrow::Cow<'b, str> {
+        if self.palette.dim.is_empty() {
+            return std::borrow::Cow::Borrowed(prompt);
+        }
+        std::borrow::Cow::Owned(format!("{}{prompt}{ANSI_RESET}", self.palette.dim))
+    }
+    /// Re-highlight on each keystroke so the bang coloring appears/clears live
+    /// as `!` is typed or deleted. Active when either bang slot is set; inert
+    /// only when both are off (color fully disabled, or both set to `"none"`).
+    fn highlight_char(&self, _line: &str, _pos: usize, _forced: bool) -> bool {
+        !(self.palette.accent.is_empty() && self.palette.shell_mode.is_empty())
+    }
+}
 impl rustyline::validate::Validator for FooterHelper {
     fn validate(
         &self,
@@ -1003,21 +1145,131 @@ impl rustyline::validate::Validator for FooterHelper {
 }
 impl rustyline::Helper for FooterHelper {}
 
-/// Install the footer helper on a freshly built editor. Multi-line entry is the
-/// trailing-`\` continuation (the `Validator`), which works in emacs and vi mode
-/// alike and in every terminal — no special-key detection. (A bound Alt+Enter
-/// would need rustyline's `custom-bindings` feature; deferred to avoid a dep
-/// change for a terminal-dependent bonus.)
+/// Install the footer helper on a freshly built editor and bind newt's
+/// multi-line entry keys. These are **newt conventions, not canonical editor
+/// bindings** — three ways to add a line without submitting:
+/// - **Ctrl-O** — reliable in every terminal and in both emacs and vi mode.
+///   NB: this is *not* vi's open-line command. Real vi uses `o`/`O` (POSIX:
+///   "enter text input mode in a new line"), which rustyline's vi mode does not
+///   implement, and a `bind_sequence` cmd cannot enter vi insert mode — so we
+///   bind a free, reliable control key instead (tracked upstream:
+///   kkawakam/rustyline#946). Ctrl-O itself is not a vi command.
+/// - **Shift-Enter** — same, *terminal permitting*: many terminals send a bare
+///   CR for Shift-Enter (indistinguishable from Enter), so it only fires where
+///   the terminal emits a distinct sequence.
+/// - **trailing `\`** — the universal fallback (the `Validator`), works in every
+///   terminal and mode with no special-key detection. Enter submits.
 fn install_footer_helper(
     rl: &mut rustyline::Editor<FooterHelper, rustyline::history::DefaultHistory>,
+    palette: Palette,
 ) {
-    rl.set_helper(Some(FooterHelper));
+    use rustyline::{Cmd, KeyCode, KeyEvent, Modifiers};
+    rl.set_helper(Some(FooterHelper { palette }));
+    // Insert a literal newline without accepting the line. `bind_sequence`
+    // normalizes the key, so `ctrl('o')` matches the incoming Ctrl-O event.
+    rl.bind_sequence(KeyEvent::ctrl('o'), Cmd::Insert(1, "\n".to_owned()));
+    rl.bind_sequence(
+        KeyEvent(KeyCode::Enter, Modifiers::SHIFT),
+        Cmd::Insert(1, "\n".to_owned()),
+    );
 }
 
 #[cfg(test)]
 mod footer_tests {
     use super::*;
     use newt_core::FooterMode;
+    use rustyline::highlight::Highlighter;
+
+    #[test]
+    fn parse_color_named_and_hex() {
+        assert_eq!(parse_color_rgb("orange"), Some((220, 60, 20)));
+        assert_eq!(
+            parse_color_rgb("Orange"),
+            Some((220, 60, 20)),
+            "case-insensitive"
+        );
+        assert_eq!(parse_color_rgb("grey"), Some((128, 128, 128)));
+        assert_eq!(parse_color_rgb("gray"), Some((128, 128, 128)), "alias");
+        assert_eq!(parse_color_rgb("#dc3c14"), Some((220, 60, 20)));
+        // Unrecognized name / malformed hex → None (caller uses the default).
+        assert_eq!(parse_color_rgb("chartreuse"), None);
+        assert_eq!(parse_color_rgb("#12"), None);
+        assert_eq!(parse_color_rgb("#gggggg"), None);
+    }
+
+    #[test]
+    fn resolve_palette_off_is_inert_and_on_uses_defaults() {
+        let colors = newt_core::ColorsConfig::default();
+        // Color disabled → every slot empty, so highlighting is a no-op.
+        let off = resolve_palette(&colors, false);
+        assert!(off.accent.is_empty() && off.shell_mode.is_empty() && off.dim.is_empty());
+        // Enabled with no overrides → two-color defaults: bold-orange sigil,
+        // amber full-line tint, grey prompt.
+        let on = resolve_palette(&colors, true);
+        assert_eq!(on.accent, fg_escape((220, 60, 20)));
+        assert_eq!(
+            on.shell_mode,
+            fg_escape((200, 140, 60)),
+            "amber line tint on by default"
+        );
+        assert_eq!(on.dim, fg_escape((128, 128, 128)));
+        // A valid override wins; an invalid spec falls back to the default;
+        // `"none"` disables a slot.
+        let overridden = newt_core::ColorsConfig {
+            accent: Some("not-a-color".into()),
+            shell_mode: Some("cyan".into()),
+            dim: Some("none".into()),
+        };
+        let p = resolve_palette(&overridden, true);
+        assert_eq!(
+            p.accent,
+            fg_escape((220, 60, 20)),
+            "invalid → default orange"
+        );
+        assert_eq!(p.shell_mode, fg_escape((17, 168, 205)), "cyan override");
+        assert!(p.dim.is_empty(), "\"none\" disables the slot");
+    }
+
+    #[test]
+    fn highlight_tints_sigil_and_line_independently() {
+        let helper = FooterHelper {
+            palette: resolve_palette(&newt_core::ColorsConfig::default(), true),
+        };
+        // A chat line is returned unchanged (borrowed, no escapes).
+        assert_eq!(helper.highlight("hello there", 0), "hello there");
+        // A bang line: bold-orange `!` sigil + amber-tinted command.
+        let bang = helper.highlight("! pa login", 0).into_owned();
+        let expected = format!(
+            "{ANSI_BOLD}{}!{ANSI_RESET}{} pa login{ANSI_RESET}",
+            fg_escape((220, 60, 20)),
+            fg_escape((200, 140, 60)),
+        );
+        assert_eq!(bang, expected, "two-color: bold sigil + line tint");
+        // `shell_mode = "none"` → sigil only (command stays plain).
+        let sigil_only = FooterHelper {
+            palette: resolve_palette(
+                &newt_core::ColorsConfig {
+                    shell_mode: Some("none".into()),
+                    ..Default::default()
+                },
+                true,
+            ),
+        };
+        let so = sigil_only.highlight("! pa login", 0).into_owned();
+        assert_eq!(
+            so,
+            format!(
+                "{ANSI_BOLD}{}!{ANSI_RESET} pa login",
+                fg_escape((220, 60, 20))
+            ),
+            "sigil-only when line tint disabled"
+        );
+        // With color disabled the same line is untouched.
+        let plain = FooterHelper {
+            palette: resolve_palette(&newt_core::ColorsConfig::default(), false),
+        };
+        assert_eq!(plain.highlight("! pa login", 0), "! pa login");
+    }
 
     #[test]
     fn rich_follows_mode_and_tty() {
@@ -1079,14 +1331,38 @@ mod footer_tests {
     }
 
     #[test]
-    fn continuation_triggers_on_trailing_backslash() {
-        // A trailing backslash means "keep typing" (multi-line continuation).
-        assert!(footer_continues("write a\\"));
+    fn backslash_continuation_is_bang_only() {
+        // A `! …` host-shell line continues on a trailing backslash.
+        assert!(footer_continues("! date \\"));
+        // A chat line submits on Enter even when it ends with `\` (literal).
+        assert!(!footer_continues("write a\\"));
         // Balanced input submits.
         assert!(!footer_continues("write a function"));
         assert!(!footer_continues(""));
         // The rejoin the REPL applies turns a `\`-break into a real newline.
         assert_eq!("foo\\\nbar".replace("\\\n", "\n"), "foo\nbar");
+    }
+
+    #[test]
+    fn triple_quote_block_stays_open_until_closed() {
+        // `"""`/`'''` alone on line 1 opens a block; it stays open until a
+        // matching closing fence appears on a later line.
+        assert!(footer_continues("\"\"\""));
+        assert!(footer_continues("\"\"\"\nline one"));
+        assert!(footer_continues("\"\"\"\nline one\nline two"));
+        assert!(
+            !footer_continues("\"\"\"\nline one\n\"\"\""),
+            "closing fence submits"
+        );
+        // `'''` works too, and mismatched fences don't close.
+        assert!(footer_continues("'''\nbody"));
+        assert!(!footer_continues("'''\nbody\n'''"));
+        assert!(
+            footer_continues("'''\nbody\n\"\"\""),
+            "mismatched fence stays open"
+        );
+        // A leading `"""` that is NOT alone on the first line is not a fence.
+        assert!(!footer_continues("\"\"\" inline text"));
     }
 }
 
@@ -3274,6 +3550,11 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
         resolve_tui(&cfg).as_ref(),
     ) && io::stdin().is_terminal();
     let mut permission_state = PermissionPromptState::default();
+    // `[tui] allow_bang_escape` (default true): the human's `!` host shell-out.
+    // The model can never reach it regardless; this only governs the keyboard.
+    let bang_escape_enabled = resolve_tui(&cfg)
+        .map(|t| t.allow_bang_escape)
+        .unwrap_or(true);
     let permission_log_path =
         newt_core::Config::user_config_path().map(|p| p.with_file_name("permission-log.jsonl"));
     print_newt(
@@ -3364,7 +3645,8 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
     let mut rl: rustyline::Editor<FooterHelper, rustyline::history::DefaultHistory> =
         rustyline::Editor::with_config(build_rl_config())?;
     if footer_on {
-        install_footer_helper(&mut rl);
+        let colors = resolve_tui(&cfg).map(|t| t.colors).unwrap_or_default();
+        install_footer_helper(&mut rl, resolve_palette(&colors, color));
     }
     if let Some(ref hp) = history_path {
         let _ = rl.load_history(hp);
@@ -3639,6 +3921,29 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                 }
                 let _ = rl.add_history_entry(&task);
                 println!();
+                // `! <cmd>` — human-only host shell-escape (interactive, inherited
+                // stdio: prompts + browser SAML work). Intercepted before the
+                // slash/chat paths; the model can never reach this. When disabled
+                // via `[tui] allow_bang_escape = false`, the line is caught and
+                // refused with a notice — never silently sent to the model.
+                //
+                // Detect + run from the RAW line, not `task`: `task` collapsed
+                // each `\`+newline to a bare newline, but the shell should do its
+                // own line-continuation, so a multi-line `! cmd \` joins into one
+                // command (`$SHELL -c` sees the backslash-newline intact).
+                if let Some(rest) = bang_command(line.trim()) {
+                    if bang_escape_enabled {
+                        run_bang_escape(rest, color, verbose);
+                    } else {
+                        print_newt(
+                            "! bang-escape is disabled ([tui] allow_bang_escape = false)",
+                            color,
+                            verbose,
+                        );
+                    }
+                    println!();
+                    continue;
+                }
                 if task.starts_with('/') {
                     // Commands that need direct access to `memory` are handled here
                     // before delegating to the generic slash dispatcher.
@@ -3937,7 +4242,8 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                     let fresh_cfg = build_rl_config();
                     rl = rustyline::Editor::with_config(fresh_cfg)?;
                     if footer_on {
-                        install_footer_helper(&mut rl);
+                        let colors = resolve_tui(&cfg).map(|t| t.colors).unwrap_or_default();
+                        install_footer_helper(&mut rl, resolve_palette(&colors, color));
                     }
                     if let Some(ref hp) = history_path {
                         let _ = rl.load_history(hp);
@@ -6064,6 +6370,7 @@ fn help_lines() -> &'static [&'static str] {
         "  /vi  /emacs              - switch line-editor key bindings for this session",
         "  /version                 - print newt version",
         "  /help                    - this message",
+        "  ! <command>              - run a host command interactively (e.g. ! pa login) — you, not the agent",
         "  /exit  /quit  exit  quit - leave the session",
     ]
 }
@@ -6643,6 +6950,70 @@ fn run_newt_subcmd(args: &[&str], color: bool, verbose: bool) -> anyhow::Result<
     Ok(())
 }
 
+/// Split a prompt line into the host command after a leading `!`, or `None`
+/// when the line is not a bang-escape (or is just `!` with no command).
+///
+/// The `!` bang-escape is a HUMAN action in the interactive readline loop — the
+/// model has no channel to type at the prompt, so it can never invoke this. It
+/// runs on the host with the user's own authority (no OCAP/Caveats leash, which
+/// governs only *model*-initiated `run_command`), like typing in a shell. Its
+/// purpose is interactive logins such as `! pa login` (browser SAML).
+fn bang_command(input: &str) -> Option<&str> {
+    let rest = input.strip_prefix('!')?.trim();
+    if rest.is_empty() {
+        None
+    } else {
+        Some(rest)
+    }
+}
+
+/// The user's shell + its "run this string" flag, per platform. Honors `$SHELL`
+/// (unix) / `%COMSPEC%` (windows), falling back to the system default. Running
+/// through a shell (not bare-exec) gives pipes, redirects, `&&`, and env
+/// expansion — matching shell muscle memory.
+///
+/// Unix uses `-c` (**non-interactive**), NOT `-ic`. An interactive shell enables
+/// job control (monitor mode): it grabs the terminal's foreground process group
+/// via `tcsetpgrp` and does not reliably restore newt's on exit, leaving newt in
+/// the background → `SIGTTOU` on its next TTY write → "suspended (tty output)".
+/// `-c` avoids that entirely. PATH is still inherited from the shell that
+/// launched newt, so binaries (e.g. `pa`) resolve fine; only `.zshrc`/`.bashrc`
+/// aliases and shell *functions* are unavailable. Windows `cmd /C`.
+fn bang_shell() -> (String, &'static str) {
+    #[cfg(windows)]
+    {
+        let sh = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd".to_string());
+        (sh, "/C")
+    }
+    #[cfg(not(windows))]
+    {
+        let sh = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+        (sh, "-c")
+    }
+}
+
+/// Run a `!`-escaped host command interactively: stdio is **inherited** (the
+/// child gets the real TTY, so it can prompt and launch a browser — e.g. the
+/// `pa login` SAML flow), output scrolls live, and control returns to the
+/// prompt. Mirrors `run_newt_subcmd`'s inherited-stdio launch. A non-zero exit
+/// prints a thin status line; a spawn failure surfaces the error.
+fn run_bang_escape(cmd: &str, color: bool, verbose: bool) {
+    let (shell, flag) = bang_shell();
+    match std::process::Command::new(&shell)
+        .arg(flag)
+        .arg(cmd)
+        .status()
+    {
+        Ok(status) if status.success() => {}
+        Ok(status) => print_newt(
+            &format!("exit {}", status.code().unwrap_or(-1)),
+            color,
+            verbose,
+        ),
+        Err(e) => print_newt(&format!("! failed to run `{shell}`: {e}"), color, verbose),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Shared helpers
 // ---------------------------------------------------------------------------
@@ -6681,6 +7052,46 @@ fn test_persona(name: &str, prompt: &str, path: std::path::PathBuf) -> Persona {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bang_command_strips_and_trims_the_escape() {
+        assert_eq!(bang_command("!date"), Some("date"));
+        assert_eq!(bang_command("! date"), Some("date"));
+        assert_eq!(bang_command("!  pa login  "), Some("pa login"));
+        // A pipeline survives intact — it's handed to the shell verbatim.
+        assert_eq!(bang_command("! echo hi | wc -c"), Some("echo hi | wc -c"));
+    }
+
+    #[test]
+    fn bang_command_ignores_non_bang_and_bare_bang() {
+        assert_eq!(bang_command("date"), None, "no leading bang");
+        assert_eq!(bang_command("/help"), None, "slash is not a bang");
+        assert_eq!(bang_command("!"), None, "bare bang has no command");
+        assert_eq!(bang_command("!   "), None, "whitespace-only is empty");
+        assert_eq!(
+            bang_command("the ! is mid-line"),
+            None,
+            "bang must lead the line"
+        );
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn bang_shell_is_a_noninteractive_unix_shell() {
+        let (shell, flag) = bang_shell();
+        // `-c`, NOT `-ic`: an interactive shell's job control suspends newt
+        // (SIGTTOU). See bang_shell docs.
+        assert_eq!(flag, "-c");
+        assert!(!shell.is_empty(), "a shell is always resolved");
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn bang_shell_is_a_windows_shell_with_slash_c() {
+        let (shell, flag) = bang_shell();
+        assert_eq!(flag, "/C");
+        assert!(!shell.is_empty(), "a shell is always resolved");
+    }
 
     fn write_pyo3_binding(root: &std::path::Path, krate: &str, submodule: &str) {
         let dir = root.join(krate).join("src");
