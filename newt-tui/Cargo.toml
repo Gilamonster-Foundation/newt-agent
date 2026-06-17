@@ -53,6 +53,8 @@ agent-mesh-protocol = { workspace = true }
 # HTTP mocking for the tool-call loop tests (cap honoured + graceful cap-exit
 # issuing a final tools-disabled completion). Mirrors newt-inference's pattern.
 wiremock.workspace = true
+tui-textarea = "0.7.0"
+chrono.workspace = true
 
 [lints]
 workspace = true
