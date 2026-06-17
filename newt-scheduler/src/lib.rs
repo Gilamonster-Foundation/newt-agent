@@ -22,8 +22,10 @@
 
 use newt_core::{BackendConfig, BackendKind, Tier};
 
+mod crew;
 mod dispatch;
 mod probe;
+pub use crew::{run_crew, CrewConfig, CrewOutcome, CrewStatus, Edit, Workspace};
 pub use dispatch::{ChatReply, ChatRequest, Dispatcher, LocalDispatcher};
 pub use probe::{Prober, TcpProber};
 
