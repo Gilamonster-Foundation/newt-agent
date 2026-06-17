@@ -98,6 +98,11 @@ jobs:
       - name: test (rich-tui)
         if: always()
         run: cargo test -p newt-tui --features rich-tui
+      - name: clippy newt binary (rich-tui forward)
+        # Proves the feature unifies into the shipped `newt` binary via the
+        # newt-cli forward, not just the leaf crate. Mirrors `just check`.
+        if: always()
+        run: cargo clippy -p newt-agent --features rich-tui -- -D warnings
 
   coverage:
     name: Workspace coverage (cargo-llvm-cov)
