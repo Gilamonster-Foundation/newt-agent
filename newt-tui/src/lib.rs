@@ -1026,31 +1026,29 @@ struct Palette {
     dim: String,
 }
 
-/// Resolve `[tui.colors]` into ready-to-print escapes. `accent` (the `!` sigil)
-/// defaults to newt orange and `dim` (the prompt) to grey; `shell_mode` — the
-/// OPT-IN full-command tint — defaults to *off*, so by default only the `!`
-/// itself is colored, not the whole line. An invalid/unset slot keeps its
-/// default; with color disabled every slot is empty, so highlighting is inert.
+/// Resolve `[tui.colors]` into ready-to-print escapes. Each slot has a built-in
+/// default (accent = bold-orange `!` sigil, shell_mode = amber full-line tint,
+/// dim = grey prompt); an unset/invalid spec keeps the default, an explicit
+/// `"none"`/`"off"` disables that slot, and with color globally off every slot
+/// is empty (highlighting inert).
 fn resolve_palette(colors: &newt_core::ColorsConfig, color_enabled: bool) -> Palette {
     if !color_enabled {
         return Palette::default();
     }
-    // A slot with a built-in default color (falls back when unset/invalid).
-    let pick = |spec: &Option<String>, default: (u8, u8, u8)| {
-        let rgb = spec.as_deref().and_then(parse_color_rgb).unwrap_or(default);
-        fg_escape(rgb)
-    };
-    // An opt-in slot: empty (no color) unless the user set a valid spec.
-    let pick_opt = |spec: &Option<String>| {
-        spec.as_deref()
-            .and_then(parse_color_rgb)
-            .map(fg_escape)
-            .unwrap_or_default()
+    let slot = |spec: &Option<String>, default: (u8, u8, u8)| -> String {
+        match spec.as_deref() {
+            // Explicit opt-out of this slot.
+            Some(s) if s.eq_ignore_ascii_case("none") || s.eq_ignore_ascii_case("off") => {
+                String::new()
+            }
+            // A valid override, else (unset/invalid) the built-in default.
+            s => fg_escape(s.and_then(parse_color_rgb).unwrap_or(default)),
+        }
     };
     Palette {
-        accent: pick(&colors.accent, (220, 60, 20)),
-        shell_mode: pick_opt(&colors.shell_mode),
-        dim: pick(&colors.dim, (128, 128, 128)),
+        accent: slot(&colors.accent, (220, 60, 20)),
+        shell_mode: slot(&colors.shell_mode, (200, 140, 60)),
+        dim: slot(&colors.dim, (128, 128, 128)),
     }
 }
 
@@ -1067,29 +1065,28 @@ impl rustyline::hint::Hinter for FooterHelper {
     type Hint = String;
 }
 impl rustyline::highlight::Highlighter for FooterHelper {
-    /// Flag a `! …` host-shell line by coloring just the leading `!` sigil
-    /// (bold accent) — a caret-adjacent mode indicator, NOT the whole line. The
-    /// command is tinted too only when the opt-in `shell_mode` slot is set. Any
-    /// other line is returned unchanged.
+    /// Color a `! …` host-shell line with two independent slots: a bold `accent`
+    /// `!` sigil and a `shell_mode` tint over the whole command, so the line
+    /// visibly changes when you escape to the shell. Either slot can be disabled
+    /// (`"none"`) for sigil-only or tint-only; if both are off the line is
+    /// returned unchanged, as is any non-`!` line.
     fn highlight<'l>(&self, line: &'l str, _pos: usize) -> std::borrow::Cow<'l, str> {
-        if self.palette.accent.is_empty() || !line.starts_with('!') {
+        let (accent, shell) = (&self.palette.accent, &self.palette.shell_mode);
+        if (accent.is_empty() && shell.is_empty()) || !line.starts_with('!') {
             return std::borrow::Cow::Borrowed(line);
         }
         let rest = &line[1..];
-        if self.palette.shell_mode.is_empty() {
-            // Default: only the `!` is colored; the command stays plain.
-            std::borrow::Cow::Owned(format!(
-                "{ANSI_BOLD}{}!{ANSI_RESET}{rest}",
-                self.palette.accent
-            ))
+        let sigil = if accent.is_empty() {
+            "!".to_string()
         } else {
-            // Opt-in: also tint the command in the shell-mode color.
-            std::borrow::Cow::Owned(format!(
-                "{ANSI_BOLD}{accent}!{ANSI_RESET}{shell}{rest}{ANSI_RESET}",
-                accent = self.palette.accent,
-                shell = self.palette.shell_mode,
-            ))
-        }
+            format!("{ANSI_BOLD}{accent}!{ANSI_RESET}")
+        };
+        let body = if shell.is_empty() {
+            rest.to_string()
+        } else {
+            format!("{shell}{rest}{ANSI_RESET}")
+        };
+        std::borrow::Cow::Owned(format!("{sigil}{body}"))
     }
     /// Dim the prompt status line so the bright bang-mode line stands out and
     /// the prompt reads as an at-rest log marker (the plain-scroller intent).
@@ -1103,12 +1100,11 @@ impl rustyline::highlight::Highlighter for FooterHelper {
         }
         std::borrow::Cow::Owned(format!("{}{prompt}{ANSI_RESET}", self.palette.dim))
     }
-    /// Re-highlight on each keystroke so the `!` sigil appears/clears live as it
-    /// is typed or deleted. Gated on `accent` (the always-on sigil color), so it
-    /// stays active even when the opt-in `shell_mode` tint is unset; inert only
-    /// when color is fully disabled.
+    /// Re-highlight on each keystroke so the bang coloring appears/clears live
+    /// as `!` is typed or deleted. Active when either bang slot is set; inert
+    /// only when both are off (color fully disabled, or both set to `"none"`).
     fn highlight_char(&self, _line: &str, _pos: usize, _forced: bool) -> bool {
-        !self.palette.accent.is_empty()
+        !(self.palette.accent.is_empty() && self.palette.shell_mode.is_empty())
     }
 }
 impl rustyline::validate::Validator for FooterHelper {
@@ -1166,21 +1162,22 @@ mod footer_tests {
         // Color disabled → every slot empty, so highlighting is a no-op.
         let off = resolve_palette(&colors, false);
         assert!(off.accent.is_empty() && off.shell_mode.is_empty() && off.dim.is_empty());
-        // Enabled with no overrides → accent + dim default; shell_mode is the
-        // opt-in full-command tint, so it stays OFF by default.
+        // Enabled with no overrides → two-color defaults: bold-orange sigil,
+        // amber full-line tint, grey prompt.
         let on = resolve_palette(&colors, true);
         assert_eq!(on.accent, fg_escape((220, 60, 20)));
-        assert!(
-            on.shell_mode.is_empty(),
-            "command tint is opt-in (off by default)"
+        assert_eq!(
+            on.shell_mode,
+            fg_escape((200, 140, 60)),
+            "amber line tint on by default"
         );
         assert_eq!(on.dim, fg_escape((128, 128, 128)));
-        // An accent override wins; an invalid spec falls back to the default;
-        // setting shell_mode opts into the command tint.
+        // A valid override wins; an invalid spec falls back to the default;
+        // `"none"` disables a slot.
         let overridden = newt_core::ColorsConfig {
             accent: Some("not-a-color".into()),
             shell_mode: Some("cyan".into()),
-            dim: Some("red".into()),
+            dim: Some("none".into()),
         };
         let p = resolve_palette(&overridden, true);
         assert_eq!(
@@ -1188,39 +1185,43 @@ mod footer_tests {
             fg_escape((220, 60, 20)),
             "invalid → default orange"
         );
-        assert_eq!(p.shell_mode, fg_escape((17, 168, 205)), "cyan opt-in tint");
-        assert_eq!(p.dim, fg_escape((205, 49, 49)), "red override");
+        assert_eq!(p.shell_mode, fg_escape((17, 168, 205)), "cyan override");
+        assert!(p.dim.is_empty(), "\"none\" disables the slot");
     }
 
     #[test]
-    fn highlight_colors_only_the_bang_sigil_by_default() {
+    fn highlight_tints_sigil_and_line_independently() {
         let helper = FooterHelper {
             palette: resolve_palette(&newt_core::ColorsConfig::default(), true),
         };
         // A chat line is returned unchanged (borrowed, no escapes).
         assert_eq!(helper.highlight("hello there", 0), "hello there");
-        // A bang line: only the `!` is bold-accent; the command stays plain
-        // (ends with the command verbatim, no trailing color escape).
+        // A bang line: bold-orange `!` sigil + amber-tinted command.
         let bang = helper.highlight("! pa login", 0).into_owned();
         let expected = format!(
-            "{ANSI_BOLD}{}!{ANSI_RESET} pa login",
-            fg_escape((220, 60, 20))
+            "{ANSI_BOLD}{}!{ANSI_RESET}{} pa login{ANSI_RESET}",
+            fg_escape((220, 60, 20)),
+            fg_escape((200, 140, 60)),
         );
-        assert_eq!(bang, expected, "sigil-only by default");
-        // Opt-in `shell_mode` also tints the command.
-        let loud = FooterHelper {
+        assert_eq!(bang, expected, "two-color: bold sigil + line tint");
+        // `shell_mode = "none"` → sigil only (command stays plain).
+        let sigil_only = FooterHelper {
             palette: resolve_palette(
                 &newt_core::ColorsConfig {
-                    shell_mode: Some("red".into()),
+                    shell_mode: Some("none".into()),
                     ..Default::default()
                 },
                 true,
             ),
         };
-        let tinted = loud.highlight("! pa login", 0).into_owned();
-        assert!(
-            tinted.contains(&fg_escape((205, 49, 49))),
-            "command tinted red"
+        let so = sigil_only.highlight("! pa login", 0).into_owned();
+        assert_eq!(
+            so,
+            format!(
+                "{ANSI_BOLD}{}!{ANSI_RESET} pa login",
+                fg_escape((220, 60, 20))
+            ),
+            "sigil-only when line tint disabled"
         );
         // With color disabled the same line is untouched.
         let plain = FooterHelper {
@@ -3860,7 +3861,12 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                 // slash/chat paths; the model can never reach this. When disabled
                 // via `[tui] allow_bang_escape = false`, the line is caught and
                 // refused with a notice — never silently sent to the model.
-                if let Some(rest) = bang_command(&task) {
+                //
+                // Detect + run from the RAW line, not `task`: `task` collapsed
+                // each `\`+newline to a bare newline, but the shell should do its
+                // own line-continuation, so a multi-line `! cmd \` joins into one
+                // command (`$SHELL -c` sees the backslash-newline intact).
+                if let Some(rest) = bang_command(line.trim()) {
                     if bang_escape_enabled {
                         run_bang_escape(rest, color, verbose);
                     } else {

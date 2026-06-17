@@ -150,11 +150,14 @@ The practical wins compound with the architectural one:
   user's own host authority (no OCAP/Caveats leash — that governs only
   *model*-initiated `run_command`). `wyvern-agent` (no interactive loop) has no
   bang-escape. A `!` line is **recolored live** via rustyline's `Highlighter`
-  (bold accent `!` sigil + the command in the `shell_mode` color) so it reads as
-  obviously *not* a chat message — within rustyline's existing carve-out, no
-  region. Colors come from a small `[tui.colors]` palette (`accent` /
-  `shell_mode` / `dim`, named or `#rrggbb`), defaulting to today's values and
-  dropped entirely under `NO_COLOR` / non-TTY.
+  (bold `accent` `!` sigil + the whole command in the `shell_mode` tint) so it
+  reads as obviously *not* a chat message — within rustyline's existing carve-out,
+  no region. Two independent slots from a small `[tui.colors]` palette (`accent` /
+  `shell_mode` / `dim`, each a named color or `#rrggbb`, or `"none"` to disable
+  that slot), defaulting to built-ins and dropped entirely under `NO_COLOR` /
+  non-TTY. Multi-line entry uses the trailing-`\` continuation, and the bang line
+  is handed to `$SHELL -c` with the `\` intact so the shell does its own
+  line-joining.
 
 ## Consequences
 
