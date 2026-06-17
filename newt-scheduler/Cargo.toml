@@ -1,0 +1,15 @@
+[package]
+name = "newt-scheduler"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "The crew's availability-adaptive BackendPool: model-pin dispatch + health over a heterogeneous inference pool"
+keywords = ["newt", "agent", "scheduler", "inference", "drake"]
+categories = ["development-tools"]
+
+[dependencies]
+newt-core.workspace = true
