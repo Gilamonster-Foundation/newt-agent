@@ -11,7 +11,9 @@
 //! - `DgxTelemetry` — async HTTP client; all fetch errors return None/empty.
 //!   - `try_connect(ollama_url)` — derives DCGM port from Ollama host; returns
 //!     `None` if DCGM is unreachable rather than failing.
-//!   - `snapshot()` — DCGM GPU metrics, None fields when unavailable.
+//!   - `snapshot()` / `snapshot_async()` — DCGM GPU metrics, None when absent.
+//!   - `into_sampler()` — background sampler publishing snapshots on a `watch`
+//!     channel so the UI reads instantly and never blocks (issue #414).
 //!   - `loaded_models()` — Ollama `/api/ps`, empty vec when unavailable.
 
 use std::collections::HashMap;
@@ -240,20 +242,52 @@ impl DgxTelemetry {
         }
     }
 
-    /// Sample current GPU metrics from DCGM Prometheus.
+    /// Sample current GPU metrics from DCGM Prometheus (async core).
     ///
     /// Returns a zeroed (all-`None`) snapshot when the endpoint is
     /// unreachable — never propagates errors.
-    pub fn snapshot(&self) -> TelemetrySnapshot {
+    pub async fn snapshot_async(&self) -> TelemetrySnapshot {
         let metrics_url = format!("{}/metrics", self.dcgm_base.trim_end_matches('/'));
-        let text = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async { fetch_text(&metrics_url, 5).await })
-        });
-        text.as_deref()
+        fetch_text(&metrics_url, 5)
+            .await
+            .as_deref()
             .map(parse_prometheus)
             .as_ref()
             .map(snapshot_from_metrics)
             .unwrap_or_default()
+    }
+
+    /// Blocking wrapper over [`snapshot_async`](Self::snapshot_async). Kept for
+    /// synchronous callers; on the UI hot path prefer the background sampler
+    /// ([`into_sampler`](Self::into_sampler)) so the prompt never blocks.
+    pub fn snapshot(&self) -> TelemetrySnapshot {
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(self.snapshot_async())
+        })
+    }
+
+    /// Consume this connection into a **background sampler**: spawn a task that
+    /// polls `snapshot_async` every `interval_secs` and publishes the latest
+    /// reading on a `watch` channel. The UI reads `*rx.borrow()` instantly and
+    /// never blocks on the network (issue #414 first step; follows #412). The
+    /// task stops when the last receiver is dropped (backend-URL change or
+    /// session exit), so there is no leak.
+    pub fn into_sampler(
+        self,
+        interval_secs: u64,
+    ) -> tokio::sync::watch::Receiver<TelemetrySnapshot> {
+        let (tx, rx) = tokio::sync::watch::channel(TelemetrySnapshot::default());
+        tokio::runtime::Handle::current().spawn(async move {
+            let mut ticker =
+                tokio::time::interval(std::time::Duration::from_secs(interval_secs.max(1)));
+            loop {
+                ticker.tick().await;
+                if tx.send(self.snapshot_async().await).is_err() {
+                    break; // last receiver dropped — stop sampling
+                }
+            }
+        });
+        rx
     }
 
     /// List models currently loaded in Ollama's VRAM (`/api/ps`).
@@ -299,6 +333,34 @@ fn parse_loaded_models(json: Option<&serde_json::Value>) -> Vec<LoadedModel> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- into_sampler (background sampler) ---
+
+    #[tokio::test]
+    async fn into_sampler_publishes_in_background_without_blocking() {
+        // An unreachable DCGM endpoint: `snapshot_async` returns the default
+        // (all-`None`) snapshot. The point is the background task PUBLISHES on
+        // the `watch` channel so the UI can read it instantly — the caller of
+        // `into_sampler` never blocks on the network.
+        let tele = DgxTelemetry {
+            ollama_base: "http://127.0.0.1:1".into(),
+            dcgm_base: "http://127.0.0.1:1".into(), // closed port -> fast fail
+        };
+        let mut rx = tele.into_sampler(1);
+        // The first interval tick fires immediately, so a sample is published
+        // promptly; reading is instant.
+        tokio::time::timeout(std::time::Duration::from_secs(3), rx.changed())
+            .await
+            .expect("sampler published within 3s")
+            .expect("sender alive");
+        assert!(
+            !rx.borrow().has_data(),
+            "unreachable endpoint yields an empty snapshot"
+        );
+        // Dropping the receiver signals the background task to stop (no leak);
+        // nothing to assert beyond it not panicking.
+        drop(rx);
+    }
 
     // --- parse_prometheus ---
 
