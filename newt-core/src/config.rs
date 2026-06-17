@@ -652,9 +652,20 @@ pub struct TuiConfig {
     pub no_splash: bool,
 
     /// Key binding mode for the chat input line.
-    /// `"emacs"` (default) or `"vi"`. Also overridable via `NEWT_EDIT_MODE`.
+    /// `"emacs"` (default), `"vi"`, or `"nano"`. Also overridable via
+    /// `NEWT_EDIT_MODE`. (`nano` is emacs-style/modeless — it differs from
+    /// `emacs` only in label today; the rich-tui surface honors it.)
     #[serde(default)]
     pub edit_mode: EditMode,
+
+    /// Rich-tui (issue #416) input gutter width, in columns. Unset = `auto`
+    /// (the responsive default: a prompt gutter when it fits under ~1/3 of the
+    /// width, else a stacked prompt row). `0` turns the gutter off (prompt on
+    /// its own row, input flush-left); a positive value indents the input that
+    /// many columns (a value wide enough to hold the prompt renders it inline).
+    /// No effect on the plain rustyline surface.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gutter: Option<u16>,
 
     /// Input-footer mode: the transient multi-line `❯` input block with a
     /// status header. `"auto"` (default) shows it on a TTY and degrades to a
@@ -1409,11 +1420,16 @@ impl ToolPermissions {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum EditMode {
-    /// Readline / emacs-style bindings (default).
-    #[default]
+    /// Readline / emacs-style bindings.
     Emacs,
     /// Vi / vim-style bindings — Esc for normal mode, i for insert.
     Vi,
+    /// Nano-style: modeless, emacs-like bindings (the **default** — the most
+    /// broadly approachable). Behaves like `Emacs` today (rustyline has no nano
+    /// mode); it is a distinct, selectable label, and the rich-tui surface shows
+    /// the nano `^G` help hint for it.
+    #[default]
+    Nano,
 }
 
 impl EditMode {
@@ -1421,13 +1437,17 @@ impl EditMode {
         match self {
             Self::Emacs => "emacs",
             Self::Vi => "vi",
+            Self::Nano => "nano",
         }
     }
 
+    /// Cycle through the modes (used by a single-key toggle): emacs → vi →
+    /// nano → emacs.
     pub fn toggle(&self) -> Self {
         match self {
             Self::Emacs => Self::Vi,
-            Self::Vi => Self::Emacs,
+            Self::Vi => Self::Nano,
+            Self::Nano => Self::Emacs,
         }
     }
 }
@@ -1438,7 +1458,8 @@ impl Default for TuiConfig {
             chat_style: ChatStyle::Compact,
             prompt: None,
             no_splash: false,
-            edit_mode: EditMode::Emacs,
+            edit_mode: EditMode::Nano,
+            gutter: None,
             footer: FooterMode::Auto,
             thinking: ThinkingMode::Stream,
             tool_output_lines: default_tool_output_lines(),

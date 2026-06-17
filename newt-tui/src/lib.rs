@@ -842,13 +842,16 @@ fn trace_mode(cfg: &newt_core::Config) -> bool {
     std::env::var("NEWT_TRACE").is_ok() || cfg.tui.as_ref().and_then(|t| t.trace).unwrap_or(false)
 }
 
-/// Build a rustyline config reading edit mode from env then config file.
-pub(crate) fn build_rl_config() -> rustyline::config::Config {
-    let em = std::env::var("NEWT_EDIT_MODE")
+/// Resolve the edit mode from env (`NEWT_EDIT_MODE`) then config file, defaulting
+/// to emacs. The single source of truth for both the rustyline config and the
+/// rich-tui surface (which needs the `nano` distinction rustyline can't express).
+pub(crate) fn resolve_edit_mode() -> newt_core::EditMode {
+    std::env::var("NEWT_EDIT_MODE")
         .ok()
         .and_then(|v| match v.to_lowercase().as_str() {
             "vi" | "vim" => Some(newt_core::EditMode::Vi),
             "emacs" => Some(newt_core::EditMode::Emacs),
+            "nano" => Some(newt_core::EditMode::Nano),
             _ => None,
         })
         .or_else(|| {
@@ -857,12 +860,42 @@ pub(crate) fn build_rl_config() -> rustyline::config::Config {
                 .and_then(|c| c.tui)
                 .map(|t| t.edit_mode)
         })
-        .unwrap_or(newt_core::EditMode::Emacs);
+        .unwrap_or(newt_core::EditMode::Emacs)
+}
 
+/// Resolve the rich-tui gutter setting from env (`NEWT_GUTTER`) then config.
+/// `None` = auto; `Some(0)` = off; `Some(n)` = an n-column input indent.
+/// `NEWT_GUTTER` accepts `auto`, `off`, or a number; an unrecognized value
+/// falls through to the config file. Only the rich-tui surface consumes this.
+#[cfg(feature = "rich-tui")]
+pub(crate) fn resolve_gutter_setting() -> Option<u16> {
+    if let Ok(v) = std::env::var("NEWT_GUTTER") {
+        match v.trim().to_lowercase().as_str() {
+            "auto" => return None,
+            "off" => return Some(0),
+            s => {
+                if let Ok(n) = s.parse::<u16>() {
+                    return Some(n);
+                }
+                // Unrecognized value: ignore the env override, use config.
+            }
+        }
+    }
+    newt_core::Config::resolve()
+        .ok()
+        .and_then(|c| c.tui)
+        .and_then(|t| t.gutter)
+}
+
+/// Build a rustyline config reading edit mode from env then config file.
+pub(crate) fn build_rl_config() -> rustyline::config::Config {
     rustyline::config::Builder::new()
-        .edit_mode(match em {
+        .edit_mode(match resolve_edit_mode() {
             newt_core::EditMode::Vi => rustyline::config::EditMode::Vi,
-            newt_core::EditMode::Emacs => rustyline::config::EditMode::Emacs,
+            // rustyline has no nano mode; nano is emacs-style there.
+            newt_core::EditMode::Emacs | newt_core::EditMode::Nano => {
+                rustyline::config::EditMode::Emacs
+            }
         })
         .build()
 }
@@ -6579,7 +6612,7 @@ fn help_lines() -> &'static [&'static str] {
         "  /config                  - dump the resolved config (secrets redacted) for audit",
         "  /prompt                  - list prompt tokens ($MODEL, $DATE, …) + current prompt",
         "  /prompt set \"<template>\"  - set the prompt for this session; /prompt reset to revert",
-        "  /vi  /emacs              - switch line-editor key bindings for this session",
+        "  /vi  /emacs  /nano       - switch line-editor key bindings for this session",
         "  /version                 - print newt version",
         "  /help                    - this message",
         "  ! <command>              - run a host command interactively (e.g. ! pa login) — you, not the agent",
@@ -6683,16 +6716,18 @@ fn dispatch_slash(
             print_newt(&format!("preview: {preview}"), color, verbose);
         }
 
-        "vi" | "emacs" | "edit-mode" => {
+        "vi" | "emacs" | "nano" | "edit-mode" => {
             // Switch the line-editor key bindings for the rest of the session.
             // Sets NEWT_EDIT_MODE; the editor rebuild + the is_vi/caret recompute
             // back in `run_chat` (after every slash command) pick it up.
             let want = match cmd {
                 "vi" => Some("vi"),
                 "emacs" => Some("emacs"),
+                "nano" => Some("nano"),
                 _ => match arg1.to_lowercase().as_str() {
                     "vi" | "vim" => Some("vi"),
                     "emacs" => Some("emacs"),
+                    "nano" => Some("nano"),
                     _ => None,
                 },
             };
@@ -6704,7 +6739,7 @@ fn dispatch_slash(
                     print_newt(&format!("edit mode: {m}"), color, verbose);
                 }
                 None => print_newt(
-                    "usage: /edit-mode <vi|emacs>  (or just /vi, /emacs)",
+                    "usage: /edit-mode <vi|emacs|nano>  (or just /vi, /emacs, /nano)",
                     color,
                     verbose,
                 ),
