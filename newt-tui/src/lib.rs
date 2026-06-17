@@ -6971,6 +6971,13 @@ fn bang_command(input: &str) -> Option<&str> {
 /// Honors `$SHELL` (unix) / `%COMSPEC%` (windows), falling back to the system
 /// default. Running through a shell (not bare-exec) gives pipes, redirects,
 /// `&&`, and env expansion — matching shell muscle memory.
+///
+/// Unix uses `-ic` — an **interactive** shell that sources the user's rc
+/// (`.zshrc`/`.bashrc`), so `!` runs commands exactly as the user's own
+/// terminal would: aliases, shell functions (e.g. a `pa` that is a function,
+/// not a binary), PATH tweaks, and a real prompt for nested shells like
+/// `! bash`. Trade-off: rc is sourced every invocation, so a chatty rc can emit
+/// startup noise. Windows `cmd /C` has no rc-sourcing equivalent.
 fn bang_shell() -> (String, &'static str) {
     #[cfg(windows)]
     {
@@ -6980,7 +6987,7 @@ fn bang_shell() -> (String, &'static str) {
     #[cfg(not(windows))]
     {
         let sh = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-        (sh, "-c")
+        (sh, "-ic")
     }
 }
 
@@ -7069,9 +7076,10 @@ mod tests {
 
     #[test]
     #[cfg(not(windows))]
-    fn bang_shell_is_a_unix_shell_with_dash_c() {
+    fn bang_shell_is_an_interactive_unix_shell() {
         let (shell, flag) = bang_shell();
-        assert_eq!(flag, "-c");
+        // Interactive (`-i`) so the user's rc is sourced; `-c` runs the string.
+        assert_eq!(flag, "-ic");
         assert!(!shell.is_empty(), "a shell is always resolved");
     }
 
