@@ -129,6 +129,23 @@ fn tool_definitions() -> Value {
             }
         }),
         serde_json::json!({
+            "name": "git",
+            "description": "Run a git operation via the embedded engine (grit-lib), gated by GitCaveats derived from the granted Caveats leash. ops: status | log | diff | add | commit | branch. Local-only; network ops (clone/fetch/push) are fail-closed. A write op (add/commit/branch) under a read-only grant is DENIED (isError). Returns structured JSON.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "op": { "type": "string", "enum": ["status", "log", "diff", "add", "commit", "branch"] },
+                    "repo": { "type": "string", "description": "Repository path (default: current directory)" },
+                    "limit": { "type": "integer", "description": "log: max commits (default 20)" },
+                    "staged": { "type": "boolean", "description": "diff: staged (index vs HEAD) instead of worktree (default false)" },
+                    "paths": { "type": "array", "items": { "type": "string" }, "description": "add: repo-relative paths to stage" },
+                    "message": { "type": "string", "description": "commit: commit message" },
+                    "name": { "type": "string", "description": "branch: new branch name" }
+                },
+                "required": ["op"]
+            }
+        }),
+        serde_json::json!({
             "name": "goal_run",
             "description": "Run a tier-routed inference turn",
             "inputSchema": {
@@ -239,6 +256,7 @@ fn register_tools_call(
                 "code_search" => handle_code_search(&arguments),
                 "goal_run" => handle_goal_run(&arguments, &registry, &router).await,
                 "fs_list" => handle_fs_list(&arguments),
+                "git" => handle_git(&arguments, &granted),
                 "shell_run" => Ok(handle_shell_run(arguments, &bridle, &granted).await),
                 "web_fetch" => Ok(handle_web_fetch(arguments, &bridle, &granted).await),
                 other => anyhow::bail!("unknown tool: {other}"),
@@ -248,6 +266,85 @@ fn register_tools_call(
 }
 
 // ── Tool implementations ───────────────────────────────────────────────────
+
+/// `git` — the embedded git engine (grit-lib via `newt-git`), gated by
+/// `GitCaveats` derived from the granted leash. Local ops only; a write under a
+/// read-only grant returns an error (MCP `isError`).
+fn handle_git(args: &Value, granted: &Caveats) -> anyhow::Result<Value> {
+    use newt_git::{Author, DiffSpec, GitEngine};
+
+    let op = args
+        .get("op")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("missing required argument: op"))?;
+    let repo = args.get("repo").and_then(|v| v.as_str()).unwrap_or(".");
+    // The git surface is bounded by the granted leash: read-only when fs_write is
+    // empty, full-local when writable, network always denied.
+    let caps = newt_core::git_caveats::GitCaveats::from_session(granted);
+    let eng = GitEngine::open(Path::new(repo)).map_err(|e| anyhow::anyhow!("git open: {e}"))?;
+
+    let result: Value = match op {
+        "status" => serde_json::to_value(eng.status(&caps).map_err(gerr)?)?,
+        "log" => {
+            let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(20) as usize;
+            serde_json::to_value(eng.log(&caps, limit).map_err(gerr)?)?
+        }
+        "diff" => {
+            let spec = if args.get("staged").and_then(Value::as_bool).unwrap_or(false) {
+                DiffSpec::Staged
+            } else {
+                DiffSpec::Worktree
+            };
+            serde_json::to_value(eng.diff(&caps, spec).map_err(gerr)?)?
+        }
+        "add" => {
+            let paths: Vec<String> = args
+                .get("paths")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            serde_json::to_value(eng.add(&caps, &paths).map_err(gerr)?)?
+        }
+        "commit" => {
+            let message = args
+                .get("message")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow::anyhow!("git commit requires 'message'"))?;
+            let author = Author {
+                name: args
+                    .get("author_name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("newt-agent[bot]")
+                    .to_string(),
+                email: args
+                    .get("author_email")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("newt-agent@users.noreply.github.com")
+                    .to_string(),
+            };
+            serde_json::to_value(eng.commit(&caps, message, &author).map_err(gerr)?)?
+        }
+        "branch" => {
+            let name = args
+                .get("name")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow::anyhow!("git branch requires 'name'"))?;
+            serde_json::to_value(eng.branch(&caps, name).map_err(gerr)?)?
+        }
+        other => anyhow::bail!("unknown git op: {other}"),
+    };
+    Ok(mcp_text_content(&serde_json::to_string_pretty(&result)?))
+}
+
+/// Map a `newt-git` engine error (incl. capability denial) to an `anyhow` error
+/// so the dispatch surfaces it as an MCP `isError`.
+fn gerr(e: newt_git::GitError) -> anyhow::Error {
+    anyhow::anyhow!("git: {e}")
+}
 
 fn handle_code_read(args: &Value) -> anyhow::Result<Value> {
     let path = args
@@ -664,6 +761,89 @@ mod tests {
 
         assert!(resp["error"].is_object(), "expected error, got: {resp}");
         assert_eq!(resp["error"]["code"], -32603);
+    }
+
+    // ── tools/call — git (embedded engine) ──────────────────────────────────
+
+    fn run_git(dir: &std::path::Path, args: &[&str]) {
+        assert!(std::process::Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .status()
+            .unwrap()
+            .success());
+    }
+
+    fn temp_repo() -> tempfile::TempDir {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path();
+        run_git(p, &["init", "-q", "-b", "main"]);
+        std::fs::write(p.join("a.txt"), "hello\n").unwrap();
+        run_git(p, &["add", "a.txt"]);
+        run_git(
+            p,
+            &[
+                "-c",
+                "user.name=T",
+                "-c",
+                "user.email=t@e",
+                "commit",
+                "-q",
+                "-m",
+                "first",
+            ],
+        );
+        d
+    }
+
+    #[tokio::test]
+    async fn git_status_returns_structured_json() {
+        let repo = temp_repo();
+        let resp = rpc_with_caveats(
+            Caveats::top(),
+            &serde_json::json!({
+                "jsonrpc": "2.0", "id": 40, "method": "tools/call",
+                "params": {
+                    "name": "git",
+                    "arguments": { "op": "status", "repo": repo.path().to_str().unwrap() }
+                }
+            }),
+        )
+        .await;
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        let v: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(v["branch"], "main");
+        assert_eq!(v["clean"], true);
+    }
+
+    #[tokio::test]
+    async fn git_commit_denied_under_readonly_grant() {
+        use agent_bridle::Scope;
+        let repo = temp_repo();
+        // fs_write empty -> GitCaveats::from_session denies stage/commit (fail-closed).
+        let readonly = Caveats {
+            fs_write: Scope::none(),
+            ..Caveats::top()
+        };
+        let resp = rpc_with_caveats(
+            readonly,
+            &serde_json::json!({
+                "jsonrpc": "2.0", "id": 41, "method": "tools/call",
+                "params": {
+                    "name": "git",
+                    "arguments": {
+                        "op": "commit",
+                        "repo": repo.path().to_str().unwrap(),
+                        "message": "should be refused"
+                    }
+                }
+            }),
+        )
+        .await;
+        assert!(
+            resp["error"].is_object(),
+            "read-only grant must refuse git commit, got: {resp}"
+        );
     }
 
     // ── tools/call — code_search ────────────────────────────────────────────
