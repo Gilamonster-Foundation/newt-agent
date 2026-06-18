@@ -4193,6 +4193,25 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
     let mut pending_retry: Option<String> = None;
     let mut retry_budget: u32 = 0;
 
+    // PR4 (#461): the embedded `git` tool. Built once per session and injected
+    // into every turn's ChatCtx — but ONLY when the workspace is inside a git
+    // repo (cheap `GitEngine::open` probe). Otherwise it stays `None`, so the
+    // tool is never advertised in a non-repo dir (the presence gate). The
+    // commit author is the resolved AgentIdentity (`newt-agent[bot]` default).
+    let session_git_tool: Option<newt_git::LocalGitTool> =
+        if newt_git::GitEngine::open(std::path::Path::new(workspace)).is_ok() {
+            let id = newt_core::AgentIdentity::resolve().unwrap_or_default();
+            Some(newt_git::LocalGitTool {
+                root: std::path::PathBuf::from(workspace),
+                author: newt_git::Author {
+                    name: id.name,
+                    email: id.email,
+                },
+            })
+        } else {
+            None
+        };
+
     loop {
         // rustyline can panic (assertion `fd != -1`) when the terminal file
         // descriptor becomes invalid — most commonly from file-descriptor
@@ -4896,8 +4915,11 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                                     write_ledger: retry_ledger.as_ref(),
                                     // Esc-to-interrupt flag, tripped by the watcher.
                                     cancel: Some(&turn_cancel),
-                                    // PR4 Phase 3 flips this to Some(&git_tool).
-                                    git_tool: None,
+                                    // PR4 (#461): the embedded git tool, present
+                                    // only when this workspace is a git repo.
+                                    git_tool: session_git_tool
+                                        .as_ref()
+                                        .map(|g| g as &dyn newt_core::agentic::GitTool),
                                 },
                                 &mut mcp,
                             ))
