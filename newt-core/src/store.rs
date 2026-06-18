@@ -664,6 +664,56 @@ impl ConversationStore {
         Ok(summaries)
     }
 
+    /// The most-recently-active **open** conversation in this workspace —
+    /// highest `activity_tick` whose `end_reason` is still NULL — or `None`
+    /// when every conversation has been ended (or none exist). This is the
+    /// auto-resume target: an ended conversation (`/end`, `/restart`, `:wq`)
+    /// is skipped here so the next launch does not silently re-enter it, yet
+    /// it stays in [`list`](Self::list) / `/recall` because it is not deleted.
+    pub fn latest_open(&self) -> anyhow::Result<Option<ConversationSummary>> {
+        let conn = self.lock_conn();
+        conn.query_row(
+            "SELECT c.id, c.title, c.persona, c.updated_at_claim,
+                    (SELECT COUNT(*) FROM turns t WHERE t.conversation_id = c.id)
+               FROM conversations c
+              WHERE c.workspace_key = ?1 AND c.end_reason IS NULL
+              ORDER BY c.activity_tick DESC, c.id DESC
+              LIMIT 1",
+            [&self.workspace_id],
+            |row| {
+                Ok(ConversationSummary {
+                    id: row.get(0)?,
+                    title: row.get(1)?,
+                    persona: row.get(2)?,
+                    updated_at_unix_nanos: claim_to_u128(row.get(3)?),
+                    turn_count: row.get::<_, i64>(4)?.max(0) as usize,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    /// Mark a conversation **ended** with a short reason (`"new"`, `"restart"`,
+    /// `"wq"`, …). Like [`rename`](Self::rename) this is metadata, not activity:
+    /// it does NOT tick the §6 clock, so it cannot perturb MRU ordering — it
+    /// only sets `end_reason` (the column reserved at 17.7), which
+    /// [`latest_open`](Self::latest_open) reads to skip the row on auto-resume.
+    /// The conversation, its turns, and its FTS rows are untouched, so
+    /// `/recall` and `/conversation` still find it. Idempotent and
+    /// workspace-fenced (an id from another workspace resolves as absent).
+    pub fn end_conversation(&self, id: &str, reason: &str) -> anyhow::Result<()> {
+        let id = self.resolve_id(id)?;
+        let now = (self.claim_clock)();
+        let conn = self.lock_conn();
+        conn.execute(
+            "UPDATE conversations SET end_reason = ?2, updated_at_claim = ?3
+              WHERE id = ?1 AND workspace_key = ?4",
+            rusqlite::params![id, reason.trim(), now, self.workspace_id],
+        )?;
+        Ok(())
+    }
+
     /// Rename a conversation. Updates the display claim but does NOT tick
     /// the activity clock: a rename is metadata, not activity, so it cannot
     /// perturb MRU ordering (§6 dissolved the old rename-bumps-`updated_at`
@@ -2070,6 +2120,81 @@ mod tests {
         assert!(store.load_turn(&conv, seq + 9_999).unwrap().is_none());
         // Unknown conversation id → None, not an error (no cross-ws leak path).
         assert!(store.load_turn("no-such-conv", seq).unwrap().is_none());
+    }
+
+    // --- end_reason: /end · /restart · :wq close-out (17.7 wiring) ---------
+
+    /// `end_conversation` marks the row so `latest_open` skips it on
+    /// auto-resume, while `list` (and therefore `/recall`/`/conversation`)
+    /// still sees it — ended, not deleted.
+    #[test]
+    fn end_conversation_hides_row_from_latest_open_but_not_from_list() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let store = ConversationStore::new(root.path(), workspace.path(), 100).unwrap();
+
+        let c1 = store.create("first", None).unwrap();
+        store.append_turn(&c1, "q1", "a1").unwrap();
+        let c2 = store.create("second", None).unwrap();
+        store.append_turn(&c2, "q2", "a2").unwrap();
+
+        // c2 was written last → highest activity tick → the resume target.
+        assert_eq!(store.latest_open().unwrap().unwrap().id, c2);
+
+        // End c2: latest_open falls back to the prior OPEN conversation…
+        store.end_conversation(&c2, "wq").unwrap();
+        assert_eq!(
+            store.latest_open().unwrap().unwrap().id,
+            c1,
+            "an ended conversation is skipped on auto-resume"
+        );
+        // …but both rows are still listed (ended ≠ deleted).
+        assert_eq!(store.list().unwrap().len(), 2);
+        // …and the ended conversation is still recall-searchable.
+        assert!(
+            store
+                .search("q2", 5)
+                .unwrap()
+                .iter()
+                .any(|h| h.conversation_id == c2),
+            "ended conversation stays in the FTS index for /recall"
+        );
+
+        // End the last open one too → nothing left to auto-resume → fresh.
+        store.end_conversation(&c1, "end").unwrap();
+        assert!(store.latest_open().unwrap().is_none());
+        assert_eq!(store.list().unwrap().len(), 2, "still listed after ending");
+    }
+
+    /// Ending is metadata, not activity: it must not tick the §6 clock (so it
+    /// cannot perturb MRU ordering), and re-ending is harmless.
+    #[test]
+    fn end_conversation_does_not_tick_activity_and_is_idempotent() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let store = ConversationStore::new(root.path(), workspace.path(), 100).unwrap();
+
+        let older = store.create("older", None).unwrap();
+        store.append_turn(&older, "q", "a").unwrap();
+        let newer = store.create("newer", None).unwrap();
+        store.append_turn(&newer, "q", "a").unwrap();
+
+        let tick_of = |id: &str| -> i64 {
+            let conn = store.lock_conn();
+            conn.query_row(
+                "SELECT activity_tick FROM conversations WHERE id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        let before = tick_of(&older);
+        store.end_conversation(&older, "new").unwrap();
+        assert_eq!(tick_of(&older), before, "ending must not bump the tick");
+        // Idempotent: re-ending an already-ended conversation is fine.
+        store.end_conversation(&older, "new").unwrap();
+        // `newer` is still open and remains the resume target.
+        assert_eq!(store.latest_open().unwrap().unwrap().id, newer);
     }
 
     // --- 17.3: the query-sanitizer adversarial matrix ---------------------
