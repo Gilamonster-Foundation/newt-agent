@@ -357,6 +357,9 @@ mod tests {
             vec!["init", "-q"],
             vec!["config", "user.email", "t@t"],
             vec!["config", "user.name", "t"],
+            // Keep line endings verbatim so checked-out content matches on
+            // Windows runners (default autocrlf would turn "\n" into "\r\n").
+            vec!["config", "core.autocrlf", "false"],
         ] {
             git(p, &args).unwrap();
         }
@@ -389,9 +392,12 @@ mod tests {
         let repo = git_repo();
         let mut ws = WorktreeWorkspace::create(repo.path(), "t1", "true".into()).unwrap();
 
-        // files() lists tracked files; read() reads them.
+        // files() lists tracked files; read() reads them (line-ending-tolerant).
         assert!(ws.files().iter().any(|f| f == "hello.txt"));
-        assert_eq!(ws.read("hello.txt").as_deref(), Some("world\n"));
+        assert_eq!(
+            ws.read("hello.txt").as_deref().map(str::trim_end),
+            Some("world")
+        );
         assert_eq!(ws.read("nope.txt"), None);
 
         // apply() writes into the WORKTREE, not the live tree.
