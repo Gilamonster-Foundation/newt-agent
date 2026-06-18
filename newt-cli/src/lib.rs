@@ -10,6 +10,7 @@
 
 mod auth_cmd;
 mod config_cmd;
+pub mod crew;
 mod dgx;
 mod doctor;
 mod identity_cmd;
@@ -212,6 +213,27 @@ pub enum Command {
     },
     /// MCP server (stdio JSON-RPC, no TUI).
     Mcp,
+    /// Run a multi-LLM crew on a task (navigate → plan → verify → triage), in an
+    /// isolated git worktree. Exit 0 = passed, 2 = needs human review, 1 = error.
+    Crew {
+        /// The task for the crew (a coding-task description).
+        task: String,
+        /// Crew name from `[crews.<name>]`. Omit when exactly one crew is defined.
+        #[arg(long)]
+        crew: Option<String>,
+        /// Target repo dir (default: current dir). Must be a git repo.
+        #[arg(long)]
+        dir: Option<PathBuf>,
+        /// Verification command override (default: the crew's `test`, else inferred).
+        #[arg(long)]
+        test: Option<String>,
+        /// Cap on planning rounds (default: the crew's budget, else 3).
+        #[arg(long)]
+        max_attempts: Option<u32>,
+        /// Resolve + show placements and exit, without editing or testing.
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+    },
     /// Health-check local backends + provider plugins.
     Doctor,
     /// Print resolved config.
@@ -438,6 +460,28 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             allow_no_key,
         } => run_worker(coder, operator_key_path, allow_no_key).await,
         Command::Mcp => run_mcp().await,
+        Command::Crew {
+            task,
+            crew,
+            dir,
+            test,
+            max_attempts,
+            dry_run,
+        } => {
+            let code = crew::run_cli(crew::CrewArgs {
+                task,
+                crew,
+                dir,
+                test,
+                max_attempts,
+                dry_run,
+            })
+            .await?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(())
+        }
         Command::Doctor => doctor::run(cli.config.as_deref()).await,
         Command::Config => config_cmd::run(cli.config.as_deref()),
         Command::Identity => identity_cmd::run(cli.config.as_deref()),
