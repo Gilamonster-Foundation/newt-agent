@@ -6652,10 +6652,13 @@ fn print_metrics(metrics: &newt_core::TurnMetrics, color: bool) {
 
 fn print_thinking(color: bool) {
     if color {
+        // Frame-0 placeholder matching the animated spinner the inference loop
+        // takes over (newt-core animates the probe wait in place), so there is
+        // no glyph jump between this instant feedback and the live line.
         execute!(
             io::stdout(),
             SetForegroundColor(CtColor::DarkGrey),
-            Print("▸  thinking…"),
+            Print("⏳ ⠋  thinking…"),
             ResetColor,
         )
         .ok();
@@ -6664,7 +6667,9 @@ fn print_thinking(color: bool) {
 }
 
 fn erase_line() {
-    print!("\r{}\r", " ".repeat(20));
+    // Clear-to-end-of-line: the animated thinking line ("⏳ ⠋ thinking… 12.3s")
+    // can be wider than a fixed blank run, so `\x1b[K` wipes whatever is there.
+    print!("\r\x1b[K");
     io::stdout().flush().ok();
 }
 

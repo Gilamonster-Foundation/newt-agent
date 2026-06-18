@@ -714,6 +714,44 @@ async fn cancellable<F: std::future::Future>(
     }
 }
 
+/// Drive `fut` while animating the thinking line in place (~8 fps), so a slow
+/// non-streaming probe still feels alive — the braille/hourglass spinner
+/// otherwise only advances when reasoning tokens arrive. Clears the line when
+/// `fut` resolves so the following output starts clean. A no-op when `animate`
+/// is false (piped / `thinking = "off"` / no TTY) — bit-for-bit today's path.
+async fn with_thinking_spinner<F: std::future::Future>(animate: bool, fut: F) -> F::Output {
+    if !animate {
+        return fut.await;
+    }
+    tokio::pin!(fut);
+    let start = std::time::Instant::now();
+    let mut frame = 0usize;
+    let mut ticker = tokio::time::interval(std::time::Duration::from_millis(120));
+    loop {
+        tokio::select! {
+            biased;
+            out = &mut fut => {
+                let _ = write!(io::stdout(), "\r\x1b[K");
+                let _ = io::stdout().flush();
+                return out;
+            }
+            _ = ticker.tick() => {
+                let line = format_spinner(frame, start.elapsed().as_secs_f32(), 0);
+                let mut out = io::stdout();
+                let _ = execute!(
+                    out,
+                    Print("\r\x1b[K"),
+                    SetForegroundColor(CtColor::DarkGrey),
+                    Print(&line),
+                    ResetColor,
+                );
+                let _ = out.flush();
+                frame = frame.wrapping_add(1);
+            }
+        }
+    }
+}
+
 pub async fn chat_complete(
     ctx: ChatCtx<'_>,
     mcp: &mut dyn McpTools,
@@ -1037,27 +1075,33 @@ pub async fn chat_complete(
         // of these steps is transient and worth retrying with backoff. Raced
         // against the interrupt flag so Esc bails out of a slow / stuck probe
         // (the common "the model isn't answering" case) without waiting for it.
-        let dispatch = match cancellable(
-            cancel,
-            with_backoff_notify(
-                &retry,
-                || async {
-                    let resp = client
-                        .post(&chat_url)
-                        .json(&body_no_stream)
-                        .send()
-                        .await
-                        .map_err(|e| anyhow::anyhow!("request failed: {e}"))?;
-                    if !resp.status().is_success() {
-                        let status = resp.status();
-                        let text = resp.text().await.unwrap_or_default();
-                        anyhow::bail!("Ollama {status}: {text}");
-                    }
-                    resp.json::<serde_json::Value>()
-                        .await
-                        .map_err(anyhow::Error::from)
-                },
-                |attempt, delay| print_retry_indicator(attempt, delay, color),
+        // Wrapped in the thinking animation so this otherwise-silent wait shows
+        // a live hourglass + clock instead of a frozen line.
+        let probe_animate = color && thinking_stream_enabled();
+        let dispatch = match with_thinking_spinner(
+            probe_animate,
+            cancellable(
+                cancel,
+                with_backoff_notify(
+                    &retry,
+                    || async {
+                        let resp = client
+                            .post(&chat_url)
+                            .json(&body_no_stream)
+                            .send()
+                            .await
+                            .map_err(|e| anyhow::anyhow!("request failed: {e}"))?;
+                        if !resp.status().is_success() {
+                            let status = resp.status();
+                            let text = resp.text().await.unwrap_or_default();
+                            anyhow::bail!("Ollama {status}: {text}");
+                        }
+                        resp.json::<serde_json::Value>()
+                            .await
+                            .map_err(anyhow::Error::from)
+                    },
+                    |attempt, delay| print_retry_indicator(attempt, delay, color),
+                ),
             ),
         )
         .await
@@ -2436,12 +2480,19 @@ fn thinking_stream_enabled() -> bool {
 /// Spinner glyph frames (braille) for the thinking renderer.
 const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
-/// The ephemeral spinner line text. Pure for testing.
+/// The ephemeral spinner line text. Pure for testing. An opening/closing
+/// hourglass (⏳/⌛, alternating per frame) plus the braille spinner — both
+/// advance every frame so the line is visibly alive even while only the clock
+/// moves (a slow probe with no tokens yet). `chars == 0` is the probe phase
+/// (nothing generated yet), so the `· N chars` tail is omitted there.
 fn format_spinner(frame: usize, secs: f32, chars: usize) -> String {
-    format!(
-        "{}  thinking… {secs:.1}s · {chars} chars",
-        SPINNER_FRAMES[frame % SPINNER_FRAMES.len()]
-    )
+    let hourglass = if frame % 2 == 0 { "⏳" } else { "⌛" };
+    let braille = SPINNER_FRAMES[frame % SPINNER_FRAMES.len()];
+    if chars == 0 {
+        format!("{hourglass} {braille}  thinking… {secs:.1}s")
+    } else {
+        format!("{hourglass} {braille}  thinking… {secs:.1}s · {chars} chars")
+    }
 }
 
 /// Cargo-style thinking renderer: a model's reasoning (#385 — normally
@@ -2663,15 +2714,16 @@ mod cap_exit_unit_tests {
 
     #[test]
     fn spinner_line_formats_and_frame_wraps() {
+        // Frame 0: hourglass ⏳ + braille ⠋, with the chars tail (streaming).
         assert_eq!(
             format_spinner(0, 1.23, 340),
-            "⠋  thinking… 1.2s · 340 chars"
+            "⏳ ⠋  thinking… 1.2s · 340 chars"
         );
-        // Frame index wraps over the glyph set.
-        assert_eq!(
-            &format_spinner(SPINNER_FRAMES.len(), 0.0, 0)[..SPINNER_FRAMES[0].len()],
-            SPINNER_FRAMES[0]
-        );
+        // Odd frame flips the hourglass (⌛) and advances the braille glyph;
+        // chars == 0 (the probe phase) drops the `· N chars` tail.
+        assert_eq!(format_spinner(1, 0.5, 0), "⌛ ⠙  thinking… 0.5s");
+        // Frame index wraps over the braille glyph set.
+        assert!(format_spinner(SPINNER_FRAMES.len(), 0.0, 0).contains(SPINNER_FRAMES[0]));
     }
 
     #[test]
