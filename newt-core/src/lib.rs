@@ -31,6 +31,7 @@ pub mod retry;
 pub mod role_profile;
 pub mod router;
 pub mod session;
+pub mod ssh_caveats;
 pub mod store;
 pub mod symbols;
 pub mod tuning;
