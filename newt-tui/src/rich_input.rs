@@ -943,9 +943,13 @@ fn draw_overhang(f: &mut Frame, area: Rect, prompt: &Line<'static>, textarea: &T
 
 /// Emit a submitted turn into real scrollback (above the inline region), so the
 /// conversation log shows what the user typed — the inline widget itself is
-/// cleared on submit.
-fn echo_submitted(terminal: &mut Term, body: &str) -> io::Result<()> {
+/// cleared on submit. Continuation lines hang-indent by the SAME gutter the
+/// input used (default 1), so a multi-line prompt reads back exactly as typed
+/// rather than being re-flowed to a different indent on submit.
+fn echo_submitted(terminal: &mut Term, body: &str, gutter: Option<u16>) -> io::Result<()> {
     let stamp = chrono::Local::now().format("%H:%M:%S").to_string();
+    let width = crossterm::terminal::size().map(|(c, _)| c).unwrap_or(80);
+    let hang = " ".repeat(resolve_gutter(gutter, width) as usize);
     let n = body.lines().count().max(1) as u16;
     terminal.insert_before(n + 1, |buf| {
         let mut lines: Vec<Line> = Vec::new();
@@ -953,7 +957,7 @@ fn echo_submitted(terminal: &mut Term, body: &str) -> io::Result<()> {
             let prefix = if i == 0 {
                 Span::styled(format!("[{stamp}] ❯ "), Style::default().fg(Color::Gray))
             } else {
-                Span::raw("            ")
+                Span::raw(hang.clone())
             };
             lines.push(Line::from(vec![prefix, Span::raw(l.to_string())]));
         }
@@ -1070,7 +1074,7 @@ impl RichSurface {
                     if body.trim().is_empty() {
                         continue;
                     }
-                    echo_submitted(&mut terminal, &body)?;
+                    echo_submitted(&mut terminal, &body, self.gutter)?;
                     return Ok(ReadOutcome::Line(body));
                 }
                 Step::SubmitQuit => {
@@ -1080,7 +1084,7 @@ impl RichSurface {
                     if body.trim().is_empty() {
                         return Ok(ReadOutcome::EndAndQuit);
                     }
-                    echo_submitted(&mut terminal, &body)?;
+                    echo_submitted(&mut terminal, &body, self.gutter)?;
                     // Submit this turn now; the end-and-quit fires on the NEXT
                     // read once the turn has run to completion.
                     self.pending_end_quit.set(true);
