@@ -2089,6 +2089,7 @@ dependencies = [
  "agent-mesh-protocol",
  "anyhow",
  "async-trait",
+ "base64",
  "blake3",
  "chrono",
  "crossterm",

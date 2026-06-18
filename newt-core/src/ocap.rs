@@ -202,3 +202,138 @@ mod tests {
         assert!(require(verify_b1()).is_err());
     }
 }
+
+// ===========================================================================
+// Disclosure filter — the by-VALUE redaction primitive for
+// `disclosure-gate-live-path` (docs/design/ocap-enforcement.md §3).
+//
+// Threat-model finding: filter by KNOWN VALUE, not by shape. A shape filter
+// ("looks like a token") both over-blocks and is **defeated by re-encoding**; a
+// value filter catches the registered secret's actual bytes in any common
+// encoding. This is the mechanism `verify_disclosure_gate` will assert on the
+// live tool-result path — the canary: a value seeded at session start must never
+// reach a model-facing message, in ANY encoding. (Wiring it into the live
+// `messages` chokepoint lives in the agentic loop — a follow-up, kept out of
+// this module to avoid colliding with concurrent work there.)
+// ===========================================================================
+
+use base64::Engine as _;
+
+/// Redacts known secret VALUES — and their common re-encodings — from text
+/// before it reaches the model. Register the live token / session canary;
+/// [`leaks`](Self::leaks) detects and [`redact`](Self::redact) removes it.
+#[derive(Debug, Default, Clone)]
+pub struct DisclosureFilter {
+    secrets: Vec<String>,
+}
+
+impl DisclosureFilter {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register a secret value to catch (raw + re-encoded). Empty values are
+    /// ignored. Secrets should be high-entropy (tokens/canaries) — a value
+    /// filter trusts the caller not to register common substrings.
+    pub fn register(&mut self, secret: impl Into<String>) {
+        let s = secret.into();
+        if !s.is_empty() {
+            self.secrets.push(s);
+        }
+    }
+
+    /// The forms of `secret` we match: raw, standard base64, and lowercase hex.
+    fn encodings(secret: &str) -> [String; 3] {
+        let bytes = secret.as_bytes();
+        let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
+        let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        [secret.to_string(), b64, hex]
+    }
+
+    /// Does `text` disclose any registered secret, raw or re-encoded?
+    #[must_use]
+    pub fn leaks(&self, text: &str) -> bool {
+        self.secrets
+            .iter()
+            .any(|s| Self::encodings(s).iter().any(|e| text.contains(e.as_str())))
+    }
+
+    /// Replace every occurrence of every registered secret (raw or re-encoded)
+    /// with `[REDACTED]`.
+    #[must_use]
+    pub fn redact(&self, text: &str) -> String {
+        let mut out = text.to_string();
+        for s in &self.secrets {
+            for enc in Self::encodings(s) {
+                out = out.replace(enc.as_str(), "[REDACTED]");
+            }
+        }
+        out
+    }
+}
+
+#[cfg(test)]
+mod disclosure_tests {
+    use super::*;
+
+    fn b64(s: &str) -> String {
+        base64::engine::general_purpose::STANDARD.encode(s.as_bytes())
+    }
+    fn hexs(s: &str) -> String {
+        s.as_bytes().iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    #[test]
+    fn catches_raw_value() {
+        let mut f = DisclosureFilter::new();
+        f.register("CANARY-7f3a9c2b");
+        assert!(f.leaks("the token is CANARY-7f3a9c2b right here"));
+        assert!(!f.leaks("nothing secret in this text"));
+    }
+
+    #[test]
+    fn catches_base64_reencoding() {
+        // The key property: re-encoding defeats a SHAPE filter, not a VALUE filter.
+        let mut f = DisclosureFilter::new();
+        f.register("CANARY-7f3a9c2b");
+        let leaked = format!("here is {} encoded", b64("CANARY-7f3a9c2b"));
+        assert!(f.leaks(&leaked), "base64 re-encoding must still be caught");
+    }
+
+    #[test]
+    fn catches_hex_reencoding() {
+        let mut f = DisclosureFilter::new();
+        f.register("CANARY-7f3a9c2b");
+        assert!(f.leaks(&format!("payload={}", hexs("CANARY-7f3a9c2b"))));
+    }
+
+    #[test]
+    fn redacts_all_forms() {
+        let mut f = DisclosureFilter::new();
+        f.register("SECRETVAL-abc123");
+        let text = format!(
+            "raw=SECRETVAL-abc123 b64={} hex={}",
+            b64("SECRETVAL-abc123"),
+            hexs("SECRETVAL-abc123")
+        );
+        let red = f.redact(&text);
+        assert!(!f.leaks(&red), "redacted text must not leak");
+        assert!(red.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn value_filter_not_shape_filter() {
+        // An UNREGISTERED token-shaped string is NOT flagged — we filter by known
+        // value, not "looks like a secret". (The deliberate threat-model choice.)
+        let f = DisclosureFilter::new();
+        assert!(!f.leaks("AKIAIOSFODNN7EXAMPLE looks like a key but isn't registered"));
+    }
+
+    #[test]
+    fn empty_registration_is_ignored() {
+        let mut f = DisclosureFilter::new();
+        f.register("");
+        assert!(!f.leaks("anything at all"));
+    }
+}
