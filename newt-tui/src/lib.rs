@@ -868,6 +868,13 @@ pub(crate) fn resolve_edit_mode() -> newt_core::EditMode {
 /// `None` = auto; `Some(0)` = off; `Some(n)` = an n-column input indent.
 /// `NEWT_GUTTER` accepts `auto`, `off`, or a number; an unrecognized value
 /// falls through to the config file. Only the rich-tui surface consumes this.
+///
+/// Default (nothing set in env or config): `Some(1)` — a single-space gutter
+/// (stacked layout, prompt on its own row, input indented one column). The
+/// user calls the continuation indent the "gutter" and wants it one space with
+/// prompt-overhang acceptable; the old wide auto-gutter read as dead space.
+/// Set `NEWT_GUTTER=auto` to restore the width-aware horizontal layout, or
+/// `tui.gutter = N` in config for a fixed indent.
 #[cfg(feature = "rich-tui")]
 pub(crate) fn resolve_gutter_setting() -> Option<u16> {
     if let Ok(v) = std::env::var("NEWT_GUTTER") {
@@ -886,6 +893,8 @@ pub(crate) fn resolve_gutter_setting() -> Option<u16> {
         .ok()
         .and_then(|c| c.tui)
         .and_then(|t| t.gutter)
+        // Unset anywhere → a 1-space gutter, not auto-wide.
+        .or(Some(1))
 }
 
 /// Build a rustyline config reading edit mode from env then config file.
