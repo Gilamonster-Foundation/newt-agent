@@ -579,10 +579,10 @@ fn help_text(edit: Edit) -> String {
         ]
         .join("\n"),
         Edit::Nano => {
-            "nano  Enter=submit · Ctrl-O or Shift-Enter=newline · Ctrl-C=quit · ^G=help".to_string()
+            "nano  Enter=submit · Ctrl-O or Shift-Enter=newline · ^X=exit · ^G=help".to_string()
         }
         Edit::Emacs => {
-            "emacs  Enter=submit · Ctrl-O or Shift-Enter=newline · Ctrl-C=quit · Ctrl-h=help"
+            "emacs  Enter=submit · Ctrl-O or Shift-Enter=newline · C-x C-c=exit · Ctrl-h=help"
                 .to_string()
         }
     }
@@ -619,6 +619,8 @@ fn current_edit() -> Edit {
 struct Editor {
     edit: Edit,
     vi: Vi,
+    /// emacs `C-x` prefix is armed, awaiting the second key (`C-c` to quit).
+    cx_pending: bool,
 }
 
 impl Editor {
@@ -626,6 +628,7 @@ impl Editor {
         Self {
             edit,
             vi: Vi::new(),
+            cx_pending: false,
         }
     }
 
@@ -633,6 +636,26 @@ impl Editor {
     /// are shared by both modes so behavior matches the rustyline validator.
     fn input(&mut self, key: KeyEvent, ta: &mut TextArea) -> Step {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        // Mode-idiomatic exit. emacs: `C-x C-c` (the `C-x` prefix is armed here
+        // and must be checked BEFORE the bare `Ctrl-C` interrupt below). nano:
+        // `^X` exits directly. vi uses `:q`/`:wq`.
+        if self.cx_pending {
+            self.cx_pending = false;
+            if ctrl && key.code == KeyCode::Char('c') {
+                return Step::Eof;
+            }
+            // Any other key cancels the prefix and is handled normally below.
+        }
+        if ctrl && key.code == KeyCode::Char('x') {
+            match self.edit {
+                Edit::Emacs => {
+                    self.cx_pending = true;
+                    return Step::Continue;
+                }
+                Edit::Nano => return Step::Eof,
+                Edit::Vi => {}
+            }
+        }
         if ctrl {
             match key.code {
                 KeyCode::Char('c') => return Step::Interrupt,
@@ -739,10 +762,10 @@ fn new_textarea(edit: Edit) -> TextArea<'static> {
     // Mode-aware hint, including the mode-idiomatic help key. In vi, Ctrl-O is
     // reserved (jumplist / insert-normal), so we advertise vi-native `o`/`O`.
     let hint = match edit {
-        Edit::Vi => "type…  (Esc=NORMAL · o/O open line · Enter submit · :help · Ctrl-C quit)",
-        Edit::Nano => "type…  (Enter submit · Ctrl-O/Shift-Enter newline · ^G help · Ctrl-C quit)",
+        Edit::Vi => "type…  (Esc=NORMAL · o/O open line · Enter submit · :help · :q quit)",
+        Edit::Nano => "type…  (Enter submit · Ctrl-O/Shift-Enter newline · ^G help · ^X exit)",
         Edit::Emacs => {
-            "type…  (Enter submit · Ctrl-O/Shift-Enter newline · Ctrl-h help · Ctrl-C quit)"
+            "type…  (Enter submit · Ctrl-O/Shift-Enter newline · Ctrl-h help · C-x C-c exit)"
         }
     };
     ta.set_placeholder_text(hint);
@@ -1369,6 +1392,43 @@ mod tests {
         assert!(
             ta.lines().iter().filter(|l| l.contains("dup")).count() >= 1,
             "yy+p yanks and pastes the line"
+        );
+    }
+
+    #[test]
+    fn mode_idiomatic_exit_keys() {
+        // emacs: C-x C-c quits.
+        let mut ed = emacs_editor();
+        let mut ta = TextArea::default();
+        assert_eq!(
+            ed.input(ctrl('x'), &mut ta),
+            Step::Continue,
+            "C-x arms prefix"
+        );
+        assert_eq!(ed.input(ctrl('c'), &mut ta), Step::Eof, "C-x C-c → exit");
+        // emacs: C-x then a non-C-c key cancels the prefix (no exit); the bare
+        // Ctrl-C afterwards is a normal interrupt, not part of the sequence.
+        let mut ed = emacs_editor();
+        let mut ta = TextArea::default();
+        ed.input(ctrl('x'), &mut ta);
+        type_chars(&mut ed, &mut ta, "a"); // cancels the prefix, inserts 'a'
+        assert_eq!(ta.lines(), &["a".to_string()]);
+        assert_eq!(
+            ed.input(ctrl('c'), &mut ta),
+            Step::Interrupt,
+            "bare C-c interrupts"
+        );
+        // nano: ^X exits directly.
+        let mut ed = nano_editor();
+        let mut ta = TextArea::default();
+        assert_eq!(ed.input(ctrl('x'), &mut ta), Step::Eof, "nano ^X → exit");
+        // vi: C-x is not an exit key (uses :q); it does nothing special here.
+        let mut ed = vi_editor();
+        let mut ta = TextArea::default();
+        assert_eq!(
+            ed.input(ctrl('x'), &mut ta),
+            Step::Continue,
+            "vi C-x → no exit"
         );
     }
 
