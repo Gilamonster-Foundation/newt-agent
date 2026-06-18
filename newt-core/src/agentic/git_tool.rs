@@ -42,17 +42,41 @@ pub fn git_tool_definition() -> serde_json::Value {
             "name": "git",
             "description": "Run a git operation through the embedded engine \
                             (NOT run_command). Local-only: read status/log/diff, \
-                            stage with add, commit, amend the last commit, and \
-                            create branches. Writes (add/commit/amend/branch) \
-                            require the session to permit them; network ops are \
-                            unavailable.",
+                            stage with add, commit, amend the last commit, create \
+                            branches, and rebase (structured plan: reword/squash/ \
+                            drop). Writes (add/commit/amend/branch/rebase) require \
+                            the session to permit them; network ops are unavailable.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "op": {
                         "type": "string",
-                        "enum": ["status", "log", "diff", "add", "commit", "amend", "branch"],
+                        "enum": ["status", "log", "diff", "add", "commit", "amend", "branch", "rebase"],
                         "description": "The git operation to run."
+                    },
+                    "onto": {
+                        "type": "string",
+                        "description": "For op=rebase: the base commit/ref to replay the plan onto."
+                    },
+                    "plan": {
+                        "type": "array",
+                        "description": "For op=rebase: ordered steps, oldest first. Each: \
+                                        {commit, action: pick|reword|squash|fixup|drop, message?}. \
+                                        reword/squash use message; squash folds into the previous \
+                                        commit keeping both messages; fixup folds discarding it; \
+                                        drop removes the commit. Aborts (no change) on any conflict.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "commit": { "type": "string" },
+                                "action": {
+                                    "type": "string",
+                                    "enum": ["pick", "reword", "squash", "fixup", "drop"]
+                                },
+                                "message": { "type": "string" }
+                            },
+                            "required": ["commit", "action"]
+                        }
                     },
                     "paths": {
                         "type": "array",
