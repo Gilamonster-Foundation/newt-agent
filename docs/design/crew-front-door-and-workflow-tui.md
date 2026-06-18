@@ -237,16 +237,28 @@ can fix) so the e2e is fast and deterministic-ish.
 Each is a focused PR; (1) and (2) are the unblock and are independently testable
 without a TTY.
 
-## 9. Open questions
+## 9. Resolved decisions (2026-06-18)
 
-- **Crew config home:** `[crews.<name>]` (per `crew-loadout.md`) vs. a crew being
-  "just another loadout that references role-loadouts." Lean: `[crews.*]` as
-  designed; revisit if it feels redundant.
-- **Default verification command:** infer from the repo (justfile → `just check`,
-  Cargo → `cargo test`, Python → `pytest`) vs. always require `--test`. Lean:
-  infer with an override, refuse if none found (no silent no-op test).
-- **Streaming granularity:** do we stream a role's tokens live, or only its
-  parsed result? Lean: result-only for v1 (cheaper, less noise); live tokens
-  behind `--verbose`.
+- **Crew config home:** `[crews.<name>]` (per `crew-loadout.md`), **plus
+  directory discovery** — crews are also `.toml` files under the
+  `/etc/newt · ~/.newt · ./.newt` triad (extending the existing bundles/loadouts
+  pattern). See the config-foundation doc (below).
+- **Default verification command:** **infer** (justfile → `just check`, Cargo →
+  `cargo test`, Python → `pytest`) with a `--test` override; **refuse** if none
+  found — never a silent no-op test.
+- **Streaming granularity:** **result-only** for v1; live role tokens behind
+  `--verbose`. The crew runs on a background tokio task and streams `OutputChunk`s
+  over a channel to the renderer (lean into tokio concurrency for responsiveness).
 - **One crew at a time** (turn-serialized session) for v1; crew-of-crews is the
   swarm layer, later.
+
+### Config foundation (prerequisite, settled separately)
+
+Because crew configs will proliferate, the front door lands on a scale-ready
+config foundation (its own design doc + first PR): crews discovered as files
+across the triad; a **cycle-safe reference resolver** (built now, `extends`/
+`include` cross-links enabled later); and a **trust gate** for committed project
+configs (`newt trust`, direnv-style) — because config is read *unconfined at
+bootstrap*, so a committed `./.newt/` in a cloned repo is a trust boundary.
+Convention: commit `./.newt/*.toml`, gitignore `./.newt/{cache,worktrees,local}/`,
+deletable caches in `~/.newt/{cache,tmp}/`.
