@@ -22,6 +22,7 @@ pub mod metrics;
 pub mod model_id;
 pub mod notes;
 pub mod notes_scan;
+pub mod ocap;
 pub mod plan;
 pub mod pricing;
 pub mod prune;
