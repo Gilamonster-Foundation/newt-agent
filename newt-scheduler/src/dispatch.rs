@@ -14,7 +14,7 @@
 use crate::{BackendPool, Failover, PoolBackend};
 use async_trait::async_trait;
 use newt_core::{BackendKind, Tier};
-use newt_inference::local::LocalOllamaBackend;
+use newt_inference::local::{LocalOllamaBackend, LocalVllmBackend};
 use newt_inference::InferenceBackend;
 
 pub use newt_inference::{ChatReply, ChatRequest};
@@ -50,10 +50,17 @@ impl Dispatcher for LocalDispatcher {
         req: ChatRequest,
     ) -> anyhow::Result<ChatReply> {
         match backend.kind {
-            // Ollama first; the OpenAI/vLLM wire (LocalVllmBackend) is a near-term
-            // addition keyed on `kind`.
-            BackendKind::Ollama | BackendKind::Openai => {
+            BackendKind::Ollama => {
                 LocalOllamaBackend::new(backend.endpoint.clone(), model)
+                    .complete(req)
+                    .await
+            }
+            // Hosted / OpenAI-compatible (hosted OpenAI, vLLM, …): the
+            // `/v1/chat/completions` wire with the bearer token, so the crew/team
+            // can run on a HOSTED LLM, not just local Ollama.
+            BackendKind::Openai => {
+                LocalVllmBackend::new(backend.endpoint.clone(), model)
+                    .with_api_key(backend.api_key.clone())
                     .complete(req)
                     .await
             }
@@ -195,5 +202,16 @@ mod tests {
     async fn local_dispatcher_is_a_trait_object() {
         // The reuse strategy compiles + is the `&dyn Dispatcher` the loop will hold.
         let _d: &dyn Dispatcher = &LocalDispatcher;
+    }
+
+    #[test]
+    fn pool_backend_carries_api_key_for_hosted() {
+        // A hosted/OpenAI backend keeps its bearer token (empty filtered to None).
+        let hosted = PoolBackend::new("openai", "https://api.openai.com", BackendKind::Openai)
+            .with_api_key(Some("sk-test".to_string()));
+        assert_eq!(hosted.api_key.as_deref(), Some("sk-test"));
+        let keyless = PoolBackend::new("o", "http://localhost", BackendKind::Ollama)
+            .with_api_key(Some(String::new()));
+        assert!(keyless.api_key.is_none(), "empty key normalises to None");
     }
 }
