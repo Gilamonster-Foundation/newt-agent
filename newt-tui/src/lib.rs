@@ -6658,7 +6658,7 @@ fn print_thinking(color: bool) {
         execute!(
             io::stdout(),
             SetForegroundColor(CtColor::DarkGrey),
-            Print("⏳ ⠋  thinking…"),
+            Print("⠋ thinking…"),
             ResetColor,
         )
         .ok();

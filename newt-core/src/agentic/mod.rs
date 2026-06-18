@@ -693,8 +693,11 @@ async fn cancelled(cancel: Option<&std::sync::atomic::AtomicBool>) {
     match cancel {
         None => std::future::pending().await,
         Some(flag) => {
+            // Poll briskly so an interrupt is felt promptly (well under the
+            // ~100 ms human threshold) — the cost is negligible next to a model
+            // round-trip.
             while !flag.load(std::sync::atomic::Ordering::Relaxed) {
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                tokio::time::sleep(std::time::Duration::from_millis(15)).await;
             }
         }
     }
@@ -719,7 +722,11 @@ async fn cancellable<F: std::future::Future>(
 /// otherwise only advances when reasoning tokens arrive. Clears the line when
 /// `fut` resolves so the following output starts clean. A no-op when `animate`
 /// is false (piped / `thinking = "off"` / no TTY) — bit-for-bit today's path.
-async fn with_thinking_spinner<F: std::future::Future>(animate: bool, fut: F) -> F::Output {
+async fn with_thinking_spinner<F: std::future::Future>(
+    animate: bool,
+    label: &str,
+    fut: F,
+) -> F::Output {
     if !animate {
         return fut.await;
     }
@@ -736,7 +743,7 @@ async fn with_thinking_spinner<F: std::future::Future>(animate: bool, fut: F) ->
                 return out;
             }
             _ = ticker.tick() => {
-                let line = format_spinner(frame, start.elapsed().as_secs_f32(), 0);
+                let line = format_spinner(frame, start.elapsed().as_secs_f32(), label, 0);
                 let mut out = io::stdout();
                 let _ = execute!(
                     out,
@@ -878,6 +885,10 @@ pub async fn chat_complete(
     // from is real-token currency.
     let cal = sanitize_estimate_ratio(estimate_ratio);
     let tool_tokens_real = calibrate_up(tool_tokens, cal);
+    // Animate the in-place "thinking…/compressing…" status line only on a TTY
+    // with streaming enabled (never in a pipe / `newt worker`). Constant for the
+    // turn — both the compression and probe waits reuse it.
+    let animate = color && thinking_stream_enabled();
     // Truthful context-size tracker: anchors on the backend's last-reported
     // prompt token count, chars/4 + schema estimate as fallback (Step 18.1).
     let mut prompt_tracker = PromptTracker::new();
@@ -972,20 +983,37 @@ pub async fn chat_complete(
                 // user-authoritative; otherwise the guard fired, authoritative
                 // only when the send budget is backed by a believed window.
                 let token_fired = mid_loop_trim_tokens.is_some_and(|t| t > 0 && current > t);
-                let outcome = compress(
-                    CompressRequest {
-                        messages: &messages,
-                        budget: pipeline_budget,
-                        max_messages: trigger.max_messages,
-                        task,
-                        hard_budget: trigger.hard_budget,
-                        authoritative: token_fired || send_budget_authoritative,
-                        focus: None,
-                    },
-                    summarizer,
-                    compress_state,
+                // Compression makes its own summarizer model call — animate the
+                // line with a "compressing context…" stage so it doesn't sit
+                // frozen, and race it against the interrupt flag so Esc bails
+                // out of a slow summarize instead of waiting for it to finish.
+                let outcome = match with_thinking_spinner(
+                    animate,
+                    "compressing context…",
+                    cancellable(
+                        cancel,
+                        compress(
+                            CompressRequest {
+                                messages: &messages,
+                                budget: pipeline_budget,
+                                max_messages: trigger.max_messages,
+                                task,
+                                hard_budget: trigger.hard_budget,
+                                authoritative: token_fired || send_budget_authoritative,
+                                focus: None,
+                            },
+                            summarizer,
+                            compress_state,
+                        ),
+                    ),
                 )
-                .await;
+                .await
+                {
+                    Some(o) => o,
+                    None => {
+                        return Ok((String::new(), false, accumulated_usage, hallucination_count))
+                    }
+                };
                 if let Some(notice) = outcome.notice {
                     print_newt(&notice, color, false);
                 }
@@ -1077,9 +1105,9 @@ pub async fn chat_complete(
         // (the common "the model isn't answering" case) without waiting for it.
         // Wrapped in the thinking animation so this otherwise-silent wait shows
         // a live hourglass + clock instead of a frozen line.
-        let probe_animate = color && thinking_stream_enabled();
         let dispatch = match with_thinking_spinner(
-            probe_animate,
+            animate,
+            "thinking…",
             cancellable(
                 cancel,
                 with_backoff_notify(
@@ -2480,18 +2508,18 @@ fn thinking_stream_enabled() -> bool {
 /// Spinner glyph frames (braille) for the thinking renderer.
 const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
-/// The ephemeral spinner line text. Pure for testing. An opening/closing
-/// hourglass (⏳/⌛, alternating per frame) plus the braille spinner — both
-/// advance every frame so the line is visibly alive even while only the clock
-/// moves (a slow probe with no tokens yet). `chars == 0` is the probe phase
-/// (nothing generated yet), so the `· N chars` tail is omitted there.
-fn format_spinner(frame: usize, secs: f32, chars: usize) -> String {
-    let hourglass = if frame % 2 == 0 { "⏳" } else { "⌛" };
+/// The ephemeral spinner line text. Pure for testing. A braille spinner that
+/// advances every frame (so the line is visibly alive even while only the clock
+/// moves), a stage `label` telling the user what's happening right now
+/// (`thinking…`, `compressing context…`, …), and the elapsed seconds. The
+/// `· N chars` tail is shown only once generation has produced output
+/// (`chars > 0`).
+fn format_spinner(frame: usize, secs: f32, label: &str, chars: usize) -> String {
     let braille = SPINNER_FRAMES[frame % SPINNER_FRAMES.len()];
     if chars == 0 {
-        format!("{hourglass} {braille}  thinking… {secs:.1}s")
+        format!("{braille} {label} {secs:.1}s")
     } else {
-        format!("{hourglass} {braille}  thinking… {secs:.1}s · {chars} chars")
+        format!("{braille} {label} {secs:.1}s · {chars} chars")
     }
 }
 
@@ -2556,7 +2584,12 @@ impl ThinkingSpinner {
 
     fn redraw_spinner(&mut self) {
         self.frame = self.frame.wrapping_add(1);
-        let line = format_spinner(self.frame, self.start.elapsed().as_secs_f32(), self.chars);
+        let line = format_spinner(
+            self.frame,
+            self.start.elapsed().as_secs_f32(),
+            "thinking…",
+            self.chars,
+        );
         let mut out = io::stdout();
         if self.color {
             let _ = execute!(
@@ -2714,16 +2747,21 @@ mod cap_exit_unit_tests {
 
     #[test]
     fn spinner_line_formats_and_frame_wraps() {
-        // Frame 0: hourglass ⏳ + braille ⠋, with the chars tail (streaming).
+        // Braille spinner + stage label + clock; the chars tail shows once
+        // generation has produced output.
         assert_eq!(
-            format_spinner(0, 1.23, 340),
-            "⏳ ⠋  thinking… 1.2s · 340 chars"
+            format_spinner(0, 1.23, "thinking…", 340),
+            "⠋ thinking… 1.2s · 340 chars"
         );
-        // Odd frame flips the hourglass (⌛) and advances the braille glyph;
-        // chars == 0 (the probe phase) drops the `· N chars` tail.
-        assert_eq!(format_spinner(1, 0.5, 0), "⌛ ⠙  thinking… 0.5s");
+        // A different stage label, and chars == 0 drops the `· N chars` tail.
+        assert_eq!(
+            format_spinner(1, 0.5, "compressing context…", 0),
+            "⠙ compressing context… 0.5s"
+        );
         // Frame index wraps over the braille glyph set.
-        assert!(format_spinner(SPINNER_FRAMES.len(), 0.0, 0).contains(SPINNER_FRAMES[0]));
+        assert!(
+            format_spinner(SPINNER_FRAMES.len(), 0.0, "thinking…", 0).contains(SPINNER_FRAMES[0])
+        );
     }
 
     #[test]
