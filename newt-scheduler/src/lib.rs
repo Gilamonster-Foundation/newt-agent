@@ -64,6 +64,9 @@ pub struct PoolBackend {
     pub models: Vec<String>,
     /// Current liveness.
     pub health: Health,
+    /// Bearer token for a hosted/OpenAI-compatible backend (`Authorization:
+    /// Bearer …`), resolved from config. `None` for keyless local endpoints.
+    pub api_key: Option<String>,
 }
 
 impl PoolBackend {
@@ -76,7 +79,15 @@ impl PoolBackend {
             tiers: Vec::new(),
             models: Vec::new(),
             health: Health::Up,
+            api_key: None,
         }
+    }
+
+    /// Builder: a bearer token for a hosted/OpenAI-compatible endpoint.
+    #[must_use]
+    pub fn with_api_key(mut self, api_key: Option<String>) -> Self {
+        self.api_key = api_key.filter(|k| !k.is_empty());
+        self
     }
 
     /// Builder: the tiers this backend serves.
@@ -123,6 +134,7 @@ impl From<&BackendConfig> for PoolBackend {
         PoolBackend::new(c.name.clone(), c.endpoint.clone(), c.kind)
             .with_tiers(c.tiers.clone())
             .with_models([c.model.clone()])
+            .with_api_key(c.resolve_api_key())
     }
 }
 
