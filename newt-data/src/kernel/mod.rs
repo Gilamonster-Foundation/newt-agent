@@ -394,7 +394,7 @@ fn base64_decode(s: &str) -> Result<Vec<u8>, String> {
         }
     }
     let bytes = s.as_bytes();
-    if bytes.len() % 4 != 0 {
+    if !bytes.len().is_multiple_of(4) {
         return Err(format!(
             "base64 length {} is not a multiple of 4",
             bytes.len()

@@ -107,7 +107,7 @@ impl PoolBackend {
     #[must_use]
     pub fn serves(&self, tier: Tier, model_pin: Option<&str>) -> bool {
         let tier_ok = self.tiers.is_empty() || self.tiers.contains(&tier);
-        let model_ok = model_pin.map_or(true, |m| self.models.iter().any(|x| x == m));
+        let model_ok = model_pin.is_none_or(|m| self.models.iter().any(|x| x == m));
         tier_ok && model_ok
     }
 }
