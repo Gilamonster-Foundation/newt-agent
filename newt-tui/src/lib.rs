@@ -394,6 +394,7 @@ fn render_inline_header(workspace: &str, color: bool) -> String {
             "ready — type a task, /help for commands, /exit to quit",
             true,
         ),
+        ("keybindings — /nano (default) · /emacs · /vi", true),
     ];
     let text_start = mid.saturating_sub(1);
 
