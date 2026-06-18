@@ -4758,100 +4758,116 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                             .map(|_| {
                                 std::cell::RefCell::new(newt_core::verify_gate::WriteLedger::new())
                             });
-                    let response = tokio::task::block_in_place(|| {
-                        rt.block_on(chat_complete(
-                            ChatCtx {
-                                url: &inf_url,
-                                model: &inf_model,
-                                kind: inf_kind,
-                                api_key: inf_key.as_deref(),
-                                messages: &messages,
-                                task: &task,
-                                workspace,
-                                color,
-                                // #307: the clamped effective caveats (base ∩
-                                // preset). Identical to `cap.caveats()` when no
-                                // mode is active.
-                                caveats: &turn_caveats,
-                                max_tool_rounds: eff_max_tool_rounds,
-                                tool_output_lines: tool_output_lines(&cfg),
-                                debug: debug_mode(&cfg),
-                                trace: trace_mode(&cfg),
-                                num_ctx: eff_num_ctx,
-                                connect_timeout_secs: connect_timeout_secs(&cfg),
-                                inference_timeout_secs: inference_timeout_secs(&cfg),
-                                mid_loop_trim_threshold: eff_mid_loop_trim,
-                                mid_loop_trim_tokens: eff_mid_loop_trim_tokens,
-                                max_ok_input: eff_max_ok_input,
-                                build_check_cmd: build_check_cmd(&cfg),
-                                safe_context: eff_safe_context,
-                                // The TUI recovers hard context-window 400s by
-                                // parsing the endpoint's real limit and persisting
-                                // it to model-capabilities.json (the probe cache
-                                // stays TUI-side). See issue #223.
-                                recover_cw_400: Some(recover_context_window_400),
-                                note_sink: Some(&mut note_sink),
-                                note_nudge: Some(&mut note_nudge),
-                                // Recall over past conversations (Step 17.5).
-                                recall_source: recall_source
-                                    .as_ref()
-                                    .map(|source| source as &dyn newt_core::RecallSource),
-                                // Progressive-disclosure memory_fetch (#319):
-                                // present only under disclosure = "index"; None
-                                // (the default) keeps the loop bit-for-bit.
-                                memory_source: memory_source
-                                    .as_ref()
-                                    .map(|s| s as &dyn newt_core::MemorySource),
-                                // Summarize-don't-discard (Step 18.4, #247).
-                                summarizer: Some(&*loop_summarizer),
-                                compress_state: Some(&mut compress_state),
-                                tool_events: Some(&mut turn_tool_events),
-                                // #263: present only when prompting is on —
-                                // the loop blocks on the prompt like a long
-                                // tool call; None keeps denials verbatim.
-                                permission_gate: permission_gate
-                                    .as_mut()
-                                    .map(|g| g as &mut dyn newt_core::PermissionGate),
-                                // Phase 20: per-round capability evidence +
-                                // the learned estimate calibration.
-                                on_round_usage: Some(&mut on_obs),
-                                estimate_ratio: eff_estimate_ratio,
-                                // #307: the active preset's exec floor — the
-                                // ceiling the --disable-ocap bypass cannot
-                                // cross. None when no mode is active.
-                                exec_floor: exec_floor.as_ref(),
-                                // retry technique: the per-turn write ledger (Some
-                                // only under a `retry` profile). The write tools
-                                // record into it; the post-turn gate reverts from it.
-                                write_ledger: retry_ledger.as_ref(),
-                            },
-                            &mut mcp,
-                        ))
+                    // Esc-to-interrupt: a sibling thread watches the keyboard
+                    // while the turn runs and trips `turn_cancel`; the loop
+                    // checks it at its await checkpoints and abandons the turn.
+                    let turn_cancel = std::sync::atomic::AtomicBool::new(false);
+                    let interruptible = io::stdin().is_terminal() && io::stdout().is_terminal();
+                    let response = with_interrupt_watch(interruptible, &turn_cancel, || {
+                        tokio::task::block_in_place(|| {
+                            rt.block_on(chat_complete(
+                                ChatCtx {
+                                    url: &inf_url,
+                                    model: &inf_model,
+                                    kind: inf_kind,
+                                    api_key: inf_key.as_deref(),
+                                    messages: &messages,
+                                    task: &task,
+                                    workspace,
+                                    color,
+                                    // #307: the clamped effective caveats (base ∩
+                                    // preset). Identical to `cap.caveats()` when no
+                                    // mode is active.
+                                    caveats: &turn_caveats,
+                                    max_tool_rounds: eff_max_tool_rounds,
+                                    tool_output_lines: tool_output_lines(&cfg),
+                                    debug: debug_mode(&cfg),
+                                    trace: trace_mode(&cfg),
+                                    num_ctx: eff_num_ctx,
+                                    connect_timeout_secs: connect_timeout_secs(&cfg),
+                                    inference_timeout_secs: inference_timeout_secs(&cfg),
+                                    mid_loop_trim_threshold: eff_mid_loop_trim,
+                                    mid_loop_trim_tokens: eff_mid_loop_trim_tokens,
+                                    max_ok_input: eff_max_ok_input,
+                                    build_check_cmd: build_check_cmd(&cfg),
+                                    safe_context: eff_safe_context,
+                                    // The TUI recovers hard context-window 400s by
+                                    // parsing the endpoint's real limit and persisting
+                                    // it to model-capabilities.json (the probe cache
+                                    // stays TUI-side). See issue #223.
+                                    recover_cw_400: Some(recover_context_window_400),
+                                    note_sink: Some(&mut note_sink),
+                                    note_nudge: Some(&mut note_nudge),
+                                    // Recall over past conversations (Step 17.5).
+                                    recall_source: recall_source
+                                        .as_ref()
+                                        .map(|source| source as &dyn newt_core::RecallSource),
+                                    // Progressive-disclosure memory_fetch (#319):
+                                    // present only under disclosure = "index"; None
+                                    // (the default) keeps the loop bit-for-bit.
+                                    memory_source: memory_source
+                                        .as_ref()
+                                        .map(|s| s as &dyn newt_core::MemorySource),
+                                    // Summarize-don't-discard (Step 18.4, #247).
+                                    summarizer: Some(&*loop_summarizer),
+                                    compress_state: Some(&mut compress_state),
+                                    tool_events: Some(&mut turn_tool_events),
+                                    // #263: present only when prompting is on —
+                                    // the loop blocks on the prompt like a long
+                                    // tool call; None keeps denials verbatim.
+                                    permission_gate: permission_gate
+                                        .as_mut()
+                                        .map(|g| g as &mut dyn newt_core::PermissionGate),
+                                    // Phase 20: per-round capability evidence +
+                                    // the learned estimate calibration.
+                                    on_round_usage: Some(&mut on_obs),
+                                    estimate_ratio: eff_estimate_ratio,
+                                    // #307: the active preset's exec floor — the
+                                    // ceiling the --disable-ocap bypass cannot
+                                    // cross. None when no mode is active.
+                                    exec_floor: exec_floor.as_ref(),
+                                    // retry technique: the per-turn write ledger (Some
+                                    // only under a `retry` profile). The write tools
+                                    // record into it; the post-turn gate reverts from it.
+                                    write_ledger: retry_ledger.as_ref(),
+                                    // Esc-to-interrupt flag, tripped by the watcher.
+                                    cancel: Some(&turn_cancel),
+                                },
+                                &mut mcp,
+                            ))
+                        })
                     });
 
                     let elapsed = t0.elapsed();
                     erase_line();
-                    match response {
-                        Ok((reply, was_streamed, usage, hallucinations)) => {
-                            if !was_streamed {
-                                print_newt(&reply, color, verbose);
-                            }
-                            // Profile techniques, post-turn (R2). `retry` supersedes
-                            // `verify_gate`: it runs the same gate but *acts* —
-                            // reverting each fabricating file to its pre-turn state
-                            // (↩), then re-prompting the model to ground the rewrite
-                            // up to `max_retries` (↻) before an honest give-up (✗) —
-                            // where bare `verify_gate` only warns (⚠).
-                            if let Some(ledger) = retry_ledger.as_ref() {
-                                let mode = active_profile
-                                    .as_ref()
-                                    .map(|p| p.verify_gate_knobs().surface_match)
-                                    .unwrap_or_default();
-                                let action = tokio::task::block_in_place(|| {
-                                    rt.block_on(retry_revert(workspace, mode, ledger))
-                                });
-                                if let Some(action) = action {
-                                    let extra = match retry_step(retry_budget) {
+                    // Esc during the turn: the loop returned early with an empty
+                    // reply. Abandon it — print a notice and skip all post-turn
+                    // processing (no save, no gates, turn not counted).
+                    if turn_cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                        print_newt("⊘ interrupted — back to you", color, verbose);
+                        println!();
+                    } else {
+                        match response {
+                            Ok((reply, was_streamed, usage, hallucinations)) => {
+                                if !was_streamed {
+                                    print_newt(&reply, color, verbose);
+                                }
+                                // Profile techniques, post-turn (R2). `retry` supersedes
+                                // `verify_gate`: it runs the same gate but *acts* —
+                                // reverting each fabricating file to its pre-turn state
+                                // (↩), then re-prompting the model to ground the rewrite
+                                // up to `max_retries` (↻) before an honest give-up (✗) —
+                                // where bare `verify_gate` only warns (⚠).
+                                if let Some(ledger) = retry_ledger.as_ref() {
+                                    let mode = active_profile
+                                        .as_ref()
+                                        .map(|p| p.verify_gate_knobs().surface_match)
+                                        .unwrap_or_default();
+                                    let action = tokio::task::block_in_place(|| {
+                                        rt.block_on(retry_revert(workspace, mode, ledger))
+                                    });
+                                    if let Some(action) = action {
+                                        let extra = match retry_step(retry_budget) {
                                         RetryStep::Reprompt => {
                                             retry_budget -= 1;
                                             // Queue the grounded corrective turn as the
@@ -4865,107 +4881,108 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                                             "\n✗ retry: gave up after {retry_max} re-prompt(s) — file(s) left reverted"
                                         ),
                                     };
-                                    let line = format!("↩ {}{extra}", action.banner);
-                                    if color {
-                                        let _ = execute!(
-                                            io::stdout(),
-                                            SetForegroundColor(CtColor::Yellow),
-                                            Print(format!("{line}\n")),
-                                            ResetColor,
-                                        );
-                                    } else {
-                                        println!("{line}");
+                                        let line = format!("↩ {}{extra}", action.banner);
+                                        if color {
+                                            let _ = execute!(
+                                                io::stdout(),
+                                                SetForegroundColor(CtColor::Yellow),
+                                                Print(format!("{line}\n")),
+                                                ResetColor,
+                                            );
+                                        } else {
+                                            println!("{line}");
+                                        }
+                                    }
+                                } else if let Some(p) =
+                                    active_profile.as_ref().filter(|p| p.enables("verify_gate"))
+                                {
+                                    if let Some(warn) = verify_gate_summary(
+                                        workspace,
+                                        p.verify_gate_knobs().surface_match,
+                                    ) {
+                                        if color {
+                                            let _ = execute!(
+                                                io::stdout(),
+                                                SetForegroundColor(CtColor::Yellow),
+                                                Print(format!("⚠ {warn}\n")),
+                                                ResetColor,
+                                            );
+                                        } else {
+                                            println!("⚠ {warn}");
+                                        }
                                     }
                                 }
-                            } else if let Some(p) =
-                                active_profile.as_ref().filter(|p| p.enables("verify_gate"))
-                            {
-                                if let Some(warn) = verify_gate_summary(
-                                    workspace,
-                                    p.verify_gate_knobs().surface_match,
+                                // Single TurnMetrics used for both memory sync and display.
+                                let pricing = cfg.pricing.clone().unwrap_or_default();
+                                let metrics = newt_core::TurnMetrics {
+                                    elapsed_ms: elapsed.as_millis() as u64,
+                                    usage,
+                                    cost_usd: pricing.estimate_cost(&inf_model, usage.as_ref()),
+                                    model_id: inf_model.clone(),
+                                    endpoint: inf_url.clone(),
+                                    hallucinations,
+                                };
+                                tokio::task::block_in_place(|| {
+                                    rt.block_on(memory.sync_all(&task, &reply, &metrics));
+                                });
+                                // 19.4: this conversation now has extractable
+                                // content — count it for the close-time gate.
+                                turns_this_conversation += 1;
+                                if let Err(e) = save_turn_if_persistent(
+                                    conversation_store.as_ref(),
+                                    &active_conversation_id,
+                                    active_persona.as_ref(),
+                                    &task,
+                                    &reply,
+                                    // 17.6: the turn's recorded tool events plus the
+                                    // backend-reported token actuals (None when the
+                                    // backend reported nothing — stored as NULL,
+                                    // never an estimate).
+                                    &turn_tool_events,
+                                    usage,
+                                    // 18.5: a compaction summary minted by the
+                                    // memory provider during sync_all persists as
+                                    // its own turn record so restore can rehydrate
+                                    // the prev-summary chain.
+                                    memory.take_compaction_record(),
                                 ) {
-                                    if color {
-                                        let _ = execute!(
-                                            io::stdout(),
-                                            SetForegroundColor(CtColor::Yellow),
-                                            Print(format!("⚠ {warn}\n")),
-                                            ResetColor,
-                                        );
-                                    } else {
-                                        println!("⚠ {warn}");
+                                    print_newt(
+                                        &format!("warning: conversation save failed: {e}"),
+                                        color,
+                                        verbose,
+                                    );
+                                }
+                                print_metrics(&metrics, color);
+                                // Append to usage log and enforce rotation policy.
+                                if let Some(log) = newt_core::Config::user_config_path()
+                                    .map(|p| p.with_file_name("usage.jsonl"))
+                                {
+                                    let policy = cfg.logs.as_ref().cloned().unwrap_or_default();
+                                    metrics.append_to_log_with_policy(&log, &policy);
+                                }
+                                // Turn-level tuning accounting (Phase 20,
+                                // docs/design/model-self-tuning.md §3): success
+                                // is gated on the turn having produced at least
+                                // one quality-gated Accepted observation. The old
+                                // `reply.is_empty()` keying was wrong twice over:
+                                // every loop failure path returns non-empty
+                                // placeholder text, so failed turns ratcheted
+                                // confidence via record_success, and the overflow
+                                // branch was dead code — overflow is now recorded
+                                // at detection by the observation hook, with the
+                                // truthful per-round number.
+                                if let Some(input_tokens) = usage.map(|u| u.input_tokens) {
+                                    if turn_saw_accepted.get() {
+                                        let entry = cap_cache.entry(inf_model.clone()).or_default();
+                                        let dirty = entry.record_success(input_tokens, &today);
+                                        if dirty {
+                                            probe::save_cache(&cap_cache);
+                                        }
                                     }
                                 }
                             }
-                            // Single TurnMetrics used for both memory sync and display.
-                            let pricing = cfg.pricing.clone().unwrap_or_default();
-                            let metrics = newt_core::TurnMetrics {
-                                elapsed_ms: elapsed.as_millis() as u64,
-                                usage,
-                                cost_usd: pricing.estimate_cost(&inf_model, usage.as_ref()),
-                                model_id: inf_model.clone(),
-                                endpoint: inf_url.clone(),
-                                hallucinations,
-                            };
-                            tokio::task::block_in_place(|| {
-                                rt.block_on(memory.sync_all(&task, &reply, &metrics));
-                            });
-                            // 19.4: this conversation now has extractable
-                            // content — count it for the close-time gate.
-                            turns_this_conversation += 1;
-                            if let Err(e) = save_turn_if_persistent(
-                                conversation_store.as_ref(),
-                                &active_conversation_id,
-                                active_persona.as_ref(),
-                                &task,
-                                &reply,
-                                // 17.6: the turn's recorded tool events plus the
-                                // backend-reported token actuals (None when the
-                                // backend reported nothing — stored as NULL,
-                                // never an estimate).
-                                &turn_tool_events,
-                                usage,
-                                // 18.5: a compaction summary minted by the
-                                // memory provider during sync_all persists as
-                                // its own turn record so restore can rehydrate
-                                // the prev-summary chain.
-                                memory.take_compaction_record(),
-                            ) {
-                                print_newt(
-                                    &format!("warning: conversation save failed: {e}"),
-                                    color,
-                                    verbose,
-                                );
-                            }
-                            print_metrics(&metrics, color);
-                            // Append to usage log and enforce rotation policy.
-                            if let Some(log) = newt_core::Config::user_config_path()
-                                .map(|p| p.with_file_name("usage.jsonl"))
-                            {
-                                let policy = cfg.logs.as_ref().cloned().unwrap_or_default();
-                                metrics.append_to_log_with_policy(&log, &policy);
-                            }
-                            // Turn-level tuning accounting (Phase 20,
-                            // docs/design/model-self-tuning.md §3): success
-                            // is gated on the turn having produced at least
-                            // one quality-gated Accepted observation. The old
-                            // `reply.is_empty()` keying was wrong twice over:
-                            // every loop failure path returns non-empty
-                            // placeholder text, so failed turns ratcheted
-                            // confidence via record_success, and the overflow
-                            // branch was dead code — overflow is now recorded
-                            // at detection by the observation hook, with the
-                            // truthful per-round number.
-                            if let Some(input_tokens) = usage.map(|u| u.input_tokens) {
-                                if turn_saw_accepted.get() {
-                                    let entry = cap_cache.entry(inf_model.clone()).or_default();
-                                    let dirty = entry.record_success(input_tokens, &today);
-                                    if dirty {
-                                        probe::save_cache(&cap_cache);
-                                    }
-                                }
-                            }
+                            Err(e) => print_newt(&format!("error: {e}"), color, verbose),
                         }
-                        Err(e) => print_newt(&format!("error: {e}"), color, verbose),
                     }
                 }
                 println!();
@@ -6652,6 +6669,166 @@ fn erase_line() {
 }
 
 // ---------------------------------------------------------------------------
+// Esc-to-interrupt: watch the keyboard during a turn and trip a cancel flag.
+//
+// The turn (`chat_complete`) runs in-place — it borrows half the session, so it
+// can't move to a background task. Instead a sibling OS thread watches stdin and
+// flips an `AtomicBool` the loop polls at its await checkpoints. The terminal is
+// put in *cbreak* (ICANON+ECHO off) so a keypress arrives immediately, but ISIG
+// and OPOST stay ON: Ctrl-C still signals as before, and streamed model output
+// still gets CR-NL translation (no staircase) while we watch.
+// ---------------------------------------------------------------------------
+
+/// A lone `Esc` (`0x1b`) is the interrupt; `Esc [` / `Esc O` begin an arrow /
+/// function-key sequence, and `Esc <char>` is an Alt-chord — neither interrupts.
+/// Terminals deliver a real Esc press as a single `0x1b` byte, so an exact match
+/// cleanly separates it from a multi-byte escape sequence read in one burst.
+fn is_lone_esc(bytes: &[u8]) -> bool {
+    bytes == [0x1b]
+}
+
+#[cfg(test)]
+mod interrupt_tests {
+    use super::is_lone_esc;
+
+    #[test]
+    fn lone_esc_interrupts_but_sequences_and_chords_do_not() {
+        assert!(is_lone_esc(&[0x1b]), "a bare Esc press interrupts");
+        // Arrow / function keys arrive as a CSI/SS3 burst — not an interrupt.
+        assert!(!is_lone_esc(&[0x1b, b'[', b'A']), "Up arrow");
+        assert!(!is_lone_esc(&[0x1b, b'O', b'P']), "F1 (SS3)");
+        // Alt-chord (Esc + char) and plain typed-ahead text never interrupt.
+        assert!(!is_lone_esc(&[0x1b, b'x']), "Alt-x");
+        assert!(!is_lone_esc(b"hello"), "typed text");
+        assert!(!is_lone_esc(&[]), "nothing");
+    }
+}
+
+/// Run `f` (the in-place turn) with an Esc watcher active, returning `f`'s value.
+/// When `enabled` is false (piped / non-TTY) or the terminal can't be put in
+/// cbreak, it simply runs `f` with no watcher. The terminal mode is always
+/// restored before returning (RAII), and the watcher thread is joined.
+#[cfg(unix)]
+fn with_interrupt_watch<T>(
+    enabled: bool,
+    cancel: &std::sync::atomic::AtomicBool,
+    f: impl FnOnce() -> T,
+) -> T {
+    use std::sync::atomic::Ordering;
+    if !enabled {
+        return f();
+    }
+    let Ok(_cbreak) = CbreakGuard::enter() else {
+        return f();
+    };
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    std::thread::scope(|s| {
+        s.spawn(|| watch_for_interrupt(cancel, &stop));
+        let out = f();
+        // Tell the watcher to exit; it polls with a 100 ms timeout, so it wakes
+        // and returns promptly, and the scope joins it before restoring the tty.
+        stop.store(true, Ordering::Relaxed);
+        out
+    })
+}
+
+#[cfg(not(unix))]
+fn with_interrupt_watch<T>(
+    _enabled: bool,
+    _cancel: &std::sync::atomic::AtomicBool,
+    f: impl FnOnce() -> T,
+) -> T {
+    // No termios on non-unix; the interrupt watcher is unix-only for now.
+    f()
+}
+
+/// Poll stdin while the turn runs; trip `cancel` on a lone Esc. Exits when
+/// `stop` is set (the turn finished) — polling with a 100 ms timeout so it
+/// never blocks past the turn's end.
+#[cfg(unix)]
+fn watch_for_interrupt(
+    cancel: &std::sync::atomic::AtomicBool,
+    stop: &std::sync::atomic::AtomicBool,
+) {
+    use std::sync::atomic::Ordering;
+    let fd = libc::STDIN_FILENO;
+    let mut buf = [0u8; 64];
+    while !stop.load(Ordering::Relaxed) {
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let n = unsafe { libc::poll(&mut pfd, 1, 100) };
+        if n <= 0 || pfd.revents & libc::POLLIN == 0 {
+            continue; // timeout or spurious — re-check `stop`
+        }
+        let r = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+        if r <= 0 {
+            continue;
+        }
+        let bytes = &buf[..r as usize];
+        if is_lone_esc(bytes) {
+            // Guard against a split escape sequence (Esc arriving in a separate
+            // read from its `[A` tail under load): wait briefly for a
+            // continuation. None arriving → it was a real Esc press.
+            let mut pfd2 = libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let m = unsafe { libc::poll(&mut pfd2, 1, 30) };
+            if m <= 0 {
+                cancel.store(true, Ordering::Relaxed);
+                return;
+            }
+            // A continuation arrived — drain it and treat the burst as a
+            // sequence (ignore), keep watching.
+            let _ = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+        }
+    }
+}
+
+/// RAII cbreak: ICANON + ECHO off (per-keystroke, no echo); ISIG + OPOST left ON
+/// so Ctrl-C still signals and streamed output keeps CR-NL translation. Restores
+/// the saved attributes on drop.
+#[cfg(unix)]
+struct CbreakGuard {
+    fd: libc::c_int,
+    orig: libc::termios,
+}
+
+#[cfg(unix)]
+impl CbreakGuard {
+    fn enter() -> io::Result<Self> {
+        let fd = libc::STDIN_FILENO;
+        unsafe {
+            let mut orig: libc::termios = std::mem::zeroed();
+            if libc::tcgetattr(fd, &mut orig) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let mut raw = orig;
+            raw.c_lflag &= !(libc::ICANON | libc::ECHO);
+            raw.c_cc[libc::VMIN] = 0;
+            raw.c_cc[libc::VTIME] = 0;
+            if libc::tcsetattr(fd, libc::TCSANOW, &raw) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(Self { fd, orig })
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for CbreakGuard {
+    fn drop(&mut self) {
+        unsafe {
+            libc::tcsetattr(self.fd, libc::TCSANOW, &self.orig);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Slash command dispatcher
 // ---------------------------------------------------------------------------
 
@@ -6697,6 +6874,7 @@ fn help_lines() -> &'static [&'static str] {
         "  /version                 - print newt version",
         "  /help                    - this message",
         "  ! <command>              - run a host command interactively (e.g. ! pa login) — you, not the agent",
+        "  Esc                      - while the agent is working: interrupt the turn, back to your prompt",
         "  /exit  /quit  exit  quit - leave the session",
     ]
 }
@@ -10582,6 +10760,7 @@ mod tool_round_cap_tests {
                     estimate_ratio: None,
                     exec_floor: None,
                     write_ledger: None,
+                    cancel: None,
                 },
                 &mut Mcp::empty(),
             )

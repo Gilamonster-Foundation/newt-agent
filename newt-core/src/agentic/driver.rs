@@ -393,6 +393,9 @@ async fn run_one_turn(
         // / newt-eval callers. A consumer enforcing a mode clamps `caveats` itself.
         exec_floor: None,
         write_ledger: None,
+        // The headless driver has no interactive keyboard to interrupt from;
+        // a consumer that wants cancellation drives its own ChatCtx.
+        cancel: None,
     };
     // NoMcp: the cowork driver advertises only the built-in tools. A consumer
     // that wants live MCP tools assembles its own ChatCtx.
