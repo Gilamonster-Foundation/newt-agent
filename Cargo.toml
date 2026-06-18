@@ -15,6 +15,7 @@ members = [
     "newt-coder",
     "newt-identity",
     "newt-scheduler",
+    "newt-git",
     "newt-eval",
     "newt-agent-py",
     "plugins-protocol",
@@ -80,6 +81,12 @@ regex = "1"
 # 1.75 floor). Now that the floor is 1.88, 0.5 is allowed — relax in a
 # follow-up if desired; kept at 0.4 here to avoid churning the lock.
 diffy = "0.4"
+
+# Embedded git engine (newt-git): grit-lib is a pure-Rust from-scratch git
+# reimplementation (MIT). It pulls icu_normalizer 2.2 (rustc 1.86) + time 0.3.x
+# (1.88) — the reason the workspace MSRV is 1.88. MIT only — never depend on the
+# sibling `grit-legacy` crate (GPL-2.0).
+grit-lib = "0.4"
 
 # SQLite for the durable conversation store (Phase 17.1a, issue #246).
 # `bundled` compiles SQLite from source so newt has zero system deps
