@@ -1636,6 +1636,20 @@ mod footer_tests {
 ///
 /// Tokens: `\t` timestamp, `\m` model, `\M` edit mode, `\u` user, `\h` host,
 /// `\w` workspace basename, `\W` full path, `\v` newt version.
+/// Whether the user has configured a prompt template (`NEWT_PROMPT` env, set by
+/// `/prompt set`, or `[tui] prompt`). The rich surface consults this to decide
+/// between rendering that template and its built-in live status row. Only the
+/// rich surface uses it, so it's compiled only with that feature.
+#[cfg(feature = "rich-tui")]
+pub(crate) fn custom_prompt_active() -> bool {
+    std::env::var("NEWT_PROMPT").is_ok()
+        || newt_core::Config::resolve()
+            .ok()
+            .and_then(|c| c.tui)
+            .and_then(|t| t.prompt)
+            .is_some()
+}
+
 fn prompt_str(workspace: &str, verbose: bool, is_vi: bool, model: &str, rich: bool) -> String {
     let template = std::env::var("NEWT_PROMPT").ok().or_else(|| {
         newt_core::Config::resolve()

@@ -853,7 +853,7 @@ fn new_textarea(edit: Edit) -> TextArea<'static> {
 /// The status / prompt line. Colors favor light/high-luminance tones (the
 /// accessibility default — deep dark-saturated hues lose letter detail); every
 /// color maps to a `[tui.colors]` key in the production palette work.
-fn prompt_line(editor: &Editor) -> Line<'static> {
+fn prompt_line(editor: &Editor, custom: Option<&str>) -> Line<'static> {
     if let Some(question) = editor.confirm_prompt() {
         // A pending [y/N] confirmation replaces the prompt until answered.
         return Line::from(Span::styled(
@@ -869,6 +869,16 @@ fn prompt_line(editor: &Editor) -> Line<'static> {
             Style::default().fg(Color::White),
         ));
     }
+    // A user-configured prompt (`/prompt set`, `NEWT_PROMPT`, `[tui] prompt`)
+    // wins over the built-in live status row — render it verbatim (already
+    // token-expanded by the caller). The user owns the format, so no extra
+    // styling beyond a readable default.
+    if let Some(p) = custom {
+        return Line::from(Span::styled(
+            p.to_string(),
+            Style::default().fg(Color::Gray),
+        ));
+    }
     let clock = chrono::Local::now().format("%H:%M:%S").to_string();
     Line::from(vec![
         Span::styled(format!("[{clock}] "), Style::default().fg(Color::Gray)),
@@ -882,9 +892,15 @@ fn prompt_line(editor: &Editor) -> Line<'static> {
     ])
 }
 
-fn draw(f: &mut Frame, textarea: &TextArea, editor: &Editor, gutter: Option<u16>) {
+fn draw(
+    f: &mut Frame,
+    textarea: &TextArea,
+    editor: &Editor,
+    gutter: Option<u16>,
+    custom_prompt: Option<&str>,
+) {
     let area = f.area();
-    let prompt = prompt_line(editor);
+    let prompt = prompt_line(editor, custom_prompt);
     let g = resolve_gutter(gutter, area.width);
     if g >= GUTTER_W {
         // Wide gutter (opt-in): prompt in a fixed left column, input to its
@@ -999,6 +1015,12 @@ pub(crate) struct RichSurface {
     /// the turn runs to completion before the session ends. A `Cell` because
     /// the event loop runs behind `&self`.
     pending_end_quit: Cell<bool>,
+    /// `Some` when a user-configured prompt (`/prompt set` · `NEWT_PROMPT` ·
+    /// `[tui] prompt`) is active: the already-expanded prompt string the caller
+    /// passed to [`read_line`](InputSurface::read_line) for this turn, rendered
+    /// in place of the built-in live status row. `None` keeps the default
+    /// `[clock] mode ❯`. Refreshed per turn (the clock is fixed within a turn).
+    custom_prompt: Option<String>,
 }
 
 impl RichSurface {
@@ -1009,6 +1031,7 @@ impl RichSurface {
             unsaved: Vec::new(),
             gutter: crate::resolve_gutter_setting(),
             pending_end_quit: Cell::new(false),
+            custom_prompt: None,
         })
     }
 
@@ -1049,7 +1072,15 @@ impl RichSurface {
                 terminal.clear()?;
                 cur_h = want;
             }
-            terminal.draw(|f| draw(f, &textarea, &editor, self.gutter))?;
+            terminal.draw(|f| {
+                draw(
+                    f,
+                    &textarea,
+                    &editor,
+                    self.gutter,
+                    self.custom_prompt.as_deref(),
+                );
+            })?;
 
             // 250ms timeout drives the live clock when idle.
             if !event::poll(Duration::from_millis(250))? {
@@ -1097,15 +1128,17 @@ impl RichSurface {
 }
 
 impl InputSurface for RichSurface {
-    fn read_line(&mut self, _prompt: &str) -> anyhow::Result<ReadOutcome> {
+    fn read_line(&mut self, prompt: &str) -> anyhow::Result<ReadOutcome> {
         // A confirmed `:wq` submitted its turn last time; now that the turn has
         // run, end the conversation and exit before reading anything new.
         if self.pending_end_quit.replace(false) {
             return Ok(ReadOutcome::EndAndQuit);
         }
-        // The rich surface renders its own status row (clock + mode), so it
-        // ignores the rustyline-formatted `prompt` string for now; the model /
-        // plan-mode tokens fold into the status row in the follow-up.
+        // Honor a user-configured prompt: when one is set, the caller has
+        // already token-expanded it into `prompt`, so render that instead of
+        // the built-in live status row. With nothing configured, keep the
+        // default `[clock] mode ❯` (and its live clock + vi-mode label).
+        self.custom_prompt = crate::custom_prompt_active().then(|| prompt.to_string());
         Ok(self.read_turn()?)
     }
 
@@ -1194,7 +1227,7 @@ mod tests {
         let ta = TextArea::new(vec!["this".to_string(), "more".to_string()]);
         let mut term = Terminal::new(TestBackend::new(40, 2)).unwrap();
         // gutter = 1 → the overhang layout (the default).
-        term.draw(|f| draw(f, &ta, &editor, Some(1))).unwrap();
+        term.draw(|f| draw(f, &ta, &editor, Some(1), None)).unwrap();
         let buf = term.backend().buffer();
         let row = |y: u16| -> String {
             (0..40)
@@ -1213,6 +1246,36 @@ mod tests {
             "continuation is 1-space hang-indented: {:?}",
             row(1)
         );
+    }
+
+    #[test]
+    fn custom_prompt_replaces_the_live_status_row() {
+        let editor = vi_editor();
+        // With a configured prompt, that string is rendered verbatim…
+        let line = prompt_line(&editor, Some("me@host ❯ "));
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "me@host ❯ ");
+        // …and with none, the built-in status row (clock + mode + ❯) is used.
+        let def: String = prompt_line(&editor, None)
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(
+            def.contains("❯") && def.contains("vi"),
+            "default row: {def:?}"
+        );
+        // A pending `:`/confirm prompt still wins over a custom prompt.
+        let mut ex = vi_editor();
+        let mut ta = TextArea::default();
+        ex.input(special(KeyCode::Esc), &mut ta);
+        ex.input(key(':'), &mut ta);
+        let exline: String = prompt_line(&ex, Some("custom"))
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(exline.starts_with(':'), "ex line wins: {exline:?}");
     }
 
     #[test]
