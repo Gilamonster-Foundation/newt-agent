@@ -1636,6 +1636,33 @@ mod footer_tests {
 ///
 /// Tokens: `\t` timestamp, `\m` model, `\M` edit mode, `\u` user, `\h` host,
 /// `\w` workspace basename, `\W` full path, `\v` newt version.
+/// The ambient "environment" the agent can see — its own model name, the
+/// harness + version, the backend it's talking to, and the current date/time.
+/// Prepended to the system prompt each turn so these are *current* (the system
+/// prompt itself is frozen at conversation start). Without it the model has no
+/// way to know its identity and confabulates one (e.g. inventing a name for
+/// commit attribution). Kept short — it rides in every request.
+fn runtime_context_block(model: &str, endpoint: &str, kind: newt_core::BackendKind) -> String {
+    let now = chrono::Local::now()
+        .format("%Y-%m-%d %H:%M:%S %Z")
+        .to_string();
+    let backend = match kind {
+        newt_core::BackendKind::Openai => "openai-compatible",
+        _ => "ollama",
+    };
+    format!(
+        "# Environment (refreshed every turn)\n\
+         Harness: newt-agent v{VERSION}\n\
+         Model: {model}\n\
+         Backend: {backend} @ {endpoint}\n\
+         Current date/time: {now}\n\
+         You are the model named above, running under the newt-agent harness. \
+         When asked who or what you are — and when attributing work (commit \
+         trailers, git notes, PR text) — use this real model name and harness; \
+         never invent or guess an identity.\n"
+    )
+}
+
 /// Whether the user has configured a prompt template (`NEWT_PROMPT` env, set by
 /// `/prompt set`, or `[tui] prompt`). The rich surface consults this to decide
 /// between rendering that template and its built-in live status row. Only the
@@ -4641,8 +4668,19 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                         .or_else(|| num_ctx(&cfg))
                         .or(eff_safe_context);
 
-                    // Build message list from memory manager.
-                    let messages = memory.build_messages(&system, &task);
+                    // Build message list from memory manager. A fresh runtime
+                    // block is prepended to the (frozen) system prompt EACH turn
+                    // so the model can actually see its own name, the harness,
+                    // the backend, and the current time — env-vars the agent
+                    // would otherwise hallucinate (issue: model confabulated an
+                    // identity for commit attribution). build_messages only uses
+                    // the system string to fill message[0], so per-turn variation
+                    // is safe.
+                    let turn_system = format!(
+                        "{}\n{system}",
+                        runtime_context_block(&inf_model, &inf_url, inf_kind)
+                    );
+                    let messages = memory.build_messages(&turn_system, &task);
                     // The save_note sink borrows the manager for this call
                     // only; `/remember` and `save_note` share its NoteStore
                     // (one write path, one scan, one cap). Step 19.3, #248.
@@ -12136,6 +12174,34 @@ mod env_resolution_tests {
                 "env trace implies debug"
             );
         });
+    }
+
+    #[test]
+    fn runtime_context_block_exposes_model_harness_and_backend() {
+        let block = runtime_context_block(
+            "qwen3:30b",
+            "http://dgx1.home.lab:11434",
+            newt_core::BackendKind::Ollama,
+        );
+        assert!(block.contains("Model: qwen3:30b"), "{block}");
+        assert!(block.contains("newt-agent v"), "harness + version: {block}");
+        assert!(
+            block.contains("ollama @ http://dgx1.home.lab:11434"),
+            "{block}"
+        );
+        assert!(block.contains("Current date/time:"), "{block}");
+        // Steers against confabulated identities (the bug this fixes).
+        assert!(block.contains("never invent"), "{block}");
+        // OpenAI backend is labeled accordingly.
+        let oa = runtime_context_block(
+            "gpt-4.1",
+            "https://api.openai.com",
+            newt_core::BackendKind::Openai,
+        );
+        assert!(
+            oa.contains("openai-compatible @ https://api.openai.com"),
+            "{oa}"
+        );
     }
 
     #[test]
