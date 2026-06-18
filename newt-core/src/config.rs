@@ -25,6 +25,14 @@ use crate::router::Tier;
 #[serde(default)]
 pub struct Config {
     /// Inference backends (Ollama, vLLM, etc.).
+    ///
+    /// Absent `[[backends]]` deserializes to **empty** (not the struct-level
+    /// default's localhost fallback) so a config that defines its backends as
+    /// per-file `~/.newt/backends/*.toml` drop-ins does NOT also pick up a
+    /// spurious synthesized `ollama` entry. The localhost fallback is restored
+    /// in [`Config::resolve`] only if backends are still empty after the disk
+    /// merge (so a truly bare setup still talks to a local Ollama).
+    #[serde(default = "Vec::new")]
     pub backends: Vec<BackendConfig>,
 
     /// External provider-plugin definitions.
@@ -1706,18 +1714,26 @@ pub struct ProviderConfig {
 // Default
 // ---------------------------------------------------------------------------
 
+/// The last-resort localhost Ollama backend: used both as `Config::default()`'s
+/// sole backend (no config file at all) and as the [`Config::resolve`] fallback
+/// when neither inline `[[backends]]` nor per-file drop-ins supply any, so a
+/// bare install still talks to a local Ollama.
+fn fallback_localhost_backend() -> BackendConfig {
+    BackendConfig {
+        name: "ollama".into(),
+        endpoint: "http://127.0.0.1:11434".into(),
+        model: "llama3.1:8b".into(),
+        tiers: vec![Tier::Fast, Tier::Standard, Tier::Complex, Tier::Review],
+        kind: BackendKind::Ollama,
+        api_key_file: None,
+        api_key_env: None,
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
-            backends: vec![BackendConfig {
-                name: "ollama".into(),
-                endpoint: "http://127.0.0.1:11434".into(),
-                model: "llama3.1:8b".into(),
-                tiers: vec![Tier::Fast, Tier::Standard, Tier::Complex, Tier::Review],
-                kind: BackendKind::Ollama,
-                api_key_file: None,
-                api_key_env: None,
-            }],
+            backends: vec![fallback_localhost_backend()],
             providers: Vec::new(),
             default_tier_order: vec![Tier::Fast, Tier::Standard, Tier::Complex, Tier::Review],
             dgx: None,
@@ -1809,6 +1825,13 @@ impl Config {
         // hand-deconflict. Runs first so disk loadouts/crews can name a disk
         // backend's provider.
         cfg.merge_disk_backends();
+        // Localhost fallback: a config that declared no inline `[[backends]]`
+        // deserializes to empty (see the field doc); if no drop-in supplied one
+        // either, restore the bare-install localhost Ollama so newt still has a
+        // backend to talk to.
+        if cfg.backends.is_empty() {
+            cfg.backends.push(fallback_localhost_backend());
+        }
         // Per-file bundles (the model-support-kit control surface): drop a
         // `~/.newt/bundles/<name>.toml` to add a bundle — no `config.toml` edit.
         cfg.merge_disk_bundles();
@@ -2553,6 +2576,11 @@ mod tests {
     fn loadout_rejects_dangling_references() {
         let cfg: Config = toml::from_str(
             r#"
+            [[backends]]
+            name = "real-box"
+            endpoint = "http://h:11434"
+            model = "m"
+
             [profiles.nemotron]
             techniques = ["verify_gate"]
             "#,
@@ -2578,8 +2606,8 @@ mod tests {
             e.contains("profile 'ghost-profile'") && e.contains("no such profile"),
             "{e}"
         );
-        // dangling provider — must name a [backends] entry (Slice 2). With no
-        // `[[backends]]` in this TOML, `cfg.backends` is the default `ollama`.
+        // dangling provider — must name a [backends] entry (Slice 2). The error
+        // lists the known backends, here the explicit `real-box`.
         let bad_provider = Loadout {
             provider: Some("ghost-provider".into()),
             ..Default::default()
@@ -2588,7 +2616,7 @@ mod tests {
         assert!(
             e.contains("provider 'ghost-provider'")
                 && e.contains("no [backends] entry")
-                && e.contains("ollama"),
+                && e.contains("real-box"),
             "{e}"
         );
         // an empty loadout is valid (no references)
@@ -2863,6 +2891,28 @@ mod tests {
             Some("http://dgx1.home.lab:11434"),
             "disk wins"
         );
+    }
+
+    #[test]
+    fn backendless_config_deserializes_empty_but_default_keeps_fallback() {
+        // A config.toml with no [[backends]] must NOT inherit the struct-default
+        // localhost Ollama — otherwise a drop-in-only setup gets a spurious
+        // 'ollama' entry alongside its real backends (the migration regression).
+        let cfg: Config = toml::from_str("providers = []\n").unwrap();
+        assert!(
+            cfg.backends.is_empty(),
+            "absent [[backends]] deserializes to empty, got {:?}",
+            cfg.backends
+        );
+        // But the no-config-file path (Config::default) keeps the fallback.
+        assert_eq!(Config::default().backends.len(), 1);
+        assert_eq!(Config::default().backends[0].name, "ollama");
+        // Inline backends still load normally.
+        let inline: Config =
+            toml::from_str("[[backends]]\nname=\"x\"\nendpoint=\"http://h:1\"\nmodel=\"m\"\n")
+                .unwrap();
+        assert_eq!(inline.backends.len(), 1);
+        assert_eq!(inline.backends[0].name, "x");
     }
 
     #[test]
