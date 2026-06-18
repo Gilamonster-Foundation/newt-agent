@@ -337,3 +337,94 @@ mod disclosure_tests {
         assert!(!f.leaks("anything at all"));
     }
 }
+
+// ===========================================================================
+// Separation of duties — `sod-proposer-not-worker`
+// (docs/security/ocap-deviations.md §sod, docs/design/ocap-enforcement.md §5).
+//
+// The policy-proposing surface must be a cryptographically DISTINCT, more-trusted
+// identity than the confined worker — otherwise observe-then-propose lets the
+// worker author its own ceiling (privilege escalation by self-proposal). The
+// distinctness half is checkable now (`proposer_distinct`); the taint-aware
+// observe-then-propose half is UNBUILT, so `verify_sod` stays Absent
+// (fail-closed) and `auto_apply_policy` refuses regardless.
+// ===========================================================================
+
+/// The distinctness primitive: a non-empty proposer fingerprint different from
+/// the worker's. **Necessary, not sufficient**, for separation of duties.
+#[must_use]
+pub fn proposer_distinct(proposer_fp: &str, worker_fp: &str) -> bool {
+    !proposer_fp.is_empty() && proposer_fp != worker_fp
+}
+
+/// Verify **sod-proposer-not-worker**: a distinct, more-trusted proposer key
+/// (`proposer_fp != worker_fp`) AND taint-aware observe-then-propose. The
+/// distinctness half is checked here; the taint-aware half is unbuilt, so this
+/// stays [`Verification::Absent`] — but the `reason` reports the distinctness
+/// state so the ledger is honest. Flips to `Verified` when taint-awareness lands.
+#[must_use]
+pub fn verify_sod(proposer_fp: &str, worker_fp: &str) -> Verification {
+    if !proposer_distinct(proposer_fp, worker_fp) {
+        return Verification::Absent {
+            deviation: "sod-proposer-not-worker",
+            reason: "proposer key is not distinct from the worker (self-proposal)".into(),
+        };
+    }
+    Verification::Absent {
+        deviation: "sod-proposer-not-worker",
+        reason: "distinct proposer key confirmed, but taint-aware observe-then-propose is unbuilt"
+            .into(),
+    }
+}
+
+/// Auto-apply a proposed policy (lower/raise a worker's `Caveats` without a human).
+///
+/// DANGEROUS: with no separation of duties this is privilege escalation by
+/// self-proposal. **Disabled while `sod-proposer-not-worker` is open** — every
+/// promotion needs a human approval bound to the lowered-`Caveats` hash. Fail-closed.
+pub fn auto_apply_policy(proposer_fp: &str, worker_fp: &str) -> Result<(), FailClosed> {
+    // OCAP-DANGER: sod-proposer-not-worker — auto-apply enables self-proposal escalation.
+    // OCAP-GATE: sod-proposer-not-worker
+    require(verify_sod(proposer_fp, worker_fp))?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod sod_tests {
+    use super::*;
+
+    #[test]
+    fn distinctness_primitive() {
+        assert!(proposer_distinct("SHA256:proposer", "SHA256:worker"));
+        assert!(!proposer_distinct("SHA256:same", "SHA256:same"));
+        assert!(
+            !proposer_distinct("", "SHA256:worker"),
+            "empty proposer is not distinct"
+        );
+    }
+
+    #[test]
+    fn verify_sod_is_absent_until_taint_aware() {
+        // Even with distinct keys, sod stays open (taint-aware half unbuilt).
+        let v = verify_sod("SHA256:proposer", "SHA256:worker");
+        assert!(!v.is_verified());
+        assert_eq!(v.deviation(), Some("sod-proposer-not-worker"));
+        // Self-proposal reports the distinctness failure specifically.
+        let self_prop = verify_sod("SHA256:same", "SHA256:same");
+        assert!(
+            matches!(self_prop, Verification::Absent { reason, .. } if reason.contains("self-proposal"))
+        );
+    }
+
+    #[test]
+    fn auto_apply_fails_closed_both_ways() {
+        assert!(matches!(
+            auto_apply_policy("SHA256:p", "SHA256:w"),
+            Err(FailClosed {
+                deviation: "sod-proposer-not-worker",
+                ..
+            })
+        ));
+        assert!(auto_apply_policy("SHA256:same", "SHA256:same").is_err());
+    }
+}
