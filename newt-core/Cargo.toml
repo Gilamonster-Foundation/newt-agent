@@ -14,6 +14,9 @@ categories = ["api-bindings", "text-processing"]
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
+# OCAP disclosure filter (ocap.rs): catch a known secret value in its common
+# re-encodings (base64), not just raw — filter by value, not by shape.
+base64.workspace = true
 # Step 19.2 (issue #248): the write-time security scan's injection-pattern
 # table (notes_scan.rs). Already a workspace dep used by newt-eval/newt-tools.
 regex.workspace = true
