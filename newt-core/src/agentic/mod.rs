@@ -13,6 +13,7 @@
 // delegates to this same pipeline instead of keeping a duplicate one.
 pub(crate) mod compress;
 mod display;
+mod git_tool;
 // Issue #308 — the cowork foundation: a non-blocking turn driver around
 // `chat_complete` (driver), a renderer-agnostic transcript render (transcript),
 // and the redaction-gated ShellObservation seam (observation). All additive;
@@ -38,6 +39,7 @@ pub use driver::{
     TurnDriver, TurnDriverConfig, TurnDriverError, TurnOutcome, TurnStatus,
     VISIBLE_TRANSCRIPT_ROLES,
 };
+pub use git_tool::{git_tool_definition, GitTool};
 pub use mcp::{McpTools, NoMcp};
 pub use memory_fetch::{
     memory_fetch_tool_definition, MemAddr, MemPayload, MemorySource, StoreMemorySource,
@@ -553,6 +555,13 @@ pub struct ChatCtx<'a> {
     /// trips it from a keyboard watcher, and inspects it after the call to tell
     /// an interrupted turn from a genuinely empty reply.
     pub cancel: Option<&'a std::sync::atomic::AtomicBool>,
+    /// The injected embedded-git capability (PR4, #461). `Some` ⇒ the `git`
+    /// tool is advertised and dispatches through it (`LocalGitTool` in
+    /// `newt-git`, injected by the binary). `None` (every headless / eval
+    /// caller, and any session not in a git repo) ⇒ the tool is never
+    /// advertised — bit-for-bit today's behavior. The trait-injection seam, not
+    /// a direct dep, because `newt-git` depends on `newt-core` (circular).
+    pub git_tool: Option<&'a dyn GitTool>,
 }
 
 /// retry technique (R2 action arm): before a `write_file`/`edit_file` is dispatched,
@@ -804,6 +813,7 @@ pub async fn chat_complete(
         exec_floor,
         write_ledger,
         cancel,
+        git_tool,
     } = ctx;
     // Headless callers may pass no session state — compression still works,
     // with per-turn anti-thrash accounting.
@@ -824,6 +834,7 @@ pub async fn chat_complete(
     let advertise_save_note = note_sink.is_some();
     let advertise_recall = recall_source.is_some();
     let advertise_memory_fetch = memory_source.is_some();
+    let advertise_git = git_tool.is_some();
 
     // Convert MemMessage list to Ollama JSON format.
     // The memory manager already included the current task as the last user message.
@@ -877,6 +888,7 @@ pub async fn chat_complete(
         advertise_save_note,
         advertise_recall,
         advertise_memory_fetch,
+        advertise_git,
     );
     let tool_tokens = estimate_value_tokens(&tools);
     // Phase 20 §2.3: one sanitized calibration ratio per turn. The
@@ -1636,6 +1648,8 @@ pub async fn chat_complete(
                     .map(|g| &mut *g as &mut dyn PermissionGate),
                 // #307: the active preset's exec floor (the bypass ceiling).
                 exec_floor,
+                // PR4: the injected embedded-git capability (None for headless).
+                git_tool,
             )
             .await;
             // 17.6: record the call for the turn's events column — args are
@@ -1980,6 +1994,7 @@ pub async fn openai_chat_complete(
         exec_floor,
         write_ledger,
         cancel,
+        git_tool,
     } = ctx;
     // Headless callers may pass no session state (mirrors the Ollama path).
     let mut local_compress_state = CompressState::new();
@@ -1999,6 +2014,7 @@ pub async fn openai_chat_complete(
     let advertise_save_note = note_sink.is_some();
     let advertise_recall = recall_source.is_some();
     let advertise_memory_fetch = memory_source.is_some();
+    let advertise_git = git_tool.is_some();
 
     let mut messages: Vec<serde_json::Value> = mem_messages
         .iter()
@@ -2037,6 +2053,7 @@ pub async fn openai_chat_complete(
         advertise_save_note,
         advertise_recall,
         advertise_memory_fetch,
+        advertise_git,
     );
     let tool_tokens = estimate_value_tokens(&tools);
     // Phase 20 §2.3: per-turn calibration ratio + real-token schema overhead
@@ -2452,6 +2469,8 @@ pub async fn openai_chat_complete(
                     .map(|g| &mut *g as &mut dyn PermissionGate),
                 // #307: the active preset's exec floor (the bypass ceiling).
                 exec_floor,
+                // PR4: the injected embedded-git capability (None for headless).
+                git_tool,
             )
             .await;
             if debug {
@@ -2956,6 +2975,7 @@ mod tool_round_cap_tests {
                 exec_floor: None,
                 write_ledger: None,
                 cancel: None,
+                git_tool: None,
             },
             &mut NoMcp,
         )
@@ -3017,6 +3037,7 @@ mod tool_round_cap_tests {
                 exec_floor: None,
                 write_ledger: None,
                 cancel: Some(&flag),
+                git_tool: None,
             },
             &mut NoMcp,
         )
@@ -3081,6 +3102,7 @@ mod tool_round_cap_tests {
                 exec_floor: None,
                 write_ledger: None,
                 cancel: None,
+                git_tool: None,
             },
             &mut NoMcp,
         )
@@ -3167,6 +3189,7 @@ mod tool_round_cap_tests {
                 exec_floor: None,
                 write_ledger: None,
                 cancel: None,
+                git_tool: None,
             },
             &mut NoMcp,
         )
@@ -3265,6 +3288,7 @@ mod tool_round_cap_tests {
                 exec_floor: None,
                 write_ledger: None,
                 cancel: None,
+                git_tool: None,
             },
             &mut NoMcp,
         )
@@ -3355,6 +3379,7 @@ mod tool_round_cap_tests {
                 exec_floor: None,
                 write_ledger: None,
                 cancel: None,
+                git_tool: None,
             },
             &mut NoMcp,
         )
@@ -3395,6 +3420,7 @@ mod tool_round_cap_tests {
                 None, // memory_source
                 None,
                 None,
+                None, // git_tool
             )
             .await;
             assert!(
@@ -3480,6 +3506,7 @@ mod tool_round_cap_tests {
                 exec_floor: None,
                 write_ledger: None,
                 cancel: None,
+                git_tool: None,
             },
             &mut NoMcp,
         )
@@ -3621,6 +3648,7 @@ mod tool_round_cap_tests {
                 exec_floor: None,
                 write_ledger: None,
                 cancel: None,
+                git_tool: None,
             },
             &mut NoMcp,
         )
@@ -3701,6 +3729,7 @@ mod http_loop_tests {
             exec_floor: None,
             write_ledger: None,
             cancel: None,
+            git_tool: None,
         }
     }
 
@@ -4577,6 +4606,7 @@ mod save_note_loop_tests {
             exec_floor: None,
             write_ledger: None,
             cancel: None,
+            git_tool: None,
         }
     }
 
@@ -5049,6 +5079,7 @@ mod compression_loop_tests {
             exec_floor: None,
             write_ledger: None,
             cancel: None,
+            git_tool: None,
         }
     }
 
@@ -6173,6 +6204,7 @@ mod observation_hook_tests {
             exec_floor: None,
             write_ledger: None,
             cancel: None,
+            git_tool: None,
         }
     }
 

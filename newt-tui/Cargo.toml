@@ -13,6 +13,7 @@ categories = ["command-line-interface"]
 
 [dependencies]
 newt-core.workspace = true
+newt-git.workspace = true
 newt-identity.workspace = true
 newt-inference.workspace = true
 newt-tools.workspace = true

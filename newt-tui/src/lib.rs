@@ -1642,6 +1642,14 @@ mod footer_tests {
 /// prompt itself is frozen at conversation start). Without it the model has no
 /// way to know its identity and confabulates one (e.g. inventing a name for
 /// commit attribution). Kept short — it rides in every request.
+/// The canonical AI-credit trailer the embedded git tool stamps on every commit
+/// (the user's format): `Co-authored-by: <model> (newt-agent v<version>)
+/// <noreply@newt-agent.com>`. The model name + harness version, so the app gets
+/// credit and the line is always well-formed (the model can't fake it).
+fn coauthor_trailer(model: &str) -> String {
+    format!("Co-authored-by: {model} (newt-agent v{VERSION}) <noreply@newt-agent.com>")
+}
+
 fn runtime_context_block(model: &str, endpoint: &str, kind: newt_core::BackendKind) -> String {
     let now = chrono::Local::now()
         .format("%Y-%m-%d %H:%M:%S %Z")
@@ -1659,7 +1667,11 @@ fn runtime_context_block(model: &str, endpoint: &str, kind: newt_core::BackendKi
          You are the model named above, running under the newt-agent harness. \
          When asked who or what you are — and when attributing work (commit \
          trailers, git notes, PR text) — use this real model name and harness; \
-         never invent or guess an identity.\n"
+         never invent or guess an identity.\n\
+         The `git` tool automatically signs every commit you make with \
+         `Co-authored-by: {model} (newt-agent v{VERSION}) <noreply@newt-agent.com>` \
+         — do NOT add that trailer yourself, and do not claim to have amended a \
+         commit (there is no amend op); just write the plain commit message.\n"
     )
 }
 
@@ -2831,6 +2843,7 @@ mod permission_prompt_tests {
             None, // memory_source
             Some(&mut gate),
             None,
+            None, // git_tool
         )
         .await;
         assert_eq!(out, "gated contents", "allow-once executed the real read");
@@ -2851,6 +2864,7 @@ mod permission_prompt_tests {
             None, // memory_source
             Some(&mut gate),
             None,
+            None, // git_tool
         )
         .await;
         assert_eq!(
@@ -2898,6 +2912,7 @@ mod permission_prompt_tests {
                 None, // memory_source
                 Some(&mut gate),
                 None,
+                None, // git_tool
             )
             .await;
             assert_eq!(out, "gated contents");
@@ -4190,6 +4205,30 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
     let mut pending_retry: Option<String> = None;
     let mut retry_budget: u32 = 0;
 
+    // PR4 (#461): the embedded `git` tool. Built once per session and injected
+    // into every turn's ChatCtx — but ONLY when the workspace is inside a git
+    // repo (cheap `GitEngine::open` probe). Otherwise it stays `None`, so the
+    // tool is never advertised in a non-repo dir (the presence gate). The
+    // commit author is the resolved AgentIdentity (`newt-agent[bot]` default).
+    let session_git_tool: Option<newt_git::LocalGitTool> =
+        if newt_git::GitEngine::open(std::path::Path::new(workspace)).is_ok() {
+            let id = newt_core::AgentIdentity::resolve().unwrap_or_default();
+            Some(newt_git::LocalGitTool {
+                root: std::path::PathBuf::from(workspace),
+                author: newt_git::Author {
+                    name: id.name,
+                    email: id.email,
+                },
+                // Auto-sign commits with the AI credit (the tool owns this so it
+                // is always present and correctly formatted — the model is told
+                // it's automatic, see runtime_context_block). Model = the
+                // session's model; harness = this newt version.
+                coauthor: Some(coauthor_trailer(&inf_model)),
+            })
+        } else {
+            None
+        };
+
     loop {
         // rustyline can panic (assertion `fd != -1`) when the terminal file
         // descriptor becomes invalid — most commonly from file-descriptor
@@ -4893,6 +4932,11 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                                     write_ledger: retry_ledger.as_ref(),
                                     // Esc-to-interrupt flag, tripped by the watcher.
                                     cancel: Some(&turn_cancel),
+                                    // PR4 (#461): the embedded git tool, present
+                                    // only when this workspace is a git repo.
+                                    git_tool: session_git_tool
+                                        .as_ref()
+                                        .map(|g| g as &dyn newt_core::agentic::GitTool),
                                 },
                                 &mut mcp,
                             ))
@@ -8585,6 +8629,7 @@ mod run_command_confinement_tests {
             None, // memory_source
             None,
             None,
+            None, // git_tool
         )
         .await;
         assert!(
@@ -8618,6 +8663,7 @@ mod run_command_confinement_tests {
             None, // memory_source
             None,
             None,
+            None, // git_tool
         )
         .await;
         assert!(
@@ -8662,6 +8708,7 @@ mod run_command_confinement_tests {
             None, // memory_source
             None,
             None,
+            None, // git_tool
         )
         .await;
 
@@ -8703,6 +8750,7 @@ mod run_command_confinement_tests {
             None, // memory_source
             None,
             None,
+            None, // git_tool
         )
         .await;
         assert_eq!(out, "hello", "read_file must still return file contents");
@@ -8737,6 +8785,7 @@ mod run_command_confinement_tests {
             None, // memory_source
             None,
             None,
+            None, // git_tool
         )
         .await;
         assert!(
@@ -8778,6 +8827,7 @@ mod run_command_confinement_tests {
             None, // memory_source
             None,
             None,
+            None, // git_tool
         )
         .await;
         assert!(out.contains("one.txt") && out.contains("two.txt"));
@@ -8903,6 +8953,7 @@ mod disable_ocap_session_tests {
             None, // memory_source
             None,
             None,
+            None, // git_tool
         )
         .await;
         assert_eq!(out, "yolo-through\n");
@@ -8922,6 +8973,7 @@ mod disable_ocap_session_tests {
             None, // memory_source
             None,
             None,
+            None, // git_tool
         )
         .await;
         assert_eq!(
@@ -8977,6 +9029,7 @@ mod disable_ocap_session_tests {
             None, // memory_source
             Some(&mut gate),
             None,
+            None, // git_tool
         )
         .await;
         assert_eq!(out, "no-prompt\n");
@@ -9013,6 +9066,7 @@ mod disable_ocap_session_tests {
             None, // memory_source
             Some(&mut gate),
             None,
+            None, // git_tool
         )
         .await;
         assert_eq!(out, "gated contents");
@@ -9055,6 +9109,7 @@ mod disable_ocap_session_tests {
             None,
             // The active preset's exec floor — the bypass ceiling.
             Some(&clamp.exec),
+            None, // git_tool
         )
         .await;
         assert_ne!(out, "should-not-run\n", "the floor must block --yolo");
@@ -11190,6 +11245,7 @@ mod tool_round_cap_tests {
                     exec_floor: None,
                     write_ledger: None,
                     cancel: None,
+                    git_tool: None,
                 },
                 &mut Mcp::empty(),
             )
