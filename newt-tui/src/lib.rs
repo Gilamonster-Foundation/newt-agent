@@ -6915,15 +6915,17 @@ the model works. Off: just the answer. Persist with [tui] thinking in config."
         }
         "probe" => {
             "\
-/probe [model|all] · /probe window [model] — classify a model empirically
+/probe [model|all] · /probe window <model> · /probe reset
 
+Classify models empirically; results feed /models capabilities.
   /probe <model>        warm up, then test: tool conformance, context window,
-                        thinking quirk, token calibration → model-capabilities
-  /probe all            probe every untested model in sequence
-  /probe window <model> empirical input-boundary search (records the max input
-                        it accepted at High confidence)
-
-Results feed the /models capabilities matrix."
+                        thinking quirk, token calibration
+  /probe                probe the active model
+  /probe all            RE-probe every model on the endpoint (a long sweep —
+                        press Esc to cancel; finishes the current model first)
+  /probe window <model> empirical input-boundary search (max input at High conf)
+  /probe reset          wipe all learned values (conformance, windows,
+                        calibration) so the next /probe re-learns from scratch"
         }
         "memory" => {
             "\
@@ -7138,8 +7140,9 @@ fn help_lines() -> &'static [&'static str] {
         "  /model <name>            - switch model for this session",
         "  /backend <openai|ollama> [model] - switch backend (e.g. /backend ollama deepseek-r1)",
         "  /thinking <on|off>       - toggle the reasoning spinner for this session",
-        "  /probe [model|all]       - cheap discovery: tool conformance, context window, thinking, calibration",
+        "  /probe [model|all]       - classify tool use, context window, thinking, calibration (all = re-probe every model; Esc cancels)",
         "  /probe window [model]    - empirical input-boundary search (records max input at High confidence)",
+        "  /probe reset             - wipe all learned probe values (conformance, windows, calibration)",
         "  /memory                  - show context window / notes usage",
         "  /compress [focus]        - compress context now, optionally focused on a topic",
         "  /remember <fact>         - add a fact to persistent NOTES.md",
@@ -7383,11 +7386,22 @@ fn dispatch_slash(
         }
 
         "probe" => {
-            // Test tool conformance for one model (or all untested).
+            // Test tool conformance for one model, or every model (`all`).
             let cfg = newt_core::Config::resolve().unwrap_or_default();
             let choice = resolve_backend_choice(&cfg);
 
-            if choice.kind != newt_core::BackendKind::Ollama {
+            if arg1 == "reset" {
+                // Wipe learned conformance, context windows, and calibration so
+                // the next /probe re-learns from scratch (works on any backend —
+                // the cache is local).
+                probe::save_cache(&probe::CapabilityCache::default());
+                print_newt(
+                    "probe cache reset — conformance, context windows, and calibration cleared. \
+                     Re-test with /probe all (Esc to cancel).",
+                    color,
+                    verbose,
+                );
+            } else if choice.kind != newt_core::BackendKind::Ollama {
                 print_newt(
                     "/probe only works with Ollama endpoints (vLLM/OpenAI keep models resident)",
                     color,
@@ -7405,14 +7419,12 @@ fn dispatch_slash(
                 let do_window = arg1 == "window";
                 let model_arg = if do_window { arg2 } else { arg1 };
 
-                // Decide which models to probe.
+                // Decide which models to probe. `all` re-probes EVERY model on
+                // the endpoint (not just untested ones) — to wipe stale learning
+                // first, run /probe reset. A long sweep; Esc cancels it.
                 let targets: Vec<String> = if !do_window && model_arg == "all" {
                     match probe::fetch_ollama_models(endpoint) {
-                        Ok(models) => models
-                            .into_iter()
-                            .filter(|m| !cache.contains_key(&m.name))
-                            .map(|m| m.name)
-                            .collect(),
+                        Ok(models) => models.into_iter().map(|m| m.name).collect(),
                         Err(e) => {
                             print_newt(&format!("error fetching model list: {e}"), color, verbose);
                             vec![]
@@ -7425,91 +7437,114 @@ fn dispatch_slash(
                 };
 
                 if targets.is_empty() {
+                    print_newt("No models to probe.", color, verbose);
+                } else if model_arg == "all" {
                     print_newt(
-                        "All models already tested — use /probe <name> to re-test one.",
+                        &format!("Probing {} models — press Esc to cancel.", targets.len()),
                         color,
                         verbose,
                     );
                 }
 
-                for model in &targets {
-                    // Warm up before probing so load time doesn't count as a timeout.
-                    if do_window {
-                        print_newt(&format!("Probing {model} (window search)…"), color, verbose);
-                    } else {
-                        print_newt(&format!("Probing {model}…"), color, verbose);
-                    }
-                    warmup_if_cold(endpoint, model, &keep_alive_str(&cfg), color, verbose);
+                // Esc-cancellable sweep: a keyboard watcher trips the flag, which
+                // we check at each model boundary (a single model still finishes;
+                // the remaining ones are skipped). Only on a TTY.
+                let probe_cancel = std::sync::atomic::AtomicBool::new(false);
+                let probe_interruptible = io::stdin().is_terminal() && io::stdout().is_terminal();
+                let mut probed = 0usize;
+                with_interrupt_watch(probe_interruptible, &probe_cancel, || {
+                    for model in &targets {
+                        if probe_cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                            print_newt(
+                                &format!("⊘ interrupted — probed {probed}/{}", targets.len()),
+                                color,
+                                verbose,
+                            );
+                            break;
+                        }
+                        // Warm up before probing so load time doesn't count as a timeout.
+                        if do_window {
+                            print_newt(
+                                &format!("Probing {model} (window search)…"),
+                                color,
+                                verbose,
+                            );
+                        } else {
+                            print_newt(&format!("Probing {model}…"), color, verbose);
+                        }
+                        warmup_if_cold(endpoint, model, &keep_alive_str(&cfg), color, verbose);
 
-                    let today = today_date();
-                    // Mutate the cache entry in place so the 20.1 fields
-                    // (estimate_ratio, emits_thinking, max_ok_input, tune_*)
-                    // are preserved and the refreshed window / quirk / ratio
-                    // that full_probe writes are kept too (§4.1, item 12).
-                    let mut entry = cache.remove(model.as_str()).unwrap_or_default();
-                    let report = probe::full_probe(
-                        endpoint,
-                        model,
-                        &mut entry,
-                        do_window,
-                        &today,
-                        |line: &str| print_newt(line, color, verbose),
-                    );
-                    cache.insert(model.clone(), entry);
-                    probe::save_cache(&cache);
+                        let today = today_date();
+                        // Mutate the cache entry in place so the 20.1 fields
+                        // (estimate_ratio, emits_thinking, max_ok_input, tune_*)
+                        // are preserved and the refreshed window / quirk / ratio
+                        // that full_probe writes are kept too (§4.1, item 12).
+                        let mut entry = cache.remove(model.as_str()).unwrap_or_default();
+                        let report = probe::full_probe(
+                            endpoint,
+                            model,
+                            &mut entry,
+                            do_window,
+                            &today,
+                            |line: &str| print_newt(line, color, verbose),
+                        );
+                        cache.insert(model.clone(), entry);
+                        probe::save_cache(&cache);
 
-                    // Rich report (§4.1): conformance symbol PLUS the window,
-                    // thinking quirk, and calibration ratio; window mode adds
-                    // the empirically-confirmed max input at High confidence.
-                    print_newt(
-                        &format!(
-                            "{model}  →  {}  (tested {today})",
-                            report.conformance.symbol()
-                        ),
-                        color,
-                        verbose,
-                    );
-                    if let Some(w) = report.context_window {
-                        print_newt(&format!("  context window: {w}"), color, verbose);
-                    }
-                    if report.emits_thinking {
-                        print_newt("  quirk: emits thinking-only responses", color, verbose);
-                    }
-                    if let Some(r) = report.estimate_ratio {
+                        // Rich report (§4.1): conformance symbol PLUS the window,
+                        // thinking quirk, and calibration ratio; window mode adds
+                        // the empirically-confirmed max input at High confidence.
                         print_newt(
-                            &format!("  estimate calibration: x{r:.2} (chars/4 → real)"),
+                            &format!(
+                                "{model}  →  {}  (tested {today})",
+                                report.conformance.symbol()
+                            ),
                             color,
                             verbose,
                         );
-                    }
-                    if let Some(outcome) = &report.boundary {
-                        match outcome.highest_accepted {
-                            Some(max) => print_newt(
-                                &format!(
-                                    "  max input (empirical): {max} — High confidence \
+                        if let Some(w) = report.context_window {
+                            print_newt(&format!("  context window: {w}"), color, verbose);
+                        }
+                        if report.emits_thinking {
+                            print_newt("  quirk: emits thinking-only responses", color, verbose);
+                        }
+                        if let Some(r) = report.estimate_ratio {
+                            print_newt(
+                                &format!("  estimate calibration: x{r:.2} (chars/4 → real)"),
+                                color,
+                                verbose,
+                            );
+                        }
+                        if let Some(outcome) = &report.boundary {
+                            match outcome.highest_accepted {
+                                Some(max) => print_newt(
+                                    &format!(
+                                        "  max input (empirical): {max} — High confidence \
                                      ({} steps)",
-                                    outcome.steps
+                                        outcome.steps
+                                    ),
+                                    color,
+                                    verbose,
                                 ),
-                                color,
-                                verbose,
-                            ),
-                            None => print_newt(
-                                &format!(
-                                    "  no input accepted in {} steps (bounds {:?})",
-                                    outcome.steps, outcome.final_bounds
+                                None => print_newt(
+                                    &format!(
+                                        "  no input accepted in {} steps (bounds {:?})",
+                                        outcome.steps, outcome.final_bounds
+                                    ),
+                                    color,
+                                    verbose,
                                 ),
-                                color,
-                                verbose,
-                            ),
+                            }
+                            if let Some(err) = &outcome.error {
+                                print_newt(&format!("  note: {err}"), color, verbose);
+                            }
                         }
-                        if let Some(err) = &outcome.error {
-                            print_newt(&format!("  note: {err}"), color, verbose);
+                        for note in &report.notes {
+                            print_newt(&format!("  note: {note}"), color, verbose);
                         }
+                        probed += 1;
                     }
-                    for note in &report.notes {
-                        print_newt(&format!("  note: {note}"), color, verbose);
-                    }
-                }
+                });
             }
         }
 
