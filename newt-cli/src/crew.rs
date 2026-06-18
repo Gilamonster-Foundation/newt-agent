@@ -139,12 +139,21 @@ impl Workspace for WorktreeWorkspace {
     }
 
     fn run_test(&self) -> (bool, String) {
-        match Command::new("sh")
-            .arg("-c")
-            .arg(&self.test_cmd)
-            .current_dir(&self.worktree)
-            .output()
-        {
+        // Shell out via the platform shell so a command string like `just check`
+        // or `cargo test` runs as written.
+        #[cfg(unix)]
+        let mut cmd = {
+            let mut c = Command::new("sh");
+            c.arg("-c").arg(&self.test_cmd);
+            c
+        };
+        #[cfg(windows)]
+        let mut cmd = {
+            let mut c = Command::new("cmd");
+            c.arg("/C").arg(&self.test_cmd);
+            c
+        };
+        match cmd.current_dir(&self.worktree).output() {
             Ok(o) => {
                 let out = format!(
                     "{}{}",
@@ -376,10 +385,9 @@ mod tests {
     }
 
     #[test]
-    fn worktree_isolates_reads_writes_and_tests() {
+    fn worktree_isolates_reads_and_writes() {
         let repo = git_repo();
-        let mut ws =
-            WorktreeWorkspace::create(repo.path(), "t1", "test -f hello.txt".into()).unwrap();
+        let mut ws = WorktreeWorkspace::create(repo.path(), "t1", "true".into()).unwrap();
 
         // files() lists tracked files; read() reads them.
         assert!(ws.files().iter().any(|f| f == "hello.txt"));
@@ -397,18 +405,18 @@ mod tests {
             !repo.path().join("src/new.rs").exists(),
             "edit must NOT touch the live tree"
         );
-
-        // run_test() shells the command in the worktree.
-        let (passed, _out) = ws.run_test();
-        assert!(passed, "test -f hello.txt passes (committed file present)");
     }
 
+    // run_test shells the platform shell; the assertions below use POSIX
+    // commands, so they're Unix-only (the deploy targets are macOS + Linux).
+    #[cfg(unix)]
     #[test]
-    fn run_test_reports_failure() {
+    fn run_test_passes_and_reports_failure() {
         let repo = git_repo();
-        let ws = WorktreeWorkspace::create(repo.path(), "t2", "exit 3".into()).unwrap();
-        let (passed, _) = ws.run_test();
-        assert!(!passed, "a non-zero exit is a failed verification");
+        let ok = WorktreeWorkspace::create(repo.path(), "t2a", "test -f hello.txt".into()).unwrap();
+        assert!(ok.run_test().0, "committed file present → pass");
+        let bad = WorktreeWorkspace::create(repo.path(), "t2b", "exit 3".into()).unwrap();
+        assert!(!bad.run_test().0, "non-zero exit → fail");
     }
 
     #[test]
@@ -509,6 +517,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)] // the verification command is a POSIX `test -f`
     #[tokio::test]
     async fn crew_converges_with_a_fixing_planner() {
         let repo = git_repo();
