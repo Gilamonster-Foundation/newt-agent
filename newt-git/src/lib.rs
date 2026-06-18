@@ -367,6 +367,142 @@ fn parse_ident(s: &str) -> (String, String, i64) {
     (name, email, timestamp)
 }
 
+// ---------------------------------------------------------------------------
+// LocalGitTool — the injected `GitTool` impl (PR4, #461)
+// ---------------------------------------------------------------------------
+
+/// The on-disk [`GitEngine`] adapted to newt-core's
+/// [`GitTool`](newt_core::agentic::GitTool) seam. The binary constructs one per
+/// session (root = workspace, author = the resolved agent identity) and injects
+/// it into the agent loop; `execute_tool`'s `git` arm calls
+/// [`dispatch`](GitTool::dispatch). A fresh `GitEngine::open` per call keeps it
+/// stateless and cheap (no long-lived handle across turns).
+pub struct LocalGitTool {
+    pub root: std::path::PathBuf,
+    pub author: Author,
+}
+
+impl newt_core::agentic::GitTool for LocalGitTool {
+    fn dispatch(
+        &self,
+        op: &str,
+        args: &serde_json::Value,
+        caps: &GitCaveats,
+    ) -> Result<String, String> {
+        let eng = GitEngine::open(&self.root).map_err(|e| e.to_string())?;
+        let s = |e: GitError| e.to_string();
+        match op {
+            "status" => Ok(render_status(&eng.status(caps).map_err(s)?)),
+            "log" => {
+                let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
+                Ok(render_log(&eng.log(caps, limit).map_err(s)?))
+            }
+            "diff" => {
+                let spec = match args.get("spec").and_then(|v| v.as_str()) {
+                    Some("staged") => DiffSpec::Staged,
+                    _ => DiffSpec::Worktree,
+                };
+                Ok(render_diff(&eng.diff(caps, spec).map_err(s)?))
+            }
+            "add" => {
+                let paths = str_array(args, "paths");
+                if paths.is_empty() {
+                    return Err("add: 'paths' (array of repo-relative paths) is required".into());
+                }
+                let staged = eng.add(caps, &paths).map_err(s)?;
+                Ok(format!(
+                    "staged {} path(s): {}",
+                    staged.len(),
+                    staged.join(", ")
+                ))
+            }
+            "commit" => {
+                let msg = args
+                    .get("message")
+                    .and_then(|v| v.as_str())
+                    .filter(|m| !m.trim().is_empty())
+                    .ok_or("commit: 'message' is required")?;
+                let c = eng.commit(caps, msg, &self.author).map_err(s)?;
+                Ok(format!("committed {}: {}", c.short_id, c.summary))
+            }
+            "branch" => {
+                let name = args
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .filter(|n| !n.trim().is_empty())
+                    .ok_or("branch: 'name' is required")?;
+                let r = eng.branch(caps, name).map_err(s)?;
+                Ok(format!("created {r}"))
+            }
+            other => Err(format!(
+                "unknown git op '{other}' (use status|log|diff|add|commit|branch)"
+            )),
+        }
+    }
+}
+
+fn str_array(args: &serde_json::Value, key: &str) -> Vec<String> {
+    args.get(key)
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Compact, model-readable status (not raw JSON — the model reads prose better).
+fn render_status(s: &StatusReport) -> String {
+    let branch = s.branch.as_deref().unwrap_or("(detached)");
+    let head = s.head.as_deref().unwrap_or("(unborn)");
+    let mut out = format!("on branch {branch} (HEAD {head})\n");
+    if s.clean {
+        out.push_str("working tree clean");
+        return out;
+    }
+    let mut group = |label: &str, files: &[FileChange]| {
+        if !files.is_empty() {
+            out.push_str(label);
+            out.push_str(":\n");
+            for f in files {
+                out.push_str(&format!("  {} {}\n", f.status, f.path));
+            }
+        }
+    };
+    group("staged", &s.staged);
+    group("unstaged", &s.unstaged);
+    if !s.untracked.is_empty() {
+        out.push_str("untracked:\n");
+        for p in &s.untracked {
+            out.push_str(&format!("  ? {p}\n"));
+        }
+    }
+    out.trim_end().to_string()
+}
+
+fn render_log(commits: &[CommitInfo]) -> String {
+    if commits.is_empty() {
+        return "no commits".to_string();
+    }
+    commits
+        .iter()
+        .map(|c| format!("{}  {}  ({})", c.short_id, c.summary, c.author_name))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn render_diff(d: &DiffReport) -> String {
+    if d.files.is_empty() {
+        return "no changes".to_string();
+    }
+    d.files
+        .iter()
+        .map(|f| format!("{} {}", f.status, f.path))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -566,5 +702,101 @@ mod tests {
             eng.commit(&stage_only, "m", &author),
             Err(GitError::Denied("commit"))
         ));
+    }
+
+    // --- LocalGitTool (the injected GitTool seam) ---------------------------
+
+    use newt_core::agentic::GitTool as _;
+
+    fn tool(dir: &Path) -> LocalGitTool {
+        LocalGitTool {
+            root: dir.to_path_buf(),
+            author: Author {
+                name: "newt-agent[bot]".into(),
+                email: "bot@example.com".into(),
+            },
+        }
+    }
+
+    #[test]
+    fn local_git_tool_status_renders_readable_text() {
+        let dir = repo_with_commit();
+        let t = tool(dir.path());
+        let out = t
+            .dispatch("status", &serde_json::json!({}), &GitCaveats::top())
+            .unwrap();
+        assert!(out.contains("on branch main"), "got: {out}");
+        assert!(out.contains("working tree clean"), "got: {out}");
+    }
+
+    #[test]
+    fn local_git_tool_log_lists_commits() {
+        let dir = repo_with_commit();
+        let t = tool(dir.path());
+        let out = t
+            .dispatch("log", &serde_json::json!({"limit": 5}), &GitCaveats::top())
+            .unwrap();
+        assert!(out.contains("first commit"), "got: {out}");
+    }
+
+    #[test]
+    fn local_git_tool_add_then_commit_succeeds_when_permitted() {
+        let dir = repo_with_commit();
+        std::fs::write(dir.path().join("b.txt"), "two\n").unwrap();
+        let t = tool(dir.path());
+        let staged = t
+            .dispatch(
+                "add",
+                &serde_json::json!({"paths": ["b.txt"]}),
+                &GitCaveats::top(),
+            )
+            .unwrap();
+        assert!(staged.contains("b.txt"), "got: {staged}");
+        let committed = t
+            .dispatch(
+                "commit",
+                &serde_json::json!({"message": "add b"}),
+                &GitCaveats::top(),
+            )
+            .unwrap();
+        assert!(committed.starts_with("committed "), "got: {committed}");
+        assert!(committed.contains("add b"), "got: {committed}");
+    }
+
+    #[test]
+    fn local_git_tool_commit_denied_on_read_only_caveats() {
+        let dir = repo_with_commit();
+        let t = tool(dir.path());
+        // read_only permits status/log/diff but never a commit.
+        let err = t
+            .dispatch(
+                "commit",
+                &serde_json::json!({"message": "nope"}),
+                &GitCaveats::read_only(),
+            )
+            .unwrap_err();
+        assert!(
+            err.contains("denied") && err.contains("commit"),
+            "got: {err}"
+        );
+        // …but a read op is allowed under the same caveats.
+        assert!(t
+            .dispatch("status", &serde_json::json!({}), &GitCaveats::read_only())
+            .is_ok());
+    }
+
+    #[test]
+    fn local_git_tool_unknown_op_and_missing_args_error() {
+        let dir = repo_with_commit();
+        let t = tool(dir.path());
+        let err = t
+            .dispatch("frobnicate", &serde_json::json!({}), &GitCaveats::top())
+            .unwrap_err();
+        assert!(err.contains("unknown git op"), "got: {err}");
+        // commit without a message is a clear arg error, not a panic.
+        let err = t
+            .dispatch("commit", &serde_json::json!({}), &GitCaveats::top())
+            .unwrap_err();
+        assert!(err.contains("message"), "got: {err}");
     }
 }
