@@ -24,9 +24,11 @@ use newt_core::{BackendConfig, BackendKind, Tier};
 
 mod crew;
 mod dispatch;
+mod panel;
 mod probe;
 pub use crew::{run_crew, CrewConfig, CrewOutcome, CrewStatus, Edit, Workspace};
 pub use dispatch::{ChatReply, ChatRequest, Dispatcher, LocalDispatcher};
+pub use panel::{run_panel, PanelConfig, PanelOutcome, PanelStatus, Verify, VoiceSpec, Vote};
 pub use probe::{Prober, TcpProber};
 
 /// Liveness of a backend.
