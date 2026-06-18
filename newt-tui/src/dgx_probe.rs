@@ -348,10 +348,12 @@ mod tests {
         };
         let mut rx = tele.into_sampler(1);
         // The first interval tick fires immediately, so a sample is published
-        // promptly; reading is instant.
-        tokio::time::timeout(std::time::Duration::from_secs(3), rx.changed())
+        // promptly; reading is instant. The generous timeout only guards against
+        // a starved timer under heavy parallel-test load (the publish itself is
+        // sub-millisecond) — it is a liveness check, not a latency assertion.
+        tokio::time::timeout(std::time::Duration::from_secs(10), rx.changed())
             .await
-            .expect("sampler published within 3s")
+            .expect("sampler published a snapshot")
             .expect("sender alive");
         assert!(
             !rx.borrow().has_data(),
