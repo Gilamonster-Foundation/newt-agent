@@ -545,6 +545,14 @@ pub struct ChatCtx<'a> {
     /// `None` (every headless caller, and any profile without `retry`) ⇒ nothing is
     /// recorded and no file is ever reverted — bit-for-bit today's behavior.
     pub write_ledger: Option<&'a std::cell::RefCell<crate::verify_gate::WriteLedger>>,
+    /// User-interrupt flag (Esc / Ctrl-C during a turn). When set mid-turn the
+    /// loop abandons at its next checkpoint — the round-loop top, and the two
+    /// model awaits (the non-streaming probe and the token stream) — and
+    /// returns early. `None` (every headless / eval caller) ⇒ no interrupt
+    /// path, bit-for-bit today's behavior. The caller owns the `AtomicBool`,
+    /// trips it from a keyboard watcher, and inspects it after the call to tell
+    /// an interrupted turn from a genuinely empty reply.
+    pub cancel: Option<&'a std::sync::atomic::AtomicBool>,
 }
 
 /// retry technique (R2 action arm): before a `write_file`/`edit_file` is dispatched,
@@ -671,6 +679,41 @@ fn is_tools_unsupported_error(e: &anyhow::Error) -> bool {
 /// NOT the per-round sum, which double-counts history (every round's prompt
 /// re-includes all prior rounds; the B3 baseline measured 5.4× inflation).
 /// `output_tokens` is the sum across rounds (each completion is new).
+/// `true` once the caller's interrupt flag is set (Esc / Ctrl-C). Cheap relaxed
+/// load — the flag is a one-way latch, so no ordering guarantees are needed.
+fn is_cancelled(cancel: Option<&std::sync::atomic::AtomicBool>) -> bool {
+    cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Resolve as soon as the interrupt flag is set, polling at ~50 ms — fine for a
+/// human keypress and cheap enough to lose the race to any real I/O future.
+/// Never resolves when `cancel` is `None`, so a `select!` against it collapses
+/// to just the other arm (no behavior change for headless callers).
+async fn cancelled(cancel: Option<&std::sync::atomic::AtomicBool>) {
+    match cancel {
+        None => std::future::pending().await,
+        Some(flag) => {
+            while !flag.load(std::sync::atomic::Ordering::Relaxed) {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }
+    }
+}
+
+/// Race a model future against the interrupt flag: `Some(v)` if it finished,
+/// `None` if the user interrupted first (the future is dropped, cancelling any
+/// in-flight request).
+async fn cancellable<F: std::future::Future>(
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+    fut: F,
+) -> Option<F::Output> {
+    tokio::select! {
+        biased;
+        _ = cancelled(cancel) => None,
+        v = fut => Some(v),
+    }
+}
+
 pub async fn chat_complete(
     ctx: ChatCtx<'_>,
     mcp: &mut dyn McpTools,
@@ -715,6 +758,7 @@ pub async fn chat_complete(
         estimate_ratio,
         exec_floor,
         write_ledger,
+        cancel,
     } = ctx;
     // Headless callers may pass no session state — compression still works,
     // with per-turn anti-thrash accounting.
@@ -810,6 +854,12 @@ pub async fn chat_complete(
 
     // Agentic loop — up to `max_tool_rounds` tool-call rounds.
     'round_loop: for round in 0..max_tool_rounds {
+        // Interrupt checkpoint (Esc / Ctrl-C): bail before spending another
+        // round on the model or a tool. The reply is empty — the caller sees
+        // `cancel` set and treats the turn as abandoned regardless.
+        if is_cancelled(cancel) {
+            return Ok((String::new(), false, accumulated_usage, hallucination_count));
+        }
         if round > 0 {
             // Brief separator between rounds so user can follow the flow.
             if color {
@@ -984,28 +1034,38 @@ pub async fn chat_complete(
         }
 
         // Retry the send+status+parse as one unit — a connection drop at any
-        // of these steps is transient and worth retrying with backoff.
-        let dispatch = with_backoff_notify(
-            &retry,
-            || async {
-                let resp = client
-                    .post(&chat_url)
-                    .json(&body_no_stream)
-                    .send()
-                    .await
-                    .map_err(|e| anyhow::anyhow!("request failed: {e}"))?;
-                if !resp.status().is_success() {
-                    let status = resp.status();
-                    let text = resp.text().await.unwrap_or_default();
-                    anyhow::bail!("Ollama {status}: {text}");
-                }
-                resp.json::<serde_json::Value>()
-                    .await
-                    .map_err(anyhow::Error::from)
-            },
-            |attempt, delay| print_retry_indicator(attempt, delay, color),
+        // of these steps is transient and worth retrying with backoff. Raced
+        // against the interrupt flag so Esc bails out of a slow / stuck probe
+        // (the common "the model isn't answering" case) without waiting for it.
+        let dispatch = match cancellable(
+            cancel,
+            with_backoff_notify(
+                &retry,
+                || async {
+                    let resp = client
+                        .post(&chat_url)
+                        .json(&body_no_stream)
+                        .send()
+                        .await
+                        .map_err(|e| anyhow::anyhow!("request failed: {e}"))?;
+                    if !resp.status().is_success() {
+                        let status = resp.status();
+                        let text = resp.text().await.unwrap_or_default();
+                        anyhow::bail!("Ollama {status}: {text}");
+                    }
+                    resp.json::<serde_json::Value>()
+                        .await
+                        .map_err(anyhow::Error::from)
+                },
+                |attempt, delay| print_retry_indicator(attempt, delay, color),
+            ),
         )
-        .await;
+        .await
+        {
+            Some(d) => d,
+            // Interrupted mid-probe: abandon the turn.
+            None => return Ok((String::new(), false, accumulated_usage, hallucination_count)),
+        };
         let json: serde_json::Value = match dispatch {
             Ok(j) => j,
             Err(e) => {
@@ -1188,20 +1248,28 @@ pub async fn chat_complete(
                 }
             }
             // Retry the connection; if we connect successfully but the stream
-            // drops mid-token, that's a separate (harder) failure mode.
-            let sresp = with_backoff_notify(
-                &retry,
-                || async {
-                    client
-                        .post(&chat_url)
-                        .json(&body_stream)
-                        .send()
-                        .await
-                        .map_err(|e| anyhow::anyhow!("stream request failed: {e}"))
-                },
-                |attempt, delay| print_retry_indicator(attempt, delay, color),
+            // drops mid-token, that's a separate (harder) failure mode. Raced
+            // against the interrupt flag like the probe above.
+            let sresp = match cancellable(
+                cancel,
+                with_backoff_notify(
+                    &retry,
+                    || async {
+                        client
+                            .post(&chat_url)
+                            .json(&body_stream)
+                            .send()
+                            .await
+                            .map_err(|e| anyhow::anyhow!("stream request failed: {e}"))
+                    },
+                    |attempt, delay| print_retry_indicator(attempt, delay, color),
+                ),
             )
-            .await?;
+            .await
+            {
+                Some(r) => r?,
+                None => return Ok((String::new(), false, accumulated_usage, hallucination_count)),
+            };
 
             if !sresp.status().is_success() {
                 if debug {
@@ -1222,7 +1290,8 @@ pub async fn chat_complete(
             // Cargo-style reasoning spinner: TTY-gated (`color`) and opt-out via
             // `[tui] thinking = "off"`. Never in a pipe / `newt worker`.
             let show_thinking = color && thinking_stream_enabled();
-            let (streamed, stream_usage) = stream_response(sresp, color, show_thinking).await?;
+            let (streamed, stream_usage) =
+                stream_response(sresp, color, show_thinking, cancel).await?;
 
             if streamed.is_empty() {
                 // The streaming re-issue produced no tokens. Fall back to the
@@ -1836,6 +1905,7 @@ pub async fn openai_chat_complete(
         estimate_ratio,
         exec_floor,
         write_ledger,
+        cancel,
     } = ctx;
     // Headless callers may pass no session state (mirrors the Ollama path).
     let mut local_compress_state = CompressState::new();
@@ -1905,6 +1975,14 @@ pub async fn openai_chat_complete(
 
     // Agentic loop — up to `max_tool_rounds` tool-call rounds (matches the Ollama path).
     'round_loop: for round in 0..max_tool_rounds {
+        // Interrupt checkpoint (Esc / Ctrl-C), same contract as the Ollama path:
+        // bail at the round boundary with an empty reply; the caller treats the
+        // turn as abandoned. (The OpenAI path's per-request awaits are not yet
+        // individually raced — round granularity is enough for the opt-in
+        // provider plugin; the Ollama first-class path cancels mid-await.)
+        if is_cancelled(cancel) {
+            return Ok((String::new(), false, accumulated_usage, hallucination_count));
+        }
         if round > 0 && color {
             execute!(
                 io::stdout(),
@@ -2471,6 +2549,7 @@ async fn stream_response(
     resp: reqwest::Response,
     color: bool,
     show_thinking: bool,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> anyhow::Result<(String, Option<crate::TokenUsage>)> {
     let mut spinner = show_thinking.then(|| ThinkingSpinner::new(color));
     let mut full = String::new();
@@ -2481,7 +2560,12 @@ async fn stream_response(
     let mut think = crate::reasoning::ThinkFilter::new();
 
     let mut resp = resp;
-    while let Some(chunk) = resp.chunk().await? {
+    // Race each chunk read against the interrupt flag so Esc stops the token
+    // stream promptly; on interrupt, stop reading and return what we have.
+    while let Some(chunk) = match cancellable(cancel, resp.chunk()).await {
+        Some(c) => c?,
+        None => None,
+    } {
         let text = String::from_utf8_lossy(&chunk);
         for line in text.lines() {
             if line.is_empty() {
@@ -2779,6 +2863,7 @@ mod tool_round_cap_tests {
                 estimate_ratio: None,
                 exec_floor: None,
                 write_ledger: None,
+                cancel: None,
             },
             &mut NoMcp,
         )
@@ -2792,6 +2877,63 @@ mod tool_round_cap_tests {
         assert_eq!(reply, "here is my partial summary");
         assert_ne!(reply, "(reached tool-call limit)");
         assert!(!streamed);
+    }
+
+    #[tokio::test]
+    async fn a_set_cancel_flag_abandons_the_turn_before_any_network_call() {
+        // The interrupt checkpoint at the round-loop top runs before the first
+        // request, so a pre-tripped flag returns instantly — the bogus URL
+        // (a closed port) is never contacted. If the checkpoint regressed,
+        // the dispatch would try to connect and this would not return empty.
+        let messages = msgs();
+        let caveats = Caveats::top();
+        let flag = std::sync::atomic::AtomicBool::new(true);
+        let (reply, streamed, usage, hallu) = chat_complete(
+            ChatCtx {
+                url: "http://127.0.0.1:1",
+                model: "test-model",
+                kind: BackendKind::Ollama,
+                api_key: None,
+                messages: &messages,
+                task: "do the thing",
+                workspace: ".",
+                color: false,
+                caveats: &caveats,
+                max_tool_rounds: 5,
+                tool_output_lines: 20,
+                debug: false,
+                trace: false,
+                num_ctx: None,
+                connect_timeout_secs: 5,
+                inference_timeout_secs: 120,
+                mid_loop_trim_threshold: 40,
+                mid_loop_trim_tokens: None,
+                max_ok_input: None,
+                build_check_cmd: None,
+                safe_context: None,
+                recover_cw_400: None,
+                note_sink: None,
+                note_nudge: None,
+                recall_source: None,
+                memory_source: None,
+                summarizer: None,
+                compress_state: None,
+                tool_events: None,
+                permission_gate: None,
+                on_round_usage: None,
+                estimate_ratio: None,
+                exec_floor: None,
+                write_ledger: None,
+                cancel: Some(&flag),
+            },
+            &mut NoMcp,
+        )
+        .await
+        .expect("an interrupted turn still returns Ok, just empty");
+        assert!(reply.is_empty(), "interrupted before any model output");
+        assert!(!streamed);
+        assert!(usage.is_none());
+        assert_eq!(hallu, 0);
     }
 
     #[tokio::test]
@@ -2846,6 +2988,7 @@ mod tool_round_cap_tests {
                 estimate_ratio: None,
                 exec_floor: None,
                 write_ledger: None,
+                cancel: None,
             },
             &mut NoMcp,
         )
@@ -2931,6 +3074,7 @@ mod tool_round_cap_tests {
                 estimate_ratio: None,
                 exec_floor: None,
                 write_ledger: None,
+                cancel: None,
             },
             &mut NoMcp,
         )
@@ -3028,6 +3172,7 @@ mod tool_round_cap_tests {
                 estimate_ratio: None,
                 exec_floor: None,
                 write_ledger: None,
+                cancel: None,
             },
             &mut NoMcp,
         )
@@ -3117,6 +3262,7 @@ mod tool_round_cap_tests {
                 estimate_ratio: None,
                 exec_floor: None,
                 write_ledger: None,
+                cancel: None,
             },
             &mut NoMcp,
         )
@@ -3241,6 +3387,7 @@ mod tool_round_cap_tests {
                 estimate_ratio: None,
                 exec_floor: None,
                 write_ledger: None,
+                cancel: None,
             },
             &mut NoMcp,
         )
@@ -3381,6 +3528,7 @@ mod tool_round_cap_tests {
                 estimate_ratio: None,
                 exec_floor: None,
                 write_ledger: None,
+                cancel: None,
             },
             &mut NoMcp,
         )
@@ -3460,6 +3608,7 @@ mod http_loop_tests {
             estimate_ratio: None,
             exec_floor: None,
             write_ledger: None,
+            cancel: None,
         }
     }
 
@@ -4335,6 +4484,7 @@ mod save_note_loop_tests {
             estimate_ratio: None,
             exec_floor: None,
             write_ledger: None,
+            cancel: None,
         }
     }
 
@@ -4806,6 +4956,7 @@ mod compression_loop_tests {
             estimate_ratio: None,
             exec_floor: None,
             write_ledger: None,
+            cancel: None,
         }
     }
 
@@ -5929,6 +6080,7 @@ mod observation_hook_tests {
             // #307: test ChatCtx carries no preset exec floor (headless default).
             exec_floor: None,
             write_ledger: None,
+            cancel: None,
         }
     }
 
