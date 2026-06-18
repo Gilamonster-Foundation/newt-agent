@@ -19,6 +19,11 @@ use std::path::Path;
 
 use grit_lib::diff::{diff_index_to_tree, diff_index_to_worktree, DiffEntry};
 use grit_lib::index::{IndexEntry, MODE_REGULAR};
+use grit_lib::merge_base::resolve_commit_specs;
+use grit_lib::merge_file::MergeFavor;
+use grit_lib::merge_trees::{
+    merge_trees_three_way, TreeMergeConflictPresentation, WhitespaceMergeOptions,
+};
 use grit_lib::objects::{parse_commit, serialize_commit, CommitData, ObjectId, ObjectKind};
 use grit_lib::porcelain::status::{collect_untracked_and_ignored, IgnoredMode};
 use grit_lib::refs::{read_head, write_ref};
@@ -42,6 +47,49 @@ pub enum GitError {
     /// detached/unborn HEAD).
     #[error("unsupported: {0}")]
     Unsupported(&'static str),
+    /// A rebase step produced a merge conflict; the rebase was aborted and the
+    /// branch ref was left untouched (no side effects).
+    #[error("rebase conflict at {0} — aborted, branch unchanged")]
+    Conflict(String),
+    /// The rebase plan was malformed (e.g. a squash before any pick).
+    #[error("bad rebase plan: {0}")]
+    BadPlan(String),
+}
+
+/// What a [rebase](GitEngine::rebase) step does with its commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RebaseAction {
+    /// Replay the commit as-is.
+    Pick,
+    /// Replay, but with a new message.
+    Reword,
+    /// Fold into the previous commit, KEEPING both messages.
+    Squash,
+    /// Fold into the previous commit, DISCARDING this message.
+    Fixup,
+    /// Skip the commit entirely.
+    Drop,
+}
+
+/// One entry in a structured rebase plan.
+#[derive(Debug, Clone)]
+pub struct RebaseStep {
+    /// The commit to act on (id / ref / short oid — resolved at run time).
+    pub commit: String,
+    pub action: RebaseAction,
+    /// New / extra message for `Reword` and `Squash`.
+    pub message: Option<String>,
+}
+
+/// Outcome of a [rebase](GitEngine::rebase).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RebaseReport {
+    /// Short oid of the new branch tip.
+    pub new_head: String,
+    /// Commits produced on the rebased segment.
+    pub produced: usize,
+    /// Steps dropped.
+    pub dropped: usize,
 }
 
 /// Commit authorship — supplied by the caller (e.g. from the agent identity).
@@ -354,6 +402,163 @@ impl GitEngine {
         Ok(commit_info(&oid, &commit))
     }
 
+    /// Resolve a commit spec (short oid / ref / id) to an `ObjectId`.
+    fn resolve_one(&self, spec: &str) -> Result<ObjectId, GitError> {
+        resolve_commit_specs(&self.repo, &[spec.to_string()])?
+            .into_iter()
+            .next()
+            .ok_or(GitError::Unsupported("could not resolve commit"))
+    }
+
+    fn commit_tree(&self, oid: &ObjectId) -> Result<ObjectId, GitError> {
+        Ok(parse_commit(&self.repo.odb.read(oid)?.data)?.tree)
+    }
+
+    /// Write a single-parent commit with the agent's identity; returns its oid.
+    fn write_commit_on(
+        &self,
+        parent: ObjectId,
+        tree: ObjectId,
+        message: &str,
+        author: &Author,
+    ) -> Result<ObjectId, GitError> {
+        let ident = author.ident_now();
+        let commit = CommitData {
+            tree,
+            parents: vec![parent],
+            author: ident.clone(),
+            committer: ident,
+            author_raw: Vec::new(),
+            committer_raw: Vec::new(),
+            encoding: None,
+            message: message.to_string(),
+            raw_message: None,
+        };
+        Ok(self
+            .repo
+            .odb
+            .write(ObjectKind::Commit, &serialize_commit(&commit))?)
+    }
+
+    /// Structured-plan rebase: replay `steps` (in order) onto `onto`, applying
+    /// pick / reword / squash / fixup / drop. All new trees and commits are
+    /// written to the ODB; the branch ref is advanced **only at the very end**,
+    /// so a conflict (or any error) aborts with the branch unchanged — no
+    /// working-tree, index, or ref side effects. Requires `commit_local`.
+    ///
+    /// Cherry-pick per step is a 3-way tree merge with `MergeFavor::None` so
+    /// real conflicts are reported (not silently resolved). Authorship on the
+    /// produced commits is the agent's (the typical case: rewriting its own
+    /// recent history). Root commits (no parent) cannot be replayed.
+    pub fn rebase(
+        &self,
+        caps: &GitCaveats,
+        onto: &str,
+        steps: &[RebaseStep],
+        author: &Author,
+    ) -> Result<RebaseReport, GitError> {
+        if !caps.permits_commit() {
+            return Err(GitError::Denied("commit"));
+        }
+        let head_ref = read_head(&self.repo.git_dir)?
+            .ok_or(GitError::Unsupported("cannot rebase on a detached HEAD"))?;
+        let onto_oid = self.resolve_one(onto)?;
+
+        // The commit currently being assembled (a `pick`/`reword` opens it;
+        // `squash`/`fixup` extend it; the next pick or the end closes it).
+        let mut tip = onto_oid;
+        let mut tip_tree = self.commit_tree(&onto_oid)?;
+        let mut open = false;
+        let mut cur_parent = onto_oid;
+        let mut cur_tree = tip_tree;
+        let mut cur_msgs: Vec<String> = Vec::new();
+        let mut produced = 0usize;
+        let mut dropped = 0usize;
+
+        for step in steps {
+            if step.action == RebaseAction::Drop {
+                dropped += 1;
+                continue;
+            }
+            let c = self.resolve_one(&step.commit)?;
+            let cc = parse_commit(&self.repo.odb.read(&c)?.data)?;
+            let parent = cc
+                .parents
+                .first()
+                .copied()
+                .ok_or(GitError::Unsupported("cannot rebase a root commit"))?;
+            let base_tree = self.commit_tree(&parent)?;
+            let ours = if open { cur_tree } else { tip_tree };
+            let merged = merge_trees_three_way(
+                &self.repo,
+                base_tree,
+                ours,
+                cc.tree,
+                MergeFavor::None,
+                WhitespaceMergeOptions::default(),
+                None,
+                TreeMergeConflictPresentation::default(),
+            )?;
+            if !merged.conflict_content.is_empty() {
+                let subj = cc.message.lines().next().unwrap_or("").trim();
+                return Err(GitError::Conflict(format!("{} ({subj})", short_oid(&c))));
+            }
+            let new_tree = write_tree_from_index(&self.repo.odb, &merged.index, "")?;
+
+            match step.action {
+                RebaseAction::Pick | RebaseAction::Reword => {
+                    // Close any open commit first.
+                    if open {
+                        tip = self.write_commit_on(
+                            cur_parent,
+                            cur_tree,
+                            &cur_msgs.join("\n\n"),
+                            author,
+                        )?;
+                        tip_tree = cur_tree;
+                        produced += 1;
+                    }
+                    cur_parent = tip;
+                    cur_tree = new_tree;
+                    cur_msgs = vec![match step.action {
+                        RebaseAction::Reword => step
+                            .message
+                            .clone()
+                            .ok_or(GitError::BadPlan("reword needs a message".into()))?,
+                        _ => cc.message.clone(),
+                    }];
+                    open = true;
+                }
+                RebaseAction::Squash => {
+                    if !open {
+                        return Err(GitError::BadPlan("squash before any pick".into()));
+                    }
+                    cur_tree = new_tree;
+                    cur_msgs.push(step.message.clone().unwrap_or_else(|| cc.message.clone()));
+                }
+                RebaseAction::Fixup => {
+                    if !open {
+                        return Err(GitError::BadPlan("fixup before any pick".into()));
+                    }
+                    cur_tree = new_tree; // message discarded
+                }
+                RebaseAction::Drop => unreachable!("filtered above"),
+            }
+        }
+        // Close the final open commit.
+        if open {
+            tip = self.write_commit_on(cur_parent, cur_tree, &cur_msgs.join("\n\n"), author)?;
+            produced += 1;
+        }
+        // The single mutating step: advance the branch ref to the new tip.
+        write_ref(&self.repo.git_dir, &head_ref, &tip)?;
+        Ok(RebaseReport {
+            new_head: short_oid(&tip),
+            produced,
+            dropped,
+        })
+    }
+
     /// `git branch <name>` — create `refs/heads/<name>` at the current HEAD commit.
     /// Requires `refs` to permit that ref name. Returns the full ref name.
     pub fn branch(&self, caps: &GitCaveats, name: &str) -> Result<String, GitError> {
@@ -504,6 +709,22 @@ impl newt_core::agentic::GitTool for LocalGitTool {
                     .map_err(s)?;
                 Ok(format!("amended {}: {}", c.short_id, c.summary))
             }
+            "rebase" => {
+                let onto = args
+                    .get("onto")
+                    .and_then(|v| v.as_str())
+                    .filter(|o| !o.trim().is_empty())
+                    .ok_or("rebase: 'onto' (the base commit/ref to replay onto) is required")?;
+                let steps = parse_rebase_plan(args, self.coauthor.as_deref())?;
+                if steps.is_empty() {
+                    return Err("rebase: 'plan' must list at least one step".to_string());
+                }
+                let r = eng.rebase(caps, onto, &steps, &self.author).map_err(s)?;
+                Ok(format!(
+                    "rebased onto {onto} → {} ({} commit(s), {} dropped)",
+                    r.new_head, r.produced, r.dropped
+                ))
+            }
             "branch" => {
                 let name = args
                     .get("name")
@@ -518,6 +739,53 @@ impl newt_core::agentic::GitTool for LocalGitTool {
             )),
         }
     }
+}
+
+/// Parse the `plan` array (`[{commit, action, message?}]`) into `RebaseStep`s.
+/// `reword`/`squash` messages are signed with the co-author trailer (the tool
+/// owns signing), so rebased commits keep the AI credit too.
+fn parse_rebase_plan(
+    args: &serde_json::Value,
+    coauthor: Option<&str>,
+) -> Result<Vec<RebaseStep>, String> {
+    let plan = args
+        .get("plan")
+        .and_then(|v| v.as_array())
+        .ok_or("rebase: 'plan' (array of {commit, action, message?}) is required")?;
+    let mut steps = Vec::with_capacity(plan.len());
+    for (i, e) in plan.iter().enumerate() {
+        let commit = e
+            .get("commit")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| format!("rebase plan[{i}]: 'commit' is required"))?
+            .to_string();
+        let action = match e.get("action").and_then(|v| v.as_str()).unwrap_or("pick") {
+            "pick" => RebaseAction::Pick,
+            "reword" => RebaseAction::Reword,
+            "squash" => RebaseAction::Squash,
+            "fixup" => RebaseAction::Fixup,
+            "drop" => RebaseAction::Drop,
+            other => {
+                return Err(format!(
+                    "rebase plan[{i}]: unknown action '{other}' (pick|reword|squash|fixup|drop)"
+                ))
+            }
+        };
+        let message = e
+            .get("message")
+            .and_then(|v| v.as_str())
+            .filter(|m| !m.trim().is_empty())
+            .map(|m| match action {
+                RebaseAction::Reword | RebaseAction::Squash => sign_message(m, coauthor),
+                _ => m.to_string(),
+            });
+        steps.push(RebaseStep {
+            commit,
+            action,
+            message,
+        });
+    }
+    Ok(steps)
 }
 
 fn str_array(args: &serde_json::Value, key: &str) -> Vec<String> {
@@ -993,6 +1261,233 @@ mod tests {
         assert!(t
             .dispatch("status", &serde_json::json!({}), &GitCaveats::read_only())
             .is_ok());
+    }
+
+    // --- rebase (structured plan) ------------------------------------------
+
+    /// A repo with three linear commits c1→c2→c3 (a/b/c.txt). Returns the dir
+    /// and the full oids [c1, c2, c3].
+    fn repo_with_three() -> (tempfile::TempDir, Vec<String>) {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        git(p, &["init", "-q", "-b", "main"]);
+        let mk = |name: &str, content: &str, msg: &str| {
+            std::fs::write(p.join(name), content).unwrap();
+            git(p, &["add", name]);
+            git(
+                p,
+                &[
+                    "-c",
+                    "user.name=T",
+                    "-c",
+                    "user.email=t@e.c",
+                    "commit",
+                    "-q",
+                    "-m",
+                    msg,
+                ],
+            );
+        };
+        mk("a.txt", "v1\n", "c1");
+        mk("b.txt", "b\n", "c2");
+        mk("c.txt", "c\n", "c3");
+        let out = Command::new("git")
+            .current_dir(p)
+            .args(["log", "--format=%H", "--reverse"])
+            .output()
+            .unwrap();
+        let oids = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(String::from)
+            .collect();
+        (dir, oids)
+    }
+
+    #[test]
+    fn rebase_rewords_a_middle_commit() {
+        let (dir, oids) = repo_with_three();
+        let t = tool(dir.path());
+        let out = t
+            .dispatch(
+                "rebase",
+                &serde_json::json!({
+                    "onto": oids[0],
+                    "plan": [
+                        {"commit": oids[1], "action": "reword", "message": "b reworded"},
+                        {"commit": oids[2], "action": "pick"},
+                    ]
+                }),
+                &GitCaveats::top(),
+            )
+            .unwrap();
+        assert!(out.starts_with("rebased onto"), "got: {out}");
+        assert_eq!(commit_count(dir.path()), 3, "same number of commits");
+        // History: c1, b reworded, c3.
+        let log = Command::new("git")
+            .current_dir(dir.path())
+            .args(["log", "--format=%s", "--reverse"])
+            .output()
+            .unwrap();
+        let subjects = String::from_utf8_lossy(&log.stdout);
+        assert!(subjects.contains("b reworded"), "got: {subjects}");
+        assert!(
+            !subjects.contains("\nc2\n"),
+            "old c2 subject gone: {subjects}"
+        );
+        // b.txt and c.txt still present (changes preserved).
+    }
+
+    #[test]
+    fn rebase_squashes_two_commits_into_one() {
+        let (dir, oids) = repo_with_three();
+        let t = tool(dir.path());
+        t.dispatch(
+            "rebase",
+            &serde_json::json!({
+                "onto": oids[0],
+                "plan": [
+                    {"commit": oids[1], "action": "pick"},
+                    {"commit": oids[2], "action": "squash", "message": "folded note"},
+                ]
+            }),
+            &GitCaveats::top(),
+        )
+        .unwrap();
+        // c1 + one squashed commit = 2.
+        assert_eq!(commit_count(dir.path()), 2);
+        // The squashed commit carries both messages.
+        let body = head_message(dir.path());
+        assert!(
+            body.contains("c2") && body.contains("folded note"),
+            "got: {body}"
+        );
+        // Both files landed in the squashed tree.
+        let files = Command::new("git")
+            .current_dir(dir.path())
+            .args(["ls-tree", "--name-only", "-r", "HEAD"])
+            .output()
+            .unwrap();
+        let names = String::from_utf8_lossy(&files.stdout);
+        assert!(
+            names.contains("b.txt") && names.contains("c.txt"),
+            "got: {names}"
+        );
+    }
+
+    #[test]
+    fn rebase_drops_a_commit() {
+        let (dir, oids) = repo_with_three();
+        let t = tool(dir.path());
+        t.dispatch(
+            "rebase",
+            &serde_json::json!({
+                "onto": oids[0],
+                "plan": [
+                    {"commit": oids[1], "action": "pick"},
+                    {"commit": oids[2], "action": "drop"},
+                ]
+            }),
+            &GitCaveats::top(),
+        )
+        .unwrap();
+        assert_eq!(commit_count(dir.path()), 2);
+        let names = Command::new("git")
+            .current_dir(dir.path())
+            .args(["ls-tree", "--name-only", "-r", "HEAD"])
+            .output()
+            .unwrap();
+        let names = String::from_utf8_lossy(&names.stdout);
+        assert!(
+            !names.contains("c.txt"),
+            "dropped commit's file gone: {names}"
+        );
+    }
+
+    #[test]
+    fn rebase_aborts_on_conflict_leaving_the_branch_unchanged() {
+        // c1: a=v1; c2: a=v2; c3: a=v3. Cherry-picking c3 onto c1 conflicts
+        // (both c1 and c3 changed a.txt from c2's base).
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        git(p, &["init", "-q", "-b", "main"]);
+        let mk = |content: &str, msg: &str| {
+            std::fs::write(p.join("a.txt"), content).unwrap();
+            git(p, &["add", "a.txt"]);
+            git(
+                p,
+                &[
+                    "-c",
+                    "user.name=T",
+                    "-c",
+                    "user.email=t@e.c",
+                    "commit",
+                    "-q",
+                    "-m",
+                    msg,
+                ],
+            );
+        };
+        mk("v1\n", "c1");
+        mk("v2\n", "c2");
+        mk("v3\n", "c3");
+        let head_before = Command::new("git")
+            .current_dir(p)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        let oids: Vec<String> = String::from_utf8_lossy(
+            &Command::new("git")
+                .current_dir(p)
+                .args(["log", "--format=%H", "--reverse"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .lines()
+        .map(String::from)
+        .collect();
+        let t = tool(p);
+        let err = t
+            .dispatch(
+                "rebase",
+                &serde_json::json!({
+                    "onto": oids[0],
+                    "plan": [{"commit": oids[2], "action": "pick"}]
+                }),
+                &GitCaveats::top(),
+            )
+            .unwrap_err();
+        assert!(
+            err.contains("conflict") && err.contains("aborted"),
+            "got: {err}"
+        );
+        // The branch ref did NOT move.
+        let head_after = Command::new("git")
+            .current_dir(p)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            head_before.stdout, head_after.stdout,
+            "branch must be unchanged"
+        );
+    }
+
+    #[test]
+    fn rebase_denied_on_read_only() {
+        let (dir, oids) = repo_with_three();
+        let t = tool(dir.path());
+        let err = t
+            .dispatch(
+                "rebase",
+                &serde_json::json!({"onto": oids[0], "plan": [{"commit": oids[1], "action": "pick"}]}),
+                &GitCaveats::read_only(),
+            )
+            .unwrap_err();
+        assert!(
+            err.contains("denied") && err.contains("commit"),
+            "got: {err}"
+        );
     }
 
     #[test]
