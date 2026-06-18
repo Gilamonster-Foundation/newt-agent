@@ -7,7 +7,7 @@
 > Small, fast, local-first agentic coder.
 > **vi to Hermes-Agent's emacs.**
 
-Newt-Agent is a single Rust binary with a sharp, minimal tool set. It runs
+Newt-Agent is a single Rust binary with a sharp, minimal tool set. It now includes embedded git tools for local file management. It runs
 locally against your NVIDIA hardware by default — no cloud bytes leave your
 machine unless you deliberately install a provider plugin.
 

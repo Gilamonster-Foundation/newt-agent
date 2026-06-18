@@ -176,6 +176,7 @@ agent-mesh-protocol = "0.6"
 # Internal crates — pinned with = for lock-step publishing
 newt-core         = { path = "newt-core",         version = "=0.6.8" }
 newt-data         = { path = "newt-data",         version = "=0.6.8" }
+newt-git          = { path = "newt-git",          version = "=0.6.8" }
 newt-inference    = { path = "newt-inference",    version = "=0.6.8" }
 newt-scheduler    = { path = "newt-scheduler",    version = "=0.6.8" }
 newt-tools        = { path = "newt-tools",        version = "=0.6.8" }

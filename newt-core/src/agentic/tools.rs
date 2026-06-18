@@ -3,6 +3,7 @@
 //! shrink guard, build-check feedback, and agent-bridle routing are unchanged.
 
 use super::display::{print_denied, print_tool_call, print_tool_output};
+use super::git_tool::GitTool;
 use super::mcp::McpTools;
 use super::memory_fetch::{execute_memory_fetch, memory_fetch_tool_definition, MemorySource};
 use super::note_sink::{execute_save_note, save_note_tool_definition, NoteSink};
@@ -143,6 +144,7 @@ pub(crate) fn merged_tool_definitions(
     with_save_note: bool,
     with_recall: bool,
     with_memory_fetch: bool,
+    with_git: bool,
 ) -> serde_json::Value {
     let mut defs = match tool_definitions() {
         serde_json::Value::Array(a) => a,
@@ -157,6 +159,11 @@ pub(crate) fn merged_tool_definitions(
     if with_memory_fetch {
         defs.push(memory_fetch_tool_definition());
     }
+    // PR4: the `git` tool is advertised only when a GitTool is injected (the
+    // binary is in a git repo and supplied LocalGitTool) — presence gate.
+    if with_git {
+        defs.push(super::git_tool::git_tool_definition());
+    }
     defs.extend(mcp.tool_defs());
     serde_json::Value::Array(defs)
 }
@@ -170,6 +177,8 @@ const DIRECT_TOOL_NAMES: &[&str] = &[
     "edit_file",
     "use_skill",
     "web_fetch",
+    // PR4: `git …` typed at run_command redirects to the embedded `git` tool.
+    "git",
 ];
 
 /// Returns `true` if a tool call looks like a hallucination:
@@ -197,6 +206,7 @@ pub(crate) fn is_hallucination(tool_name: &str, args: &serde_json::Value) -> boo
             | "save_note"
             | "recall"
             | "memory_fetch"
+            | "git"
     )
 }
 
@@ -678,6 +688,7 @@ pub async fn execute_tool(
     memory_source: Option<&dyn MemorySource>,
     permission_gate: Option<&mut dyn PermissionGate>,
     exec_floor: Option<&crate::caveats::Scope<String>>,
+    git_tool: Option<&dyn GitTool>,
 ) -> String {
     // Remote MCP tools (namespaced `server__tool`) route to their server before
     // the built-in match. They carry no Caveats leash in this build.
@@ -719,6 +730,28 @@ pub async fn execute_tool(
             // Without a source the tool was never advertised — same
             // unknown-tool answer as the source-less recall path.
             None => "unknown tool: memory_fetch (no memory source in this session)".to_string(),
+        },
+
+        // Embedded git (PR4, #461): dispatch through the injected GitTool
+        // (newt-git's LocalGitTool). `GitCaveats::from_session` projects the
+        // session's authority onto the git surface (fail-closed: a read-only
+        // session can read but not commit). Same presence-gating as `recall` —
+        // without an injected impl the tool was never advertised.
+        "git" => match git_tool {
+            Some(tool) => {
+                let gc = crate::git_caveats::GitCaveats::from_session(caveats);
+                let op = args.get("op").and_then(|v| v.as_str()).unwrap_or("");
+                print_tool_call("git", op, color);
+                let out = match tool.dispatch(op, args, &gc) {
+                    Ok(rendered) => rendered,
+                    // Denials + engine errors surface verbatim so the model
+                    // sees WHY (e.g. "denied: commit" on a read-only session).
+                    Err(e) => format!("error: {e}"),
+                };
+                print_tool_output(&out, tool_output_lines, color);
+                out
+            }
+            None => "unknown tool: git (no git surface in this session)".to_string(),
         },
 
         "run_command" => {
@@ -1191,7 +1224,7 @@ mod tests {
 
     #[test]
     fn merged_tool_definitions_with_empty_mcp_is_builtin_set() {
-        let merged = merged_tool_definitions(&NoMcp, false, false, false);
+        let merged = merged_tool_definitions(&NoMcp, false, false, false, false);
         let names: Vec<&str> = merged
             .as_array()
             .unwrap()
@@ -1228,10 +1261,10 @@ mod tests {
         let base = tool_definitions();
         assert!(!names(&base).contains(&"save_note"), "got: {base}");
         // … nor in the merged set without a sink …
-        let without = merged_tool_definitions(&NoMcp, false, false, false);
+        let without = merged_tool_definitions(&NoMcp, false, false, false, false);
         assert!(!names(&without).contains(&"save_note"));
         // … but a sink advertises it.
-        let with = merged_tool_definitions(&NoMcp, true, false, false);
+        let with = merged_tool_definitions(&NoMcp, true, false, false, false);
         assert!(names(&with).contains(&"save_note"), "got: {with}");
     }
 
@@ -1249,12 +1282,12 @@ mod tests {
         }
         let base = tool_definitions();
         assert!(!names(&base).contains(&"recall"), "got: {base}");
-        let without = merged_tool_definitions(&NoMcp, false, false, false);
+        let without = merged_tool_definitions(&NoMcp, false, false, false, false);
         assert!(!names(&without).contains(&"recall"));
-        let with = merged_tool_definitions(&NoMcp, false, true, false);
+        let with = merged_tool_definitions(&NoMcp, false, true, false, false);
         assert!(names(&with).contains(&"recall"), "got: {with}");
         // The two gates are independent: both on advertises both.
-        let both = merged_tool_definitions(&NoMcp, true, true, false);
+        let both = merged_tool_definitions(&NoMcp, true, true, false, false);
         assert!(names(&both).contains(&"save_note"));
         assert!(names(&both).contains(&"recall"));
     }
@@ -1274,13 +1307,13 @@ mod tests {
         let base = tool_definitions();
         assert!(!names(&base).contains(&"memory_fetch"), "got: {base}");
         // Flag off (every existing caller, the inert default) → not advertised.
-        let without = merged_tool_definitions(&NoMcp, false, false, false);
+        let without = merged_tool_definitions(&NoMcp, false, false, false, false);
         assert!(!names(&without).contains(&"memory_fetch"));
         // Flag on → advertised.
-        let with = merged_tool_definitions(&NoMcp, false, false, true);
+        let with = merged_tool_definitions(&NoMcp, false, false, true, false);
         assert!(names(&with).contains(&"memory_fetch"), "got: {with}");
         // Independent of the save_note / recall gates: all three on lists all.
-        let all = merged_tool_definitions(&NoMcp, true, true, true);
+        let all = merged_tool_definitions(&NoMcp, true, true, true, false);
         assert!(names(&all).contains(&"save_note"));
         assert!(names(&all).contains(&"recall"));
         assert!(names(&all).contains(&"memory_fetch"));
@@ -1519,6 +1552,23 @@ mod tests {
         assert!(!tui_permits_path(&only, "/elsewhere/file.rs"));
     }
 
+    // --- PR4: the `git` tool is presence-gated -----------------------------
+
+    #[test]
+    fn git_tool_advertised_only_with_the_presence_gate() {
+        fn names(defs: &serde_json::Value) -> Vec<&str> {
+            defs.as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|d| d["function"]["name"].as_str())
+                .collect()
+        }
+        let with = merged_tool_definitions(&NoMcp, false, false, false, true);
+        assert!(names(&with).contains(&"git"), "with_git advertises git");
+        let without = merged_tool_definitions(&NoMcp, false, false, false, false);
+        assert!(!names(&without).contains(&"git"), "no git without the gate");
+    }
+
     #[test]
     fn run_build_check_reports_pass_fail_and_spawn_error() {
         let ws = tempfile::TempDir::new().unwrap();
@@ -1559,6 +1609,96 @@ mod execute_tool_branch_tests {
         }
     }
 
+    // --- PR4: the `git` tool arm in execute_tool ---------------------------
+
+    /// A stub GitTool: echoes the op, and refuses `commit` when the projected
+    /// GitCaveats deny it — exercises the arm's caveat projection without a repo.
+    struct StubGit;
+    impl crate::agentic::GitTool for StubGit {
+        fn dispatch(
+            &self,
+            op: &str,
+            _args: &serde_json::Value,
+            caps: &crate::git_caveats::GitCaveats,
+        ) -> Result<String, String> {
+            match op {
+                "status" => Ok("on branch main (HEAD abc123)".to_string()),
+                "commit" if !caps.permits_commit() => {
+                    Err("capability denied: git commit not permitted".to_string())
+                }
+                "commit" => Ok("committed abc123: msg".to_string()),
+                other => Err(format!("unknown git op '{other}'")),
+            }
+        }
+    }
+
+    async fn run_git(
+        op: &str,
+        caveats: &Caveats,
+        git: Option<&dyn crate::agentic::GitTool>,
+    ) -> String {
+        let ws = tempfile::TempDir::new().unwrap();
+        execute_tool(
+            "git",
+            &serde_json::json!({ "op": op }),
+            &ws.path().to_string_lossy(),
+            false,
+            20,
+            caveats,
+            &mut NoMcp,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            git,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn git_arm_dispatches_when_injected() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let out = run_git("status", &caveats_rw(ws.path()), Some(&StubGit)).await;
+        assert!(out.contains("on branch main"), "got: {out}");
+    }
+
+    #[tokio::test]
+    async fn git_arm_surfaces_denials_from_projected_caveats() {
+        // A session with no fs_write → from_session denies commit_local.
+        let ws = tempfile::TempDir::new().unwrap();
+        let read_only = Caveats {
+            fs_write: Scope::none(),
+            ..caveats_rw(ws.path())
+        };
+        let out = run_git("commit", &read_only, Some(&StubGit)).await;
+        assert!(
+            out.contains("error:") && out.contains("commit"),
+            "got: {out}"
+        );
+        // The same session can still run a read op.
+        let out = run_git("status", &read_only, Some(&StubGit)).await;
+        assert!(out.contains("on branch main"), "got: {out}");
+    }
+
+    #[tokio::test]
+    async fn git_arm_unknown_op_is_an_error_not_a_panic() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let out = run_git("frobnicate", &caveats_rw(ws.path()), Some(&StubGit)).await;
+        assert!(
+            out.contains("error:") && out.contains("unknown git op"),
+            "got: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn git_arm_without_injection_is_unknown_tool() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let out = run_git("status", &caveats_rw(ws.path()), None).await;
+        assert!(out.contains("unknown tool: git"), "got: {out}");
+    }
+
     async fn run_tool(
         name: &str,
         args: serde_json::Value,
@@ -1580,6 +1720,7 @@ mod execute_tool_branch_tests {
             None, // memory_source
             None,
             None,
+            None, // git_tool
         )
         .await
     }
@@ -1896,6 +2037,7 @@ mod execute_tool_branch_tests {
             None, // memory_source
             Some(gate),
             None,
+            None, // git_tool
         )
         .await
     }
@@ -2117,6 +2259,7 @@ mod execute_tool_branch_tests {
             None, // memory_source
             Some(&mut gate),
             None,
+            None, // git_tool
         )
         .await;
         assert_eq!(
@@ -2209,6 +2352,7 @@ mod execute_tool_branch_tests {
             None, // memory_source
             None,
             None,
+            None, // git_tool
         )
         .await;
         assert_eq!(sink.calls, vec!["add:workspace builds with just check"]);
@@ -2264,6 +2408,7 @@ mod execute_tool_branch_tests {
             None, // memory_source
             None,
             None,
+            None, // git_tool
         )
         .await;
         assert_eq!(
@@ -2322,6 +2467,7 @@ mod execute_tool_branch_tests {
             Some(&source),
             None,
             None,
+            None, // git_tool
         )
         .await;
         assert_eq!(out, "the exact note body");
@@ -2434,6 +2580,7 @@ mod disable_ocap_tests {
             None, // memory_source
             None,
             exec_floor,
+            None, // git_tool
         )
         .await
     }
@@ -2842,6 +2989,7 @@ mod disable_ocap_tests {
             None, // memory_source
             Some(&mut gate),
             None,
+            None, // git_tool
         )
         .await;
         assert_eq!(out, "no-prompt\n");
