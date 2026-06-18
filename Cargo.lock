@@ -1949,6 +1949,7 @@ version = "0.6.8"
 dependencies = [
  "anyhow",
  "assert_cmd",
+ "async-trait",
  "cargo_metadata",
  "clap",
  "libc",
@@ -1958,6 +1959,7 @@ dependencies = [
  "newt-inference",
  "newt-mcp-client",
  "newt-mcp-server",
+ "newt-scheduler",
  "newt-skills",
  "newt-tools",
  "newt-tui",
