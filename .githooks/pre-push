@@ -10,8 +10,9 @@
 #
 # PIPELINE PARITY: This hook mirrors .github/workflows/ci.yml.
 #   - `just shell-check` matches the lint job's "agent-bridle stub guard" step
-#   - `just check` matches the lint + test + rich-tui jobs (fmt + clippy +
-#     cargo test, plus the rich-tui feature lint/test for issue #416)
+#   - `just check` matches the lint + test + lean-build jobs (fmt + clippy +
+#     cargo test, plus the `--no-default-features` lean build for issue #416 —
+#     rich-tui is a default feature now, so the main jobs already cover it)
 #   - `just cov-ci` matches the coverage job (cargo llvm-cov with floor)
 # When editing this hook, update the workflow to match.
 # When editing the workflow, update this hook to match.

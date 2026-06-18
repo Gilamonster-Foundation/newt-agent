@@ -45,11 +45,14 @@ tracing-subscriber.workspace = true
 # require the agent-mesh sibling checkout for every `cargo metadata`
 # call, which breaks default CI.
 
+# Amphibian default: the `newt` binary ships the rich TTY inline surface
+# (issue #416) ON, and you strip DOWN for the water. `default = ["rich-tui"]`
+# means plain `cargo build` / `just install` give the ratatui inline editor on a
+# TTY; `cargo build --no-default-features` produces the lean rustyline-only build
+# (the headless / wyvern tier). The `is_terminal()` runtime gate still falls back
+# to rustyline when piped/headless even in the rich build.
 [features]
-# Forward the TTY rich inline input surface (issue #416) to the `newt` binary.
-# OFF by default — `cargo run -p newt-agent --features rich-tui` (then a TTY)
-# selects the ratatui inline surface; the default build / headless / wyvern keep
-# the rustyline surface. The `is_terminal()` runtime gate still applies.
+default = ["rich-tui"]
 rich-tui = ["newt-tui/rich-tui"]
 
 [target.'cfg(unix)'.dependencies]
