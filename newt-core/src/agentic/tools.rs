@@ -1552,6 +1552,23 @@ mod tests {
         assert!(!tui_permits_path(&only, "/elsewhere/file.rs"));
     }
 
+    // --- PR4: the `git` tool is presence-gated -----------------------------
+
+    #[test]
+    fn git_tool_advertised_only_with_the_presence_gate() {
+        fn names(defs: &serde_json::Value) -> Vec<&str> {
+            defs.as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|d| d["function"]["name"].as_str())
+                .collect()
+        }
+        let with = merged_tool_definitions(&NoMcp, false, false, false, true);
+        assert!(names(&with).contains(&"git"), "with_git advertises git");
+        let without = merged_tool_definitions(&NoMcp, false, false, false, false);
+        assert!(!names(&without).contains(&"git"), "no git without the gate");
+    }
+
     #[test]
     fn run_build_check_reports_pass_fail_and_spawn_error() {
         let ws = tempfile::TempDir::new().unwrap();
@@ -1590,6 +1607,96 @@ mod execute_tool_branch_tests {
             max_calls: CountBound::Unlimited,
             valid_for_generation: Scope::All,
         }
+    }
+
+    // --- PR4: the `git` tool arm in execute_tool ---------------------------
+
+    /// A stub GitTool: echoes the op, and refuses `commit` when the projected
+    /// GitCaveats deny it — exercises the arm's caveat projection without a repo.
+    struct StubGit;
+    impl crate::agentic::GitTool for StubGit {
+        fn dispatch(
+            &self,
+            op: &str,
+            _args: &serde_json::Value,
+            caps: &crate::git_caveats::GitCaveats,
+        ) -> Result<String, String> {
+            match op {
+                "status" => Ok("on branch main (HEAD abc123)".to_string()),
+                "commit" if !caps.permits_commit() => {
+                    Err("capability denied: git commit not permitted".to_string())
+                }
+                "commit" => Ok("committed abc123: msg".to_string()),
+                other => Err(format!("unknown git op '{other}'")),
+            }
+        }
+    }
+
+    async fn run_git(
+        op: &str,
+        caveats: &Caveats,
+        git: Option<&dyn crate::agentic::GitTool>,
+    ) -> String {
+        let ws = tempfile::TempDir::new().unwrap();
+        execute_tool(
+            "git",
+            &serde_json::json!({ "op": op }),
+            &ws.path().to_string_lossy(),
+            false,
+            20,
+            caveats,
+            &mut NoMcp,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            git,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn git_arm_dispatches_when_injected() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let out = run_git("status", &caveats_rw(ws.path()), Some(&StubGit)).await;
+        assert!(out.contains("on branch main"), "got: {out}");
+    }
+
+    #[tokio::test]
+    async fn git_arm_surfaces_denials_from_projected_caveats() {
+        // A session with no fs_write → from_session denies commit_local.
+        let ws = tempfile::TempDir::new().unwrap();
+        let read_only = Caveats {
+            fs_write: Scope::none(),
+            ..caveats_rw(ws.path())
+        };
+        let out = run_git("commit", &read_only, Some(&StubGit)).await;
+        assert!(
+            out.contains("error:") && out.contains("commit"),
+            "got: {out}"
+        );
+        // The same session can still run a read op.
+        let out = run_git("status", &read_only, Some(&StubGit)).await;
+        assert!(out.contains("on branch main"), "got: {out}");
+    }
+
+    #[tokio::test]
+    async fn git_arm_unknown_op_is_an_error_not_a_panic() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let out = run_git("frobnicate", &caveats_rw(ws.path()), Some(&StubGit)).await;
+        assert!(
+            out.contains("error:") && out.contains("unknown git op"),
+            "got: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn git_arm_without_injection_is_unknown_tool() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let out = run_git("status", &caveats_rw(ws.path()), None).await;
+        assert!(out.contains("unknown tool: git"), "got: {out}");
     }
 
     async fn run_tool(

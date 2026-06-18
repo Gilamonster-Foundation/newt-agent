@@ -380,6 +380,26 @@ fn parse_ident(s: &str) -> (String, String, i64) {
 pub struct LocalGitTool {
     pub root: std::path::PathBuf,
     pub author: Author,
+    /// A `Co-authored-by:` trailer auto-appended to every commit message — the
+    /// AI credit, e.g. `Co-authored-by: qwen3:30b (newt-agent v0.6.8)
+    /// <noreply@newt-agent.com>`. The tool owns this (deterministic, always
+    /// correct) rather than trusting the model to add it; the system prompt
+    /// tells the model it's automatic so it does not add a second copy.
+    /// `None` disables auto-signing. Skipped when the message already carries a
+    /// co-authored-by line (the model signed anyway → don't duplicate).
+    pub coauthor: Option<String>,
+}
+
+/// Append the `coauthor` trailer to a commit message, unless the message
+/// already carries any `Co-authored-by:` line (case-insensitive) — the user's
+/// "skip if one already present" rule. Pure, for testing.
+fn sign_message(message: &str, coauthor: Option<&str>) -> String {
+    match coauthor {
+        Some(trailer) if !message.to_lowercase().contains("co-authored-by:") => {
+            format!("{}\n\n{trailer}", message.trim_end())
+        }
+        _ => message.to_string(),
+    }
 }
 
 impl newt_core::agentic::GitTool for LocalGitTool {
@@ -422,7 +442,8 @@ impl newt_core::agentic::GitTool for LocalGitTool {
                     .and_then(|v| v.as_str())
                     .filter(|m| !m.trim().is_empty())
                     .ok_or("commit: 'message' is required")?;
-                let c = eng.commit(caps, msg, &self.author).map_err(s)?;
+                let signed = sign_message(msg, self.coauthor.as_deref());
+                let c = eng.commit(caps, &signed, &self.author).map_err(s)?;
                 Ok(format!("committed {}: {}", c.short_id, c.summary))
             }
             "branch" => {
@@ -715,7 +736,54 @@ mod tests {
                 name: "newt-agent[bot]".into(),
                 email: "bot@example.com".into(),
             },
+            coauthor: Some(
+                "Co-authored-by: qwen3:30b (newt-agent v0.6.8) <noreply@newt-agent.com>".into(),
+            ),
         }
+    }
+
+    #[test]
+    fn sign_message_appends_trailer_then_dedups() {
+        let tr = "Co-authored-by: qwen3:30b (newt-agent v0.6.8) <noreply@newt-agent.com>";
+        // Plain message → trailer appended after a blank line.
+        let out = sign_message("docs: tweak", Some(tr));
+        assert_eq!(out, format!("docs: tweak\n\n{tr}"));
+        // Message already carrying a co-authored-by → left untouched (no dup).
+        let already = "feat: x\n\nCo-authored-by: someone <a@b.c>";
+        assert_eq!(sign_message(already, Some(tr)), already);
+        // No trailer configured → message unchanged.
+        assert_eq!(sign_message("m", None), "m");
+    }
+
+    #[test]
+    fn commit_carries_the_coauthor_trailer_in_the_message() {
+        let dir = repo_with_commit();
+        std::fs::write(dir.path().join("c.txt"), "x\n").unwrap();
+        let t = tool(dir.path());
+        t.dispatch(
+            "add",
+            &serde_json::json!({"paths": ["c.txt"]}),
+            &GitCaveats::top(),
+        )
+        .unwrap();
+        t.dispatch(
+            "commit",
+            &serde_json::json!({"message": "add c"}),
+            &GitCaveats::top(),
+        )
+        .unwrap();
+        // Inspect the real commit message via system git.
+        let log = Command::new("git")
+            .current_dir(dir.path())
+            .args(["log", "-1", "--pretty=%B"])
+            .output()
+            .unwrap();
+        let body = String::from_utf8_lossy(&log.stdout);
+        assert!(body.contains("add c"), "subject present: {body}");
+        assert!(
+            body.contains("Co-authored-by: qwen3:30b (newt-agent v0.6.8)"),
+            "trailer present: {body}"
+        );
     }
 
     #[test]
