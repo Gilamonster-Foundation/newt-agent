@@ -74,10 +74,32 @@ pub struct TeamOutcome {
     pub results: Vec<SubtaskResult>,
 }
 
+/// A planned subtask: the work, plus an optional **per-subtask** verification
+/// command (so independent subtasks each get their own check, not one shared one).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Subtask {
+    task: String,
+    verify: Option<String>,
+}
+
+/// The lead's entry — accepts a plain string OR a `{task, verify}` object, so a
+/// weaker lead that emits bare strings still works (verify falls back to the
+/// workspace's default check).
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum SubtaskSpec {
+    Plain(String),
+    Detailed {
+        task: String,
+        #[serde(default)]
+        verify: Option<String>,
+    },
+}
+
 #[derive(Deserialize, Default)]
 struct PlanOut {
     #[serde(default)]
-    subtasks: Vec<String>,
+    subtasks: Vec<SubtaskSpec>,
 }
 
 /// Run the team on `goal`: lead decomposes → a crew runs each subtask over the
@@ -94,13 +116,15 @@ pub async fn run_team(
         .system(
             "You are a tech lead. Break the GOAL into an ordered list of small, \
              independently-verifiable engineering subtasks. Reply with ONLY JSON \
-             {\"subtasks\":[\"...\", \"...\"]} — concrete, imperative, smallest-first.",
+             {\"subtasks\":[{\"task\":\"<imperative step>\",\"verify\":\"<a shell command \
+             that exits 0 once THIS step is done; omit if there is no per-step check>\"}]} \
+             — concrete, smallest-first.",
         )
         .user(format!(
             "GOAL:\n{goal}\n\nAt most {} subtasks.",
             cfg.max_subtasks
         ));
-    let plan: Vec<String> = match pool
+    let plan: Vec<Subtask> = match pool
         .run_role(dispatcher, cfg.lead_tier, &cfg.lead_model, req)
         .await
     {
@@ -116,25 +140,31 @@ pub async fn run_team(
     if plan.is_empty() {
         return TeamOutcome {
             status: TeamStatus::NoPlan,
-            plan,
+            plan: Vec::new(),
             results: Vec::new(),
         };
     }
+    let task_list: Vec<String> = plan.iter().map(|s| s.task.clone()).collect();
 
     // 2. DISPATCH — a crew per subtask, sequential over the shared workspace,
     //    stopping at the first block (a plan can't proceed past a failed step).
+    //    Each subtask installs its OWN verification command when the lead supplied
+    //    one (per-subtask verify); otherwise the workspace's default check stands.
     let mut results = Vec::with_capacity(plan.len());
     let mut blocked = false;
-    for subtask in &plan {
+    for st in &plan {
         if blocked {
             results.push(SubtaskResult {
-                subtask: subtask.clone(),
+                subtask: st.task.clone(),
                 status: SubtaskStatus::Skipped,
                 attempts: 0,
             });
             continue;
         }
-        let outcome = run_crew(pool, dispatcher, workspace, &cfg.crew, subtask).await;
+        if let Some(verify) = &st.verify {
+            workspace.set_test_command(verify);
+        }
+        let outcome = run_crew(pool, dispatcher, workspace, &cfg.crew, &st.task).await;
         let status = match outcome.status {
             CrewStatus::Passed => SubtaskStatus::Passed,
             CrewStatus::NeedsHumanReview => {
@@ -143,7 +173,7 @@ pub async fn run_team(
             }
         };
         results.push(SubtaskResult {
-            subtask: subtask.clone(),
+            subtask: st.task.clone(),
             status,
             attempts: outcome.attempts,
         });
@@ -156,14 +186,14 @@ pub async fn run_team(
     };
     TeamOutcome {
         status,
-        plan,
+        plan: task_list,
         results,
     }
 }
 
 /// Parse the lead's reply into a subtask list: try the whole string as JSON, then
 /// the outermost `{..}` (local models often wrap JSON in prose). Capped at `max`.
-fn parse_plan(content: &str, max: usize) -> Vec<String> {
+fn parse_plan(content: &str, max: usize) -> Vec<Subtask> {
     let parsed: PlanOut = serde_json::from_str(content)
         .ok()
         .or_else(|| {
@@ -176,8 +206,18 @@ fn parse_plan(content: &str, max: usize) -> Vec<String> {
     parsed
         .subtasks
         .into_iter()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+        .map(|s| match s {
+            SubtaskSpec::Plain(task) => Subtask { task, verify: None },
+            SubtaskSpec::Detailed { task, verify } => Subtask {
+                task,
+                verify: verify.filter(|v| !v.trim().is_empty()),
+            },
+        })
+        .map(|s| Subtask {
+            task: s.task.trim().to_string(),
+            verify: s.verify,
+        })
+        .filter(|s| !s.task.is_empty())
         .take(max)
         .collect()
 }
@@ -192,14 +232,19 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// In-memory workspace: `run_test` passes iff `target.rs` contains "GOOD".
+    /// Records the per-subtask verify commands the team installs.
     struct MemWs {
         files: BTreeMap<String, String>,
+        verifies: Vec<String>,
     }
     impl MemWs {
         fn new() -> Self {
             let mut files = BTreeMap::new();
             files.insert("target.rs".to_string(), "BAD".to_string());
-            Self { files }
+            Self {
+                files,
+                verifies: Vec::new(),
+            }
         }
     }
     impl Workspace for MemWs {
@@ -223,6 +268,9 @@ mod tests {
                 Some(c) if c.contains("GOOD") => (true, "ok".into()),
                 _ => (false, "needs GOOD".into()),
             }
+        }
+        fn set_test_command(&mut self, cmd: &str) {
+            self.verifies.push(cmd.to_string());
         }
     }
 
@@ -340,6 +388,30 @@ mod tests {
         let out = run_team(&p, &d, &mut ws, &cfg(), "goal").await;
         assert_eq!(out.status, TeamStatus::NoPlan);
         assert!(out.results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn installs_per_subtask_verify_commands() {
+        // The lead emits {task, verify} objects → run_team installs each subtask's
+        // own verification on the workspace before running its crew.
+        let p = pool();
+        let d = TeamMock {
+            plan_json: r#"{"subtasks":[
+                {"task":"do A","verify":"check-a"},
+                {"task":"do B","verify":"check-b"}
+            ]}"#
+            .into(),
+            block: false,
+            planner_calls: AtomicUsize::new(0),
+        };
+        let mut ws = MemWs::new();
+        let out = run_team(&p, &d, &mut ws, &cfg(), "goal").await;
+        assert_eq!(out.status, TeamStatus::AllPassed);
+        assert_eq!(out.plan, vec!["do A".to_string(), "do B".to_string()]);
+        assert_eq!(
+            ws.verifies,
+            vec!["check-a".to_string(), "check-b".to_string()]
+        );
     }
 
     #[tokio::test]

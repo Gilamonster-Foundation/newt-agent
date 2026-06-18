@@ -59,12 +59,16 @@ impl Workspace for FsWorkspace {
         );
         (out.status.success(), combined.trim().to_string())
     }
+    fn set_test_command(&mut self, cmd: &str) {
+        println!("    · verify ← {cmd}");
+        self.test_cmd = cmd.to_string();
+    }
 }
 
 #[tokio::main]
 async fn main() {
     let endpoint = std::env::var("OLLAMA").unwrap_or_else(|_| "http://localhost:11434".to_string());
-    let lead = std::env::var("LEAD").unwrap_or_else(|_| "qwen2.5-coder:7b".to_string());
+    let lead = std::env::var("LEAD").unwrap_or_else(|_| "qwen2.5-coder:14b".to_string());
     let planner = std::env::var("PLANNER").unwrap_or_else(|_| "qwen2.5-coder:7b".to_string());
     let small = std::env::var("SMALL").unwrap_or_else(|_| "qwen2.5-coder:3b".to_string());
 
@@ -90,14 +94,18 @@ async fn main() {
     };
     let mut ws = FsWorkspace {
         root: root.clone(),
-        // The verification: a calc.py with add() must make this pass.
-        test_cmd: "python3 -c \"from calc import add; assert add(2,3)==5; print('OK')\""
+        // Default (whole-goal) check; the lead is expected to install a tighter
+        // per-subtask `verify` for each step (otherwise this full check stands,
+        // and an early subtask would block — exactly what per-subtask verify fixes).
+        test_cmd: "python3 -c \"from calc import add, mul; assert add(2,3)==5 and \
+                   mul(2,3)==6; print('OK')\""
             .to_string(),
     };
 
-    let goal = "Create a Python file `calc.py` containing a function `add(a, b)` that \
-                returns the sum of a and b. (A test imports `add` from `calc` and checks \
-                add(2,3)==5.)";
+    let goal = "In `calc.py`, implement TWO functions: `add(a, b)` returning a+b, and \
+                `mul(a, b)` returning a*b. Each is independently checkable: \
+                `python3 -c \"from calc import add; assert add(2,3)==5\"` and \
+                `python3 -c \"from calc import mul; assert mul(2,3)==6\"`.";
 
     println!("== team_live ==");
     println!("  endpoint {endpoint}");
