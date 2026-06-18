@@ -29,10 +29,11 @@ release:
     cargo build --workspace --release
 
 # Install newt + newt-mcp-server release binaries to DEST (default: ~/bin).
-# Override dest:        just install /usr/local/bin
-# Opt into features:    just install ~/bin newt-agent/rich-tui
-#   (the rich-tui TTY surface is off by default — pass it here to bake it into
-#    the installed binary so plain `newt code` uses the rich inline editor.)
+# The rich TTY inline surface (issue #416) is a DEFAULT feature, so plain
+# `just install` already gives you the rich editor — no flag needed.
+# Override dest:           just install /usr/local/bin
+# Extra features:          just install ~/bin some-crate/some-feature
+# Lean / strip-down build: just install-lean   (rustyline-only, wyvern tier)
 install dest=`echo $HOME/bin` features="":
     cargo build --release --bin newt --bin newt-mcp-server {{ if features == "" { "" } else { "--features " + features } }}
     mkdir -p {{dest}}
@@ -40,6 +41,15 @@ install dest=`echo $HOME/bin` features="":
     cp target/release/newt-mcp-server {{dest}}/newt-mcp-server
     @echo "Installed: {{dest}}/newt  {{dest}}/newt-mcp-server {{ if features == "" { "" } else { "[features: " + features + "]" } }}"
     @case ":$PATH:" in *":{{dest}}:"*) ;; *) echo "Note: {{dest}} is not in PATH — add:  export PATH={{dest}}:\$PATH" ;; esac
+
+# Install the LEAN strip-down build (rustyline-only, no rich TTY surface) — the
+# wyvern/headless tier. Same as `just install` but with `--no-default-features`.
+install-lean dest=`echo $HOME/bin`:
+    cargo build --release --no-default-features --bin newt --bin newt-mcp-server
+    mkdir -p {{dest}}
+    cp target/release/newt {{dest}}/newt
+    cp target/release/newt-mcp-server {{dest}}/newt-mcp-server
+    @echo "Installed (lean, no rich-tui): {{dest}}/newt  {{dest}}/newt-mcp-server"
 
 # Remove the binaries `just install` placed in DEST (default: ~/bin) — the
 # inverse of `just install`, so you can guarantee which build is on PATH.
@@ -93,19 +103,16 @@ check:
     cargo fmt --all -- --check || rc=1
     cargo clippy --workspace --all-targets --features newt-data/kernel -- -D warnings || rc=1
     cargo test --workspace --features newt-data/kernel || rc=1
-    # rich-tui (issue #416): the TTY rich input surface is off by default. Lint +
-    # test it under its feature so it can't rot, but keep it OUT of the coverage
-    # run (its TTY event loop is unit-untestable and would drag the floor down).
-    # The `-p newt-agent` clippy proves the feature still unifies into the shipped
-    # binary (the forward from newt-cli), not just the leaf crate.
-    cargo clippy -p newt-tui --features rich-tui --all-targets -- -D warnings || rc=1
-    cargo test -p newt-tui --features rich-tui || rc=1
-    cargo clippy -p newt-agent --features rich-tui -- -D warnings || rc=1
+    # rich-tui (issue #416) is now a DEFAULT feature (amphibian: comfortable by
+    # default, strip for the water), so the workspace clippy/test above already
+    # cover it. Guard the LEAN strip-down build instead — the wyvern/headless
+    # tier (`--no-default-features`) must still compile + lint clean.
+    cargo clippy -p newt-agent --no-default-features --all-targets -- -D warnings || rc=1
     exit $rc
 
 [windows]
 check:
-    $rc = 0; cargo fmt --all -- --check; if ($LASTEXITCODE -ne 0) { $rc = 1 }; cargo clippy --workspace --all-targets --features newt-data/kernel -- -D warnings; if ($LASTEXITCODE -ne 0) { $rc = 1 }; cargo test --workspace --features newt-data/kernel; if ($LASTEXITCODE -ne 0) { $rc = 1 }; cargo clippy -p newt-tui --features rich-tui --all-targets -- -D warnings; if ($LASTEXITCODE -ne 0) { $rc = 1 }; cargo test -p newt-tui --features rich-tui; if ($LASTEXITCODE -ne 0) { $rc = 1 }; cargo clippy -p newt-agent --features rich-tui -- -D warnings; if ($LASTEXITCODE -ne 0) { $rc = 1 }; exit $rc
+    $rc = 0; cargo fmt --all -- --check; if ($LASTEXITCODE -ne 0) { $rc = 1 }; cargo clippy --workspace --all-targets --features newt-data/kernel -- -D warnings; if ($LASTEXITCODE -ne 0) { $rc = 1 }; cargo test --workspace --features newt-data/kernel; if ($LASTEXITCODE -ne 0) { $rc = 1 }; cargo clippy -p newt-agent --no-default-features --all-targets -- -D warnings; if ($LASTEXITCODE -ne 0) { $rc = 1 }; exit $rc
 
 # Build + test the out-of-workspace newt-mesh crate. Requires the
 # sibling `../agent-mesh/` checkout. Not run by `just check` /
