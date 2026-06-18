@@ -20,8 +20,10 @@
 //!   where it is idiomatic (emacs `open-line`). In **vi**, Ctrl-O is left free
 //!   for its real semantics (jumplist back in NORMAL, insert-normal in INSERT);
 //!   vi users open lines with `o`/`O`.
-//! - **Ctrl-C** interrupts; **Ctrl-D** on an empty buffer is EOF (both exit
-//!   cleanly, as in rustyline).
+//! - **Ctrl-C** abandons the current line (clears it, stays in the session — a
+//!   shell-like "give me a clean line", NOT an exit). **Exit** is mode-idiomatic:
+//!   `C-x C-c` (emacs), `^X` (nano), `:q`/`:wq` (vi), `Ctrl-D` on an empty
+//!   buffer, or typing `/exit`.
 //! - Vi mode adds `:w`/`:wq`/`:x` (submit) and `:q`/`:q!` (quit) ex-commands.
 //!
 //! ## Vi gaps (future faithful-keymap work, issue #416 follow-up)
@@ -57,7 +59,7 @@ use tui_textarea::{CursorMove, TextArea};
 
 use crate::{footer_continues, InputSurface, ReadOutcome};
 
-const GUTTER_W: u16 = 24; // wide enough for "[HH:MM:SS] vi NORMAL ❯ "
+const GUTTER_W: u16 = 19; // fits the widest label "[HH:MM:SS] emacs ❯ " (vi uses "vi N"/"vi I")
 const MAX_INPUT_ROWS: u16 = 8;
 /// Auto-gutter threshold: use the left gutter only while it stays under this
 /// fraction of the terminal width; on a squished terminal, drop it and stack
@@ -99,9 +101,7 @@ enum Step {
     Continue,
     /// Accept the buffer as this turn's input.
     Submit,
-    /// Ctrl-C — interrupt (clean exit).
-    Interrupt,
-    /// Ctrl-D on empty / `:q` — end of input (clean exit).
+    /// End of input — clean exit (Ctrl-D on empty, `:q`, `C-x C-c`, nano `^X`).
     Eof,
 }
 
@@ -498,12 +498,13 @@ impl Vi {
         }
     }
 
-    /// Status label — `vi` lit up plus the mode, so a vi user always knows the
-    /// surface is modal and which mode they're in.
+    /// Status label — `vi` lit up plus a one-letter mode (`N`/`I`), so a vi user
+    /// always knows the surface is modal and which mode they're in, without the
+    /// long `NORMAL`/`INSERT` words widening the gutter for every mode.
     fn mode_label(&self) -> &'static str {
         match self.mode {
-            Mode::Normal => "vi NORMAL",
-            Mode::Insert => "vi INSERT",
+            Mode::Normal => "vi N",
+            Mode::Insert => "vi I",
         }
     }
 }
@@ -658,7 +659,16 @@ impl Editor {
         }
         if ctrl {
             match key.code {
-                KeyCode::Char('c') => return Step::Interrupt,
+                // Ctrl-C abandons the current line (clear it, fresh start) and
+                // stays in the session — it does NOT exit. Exit is C-x C-c
+                // (emacs) / ^X (nano) / `:q` (vi) / `/exit`. This matches a
+                // shell's "^C gives me a clean line" reflex.
+                KeyCode::Char('c') => {
+                    *ta = new_textarea(self.edit);
+                    self.vi = Vi::new();
+                    self.cx_pending = false;
+                    return Step::Continue;
+                }
                 KeyCode::Char('d') => {
                     return if buffer_is_empty(ta) {
                         Step::Eof
@@ -915,6 +925,12 @@ impl RichSurface {
             let want = (textarea.lines().len() as u16 + prompt_rows)
                 .clamp(1, MAX_INPUT_ROWS + prompt_rows);
             if want != cur_h {
+                // Blank the CURRENT region before resizing. ratatui reserves
+                // space for a taller inline viewport by scrolling whatever is on
+                // screen up into scrollback — which was committing each shorter
+                // render as a permanent "ghost" line. Clearing first means only
+                // blank rows get scrolled up, so the region grows in place.
+                terminal.clear()?;
                 terminal = make_terminal(want)?;
                 terminal.clear()?;
                 cur_h = want;
@@ -947,7 +963,6 @@ impl RichSurface {
                     echo_submitted(&mut terminal, &body)?;
                     return Ok(ReadOutcome::Line(body));
                 }
-                Step::Interrupt => return Ok(ReadOutcome::Interrupted),
                 Step::Eof => return Ok(ReadOutcome::Eof),
             }
         }
@@ -1067,11 +1082,11 @@ mod tests {
 
     #[test]
     fn use_gutter_drops_when_over_a_third() {
-        // Keep the gutter while GUTTER_W (24) <= 0.33*width, i.e. width >= ~73.
+        // Keep the gutter while GUTTER_W (19) <= 0.33*width, i.e. width >= ~58.
         assert!(use_gutter(80), "gutter fits at 80 cols");
-        assert!(use_gutter(73), "24 <= 0.33*73 (24.09) → gutter stays on");
-        assert!(!use_gutter(72), "24 > 0.33*72 (23.76) → drop the gutter");
-        assert!(!use_gutter(50), "way too narrow → drop the gutter");
+        assert!(use_gutter(58), "19 <= 0.33*58 (19.14) → gutter stays on");
+        assert!(!use_gutter(57), "19 > 0.33*57 (18.81) → drop the gutter");
+        assert!(!use_gutter(40), "way too narrow → drop the gutter");
         assert!(!use_gutter(0), "zero width never uses a gutter");
     }
 
@@ -1148,10 +1163,18 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_c_interrupts_and_ctrl_d_empty_is_eof() {
+    fn ctrl_c_abandons_line_and_ctrl_d_empty_is_eof() {
         let mut ed = emacs_editor();
         let mut ta = TextArea::default();
-        assert_eq!(ed.input(ctrl('c'), &mut ta), Step::Interrupt);
+        // Ctrl-C abandons the current line (clears it) and stays in the session.
+        type_chars(&mut ed, &mut ta, "throwaway");
+        assert_eq!(
+            ed.input(ctrl('c'), &mut ta),
+            Step::Continue,
+            "Ctrl-C does not exit"
+        );
+        assert!(buffer_is_empty(&ta), "Ctrl-C cleared the buffer");
+        // Ctrl-D on the now-empty buffer is EOF (exit).
         assert_eq!(
             ed.input(ctrl('d'), &mut ta),
             Step::Eof,
@@ -1169,10 +1192,10 @@ mod tests {
         // Start in INSERT (vi default), type, Esc to NORMAL.
         type_chars(&mut ed, &mut ta, "first");
         ed.input(special(KeyCode::Esc), &mut ta);
-        assert_eq!(ed.label(), "vi NORMAL");
+        assert_eq!(ed.label(), "vi N");
         // `o` opens a line below and returns to INSERT.
         ed.input(key('o'), &mut ta);
-        assert_eq!(ed.label(), "vi INSERT");
+        assert_eq!(ed.label(), "vi I");
         type_chars(&mut ed, &mut ta, "second");
         assert_eq!(ta.lines(), &["first".to_string(), "second".to_string()]);
     }
@@ -1275,9 +1298,9 @@ mod tests {
         type_chars(&mut ed, &mut ta, "hello"); // INSERT, cursor at end
                                                // i_CTRL-O: one Normal command (`0` → head) then back to INSERT.
         ed.input(ctrl('o'), &mut ta);
-        assert_eq!(ed.label(), "vi NORMAL", "Ctrl-O drops to NORMAL");
+        assert_eq!(ed.label(), "vi N", "Ctrl-O drops to NORMAL");
         ed.input(key('0'), &mut ta);
-        assert_eq!(ed.label(), "vi INSERT", "resumes INSERT after one command");
+        assert_eq!(ed.label(), "vi I", "resumes INSERT after one command");
         type_chars(&mut ed, &mut ta, "X");
         assert_eq!(ta.lines(), &["Xhello".to_string()], "inserted at head");
     }
@@ -1406,8 +1429,8 @@ mod tests {
             "C-x arms prefix"
         );
         assert_eq!(ed.input(ctrl('c'), &mut ta), Step::Eof, "C-x C-c → exit");
-        // emacs: C-x then a non-C-c key cancels the prefix (no exit); the bare
-        // Ctrl-C afterwards is a normal interrupt, not part of the sequence.
+        // emacs: C-x then a non-C-c key cancels the prefix (no exit); a bare
+        // Ctrl-C afterwards abandons the line (not exit), not part of a sequence.
         let mut ed = emacs_editor();
         let mut ta = TextArea::default();
         ed.input(ctrl('x'), &mut ta);
@@ -1415,9 +1438,10 @@ mod tests {
         assert_eq!(ta.lines(), &["a".to_string()]);
         assert_eq!(
             ed.input(ctrl('c'), &mut ta),
-            Step::Interrupt,
-            "bare C-c interrupts"
+            Step::Continue,
+            "bare C-c abandons the line, does not exit"
         );
+        assert!(buffer_is_empty(&ta), "bare C-c cleared the line");
         // nano: ^X exits directly.
         let mut ed = nano_editor();
         let mut ta = TextArea::default();
