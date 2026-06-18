@@ -934,9 +934,11 @@ pub async fn chat_complete(
             messages.push(serde_json::json!({
                 "role": "user",
                 "content": format!(
-                    "[{read_only_rounds} consecutive read-only rounds with no file writes. \
-                     Stop exploring. Call edit_file or write_file now to make the change. \
-                     You have {remaining} round(s) remaining — spend them writing, not reading.]"
+                    "[{read_only_rounds} read-only rounds so far. Stop AIMLESS exploring and \
+                     start making the change. This is a nudge, not a limit — you may still \
+                     read. In particular, before an edit_file, read the ONE file you are about \
+                     to change so your old_string matches its exact text; never guess old_string \
+                     or repeat a failed edit. ~{remaining} round(s) left.]"
                 )
             }));
             read_only_rounds = 0;
@@ -3535,7 +3537,7 @@ mod tool_round_cap_tests {
                     msgs.iter().any(|m| {
                         m["content"]
                             .as_str()
-                            .map(|c| c.contains("consecutive read-only rounds"))
+                            .map(|c| c.contains("read-only rounds so far"))
                             .unwrap_or(false)
                     })
                 })
@@ -5737,7 +5739,7 @@ mod compression_loop_tests {
                     .filter_map(|m| m["content"].as_str())
                     .map(|c| c.chars().count())
                     .collect();
-                let nudged = messages_contain(&body, "consecutive read-only rounds");
+                let nudged = messages_contain(&body, "read-only rounds so far");
                 self.log
                     .lock()
                     .unwrap()
