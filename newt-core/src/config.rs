@@ -228,6 +228,11 @@ pub struct VerifyGateKnobs {
     /// adversarially-complete setting (the retry-Goodhart finding).
     #[serde(default)]
     pub surface_match: crate::verify_gate::SurfaceMatch,
+    /// How strictly the gate ACTS on flagged output — the tier. Default
+    /// `RevertRetry` (today's behavior when the `retry` technique is on); lower
+    /// tiers (`off`/`advisory`/`revert_once`) trade enforcement for latitude.
+    #[serde(default)]
+    pub tier: crate::verify_gate::VerifyTier,
 }
 
 /// Tunable knobs for the `retry` technique.

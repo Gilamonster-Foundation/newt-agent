@@ -107,6 +107,85 @@ pub enum SurfaceMatch {
     Prefix,
 }
 
+/// How strictly the verify gate acts on a turn's flagged output — the **tier**.
+/// `RevertRetry` is today's behavior; lower tiers trade enforcement for latitude
+/// (a per-model/profile knob).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerifyTier {
+    /// Gate disabled — flagged output is left as-is.
+    Off,
+    /// Measure + warn only; never revert (non-destructive).
+    Advisory,
+    /// Revert the flagged files; do not re-prompt.
+    RevertOnce,
+    /// Revert the flagged files AND issue a corrective retry (today's behavior).
+    #[default]
+    RevertRetry,
+}
+
+/// What a [`VerifyTier`] decides to do, given a [`GateReport`]. A **pure decision**
+/// — the caller (the turn loop) executes the revert/retry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerifyAction {
+    /// Nothing flagged (or the gate is `Off`) — accept the turn.
+    Pass,
+    /// Report the fabrications; leave the files in place (advisory).
+    Warn,
+    /// Revert the flagged files; do not retry.
+    Revert,
+    /// Revert the flagged files and issue a corrective re-prompt.
+    RevertAndRetry,
+}
+
+impl VerifyTier {
+    /// The action this tier takes for `report` (pure; the caller executes it).
+    #[must_use]
+    pub fn action(self, report: &GateReport) -> VerifyAction {
+        if report.accept() {
+            return VerifyAction::Pass; // nothing fabricated
+        }
+        match self {
+            Self::Off => VerifyAction::Pass,
+            Self::Advisory => VerifyAction::Warn,
+            Self::RevertOnce => VerifyAction::Revert,
+            Self::RevertRetry => VerifyAction::RevertAndRetry,
+        }
+    }
+}
+
+/// The honest end-of-turn banner. A turn that did **not** finish cleanly — because
+/// the verify gate reverted work (`reverted`), and/or the tool-round cap was hit
+/// (`cap_hit`) — gets ONE `needs human review` line naming *both* facts, never a
+/// false success. Returns `None` when the turn finished cleanly (nothing reverted,
+/// no cap hit). `gave_up` marks revert-retry exhaustion.
+#[must_use]
+pub fn turn_verdict_banner(reverted: &[String], gave_up: bool, cap_hit: bool) -> Option<String> {
+    if reverted.is_empty() && !cap_hit {
+        return None;
+    }
+    let mut parts = Vec::new();
+    if !reverted.is_empty() {
+        parts.push(format!(
+            "the verify gate reverted {} file(s) [{}]{}",
+            reverted.len(),
+            reverted.join(", "),
+            if gave_up {
+                " after exhausting retries"
+            } else {
+                ""
+            }
+        ));
+    }
+    if cap_hit {
+        parts.push("the tool-round cap was reached".to_string());
+    }
+    Some(format!(
+        "needs human review: {} — the turn did not finish cleanly.",
+        parts.join("; and ")
+    ))
+}
+
 /// Is `module` resolvable? The project `surface` is matched per `mode`; the
 /// Python stdlib is always prefix-matched (`os` covers `os.path`).
 fn module_resolves(
@@ -1065,5 +1144,83 @@ pub struct PyRouter;
             vec![PathBuf::from("own.py")],
             "only the workspace's own .py is gated; the symlinked external file is skipped"
         );
+    }
+}
+
+#[cfg(test)]
+mod tier_tests {
+    use super::*;
+
+    fn dirty() -> GateReport {
+        GateReport {
+            files: vec![FileVerdict {
+                path: PathBuf::from("fab.py"),
+                fabrications: vec![Fabrication {
+                    module: "newt_core".to_string(),
+                    line: 1,
+                }],
+            }],
+        }
+    }
+
+    #[test]
+    fn clean_report_passes_every_tier() {
+        let clean = GateReport::default();
+        for t in [
+            VerifyTier::Off,
+            VerifyTier::Advisory,
+            VerifyTier::RevertOnce,
+            VerifyTier::RevertRetry,
+        ] {
+            assert_eq!(t.action(&clean), VerifyAction::Pass);
+        }
+    }
+
+    #[test]
+    fn dirty_report_maps_per_tier() {
+        let d = dirty();
+        assert_eq!(VerifyTier::Off.action(&d), VerifyAction::Pass);
+        assert_eq!(VerifyTier::Advisory.action(&d), VerifyAction::Warn);
+        assert_eq!(VerifyTier::RevertOnce.action(&d), VerifyAction::Revert);
+        assert_eq!(
+            VerifyTier::RevertRetry.action(&d),
+            VerifyAction::RevertAndRetry
+        );
+    }
+
+    #[test]
+    fn default_tier_is_revert_retry() {
+        assert_eq!(VerifyTier::default(), VerifyTier::RevertRetry);
+        let t: VerifyTier = serde_json::from_str("\"advisory\"").unwrap();
+        assert_eq!(t, VerifyTier::Advisory);
+    }
+
+    #[test]
+    fn banner_is_none_on_clean_finish() {
+        assert!(turn_verdict_banner(&[], false, false).is_none());
+    }
+
+    #[test]
+    fn banner_names_reverts_only() {
+        let b = turn_verdict_banner(&["a.py".to_string()], false, false).unwrap();
+        assert!(b.contains("reverted 1 file") && b.contains("a.py"));
+        assert!(!b.contains("tool-round cap"));
+        assert!(b.contains("needs human review"));
+    }
+
+    #[test]
+    fn banner_names_cap_only() {
+        let b = turn_verdict_banner(&[], false, true).unwrap();
+        assert!(b.contains("tool-round cap"));
+        assert!(!b.contains("reverted"));
+    }
+
+    #[test]
+    fn banner_names_both_in_one_line() {
+        let b = turn_verdict_banner(&["a.py".to_string(), "b.py".to_string()], true, true).unwrap();
+        assert!(b.contains("reverted 2 file"));
+        assert!(b.contains("exhausting retries"));
+        assert!(b.contains("tool-round cap"));
+        assert_eq!(b.lines().count(), 1, "one honest line");
     }
 }
