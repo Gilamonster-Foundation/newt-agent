@@ -6683,11 +6683,13 @@ fn erase_line() {
 /// function-key sequence, and `Esc <char>` is an Alt-chord — neither interrupts.
 /// Terminals deliver a real Esc press as a single `0x1b` byte, so an exact match
 /// cleanly separates it from a multi-byte escape sequence read in one burst.
+/// Unix-only: the keyboard watcher (its sole caller) needs termios.
+#[cfg(unix)]
 fn is_lone_esc(bytes: &[u8]) -> bool {
     bytes == [0x1b]
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod interrupt_tests {
     use super::is_lone_esc;
 
