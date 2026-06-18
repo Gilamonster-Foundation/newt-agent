@@ -1820,6 +1820,11 @@ impl Config {
         // `~/.newt/crews/<name>.toml` to add a crew — no `config.toml` edit.
         // Runs after loadouts so a disk crew may name a disk loadout.
         cfg.merge_disk_crews();
+        // Per-file DGX nodes (the per-host control surface): drop a
+        // `~/.newt/dgx/<name>.toml` to add/override a DGX node — each host its
+        // own file, no inline `[[dgx.nodes]]`. The active selection
+        // (active_node/active_endpoint/active_model) stays in `[dgx]`.
+        cfg.merge_disk_dgx_nodes();
         Ok(cfg)
     }
 
@@ -1869,6 +1874,61 @@ impl Config {
                 }
                 Ok(Err(e)) => {
                     tracing::warn!(path = %path.display(), error = %e, "skipping malformed backend file");
+                }
+                Err(_) => {}
+            }
+        }
+    }
+
+    /// Merge per-file DGX nodes from the `dgx/` dirs next to the config:
+    /// `~/.newt/dgx/*.toml` first, then the project `.newt/dgx/` (so project
+    /// overrides home overrides inline `[[dgx.nodes]]`). Filename stem = node
+    /// name. A malformed drop-in is skipped with a warning; it must not break
+    /// startup.
+    fn merge_disk_dgx_nodes(&mut self) {
+        if let Some(h) = home_dir() {
+            self.merge_dgx_nodes_from_dir(&h.join(".newt").join("dgx"));
+        }
+        if let Some(proj) = Self::project_config_path() {
+            if let Some(parent) = proj.parent() {
+                self.merge_dgx_nodes_from_dir(&parent.join("dgx"));
+            }
+        }
+    }
+
+    /// Load `<dir>/*.toml` as DGX nodes (filename stem = name) into
+    /// `self.dgx.nodes`. A drop-in **replaces** an existing node of the same
+    /// name (last-wins), else it is appended — so a `dgx1.toml` file supersedes
+    /// an inline `[[dgx.nodes]]` named `dgx1` without a duplicate. The `[dgx]`
+    /// table is created (default selection) if it was absent. A malformed file
+    /// is skipped with a warning.
+    fn merge_dgx_nodes_from_dir(&mut self, dir: &Path) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return; // no dgx dir — fine
+        };
+        let mut paths: Vec<PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "toml"))
+            .collect();
+        paths.sort();
+        for path in paths {
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            match std::fs::read_to_string(&path).map(|t| toml::from_str::<crate::dgx::DgxNode>(&t))
+            {
+                Ok(Ok(mut node)) => {
+                    // The filename is authoritative for the name (collision-free).
+                    node.name = stem.to_string();
+                    let dgx = self.dgx.get_or_insert_with(Default::default);
+                    match dgx.nodes.iter_mut().find(|n| n.name == node.name) {
+                        Some(existing) => *existing = node,
+                        None => dgx.nodes.push(node),
+                    }
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!(path = %path.display(), error = %e, "skipping malformed dgx node file");
                 }
                 Err(_) => {}
             }
@@ -2764,6 +2824,45 @@ mod tests {
         assert_eq!(dgx1.model, "qwen3:30b");
         assert_eq!(dgx1.kind, BackendKind::Ollama, "kind defaults to ollama");
         assert!(cfg.backends.iter().any(|b| b.name == "gnuc"), "gnuc kept");
+    }
+
+    #[test]
+    fn disk_dgx_nodes_load_per_file_by_stem_and_override_inline() {
+        let dir = tempfile::tempdir().unwrap();
+        // A minimal drop-in: name omitted (filename is authoritative), carries
+        // the multi-endpoint info a [[backends]] entry can't (vllm + ssh_host).
+        std::fs::write(
+            dir.path().join("dgx1.toml"),
+            "ollama = \"http://dgx1.home.lab:11434\"\n\
+             vllm = \"http://dgx1.home.lab:8000\"\n\
+             ssh_host = \"dgx1.home.lab\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("README.md"), "not a node").unwrap();
+
+        // [dgx] absent → created on first drop-in, with the node populated.
+        let mut cfg = Config::default();
+        assert!(cfg.dgx.is_none());
+        cfg.merge_dgx_nodes_from_dir(dir.path());
+        let dgx = cfg.dgx.as_ref().expect("[dgx] created from drop-ins");
+        assert_eq!(dgx.nodes.len(), 1);
+        let node = &dgx.nodes[0];
+        assert_eq!(node.name, "dgx1", "name comes from the filename stem");
+        assert_eq!(node.ollama.as_deref(), Some("http://dgx1.home.lab:11434"));
+        assert_eq!(node.vllm.as_deref(), Some("http://dgx1.home.lab:8000"));
+        assert_eq!(node.ssh_host.as_deref(), Some("dgx1.home.lab"));
+        // A single node resolves as active without an explicit active_node.
+        assert_eq!(dgx.active_node().unwrap().name, "dgx1");
+
+        // Disk replaces an inline node of the same name in place (no duplicate).
+        cfg.dgx.as_mut().unwrap().nodes[0].ollama = Some("http://stale:1".into());
+        cfg.merge_dgx_nodes_from_dir(dir.path());
+        assert_eq!(cfg.dgx.as_ref().unwrap().nodes.len(), 1, "no duplicate");
+        assert_eq!(
+            cfg.dgx.unwrap().nodes[0].ollama.as_deref(),
+            Some("http://dgx1.home.lab:11434"),
+            "disk wins"
+        );
     }
 
     #[test]
