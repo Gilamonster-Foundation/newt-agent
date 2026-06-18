@@ -18,23 +18,58 @@ pub const NEWT_ORANGE_CT: CtColor = CtColor::Rgb {
     b: 20,
 };
 
-/// Print a newt response line.
-/// Color: orange ▸ (matches the logo).  No-color: >.
+/// Print a newt narrator line.
+///
+/// The `▸` marker stays the **default text color**: a colored sigil on every
+/// narrator line reads as noise, and the saturated logo orange is exactly the
+/// hue that's hard to parse on this operator's display (accessibility note —
+/// never lean on a deep saturated color for anything readable). No-color: `>`.
 pub fn print_newt(msg: &str, color: bool, verbose: bool) {
+    let prefix = if color {
+        if verbose {
+            "newt ▸  "
+        } else {
+            "▸  "
+        }
+    } else if verbose {
+        "newt >  "
+    } else {
+        ">  "
+    };
+    println!("{prefix}{msg}");
+}
+
+/// Print one row of a selectable list in newt's default list style.
+///
+/// The **active** row is flagged with a red `▸` margin sigil and a green
+/// `◀ active` tag; inactive rows align under it with two leading spaces (the
+/// `▸ ` sigil consumes one of those two columns, so labels line up). The label
+/// itself is always default-colored — only the small arrow sigils carry color,
+/// and the words `▸`/`active` carry the meaning too, so nothing depends on
+/// color alone.
+pub fn print_list_item(label: &str, active: bool, color: bool) {
+    if !active {
+        println!("  {label}");
+        return;
+    }
     if color {
-        let prefix = if verbose { "newt ▸  " } else { "▸  " };
         execute!(
             io::stdout(),
-            SetForegroundColor(NEWT_ORANGE_CT),
-            Print(prefix),
+            SetForegroundColor(CtColor::Red),
+            Print("▸ "),
             ResetColor,
-            Print(msg),
+            Print(label),
+            Print("  "),
+            SetForegroundColor(CtColor::Red),
+            Print("◀ "),
+            SetForegroundColor(CtColor::Green),
+            Print("active"),
+            ResetColor,
             Print("\n"),
         )
         .ok();
     } else {
-        let prefix = if verbose { "newt >  " } else { ">  " };
-        println!("{prefix}{msg}");
+        println!("> {label}  <- active");
     }
 }
 
@@ -247,7 +282,7 @@ pub(crate) fn print_denied(axis: &str, target: &str, color: bool) {
 
 #[cfg(test)]
 mod tests {
-    use super::fmt_tokens;
+    use super::{fmt_tokens, print_list_item, print_newt};
 
     #[test]
     fn fmt_tokens_inserts_thousands_separators() {
@@ -255,5 +290,19 @@ mod tests {
         assert_eq!(fmt_tokens(999), "999");
         assert_eq!(fmt_tokens(1_000), "1,000");
         assert_eq!(fmt_tokens(1_234_567), "1,234,567");
+    }
+
+    /// The narrator + list-item printers write to stdout (hard to capture here),
+    /// so this just exercises every branch — color/no-color × active/inactive ×
+    /// verbose — to keep them from rotting and to cover them for the gate.
+    #[test]
+    fn printers_cover_every_branch_without_panicking() {
+        for color in [true, false] {
+            for verbose in [true, false] {
+                print_newt("narrator line", color, verbose);
+            }
+            print_list_item("name · ollama · model @ url", true, color);
+            print_list_item("name · ollama · model @ url", false, color);
+        }
     }
 }

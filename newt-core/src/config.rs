@@ -1629,11 +1629,20 @@ pub enum BackendKind {
 }
 
 /// A single inference backend entry.
+///
+/// Two ways to define one: an inline `[[backends]]` array element in
+/// `config.toml`, or a per-file drop-in `~/.newt/backends/<name>.toml` (the
+/// filename stem is the `name`, so a drop-in omits it). `name` and `tiers`
+/// therefore default — a minimal drop-in is just `endpoint` + `model`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackendConfig {
+    /// Backend name. For a per-file drop-in this is overwritten by the filename
+    /// stem, so the file body may omit it.
+    #[serde(default)]
     pub name: String,
     pub endpoint: String,
     pub model: String,
+    #[serde(default)]
     pub tiers: Vec<Tier>,
     /// Which wire protocol this backend speaks. Defaults to `ollama`
     /// so configs written before this field existed keep working.
@@ -1794,6 +1803,12 @@ impl Config {
                     .map_err(|e| NewtError::Config(e.to_string()))?
             }
         };
+        // Per-file backends (the endpoint control surface): drop a
+        // `~/.newt/backends/<name>.toml` to add/override a backend — no
+        // `config.toml` edit, and no overlapping inline `[[backends]]` to
+        // hand-deconflict. Runs first so disk loadouts/crews can name a disk
+        // backend's provider.
+        cfg.merge_disk_backends();
         // Per-file bundles (the model-support-kit control surface): drop a
         // `~/.newt/bundles/<name>.toml` to add a bundle — no `config.toml` edit.
         cfg.merge_disk_bundles();
@@ -1806,6 +1821,58 @@ impl Config {
         // Runs after loadouts so a disk crew may name a disk loadout.
         cfg.merge_disk_crews();
         Ok(cfg)
+    }
+
+    /// Merge per-file backends from the `backends/` dirs next to the config:
+    /// `~/.newt/backends/*.toml` first, then the project `.newt/backends/` (so
+    /// project overrides home overrides inline `[[backends]]`). Filename stem =
+    /// backend name. A malformed drop-in is skipped with a warning; it must not
+    /// break startup.
+    fn merge_disk_backends(&mut self) {
+        if let Some(h) = home_dir() {
+            self.merge_backends_from_dir(&h.join(".newt").join("backends"));
+        }
+        if let Some(proj) = Self::project_config_path() {
+            if let Some(parent) = proj.parent() {
+                self.merge_backends_from_dir(&parent.join("backends"));
+            }
+        }
+    }
+
+    /// Load `<dir>/*.toml` as backends (filename stem = name) into
+    /// `self.backends`. A drop-in **replaces** an existing backend of the same
+    /// name (last-wins), else it is appended — so a `dgx1.toml` file supersedes
+    /// an inline `[[backends]]` named `dgx1` without a duplicate. A malformed
+    /// file is skipped with a warning.
+    fn merge_backends_from_dir(&mut self, dir: &Path) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return; // no backends dir — fine
+        };
+        let mut paths: Vec<PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "toml"))
+            .collect();
+        paths.sort();
+        for path in paths {
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            match std::fs::read_to_string(&path).map(|t| toml::from_str::<BackendConfig>(&t)) {
+                Ok(Ok(mut backend)) => {
+                    // The filename is authoritative for the name (collision-free).
+                    backend.name = stem.to_string();
+                    match self.backends.iter_mut().find(|b| b.name == backend.name) {
+                        Some(existing) => *existing = backend,
+                        None => self.backends.push(backend),
+                    }
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!(path = %path.display(), error = %e, "skipping malformed backend file");
+                }
+                Err(_) => {}
+            }
+        }
     }
 
     /// Merge per-file crews from the `crews/` dirs next to the config:
@@ -2647,6 +2714,56 @@ mod tests {
         );
         cfg.merge_crews_from_dir(dir.path());
         assert_eq!(cfg.crews["coder"].planner, "planner", "disk wins");
+    }
+
+    #[test]
+    fn disk_backends_load_per_file_by_stem_and_override_inline() {
+        let dir = tempfile::tempdir().unwrap();
+        // A minimal drop-in: name omitted (filename is authoritative), tiers
+        // omitted (defaults empty), kind omitted (defaults ollama).
+        std::fs::write(
+            dir.path().join("dgx1.toml"),
+            "endpoint = \"http://dgx1.home.lab:11434\"\nmodel = \"qwen3:30b\"\n",
+        )
+        .unwrap();
+        // Malformed (missing required `endpoint`) is skipped, not fatal.
+        std::fs::write(dir.path().join("broken.toml"), "model = \"x\"\n").unwrap();
+        std::fs::write(dir.path().join("README.md"), "not a backend").unwrap();
+
+        let mut cfg = Config {
+            // An inline backend of the same name that the drop-in should replace,
+            // plus an unrelated one that must survive untouched.
+            backends: vec![
+                BackendConfig {
+                    name: "dgx1".into(),
+                    endpoint: "http://stale:11434".into(),
+                    model: "old-model".into(),
+                    tiers: vec![],
+                    kind: BackendKind::Ollama,
+                    api_key_file: None,
+                    api_key_env: None,
+                },
+                BackendConfig {
+                    name: "gnuc".into(),
+                    endpoint: "http://gnuc:11434".into(),
+                    model: "qwen2.5-coder:14b".into(),
+                    tiers: vec![],
+                    kind: BackendKind::Ollama,
+                    api_key_file: None,
+                    api_key_env: None,
+                },
+            ],
+            ..Default::default()
+        };
+        cfg.merge_backends_from_dir(dir.path());
+
+        // The drop-in replaced the inline dgx1 in place (no duplicate), gnuc kept.
+        assert_eq!(cfg.backends.len(), 2, "only the valid .toml loads, no dup");
+        let dgx1 = cfg.backends.iter().find(|b| b.name == "dgx1").unwrap();
+        assert_eq!(dgx1.endpoint, "http://dgx1.home.lab:11434", "disk wins");
+        assert_eq!(dgx1.model, "qwen3:30b");
+        assert_eq!(dgx1.kind, BackendKind::Ollama, "kind defaults to ollama");
+        assert!(cfg.backends.iter().any(|b| b.name == "gnuc"), "gnuc kept");
     }
 
     #[test]
