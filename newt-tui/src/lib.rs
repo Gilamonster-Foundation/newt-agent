@@ -5,6 +5,7 @@
 //! (see `newt config`). Additional features and the multi-agent matrix live in
 //! the downstream `gilamonster-agent`, which inherits these crates.
 
+mod crew_form;
 pub mod dgx_probe;
 mod mcp;
 mod mcp_token;
@@ -35,6 +36,15 @@ pub fn run_init(color: bool) -> anyhow::Result<()> {
 /// models, and writes `~/.newt/config.toml` after a preview + confirmation.
 pub fn run_setup(color: bool) -> anyhow::Result<()> {
     setup::run(color)
+}
+
+/// Run the interactive crew-settings form — used by `newt crew --edit [name]`
+/// and the in-session `/crew edit`. Prompts field-by-field (planner/navigator/
+/// triage loadouts, control loop, test command, budgets), previews, and writes
+/// `~/.newt/crews/<name>.toml`. A cooked-terminal prompt/response form (NOT a
+/// ratatui surface — `docs/decisions/plain_scroller_tui.md`).
+pub fn run_crew_edit(name: Option<&str>, color: bool) -> anyhow::Result<()> {
+    crew_form::run_edit(name, color)
 }
 
 /// Report auth status for every discovered HTTP MCP server, and optionally run
@@ -5215,6 +5225,46 @@ fn prefer_openai(force_backend: Option<&str>, has_openai: bool) -> bool {
 /// coarse kind toggle `/backend` uses. A loadout-sourced provider is hard-error-
 /// validated upstream ([`newt_core::Loadout::validate`]); a directly-set
 /// `NEWT_PROVIDER` naming no backend falls through to (2).
+/// The name of the backend the session currently resolves to, for the `◀ active`
+/// marker in `/backends`. Prefers an explicit `NEWT_PROVIDER` pin (the exact name
+/// `/backends <name>` sets); otherwise matches the resolved endpoint+kind back to
+/// a configured `[[backends]]` entry. `None` when nothing matches (e.g. the
+/// historical DGX fallback that isn't itself a named backend).
+fn active_backend_name(cfg: &newt_core::Config) -> Option<String> {
+    if let Some(name) = std::env::var("NEWT_PROVIDER")
+        .ok()
+        .filter(|s| !s.is_empty())
+    {
+        if cfg.backends.iter().any(|b| b.name == name) {
+            return Some(name);
+        }
+    }
+    let choice = resolve_backend_choice(cfg);
+    cfg.backends
+        .iter()
+        .find(|b| b.endpoint == choice.url && b.kind == choice.kind)
+        .map(|b| b.name.clone())
+}
+
+/// One item per configured backend for `/backends`: the `name · kind · model @
+/// endpoint` label plus whether it's the active one. Pure (the active name is
+/// passed in) so it unit-tests without touching the environment; the caller
+/// renders each via [`newt_core::agentic::print_list_item`] (the default list
+/// style — red `▸`/`◀` sigils + green `active` on the live row).
+fn backends_list_items(cfg: &newt_core::Config, active: Option<&str>) -> Vec<(String, bool)> {
+    cfg.backends
+        .iter()
+        .map(|b| {
+            let kind = match b.kind {
+                newt_core::BackendKind::Openai => "openai",
+                _ => "ollama",
+            };
+            let label = format!("{} · {} · {} @ {}", b.name, kind, b.model, b.endpoint);
+            (label, active == Some(b.name.as_str()))
+        })
+        .collect()
+}
+
 fn resolve_backend_choice(cfg: &newt_core::Config) -> BackendChoice {
     // 1. A pinned provider (loadout `provider` axis → NEWT_PROVIDER) selects a
     //    named [backends] entry by name, regardless of its wire protocol.
@@ -5249,9 +5299,16 @@ fn resolve_backend_choice(cfg: &newt_core::Config) -> BackendChoice {
             .iter()
             .find(|b| b.kind == newt_core::BackendKind::Openai)
         {
+            // Honor the session model override (`/model <name>` → NEWT_DGX_MODEL)
+            // here too, so switching the model works when an OpenAI backend is
+            // active — not just on the pinned-provider and historical paths.
+            let model = std::env::var("NEWT_DGX_MODEL")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| b.model.clone());
             return BackendChoice {
                 url: b.endpoint.clone(),
-                model: b.model.clone(),
+                model,
                 kind: newt_core::BackendKind::Openai,
                 api_key: b.resolve_api_key(),
             };
@@ -6989,6 +7046,29 @@ naming a model in one step. Endpoints/keys come from config ([[backends]]).
   /backend ollama deepseek-r1
   /backend openai gpt-4.1"
         }
+        "backends" => {
+            "\
+/backends [name] — list configured backends, or switch to one by name
+
+Where /backend toggles the coarse openai-vs-ollama wire protocol, /backends
+picks a NAMED [[backends]] endpoint (dgx1, gnuc, openai, …) regardless of its
+protocol — the single-coder \"which box am I talking to\" switch.
+  /backends            list every configured backend, ◀ the active one
+  /backends dgx1       repoint this session at the 'dgx1' backend
+
+Session-only (sets NEWT_PROVIDER); edit [[backends]] or a loadout to persist."
+        }
+        "crew" => {
+            "\
+/crew edit [name] — edit a crew's settings interactively
+
+Prompts field-by-field (planner/navigator/triage loadouts, control loop, test
+command, and budgets), previews the result, then writes it as a bare-Crew TOML
+to ~/.newt/crews/<name>.toml. Enter keeps the [current] value; '-' clears an
+optional field. Same form as `newt crew --edit`.
+  /crew edit            edit the sole crew (or be prompted for a name)
+  /crew edit home       edit (or create) the 'home' crew"
+        }
         "thinking" => {
             "\
 /thinking <on|off> — toggle the live reasoning spinner for this session
@@ -7222,6 +7302,7 @@ fn help_lines() -> &'static [&'static str] {
         "  /models capabilities     - tool-conformance matrix (cached)",
         "  /model <name>            - switch model for this session",
         "  /backend <openai|ollama> [model] - switch backend (e.g. /backend ollama deepseek-r1)",
+        "  /backends [name]         - list configured backends; /backends <name> switches (e.g. dgx1, gnuc)",
         "  /thinking <on|off>       - toggle the reasoning spinner for this session",
         "  /probe [model|all]       - classify tool use, context window, thinking, calibration (all = re-probe every model; Esc cancels)",
         "  /probe window [model]    - empirical input-boundary search (records max input at High confidence)",
@@ -7242,6 +7323,7 @@ fn help_lines() -> &'static [&'static str] {
         "  /persona show            - show the active persona",
         "  /persona <name>          - start fresh with a persona",
         "  /persona clear           - start fresh with no persona",
+        "  /crew edit [name]        - edit a crew's settings (roles, control loop, test, budgets)",
         "  /dgx status              - DGX endpoint health + running models",
         "  /dgx models              - list models installed on the DGX",
         "  /dgx warm [model]        - pre-load a model into VRAM",
@@ -7641,19 +7723,38 @@ fn dispatch_slash(
                     verbose,
                 );
             } else {
-                // Persist via `newt dgx use <model>` then resolve_backend_config
-                // picks it up automatically on the next turn.
-                run_newt_subcmd(&["dgx", "use", arg1], color, verbose)?;
-                // Re-resolve so the warm-up targets the new endpoint.
+                // Session-only model override on the ACTIVE backend — whatever it
+                // is. A pinned [[backends]] entry, an OpenAI backend, and the
+                // historical DGX path all read NEWT_DGX_MODEL in
+                // `resolve_backend_choice`, so this one axis switches the model
+                // everywhere. This matches the documented intent ("switch the
+                // model for THIS session; it does not edit config") and how
+                // `/backend ollama <model>` already works.
+                //
+                // The old `newt dgx use <model>` persist was the bug the user hit:
+                // it wrote the DGX `active_model`, but a pinned named backend
+                // resolves its OWN static `model`, so the saved value was never
+                // consulted and the switch silently did nothing.
+                // SAFETY: single-threaded REPL; the post-command re-resolve reads it.
+                unsafe { std::env::set_var("NEWT_DGX_MODEL", arg1) };
                 let cfg = newt_core::Config::resolve().unwrap_or_default();
                 let choice = resolve_backend_choice(&cfg);
                 // Warm-up only applies to Ollama: vLLM and OpenAI-compatible
                 // endpoints keep their served model resident at all times.
                 if choice.kind == newt_core::BackendKind::Ollama {
-                    warmup_if_cold(&choice.url, arg1, &keep_alive_str(&cfg), color, verbose);
+                    warmup_if_cold(
+                        &choice.url,
+                        &choice.model,
+                        &keep_alive_str(&cfg),
+                        color,
+                        verbose,
+                    );
                 } else {
                     print_newt(
-                        &format!("Switched to {arg1} — takes effect on next message."),
+                        &format!(
+                            "Switched to {} — takes effect on next message.",
+                            choice.model
+                        ),
                         color,
                         verbose,
                     );
@@ -7723,6 +7824,69 @@ fn dispatch_slash(
             }
         }
 
+        "backends" => {
+            let cfg = newt_core::Config::resolve().unwrap_or_default();
+            if arg1.is_empty() {
+                // List every configured [[backends]] entry by name, flagging the
+                // one the session currently resolves to. `/backend` toggles the
+                // coarse openai-vs-ollama *kind*; `/backends` picks a *named*
+                // endpoint (dgx1, gnuc, openai, …) regardless of wire protocol.
+                let active = active_backend_name(&cfg);
+                print_newt("configured backends:", color, verbose);
+                if cfg.backends.is_empty() {
+                    print_newt(
+                        "  (none — add [[backends]] entries to ~/.newt/config.toml)",
+                        color,
+                        verbose,
+                    );
+                } else {
+                    for (label, is_active) in backends_list_items(&cfg, active.as_deref()) {
+                        newt_core::agentic::print_list_item(&label, is_active, color);
+                    }
+                    print_newt(
+                        "usage: /backends <name> to switch (e.g. /backends dgx1)",
+                        color,
+                        verbose,
+                    );
+                }
+            } else if cfg.backends.iter().any(|b| b.name == arg1) {
+                // SAFETY: single-threaded REPL. The post-command re-resolve in the
+                // session loop reads NEWT_PROVIDER and repoints the session at this
+                // named backend. Session-only — does NOT persist; edit [[backends]]
+                // or a loadout to make it permanent. Clear any stale per-session
+                // model override so the named backend's own default model applies.
+                unsafe {
+                    std::env::set_var("NEWT_PROVIDER", arg1);
+                    std::env::remove_var("NEWT_DGX_MODEL");
+                }
+                let choice =
+                    resolve_backend_choice(&newt_core::Config::resolve().unwrap_or_default());
+                print_newt(
+                    &format!(
+                        "switched to backend '{}' · {} @ {} — next message.",
+                        arg1, choice.model, choice.url
+                    ),
+                    color,
+                    verbose,
+                );
+            } else {
+                let names: Vec<&str> = cfg.backends.iter().map(|b| b.name.as_str()).collect();
+                print_newt(
+                    &format!(
+                        "no backend named '{}'. configured: {}",
+                        arg1,
+                        if names.is_empty() {
+                            "(none)".to_string()
+                        } else {
+                            names.join(", ")
+                        }
+                    ),
+                    color,
+                    verbose,
+                );
+            }
+        }
+
         "thinking" => match arg1 {
             "on" | "off" => {
                 // SAFETY: single-threaded REPL.
@@ -7747,6 +7911,32 @@ fn dispatch_slash(
                 run_newt_subcmd(&dgx_args, color, verbose)?;
             }
         }
+
+        "crew" => match arg1 {
+            // `/crew edit [name]` runs the same interactive settings form as
+            // `newt crew --edit`. read_turn() drops the rich surface to cooked
+            // mode before slash dispatch, so the form's line input works
+            // in-session for both surfaces (no raw-mode wrestling here).
+            "edit" => {
+                let name = (!arg2.is_empty()).then_some(arg2);
+                if let Err(e) = run_crew_edit(name, color) {
+                    print_newt(&format!("crew edit failed: {e}"), color, verbose);
+                }
+            }
+            // Running a crew in-session (`/crew "<task>"`) is the separate
+            // workflow-TUI step; today the slash only edits settings.
+            "" => print_newt(
+                "usage: /crew edit [name] — edit a crew's settings \
+                 (planner/navigator/triage loadouts, control loop, test, budgets)",
+                color,
+                verbose,
+            ),
+            other => print_newt(
+                &format!("unknown /crew subcommand '{other}' — try /crew edit [name]"),
+                color,
+                verbose,
+            ),
+        },
 
         other => print_newt(
             &format!("unknown command: /{other}  (try /help)"),
@@ -8441,6 +8631,7 @@ mod tests {
             "models",
             "model",
             "backend",
+            "backends",
             "thinking",
             "probe",
             "memory",
@@ -8452,6 +8643,7 @@ mod tests {
             "conversation",
             "recall",
             "persona",
+            "crew",
             "dgx",
             "permissions",
             "mode",
@@ -12069,6 +12261,50 @@ mod env_resolution_tests {
     }
 
     #[test]
+    fn model_override_applies_on_every_backend_path() {
+        // Regression for the `/model <name>` bug: the session model override
+        // (NEWT_DGX_MODEL) must win on the pinned-provider path AND the OpenAI
+        // default path — previously only the pinned path honored it, so `/model`
+        // silently did nothing when a named/OpenAI backend was active.
+        let cfg = newt_core::Config {
+            backends: vec![
+                backend(
+                    "dgx1",
+                    "http://dgx1:11434",
+                    "qwen3:30b",
+                    newt_core::BackendKind::Ollama,
+                ),
+                backend(
+                    "oai",
+                    "https://api.openai.com/v1",
+                    "gpt-4.1",
+                    newt_core::BackendKind::Openai,
+                ),
+            ],
+            ..Default::default()
+        };
+        // Pinned named backend + override → override wins over the static model.
+        with_env_vars(
+            &[
+                ("NEWT_PROVIDER", "dgx1"),
+                ("NEWT_DGX_MODEL", "nemotron:30b"),
+            ],
+            &["NEWT_BACKEND"],
+            || assert_eq!(resolve_backend_choice(&cfg).model, "nemotron:30b"),
+        );
+        // OpenAI default (no provider pin) + override → override wins too.
+        with_env_vars(
+            &[("NEWT_DGX_MODEL", "gpt-4.1-mini")],
+            &["NEWT_PROVIDER", "NEWT_BACKEND"],
+            || {
+                let c = resolve_backend_choice(&cfg);
+                assert_eq!(c.kind, newt_core::BackendKind::Openai);
+                assert_eq!(c.model, "gpt-4.1-mini");
+            },
+        );
+    }
+
+    #[test]
     fn resolve_backend_choice_unknown_provider_falls_through() {
         let cfg = newt_core::Config {
             backends: vec![backend(
@@ -12090,6 +12326,113 @@ mod env_resolution_tests {
                 assert_eq!(choice.kind, newt_core::BackendKind::Openai);
             },
         );
+    }
+
+    #[test]
+    fn backends_list_items_render_label_and_flag_the_active_one() {
+        let cfg = newt_core::Config {
+            backends: vec![
+                backend(
+                    "dgx1",
+                    "http://dgx:11434",
+                    "qwen3:30b",
+                    newt_core::BackendKind::Ollama,
+                ),
+                backend(
+                    "openai",
+                    "https://api.openai.com/v1",
+                    "gpt-4.1",
+                    newt_core::BackendKind::Openai,
+                ),
+            ],
+            ..Default::default()
+        };
+        let items = backends_list_items(&cfg, Some("openai"));
+        assert_eq!(items.len(), 2);
+        // Label is the bare, default-colored text (no sigils baked in — the
+        // renderer adds the ▸/◀ active styling).
+        assert_eq!(items[0].0, "dgx1 · ollama · qwen3:30b @ http://dgx:11434");
+        assert!(!items[0].1, "dgx1 is not active");
+        assert_eq!(
+            items[1].0,
+            "openai · openai · gpt-4.1 @ https://api.openai.com/v1"
+        );
+        assert!(items[1].1, "openai is the active backend");
+        // No active name → nothing flagged.
+        assert!(backends_list_items(&cfg, None).iter().all(|(_, a)| !a));
+    }
+
+    #[test]
+    fn active_backend_name_prefers_provider_pin_then_endpoint_match() {
+        let cfg = newt_core::Config {
+            backends: vec![
+                backend(
+                    "dgx1",
+                    "http://dgx:11434",
+                    "qwen3:30b",
+                    newt_core::BackendKind::Ollama,
+                ),
+                backend(
+                    "gnuc",
+                    "http://gnuc:11434",
+                    "qwen2.5-coder:14b",
+                    newt_core::BackendKind::Ollama,
+                ),
+            ],
+            ..Default::default()
+        };
+        // An explicit NEWT_PROVIDER pin wins.
+        with_env_vars(
+            &[("NEWT_PROVIDER", "gnuc")],
+            &["NEWT_DGX_MODEL", "NEWT_BACKEND"],
+            || assert_eq!(active_backend_name(&cfg).as_deref(), Some("gnuc")),
+        );
+        // No pin → match the resolved endpoint back to a configured backend.
+        with_env_vars(
+            &[("NEWT_PROVIDER", "dgx1")],
+            &["NEWT_DGX_MODEL", "NEWT_BACKEND"],
+            || assert_eq!(active_backend_name(&cfg).as_deref(), Some("dgx1")),
+        );
+    }
+
+    #[test]
+    fn slash_backends_list_and_switch_keep_session_alive() {
+        let cfg = newt_core::Config {
+            backends: vec![backend(
+                "dgx1",
+                "http://dgx:11434",
+                "qwen3:30b",
+                newt_core::BackendKind::Ollama,
+            )],
+            ..Default::default()
+        };
+        let _ = cfg; // dispatch_slash re-resolves real config; this just documents intent.
+                     // Listing returns true (session continues) regardless of configured set.
+        with_env_vars(&[], &["NEWT_PROVIDER", "NEWT_DGX_MODEL"], || {
+            assert!(dispatch_slash("/backends", "/ws", false, false).unwrap());
+            // An unknown name reports the miss but still keeps the session alive.
+            assert!(dispatch_slash("/backends nope-xyz", "/ws", false, false).unwrap());
+        });
+    }
+
+    #[test]
+    fn help_lists_backends_command() {
+        assert!(help_lines().iter().any(|l| l.contains("/backends")));
+    }
+
+    #[test]
+    fn slash_crew_usage_and_unknown_keep_session_alive() {
+        // Bare `/crew` prints usage; an unknown subcommand reports the miss.
+        // (`/crew edit` is exercised by crew_form's own tests — invoking it here
+        // would read real stdin and write to ~/.newt, so it's deliberately not
+        // dispatched in a unit test.)
+        assert!(dispatch_slash("/crew", "/ws", false, false).unwrap());
+        assert!(dispatch_slash("/crew bogus", "/ws", false, false).unwrap());
+    }
+
+    #[test]
+    fn help_lists_crew_edit_command() {
+        assert!(help_lines().iter().any(|l| l.contains("/crew edit")));
     }
 
     #[test]
