@@ -42,15 +42,16 @@ pub fn git_tool_definition() -> serde_json::Value {
             "name": "git",
             "description": "Run a git operation through the embedded engine \
                             (NOT run_command). Local-only: read status/log/diff, \
-                            stage with add, commit, and create branches. Writes \
-                            (add/commit/branch) require the session to permit \
-                            them; network ops are unavailable.",
+                            stage with add, commit, amend the last commit, and \
+                            create branches. Writes (add/commit/amend/branch) \
+                            require the session to permit them; network ops are \
+                            unavailable.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "op": {
                         "type": "string",
-                        "enum": ["status", "log", "diff", "add", "commit", "branch"],
+                        "enum": ["status", "log", "diff", "add", "commit", "amend", "branch"],
                         "description": "The git operation to run."
                     },
                     "paths": {
@@ -60,7 +61,9 @@ pub fn git_tool_definition() -> serde_json::Value {
                     },
                     "message": {
                         "type": "string",
-                        "description": "For op=commit: the commit message."
+                        "description": "For op=commit: the commit message. For \
+                                        op=amend: the reworded message (omit to \
+                                        keep the existing one)."
                     },
                     "name": {
                         "type": "string",
