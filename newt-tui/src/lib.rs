@@ -4230,6 +4230,15 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                     continue;
                 }
                 if task.starts_with('/') {
+                    // Per-command help, intercepted before ANY command runs so
+                    // every command answers `--help`/`-h`/`help` (and `/help
+                    // <cmd>`) uniformly — even the ones handled inline below.
+                    // A bare `/help` falls through to the full command list.
+                    if let Some(topic) = help_request(&task) {
+                        print_command_help(&topic, color, verbose);
+                        println!();
+                        continue;
+                    }
                     // Commands that need direct access to `memory` are handled here
                     // before delegating to the generic slash dispatcher.
                     if task.trim_start_matches('/').starts_with("memory") {
@@ -6853,6 +6862,275 @@ impl Drop for CbreakGuard {
 // Slash command dispatcher
 // ---------------------------------------------------------------------------
 
+/// Map a typed command (incl. aliases) to its help topic. Several commands
+/// share one page (the editor modes; the conversation-end trio).
+fn canonical_help_topic(cmd: &str) -> &str {
+    match cmd {
+        "quit" => "exit",
+        "end" | "restart" => "new",
+        "vi" | "vim" | "emacs" | "nano" | "edit-mode" => "editor",
+        _ => cmd,
+    }
+}
+
+/// A single-page `--help` for one command — usage, what it does, and a couple of
+/// examples. `None` for an unknown topic. Kept terse on purpose: newt's help is
+/// a one-screen reference (the man-page-style browser is gilamonster's job).
+fn command_help_page(cmd: &str) -> Option<&'static str> {
+    let page = match canonical_help_topic(cmd) {
+        "models" => {
+            "\
+/models · /models capabilities — inspect the active endpoint's models
+
+  /models                list models on the active endpoint, ◀ the active one
+  /models capabilities   the matrix: Tool Use, Think (reasoning), Ctx Win,
+                         Safe Ctx, tuning Conf, and tested date
+
+Untested rows show '—'; classify one with /probe <model>. Per-model overrides
+live in [model_tuning] (see /config)."
+        }
+        "model" => {
+            "\
+/model <name> — switch the model for THIS session
+
+Changes the model newt talks to until you exit or switch again; it does not edit
+config. Tab through what's installed with /models.
+  /model qwen3:30b"
+        }
+        "backend" => {
+            "\
+/backend <openai|ollama> [model] — switch the backend wire protocol
+
+Repoint the session at an Ollama or OpenAI-compatible endpoint, optionally
+naming a model in one step. Endpoints/keys come from config ([[backends]]).
+  /backend ollama deepseek-r1
+  /backend openai gpt-4.1"
+        }
+        "thinking" => {
+            "\
+/thinking <on|off> — toggle the live reasoning spinner for this session
+
+On (default on a TTY): chain-of-thought streams dimmed above the answer while
+the model works. Off: just the answer. Persist with [tui] thinking in config."
+        }
+        "probe" => {
+            "\
+/probe [model|all] · /probe window [model] — classify a model empirically
+
+  /probe <model>        warm up, then test: tool conformance, context window,
+                        thinking quirk, token calibration → model-capabilities
+  /probe all            probe every untested model in sequence
+  /probe window <model> empirical input-boundary search (records the max input
+                        it accepted at High confidence)
+
+Results feed the /models capabilities matrix."
+        }
+        "memory" => {
+            "\
+/memory — show context-window and notes usage
+
+Read-only: how full the context window is, persistent NOTES usage, and the
+session compression counters. Add facts with /remember; compact with /compress."
+        }
+        "compress" => {
+            "\
+/compress [focus] — compress the conversation context now
+
+Summarize-and-prune the in-flight context to reclaim window, optionally biased
+toward a topic. Runs automatically when the window fills; this forces it early.
+  /compress
+  /compress the auth refactor"
+        }
+        "remember" => {
+            "\
+/remember <fact> — add a fact to persistent NOTES.md
+
+Writes a durable note the agent carries across turns and sessions (workspace
+NOTES). Survives /new. View usage with /memory.
+  /remember the staging DB is read-only"
+        }
+        "new" => {
+            "\
+/new · /end · /restart — close out this conversation and start fresh
+
+All three end the current conversation (its summary is extracted to memory) and
+begin a new one; the old one will NOT auto-resume next launch but stays in
+/recall. /end and /restart are aliases of /new. To resume-on-restart instead,
+just /exit. To send a final prompt THEN end, use vi :wq."
+        }
+        "conversation" => {
+            "\
+/conversation <sub> — manage saved conversations
+
+  /conversation list              list saved conversations
+  /conversation show <id>         print one
+  /conversation restore <id>      switch the session to it
+  /conversation rename <id> <t>   retitle it
+  /conversation delete <id>       delete it (alias: rm)
+
+ids accept a unique prefix. Search bodies with /recall."
+        }
+        "recall" => {
+            "\
+/recall [query] — browse or search past conversations
+
+  /recall            recent conversations in this workspace
+  /recall <query>    full-text search across this workspace's turns
+
+Read-only and workspace-fenced. Bring one back with /conversation restore <id>."
+        }
+        "persona" => {
+            "\
+/persona <sub> — configured personas
+
+  /persona list        list configured personas
+  /persona show        show the active persona
+  /persona <name>      start a fresh conversation with that persona
+  /persona clear       start fresh with no persona
+
+Setting or clearing a persona starts a new conversation (the system prompt
+changes). Define personas in config."
+        }
+        "dgx" => {
+            "\
+/dgx <sub> — NVIDIA DGX endpoint operations
+
+  /dgx status       endpoint health + currently-loaded models
+  /dgx models       models installed on the DGX
+  /dgx warm [model] pre-load a model into VRAM (cuts first-token latency)
+  /dgx route <task> recommend a formation for a task
+  /dgx doctor       probe every configured endpoint"
+        }
+        "permissions" => {
+            "\
+/permissions — review prompted permission decisions + the active clamp
+
+Read-only: what you've allowed/denied this session and the mode's authority
+floor. Durable grants are made by editing [tui.permissions] in config, not here."
+        }
+        "mode" => {
+            "\
+/mode [name] — enter a named mode (skill + authority clamp)
+
+  /mode <name>   load that mode's skill and clamp authority to its floor
+  /mode          show the active mode
+  /mode off      clear it
+
+A mode can only NARROW authority, never widen it."
+        }
+        "loadout" => {
+            "\
+/loadout — show the active loadout
+
+Prints the declared axes (backend, model, persona, mode, …) and what each
+actually resolved to, so you can see why the session is configured as it is."
+        }
+        "workspace" => {
+            "\
+/workspace — print the current workspace path
+
+The workspace fences conversations, recall, and NOTES. It's the directory newt
+was launched in unless overridden."
+        }
+        "config" => {
+            "\
+/config — dump the resolved configuration (secrets redacted)
+
+Shows the effective config after merging /etc/newt, ~/.newt, and ./.newt — the
+source of truth for backends, loadouts, model tuning, and [tui] settings.
+api_key_file/env values are redacted."
+        }
+        "prompt" => {
+            "\
+/prompt · /prompt set \"<tmpl>\" · /prompt reset — customize the input prompt
+
+  /prompt                  list tokens ($MODEL/$DATE/…, \\m/\\t/\\M/…) + current
+  /prompt set \"<template>\"  set the prompt for this session
+  /prompt reset            revert to [tui] prompt / the built-in default
+
+Tokens: \\t time · \\m model · \\M edit mode · \\w workspace · \\u user · \\h host ·
+\\v version. Persist by putting a template in [tui] prompt (prefer the $NAME
+macros there to dodge TOML escaping)."
+        }
+        "editor" => {
+            "\
+/vi · /emacs · /nano — switch line-editor key bindings for this session
+
+  /vi      modal vi keys (Esc=NORMAL; i/a/o insert; :w send, :wq send+end+quit)
+  /emacs   emacs/readline keys (Enter sends; Ctrl-O newline; C-x C-c exit)
+  /nano    nano-style (Enter sends; ^X exit; ^G help)
+
+Persist with [tui] edit_mode. Press Ctrl-h/^G/:help in-editor for the cheatsheet."
+        }
+        "version" => {
+            "\
+/version — print the newt-agent version."
+        }
+        "exit" => {
+            "\
+/exit · /quit (or bare exit/quit, Ctrl-D) — leave the session
+
+Ends the session; with conversation persistence on, the SAME conversation
+auto-resumes next launch. To start fresh next time, use /end (or vi :wq) first."
+        }
+        "help" => {
+            "\
+/help [command] — command help
+
+  /help            list every command
+  /help <command>  this page for one command (same as /<command> --help)
+
+Add --help (or -h) to any command for its page."
+        }
+        _ => return None,
+    };
+    Some(page)
+}
+
+/// Print one command's `--help` page; `true` when a page exists. Unknown topics
+/// get a one-line miss so a typo doesn't fall through to the wrong handler.
+fn print_command_help(cmd: &str, color: bool, verbose: bool) -> bool {
+    match command_help_page(cmd) {
+        Some(page) => {
+            print_newt(
+                &format!("/{} help", canonical_help_topic(cmd)),
+                color,
+                verbose,
+            );
+            for line in page.lines() {
+                println!("{line}");
+            }
+            true
+        }
+        None => {
+            print_newt(
+                &format!("no help for '/{cmd}' — /help lists every command"),
+                color,
+                verbose,
+            );
+            false
+        }
+    }
+}
+
+/// `(topic, arg)` from a slash line if it is asking for help — `/<cmd> --help`,
+/// `/<cmd> -h`, `/<cmd> help`, or `/help <cmd>`. `None` when it's an ordinary
+/// command. Pure so the dispatch interception is unit-testable.
+fn help_request(task: &str) -> Option<String> {
+    let body = task.trim_start_matches('/');
+    let mut parts = body.split_whitespace();
+    let cmd = parts.next().unwrap_or("");
+    let rest: Vec<&str> = parts.collect();
+    if cmd == "help" {
+        // `/help <cmd>` → that cmd's page; bare `/help` is the full list (None).
+        return rest.first().map(|c| c.to_string());
+    }
+    if rest.iter().any(|a| matches!(*a, "--help" | "-h" | "help")) {
+        return Some(cmd.to_string());
+    }
+    None
+}
+
 fn help_lines() -> &'static [&'static str] {
     &[
         "  /models                  - list models on the active endpoint",
@@ -6893,10 +7171,11 @@ fn help_lines() -> &'static [&'static str] {
         "  /prompt set \"<template>\"  - set the prompt for this session; /prompt reset to revert",
         "  /vi  /emacs  /nano       - switch line-editor key bindings for this session",
         "  /version                 - print newt version",
-        "  /help                    - this message",
         "  ! <command>              - run a host command interactively (e.g. ! pa login) — you, not the agent",
         "  Esc                      - while the agent is working: interrupt the turn, back to your prompt",
         "  /exit  /quit  exit  quit - leave the session",
+        "",
+        "  Add --help (or -h) to any command — or /help <command> — for its detail page.",
     ]
 }
 
@@ -8023,6 +8302,62 @@ mod tests {
     #[test]
     fn slash_help_returns_true() {
         assert!(dispatch_slash("/help", "/ws", false, false).unwrap());
+    }
+
+    #[test]
+    fn help_request_recognizes_every_form() {
+        assert_eq!(help_request("/models --help").as_deref(), Some("models"));
+        assert_eq!(help_request("/models -h").as_deref(), Some("models"));
+        assert_eq!(help_request("/probe help").as_deref(), Some("probe"));
+        assert_eq!(help_request("/help models").as_deref(), Some("models"));
+        // Bare /help is the full list, not a per-command page.
+        assert_eq!(help_request("/help"), None);
+        // Ordinary commands (and their args) are not help requests.
+        assert_eq!(help_request("/models capabilities"), None);
+        assert_eq!(help_request("/model qwen3:30b"), None);
+    }
+
+    #[test]
+    fn command_help_covers_every_listed_command_and_folds_aliases() {
+        for cmd in [
+            "models",
+            "model",
+            "backend",
+            "thinking",
+            "probe",
+            "memory",
+            "compress",
+            "remember",
+            "new",
+            "end",
+            "restart",
+            "conversation",
+            "recall",
+            "persona",
+            "dgx",
+            "permissions",
+            "mode",
+            "loadout",
+            "workspace",
+            "config",
+            "prompt",
+            "vi",
+            "emacs",
+            "nano",
+            "version",
+            "exit",
+            "quit",
+            "help",
+        ] {
+            assert!(command_help_page(cmd).is_some(), "no help page for /{cmd}");
+        }
+        assert!(command_help_page("bogus").is_none());
+        // Aliases share one page.
+        assert_eq!(command_help_page("restart"), command_help_page("new"));
+        assert_eq!(command_help_page("emacs"), command_help_page("vi"));
+        assert_eq!(command_help_page("quit"), command_help_page("exit"));
+        // The unknown-topic miss is reported (returns false).
+        assert!(!print_command_help("bogus", false, false));
     }
 
     #[test]
