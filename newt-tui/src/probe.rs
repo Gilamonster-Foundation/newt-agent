@@ -1390,10 +1390,10 @@ pub fn print_capabilities_table(
     // Header.
     let sep = "─".repeat(name_w);
     println!(
-        "  {:<name_w$}  {:>6}  {:<8}  {:>8}  {:>8}  Conf  Tested",
-        "Model", "Size", "Tool Use", "Ctx Win", "Safe Ctx"
+        "  {:<name_w$}  {:>6}  {:<8}  {:<5}  {:>8}  {:>8}  Conf  Tested",
+        "Model", "Size", "Tool Use", "Think", "Ctx Win", "Safe Ctx"
     );
-    println!("  {sep}  ──────  ────────  ────────  ────────  ────  ──────────");
+    println!("  {sep}  ──────  ────────  ─────  ────────  ────────  ────  ──────────");
 
     for m in models {
         let is_active = m.name == active;
@@ -1403,7 +1403,7 @@ pub fn print_capabilities_table(
         } else {
             format!("{:>6}", m.param_size)
         };
-        let (conformance_str, ctx_win_str, safe_ctx_str, conf_str, date_str) =
+        let (conformance_str, think_str, ctx_win_str, safe_ctx_str, conf_str, date_str) =
             match cache.get(&m.name) {
                 Some(e) => {
                     let ctx = e
@@ -1420,8 +1420,16 @@ pub fn print_capabilities_table(
                         TuneConfidence::Medium => " Med".to_string(),
                         TuneConfidence::High => "High".to_string(),
                     };
+                    // A reasoning/"thinking" model: it has been observed
+                    // returning chain-of-thought tokens (emits_thinking sticky).
+                    let think = if e.emits_thinking == Some(true) {
+                        "✓".to_string()
+                    } else {
+                        "—".to_string()
+                    };
                     (
                         e.conformance.symbol().to_string(),
+                        think,
                         ctx,
                         safe,
                         conf,
@@ -1430,6 +1438,7 @@ pub fn print_capabilities_table(
                 }
                 None => (
                     "—       ".to_string(),
+                    "—".to_string(),
                     "       —".to_string(),
                     "       —".to_string(),
                     "  — ".to_string(),
@@ -1439,7 +1448,7 @@ pub fn print_capabilities_table(
 
         let name = &m.name;
         let row = format!(
-            "  {name:<name_w$}{active_tag}  {size}  {conformance_str}  {ctx_win_str}  {safe_ctx_str}  {conf_str}  {date_str}"
+            "  {name:<name_w$}{active_tag}  {size}  {conformance_str}  {think_str:<5}  {ctx_win_str}  {safe_ctx_str}  {conf_str}  {date_str}"
         );
         if color && is_active {
             use crossterm::style::Color as CtColor;
@@ -1470,6 +1479,8 @@ pub fn print_capabilities_table(
     println!("  ✗ none    ignores tools, answers directly");
     println!("  —         untested  →  /probe <model> to classify");
     println!();
+    println!("  Think ✓   reasoning model — emits chain-of-thought tokens (auto-detected;");
+    println!("            newt streams it dimmed and keeps it out of the saved answer)");
     println!("  Ctx Win   declared context window from Ollama /api/show");
     println!("  Safe Ctx  num_ctx sent to Ollama (auto-tuned; human-overridable in config)");
     println!("  Conf      tuning confidence: None | Low | Med | High");
@@ -2454,12 +2465,23 @@ mod tests {
                 ..Default::default()
             },
         );
+        // A reasoning model: emits_thinking → the ✓ in the Think column.
+        cache.insert(
+            "m-think".to_string(),
+            CapabilityEntry {
+                conformance: ToolConformance::Native,
+                tested_date: "2026-06-10".to_string(),
+                emits_thinking: Some(true),
+                ..Default::default()
+            },
+        );
         let models: Vec<ModelInfo> = [
             ("m-none", "7B"),
             ("m-low", "13B"),
             ("m-med", ""),
             ("m-high", "32.8B"),
             ("m-noctx", "3B"),
+            ("m-think", "30B"),
             ("m-untested", "1B"),
         ]
         .into_iter()
