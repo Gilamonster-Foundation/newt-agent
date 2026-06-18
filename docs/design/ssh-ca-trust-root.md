@@ -128,6 +128,30 @@ pub struct SshCaveats {
 - Keep to **hosts + keys** for now (per the directive); `actions` (port-forward,
   subsystem, exec class) is a later axis.
 
+**Built:** `SshCaveats { hosts, keys }` ships in `newt-core/src/ssh_caveats.rs`
+(sibling of `GitCaveats`) with `top`/`none`(fail-closed default)/`meet`/`leq`/
+`permits_host`/`permits_key`.
+
+### 5.1 The read/write split for git-over-SSH (operator requirement)
+
+git push/pull/fetch ride SSH, so two lattices compose and `git_over_ssh_permitted()`
+gates a network op by **both**:
+
+- **`SshCaveats`** gates the **transport** (which hosts/keys). Disable it
+  (`hosts = none`) → **all** git network blocked: push *and* pull.
+- **`GitCaveats`** gates the **verb** (`fetch` vs `push` are separate gates) → the
+  read/write split: grant `fetch` not `push` to allow pulls while blocking pushes.
+
+| want | `SshCaveats.hosts` | `GitCaveats` |
+|---|---|---|
+| block all SSH (push + pull) | `none` | (anything) |
+| allow pull, block push | host allowed | `fetch=true, push=false` |
+| full git over SSH | host allowed | `fetch=true, push=true` |
+
+A future `SshCaveats` `actions` axis can *also* split at the SSH-command level
+(`git-upload-pack` = read vs `git-receive-pack` = write) for defense in depth; today
+the verb split lives in `GitCaveats`.
+
 ## 6. Reconciliations (so the design isn't self-contradictory)
 
 - **"All mesh over SSH" vs keeping iroh** → resolved by §3–4: the SSH *key* is the
@@ -155,14 +179,16 @@ Long-haul networking is exactly what the open deviations gate
 - `SshCaveats` is the *capability* layer; the deviation ratchet is the
   *enforcement-readiness* layer. Both must pass.
 
-## 8. Engine notes (russh)
+## 8. Engine notes (russh) — spike done: GO
 
-- Pure-Rust, no mandatory C deps; **client + server**; ed25519; crates.io. MSRV to
-  confirm in a spike (like grit; the workspace floor is now 1.88 after #452).
-- **OpenSSH certificate validation is not in russh's own auth API** — it rides the
-  `ssh-key` crate (RustCrypto) that russh already pulls. So cert-chain verification
-  (CA signature, principals, validity window, KRL check) is **glue we write in the
-  `server::Handler`**. This is the main integration point to prove in the spike.
+- **Spike verdict (2026-06-18):** `russh 0.61` + `ssh-key 0.6.7` build clean on
+  **1.88** (the workspace floor — no MSRV problem), pure-Rust, crates.io. russh
+  provides **client + server**; ed25519.
+- **OpenSSH certificate support is in `ssh-key`** (which russh already pulls):
+  `ssh_key::Certificate` + `CertType{User,Host}`, principals, validity window, and
+  signature verification. russh's own auth API doesn't wire certs, so cert-chain
+  verification (CA signature, principals, `valid_after/before`, KRL) is **glue we
+  write in the `server::Handler`** over `ssh-key`'s primitives — confirmed feasible.
 
 ## 9. Phasing + relation to grit
 
@@ -177,18 +203,21 @@ Long-haul networking is exactly what the open deviations gate
   5. The SSH-CA **cert identity** — sign/verify member certs; GitHub/GitLab/LDAP anchor.
   6. The `Transport` trait + iroh/ssh **selection** (reachability + platform aware).
 
-## 10. Open questions
+## 10. Decisions + open questions
 
-- **Cert format:** adopt OpenSSH certs *as* the mesh `CertChain`, or bridge
-  agent-mesh-protocol's `CertChain` ↔ OpenSSH cert? (russh/`ssh-key` speak OpenSSH;
-  agent-mesh has its own ed25519 cert.)
+**Decided (operator, 2026-06-18):**
+- **Cert format → adopt OpenSSH certs** as the mesh cert (bridge/replace
+  agent-mesh-protocol's ed25519 `CertChain`). russh/`ssh-key` speak OpenSSH natively.
+- **Ownership → the `Transport` trait + SSH server live in agent-mesh** (the sibling
+  repo), not newt. The trust root (`agent_identity` / UserKey) spans both; `SshCaveats`
+  (the capability surface) lives in newt-core.
+
+**Still open:**
 - **Where `Caveats` live in a cert:** a custom OpenSSH cert `extension` vs a
   side-channel keyed by fingerprint.
 - **KRL distribution:** a signed revocation topic on the mesh (mesh-remote §5.4).
 - **Directory abstraction:** `github.com/.keys` polling/caching + a multi-provider
   (GitLab / LDAP / SSO) trait.
-- **Ownership:** does the `Transport` trait + SSH live in agent-mesh (likely) or
-  newt? The trust root (`agent_identity` / UserKey) spans both.
 - **Transport advertisement/negotiation** wire format.
 
 ## 11. Out of scope
