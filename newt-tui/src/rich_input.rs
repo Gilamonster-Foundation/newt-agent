@@ -53,7 +53,7 @@ use std::time::Duration;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Layout};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
@@ -887,21 +887,57 @@ fn draw(f: &mut Frame, textarea: &TextArea, editor: &Editor, gutter: Option<u16>
     let prompt = prompt_line(editor);
     let g = resolve_gutter(gutter, area.width);
     if g >= GUTTER_W {
-        // Wide enough to hold the inline prompt: prompt in the left gutter, input
-        // to its right (continuation lines align under the input).
+        // Wide gutter (opt-in): prompt in a fixed left column, input to its
+        // right — continuation lines align under the input at column `g`.
         let [gutter_area, input] =
             Layout::horizontal([Constraint::Length(g), Constraint::Min(1)]).areas(area);
         f.render_widget(Paragraph::new(prompt), gutter_area);
         f.render_widget(textarea, input);
     } else {
-        // Narrow (incl. 0): stack the prompt on its own row, then indent the
-        // input by `g` columns (0 = flush-left, the old squished behavior).
-        let [prow, rest] =
-            Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(area);
-        f.render_widget(Paragraph::new(prompt), prow);
-        let [_pad, input] =
-            Layout::horizontal([Constraint::Length(g), Constraint::Min(1)]).areas(rest);
-        f.render_widget(textarea, input);
+        // Overhang (the default): the prompt prefixes the FIRST input row inline
+        // (`❯ this`); continuation rows hang-indent by `g` columns (default 1).
+        draw_overhang(f, area, &prompt, textarea, g);
+    }
+}
+
+/// Render the prompt as an inline prefix on row 0 with the input flowing after
+/// it, and continuation rows hang-indented by `g` columns. tui-textarea can't
+/// vary indent per row (it fills one rect), so we render the buffer ourselves
+/// as a `Paragraph` and place the block cursor by hand. A single horizontal
+/// scroll keeps the cursor visible on an over-long line (the prompt scrolls off
+/// with it, shell-style).
+fn draw_overhang(f: &mut Frame, area: Rect, prompt: &Line<'static>, textarea: &TextArea, g: u16) {
+    let pw = prompt.width() as u16;
+    let (crow, ccol) = textarea.cursor();
+    let indent = |i: usize| if i == 0 { pw } else { g };
+
+    let mut rows: Vec<Line> = Vec::with_capacity(textarea.lines().len());
+    for (i, text) in textarea.lines().iter().enumerate() {
+        if i == 0 {
+            let mut spans = prompt.spans.clone();
+            spans.push(Span::raw(text.clone()));
+            rows.push(Line::from(spans));
+        } else {
+            rows.push(Line::from(vec![
+                Span::raw(" ".repeat(g as usize)),
+                Span::raw(text.clone()),
+            ]));
+        }
+    }
+
+    // Horizontal scroll so the cursor stays on screen for a long line.
+    let cur_x = indent(crow).saturating_add(ccol as u16);
+    let last_col = area.width.saturating_sub(1);
+    let scroll_x = cur_x.saturating_sub(last_col);
+    f.render_widget(Paragraph::new(rows).scroll((0, scroll_x)), area);
+
+    // Block (reverse) cursor, matching the widget path's look.
+    let cx = area.x + cur_x - scroll_x;
+    let cy = area.y + crow as u16;
+    if cx <= area.right().saturating_sub(1) && cy <= area.bottom().saturating_sub(1) {
+        if let Some(cell) = f.buffer_mut().cell_mut((cx, cy)) {
+            cell.set_style(Style::default().add_modifier(Modifier::REVERSED));
+        }
     }
 }
 
@@ -994,16 +1030,10 @@ impl RichSurface {
         let mut textarea = new_textarea(self.edit);
         let mut editor = Editor::new(self.edit);
         loop {
-            // Grow/shrink the inline viewport to the input. When the gutter is
-            // too narrow to hold the inline prompt, it needs its own row on top.
-            let (cols, _) = crossterm::terminal::size()?;
-            let prompt_rows = if resolve_gutter(self.gutter, cols) >= GUTTER_W {
-                0
-            } else {
-                1
-            };
-            let want = (textarea.lines().len() as u16 + prompt_rows)
-                .clamp(1, MAX_INPUT_ROWS + prompt_rows);
+            // Grow/shrink the inline viewport to the input. The prompt is always
+            // inline now — on the first row, either in a wide left gutter or as
+            // an overhang prefix — so it never needs a row of its own.
+            let want = (textarea.lines().len() as u16).clamp(1, MAX_INPUT_ROWS);
             if want != cur_h {
                 // Blank the CURRENT region before resizing. ratatui reserves
                 // space for a taller inline viewport by scrolling whatever is on
@@ -1149,6 +1179,36 @@ mod tests {
             ed.input(key(c), ta);
         }
         ed.input(special(KeyCode::Enter), ta)
+    }
+
+    #[test]
+    fn overhang_prompt_is_inline_with_one_space_hanging_continuation() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let editor = vi_editor();
+        // Two input lines (as if a `o`/newline added a continuation).
+        let ta = TextArea::new(vec!["this".to_string(), "more".to_string()]);
+        let mut term = Terminal::new(TestBackend::new(40, 2)).unwrap();
+        // gutter = 1 → the overhang layout (the default).
+        term.draw(|f| draw(f, &ta, &editor, Some(1))).unwrap();
+        let buf = term.backend().buffer();
+        let row = |y: u16| -> String {
+            (0..40)
+                .map(|x| buf.cell((x, y)).unwrap().symbol().to_string())
+                .collect::<String>()
+        };
+        // Row 0: the prompt prefixes the first input line inline (`❯ this`).
+        assert!(
+            row(0).contains("❯ this"),
+            "first input line rides on the prompt row: {:?}",
+            row(0)
+        );
+        // Row 1: continuation hangs by exactly one space, not the prompt width.
+        assert!(
+            row(1).starts_with(" more"),
+            "continuation is 1-space hang-indented: {:?}",
+            row(1)
+        );
     }
 
     #[test]
