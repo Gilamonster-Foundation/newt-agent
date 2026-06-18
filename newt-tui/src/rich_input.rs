@@ -264,6 +264,17 @@ impl Vi {
                 Step::Continue
             }
             Mode::Normal => {
+                // Esc in NORMAL cancels any incomplete command — a pending
+                // operator (`d`/`c`/`y`), char-search (`f`…), `r`/`g`, or a
+                // building count — and ends a one-shot i_CTRL-O so we stay in
+                // NORMAL. Idle Esc is then a harmless no-op (extra presses just
+                // confirm NORMAL), matching vim.
+                if key.code == KeyCode::Esc {
+                    self.pending = Pending::None;
+                    self.count = 0;
+                    self.insert_normal = false;
+                    return Step::Continue;
+                }
                 if ctrl && key.code == KeyCode::Char('r') {
                     ta.redo();
                     return Step::Continue;
@@ -1246,6 +1257,32 @@ mod tests {
         assert_eq!(ed.label(), "vi INSERT", "resumes INSERT after one command");
         type_chars(&mut ed, &mut ta, "X");
         assert_eq!(ta.lines(), &["Xhello".to_string()], "inserted at head");
+    }
+
+    #[test]
+    fn vi_esc_cancels_incomplete_command() {
+        // A pending operator is cancelled by Esc — the next key is a fresh
+        // command, not the operator's motion.
+        let (mut ed, mut ta) = vi_line("hello world");
+        ed.input(key('d'), &mut ta); // pending d
+        ed.input(special(KeyCode::Esc), &mut ta); // cancel
+        ed.input(key('w'), &mut ta); // plain motion now, not `dw`
+        assert_eq!(
+            ta.lines(),
+            &["hello world".to_string()],
+            "Esc cancelled the d operator"
+        );
+
+        // A building count is cancelled by Esc.
+        let (mut ed, mut ta) = vi_line("abcdef");
+        ed.input(key('3'), &mut ta); // count = 3
+        ed.input(special(KeyCode::Esc), &mut ta); // cancel count
+        ed.input(key('x'), &mut ta); // deletes 1, not 3
+        assert_eq!(
+            ta.lines(),
+            &["bcdef".to_string()],
+            "Esc cancelled the count"
+        );
     }
 
     #[test]
