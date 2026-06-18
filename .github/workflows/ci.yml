@@ -1,6 +1,6 @@
 name: CI
 
-# HOOK PARITY: The lint/test/rich-tui/coverage jobs are mirrored by
+# HOOK PARITY: The lint/test/lean-build/coverage jobs are mirrored by
 # .githooks/pre-push (via `just check` + `just cov-ci`).
 # When editing those, update the push hook to match.
 # EXCEPTION: the `windows` job is CI-only — it cannot be mirrored locally (no
@@ -77,32 +77,23 @@ jobs:
         # off by default; mirrored in the justfile `test`/`check` recipes.
         run: cargo test --workspace --features newt-data/kernel
 
-  rich-tui:
-    name: rich-tui feature (lint + test)
+  lean-build:
+    name: lean strip-down build (--no-default-features)
     runs-on: ubuntu-latest
-    # PIPELINE PARITY: mirrors the two `rich-tui` steps in the justfile `check`
-    # recipe (and the pre-push hook via `just check`). The TTY rich input
-    # surface (issue #416) is off by default; this job ensures the feature still
-    # builds, lints, and passes its unit tests so it can't rot. Kept OUT of the
-    # coverage job on purpose: its inline event loop is unit-untestable and would
-    # drag the floor down.
+    # PIPELINE PARITY: mirrors the `--no-default-features` step in the justfile
+    # `check` recipe (and the pre-push hook via `just check`). rich-tui (issue
+    # #416) is now a DEFAULT feature, so the lint/test/coverage jobs above
+    # already cover it; this job guards the LEAN wyvern/headless build (rich
+    # surface stripped out) so it can't rot.
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - name: clippy (rich-tui)
+      - name: clippy (lean, no default features)
         if: always()
-        run: cargo clippy -p newt-tui --features rich-tui --all-targets -- -D warnings
-      - name: test (rich-tui)
-        if: always()
-        run: cargo test -p newt-tui --features rich-tui
-      - name: clippy newt binary (rich-tui forward)
-        # Proves the feature unifies into the shipped `newt` binary via the
-        # newt-cli forward, not just the leaf crate. Mirrors `just check`.
-        if: always()
-        run: cargo clippy -p newt-agent --features rich-tui -- -D warnings
+        run: cargo clippy -p newt-agent --no-default-features --all-targets -- -D warnings
 
   coverage:
     name: Workspace coverage (cargo-llvm-cov)
