@@ -36,9 +36,7 @@ release:
 # Lean / strip-down build: just install-lean   (rustyline-only, wyvern tier)
 install dest=`echo $HOME/bin` features="":
     cargo build --release --bin newt --bin newt-mcp-server {{ if features == "" { "" } else { "--features " + features } }}
-    mkdir -p {{dest}}
-    cp target/release/newt {{dest}}/newt
-    cp target/release/newt-mcp-server {{dest}}/newt-mcp-server
+    @just _place-binaries {{dest}}
     @echo "Installed: {{dest}}/newt  {{dest}}/newt-mcp-server {{ if features == "" { "" } else { "[features: " + features + "]" } }}"
     @case ":$PATH:" in *":{{dest}}:"*) ;; *) echo "Note: {{dest}} is not in PATH — add:  export PATH={{dest}}:\$PATH" ;; esac
 
@@ -46,10 +44,22 @@ install dest=`echo $HOME/bin` features="":
 # wyvern/headless tier. Same as `just install` but with `--no-default-features`.
 install-lean dest=`echo $HOME/bin`:
     cargo build --release --no-default-features --bin newt --bin newt-mcp-server
+    @just _place-binaries {{dest}}
+    @echo "Installed (lean, no rich-tui): {{dest}}/newt  {{dest}}/newt-mcp-server"
+
+# Place freshly built release binaries into DEST with a CLEAN inode and (on
+# macOS) a fresh ad-hoc signature. Why not a plain `cp` over the old binary:
+# on Apple Silicon, overwriting a running/launched binary in place invalidates
+# the ad-hoc code signature the kernel's AMFI launch cache remembers, so the
+# NEXT launch dies with "Killed: 9" even though `codesign -v` still passes on
+# disk. Removing first gives a new inode; re-signing ad-hoc clears the cache.
+# `codesign` exists only on macOS, so the re-sign is a no-op elsewhere.
+_place-binaries dest:
     mkdir -p {{dest}}
+    rm -f {{dest}}/newt {{dest}}/newt-mcp-server
     cp target/release/newt {{dest}}/newt
     cp target/release/newt-mcp-server {{dest}}/newt-mcp-server
-    @echo "Installed (lean, no rich-tui): {{dest}}/newt  {{dest}}/newt-mcp-server"
+    @if command -v codesign >/dev/null 2>&1; then codesign --force --sign - {{dest}}/newt {{dest}}/newt-mcp-server && echo "re-signed ad-hoc (macOS AMFI)"; fi
 
 # Remove the binaries `just install` placed in DEST (default: ~/bin) — the
 # inverse of `just install`, so you can guarantee which build is on PATH.
