@@ -26,11 +26,13 @@ mod crew;
 mod dispatch;
 mod panel;
 mod probe;
+mod roster;
 mod team;
 pub use crew::{run_crew, CrewConfig, CrewOutcome, CrewStatus, Edit, Workspace};
 pub use dispatch::{ChatReply, ChatRequest, Dispatcher, LocalDispatcher};
 pub use panel::{run_panel, PanelConfig, PanelOutcome, PanelStatus, Verify, VoiceSpec, Vote};
 pub use probe::{Prober, TcpProber};
+pub use roster::{compose_from_pool, compose_roster, ModelPrior, RosterMode, RosterSpec};
 pub use team::{run_team, SubtaskResult, SubtaskStatus, TeamConfig, TeamOutcome, TeamStatus};
 
 /// Liveness of a backend.
@@ -209,6 +211,22 @@ impl BackendPool {
     #[must_use]
     pub fn backends(&self) -> &[PoolBackend] {
         &self.backends
+    }
+
+    /// The distinct models the environment **actually offers right now** — every
+    /// model on a live backend, deduplicated, sorted. This is the "what it saw in
+    /// its environment" survey the roster composer reads.
+    #[must_use]
+    pub fn live_models(&self) -> Vec<String> {
+        let mut models: Vec<String> = self
+            .backends
+            .iter()
+            .filter(|b| b.is_live())
+            .flat_map(|b| b.models.iter().cloned())
+            .collect();
+        models.sort();
+        models.dedup();
+        models
     }
 
     /// Live backends that can serve `(tier, model_pin)`.
