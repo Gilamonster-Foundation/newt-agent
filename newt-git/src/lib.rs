@@ -310,6 +310,50 @@ impl GitEngine {
         Ok(commit_info(&oid, &commit))
     }
 
+    /// `git commit --amend` — replace HEAD with a new commit carrying the
+    /// current index tree, keeping HEAD's PARENTS (not HEAD itself). `message`
+    /// `None` reuses HEAD's existing message (amend-to-add-files); `Some` rewords
+    /// it. Requires `commit_local`. Errors on an unborn / detached HEAD.
+    pub fn amend(
+        &self,
+        caps: &GitCaveats,
+        message: Option<&str>,
+        author: &Author,
+    ) -> Result<CommitInfo, GitError> {
+        if !caps.permits_commit() {
+            return Err(GitError::Denied("commit"));
+        }
+        let head = self
+            .head_oid()?
+            .ok_or(GitError::Unsupported("nothing to amend (unborn HEAD)"))?;
+        let head_commit = parse_commit(&self.repo.odb.read(&head)?.data)?;
+        let index = self.repo.load_index()?;
+        let tree = write_tree_from_index(&self.repo.odb, &index, "")?;
+        let ident = author.ident_now();
+        let commit = CommitData {
+            tree,
+            // The defining difference from `commit`: keep HEAD's parents so the
+            // amended commit replaces HEAD rather than stacking on top of it.
+            parents: head_commit.parents.clone(),
+            author: ident.clone(),
+            committer: ident,
+            author_raw: Vec::new(),
+            committer_raw: Vec::new(),
+            encoding: None,
+            message: message.map(str::to_string).unwrap_or(head_commit.message),
+            raw_message: None,
+        };
+        let oid = self
+            .repo
+            .odb
+            .write(ObjectKind::Commit, &serialize_commit(&commit))?;
+        match read_head(&self.repo.git_dir)? {
+            Some(branch_ref) => write_ref(&self.repo.git_dir, &branch_ref, &oid)?,
+            None => return Err(GitError::Unsupported("cannot amend on a detached HEAD")),
+        }
+        Ok(commit_info(&oid, &commit))
+    }
+
     /// `git branch <name>` — create `refs/heads/<name>` at the current HEAD commit.
     /// Requires `refs` to permit that ref name. Returns the full ref name.
     pub fn branch(&self, caps: &GitCaveats, name: &str) -> Result<String, GitError> {
@@ -445,6 +489,20 @@ impl newt_core::agentic::GitTool for LocalGitTool {
                 let signed = sign_message(msg, self.coauthor.as_deref());
                 let c = eng.commit(caps, &signed, &self.author).map_err(s)?;
                 Ok(format!("committed {}: {}", c.short_id, c.summary))
+            }
+            "amend" => {
+                // Optional message: present → reword (signed); absent → keep
+                // HEAD's existing message (which already carries its trailer, so
+                // no re-sign needed).
+                let msg = args
+                    .get("message")
+                    .and_then(|v| v.as_str())
+                    .filter(|m| !m.trim().is_empty());
+                let signed = msg.map(|m| sign_message(m, self.coauthor.as_deref()));
+                let c = eng
+                    .amend(caps, signed.as_deref(), &self.author)
+                    .map_err(s)?;
+                Ok(format!("amended {}: {}", c.short_id, c.summary))
             }
             "branch" => {
                 let name = args
@@ -829,6 +887,90 @@ mod tests {
             .unwrap();
         assert!(committed.starts_with("committed "), "got: {committed}");
         assert!(committed.contains("add b"), "got: {committed}");
+    }
+
+    #[test]
+    fn local_git_tool_amend_rewords_head_without_adding_a_commit() {
+        let dir = repo_with_commit();
+        std::fs::write(dir.path().join("d.txt"), "d\n").unwrap();
+        let t = tool(dir.path());
+        t.dispatch(
+            "add",
+            &serde_json::json!({"paths": ["d.txt"]}),
+            &GitCaveats::top(),
+        )
+        .unwrap();
+        t.dispatch(
+            "commit",
+            &serde_json::json!({"message": "add d"}),
+            &GitCaveats::top(),
+        )
+        .unwrap();
+        let count_before = commit_count(dir.path());
+
+        // Reword the last commit.
+        let out = t
+            .dispatch(
+                "amend",
+                &serde_json::json!({"message": "add d (reworded)"}),
+                &GitCaveats::top(),
+            )
+            .unwrap();
+        assert!(out.starts_with("amended "), "got: {out}");
+        // Same number of commits (HEAD replaced, not stacked).
+        assert_eq!(commit_count(dir.path()), count_before);
+        // The new subject is in HEAD.
+        let body = head_message(dir.path());
+        assert!(body.contains("add d (reworded)"), "got: {body}");
+        assert!(
+            body.contains("Co-authored-by: qwen3:30b"),
+            "amend re-signs the new message: {body}"
+        );
+    }
+
+    #[test]
+    fn local_git_tool_amend_keeps_message_when_omitted() {
+        let dir = repo_with_commit();
+        let t = tool(dir.path());
+        // Amend with no message → keep "first commit".
+        t.dispatch("amend", &serde_json::json!({}), &GitCaveats::top())
+            .unwrap();
+        assert!(head_message(dir.path()).contains("first commit"));
+    }
+
+    #[test]
+    fn local_git_tool_amend_denied_on_read_only() {
+        let dir = repo_with_commit();
+        let t = tool(dir.path());
+        let err = t
+            .dispatch(
+                "amend",
+                &serde_json::json!({"message": "x"}),
+                &GitCaveats::read_only(),
+            )
+            .unwrap_err();
+        assert!(
+            err.contains("denied") && err.contains("commit"),
+            "got: {err}"
+        );
+    }
+
+    fn commit_count(dir: &Path) -> usize {
+        let out = Command::new("git")
+            .current_dir(dir)
+            .args(["rev-list", "--count", "HEAD"])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().parse().unwrap()
+    }
+
+    fn head_message(dir: &Path) -> String {
+        let out = Command::new("git")
+            .current_dir(dir)
+            .args(["log", "-1", "--pretty=%B"])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).to_string()
     }
 
     #[test]
