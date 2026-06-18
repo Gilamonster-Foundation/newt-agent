@@ -1234,6 +1234,12 @@ pub(crate) enum ReadOutcome {
     Interrupted,
     /// Ctrl-D / EOF — end of input; the loop exits cleanly.
     Eof,
+    /// vi `:wq` after its turn ran — exit cleanly AND end the active
+    /// conversation (mark `end_reason`) so the next launch starts fresh.
+    /// Only the rich surface produces this; the rustyline path never does, so
+    /// in the lean (`--no-default-features`) build it is constructed nowhere.
+    #[cfg_attr(not(feature = "rich-tui"), allow(dead_code))]
+    EndAndQuit,
     /// The terminal degraded (EMFILE, or a readline panic from fd exhaustion).
     /// Carries a ready-to-print, multi-line message; the loop prints it and
     /// breaks **without** a clean exit (no close-time network round-trip on a
@@ -4084,6 +4090,10 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
     // `exit`, `/exit`) as opposed to the EMFILE/readline-panic crash paths —
     // only a clean exit runs the close-time extraction.
     let mut clean_exit = false;
+    // Set by a `:wq` (ReadOutcome::EndAndQuit): on exit, mark the active
+    // conversation ended so the next launch starts fresh — the same close-out
+    // `/end` does, but folded into the quit.
+    let mut end_conversation_on_exit = false;
 
     // 17.7 session-start resume. Both arms go through the SAME restore
     // implementation `/conversation restore` uses — one restore path.
@@ -4318,9 +4328,19 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                         println!();
                         continue;
                     }
-                    if task.trim_start_matches('/') == "new" {
+                    // `/new` · `/end` · `/restart` all close out the current
+                    // conversation and start a fresh one (the three are aliases
+                    // per the user's "end/restart vocabulary" choice). The only
+                    // difference is the `end_reason` recorded and the wording.
+                    let close_word = match task.trim_start_matches('/') {
+                        "new" => Some("new"),
+                        "end" => Some("end"),
+                        "restart" => Some("restart"),
+                        _ => None,
+                    };
+                    if let Some(reason) = close_word {
                         // 19.4: extraction runs BEFORE the reset below wipes
-                        // the history it reads. Failure never blocks /new.
+                        // the history it reads. Failure never blocks the reset.
                         let close_complete = make_loop_summarizer(
                             inf_url.clone(),
                             inf_model.clone(),
@@ -4339,8 +4359,26 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                         }) {
                             print_newt(&notice, color, verbose);
                         }
+                        // Mark the OUTGOING conversation ended so the next launch
+                        // does not auto-resume it (`latest_open` skips ended
+                        // rows) — yet it stays in `/recall`. Only when it was
+                        // actually persisted: an empty conversation (no turn
+                        // saved yet) has no row to resolve.
+                        if let Some(store) = conversation_store.as_ref() {
+                            if store.exists(&active_conversation_id).unwrap_or(false) {
+                                if let Err(e) =
+                                    store.end_conversation(&active_conversation_id, reason)
+                                {
+                                    print_newt(
+                                        &format!("warning: could not mark conversation ended: {e}"),
+                                        color,
+                                        verbose,
+                                    );
+                                }
+                            }
+                        }
                         turns_this_conversation = 0;
-                        let msg = handle_new_conversation(
+                        let started = handle_new_conversation(
                             workspace,
                             &mut memory,
                             &mut system,
@@ -4349,6 +4387,16 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                             &mut compress_state,
                             &mut session_opted_fresh,
                         );
+                        // `/new` keeps its historical message verbatim; the
+                        // end/restart aliases say so explicitly (the previous
+                        // conversation won't resume next launch).
+                        let msg = if reason == "new" {
+                            started
+                        } else {
+                            format!(
+                                "Ended this conversation — it won't resume next launch. {started}"
+                            )
+                        };
                         print_newt(&msg, color, verbose);
                         surface.save_history();
                         println!();
@@ -4926,6 +4974,13 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                 clean_exit = true;
                 break;
             }
+            ReadOutcome::EndAndQuit => {
+                // vi `:wq` — its turn already ran; end the conversation on the
+                // way out so the next launch starts fresh.
+                clean_exit = true;
+                end_conversation_on_exit = true;
+                break;
+            }
             ReadOutcome::Fatal(msg) => {
                 // Raw mode already disabled by the surface; clean_exit stays
                 // false so the broken terminal skips the close-time round-trip.
@@ -4956,6 +5011,17 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
             ))
         }) {
             print_newt(&notice, color, verbose);
+        }
+    }
+
+    // vi `:wq` close-out: mark the active conversation ended so `latest_open`
+    // skips it next launch (it stays in `/recall`). Runs after extraction so
+    // the summary still reads the turns. Only when persisted (a turn saved).
+    if end_conversation_on_exit {
+        if let Some(store) = conversation_store.as_ref() {
+            if store.exists(&active_conversation_id).unwrap_or(false) {
+                let _ = store.end_conversation(&active_conversation_id, "wq");
+            }
         }
     }
 
@@ -6015,7 +6081,11 @@ fn resume_session_conversation(
 /// a timestamp comparison. `Ok(None)` when the workspace has no saved
 /// conversations yet (fresh start, no banner).
 fn auto_resume_latest(ctx: &mut ConversationCommandContext<'_>) -> anyhow::Result<Option<String>> {
-    let Some(latest) = ctx.store.list()?.pop() else {
+    // `latest_open` skips conversations ended via `/end` · `/restart` · `:wq`
+    // (their `end_reason` is set) so an explicitly closed-out conversation is
+    // never silently re-entered — yet it stays in `list()` for `/recall`. With
+    // no open conversation left, the session starts fresh (`Ok(None)`).
+    let Some(latest) = ctx.store.latest_open()? else {
         return Ok(None);
     };
     resume_session_conversation(ctx, &latest.id).map(Some)
@@ -6597,7 +6667,8 @@ fn help_lines() -> &'static [&'static str] {
         "  /memory                  - show context window / notes usage",
         "  /compress [focus]        - compress context now, optionally focused on a topic",
         "  /remember <fact>         - add a fact to persistent NOTES.md",
-        "  /new                     - start a fresh conversation",
+        "  /new                     - start a fresh conversation (ends the current one; it won't auto-resume)",
+        "  /end  /restart           - aliases for /new — close out this conversation and start fresh",
         "  /conversation list       - list saved conversations",
         "  /conversation show <id>  - show a saved conversation",
         "  /conversation restore <id> - restore a saved conversation",
