@@ -29,14 +29,23 @@ release:
     cargo build --workspace --release
 
 # Install newt + newt-mcp-server release binaries to DEST (default: ~/bin).
-# Override: just install /usr/local/bin
-install dest=`echo $HOME/bin`:
-    cargo build --release --bin newt --bin newt-mcp-server
+# Override dest:        just install /usr/local/bin
+# Opt into features:    just install ~/bin newt-agent/rich-tui
+#   (the rich-tui TTY surface is off by default — pass it here to bake it into
+#    the installed binary so plain `newt code` uses the rich inline editor.)
+install dest=`echo $HOME/bin` features="":
+    cargo build --release --bin newt --bin newt-mcp-server {{ if features == "" { "" } else { "--features " + features } }}
     mkdir -p {{dest}}
     cp target/release/newt {{dest}}/newt
     cp target/release/newt-mcp-server {{dest}}/newt-mcp-server
-    @echo "Installed: {{dest}}/newt  {{dest}}/newt-mcp-server"
+    @echo "Installed: {{dest}}/newt  {{dest}}/newt-mcp-server {{ if features == "" { "" } else { "[features: " + features + "]" } }}"
     @case ":$PATH:" in *":{{dest}}:"*) ;; *) echo "Note: {{dest}} is not in PATH — add:  export PATH={{dest}}:\$PATH" ;; esac
+
+# Remove the binaries `just install` placed in DEST (default: ~/bin) — the
+# inverse of `just install`, so you can guarantee which build is on PATH.
+uninstall dest=`echo $HOME/bin`:
+    rm -f {{dest}}/newt {{dest}}/newt-mcp-server
+    @echo "Removed newt + newt-mcp-server from {{dest}}"
 
 # Remove all Cargo build artefacts (force a clean rebuild / free disk space).
 clean:
