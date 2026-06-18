@@ -216,8 +216,14 @@ pub enum Command {
     /// Run a multi-LLM crew on a task (navigate → plan → verify → triage), in an
     /// isolated git worktree. Exit 0 = passed, 2 = needs human review, 1 = error.
     Crew {
-        /// The task for the crew (a coding-task description).
-        task: String,
+        /// The task for the crew (a coding-task description). In `--edit` mode
+        /// this slot is instead the crew NAME to edit (or use `--crew`).
+        task: Option<String>,
+        /// Edit a crew's settings interactively (planner/navigator/triage
+        /// loadouts, control loop, test command, budgets) and write
+        /// `~/.newt/crews/<name>.toml`. No task is run.
+        #[arg(long, default_value_t = false)]
+        edit: bool,
         /// Crew name from `[crews.<name>]`. Omit when exactly one crew is defined.
         #[arg(long)]
         crew: Option<String>,
@@ -462,12 +468,22 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         Command::Mcp => run_mcp().await,
         Command::Crew {
             task,
+            edit,
             crew,
             dir,
             test,
             max_attempts,
             dry_run,
         } => {
+            if edit {
+                // Edit-settings mode: the name comes from --crew, else the
+                // positional slot. No task is run.
+                let name = crew.or(task);
+                return newt_tui::run_crew_edit(name.as_deref(), newt_tui::color_supported());
+            }
+            let task = task.ok_or_else(|| {
+                anyhow::anyhow!("a task is required (or pass --edit to edit crew settings)")
+            })?;
             let code = crew::run_cli(crew::CrewArgs {
                 task,
                 crew,

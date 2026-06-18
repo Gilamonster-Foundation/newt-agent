@@ -34,7 +34,7 @@ pub use compress::{
     compress_user_initiated, CompressCounters, CompressState, ManualCompressOutcome, SummarizeFn,
     SummarizeFuture, Summarizer, SUMMARY_END_MARKER, SUMMARY_PREFIX,
 };
-pub use display::{print_newt, NEWT_ORANGE_CT};
+pub use display::{print_list_item, print_newt, NEWT_ORANGE_CT};
 pub use driver::{
     TurnDriver, TurnDriverConfig, TurnDriverError, TurnOutcome, TurnStatus,
     VISIBLE_TRANSCRIPT_ROLES,
