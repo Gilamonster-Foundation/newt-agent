@@ -2,6 +2,7 @@
 //! Moved verbatim from `newt-tui` in Step 9.7 — the Caveats enforcement,
 //! shrink guard, build-check feedback, and agent-bridle routing are unchanged.
 
+use super::crew_tool::CrewRunner;
 use super::display::{print_denied, print_tool_call, print_tool_output};
 use super::git_tool::GitTool;
 use super::mcp::McpTools;
@@ -145,6 +146,7 @@ pub(crate) fn merged_tool_definitions(
     with_recall: bool,
     with_memory_fetch: bool,
     with_git: bool,
+    with_team: bool,
 ) -> serde_json::Value {
     let mut defs = match tool_definitions() {
         serde_json::Value::Array(a) => a,
@@ -163,6 +165,12 @@ pub(crate) fn merged_tool_definitions(
     // binary is in a git repo and supplied LocalGitTool) — presence gate.
     if with_git {
         defs.push(super::git_tool::git_tool_definition());
+    }
+    // #479: the `compose_roster` + `crew` tools are advertised only when a
+    // CrewRunner is injected (the `/team` toggle) — presence gate.
+    if with_team {
+        defs.push(super::crew_tool::compose_roster_tool_definition());
+        defs.push(super::crew_tool::crew_tool_definition());
     }
     defs.extend(mcp.tool_defs());
     serde_json::Value::Array(defs)
@@ -207,6 +215,8 @@ pub(crate) fn is_hallucination(tool_name: &str, args: &serde_json::Value) -> boo
             | "recall"
             | "memory_fetch"
             | "git"
+            | "compose_roster"
+            | "crew"
     )
 }
 
@@ -689,6 +699,7 @@ pub async fn execute_tool(
     permission_gate: Option<&mut dyn PermissionGate>,
     exec_floor: Option<&crate::caveats::Scope<String>>,
     git_tool: Option<&dyn GitTool>,
+    crew_runner: Option<&dyn CrewRunner>,
 ) -> String {
     // Remote MCP tools (namespaced `server__tool`) route to their server before
     // the built-in match. They carry no Caveats leash in this build.
@@ -752,6 +763,25 @@ pub async fn execute_tool(
                 out
             }
             None => "unknown tool: git (no git surface in this session)".to_string(),
+        },
+
+        // Agent-callable orchestration (#479): compose_roster proposes a crew
+        // roster from the live environment; crew dispatches a crew/team on a task
+        // and returns the diff + verify status for the overseer to review. Both
+        // route through the injected CrewRunner, which runs spawned crews under
+        // `meet`-attenuated caveats. Same presence-gating as `git` (the `/team`
+        // toggle) — without an injected impl the tools were never advertised.
+        "compose_roster" | "crew" => match crew_runner {
+            Some(runner) => {
+                print_tool_call(name, &args.to_string(), color);
+                let out = match runner.dispatch(name, args, caveats) {
+                    Ok(rendered) => rendered,
+                    Err(e) => format!("error: {e}"),
+                };
+                print_tool_output(&out, tool_output_lines, color);
+                out
+            }
+            None => format!("unknown tool: {name} (no crew surface in this session)"),
         },
 
         "run_command" => {
@@ -1224,7 +1254,7 @@ mod tests {
 
     #[test]
     fn merged_tool_definitions_with_empty_mcp_is_builtin_set() {
-        let merged = merged_tool_definitions(&NoMcp, false, false, false, false);
+        let merged = merged_tool_definitions(&NoMcp, false, false, false, false, false);
         let names: Vec<&str> = merged
             .as_array()
             .unwrap()
@@ -1261,10 +1291,10 @@ mod tests {
         let base = tool_definitions();
         assert!(!names(&base).contains(&"save_note"), "got: {base}");
         // … nor in the merged set without a sink …
-        let without = merged_tool_definitions(&NoMcp, false, false, false, false);
+        let without = merged_tool_definitions(&NoMcp, false, false, false, false, false);
         assert!(!names(&without).contains(&"save_note"));
         // … but a sink advertises it.
-        let with = merged_tool_definitions(&NoMcp, true, false, false, false);
+        let with = merged_tool_definitions(&NoMcp, true, false, false, false, false);
         assert!(names(&with).contains(&"save_note"), "got: {with}");
     }
 
@@ -1282,12 +1312,12 @@ mod tests {
         }
         let base = tool_definitions();
         assert!(!names(&base).contains(&"recall"), "got: {base}");
-        let without = merged_tool_definitions(&NoMcp, false, false, false, false);
+        let without = merged_tool_definitions(&NoMcp, false, false, false, false, false);
         assert!(!names(&without).contains(&"recall"));
-        let with = merged_tool_definitions(&NoMcp, false, true, false, false);
+        let with = merged_tool_definitions(&NoMcp, false, true, false, false, false);
         assert!(names(&with).contains(&"recall"), "got: {with}");
         // The two gates are independent: both on advertises both.
-        let both = merged_tool_definitions(&NoMcp, true, true, false, false);
+        let both = merged_tool_definitions(&NoMcp, true, true, false, false, false);
         assert!(names(&both).contains(&"save_note"));
         assert!(names(&both).contains(&"recall"));
     }
@@ -1307,13 +1337,13 @@ mod tests {
         let base = tool_definitions();
         assert!(!names(&base).contains(&"memory_fetch"), "got: {base}");
         // Flag off (every existing caller, the inert default) → not advertised.
-        let without = merged_tool_definitions(&NoMcp, false, false, false, false);
+        let without = merged_tool_definitions(&NoMcp, false, false, false, false, false);
         assert!(!names(&without).contains(&"memory_fetch"));
         // Flag on → advertised.
-        let with = merged_tool_definitions(&NoMcp, false, false, true, false);
+        let with = merged_tool_definitions(&NoMcp, false, false, true, false, false);
         assert!(names(&with).contains(&"memory_fetch"), "got: {with}");
         // Independent of the save_note / recall gates: all three on lists all.
-        let all = merged_tool_definitions(&NoMcp, true, true, true, false);
+        let all = merged_tool_definitions(&NoMcp, true, true, true, false, false);
         assert!(names(&all).contains(&"save_note"));
         assert!(names(&all).contains(&"recall"));
         assert!(names(&all).contains(&"memory_fetch"));
@@ -1563,10 +1593,20 @@ mod tests {
                 .filter_map(|d| d["function"]["name"].as_str())
                 .collect()
         }
-        let with = merged_tool_definitions(&NoMcp, false, false, false, true);
+        let with = merged_tool_definitions(&NoMcp, false, false, false, true, false);
         assert!(names(&with).contains(&"git"), "with_git advertises git");
-        let without = merged_tool_definitions(&NoMcp, false, false, false, false);
+        let without = merged_tool_definitions(&NoMcp, false, false, false, false, false);
         assert!(!names(&without).contains(&"git"), "no git without the gate");
+        // #479: the /team toggle advertises both crew tools, and only then.
+        let team = merged_tool_definitions(&NoMcp, false, false, false, false, true);
+        assert!(
+            names(&team).contains(&"crew") && names(&team).contains(&"compose_roster"),
+            "with_team advertises crew + compose_roster"
+        );
+        assert!(
+            !names(&without).contains(&"crew"),
+            "no crew without the gate"
+        );
     }
 
     #[test]
@@ -1653,6 +1693,7 @@ mod execute_tool_branch_tests {
             None,
             None,
             git,
+            None, // crew_runner
         )
         .await
     }
@@ -1699,6 +1740,77 @@ mod execute_tool_branch_tests {
         assert!(out.contains("unknown tool: git"), "got: {out}");
     }
 
+    // #479: the agent-callable crew/compose_roster tools route through the
+    // injected CrewRunner — same presence-gating + dispatch shape as `git`.
+    struct StubCrew;
+    impl crate::agentic::CrewRunner for StubCrew {
+        fn dispatch(
+            &self,
+            op: &str,
+            _args: &serde_json::Value,
+            _caveats: &Caveats,
+        ) -> Result<String, String> {
+            match op {
+                "compose_roster" => Ok("proposed roster: planner <- qwen3-coder:30b".to_string()),
+                "crew" => Ok("crew ran: diff +1/-0, status PASS".to_string()),
+                other => Err(format!("unknown op: {other}")),
+            }
+        }
+    }
+
+    async fn run_crew_tool(
+        name: &str,
+        args: serde_json::Value,
+        crew: Option<&dyn crate::agentic::CrewRunner>,
+    ) -> String {
+        let ws = tempfile::TempDir::new().unwrap();
+        execute_tool(
+            name,
+            &args,
+            &ws.path().to_string_lossy(),
+            false,
+            20,
+            &caveats_rw(ws.path()),
+            &mut NoMcp,
+            None, // build_check_cmd
+            None, // note_sink
+            None, // recall_source
+            None, // memory_source
+            None, // permission_gate
+            None, // exec_floor
+            None, // git_tool
+            crew,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn crew_arm_dispatches_when_injected() {
+        let out = run_crew_tool(
+            "crew",
+            serde_json::json!({ "task": "do X" }),
+            Some(&StubCrew),
+        )
+        .await;
+        assert!(
+            out.contains("crew ran") && out.contains("PASS"),
+            "got: {out}"
+        );
+        let out = run_crew_tool(
+            "compose_roster",
+            serde_json::json!({ "mode": "crew" }),
+            Some(&StubCrew),
+        )
+        .await;
+        assert!(out.contains("proposed roster"), "got: {out}");
+    }
+
+    #[tokio::test]
+    async fn crew_arm_without_injection_is_unknown_tool() {
+        let out = run_crew_tool("crew", serde_json::json!({ "task": "x" }), None).await;
+        assert!(out.contains("unknown tool: crew"), "got: {out}");
+    }
+
     async fn run_tool(
         name: &str,
         args: serde_json::Value,
@@ -1721,6 +1833,7 @@ mod execute_tool_branch_tests {
             None,
             None,
             None, // git_tool
+            None, // crew_runner
         )
         .await
     }
@@ -2038,6 +2151,7 @@ mod execute_tool_branch_tests {
             Some(gate),
             None,
             None, // git_tool
+            None, // crew_runner
         )
         .await
     }
@@ -2260,6 +2374,7 @@ mod execute_tool_branch_tests {
             Some(&mut gate),
             None,
             None, // git_tool
+            None, // crew_runner
         )
         .await;
         assert_eq!(
@@ -2353,6 +2468,7 @@ mod execute_tool_branch_tests {
             None,
             None,
             None, // git_tool
+            None, // crew_runner
         )
         .await;
         assert_eq!(sink.calls, vec!["add:workspace builds with just check"]);
@@ -2409,6 +2525,7 @@ mod execute_tool_branch_tests {
             None,
             None,
             None, // git_tool
+            None, // crew_runner
         )
         .await;
         assert_eq!(
@@ -2468,6 +2585,7 @@ mod execute_tool_branch_tests {
             None,
             None,
             None, // git_tool
+            None, // crew_runner
         )
         .await;
         assert_eq!(out, "the exact note body");
@@ -2581,6 +2699,7 @@ mod disable_ocap_tests {
             None,
             exec_floor,
             None, // git_tool
+            None, // crew_runner
         )
         .await
     }
@@ -2990,6 +3109,7 @@ mod disable_ocap_tests {
             Some(&mut gate),
             None,
             None, // git_tool
+            None, // crew_runner
         )
         .await;
         assert_eq!(out, "no-prompt\n");

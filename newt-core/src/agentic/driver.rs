@@ -397,6 +397,7 @@ async fn run_one_turn(
         // a consumer that wants cancellation drives its own ChatCtx.
         cancel: None,
         git_tool: None,
+        crew_runner: None,
     };
     // NoMcp: the cowork driver advertises only the built-in tools. A consumer
     // that wants live MCP tools assembles its own ChatCtx.
