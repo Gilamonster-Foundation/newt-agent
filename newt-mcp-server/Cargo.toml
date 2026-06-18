@@ -21,6 +21,9 @@ path = "src/lib.rs"
 
 [dependencies]
 newt-core.workspace = true
+# The embedded git engine, exposed as the MCP `git` tool (a full coder dev-kit
+# surface), gated by GitCaveats derived from the granted leash.
+newt-git.workspace = true
 newt-inference.workspace = true
 newt-tools.workspace = true
 anyhow.workspace = true
