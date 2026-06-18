@@ -26,10 +26,12 @@ mod crew;
 mod dispatch;
 mod panel;
 mod probe;
+mod team;
 pub use crew::{run_crew, CrewConfig, CrewOutcome, CrewStatus, Edit, Workspace};
 pub use dispatch::{ChatReply, ChatRequest, Dispatcher, LocalDispatcher};
 pub use panel::{run_panel, PanelConfig, PanelOutcome, PanelStatus, Verify, VoiceSpec, Vote};
 pub use probe::{Prober, TcpProber};
+pub use team::{run_team, SubtaskResult, SubtaskStatus, TeamConfig, TeamOutcome, TeamStatus};
 
 /// Liveness of a backend.
 ///

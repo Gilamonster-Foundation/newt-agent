@@ -1,0 +1,357 @@
+//! team.rs — the **plan → task → crew** loop (the "team" front door).
+//!
+//! Where a [crew](crate::run_crew) solves ONE task and a [panel](crate::run_panel)
+//! runs N voices on one task, a **team** takes a whole GOAL: a **lead** model
+//! decomposes it into an ordered list of subtasks, and each subtask is then handed
+//! to a crew. Subtasks run **sequentially over a shared workspace** (subtask N
+//! builds on N-1), and the team **stops at the first blocked subtask** — a plan
+//! can't proceed past a step the crew couldn't land. The aggregate is honest:
+//! `AllPassed` only if every crew passed; otherwise `Blocked` with the remaining
+//! subtasks marked `Skipped`.
+//!
+//! "Different LLM, different personas, different tasks": the lead uses its own
+//! model; the crew's planner/navigator/triage use theirs (each a pinned model /
+//! loadout, routed by the [`BackendPool`]); each subtask is distinct work. Pure
+//! orchestration over the existing seams — unit-testable with mocks, no network.
+
+use crate::{run_crew, BackendPool, ChatRequest, CrewConfig, CrewStatus, Dispatcher, Workspace};
+use newt_core::Tier;
+use serde::{Deserialize, Serialize};
+
+/// How a team runs: which model leads (decomposes), and the crew that executes
+/// each subtask.
+#[derive(Debug, Clone)]
+pub struct TeamConfig {
+    /// The model that decomposes the goal into subtasks.
+    pub lead_model: String,
+    /// The tier the lead runs at.
+    pub lead_tier: Tier,
+    /// The crew (planner/navigator/triage models + budget) that runs each subtask.
+    pub crew: CrewConfig,
+    /// Cap on how many subtasks the plan may have.
+    pub max_subtasks: usize,
+}
+
+/// What happened to one subtask.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubtaskStatus {
+    /// The crew landed it (verification passed).
+    Passed,
+    /// The crew exhausted its budget — escalate.
+    NeedsHumanReview,
+    /// Not attempted because an earlier subtask blocked the plan.
+    Skipped,
+}
+
+/// One subtask's record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubtaskResult {
+    pub subtask: String,
+    pub status: SubtaskStatus,
+    /// Planning rounds the crew spent (0 if skipped / not started).
+    pub attempts: u32,
+}
+
+/// Terminal disposition of a team run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TeamStatus {
+    /// Every subtask's crew passed.
+    AllPassed,
+    /// A subtask blocked; the rest were skipped — honest `NeedsHumanReview`.
+    Blocked,
+    /// The lead produced no usable plan (unreachable, or empty/garbled).
+    NoPlan,
+}
+
+/// The result of a team run.
+#[derive(Debug, Clone)]
+pub struct TeamOutcome {
+    pub status: TeamStatus,
+    /// The decomposed subtasks, in order.
+    pub plan: Vec<String>,
+    /// Per-subtask records (same order as `plan`).
+    pub results: Vec<SubtaskResult>,
+}
+
+#[derive(Deserialize, Default)]
+struct PlanOut {
+    #[serde(default)]
+    subtasks: Vec<String>,
+}
+
+/// Run the team on `goal`: lead decomposes → a crew runs each subtask over the
+/// shared `workspace`, stopping at the first block.
+pub async fn run_team(
+    pool: &BackendPool,
+    dispatcher: &dyn Dispatcher,
+    workspace: &mut dyn Workspace,
+    cfg: &TeamConfig,
+    goal: &str,
+) -> TeamOutcome {
+    // 1. DECOMPOSE — the lead breaks the goal into ordered subtasks.
+    let req = ChatRequest::new()
+        .system(
+            "You are a tech lead. Break the GOAL into an ordered list of small, \
+             independently-verifiable engineering subtasks. Reply with ONLY JSON \
+             {\"subtasks\":[\"...\", \"...\"]} — concrete, imperative, smallest-first.",
+        )
+        .user(format!(
+            "GOAL:\n{goal}\n\nAt most {} subtasks.",
+            cfg.max_subtasks
+        ));
+    let plan: Vec<String> = match pool
+        .run_role(dispatcher, cfg.lead_tier, &cfg.lead_model, req)
+        .await
+    {
+        Some(f) => parse_plan(&f.result.content, cfg.max_subtasks),
+        None => {
+            return TeamOutcome {
+                status: TeamStatus::NoPlan,
+                plan: Vec::new(),
+                results: Vec::new(),
+            }
+        }
+    };
+    if plan.is_empty() {
+        return TeamOutcome {
+            status: TeamStatus::NoPlan,
+            plan,
+            results: Vec::new(),
+        };
+    }
+
+    // 2. DISPATCH — a crew per subtask, sequential over the shared workspace,
+    //    stopping at the first block (a plan can't proceed past a failed step).
+    let mut results = Vec::with_capacity(plan.len());
+    let mut blocked = false;
+    for subtask in &plan {
+        if blocked {
+            results.push(SubtaskResult {
+                subtask: subtask.clone(),
+                status: SubtaskStatus::Skipped,
+                attempts: 0,
+            });
+            continue;
+        }
+        let outcome = run_crew(pool, dispatcher, workspace, &cfg.crew, subtask).await;
+        let status = match outcome.status {
+            CrewStatus::Passed => SubtaskStatus::Passed,
+            CrewStatus::NeedsHumanReview => {
+                blocked = true;
+                SubtaskStatus::NeedsHumanReview
+            }
+        };
+        results.push(SubtaskResult {
+            subtask: subtask.clone(),
+            status,
+            attempts: outcome.attempts,
+        });
+    }
+
+    let status = if blocked {
+        TeamStatus::Blocked
+    } else {
+        TeamStatus::AllPassed
+    };
+    TeamOutcome {
+        status,
+        plan,
+        results,
+    }
+}
+
+/// Parse the lead's reply into a subtask list: try the whole string as JSON, then
+/// the outermost `{..}` (local models often wrap JSON in prose). Capped at `max`.
+fn parse_plan(content: &str, max: usize) -> Vec<String> {
+    let parsed: PlanOut = serde_json::from_str(content)
+        .ok()
+        .or_else(|| {
+            let (i, j) = (content.find('{')?, content.rfind('}')?);
+            (j > i)
+                .then(|| serde_json::from_str(&content[i..=j]).ok())
+                .flatten()
+        })
+        .unwrap_or_default();
+    parsed
+        .subtasks
+        .into_iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .take(max)
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{ChatReply, Edit, Health, PoolBackend, StaticSource};
+    use async_trait::async_trait;
+    use newt_core::BackendKind;
+    use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// In-memory workspace: `run_test` passes iff `target.rs` contains "GOOD".
+    struct MemWs {
+        files: BTreeMap<String, String>,
+    }
+    impl MemWs {
+        fn new() -> Self {
+            let mut files = BTreeMap::new();
+            files.insert("target.rs".to_string(), "BAD".to_string());
+            Self { files }
+        }
+    }
+    impl Workspace for MemWs {
+        fn files(&self) -> Vec<String> {
+            self.files.keys().cloned().collect()
+        }
+        fn read(&self, p: &str) -> Option<String> {
+            self.files.get(p).cloned()
+        }
+        fn apply(&mut self, edits: &[Edit]) -> Vec<String> {
+            edits
+                .iter()
+                .map(|e| {
+                    self.files.insert(e.path.clone(), e.new_content.clone());
+                    e.path.clone()
+                })
+                .collect()
+        }
+        fn run_test(&self) -> (bool, String) {
+            match self.files.get("target.rs") {
+                Some(c) if c.contains("GOOD") => (true, "ok".into()),
+                _ => (false, "needs GOOD".into()),
+            }
+        }
+    }
+
+    /// Mock dispatcher: the lead returns a 2-subtask plan; the crew roles converge
+    /// (planner emits GOOD) UNLESS `block` is set (planner always emits BAD).
+    struct TeamMock {
+        plan_json: String,
+        block: bool,
+        planner_calls: AtomicUsize,
+    }
+    #[async_trait]
+    impl Dispatcher for TeamMock {
+        async fn dispatch(
+            &self,
+            _b: &PoolBackend,
+            model: &str,
+            _req: ChatRequest,
+        ) -> anyhow::Result<ChatReply> {
+            let content = match model {
+                "lead" => self.plan_json.clone(),
+                "nav" => r#"{"relevant_files":["target.rs"]}"#.to_string(),
+                "triage" => r#"{"summary":"missing GOOD","next_action":"set GOOD"}"#.to_string(),
+                "planner" => {
+                    let n = self.planner_calls.fetch_add(1, Ordering::SeqCst);
+                    // block => never GOOD; else GOOD from the first attempt.
+                    if self.block {
+                        r#"{"edits":[{"path":"target.rs","new_content":"BAD"}]}"#.to_string()
+                    } else {
+                        let _ = n;
+                        r#"{"edits":[{"path":"target.rs","new_content":"GOOD"}]}"#.to_string()
+                    }
+                }
+                other => panic!("unexpected model {other}"),
+            };
+            Ok(ChatReply {
+                content,
+                model_id: model.to_string(),
+                usage: None,
+            })
+        }
+    }
+
+    fn pool() -> BackendPool {
+        BackendPool::from_source(&StaticSource {
+            backends: vec![
+                PoolBackend::new("dgx", "http://dgx:11434", BackendKind::Ollama)
+                    .with_models(["lead", "nav", "planner", "triage"])
+                    .with_health(Health::Up),
+            ],
+        })
+    }
+
+    fn cfg() -> TeamConfig {
+        TeamConfig {
+            lead_model: "lead".into(),
+            lead_tier: Tier::Complex,
+            crew: CrewConfig {
+                navigator_model: "nav".into(),
+                planner_model: "planner".into(),
+                triage_model: "triage".into(),
+                max_attempts: 2,
+            },
+            max_subtasks: 5,
+        }
+    }
+
+    #[tokio::test]
+    async fn decomposes_and_runs_every_subtask() {
+        let p = pool();
+        let d = TeamMock {
+            plan_json: r#"{"subtasks":["do A","do B"]}"#.into(),
+            block: false,
+            planner_calls: AtomicUsize::new(0),
+        };
+        let mut ws = MemWs::new();
+        let out = run_team(&p, &d, &mut ws, &cfg(), "build the thing").await;
+        assert_eq!(out.status, TeamStatus::AllPassed);
+        assert_eq!(out.plan, vec!["do A".to_string(), "do B".to_string()]);
+        assert!(out
+            .results
+            .iter()
+            .all(|r| r.status == SubtaskStatus::Passed));
+    }
+
+    #[tokio::test]
+    async fn blocks_and_skips_the_rest() {
+        let p = pool();
+        let d = TeamMock {
+            plan_json: r#"prose {"subtasks":["do A","do B","do C"]} more"#.into(),
+            block: true, // the crew never converges -> first subtask blocks
+            planner_calls: AtomicUsize::new(0),
+        };
+        let mut ws = MemWs::new();
+        let out = run_team(&p, &d, &mut ws, &cfg(), "goal").await;
+        assert_eq!(out.status, TeamStatus::Blocked);
+        assert_eq!(out.results[0].status, SubtaskStatus::NeedsHumanReview);
+        assert_eq!(out.results[1].status, SubtaskStatus::Skipped);
+        assert_eq!(out.results[2].status, SubtaskStatus::Skipped);
+    }
+
+    #[tokio::test]
+    async fn no_plan_when_lead_unreachable() {
+        // Pool serves the crew models but NOT "lead" -> run_role None -> NoPlan.
+        let p = BackendPool::from_source(&StaticSource {
+            backends: vec![PoolBackend::new("x", "http://x:11434", BackendKind::Ollama)
+                .with_models(["nav", "planner", "triage"])
+                .with_health(Health::Up)],
+        });
+        let d = TeamMock {
+            plan_json: String::new(),
+            block: false,
+            planner_calls: AtomicUsize::new(0),
+        };
+        let mut ws = MemWs::new();
+        let out = run_team(&p, &d, &mut ws, &cfg(), "goal").await;
+        assert_eq!(out.status, TeamStatus::NoPlan);
+        assert!(out.results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn empty_plan_is_no_plan() {
+        let p = pool();
+        let d = TeamMock {
+            plan_json: r#"{"subtasks":[]}"#.into(),
+            block: false,
+            planner_calls: AtomicUsize::new(0),
+        };
+        let mut ws = MemWs::new();
+        let out = run_team(&p, &d, &mut ws, &cfg(), "goal").await;
+        assert_eq!(out.status, TeamStatus::NoPlan);
+    }
+}
