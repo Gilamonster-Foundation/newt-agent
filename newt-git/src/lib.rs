@@ -7,20 +7,24 @@
 //! grit-lib boundary — so grit-lib's pre-1.0 API churn is contained to this one crate
 //! and never leaks into the rest of the workspace.
 //!
-//! **PR2 scope: safe LOCAL READ ops** (`open`/`status`/`log`/`diff`). Local writes
-//! (`add`/`commit`/`branch`) are PR3; network ops (`clone`/`fetch`/`push`) are PR5 —
-//! fail-closed under the OCAP deviation ratchet. We depend ONLY on the MIT `grit-lib`,
-//! never the GPL-2.0 `grit-legacy`.
+//! **Scope: LOCAL ops** — reads (`open`/`status`/`log`/`diff`) and writes
+//! (`add`/`commit`/`branch`), each gated by the matching `GitCaveats` axis and
+//! fail-closed without it. Network ops (`clone`/`fetch`/`push`) are deferred (PR5) —
+//! fail-closed under the OCAP deviation ratchet, riding the SSH transport. We depend
+//! ONLY on the MIT `grit-lib`, never the GPL-2.0 `grit-legacy`.
 
 use newt_core::git_caveats::GitCaveats;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 use grit_lib::diff::{diff_index_to_tree, diff_index_to_worktree, DiffEntry};
-use grit_lib::objects::{parse_commit, CommitData, ObjectId};
+use grit_lib::index::{IndexEntry, MODE_REGULAR};
+use grit_lib::objects::{parse_commit, serialize_commit, CommitData, ObjectId, ObjectKind};
 use grit_lib::porcelain::status::{collect_untracked_and_ignored, IgnoredMode};
+use grit_lib::refs::{read_head, write_ref};
 use grit_lib::repo::Repository;
 use grit_lib::state::{resolve_head, HeadState};
+use grit_lib::write_tree::write_tree_from_index;
 
 /// Errors from the embedded git engine.
 #[derive(Debug, thiserror::Error)]
@@ -31,6 +35,31 @@ pub enum GitError {
     /// The underlying grit-lib engine failed.
     #[error("git: {0}")]
     Engine(#[from] grit_lib::error::Error),
+    /// A filesystem read of a worktree file failed (during staging).
+    #[error("io: {0}")]
+    Io(#[from] std::io::Error),
+    /// The operation isn't supported in this repository state (e.g. bare repo,
+    /// detached/unborn HEAD).
+    #[error("unsupported: {0}")]
+    Unsupported(&'static str),
+}
+
+/// Commit authorship — supplied by the caller (e.g. from the agent identity).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Author {
+    pub name: String,
+    pub email: String,
+}
+
+impl Author {
+    /// A git ident line stamped at the current time, UTC: `"Name <email> <secs> +0000"`.
+    fn ident_now(&self) -> String {
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        format!("{} <{}> {} +0000", self.name, self.email, secs)
+    }
 }
 
 /// A single changed path. `status` is git's status letter (`M`/`A`/`D`/`R`/`C`/…).
@@ -198,6 +227,102 @@ impl GitEngine {
             files: entries.iter().map(file_change).collect(),
         })
     }
+
+    /// `git add` — stage worktree files into the index. Requires `stage`.
+    /// Each `path` is repository-relative. Returns the paths actually staged.
+    pub fn add(&self, caps: &GitCaveats, paths: &[String]) -> Result<Vec<String>, GitError> {
+        if !caps.permits_stage() {
+            return Err(GitError::Denied("stage"));
+        }
+        let wt = self
+            .repo
+            .work_tree
+            .clone()
+            .ok_or(GitError::Unsupported("cannot stage in a bare repository"))?;
+        let mut index = self.repo.load_index()?;
+        let mut staged = Vec::with_capacity(paths.len());
+        for rel in paths {
+            let abs = wt.join(rel);
+            let bytes = std::fs::read(&abs)?;
+            let oid = self.repo.odb.write(ObjectKind::Blob, &bytes)?;
+            let size = bytes.len() as u32;
+            let path = rel.as_bytes().to_vec();
+            // The stat fields are left zero (a benign "needs refresh" to git); the
+            // blob oid is authoritative for diffs. `flags` carries the name length.
+            let flags = path.len().min(0x0FFF) as u16;
+            index.add_or_replace(IndexEntry {
+                ctime_sec: 0,
+                ctime_nsec: 0,
+                mtime_sec: 0,
+                mtime_nsec: 0,
+                dev: 0,
+                ino: 0,
+                mode: MODE_REGULAR,
+                uid: 0,
+                gid: 0,
+                size,
+                oid,
+                flags,
+                flags_extended: None,
+                path,
+                base_index_pos: 0,
+            });
+            staged.push(rel.clone());
+        }
+        self.repo.write_index(&mut index)?;
+        Ok(staged)
+    }
+
+    /// `git commit` — build a tree from the index, write the commit, and advance the
+    /// current branch. Requires `commit_local`. Errors on detached HEAD.
+    pub fn commit(
+        &self,
+        caps: &GitCaveats,
+        message: &str,
+        author: &Author,
+    ) -> Result<CommitInfo, GitError> {
+        if !caps.permits_commit() {
+            return Err(GitError::Denied("commit"));
+        }
+        let index = self.repo.load_index()?;
+        let tree = write_tree_from_index(&self.repo.odb, &index, "")?;
+        let parents: Vec<ObjectId> = self.head_oid()?.into_iter().collect();
+        let ident = author.ident_now();
+        let commit = CommitData {
+            tree,
+            parents,
+            author: ident.clone(),
+            committer: ident,
+            author_raw: Vec::new(),
+            committer_raw: Vec::new(),
+            encoding: None,
+            message: message.to_string(),
+            raw_message: None,
+        };
+        let oid = self
+            .repo
+            .odb
+            .write(ObjectKind::Commit, &serialize_commit(&commit))?;
+        match read_head(&self.repo.git_dir)? {
+            Some(branch_ref) => write_ref(&self.repo.git_dir, &branch_ref, &oid)?,
+            None => return Err(GitError::Unsupported("cannot commit on a detached HEAD")),
+        }
+        Ok(commit_info(&oid, &commit))
+    }
+
+    /// `git branch <name>` — create `refs/heads/<name>` at the current HEAD commit.
+    /// Requires `refs` to permit that ref name. Returns the full ref name.
+    pub fn branch(&self, caps: &GitCaveats, name: &str) -> Result<String, GitError> {
+        let refname = format!("refs/heads/{name}");
+        if !caps.permits_ref(&refname) {
+            return Err(GitError::Denied("refs"));
+        }
+        let oid = self
+            .head_oid()?
+            .ok_or(GitError::Unsupported("cannot branch from an unborn HEAD"))?;
+        write_ref(&self.repo.git_dir, &refname, &oid)?;
+        Ok(refname)
+    }
 }
 
 fn short_oid(oid: &ObjectId) -> String {
@@ -352,5 +477,94 @@ mod tests {
         let json = serde_json::to_string(&s).unwrap();
         let back: StatusReport = serde_json::from_str(&json).unwrap();
         assert_eq!(s, back);
+    }
+
+    #[test]
+    fn add_then_commit_advances_history() {
+        let dir = repo_with_commit();
+        std::fs::write(dir.path().join("new.txt"), "data\n").unwrap();
+        let eng = GitEngine::open(dir.path()).unwrap();
+        let caps = GitCaveats::top();
+
+        let staged = eng.add(&caps, &["new.txt".to_string()]).unwrap();
+        assert_eq!(staged, vec!["new.txt".to_string()]);
+        assert!(eng
+            .status(&caps)
+            .unwrap()
+            .staged
+            .iter()
+            .any(|f| f.path == "new.txt"));
+
+        let author = Author {
+            name: "Bot".into(),
+            email: "bot@newt.dev".into(),
+        };
+        let c = eng.commit(&caps, "add new file", &author).unwrap();
+        assert_eq!(c.summary, "add new file");
+        assert_eq!(c.author_name, "Bot");
+
+        let log = eng.log(&caps, 10).unwrap();
+        assert_eq!(log.len(), 2);
+        assert_eq!(log[0].summary, "add new file");
+        assert!(eng.status(&caps).unwrap().clean, "clean after commit");
+
+        // The system `git` agrees grit wrote a real, readable history.
+        let out = std::process::Command::new("git")
+            .current_dir(dir.path())
+            .args(["log", "--oneline"])
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout).lines().count(), 2);
+    }
+
+    #[test]
+    fn branch_creates_a_ref_at_head() {
+        let dir = repo_with_commit();
+        let eng = GitEngine::open(dir.path()).unwrap();
+        let refname = eng.branch(&GitCaveats::top(), "feat/x").unwrap();
+        assert_eq!(refname, "refs/heads/feat/x");
+        let ok = Command::new("git")
+            .current_dir(dir.path())
+            .args(["rev-parse", "--verify", "refs/heads/feat/x"])
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "branch ref must resolve under the system git too");
+    }
+
+    #[test]
+    fn writes_fail_closed_without_capability() {
+        let dir = repo_with_commit();
+        std::fs::write(dir.path().join("new.txt"), "x\n").unwrap();
+        let eng = GitEngine::open(dir.path()).unwrap();
+        let author = Author {
+            name: "B".into(),
+            email: "b@b".into(),
+        };
+
+        let ro = GitCaveats::read_only();
+        assert!(matches!(
+            eng.add(&ro, &["new.txt".to_string()]),
+            Err(GitError::Denied("stage"))
+        ));
+        assert!(matches!(
+            eng.commit(&ro, "m", &author),
+            Err(GitError::Denied("commit"))
+        ));
+        assert!(matches!(
+            eng.branch(&ro, "x"),
+            Err(GitError::Denied("refs"))
+        ));
+
+        // Stage-but-not-commit: add is allowed, commit is refused.
+        let stage_only = GitCaveats {
+            commit_local: false,
+            ..GitCaveats::top()
+        };
+        assert!(eng.add(&stage_only, &["new.txt".to_string()]).is_ok());
+        assert!(matches!(
+            eng.commit(&stage_only, "m", &author),
+            Err(GitError::Denied("commit"))
+        ));
     }
 }
