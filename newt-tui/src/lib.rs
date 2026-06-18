@@ -2831,6 +2831,7 @@ mod permission_prompt_tests {
             None, // memory_source
             Some(&mut gate),
             None,
+            None, // git_tool
         )
         .await;
         assert_eq!(out, "gated contents", "allow-once executed the real read");
@@ -2851,6 +2852,7 @@ mod permission_prompt_tests {
             None, // memory_source
             Some(&mut gate),
             None,
+            None, // git_tool
         )
         .await;
         assert_eq!(
@@ -2898,6 +2900,7 @@ mod permission_prompt_tests {
                 None, // memory_source
                 Some(&mut gate),
                 None,
+                None, // git_tool
             )
             .await;
             assert_eq!(out, "gated contents");
@@ -4893,6 +4896,8 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                                     write_ledger: retry_ledger.as_ref(),
                                     // Esc-to-interrupt flag, tripped by the watcher.
                                     cancel: Some(&turn_cancel),
+                                    // PR4 Phase 3 flips this to Some(&git_tool).
+                                    git_tool: None,
                                 },
                                 &mut mcp,
                             ))
@@ -8585,6 +8590,7 @@ mod run_command_confinement_tests {
             None, // memory_source
             None,
             None,
+            None, // git_tool
         )
         .await;
         assert!(
@@ -8618,6 +8624,7 @@ mod run_command_confinement_tests {
             None, // memory_source
             None,
             None,
+            None, // git_tool
         )
         .await;
         assert!(
@@ -8662,6 +8669,7 @@ mod run_command_confinement_tests {
             None, // memory_source
             None,
             None,
+            None, // git_tool
         )
         .await;
 
@@ -8703,6 +8711,7 @@ mod run_command_confinement_tests {
             None, // memory_source
             None,
             None,
+            None, // git_tool
         )
         .await;
         assert_eq!(out, "hello", "read_file must still return file contents");
@@ -8737,6 +8746,7 @@ mod run_command_confinement_tests {
             None, // memory_source
             None,
             None,
+            None, // git_tool
         )
         .await;
         assert!(
@@ -8778,6 +8788,7 @@ mod run_command_confinement_tests {
             None, // memory_source
             None,
             None,
+            None, // git_tool
         )
         .await;
         assert!(out.contains("one.txt") && out.contains("two.txt"));
@@ -8903,6 +8914,7 @@ mod disable_ocap_session_tests {
             None, // memory_source
             None,
             None,
+            None, // git_tool
         )
         .await;
         assert_eq!(out, "yolo-through\n");
@@ -8922,6 +8934,7 @@ mod disable_ocap_session_tests {
             None, // memory_source
             None,
             None,
+            None, // git_tool
         )
         .await;
         assert_eq!(
@@ -8977,6 +8990,7 @@ mod disable_ocap_session_tests {
             None, // memory_source
             Some(&mut gate),
             None,
+            None, // git_tool
         )
         .await;
         assert_eq!(out, "no-prompt\n");
@@ -9013,6 +9027,7 @@ mod disable_ocap_session_tests {
             None, // memory_source
             Some(&mut gate),
             None,
+            None, // git_tool
         )
         .await;
         assert_eq!(out, "gated contents");
@@ -9055,6 +9070,7 @@ mod disable_ocap_session_tests {
             None,
             // The active preset's exec floor — the bypass ceiling.
             Some(&clamp.exec),
+            None, // git_tool
         )
         .await;
         assert_ne!(out, "should-not-run\n", "the floor must block --yolo");
@@ -11190,6 +11206,7 @@ mod tool_round_cap_tests {
                     exec_floor: None,
                     write_ledger: None,
                     cancel: None,
+                    git_tool: None,
                 },
                 &mut Mcp::empty(),
             )

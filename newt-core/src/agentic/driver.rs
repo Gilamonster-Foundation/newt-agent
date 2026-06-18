@@ -396,6 +396,7 @@ async fn run_one_turn(
         // The headless driver has no interactive keyboard to interrupt from;
         // a consumer that wants cancellation drives its own ChatCtx.
         cancel: None,
+        git_tool: None,
     };
     // NoMcp: the cowork driver advertises only the built-in tools. A consumer
     // that wants live MCP tools assembles its own ChatCtx.
