@@ -143,6 +143,12 @@ pub struct Config {
     /// show. Empty by default. See [`Loadout`].
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub loadouts: std::collections::BTreeMap<String, Loadout>,
+
+    /// Named crews (`[crews.<name>]` or `crews/<name>.toml`) — role-specialized
+    /// ensembles over the backend pool (`docs/design/crew-loadout.md`). Each role
+    /// names a `[loadouts.<name>]`. Empty by default. See [`Crew`].
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub crews: std::collections::BTreeMap<String, Crew>,
 }
 
 /// One named mode (`[modes.<name>]`, issue #307): the atomic binding the
@@ -1174,6 +1180,98 @@ impl Loadout {
     }
 }
 
+/// A named crew (`[crews.<name>]` or `crews/<name>.toml`): a role-specialized
+/// ensemble over the heterogeneous backend pool. Each role names a `[loadouts.*]`
+/// (so a crew is a *composition of loadouts* — the canonical example routes the
+/// planner/triage to frontier models and bulk work to cheap local inference,
+/// `docs/design/config-scaling-deployment-and-trust.md`). The harness owns the
+/// control loop (`run_crew`); these fields pin the workers + budgets.
+///
+/// ```toml
+/// [crews.coder]
+/// planner = "planner"          # → [loadouts.planner]  (required)
+/// navigator = "navigator"      # → [loadouts.navigator]
+/// triage = "triage"            # → [loadouts.triage]
+/// loop = "patch-revise"        # control program (default)
+///   [crews.coder.budgets]
+///   max_attempts = 4
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct Crew {
+    /// Planner/editor role — must name a `[loadouts.<name>]`. Required (a crew
+    /// with no planner can't make edits).
+    pub planner: String,
+    /// Repo-navigator role — names a `[loadouts.<name>]`. Optional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub navigator: Option<String>,
+    /// Test-triage role — names a `[loadouts.<name>]`. Optional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub triage: Option<String>,
+    /// Control program (e.g. `"patch-revise"`). Omitted ⇒ the default loop.
+    #[serde(default, rename = "loop", skip_serializing_if = "Option::is_none")]
+    pub loop_program: Option<String>,
+    /// Verification command override (e.g. `"just check"`). Omitted ⇒ inferred
+    /// from the repo (justfile → `just check`, Cargo → `cargo test`, …).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test: Option<String>,
+    /// Budgets / safety gates for the control loop.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budgets: Option<CrewBudgets>,
+}
+
+/// Budgets + review gates for a crew's control loop (`crew-loadout.md` §budgets).
+/// Consumed by the front door; an honest cap-exit at `max_attempts` returns
+/// `NeedsHumanReview`, never a false success.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct CrewBudgets {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_attempts: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_files_touched: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_lines_changed: Option<u32>,
+    /// Topics that force a human-review pause (e.g. `["auth","crypto","migrations"]`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub require_human_review_on: Vec<String>,
+}
+
+impl Crew {
+    /// Validate the crew's role references against `cfg`: each named role
+    /// (`planner`/`navigator`/`triage`) must name a known `[loadouts.<name>]`,
+    /// and that loadout must itself validate (so a crew transitively checks the
+    /// whole `crew → loadout → {backend,bundle,profile}` chain). A dangling role
+    /// is a hard error — a crew that silently dropped a worker would be a false
+    /// claim.
+    ///
+    /// # Errors
+    /// The first dangling or invalid role reference, as a message.
+    pub fn validate(&self, cfg: &Config) -> std::result::Result<(), String> {
+        let check = |label: &str, name: &str| -> std::result::Result<(), String> {
+            let loadout = cfg.loadouts.get(name).ok_or_else(|| {
+                let known = if cfg.loadouts.is_empty() {
+                    "none defined".to_string()
+                } else {
+                    cfg.loadouts.keys().cloned().collect::<Vec<_>>().join(", ")
+                };
+                format!(
+                    "crew {label} '{name}': no [loadouts] entry named '{name}' (known: {known})"
+                )
+            })?;
+            loadout
+                .validate(cfg)
+                .map_err(|e| format!("crew {label} '{name}': {e}"))
+        };
+        check("planner", &self.planner)?;
+        if let Some(nav) = &self.navigator {
+            check("navigator", nav)?;
+        }
+        if let Some(tri) = &self.triage {
+            check("triage", tri)?;
+        }
+        Ok(())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tool permissions — preset policies, lowered to attenuated capabilities
 // ---------------------------------------------------------------------------
@@ -1624,6 +1722,7 @@ impl Default for Config {
             profiles: std::collections::BTreeMap::new(),
             bundles: std::collections::BTreeMap::new(),
             loadouts: std::collections::BTreeMap::new(),
+            crews: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -1697,7 +1796,56 @@ impl Config {
         // `~/.newt/loadouts/<name>.toml` to add a loadout — no `config.toml` edit.
         // Runs after bundles so a disk loadout may name a disk bundle.
         cfg.merge_disk_loadouts();
+        // Per-file crews (the role-ensemble control surface): drop a
+        // `~/.newt/crews/<name>.toml` to add a crew — no `config.toml` edit.
+        // Runs after loadouts so a disk crew may name a disk loadout.
+        cfg.merge_disk_crews();
         Ok(cfg)
+    }
+
+    /// Merge per-file crews from the `crews/` dirs next to the config:
+    /// `~/.newt/crews/*.toml` first, then the project `.newt/crews/` (so project
+    /// overrides home overrides inline `[crews.*]`). Filename stem = crew name. A
+    /// malformed drop-in is skipped with a warning; references inside a crew are
+    /// validated when it is selected (`newt crew --crew <name>`), mirroring the
+    /// inline `[crews.*]` and disk-loadout paths.
+    fn merge_disk_crews(&mut self) {
+        if let Some(h) = home_dir() {
+            self.merge_crews_from_dir(&h.join(".newt").join("crews"));
+        }
+        if let Some(proj) = Self::project_config_path() {
+            if let Some(parent) = proj.parent() {
+                self.merge_crews_from_dir(&parent.join("crews"));
+            }
+        }
+    }
+
+    /// Load `<dir>/*.toml` as crews (filename stem = name) into `self.crews`,
+    /// last-wins on a name clash. A malformed file is skipped with a warning.
+    fn merge_crews_from_dir(&mut self, dir: &Path) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return; // no crews dir — fine
+        };
+        let mut paths: Vec<PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "toml"))
+            .collect();
+        paths.sort();
+        for path in paths {
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            match std::fs::read_to_string(&path).map(|t| toml::from_str::<Crew>(&t)) {
+                Ok(Ok(crew)) => {
+                    self.crews.insert(stem.to_string(), crew);
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!(path = %path.display(), error = %e, "skipping malformed crew file");
+                }
+                Err(_) => {}
+            }
+        }
     }
 
     /// Merge per-file bundles from the well-known `bundles/` dirs next to the
@@ -2380,6 +2528,120 @@ mod tests {
         std::fs::write(dir.path().join("x.toml"), "role = \"from-disk\"\n").unwrap();
         cfg.merge_loadouts_from_dir(dir.path());
         assert_eq!(cfg.loadouts["x"].role.as_deref(), Some("from-disk"));
+    }
+
+    #[test]
+    fn crew_parses_inline_and_validates_role_references() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [[backends]]
+            name = "dgx"
+            endpoint = "http://dgx.local:11434"
+            model = "qwen3-coder:30b"
+            tiers = []
+            [[backends]]
+            name = "gnuc"
+            endpoint = "http://localhost:11434"
+            model = "qwen2.5-coder:3b"
+            tiers = []
+
+            [loadouts.planner]
+            provider = "dgx"
+            [loadouts.navigator]
+            provider = "dgx"
+            [loadouts.triage]
+            provider = "gnuc"
+
+            [crews.coder]
+            planner = "planner"
+            navigator = "navigator"
+            triage = "triage"
+            loop = "patch-revise"
+            [crews.coder.budgets]
+            max_attempts = 4
+            require_human_review_on = ["auth", "crypto"]
+            "#,
+        )
+        .unwrap();
+        let c = &cfg.crews["coder"];
+        assert_eq!(c.planner, "planner");
+        assert_eq!(c.navigator.as_deref(), Some("navigator"));
+        assert_eq!(c.loop_program.as_deref(), Some("patch-revise"));
+        assert_eq!(c.budgets.as_ref().unwrap().max_attempts, Some(4));
+        // each role names a known loadout, and each loadout validates
+        assert!(c.validate(&cfg).is_ok());
+    }
+
+    #[test]
+    fn crew_rejects_dangling_and_invalid_roles() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [[backends]]
+            name = "dgx"
+            endpoint = "http://dgx.local:11434"
+            model = "m"
+            tiers = []
+            [loadouts.planner]
+            provider = "dgx"
+            "#,
+        )
+        .unwrap();
+        // dangling role: triage names no loadout
+        let dangling = Crew {
+            planner: "planner".into(),
+            triage: Some("ghost".into()),
+            ..Default::default()
+        };
+        let e = dangling.validate(&cfg).unwrap_err();
+        assert!(e.contains("triage 'ghost'"), "{e}");
+        assert!(e.contains("no [loadouts]"), "{e}");
+        // transitive: a role's loadout has a dangling provider
+        let mut cfg2 = cfg.clone();
+        cfg2.loadouts.insert(
+            "bad".into(),
+            Loadout {
+                provider: Some("nope".into()),
+                ..Default::default()
+            },
+        );
+        let transitive = Crew {
+            planner: "bad".into(),
+            ..Default::default()
+        };
+        let e = transitive.validate(&cfg2).unwrap_err();
+        assert!(
+            e.contains("planner 'bad'") && e.contains("provider 'nope'"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn disk_crews_load_per_file_by_stem() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("coder.toml"),
+            "planner = \"planner\"\nnavigator = \"navigator\"\n",
+        )
+        .unwrap();
+        // malformed (missing required `planner`) is skipped, not fatal
+        std::fs::write(dir.path().join("broken.toml"), "navigator = \"x\"\n").unwrap();
+        std::fs::write(dir.path().join("README.md"), "not a crew").unwrap();
+
+        let mut cfg = Config::default();
+        cfg.merge_crews_from_dir(dir.path());
+        assert_eq!(cfg.crews.len(), 1, "only the valid .toml loads");
+        let c = cfg.crews.get("coder").expect("loaded by filename stem");
+        assert_eq!(c.planner, "planner");
+        // disk overrides inline of the same name (last-wins)
+        cfg.crews.insert(
+            "coder".into(),
+            Crew {
+                planner: "inline".into(),
+                ..Default::default()
+            },
+        );
+        cfg.merge_crews_from_dir(dir.path());
+        assert_eq!(cfg.crews["coder"].planner, "planner", "disk wins");
     }
 
     #[test]
