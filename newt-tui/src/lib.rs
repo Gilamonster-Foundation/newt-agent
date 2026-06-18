@@ -1668,10 +1668,11 @@ fn runtime_context_block(model: &str, endpoint: &str, kind: newt_core::BackendKi
          When asked who or what you are — and when attributing work (commit \
          trailers, git notes, PR text) — use this real model name and harness; \
          never invent or guess an identity.\n\
-         The `git` tool automatically signs every commit you make with \
+         The `git` tool automatically signs every commit (and amend) with \
          `Co-authored-by: {model} (newt-agent v{VERSION}) <noreply@newt-agent.com>` \
-         — do NOT add that trailer yourself, and do not claim to have amended a \
-         commit (there is no amend op); just write the plain commit message.\n"
+         — do NOT add that trailer yourself; just write the plain message. To \
+         change the last commit, use the git tool with op=amend (do not claim to \
+         amend without calling it).\n"
     )
 }
 
