@@ -1642,6 +1642,14 @@ mod footer_tests {
 /// prompt itself is frozen at conversation start). Without it the model has no
 /// way to know its identity and confabulates one (e.g. inventing a name for
 /// commit attribution). Kept short — it rides in every request.
+/// The canonical AI-credit trailer the embedded git tool stamps on every commit
+/// (the user's format): `Co-authored-by: <model> (newt-agent v<version>)
+/// <noreply@newt-agent.com>`. The model name + harness version, so the app gets
+/// credit and the line is always well-formed (the model can't fake it).
+fn coauthor_trailer(model: &str) -> String {
+    format!("Co-authored-by: {model} (newt-agent v{VERSION}) <noreply@newt-agent.com>")
+}
+
 fn runtime_context_block(model: &str, endpoint: &str, kind: newt_core::BackendKind) -> String {
     let now = chrono::Local::now()
         .format("%Y-%m-%d %H:%M:%S %Z")
@@ -1659,7 +1667,11 @@ fn runtime_context_block(model: &str, endpoint: &str, kind: newt_core::BackendKi
          You are the model named above, running under the newt-agent harness. \
          When asked who or what you are — and when attributing work (commit \
          trailers, git notes, PR text) — use this real model name and harness; \
-         never invent or guess an identity.\n"
+         never invent or guess an identity.\n\
+         The `git` tool automatically signs every commit you make with \
+         `Co-authored-by: {model} (newt-agent v{VERSION}) <noreply@newt-agent.com>` \
+         — do NOT add that trailer yourself, and do not claim to have amended a \
+         commit (there is no amend op); just write the plain commit message.\n"
     )
 }
 
@@ -4207,6 +4219,11 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                     name: id.name,
                     email: id.email,
                 },
+                // Auto-sign commits with the AI credit (the tool owns this so it
+                // is always present and correctly formatted — the model is told
+                // it's automatic, see runtime_context_block). Model = the
+                // session's model; harness = this newt version.
+                coauthor: Some(coauthor_trailer(&inf_model)),
             })
         } else {
             None
