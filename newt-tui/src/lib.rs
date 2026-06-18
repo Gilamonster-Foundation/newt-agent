@@ -2855,6 +2855,7 @@ mod permission_prompt_tests {
             Some(&mut gate),
             None,
             None, // git_tool
+            None, // crew_runner
         )
         .await;
         assert_eq!(out, "gated contents", "allow-once executed the real read");
@@ -2876,6 +2877,7 @@ mod permission_prompt_tests {
             Some(&mut gate),
             None,
             None, // git_tool
+            None, // crew_runner
         )
         .await;
         assert_eq!(
@@ -2924,6 +2926,7 @@ mod permission_prompt_tests {
                 Some(&mut gate),
                 None,
                 None, // git_tool
+                None, // crew_runner
             )
             .await;
             assert_eq!(out, "gated contents");
@@ -4948,6 +4951,9 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                                     git_tool: session_git_tool
                                         .as_ref()
                                         .map(|g| g as &dyn newt_core::agentic::GitTool),
+                                    // #479: the crew/team tool is injected once the
+                                    // LocalCrewRunner lands (next increment); None today.
+                                    crew_runner: None,
                                 },
                                 &mut mcp,
                             ))
@@ -8823,6 +8829,7 @@ mod run_command_confinement_tests {
             None,
             None,
             None, // git_tool
+            None, // crew_runner
         )
         .await;
         assert!(
@@ -8857,6 +8864,7 @@ mod run_command_confinement_tests {
             None,
             None,
             None, // git_tool
+            None, // crew_runner
         )
         .await;
         assert!(
@@ -8902,6 +8910,7 @@ mod run_command_confinement_tests {
             None,
             None,
             None, // git_tool
+            None, // crew_runner
         )
         .await;
 
@@ -8944,6 +8953,7 @@ mod run_command_confinement_tests {
             None,
             None,
             None, // git_tool
+            None, // crew_runner
         )
         .await;
         assert_eq!(out, "hello", "read_file must still return file contents");
@@ -8979,6 +8989,7 @@ mod run_command_confinement_tests {
             None,
             None,
             None, // git_tool
+            None, // crew_runner
         )
         .await;
         assert!(
@@ -9021,6 +9032,7 @@ mod run_command_confinement_tests {
             None,
             None,
             None, // git_tool
+            None, // crew_runner
         )
         .await;
         assert!(out.contains("one.txt") && out.contains("two.txt"));
@@ -9147,6 +9159,7 @@ mod disable_ocap_session_tests {
             None,
             None,
             None, // git_tool
+            None, // crew_runner
         )
         .await;
         assert_eq!(out, "yolo-through\n");
@@ -9167,6 +9180,7 @@ mod disable_ocap_session_tests {
             None,
             None,
             None, // git_tool
+            None, // crew_runner
         )
         .await;
         assert_eq!(
@@ -9223,6 +9237,7 @@ mod disable_ocap_session_tests {
             Some(&mut gate),
             None,
             None, // git_tool
+            None, // crew_runner
         )
         .await;
         assert_eq!(out, "no-prompt\n");
@@ -9260,6 +9275,7 @@ mod disable_ocap_session_tests {
             Some(&mut gate),
             None,
             None, // git_tool
+            None, // crew_runner
         )
         .await;
         assert_eq!(out, "gated contents");
@@ -9303,6 +9319,7 @@ mod disable_ocap_session_tests {
             // The active preset's exec floor — the bypass ceiling.
             Some(&clamp.exec),
             None, // git_tool
+            None, // crew_runner
         )
         .await;
         assert_ne!(out, "should-not-run\n", "the floor must block --yolo");
@@ -11439,6 +11456,7 @@ mod tool_round_cap_tests {
                     write_ledger: None,
                     cancel: None,
                     git_tool: None,
+                    crew_runner: None,
                 },
                 &mut Mcp::empty(),
             )

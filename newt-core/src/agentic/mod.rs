@@ -12,6 +12,7 @@
 // pub(crate) since Step 18.5 (#247): the `Summarizing` memory provider
 // delegates to this same pipeline instead of keeping a duplicate one.
 pub(crate) mod compress;
+mod crew_tool;
 mod display;
 mod git_tool;
 // Issue #308 — the cowork foundation: a non-blocking turn driver around
@@ -34,6 +35,7 @@ pub use compress::{
     compress_user_initiated, CompressCounters, CompressState, ManualCompressOutcome, SummarizeFn,
     SummarizeFuture, Summarizer, SUMMARY_END_MARKER, SUMMARY_PREFIX,
 };
+pub use crew_tool::{compose_roster_tool_definition, crew_tool_definition, CrewRunner};
 pub use display::{print_list_item, print_newt, NEWT_ORANGE_CT};
 pub use driver::{
     TurnDriver, TurnDriverConfig, TurnDriverError, TurnOutcome, TurnStatus,
@@ -562,6 +564,12 @@ pub struct ChatCtx<'a> {
     /// advertised — bit-for-bit today's behavior. The trait-injection seam, not
     /// a direct dep, because `newt-git` depends on `newt-core` (circular).
     pub git_tool: Option<&'a dyn GitTool>,
+    /// The injected crew/team orchestration capability (#479). `Some` ⇒ the
+    /// `compose_roster` + `crew` tools are advertised and dispatch through it
+    /// (`LocalCrewRunner` in `newt-cli`, injected by the `/team` toggle). `None`
+    /// ⇒ never advertised. Trait-injection seam like `git_tool` (newt-scheduler
+    /// depends on newt-core, so the dep can't be direct).
+    pub crew_runner: Option<&'a dyn CrewRunner>,
 }
 
 /// retry technique (R2 action arm): before a `write_file`/`edit_file` is dispatched,
@@ -814,6 +822,7 @@ pub async fn chat_complete(
         write_ledger,
         cancel,
         git_tool,
+        crew_runner,
     } = ctx;
     // Headless callers may pass no session state — compression still works,
     // with per-turn anti-thrash accounting.
@@ -835,6 +844,7 @@ pub async fn chat_complete(
     let advertise_recall = recall_source.is_some();
     let advertise_memory_fetch = memory_source.is_some();
     let advertise_git = git_tool.is_some();
+    let advertise_team = crew_runner.is_some();
 
     // Convert MemMessage list to Ollama JSON format.
     // The memory manager already included the current task as the last user message.
@@ -889,6 +899,7 @@ pub async fn chat_complete(
         advertise_recall,
         advertise_memory_fetch,
         advertise_git,
+        advertise_team,
     );
     let tool_tokens = estimate_value_tokens(&tools);
     // Phase 20 §2.3: one sanitized calibration ratio per turn. The
@@ -1650,6 +1661,8 @@ pub async fn chat_complete(
                 exec_floor,
                 // PR4: the injected embedded-git capability (None for headless).
                 git_tool,
+                // #479: the injected crew/team orchestration (None for headless).
+                crew_runner,
             )
             .await;
             // 17.6: record the call for the turn's events column — args are
@@ -1995,6 +2008,7 @@ pub async fn openai_chat_complete(
         write_ledger,
         cancel,
         git_tool,
+        crew_runner,
     } = ctx;
     // Headless callers may pass no session state (mirrors the Ollama path).
     let mut local_compress_state = CompressState::new();
@@ -2015,6 +2029,7 @@ pub async fn openai_chat_complete(
     let advertise_recall = recall_source.is_some();
     let advertise_memory_fetch = memory_source.is_some();
     let advertise_git = git_tool.is_some();
+    let advertise_team = crew_runner.is_some();
 
     let mut messages: Vec<serde_json::Value> = mem_messages
         .iter()
@@ -2054,6 +2069,7 @@ pub async fn openai_chat_complete(
         advertise_recall,
         advertise_memory_fetch,
         advertise_git,
+        advertise_team,
     );
     let tool_tokens = estimate_value_tokens(&tools);
     // Phase 20 §2.3: per-turn calibration ratio + real-token schema overhead
@@ -2471,6 +2487,8 @@ pub async fn openai_chat_complete(
                 exec_floor,
                 // PR4: the injected embedded-git capability (None for headless).
                 git_tool,
+                // #479: the injected crew/team orchestration (None for headless).
+                crew_runner,
             )
             .await;
             if debug {
@@ -2976,6 +2994,7 @@ mod tool_round_cap_tests {
                 write_ledger: None,
                 cancel: None,
                 git_tool: None,
+                crew_runner: None,
             },
             &mut NoMcp,
         )
@@ -3038,6 +3057,7 @@ mod tool_round_cap_tests {
                 write_ledger: None,
                 cancel: Some(&flag),
                 git_tool: None,
+                crew_runner: None,
             },
             &mut NoMcp,
         )
@@ -3103,6 +3123,7 @@ mod tool_round_cap_tests {
                 write_ledger: None,
                 cancel: None,
                 git_tool: None,
+                crew_runner: None,
             },
             &mut NoMcp,
         )
@@ -3190,6 +3211,7 @@ mod tool_round_cap_tests {
                 write_ledger: None,
                 cancel: None,
                 git_tool: None,
+                crew_runner: None,
             },
             &mut NoMcp,
         )
@@ -3289,6 +3311,7 @@ mod tool_round_cap_tests {
                 write_ledger: None,
                 cancel: None,
                 git_tool: None,
+                crew_runner: None,
             },
             &mut NoMcp,
         )
@@ -3380,6 +3403,7 @@ mod tool_round_cap_tests {
                 write_ledger: None,
                 cancel: None,
                 git_tool: None,
+                crew_runner: None,
             },
             &mut NoMcp,
         )
@@ -3421,6 +3445,7 @@ mod tool_round_cap_tests {
                 None,
                 None,
                 None, // git_tool
+                None, // crew_runner
             )
             .await;
             assert!(
@@ -3507,6 +3532,7 @@ mod tool_round_cap_tests {
                 write_ledger: None,
                 cancel: None,
                 git_tool: None,
+                crew_runner: None,
             },
             &mut NoMcp,
         )
@@ -3649,6 +3675,7 @@ mod tool_round_cap_tests {
                 write_ledger: None,
                 cancel: None,
                 git_tool: None,
+                crew_runner: None,
             },
             &mut NoMcp,
         )
@@ -3730,6 +3757,7 @@ mod http_loop_tests {
             write_ledger: None,
             cancel: None,
             git_tool: None,
+            crew_runner: None,
         }
     }
 
@@ -4607,6 +4635,7 @@ mod save_note_loop_tests {
             write_ledger: None,
             cancel: None,
             git_tool: None,
+            crew_runner: None,
         }
     }
 
@@ -5080,6 +5109,7 @@ mod compression_loop_tests {
             write_ledger: None,
             cancel: None,
             git_tool: None,
+            crew_runner: None,
         }
     }
 
@@ -6205,6 +6235,7 @@ mod observation_hook_tests {
             write_ledger: None,
             cancel: None,
             git_tool: None,
+            crew_runner: None,
         }
     }
 
