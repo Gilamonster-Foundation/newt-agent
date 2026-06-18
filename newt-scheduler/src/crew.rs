@@ -67,6 +67,10 @@ pub trait Workspace: Send {
     fn apply(&mut self, edits: &[Edit]) -> Vec<String>;
     /// Run the verification command: `(passed, captured_output)`.
     fn run_test(&self) -> (bool, String);
+    /// Swap the verification command — used by the [team](crate::run_team) loop to
+    /// give each subtask its **own** check (per-subtask verify). Default no-op, so
+    /// a fixed-verification workspace (most mocks) is unaffected.
+    fn set_test_command(&mut self, _cmd: &str) {}
 }
 
 /// Which model each role is pinned to (the [`BackendPool`] routes by these).
