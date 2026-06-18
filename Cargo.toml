@@ -42,7 +42,15 @@ exclude = ["newt-mesh"]
 # Holding the 0.6.x line through June.
 version = "0.6.8"
 edition = "2021"
-rust-version = "1.75"
+# MSRV 1.75 -> 1.88. The old "1.75" was already STALE: the current lock needs
+# 1.88 (darling 0.23 + instability 0.3.12, pulled in by the ratatui/rich-tui
+# work) — CI hid it by building on stable, so the declared floor drifted from
+# reality. 1.88 is the honest floor verified by `cargo +1.88 check --workspace`,
+# and it also clears the embedded git tool (newt-git/grit-lib, whose icu 2.2 /
+# time 0.3.x deps top out at 1.88) with no dep pins. The diffy 0.4 / rusqlite
+# 0.31 pins below were forced by the old 1.75 floor and MAY now be relaxed in a
+# separate follow-up; left as-is here to keep this change minimal.
+rust-version = "1.88"
 license = "Apache-2.0"
 repository = "https://github.com/hartsock/newt-agent"
 homepage = "https://github.com/hartsock/newt-agent"
@@ -68,7 +76,9 @@ regex = "1"
 # Patch application — optional strict backend behind newt-tools'
 # `applier-diffy` feature (default applier stays the in-house fuzzy
 # parser). Pure-Rust, no C deps → preserves the PyO3 wheel story.
-# Pinned to 0.4: diffy 0.5 raises its MSRV to 1.85, above our 1.75.
+# Pinned to 0.4 historically (diffy 0.5 raised MSRV to 1.85, above the old
+# 1.75 floor). Now that the floor is 1.88, 0.5 is allowed — relax in a
+# follow-up if desired; kept at 0.4 here to avoid churning the lock.
 diffy = "0.4"
 
 # SQLite for the durable conversation store (Phase 17.1a, issue #246).
@@ -82,10 +92,11 @@ diffy = "0.4"
 # so 17.3 "enables" FTS5 by building on it; the store's schema creation
 # and the tests/store.rs FTS suite fail loudly if the bundled build ever
 # stops shipping it.
-# Pinned to 0.31: it is the newest rusqlite that compiles at our MSRV
-# (rust-version 1.75). Verified empirically: 0.32+ use post-1.75 language
-# features and 0.40 pulls edition-2024 hashlink (requires Cargo 1.85+).
-# Same MSRV-pin pattern as diffy 0.4 above.
+# Pinned to 0.31 historically: the newest rusqlite that compiled at the old
+# 1.75 floor (0.32+ used post-1.75 features; 0.40 pulls edition-2024 hashlink,
+# Cargo 1.85+). With the floor now 1.88 those are all allowed — relax in a
+# follow-up if desired; kept at 0.31 here to avoid churning the lock + the
+# bundled-SQLite/FTS5 story. Same minimal-change stance as diffy 0.4 above.
 rusqlite = { version = "0.31", features = ["bundled"] }
 
 # CSV ingest for the Phase 21 `newt-data` engine (docs/design/centaur-data-scientist.md).
