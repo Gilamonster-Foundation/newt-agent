@@ -978,9 +978,31 @@ pub async fn execute_tool(
             };
             let count = existing.matches(old_string).count();
             if count == 0 {
+                // Show the file's actual head so the model can copy the exact
+                // text and self-correct on the next call — instead of guessing
+                // old_string blind and looping (the failure mode that left a
+                // model unable to add a header comment). The content is already
+                // in hand from the read above; no extra round needed.
+                const HEAD: usize = 40;
+                let total = existing.lines().count();
+                let head: String = existing
+                    .lines()
+                    .take(HEAD)
+                    .map(|l| format!("  {l}"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let more = if total > HEAD {
+                    format!("\n  … ({} more line(s))", total - HEAD)
+                } else {
+                    String::new()
+                };
                 return format!(
-                    "error: old_string not found in {path}. \
-                     Check for whitespace differences or read the file first to confirm the exact text."
+                    "error: old_string not found in {path} — do not guess again. Copy the \
+                     EXACT text (including leading whitespace) from the contents below, then \
+                     retry. To add a header/first line, set old_string to the shown first \
+                     line and put your header + that line in new_string; to create a new \
+                     file use write_file.\n--- {path} (first {shown} of {total} line(s)) ---\n{head}{more}",
+                    shown = total.min(HEAD),
                 );
             }
             if count > 1 {
@@ -1611,6 +1633,13 @@ mod execute_tool_branch_tests {
         )
         .await;
         assert!(out.contains("old_string not found in f.txt"), "got: {out}");
+        // The miss error now shows the file's actual contents so the model can
+        // copy the exact text instead of blind-guessing old_string again.
+        assert!(out.contains("do not guess again"), "got: {out}");
+        assert!(
+            out.contains("dup"),
+            "miss error must include the file content: {out}"
+        );
 
         let out = run_tool(
             "edit_file",
