@@ -24,7 +24,9 @@
 //!   shell-like "give me a clean line", NOT an exit). **Exit** is mode-idiomatic:
 //!   `C-x C-c` (emacs), `^X` (nano), `:q`/`:wq` (vi), `Ctrl-D` on an empty
 //!   buffer, or typing `/exit`.
-//! - Vi mode adds `:w`/`:wq`/`:x` (submit) and `:q`/`:q!` (quit) ex-commands.
+//! - Vi ex-commands: `:w` submits (= Enter); `:wq`/`:x` submit, run the turn,
+//!   then **end the conversation and quit** (behind a `[y/N]` confirm; the `!`
+//!   forms skip it); `:q`/`:q!` quit without sending.
 //!
 //! ## Vi gaps (future faithful-keymap work, issue #416 follow-up)
 //! - **`.` repeat** (replay the last change, incl. insert sessions) — not yet.
@@ -43,6 +45,7 @@
 //!   creature-testing, not unit tests; the editing/state logic below is fully
 //!   unit-tested.
 
+use std::cell::Cell;
 use std::io::{self, Stdout, Write as _};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -101,8 +104,21 @@ enum Step {
     Continue,
     /// Accept the buffer as this turn's input.
     Submit,
+    /// vi `:wq`/`:x` (confirmed) — submit this turn, run it to completion, then
+    /// END the conversation and exit (the next launch starts fresh). Distinct
+    /// from [`Step::Submit`] (stay) and [`Step::Eof`] (suspend & resume later).
+    SubmitQuit,
     /// End of input — clean exit (Ctrl-D on empty, `:q`, `C-x C-c`, nano `^X`).
     Eof,
+}
+
+/// A pending `[y/N]` confirmation in the vi `:`-line. Today only `:wq`/`:x`
+/// arms one ("send prompt then quit?"); modeled as an enum so other
+/// destructive ex-commands can reuse the same gate.
+#[derive(Clone, Copy, PartialEq)]
+enum Confirm {
+    /// `:wq` / `:x` — submit + end-conversation + quit, pending a `y`.
+    SubmitQuit,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -133,6 +149,10 @@ struct Vi {
     count: usize,
     /// `:`-command line buffer (`:wq`, `:q`, …); `Some` while active.
     ex: Option<String>,
+    /// A pending `[y/N]` confirmation (e.g. `:wq` → "send prompt then quit?").
+    /// While `Some`, the next key is the answer — `y`/`Y` confirms, anything
+    /// else cancels back to NORMAL editing.
+    confirm: Option<Confirm>,
     /// i_CTRL-O: run exactly one Normal command from INSERT, then resume INSERT.
     insert_normal: bool,
     /// Jumplist: positions we jumped *from*, older toward the front of `jback`;
@@ -154,6 +174,7 @@ impl Vi {
             pending: Pending::None,
             count: 0,
             ex: None,
+            confirm: None,
             insert_normal: false,
             jback: Vec::new(),
             jfwd: Vec::new(),
@@ -210,15 +231,25 @@ impl Vi {
         )
     }
 
-    /// The `:`-command line: `:w`/`:wq`/`:x` submit, `:q`/`:q!` quit. Esc or
-    /// backspacing past the `:` cancels.
+    /// The `:`-command line. `:w` submits (= Enter); `:wq`/`:x` submit-then-end
+    /// the conversation and quit, behind a `[y/N]` confirm (the `!` forms skip
+    /// the prompt); `:q`/`:q!` quit. Esc or backspacing past the `:` cancels.
     fn ex_input(&mut self, key: KeyEvent) -> Step {
         match key.code {
             KeyCode::Esc => self.ex = None,
             KeyCode::Enter => {
                 let cmd = self.ex.take().unwrap_or_default();
                 match cmd.as_str() {
-                    "w" | "wq" | "x" | "wq!" | "x!" => return Step::Submit,
+                    // `:w` = write = submit, same as Enter (vi muscle memory).
+                    "w" => return Step::Submit,
+                    // `:wq`/`:x` = send, run to completion, then end+quit — but
+                    // that combination is destructive, so confirm first.
+                    "wq" | "x" => {
+                        self.confirm = Some(Confirm::SubmitQuit);
+                        return Step::Continue;
+                    }
+                    // `:wq!`/`:x!` — the `!` means "I'm sure": skip the confirm.
+                    "wq!" | "x!" => return Step::SubmitQuit,
                     "q" | "q!" => return Step::Eof,
                     "jumps" => self.msg = Some(self.format_jumps()),
                     "help" | "h" => self.msg = Some(help_text(Edit::Vi)),
@@ -243,7 +274,22 @@ impl Vi {
         Step::Continue
     }
 
+    /// Answer a pending `[y/N]` confirmation: `y`/`Y` commits the action,
+    /// anything else (n/N/Esc/Enter/…) cancels back to NORMAL editing. The
+    /// confirm is always cleared.
+    fn confirm_input(&mut self, key: KeyEvent, what: Confirm) -> Step {
+        self.confirm = None;
+        let yes = matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y'));
+        match what {
+            Confirm::SubmitQuit if yes => Step::SubmitQuit,
+            _ => Step::Continue,
+        }
+    }
+
     fn input(&mut self, key: KeyEvent, ta: &mut TextArea) -> Step {
+        if let Some(what) = self.confirm {
+            return self.confirm_input(key, what);
+        }
         if self.ex.is_some() {
             return self.ex_input(key);
         }
@@ -574,7 +620,7 @@ fn reverse_find(kind: char) -> char {
 fn help_text(edit: Edit) -> String {
     match edit {
         Edit::Vi => [
-            "vi  Esc=NORMAL · i I a A o O=insert · :w :wq :q :jumps :help",
+            "vi  Esc=NORMAL · i I a A o O=insert · :w=send · :wq=send+end · :q=quit · :jumps :help",
             "    move: h j k l · w b e · 0 ^ $ · gg G · f F t T ; , · Ctrl-O/Ctrl-I jumps",
             "    edit: x X · dd dw D C s S r · yy p · J join · u Ctrl-R · d/c/y+motion",
         ]
@@ -636,6 +682,13 @@ impl Editor {
     /// Handle one key. Submit / interrupt / EOF and the continuation-aware Enter
     /// are shared by both modes so behavior matches the rustyline validator.
     fn input(&mut self, key: KeyEvent, ta: &mut TextArea) -> Step {
+        // A pending vi `[y/N]` confirmation (e.g. `:wq`) owns the next key
+        // outright — it must run BEFORE the shared Enter/Ctrl handling, or
+        // Enter would submit and Ctrl-C would clear the line instead of
+        // answering the prompt.
+        if self.edit == Edit::Vi && self.vi.confirm.is_some() {
+            return self.vi.input(key, ta);
+        }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         // Mode-idiomatic exit. emacs: `C-x C-c` (the `C-x` prefix is armed here
         // and must be checked BEFORE the bare `Ctrl-C` interrupt below). nano:
@@ -748,6 +801,18 @@ impl Editor {
         }
     }
 
+    /// The `[y/N]` question to render while a confirmation is pending (vi only),
+    /// e.g. after `:wq`. `None` when nothing is awaiting an answer.
+    fn confirm_prompt(&self) -> Option<&'static str> {
+        if self.edit != Edit::Vi {
+            return None;
+        }
+        match self.vi.confirm {
+            Some(Confirm::SubmitQuit) => Some("send prompt then quit? [y/N] "),
+            None => None,
+        }
+    }
+
     /// Take a one-shot message to print to scrollback (e.g. `:jumps` output).
     fn take_msg(&mut self) -> Option<String> {
         self.vi.msg.take()
@@ -789,6 +854,15 @@ fn new_textarea(edit: Edit) -> TextArea<'static> {
 /// accessibility default — deep dark-saturated hues lose letter detail); every
 /// color maps to a `[tui.colors]` key in the production palette work.
 fn prompt_line(editor: &Editor) -> Line<'static> {
+    if let Some(question) = editor.confirm_prompt() {
+        // A pending [y/N] confirmation replaces the prompt until answered.
+        return Line::from(Span::styled(
+            question.to_string(),
+            Style::default()
+                .fg(Color::LightYellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
     if let Some(ex) = editor.ex() {
         return Line::from(Span::styled(
             format!(":{ex}"),
@@ -880,6 +954,11 @@ pub(crate) struct RichSurface {
     /// `[tui] gutter` setting: `None` = auto, `Some(0)` = off, `Some(n)` = an
     /// n-column input indent (see [`resolve_gutter`]).
     gutter: Option<u16>,
+    /// Armed by a confirmed `:wq`: its turn submits as a normal `Line`, then on
+    /// the NEXT `read_line` the surface returns [`ReadOutcome::EndAndQuit`] so
+    /// the turn runs to completion before the session ends. A `Cell` because
+    /// the event loop runs behind `&self`.
+    pending_end_quit: Cell<bool>,
 }
 
 impl RichSurface {
@@ -889,6 +968,7 @@ impl RichSurface {
             history_path,
             unsaved: Vec::new(),
             gutter: crate::resolve_gutter_setting(),
+            pending_end_quit: Cell::new(false),
         })
     }
 
@@ -963,6 +1043,19 @@ impl RichSurface {
                     echo_submitted(&mut terminal, &body)?;
                     return Ok(ReadOutcome::Line(body));
                 }
+                Step::SubmitQuit => {
+                    let body = textarea.lines().join("\n");
+                    // `:wq` on an empty buffer has nothing to send — treat it
+                    // as a plain `:q` (end + quit, no turn).
+                    if body.trim().is_empty() {
+                        return Ok(ReadOutcome::EndAndQuit);
+                    }
+                    echo_submitted(&mut terminal, &body)?;
+                    // Submit this turn now; the end-and-quit fires on the NEXT
+                    // read once the turn has run to completion.
+                    self.pending_end_quit.set(true);
+                    return Ok(ReadOutcome::Line(body));
+                }
                 Step::Eof => return Ok(ReadOutcome::Eof),
             }
         }
@@ -971,6 +1064,11 @@ impl RichSurface {
 
 impl InputSurface for RichSurface {
     fn read_line(&mut self, _prompt: &str) -> anyhow::Result<ReadOutcome> {
+        // A confirmed `:wq` submitted its turn last time; now that the turn has
+        // run, end the conversation and exit before reading anything new.
+        if self.pending_end_quit.replace(false) {
+            return Ok(ReadOutcome::EndAndQuit);
+        }
         // The rich surface renders its own status row (clock + mode), so it
         // ignores the rustyline-formatted `prompt` string for now; the model /
         // plan-mode tokens fold into the status row in the follow-up.
@@ -1041,6 +1139,86 @@ mod tests {
 
     fn nano_editor() -> Editor {
         Editor::new(Edit::Nano)
+    }
+
+    /// Drive `:`-command `cmd` from NORMAL and return the Enter step.
+    fn run_ex(ed: &mut Editor, ta: &mut TextArea, cmd: &str) -> Step {
+        ed.input(special(KeyCode::Esc), ta); // INSERT → NORMAL
+        ed.input(key(':'), ta);
+        for c in cmd.chars() {
+            ed.input(key(c), ta);
+        }
+        ed.input(special(KeyCode::Enter), ta)
+    }
+
+    #[test]
+    fn vi_w_submits_like_enter() {
+        let mut ed = vi_editor();
+        let mut ta = TextArea::default();
+        type_chars(&mut ed, &mut ta, "hello");
+        // `:w` = write = submit, no confirm.
+        assert_eq!(run_ex(&mut ed, &mut ta, "w"), Step::Submit);
+        assert!(ed.confirm_prompt().is_none());
+    }
+
+    #[test]
+    fn vi_wq_confirms_then_y_submit_quits() {
+        let mut ed = vi_editor();
+        let mut ta = TextArea::default();
+        type_chars(&mut ed, &mut ta, "ship it");
+        // `:wq` arms a [y/N] confirm rather than submitting outright.
+        assert_eq!(
+            run_ex(&mut ed, &mut ta, "wq"),
+            Step::Continue,
+            ":wq must not submit until confirmed"
+        );
+        assert!(
+            ed.confirm_prompt().is_some(),
+            "the [y/N] question is showing"
+        );
+        // `y` commits → submit-then-end-and-quit.
+        assert_eq!(ed.input(key('y'), &mut ta), Step::SubmitQuit);
+        assert!(
+            ed.confirm_prompt().is_none(),
+            "confirm cleared after answer"
+        );
+    }
+
+    #[test]
+    fn vi_wq_confirm_cancels_on_n_or_enter() {
+        for answer in [KeyCode::Char('n'), KeyCode::Enter, KeyCode::Esc] {
+            let mut ed = vi_editor();
+            let mut ta = TextArea::default();
+            type_chars(&mut ed, &mut ta, "keep editing");
+            assert_eq!(run_ex(&mut ed, &mut ta, "wq"), Step::Continue);
+            // Anything but y/Y dumps the user back into editing — no submit.
+            assert_eq!(
+                ed.input(special(answer), &mut ta),
+                Step::Continue,
+                "{answer:?} cancels the confirm"
+            );
+            assert!(ed.confirm_prompt().is_none(), "confirm cleared on cancel");
+            // The buffer survived the aborted quit.
+            assert_eq!(ta.lines(), &["keep editing".to_string()]);
+        }
+    }
+
+    #[test]
+    fn vi_wq_bang_forces_without_confirm() {
+        let mut ed = vi_editor();
+        let mut ta = TextArea::default();
+        type_chars(&mut ed, &mut ta, "no prompt");
+        // The `!` form means "I'm sure" — straight to SubmitQuit.
+        assert_eq!(run_ex(&mut ed, &mut ta, "wq!"), Step::SubmitQuit);
+        assert!(ed.confirm_prompt().is_none());
+    }
+
+    #[test]
+    fn vi_q_quits_without_sending() {
+        let mut ed = vi_editor();
+        let mut ta = TextArea::default();
+        type_chars(&mut ed, &mut ta, "discard me");
+        assert_eq!(run_ex(&mut ed, &mut ta, "q"), Step::Eof);
     }
 
     #[test]
@@ -1239,12 +1417,14 @@ mod tests {
         let mut ta = TextArea::default();
         type_chars(&mut ed, &mut ta, "payload");
         ed.input(special(KeyCode::Esc), &mut ta);
-        // `:wq` → submit.
+        // `:wq` arms the send-then-end-and-quit confirm (see the dedicated
+        // confirm tests); it does NOT submit outright.
         ed.input(key(':'), &mut ta);
         assert_eq!(ed.ex(), Some(""), "ex line is active");
         ed.input(key('w'), &mut ta);
         ed.input(key('q'), &mut ta);
-        assert_eq!(ed.input(special(KeyCode::Enter), &mut ta), Step::Submit);
+        assert_eq!(ed.input(special(KeyCode::Enter), &mut ta), Step::Continue);
+        assert!(ed.confirm_prompt().is_some());
 
         // `:q` → EOF.
         let mut ed = vi_editor();
