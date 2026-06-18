@@ -850,6 +850,42 @@ fn new_textarea(edit: Edit) -> TextArea<'static> {
     ta
 }
 
+/// A fresh editor textarea pre-filled with `content`, cursor at the end — used
+/// when recalling a history entry into the input.
+fn textarea_with(edit: Edit, content: &str) -> TextArea<'static> {
+    let mut ta = new_textarea(edit);
+    ta.insert_str(content);
+    ta
+}
+
+/// Pure ↑/↓ history step. `pos == len` is the fresh (un-recalled) line; `up`
+/// walks toward older entries (index 0), `down` back toward the fresh line.
+/// `None` when already at the edge (nothing to move to).
+fn history_step(pos: usize, len: usize, up: bool) -> Option<usize> {
+    if up {
+        (pos > 0).then(|| pos - 1)
+    } else {
+        (pos < len).then(|| pos + 1)
+    }
+}
+
+/// Load prior input lines for ↑/↓ recall: the on-disk history file (one entry
+/// per line, oldest first), in the rustyline-compatible format `save_history`
+/// writes. Blank lines are skipped. Missing/unreadable file → empty.
+fn load_history(path: Option<&PathBuf>) -> Vec<String> {
+    let Some(p) = path else {
+        return Vec::new();
+    };
+    std::fs::read_to_string(p)
+        .map(|s| {
+            s.lines()
+                .filter(|l| !l.trim().is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// The status / prompt line. Colors favor light/high-luminance tones (the
 /// accessibility default — deep dark-saturated hues lose letter detail); every
 /// color maps to a `[tui.colors]` key in the production palette work.
@@ -1056,6 +1092,15 @@ impl RichSurface {
         terminal.clear()?;
         let mut textarea = new_textarea(self.edit);
         let mut editor = Editor::new(self.edit);
+        // ↑/↓ history recall (the rustyline behavior the rich surface had
+        // dropped): the on-disk history plus this session's not-yet-flushed
+        // entries, oldest first. `hist_pos == len` means "the fresh line"; `↑`
+        // walks backward into older entries, `↓` forward, restoring the stashed
+        // in-progress line at the end.
+        let mut history = load_history(self.history_path.as_ref());
+        history.extend(self.unsaved.iter().cloned());
+        let mut hist_pos = history.len();
+        let mut stash = String::new();
         loop {
             // Grow/shrink the inline viewport to the input. The prompt is always
             // inline now — on the first row, either in a wide left gutter or as
@@ -1091,6 +1136,38 @@ impl RichSurface {
             };
             if key.kind != KeyEventKind::Press {
                 continue;
+            }
+            // History recall on ↑/↓ — but only at a vertical edge of the buffer
+            // (top row for ↑, bottom row for ↓) so multi-line cursor movement
+            // still works, and never while a `:` ex-line or `[y/N]` confirm is
+            // open. Plain arrows only (modified arrows fall through to editing).
+            if matches!(key.code, KeyCode::Up | KeyCode::Down)
+                && key.modifiers.is_empty()
+                && editor.ex().is_none()
+                && editor.confirm_prompt().is_none()
+                && !history.is_empty()
+            {
+                let (row, _) = textarea.cursor();
+                let last_row = textarea.lines().len().saturating_sub(1);
+                let at_edge = (key.code == KeyCode::Up && row == 0)
+                    || (key.code == KeyCode::Down && row == last_row);
+                if at_edge {
+                    let up = key.code == KeyCode::Up;
+                    if let Some(next) = history_step(hist_pos, history.len(), up) {
+                        // Stash the in-progress line when first leaving it.
+                        if hist_pos == history.len() {
+                            stash = textarea.lines().join("\n");
+                        }
+                        hist_pos = next;
+                        let content = if hist_pos == history.len() {
+                            stash.clone()
+                        } else {
+                            history[hist_pos].clone()
+                        };
+                        textarea = textarea_with(self.edit, &content);
+                    }
+                    continue;
+                }
             }
             let step = editor.input(key, &mut textarea);
             // A command (e.g. `:jumps`) may have queued a note to print above the
@@ -1276,6 +1353,48 @@ mod tests {
             .map(|s| s.content.as_ref())
             .collect();
         assert!(exline.starts_with(':'), "ex line wins: {exline:?}");
+    }
+
+    #[test]
+    fn history_step_walks_older_then_back_to_the_fresh_line() {
+        // Three entries; pos 3 == the fresh line.
+        let len = 3;
+        // ↑ from fresh walks back through 2,1,0 then stops.
+        assert_eq!(history_step(3, len, true), Some(2));
+        assert_eq!(history_step(2, len, true), Some(1));
+        assert_eq!(history_step(1, len, true), Some(0));
+        assert_eq!(history_step(0, len, true), None, "oldest: nowhere up");
+        // ↓ walks forward and back onto the fresh line, then stops.
+        assert_eq!(history_step(0, len, false), Some(1));
+        assert_eq!(history_step(2, len, false), Some(3));
+        assert_eq!(history_step(3, len, false), None, "fresh: nowhere down");
+        // Empty history never moves.
+        assert_eq!(history_step(0, 0, true), None);
+        assert_eq!(history_step(0, 0, false), None);
+    }
+
+    #[test]
+    fn load_history_reads_nonblank_lines_oldest_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history");
+        std::fs::write(&path, "first\n\nsecond\n  \nthird\n").unwrap();
+        assert_eq!(
+            load_history(Some(&path)),
+            vec![
+                "first".to_string(),
+                "second".to_string(),
+                "third".to_string()
+            ]
+        );
+        // Missing file / no path → empty, never an error.
+        assert!(load_history(Some(&dir.path().join("nope"))).is_empty());
+        assert!(load_history(None).is_empty());
+    }
+
+    #[test]
+    fn textarea_with_prefills_content_for_recall() {
+        let ta = textarea_with(Edit::Vi, "recalled prompt");
+        assert_eq!(ta.lines(), &["recalled prompt".to_string()]);
     }
 
     #[test]
