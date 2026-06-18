@@ -2247,6 +2247,7 @@ dependencies = [
  "agent-mesh-protocol",
  "anyhow",
  "newt-core",
+ "newt-git",
  "newt-inference",
  "newt-tools",
  "pyo3",
