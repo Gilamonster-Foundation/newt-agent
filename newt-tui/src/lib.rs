@@ -8866,7 +8866,7 @@ mod run_command_confinement_tests {
         )
         .await;
         assert!(
-            out.contains("reubeno/brush/pull/1184"),
+            out.contains("shell unavailable in this build"),
             "stub error must link to tracking PR, got: {out}"
         );
     }
@@ -8901,7 +8901,7 @@ mod run_command_confinement_tests {
         )
         .await;
         assert!(
-            out.contains("reubeno/brush/pull/1184"),
+            out.contains("shell unavailable in this build"),
             "stub error must link to tracking PR, got: {out}"
         );
     }
