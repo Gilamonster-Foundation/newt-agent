@@ -408,7 +408,7 @@ fn render_inline_header(workspace: &str, color: bool) -> String {
             "ready — type a task, /help for commands, /exit to quit",
             true,
         ),
-        ("keybindings — /nano (default) · /emacs · /vi", true),
+        ("keybindings — /vi (default) · /emacs · /nano", true),
     ];
     let text_start = mid.saturating_sub(1);
 
@@ -875,7 +875,9 @@ pub(crate) fn resolve_edit_mode() -> newt_core::EditMode {
                 .and_then(|c| c.tui)
                 .map(|t| t.edit_mode)
         })
-        .unwrap_or(newt_core::EditMode::Emacs)
+        // vi is the default (no env, no `[tui] edit_mode`); `/nano` and `/emacs`
+        // switch for those who want them.
+        .unwrap_or(newt_core::EditMode::Vi)
 }
 
 /// Resolve the rich-tui gutter setting from env (`NEWT_GUTTER`) then config.
@@ -1702,20 +1704,6 @@ fn runtime_context_block(model: &str, endpoint: &str, kind: newt_core::BackendKi
          email must always be `{bot_email}`). Never commit with a guessed or \
          personal email.\n"
     )
-}
-
-/// Whether the user has configured a prompt template (`NEWT_PROMPT` env, set by
-/// `/prompt set`, or `[tui] prompt`). The rich surface consults this to decide
-/// between rendering that template and its built-in live status row. Only the
-/// rich surface uses it, so it's compiled only with that feature.
-#[cfg(feature = "rich-tui")]
-pub(crate) fn custom_prompt_active() -> bool {
-    std::env::var("NEWT_PROMPT").is_ok()
-        || newt_core::Config::resolve()
-            .ok()
-            .and_then(|c| c.tui)
-            .and_then(|t| t.prompt)
-            .is_some()
 }
 
 fn prompt_str(workspace: &str, verbose: bool, is_vi: bool, model: &str, rich: bool) -> String {
