@@ -1813,17 +1813,64 @@ fn read_only_caveats(workspace: &str) -> newt_core::caveats::Caveats {
 /// exec scope at session-start so the agent can run tools in those directories
 /// without requiring per-binary `extra_exec` entries in the config file. Only
 /// `Scope::Only` is widened; `Scope::All` (FullAccess) is already unrestricted.
+///
+/// The agent's reads are **locked to the workspace by default**: newt's presets
+/// ship `fs_read = All` (read anything anywhere), but the operator wants the
+/// agent confined to the CWD unless a path is explicitly opened. So `policy_for`
+/// fences `fs_read` to `workspace + the granted paths` for every preset EXCEPT
+/// `full_access` (which is `fs_write = All` — an explicit "no fence" choice).
+/// `--read <path>` adds a read path; `--write <path>` adds a read+write path
+/// (write implies read) and is also widened into the already-fenced `fs_write`.
 fn policy_for(tui: Option<newt_core::TuiConfig>, workspace: &str) -> newt_core::caveats::Caveats {
+    use newt_core::caveats::Scope;
     let mut caveats = tui
         .map(|t| t.permissions.to_caveats(workspace))
         .unwrap_or_else(|| read_only_caveats(workspace));
     let extra = scan_cli_exec_grants();
     if !extra.is_empty() {
-        if let newt_core::caveats::Scope::Only(ref mut set) = caveats.exec {
+        if let Scope::Only(ref mut set) = caveats.exec {
             set.extend(extra);
         }
     }
+    let (reads, writes) = scan_cli_fs_grants();
+    // `full_access` (fs_write == All) opts out of the read lock entirely.
+    if !matches!(caveats.fs_write, Scope::All) {
+        // The read sandbox: the workspace, plus every explicitly granted path
+        // (a --write path implies read).
+        let mut sandbox: Vec<String> = vec![workspace.to_string()];
+        sandbox.extend(reads);
+        sandbox.extend(writes.iter().cloned());
+        match &mut caveats.fs_read {
+            Scope::Only(set) => set.extend(sandbox), // a role already fenced reads → add to it
+            all @ Scope::All => *all = Scope::only(sandbox), // flip the open default → the lock
+        }
+        if let Scope::Only(ref mut set) = caveats.fs_write {
+            set.extend(writes);
+        }
+    }
     caveats
+}
+
+/// CLI out-of-workspace fs grants from `--read` / `--write` (carried as the
+/// colon-separated absolute-path env vars `NEWT_READ_PATHS` / `NEWT_WRITE_PATHS`
+/// that `newt-cli` sets). Returns `(read_roots, write_roots)`; `policy_for`
+/// widens `fs_read` with both and `fs_write` with the write roots. A root that
+/// is a directory grants everything under it; a file root grants just that file
+/// (prefix-matched by [`tui_permits_path`](newt_core::agentic) via the stored
+/// scope set).
+fn scan_cli_fs_grants() -> (Vec<String>, Vec<String>) {
+    let parse = |var: &str| -> Vec<String> {
+        std::env::var(var)
+            .ok()
+            .map(|s| {
+                s.split(':')
+                    .filter(|p| !p.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    (parse("NEWT_READ_PATHS"), parse("NEWT_WRITE_PATHS"))
 }
 
 /// Resolve the configured `[tui]` block, if any.
@@ -3114,7 +3161,16 @@ mod caveat_policy_tests {
             !policy.permits_fs_write("/ws/x"),
             "no write when unconfigured"
         );
-        assert!(policy.permits_fs_read("/ws/x"), "reads still allowed");
+        // Reads are now LOCKED to the workspace (the operator wants the agent
+        // confined to the CWD). The workspace root is readable; paths outside it
+        // are not. (Files *under* the root, e.g. /ws/x, are reached at runtime
+        // via the TUI's prefix match in `tui_permits_path`; the core method here
+        // is exact-set, matching how fs_write has always stored the root.)
+        assert!(policy.permits_fs_read("/ws"), "the workspace is readable");
+        assert!(
+            !policy.permits_fs_read("/etc/passwd"),
+            "reads are locked to the workspace by default"
+        );
     }
 
     #[test]
@@ -3129,7 +3185,9 @@ mod caveat_policy_tests {
         let cap = SessionCapability::establish(None, Some(&key), "/ws");
         assert_ne!(*cap.caveats(), newt_core::caveats::Caveats::top());
         assert!(!cap.caveats().permits_exec("cargo"));
-        assert!(cap.caveats().permits_fs_read("/ws/x"));
+        // Reads locked to the workspace (see absent_config_is_read_only).
+        assert!(cap.caveats().permits_fs_read("/ws"));
+        assert!(!cap.caveats().permits_fs_read("/etc/passwd"));
         assert!(key.exists(), "the per-user identity key was generated");
     }
 
@@ -12174,6 +12232,113 @@ mod env_resolution_tests {
             }
         }
         out
+    }
+
+    #[test]
+    fn cli_fs_grants_widen_read_and_write_scopes() {
+        use newt_core::caveats::Scope;
+        with_env_vars(
+            &[
+                (
+                    "NEWT_READ_PATHS",
+                    "/home/u/.newt:/home/u/.hotseat/config.yml",
+                ),
+                ("NEWT_WRITE_PATHS", "/home/u/scratch"),
+            ],
+            &[],
+            || {
+                // workspace_dev fences BOTH fs_read and fs_write to the workspace
+                // (the operator's real case), so both --read and --write widen.
+                let tui = newt_core::TuiConfig {
+                    permissions: newt_core::ToolPermissions {
+                        preset: newt_core::PermissionPreset::WorkspaceDev,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                };
+                let cav = policy_for(Some(tui), "/ws");
+                let reads = match &cav.fs_read {
+                    Scope::Only(s) => s,
+                    Scope::All => panic!("expected scoped fs_read"),
+                };
+                let writes = match &cav.fs_write {
+                    Scope::Only(s) => s,
+                    Scope::All => panic!("expected scoped fs_write"),
+                };
+                // The workspace fence survives, and the --read grants joined fs_read.
+                assert!(reads.contains("/ws"), "workspace still fenced in");
+                assert!(reads.contains("/home/u/.newt"));
+                assert!(reads.contains("/home/u/.hotseat/config.yml"));
+                // --write joins fs_write AND fs_read (write implies read).
+                assert!(writes.contains("/home/u/scratch"));
+                assert!(reads.contains("/home/u/scratch"), "write implies read");
+                // A --write-only path is NOT writable-only by accident: scratch is
+                // the sole extra write root; the .newt read grant is not writable.
+                assert!(
+                    !writes.contains("/home/u/.newt"),
+                    "read grant is not writable"
+                );
+                // The sandbox is exactly {ws + the 3 grants} — nothing else leaks in.
+                assert_eq!(reads.len(), 4, "read sandbox is exactly ws + the grants");
+            },
+        );
+    }
+
+    #[test]
+    fn reads_are_locked_to_the_workspace_by_default() {
+        use newt_core::caveats::Scope;
+        // No grants at all: a fenced preset's reads still flip from All → just the
+        // workspace (the operator wants the agent locked to the CWD by default).
+        with_env_vars(&[], &["NEWT_READ_PATHS", "NEWT_WRITE_PATHS"], || {
+            let tui = newt_core::TuiConfig {
+                permissions: newt_core::ToolPermissions {
+                    preset: newt_core::PermissionPreset::WorkspaceDev,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            match policy_for(Some(tui), "/ws").fs_read {
+                Scope::Only(set) => {
+                    assert_eq!(set.len(), 1, "exactly the workspace");
+                    assert!(set.contains("/ws"));
+                }
+                Scope::All => panic!("reads should be locked to the workspace, not All"),
+            }
+        });
+    }
+
+    #[test]
+    fn full_access_opts_out_of_the_read_lock() {
+        use newt_core::caveats::Scope;
+        with_env_vars(&[], &["NEWT_READ_PATHS", "NEWT_WRITE_PATHS"], || {
+            let tui = newt_core::TuiConfig {
+                permissions: newt_core::ToolPermissions {
+                    preset: newt_core::PermissionPreset::FullAccess,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            // full_access keeps unrestricted reads — the explicit "no fence" choice.
+            assert!(matches!(policy_for(Some(tui), "/ws").fs_read, Scope::All));
+        });
+    }
+
+    #[test]
+    fn scan_cli_fs_grants_parses_empty_and_populated() {
+        with_env_vars(&[], &["NEWT_READ_PATHS", "NEWT_WRITE_PATHS"], || {
+            assert_eq!(scan_cli_fs_grants(), (vec![], vec![]));
+        });
+        with_env_vars(
+            &[("NEWT_READ_PATHS", "/a::/b")],
+            &["NEWT_WRITE_PATHS"],
+            || {
+                // Empty segments (the `::`) are dropped.
+                assert_eq!(
+                    scan_cli_fs_grants(),
+                    (vec!["/a".to_string(), "/b".to_string()], vec![])
+                );
+            },
+        );
     }
 
     const DGX_VARS: &[&str] = &[

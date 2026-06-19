@@ -167,6 +167,19 @@ pub struct Cli {
     #[arg(long = "exec-path", global = true, value_name = "DIR")]
     pub exec_paths: Vec<PathBuf>,
 
+    /// Grant the agent READ access to a file or directory OUTSIDE the workspace.
+    /// A directory grants everything under it; a file grants just that file. May
+    /// be repeated. Reference the path by its absolute path in tools.
+    /// Example: `newt --read ~/.newt --read ~/.hotseat/config.yml`.
+    #[arg(long = "read", global = true, value_name = "PATH")]
+    pub read_paths: Vec<PathBuf>,
+
+    /// Grant the agent READ+WRITE access to a file or directory OUTSIDE the
+    /// workspace (implies `--read` for the same path). May be repeated.
+    /// Example: `newt --write ~/scratch`.
+    #[arg(long = "write", global = true, value_name = "PATH")]
+    pub write_paths: Vec<PathBuf>,
+
     /// Subcommand to run. Defaults to `code` (TUI coder) when omitted.
     #[command(subcommand)]
     pub command: Option<Command>,
@@ -295,6 +308,37 @@ pub enum Command {
     },
 }
 
+/// Absolutise a single `--read`/`--write` grant: expand a leading `~`, then make
+/// it absolute relative to the current dir. Does NOT require the path to exist (a
+/// `--write` target may be created later) and does not canonicalise (which would
+/// resolve symlinks and need existence) — the goal is a stable absolute string
+/// the fs tools' `workspace.join(path)` results can prefix-match.
+fn abs_grant_path(p: &std::path::Path) -> PathBuf {
+    let expanded: PathBuf = match p.strip_prefix("~") {
+        Ok(rest) => match std::env::var_os("HOME") {
+            Some(home) => PathBuf::from(home).join(rest),
+            None => p.to_path_buf(),
+        },
+        Err(_) => p.to_path_buf(),
+    };
+    if expanded.is_absolute() {
+        expanded
+    } else {
+        std::env::current_dir()
+            .map(|d| d.join(&expanded))
+            .unwrap_or(expanded)
+    }
+}
+
+/// Colon-join absolutised grant paths for `NEWT_READ_PATHS` / `NEWT_WRITE_PATHS`.
+fn abs_grant_paths(paths: &[PathBuf]) -> String {
+    paths
+        .iter()
+        .map(|p| abs_grant_path(p).display().to_string())
+        .collect::<Vec<_>>()
+        .join(":")
+}
+
 pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
     // Resolve the venv: --venv flag wins, then fall back to an already-activated $VIRTUAL_ENV.
     // Set NEWT_VENV so the TUI can inject it into the agent-bridle confined shell (which does
@@ -326,6 +370,17 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             .collect::<Vec<_>>()
             .join(":");
         unsafe { std::env::set_var("NEWT_EXEC_PATHS", &joined) };
+    }
+
+    // --read / --write: store absolutised, colon-separated paths so the TUI can
+    // widen the agent's fs_read / fs_write scope to these out-of-workspace
+    // locations (a dir grants everything under it; a file grants just itself).
+    // --write implies --read for the same path.
+    if !cli.read_paths.is_empty() {
+        unsafe { std::env::set_var("NEWT_READ_PATHS", abs_grant_paths(&cli.read_paths)) };
+    }
+    if !cli.write_paths.is_empty() {
+        unsafe { std::env::set_var("NEWT_WRITE_PATHS", abs_grant_paths(&cli.write_paths)) };
     }
 
     match cli.command.unwrap_or(Command::Code { path: None }) {
@@ -762,6 +817,43 @@ mod tests {
         assert!(matches!(cli.command, Some(Command::Code { .. })));
         let cli = Cli::try_parse_from(["newt"]).unwrap();
         assert!(!cli.disable_ocap);
+    }
+
+    #[test]
+    fn parses_repeated_read_and_write_grants() {
+        let cli = Cli::try_parse_from([
+            "newt",
+            "--read",
+            "/a/.newt",
+            "--read",
+            "/a/x.yml",
+            "--write",
+            "/a/scratch",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.read_paths,
+            vec![PathBuf::from("/a/.newt"), PathBuf::from("/a/x.yml")]
+        );
+        assert_eq!(cli.write_paths, vec![PathBuf::from("/a/scratch")]);
+    }
+
+    #[test]
+    fn abs_grant_path_expands_tilde_and_absolutises() {
+        // A leading ~ expands to $HOME; an absolute path is unchanged.
+        std::env::set_var("HOME", "/home/u");
+        assert_eq!(
+            abs_grant_path(std::path::Path::new("~/.newt")),
+            PathBuf::from("/home/u/.newt")
+        );
+        assert_eq!(
+            abs_grant_path(std::path::Path::new("/etc/hosts")),
+            PathBuf::from("/etc/hosts")
+        );
+        // A relative path is joined onto the current dir.
+        let rel = abs_grant_path(std::path::Path::new("sub/file"));
+        assert!(rel.is_absolute(), "relative grant absolutised: {rel:?}");
+        assert!(rel.ends_with("sub/file"));
     }
 
     #[test]
