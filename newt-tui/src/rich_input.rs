@@ -50,7 +50,10 @@ use std::io::{self, Stdout, Write as _};
 use std::path::PathBuf;
 use std::time::Duration;
 
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers,
+};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -952,42 +955,110 @@ fn draw(
     }
 }
 
-/// Render the prompt as an inline prefix on row 0 with the input flowing after
-/// it, and continuation rows hang-indented by `g` columns. tui-textarea can't
-/// vary indent per row (it fills one rect), so we render the buffer ourselves
-/// as a `Paragraph` and place the block cursor by hand. A single horizontal
-/// scroll keeps the cursor visible on an over-long line (the prompt scrolls off
-/// with it, shell-style).
-fn draw_overhang(f: &mut Frame, area: Rect, prompt: &Line<'static>, textarea: &TextArea, g: u16) {
-    let pw = prompt.width() as u16;
-    let (crow, ccol) = textarea.cursor();
-    let indent = |i: usize| if i == 0 { pw } else { g };
+/// Soft-wrap one logical line into visual segments that fit the input width.
+/// `first_w` is the available text width for the first segment (after the prompt
+/// or gutter indent), `cont_w` for each wrapped continuation. Breaks at the last
+/// space within the width (word wrap), falling back to a hard mid-token break so
+/// an unbreakable run still fits. Every char belongs to exactly one segment (the
+/// breaking space ends its segment, nothing is dropped) so the cursor maps back
+/// cleanly. Each entry is `(char_index_where_the_segment_starts, segment_text)`;
+/// there is always at least one segment (empty for an empty line).
+fn wrap_segments(text: &str, first_w: usize, cont_w: usize) -> Vec<(usize, String)> {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.is_empty() {
+        return vec![(0, String::new())];
+    }
+    let mut segs: Vec<(usize, String)> = Vec::new();
+    let mut start = 0;
+    while start < chars.len() {
+        let avail = if segs.is_empty() { first_w } else { cont_w }.max(1);
+        if chars.len() - start <= avail {
+            segs.push((start, chars[start..].iter().collect()));
+            break;
+        }
+        let hard_end = start + avail;
+        // Prefer breaking just after the last space in range (word wrap); else
+        // hard-break at the width. Force ≥1 char of progress.
+        let break_at = (start..hard_end)
+            .rev()
+            .find(|&i| chars[i] == ' ')
+            .map(|i| i + 1)
+            .unwrap_or(hard_end)
+            .max(start + 1);
+        segs.push((start, chars[start..break_at].iter().collect()));
+        start = break_at;
+    }
+    segs
+}
 
-    let mut rows: Vec<Line> = Vec::with_capacity(textarea.lines().len());
-    for (i, text) in textarea.lines().iter().enumerate() {
-        if i == 0 {
-            let mut spans = prompt.spans.clone();
-            spans.push(Span::raw(text.clone()));
-            rows.push(Line::from(spans));
-        } else {
-            rows.push(Line::from(vec![
-                Span::raw(" ".repeat(g as usize)),
-                Span::raw(text.clone()),
-            ]));
+/// Build the wrapped visual rows for the overhang surface, plus the cursor's
+/// position in full-row space `(col, row)`. Row 0 is prefixed by `prompt`;
+/// wrapped continuations and later logical lines hang-indent by `g`. Pure
+/// (no `Frame`) so the wrap + cursor math is unit-tested; `draw_overhang`
+/// renders it (with vertical scroll) and `event_loop` uses the row count to
+/// size the inline viewport.
+fn overhang_rows(
+    prompt: &Line<'static>,
+    lines: &[String],
+    cursor: (usize, usize),
+    g: u16,
+    width: u16,
+) -> (Vec<Line<'static>>, u16, u16) {
+    let pw = prompt.width() as u16;
+    let (crow, ccol) = cursor;
+    let cont_w = width.saturating_sub(g).max(1) as usize;
+    let mut rows: Vec<Line> = Vec::new();
+    let (mut cx, mut cy) = (pw, 0u16);
+    for (i, text) in lines.iter().enumerate() {
+        let first_indent = if i == 0 { pw } else { g };
+        let first_w = width.saturating_sub(first_indent).max(1) as usize;
+        let segs = wrap_segments(text, first_w, cont_w);
+        let n = segs.len();
+        for (s, (seg_start, seg_text)) in segs.into_iter().enumerate() {
+            let indent = if s == 0 { first_indent } else { g };
+            let line = if i == 0 && s == 0 {
+                let mut spans = prompt.spans.clone();
+                spans.push(Span::raw(seg_text.clone()));
+                Line::from(spans)
+            } else {
+                Line::from(vec![
+                    Span::raw(" ".repeat(indent as usize)),
+                    Span::raw(seg_text.clone()),
+                ])
+            };
+            if i == crow {
+                let seg_end = seg_start + seg_text.chars().count();
+                let last = s + 1 == n;
+                if (ccol >= seg_start && ccol < seg_end) || (last && ccol >= seg_end) {
+                    cy = rows.len() as u16;
+                    cx = indent + (ccol.saturating_sub(seg_start)) as u16;
+                }
+            }
+            rows.push(line);
         }
     }
+    (rows, cx, cy)
+}
 
-    // Horizontal scroll so the cursor stays on screen for a long line.
-    let cur_x = indent(crow).saturating_add(ccol as u16);
-    let last_col = area.width.saturating_sub(1);
-    let scroll_x = cur_x.saturating_sub(last_col);
-    f.render_widget(Paragraph::new(rows).scroll((0, scroll_x)), area);
+/// Render the prompt as an inline prefix on row 0, the input flowing after it
+/// and **soft-wrapping** within the terminal width; continuation/wrapped rows
+/// hang-indent by `g`. tui-textarea can't vary indent per row or soft-wrap, so
+/// we render the buffer ourselves as a `Paragraph` and place the block cursor by
+/// hand. A vertical scroll keeps the cursor row visible when the wrapped input
+/// is taller than the inline region.
+fn draw_overhang(f: &mut Frame, area: Rect, prompt: &Line<'static>, textarea: &TextArea, g: u16) {
+    let (rows, cx, cy) = overhang_rows(prompt, textarea.lines(), textarea.cursor(), g, area.width);
+
+    // Vertical scroll so the cursor row stays visible past MAX_INPUT_ROWS.
+    let last_row = area.height.saturating_sub(1);
+    let scroll_y = cy.saturating_sub(last_row);
+    f.render_widget(Paragraph::new(rows).scroll((scroll_y, 0)), area);
 
     // Block (reverse) cursor, matching the widget path's look.
-    let cx = area.x + cur_x - scroll_x;
-    let cy = area.y + crow as u16;
-    if cx <= area.right().saturating_sub(1) && cy <= area.bottom().saturating_sub(1) {
-        if let Some(cell) = f.buffer_mut().cell_mut((cx, cy)) {
+    let cur_x = area.x + cx;
+    let cur_y = area.y + cy - scroll_y;
+    if cur_x <= area.right().saturating_sub(1) && cur_y <= area.bottom().saturating_sub(1) {
+        if let Some(cell) = f.buffer_mut().cell_mut((cur_x, cur_y)) {
             cell.set_style(Style::default().add_modifier(Modifier::REVERSED));
         }
     }
@@ -1076,7 +1147,13 @@ impl RichSurface {
     /// prints normally into scrollback.
     fn read_turn(&self) -> io::Result<ReadOutcome> {
         enable_raw_mode()?;
+        // Bracketed paste: the terminal wraps a paste in escape markers and
+        // delivers it as ONE `Event::Paste(text)` instead of a stream of key
+        // presses. Without it, a multi-line paste arrives as Char…Enter…Char…
+        // and every embedded Enter submits a line. See the `Event::Paste` arm.
+        let _ = crossterm::execute!(io::stdout(), EnableBracketedPaste);
         let outcome = self.event_loop();
+        let _ = crossterm::execute!(io::stdout(), DisableBracketedPaste);
         let _ = disable_raw_mode();
         outcome
     }
@@ -1104,8 +1181,26 @@ impl RichSurface {
         loop {
             // Grow/shrink the inline viewport to the input. The prompt is always
             // inline now — on the first row, either in a wide left gutter or as
-            // an overhang prefix — so it never needs a row of its own.
-            let want = (textarea.lines().len() as u16).clamp(1, MAX_INPUT_ROWS);
+            // an overhang prefix — so it never needs a row of its own. The
+            // overhang path soft-wraps, so the height is the WRAPPED row count
+            // (not the logical-line count); the wide-gutter widget path is one
+            // row per logical line.
+            let term_w = crossterm::terminal::size().map(|(c, _)| c).unwrap_or(80);
+            let rows = if resolve_gutter(self.gutter, term_w) >= GUTTER_W {
+                textarea.lines().len() as u16
+            } else {
+                let prompt = prompt_line(&editor, self.custom_prompt.as_deref());
+                overhang_rows(
+                    &prompt,
+                    textarea.lines(),
+                    textarea.cursor(),
+                    resolve_gutter(self.gutter, term_w),
+                    term_w,
+                )
+                .0
+                .len() as u16
+            };
+            let want = rows.clamp(1, MAX_INPUT_ROWS);
             if want != cur_h {
                 // Blank the CURRENT region before resizing. ratatui reserves
                 // space for a taller inline viewport by scrolling whatever is on
@@ -1131,7 +1226,17 @@ impl RichSurface {
             if !event::poll(Duration::from_millis(250))? {
                 continue;
             }
-            let Event::Key(key) = event::read()? else {
+            let evt = event::read()?;
+            // Bracketed paste: insert the whole block at the cursor — newlines
+            // become real line breaks in the buffer, and NOTHING is submitted
+            // (only an explicit Enter keypress submits). Normalize CRLF/CR so a
+            // paste from any platform lands as clean `\n` lines.
+            if let Event::Paste(text) = evt {
+                let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+                textarea.insert_str(normalized);
+                continue;
+            }
+            let Event::Key(key) = evt else {
                 continue;
             };
             if key.kind != KeyEventKind::Press {
@@ -1256,6 +1361,72 @@ impl InputSurface for RichSurface {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wrap_segments_empty_and_fitting() {
+        assert_eq!(wrap_segments("", 10, 10), vec![(0, String::new())]);
+        assert_eq!(wrap_segments("hi", 10, 10), vec![(0, "hi".to_string())]);
+    }
+
+    #[test]
+    fn wrap_segments_breaks_at_spaces_word_wrap() {
+        // first_w = cont_w = 8. The breaking space ends its segment (no char
+        // dropped — every index has a home for cursor mapping).
+        let segs = wrap_segments("hello world foo", 8, 8);
+        assert_eq!(
+            segs,
+            vec![
+                (0, "hello ".to_string()),
+                (6, "world ".to_string()),
+                (12, "foo".to_string()),
+            ]
+        );
+        // Concatenating the segments reproduces the line exactly.
+        let joined: String = segs.iter().map(|(_, s)| s.as_str()).collect();
+        assert_eq!(joined, "hello world foo");
+    }
+
+    #[test]
+    fn wrap_segments_hard_breaks_an_unbreakable_run() {
+        assert_eq!(
+            wrap_segments("abcdefghij", 4, 4),
+            vec![
+                (0, "abcd".to_string()),
+                (4, "efgh".to_string()),
+                (8, "ij".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn wrap_segments_honors_a_narrower_first_width() {
+        // First segment fits 3 (after a wide prompt), continuations fit 6.
+        let segs = wrap_segments("abcdefghi", 3, 6);
+        assert_eq!(segs[0], (0, "abc".to_string()));
+        assert_eq!(segs[1], (3, "defghi".to_string()));
+    }
+
+    #[test]
+    fn overhang_rows_wraps_a_long_line_and_tracks_the_cursor() {
+        let prompt = Line::from("❯ "); // width 2
+        let lines = vec!["hello world foo".to_string()];
+        // width 8 → row0 text width = 8-2 = 6; continuations 8-1 = 7 (g=1).
+        // "hello " (6, after the 2-col prompt), then "world f" (7), then "oo".
+        let (rows, cx, cy) = overhang_rows(&prompt, &lines, (0, 15), 1, 8);
+        assert!(rows.len() >= 2, "the long line wrapped to multiple rows");
+        // Cursor at end (col 15) lands on the last wrapped row.
+        assert_eq!(cy as usize, rows.len() - 1);
+        assert!(cx >= 1, "cursor is indented on the continuation row");
+    }
+
+    #[test]
+    fn overhang_rows_short_line_is_one_row_after_the_prompt() {
+        let prompt = Line::from("❯ "); // width 2
+        let (rows, cx, cy) = overhang_rows(&prompt, &["hi".to_string()], (0, 2), 1, 80);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(cy, 0);
+        assert_eq!(cx, 2 + 2, "prompt width (2) + cursor col (2)");
+    }
 
     fn key(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
