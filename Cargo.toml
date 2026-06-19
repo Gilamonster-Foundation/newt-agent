@@ -73,6 +73,10 @@ chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "v5", "serde"] }
 toml = "1.0"
 regex = "1"
+# Gitignore-aware recursive filesystem walking for the embedded `find` tool
+# (#496). Pure-Rust (ripgrep's walker), no C deps → preserves the PyO3 wheel
+# story; honours nested .gitignore / .git/info/exclude / hidden-file rules.
+ignore = "0.4"
 
 # Patch application — optional strict backend behind newt-tools'
 # `applier-diffy` feature (default applier stays the in-house fuzzy

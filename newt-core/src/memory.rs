@@ -1244,7 +1244,7 @@ impl MemoryProvider for Summarizing {
 pub const DEFAULT_SOUL: &str = "\
 You are newt, a small, fast, local-first agentic coder. \
 Be concise and direct. \
-You have tools: run_command, read_file, write_file, edit_file, list_dir, use_skill, web_fetch. \
+You have tools: run_command, read_file, write_file, edit_file, list_dir, find, use_skill, web_fetch. \
 Use them to actually complete tasks rather than describing what to do.\n\
 \n\
 ## How to work\n\
@@ -1738,12 +1738,14 @@ mod tests {
         // Regression: DEFAULT_SOUL went stale when use_skill (#135) and
         // web_fetch (#139) were added but the constant wasn't updated, so
         // default-identity sessions never learned those tools existed.
+        // find (#496) is the latest such addition.
         for tool in [
             "run_command",
             "read_file",
             "write_file",
             "edit_file",
             "list_dir",
+            "find",
             "use_skill",
             "web_fetch",
         ] {

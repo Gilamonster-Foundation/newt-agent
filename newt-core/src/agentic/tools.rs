@@ -99,6 +99,26 @@ pub fn tool_definitions() -> serde_json::Value {
         {
             "type": "function",
             "function": {
+                "name": "find",
+                "description": "Find files and directories by name under the workspace, recursively, WITHOUT a shell (use this instead of the `find` shell command). Returns matching paths relative to the workspace root, one per line, already sorted — no need to pipe to `sort`. Respects .gitignore and skips noise (.git, target, node_modules) by default.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "Directory to search under, relative to workspace root. Default '.' (the whole workspace)." },
+                        "name": { "type": "string", "description": "Glob matched against each entry's basename, e.g. '*.py' or 'pyo3_module.rs'. '*' matches any run, '?' any single char. Omit to match everything." },
+                        "type": { "type": "string", "enum": ["f", "d", "any"], "description": "Restrict to files ('f'), directories ('d'), or both ('any', the default)." },
+                        "max_depth": { "type": "integer", "description": "Maximum directory depth below `path` (1 = immediate children only). Omit for unlimited." },
+                        "max_results": { "type": "integer", "description": "Cap on the number of matches returned. Default 1000; output notes when truncated." },
+                        "respect_gitignore": { "type": "boolean", "description": "When true (default) skip .gitignored paths plus .git/target/node_modules/hidden dirs. Set false to search everything." },
+                        "case_sensitive": { "type": "boolean", "description": "Case-sensitive basename match. Default true." }
+                    },
+                    "required": []
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
                 "name": "use_skill",
                 "description": "Load a skill's full procedural instructions on demand. The system prompt lists the available skills (name + description); call this with a skill's name to get its complete SKILL.md body plus the paths of any bundled files (scripts/templates) you can read or run.",
                 "parameters": {
@@ -185,6 +205,9 @@ const DIRECT_TOOL_NAMES: &[&str] = &[
     "edit_file",
     "use_skill",
     "web_fetch",
+    // #496: `find …` typed at run_command redirects to the embedded `find`
+    // tool — which works even when the shell is unavailable in this build.
+    "find",
     // PR4: `git …` typed at run_command redirects to the embedded `git` tool.
     "git",
 ];
@@ -211,6 +234,7 @@ pub(crate) fn is_hallucination(tool_name: &str, args: &serde_json::Value) -> boo
             | "edit_file"
             | "use_skill"
             | "web_fetch"
+            | "find"
             | "save_note"
             | "recall"
             | "memory_fetch"
@@ -644,6 +668,139 @@ pub(crate) fn host_of_url(url: &str) -> Option<String> {
     } else {
         Some(host.to_ascii_lowercase())
     }
+}
+
+/// File-type restriction for the embedded `find` tool (#496).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FindType {
+    Files,
+    Dirs,
+    Any,
+}
+
+/// Parsed, validated options for one `find` invocation.
+struct FindOpts<'a> {
+    /// Glob matched against each basename; `None` matches everything.
+    name: Option<&'a str>,
+    type_filter: FindType,
+    /// Max depth below the search root (1 = immediate children); `None` =
+    /// unlimited.
+    max_depth: Option<usize>,
+    /// Hard cap on returned matches.
+    max_results: usize,
+    /// Honour .gitignore + skip .git/target/node_modules/hidden dirs.
+    respect_gitignore: bool,
+    case_sensitive: bool,
+}
+
+/// Translate a shell-style basename glob (`*`, `?`) into an anchored regex.
+/// Every other character is matched literally (regex metacharacters escaped),
+/// so `pyo3_module.rs` matches only that exact basename, not `pyo3Xmodulexrs`.
+fn glob_to_regex(glob: &str, case_sensitive: bool) -> Result<regex::Regex, String> {
+    let mut re = String::with_capacity(glob.len() + 8);
+    if !case_sensitive {
+        re.push_str("(?i)");
+    }
+    re.push('^');
+    for ch in glob.chars() {
+        match ch {
+            '*' => re.push_str(".*"),
+            '?' => re.push('.'),
+            // Escape every regex metacharacter so the rest is literal.
+            '.' | '+' | '(' | ')' | '|' | '[' | ']' | '{' | '}' | '^' | '$' | '\\' => {
+                re.push('\\');
+                re.push(ch);
+            }
+            other => re.push(other),
+        }
+    }
+    re.push('$');
+    regex::Regex::new(&re).map_err(|e| format!("invalid name pattern: {e}"))
+}
+
+/// Recursively walk `root` and collect matches as workspace-relative,
+/// `/`-normalised, sorted paths. Pure-`ignore`-crate traversal (no shell, no
+/// subprocess) — the whole point of #496. Never follows symlinked directories
+/// (avoids cycles and workspace escapes). Returns `(matches, truncated)` where
+/// `truncated` is true if `max_results` was reached and more existed.
+fn find_walk(
+    root: &std::path::Path,
+    workspace_root: &std::path::Path,
+    opts: &FindOpts<'_>,
+) -> Result<(Vec<String>, bool), String> {
+    let pattern = match opts.name {
+        Some(g) if !g.is_empty() => Some(glob_to_regex(g, opts.case_sensitive)?),
+        _ => None,
+    };
+
+    let mut builder = ignore::WalkBuilder::new(root);
+    builder
+        .hidden(opts.respect_gitignore)
+        .ignore(opts.respect_gitignore)
+        .git_ignore(opts.respect_gitignore)
+        .git_global(opts.respect_gitignore)
+        .git_exclude(opts.respect_gitignore)
+        .parents(opts.respect_gitignore)
+        // Honour .gitignore even outside a git repo (the agent's cwd may not be
+        // a checkout); without this `ignore` silently ignores gitignore files.
+        .require_git(false)
+        .follow_links(false);
+    if let Some(d) = opts.max_depth {
+        builder.max_depth(Some(d));
+    }
+    // The `ignore` walker prunes via .gitignore/hidden but has no built-in
+    // skip for build/dep dirs. Prune them explicitly (and cheaply, before
+    // descent) so a default `find` doesn't drown in target/ or node_modules/.
+    // `.git` is already covered by `.hidden(true)`. Skipped only when respecting
+    // ignores — `respect_gitignore=false` means "search everything".
+    if opts.respect_gitignore {
+        let mut ob = ignore::overrides::OverrideBuilder::new(root);
+        // In override globs a leading `!` excludes; with no whitelist globs
+        // present, everything else stays included.
+        if ob.add("!target/").is_ok() && ob.add("!node_modules/").is_ok() {
+            if let Ok(ov) = ob.build() {
+                builder.overrides(ov);
+            }
+        }
+    }
+
+    let mut out: Vec<String> = Vec::new();
+    let mut truncated = false;
+    for result in builder.build() {
+        let entry = match result {
+            Ok(e) => e,
+            // Skip individual unreadable entries rather than failing the walk.
+            Err(_) => continue,
+        };
+        // depth 0 is the search root itself — never a match.
+        if entry.depth() == 0 {
+            continue;
+        }
+        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        match opts.type_filter {
+            FindType::Files if is_dir => continue,
+            FindType::Dirs if !is_dir => continue,
+            _ => {}
+        }
+        if let Some(re) = &pattern {
+            let base = entry.file_name().to_string_lossy();
+            if !re.is_match(&base) {
+                continue;
+            }
+        }
+        if out.len() >= opts.max_results {
+            truncated = true;
+            break;
+        }
+        let rel = entry
+            .path()
+            .strip_prefix(workspace_root)
+            .unwrap_or_else(|_| entry.path());
+        out.push(rel.to_string_lossy().replace('\\', "/"));
+    }
+    out.sort();
+    out.dedup();
+    Ok((out, truncated))
 }
 
 /// Execute a single tool call and return the result string sent back to the model.
@@ -1129,6 +1286,74 @@ pub async fn execute_tool(
             }
         }
 
+        // #496: embedded, shell-free file search. The reported breakage was an
+        // agent that needed `find` but the build's shell tool was unavailable;
+        // this arm walks the workspace with the `ignore` crate (no subprocess),
+        // gated by the same fs_read caveat as list_dir/read_file.
+        "find" => {
+            let path = args["path"].as_str().unwrap_or(".");
+            let full = std::path::Path::new(workspace).join(path);
+            let full_str = full.to_string_lossy();
+            if !tui_permits_path(&caveats.fs_read, &full_str) {
+                let allowed = permission_gate.is_some_and(|gate| {
+                    fs_gate_allows(gate, "find", DenialKind::FsRead, &full_str, |c| &c.fs_read)
+                });
+                if !allowed {
+                    let msg = format!("capability denied: fs_read does not permit '{path}'");
+                    print_denied("fs_read", path, color);
+                    return msg;
+                }
+            }
+            print_tool_call("find", path, color);
+            if !full.exists() {
+                return format!("error: no such path '{path}'");
+            }
+            // Defence-in-depth for a *recursive* read: refuse a root that
+            // canonicalises outside the workspace (e.g. via `..`). `find` never
+            // follows symlinks, so descent can't escape either.
+            if let (Ok(ws_canon), Ok(root_canon)) = (
+                std::path::Path::new(workspace).canonicalize(),
+                full.canonicalize(),
+            ) {
+                if !root_canon.starts_with(&ws_canon) {
+                    let msg = format!("capability denied: fs_read does not permit '{path}'");
+                    print_denied("fs_read", path, color);
+                    return msg;
+                }
+            }
+            let opts = FindOpts {
+                name: args["name"].as_str(),
+                type_filter: match args["type"].as_str() {
+                    Some("f") => FindType::Files,
+                    Some("d") => FindType::Dirs,
+                    _ => FindType::Any,
+                },
+                max_depth: args["max_depth"].as_u64().map(|d| d as usize),
+                max_results: args["max_results"]
+                    .as_u64()
+                    .map(|m| m as usize)
+                    .unwrap_or(1000),
+                respect_gitignore: args["respect_gitignore"].as_bool().unwrap_or(true),
+                case_sensitive: args["case_sensitive"].as_bool().unwrap_or(true),
+            };
+            match find_walk(&full, std::path::Path::new(workspace), &opts) {
+                Ok((hits, truncated)) => {
+                    let mut listing = if hits.is_empty() {
+                        "no matches".to_string()
+                    } else {
+                        hits.join("\n")
+                    };
+                    if truncated {
+                        listing
+                            .push_str(&format!("\n… (truncated at {} matches)", opts.max_results));
+                    }
+                    print_tool_output(&listing, tool_output_lines, color);
+                    listing
+                }
+                Err(e) => format!("error: {e}"),
+            }
+        }
+
         "use_skill" => {
             let skill_name = args["name"].as_str().unwrap_or("");
             print_tool_call("use_skill", skill_name, color);
@@ -1269,6 +1494,7 @@ mod tests {
                 "write_file",
                 "edit_file",
                 "list_dir",
+                "find",
                 "use_skill",
                 "web_fetch"
             ]
@@ -1810,6 +2036,273 @@ mod execute_tool_branch_tests {
     async fn crew_arm_without_injection_is_unknown_tool() {
         let out = run_crew_tool("crew", serde_json::json!({ "task": "x" }), None).await;
         assert!(out.contains("unknown tool: crew"), "got: {out}");
+    }
+
+    // --- #496: the embedded `find` tool -----------------------------------
+
+    /// Convenience for `find` calls through the real dispatch under a
+    /// read-everything session.
+    async fn run_find(args: serde_json::Value, ws: &std::path::Path) -> String {
+        run_tool("find", args, ws, &caveats_rw(ws), None).await
+    }
+
+    fn touch(root: &std::path::Path, rel: &str) {
+        let p = root.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, b"x").unwrap();
+    }
+
+    /// Regression for #496: an agent needed `find . -name pyo3_module.rs` but
+    /// the build's shell tool was unavailable. The embedded tool must locate the
+    /// file by basename, ignoring decoys, and return its workspace-relative path
+    /// (no shell, no `| sort`). Fails before this tool existed (`unknown tool:
+    /// find`).
+    #[tokio::test]
+    async fn find_locates_file_by_name_issue_496() {
+        let ws = tempfile::TempDir::new().unwrap();
+        touch(ws.path(), "newt-core/src/pyo3_module.rs");
+        touch(ws.path(), "newt-data/src/other.rs");
+        touch(ws.path(), "docs/pyo3_module.md"); // decoy: wrong extension
+        let out = run_find(serde_json::json!({ "name": "pyo3_module.rs" }), ws.path()).await;
+        assert_eq!(out, "newt-core/src/pyo3_module.rs", "got: {out}");
+    }
+
+    /// The other call the blocked agent reached for:
+    /// `find examples -maxdepth 2 -type f -name '*.py'`. Exercises glob + type
+    /// filter + max_depth together, and confirms output is pre-sorted.
+    #[tokio::test]
+    async fn find_glob_type_and_maxdepth_together() {
+        let ws = tempfile::TempDir::new().unwrap();
+        touch(ws.path(), "examples/a.py"); // depth 1 — match
+        touch(ws.path(), "examples/sub/b.py"); // depth 2 — match
+        touch(ws.path(), "examples/sub/deep/c.py"); // depth 3 — too deep
+        touch(ws.path(), "examples/readme.md"); // wrong extension
+        std::fs::create_dir_all(ws.path().join("examples/empty_dir")).unwrap();
+        let out = run_find(
+            serde_json::json!({
+                "path": "examples", "name": "*.py", "type": "f", "max_depth": 2
+            }),
+            ws.path(),
+        )
+        .await;
+        // Pre-sorted, exactly the two in-depth .py files, no dir, no .md, no
+        // depth-3 file — and no shell `| sort` needed.
+        assert_eq!(out, "examples/a.py\nexamples/sub/b.py", "got: {out}");
+    }
+
+    /// Output is sorted ascending regardless of filesystem/creation order.
+    #[tokio::test]
+    async fn find_output_is_sorted() {
+        let ws = tempfile::TempDir::new().unwrap();
+        for f in ["m.txt", "a.txt", "z.txt", "c.txt"] {
+            touch(ws.path(), f);
+        }
+        let out = run_find(serde_json::json!({ "name": "*.txt" }), ws.path()).await;
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(
+            lines,
+            vec!["a.txt", "c.txt", "m.txt", "z.txt"],
+            "got: {out}"
+        );
+    }
+
+    /// `type` restricts to files or directories.
+    #[tokio::test]
+    async fn find_type_filter() {
+        let ws = tempfile::TempDir::new().unwrap();
+        touch(ws.path(), "pkg/file.rs");
+        std::fs::create_dir_all(ws.path().join("pkg/sub")).unwrap();
+        let dirs = run_find(serde_json::json!({ "type": "d" }), ws.path()).await;
+        assert!(
+            dirs.contains("pkg") && dirs.contains("pkg/sub"),
+            "got: {dirs}"
+        );
+        assert!(!dirs.contains("file.rs"), "dirs-only leaked a file: {dirs}");
+        let files = run_find(serde_json::json!({ "type": "f" }), ws.path()).await;
+        assert!(files.contains("pkg/file.rs"), "got: {files}");
+        assert!(
+            !files.lines().any(|l| l == "pkg" || l == "pkg/sub"),
+            "files-only leaked a dir: {files}"
+        );
+    }
+
+    /// .gitignore + the default build/dep skips are honoured by default and
+    /// can be disabled with `respect_gitignore=false`.
+    #[tokio::test]
+    async fn find_gitignore_and_default_skips() {
+        let ws = tempfile::TempDir::new().unwrap();
+        std::fs::write(ws.path().join(".gitignore"), "ignored.txt\n").unwrap();
+        touch(ws.path(), "kept.txt");
+        touch(ws.path(), "ignored.txt");
+        touch(ws.path(), "target/build_artifact.txt");
+        touch(ws.path(), "node_modules/dep.txt");
+
+        let on = run_find(serde_json::json!({ "name": "*.txt" }), ws.path()).await;
+        assert!(on.contains("kept.txt"), "got: {on}");
+        assert!(!on.contains("ignored.txt"), "gitignore not honoured: {on}");
+        assert!(!on.contains("target/"), "target not skipped: {on}");
+        assert!(
+            !on.contains("node_modules/"),
+            "node_modules not skipped: {on}"
+        );
+
+        let off = run_find(
+            serde_json::json!({ "name": "*.txt", "respect_gitignore": false }),
+            ws.path(),
+        )
+        .await;
+        assert!(off.contains("ignored.txt"), "opt-out should show it: {off}");
+        assert!(off.contains("target/build_artifact.txt"), "got: {off}");
+    }
+
+    /// `max_results` caps output and the result notes the truncation.
+    #[tokio::test]
+    async fn find_max_results_caps_and_notes_truncation() {
+        let ws = tempfile::TempDir::new().unwrap();
+        for i in 0..10 {
+            touch(ws.path(), &format!("f{i}.txt"));
+        }
+        let out = run_find(
+            serde_json::json!({ "name": "*.txt", "max_results": 3 }),
+            ws.path(),
+        )
+        .await;
+        let body: Vec<&str> = out.lines().filter(|l| l.ends_with(".txt")).collect();
+        assert_eq!(body.len(), 3, "should cap at 3: {out}");
+        assert!(out.contains("truncated at 3"), "got: {out}");
+    }
+
+    /// A missing root is a clear error, and an empty match set says so.
+    #[tokio::test]
+    async fn find_missing_root_and_no_matches() {
+        let ws = tempfile::TempDir::new().unwrap();
+        touch(ws.path(), "a.txt");
+        let missing = run_find(serde_json::json!({ "path": "does/not/exist" }), ws.path()).await;
+        assert!(missing.starts_with("error:"), "got: {missing}");
+        let empty = run_find(serde_json::json!({ "name": "*.nope" }), ws.path()).await;
+        assert_eq!(empty, "no matches", "got: {empty}");
+    }
+
+    /// fs_read denial: no scope + no prompt gate ⇒ capability denied (same UX
+    /// as list_dir/read_file).
+    #[tokio::test]
+    async fn find_denied_without_fs_read() {
+        let ws = tempfile::TempDir::new().unwrap();
+        touch(ws.path(), "secret.txt");
+        let denied = Caveats {
+            fs_read: Scope::none(),
+            ..caveats_rw(ws.path())
+        };
+        let out = run_tool(
+            "find",
+            serde_json::json!({ "name": "*" }),
+            ws.path(),
+            &denied,
+            None,
+        )
+        .await;
+        assert!(out.starts_with("capability denied"), "got: {out}");
+    }
+
+    /// A `..` root that escapes the workspace is refused even when the session
+    /// grants fs_read everywhere (defence-in-depth for a recursive read).
+    #[tokio::test]
+    async fn find_refuses_root_outside_workspace() {
+        let parent = tempfile::TempDir::new().unwrap();
+        std::fs::write(parent.path().join("outside.txt"), b"x").unwrap();
+        let ws = parent.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        // fs_read: All, so the only thing that can stop the escape is the
+        // canonical-root containment check.
+        let out = run_find(serde_json::json!({ "path": ".." }), &ws).await;
+        assert!(out.starts_with("capability denied"), "got: {out}");
+    }
+
+    /// An empty `name` is treated as "match everything" (the `!g.is_empty()`
+    /// guard routes `Some("")` to the no-filter path; without it the glob would
+    /// compile to `^$` and match nothing).
+    #[tokio::test]
+    async fn find_empty_name_matches_everything() {
+        let ws = tempfile::TempDir::new().unwrap();
+        touch(ws.path(), "a.txt");
+        touch(ws.path(), "sub/b.rs");
+        let out = run_find(serde_json::json!({ "name": "" }), ws.path()).await;
+        for expected in ["a.txt", "sub", "sub/b.rs"] {
+            assert!(
+                out.lines().any(|l| l == expected),
+                "empty name should match `{expected}`: {out}"
+            );
+        }
+    }
+
+    /// Hidden entries (dotfiles / dotdirs) are pruned by default and surface
+    /// only when `respect_gitignore=false` — relevant because dotfiles can hold
+    /// secrets (.env, .ssh). Pins the `.hidden(respect_gitignore)` branch.
+    #[tokio::test]
+    async fn find_hidden_entries_gated_by_respect_gitignore() {
+        let ws = tempfile::TempDir::new().unwrap();
+        touch(ws.path(), "visible.txt");
+        touch(ws.path(), ".hidden.txt");
+        touch(ws.path(), ".config/secret.txt");
+
+        let default = run_find(serde_json::json!({ "name": "*" }), ws.path()).await;
+        assert!(
+            default.lines().any(|l| l == "visible.txt"),
+            "got: {default}"
+        );
+        assert!(
+            !default.contains(".hidden") && !default.contains(".config"),
+            "hidden entries must be skipped by default: {default}"
+        );
+
+        let all = run_find(
+            serde_json::json!({ "name": "*", "respect_gitignore": false }),
+            ws.path(),
+        )
+        .await;
+        assert!(all.contains(".hidden.txt"), "opt-out should show it: {all}");
+        assert!(all.contains(".config/secret.txt"), "got: {all}");
+    }
+
+    /// Security boundary: `find` never follows symlinked directories, so a link
+    /// pointing outside the workspace cannot leak the target's contents (pins
+    /// `.follow_links(false)`). Unix-only — Windows symlinks need privileges.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn find_does_not_follow_symlinks_out_of_workspace() {
+        let outside = tempfile::TempDir::new().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), b"x").unwrap();
+        let ws = tempfile::TempDir::new().unwrap();
+        touch(ws.path(), "inside.txt");
+        std::os::unix::fs::symlink(outside.path(), ws.path().join("link")).unwrap();
+
+        // The symlink is present but is NOT descended into.
+        let leaked = run_find(serde_json::json!({ "name": "secret.txt" }), ws.path()).await;
+        assert_eq!(
+            leaked, "no matches",
+            "symlink was followed out of ws: {leaked}"
+        );
+        // Sanity: a real in-workspace file is still found.
+        let found = run_find(serde_json::json!({ "name": "inside.txt" }), ws.path()).await;
+        assert_eq!(found, "inside.txt", "got: {found}");
+    }
+
+    #[test]
+    fn glob_to_regex_anchors_and_escapes() {
+        // '*' is a wildcard; '.' is literal (not "any char").
+        let re = glob_to_regex("*.py", true).unwrap();
+        assert!(re.is_match("foo.py"));
+        assert!(!re.is_match("foo.pyc")); // anchored at end
+        assert!(!re.is_match("fooxpy")); // '.' is literal
+                                         // Exact basename, '?' = single char, case-sensitivity honoured.
+        assert!(glob_to_regex("a?c", true).unwrap().is_match("abc"));
+        assert!(!glob_to_regex("a?c", true).unwrap().is_match("ac"));
+        assert!(glob_to_regex("readme.md", false)
+            .unwrap()
+            .is_match("README.MD"));
+        assert!(!glob_to_regex("readme.md", true)
+            .unwrap()
+            .is_match("README.MD"));
     }
 
     async fn run_tool(
