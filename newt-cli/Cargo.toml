@@ -21,6 +21,7 @@ name = "newt_cli"
 path = "src/lib.rs"
 
 [dependencies]
+async-trait.workspace = true
 newt-core.workspace = true
 newt-inference.workspace = true
 newt-scheduler.workspace = true
