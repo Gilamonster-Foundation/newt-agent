@@ -1839,11 +1839,21 @@ fn policy_for(tui: Option<newt_core::TuiConfig>, workspace: &str) -> newt_core::
             set.extend(extra);
         }
     }
-    // `full_access` (fs_write == All) opts out of the lock — an explicit
-    // "no fence" preset choice. Every other preset is locked to the workspace +
-    // the `--read`/`--write` grants by the shared newt-core helper (the headless
-    // crew/worker paths call the same helper).
-    if !matches!(caveats.fs_write, Scope::All) {
+    // Opt out of the read-fence ONLY for a preset whose reads AND writes are
+    // BOTH deliberately unbounded — i.e. `full_access` (`fs_read == All &&
+    // fs_write == All`). Keying on both axes (not `fs_write` alone) makes the
+    // read-axis intent explicit: `read_only` is `fs_read == All, fs_write ==
+    // none`, and its broad read scope is fenced ON PURPOSE here, not as an
+    // accident of the discriminator. That is deliberate — `read_only` is the
+    // DEFAULT preset for an unconfigured session, and confining the default is
+    // the entire point of the lock (an unconfigured agent must not read outside
+    // the CWD). `read_only` still reads broadly *within* the workspace and any
+    // `--read`/`--write` grants. Every other preset is locked to the workspace +
+    // the grants by the shared newt-core helper (the headless crew/worker paths
+    // call the same helper).
+    let reads_deliberately_unbounded =
+        matches!(caveats.fs_read, Scope::All) && matches!(caveats.fs_write, Scope::All);
+    if !reads_deliberately_unbounded {
         newt_core::caveats::apply_cli_fs_grants(&mut caveats, workspace);
     }
     caveats
@@ -12299,6 +12309,34 @@ mod env_resolution_tests {
             };
             // full_access keeps unrestricted reads — the explicit "no fence" choice.
             assert!(matches!(policy_for(Some(tui), "/ws").fs_read, Scope::All));
+        });
+    }
+
+    #[test]
+    fn read_only_reads_are_confined_to_the_workspace() {
+        use newt_core::caveats::{CaveatsExt, Scope};
+        // Conscious decision (review of #502): `read_only` ships `fs_read = All`
+        // but is the DEFAULT preset, so the CWD-lock confines its reads — an
+        // unconfigured session must not read outside the workspace. Unlike
+        // full_access (whose writes are also unbounded), it opts out of NOTHING.
+        with_env_vars(&[], &["NEWT_READ_PATHS", "NEWT_WRITE_PATHS"], || {
+            let tui = newt_core::TuiConfig {
+                permissions: newt_core::ToolPermissions {
+                    preset: newt_core::PermissionPreset::ReadOnly,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let caveats = policy_for(Some(tui), "/ws");
+            assert!(
+                matches!(caveats.fs_read, Scope::Only(_)),
+                "read_only's broad reads are fenced to the workspace by the lock"
+            );
+            assert!(caveats.permits_fs_read("/ws"), "the workspace is readable");
+            assert!(
+                !caveats.permits_fs_read("/etc/passwd"),
+                "reads outside the workspace are denied"
+            );
         });
     }
 
