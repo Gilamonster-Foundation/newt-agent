@@ -95,6 +95,44 @@ impl WorktreeWorkspace {
         git(&self.worktree, &["diff", "--cached", "HEAD"]).unwrap_or_default()
     }
 
+    /// **Land** the crew's work as a commit on a new `branch` in the SHARED object
+    /// store, so verified work persists (a reviewable, mergeable branch the base
+    /// repo sees) instead of being thrown away with the worktree. The worktree is a
+    /// linked `git worktree`, so the commit + branch ref live in the common `.git`
+    /// and survive `cleanup()`. Returns `(branch, short_sha)`; errs if nothing
+    /// changed. (Provenance: a content-addressed commit, authored by the agent
+    /// identity — the seam where agent-mesh signing later attests the crew member.)
+    pub fn commit_to_branch(
+        &self,
+        branch: &str,
+        author_name: &str,
+        author_email: &str,
+        message: &str,
+    ) -> anyhow::Result<(String, String)> {
+        git(&self.worktree, &["checkout", "-q", "-b", branch])?;
+        git(&self.worktree, &["add", "-A"])?;
+        // `diff --cached --quiet` exits 0 when the index matches HEAD (nothing to
+        // land) → don't manufacture an empty commit.
+        if git(&self.worktree, &["diff", "--cached", "--quiet"]).is_ok() {
+            anyhow::bail!("no changes to land");
+        }
+        git(
+            &self.worktree,
+            &[
+                "-c",
+                &format!("user.name={author_name}"),
+                "-c",
+                &format!("user.email={author_email}"),
+                "commit",
+                "-q",
+                "-m",
+                message,
+            ],
+        )?;
+        let sha = git(&self.worktree, &["rev-parse", "--short", "HEAD"])?;
+        Ok((branch.to_string(), sha))
+    }
+
     /// Remove the worktree (best-effort). Called by `Drop`; also callable early.
     pub fn cleanup(&self) {
         let _ = git(
@@ -392,6 +430,45 @@ mod tests {
         assert_eq!(
             infer_test_command(dir.path()).as_deref(),
             Some("just check")
+        );
+    }
+
+    #[test]
+    fn commit_to_branch_lands_work_visible_to_base() {
+        let repo = git_repo();
+        let mut ws = WorktreeWorkspace::create(repo.path(), "land1", "true".into()).unwrap();
+        ws.apply(&[Edit {
+            path: "added.rs".into(),
+            new_content: "pub fn f() {}\n".into(),
+        }]);
+        let (branch, sha) = ws
+            .commit_to_branch("crew/land1", "newt", "newt@bot", "land it")
+            .unwrap();
+        assert_eq!(branch, "crew/land1");
+        assert!(!sha.is_empty());
+        // The branch lives in the SHARED object store → the base repo sees it and
+        // it carries the work, even after the worktree is dropped.
+        drop(ws);
+        let files = git(repo.path(), &["ls-tree", "-r", "--name-only", "crew/land1"]).unwrap();
+        assert!(
+            files.lines().any(|l| l == "added.rs"),
+            "branch carries the work: {files}"
+        );
+        // Base working tree is untouched until a human merges the branch.
+        assert!(
+            !repo.path().join("added.rs").exists(),
+            "base tree untouched until merge"
+        );
+    }
+
+    #[test]
+    fn commit_to_branch_errs_with_no_changes() {
+        let repo = git_repo();
+        let ws = WorktreeWorkspace::create(repo.path(), "land2", "true".into()).unwrap();
+        assert!(
+            ws.commit_to_branch("crew/land2", "n", "n@b", "noop")
+                .is_err(),
+            "no changes → nothing to land"
         );
     }
 
