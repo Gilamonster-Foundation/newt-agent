@@ -80,10 +80,28 @@ acceptance contract's target floor.
 ## Editor / shell preferences
 
 - Editor: vi (no emacs).
-- Test mocking: `wiremock` for HTTP, `tempfile` for fs, `mockall`
-  for traits, `assert_cmd` + `predicates` for CLI binaries,
-  `tokio-test` for async. See Step 0.4 in the roadmap for the
-  shared `tests/common` helper crate.
+- Test mocking: `wiremock` for HTTP, in-memory fakes / injected fs seams
+  for filesystem logic, `mockall` for traits, `assert_cmd` + `predicates`
+  for CLI binaries, `tokio-test` for async. **Unit tests must not touch the
+  real filesystem** — see "Filesystem tests" below. See Step 0.4 in the
+  roadmap for the shared `tests/common` helper crate.
+
+## Filesystem tests (release-gated, run sequentially)
+
+- **Unit tests do not create real temp dirs or files — ever.** No
+  `tempfile` / `TempDir` / `std::fs::write` / `create_dir` in the unit
+  tier. Test filesystem logic with in-memory data, fakes, or an injectable
+  fs seam (production code that writes via a path argument should expose a
+  writer seam). Pattern to copy: `newt-cli/src/dgx_pull.rs` — pure, fs-free.
+- **Any test that needs the real filesystem is an integration test, not a
+  unit test.** It belongs in the **release gate**, not the per-PR unit run.
+- **Release-gate filesystem tests run in sequence**
+  (`cargo test -- --test-threads=1`, or `#[serial]` via `serial_test`).
+  Real-fs tests contend on the filesystem; under parallel load they
+  intermittently fail with `Permission denied (os error 13)` on tempdir
+  creation, which aborts the entire test binary. Single-threaded execution
+  removes the contention. Never run real-fs tests multi-threaded.
+- Migration of the existing `tempfile`-based tests is tracked in issue #514.
 
 ## Versioning
 
