@@ -12,6 +12,7 @@
 // pub(crate) since Step 18.5 (#247): the `Summarizing` memory provider
 // delegates to this same pipeline instead of keeping a duplicate one.
 pub(crate) mod compress;
+mod crew_attest;
 mod crew_tool;
 mod display;
 mod git_tool;
@@ -35,6 +36,7 @@ pub use compress::{
     compress_user_initiated, CompressCounters, CompressState, ManualCompressOutcome, SummarizeFn,
     SummarizeFuture, Summarizer, SUMMARY_END_MARKER, SUMMARY_PREFIX,
 };
+pub use crew_attest::{crew_authz, crew_step_up_policy, CrewAuthz};
 pub use crew_tool::{compose_roster_tool_definition, crew_tool_definition, CrewRunner};
 pub use display::{print_harness_notice, print_list_item, print_newt, NEWT_ORANGE_CT};
 pub use driver::{
