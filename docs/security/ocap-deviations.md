@@ -124,10 +124,37 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   asserts no auto-apply path exists.
 - **Status:** OPEN
 
-> `exec-behavior-bound`, `fs-canonical-containment`, `mcp-under-leash` — full entries to be
-> filled as those land; each is **disabled-while-open bounded by `b1`** (the OS sandbox is
-> the backstop for name-granularity exec, prefix-fs-fence, and unleashed MCP until they are
-> closed).
+### fs-canonical-containment
+- **Invariant (ideal):** the fs gate canonicalizes the target (resolving symlinks,
+  e.g. via `openat2(RESOLVE_BENEATH)`) and contains it under the workspace root, so no
+  path — symlink, `..`, or otherwise — escapes the fence.
+- **Practical caveat (now):** `tui_permits_path` (`newt-core/src/agentic/tools.rs`)
+  **lexically** normalizes the target and each root (collapsing `.`/`..`) and contains with
+  a component-aware `Path::starts_with`. This closes `..` traversal (`/ws/../etc/passwd` →
+  `/etc/passwd`, denied) and sibling-prefix escapes (`/ws-evil` denied against `/ws`) — both
+  were reproduced on the host before the #502 review. It does NOT resolve symlinks: a symlink
+  *inside* the workspace pointing out would still be read.
+- **Residual:** 🟠 high — a symlink under the workspace that targets an outside path escapes
+  the read/write fence (lexical normalization can't see through it). Planting one needs a
+  write/exec, both separately gated.
+- **Disabled while open:** seeding a shared filesystem across mutually-distrusting voices
+  where one can plant a symlink the other follows; relying on the fence alone (no OS sandbox)
+  for a genuinely-untrusted worker.
+- **Compensating controls:** lexical containment (the #502 fix) blocks the `..`/sibling
+  vectors; the crew/worker run in throwaway git worktrees; `b1`'s OS sandbox (Landlock fs) is
+  the backstop that bounds the symlink residual once present.
+- **Closure criterion:** the gate canonicalizes (or `openat2`-resolves) the target before
+  containment, and a symlink-escape test (a link under `/ws` → `/etc` resolved through the
+  gate) is denied.
+- **Ratchet guard:** `tui_permits_path_prefix_semantics` (`tools.rs`) drives `..`, repeated
+  `..`, and a sibling-prefix path through the real gate and asserts denial; it can't regress
+  to a raw `str::starts_with` without failing.
+- **Status:** OPEN (lexical containment landed; symlink resolution pending) · review-by: with
+  `b1` OS-sandbox work (#84)
+
+> `exec-behavior-bound`, `mcp-under-leash` — full entries to be filled as those land; each is
+> **disabled-while-open bounded by `b1`** (the OS sandbox is the backstop for
+> name-granularity exec and unleashed MCP until they are closed).
 
 ## 5. How to use this (for the practical-caveat moments)
 

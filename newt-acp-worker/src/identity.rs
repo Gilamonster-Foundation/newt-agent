@@ -183,6 +183,11 @@ impl WorkerIdentity {
     ) -> Result<Caveats, IdentityError> {
         match self {
             Self::Operator { root } => {
+                // NOTE: the CWD fs-lock (newt_core::caveats::apply_cli_fs_grants,
+                // applied for `newt code` and `newt crew`) is NOT applied here yet
+                // — the ACP worker's workspace is per-session (the ACP `cwd`
+                // param), not the process CWD, so the lock must be threaded from
+                // the session, not read from `current_dir()`. Follow-up.
                 let policy = worker_session_caveats(backend_host);
                 let op = attenuate(root, &policy)?;
                 let verified = enforced_caveats(&op)?;

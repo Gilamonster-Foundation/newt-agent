@@ -416,18 +416,50 @@ async fn host_shell_output(cmd: &str, cwd: &str) -> std::io::Result<std::process
         .await
 }
 
-/// Returns true if `full_path` is permitted by `scope`, using prefix matching
-/// against the stored workspace-root strings.
+/// Lexically normalise a path *string* — collapse `.` and `..` components
+/// without touching the filesystem — so containment is decided on the location
+/// the caller actually named, not on a raw byte prefix. Does NOT resolve
+/// symlinks (that needs `canonicalize`, which requires the path to exist and is
+/// the still-open `fs-canonical-containment` deviation): a symlink *inside* the
+/// workspace can still point out. What this DOES close are the string-only
+/// escapes — `..` traversal and sibling-prefix collisions.
+fn lexically_normalize(path: &str) -> std::path::PathBuf {
+    use std::path::{Component, PathBuf};
+    let mut out = PathBuf::new();
+    for comp in std::path::Path::new(path).components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                // Pop a real segment; never climb above a root/prefix.
+                if !out.pop() {
+                    out.push(comp.as_os_str());
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// Returns true if `full_path` is permitted by `scope`.
 ///
-/// The `Caveats` lattice stores workspace root strings (not individual file paths)
-/// and uses exact-set semantics. The TUI adds path-prefix semantics here so that
-/// "workspace root is permitted" translates to "any file under it is permitted".
+/// The `Caveats` lattice stores workspace-root strings (not individual file
+/// paths) with exact-set semantics; this layer adds containment so that "the
+/// workspace root is permitted" means "any path *under* it is permitted". Both
+/// the candidate and each root are lexically normalised (collapsing `..`) and
+/// then compared by whole path components via [`std::path::Path::starts_with`],
+/// so `..` traversal (`/ws/../etc/passwd`) and sibling-prefix collisions
+/// (`/ws-secret` vs root `/ws`) no longer escape the fence — unlike the raw
+/// string prefix match this replaced. Symlink containment is still open
+/// (`fs-canonical-containment`); creating one needs exec, which is gated separately.
 pub(crate) fn tui_permits_path(scope: &crate::caveats::Scope<String>, full_path: &str) -> bool {
     match scope {
         crate::caveats::Scope::All => true,
         crate::caveats::Scope::Only(set) if set.is_empty() => false,
         crate::caveats::Scope::Only(set) => {
-            set.iter().any(|root| full_path.starts_with(root.as_str()))
+            let candidate = lexically_normalize(full_path);
+            set.iter()
+                .any(|root| candidate.starts_with(lexically_normalize(root)))
         }
     }
 }
@@ -1805,7 +1837,25 @@ mod tests {
         assert!(!tui_permits_path(&Scope::<String>::none(), "/ws/file"));
         let only = Scope::only(["/ws".to_string()]);
         assert!(tui_permits_path(&only, "/ws/sub/file.rs"));
+        assert!(tui_permits_path(&only, "/ws"), "the workspace root itself");
         assert!(!tui_permits_path(&only, "/elsewhere/file.rs"));
+        // `..` traversal must NOT escape: a path that lexically resolves outside
+        // the workspace is denied even though it textually begins with it.
+        assert!(
+            !tui_permits_path(&only, "/ws/../etc/passwd"),
+            "`..` traversal escapes the workspace"
+        );
+        assert!(
+            !tui_permits_path(&only, "/ws/../../etc/passwd"),
+            "repeated `..` traversal escapes the workspace"
+        );
+        // A sibling dir that merely shares the string prefix is not under /ws.
+        assert!(
+            !tui_permits_path(&only, "/ws-secret/file.rs"),
+            "sibling-prefix collision escapes the workspace"
+        );
+        // A `..` that stays inside the workspace is still permitted.
+        assert!(tui_permits_path(&only, "/ws/sub/../file.rs"));
     }
 
     // --- PR4: the `git` tool is presence-gated -----------------------------
