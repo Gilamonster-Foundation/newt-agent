@@ -550,6 +550,9 @@ impl Vi {
     /// Status label — `vi` lit up plus a one-letter mode (`N`/`I`), so a vi user
     /// always knows the surface is modal and which mode they're in, without the
     /// long `NORMAL`/`INSERT` words widening the gutter for every mode.
+    /// Short mode label (`vi N` / `vi I`) — used by tests to assert mode flips;
+    /// the live status row shows the mode via its indicator/hint instead.
+    #[cfg(test)]
     fn mode_label(&self) -> &'static str {
         match self.mode {
             Mode::Normal => "vi N",
@@ -788,6 +791,9 @@ impl Editor {
         self.vi.input(key, ta)
     }
 
+    /// Short mode label — test-only mode introspection; the live status row
+    /// shows the mode through its `❯`/`:` indicator + dim hint.
+    #[cfg(test)]
     fn label(&self) -> &'static str {
         match self.edit {
             Edit::Emacs => "emacs",
@@ -801,6 +807,25 @@ impl Editor {
             self.vi.ex.as_deref()
         } else {
             None
+        }
+    }
+
+    /// In vi NORMAL mode the prompt indicator is a highlighted `:` instead of
+    /// `❯`. False for emacs/nano and for vi INSERT.
+    fn is_vi_normal(&self) -> bool {
+        self.edit == Edit::Vi && self.vi.mode == Mode::Normal
+    }
+
+    /// The dim, clears-on-type hint shown on an empty line — the editor mode plus
+    /// how to switch. vi is the default; `/nano` and `/emacs` are advertised.
+    fn mode_hint(&self) -> &'static str {
+        match self.edit {
+            Edit::Vi => match self.vi.mode {
+                Mode::Insert => "vi INSERT — Esc: NORMAL · :help · /nano /emacs available",
+                Mode::Normal => "vi NORMAL — i: insert · :cmd · /nano /emacs available",
+            },
+            Edit::Emacs => "emacs — Enter sends · Ctrl-h help · /vi /nano available",
+            Edit::Nano => "nano — Enter sends · ^G help · /vi /emacs available",
         }
     }
 
@@ -889,12 +914,34 @@ fn load_history(path: Option<&PathBuf>) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// The status / prompt line. Colors favor light/high-luminance tones (the
-/// accessibility default — deep dark-saturated hues lose letter detail); every
-/// color maps to a `[tui.colors]` key in the production palette work.
-fn prompt_line(editor: &Editor, custom: Option<&str>) -> Line<'static> {
+/// The `[options]` block for the status row: session overrides the operator set
+/// — `--loadout`/`NEWT_LOADOUT` and `/model`/`NEWT_DGX_MODEL`. `None` when none
+/// is active, so the bracket is omitted entirely (no empty `[]` by default).
+fn status_options() -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    for var in ["NEWT_LOADOUT", "NEWT_DGX_MODEL"] {
+        if let Ok(v) = std::env::var(var) {
+            if !v.is_empty() {
+                parts.push(v);
+            }
+        }
+    }
+    (!parts.is_empty()).then(|| parts.join(" "))
+}
+
+/// The rich surface's native live status row. The PS1 token prompt
+/// (`[tui] prompt` / `$TIMESTAMP …`) is the RUSTYLINE surface's job — it lands in
+/// logfiles — so the rich surface always renders THIS row.
+///
+/// `[clock]` always; an optional `[options]` block (session overrides) only when
+/// present. The editor MODE is the indicator itself: `❯` for input/INSERT, a
+/// bold bright `:` for vi NORMAL, `:cmd` for an open ex-line. The bracket fields
+/// are the accent color while you're typing (`active`) and dim on an empty line,
+/// where a dim mode hint (clears as you type) also shows. Colors favor
+/// light/high-luminance tones (the accessibility default).
+fn prompt_line(editor: &Editor, active: bool) -> Line<'static> {
     if let Some(question) = editor.confirm_prompt() {
-        // A pending [y/N] confirmation replaces the prompt until answered.
+        // A pending [y/N] confirmation replaces the row until answered.
         return Line::from(Span::styled(
             question.to_string(),
             Style::default()
@@ -902,44 +949,54 @@ fn prompt_line(editor: &Editor, custom: Option<&str>) -> Line<'static> {
                 .add_modifier(Modifier::BOLD),
         ));
     }
-    if let Some(ex) = editor.ex() {
-        return Line::from(Span::styled(
-            format!(":{ex}"),
-            Style::default().fg(Color::White),
-        ));
-    }
-    // A user-configured prompt (`/prompt set`, `NEWT_PROMPT`, `[tui] prompt`)
-    // wins over the built-in live status row — render it verbatim (already
-    // token-expanded by the caller). The user owns the format, so no extra
-    // styling beyond a readable default.
-    if let Some(p) = custom {
-        return Line::from(Span::styled(
-            p.to_string(),
-            Style::default().fg(Color::Gray),
-        ));
-    }
+    let accent = Color::Rgb(255, 165, 90);
+    let bracket = if active { accent } else { Color::DarkGray };
+    let bold_hi = Style::default()
+        .fg(Color::LightYellow)
+        .add_modifier(Modifier::BOLD);
+
     let clock = chrono::Local::now().format("%H:%M:%S").to_string();
-    Line::from(vec![
-        Span::styled(format!("[{clock}] "), Style::default().fg(Color::Gray)),
-        Span::styled(
-            editor.label().to_string(),
-            Style::default()
-                .fg(Color::LightYellow)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(" ❯ ", Style::default().fg(Color::Rgb(255, 165, 90))),
-    ])
+    let mut spans: Vec<Span> = vec![Span::styled(
+        format!("[{clock}]"),
+        Style::default().fg(bracket),
+    )];
+    if let Some(opts) = status_options() {
+        spans.push(Span::styled(
+            format!("[{opts}]"),
+            Style::default().fg(bracket),
+        ));
+    }
+
+    // An open ex-line (`:command` being typed): the highlighted `:` IS the mode
+    // marker; show the command after it.
+    if let Some(ex) = editor.ex() {
+        spans.push(Span::styled(format!(" :{ex}"), bold_hi));
+        return Line::from(spans);
+    }
+
+    // The mode indicator: a bold bright `:` for vi NORMAL, else the `❯`.
+    if editor.is_vi_normal() {
+        spans.push(Span::styled(" : ", bold_hi));
+    } else {
+        spans.push(Span::styled(" ❯ ", Style::default().fg(accent)));
+    }
+
+    // The dim mode hint shows only on an empty line — it clears the moment you
+    // type (`active`).
+    if !active {
+        spans.push(Span::styled(
+            editor.mode_hint().to_string(),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    Line::from(spans)
 }
 
-fn draw(
-    f: &mut Frame,
-    textarea: &TextArea,
-    editor: &Editor,
-    gutter: Option<u16>,
-    custom_prompt: Option<&str>,
-) {
+fn draw(f: &mut Frame, textarea: &TextArea, editor: &Editor, gutter: Option<u16>) {
     let area = f.area();
-    let prompt = prompt_line(editor, custom_prompt);
+    // "active" = the line has content, so the brackets brighten and the dim
+    // mode hint clears as you type.
+    let prompt = prompt_line(editor, !buffer_is_empty(textarea));
     let g = resolve_gutter(gutter, area.width);
     if g >= GUTTER_W {
         // Wide gutter (opt-in): prompt in a fixed left column, input to its
@@ -1122,12 +1179,6 @@ pub(crate) struct RichSurface {
     /// the turn runs to completion before the session ends. A `Cell` because
     /// the event loop runs behind `&self`.
     pending_end_quit: Cell<bool>,
-    /// `Some` when a user-configured prompt (`/prompt set` · `NEWT_PROMPT` ·
-    /// `[tui] prompt`) is active: the already-expanded prompt string the caller
-    /// passed to [`read_line`](InputSurface::read_line) for this turn, rendered
-    /// in place of the built-in live status row. `None` keeps the default
-    /// `[clock] mode ❯`. Refreshed per turn (the clock is fixed within a turn).
-    custom_prompt: Option<String>,
 }
 
 impl RichSurface {
@@ -1138,7 +1189,6 @@ impl RichSurface {
             unsaved: Vec::new(),
             gutter: crate::resolve_gutter_setting(),
             pending_end_quit: Cell::new(false),
-            custom_prompt: None,
         })
     }
 
@@ -1189,7 +1239,7 @@ impl RichSurface {
             let rows = if resolve_gutter(self.gutter, term_w) >= GUTTER_W {
                 textarea.lines().len() as u16
             } else {
-                let prompt = prompt_line(&editor, self.custom_prompt.as_deref());
+                let prompt = prompt_line(&editor, !buffer_is_empty(&textarea));
                 overhang_rows(
                     &prompt,
                     textarea.lines(),
@@ -1213,13 +1263,7 @@ impl RichSurface {
                 cur_h = want;
             }
             terminal.draw(|f| {
-                draw(
-                    f,
-                    &textarea,
-                    &editor,
-                    self.gutter,
-                    self.custom_prompt.as_deref(),
-                );
+                draw(f, &textarea, &editor, self.gutter);
             })?;
 
             // 250ms timeout drives the live clock when idle.
@@ -1310,17 +1354,15 @@ impl RichSurface {
 }
 
 impl InputSurface for RichSurface {
-    fn read_line(&mut self, prompt: &str) -> anyhow::Result<ReadOutcome> {
+    fn read_line(&mut self, _prompt: &str) -> anyhow::Result<ReadOutcome> {
         // A confirmed `:wq` submitted its turn last time; now that the turn has
         // run, end the conversation and exit before reading anything new.
         if self.pending_end_quit.replace(false) {
             return Ok(ReadOutcome::EndAndQuit);
         }
-        // Honor a user-configured prompt: when one is set, the caller has
-        // already token-expanded it into `prompt`, so render that instead of
-        // the built-in live status row. With nothing configured, keep the
-        // default `[clock] mode ❯` (and its live clock + vi-mode label).
-        self.custom_prompt = crate::custom_prompt_active().then(|| prompt.to_string());
+        // The rich surface always renders its native live status row — it ignores
+        // the PS1 token prompt the caller passes (`_prompt`), which is the
+        // RUSTYLINE surface's format (it lands in logfiles).
         Ok(self.read_turn()?)
     }
 
@@ -1475,7 +1517,7 @@ mod tests {
         let ta = TextArea::new(vec!["this".to_string(), "more".to_string()]);
         let mut term = Terminal::new(TestBackend::new(40, 2)).unwrap();
         // gutter = 1 → the overhang layout (the default).
-        term.draw(|f| draw(f, &ta, &editor, Some(1), None)).unwrap();
+        term.draw(|f| draw(f, &ta, &editor, Some(1))).unwrap();
         let buf = term.backend().buffer();
         let row = |y: u16| -> String {
             (0..40)
@@ -1496,34 +1538,50 @@ mod tests {
         );
     }
 
-    #[test]
-    fn custom_prompt_replaces_the_live_status_row() {
-        let editor = vi_editor();
-        // With a configured prompt, that string is rendered verbatim…
-        let line = prompt_line(&editor, Some("me@host ❯ "));
-        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-        assert_eq!(text, "me@host ❯ ");
-        // …and with none, the built-in status row (clock + mode + ❯) is used.
-        let def: String = prompt_line(&editor, None)
+    fn row_text(editor: &Editor, active: bool) -> String {
+        prompt_line(editor, active)
             .spans
             .iter()
             .map(|s| s.content.as_ref())
-            .collect();
+            .collect()
+    }
+
+    #[test]
+    fn native_status_row_shows_mode_and_clears_hint_on_type() {
+        // vi INSERT, empty line (inactive): clock + ❯ + the dim mode hint, which
+        // advertises the other editor modes.
+        let editor = vi_editor();
+        let idle = row_text(&editor, false);
+        assert!(idle.contains('❯'), "insert indicator: {idle:?}");
+        assert!(idle.contains("INSERT"), "mode hint when empty: {idle:?}");
         assert!(
-            def.contains("❯") && def.contains("vi"),
-            "default row: {def:?}"
+            idle.contains("/emacs") && idle.contains("/nano"),
+            "hint advertises other modes: {idle:?}"
         );
-        // A pending `:`/confirm prompt still wins over a custom prompt.
-        let mut ex = vi_editor();
+        // Typing (active): the hint clears; the ❯ stays.
+        let active = row_text(&editor, true);
+        assert!(active.contains('❯'));
+        assert!(
+            !active.contains("INSERT"),
+            "hint cleared while typing: {active:?}"
+        );
+    }
+
+    #[test]
+    fn native_status_row_uses_colon_for_vi_normal_not_arrow() {
+        let mut normal = vi_editor();
         let mut ta = TextArea::default();
+        normal.input(special(KeyCode::Esc), &mut ta); // INSERT → NORMAL
+        let row = row_text(&normal, true);
+        assert!(!row.contains('❯'), "NORMAL drops the ❯ for `:`: {row:?}");
+        // An open ex-line shows the typed command (still no ❯).
+        let mut ex = vi_editor();
         ex.input(special(KeyCode::Esc), &mut ta);
         ex.input(key(':'), &mut ta);
-        let exline: String = prompt_line(&ex, Some("custom"))
-            .spans
-            .iter()
-            .map(|s| s.content.as_ref())
-            .collect();
-        assert!(exline.starts_with(':'), "ex line wins: {exline:?}");
+        ex.input(key('w'), &mut ta);
+        let exrow = row_text(&ex, true);
+        assert!(exrow.contains(":w"), "ex line shows the command: {exrow:?}");
+        assert!(!exrow.contains('❯'));
     }
 
     #[test]
