@@ -1636,6 +1636,24 @@ pub enum BackendKind {
     Openai,
 }
 
+/// Which OpenAI HTTP surface a `kind = "openai"` backend speaks.
+///
+/// `chat_completions` (the default) is the classic `POST /v1/chat/completions`.
+/// `responses` is the newer `POST /v1/responses` — required by models that
+/// OpenAI serves *only* there (e.g. `gpt-5-codex`, which 404s on
+/// chat/completions with "only supported in v1/responses"). Ignored for
+/// `kind = "ollama"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum OpenAiApi {
+    /// `POST /v1/chat/completions` (the historical default).
+    #[default]
+    #[serde(alias = "chat", alias = "completions")]
+    ChatCompletions,
+    /// `POST /v1/responses` (the newer Responses API).
+    Responses,
+}
+
 /// A single inference backend entry.
 ///
 /// Two ways to define one: an inline `[[backends]]` array element in
@@ -1656,6 +1674,12 @@ pub struct BackendConfig {
     /// so configs written before this field existed keep working.
     #[serde(default)]
     pub kind: BackendKind,
+    /// For `kind = "openai"`: which OpenAI HTTP surface to use
+    /// (`chat_completions` default, or `responses` for models served only on
+    /// `/v1/responses`). Ignored for Ollama. The agent loop also auto-falls-back
+    /// to `responses` if chat/completions 404s with the responses-only error.
+    #[serde(default)]
+    pub api: OpenAiApi,
     /// Optional path to a file whose first non-empty line is a bearer
     /// token, sent as `Authorization: Bearer <token>` by
     /// OpenAI-compatible backends. A leading `~/` is expanded to the
@@ -1725,6 +1749,7 @@ fn fallback_localhost_backend() -> BackendConfig {
         model: "llama3.1:8b".into(),
         tiers: vec![Tier::Fast, Tier::Standard, Tier::Complex, Tier::Review],
         kind: BackendKind::Ollama,
+        api: Default::default(),
         api_key_file: None,
         api_key_env: None,
     }
@@ -2805,6 +2830,24 @@ mod tests {
     }
 
     #[test]
+    fn backend_api_axis_defaults_and_parses() {
+        // Absent → chat/completions (back-compat).
+        let def: BackendConfig =
+            toml::from_str("endpoint=\"http://h:1\"\nmodel=\"m\"\nkind=\"openai\"\n").unwrap();
+        assert_eq!(def.api, OpenAiApi::ChatCompletions);
+        // Explicit responses opt-in.
+        let resp: BackendConfig = toml::from_str(
+            "endpoint=\"http://h:1\"\nmodel=\"gpt-5-codex\"\nkind=\"openai\"\napi=\"responses\"\n",
+        )
+        .unwrap();
+        assert_eq!(resp.api, OpenAiApi::Responses);
+        // `chat` is an accepted alias for the default.
+        let alias: BackendConfig =
+            toml::from_str("endpoint=\"http://h:1\"\nmodel=\"m\"\napi=\"chat\"\n").unwrap();
+        assert_eq!(alias.api, OpenAiApi::ChatCompletions);
+    }
+
+    #[test]
     fn disk_backends_load_per_file_by_stem_and_override_inline() {
         let dir = tempfile::tempdir().unwrap();
         // A minimal drop-in: name omitted (filename is authoritative), tiers
@@ -2828,6 +2871,7 @@ mod tests {
                     model: "old-model".into(),
                     tiers: vec![],
                     kind: BackendKind::Ollama,
+                    api: Default::default(),
                     api_key_file: None,
                     api_key_env: None,
                 },
@@ -2837,6 +2881,7 @@ mod tests {
                     model: "qwen2.5-coder:14b".into(),
                     tiers: vec![],
                     kind: BackendKind::Ollama,
+                    api: Default::default(),
                     api_key_file: None,
                     api_key_env: None,
                 },
@@ -3668,6 +3713,7 @@ max_tool_rounds = 25
             model: "some-model".into(),
             tiers: vec![Tier::Fast],
             kind: BackendKind::Openai,
+            api: Default::default(),
             api_key_file,
             api_key_env,
         }
