@@ -152,6 +152,89 @@ fn dgx_requires_subcommand() {
         .failure();
 }
 
+#[test]
+fn dgx_pull_help_lists_flags() {
+    Command::cargo_bin("newt")
+        .unwrap()
+        .args(["dgx", "pull", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--dry-run"))
+        .stdout(predicate::str::contains("--force"))
+        .stdout(predicate::str::contains("--name"))
+        .stdout(predicate::str::contains("HuggingFace").or(predicate::str::contains("GGUF")));
+}
+
+/// A config file with a `[dgx]` node that carries an ssh_host (so `pull` can
+/// resolve a node) but no live endpoint.
+fn dgx_ssh_config() -> tempfile::NamedTempFile {
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    f.write_all(
+        br#"
+[[backends]]
+name = "x"
+endpoint = "http://localhost:11434"
+model = "m"
+tiers = ["FAST"]
+
+default_tier_order = ["FAST"]
+
+[dgx]
+active_node = "dgx"
+active_endpoint = "ollama"
+
+[[dgx.nodes]]
+name = "dgx"
+ollama = "http://localhost:11434"
+ssh_host = "dgx.example"
+ssh_user = "bob"
+"#,
+    )
+    .unwrap();
+    f.flush().unwrap();
+    f
+}
+
+#[test]
+fn dgx_pull_dry_run_native_prints_plan_and_does_not_ssh() {
+    let f = dgx_ssh_config();
+    Command::cargo_bin("newt")
+        .unwrap()
+        .env_remove("NEWT_DGX_SSH_HOST")
+        .args([
+            "--config",
+            f.path().to_str().unwrap(),
+            "dgx",
+            "pull",
+            "qwen2.5-coder:32b",
+            "--dry-run",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("OllamaNative"))
+        .stdout(predicate::str::contains("ssh bob@dgx.example"))
+        .stdout(predicate::str::contains("ollama pull 'qwen2.5-coder:32b'"));
+}
+
+#[test]
+fn dgx_pull_without_ssh_host_fails() {
+    let f = dgx_less_config();
+    Command::cargo_bin("newt")
+        .unwrap()
+        .env_remove("NEWT_DGX_SSH_HOST")
+        .env_remove("NEWT_DGX_HOST")
+        .args([
+            "--config",
+            f.path().to_str().unwrap(),
+            "dgx",
+            "pull",
+            "some-model:1b",
+            "--dry-run",
+        ])
+        .assert()
+        .failure();
+}
+
 /// A dgx-less config file used by the probe tests so they don't depend on
 /// the developer's `~/.newt/config.toml`.
 fn dgx_less_config() -> tempfile::NamedTempFile {

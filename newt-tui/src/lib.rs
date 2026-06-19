@@ -7215,9 +7215,15 @@ changes). Define personas in config."
 
   /dgx status       endpoint health + currently-loaded models
   /dgx models       models installed on the DGX
+  /dgx ps           models currently loaded in VRAM
   /dgx warm [model] pre-load a model into VRAM (cuts first-token latency)
+  /dgx pull <model> pull an Ollama or HuggingFace GGUF model onto the node
+  /dgx rm <model>   delete a model from the DGX
   /dgx route <task> recommend a formation for a task
-  /dgx doctor       probe every configured endpoint"
+  /dgx doctor       probe every configured endpoint
+
+  Note: flags like --dry-run/--force/--name are CLI-only; use
+  `newt dgx pull ...` from a shell for the full pull workflow."
         }
         "permissions" => {
             "\
@@ -7379,7 +7385,10 @@ fn help_lines() -> &'static [&'static str] {
         "  /crew edit [name]        - edit a crew's settings (roles, control loop, test, budgets)",
         "  /dgx status              - DGX endpoint health + running models",
         "  /dgx models              - list models installed on the DGX",
+        "  /dgx ps                  - models currently loaded in VRAM",
         "  /dgx warm [model]        - pre-load a model into VRAM",
+        "  /dgx pull <model>        - pull an Ollama/HuggingFace GGUF model onto the node",
+        "  /dgx rm <model>          - delete a model from the DGX",
         "  /dgx route <task>        - recommend a formation for a task",
         "  /dgx doctor              - probe every configured endpoint",
         "  /permissions             - prompted permission decisions + active mode clamp",
@@ -7952,7 +7961,7 @@ fn dispatch_slash(
         "dgx" => {
             if arg1.is_empty() {
                 print_newt(
-                    "usage: /dgx <status|models|warm [model]|route <task>|doctor>",
+                    "usage: /dgx <status|models|ps|warm [model]|pull <model>|rm <model>|route <task>|doctor>",
                     color,
                     verbose,
                 );

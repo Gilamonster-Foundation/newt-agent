@@ -13,6 +13,7 @@ mod config_cmd;
 pub mod crew;
 pub mod crew_runner;
 mod dgx;
+mod dgx_pull;
 mod doctor;
 mod identity_cmd;
 mod skills;
