@@ -974,20 +974,14 @@ fn prompt_line(editor: &Editor, active: bool) -> Line<'static> {
         return Line::from(spans);
     }
 
-    // The mode indicator: a bold bright `:` for vi NORMAL, else the `❯`.
+    // The mode indicator: a bold bright `:` for vi NORMAL, else the `❯`. This is
+    // where the input begins, so the cursor anchors right after it — the dim
+    // mode hint (rendered by `draw_overhang` on an empty line) sits AFTER the
+    // cursor, like a placeholder, instead of pushing it to the end of the row.
     if editor.is_vi_normal() {
         spans.push(Span::styled(" : ", bold_hi));
     } else {
         spans.push(Span::styled(" ❯ ", Style::default().fg(accent)));
-    }
-
-    // The dim mode hint shows only on an empty line — it clears the moment you
-    // type (`active`).
-    if !active {
-        spans.push(Span::styled(
-            editor.mode_hint().to_string(),
-            Style::default().fg(Color::DarkGray),
-        ));
     }
     Line::from(spans)
 }
@@ -995,8 +989,10 @@ fn prompt_line(editor: &Editor, active: bool) -> Line<'static> {
 fn draw(f: &mut Frame, textarea: &TextArea, editor: &Editor, gutter: Option<u16>) {
     let area = f.area();
     // "active" = the line has content, so the brackets brighten and the dim
-    // mode hint clears as you type.
-    let prompt = prompt_line(editor, !buffer_is_empty(textarea));
+    // mode hint clears as you type. The hint shows only on an empty line.
+    let empty = buffer_is_empty(textarea);
+    let prompt = prompt_line(editor, !empty);
+    let hint = empty.then(|| editor.mode_hint());
     let g = resolve_gutter(gutter, area.width);
     if g >= GUTTER_W {
         // Wide gutter (opt-in): prompt in a fixed left column, input to its
@@ -1008,7 +1004,7 @@ fn draw(f: &mut Frame, textarea: &TextArea, editor: &Editor, gutter: Option<u16>
     } else {
         // Overhang (the default): the prompt prefixes the FIRST input row inline
         // (`❯ this`); continuation rows hang-indent by `g` columns (default 1).
-        draw_overhang(f, area, &prompt, textarea, g);
+        draw_overhang(f, area, &prompt, textarea, g, hint);
     }
 }
 
@@ -1060,6 +1056,7 @@ fn overhang_rows(
     cursor: (usize, usize),
     g: u16,
     width: u16,
+    hint: Option<&str>,
 ) -> (Vec<Line<'static>>, u16, u16) {
     let pw = prompt.width() as u16;
     let (crow, ccol) = cursor;
@@ -1076,6 +1073,16 @@ fn overhang_rows(
             let line = if i == 0 && s == 0 {
                 let mut spans = prompt.spans.clone();
                 spans.push(Span::raw(seg_text.clone()));
+                // The dim mode hint sits AFTER the input on the first row (the
+                // line is empty when a hint is shown), so the block cursor —
+                // anchored at the prompt end — lands ON the hint's first cell,
+                // placeholder-style, instead of after the whole hint.
+                if let Some(h) = hint {
+                    spans.push(Span::styled(
+                        h.to_string(),
+                        Style::default().fg(Color::DarkGray),
+                    ));
+                }
                 Line::from(spans)
             } else {
                 Line::from(vec![
@@ -1103,21 +1110,36 @@ fn overhang_rows(
 /// we render the buffer ourselves as a `Paragraph` and place the block cursor by
 /// hand. A vertical scroll keeps the cursor row visible when the wrapped input
 /// is taller than the inline region.
-fn draw_overhang(f: &mut Frame, area: Rect, prompt: &Line<'static>, textarea: &TextArea, g: u16) {
-    let (rows, cx, cy) = overhang_rows(prompt, textarea.lines(), textarea.cursor(), g, area.width);
+fn draw_overhang(
+    f: &mut Frame,
+    area: Rect,
+    prompt: &Line<'static>,
+    textarea: &TextArea,
+    g: u16,
+    hint: Option<&str>,
+) {
+    let (rows, cx, cy) = overhang_rows(
+        prompt,
+        textarea.lines(),
+        textarea.cursor(),
+        g,
+        area.width,
+        hint,
+    );
 
     // Vertical scroll so the cursor row stays visible past MAX_INPUT_ROWS.
     let last_row = area.height.saturating_sub(1);
     let scroll_y = cy.saturating_sub(last_row);
     f.render_widget(Paragraph::new(rows).scroll((scroll_y, 0)), area);
 
-    // Block (reverse) cursor, matching the widget path's look.
+    // Place the REAL terminal cursor at the input position so it blinks (the
+    // terminal's native cursor), sitting on the first hint cell when the line is
+    // empty — a placeholder-style cursor rather than a static block tacked on at
+    // the end of the dim hint.
     let cur_x = area.x + cx;
     let cur_y = area.y + cy - scroll_y;
     if cur_x <= area.right().saturating_sub(1) && cur_y <= area.bottom().saturating_sub(1) {
-        if let Some(cell) = f.buffer_mut().cell_mut((cur_x, cur_y)) {
-            cell.set_style(Style::default().add_modifier(Modifier::REVERSED));
-        }
+        f.set_cursor_position((cur_x, cur_y));
     }
 }
 
@@ -1239,13 +1261,15 @@ impl RichSurface {
             let rows = if resolve_gutter(self.gutter, term_w) >= GUTTER_W {
                 textarea.lines().len() as u16
             } else {
-                let prompt = prompt_line(&editor, !buffer_is_empty(&textarea));
+                let empty = buffer_is_empty(&textarea);
+                let prompt = prompt_line(&editor, !empty);
                 overhang_rows(
                     &prompt,
                     textarea.lines(),
                     textarea.cursor(),
                     resolve_gutter(self.gutter, term_w),
                     term_w,
+                    empty.then(|| editor.mode_hint()),
                 )
                 .0
                 .len() as u16
@@ -1454,7 +1478,7 @@ mod tests {
         let lines = vec!["hello world foo".to_string()];
         // width 8 → row0 text width = 8-2 = 6; continuations 8-1 = 7 (g=1).
         // "hello " (6, after the 2-col prompt), then "world f" (7), then "oo".
-        let (rows, cx, cy) = overhang_rows(&prompt, &lines, (0, 15), 1, 8);
+        let (rows, cx, cy) = overhang_rows(&prompt, &lines, (0, 15), 1, 8, None);
         assert!(rows.len() >= 2, "the long line wrapped to multiple rows");
         // Cursor at end (col 15) lands on the last wrapped row.
         assert_eq!(cy as usize, rows.len() - 1);
@@ -1464,10 +1488,31 @@ mod tests {
     #[test]
     fn overhang_rows_short_line_is_one_row_after_the_prompt() {
         let prompt = Line::from("❯ "); // width 2
-        let (rows, cx, cy) = overhang_rows(&prompt, &["hi".to_string()], (0, 2), 1, 80);
+        let (rows, cx, cy) = overhang_rows(&prompt, &["hi".to_string()], (0, 2), 1, 80, None);
         assert_eq!(rows.len(), 1);
         assert_eq!(cy, 0);
         assert_eq!(cx, 2 + 2, "prompt width (2) + cursor col (2)");
+    }
+
+    #[test]
+    fn overhang_rows_cursor_sits_on_the_hint_not_after_it() {
+        let prompt = Line::from("❯ "); // width 2
+                                       // Empty line with a dim hint: the cursor anchors at the prompt end (col
+                                       // 2) — ON the hint's first cell — NOT after the whole hint string.
+        let (rows, cx, cy) = overhang_rows(
+            &prompt,
+            &[String::new()],
+            (0, 0),
+            1,
+            80,
+            Some("vi INSERT — type…"),
+        );
+        assert_eq!((cx, cy), (2, 0), "cursor at prompt end, on the hint");
+        let text: String = rows[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            text.contains("vi INSERT"),
+            "hint rendered after the cursor: {text:?}"
+        );
     }
 
     fn key(c: char) -> KeyEvent {
@@ -1547,24 +1592,20 @@ mod tests {
     }
 
     #[test]
-    fn native_status_row_shows_mode_and_clears_hint_on_type() {
-        // vi INSERT, empty line (inactive): clock + ❯ + the dim mode hint, which
-        // advertises the other editor modes.
+    fn native_status_row_shows_the_insert_indicator() {
+        // The prompt LINE carries the clock + `❯` indicator (the dim mode hint
+        // lives in the draw layer now — it's rendered after the cursor on an
+        // empty line, see `overhang_rows_cursor_sits_on_the_hint_not_after_it`).
         let editor = vi_editor();
-        let idle = row_text(&editor, false);
-        assert!(idle.contains('❯'), "insert indicator: {idle:?}");
-        assert!(idle.contains("INSERT"), "mode hint when empty: {idle:?}");
-        assert!(
-            idle.contains("/emacs") && idle.contains("/nano"),
-            "hint advertises other modes: {idle:?}"
-        );
-        // Typing (active): the hint clears; the ❯ stays.
-        let active = row_text(&editor, true);
-        assert!(active.contains('❯'));
-        assert!(
-            !active.contains("INSERT"),
-            "hint cleared while typing: {active:?}"
-        );
+        assert!(row_text(&editor, false).contains('❯'), "insert indicator");
+        assert!(row_text(&editor, true).contains('❯'));
+    }
+
+    #[test]
+    fn mode_hint_advertises_the_other_editor_modes() {
+        assert!(vi_editor().mode_hint().contains("INSERT"));
+        assert!(vi_editor().mode_hint().contains("/nano"));
+        assert!(vi_editor().mode_hint().contains("/emacs"));
     }
 
     #[test]
