@@ -28,6 +28,11 @@ per step, and reviews — under capability leashes that only ever *attenuate*.
   unverified work is isolated and discarded (#489).
 - **per-member fs_write leash** — `run_crew`/`run_team` enforce `Caveats` at the apply
   step: a member's out-of-leash edits are refused (attenuation, never amplify) (#494).
+- **crew step-up authority (23.2)** — `crew_attest` decision surface (`crew_step_up_policy`
+  + `crew_authz → {Allow, NeedsAttest}`, #508) wired onto the live dispatch path:
+  `LocalCrewRunner` consults it before any effect, so a crew/team dispatch (an *amplify*,
+  §7.5) is held for a human attestation (#517). Structure now — the `/team` enable maps to
+  `Presence::Prompt`, so it allows today; real passkey teeth arrive with BOOT (#472).
 - **MCP git dev-kit** — a `git` tool on `newt-mcp-server`, so any MCP client can drive
   a full coder out-of-band (#469).
 - **tiered verify gate** — `VerifyTier` + one honest cap-exit banner (#470).
@@ -51,6 +56,11 @@ per step, and reviews — under capability leashes that only ever *attenuate*.
 - **backendless config** no longer re-grows a synthesized `ollama` backend when only
   per-file drop-ins are present; amber harness notices (#492, recovering a regression
   the #473 squash dropped).
+- **flaky pre-push gate** (#516, closing the primary cause of #507) — the cw-400 recovery
+  test swapped the process-global `$HOME` to isolate the probe cache, racing ~20
+  HOME-reading tests (intermittent EACCES under the workspace-wide instrumented run). The
+  cache now redirects via a `#[cfg(test)]` thread-local, touching no global state. Residual
+  `set_var`/`getenv` test-isolation work is tracked in #514 (the CLAUDE.md testing tiers).
 
 ### Release action when cutting 0.6.9
 
