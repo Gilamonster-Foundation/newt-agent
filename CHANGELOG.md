@@ -35,11 +35,15 @@ per step, and reviews — under capability leashes that only ever *attenuate*.
 
 ### Changed — dependencies
 
-- **agent-bridle `[patch.crates-io]` advanced `feat/stub-shell` → `main`** (newt#497):
-  main carries the human-presence `step_up` Gate (agent-bridle#24) that ROADMAP 23.2
-  builds on, AND keeps the brush git-deps removed (the shell tool is a stub), so the
-  build stays crates.io-safe. Locked at `main#7e5e8f4`. Full workspace green, no API
-  drift. The older `feat/stub-shell` branch lacked `step_up`, which blocked 23.2.
+- **agent-bridle `[patch.crates-io]` advanced `feat/stub-shell` →
+  `brush-stub/publish-unblock`** (newt#497): the new publishable **stub** branch —
+  brush git-deps removed (crates.io-safe) — that ALSO carries the human-presence
+  `step_up` Gate (agent-bridle#24) ROADMAP 23.2 builds on. `feat/stub-shell` lacked
+  `step_up`; `main` carries the real brush shell (dev-only, forbidden by the CI stub
+  guard, so the pin can't sit there). The `just shell-stub`/`shell-real` toggle + the
+  stub-guard convention now target this branch. **Interim (Path B)** — revisit before
+  release; the canonical fix is folding `step_up` into `feat/stub-shell`. Full
+  workspace green, no API drift.
 
 ### Fixed
 
@@ -51,9 +55,11 @@ per step, and reviews — under capability leashes that only ever *attenuate*.
 
 - Bump `[workspace.package] version` 0.6.8 → 0.6.9.
 - The `[patch.crates-io]` agent-bridle block is still **git-pinned** (`branch =
-  "main"`). When agent-bridle 0.1.0 is indexed on crates.io, drop the block and
-  `cargo update -p agent-bridle` (agent-bridle#20). Until then, the `main` pin is the
-  supported path — do **not** revert to `feat/stub-shell` (it lacks `step_up`).
+  "brush-stub/publish-unblock"`). When agent-bridle 0.1.0 is indexed on crates.io,
+  drop the block and `cargo update -p agent-bridle` (agent-bridle#20). **Decide before
+  release (Path B is interim):** either keep this stub branch, or fold `step_up` into
+  `feat/stub-shell` and revert the convention. Do **not** revert the pin to
+  `feat/stub-shell` as-is (it lacks `step_up`).
 
 ## [0.6.8] — 2026-06-14
 

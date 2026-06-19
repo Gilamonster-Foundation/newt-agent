@@ -228,11 +228,14 @@ strip = true
 # but agent-bridle 0.1.0 is not yet indexed on crates.io. Until then this patch
 # satisfies the dependency from git.
 #
-# Pinned to `main` (advanced from `feat/stub-shell` on 2026-06-19, newt#497):
-# main carries the human-presence `step_up` Gate (agent-bridle#24) that ROADMAP
-# 23.2 builds on, AND keeps the brush git-deps removed (the shell tool is a stub),
-# so the build stays crates.io-safe. The older `feat/stub-shell` branch lacked
-# `step_up`, which blocked 23.2 — hence this advance.
+# Pinned to `brush-stub/publish-unblock` (advanced from `feat/stub-shell` on
+# 2026-06-19, newt#497): this is the publishable **stub** branch — brush git-deps
+# removed (crates.io-safe) — that ALSO carries the human-presence `step_up` Gate
+# (agent-bridle#24) ROADMAP 23.2 builds on. `feat/stub-shell` lacked `step_up`;
+# `main` carries the real brush shell (dev-only, forbidden by the CI stub guard).
+# This is the new publishable-stub branch the `just shell-stub` toggle targets.
+# INTERIM (Path B) — revisit before cutting 0.6.9; the canonical fix is folding
+# `step_up` into `feat/stub-shell`.
 #
 # After agent-bridle 0.1.0 is indexed on crates.io:
 #   1. Remove this entire [patch.crates-io] block.
@@ -241,7 +244,7 @@ strip = true
 # See: https://github.com/Gilamonster-Foundation/agent-bridle/issues/20
 
 [patch.crates-io]
-agent-bridle           = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", branch = "main" }
-agent-bridle-core      = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", branch = "main" }
-agent-bridle-tool-shell = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", branch = "main" }
-agent-bridle-tool-web  = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", branch = "main" }
+agent-bridle           = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", branch = "brush-stub/publish-unblock" }
+agent-bridle-core      = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", branch = "brush-stub/publish-unblock" }
+agent-bridle-tool-shell = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", branch = "brush-stub/publish-unblock" }
+agent-bridle-tool-web  = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", branch = "brush-stub/publish-unblock" }

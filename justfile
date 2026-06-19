@@ -213,8 +213,10 @@ ocap-check:
 
 # --- agent-bridle shell toggle (publishable stub vs. real confined shell) ---
 #
-# `main`/release MUST stay on agent-bridle's `feat/stub-shell` branch: it
-# carries NO brush git deps, so the workspace publishes to crates.io (see the
+# `main`/release MUST stay on agent-bridle's `brush-stub/publish-unblock` branch
+# (advanced from `feat/stub-shell` on 2026-06-19, newt#497 — it adds the `step_up`
+# Gate while staying stub): it carries NO brush git deps, so the workspace
+# publishes to crates.io (see the
 # [patch.crates-io] block in Cargo.toml, and #206 / #208). The real
 # Caveats-confined shell lives on agent-bridle `main`, but it pulls the brush
 # git fork — which crates.io forbids in any form (even optional / feature-gated)
@@ -234,7 +236,7 @@ shell-real:
     # Portable across GNU and BSD/macOS sed: `[{]` (not `\{`, which BSD ERE
     # reads as an interval) and a temp-file rewrite (not `sed -i`, whose suffix
     # arg differs between GNU and BSD). See PR #238 followup.
-    sed -E 's|(agent-bridle[a-z-]*[[:space:]]*= [{] git = "[^"]*agent-bridle", branch = )"feat/stub-shell"|\1"main"|' Cargo.toml > Cargo.toml.shelltmp && mv Cargo.toml.shelltmp Cargo.toml
+    sed -E 's|(agent-bridle[a-z-]*[[:space:]]*= [{] git = "[^"]*agent-bridle", branch = )"brush-stub/publish-unblock"|\1"main"|' Cargo.toml > Cargo.toml.shelltmp && mv Cargo.toml.shelltmp Cargo.toml
     @echo "⚠️  agent-bridle → REAL brush shell (agent-bridle main). DEV ONLY."
     @echo "⚠️  Do NOT commit Cargo.toml / Cargo.lock — run 'just shell-stub' first."
     @echo "   Now rebuild: cargo build --workspace"
@@ -242,7 +244,7 @@ shell-real:
 # Switch back to the publishable stub shell (the release / main default).
 shell-stub:
     # Portable sed (see `shell-real` for why `[{]` + temp-file, not `sed -i -E`).
-    sed -E 's|(agent-bridle[a-z-]*[[:space:]]*= [{] git = "[^"]*agent-bridle", branch = )"main"|\1"feat/stub-shell"|' Cargo.toml > Cargo.toml.shelltmp && mv Cargo.toml.shelltmp Cargo.toml
+    sed -E 's|(agent-bridle[a-z-]*[[:space:]]*= [{] git = "[^"]*agent-bridle", branch = )"main"|\1"brush-stub/publish-unblock"|' Cargo.toml > Cargo.toml.shelltmp && mv Cargo.toml.shelltmp Cargo.toml
     @echo "agent-bridle → stub shell (publishable). Safe to commit."
     @echo "   Now rebuild: cargo build --workspace"
 

@@ -1016,7 +1016,7 @@ mod tests {
         );
         let text = result["content"][0]["text"].as_str().unwrap();
         assert!(
-            text.contains("reubeno/brush/pull/1184"),
+            text.contains("shell unavailable in this build"),
             "stub error must link to tracking PR: {text}"
         );
     }
@@ -1051,7 +1051,7 @@ mod tests {
         );
         let text = result["content"][0]["text"].as_str().unwrap();
         assert!(
-            text.contains("reubeno/brush/pull/1184"),
+            text.contains("shell unavailable in this build"),
             "stub error must link to tracking PR: {text}"
         );
     }
@@ -1206,7 +1206,7 @@ mod tests {
         );
         let text = result["content"][0]["text"].as_str().unwrap();
         assert!(
-            text.contains("reubeno/brush/pull/1184"),
+            text.contains("shell unavailable in this build"),
             "stub error must link to tracking PR: {text}"
         );
     }
