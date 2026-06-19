@@ -1656,12 +1656,18 @@ mod footer_tests {
 /// prompt itself is frozen at conversation start). Without it the model has no
 /// way to know its identity and confabulates one (e.g. inventing a name for
 /// commit attribution). Kept short — it rides in every request.
-/// The canonical AI-credit trailer the embedded git tool stamps on every commit
-/// (the user's format): `Co-authored-by: <model> (newt-agent v<version>)
-/// <noreply@newt-agent.com>`. The model name + harness version, so the app gets
-/// credit and the line is always well-formed (the model can't fake it).
+/// The canonical AI-credit trailer the embedded git tool stamps on every commit:
+/// `Co-authored-by: <model> <293447090+newt-agent[bot]@users.noreply.github.com>`.
+/// The model name credits which model did the work; the email is the
+/// `newt-agent[bot]` GitHub App's no-reply address ([`newt_core::DEFAULT_AGENT_EMAIL`]),
+/// so GitHub attributes the credit to the bot account. (The old
+/// `<noreply@newt-agent.com>` attributed to no GitHub account at all — the wrong
+/// message.) Always well-formed; the model can't fake it.
 fn coauthor_trailer(model: &str) -> String {
-    format!("Co-authored-by: {model} (newt-agent v{VERSION}) <noreply@newt-agent.com>")
+    format!(
+        "Co-authored-by: {model} <{}>",
+        newt_core::DEFAULT_AGENT_EMAIL
+    )
 }
 
 fn runtime_context_block(model: &str, endpoint: &str, kind: newt_core::BackendKind) -> String {
@@ -1672,6 +1678,7 @@ fn runtime_context_block(model: &str, endpoint: &str, kind: newt_core::BackendKi
         newt_core::BackendKind::Openai => "openai-compatible",
         _ => "ollama",
     };
+    let bot_email = newt_core::DEFAULT_AGENT_EMAIL;
     format!(
         "# Environment (refreshed every turn)\n\
          Harness: newt-agent v{VERSION}\n\
@@ -1682,11 +1689,18 @@ fn runtime_context_block(model: &str, endpoint: &str, kind: newt_core::BackendKi
          When asked who or what you are — and when attributing work (commit \
          trailers, git notes, PR text) — use this real model name and harness; \
          never invent or guess an identity.\n\
-         The `git` tool automatically signs every commit (and amend) with \
-         `Co-authored-by: {model} (newt-agent v{VERSION}) <noreply@newt-agent.com>` \
-         — do NOT add that trailer yourself; just write the plain message. To \
-         change the last commit, use the git tool with op=amend (do not claim to \
-         amend without calling it).\n"
+         # Git commit identity\n\
+         Prefer the `git` tool: it commits as `newt-agent[bot] <{bot_email}>` and \
+         auto-signs `Co-authored-by: {model} <{bot_email}>` — do NOT add that \
+         trailer yourself, just write the plain message; for the last commit use \
+         op=amend (don't claim to amend without calling it).\n\
+         If you instead commit with the SHELL `git` command (run_command), you \
+         MUST set the same identity explicitly — the email is what attributes the \
+         commit to the bot on GitHub. Use:\n\
+         `git -c user.name='newt-agent[bot]' -c user.email='{bot_email}' commit -m \"…\"`\n\
+         (the author name may be `newt-agent[bot]` or this model's name, but the \
+         email must always be `{bot_email}`). Never commit with a guessed or \
+         personal email.\n"
     )
 }
 
@@ -8182,6 +8196,31 @@ fn test_persona(name: &str, prompt: &str, path: std::path::PathBuf) -> Persona {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn coauthor_trailer_uses_the_bot_github_email() {
+        let tr = coauthor_trailer("nemotron-3-nano:30b");
+        // Model name credits the work; the email attributes to the newt-agent[bot]
+        // GitHub App (the fix — the old noreply@newt-agent.com attributed nowhere).
+        assert_eq!(
+            tr,
+            "Co-authored-by: nemotron-3-nano:30b <293447090+newt-agent[bot]@users.noreply.github.com>"
+        );
+        assert!(tr.contains(newt_core::DEFAULT_AGENT_EMAIL));
+        assert!(
+            !tr.contains("noreply@newt-agent.com"),
+            "old wrong email is gone"
+        );
+    }
+
+    #[test]
+    fn runtime_context_block_instructs_shell_git_identity() {
+        let blk = runtime_context_block("m", "http://h", newt_core::BackendKind::Ollama);
+        // The shell-git fallback (for a model that bypasses the embedded tool)
+        // must carry the canonical bot email.
+        assert!(blk.contains("user.email='293447090+newt-agent[bot]@users.noreply.github.com'"));
+        assert!(blk.contains("git -c user.name="));
+    }
 
     #[test]
     fn bang_command_strips_and_trims_the_escape() {
