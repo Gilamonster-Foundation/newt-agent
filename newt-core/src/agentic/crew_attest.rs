@@ -15,7 +15,11 @@
 //!
 //! Pure (no I/O); the caller surfaces `NeedsAttest` to the overseer.
 
-use agent_bridle::{AttestRequirement, CallRequest, Presence, Rule, StepUpPolicy};
+use agent_bridle::{AttestRequirement, CallRequest, Rule, StepUpPolicy};
+
+// Re-export the presence ladder so callers (e.g. the CLI's LocalCrewRunner) can
+// name the established presence without a direct agent-bridle dependency.
+pub use agent_bridle::Presence;
 
 /// The default crew/team step-up policy. `crew`/`team` dispatch requires a human
 /// gesture (`Prompt` today; raise to `Passkey` for amplifying crews once BOOT
