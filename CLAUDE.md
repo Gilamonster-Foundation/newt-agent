@@ -82,26 +82,45 @@ acceptance contract's target floor.
 - Editor: vi (no emacs).
 - Test mocking: `wiremock` for HTTP, in-memory fakes / injected fs seams
   for filesystem logic, `mockall` for traits, `assert_cmd` + `predicates`
-  for CLI binaries, `tokio-test` for async. **Unit tests must not touch the
-  real filesystem** — see "Filesystem tests" below. See Step 0.4 in the
-  roadmap for the shared `tests/common` helper crate.
+  for CLI binaries, `tokio-test` for async. **The unit tier is fully
+  mocked** — see "Testing strategy" below. See Step 0.4 in the roadmap for
+  the shared `tests/common` helper crate.
 
-## Filesystem tests (release-gated, run sequentially)
+## Testing strategy
 
-- **Unit tests do not create real temp dirs or files — ever.** No
-  `tempfile` / `TempDir` / `std::fs::write` / `create_dir` in the unit
-  tier. Test filesystem logic with in-memory data, fakes, or an injectable
-  fs seam (production code that writes via a path argument should expose a
-  writer seam). Pattern to copy: `newt-cli/src/dgx_pull.rs` — pure, fs-free.
-- **Any test that needs the real filesystem is an integration test, not a
-  unit test.** It belongs in the **release gate**, not the per-PR unit run.
-- **Release-gate filesystem tests run in sequence**
-  (`cargo test -- --test-threads=1`, or `#[serial]` via `serial_test`).
-  Real-fs tests contend on the filesystem; under parallel load they
-  intermittently fail with `Permission denied (os error 13)` on tempdir
-  creation, which aborts the entire test binary. Single-threaded execution
-  removes the contention. Never run real-fs tests multi-threaded.
-- Migration of the existing `tempfile`-based tests is tracked in issue #514.
+newt's tests run in tiers. Default to the cheapest tier that proves the
+behavior; reserve expensive tiers for what only they can catch.
+
+- **Unit + regression tier — FULLY MOCKED, ALWAYS (every PR).** No real
+  network, filesystem, subprocess, or wall-clock — *ever*. HTTP →
+  `wiremock`; traits → `mockall`; filesystem → in-memory data / fakes /
+  injected fs seams (never `tempfile` / `TempDir` / `std::fs::write` /
+  `create_dir` in a unit test); CLI → `assert_cmd` against mocked
+  dependencies; time/async → injected clock / `tokio-test`. These are fast,
+  deterministic, and parallel-safe, and they gate every PR. Pattern to
+  copy: `newt-cli/src/dgx_pull.rs` — pure, fully mocked, fs-free.
+
+- **BAT / UAT regression pipelines — simulated systems-integration env.**
+  Write **Basic Acceptance Tests (BAT)** and **User Acceptance Tests (UAT)**
+  that replay real-world scenarios against a *simulated* integration
+  environment — mocked/stubbed external systems standing in for the real
+  ones, **not** live production systems. BAT = smoke / contract-level "does
+  the wired-up system accept the basic flows"; UAT = end-user scenarios
+  phrased the way a user would actually exercise them. These are the durable
+  acceptance story and guard against regressions in real-world behavior.
+
+- **End-to-end + real integration tests — EXPENSIVE → weekly + release
+  gates only.** Anything touching a real filesystem, real network, real
+  subprocess, or a live/standalone service is costly and flaky under load.
+  Run it on the **weekly** schedule and on **release gates**, never in the
+  per-PR unit run. **Run these single-threaded**
+  (`cargo test -- --test-threads=1`, or `#[serial]` via `serial_test`):
+  real-resource tests contend, and under parallel load intermittently fail
+  with `Permission denied (os error 13)` on tempdir creation, aborting the
+  whole test binary. Never run them multi-threaded.
+
+Migration of the existing real-fs (`tempfile`) tests out of the unit tier
+is tracked in issue #514.
 
 ## Versioning
 
