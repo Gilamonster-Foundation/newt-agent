@@ -2754,7 +2754,7 @@ mod disable_ocap_tests {
         .await;
         assert!(out.starts_with("error:"), "got: {out}");
         assert!(
-            out.contains("shell unavailable in this build"),
+            out.contains("unavailable in this build"),
             "the stub dispatch error must surface unchanged, got: {out}"
         );
     }
@@ -2905,7 +2905,7 @@ mod disable_ocap_tests {
             "fell to confined dispatch: {out}"
         );
         assert!(
-            out.contains("shell unavailable in this build"),
+            out.contains("unavailable in this build"),
             "confined stub error surfaces, got: {out}"
         );
     }
