@@ -225,9 +225,14 @@ strip = true
 # ── Temporary patch: agent-bridle → crates.io transition ──────────────────
 #
 # newt-tui and newt-mcp-server declare `agent-bridle = "0.1"` (registry dep)
-# but agent-bridle 0.1.0 lands on crates.io only after its PR #21 merges and
-# the tag-triggered release workflow runs. Until then this patch satisfies the
-# dependency from the stub-shell branch (no brush git deps, all crates.io safe).
+# but agent-bridle 0.1.0 is not yet indexed on crates.io. Until then this patch
+# satisfies the dependency from git.
+#
+# Pinned to `main` (advanced from `feat/stub-shell` on 2026-06-19, newt#497):
+# main carries the human-presence `step_up` Gate (agent-bridle#24) that ROADMAP
+# 23.2 builds on, AND keeps the brush git-deps removed (the shell tool is a stub),
+# so the build stays crates.io-safe. The older `feat/stub-shell` branch lacked
+# `step_up`, which blocked 23.2 — hence this advance.
 #
 # After agent-bridle 0.1.0 is indexed on crates.io:
 #   1. Remove this entire [patch.crates-io] block.
@@ -236,7 +241,7 @@ strip = true
 # See: https://github.com/Gilamonster-Foundation/agent-bridle/issues/20
 
 [patch.crates-io]
-agent-bridle           = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", branch = "feat/stub-shell" }
-agent-bridle-core      = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", branch = "feat/stub-shell" }
-agent-bridle-tool-shell = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", branch = "feat/stub-shell" }
-agent-bridle-tool-web  = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", branch = "feat/stub-shell" }
+agent-bridle           = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", branch = "main" }
+agent-bridle-core      = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", branch = "main" }
+agent-bridle-tool-shell = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", branch = "main" }
+agent-bridle-tool-web  = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", branch = "main" }

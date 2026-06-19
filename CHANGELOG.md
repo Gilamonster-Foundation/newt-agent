@@ -5,6 +5,56 @@ Notable changes to the newt-agent workspace. Format follows
 (`0.MINOR.PATCH`, pre-1.0). The workspace version in the top-level `Cargo.toml`
 is inherited by all internal crates.
 
+## [Unreleased] — targeting 0.6.9
+
+**Theme: the crew / team / overseer orchestration stack + honest, attenuating
+authority.** A conversational overseer plans, composes a roster, dispatches crews
+per step, and reviews — under capability leashes that only ever *attenuate*.
+
+### Added — multi-LLM orchestration (`newt-scheduler`, ROADMAP Phase 23)
+
+- **crew / panel / team / roster** — `run_crew` (role-routing loop, #425), `run_panel`
+  (N decorrelated voices, verify-gate each, anti-groupthink, #468), `run_team` (a lead
+  decomposes a goal → a crew per subtask, per-subtask verify, #474/#477), and the
+  `compose_roster` composer (survey live models → propose role→model with a rationale,
+  #480).
+- **hosted-LLM dispatch** — `BackendKind::Openai` over `/v1/chat/completions` + bearer
+  `api_key`, so crews/teams run on a hosted model, not just local Ollama (#478).
+- **agent-callable crew/team tools** — the async `CrewRunner` trait + `compose_roster`
+  / `crew` tools behind the `NEWT_TEAM` toggle; `LocalCrewRunner` injected into the
+  scheduler-free TUI loop (the inversion: newt-cli owns the scheduler) (#479/#482/#484).
+- **verified work lands as a git branch** — a passing crew commits to a `crew/<id>`
+  branch in the shared object store (review/merge with the embedded `git` tool);
+  unverified work is isolated and discarded (#489).
+- **per-member fs_write leash** — `run_crew`/`run_team` enforce `Caveats` at the apply
+  step: a member's out-of-leash edits are refused (attenuation, never amplify) (#494).
+- **MCP git dev-kit** — a `git` tool on `newt-mcp-server`, so any MCP client can drive
+  a full coder out-of-band (#469).
+- **tiered verify gate** — `VerifyTier` + one honest cap-exit banner (#470).
+- **architecture doc** — `docs/design/crew-swarm-overseer.md`; ROADMAP Phase 23.
+
+### Changed — dependencies
+
+- **agent-bridle `[patch.crates-io]` advanced `feat/stub-shell` → `main`** (newt#497):
+  main carries the human-presence `step_up` Gate (agent-bridle#24) that ROADMAP 23.2
+  builds on, AND keeps the brush git-deps removed (the shell tool is a stub), so the
+  build stays crates.io-safe. Locked at `main#7e5e8f4`. Full workspace green, no API
+  drift. The older `feat/stub-shell` branch lacked `step_up`, which blocked 23.2.
+
+### Fixed
+
+- **backendless config** no longer re-grows a synthesized `ollama` backend when only
+  per-file drop-ins are present; amber harness notices (#492, recovering a regression
+  the #473 squash dropped).
+
+### Release action when cutting 0.6.9
+
+- Bump `[workspace.package] version` 0.6.8 → 0.6.9.
+- The `[patch.crates-io]` agent-bridle block is still **git-pinned** (`branch =
+  "main"`). When agent-bridle 0.1.0 is indexed on crates.io, drop the block and
+  `cargo update -p agent-bridle` (agent-bridle#20). Until then, the `main` pin is the
+  supported path — do **not** revert to `feat/stub-shell` (it lacks `step_up`).
+
 ## [0.6.8] — 2026-06-14
 
 **Theme: an honest, measurable, family-aware harness.** This release turns the
