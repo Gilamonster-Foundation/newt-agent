@@ -8635,8 +8635,12 @@ mod tests {
 
     #[test]
     fn inline_header_lists_plugins_when_brand_set() {
-        // SAFETY: single-threaded set/clear of a process var that no other test
-        // asserts against (the other header tests are contains-only + ANSI-safe).
+        // #507: tests run in PARALLEL and Rust's `set_var`/`remove_var` are not
+        // thread-safe — a raw, unguarded mutation here races the `HOME` swap in the
+        // cw-400 recovery test (and any other env-touching test), which was the
+        // intermittent pre-push-gate flake. Serialize on the shared write guard
+        // (the same lock `with_env_vars` and the cw-400 test hold).
+        let _g = crate::test_env_guard::env_write_guard();
         unsafe { std::env::set_var("NEWT_BRAND_PLUGINS", "mogul, diagram") };
         let color = render_inline_header("/w", true);
         let plain = render_inline_header("/w", false);
@@ -11502,15 +11506,14 @@ mod tool_round_cap_tests {
             }
         }
 
-        // Isolate cache persistence to a temp HOME so the test never touches the
-        // developer's ~/.newt/model-capabilities.json. The write guard serializes
-        // against every other env-mutating / env-reading test in this binary.
-        let _g = crate::test_env_guard::env_write_guard();
+        // Isolate cache persistence to a temp dir via the thread-local cache
+        // override — NOT a global $HOME swap. The swap raced every HOME-reading
+        // test in this binary (#507: ~20 tests intermittently failed writing
+        // `~/.newt/...` when their thread saw this test's transient HOME). The
+        // override is thread-local, so no other test thread is affected and no env
+        // write guard is needed.
         let tmp = tempfile::tempdir().unwrap();
-        let saved_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", tmp.path());
-        // The cache lives next to the config file; ensure the dir exists.
-        std::fs::create_dir_all(tmp.path().join(".newt")).unwrap();
+        probe::set_cache_dir_override(Some(tmp.path().to_path_buf()));
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -11581,11 +11584,8 @@ mod tool_round_cap_tests {
             (out, calls.load(Ordering::SeqCst), persisted)
         });
 
-        // Restore HOME before any assertion can unwind.
-        match saved_home {
-            Some(h) => std::env::set_var("HOME", h),
-            None => std::env::remove_var("HOME"),
-        }
+        // Clear the thread-local cache override before any assertion can unwind.
+        probe::set_cache_dir_override(None);
 
         let (reply, _streamed, _usage, _hallu) =
             result.expect("loop must recover from the 400, not propagate it");

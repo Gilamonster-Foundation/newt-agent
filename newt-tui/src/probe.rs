@@ -334,7 +334,29 @@ pub struct ModelInfo {
 // Cache persistence
 // ---------------------------------------------------------------------------
 
+// Test-only: redirect the capability cache to an isolated dir on THIS thread, so a
+// test can exercise cache load/save persistence WITHOUT swapping the process-global
+// `$HOME`. Swapping global HOME raced every HOME-reading test in this binary (#507:
+// ~20 tests intermittently failed with "Permission denied" writing `~/.newt/...`
+// when their thread saw the cw-400 test's transient HOME). A thread-local override
+// is invisible to the other test threads, so the race is gone at the source.
+#[cfg(test)]
+thread_local! {
+    static CACHE_DIR_OVERRIDE: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Test hook: point this thread's capability cache at `dir` (`None` clears it).
+#[cfg(test)]
+pub(crate) fn set_cache_dir_override(dir: Option<PathBuf>) {
+    CACHE_DIR_OVERRIDE.with(|c| *c.borrow_mut() = dir);
+}
+
 fn cache_path() -> Option<PathBuf> {
+    #[cfg(test)]
+    if let Some(dir) = CACHE_DIR_OVERRIDE.with(|c| c.borrow().clone()) {
+        return Some(dir.join("model-capabilities.json"));
+    }
     newt_core::Config::user_config_path().map(|p| p.with_file_name("model-capabilities.json"))
 }
 
