@@ -21,6 +21,7 @@
 //! ↔ a future panel/tournament) the same way it swaps the `Dispatcher` transport.
 
 use crate::{BackendPool, ChatRequest, Dispatcher};
+use newt_core::caveats::{Caveats, CaveatsExt};
 use newt_core::Tier;
 use serde::Deserialize;
 
@@ -143,6 +144,7 @@ pub async fn run_crew(
     dispatcher: &dyn Dispatcher,
     workspace: &mut dyn Workspace,
     cfg: &CrewConfig,
+    caveats: &Caveats,
     task: &str,
 ) -> CrewOutcome {
     // 1. NAVIGATE — pick the relevant files (then the harness reads them).
@@ -217,7 +219,14 @@ pub async fn run_crew(
             .collect();
 
         // 4. APPLY (isolated worktree) + 5. VERIFY (harness runs the check).
-        touched = workspace.apply(&edits);
+        //    Per-member authority (ROADMAP 23.1): only edits the leash permits land;
+        //    out-of-`fs_write` edits are REFUSED (attenuation, never amplify) and fed
+        //    back, so a crew member cannot write outside its granted scope — even in
+        //    the isolated worktree. Verification stays ground truth.
+        let (allowed, refused): (Vec<Edit>, Vec<Edit>) = edits
+            .into_iter()
+            .partition(|e| caveats.permits_fs_write(&e.path));
+        touched = workspace.apply(&allowed);
         let (ok, output) = workspace.run_test();
         if ok {
             return CrewOutcome {
@@ -226,6 +235,15 @@ pub async fn run_crew(
                 touched,
             };
         }
+        let output = if refused.is_empty() {
+            output
+        } else {
+            let names: Vec<&str> = refused.iter().map(|e| e.path.as_str()).collect();
+            format!(
+                "REFUSED (outside the fs_write leash — attenuate the task or widen the grant): {}\n{output}",
+                names.join(", ")
+            )
+        };
 
         // 6. TRIAGE — diagnose the failure; fed into the next planning round.
         let tri_req = ChatRequest::new()
@@ -368,7 +386,15 @@ mod tests {
         let p = pool();
         let d = RoleMock::new();
         let mut ws = MemWs::new();
-        let out = run_crew(&p, &d, &mut ws, &cfg(3), "make target.rs GOOD").await;
+        let out = run_crew(
+            &p,
+            &d,
+            &mut ws,
+            &cfg(3),
+            &newt_core::caveats::Caveats::top(),
+            "make target.rs GOOD",
+        )
+        .await;
         assert_eq!(out.status, CrewStatus::Passed);
         assert_eq!(out.attempts, 2);
         assert_eq!(out.touched, vec!["target.rs".to_string()]);
@@ -381,9 +407,39 @@ mod tests {
         let p = pool();
         let d = RoleMock::new();
         let mut ws = MemWs::new();
-        let out = run_crew(&p, &d, &mut ws, &cfg(1), "make target.rs GOOD").await;
+        let out = run_crew(
+            &p,
+            &d,
+            &mut ws,
+            &cfg(1),
+            &newt_core::caveats::Caveats::top(),
+            "make target.rs GOOD",
+        )
+        .await;
         assert_eq!(out.status, CrewStatus::NeedsHumanReview);
         assert_eq!(out.attempts, 1);
+    }
+
+    #[tokio::test]
+    async fn refuses_edits_outside_the_fs_write_leash() {
+        // 23.1: a read-only session (fs_write = none) means every edit is REFUSED at
+        // apply — even the GOOD one — so the crew can never satisfy the check and
+        // exits honestly, having written nothing. The leash holds against a crew that
+        // *would* otherwise converge.
+        let p = pool();
+        let d = RoleMock::new();
+        let mut ws = MemWs::new();
+        let read_only = newt_core::caveats::Caveats {
+            fs_write: newt_core::caveats::Scope::none(),
+            ..newt_core::caveats::Caveats::top()
+        };
+        let out = run_crew(&p, &d, &mut ws, &cfg(3), &read_only, "make target.rs GOOD").await;
+        assert_eq!(out.status, CrewStatus::NeedsHumanReview);
+        assert!(
+            out.touched.is_empty(),
+            "nothing may be written outside the leash"
+        );
+        assert_eq!(ws.read("target.rs").as_deref(), Some("BAD"), "untouched");
     }
 
     #[tokio::test]
@@ -396,7 +452,15 @@ mod tests {
         });
         let d = RoleMock::new();
         let mut ws = MemWs::new();
-        let out = run_crew(&p, &d, &mut ws, &cfg(3), "task").await;
+        let out = run_crew(
+            &p,
+            &d,
+            &mut ws,
+            &cfg(3),
+            &newt_core::caveats::Caveats::top(),
+            "task",
+        )
+        .await;
         assert_eq!(out.status, CrewStatus::NeedsHumanReview);
         assert_eq!(out.attempts, 0);
     }

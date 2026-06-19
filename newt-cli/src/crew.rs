@@ -302,7 +302,11 @@ async fn run_with(
         triage_model,
         max_attempts,
     };
-    let outcome = run_crew(&pool, dispatcher, &mut ws, &crew_cfg, &args.task).await;
+    // Honest, non-top session caveats (the #94 guardrail forbids `Caveats::top()`
+    // in dispatch code): `fs_write` for the worktree, exec/net locked down. The
+    // per-member fs_write leash in `run_crew` enforces it.
+    let caveats = newt_acp_worker::worker_session_caveats(None);
+    let outcome = run_crew(&pool, dispatcher, &mut ws, &crew_cfg, &caveats, &args.task).await;
     // Drop ws (removes the worktree) BEFORE we may process::exit upstream.
     let touched_in = ws.path().to_path_buf();
     drop(ws);

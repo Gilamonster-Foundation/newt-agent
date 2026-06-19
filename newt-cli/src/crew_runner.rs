@@ -196,11 +196,13 @@ impl CrewRunner for LocalCrewRunner {
                         crew: crew_cfg,
                         max_subtasks: MAX_SUBTASKS,
                     };
-                    let out = run_team(&pool, &LocalDispatcher, &mut ws, &team_cfg, task).await;
+                    let out =
+                        run_team(&pool, &LocalDispatcher, &mut ws, &team_cfg, caveats, task).await;
                     let passed = out.status == TeamStatus::AllPassed;
                     (render_team(&out), passed)
                 } else {
-                    let out = run_crew(&pool, &LocalDispatcher, &mut ws, &crew_cfg, task).await;
+                    let out =
+                        run_crew(&pool, &LocalDispatcher, &mut ws, &crew_cfg, caveats, task).await;
                     let passed = out.status == CrewStatus::Passed;
                     (render_crew(&out), passed)
                 };
