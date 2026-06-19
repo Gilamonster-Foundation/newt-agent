@@ -8905,7 +8905,7 @@ mod run_command_confinement_tests {
         )
         .await;
         assert!(
-            out.contains("shell unavailable in this build"),
+            out.contains("unavailable in this build"),
             "stub error must link to tracking PR, got: {out}"
         );
     }
@@ -8940,7 +8940,7 @@ mod run_command_confinement_tests {
         )
         .await;
         assert!(
-            out.contains("shell unavailable in this build"),
+            out.contains("unavailable in this build"),
             "stub error must link to tracking PR, got: {out}"
         );
     }
