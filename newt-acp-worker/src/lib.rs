@@ -193,6 +193,7 @@ mod backend_selection_tests {
             model: "m".into(),
             tiers: vec![Tier::Fast],
             kind,
+            api: Default::default(),
             api_key_file: None,
             api_key_env: None,
         }

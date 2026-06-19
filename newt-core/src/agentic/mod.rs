@@ -36,7 +36,7 @@ pub use compress::{
     SummarizeFuture, Summarizer, SUMMARY_END_MARKER, SUMMARY_PREFIX,
 };
 pub use crew_tool::{compose_roster_tool_definition, crew_tool_definition, CrewRunner};
-pub use display::{print_list_item, print_newt, NEWT_ORANGE_CT};
+pub use display::{print_harness_notice, print_list_item, print_newt, NEWT_ORANGE_CT};
 pub use driver::{
     TurnDriver, TurnDriverConfig, TurnDriverError, TurnOutcome, TurnStatus,
     VISIBLE_TRANSCRIPT_ROLES,
@@ -783,6 +783,12 @@ pub async fn chat_complete(
     // OpenAI-compatible endpoints speak a different wire format (request,
     // tool_calls, and usage shapes all differ), so they get their own loop.
     if ctx.kind == crate::BackendKind::Openai {
+        // A backend with `api = "responses"` speaks the newer Responses API
+        // (gpt-5-codex et al., served only there); the default stays on
+        // /v1/chat/completions.
+        if responses_api_selected() {
+            return openai_responses_complete(ctx, mcp).await;
+        }
         return openai_chat_complete(ctx, mcp).await;
     }
     let ChatCtx {
@@ -1040,7 +1046,7 @@ pub async fn chat_complete(
                     }
                 };
                 if let Some(notice) = outcome.notice {
-                    print_newt(&notice, color, false);
+                    print_harness_notice(&notice, color);
                 }
                 if outcome.action == CompressAction::Refused {
                     // Anti-thrash disabled compression and the context still
@@ -1225,7 +1231,7 @@ pub async fn chat_complete(
                         )
                         .await;
                         if let Some(notice) = outcome.notice {
-                            print_newt(&notice, color, false);
+                            print_harness_notice(&notice, color);
                         }
                         if outcome.action == CompressAction::Refused {
                             // Refuse the resend; surface the endpoint's 400.
@@ -1498,7 +1504,7 @@ pub async fn chat_complete(
                         )
                         .await;
                         if let Some(notice) = outcome.notice {
-                            print_newt(&notice, color, false);
+                            print_harness_notice(&notice, color);
                         }
                         if outcome.fired {
                             messages = outcome.messages;
@@ -2145,7 +2151,7 @@ pub async fn openai_chat_complete(
                 )
                 .await;
                 if let Some(notice) = outcome.notice {
-                    print_newt(&notice, color, false);
+                    print_harness_notice(&notice, color);
                 }
                 if outcome.action == CompressAction::Refused {
                     anyhow::bail!(
@@ -2295,7 +2301,7 @@ pub async fn openai_chat_complete(
                         )
                         .await;
                         if let Some(notice) = outcome.notice {
-                            print_newt(&notice, color, false);
+                            print_harness_notice(&notice, color);
                         }
                         if outcome.action == CompressAction::Refused {
                             // Refuse the resend; surface the endpoint's 400.
@@ -2527,6 +2533,387 @@ pub async fn openai_chat_complete(
     )
     .await?;
     Ok((text, streamed, usage, hallucination_count))
+}
+
+// ── OpenAI Responses API (`POST /v1/responses`) ────────────────────────────
+//
+// The newer OpenAI surface. Models like `gpt-5-codex` are served ONLY here and
+// 404 on `/v1/chat/completions`. The request/response shapes differ (input vs
+// messages, instructions vs system message, a flatter tool schema, `output[]`
+// items vs `choices`, `input_tokens`/`output_tokens` usage), so this is a
+// parallel — deliberately leaner — loop. Selected per backend via
+// `api = "responses"` (surfaced to the loop as `NEWT_OPENAI_API`). Non-streaming
+// in v1 (matching the chat path's UX); the chat path's budget / cw-400 recovery
+// is intentionally not duplicated here yet (opt-in path) — tracked.
+
+/// `true` when the active OpenAI backend selected the Responses API
+/// (`[backends].api = "responses"`, surfaced to the loop as `NEWT_OPENAI_API`).
+fn responses_api_selected() -> bool {
+    std::env::var("NEWT_OPENAI_API")
+        .ok()
+        .is_some_and(|v| v.eq_ignore_ascii_case("responses"))
+}
+
+/// Split chat-style messages into the Responses API's `(instructions, input)`:
+/// `system`/`developer` messages concatenate into top-level `instructions`;
+/// `user`/`assistant` become `input` message items (plain string content). Any
+/// item already shaped as a Responses item (carrying a `type` field, e.g.
+/// `function_call` / `function_call_output`) passes through untouched.
+fn build_responses_input(
+    messages: &[serde_json::Value],
+) -> (Option<String>, Vec<serde_json::Value>) {
+    let mut instructions: Vec<String> = Vec::new();
+    let mut input: Vec<serde_json::Value> = Vec::new();
+    for m in messages {
+        if m.get("type").is_some() {
+            input.push(m.clone());
+            continue;
+        }
+        let role = m["role"].as_str().unwrap_or("user");
+        let content = m["content"].as_str().unwrap_or("");
+        match role {
+            "system" | "developer" => instructions.push(content.to_string()),
+            _ => input.push(serde_json::json!({ "role": role, "content": content })),
+        }
+    }
+    let ins = (!instructions.is_empty()).then(|| instructions.join("\n\n"));
+    (ins, input)
+}
+
+/// Translate the chat/completions tool array (`{type:function,
+/// function:{name,…}}` elements, as returned by `merged_tool_definitions`) to
+/// the Responses API's flatter `{type:function, name, description, parameters}`.
+/// An already-flat (or unknown) element passes through.
+fn tools_to_responses(tools: &serde_json::Value) -> Vec<serde_json::Value> {
+    tools
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .map(|t| {
+                    let f = &t["function"];
+                    if f.is_object() {
+                        serde_json::json!({
+                            "type": "function",
+                            "name": f["name"],
+                            "description": f["description"],
+                            "parameters": f["parameters"],
+                        })
+                    } else {
+                        t.clone()
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Extract `(assistant_text, function_call_items)` from a Responses reply's
+/// `output[]`: text is the concatenation of `output_text` parts inside
+/// `message` items; `function_call` items are returned verbatim (they carry
+/// `call_id` / `name` / `arguments` and are echoed back into the next request).
+/// Falls back to a flattened top-level `output_text` if the structured walk
+/// found no text.
+fn parse_responses_output(json: &serde_json::Value) -> (String, Vec<serde_json::Value>) {
+    let mut text = String::new();
+    let mut calls = Vec::new();
+    if let Some(items) = json["output"].as_array() {
+        for item in items {
+            match item["type"].as_str() {
+                Some("message") => {
+                    if let Some(parts) = item["content"].as_array() {
+                        for p in parts {
+                            if let Some(t) = p["text"].as_str() {
+                                text.push_str(t);
+                            }
+                        }
+                    }
+                }
+                Some("function_call") => calls.push(item.clone()),
+                _ => {}
+            }
+        }
+    }
+    if text.is_empty() {
+        if let Some(t) = json["output_text"].as_str() {
+            text.push_str(t);
+        }
+    }
+    (text, calls)
+}
+
+/// Responses API usage → `TokenUsage` (`input_tokens`/`output_tokens`, distinct
+/// from chat/completions' `prompt_tokens`/`completion_tokens`).
+fn responses_usage(v: &serde_json::Value) -> Option<crate::TokenUsage> {
+    let input = v["input_tokens"].as_u64().map(|n| n as u32);
+    let output = v["output_tokens"].as_u64().map(|n| n as u32);
+    input.zip(output).map(|(i, o)| crate::TokenUsage {
+        input_tokens: i,
+        output_tokens: o,
+    })
+}
+
+/// The OpenAI **Responses API** agentic loop (`POST {endpoint}/v1/responses`).
+/// Parallel to [`openai_chat_complete`] but over the Responses shapes, for
+/// models served only there (`gpt-5-codex`). Non-streaming; selected via
+/// `api = "responses"`. The chat path's budget / cw-400 recovery is not yet
+/// mirrored here (opt-in path) — tracked as a follow-up.
+pub async fn openai_responses_complete(
+    ctx: ChatCtx<'_>,
+    mcp: &mut dyn McpTools,
+) -> anyhow::Result<(String, bool, Option<crate::TokenUsage>, u32)> {
+    let ChatCtx {
+        url,
+        model,
+        kind: _,
+        api_key,
+        messages: mem_messages,
+        task: _,
+        workspace,
+        color,
+        caveats,
+        max_tool_rounds,
+        tool_output_lines,
+        debug,
+        trace,
+        num_ctx: _,
+        connect_timeout_secs,
+        inference_timeout_secs,
+        mid_loop_trim_threshold: _,
+        mid_loop_trim_tokens: _,
+        max_ok_input: _,
+        build_check_cmd,
+        safe_context: _,
+        recover_cw_400: _,
+        mut note_sink,
+        mut note_nudge,
+        recall_source,
+        memory_source,
+        summarizer: _,
+        compress_state: _,
+        mut tool_events,
+        mut permission_gate,
+        on_round_usage: _,
+        estimate_ratio: _,
+        exec_floor,
+        write_ledger,
+        cancel,
+        git_tool,
+        crew_runner,
+    } = ctx;
+
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(connect_timeout_secs))
+        .timeout(std::time::Duration::from_secs(inference_timeout_secs))
+        .build()?;
+    let responses_url = format!("{}/v1/responses", url.trim_end_matches('/'));
+    let retry = tui_retry_policy();
+    let advertise_save_note = note_sink.is_some();
+    let advertise_recall = recall_source.is_some();
+    let advertise_memory_fetch = memory_source.is_some();
+    let advertise_git = git_tool.is_some();
+    let advertise_team = crew_runner.is_some();
+
+    let msgs_json: Vec<serde_json::Value> = mem_messages
+        .iter()
+        .map(|m| serde_json::json!({"role": m.role.as_str(), "content": m.content}))
+        .collect();
+    let (instructions, mut input) = build_responses_input(&msgs_json);
+    let tools_chat = merged_tool_definitions(
+        mcp,
+        advertise_save_note,
+        advertise_recall,
+        advertise_memory_fetch,
+        advertise_git,
+        advertise_team,
+    );
+    let tools = tools_to_responses(&tools_chat);
+
+    let mut accumulated_usage: Option<crate::TokenUsage> = None;
+    let mut hallucination_count: u32 = 0;
+    let mut tools_supported = true;
+    let mut tools_unsupported_notified = false;
+
+    let build_body = |input: &[serde_json::Value], with_tools: bool| {
+        let mut body = serde_json::json!({ "model": model, "input": input, "stream": false });
+        if let Some(ins) = &instructions {
+            body["instructions"] = serde_json::json!(ins);
+        }
+        if with_tools && !tools.is_empty() {
+            body["tools"] = serde_json::json!(tools);
+            body["tool_choice"] = serde_json::json!("auto");
+        }
+        body
+    };
+
+    for round in 0..max_tool_rounds {
+        if is_cancelled(cancel) {
+            return Ok((String::new(), false, accumulated_usage, hallucination_count));
+        }
+        let body = build_body(&input, tools_supported);
+        let dispatch = with_backoff_notify(
+            &retry,
+            || async {
+                let mut req = client.post(&responses_url).json(&body);
+                if let Some(key) = api_key {
+                    req = req.bearer_auth(key);
+                }
+                let resp = req
+                    .send()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("request failed: {e}"))?;
+                if !resp.status().is_success() {
+                    let status = resp.status();
+                    let text = resp.text().await.unwrap_or_default();
+                    anyhow::bail!("inference endpoint {status}: {text}");
+                }
+                resp.json::<serde_json::Value>()
+                    .await
+                    .map_err(anyhow::Error::from)
+            },
+            |attempt, delay| print_retry_indicator(attempt, delay, color),
+        )
+        .await;
+
+        let json = match dispatch {
+            Ok(j) => j,
+            Err(e) => {
+                if tools_supported && is_tools_unsupported_error(&e) {
+                    tools_supported = false;
+                    if !tools_unsupported_notified {
+                        tools_unsupported_notified = true;
+                        print_newt(
+                            &format!(
+                                "{model} does not support tools — tools disabled for this session"
+                            ),
+                            color,
+                            false,
+                        );
+                    }
+                    continue;
+                }
+                return Err(e);
+            }
+        };
+
+        let round_usage = responses_usage(&json["usage"]);
+        accumulated_usage = merge_round_usage(accumulated_usage, round_usage);
+        let (text, calls) = parse_responses_output(&json);
+
+        if debug {
+            let excerpt: String = text.chars().take(80).collect();
+            print_debug(
+                &format!(
+                    "responses round {round}: function_calls={} content={excerpt:?}",
+                    calls.len()
+                ),
+                color,
+            );
+        }
+
+        if calls.is_empty() {
+            let out = if text.is_empty() {
+                "(model returned an empty response — try rephrasing, or check the model with `newt doctor`)".to_string()
+            } else {
+                text
+            };
+            return Ok((out, false, accumulated_usage, hallucination_count));
+        }
+
+        // Echo the model's function_call items back into the running input,
+        // then run each and append its function_call_output.
+        for call in &calls {
+            input.push(call.clone());
+        }
+        for call in &calls {
+            let call_id = call["call_id"]
+                .as_str()
+                .or_else(|| call["id"].as_str())
+                .unwrap_or("");
+            let name = call["name"].as_str().unwrap_or("unknown");
+            let args = match &call["arguments"] {
+                serde_json::Value::String(s) => {
+                    serde_json::from_str(s).unwrap_or(serde_json::Value::Null)
+                }
+                v => v.clone(),
+            };
+            if trace {
+                print_trace(
+                    &format!(
+                        "raw function_call: {}",
+                        serde_json::to_string(call).unwrap_or_else(|_| "?".into())
+                    ),
+                    color,
+                );
+            }
+            if is_hallucination(name, &args) {
+                hallucination_count += 1;
+            }
+            if name == "save_note" && note_sink.is_some() {
+                if let Some(n) = note_nudge.as_deref_mut() {
+                    n.note_saved();
+                }
+            }
+            ledger_note_write(write_ledger, name, &args, workspace);
+            let tool_t0 = std::time::Instant::now();
+            let result = execute_tool(
+                name,
+                &args,
+                workspace,
+                color,
+                tool_output_lines,
+                caveats,
+                mcp,
+                build_check_cmd.as_deref(),
+                note_sink
+                    .as_deref_mut()
+                    .map(|s| &mut *s as &mut dyn NoteSink),
+                recall_source,
+                memory_source,
+                permission_gate
+                    .as_deref_mut()
+                    .map(|g| &mut *g as &mut dyn PermissionGate),
+                exec_floor,
+                git_tool,
+                crew_runner,
+            )
+            .await;
+            if debug {
+                let excerpt: String = result.chars().take(120).collect();
+                print_debug(&format!("tool result: {excerpt:?}"), color);
+            }
+            if let Some(rec) = tool_events.as_deref_mut() {
+                rec.push(crate::ToolEvent::from_call(
+                    name,
+                    &args,
+                    tools::tool_result_ok(&result),
+                    u64::try_from(tool_t0.elapsed().as_millis()).ok(),
+                ));
+            }
+            input.push(serde_json::json!({
+                "type": "function_call_output",
+                "call_id": call_id,
+                "output": result,
+            }));
+        }
+    }
+
+    // Round cap: one final tools-disabled call for a summary answer (mirrors
+    // the chat path's final_summary, in the Responses shape).
+    let body = build_body(&input, false);
+    let mut req = client.post(&responses_url).json(&body);
+    if let Some(key) = api_key {
+        req = req.bearer_auth(key);
+    }
+    let resp = req.send().await?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        anyhow::bail!("inference endpoint {status}: {text}");
+    }
+    let json: serde_json::Value = resp.json().await?;
+    accumulated_usage = merge_round_usage(accumulated_usage, responses_usage(&json["usage"]));
+    let (text, _) = parse_responses_output(&json);
+    Ok((text, false, accumulated_usage, hallucination_count))
 }
 
 /// Whether the reasoning spinner is enabled: `NEWT_THINKING` (set by
@@ -3067,6 +3454,133 @@ mod tool_round_cap_tests {
         assert!(!streamed);
         assert!(usage.is_none());
         assert_eq!(hallu, 0);
+    }
+
+    #[test]
+    fn responses_input_splits_system_to_instructions_and_passes_typed_items() {
+        let msgs = vec![
+            serde_json::json!({"role": "system", "content": "be terse"}),
+            serde_json::json!({"role": "user", "content": "hi"}),
+            serde_json::json!({"role": "assistant", "content": "hello"}),
+            // an already-typed Responses item passes through untouched
+            serde_json::json!({"type": "function_call_output", "call_id": "c1", "output": "ok"}),
+        ];
+        let (instructions, input) = build_responses_input(&msgs);
+        assert_eq!(instructions.as_deref(), Some("be terse"));
+        assert_eq!(input.len(), 3);
+        assert_eq!(input[0]["role"], "user");
+        assert_eq!(input[0]["content"], "hi");
+        assert_eq!(input[2]["type"], "function_call_output");
+    }
+
+    #[test]
+    fn tools_flatten_to_responses_shape() {
+        let chat = serde_json::json!([{
+            "type": "function",
+            "function": {
+                "name": "git",
+                "description": "run git",
+                "parameters": {"type": "object"}
+            }
+        }]);
+        let out = tools_to_responses(&chat);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["type"], "function");
+        assert_eq!(
+            out[0]["name"], "git",
+            "name hoisted out of the function wrapper"
+        );
+        assert_eq!(out[0]["description"], "run git");
+        assert!(out[0]["function"].is_null(), "no nested function wrapper");
+    }
+
+    #[test]
+    fn parse_responses_output_extracts_text_calls_and_usage() {
+        let json = serde_json::json!({
+            "output": [
+                {"type": "reasoning", "summary": "…"},
+                {"type": "message", "role": "assistant",
+                 "content": [{"type": "output_text", "text": "the answer"}]},
+                {"type": "function_call", "call_id": "call_1", "name": "git",
+                 "arguments": "{\"op\":\"status\"}"}
+            ],
+            "usage": {"input_tokens": 100, "output_tokens": 20}
+        });
+        let (text, calls) = parse_responses_output(&json);
+        assert_eq!(text, "the answer");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["call_id"], "call_1");
+        let usage = responses_usage(&json["usage"]).unwrap();
+        assert_eq!(usage.input_tokens, 100);
+        assert_eq!(usage.output_tokens, 20);
+    }
+
+    #[tokio::test]
+    async fn responses_loop_returns_message_text_from_v1_responses() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "output": [{
+                        "type": "message", "role": "assistant",
+                        "content": [{"type": "output_text", "text": "hello from responses"}]
+                    }],
+                    "usage": {"input_tokens": 12, "output_tokens": 4}
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let messages = msgs();
+        let caveats = Caveats::top();
+        let (reply, streamed, usage, _hallu) = openai_responses_complete(
+            ChatCtx {
+                url: &server.uri(),
+                model: "gpt-5-codex",
+                kind: BackendKind::Openai,
+                api_key: Some("sk-test"),
+                messages: &messages,
+                task: "do the thing",
+                workspace: ".",
+                color: false,
+                caveats: &caveats,
+                max_tool_rounds: 5,
+                tool_output_lines: 20,
+                debug: false,
+                trace: false,
+                num_ctx: None,
+                connect_timeout_secs: 5,
+                inference_timeout_secs: 120,
+                mid_loop_trim_threshold: 40,
+                mid_loop_trim_tokens: None,
+                max_ok_input: None,
+                build_check_cmd: None,
+                safe_context: None,
+                recover_cw_400: None,
+                note_sink: None,
+                note_nudge: None,
+                recall_source: None,
+                memory_source: None,
+                summarizer: None,
+                compress_state: None,
+                tool_events: None,
+                permission_gate: None,
+                on_round_usage: None,
+                estimate_ratio: None,
+                exec_floor: None,
+                write_ledger: None,
+                cancel: None,
+                git_tool: None,
+                crew_runner: None,
+            },
+            &mut NoMcp,
+        )
+        .await
+        .expect("responses loop returns the message text");
+        assert_eq!(reply, "hello from responses");
+        assert!(!streamed);
+        assert_eq!(usage.map(|u| u.input_tokens), Some(12));
     }
 
     #[tokio::test]

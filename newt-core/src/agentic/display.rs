@@ -73,6 +73,27 @@ pub fn print_list_item(label: &str, active: bool, color: bool) {
     }
 }
 
+/// Print a harness-originated notice — an adaptation/diagnostic message from
+/// newt *itself* (context-budget fail-open, compression latch, …), NOT model
+/// output and NOT a plain narrator line. Rendered in amber with a `newt:` label
+/// so it reads as the harness speaking and doesn't blend into the conversation
+/// (the failure mode the operator flagged). Multi-line text stays amber; the
+/// marker leads the first line.
+pub fn print_harness_notice(msg: &str, color: bool) {
+    if color {
+        execute!(
+            io::stdout(),
+            SetForegroundColor(CtColor::DarkYellow),
+            Print(format!("⚠  newt: {msg}\n")),
+            ResetColor,
+        )
+        .ok();
+    } else {
+        println!("⚠  newt: {msg}");
+    }
+    io::stdout().flush().ok();
+}
+
 /// Print a single-line debug diagnostic (dimmed, prefix `[debug]`).
 /// Only called when `ChatCtx.debug` is true — guard at the call site.
 pub(crate) fn print_debug(msg: &str, color: bool) {
@@ -282,7 +303,7 @@ pub(crate) fn print_denied(axis: &str, target: &str, color: bool) {
 
 #[cfg(test)]
 mod tests {
-    use super::{fmt_tokens, print_list_item, print_newt};
+    use super::{fmt_tokens, print_harness_notice, print_list_item, print_newt};
 
     #[test]
     fn fmt_tokens_inserts_thousands_separators() {
@@ -303,6 +324,10 @@ mod tests {
             }
             print_list_item("name · ollama · model @ url", true, color);
             print_list_item("name · ollama · model @ url", false, color);
+            print_harness_notice(
+                "over budget — dispatching and letting the backend decide",
+                color,
+            );
         }
     }
 }
