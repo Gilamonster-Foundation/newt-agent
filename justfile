@@ -47,6 +47,30 @@ install-lean dest=`echo $HOME/bin`:
     @just _place-binaries {{dest}}
     @echo "Installed (lean, no rich-tui): {{dest}}/newt  {{dest}}/newt-mcp-server"
 
+# Install a build that uses the REAL confined brush shell (agent-bridle `main`,
+# from source) so the `run_command` OCAP confinement is live — instead of the
+# publishable *stub* shell the default/release build links. This is the one-shot
+# form of the chain you'd otherwise type: `just clean && just shell-real &&
+# just install`.
+#
+# The `clean` is required: swapping a dependency *source* (stub branch → main)
+# doesn't always force a rebuild of the dependent crates, so we wipe artefacts
+# first — expect a full from-scratch release build (minutes).
+#
+# DEV ONLY. This LEAVES Cargo.toml/Cargo.lock flipped to the git dep (the
+# `shell-real` override). That tree must NOT be committed — it reintroduces the
+# brush git dep and breaks the crates.io publish (and the pre-push `shell-check`
+# guard will reject it). Run `just shell-stub` before you commit.
+#
+# One-shot DEV install with the real brush OCAP shell (clean + shell-real + install).
+install-real dest=`echo $HOME/bin`:
+    just clean
+    just shell-real
+    just install {{dest}}
+    @echo ""
+    @echo "✅ Installed the REAL-brush-shell build to {{dest}} — OCAP run_command confinement is live."
+    @echo "⚠️  Cargo.toml/Cargo.lock are flipped to agent-bridle 'main'. Run 'just shell-stub' before committing."
+
 # Place freshly built release binaries into DEST with a CLEAN inode and (on
 # macOS) a fresh ad-hoc signature. Why not a plain `cp` over the old binary:
 # on Apple Silicon, overwriting a running/launched binary in place invalidates
