@@ -1131,10 +1131,12 @@ plane (#490, signed agent acts) — built once.
 
 **Remaining local steps:**
 
-- **23.1** Per-crew-member caveat threading — route the crew's authority check
-  through agent-bridle's `Gate` (the single mint site): attenuation (`meet`) is
-  always safe; a shortfall returns `NeedsDischarge`, not a crude deny. (Today: a
-  worktree-isolation + `permits_fs_write` bound in `LocalCrewRunner`.)
+- **23.1** ✅ **done (#494)** — per-member caveat threading: `run_crew`/`run_team`
+  take `&Caveats` and enforce them at the apply step (a member's out-of-`fs_write`
+  edits are **refused** — attenuation, never amplify — and fed to triage). Caveats
+  travel with the work (the seam for the bridle `Gate` + the remote `CrewTask`).
+  *Next within 23.1:* route the shortfall through the Gate's `NeedsDischarge` (folds
+  into 23.2's `attest` reframe) rather than the current honest refusal.
 - **23.2** *(reframed)* Enabling the crew/team tools **enlarges authority** — a
   standing `allow`, which §7.5 says must be a **live human gesture**, not the
   `NEWT_TEAM` env var (kept only as a dev escape). So the `/team` enable + the
