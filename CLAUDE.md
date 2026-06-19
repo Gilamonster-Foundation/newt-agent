@@ -80,10 +80,47 @@ acceptance contract's target floor.
 ## Editor / shell preferences
 
 - Editor: vi (no emacs).
-- Test mocking: `wiremock` for HTTP, `tempfile` for fs, `mockall`
-  for traits, `assert_cmd` + `predicates` for CLI binaries,
-  `tokio-test` for async. See Step 0.4 in the roadmap for the
-  shared `tests/common` helper crate.
+- Test mocking: `wiremock` for HTTP, in-memory fakes / injected fs seams
+  for filesystem logic, `mockall` for traits, `assert_cmd` + `predicates`
+  for CLI binaries, `tokio-test` for async. **The unit tier is fully
+  mocked** — see "Testing strategy" below. See Step 0.4 in the roadmap for
+  the shared `tests/common` helper crate.
+
+## Testing strategy
+
+newt's tests run in tiers. Default to the cheapest tier that proves the
+behavior; reserve expensive tiers for what only they can catch.
+
+- **Unit + regression tier — FULLY MOCKED, ALWAYS (every PR).** No real
+  network, filesystem, subprocess, or wall-clock — *ever*. HTTP →
+  `wiremock`; traits → `mockall`; filesystem → in-memory data / fakes /
+  injected fs seams (never `tempfile` / `TempDir` / `std::fs::write` /
+  `create_dir` in a unit test); CLI → `assert_cmd` against mocked
+  dependencies; time/async → injected clock / `tokio-test`. These are fast,
+  deterministic, and parallel-safe, and they gate every PR. Pattern to
+  copy: `newt-cli/src/dgx_pull.rs` — pure, fully mocked, fs-free.
+
+- **BAT / UAT regression pipelines — simulated systems-integration env.**
+  Write **Basic Acceptance Tests (BAT)** and **User Acceptance Tests (UAT)**
+  that replay real-world scenarios against a *simulated* integration
+  environment — mocked/stubbed external systems standing in for the real
+  ones, **not** live production systems. BAT = smoke / contract-level "does
+  the wired-up system accept the basic flows"; UAT = end-user scenarios
+  phrased the way a user would actually exercise them. These are the durable
+  acceptance story and guard against regressions in real-world behavior.
+
+- **End-to-end + real integration tests — EXPENSIVE → weekly + release
+  gates only.** Anything touching a real filesystem, real network, real
+  subprocess, or a live/standalone service is costly and flaky under load.
+  Run it on the **weekly** schedule and on **release gates**, never in the
+  per-PR unit run. **Run these single-threaded**
+  (`cargo test -- --test-threads=1`, or `#[serial]` via `serial_test`):
+  real-resource tests contend, and under parallel load intermittently fail
+  with `Permission denied (os error 13)` on tempdir creation, aborting the
+  whole test binary. Never run them multi-threaded.
+
+Migration of the existing real-fs (`tempfile`) tests out of the unit tier
+is tracked in issue #514.
 
 ## Versioning
 
