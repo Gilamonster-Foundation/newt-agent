@@ -105,6 +105,68 @@ impl CaveatsExt for Caveats {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Workspace fs-lock (the `--read` / `--write` CLI grants)
+// ---------------------------------------------------------------------------
+
+/// Lock the agent's filesystem authority to `workspace` plus the explicitly
+/// granted paths — the shared mechanism behind "the agent is confined to the
+/// CWD unless a path is opened", used by both the interactive session
+/// (`newt code`) and the headless paths (`newt crew` / `newt worker`).
+///
+/// - `fs_read` → `workspace + read_grants + write_grants` (a write grant implies
+///   read). An open default (`All`) is locked; an already-fenced set is widened.
+/// - `fs_write` → an open default (`All`) is fenced to `workspace + write_grants`;
+///   an already-fenced set keeps its members and gains only `write_grants` (so a
+///   read-only `fs_write = none` opens ONLY the explicit write paths, never the
+///   workspace).
+///
+/// Files *under* a granted directory are matched at the enforcement site
+/// (`tui_permits_path`, prefix semantics); this only sets the root set.
+pub fn lock_fs_to_workspace(
+    caveats: &mut Caveats,
+    workspace: &str,
+    read_grants: &[String],
+    write_grants: &[String],
+) {
+    let mut read_roots: Vec<String> = vec![workspace.to_string()];
+    read_roots.extend(read_grants.iter().cloned());
+    read_roots.extend(write_grants.iter().cloned());
+    caveats.fs_read = match &caveats.fs_read {
+        Scope::All => Scope::only(read_roots),
+        Scope::Only(set) => Scope::only(set.iter().cloned().chain(read_roots)),
+    };
+    caveats.fs_write = match &caveats.fs_write {
+        Scope::All => {
+            Scope::only(std::iter::once(workspace.to_string()).chain(write_grants.iter().cloned()))
+        }
+        Scope::Only(set) => Scope::only(set.iter().cloned().chain(write_grants.iter().cloned())),
+    };
+}
+
+/// Apply [`lock_fs_to_workspace`] from the CLI grant env vars `NEWT_READ_PATHS` /
+/// `NEWT_WRITE_PATHS` (colon-separated absolute paths that `newt-cli` sets from
+/// `--read` / `--write`). The single entry point every session path calls.
+pub fn apply_cli_fs_grants(caveats: &mut Caveats, workspace: &str) {
+    let parse = |var: &str| -> Vec<String> {
+        std::env::var(var)
+            .ok()
+            .map(|s| {
+                s.split(':')
+                    .filter(|p| !p.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    lock_fs_to_workspace(
+        caveats,
+        workspace,
+        &parse("NEWT_READ_PATHS"),
+        &parse("NEWT_WRITE_PATHS"),
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -123,6 +185,56 @@ mod tests {
         assert!(s.permits(&"b".to_string()));
         assert!(!s.permits(&"c".to_string()));
         assert!(!s.permits(&"".to_string()));
+    }
+
+    fn s(v: &[&str]) -> std::collections::BTreeSet<String> {
+        v.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn lock_fs_to_workspace_locks_open_reads_and_writes() {
+        // Headless default (fs open both ways) → fenced to ws + grants.
+        let mut c = Caveats {
+            fs_read: Scope::All,
+            fs_write: Scope::All,
+            ..Caveats::top()
+        };
+        lock_fs_to_workspace(&mut c, "/ws", &["/ext/ro".into()], &["/ext/rw".into()]);
+        // reads = ws + read grant + write grant (write implies read)
+        assert_eq!(c.fs_read, Scope::Only(s(&["/ws", "/ext/ro", "/ext/rw"])));
+        // writes = ws + write grant only (the read grant is NOT writable)
+        assert_eq!(c.fs_write, Scope::Only(s(&["/ws", "/ext/rw"])));
+    }
+
+    #[test]
+    fn lock_fs_to_workspace_preserves_a_readonly_write_fence() {
+        // read-only base: fs_write = none. A --write grant opens ONLY that path;
+        // the workspace stays unwritable (the read-only contract holds).
+        let mut c = Caveats {
+            fs_read: Scope::All,
+            fs_write: Scope::none(),
+            ..Caveats::top()
+        };
+        lock_fs_to_workspace(&mut c, "/ws", &[], &["/ext/rw".into()]);
+        assert_eq!(c.fs_read, Scope::Only(s(&["/ws", "/ext/rw"])));
+        assert_eq!(
+            c.fs_write,
+            Scope::Only(s(&["/ext/rw"])),
+            "ws stays unwritable"
+        );
+    }
+
+    #[test]
+    fn lock_fs_to_workspace_widens_an_existing_fence() {
+        // workspace_dev-like base: both fenced to the workspace already.
+        let mut c = Caveats {
+            fs_read: Scope::only(["/ws".to_string()]),
+            fs_write: Scope::only(["/ws".to_string()]),
+            ..Caveats::top()
+        };
+        lock_fs_to_workspace(&mut c, "/ws", &["/ext/ro".into()], &["/ext/rw".into()]);
+        assert_eq!(c.fs_read, Scope::Only(s(&["/ws", "/ext/ro", "/ext/rw"])));
+        assert_eq!(c.fs_write, Scope::Only(s(&["/ws", "/ext/rw"])));
     }
 
     #[test]

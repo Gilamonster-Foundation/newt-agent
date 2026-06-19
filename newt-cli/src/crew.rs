@@ -305,6 +305,14 @@ async fn run_with(
     // Honest, non-top session caveats (the #94 guardrail forbids `Caveats::top()`
     // in dispatch code): `fs_write` for the worktree, exec/net locked down. The
     // per-member fs_write leash in `run_crew` enforces it.
+    //
+    // NOTE: the CWD fs-lock (newt_core::caveats::apply_cli_fs_grants, applied for
+    // `newt code`) is NOT applied here yet — `run_crew` enforces `permits_fs_write`
+    // by EXACT match on the planner's (relative) edit paths, which an
+    // absolute-workspace-root grant can't match, so the lock would deny
+    // legitimate edits. The crew is already sandboxed by its isolated git
+    // worktree. Reconciling the scheduler's path-enforcement with the lock is a
+    // follow-up.
     let caveats = newt_acp_worker::worker_session_caveats(None);
     let outcome = run_crew(&pool, dispatcher, &mut ws, &crew_cfg, &caveats, &args.task).await;
     // Drop ws (removes the worktree) BEFORE we may process::exit upstream.

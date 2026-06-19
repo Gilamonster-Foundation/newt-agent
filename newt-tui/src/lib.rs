@@ -1700,7 +1700,14 @@ fn runtime_context_block(model: &str, endpoint: &str, kind: newt_core::BackendKi
          `git -c user.name='newt-agent[bot]' -c user.email='{bot_email}' commit -m \"…\"`\n\
          (the author name may be `newt-agent[bot]` or this model's name, but the \
          email must always be `{bot_email}`). Never commit with a guessed or \
-         personal email.\n"
+         personal email.\n\
+         # Filesystem confinement\n\
+         You are confined to the workspace (the current directory) plus any paths \
+         the operator explicitly opened. A read or write outside that returns \
+         `capability denied: fs_read/fs_write does not permit '<path>'`. Do NOT \
+         retry a denied path or try to work around it — instead tell the operator \
+         it's outside your workspace and that they can relaunch with \
+         `--read <path>` (read-only) or `--write <path>` (read+write) to grant it.\n"
     )
 }
 
@@ -1832,45 +1839,14 @@ fn policy_for(tui: Option<newt_core::TuiConfig>, workspace: &str) -> newt_core::
             set.extend(extra);
         }
     }
-    let (reads, writes) = scan_cli_fs_grants();
-    // `full_access` (fs_write == All) opts out of the read lock entirely.
+    // `full_access` (fs_write == All) opts out of the lock — an explicit
+    // "no fence" preset choice. Every other preset is locked to the workspace +
+    // the `--read`/`--write` grants by the shared newt-core helper (the headless
+    // crew/worker paths call the same helper).
     if !matches!(caveats.fs_write, Scope::All) {
-        // The read sandbox: the workspace, plus every explicitly granted path
-        // (a --write path implies read).
-        let mut sandbox: Vec<String> = vec![workspace.to_string()];
-        sandbox.extend(reads);
-        sandbox.extend(writes.iter().cloned());
-        match &mut caveats.fs_read {
-            Scope::Only(set) => set.extend(sandbox), // a role already fenced reads → add to it
-            all @ Scope::All => *all = Scope::only(sandbox), // flip the open default → the lock
-        }
-        if let Scope::Only(ref mut set) = caveats.fs_write {
-            set.extend(writes);
-        }
+        newt_core::caveats::apply_cli_fs_grants(&mut caveats, workspace);
     }
     caveats
-}
-
-/// CLI out-of-workspace fs grants from `--read` / `--write` (carried as the
-/// colon-separated absolute-path env vars `NEWT_READ_PATHS` / `NEWT_WRITE_PATHS`
-/// that `newt-cli` sets). Returns `(read_roots, write_roots)`; `policy_for`
-/// widens `fs_read` with both and `fs_write` with the write roots. A root that
-/// is a directory grants everything under it; a file root grants just that file
-/// (prefix-matched by [`tui_permits_path`](newt_core::agentic) via the stored
-/// scope set).
-fn scan_cli_fs_grants() -> (Vec<String>, Vec<String>) {
-    let parse = |var: &str| -> Vec<String> {
-        std::env::var(var)
-            .ok()
-            .map(|s| {
-                s.split(':')
-                    .filter(|p| !p.is_empty())
-                    .map(str::to_string)
-                    .collect()
-            })
-            .unwrap_or_default()
-    };
-    (parse("NEWT_READ_PATHS"), parse("NEWT_WRITE_PATHS"))
 }
 
 /// Resolve the configured `[tui]` block, if any.
@@ -12321,24 +12297,6 @@ mod env_resolution_tests {
             // full_access keeps unrestricted reads — the explicit "no fence" choice.
             assert!(matches!(policy_for(Some(tui), "/ws").fs_read, Scope::All));
         });
-    }
-
-    #[test]
-    fn scan_cli_fs_grants_parses_empty_and_populated() {
-        with_env_vars(&[], &["NEWT_READ_PATHS", "NEWT_WRITE_PATHS"], || {
-            assert_eq!(scan_cli_fs_grants(), (vec![], vec![]));
-        });
-        with_env_vars(
-            &[("NEWT_READ_PATHS", "/a::/b")],
-            &["NEWT_WRITE_PATHS"],
-            || {
-                // Empty segments (the `::`) are dropped.
-                assert_eq!(
-                    scan_cli_fs_grants(),
-                    (vec!["/a".to_string(), "/b".to_string()], vec![])
-                );
-            },
-        );
     }
 
     const DGX_VARS: &[&str] = &[
