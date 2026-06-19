@@ -3023,17 +3023,24 @@ impl ThinkingSpinner {
             "thinking…",
             self.chars,
         );
+        // The spinner is redrawn in place with `\r` and never scrolls, so it
+        // must not exceed the terminal width — a wrapped spinner leaves stale
+        // rows behind. Truncate to width with a faded `…` tail.
+        let fitted = display::fit_line(&line, display::term_cols());
         let mut out = io::stdout();
         if self.color {
             let _ = execute!(
                 out,
                 Print("\r\x1b[K"),
                 SetForegroundColor(CtColor::DarkGrey),
-                Print(&line),
+                Print(&fitted.head),
+                SetForegroundColor(display::FADE_CT),
+                Print(&fitted.fade),
+                Print(fitted.ellipsis),
                 ResetColor,
             );
         } else {
-            let _ = write!(out, "\r{line}");
+            let _ = write!(out, "\r{}{}{}", fitted.head, fitted.fade, fitted.ellipsis);
         }
         let _ = out.flush();
         self.spinner_drawn = true;
