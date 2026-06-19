@@ -113,7 +113,15 @@ async fn main() {
     println!("  scratch {}", root.display());
     println!("  goal: {goal}\n");
 
-    let out = run_team(&pool, &LocalDispatcher, &mut ws, &cfg, goal).await;
+    let out = run_team(
+        &pool,
+        &LocalDispatcher,
+        &mut ws,
+        &cfg,
+        &newt_core::caveats::Caveats::top(),
+        goal,
+    )
+    .await;
 
     println!("\n== plan ({} subtasks) ==", out.plan.len());
     for (i, s) in out.plan.iter().enumerate() {
