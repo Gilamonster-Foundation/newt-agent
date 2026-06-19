@@ -14,7 +14,7 @@
 
 use crate::crew::{infer_test_command, model_for_role, worktree_id, WorktreeWorkspace};
 use async_trait::async_trait;
-use newt_core::agentic::CrewRunner;
+use newt_core::agentic::{crew_authz, crew_step_up_policy, CrewAuthz, CrewRunner, Presence};
 use newt_core::caveats::{Caveats, CaveatsExt};
 use newt_core::{Config, Tier};
 use newt_scheduler::{
@@ -33,11 +33,21 @@ const MAX_SUBTASKS: usize = 4;
 pub struct LocalCrewRunner {
     cfg: Config,
     dir: PathBuf,
+    /// The human presence this session established when the crew tools were enabled
+    /// (23.2). `crew`/`team` dispatch is an *amplify* — §7.5 says it must ride a live
+    /// human gesture — so dispatch consults the step-up policy against this. Today
+    /// the `/team` enable maps to `Presence::Prompt` (a soft affirmation); a
+    /// `Passkey`-required action surfaces `NeedsAttest` until BOOT's verifier (#472).
+    established: Presence,
 }
 
 impl LocalCrewRunner {
-    pub fn new(cfg: Config, dir: PathBuf) -> Self {
-        Self { cfg, dir }
+    pub fn new(cfg: Config, dir: PathBuf, established: Presence) -> Self {
+        Self {
+            cfg,
+            dir,
+            established,
+        }
     }
 
     fn pool(&self) -> BackendPool {
@@ -159,16 +169,35 @@ impl CrewRunner for LocalCrewRunner {
             // per-crew-member caveat enforcement is a follow-up (run_crew does not
             // yet thread caveats to members).
             "crew" => {
+                let task = args
+                    .get("task")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| "crew requires 'task'".to_string())?;
+                // 23.2 — authority gate FIRST: dispatching a crew is an *amplify* (a
+                // standing grant of write authority to sub-agents), which §7.5 says
+                // must ride a live human gesture — the `attest` decision, not a bare
+                // env toggle. Consult the step-up policy against the presence this
+                // session established. Structure now (the /team enable = `Prompt`);
+                // real passkey teeth land with BOOT (#472).
+                match crew_authz(&crew_step_up_policy(), op, task, self.established) {
+                    CrewAuthz::Allow => {}
+                    CrewAuthz::NeedsAttest(required) => {
+                        return Err(format!(
+                            "denied: dispatching a crew enlarges authority and needs a human \
+                             attestation (presence: {required:?}); this session established \
+                             {:?}. Real passkey enforcement lands with BOOT (#472).",
+                            self.established
+                        ));
+                    }
+                }
+                // Capability gate: the worktree isolates effects, but a read-only
+                // session must still be refused before any write.
                 if !caveats.permits_fs_write(&self.dir.to_string_lossy()) {
                     return Err(
                         "denied: crew dispatch needs workspace-write authority (session is read-only)"
                             .to_string(),
                     );
                 }
-                let task = args
-                    .get("task")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| "crew requires 'task'".to_string())?;
                 let as_team = args.get("mode").and_then(|v| v.as_str()) == Some("team");
                 let mode = if as_team {
                     RosterMode::Team
@@ -248,8 +277,25 @@ mod tests {
     use newt_core::caveats::Scope;
 
     fn runner() -> LocalCrewRunner {
-        // Default Config has no backends → composing finds no live models.
-        LocalCrewRunner::new(Config::default(), std::env::temp_dir())
+        // Default Config has no backends → composing finds no live models. The /team
+        // enable establishes `Prompt` presence (the dev-escape toggle today).
+        LocalCrewRunner::new(Config::default(), std::env::temp_dir(), Presence::Prompt)
+    }
+
+    #[tokio::test]
+    async fn crew_needs_attestation_without_an_established_presence() {
+        // 23.2 — with NO human presence established, dispatching a crew (an amplify)
+        // is HELD for an attest, before any effect and regardless of fs_write. This
+        // is the §7.5 gate wired onto the live path; the teeth arrive with BOOT.
+        let r = LocalCrewRunner::new(Config::default(), std::env::temp_dir(), Presence::None);
+        let err = r
+            .dispatch("crew", &serde_json::json!({ "task": "x" }), &Caveats::top())
+            .await
+            .expect_err("no established presence must hold for an attestation");
+        assert!(
+            err.contains("attestation") && err.contains("BOOT"),
+            "must surface the attest requirement, got: {err}"
+        );
     }
 
     #[tokio::test]
