@@ -1140,9 +1140,17 @@ plane (#490, signed agent acts) — built once.
 - **23.2** *(reframed)* Enabling the crew/team tools **enlarges authority** — a
   standing `allow`, which §7.5 says must be a **live human gesture**, not the
   `NEWT_TEAM` env var (kept only as a dev escape). So the `/team` enable + the
-  roster-approval become **`attest` decisions** through `agent-bridle#24`'s `Gate`
-  (structure now against the stub/`Prompt` presence; real passkey teeth after BOOT).
-  Plus the `[team]` config + `[crews.*]` selection.
+  roster-approval become **`attest` decisions** through `agent-bridle#24`'s `Gate`.
+  - **23.2a** ✅ **done (#508)** — the `crew_attest` decision surface in newt-core:
+    `crew_step_up_policy()` + `crew_authz(policy, op, resource, established) →
+    {Allow, NeedsAttest(Presence)}`, wrapping the now-reachable `step_up` primitive.
+  - **23.2b** ✅ **done** — `LocalCrewRunner` consults `crew_authz` on the live
+    dispatch path: a `crew`/`team` op is held for an attest when the established
+    presence is insufficient. The `/team`/`NEWT_TEAM` enable maps to `Presence::Prompt`
+    (structure now), so today it *allows*; a `Passkey`-required op surfaces
+    `NeedsAttest` — the real teeth arrive with **BOOT** (#472).
+  - *Remaining:* `[team]` config + `[crews.*]` selection; real passkey enforcement
+    (BOOT). Until BOOT, this is honest structure, not enforcement.
 - **23.3** ✅ **done (#489)** — verified crew work lands as a `crew/<id>` commit on a
   branch in the shared object store (the overseer merges with the embedded `git`
   tool); unverified work is discarded. No file-copy.

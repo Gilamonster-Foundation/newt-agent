@@ -548,9 +548,17 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
                     .as_deref()
                     .map(|p| p.to_path_buf())
                     .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-                newt_core::Config::resolve()
-                    .ok()
-                    .map(|cfg| crate::crew_runner::LocalCrewRunner::new(cfg, dir))
+                // The NEWT_TEAM enable IS the human gesture today — a soft
+                // affirmation, modelled as `Presence::Prompt` (23.2). It's the
+                // dev-escape stand-in for the real attest ceremony, which arrives
+                // with BOOT (#472); a `Passkey`-required crew op holds until then.
+                newt_core::Config::resolve().ok().map(|cfg| {
+                    crate::crew_runner::LocalCrewRunner::new(
+                        cfg,
+                        dir,
+                        newt_core::agentic::Presence::Prompt,
+                    )
+                })
             } else {
                 None
             };
