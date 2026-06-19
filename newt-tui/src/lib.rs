@@ -330,6 +330,10 @@ pub fn run_code(
     path: Option<&std::path::Path>,
     no_splash: bool,
     persona: Option<&str>,
+    // #479 part 2: the crew/team runner, BUILT BY THE BINARY (newt-cli owns
+    // newt-scheduler + the worktree) and injected down — newt-tui stays
+    // scheduler-free. `None` ⇒ the `/team` tools are never advertised.
+    crew_runner: Option<&dyn newt_core::agentic::CrewRunner>,
 ) -> anyhow::Result<()> {
     let color = color_supported_with(&|k| std::env::var(k).ok());
 
@@ -364,7 +368,7 @@ pub fn run_code(
     // and vanishes with it, so the inline header is printed into normal
     // scrollback in BOTH modes before chat starts.
     print_inline_header(&workspace, color);
-    run_chat(&workspace, color, persona)
+    run_chat(&workspace, color, persona, crew_runner)
 }
 
 /// Compact inline header — the session preamble.
@@ -3765,7 +3769,12 @@ async fn retry_revert(
     Some(RevertAction { banner, corrective })
 }
 
-fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Result<()> {
+fn run_chat(
+    workspace: &str,
+    color: bool,
+    persona: Option<&str>,
+    crew_runner: Option<&dyn newt_core::agentic::CrewRunner>,
+) -> anyhow::Result<()> {
     let verbose = verbose_mode();
 
     // Header line — one-time print, then normal scroll from here.
@@ -4951,9 +4960,10 @@ fn run_chat(workspace: &str, color: bool, persona: Option<&str>) -> anyhow::Resu
                                     git_tool: session_git_tool
                                         .as_ref()
                                         .map(|g| g as &dyn newt_core::agentic::GitTool),
-                                    // #479: the crew/team tool is injected once the
-                                    // LocalCrewRunner lands (next increment); None today.
-                                    crew_runner: None,
+                                    // #479 part 2: the crew/team runner, injected by
+                                    // the binary (newt-cli) — advertises + dispatches
+                                    // the `/team` tools when present.
+                                    crew_runner,
                                 },
                                 &mut mcp,
                             ))

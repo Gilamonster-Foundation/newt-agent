@@ -1,0 +1,274 @@
+//! `LocalCrewRunner` — the in-process [`CrewRunner`] the binary injects into the
+//! agent loop (#479 part 2). It backs the `compose_roster` + `crew` tools with
+//! `newt-scheduler`'s `compose_from_pool` / `run_crew` / `run_team` over an
+//! isolated [`WorktreeWorkspace`], under caveat attenuation.
+//!
+//! This is the **local** impl of the universal `CrewRunner` primitive; a
+//! `MeshCrewRunner` (wyvern-agent#42) is the remote sibling, and a wyvern resident
+//! is the server side — same `(op, args, caveats) → rendered result` contract.
+//!
+//! The inversion (newt-cli owns newt-scheduler + the worktree; newt-tui stays
+//! scheduler-free): the binary builds this and passes `&dyn CrewRunner` down into
+//! newt-tui's session entry, exactly as it cannot do for `git` (which newt-tui
+//! owns directly).
+
+use crate::crew::{infer_test_command, model_for_role, worktree_id, WorktreeWorkspace};
+use async_trait::async_trait;
+use newt_core::agentic::CrewRunner;
+use newt_core::caveats::{Caveats, CaveatsExt};
+use newt_core::{Config, Tier};
+use newt_scheduler::{
+    compose_from_pool, run_crew, run_team, BackendPool, CrewConfig, CrewStatus, LocalDispatcher,
+    RosterMode, RosterSpec, StaticSource, SubtaskStatus, TeamConfig, TeamStatus,
+};
+use serde_json::Value;
+use std::path::PathBuf;
+
+/// The default per-crew retry budget and team subtask cap (config override TBD).
+const MAX_ATTEMPTS: u32 = 3;
+const MAX_SUBTASKS: usize = 4;
+
+/// The in-process crew runner: resolves rosters + dispatches crews over the live
+/// backend pool, in an isolated worktree off `dir`.
+pub struct LocalCrewRunner {
+    cfg: Config,
+    dir: PathBuf,
+}
+
+impl LocalCrewRunner {
+    pub fn new(cfg: Config, dir: PathBuf) -> Self {
+        Self { cfg, dir }
+    }
+
+    fn pool(&self) -> BackendPool {
+        BackendPool::from_source(&StaticSource::from_configs(self.cfg.backends.iter()))
+    }
+
+    /// Resolve the crew to field: a named saved `[crews.<name>]` if `args.crew`
+    /// is given, else compose one from the live environment. Returns the crew
+    /// config, an optional lead (team mode), and the rationale lines.
+    fn resolve_roster(
+        &self,
+        pool: &BackendPool,
+        args: &Value,
+        mode: RosterMode,
+    ) -> Result<(CrewConfig, Option<String>, Vec<String>), String> {
+        if let Some(name) = args.get("crew").and_then(|v| v.as_str()) {
+            let crew = self
+                .cfg
+                .crews
+                .get(name)
+                .ok_or_else(|| format!("no saved crew named '{name}'"))?;
+            let planner = model_for_role(&self.cfg, &crew.planner).map_err(|e| e.to_string())?;
+            let navigator = match &crew.navigator {
+                Some(n) => model_for_role(&self.cfg, n).map_err(|e| e.to_string())?,
+                None => planner.clone(),
+            };
+            let triage = match &crew.triage {
+                Some(t) => model_for_role(&self.cfg, t).map_err(|e| e.to_string())?,
+                None => planner.clone(),
+            };
+            let cc = CrewConfig {
+                planner_model: planner.clone(),
+                navigator_model: navigator,
+                triage_model: triage,
+                max_attempts: MAX_ATTEMPTS,
+            };
+            return Ok((
+                cc,
+                Some(planner),
+                vec![format!("using saved crew '{name}'")],
+            ));
+        }
+        let spec = compose_from_pool(pool, &[], mode)
+            .ok_or_else(|| "no live models reachable to compose a roster".to_string())?;
+        Ok((
+            spec.to_crew(MAX_ATTEMPTS),
+            spec.lead.clone(),
+            spec.rationale.clone(),
+        ))
+    }
+}
+
+fn parse_mode(args: &Value) -> RosterMode {
+    match args.get("mode").and_then(|v| v.as_str()) {
+        Some("team") => RosterMode::Team,
+        Some("panel") => RosterMode::Panel,
+        _ => RosterMode::Crew,
+    }
+}
+
+fn render_roster(spec: &RosterSpec) -> String {
+    let mut out = format!(
+        "Proposed roster ({:?}) — APPROVE before dispatch:\n",
+        spec.mode
+    );
+    for line in &spec.rationale {
+        out.push_str(&format!("  • {line}\n"));
+    }
+    out
+}
+
+fn render_crew(o: &newt_scheduler::CrewOutcome) -> String {
+    let status = match o.status {
+        CrewStatus::Passed => "PASS",
+        CrewStatus::NeedsHumanReview => "NEEDS HUMAN REVIEW",
+    };
+    format!(
+        "crew: {status} after {} attempt(s); touched: {}",
+        o.attempts,
+        if o.touched.is_empty() {
+            "(none)".to_string()
+        } else {
+            o.touched.join(", ")
+        }
+    )
+}
+
+fn render_team(o: &newt_scheduler::TeamOutcome) -> String {
+    let overall = match o.status {
+        TeamStatus::AllPassed => "ALL PASSED",
+        TeamStatus::Blocked => "BLOCKED",
+        TeamStatus::NoPlan => "NO PLAN",
+    };
+    let mut out = format!("team: {overall}\nplan:\n");
+    for r in &o.results {
+        let mark = match r.status {
+            SubtaskStatus::Passed => "PASS",
+            SubtaskStatus::NeedsHumanReview => "NEEDS-REVIEW",
+            SubtaskStatus::Skipped => "skipped",
+        };
+        out.push_str(&format!("  [{mark}] {}\n", r.subtask));
+    }
+    out
+}
+
+#[async_trait]
+impl CrewRunner for LocalCrewRunner {
+    async fn dispatch(&self, op: &str, args: &Value, caveats: &Caveats) -> Result<String, String> {
+        match op {
+            // Propose only — no effects, so no write authority required.
+            "compose_roster" => {
+                let pool = self.pool();
+                let spec = compose_from_pool(&pool, &[], parse_mode(args))
+                    .ok_or_else(|| "no live models reachable to compose a roster".to_string())?;
+                Ok(render_roster(&spec))
+            }
+            // Dispatch a crew/team — writes files, so FAIL CLOSED unless the
+            // session permits workspace writes. The worktree isolates the effects;
+            // per-crew-member caveat enforcement is a follow-up (run_crew does not
+            // yet thread caveats to members).
+            "crew" => {
+                if !caveats.permits_fs_write(&self.dir.to_string_lossy()) {
+                    return Err(
+                        "denied: crew dispatch needs workspace-write authority (session is read-only)"
+                            .to_string(),
+                    );
+                }
+                let task = args
+                    .get("task")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| "crew requires 'task'".to_string())?;
+                let as_team = args.get("mode").and_then(|v| v.as_str()) == Some("team");
+                let mode = if as_team {
+                    RosterMode::Team
+                } else {
+                    RosterMode::Crew
+                };
+                let pool = self.pool();
+                let (crew_cfg, lead, rationale) = self.resolve_roster(&pool, args, mode)?;
+                let test_cmd = args
+                    .get("verify")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+                    .or_else(|| infer_test_command(&self.dir))
+                    .ok_or_else(|| {
+                        "no verification command — pass 'verify' or add a justfile / Cargo.toml / pyproject.toml"
+                            .to_string()
+                    })?;
+                let mut ws = WorktreeWorkspace::create(&self.dir, &worktree_id(), test_cmd)
+                    .map_err(|e| e.to_string())?;
+                let body = if as_team {
+                    let team_cfg = TeamConfig {
+                        lead_model: lead.unwrap_or_else(|| crew_cfg.planner_model.clone()),
+                        lead_tier: Tier::Complex,
+                        crew: crew_cfg,
+                        max_subtasks: MAX_SUBTASKS,
+                    };
+                    let out = run_team(&pool, &LocalDispatcher, &mut ws, &team_cfg, task).await;
+                    render_team(&out)
+                } else {
+                    let out = run_crew(&pool, &LocalDispatcher, &mut ws, &crew_cfg, task).await;
+                    render_crew(&out)
+                };
+                let diff = ws.diff();
+                let diff_block = if diff.trim().is_empty() {
+                    "(no changes)".to_string()
+                } else {
+                    diff
+                };
+                Ok(format!(
+                    "roster: {}\n{body}\n--- diff (review, then accept or re-dispatch) ---\n{diff_block}",
+                    rationale.join("; ")
+                ))
+            }
+            other => Err(format!("unknown crew op: {other}")),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use newt_core::caveats::Scope;
+
+    fn runner() -> LocalCrewRunner {
+        // Default Config has no backends → composing finds no live models.
+        LocalCrewRunner::new(Config::default(), std::env::temp_dir())
+    }
+
+    #[tokio::test]
+    async fn crew_is_denied_on_a_read_only_session() {
+        let r = runner();
+        let read_only = Caveats {
+            fs_write: Scope::none(),
+            ..Caveats::top()
+        };
+        let out = r
+            .dispatch("crew", &serde_json::json!({ "task": "x" }), &read_only)
+            .await;
+        assert!(
+            out.is_err() && out.unwrap_err().contains("denied"),
+            "a read-only session must be refused before any effect"
+        );
+    }
+
+    #[tokio::test]
+    async fn compose_roster_proposes_from_the_live_environment() {
+        // Default Config ships a localhost Ollama backend, so the composer has a
+        // live model to propose — and compose_roster has no effects, so it needs
+        // no write authority (runs under top() here, but never touches the fs).
+        let r = runner();
+        let out = r
+            .dispatch(
+                "compose_roster",
+                &serde_json::json!({ "mode": "crew" }),
+                &Caveats::top(),
+            )
+            .await
+            .expect("a roster proposal");
+        assert!(
+            out.contains("roster") && out.contains("planner"),
+            "proposes a roster with rationale, got: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_op_is_an_error() {
+        let r = runner();
+        let out = r
+            .dispatch("bogus", &serde_json::json!({}), &Caveats::top())
+            .await;
+        assert!(out.is_err());
+    }
+}

@@ -774,7 +774,7 @@ pub async fn execute_tool(
         "compose_roster" | "crew" => match crew_runner {
             Some(runner) => {
                 print_tool_call(name, &args.to_string(), color);
-                let out = match runner.dispatch(name, args, caveats) {
+                let out = match runner.dispatch(name, args, caveats).await {
                     Ok(rendered) => rendered,
                     Err(e) => format!("error: {e}"),
                 };
@@ -1743,8 +1743,9 @@ mod execute_tool_branch_tests {
     // #479: the agent-callable crew/compose_roster tools route through the
     // injected CrewRunner — same presence-gating + dispatch shape as `git`.
     struct StubCrew;
+    #[async_trait::async_trait]
     impl crate::agentic::CrewRunner for StubCrew {
-        fn dispatch(
+        async fn dispatch(
             &self,
             op: &str,
             _args: &serde_json::Value,

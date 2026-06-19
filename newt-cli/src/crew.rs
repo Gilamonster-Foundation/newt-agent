@@ -87,6 +87,14 @@ impl WorktreeWorkspace {
         &self.worktree
     }
 
+    /// The crew's changes as a unified diff (all edits incl. new files), for the
+    /// overseer to review. Stages everything in the throwaway worktree, then diffs
+    /// the index against HEAD. Empty string if nothing changed or git errs.
+    pub fn diff(&self) -> String {
+        let _ = git(&self.worktree, &["add", "-A"]);
+        git(&self.worktree, &["diff", "--cached", "HEAD"]).unwrap_or_default()
+    }
+
     /// Remove the worktree (best-effort). Called by `Drop`; also callable early.
     pub fn cleanup(&self) {
         let _ = git(
@@ -283,7 +291,7 @@ fn resolve_crew_name(cfg: &Config, explicit: Option<&str>) -> anyhow::Result<Str
 
 /// The model a role-loadout pins: its `model` (with any `@variant` stripped for
 /// pool pinning), else its provider backend's default model.
-fn model_for_role(cfg: &Config, loadout_name: &str) -> anyhow::Result<String> {
+pub(crate) fn model_for_role(cfg: &Config, loadout_name: &str) -> anyhow::Result<String> {
     let l = cfg
         .loadouts
         .get(loadout_name)
@@ -311,7 +319,7 @@ fn names<'a>(keys: impl Iterator<Item = &'a String>) -> String {
 }
 
 /// A unique worktree id for this run (pid + nanos — no extra deps).
-fn worktree_id() -> String {
+pub(crate) fn worktree_id() -> String {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
