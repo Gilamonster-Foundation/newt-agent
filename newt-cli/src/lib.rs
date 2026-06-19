@@ -11,6 +11,7 @@
 mod auth_cmd;
 mod config_cmd;
 pub mod crew;
+pub mod crew_runner;
 mod dgx;
 mod doctor;
 mod identity_cmd;
@@ -457,7 +458,31 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             let no_splash = (cli.no_splash || config_no_splash) && !cli.splash;
             // The loadout's `role` is the persona when `--persona` was not given.
             let persona = cli.persona.as_deref().or(loadout_role.as_deref());
-            newt_tui::run_code(path.as_deref(), no_splash, persona)
+            // #479 part 2 — the crew/team runner: BUILT HERE (newt-cli owns
+            // newt-scheduler + the worktree) and injected DOWN into the
+            // scheduler-free TUI loop. Enabled by NEWT_TEAM (the operator's /team
+            // toggle); off by default, so nothing changes unless asked. Crews run
+            // under attenuated caveats (the runner fails closed on a read-only
+            // session) in an isolated worktree.
+            let team_runner = if std::env::var("NEWT_TEAM").is_ok() {
+                let dir = path
+                    .as_deref()
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+                newt_core::Config::resolve()
+                    .ok()
+                    .map(|cfg| crate::crew_runner::LocalCrewRunner::new(cfg, dir))
+            } else {
+                None
+            };
+            newt_tui::run_code(
+                path.as_deref(),
+                no_splash,
+                persona,
+                team_runner
+                    .as_ref()
+                    .map(|r| r as &dyn newt_core::agentic::CrewRunner),
+            )
         }
         Command::Pilot { flight_id } => newt_tui::run_pilot(&flight_id),
         Command::Worker {

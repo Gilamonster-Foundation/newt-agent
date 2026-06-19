@@ -16,6 +16,7 @@
 //! bound. See `docs/design/crew-swarm-overseer.md`.
 
 use crate::caveats::Caveats;
+use async_trait::async_trait;
 use serde_json::Value;
 
 /// The injected crew/team capability. Object-safe and shareable (the loop holds
@@ -27,8 +28,16 @@ use serde_json::Value;
 /// returns either a rendered, model-readable result string (`Ok`) — a roster
 /// proposal, or a crew's diff + verify status for the overseer to review — or an
 /// error string the tool layer surfaces verbatim (`Err`).
+///
+/// This is the **universal crew primitive**: `LocalCrewRunner` (newt-cli) runs the
+/// crew here; a future `MeshCrewRunner` ships the task over agent-mesh; and a
+/// **wyvern resident** implements it server-side to receive crew/plan tasks
+/// (wyvern-agent#42). Same contract — `(op, args, caveats) → rendered result` —
+/// with `caveats` travelling (attenuated per hop) so authority crosses the wire
+/// with the work. `async` because dispatch runs inference, not just local I/O.
+#[async_trait]
 pub trait CrewRunner: Send + Sync {
-    fn dispatch(&self, op: &str, args: &Value, caveats: &Caveats) -> Result<String, String>;
+    async fn dispatch(&self, op: &str, args: &Value, caveats: &Caveats) -> Result<String, String>;
 }
 
 /// `compose_roster` — survey the live environment and **propose** a roster for the
