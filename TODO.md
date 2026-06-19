@@ -20,30 +20,51 @@ _Last updated: 2026-06-18._
 | architecture doc | #481 |
 | agent-callable crew/team tool surface | #482 |
 | `LocalCrewRunner` + scheduler-free injection | #484 |
+| **23.3 — land verified work as a `crew/<id>` git branch** | #489 |
 
 The overseer loop is live: with `NEWT_TEAM` set, `newt code` can plan → propose a
-roster → dispatch crews per step → review the diff. **2048 tests green.**
+roster → dispatch crews per step → review the diff → **land verified work on a
+branch** (merge with the embedded `git` tool). **2050 tests green.**
 
-## 🔜 Next — finish LOCAL workflows before going remote
+## 🔀 Authority convergence (fold the `attest` trilogy in)
 
-1. **23.1 — Per-crew-member caveat threading.** `run_crew`/`run_team` pass
-   `meet`-attenuated caveats to each crew member. Today's bound is worktree
-   isolation + the fail-closed write check in `LocalCrewRunner`; this makes the
-   per-member authority real. _(newt-scheduler crew.rs/team.rs + the member tool calls.)_
-2. **23.2 — `[team]` config + runtime `/team`.** Replace the `NEWT_TEAM` env gate
-   with a `[team] enabled` config section + a `/team` slash command that toggles the
-   tool advertisement live; let the `crew` tool select a saved `[crews.<name>]`.
-3. **23.3 — Accept / merge-back.** On the overseer's approval, apply the reviewed
-   crew diff from the worktree to the live tree (today the diff is review-only).
-4. **23.4 — Empirical priors.** Feed the rig's model-family profiles (#80) into
-   `compose_roster` so role picks are measured, not name-heuristic.
+The overseer's human gates — "approve the plan / roster" — **are** §7.5's `attest`
+decision surface `{allow, attest, deny}`: knowledge#40 §7.5 (principle) · newt-agent#472
+(plan) · **agent-bridle#24 (MVP merged)**. Approving a roster *grants a crew authority*
+= a policy mutation; §7.5's keystone: **attenuate freely, amplify needs the human root
+via `attest`**. So crew authority builds **on** the merged `attest` `Gate`, not env
+vars; and `attest` shares #472's root-of-trust bootstrap with provenance (#490).
 
-## 🛰️ After local lands — remote crew
+## 🔜 Next — finish LOCAL workflows (revised by the convergence)
 
-5. **`MeshCrewRunner`** — the remote sibling of `LocalCrewRunner` (own follow-up
-   issue). A resident Newt/Wyvern parked on a project links to the swarm and
-   receives `CrewTask → CrewResult` over agent-mesh; caveats attenuate per hop.
-   _Do not start until 1–4 are solid._
+1. **23.1 — per-member caveats via the bridle `Gate`.** Route the crew's authority
+   check through agent-bridle's single mint site: attenuation (`meet`) is always safe;
+   a shortfall returns `NeedsDischarge`, not `LocalCrewRunner`'s crude `permits_fs_write`
+   deny.
+2. **23.2 — `attest`-gate the team enable (REFRAMED).** Enabling crew/team tools
+   *enlarges authority* → a live human gesture, not `NEWT_TEAM` (kept as a dev escape).
+   The `/team` enable + roster-approval become `attest` decisions through agent-bridle#24's
+   `Gate` (structure now vs the stub/`Prompt`; real teeth after BOOT). Plus `[team]`
+   config + `[crews.*]` selection.
+3. **23.4 — empirical priors.** Feed the rig's profiles (#80) into `compose_roster`
+   (heuristic today). Independent — anytime.
+
+## 🔑 BOOT — root-of-trust bootstrap (new shared prerequisite, #472)
+
+Passkey **seals** the ed25519 `UserKey` (GitHub anchors identity only). Built **once**;
+unblocks BOTH real `attest` enforcement AND provenance. Gated by #472's **four blocking
+fixes** (revocation no-op · no proof-of-possession · unsigned fail-open grant · dead
+push-gate) + a real WebAuthn verifier + the server-side `pre-receive` hook (the teeth;
+the client `Gate` isn't the boundary).
+
+## 🛰️ After BOOT + teeth
+
+- **Provenance plane (#490)** — sign config / commands / prompts; seam = 23.3's
+  `commit_to_branch` → sign it with the mesh key.
+- **`MeshCrewRunner` (#488)** — remote resident: `CrewTask → CrewResult` over
+  agent-mesh; caveats attenuate per hop; remote *amplify* needs `attest`, push-back
+  rides the `pre-receive` teeth. A `CrewRunner` swap, not a rewrite. _Do not start
+  until BOOT + teeth._
 
 ## 🧪 Parallel / independent
 

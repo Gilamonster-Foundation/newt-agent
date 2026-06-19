@@ -1119,25 +1119,51 @@ the containment.
   diff for review. The **inversion**: newt-cli owns newt-scheduler + the worktree
   and injects `&dyn CrewRunner` down into the scheduler-free newt-tui loop.
 
-**Remaining local steps (finish before remote):**
+**Authority convergence (knowledge#40 §7.5 · newt-agent#472 · agent-bridle#24).**
+The overseer's human gates — "approve the plan", "approve the roster" — *are* §7.5's
+`attest` decision surface `{allow, attest, deny}`. Approving a roster **grants a crew
+authority**: a policy mutation, and §7.5's keystone is exact — *attenuate freely, but
+amplifying (a standing `allow`) requires the human root via `attest`*. So the crew
+authority steps build **on the now-merged `attest` primitive** (`agent-bridle#24`:
+`Gate::evaluate → Allow | NeedsDischarge | Deny`), not ad-hoc env vars. And `attest`
+(signed human acts) shares #472's **root-of-trust bootstrap** with the provenance
+plane (#490, signed agent acts) — built once.
 
-- **23.1** Per-crew-member caveat threading — `run_crew` passes `meet`-attenuated
-  caveats to each member (today the bound is worktree isolation + the fail-closed
-  write check at dispatch).
-- **23.2** `[team]` config section + a runtime `/team` slash command (env
-  `NEWT_TEAM` toggle today) + `[crews.*]` selection from the `crew` tool.
-- **23.3** Accept / merge-back — apply the reviewed crew diff to the live tree on
-  the overseer's approval (today the diff is returned for review only).
+**Remaining local steps:**
+
+- **23.1** Per-crew-member caveat threading — route the crew's authority check
+  through agent-bridle's `Gate` (the single mint site): attenuation (`meet`) is
+  always safe; a shortfall returns `NeedsDischarge`, not a crude deny. (Today: a
+  worktree-isolation + `permits_fs_write` bound in `LocalCrewRunner`.)
+- **23.2** *(reframed)* Enabling the crew/team tools **enlarges authority** — a
+  standing `allow`, which §7.5 says must be a **live human gesture**, not the
+  `NEWT_TEAM` env var (kept only as a dev escape). So the `/team` enable + the
+  roster-approval become **`attest` decisions** through `agent-bridle#24`'s `Gate`
+  (structure now against the stub/`Prompt` presence; real passkey teeth after BOOT).
+  Plus the `[team]` config + `[crews.*]` selection.
+- **23.3** ✅ **done (#489)** — verified crew work lands as a `crew/<id>` commit on a
+  branch in the shared object store (the overseer merges with the embedded `git`
+  tool); unverified work is discarded. No file-copy.
 - **23.4** Empirical role priors from the rig (#80) feed `compose_roster` (heuristic
-  name-based priors today).
+  name-based priors today). Independent — anytime.
 
-**Follow-on (remote — after local lands): `MeshCrewRunner`.** The remote sibling of
-`LocalCrewRunner`: a resident Newt/Wyvern *parked* on a project receives
-`CrewTask{goal, caveats, workspace_ref}` over agent-mesh and returns
-`CrewResult{diff, status, ledger}`; caveats attenuate per hop (`meet`, never widen),
-so recursion is safe by construction. Same `CrewRunner` contract — a runner swap,
-not a rewrite. Transport = the SSH-CA / iroh dual plane (iroh LAN, SSH long-haul).
-See the MeshCrewRunner follow-up issue + `crew-swarm-overseer.md` (wyvern-agent#42).
+**BOOT — root-of-trust bootstrap (shared prerequisite, `newt-agent#472`).** A passkey
+**seals** the software ed25519 `UserKey` (GitHub anchors identity only). Built **once**;
+unblocks BOTH the real `attest` enforcement and the provenance plane. Gated by #472's
+**four blocking prereq fixes** (revocation no-op · no proof-of-possession · unsigned
+fail-open grant · dead push-gate code) + the real WebAuthn/CTAP2 verifier + the
+server-side `pre-receive` hook (the teeth — the client `Gate` is not the boundary).
+
+**Follow-on (after BOOT + teeth):**
+
+- **Provenance plane (#490)** — sign config / commands / prompts; the seam is 23.3's
+  content-addressed `commit_to_branch` → sign it with the mesh key.
+- **`MeshCrewRunner` (#488, remote)** — a resident Newt/Wyvern *parked* on a project
+  receives `CrewTask{goal, caveats, workspace_ref}` over agent-mesh and returns
+  `CrewResult{diff, status, ledger}`; caveats attenuate per hop (`meet`, never widen)
+  so recursion is safe by construction. A `CrewRunner` swap, not a rewrite; remote
+  *amplify* needs `attest`, the push-back rides the `pre-receive` teeth. Transport =
+  the SSH-CA / iroh dual plane. (wyvern-agent#42.)
 
 ---
 
