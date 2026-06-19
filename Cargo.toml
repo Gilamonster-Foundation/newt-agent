@@ -228,14 +228,15 @@ strip = true
 # but agent-bridle 0.1.0 is not yet indexed on crates.io. Until then this patch
 # satisfies the dependency from git.
 #
-# Pinned to `brush-stub/publish-unblock` (advanced from `feat/stub-shell` on
-# 2026-06-19, newt#497): this is the publishable **stub** branch — brush git-deps
-# removed (crates.io-safe) — that ALSO carries the human-presence `step_up` Gate
-# (agent-bridle#24) ROADMAP 23.2 builds on. `feat/stub-shell` lacked `step_up`;
-# `main` carries the real brush shell (dev-only, forbidden by the CI stub guard).
-# This is the new publishable-stub branch the `just shell-stub` toggle targets.
-# INTERIM (Path B) — revisit before cutting 0.6.9; the canonical fix is folding
-# `step_up` into `feat/stub-shell`.
+# Pinned to `feat/step-up-decision-mvp` (advanced from `feat/stub-shell` on
+# 2026-06-19, newt#497): this is the agent-bridle branch that **actually carries**
+# the human-presence `step_up` Gate (agent-bridle#24) ROADMAP 23.2 builds on, AND
+# is brush-free (crates.io-safe — a stub shell). `feat/stub-shell` and
+# `brush-stub/publish-unblock` both LACK `step_up`; `main` has it but carries the
+# real brush shell (dev-only, forbidden by the CI stub guard). The `just shell-stub`
+# toggle targets this branch.
+# INTERIM (Path B) — this is a feature branch; revisit before cutting 0.6.9. The
+# canonical fix is folding `step_up` into the durable stub branch `feat/stub-shell`.
 #
 # After agent-bridle 0.1.0 is indexed on crates.io:
 #   1. Remove this entire [patch.crates-io] block.
@@ -244,7 +245,7 @@ strip = true
 # See: https://github.com/Gilamonster-Foundation/agent-bridle/issues/20
 
 [patch.crates-io]
-agent-bridle           = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", branch = "brush-stub/publish-unblock" }
-agent-bridle-core      = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", branch = "brush-stub/publish-unblock" }
-agent-bridle-tool-shell = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", branch = "brush-stub/publish-unblock" }
-agent-bridle-tool-web  = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", branch = "brush-stub/publish-unblock" }
+agent-bridle           = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", branch = "feat/step-up-decision-mvp" }
+agent-bridle-core      = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", branch = "feat/step-up-decision-mvp" }
+agent-bridle-tool-shell = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", branch = "feat/step-up-decision-mvp" }
+agent-bridle-tool-web  = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", branch = "feat/step-up-decision-mvp" }

@@ -36,14 +36,15 @@ per step, and reviews — under capability leashes that only ever *attenuate*.
 ### Changed — dependencies
 
 - **agent-bridle `[patch.crates-io]` advanced `feat/stub-shell` →
-  `brush-stub/publish-unblock`** (newt#497): the new publishable **stub** branch —
-  brush git-deps removed (crates.io-safe) — that ALSO carries the human-presence
-  `step_up` Gate (agent-bridle#24) ROADMAP 23.2 builds on. `feat/stub-shell` lacked
-  `step_up`; `main` carries the real brush shell (dev-only, forbidden by the CI stub
-  guard, so the pin can't sit there). The `just shell-stub`/`shell-real` toggle + the
-  stub-guard convention now target this branch. **Interim (Path B)** — revisit before
-  release; the canonical fix is folding `step_up` into `feat/stub-shell`. Full
-  workspace green, no API drift.
+  `feat/step-up-decision-mvp`** (newt#497): the agent-bridle branch that **actually
+  carries** the human-presence `step_up` Gate (agent-bridle#24) ROADMAP 23.2 builds
+  on, and is brush-free (crates.io-safe). `feat/stub-shell` *and*
+  `brush-stub/publish-unblock` both lack `step_up`; `main` has it but carries the real
+  brush shell (dev-only, forbidden by the CI stub guard, so the pin can't sit there).
+  The `just shell-stub`/`shell-real` toggle now targets this branch. **Interim
+  (Path B)** — it's a feature branch; revisit before release; the canonical fix is
+  folding `step_up` into the durable stub branch `feat/stub-shell`. Full workspace
+  green, no API drift.
 
 ### Fixed
 
@@ -55,10 +56,11 @@ per step, and reviews — under capability leashes that only ever *attenuate*.
 
 - Bump `[workspace.package] version` 0.6.8 → 0.6.9.
 - The `[patch.crates-io]` agent-bridle block is still **git-pinned** (`branch =
-  "brush-stub/publish-unblock"`). When agent-bridle 0.1.0 is indexed on crates.io,
-  drop the block and `cargo update -p agent-bridle` (agent-bridle#20). **Decide before
-  release (Path B is interim):** either keep this stub branch, or fold `step_up` into
-  `feat/stub-shell` and revert the convention. Do **not** revert the pin to
+  "feat/step-up-decision-mvp"` — a **feature branch**, so the most interim of the
+  pins). When agent-bridle 0.1.0 is indexed on crates.io, drop the block and
+  `cargo update -p agent-bridle` (agent-bridle#20). **Decide before release (Path B is
+  interim):** fold `step_up` into the durable stub branch `feat/stub-shell` (the
+  canonical fix) and revert the convention. Do **not** revert the pin to
   `feat/stub-shell` as-is (it lacks `step_up`).
 
 ## [0.6.8] — 2026-06-14

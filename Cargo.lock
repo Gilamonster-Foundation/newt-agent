@@ -11,7 +11,7 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 [[package]]
 name = "agent-bridle"
 version = "0.1.0"
-source = "git+https://github.com/Gilamonster-Foundation/agent-bridle?branch=brush-stub%2Fpublish-unblock#d5af5d4336dfd4f1f3caa3d0f37347c8297bd879"
+source = "git+https://github.com/Gilamonster-Foundation/agent-bridle?branch=feat%2Fstep-up-decision-mvp#cb7e1ea3192ca125c1756d3e9f24e3064f258118"
 dependencies = [
  "agent-bridle-core",
  "agent-bridle-tool-shell",
@@ -21,7 +21,7 @@ dependencies = [
 [[package]]
 name = "agent-bridle-core"
 version = "0.1.0"
-source = "git+https://github.com/Gilamonster-Foundation/agent-bridle?branch=brush-stub%2Fpublish-unblock#d5af5d4336dfd4f1f3caa3d0f37347c8297bd879"
+source = "git+https://github.com/Gilamonster-Foundation/agent-bridle?branch=feat%2Fstep-up-decision-mvp#cb7e1ea3192ca125c1756d3e9f24e3064f258118"
 dependencies = [
  "agent-mesh-protocol",
  "anyhow",
@@ -33,19 +33,20 @@ dependencies = [
 [[package]]
 name = "agent-bridle-tool-shell"
 version = "0.1.0"
-source = "git+https://github.com/Gilamonster-Foundation/agent-bridle?branch=brush-stub%2Fpublish-unblock#d5af5d4336dfd4f1f3caa3d0f37347c8297bd879"
+source = "git+https://github.com/Gilamonster-Foundation/agent-bridle?branch=feat%2Fstep-up-decision-mvp#cb7e1ea3192ca125c1756d3e9f24e3064f258118"
 dependencies = [
  "agent-bridle-core",
  "anyhow",
  "async-trait",
  "serde",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
 name = "agent-bridle-tool-web"
 version = "0.1.0"
-source = "git+https://github.com/Gilamonster-Foundation/agent-bridle?branch=brush-stub%2Fpublish-unblock#d5af5d4336dfd4f1f3caa3d0f37347c8297bd879"
+source = "git+https://github.com/Gilamonster-Foundation/agent-bridle?branch=feat%2Fstep-up-decision-mvp#cb7e1ea3192ca125c1756d3e9f24e3064f258118"
 dependencies = [
  "agent-bridle-core",
  "anyhow",
