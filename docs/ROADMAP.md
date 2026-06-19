@@ -1160,9 +1160,36 @@ plane (#490, signed agent acts) — built once.
 **BOOT — root-of-trust bootstrap (shared prerequisite, `newt-agent#472`).** A passkey
 **seals** the software ed25519 `UserKey` (GitHub anchors identity only). Built **once**;
 unblocks BOTH the real `attest` enforcement and the provenance plane. Gated by #472's
-**four blocking prereq fixes** (revocation no-op · no proof-of-possession · unsigned
-fail-open grant · dead push-gate code) + the real WebAuthn/CTAP2 verifier + the
-server-side `pre-receive` hook (the teeth — the client `Gate` is not the boundary).
+red-team **prerequisite fixes** + the real WebAuthn/CTAP2 verifier + the server-side
+`pre-receive` hook (the teeth — the client `Gate` is not the boundary).
+
+**Prereq fixes — the unblocked, solo-implementable ones are DONE (all fail-CLOSED now):**
+
+- **§9.3a** ✅ **agent-bridle#25** — bridle MCP boundary: a *missing* grant now defaults
+  to DENY-ALL, not `Caveats::top()` (was fail-open). (Follow-up §9.3b: *signed* grant —
+  needs the trust root.)
+- **§9.1** ✅ **agent-mesh#39** — `CertChain::verify()` fail-closed on causal generation:
+  a cert declaring a bounded `valid_for_generation` is refused context-free (was silently
+  ignored = fail-open); new `verify_at(generation)` is the checkable path. No wall-clock.
+- **§9.2** ✅ **agent-mesh#40** — `delegate_external` now requires **proof-of-possession**
+  (`PossessionChallenge` + the subject's signature) before certifying an external pubkey
+  (was: certify any pubkey, incl. one you don't control).
+
+**Remaining BOOT prereqs need a DESIGN decision (operator) or are blocked — not solo work:**
+
+- **§9.1 follow-ons** — the KRL (revocation list) + its distribution (a signed mesh topic),
+  and a current-generation **source** (none exists yet) + wiring `verify_at` callers. §12
+  open questions.
+- **§9.3b** signed grant (needs the trust root); **§9.5** online-root SPOF (intermediate-issuer
+  split); **§9.4** newt-git push-gate (blocked: no production push site yet).
+
+> **▶ Resume — next session (Monday 2026-06-22): start §11.2 `PresenceCaveats`.** The one
+> remaining *unblocked* forward build step: a presence-floor lattice in newt-core, a sibling
+> of `GitCaveats`/`SshCaveats` (`meet` = MAX-of-floors, non-amplifying — design §3), carried
+> across the mesh envelope. Branch `feat/presence-caveats` off `main`. **Build/push note:**
+> the workspace NFS (ontap-sim) can't hold a full build — prefix git push with
+> `CARGO_TARGET_DIR=/home/hartsock/.cache/newt-cargo-target` (local 936G disk) so the
+> pre-push gate doesn't hit the quota wall. Then §11.3 ceremony → §11.4 `pre-receive` → genesis.
 
 **Follow-on (after BOOT + teeth):**
 
