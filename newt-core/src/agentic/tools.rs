@@ -1858,6 +1858,49 @@ mod tests {
         assert!(tui_permits_path(&only, "/ws/sub/../file.rs"));
     }
 
+    /// Ratchet for the OPEN `fs-canonical-containment` deviation (issue #522,
+    /// `docs/security/ocap-deviations.md`). `tui_permits_path` is string-lexical:
+    /// it collapses `..` but does NOT resolve symlinks, so a link *inside* the
+    /// workspace pointing OUT is permitted even though the OS would read the
+    /// outside target. This test builds the path the call sites do
+    /// (`workspace.join(model_path)`) over a REAL symlink and PINS that residual.
+    ///
+    /// When canonicalize-then-contain lands (the deviation's closure criterion),
+    /// the gate will deny the symlinked path and this assertion MUST flip to
+    /// `!tui_permits_path(...)` — that break is the signal to close the deviation.
+    /// Unix-only: Windows symlinks need privileges (mirrors
+    /// `find_does_not_follow_symlinks_out_of_workspace`).
+    #[cfg(unix)]
+    #[test]
+    fn tui_permits_path_symlink_escape_is_the_known_residual() {
+        use crate::caveats::Scope;
+        let outside = tempfile::TempDir::new().unwrap();
+        std::fs::write(outside.path().join("secret"), b"x").unwrap();
+        let ws = tempfile::TempDir::new().unwrap();
+        // A symlink under the workspace whose target is OUTSIDE it.
+        std::os::unix::fs::symlink(outside.path(), ws.path().join("link")).unwrap();
+
+        let only = Scope::only([ws.path().to_string_lossy().into_owned()]);
+
+        // What the read/write call sites feed the gate for model path "link/secret".
+        let via_link = ws.path().join("link").join("secret");
+        // RESIDUAL: permitted today — the gate can't see through the symlink.
+        // Flip to `!` when the gate canonicalizes (closes fs-canonical-containment).
+        assert!(
+            tui_permits_path(&only, &via_link.to_string_lossy()),
+            "string gate permits a symlinked escape — known residual (#522)"
+        );
+
+        // Contrast: a plain `..` escape through the SAME root is already denied
+        // (lexical containment, the part #502 did fix) — so this isn't a blanket
+        // hole, only the symlink-resolution gap.
+        let dotdot = ws.path().join("..").join("etc").join("passwd");
+        assert!(
+            !tui_permits_path(&only, &dotdot.to_string_lossy()),
+            "`..` escape is denied even though symlink escape is not"
+        );
+    }
+
     // --- PR4: the `git` tool is presence-gated -----------------------------
 
     #[test]
