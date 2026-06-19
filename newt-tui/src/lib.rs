@@ -3881,6 +3881,7 @@ fn run_chat(
     };
     let mut inf_kind = choice.kind;
     let mut inf_key = choice.api_key.clone();
+    apply_openai_api_env(choice.api);
     let key_path = newt_identity::default_key_path().ok();
     let mut cap = SessionCapability::establish(resolve_tui(&cfg), key_path.as_deref(), workspace);
     // #307: the active `/mode` preset clamp (an authority FLOOR), if any. `None`
@@ -4638,6 +4639,7 @@ fn run_chat(
                     inf_model = choice.model.clone();
                     inf_kind = choice.kind;
                     inf_key = choice.api_key.clone();
+                    apply_openai_api_env(choice.api);
                     // Re-probe DCGM ONLY when the backend URL actually changed
                     // (and only in verbose mode, where the snapshot is shown).
                     // `try_connect` is a blocking ~3s network call (issue #412);
@@ -5214,6 +5216,9 @@ struct BackendChoice {
     model: String,
     kind: newt_core::BackendKind,
     api_key: Option<String>,
+    /// For an OpenAI backend: which HTTP surface (chat/completions vs the newer
+    /// /v1/responses). Surfaced to the agent loop via `NEWT_OPENAI_API`.
+    api: newt_core::OpenAiApi,
 }
 
 /// Whether to use the OpenAI backend, given a `NEWT_BACKEND` override and
@@ -5298,6 +5303,7 @@ fn resolve_backend_choice(cfg: &newt_core::Config) -> BackendChoice {
                 model,
                 kind: b.kind,
                 api_key: b.resolve_api_key(),
+                api: b.api,
             };
         }
         // Unknown provider name: fall through. The loadout path validates the
@@ -5327,6 +5333,7 @@ fn resolve_backend_choice(cfg: &newt_core::Config) -> BackendChoice {
                 model,
                 kind: newt_core::BackendKind::Openai,
                 api_key: b.resolve_api_key(),
+                api: b.api,
             };
         }
     }
@@ -5337,6 +5344,22 @@ fn resolve_backend_choice(cfg: &newt_core::Config) -> BackendChoice {
         model,
         kind: newt_core::BackendKind::Ollama,
         api_key: None,
+        api: newt_core::OpenAiApi::default(),
+    }
+}
+
+/// Surface the resolved OpenAI API surface to the agent loop via
+/// `NEWT_OPENAI_API` (read by `chat_complete` to route to the Responses path).
+/// Called whenever the session (re)resolves its backend, so a `/backends`
+/// switch to a `responses` backend takes effect on the next message.
+fn apply_openai_api_env(api: newt_core::OpenAiApi) {
+    // SAFETY: single-threaded session setup; the agent loop reads this between
+    // turns, never concurrently.
+    unsafe {
+        match api {
+            newt_core::OpenAiApi::Responses => std::env::set_var("NEWT_OPENAI_API", "responses"),
+            newt_core::OpenAiApi::ChatCompletions => std::env::remove_var("NEWT_OPENAI_API"),
+        }
     }
 }
 
@@ -11778,6 +11801,7 @@ mod helper_fn_tests {
                 model: "qwen3:32b".into(),
                 tiers: vec![],
                 kind: newt_core::BackendKind::Openai,
+                api: Default::default(),
                 api_key_file: None,
                 api_key_env: None,
             }],
@@ -12221,6 +12245,7 @@ mod env_resolution_tests {
             model: model.into(),
             tiers: vec![],
             kind,
+            api: Default::default(),
             api_key_file: None,
             api_key_env: None,
         }

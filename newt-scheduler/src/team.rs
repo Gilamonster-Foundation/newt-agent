@@ -15,6 +15,7 @@
 //! orchestration over the existing seams — unit-testable with mocks, no network.
 
 use crate::{run_crew, BackendPool, ChatRequest, CrewConfig, CrewStatus, Dispatcher, Workspace};
+use newt_core::caveats::Caveats;
 use newt_core::Tier;
 use serde::{Deserialize, Serialize};
 
@@ -109,6 +110,7 @@ pub async fn run_team(
     dispatcher: &dyn Dispatcher,
     workspace: &mut dyn Workspace,
     cfg: &TeamConfig,
+    caveats: &Caveats,
     goal: &str,
 ) -> TeamOutcome {
     // 1. DECOMPOSE — the lead breaks the goal into ordered subtasks.
@@ -164,7 +166,7 @@ pub async fn run_team(
         if let Some(verify) = &st.verify {
             workspace.set_test_command(verify);
         }
-        let outcome = run_crew(pool, dispatcher, workspace, &cfg.crew, &st.task).await;
+        let outcome = run_crew(pool, dispatcher, workspace, &cfg.crew, caveats, &st.task).await;
         let status = match outcome.status {
             CrewStatus::Passed => SubtaskStatus::Passed,
             CrewStatus::NeedsHumanReview => {
@@ -346,7 +348,15 @@ mod tests {
             planner_calls: AtomicUsize::new(0),
         };
         let mut ws = MemWs::new();
-        let out = run_team(&p, &d, &mut ws, &cfg(), "build the thing").await;
+        let out = run_team(
+            &p,
+            &d,
+            &mut ws,
+            &cfg(),
+            &newt_core::caveats::Caveats::top(),
+            "build the thing",
+        )
+        .await;
         assert_eq!(out.status, TeamStatus::AllPassed);
         assert_eq!(out.plan, vec!["do A".to_string(), "do B".to_string()]);
         assert!(out
@@ -364,7 +374,15 @@ mod tests {
             planner_calls: AtomicUsize::new(0),
         };
         let mut ws = MemWs::new();
-        let out = run_team(&p, &d, &mut ws, &cfg(), "goal").await;
+        let out = run_team(
+            &p,
+            &d,
+            &mut ws,
+            &cfg(),
+            &newt_core::caveats::Caveats::top(),
+            "goal",
+        )
+        .await;
         assert_eq!(out.status, TeamStatus::Blocked);
         assert_eq!(out.results[0].status, SubtaskStatus::NeedsHumanReview);
         assert_eq!(out.results[1].status, SubtaskStatus::Skipped);
@@ -385,7 +403,15 @@ mod tests {
             planner_calls: AtomicUsize::new(0),
         };
         let mut ws = MemWs::new();
-        let out = run_team(&p, &d, &mut ws, &cfg(), "goal").await;
+        let out = run_team(
+            &p,
+            &d,
+            &mut ws,
+            &cfg(),
+            &newt_core::caveats::Caveats::top(),
+            "goal",
+        )
+        .await;
         assert_eq!(out.status, TeamStatus::NoPlan);
         assert!(out.results.is_empty());
     }
@@ -405,7 +431,15 @@ mod tests {
             planner_calls: AtomicUsize::new(0),
         };
         let mut ws = MemWs::new();
-        let out = run_team(&p, &d, &mut ws, &cfg(), "goal").await;
+        let out = run_team(
+            &p,
+            &d,
+            &mut ws,
+            &cfg(),
+            &newt_core::caveats::Caveats::top(),
+            "goal",
+        )
+        .await;
         assert_eq!(out.status, TeamStatus::AllPassed);
         assert_eq!(out.plan, vec!["do A".to_string(), "do B".to_string()]);
         assert_eq!(
@@ -423,7 +457,15 @@ mod tests {
             planner_calls: AtomicUsize::new(0),
         };
         let mut ws = MemWs::new();
-        let out = run_team(&p, &d, &mut ws, &cfg(), "goal").await;
+        let out = run_team(
+            &p,
+            &d,
+            &mut ws,
+            &cfg(),
+            &newt_core::caveats::Caveats::top(),
+            "goal",
+        )
+        .await;
         assert_eq!(out.status, TeamStatus::NoPlan);
     }
 }

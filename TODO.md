@@ -37,11 +37,11 @@ vars; and `attest` shares #472's root-of-trust bootstrap with provenance (#490).
 
 ## 🔜 Next — finish LOCAL workflows (revised by the convergence)
 
-1. **23.1 — per-member caveats via the bridle `Gate`.** Route the crew's authority
-   check through agent-bridle's single mint site: attenuation (`meet`) is always safe;
-   a shortfall returns `NeedsDischarge`, not `LocalCrewRunner`'s crude `permits_fs_write`
-   deny.
-2. **23.2 — `attest`-gate the team enable (REFRAMED).** Enabling crew/team tools
+1. **23.1 — per-member caveats ✅ done (#494).** `run_crew`/`run_team` take `&Caveats`
+   and refuse out-of-`fs_write` edits at apply (attenuation). Caveats travel with the
+   work. _Remaining within 23.1:_ route the shortfall through the bridle Gate's
+   `NeedsDischarge` (folds into 23.2).
+2. **23.2 — `attest`-gate the team enable (REFRAMED) ← NEXT.** Enabling crew/team tools
    *enlarges authority* → a live human gesture, not `NEWT_TEAM` (kept as a dev escape).
    The `/team` enable + roster-approval become `attest` decisions through agent-bridle#24's
    `Gate` (structure now vs the stub/`Prompt`; real teeth after BOOT). Plus `[team]`
