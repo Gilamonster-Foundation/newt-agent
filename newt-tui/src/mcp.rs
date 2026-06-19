@@ -175,7 +175,7 @@ impl Mcp {
             };
             match result {
                 Ok(connected) => servers.push(connected),
-                Err(e) => tracing::warn!("MCP server `{}` skipped: {e}", entry.name),
+                Err(e) => tracing::warn!("MCP server `{}` skipped: {e:#}", entry.name),
             }
         }
         Self {
