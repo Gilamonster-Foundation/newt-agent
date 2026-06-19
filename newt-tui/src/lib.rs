@@ -12213,12 +12213,15 @@ mod env_resolution_tests {
     #[test]
     fn cli_fs_grants_widen_read_and_write_scopes() {
         use newt_core::caveats::Scope;
+        // Join with the platform path-list separator (`;` on Windows, `:` on
+        // Unix), matching how the CLI now writes these vars via join_paths.
+        let read_paths = std::env::join_paths(["/home/u/.newt", "/home/u/.hotseat/config.yml"])
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
         with_env_vars(
             &[
-                (
-                    "NEWT_READ_PATHS",
-                    "/home/u/.newt:/home/u/.hotseat/config.yml",
-                ),
+                ("NEWT_READ_PATHS", read_paths.as_str()),
                 ("NEWT_WRITE_PATHS", "/home/u/scratch"),
             ],
             &[],

@@ -145,16 +145,20 @@ pub fn lock_fs_to_workspace(
 }
 
 /// Apply [`lock_fs_to_workspace`] from the CLI grant env vars `NEWT_READ_PATHS` /
-/// `NEWT_WRITE_PATHS` (colon-separated absolute paths that `newt-cli` sets from
-/// `--read` / `--write`). The single entry point every session path calls.
+/// `NEWT_WRITE_PATHS` (absolute paths that `newt-cli` sets from `--read` /
+/// `--write`, joined with the platform path-list separator). The single entry
+/// point every session path calls.
+///
+/// Uses [`std::env::split_paths`] rather than splitting on a hard-coded `':'`,
+/// so a Windows drive-letter grant (`C:\…`) is not shattered into a bare `"C"`
+/// root that would prefix-match the whole drive.
 pub fn apply_cli_fs_grants(caveats: &mut Caveats, workspace: &str) {
     let parse = |var: &str| -> Vec<String> {
-        std::env::var(var)
-            .ok()
+        std::env::var_os(var)
             .map(|s| {
-                s.split(':')
-                    .filter(|p| !p.is_empty())
-                    .map(str::to_string)
+                std::env::split_paths(&s)
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .map(|p| p.to_string_lossy().into_owned())
                     .collect()
             })
             .unwrap_or_default()

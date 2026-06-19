@@ -308,15 +308,26 @@ pub enum Command {
     },
 }
 
-/// Absolutise a single `--read`/`--write` grant: expand a leading `~`, then make
-/// it absolute relative to the current dir. Does NOT require the path to exist (a
-/// `--write` target may be created later) and does not canonicalise (which would
-/// resolve symlinks and need existence) — the goal is a stable absolute string
-/// the fs tools' `workspace.join(path)` results can prefix-match.
+/// Resolve the user's home directory cross-platform: `$HOME` (set on Unix and
+/// many Windows shells) first, then `%USERPROFILE%` (the Windows default). Empty
+/// values are treated as unset.
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .filter(|h| !h.is_empty())
+        .or_else(|| std::env::var_os("USERPROFILE").filter(|h| !h.is_empty()))
+        .map(PathBuf::from)
+}
+
+/// Absolutise a single `--read`/`--write` grant: expand a leading `~` (via
+/// [`home_dir`]), then make it absolute relative to the current dir. Does NOT
+/// require the path to exist (a `--write` target may be created later) and does
+/// not canonicalise (which would resolve symlinks and need existence) — the goal
+/// is a stable absolute path the fs tools' `workspace.join(path)` results can be
+/// contained under.
 fn abs_grant_path(p: &std::path::Path) -> PathBuf {
     let expanded: PathBuf = match p.strip_prefix("~") {
-        Ok(rest) => match std::env::var_os("HOME") {
-            Some(home) => PathBuf::from(home).join(rest),
+        Ok(rest) => match home_dir() {
+            Some(home) => home.join(rest),
             None => p.to_path_buf(),
         },
         Err(_) => p.to_path_buf(),
@@ -330,13 +341,13 @@ fn abs_grant_path(p: &std::path::Path) -> PathBuf {
     }
 }
 
-/// Colon-join absolutised grant paths for `NEWT_READ_PATHS` / `NEWT_WRITE_PATHS`.
-fn abs_grant_paths(paths: &[PathBuf]) -> String {
-    paths
-        .iter()
-        .map(|p| abs_grant_path(p).display().to_string())
-        .collect::<Vec<_>>()
-        .join(":")
+/// Join absolutised grant paths into a single `NEWT_READ_PATHS` /
+/// `NEWT_WRITE_PATHS` value using the platform path-list separator (`;` on
+/// Windows, `:` elsewhere) via [`std::env::join_paths`], so a Windows
+/// drive-letter path (`C:\…`) is not shattered on a literal `:`. Returns `Err`
+/// (fail-closed) if a grant path itself contains the separator.
+fn abs_grant_paths(paths: &[PathBuf]) -> Result<std::ffi::OsString, std::env::JoinPathsError> {
+    std::env::join_paths(paths.iter().map(|p| abs_grant_path(p)))
 }
 
 pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
@@ -372,15 +383,27 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         unsafe { std::env::set_var("NEWT_EXEC_PATHS", &joined) };
     }
 
-    // --read / --write: store absolutised, colon-separated paths so the TUI can
-    // widen the agent's fs_read / fs_write scope to these out-of-workspace
-    // locations (a dir grants everything under it; a file grants just itself).
-    // --write implies --read for the same path.
+    // --read / --write: store absolutised paths (joined with the platform
+    // path-list separator) so the TUI can widen the agent's fs_read / fs_write
+    // scope to these out-of-workspace locations (a dir grants everything under
+    // it; a file grants just itself). --write implies --read for the same path.
     if !cli.read_paths.is_empty() {
-        unsafe { std::env::set_var("NEWT_READ_PATHS", abs_grant_paths(&cli.read_paths)) };
+        match abs_grant_paths(&cli.read_paths) {
+            Ok(joined) => unsafe { std::env::set_var("NEWT_READ_PATHS", &joined) },
+            Err(e) => {
+                eprintln!(
+                    "warning: ignoring --read grants (path contains the path separator): {e}"
+                );
+            }
+        }
     }
     if !cli.write_paths.is_empty() {
-        unsafe { std::env::set_var("NEWT_WRITE_PATHS", abs_grant_paths(&cli.write_paths)) };
+        match abs_grant_paths(&cli.write_paths) {
+            Ok(joined) => unsafe { std::env::set_var("NEWT_WRITE_PATHS", &joined) },
+            Err(e) => eprintln!(
+                "warning: ignoring --write grants (path contains the path separator): {e}"
+            ),
+        }
     }
 
     match cli.command.unwrap_or(Command::Code { path: None }) {
@@ -840,18 +863,29 @@ mod tests {
 
     #[test]
     fn abs_grant_path_expands_tilde_and_absolutises() {
-        // A leading ~ expands to $HOME; an absolute path is unchanged.
-        std::env::set_var("HOME", "/home/u");
+        use std::path::Path;
+        // A leading ~ expands to the home dir. Use a platform-absolute HOME so
+        // the expansion is itself absolute on both Unix and Windows (a bare
+        // `/home/u` is NOT absolute on Windows, where it would be re-based).
+        let home = if cfg!(windows) {
+            r"C:\home\u"
+        } else {
+            "/home/u"
+        };
+        std::env::set_var("HOME", home);
         assert_eq!(
-            abs_grant_path(std::path::Path::new("~/.newt")),
-            PathBuf::from("/home/u/.newt")
+            abs_grant_path(Path::new("~/.newt")),
+            PathBuf::from(home).join(".newt")
         );
-        assert_eq!(
-            abs_grant_path(std::path::Path::new("/etc/hosts")),
-            PathBuf::from("/etc/hosts")
-        );
+        // An already-absolute path is unchanged.
+        let abs = if cfg!(windows) {
+            r"C:\etc\hosts"
+        } else {
+            "/etc/hosts"
+        };
+        assert_eq!(abs_grant_path(Path::new(abs)), PathBuf::from(abs));
         // A relative path is joined onto the current dir.
-        let rel = abs_grant_path(std::path::Path::new("sub/file"));
+        let rel = abs_grant_path(Path::new("sub/file"));
         assert!(rel.is_absolute(), "relative grant absolutised: {rel:?}");
         assert!(rel.ends_with("sub/file"));
     }
