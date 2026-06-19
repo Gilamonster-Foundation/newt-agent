@@ -433,6 +433,7 @@ mod tests {
             model: "qwen3:32b".into(),
             tiers: vec![Tier::Standard],
             kind: BackendKind::Openai,
+            api: Default::default(),
             api_key_file: None,
             api_key_env: None,
         };
