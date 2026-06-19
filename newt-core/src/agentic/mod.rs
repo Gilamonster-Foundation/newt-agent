@@ -1717,7 +1717,14 @@ pub async fn chat_complete(
 fn is_read_only_tool(name: &str) -> bool {
     matches!(
         name,
-        "list_dir" | "read_file" | "search" | "web_fetch" | "use_skill" | "save_note" | "recall"
+        "list_dir"
+            | "read_file"
+            | "find"
+            | "search"
+            | "web_fetch"
+            | "use_skill"
+            | "save_note"
+            | "recall"
     )
 }
 
@@ -3214,6 +3221,7 @@ mod cap_exit_unit_tests {
         for name in &[
             "list_dir",
             "read_file",
+            "find",
             "search",
             "web_fetch",
             "use_skill",
