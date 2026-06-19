@@ -144,13 +144,17 @@ A deviation is only real if the system *enforces* the bound. Two enforcement poi
   vectors; the crew/worker run in throwaway git worktrees; `b1`'s OS sandbox (Landlock fs) is
   the backstop that bounds the symlink residual once present.
 - **Closure criterion:** the gate canonicalizes (or `openat2`-resolves) the target before
-  containment, and a symlink-escape test (a link under `/ws` → `/etc` resolved through the
-  gate) is denied.
-- **Ratchet guard:** `tui_permits_path_prefix_semantics` (`tools.rs`) drives `..`, repeated
-  `..`, and a sibling-prefix path through the real gate and asserts denial; it can't regress
-  to a raw `str::starts_with` without failing.
-- **Status:** OPEN (lexical containment landed; symlink resolution pending) · review-by: with
-  `b1` OS-sandbox work (#84)
+  containment, and `tui_permits_path_symlink_escape_is_the_known_residual` (`tools.rs`) is
+  flipped from "permitted" to "denied" — that test already drives a real symlink under the
+  workspace through the gate, so closing the deviation is exactly: implement canonicalization,
+  flip the assertion.
+- **Ratchet guard:** two tests in `tools.rs` — `tui_permits_path_prefix_semantics` drives
+  `..`, repeated `..`, and a sibling-prefix path through the real gate and asserts denial (the
+  lexical part #502 fixed; can't regress to raw `str::starts_with` without failing); and
+  `tui_permits_path_symlink_escape_is_the_known_residual` pins the still-open symlink gap so it
+  can't silently widen and so closing it is a visible, test-driven flip.
+- **Status:** OPEN (lexical containment landed; symlink resolution pending — issue #522) ·
+  review-by: with `b1` OS-sandbox work (#84)
 
 > `exec-behavior-bound`, `mcp-under-leash` — full entries to be filled as those land; each is
 > **disabled-while-open bounded by `b1`** (the OS sandbox is the backstop for
