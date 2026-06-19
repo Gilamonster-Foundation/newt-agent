@@ -186,9 +186,10 @@ impl CrewRunner for LocalCrewRunner {
                         "no verification command — pass 'verify' or add a justfile / Cargo.toml / pyproject.toml"
                             .to_string()
                     })?;
-                let mut ws = WorktreeWorkspace::create(&self.dir, &worktree_id(), test_cmd)
+                let id = worktree_id();
+                let mut ws = WorktreeWorkspace::create(&self.dir, &id, test_cmd)
                     .map_err(|e| e.to_string())?;
-                let body = if as_team {
+                let (body, passed) = if as_team {
                     let team_cfg = TeamConfig {
                         lead_model: lead.unwrap_or_else(|| crew_cfg.planner_model.clone()),
                         lead_tier: Tier::Complex,
@@ -196,19 +197,41 @@ impl CrewRunner for LocalCrewRunner {
                         max_subtasks: MAX_SUBTASKS,
                     };
                     let out = run_team(&pool, &LocalDispatcher, &mut ws, &team_cfg, task).await;
-                    render_team(&out)
+                    let passed = out.status == TeamStatus::AllPassed;
+                    (render_team(&out), passed)
                 } else {
                     let out = run_crew(&pool, &LocalDispatcher, &mut ws, &crew_cfg, task).await;
-                    render_crew(&out)
+                    let passed = out.status == CrewStatus::Passed;
+                    (render_crew(&out), passed)
                 };
                 let diff = ws.diff();
+                // 23.3 — LAND verified work as a git branch: the worktree shares the
+                // base's object store, so the commit + branch ref survive cleanup and
+                // the base repo can review/merge it with the embedded `git` tool.
+                // Unverified work stays isolated and is discarded. (No file-copy / no
+                // merge ceremony — we have embedded git; work is passed as a commit.)
+                let landed = if passed {
+                    let (name, email) = newt_core::AgentIdentity::resolve()
+                        .unwrap_or_default()
+                        .git_author();
+                    match ws.commit_to_branch(&format!("crew/{id}"), &name, &email, task) {
+                        Ok((branch, sha)) => format!(
+                            "\n✓ LANDED on branch `{branch}` @ {sha} — review with \
+                             `git diff main..{branch}`, then merge with the `git` tool.\n"
+                        ),
+                        Err(e) => format!("\n⚠ verified but nothing to land: {e}\n"),
+                    }
+                } else {
+                    "\n✗ verification did NOT pass — work isolated and discarded, NOT landed.\n"
+                        .to_string()
+                };
                 let diff_block = if diff.trim().is_empty() {
                     "(no changes)".to_string()
                 } else {
                     diff
                 };
                 Ok(format!(
-                    "roster: {}\n{body}\n--- diff (review, then accept or re-dispatch) ---\n{diff_block}",
+                    "roster: {}\n{body}{landed}--- diff (review) ---\n{diff_block}",
                     rationale.join("; ")
                 ))
             }
