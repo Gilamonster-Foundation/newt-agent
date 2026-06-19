@@ -157,7 +157,10 @@ pub enum DgxNotConfigured {
 /// A single DGX host and the endpoints it exposes.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DgxNode {
-    /// Short name used by `newt dgx node use <name>`.
+    /// Short name used by `newt dgx node use <name>`. For a per-file drop-in
+    /// (`~/.newt/dgx/<name>.toml`) this is overwritten by the filename stem, so
+    /// the file body may omit it.
+    #[serde(default)]
     pub name: String,
 
     /// Direct DGX Ollama URL (e.g. `https://REDACTED-HOST`).
