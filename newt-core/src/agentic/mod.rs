@@ -36,7 +36,7 @@ pub use compress::{
     SummarizeFuture, Summarizer, SUMMARY_END_MARKER, SUMMARY_PREFIX,
 };
 pub use crew_tool::{compose_roster_tool_definition, crew_tool_definition, CrewRunner};
-pub use display::{print_list_item, print_newt, NEWT_ORANGE_CT};
+pub use display::{print_harness_notice, print_list_item, print_newt, NEWT_ORANGE_CT};
 pub use driver::{
     TurnDriver, TurnDriverConfig, TurnDriverError, TurnOutcome, TurnStatus,
     VISIBLE_TRANSCRIPT_ROLES,
@@ -1040,7 +1040,7 @@ pub async fn chat_complete(
                     }
                 };
                 if let Some(notice) = outcome.notice {
-                    print_newt(&notice, color, false);
+                    print_harness_notice(&notice, color);
                 }
                 if outcome.action == CompressAction::Refused {
                     // Anti-thrash disabled compression and the context still
@@ -1225,7 +1225,7 @@ pub async fn chat_complete(
                         )
                         .await;
                         if let Some(notice) = outcome.notice {
-                            print_newt(&notice, color, false);
+                            print_harness_notice(&notice, color);
                         }
                         if outcome.action == CompressAction::Refused {
                             // Refuse the resend; surface the endpoint's 400.
@@ -1498,7 +1498,7 @@ pub async fn chat_complete(
                         )
                         .await;
                         if let Some(notice) = outcome.notice {
-                            print_newt(&notice, color, false);
+                            print_harness_notice(&notice, color);
                         }
                         if outcome.fired {
                             messages = outcome.messages;
@@ -2145,7 +2145,7 @@ pub async fn openai_chat_complete(
                 )
                 .await;
                 if let Some(notice) = outcome.notice {
-                    print_newt(&notice, color, false);
+                    print_harness_notice(&notice, color);
                 }
                 if outcome.action == CompressAction::Refused {
                     anyhow::bail!(
@@ -2295,7 +2295,7 @@ pub async fn openai_chat_complete(
                         )
                         .await;
                         if let Some(notice) = outcome.notice {
-                            print_newt(&notice, color, false);
+                            print_harness_notice(&notice, color);
                         }
                         if outcome.action == CompressAction::Refused {
                             // Refuse the resend; surface the endpoint's 400.
