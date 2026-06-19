@@ -1085,6 +1085,62 @@ slot behind the same `Engine` seam later.
 
 ---
 
+# Phase 23 — Crew / Team / Overseer (multi-LLM orchestration)
+
+The **overseer stack**: a conversational model (the overseer) plans, composes a
+roster, dispatches crews per plan-step, reviews the returned diff, reports — the
+human approves the plan and the roster. All orchestration is pure over three
+injected seams (`Dispatcher` + `BackendPool` + `Workspace`), unit-testable with
+mocks. **Design of record: [`docs/design/crew-swarm-overseer.md`](design/crew-swarm-overseer.md).**
+
+The keystone: **an agent is the one runtime, scoped** — a crew member (incl. a
+resident keysmith/herald) is a Newt/Wyvern *instance* (loadout + tools + caveats +
+role), not a program. Capability-as-identity: the caveat spec is both the grant and
+the containment.
+
+**Shipped (landed on `main`):**
+
+- **crew** (`newt-scheduler/src/crew.rs`, #425) — one task, roles divide labor
+  (planner/navigator/triage); honest `NeedsHumanReview`; CLI front door `newt crew`.
+- **panel** (`panel.rs`, #468) — same task to N decorrelated voices, verify-gate
+  each, accept by agreement (anti-groupthink).
+- **team** (`team.rs`, #474 + per-subtask verify #477) — a lead decomposes a goal,
+  a crew runs each subtask over a shared workspace, stops at first block; each
+  subtask installs its own `verify`. Live harness: `examples/team_live.rs` (#475).
+- **hosted dispatch** (#478) — `BackendKind::Openai` → `/v1/chat/completions` +
+  Bearer (`PoolBackend.api_key`); crews/teams run on a hosted LLM, not just Ollama.
+- **roster composer** (`roster.rs`, #480) — `compose_roster` surveys live models +
+  capability priors → proposes role→model (panel = strongest-per-distinct-family)
+  with a rationale, for human approval.
+- **agent-callable tools** (#479: surface #482 + impl #484) — the async
+  **`CrewRunner`** trait (the universal crew primitive); `compose_roster` + `crew`
+  tools behind the **`NEWT_TEAM`** toggle; `LocalCrewRunner` (newt-cli) runs them
+  over a `WorktreeWorkspace`, **fails closed** on a read-only session, returns the
+  diff for review. The **inversion**: newt-cli owns newt-scheduler + the worktree
+  and injects `&dyn CrewRunner` down into the scheduler-free newt-tui loop.
+
+**Remaining local steps (finish before remote):**
+
+- **23.1** Per-crew-member caveat threading — `run_crew` passes `meet`-attenuated
+  caveats to each member (today the bound is worktree isolation + the fail-closed
+  write check at dispatch).
+- **23.2** `[team]` config section + a runtime `/team` slash command (env
+  `NEWT_TEAM` toggle today) + `[crews.*]` selection from the `crew` tool.
+- **23.3** Accept / merge-back — apply the reviewed crew diff to the live tree on
+  the overseer's approval (today the diff is returned for review only).
+- **23.4** Empirical role priors from the rig (#80) feed `compose_roster` (heuristic
+  name-based priors today).
+
+**Follow-on (remote — after local lands): `MeshCrewRunner`.** The remote sibling of
+`LocalCrewRunner`: a resident Newt/Wyvern *parked* on a project receives
+`CrewTask{goal, caveats, workspace_ref}` over agent-mesh and returns
+`CrewResult{diff, status, ledger}`; caveats attenuate per hop (`meet`, never widen),
+so recursion is safe by construction. Same `CrewRunner` contract — a runner swap,
+not a rewrite. Transport = the SSH-CA / iroh dual plane (iroh LAN, SSH long-haul).
+See the MeshCrewRunner follow-up issue + `crew-swarm-overseer.md` (wyvern-agent#42).
+
+---
+
 # Cross-cutting notes
 
 - **drake-foreman dispatch:** each step's branch is the unit of work. The
