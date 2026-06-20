@@ -590,19 +590,51 @@ pub(crate) fn parse_show_response(json: &serde_json::Value) -> Option<u32> {
 /// Ensure `entry` has a `context_window` and an initial `safe_context`.
 /// Calls `/api/show` only when the context window is not yet known.
 /// Returns `true` if the entry was updated (caller should save cache).
-pub fn ensure_context_window(entry: &mut CapabilityEntry, endpoint: &str, model: &str) -> bool {
-    if entry.context_window.is_some() {
+///
+/// `trust_declared` (the default posture, `real_context_discovery = false`):
+/// the declared window is authoritative — `safe_context` is (re)asserted to
+/// ~80 % of it every session, **raising** a value a past overflow reined down,
+/// so a capable model is never permanently capped. When `false` (empirical
+/// mode) the original VRAM rule holds: bootstrap once, never auto-raise.
+pub fn ensure_context_window(
+    entry: &mut CapabilityEntry,
+    endpoint: &str,
+    model: &str,
+    trust_declared: bool,
+) -> bool {
+    // Empirical mode keeps the original fetch-once contract: when the window is
+    // already known, do nothing — a reined-down safe_context must persist.
+    if !trust_declared && entry.context_window.is_some() {
         return false;
     }
-    let Some(window) = fetch_context_window(endpoint, model) else {
-        return false;
+    // Fetch the declared window once (negative-cached by the caller). When it's
+    // already known we skip the /api/show round trip but still (re)assert
+    // safe_context below in trust-declared mode.
+    let mut changed = false;
+    if entry.context_window.is_none() {
+        let Some(window) = fetch_context_window(endpoint, model) else {
+            return false;
+        };
+        entry.context_window = Some(window);
+        changed = true;
+    }
+    let Some(window) = entry.context_window else {
+        return changed;
     };
-    entry.context_window = Some(window);
-    // Bootstrap safe_context at 80 % of declared max unless already set.
-    if entry.safe_context.is_none() {
-        entry.safe_context = Some(window * 80 / 100);
+    let declared_safe = window * 80 / 100;
+    if trust_declared {
+        // Authoritative declared window: raise/assert safe_context to ~80 %,
+        // un-sticking any reined-down value (issue #382/#383).
+        if entry.safe_context != Some(declared_safe) {
+            entry.safe_context = Some(declared_safe);
+            changed = true;
+        }
+    } else if entry.safe_context.is_none() {
+        // Empirical: bootstrap at 80 % unless already set; never auto-raise.
+        entry.safe_context = Some(declared_safe);
+        changed = true;
     }
-    true
+    changed
 }
 
 // ---------------------------------------------------------------------------
@@ -622,24 +654,37 @@ pub fn today_local_date() -> String {
 /// `/probe` is the explicit re-discover command, so this **always** calls
 /// [`fetch_context_window`] (no early return on a known window) and updates
 /// `entry.context_window` whenever the fetch succeeds — catching a re-pulled
-/// model whose Modelfile `num_ctx` changed since the last probe. It
-/// re-bootstraps `safe_context` to 80 % of the declared window **only when
-/// `safe_context.is_none()`**, and never auto-raises an existing value (the
-/// VRAM rule, §2.1 / §4.2): a larger declared window does not free more KV
-/// cache. Returns `true` when `context_window` actually changed (caller
+/// model whose Modelfile `num_ctx` changed since the last probe. With
+/// `trust_declared` (the default) it asserts `safe_context` to 80 % of the
+/// declared window, **raising** it if needed; in empirical mode
+/// (`real_context_discovery`) it re-bootstraps only when `safe_context.is_none()`
+/// and never auto-raises (the VRAM rule, §2.1 / §4.2): a larger declared window
+/// does not free more KV cache. Returns `true` when anything changed (caller
 /// saves); a fetch failure leaves the entry untouched and returns `false`.
 ///
 /// The passive session path keeps using [`ensure_context_window`]
 /// (fetch-once, negative-cached); only `/probe` forces this refresh.
-pub fn refresh_context_window(entry: &mut CapabilityEntry, endpoint: &str, model: &str) -> bool {
+pub fn refresh_context_window(
+    entry: &mut CapabilityEntry,
+    endpoint: &str,
+    model: &str,
+    trust_declared: bool,
+) -> bool {
     let Some(window) = fetch_context_window(endpoint, model) else {
         return false;
     };
-    let changed = entry.context_window != Some(window);
+    let mut changed = entry.context_window != Some(window);
     entry.context_window = Some(window);
-    // Bootstrap (never auto-raise) safe_context at 80 % of declared max.
-    if entry.safe_context.is_none() {
-        entry.safe_context = Some(window * 80 / 100);
+    let declared_safe = window * 80 / 100;
+    if trust_declared {
+        // `/probe` re-trusts the declared window: raise safe_context to ~80 %.
+        if entry.safe_context != Some(declared_safe) {
+            entry.safe_context = Some(declared_safe);
+            changed = true;
+        }
+    } else if entry.safe_context.is_none() {
+        // Empirical: bootstrap (never auto-raise) at 80 % of declared max.
+        entry.safe_context = Some(declared_safe);
     }
     changed
 }
@@ -1152,8 +1197,11 @@ pub fn full_probe(
     entry.conformance = conformance.clone();
     entry.tested_date = today.to_string();
 
-    // 2. Context-window refresh (§4.2) — always re-queries /api/show.
-    refresh_context_window(entry, endpoint, model);
+    // 2. Context-window refresh (§4.2) — always re-queries /api/show. This is
+    // the active (empirical) discovery driver, so it keeps the conservative
+    // bootstrap-if-none behaviour; the passive session path
+    // (`ensure_context_window`) delivers the trust-declared default.
+    refresh_context_window(entry, endpoint, model, false);
 
     // 3. Thinking probe + calibration bootstrap (§4.3 / §4.4).
     let mut emits_thinking = entry.emits_thinking.unwrap_or(false);
