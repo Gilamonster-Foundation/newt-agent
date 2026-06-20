@@ -55,13 +55,16 @@ pub struct Cli {
     )]
     pub splash: bool,
 
-    /// Disable the input footer (the transient multi-line `❯` block + status
-    /// header) and use a plain bash-like prompt. Equivalent to `NEWT_FOOTER=off`
-    /// or `[tui] footer = "off"`. By default the footer shows on a TTY and
-    /// auto-degrades to a plain scroller off one (pipes, `newt worker`).
+    /// Lean / flight / wyvern mode (issue #527): drop the rich footer and use the
+    /// dead-simple LeanTUI text box, where each prompt renders as a timestamped
+    /// server-log line (`[ts] ❯ <prompt>`). Equivalent to `NEWT_FOOTER=off` /
+    /// `[tui] footer = "off"`. By default the rich footer shows on a TTY and
+    /// auto-degrades to this lean morphology off one (pipes, `newt worker`).
+    /// `-n` / `--neat` / `--lite` (vi's "no-swap" spirit) are the same switch.
     #[arg(
+        short = 'n',
         long,
-        visible_alias = "no-footer",
+        visible_aliases = ["neat", "lite", "lean", "flight", "no-footer"],
         global = true,
         default_value_t = false
     )]
@@ -895,6 +898,29 @@ mod tests {
         assert_eq!(parse_color_mode("on"), Ok(newt_core::ColorMode::Always));
         assert_eq!(parse_color_mode("OFF"), Ok(newt_core::ColorMode::Never));
         assert!(parse_color_mode("chartreuse").is_err());
+    }
+
+    // ── lean / flight flag (issue #527) ─────────────────────────────────
+
+    #[test]
+    fn parses_lean_flag_and_all_aliases() {
+        // -n / --neat / --lite / --lean / --flight / --plain / --no-footer all
+        // set the same `plain` switch (lean morphology), bare or after `code`.
+        for argv in [
+            vec!["newt", "-n"],
+            vec!["newt", "--neat"],
+            vec!["newt", "--lite"],
+            vec!["newt", "--lean"],
+            vec!["newt", "--flight"],
+            vec!["newt", "--plain"],
+            vec!["newt", "--no-footer"],
+            vec!["newt", "code", "-n"],
+        ] {
+            let cli = Cli::try_parse_from(argv.clone()).unwrap();
+            assert!(cli.plain, "{argv:?} should set the lean/plain switch");
+        }
+        // Off by default.
+        assert!(!Cli::try_parse_from(["newt"]).unwrap().plain);
     }
 
     #[test]

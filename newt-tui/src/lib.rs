@@ -14,6 +14,9 @@ pub mod probe;
 // and headless/wyvern builds never compile it in — newt stays amphibious.
 #[cfg(feature = "rich-tui")]
 mod rich_input;
+// The lean input surface (issue #527): a dead-simple word-wrapped text box, the
+// flight/wyvern morphology. Always built — it is the footer-off / lean tier.
+mod lean_input;
 mod setup;
 mod wizard;
 
@@ -1016,6 +1019,12 @@ fn footer_rich_enabled(mode: newt_core::FooterMode, is_tty: bool) -> bool {
 /// readable `$NAME` form so it self-documents when copied into a config.
 pub const DEFAULT_RICH_PROMPT: &str = "[$TIMESTAMP] $MODEL | $MODE | $WS ❯ ";
 
+/// The built-in **lean** prompt template (issue #527): a timestamped server-log
+/// line so the LeanTUI conversational stream doubles as a greppable log when
+/// captured (`script`, tmux, a pipe). Used when `[tui] prompt` is unset and the
+/// prompt is not rich (footer off / `-n` / `--plain` / piped).
+pub const DEFAULT_LEAN_PROMPT: &str = "[$TIMESTAMP] ❯ ";
+
 /// The prompt-token reference — the single source of truth shared by the
 /// `/prompt` command, the scaffolded config comment, and the docs. Each entry
 /// is `($NAME, \x, description)`.
@@ -1625,6 +1634,16 @@ mod footer_tests {
     }
 
     #[test]
+    fn lean_default_prompt_is_a_timestamped_log_line() {
+        // The built-in lean default (#527) expands to `[<ts>] ❯ ` — the
+        // server-log morphology, no model/mode/ws status.
+        let p = expand_prompt_tokens(DEFAULT_LEAN_PROMPT, "/home/me/newt-agent", "gpt-4.1", true);
+        assert!(p.starts_with('['), "{p}");
+        assert!(p.ends_with("] ❯ "), "{p}");
+        assert!(!p.contains("$TIMESTAMP"), "timestamp token expanded: {p}");
+    }
+
+    #[test]
     fn strip_one_quote_pair_preserves_inner_spaces() {
         assert_eq!(strip_one_quote_pair("\"[$TIME] ❯ \""), "[$TIME] ❯ ");
         assert_eq!(strip_one_quote_pair("'hi'"), "hi");
@@ -1692,8 +1711,8 @@ mod footer_tests {
 ///
 /// Precedence: `NEWT_PROMPT` env > `[tui] prompt` config > built-in default.
 /// The built-in default is the **rich** prompt ([`DEFAULT_RICH_PROMPT`] — the
-/// timestamped status line) when `rich` is set, else the plain `\w $ ` /
-/// `you \w $ ` (vi-mode prefixes `[i] `).
+/// timestamped status line) when `rich` is set, else the **lean** prompt
+/// ([`DEFAULT_LEAN_PROMPT`] — `[ts] ❯ `, the server-log morphology, issue #527).
 ///
 /// Tokens: `\t` timestamp, `\m` model, `\M` edit mode, `\u` user, `\h` host,
 /// `\w` workspace basename, `\W` full path, `\v` newt version.
@@ -1758,7 +1777,7 @@ fn runtime_context_block(model: &str, endpoint: &str, kind: newt_core::BackendKi
     )
 }
 
-fn prompt_str(workspace: &str, verbose: bool, is_vi: bool, model: &str, rich: bool) -> String {
+fn prompt_str(workspace: &str, is_vi: bool, model: &str, rich: bool) -> String {
     let template = std::env::var("NEWT_PROMPT").ok().or_else(|| {
         newt_core::Config::resolve()
             .ok()
@@ -1769,23 +1788,15 @@ fn prompt_str(workspace: &str, verbose: bool, is_vi: bool, model: &str, rich: bo
     if let Some(ref tmpl) = template {
         return expand_prompt_tokens(tmpl, workspace, model, is_vi);
     }
-    if rich {
-        return expand_prompt_tokens(DEFAULT_RICH_PROMPT, workspace, model, is_vi);
-    }
-    let base = std::path::Path::new(workspace)
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let plain = if verbose {
-        format!("you {base} $ ")
+    // Rich (footer on, TTY): the timestamped status line. Lean (#527: footer off
+    // / `-n` / `--plain` / piped): a timestamped server-log line so the stream
+    // doubles as a greppable log.
+    let default = if rich {
+        DEFAULT_RICH_PROMPT
     } else {
-        format!("{base} $ ")
+        DEFAULT_LEAN_PROMPT
     };
-    if is_vi {
-        format!("[i] {plain}")
-    } else {
-        plain
-    }
+    expand_prompt_tokens(default, workspace, model, is_vi)
 }
 
 fn expand_prompt_tokens(template: &str, workspace: &str, model: &str, is_vi: bool) -> String {
@@ -4081,17 +4092,23 @@ fn run_chat(
     // fresh each turn (below) so the timestamp is current.
     let footer_on = footer_rich_enabled(footer_mode(), io::stdout().is_terminal());
     // Input goes through the InputSurface seam so the chat dispatch below is
-    // widget-agnostic. Two-mode (issue #416): on a TTY with the rich footer and
-    // the `rich-tui` feature compiled in, use the ratatui inline rich surface;
-    // otherwise (piped / headless / wyvern / footer off, or the feature absent)
-    // the rustyline surface. The palette is resolved unconditionally (it is
-    // pure) and only installed by the rustyline surface when the footer is on.
+    // widget-agnostic. Three morphologies:
+    //  - footer ON + TTY + `rich-tui` feature → the ratatui inline RICH surface
+    //    (issue #416);
+    //  - footer OFF (`-n` / `--plain` / `NEWT_FOOTER=off`, or piped/headless) →
+    //    the dead-simple LEAN text box (issue #527), the flight/wyvern morphology;
+    //  - footer ON but off a TTY (e.g. `[tui] footer = "on"` piped) → the
+    //    rustyline rich single-line prompt (kept until rustyline is retired).
+    // The palette is resolved unconditionally (it is pure) and only installed by
+    // the rustyline surface when the footer is on.
     let colors = resolve_tui(&cfg).map(|t| t.colors).unwrap_or_default();
     let mut surface: Box<dyn InputSurface> = {
         #[cfg(feature = "rich-tui")]
         {
             if footer_on && io::stdout().is_terminal() {
                 Box::new(rich_input::RichSurface::new(history_path)?)
+            } else if !footer_on {
+                Box::new(lean_input::LeanSurface::new(history_path)?)
             } else {
                 Box::new(RustylineSurface::new(
                     footer_on,
@@ -4102,11 +4119,15 @@ fn run_chat(
         }
         #[cfg(not(feature = "rich-tui"))]
         {
-            Box::new(RustylineSurface::new(
-                footer_on,
-                resolve_palette(&colors, color),
-                history_path,
-            )?)
+            if !footer_on {
+                Box::new(lean_input::LeanSurface::new(history_path)?)
+            } else {
+                Box::new(RustylineSurface::new(
+                    footer_on,
+                    resolve_palette(&colors, color),
+                    history_path,
+                )?)
+            }
         }
     };
     // Mark all open fds (terminal, history file, sockets) as O_CLOEXEC so
@@ -4379,7 +4400,7 @@ fn run_chat(
             // idle and it stays in scrollback (the per-turn log marker) on
             // submit — no region, no cursor games. The EMFILE probe and the
             // panic guard now live inside the surface (returned as `Fatal`).
-            let prompt = prompt_str(workspace, verbose, is_vi, &inf_model, footer_on);
+            let prompt = prompt_str(workspace, is_vi, &inf_model, footer_on);
             surface.read_line(&prompt)?
         };
         match outcome {
@@ -13077,9 +13098,9 @@ mod env_resolution_tests {
         // no auto `[i]` prefix; `\M` surfaces the edit mode for those who want
         // it, and the model/rich args don't interfere with an explicit template.
         with_env_vars(&[("NEWT_PROMPT", "\\w \\M \\v> ")], &[], || {
-            let vi = prompt_str("/tmp/proj", false, true, "gpt-4.1", true);
+            let vi = prompt_str("/tmp/proj", true, "gpt-4.1", true);
             assert_eq!(vi, format!("proj vi {}> ", env!("CARGO_PKG_VERSION")));
-            let em = prompt_str("/tmp/proj", false, false, "gpt-4.1", false);
+            let em = prompt_str("/tmp/proj", false, "gpt-4.1", false);
             assert_eq!(em, format!("proj emacs {}> ", env!("CARGO_PKG_VERSION")));
         });
     }
