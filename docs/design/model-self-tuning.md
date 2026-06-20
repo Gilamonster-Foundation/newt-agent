@@ -9,6 +9,21 @@ same session's transcript shows the backend **accepting an 8,734-token
 prompt** (`prompt_eval_count=8734`). The system held proof that its budget
 was wrong and discarded it.
 
+> **Update (2026-06-20 — `real_context_discovery`):** The VRAM-conservative
+> default described below — never raising `safe_context` above a reined-down
+> value (§2.1, §4.2) — is now **opt-in**. By default newt **trusts the declared
+> `/api/show` window**: `ensure_context_window` / `refresh_context_window`
+> (re)assert `safe_context` to ~80% of the declared window each session,
+> **un-sticking** a value a past overflow reined down. (A 1M-context model —
+> nemotron-3-nano:30b — was being capped to ~6k and compressing every turn:
+> #382/#383.) The conserve-and-ratchet behaviour in §2.1/§4.2 now applies only
+> when `[tui] real_context_discovery = true` (or the per-model
+> `[[model_tuning]] real_context_discovery` override) — for hardware that
+> genuinely cannot serve the full declared window. A real runtime cw-400 still
+> reins down **for the session** (recover); the next session re-asserts the
+> declared window (don't stick). An explicit `[tui] num_ctx` /
+> `[[model_tuning]] num_ctx` still caps everything.
+
 ## 1. The failure chain
 
 1. A prior turn ratcheted `max_ok_input = 6068` for the model in

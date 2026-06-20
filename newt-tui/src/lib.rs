@@ -4099,7 +4099,12 @@ fn run_chat(
         // Once per model per session, even on failure (Phase 20): the set
         // insert returning true means this is the first attempt.
         let updated = ctx_window_probed.insert(inf_model.clone())
-            && probe::ensure_context_window(entry, &inf_url, &inf_model);
+            && probe::ensure_context_window(
+                entry,
+                &inf_url,
+                &inf_model,
+                !real_context_discovery(&cfg, &inf_model),
+            );
         if updated {
             probe::save_cache(&cap_cache);
         }
@@ -4759,7 +4764,12 @@ fn run_chat(
                     let (eff_safe_context, eff_max_ok_input, eff_estimate_ratio) = {
                         let entry = cap_cache.entry(inf_model.clone()).or_default();
                         let updated = ctx_window_probed.insert(inf_model.clone())
-                            && probe::ensure_context_window(entry, &inf_url, &inf_model);
+                            && probe::ensure_context_window(
+                                entry,
+                                &inf_url,
+                                &inf_model,
+                                !real_context_discovery(&cfg, &inf_model),
+                            );
                         let sc = entry.safe_context;
                         let moi = entry.max_ok_input;
                         let ratio = entry.estimate_ratio;
@@ -6836,6 +6846,17 @@ fn num_ctx(cfg: &newt_core::Config) -> Option<u32> {
         }
     }
     cfg.tui.as_ref().and_then(|t| t.num_ctx)
+}
+
+/// Whether to use empirical "real context discovery" (conserve-and-ratchet) for
+/// `model`, vs. trusting the declared `/api/show` window. Resolution: per-model
+/// `[[model_tuning]] real_context_discovery` wins, else `[tui]
+/// real_context_discovery`, else `false` (trust declared — the default).
+fn real_context_discovery(cfg: &newt_core::Config, model: &str) -> bool {
+    cfg.find_model_tuning(model)
+        .and_then(|t| t.real_context_discovery)
+        .or_else(|| cfg.tui.as_ref().and_then(|t| t.real_context_discovery))
+        .unwrap_or(false)
 }
 
 /// TCP connect timeout from `[tui].connect_timeout_secs` (default 5).
@@ -12751,6 +12772,47 @@ mod env_resolution_tests {
                     "CLI exec grant must widen the session exec scope"
                 );
             },
+        );
+    }
+
+    #[test]
+    fn real_context_discovery_resolves_model_over_tui_default_false() {
+        // Default (no config): trust the declared window.
+        assert!(!real_context_discovery(&newt_core::Config::default(), "m"));
+
+        // [tui] opts into empirical discovery globally.
+        let cfg = newt_core::Config {
+            tui: Some(newt_core::TuiConfig {
+                real_context_discovery: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(real_context_discovery(&cfg, "m"));
+
+        // A per-model Some(false) overrides the global true.
+        let cfg = newt_core::Config {
+            tui: Some(newt_core::TuiConfig {
+                real_context_discovery: Some(true),
+                ..Default::default()
+            }),
+            model_tuning: vec![newt_core::config::ModelTuning {
+                model: "m".into(),
+                num_ctx: None,
+                real_context_discovery: Some(false),
+                mid_loop_trim_threshold: None,
+                mid_loop_trim_tokens: None,
+                max_tool_rounds: None,
+            }],
+            ..Default::default()
+        };
+        assert!(
+            !real_context_discovery(&cfg, "m"),
+            "per-model override wins"
+        );
+        assert!(
+            real_context_discovery(&cfg, "other"),
+            "a different model still inherits the [tui] default"
         );
     }
 
