@@ -756,12 +756,25 @@ pub struct TuiConfig {
     // -----------------------------------------------------------------------
     /// Ollama context-window cap sent as `options.num_ctx` on every request.
     /// Limits the KV-cache allocation so a large model can't exhaust VRAM
-    /// mid-session. `None` → let Ollama use the model's compiled-in default
-    /// (often 131k for recent models — far too large to coexist with weights
-    /// on a single GPU). Recommended starting point: 8192 or 16384.
-    /// Tune upward if you need longer tool-call histories.
+    /// mid-session. `None` → newt trusts the model's declared context window
+    /// from Ollama `/api/show` and sends ~80 % of it as `num_ctx` (see
+    /// `real_context_discovery`). Set an explicit cap here (e.g. 8192 / 16384)
+    /// on VRAM-constrained hosts; this always takes precedence over the
+    /// declared window.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub num_ctx: Option<u32>,
+
+    /// Opt into **empirical** context-window discovery (the conserve-for-tiny-
+    /// hardware mode). When `false`/unset (the default), newt **trusts the
+    /// declared** `/api/show` window: `safe_context` tracks ~80 % of it and is
+    /// raised back to it each session, so a model is never permanently capped
+    /// by a past overflow. When `true`, newt instead keeps the conservative
+    /// behaviour — bootstrap `safe_context` once, never auto-raise it, and let
+    /// runtime context-window 400s ratchet it down and persist (for hardware
+    /// that genuinely can't serve the full declared window). Overridable
+    /// per-model via `[[model_tuning]] real_context_discovery`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub real_context_discovery: Option<bool>,
 
     /// TCP connect timeout in seconds for inference requests (default: 5).
     /// A fast failure here means the endpoint is down (connection refused),
@@ -914,6 +927,13 @@ pub struct ModelTuning {
     /// derived `safe_context` from `model-capabilities.json`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub num_ctx: Option<u32>,
+
+    /// Per-model override of `[tui].real_context_discovery`. `Some(true)` opts
+    /// this model into empirical conserve-and-ratchet discovery; `Some(false)`
+    /// forces trust-the-declared-window even when the global default is
+    /// empirical; `None` inherits the global setting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub real_context_discovery: Option<bool>,
 
     /// Per-model `mid_loop_trim_threshold` override.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1580,6 +1600,7 @@ impl Default for TuiConfig {
             trace: None,
             build_check_cmd: None,
             num_ctx: None,
+            real_context_discovery: None,
             connect_timeout_secs: default_connect_timeout_secs(),
             inference_timeout_secs: default_inference_timeout_secs(),
             keep_alive: default_keep_alive(),
