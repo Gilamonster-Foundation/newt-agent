@@ -571,6 +571,93 @@ pub enum FooterMode {
     Off,
 }
 
+/// Color / theme mode — the `[tui] color` key and the `--color` CLI flag
+/// (issue #527). Selects whether — and eventually how — ANSI color is emitted
+/// for the interactive prompt and chat surface. The default is `auto`: color on
+/// a TTY, none in pipes / under `NO_COLOR` / `TERM=dumb`.
+///
+/// `dark`/`light`/`inverted`/`minimal` are accepted and parse today; their
+/// palettes are initial mappings (currently the chromatic default) tuned in a
+/// later pass. The terminal-aware *resolution* lives in the TUI layer — newt-core
+/// has no business probing the terminal — so this enum only exposes the pure
+/// pieces ([`from_keyword`](Self::from_keyword) / [`keyword`](Self::keyword) /
+/// [`forced`](Self::forced) / [`is_mono`](Self::is_mono)).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ColorMode {
+    /// Color on a TTY; none off one or under `NO_COLOR`/`TERM=dumb` (default).
+    #[default]
+    Auto,
+    /// Always emit color — even off a TTY (screenshots, captured logs). An
+    /// explicit `--color=always` also overrides `NO_COLOR` (documented deviation).
+    Always,
+    /// Never emit color.
+    Never,
+    /// Reduced color: structure only, no bright accents. (Initial mapping:
+    /// chromatic; tuned later.)
+    Minimal,
+    /// Swapped foreground/background accents for high-contrast terminals.
+    /// (Initial mapping: chromatic; tuned later.)
+    Inverted,
+    /// Palette tuned for a dark background — the current chromatic default.
+    Dark,
+    /// Palette tuned for a light background. (Initial mapping: chromatic; tuned later.)
+    Light,
+    /// Force monochrome — no color, ASCII glyph fallbacks. Equivalent to `--mono`.
+    Mono,
+}
+
+impl ColorMode {
+    /// Parse a CLI/config keyword (case-insensitive) into a mode. `on`/`off` are
+    /// accepted as aliases of `always`/`never`; `monochrome` aliases `mono`.
+    pub fn from_keyword(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "auto" => Some(Self::Auto),
+            "always" | "on" => Some(Self::Always),
+            "never" | "off" => Some(Self::Never),
+            "minimal" => Some(Self::Minimal),
+            "inverted" => Some(Self::Inverted),
+            "dark" => Some(Self::Dark),
+            "light" => Some(Self::Light),
+            "mono" | "monochrome" => Some(Self::Mono),
+            _ => None,
+        }
+    }
+
+    /// The canonical lowercase keyword for this mode (round-trips `from_keyword`
+    /// and matches the serde representation).
+    pub fn keyword(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Always => "always",
+            Self::Never => "never",
+            Self::Minimal => "minimal",
+            Self::Inverted => "inverted",
+            Self::Dark => "dark",
+            Self::Light => "light",
+            Self::Mono => "mono",
+        }
+    }
+
+    /// Whether this mode forces a color decision regardless of the terminal:
+    /// `Some(true)` = force color on, `Some(false)` = force off, `None` = defer
+    /// to terminal detection (`Auto`).
+    pub fn forced(self) -> Option<bool> {
+        match self {
+            Self::Always | Self::Minimal | Self::Inverted | Self::Dark | Self::Light => Some(true),
+            Self::Never | Self::Mono => Some(false),
+            Self::Auto => None,
+        }
+    }
+
+    /// Whether color is fully disabled in monochrome form. `Mono` additionally
+    /// signals ASCII-glyph fallbacks (`>` for `❯`) to callers; `Never` just
+    /// drops color.
+    pub fn is_mono(self) -> bool {
+        matches!(self, Self::Mono)
+    }
+}
+
 /// How a thinking model's streamed reasoning is surfaced — the `[tui] thinking`
 /// key. Newt strips `<think>…</think>` from the reply regardless (#385); this
 /// only controls the live human display.
@@ -692,6 +779,14 @@ pub struct TuiConfig {
     /// (the `--plain` CLI flag, or `NEWT_FOOTER=off`).
     #[serde(default)]
     pub footer: FooterMode,
+
+    /// Color / theme mode (issue #527): `"auto"` (default), `"always"`,
+    /// `"never"`, `"minimal"`, `"inverted"`, `"dark"`, `"light"`, `"mono"`.
+    /// The `--color` CLI flag and `--mono` override this; `NO_COLOR` /
+    /// `TERM=dumb` force it off unless an explicit `--color` is given. This is
+    /// the on/off + theme *mode*; `[tui.colors]` below is the palette.
+    #[serde(default)]
+    pub color: ColorMode,
 
     /// How a thinking model's streamed reasoning is shown: `"stream"` (default
     /// — dim reasoning + a cargo-style spinner, TTY only) or `"off"`.
@@ -1592,6 +1687,7 @@ impl Default for TuiConfig {
             edit_mode: EditMode::Nano,
             gutter: None,
             footer: FooterMode::Auto,
+            color: ColorMode::Auto,
             thinking: ThinkingMode::Stream,
             tool_output_lines: default_tool_output_lines(),
             max_tool_rounds: default_max_tool_rounds(),
@@ -2363,6 +2459,70 @@ mod tests {
             let cfg: TuiConfig = toml::from_str(&format!("footer = \"{key}\"")).unwrap();
             assert_eq!(cfg.footer, want, "footer = {key}");
         }
+    }
+
+    // ── color / theme mode (issue #527) ─────────────────────────────────
+
+    #[test]
+    fn color_mode_defaults_to_auto_and_round_trips() {
+        // Absent key → Auto (color on a TTY, none off one).
+        let cfg: TuiConfig = toml::from_str("").unwrap();
+        assert_eq!(cfg.color, ColorMode::Auto);
+        // Every keyword parses from its serde (lowercase) key.
+        for (key, want) in [
+            ("auto", ColorMode::Auto),
+            ("always", ColorMode::Always),
+            ("never", ColorMode::Never),
+            ("minimal", ColorMode::Minimal),
+            ("inverted", ColorMode::Inverted),
+            ("dark", ColorMode::Dark),
+            ("light", ColorMode::Light),
+            ("mono", ColorMode::Mono),
+        ] {
+            let cfg: TuiConfig = toml::from_str(&format!("color = \"{key}\"")).unwrap();
+            assert_eq!(cfg.color, want, "color = {key}");
+        }
+    }
+
+    #[test]
+    fn color_mode_keyword_round_trips_and_aliases_parse() {
+        // keyword() is the inverse of from_keyword() for every canonical variant.
+        for m in [
+            ColorMode::Auto,
+            ColorMode::Always,
+            ColorMode::Never,
+            ColorMode::Minimal,
+            ColorMode::Inverted,
+            ColorMode::Dark,
+            ColorMode::Light,
+            ColorMode::Mono,
+        ] {
+            assert_eq!(ColorMode::from_keyword(m.keyword()), Some(m));
+        }
+        // Case-insensitive + aliases.
+        assert_eq!(ColorMode::from_keyword("ALWAYS"), Some(ColorMode::Always));
+        assert_eq!(ColorMode::from_keyword(" on "), Some(ColorMode::Always));
+        assert_eq!(ColorMode::from_keyword("off"), Some(ColorMode::Never));
+        assert_eq!(ColorMode::from_keyword("monochrome"), Some(ColorMode::Mono));
+        // Unknown keyword is rejected (the CLI value_parser surfaces this).
+        assert_eq!(ColorMode::from_keyword("rainbow"), None);
+    }
+
+    #[test]
+    fn color_mode_forced_and_is_mono() {
+        // forced(): Some(true) = color on, Some(false) = off, None = defer to TTY.
+        assert_eq!(ColorMode::Always.forced(), Some(true));
+        assert_eq!(ColorMode::Dark.forced(), Some(true));
+        assert_eq!(ColorMode::Light.forced(), Some(true));
+        assert_eq!(ColorMode::Inverted.forced(), Some(true));
+        assert_eq!(ColorMode::Minimal.forced(), Some(true));
+        assert_eq!(ColorMode::Never.forced(), Some(false));
+        assert_eq!(ColorMode::Mono.forced(), Some(false));
+        assert_eq!(ColorMode::Auto.forced(), None);
+        // is_mono distinguishes the ASCII-fallback mode from plain Never.
+        assert!(ColorMode::Mono.is_mono());
+        assert!(!ColorMode::Never.is_mono());
+        assert!(!ColorMode::Auto.is_mono());
     }
 
     #[test]
