@@ -393,7 +393,7 @@ impl Editor {
 
 fn main() -> io::Result<()> {
     if !io::stdout().is_terminal() {
-        eprintln!("rich_tui_spike: not a TTY — the plain (rustyline) path handles this. Exiting.");
+        eprintln!("rich_tui_spike: not a TTY — the plain (lean) path handles this. Exiting.");
         return Ok(());
     }
     // Default emacs; `--`-free `vi` arg opts in (maps to [tui] edit_mode).

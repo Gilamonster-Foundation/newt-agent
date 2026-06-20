@@ -2,19 +2,19 @@
 //!
 //! This is the production port of `examples/rich_tui_spike.rs`, reshaped to the
 //! [`InputSurface`](crate::InputSurface) contract so `run_chat` can drive it the
-//! same way it drives the rustyline path. It renders a ratatui
+//! same way it drives the lean surface. It renders a ratatui
 //! `Viewport::Inline` region pinned to the bottom of the terminal — **no
 //! alternate screen** — so submitted turns and model output flow into real
 //! scrollback. On a TTY (and only when the `rich-tui` feature is compiled in) it
-//! replaces the rustyline surface; everywhere else (piped, headless, wyvern) the
-//! rustyline surface still handles input.
+//! replaces the lean surface; everywhere else (piped, headless, wyvern) the
+//! lean crossterm surface handles input.
 //!
-//! ## Submit semantics (parity with the rustyline path)
+//! ## Submit semantics (parity with the lean path)
 //! - **Enter** submits — unless the line is mid-continuation
 //!   ([`footer_continues`](crate::footer_continues): a `! …\` host-shell line or
 //!   an open `"""`/`'''` block), in which case Enter adds a line. This reuses
-//!   the *exact* classifier the rustyline validator uses, so multi-line entry
-//!   behaves identically across both surfaces.
+//!   the *exact* continuation classifier, so multi-line entry behaves
+//!   identically across both surfaces.
 //! - **Shift-Enter** inserts a newline in every mode (terminal permitting).
 //!   **Ctrl-O** inserts a newline only in the **modeless** modes (emacs/nano),
 //!   where it is idiomatic (emacs `open-line`). In **vi**, Ctrl-O is left free
@@ -38,7 +38,7 @@
 //! ## Not yet (documented limitations of v1)
 //! - No in-session history recall (Up/Down navigate the buffer, not history);
 //!   submitted entries are still **persisted** to the shared history file so the
-//!   rustyline path sees them next session.
+//!   lean path sees them next session.
 //! - The status row shows the live clock + edit mode only; model / plan-mode
 //!   tokens land with the status-row work (issue #416 follow-up).
 //! - The per-turn event loop (`read_line`) needs a real TTY and is exercised by
@@ -653,7 +653,7 @@ fn help_text(edit: Edit) -> String {
 /// The editor mode. **Default is Nano** (modeless, tui-textarea's native
 /// emacs-style bindings — the most approachable); Emacs is the same bindings
 /// under a different label, and Vi is opt-in via `[tui] edit_mode` / `/vi`. Read
-/// from the same source as the rustyline path ([`crate::resolve_edit_mode`]).
+/// from the shared edit-mode source ([`crate::resolve_edit_mode`]).
 #[derive(Clone, Copy, PartialEq)]
 enum Edit {
     Emacs,
@@ -695,7 +695,7 @@ impl Editor {
     }
 
     /// Handle one key. Submit / interrupt / EOF and the continuation-aware Enter
-    /// are shared by both modes so behavior matches the rustyline validator.
+    /// are shared by both modes via the [`crate::footer_continues`] classifier.
     fn input(&mut self, key: KeyEvent, ta: &mut TextArea) -> Step {
         // A pending vi `[y/N]` confirmation (e.g. `:wq`) owns the next key
         // outright — it must run BEFORE the shared Enter/Ctrl handling, or
@@ -961,8 +961,8 @@ fn status_options() -> Option<String> {
 
 /// The rich surface's two-line live view (issue #527): a status HEADER row
 /// (`[header_line`]) over an input-indicator row ([`prompt_line`]). The PS1 token
-/// prompt (`[tui] prompt`) is the LEAN/rustyline surface's job (it lands in
-/// logfiles); the rich surface renders these instead.
+/// prompt (`[tui] prompt`) is the LEAN surface's job (it lands in logfiles); the
+/// rich surface renders these instead.
 ///
 /// The header is `[YYYY-MM-DD HH:MM:SS] vi --INSERT-- <model> @ <endpoint>` plus
 /// an optional `[options]` session-override block. The clock + editor mode update

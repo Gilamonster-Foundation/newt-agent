@@ -33,15 +33,16 @@ release:
 # `just install` already gives you the rich editor — no flag needed.
 # Override dest:           just install /usr/local/bin
 # Extra features:          just install ~/bin some-crate/some-feature
-# Lean / strip-down build: just install-lean   (rustyline-only, wyvern tier)
+# Lean / strip-down build: just install-lean   (lean crossterm box, wyvern tier)
 install dest=`echo $HOME/bin` features="":
     cargo build --release --bin newt --bin newt-mcp-server {{ if features == "" { "" } else { "--features " + features } }}
     @just _place-binaries {{dest}}
     @echo "Installed: {{dest}}/newt  {{dest}}/newt-mcp-server {{ if features == "" { "" } else { "[features: " + features + "]" } }}"
     @case ":$PATH:" in *":{{dest}}:"*) ;; *) echo "Note: {{dest}} is not in PATH — add:  export PATH={{dest}}:\$PATH" ;; esac
 
-# Install the LEAN strip-down build (rustyline-only, no rich TTY surface) — the
-# wyvern/headless tier. Same as `just install` but with `--no-default-features`.
+# Install the LEAN strip-down build (hand-rolled crossterm lean box, no rich TTY
+# surface) — the wyvern/headless tier. Same as `just install` but with
+# `--no-default-features`.
 install-lean dest=`echo $HOME/bin`:
     cargo build --release --no-default-features --bin newt --bin newt-mcp-server
     @just _place-binaries {{dest}}

@@ -794,15 +794,15 @@ fn today_date() -> String {
 }
 
 // ---------------------------------------------------------------------------
-// File-descriptor hygiene — prevent EMFILE from killing rustyline
+// File-descriptor hygiene — prevent EMFILE from killing the input surface
 // ---------------------------------------------------------------------------
 
 /// Mark every open fd above stderr (`fd > 2`) as `O_CLOEXEC` so that
 /// subprocesses spawned by `run_command` (via agent-bridle / brush) do NOT
 /// inherit the parent's terminal fd, history file handle, or socket fds.
 ///
-/// Call this **after** rustyline and history are initialised so that their
-/// fds are also marked. Safe to call multiple times — already-CLOEXEC fds
+/// Call this **after** the input surface and history are initialised so that
+/// their fds are also marked. Safe to call multiple times — already-CLOEXEC fds
 /// are skipped.
 ///
 /// macOS returns `LONG_MAX` for `sysconf(_SC_OPEN_MAX)`; we cap the sweep
@@ -827,7 +827,7 @@ fn mark_fds_cloexec() {
 
 /// Probe whether the fd table has at least one free slot by attempting to
 /// open the platform null device. Returns `false` when the process is at EMFILE — i.e.,
-/// the next `open("/dev/tty")` by rustyline would fail and panic.
+/// the next `open("/dev/tty")` by the input surface would fail and panic.
 ///
 /// Uses only `std::fs` (no libc dep) so it compiles on all platforms.
 fn terminal_fd_available() -> bool {
@@ -906,8 +906,8 @@ fn trace_mode(cfg: &newt_core::Config) -> bool {
 }
 
 /// Resolve the edit mode from env (`NEWT_EDIT_MODE`) then config file, defaulting
-/// to emacs. The single source of truth for both the rustyline config and the
-/// rich-tui surface (which needs the `nano` distinction rustyline can't express).
+/// to vi. The single source of truth for the lean and rich-tui surfaces (the
+/// latter needs the `nano` distinction the others fold into emacs-style editing).
 pub(crate) fn resolve_edit_mode() -> newt_core::EditMode {
     std::env::var("NEWT_EDIT_MODE")
         .ok()
@@ -961,24 +961,11 @@ pub(crate) fn resolve_gutter_setting() -> Option<u16> {
         .or(Some(1))
 }
 
-/// Build a rustyline config reading edit mode from env then config file.
-pub(crate) fn build_rl_config() -> rustyline::config::Config {
-    rustyline::config::Builder::new()
-        .edit_mode(match resolve_edit_mode() {
-            newt_core::EditMode::Vi => rustyline::config::EditMode::Vi,
-            // rustyline has no nano mode; nano is emacs-style there.
-            newt_core::EditMode::Emacs | newt_core::EditMode::Nano => {
-                rustyline::config::EditMode::Emacs
-            }
-        })
-        .build()
-}
-
 // ---------------------------------------------------------------------------
 // Input footer (the transient multi-line `❯` block — see
 // docs/decisions/plain_scroller_tui.md). It is NOT a pinned region: the
 // separator + status header are printed as ordinary scrolled lines just
-// before each `readline`, the `❯` caret is rustyline's prompt, and the whole
+// before each read, the `❯` caret is the surface's prompt, and the whole
 // thing collapses into scrollback on submit while model output scrolls
 // plainly above it. Off a TTY it degrades to a plain bash-like prompt.
 // ---------------------------------------------------------------------------
@@ -1081,96 +1068,14 @@ fn current_prompt_and_preview(workspace: &str) -> (String, String) {
         .ok()
         .map(|c| resolve_backend_choice(&c).model)
         .unwrap_or_default();
-    let is_vi = build_rl_config().edit_mode() == rustyline::config::EditMode::Vi;
+    let is_vi = resolve_edit_mode() == newt_core::EditMode::Vi;
     let preview = expand_prompt_tokens(&template, workspace, &model, is_vi);
     (template, preview)
 }
 
-/// rustyline helper enabling multi-line entry: a line ending in `\` continues
-/// onto the next line (the shell/Python continuation idiom — portable across
-/// terminals, no special key detection). On submit the caller rejoins
-/// `"\\\n"` to `"\n"`. Installed only when the footer is on; off-mode keeps
-/// today's single-line behavior exactly.
-struct FooterHelper {
-    palette: Palette,
-}
-
-const ANSI_RESET: &str = "\x1b[0m";
-const ANSI_BOLD: &str = "\x1b[1m";
-
-/// Parse a color spec — a named color or `#rrggbb` hex — into RGB. Returns
-/// `None` for an unrecognized name or malformed hex, so the caller falls back
-/// to the slot's built-in default.
-fn parse_color_rgb(spec: &str) -> Option<(u8, u8, u8)> {
-    let s = spec.trim();
-    if let Some(hex) = s.strip_prefix('#') {
-        if hex.len() != 6 {
-            return None;
-        }
-        let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
-        let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
-        let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
-        return Some((r, g, b));
-    }
-    let rgb = match s.to_ascii_lowercase().as_str() {
-        "orange" => (220, 60, 20), // newt orange
-        "black" => (0, 0, 0),
-        "red" => (205, 49, 49),
-        "green" => (13, 188, 121),
-        "yellow" => (229, 229, 16),
-        "blue" => (36, 114, 200),
-        "magenta" | "purple" => (188, 63, 188),
-        "cyan" => (17, 168, 205),
-        "white" => (229, 229, 229),
-        "grey" | "gray" => (128, 128, 128),
-        "darkgrey" | "darkgray" => (85, 85, 85),
-        _ => return None,
-    };
-    Some(rgb)
-}
-
-/// An SGR truecolor foreground escape for `rgb`.
-fn fg_escape(rgb: (u8, u8, u8)) -> String {
-    format!("\x1b[38;2;{};{};{}m", rgb.0, rgb.1, rgb.2)
-}
-
-/// A resolved color palette: each field is a ready-to-print SGR foreground
-/// escape, or empty when color is disabled (`NO_COLOR` / non-TTY).
-#[derive(Clone, Default)]
-struct Palette {
-    accent: String,
-    shell_mode: String,
-    dim: String,
-}
-
-/// Resolve `[tui.colors]` into ready-to-print escapes. Each slot has a built-in
-/// default (accent = bold-orange `!` sigil, shell_mode = amber full-line tint,
-/// dim = grey prompt); an unset/invalid spec keeps the default, an explicit
-/// `"none"`/`"off"` disables that slot, and with color globally off every slot
-/// is empty (highlighting inert).
-fn resolve_palette(colors: &newt_core::ColorsConfig, color_enabled: bool) -> Palette {
-    if !color_enabled {
-        return Palette::default();
-    }
-    let slot = |spec: &Option<String>, default: (u8, u8, u8)| -> String {
-        match spec.as_deref() {
-            // Explicit opt-out of this slot.
-            Some(s) if s.eq_ignore_ascii_case("none") || s.eq_ignore_ascii_case("off") => {
-                String::new()
-            }
-            // A valid override, else (unset/invalid) the built-in default.
-            s => fg_escape(s.and_then(parse_color_rgb).unwrap_or(default)),
-        }
-    };
-    Palette {
-        accent: slot(&colors.accent, (220, 60, 20)),
-        shell_mode: slot(&colors.shell_mode, (200, 140, 60)),
-        dim: slot(&colors.dim, (128, 128, 128)),
-    }
-}
-
 /// If the first line is a lone triple-quote fence (`"""` or `'''`), return it —
 /// the opener of a markdown-style multi-line block.
+#[cfg(feature = "rich-tui")]
 fn block_open_delim(input: &str) -> Option<&'static str> {
     match input.lines().next().unwrap_or("").trim() {
         "\"\"\"" => Some("\"\"\""),
@@ -1181,17 +1086,21 @@ fn block_open_delim(input: &str) -> Option<&'static str> {
 
 /// Whether a `"""`/`'''` block opened on the first line has been closed by a
 /// matching fence on any later line.
+#[cfg(feature = "rich-tui")]
 fn block_is_closed(input: &str, delim: &str) -> bool {
     input.lines().skip(1).any(|l| l.trim() == delim)
 }
 
-/// Whether the input wants another line (the `Validator`'s pure core):
+/// Whether the input wants another line — the multi-line continuation classifier
+/// the rich surface ([`rich_input::RichSurface`]) uses to decide whether Enter
+/// submits or adds a line:
 /// - a **triple-quote block** (`"""`/`'''` alone on the first line) stays open
 ///   until a matching closing fence — Enter adds lines, the closing fence
 ///   submits. The fences are kept and flow to the model as a fenced block.
 /// - a **`! …` host-shell line** continues on a trailing `\` so multi-line shell
 ///   commands work. A chat line submits on Enter even if it ends with `\` (that
 ///   backslash is literal text) — `\`-continuation is bang-only.
+#[cfg(feature = "rich-tui")]
 pub(crate) fn footer_continues(input: &str) -> bool {
     if let Some(delim) = block_open_delim(input) {
         return !block_is_closed(input, delim);
@@ -1199,104 +1108,12 @@ pub(crate) fn footer_continues(input: &str) -> bool {
     input.trim_start().starts_with('!') && input.ends_with('\\')
 }
 
-impl rustyline::completion::Completer for FooterHelper {
-    type Candidate = String;
-}
-impl rustyline::hint::Hinter for FooterHelper {
-    type Hint = String;
-}
-impl rustyline::highlight::Highlighter for FooterHelper {
-    /// Color a `! …` host-shell line with two independent slots: a bold `accent`
-    /// `!` sigil and a `shell_mode` tint over the whole command, so the line
-    /// visibly changes when you escape to the shell. Either slot can be disabled
-    /// (`"none"`) for sigil-only or tint-only; if both are off the line is
-    /// returned unchanged, as is any non-`!` line.
-    fn highlight<'l>(&self, line: &'l str, _pos: usize) -> std::borrow::Cow<'l, str> {
-        let (accent, shell) = (&self.palette.accent, &self.palette.shell_mode);
-        if (accent.is_empty() && shell.is_empty()) || !line.starts_with('!') {
-            return std::borrow::Cow::Borrowed(line);
-        }
-        let rest = &line[1..];
-        let sigil = if accent.is_empty() {
-            "!".to_string()
-        } else {
-            format!("{ANSI_BOLD}{accent}!{ANSI_RESET}")
-        };
-        let body = if shell.is_empty() {
-            rest.to_string()
-        } else {
-            format!("{shell}{rest}{ANSI_RESET}")
-        };
-        std::borrow::Cow::Owned(format!("{sigil}{body}"))
-    }
-    /// Dim the prompt status line so the bright bang-mode line stands out and
-    /// the prompt reads as an at-rest log marker (the plain-scroller intent).
-    fn highlight_prompt<'b, 's: 'b, 'p: 'b>(
-        &'s self,
-        prompt: &'p str,
-        _default: bool,
-    ) -> std::borrow::Cow<'b, str> {
-        if self.palette.dim.is_empty() {
-            return std::borrow::Cow::Borrowed(prompt);
-        }
-        std::borrow::Cow::Owned(format!("{}{prompt}{ANSI_RESET}", self.palette.dim))
-    }
-    /// Re-highlight on each keystroke so the bang coloring appears/clears live
-    /// as `!` is typed or deleted. Active when either bang slot is set; inert
-    /// only when both are off (color fully disabled, or both set to `"none"`).
-    fn highlight_char(&self, _line: &str, _pos: usize, _forced: bool) -> bool {
-        !(self.palette.accent.is_empty() && self.palette.shell_mode.is_empty())
-    }
-}
-impl rustyline::validate::Validator for FooterHelper {
-    fn validate(
-        &self,
-        ctx: &mut rustyline::validate::ValidationContext,
-    ) -> rustyline::Result<rustyline::validate::ValidationResult> {
-        if footer_continues(ctx.input()) {
-            Ok(rustyline::validate::ValidationResult::Incomplete)
-        } else {
-            Ok(rustyline::validate::ValidationResult::Valid(None))
-        }
-    }
-}
-impl rustyline::Helper for FooterHelper {}
-
-/// Install the footer helper on a freshly built editor and bind newt's
-/// multi-line entry keys. These are **newt conventions, not canonical editor
-/// bindings** — three ways to add a line without submitting:
-/// - **Ctrl-O** — reliable in every terminal and in both emacs and vi mode.
-///   NB: this is *not* vi's open-line command. Real vi uses `o`/`O` (POSIX:
-///   "enter text input mode in a new line"), which rustyline's vi mode does not
-///   implement, and a `bind_sequence` cmd cannot enter vi insert mode — so we
-///   bind a free, reliable control key instead (tracked upstream:
-///   kkawakam/rustyline#946). Ctrl-O itself is not a vi command.
-/// - **Shift-Enter** — same, *terminal permitting*: many terminals send a bare
-///   CR for Shift-Enter (indistinguishable from Enter), so it only fires where
-///   the terminal emits a distinct sequence.
-/// - **trailing `\`** — the universal fallback (the `Validator`), works in every
-///   terminal and mode with no special-key detection. Enter submits.
-fn install_footer_helper(
-    rl: &mut rustyline::Editor<FooterHelper, rustyline::history::DefaultHistory>,
-    palette: Palette,
-) {
-    use rustyline::{Cmd, KeyCode, KeyEvent, Modifiers};
-    rl.set_helper(Some(FooterHelper { palette }));
-    // Insert a literal newline without accepting the line. `bind_sequence`
-    // normalizes the key, so `ctrl('o')` matches the incoming Ctrl-O event.
-    rl.bind_sequence(KeyEvent::ctrl('o'), Cmd::Insert(1, "\n".to_owned()));
-    rl.bind_sequence(
-        KeyEvent(KeyCode::Enter, Modifiers::SHIFT),
-        Cmd::Insert(1, "\n".to_owned()),
-    );
-}
-
 /// The result of reading one turn from an [`InputSurface`].
 ///
 /// This is the widget-agnostic vocabulary the chat loop speaks: it never sees a
-/// `rustyline::ReadlineError` directly, so a second surface (the ratatui inline
-/// rich input, issue #416) can satisfy the same contract without leaking its own
-/// error types into `run_chat`.
+/// surface's native error type, so each surface (the lean crossterm box, the
+/// ratatui inline rich input — issue #416) can satisfy the same contract without
+/// leaking its own error types into `run_chat`.
 pub(crate) enum ReadOutcome {
     /// A submitted line. May contain `\`-continued newlines the loop rejoins.
     Line(String),
@@ -1306,7 +1123,7 @@ pub(crate) enum ReadOutcome {
     Eof,
     /// vi `:wq` after its turn ran — exit cleanly AND end the active
     /// conversation (mark `end_reason`) so the next launch starts fresh.
-    /// Only the rich surface produces this; the rustyline path never does, so
+    /// Only the rich surface produces this; the lean surface never does, so
     /// in the lean (`--no-default-features`) build it is constructed nowhere.
     #[cfg_attr(not(feature = "rich-tui"), allow(dead_code))]
     EndAndQuit,
@@ -1321,11 +1138,13 @@ pub(crate) enum ReadOutcome {
 ///
 /// `run_chat` drives the conversation through this trait so the *input widget*
 /// can change without the surrounding dispatch (bang-escape, slash commands,
-/// chat, history) changing with it. Planned impls:
-/// - [`RustylineSurface`] — today's readline path. Used for the non-TTY/piped
-///   path, the headless/wyvern tier, and `\r`-erased spinners. Always built.
-/// - a ratatui inline **rich** surface — TTY multi-line input + status row,
-///   behind a `rich-tui` cargo feature (issue #416, next PR).
+/// chat, history) changing with it. Impls:
+/// - [`lean_input::LeanSurface`] — the hand-rolled crossterm lean box. Used for
+///   the non-TTY/piped path, the headless/wyvern tier, and any non-`rich-tui`
+///   build. Always available.
+/// - [`rich_input::RichSurface`] — a ratatui inline **rich** surface: TTY
+///   multi-line input + status row, behind the `rich-tui` cargo feature
+///   (issue #416).
 pub(crate) trait InputSurface {
     /// Read one turn, given the per-turn `prompt` (built fresh by the caller so
     /// the rich default's timestamp is current). Returns a [`ReadOutcome`];
@@ -1341,270 +1160,14 @@ pub(crate) trait InputSurface {
     /// Update the runtime context (active model + endpoint) shown in the rich
     /// status header (issue #527). Called once per turn before `read_line` so a
     /// `/model` switch is reflected. Default no-op: only the rich surface renders
-    /// it; the lean / rustyline surfaces carry it in the prompt string (or not).
+    /// it; the lean surface carries it in the prompt string (or not).
     fn set_runtime_context(&mut self, _model: &str, _endpoint: &str) {}
-}
-
-/// The default input surface: a rustyline editor with newt's footer helper.
-///
-/// Owns its history path and (when the footer is on) the palette, so it can
-/// reinstall the helper on [`reload`](InputSurface::reload). The EMFILE probe
-/// and the `catch_unwind` around `readline` (PR #184) live here, behind the
-/// trait, as `ReadOutcome::Fatal`.
-struct RustylineSurface {
-    rl: rustyline::Editor<FooterHelper, rustyline::history::DefaultHistory>,
-    history_path: Option<std::path::PathBuf>,
-    /// `Some` when the footer is on — the palette to reinstall on `reload`.
-    palette: Option<Palette>,
-}
-
-impl RustylineSurface {
-    fn new(
-        footer_on: bool,
-        palette: Palette,
-        history_path: Option<std::path::PathBuf>,
-    ) -> anyhow::Result<Self> {
-        let mut rl = rustyline::Editor::with_config(build_rl_config())?;
-        let palette = if footer_on {
-            install_footer_helper(&mut rl, palette.clone());
-            Some(palette)
-        } else {
-            None
-        };
-        if let Some(ref hp) = history_path {
-            let _ = rl.load_history(hp);
-        }
-        Ok(Self {
-            rl,
-            history_path,
-            palette,
-        })
-    }
-}
-
-impl InputSurface for RustylineSurface {
-    fn read_line(&mut self, prompt: &str) -> anyhow::Result<ReadOutcome> {
-        // Layer 2: probe for EMFILE before rustyline tries to open /dev/tty, so
-        // we give a clean message when the fd table is already full.
-        if !terminal_fd_available() {
-            let _ = disable_raw_mode();
-            return Ok(ReadOutcome::Fatal(
-                "\nnewt: EMFILE — file descriptor table is full.\n      \
-                 Too many subprocesses (e.g. cargo test workers) inherited fds.\n      \
-                 Restart newt. The O_CLOEXEC fix prevents recurrence on rebuilt binaries."
-                    .to_string(),
-            ));
-        }
-        // Layer 3 (PR #184): rustyline can panic (`assert fd != -1`) when the
-        // tty fd becomes invalid. Catch it before it crosses the non-unwindable
-        // tokio boundary and convert it into a clean exit. `AssertUnwindSafe` is
-        // safe: editor state may be inconsistent after a panic, but we return
-        // immediately and drop it rather than reusing it.
-        let res =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.rl.readline(prompt)));
-        let line = match res {
-            Ok(r) => r,
-            Err(_panic) => {
-                let _ = disable_raw_mode();
-                return Ok(ReadOutcome::Fatal(
-                    "\nnewt: terminal error — readline panicked (likely fd exhaustion).\n      \
-                     Restart newt. If this recurs, reduce concurrent subprocesses."
-                        .to_string(),
-                ));
-            }
-        };
-        match line {
-            Ok(s) => Ok(ReadOutcome::Line(s)),
-            Err(rustyline::error::ReadlineError::Interrupted) => Ok(ReadOutcome::Interrupted),
-            Err(rustyline::error::ReadlineError::Eof) => Ok(ReadOutcome::Eof),
-            Err(e) => Err(e.into()),
-        }
-    }
-
-    fn add_history(&mut self, entry: &str) {
-        let _ = self.rl.add_history_entry(entry);
-    }
-
-    fn save_history(&mut self) {
-        if let Some(ref hp) = self.history_path {
-            let _ = self.rl.save_history(hp);
-        }
-    }
-
-    fn reload(&mut self) -> anyhow::Result<()> {
-        self.rl = rustyline::Editor::with_config(build_rl_config())?;
-        if let Some(ref pal) = self.palette {
-            install_footer_helper(&mut self.rl, pal.clone());
-        }
-        if let Some(ref hp) = self.history_path {
-            let _ = self.rl.load_history(hp);
-        }
-        Ok(())
-    }
-}
-
-#[cfg(test)]
-mod input_surface_tests {
-    use super::*;
-
-    fn off_palette() -> Palette {
-        Palette::default()
-    }
-
-    #[test]
-    fn builds_with_footer_off_and_on() {
-        // Footer off: no palette retained.
-        let s = RustylineSurface::new(false, off_palette(), None).expect("build off");
-        assert!(s.palette.is_none(), "footer off keeps no palette");
-        // Footer on: palette retained for reinstall on reload.
-        let s = RustylineSurface::new(true, off_palette(), None).expect("build on");
-        assert!(s.palette.is_some(), "footer on retains the palette");
-    }
-
-    #[test]
-    fn missing_history_file_is_not_an_error() {
-        let dir = tempfile::tempdir().unwrap();
-        let hp = dir.path().join("does-not-exist-history");
-        // load_history on a missing path is swallowed; construction still succeeds.
-        let mut s = RustylineSurface::new(false, off_palette(), Some(hp.clone())).expect("build");
-        // save_history creates the file even if it did not exist.
-        s.add_history("alpha");
-        s.save_history();
-        assert!(hp.exists(), "save_history writes the history file");
-    }
-
-    #[test]
-    fn add_then_save_persists_entries() {
-        let dir = tempfile::tempdir().unwrap();
-        let hp = dir.path().join("history");
-        let mut s = RustylineSurface::new(false, off_palette(), Some(hp.clone())).expect("build");
-        s.add_history("first command");
-        s.add_history("second command");
-        s.save_history();
-        let contents = std::fs::read_to_string(&hp).expect("history file readable");
-        assert!(contents.contains("first command"), "first entry persisted");
-        assert!(
-            contents.contains("second command"),
-            "second entry persisted"
-        );
-    }
-
-    #[test]
-    fn save_history_without_path_is_a_noop() {
-        let mut s = RustylineSurface::new(false, off_palette(), None).expect("build");
-        s.add_history("ephemeral");
-        // No path, no panic, nothing to assert beyond "does not blow up".
-        s.save_history();
-    }
-
-    #[test]
-    fn reload_rebuilds_and_reloads_history() {
-        let dir = tempfile::tempdir().unwrap();
-        let hp = dir.path().join("history");
-        std::fs::write(&hp, "earlier entry\n").unwrap();
-        let mut s = RustylineSurface::new(true, off_palette(), Some(hp)).expect("build");
-        // A `/vi` / `/emacs` switch triggers reload; it must rebuild cleanly.
-        s.reload().expect("reload succeeds");
-        assert!(s.palette.is_some(), "reload preserves the footer palette");
-    }
 }
 
 #[cfg(test)]
 mod footer_tests {
     use super::*;
     use newt_core::FooterMode;
-    use rustyline::highlight::Highlighter;
-
-    #[test]
-    fn parse_color_named_and_hex() {
-        assert_eq!(parse_color_rgb("orange"), Some((220, 60, 20)));
-        assert_eq!(
-            parse_color_rgb("Orange"),
-            Some((220, 60, 20)),
-            "case-insensitive"
-        );
-        assert_eq!(parse_color_rgb("grey"), Some((128, 128, 128)));
-        assert_eq!(parse_color_rgb("gray"), Some((128, 128, 128)), "alias");
-        assert_eq!(parse_color_rgb("#dc3c14"), Some((220, 60, 20)));
-        // Unrecognized name / malformed hex → None (caller uses the default).
-        assert_eq!(parse_color_rgb("chartreuse"), None);
-        assert_eq!(parse_color_rgb("#12"), None);
-        assert_eq!(parse_color_rgb("#gggggg"), None);
-    }
-
-    #[test]
-    fn resolve_palette_off_is_inert_and_on_uses_defaults() {
-        let colors = newt_core::ColorsConfig::default();
-        // Color disabled → every slot empty, so highlighting is a no-op.
-        let off = resolve_palette(&colors, false);
-        assert!(off.accent.is_empty() && off.shell_mode.is_empty() && off.dim.is_empty());
-        // Enabled with no overrides → two-color defaults: bold-orange sigil,
-        // amber full-line tint, grey prompt.
-        let on = resolve_palette(&colors, true);
-        assert_eq!(on.accent, fg_escape((220, 60, 20)));
-        assert_eq!(
-            on.shell_mode,
-            fg_escape((200, 140, 60)),
-            "amber line tint on by default"
-        );
-        assert_eq!(on.dim, fg_escape((128, 128, 128)));
-        // A valid override wins; an invalid spec falls back to the default;
-        // `"none"` disables a slot.
-        let overridden = newt_core::ColorsConfig {
-            accent: Some("not-a-color".into()),
-            shell_mode: Some("cyan".into()),
-            dim: Some("none".into()),
-        };
-        let p = resolve_palette(&overridden, true);
-        assert_eq!(
-            p.accent,
-            fg_escape((220, 60, 20)),
-            "invalid → default orange"
-        );
-        assert_eq!(p.shell_mode, fg_escape((17, 168, 205)), "cyan override");
-        assert!(p.dim.is_empty(), "\"none\" disables the slot");
-    }
-
-    #[test]
-    fn highlight_tints_sigil_and_line_independently() {
-        let helper = FooterHelper {
-            palette: resolve_palette(&newt_core::ColorsConfig::default(), true),
-        };
-        // A chat line is returned unchanged (borrowed, no escapes).
-        assert_eq!(helper.highlight("hello there", 0), "hello there");
-        // A bang line: bold-orange `!` sigil + amber-tinted command.
-        let bang = helper.highlight("! pa login", 0).into_owned();
-        let expected = format!(
-            "{ANSI_BOLD}{}!{ANSI_RESET}{} pa login{ANSI_RESET}",
-            fg_escape((220, 60, 20)),
-            fg_escape((200, 140, 60)),
-        );
-        assert_eq!(bang, expected, "two-color: bold sigil + line tint");
-        // `shell_mode = "none"` → sigil only (command stays plain).
-        let sigil_only = FooterHelper {
-            palette: resolve_palette(
-                &newt_core::ColorsConfig {
-                    shell_mode: Some("none".into()),
-                    ..Default::default()
-                },
-                true,
-            ),
-        };
-        let so = sigil_only.highlight("! pa login", 0).into_owned();
-        assert_eq!(
-            so,
-            format!(
-                "{ANSI_BOLD}{}!{ANSI_RESET} pa login",
-                fg_escape((220, 60, 20))
-            ),
-            "sigil-only when line tint disabled"
-        );
-        // With color disabled the same line is untouched.
-        let plain = FooterHelper {
-            palette: resolve_palette(&newt_core::ColorsConfig::default(), false),
-        };
-        assert_eq!(plain.highlight("! pa login", 0), "! pa login");
-    }
 
     #[test]
     fn rich_follows_mode_and_tty() {
@@ -1675,6 +1238,7 @@ mod footer_tests {
         }
     }
 
+    #[cfg(feature = "rich-tui")]
     #[test]
     fn backslash_continuation_is_bang_only() {
         // A `! …` host-shell line continues on a trailing backslash.
@@ -1688,6 +1252,7 @@ mod footer_tests {
         assert_eq!("foo\\\nbar".replace("\\\n", "\n"), "foo\nbar");
     }
 
+    #[cfg(feature = "rich-tui")]
     #[test]
     fn triple_quote_block_stays_open_until_closed() {
         // `"""`/`'''` alone on line 1 opens a block; it stays open until a
@@ -1711,7 +1276,7 @@ mod footer_tests {
     }
 }
 
-/// Build the rustyline prompt string for this turn — PS1 tokens expanded, a
+/// Build the input-surface prompt string for this turn — PS1 tokens expanded, a
 /// fresh timestamp each call.
 ///
 /// Precedence: `NEWT_PROMPT` env > `[tui] prompt` config > built-in default.
@@ -3903,8 +3468,8 @@ fn run_chat(
     // Input history file and tokio runtime for async inference.
     let history_path = newt_core::Config::user_config_path().map(|p| p.with_file_name("history"));
 
-    // Use the existing tokio runtime from main — block_in_place lets rustyline
-    // block the thread while still allowing block_on() inside it.
+    // Use the existing tokio runtime from main — block_in_place lets the input
+    // surface block the thread while still allowing block_on() inside it.
     let rt = tokio::runtime::Handle::current();
 
     // Resolve config ONCE per session and reuse it for every read this turn.
@@ -4097,42 +3662,24 @@ fn run_chat(
     // fresh each turn (below) so the timestamp is current.
     let footer_on = footer_rich_enabled(footer_mode(), io::stdout().is_terminal());
     // Input goes through the InputSurface seam so the chat dispatch below is
-    // widget-agnostic. Three morphologies:
+    // widget-agnostic. Two morphologies:
     //  - footer ON + TTY + `rich-tui` feature → the ratatui inline RICH surface
     //    (issue #416);
-    //  - footer OFF (`-n` / `--plain` / `NEWT_FOOTER=off`, or piped/headless) →
-    //    the dead-simple LEAN text box (issue #527), the flight/wyvern morphology;
-    //  - footer ON but off a TTY (e.g. `[tui] footer = "on"` piped) → the
-    //    rustyline rich single-line prompt (kept until rustyline is retired).
-    // The palette is resolved unconditionally (it is pure) and only installed by
-    // the rustyline surface when the footer is on.
-    let colors = resolve_tui(&cfg).map(|t| t.colors).unwrap_or_default();
+    //  - otherwise (footer OFF via `-n` / `--plain` / `NEWT_FOOTER=off`, piped /
+    //    headless, or a non-`rich-tui` build) → the dead-simple LEAN crossterm
+    //    text box (issue #527), the flight/wyvern morphology.
     let mut surface: Box<dyn InputSurface> = {
         #[cfg(feature = "rich-tui")]
         {
             if footer_on && io::stdout().is_terminal() {
                 Box::new(rich_input::RichSurface::new(history_path)?)
-            } else if !footer_on {
-                Box::new(lean_input::LeanSurface::new(history_path)?)
             } else {
-                Box::new(RustylineSurface::new(
-                    footer_on,
-                    resolve_palette(&colors, color),
-                    history_path,
-                )?)
+                Box::new(lean_input::LeanSurface::new(history_path)?)
             }
         }
         #[cfg(not(feature = "rich-tui"))]
         {
-            if !footer_on {
-                Box::new(lean_input::LeanSurface::new(history_path)?)
-            } else {
-                Box::new(RustylineSurface::new(
-                    footer_on,
-                    resolve_palette(&colors, color),
-                    history_path,
-                )?)
-            }
+            Box::new(lean_input::LeanSurface::new(history_path)?)
         }
     };
     // Mark all open fds (terminal, history file, sockets) as O_CLOEXEC so
@@ -4142,7 +3689,7 @@ fn run_chat(
     mark_fds_cloexec();
 
     // `mut` so a runtime `/vi` / `/emacs` switch is reflected in the next prompt.
-    let mut is_vi = build_rl_config().edit_mode() == rustyline::config::EditMode::Vi;
+    let mut is_vi = resolve_edit_mode() == newt_core::EditMode::Vi;
 
     // system prompt is built AFTER initialize_all (see below) so soul files are loaded.
     // Placeholder until then.
@@ -4376,8 +3923,8 @@ fn run_chat(
         };
 
     loop {
-        // rustyline can panic (assertion `fd != -1`) when the terminal file
-        // descriptor becomes invalid — most commonly from file-descriptor
+        // The input surface can panic (assertion `fd != -1`) when the terminal
+        // file descriptor becomes invalid — most commonly from file-descriptor
         // exhaustion after spawning many subprocesses (e.g., `cargo test`
         // with multiple compile workers). Without this guard the panic
         // propagates through a non-unwindable tokio boundary and the process
@@ -4385,13 +3932,13 @@ fn run_chat(
         //
         // `catch_unwind` catches the panic before it reaches that boundary and
         // converts it into a clean exit. `AssertUnwindSafe` is safe here:
-        // `DefaultEditor` state may be inconsistent after a panic, but we
+        // the surface's editor state may be inconsistent after a panic, but we
         // immediately `break` out of the loop and drop it rather than
         // continuing to use it.
-        // Layer 2: probe for EMFILE before rustyline tries to open /dev/tty.
+        // Layer 2: probe for EMFILE before the surface tries to open /dev/tty.
         // Catching the panic (Layer 3 / PR #184) remains as a last resort, but
         // this check fires first and gives a cleaner message when the fd table
-        // is already full before readline even starts.
+        // is already full before reading even starts.
         let outcome = if let Some(corrective) = pending_retry.take() {
             // retry technique (2b): run the queued corrective re-prompt as this
             // turn's input instead of reading from the user. The budget was already
@@ -4789,7 +4336,7 @@ fn run_chat(
                     // surface from fresh config so the next read uses the new
                     // mode, then keep is_vi in sync for the next prompt.
                     surface.reload()?;
-                    is_vi = build_rl_config().edit_mode() == rustyline::config::EditMode::Vi;
+                    is_vi = resolve_edit_mode() == newt_core::EditMode::Vi;
                 } else if matches!(task.as_str(), "exit" | "quit") {
                     clean_exit = true;
                     break;
