@@ -493,7 +493,12 @@ impl Vi {
                 }
             }
             ':' => self.ex = Some(String::new()),
-            _ => {}
+            // #530: an unbound NORMAL key (e.g. `q`) used to do nothing at all,
+            // leaving a user who didn't realise the prompt is modal stuck with
+            // no feedback. Nudge them toward INSERT.
+            _ => {
+                self.msg = Some("vi NORMAL — press i to insert · :help for commands".to_string());
+            }
         }
         Step::Continue
     }
@@ -1551,6 +1556,23 @@ mod tests {
             ed.input(key(c), ta);
         }
         ed.input(special(KeyCode::Enter), ta)
+    }
+
+    #[test]
+    fn vi_unbound_normal_key_emits_a_hint() {
+        // #530: an unbound NORMAL key gives feedback instead of silently
+        // swallowing the keypress.
+        let mut ed = vi_editor();
+        let mut ta = new_textarea(Edit::Vi);
+        type_chars(&mut ed, &mut ta, "hi");
+        ed.input(special(KeyCode::Esc), &mut ta); // → NORMAL
+        let _ = ed.take_msg(); // drain anything prior
+        ed.input(key('q'), &mut ta); // unbound in NORMAL
+        let msg = ed
+            .take_msg()
+            .expect("an unbound NORMAL key should surface a hint");
+        assert!(msg.contains("insert"), "hint nudges toward insert: {msg:?}");
+        assert_eq!(ta.lines(), &["hi"], "`q` still types nothing in NORMAL");
     }
 
     #[test]
