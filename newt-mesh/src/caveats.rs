@@ -78,14 +78,47 @@ impl From<MeshError> for CaveatsError {
 /// — i.e. the authority *this peer itself* holds, which is by construction
 /// `⊑` every ancestor along the chain.
 ///
+/// This is the **context-free** verification ([`CertChain::verify`]): a chain
+/// that is *generation-scoped* (any link declares a bounded
+/// `valid_for_generation`) is refused fail-closed — a scope that cannot be
+/// checked must never be silently honoured. Use [`caveats_for_peer_at`] with
+/// the mesh's current generation to consume those (agent-mesh's §9.1 causal
+/// revocation axis).
+///
 /// # Errors
 ///
-/// - [`CaveatsError::Verification`] if any signature in the chain fails or
-///   the chain is structurally inconsistent.
+/// - [`CaveatsError::Verification`] if any signature in the chain fails, the
+///   chain is structurally inconsistent, or a link is generation-scoped
+///   (verify it via [`caveats_for_peer_at`] instead).
 /// - [`CaveatsError::Amplification`] if any link grants more authority than
 ///   its parent.
 pub fn caveats_for_peer(cert: &CertChain) -> Result<&Caveats, CaveatsError> {
     cert.verify()?;
+    Ok(&cert.metadata.caveats)
+}
+
+/// Like [`caveats_for_peer`], but verifies the chain against a known
+/// **current generation** — agent-mesh's causal revocation axis (§9.1).
+///
+/// A cert whose chain declares a bounded `valid_for_generation` (a peer scoped
+/// to specific generations) cannot be consumed by the context-free
+/// [`caveats_for_peer`], which fail-closes on it. Pass the mesh's current
+/// generation here to honour the scope: the chain verifies only if **every**
+/// link is valid for `current_generation` (bumping the generation is how an
+/// earlier-scoped peer is revoked, pull-based and without any wall-clock).
+///
+/// # Errors
+///
+/// - [`CaveatsError::Verification`] if any signature fails, the chain is
+///   structurally inconsistent, or a link is not valid for
+///   `current_generation`.
+/// - [`CaveatsError::Amplification`] if any link grants more authority than
+///   its parent.
+pub fn caveats_for_peer_at(
+    cert: &CertChain,
+    current_generation: u64,
+) -> Result<&Caveats, CaveatsError> {
+    cert.verify_at(current_generation)?;
     Ok(&cert.metadata.caveats)
 }
 
@@ -180,11 +213,53 @@ mod tests {
             fixture_metadata("attenuated-peer", attenuated.clone()),
         );
 
-        let caveats = caveats_for_peer(agent.cert()).expect("valid attenuated cert verifies");
+        // The cert is generation-scoped (valid_for_generation = {42}), so it
+        // must be verified against a current generation it is valid for —
+        // context-free extraction is refused fail-closed (see the test below).
+        let caveats = caveats_for_peer_at(agent.cert(), 42)
+            .expect("valid attenuated cert verifies at gen 42");
         assert_eq!(caveats, &attenuated);
         // Sanity: attenuated authority is strictly below ⊤.
         assert!(caveats.leq(&Caveats::top()));
         assert!(!Caveats::top().leq(caveats));
+    }
+
+    /// A generation-scoped cert is refused by the **context-free**
+    /// `caveats_for_peer` (fail-closed: a scope that can't be checked must not
+    /// be silently honoured) — but extracts cleanly via `caveats_for_peer_at`
+    /// at a generation it is valid for, and is rejected at one it is not.
+    #[test]
+    fn generation_scoped_cert_requires_a_current_generation() {
+        let scoped = Caveats {
+            valid_for_generation: Scope::only([7u64]),
+            ..Caveats::top()
+        };
+        let user = UserKey::generate();
+        let agent = AgentKey::issue(&user, fixture_metadata("gen-scoped-peer", scoped.clone()));
+
+        // Context-free: refused fail-closed.
+        assert!(matches!(
+            caveats_for_peer(agent.cert()),
+            Err(CaveatsError::Verification(_))
+        ));
+        // Verified at the generation it is valid for: extracts the caveats.
+        let caveats = caveats_for_peer_at(agent.cert(), 7).expect("verifies at gen 7");
+        assert_eq!(caveats, &scoped);
+        // Verified at a generation it is NOT valid for: refused.
+        assert!(matches!(
+            caveats_for_peer_at(agent.cert(), 8),
+            Err(CaveatsError::Verification(_))
+        ));
+    }
+
+    /// An unscoped (`valid_for_generation = ⊤`) cert verifies under either
+    /// surface — context-free or at any current generation.
+    #[test]
+    fn unscoped_cert_verifies_either_way() {
+        let user = UserKey::generate();
+        let agent = AgentKey::issue(&user, fixture_metadata("peer", Caveats::top()));
+        assert!(caveats_for_peer(agent.cert()).is_ok());
+        assert!(caveats_for_peer_at(agent.cert(), 99).is_ok());
     }
 
     /// Delegated (multi-link) chain whose every link is properly attenuated
