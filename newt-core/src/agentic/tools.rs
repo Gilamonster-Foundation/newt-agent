@@ -725,6 +725,40 @@ struct FindOpts<'a> {
     case_sensitive: bool,
 }
 
+/// One-line summary of a `find` invocation for the tool trace (#529): the path
+/// plus only the *non-default* filters, so two searches with different filters
+/// don't both render as a bare `find: .`. Defaults (any type, unlimited depth,
+/// the 1000-match cap, gitignore-respecting, case-sensitive) are omitted.
+fn find_detail(path: &str, opts: &FindOpts) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(name) = opts.name {
+        parts.push(format!("name={name}"));
+    }
+    match opts.type_filter {
+        FindType::Files => parts.push("type=f".to_string()),
+        FindType::Dirs => parts.push("type=d".to_string()),
+        FindType::Any => {}
+    }
+    if let Some(d) = opts.max_depth {
+        parts.push(format!("depth={d}"));
+    }
+    // Mirrors the parse default in the `find` arm.
+    if opts.max_results != 1000 {
+        parts.push(format!("max={}", opts.max_results));
+    }
+    if !opts.respect_gitignore {
+        parts.push("no-gitignore".to_string());
+    }
+    if !opts.case_sensitive {
+        parts.push("icase".to_string());
+    }
+    if parts.is_empty() {
+        path.to_string()
+    } else {
+        format!("{path} ({})", parts.join(", "))
+    }
+}
+
 /// Translate a shell-style basename glob (`*`, `?`) into an anchored regex.
 /// Every other character is matched literally (regex metacharacters escaped),
 /// so `pyo3_module.rs` matches only that exact basename, not `pyo3Xmodulexrs`.
@@ -1336,7 +1370,24 @@ pub async fn execute_tool(
                     return msg;
                 }
             }
-            print_tool_call("find", path, color);
+            let opts = FindOpts {
+                name: args["name"].as_str(),
+                type_filter: match args["type"].as_str() {
+                    Some("f") => FindType::Files,
+                    Some("d") => FindType::Dirs,
+                    _ => FindType::Any,
+                },
+                max_depth: args["max_depth"].as_u64().map(|d| d as usize),
+                max_results: args["max_results"]
+                    .as_u64()
+                    .map(|m| m as usize)
+                    .unwrap_or(1000),
+                respect_gitignore: args["respect_gitignore"].as_bool().unwrap_or(true),
+                case_sensitive: args["case_sensitive"].as_bool().unwrap_or(true),
+            };
+            // #529: echo the active filters, not a bare `find: .` — two very
+            // different searches must not render identically in the trace.
+            print_tool_call("find", &find_detail(path, &opts), color);
             if !full.exists() {
                 return format!("error: no such path '{path}'");
             }
@@ -1353,21 +1404,6 @@ pub async fn execute_tool(
                     return msg;
                 }
             }
-            let opts = FindOpts {
-                name: args["name"].as_str(),
-                type_filter: match args["type"].as_str() {
-                    Some("f") => FindType::Files,
-                    Some("d") => FindType::Dirs,
-                    _ => FindType::Any,
-                },
-                max_depth: args["max_depth"].as_u64().map(|d| d as usize),
-                max_results: args["max_results"]
-                    .as_u64()
-                    .map(|m| m as usize)
-                    .unwrap_or(1000),
-                respect_gitignore: args["respect_gitignore"].as_bool().unwrap_or(true),
-                case_sensitive: args["case_sensitive"].as_bool().unwrap_or(true),
-            };
             match find_walk(&full, std::path::Path::new(workspace), &opts) {
                 Ok((hits, truncated)) => {
                     let mut listing = if hits.is_empty() {
@@ -1496,6 +1532,48 @@ pub(crate) fn tool_result_ok(result: &str) -> bool {
 mod tests {
     use super::*;
     use crate::agentic::NoMcp;
+
+    #[test]
+    fn find_detail_bare_path_has_no_filters() {
+        let opts = FindOpts {
+            name: None,
+            type_filter: FindType::Any,
+            max_depth: None,
+            max_results: 1000,
+            respect_gitignore: true,
+            case_sensitive: true,
+        };
+        assert_eq!(find_detail(".", &opts), ".");
+    }
+
+    #[test]
+    fn find_detail_shows_only_non_default_filters() {
+        let opts = FindOpts {
+            name: Some("*.rs"),
+            type_filter: FindType::Files,
+            max_depth: Some(2),
+            max_results: 50,
+            respect_gitignore: false,
+            case_sensitive: false,
+        };
+        assert_eq!(
+            find_detail("src", &opts),
+            "src (name=*.rs, type=f, depth=2, max=50, no-gitignore, icase)"
+        );
+    }
+
+    #[test]
+    fn find_detail_omits_each_default_independently() {
+        let opts = FindOpts {
+            name: None,
+            type_filter: FindType::Dirs,
+            max_depth: None,
+            max_results: 1000,
+            respect_gitignore: true,
+            case_sensitive: true,
+        };
+        assert_eq!(find_detail(".", &opts), ". (type=d)");
+    }
 
     #[test]
     fn use_skill_tool_is_advertised_in_definitions() {
