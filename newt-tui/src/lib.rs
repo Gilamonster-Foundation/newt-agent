@@ -1338,6 +1338,11 @@ pub(crate) trait InputSurface {
     /// Rebuild the editor from fresh config — used after a `/vi` · `/emacs`
     /// edit-mode switch so the next read reflects the new mode.
     fn reload(&mut self) -> anyhow::Result<()>;
+    /// Update the runtime context (active model + endpoint) shown in the rich
+    /// status header (issue #527). Called once per turn before `read_line` so a
+    /// `/model` switch is reflected. Default no-op: only the rich surface renders
+    /// it; the lean / rustyline surfaces carry it in the prompt string (or not).
+    fn set_runtime_context(&mut self, _model: &str, _endpoint: &str) {}
 }
 
 /// The default input surface: a rustyline editor with newt's footer helper.
@@ -4401,6 +4406,9 @@ fn run_chat(
             // submit — no region, no cursor games. The EMFILE probe and the
             // panic guard now live inside the surface (returned as `Fatal`).
             let prompt = prompt_str(workspace, is_vi, &inf_model, footer_on);
+            // Refresh the rich status header's model @ endpoint each turn (#527)
+            // so a mid-session `/model` switch is reflected (no-op for lean).
+            surface.set_runtime_context(&inf_model, &inf_url);
             surface.read_line(&prompt)?
         };
         match outcome {
