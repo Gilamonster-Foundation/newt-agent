@@ -65,7 +65,11 @@ use tui_textarea::{CursorMove, TextArea};
 
 use crate::{footer_continues, InputSurface, ReadOutcome};
 
-const GUTTER_W: u16 = 19; // fits the widest label "[HH:MM:SS] emacs ❯ " (vi uses "vi N"/"vi I")
+// Opt-in wide-gutter width (`NEWT_GUTTER=auto`/`tui.gutter=N`): a fixed left
+// column for the input-row indicator. Since #527 the clock/mode/model live on the
+// status header row, so the gutter only carries `❯`/`:` — this stays a generous
+// fixed width for the opt-in aligned layout; the default is the 1-col overhang.
+const GUTTER_W: u16 = 19;
 const MAX_INPUT_ROWS: u16 = 8;
 /// Auto-gutter threshold: use the left gutter only while it stays under this
 /// fraction of the terminal width; on a squished terminal, drop it and stack
