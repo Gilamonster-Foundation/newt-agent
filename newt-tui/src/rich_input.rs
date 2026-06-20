@@ -841,6 +841,20 @@ impl Editor {
         }
     }
 
+    /// The status-header mode word (issue #527): `vi --INSERT--` / `vi --NORMAL--`
+    /// for vi, else the bare editor name. Reflects the LIVE mode — the surface
+    /// redraws every frame, so the header tracks Esc/i with no extra machinery.
+    fn header_mode(&self) -> &'static str {
+        match self.edit {
+            Edit::Emacs => "emacs",
+            Edit::Nano => "nano",
+            Edit::Vi => match self.vi.mode {
+                Mode::Insert => "vi --INSERT--",
+                Mode::Normal => "vi --NORMAL--",
+            },
+        }
+    }
+
     /// The `[y/N]` question to render while a confirmation is pending (vi only),
     /// e.g. after `:wq`. `None` when nothing is awaiting an answer.
     fn confirm_prompt(&self) -> Option<&'static str> {
@@ -941,19 +955,46 @@ fn status_options() -> Option<String> {
     (!parts.is_empty()).then(|| parts.join(" "))
 }
 
-/// The rich surface's native live status row. The PS1 token prompt
-/// (`[tui] prompt` / `$TIMESTAMP …`) is the RUSTYLINE surface's job — it lands in
-/// logfiles — so the rich surface always renders THIS row.
+/// The rich surface's two-line live view (issue #527): a status HEADER row
+/// (`[header_line`]) over an input-indicator row ([`prompt_line`]). The PS1 token
+/// prompt (`[tui] prompt`) is the LEAN/rustyline surface's job (it lands in
+/// logfiles); the rich surface renders these instead.
 ///
-/// `[clock]` always; an optional `[options]` block (session overrides) only when
-/// present. The editor MODE is the indicator itself: `❯` for input/INSERT, a
-/// bold bright `:` for vi NORMAL, `:cmd` for an open ex-line. The bracket fields
-/// are the accent color while you're typing (`active`) and dim on an empty line,
-/// where a dim mode hint (clears as you type) also shows. Colors favor
-/// light/high-luminance tones (the accessibility default).
-fn prompt_line(editor: &Editor, active: bool, ex_inline: bool) -> Line<'static> {
+/// The header is `[YYYY-MM-DD HH:MM:SS] vi --INSERT-- <model> @ <endpoint>` plus
+/// an optional `[options]` session-override block. The clock + editor mode update
+/// live (the event loop redraws every frame). `active` (the line has content)
+/// brightens the mode word; colors favor light/high-luminance tones (the
+/// accessibility default).
+fn header_line(editor: &Editor, model: &str, endpoint: &str, active: bool) -> Line<'static> {
+    let accent = Color::Rgb(255, 165, 90);
+    let dim = Color::DarkGray;
+    let stamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let mut spans: Vec<Span> = vec![Span::styled(format!("[{stamp}]"), Style::default().fg(dim))];
+    spans.push(Span::styled(
+        format!(" {}", editor.header_mode()),
+        Style::default().fg(if active { accent } else { dim }),
+    ));
+    if !model.is_empty() {
+        let loc = if endpoint.is_empty() {
+            model.to_string()
+        } else {
+            format!("{model} @ {endpoint}")
+        };
+        spans.push(Span::styled(format!(" {loc}"), Style::default().fg(dim)));
+    }
+    if let Some(opts) = status_options() {
+        spans.push(Span::styled(format!(" [{opts}]"), Style::default().fg(dim)));
+    }
+    Line::from(spans)
+}
+
+/// The input-row indicator (below [`header_line`]): `❯ ` for input/INSERT, a bold
+/// bright `: ` for vi NORMAL, `:cmd` for an open ex-line, or the `[y/N]`
+/// confirmation. The input begins right after it, so the cursor anchors here and
+/// the dim mode hint (drawn by `draw_overhang` on an empty line) sits after it.
+fn prompt_line(editor: &Editor, ex_inline: bool) -> Line<'static> {
     if let Some(question) = editor.confirm_prompt() {
-        // A pending [y/N] confirmation replaces the row until answered.
+        // A pending [y/N] confirmation replaces the input-row prompt until answered.
         return Line::from(Span::styled(
             question.to_string(),
             Style::default()
@@ -962,43 +1003,21 @@ fn prompt_line(editor: &Editor, active: bool, ex_inline: bool) -> Line<'static> 
         ));
     }
     let accent = Color::Rgb(255, 165, 90);
-    let bracket = if active { accent } else { Color::DarkGray };
     let bold_hi = Style::default()
         .fg(Color::LightYellow)
         .add_modifier(Modifier::BOLD);
-
-    let clock = chrono::Local::now().format("%H:%M:%S").to_string();
-    let mut spans: Vec<Span> = vec![Span::styled(
-        format!("[{clock}]"),
-        Style::default().fg(bracket),
-    )];
-    if let Some(opts) = status_options() {
-        spans.push(Span::styled(
-            format!("[{opts}]"),
-            Style::default().fg(bracket),
-        ));
-    }
-
-    // An open ex-line (`:command` being typed): the highlighted `:` IS the mode
-    // marker; show the command after it. Only inline on a single-line buffer —
-    // multi-line moves the command to its own bottom row (#531; see `draw`).
+    // An open ex-line is inline only on a single-line buffer; a multi-line
+    // `:`-command moves to its own bottom row (#531; see `draw`).
     if ex_inline {
         if let Some(ex) = editor.ex() {
-            spans.push(Span::styled(format!(" :{ex}"), bold_hi));
-            return Line::from(spans);
+            return Line::from(Span::styled(format!(":{ex}"), bold_hi));
         }
     }
-
-    // The mode indicator: a bold bright `:` for vi NORMAL, else the `❯`. This is
-    // where the input begins, so the cursor anchors right after it — the dim
-    // mode hint (rendered by `draw_overhang` on an empty line) sits AFTER the
-    // cursor, like a placeholder, instead of pushing it to the end of the row.
     if editor.is_vi_normal() {
-        spans.push(Span::styled(" : ", bold_hi));
+        Line::from(Span::styled(": ", bold_hi))
     } else {
-        spans.push(Span::styled(" ❯ ", Style::default().fg(accent)));
+        Line::from(Span::styled("❯ ", Style::default().fg(accent)))
     }
-    Line::from(spans)
 }
 
 /// The `:`-command text to render on a dedicated **bottom** row (vi-style) —
@@ -1011,27 +1030,42 @@ fn ex_bottom_line(editor: &Editor, textarea: &TextArea) -> Option<String> {
         .map(str::to_string)
 }
 
-fn draw(f: &mut Frame, textarea: &TextArea, editor: &Editor, gutter: Option<u16>) {
+fn draw(
+    f: &mut Frame,
+    textarea: &TextArea,
+    editor: &Editor,
+    gutter: Option<u16>,
+    model: &str,
+    endpoint: &str,
+) {
     let area = f.area();
-    // "active" = the line has content, so the brackets brighten and the dim
-    // mode hint clears as you type. The hint shows only on an empty line.
+    // "active" = the line has content, so the header mode word brightens and the
+    // dim mode hint clears as you type. The hint shows only on an empty line.
     let empty = buffer_is_empty(textarea);
-    let g = resolve_gutter(gutter, area.width);
+    // Two-line layout (#527): the status header on row 0, the input row(s) below.
+    let [header_area, input_area] =
+        Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(area);
+    f.render_widget(
+        Paragraph::new(header_line(editor, model, endpoint, !empty)),
+        header_area,
+    );
+    let g = resolve_gutter(gutter, input_area.width);
 
     // #531: a `:`-command on a multi-line buffer renders on its own row at the
-    // bottom, vi-style — not glued to the first row's chevron. The message above
-    // keeps its normal prompt; the real cursor sits on the command line.
+    // bottom of the input area, vi-style — not glued to the first row's chevron.
+    // The message above keeps its normal prompt; the real cursor sits on the
+    // command line.
     if let Some(ex) = ex_bottom_line(editor, textarea) {
-        let [input_area, ex_area] =
-            Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(area);
-        let prompt = prompt_line(editor, !empty, false);
+        let [msg_area, ex_area] =
+            Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(input_area);
+        let prompt = prompt_line(editor, false);
         if g >= GUTTER_W {
             let [gutter_area, input] =
-                Layout::horizontal([Constraint::Length(g), Constraint::Min(1)]).areas(input_area);
+                Layout::horizontal([Constraint::Length(g), Constraint::Min(1)]).areas(msg_area);
             f.render_widget(Paragraph::new(prompt), gutter_area);
             f.render_widget(textarea, input);
         } else {
-            draw_overhang(f, input_area, &prompt, textarea, g, None);
+            draw_overhang(f, msg_area, &prompt, textarea, g, None);
         }
         let bold_hi = Style::default()
             .fg(Color::LightYellow)
@@ -1047,19 +1081,19 @@ fn draw(f: &mut Frame, textarea: &TextArea, editor: &Editor, gutter: Option<u16>
         return;
     }
 
-    let prompt = prompt_line(editor, !empty, true);
+    let prompt = prompt_line(editor, true);
     let hint = empty.then(|| editor.mode_hint());
     if g >= GUTTER_W {
         // Wide gutter (opt-in): prompt in a fixed left column, input to its
         // right — continuation lines align under the input at column `g`.
         let [gutter_area, input] =
-            Layout::horizontal([Constraint::Length(g), Constraint::Min(1)]).areas(area);
+            Layout::horizontal([Constraint::Length(g), Constraint::Min(1)]).areas(input_area);
         f.render_widget(Paragraph::new(prompt), gutter_area);
         f.render_widget(textarea, input);
     } else {
         // Overhang (the default): the prompt prefixes the FIRST input row inline
         // (`❯ this`); continuation rows hang-indent by `g` columns (default 1).
-        draw_overhang(f, area, &prompt, textarea, g, hint);
+        draw_overhang(f, input_area, &prompt, textarea, g, hint);
     }
 }
 
@@ -1204,15 +1238,19 @@ fn draw_overhang(
 /// input used (default 1), so a multi-line prompt reads back exactly as typed
 /// rather than being re-flowed to a different indent on submit.
 fn echo_submitted(terminal: &mut Term, body: &str, gutter: Option<u16>) -> io::Result<()> {
-    let stamp = chrono::Local::now().format("%H:%M:%S").to_string();
+    let stamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
     let width = crossterm::terminal::size().map(|(c, _)| c).unwrap_or(80);
     let hang = " ".repeat(resolve_gutter(gutter, width) as usize);
     let n = body.lines().count().max(1) as u16;
+    let dim = Style::default().fg(Color::DarkGray);
+    // Two-line committed form (#527): the full-datetime header on its own row,
+    // then the body behind a DIMMED `›` — the live `❯` frozen into an at-rest
+    // log marker. Header (1) + one row per body line.
     terminal.insert_before(n + 1, |buf| {
-        let mut lines: Vec<Line> = Vec::new();
+        let mut lines: Vec<Line> = vec![Line::from(Span::styled(format!("[{stamp}]"), dim))];
         for (i, l) in body.lines().enumerate() {
             let prefix = if i == 0 {
-                Span::styled(format!("[{stamp}] ❯ "), Style::default().fg(Color::Gray))
+                Span::styled("›  ", dim)
             } else {
                 Span::raw(hang.clone())
             };
@@ -1256,6 +1294,11 @@ pub(crate) struct RichSurface {
     /// the turn runs to completion before the session ends. A `Cell` because
     /// the event loop runs behind `&self`.
     pending_end_quit: Cell<bool>,
+    /// The active model + endpoint shown in the status header (#527), refreshed
+    /// each turn via [`InputSurface::set_runtime_context`] so a `/model` switch
+    /// is reflected. Empty until the first turn sets them.
+    model: String,
+    endpoint: String,
 }
 
 impl RichSurface {
@@ -1266,6 +1309,8 @@ impl RichSurface {
             unsaved: Vec::new(),
             gutter: crate::resolve_gutter_setting(),
             pending_end_quit: Cell::new(false),
+            model: String::new(),
+            endpoint: String::new(),
         })
     }
 
@@ -1319,7 +1364,7 @@ impl RichSurface {
                 textarea.lines().len() as u16
             } else {
                 let empty = buffer_is_empty(&textarea);
-                let prompt = prompt_line(&editor, !empty, ex_extra == 0);
+                let prompt = prompt_line(&editor, ex_extra == 0);
                 overhang_rows(
                     &prompt,
                     textarea.lines(),
@@ -1331,7 +1376,8 @@ impl RichSurface {
                 .0
                 .len() as u16
             };
-            let want = (rows + ex_extra).clamp(1, MAX_INPUT_ROWS);
+            // #531 ex-bottom row + #527 status header row both add height.
+            let want = (rows + ex_extra).clamp(1, MAX_INPUT_ROWS) + 1;
             if want != cur_h {
                 // Blank the CURRENT region before resizing. ratatui reserves
                 // space for a taller inline viewport by scrolling whatever is on
@@ -1344,7 +1390,14 @@ impl RichSurface {
                 cur_h = want;
             }
             terminal.draw(|f| {
-                draw(f, &textarea, &editor, self.gutter);
+                draw(
+                    f,
+                    &textarea,
+                    &editor,
+                    self.gutter,
+                    &self.model,
+                    &self.endpoint,
+                );
             })?;
 
             // 250ms timeout drives the live clock when idle.
@@ -1478,6 +1531,13 @@ impl InputSurface for RichSurface {
         self.edit = current_edit();
         self.gutter = crate::resolve_gutter_setting();
         Ok(())
+    }
+
+    fn set_runtime_context(&mut self, model: &str, endpoint: &str) {
+        // Refresh the status-header model @ endpoint each turn (#527) so a
+        // mid-session `/model` switch shows up on the next prompt.
+        self.model = model.to_string();
+        self.endpoint = endpoint.to_string();
     }
 }
 
@@ -1643,8 +1703,10 @@ mod tests {
             "multi-line ex → bottom row"
         );
 
-        let mut term = Terminal::new(TestBackend::new(40, 3)).unwrap();
-        term.draw(|f| draw(f, &ta, &ed, Some(1))).unwrap();
+        // Two-line layout (#527): row 0 is the status header; the message renders
+        // below it, and the `:`-command on the last (bottom) row.
+        let mut term = Terminal::new(TestBackend::new(40, 4)).unwrap();
+        term.draw(|f| draw(f, &ta, &ed, Some(1), "", "")).unwrap();
         let buf = term.backend().buffer();
         let row = |y: u16| -> String {
             (0..40)
@@ -1652,19 +1714,18 @@ mod tests {
                 .collect::<String>()
         };
         assert!(
-            row(2).starts_with(":wq"),
+            row(3).starts_with(":wq"),
             "command on the bottom row: {:?}",
-            row(2)
+            row(3)
         );
         assert!(
-            row(0).contains("hello"),
-            "message stays on top: {:?}",
-            row(0)
+            row(1).contains("hello"),
+            "message renders below the header: {:?}",
+            row(1)
         );
         assert!(
-            !row(0).contains(":wq"),
-            "command must NOT be glued to row 0: {:?}",
-            row(0)
+            !row(0).contains(":wq") && !row(1).contains(":wq"),
+            "command must NOT be glued to the input rows"
         );
     }
 
@@ -1680,7 +1741,7 @@ mod tests {
             ex_bottom_line(&ed, &ta).is_none(),
             "single-line stays inline"
         );
-        let line = prompt_line(&ed, true, true);
+        let line = prompt_line(&ed, true);
         let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.contains(":wq"), "single-line ex is inline: {text:?}");
     }
@@ -1696,15 +1757,15 @@ mod tests {
         ed.input(special(KeyCode::Esc), &mut ta);
         ed.input(key(':'), &mut ta);
         type_chars(&mut ed, &mut ta, "wq");
-        let mut term = Terminal::new(TestBackend::new(80, 3)).unwrap();
-        term.draw(|f| draw(f, &ta, &ed, Some(25))).unwrap(); // 25 >= GUTTER_W (19)
+        let mut term = Terminal::new(TestBackend::new(80, 4)).unwrap();
+        term.draw(|f| draw(f, &ta, &ed, Some(25), "", "")).unwrap(); // 25 >= GUTTER_W (19)
         let buf = term.backend().buffer();
-        let row2: String = (0..80)
-            .map(|x| buf.cell((x, 2)).unwrap().symbol().to_string())
+        let last: String = (0..80)
+            .map(|x| buf.cell((x, 3)).unwrap().symbol().to_string())
             .collect();
         assert!(
-            row2.starts_with(":wq"),
-            "command on the bottom row (wide gutter): {row2:?}"
+            last.starts_with(":wq"),
+            "command on the bottom row (wide gutter): {last:?}"
         );
     }
 
@@ -1715,31 +1776,48 @@ mod tests {
         let editor = vi_editor();
         // Two input lines (as if a `o`/newline added a continuation).
         let ta = TextArea::new(vec!["this".to_string(), "more".to_string()]);
-        let mut term = Terminal::new(TestBackend::new(40, 2)).unwrap();
+        // Width 80 so the full status header fits (it clips on a narrow term);
+        // height 3: row 0 = status header (#527), rows 1-2 = the input.
+        let mut term = Terminal::new(TestBackend::new(80, 3)).unwrap();
         // gutter = 1 → the overhang layout (the default).
-        term.draw(|f| draw(f, &ta, &editor, Some(1))).unwrap();
+        term.draw(|f| draw(f, &ta, &editor, Some(1), "m", "http://e:1"))
+            .unwrap();
         let buf = term.backend().buffer();
         let row = |y: u16| -> String {
-            (0..40)
+            (0..80)
                 .map(|x| buf.cell((x, y)).unwrap().symbol().to_string())
                 .collect::<String>()
         };
-        // Row 0: the prompt prefixes the first input line inline (`❯ this`).
+        // Row 0: the status header (two-line layout, #527).
         assert!(
-            row(0).contains("❯ this"),
-            "first input line rides on the prompt row: {:?}",
+            row(0).contains("vi --INSERT--") && row(0).contains("m @ http://e:1"),
+            "header row carries mode + model @ endpoint: {:?}",
             row(0)
         );
-        // Row 1: continuation hangs by exactly one space, not the prompt width.
+        // Row 1: the prompt prefixes the first input line inline (`❯ this`).
         assert!(
-            row(1).starts_with(" more"),
-            "continuation is 1-space hang-indented: {:?}",
+            row(1).contains("❯ this"),
+            "first input line rides on the prompt row: {:?}",
             row(1)
+        );
+        // Row 2: continuation hangs by exactly one space, not the prompt width.
+        assert!(
+            row(2).starts_with(" more"),
+            "continuation is 1-space hang-indented: {:?}",
+            row(2)
         );
     }
 
-    fn row_text(editor: &Editor, active: bool) -> String {
-        prompt_line(editor, active, true)
+    fn row_text(editor: &Editor) -> String {
+        prompt_line(editor, true)
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect()
+    }
+
+    fn header_text(editor: &Editor, model: &str, endpoint: &str) -> String {
+        header_line(editor, model, endpoint, true)
             .spans
             .iter()
             .map(|s| s.content.as_ref())
@@ -1748,12 +1826,30 @@ mod tests {
 
     #[test]
     fn native_status_row_shows_the_insert_indicator() {
-        // The prompt LINE carries the clock + `❯` indicator (the dim mode hint
-        // lives in the draw layer now — it's rendered after the cursor on an
-        // empty line, see `overhang_rows_cursor_sits_on_the_hint_not_after_it`).
+        // The input row carries the `❯` indicator; the header carries the clock,
+        // mode word, and model @ endpoint (two-line layout, #527).
         let editor = vi_editor();
-        assert!(row_text(&editor, false).contains('❯'), "insert indicator");
-        assert!(row_text(&editor, true).contains('❯'));
+        assert!(row_text(&editor).contains('❯'), "insert indicator");
+    }
+
+    #[test]
+    fn header_shows_datetime_mode_and_model_endpoint() {
+        let insert = vi_editor(); // starts in INSERT
+        let h = header_text(&insert, "nemotron-3-nano:30b", "http://dgx1.home.lab:11434");
+        assert!(h.starts_with('['), "datetime stamp: {h:?}");
+        assert!(h.contains("vi --INSERT--"), "{h:?}");
+        assert!(
+            h.contains("nemotron-3-nano:30b @ http://dgx1.home.lab:11434"),
+            "{h:?}"
+        );
+        // NORMAL flips the mode word live.
+        let mut normal = vi_editor();
+        let mut ta = TextArea::default();
+        normal.input(special(KeyCode::Esc), &mut ta);
+        assert!(header_text(&normal, "m", "e").contains("vi --NORMAL--"));
+        // emacs/nano show the bare editor name; empty model omits the `@`.
+        assert!(header_text(&emacs_editor(), "m", "e").contains("emacs"));
+        assert!(!header_text(&insert, "", "").contains('@'));
     }
 
     #[test]
@@ -1768,14 +1864,14 @@ mod tests {
         let mut normal = vi_editor();
         let mut ta = TextArea::default();
         normal.input(special(KeyCode::Esc), &mut ta); // INSERT → NORMAL
-        let row = row_text(&normal, true);
+        let row = row_text(&normal);
         assert!(!row.contains('❯'), "NORMAL drops the ❯ for `:`: {row:?}");
         // An open ex-line shows the typed command (still no ❯).
         let mut ex = vi_editor();
         ex.input(special(KeyCode::Esc), &mut ta);
         ex.input(key(':'), &mut ta);
         ex.input(key('w'), &mut ta);
-        let exrow = row_text(&ex, true);
+        let exrow = row_text(&ex);
         assert!(exrow.contains(":w"), "ex line shows the command: {exrow:?}");
         assert!(!exrow.contains('❯'));
     }
