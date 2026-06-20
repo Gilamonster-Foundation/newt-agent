@@ -1395,8 +1395,12 @@ pub async fn chat_complete(
             // Cargo-style reasoning spinner: TTY-gated (`color`) and opt-out via
             // `[tui] thinking = "off"`. Never in a pipe / `newt worker`.
             let show_thinking = color && thinking_stream_enabled();
+            // #528: models that stream a lone-leading `</think>` (Nemotron et al.)
+            // need the filter to start inside the reasoning block so the closer
+            // and the reasoning it follows don't leak into the reply.
+            let leading_reasoning = crate::reasoning::emits_leading_reasoning(model);
             let (streamed, stream_usage) =
-                stream_response(sresp, color, show_thinking, cancel).await?;
+                stream_response(sresp, color, show_thinking, leading_reasoning, cancel).await?;
 
             if streamed.is_empty() {
                 // The streaming re-issue produced no tokens. Fall back to the
@@ -3075,6 +3079,7 @@ async fn stream_response(
     resp: reqwest::Response,
     color: bool,
     show_thinking: bool,
+    leading_reasoning: bool,
     cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> anyhow::Result<(String, Option<crate::TokenUsage>)> {
     let mut spinner = show_thinking.then(|| ThinkingSpinner::new(color));
@@ -3083,7 +3088,13 @@ async fn stream_response(
     let mut usage: Option<crate::TokenUsage> = None;
     // #385: suppress inline <think>…</think> reasoning from the live stream + the
     // accumulated reply, even when a tag is split across token boundaries.
-    let mut think = crate::reasoning::ThinkFilter::new();
+    // #528: models that emit a lone leading `</think>` (no opener) start the
+    // filter *inside* the reasoning block so the closer + reasoning don't leak.
+    let mut think = if leading_reasoning {
+        crate::reasoning::ThinkFilter::with_leading_reasoning()
+    } else {
+        crate::reasoning::ThinkFilter::new()
+    };
 
     let mut resp = resp;
     // Race each chunk read against the interrupt flag so Esc stops the token

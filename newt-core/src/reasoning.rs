@@ -89,6 +89,12 @@ fn non_empty(s: &str) -> Option<String> {
 #[derive(Debug, Default)]
 pub struct ThinkFilter {
     inside: bool,
+    /// `inside` was *assumed* (lone-leading-closer mode) rather than entered via
+    /// a literal `<think>`, so buffered content is only provisionally reasoning:
+    /// if no `</think>` ever arrives it is flushed as clean (the model wasn't
+    /// actually emitting reasoning), so a reply is never lost. See
+    /// [`with_leading_reasoning`](Self::with_leading_reasoning).
+    implicit: bool,
     buf: String,
 }
 
@@ -97,6 +103,25 @@ impl ThinkFilter {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A filter that begins *inside* a reasoning block — for models that stream
+    /// the **lone-leading-closer** shape (`reasoning</think>answer`, with no
+    /// opening `<think>`), e.g. Nemotron with `detailed thinking on`. Everything
+    /// up to the first `</think>` is treated as reasoning, matching
+    /// [`split_reasoning`]'s batch handling of the same shape (#528).
+    ///
+    /// The leading block is held *provisionally*: if a `</think>` never arrives
+    /// (the model wasn't actually reasoning — e.g. thinking turned off), the
+    /// buffered text is flushed as clean by [`finish`](Self::finish), so a reply
+    /// is never dropped. Gate via [`emits_leading_reasoning`].
+    #[must_use]
+    pub fn with_leading_reasoning() -> Self {
+        Self {
+            inside: true,
+            implicit: true,
+            buf: String::new(),
+        }
     }
 
     /// Feed one streamed token; returns the clean text to emit now (may be empty).
@@ -120,8 +145,16 @@ impl ThinkFilter {
                         reasoning.push_str(&self.buf[..i]);
                         self.buf.drain(..i + CLOSE.len());
                         self.inside = false; // continue: there may be clean text after
+                        self.implicit = false; // the closer resolved a leading block
                     }
                     None => {
+                        if self.implicit {
+                            // Assumed leading reasoning: keep everything buffered
+                            // until a closer proves it was reasoning. finish()
+                            // flushes it as clean if none ever arrives, so a
+                            // non-thinking reply is not lost.
+                            break;
+                        }
                         // Suppress reasoning, but keep a trailing partial `</think>`.
                         let cut = safe_len(&self.buf, CLOSE);
                         reasoning.push_str(&self.buf[..cut]);
@@ -152,15 +185,35 @@ impl ThinkFilter {
     /// Flush at end of stream: emits any buffered clean tail (an unterminated
     /// `<think>` leaves its reasoning suppressed).
     pub fn finish(&mut self) -> String {
-        let out = if self.inside {
+        // A real unterminated `<think>` suppresses its reasoning; an *assumed*
+        // (implicit) leading block that never closed turned out to be the reply
+        // itself, so flush it as clean — no data loss for a non-thinking model.
+        let out = if self.inside && !self.implicit {
             String::new()
         } else {
             std::mem::take(&mut self.buf)
         };
         self.buf.clear();
         self.inside = false;
+        self.implicit = false;
         out
     }
+}
+
+/// Whether a model streams its chain-of-thought as a **lone leading closer**
+/// (`reasoning</think>answer`, with no opening `<think>`) — the shape Nemotron
+/// (`detailed thinking on`), DeepSeek-R1, and Qwen3 emit. Such models need
+/// [`ThinkFilter::with_leading_reasoning`] so the streamed reasoning (and the
+/// bare `</think>`) is suppressed rather than printed into the reply.
+///
+/// Name-based stopgap until a per-model capability card carries this flag
+/// (#384); matched case-insensitively against the known families.
+#[must_use]
+pub fn emits_leading_reasoning(model: &str) -> bool {
+    let m = model.to_ascii_lowercase();
+    ["nemotron", "deepseek-r1", "qwen3"]
+        .iter()
+        .any(|fam| m.contains(fam))
 }
 
 /// The length of `buf` that is safe to commit (emit *or* discard) without splitting
@@ -297,5 +350,63 @@ mod tests {
             stream("", &["answer ", "<think>still ", "thinking"]),
             "answer "
         );
+    }
+
+    /// Drive the leading-reasoning filter; returns `(clean, reasoning)`.
+    fn stream_leading(tokens: &[&str]) -> (String, String) {
+        let mut f = ThinkFilter::with_leading_reasoning();
+        let (mut clean, mut reasoning) = (String::new(), String::new());
+        for t in tokens {
+            let (c, r) = f.feed_split(t);
+            clean.push_str(&c);
+            reasoning.push_str(&r);
+        }
+        clean.push_str(&f.finish());
+        (clean, reasoning)
+    }
+
+    #[test]
+    fn leading_reasoning_strips_lone_closer() {
+        // The Nemotron shape: reasoning, a bare `</think>`, then the answer —
+        // no opening `<think>`. Matches the batch `lone_leading_closer_is_reasoning`.
+        let (clean, reasoning) = stream_leading(&["reasoning", "</think>", "the answer"]);
+        assert_eq!(clean, "the answer");
+        assert_eq!(reasoning, "reasoning");
+    }
+
+    #[test]
+    fn leading_reasoning_handles_closer_split_across_tokens() {
+        let (clean, reasoning) = stream_leading(&["reason", "ing</thi", "nk>the ", "answer"]);
+        assert_eq!(clean, "the answer");
+        assert_eq!(reasoning, "reasoning");
+    }
+
+    #[test]
+    fn leading_reasoning_without_closer_flushes_as_clean() {
+        // A flagged model that emits no `</think>` (e.g. thinking turned off)
+        // must still get its full reply — provisional reasoning is flushed as
+        // clean, never lost.
+        let (clean, reasoning) = stream_leading(&["a plain ", "reply with ", "no tags"]);
+        assert_eq!(clean, "a plain reply with no tags");
+        assert_eq!(reasoning, "");
+    }
+
+    #[test]
+    fn leading_reasoning_tolerates_a_paired_block() {
+        // Even if a flagged model does emit an opener, the literal tag is folded
+        // into the (discarded) reasoning and the answer stays clean.
+        let (clean, _r) = stream_leading(&["<think>r</think>", "answer"]);
+        assert_eq!(clean, "answer");
+    }
+
+    #[test]
+    fn emits_leading_reasoning_matches_known_families() {
+        assert!(emits_leading_reasoning("nemotron-3-nano:30b"));
+        assert!(emits_leading_reasoning("nemotron3:33b"));
+        assert!(emits_leading_reasoning("deepseek-r1:7b"));
+        assert!(emits_leading_reasoning("qwen3:8b"));
+        assert!(!emits_leading_reasoning("llama3:8b"));
+        assert!(!emits_leading_reasoning("qwen2.5-coder:7b"));
+        assert!(!emits_leading_reasoning("gpt-4o"));
     }
 }
