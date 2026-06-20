@@ -944,7 +944,7 @@ fn status_options() -> Option<String> {
 /// are the accent color while you're typing (`active`) and dim on an empty line,
 /// where a dim mode hint (clears as you type) also shows. Colors favor
 /// light/high-luminance tones (the accessibility default).
-fn prompt_line(editor: &Editor, active: bool) -> Line<'static> {
+fn prompt_line(editor: &Editor, active: bool, ex_inline: bool) -> Line<'static> {
     if let Some(question) = editor.confirm_prompt() {
         // A pending [y/N] confirmation replaces the row until answered.
         return Line::from(Span::styled(
@@ -973,10 +973,13 @@ fn prompt_line(editor: &Editor, active: bool) -> Line<'static> {
     }
 
     // An open ex-line (`:command` being typed): the highlighted `:` IS the mode
-    // marker; show the command after it.
-    if let Some(ex) = editor.ex() {
-        spans.push(Span::styled(format!(" :{ex}"), bold_hi));
-        return Line::from(spans);
+    // marker; show the command after it. Only inline on a single-line buffer —
+    // multi-line moves the command to its own bottom row (#531; see `draw`).
+    if ex_inline {
+        if let Some(ex) = editor.ex() {
+            spans.push(Span::styled(format!(" :{ex}"), bold_hi));
+            return Line::from(spans);
+        }
     }
 
     // The mode indicator: a bold bright `:` for vi NORMAL, else the `❯`. This is
@@ -991,14 +994,54 @@ fn prompt_line(editor: &Editor, active: bool) -> Line<'static> {
     Line::from(spans)
 }
 
+/// The `:`-command text to render on a dedicated **bottom** row (vi-style) —
+/// only when an ex command is open AND the buffer spans multiple lines (#531).
+/// On a single line the inline chevron↔`:` swap is kept (see `prompt_line`).
+fn ex_bottom_line(editor: &Editor, textarea: &TextArea) -> Option<String> {
+    editor
+        .ex()
+        .filter(|_| textarea.lines().len() > 1)
+        .map(str::to_string)
+}
+
 fn draw(f: &mut Frame, textarea: &TextArea, editor: &Editor, gutter: Option<u16>) {
     let area = f.area();
     // "active" = the line has content, so the brackets brighten and the dim
     // mode hint clears as you type. The hint shows only on an empty line.
     let empty = buffer_is_empty(textarea);
-    let prompt = prompt_line(editor, !empty);
-    let hint = empty.then(|| editor.mode_hint());
     let g = resolve_gutter(gutter, area.width);
+
+    // #531: a `:`-command on a multi-line buffer renders on its own row at the
+    // bottom, vi-style — not glued to the first row's chevron. The message above
+    // keeps its normal prompt; the real cursor sits on the command line.
+    if let Some(ex) = ex_bottom_line(editor, textarea) {
+        let [input_area, ex_area] =
+            Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(area);
+        let prompt = prompt_line(editor, !empty, false);
+        if g >= GUTTER_W {
+            let [gutter_area, input] =
+                Layout::horizontal([Constraint::Length(g), Constraint::Min(1)]).areas(input_area);
+            f.render_widget(Paragraph::new(prompt), gutter_area);
+            f.render_widget(textarea, input);
+        } else {
+            draw_overhang(f, input_area, &prompt, textarea, g, None);
+        }
+        let bold_hi = Style::default()
+            .fg(Color::LightYellow)
+            .add_modifier(Modifier::BOLD);
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(format!(":{ex}"), bold_hi))),
+            ex_area,
+        );
+        let cx = ex_area.x + 1 + ex.chars().count() as u16;
+        if cx <= ex_area.right().saturating_sub(1) {
+            f.set_cursor_position((cx, ex_area.y));
+        }
+        return;
+    }
+
+    let prompt = prompt_line(editor, !empty, true);
+    let hint = empty.then(|| editor.mode_hint());
     if g >= GUTTER_W {
         // Wide gutter (opt-in): prompt in a fixed left column, input to its
         // right — continuation lines align under the input at column `g`.
@@ -1263,11 +1306,13 @@ impl RichSurface {
             // (not the logical-line count); the wide-gutter widget path is one
             // row per logical line.
             let term_w = crossterm::terminal::size().map(|(c, _)| c).unwrap_or(80);
+            // #531: a multi-line `:`-command reserves an extra bottom row.
+            let ex_extra = u16::from(ex_bottom_line(&editor, &textarea).is_some());
             let rows = if resolve_gutter(self.gutter, term_w) >= GUTTER_W {
                 textarea.lines().len() as u16
             } else {
                 let empty = buffer_is_empty(&textarea);
-                let prompt = prompt_line(&editor, !empty);
+                let prompt = prompt_line(&editor, !empty, ex_extra == 0);
                 overhang_rows(
                     &prompt,
                     textarea.lines(),
@@ -1279,7 +1324,7 @@ impl RichSurface {
                 .0
                 .len() as u16
             };
-            let want = rows.clamp(1, MAX_INPUT_ROWS);
+            let want = (rows + ex_extra).clamp(1, MAX_INPUT_ROWS);
             if want != cur_h {
                 // Blank the CURRENT region before resizing. ratatui reserves
                 // space for a taller inline viewport by scrolling whatever is on
@@ -1576,6 +1621,87 @@ mod tests {
     }
 
     #[test]
+    fn vi_ex_command_renders_on_a_bottom_row_when_multiline() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        // #531: a `:`-command on a multi-line buffer belongs on its own bottom
+        // row, vi-style — not glued to the first row's prompt.
+        let mut ed = vi_editor();
+        let mut ta = TextArea::new(vec!["hello".to_string(), "world".to_string()]);
+        ed.input(special(KeyCode::Esc), &mut ta); // INSERT → NORMAL
+        ed.input(key(':'), &mut ta); // open the ex line
+        type_chars(&mut ed, &mut ta, "wq");
+        assert!(
+            ex_bottom_line(&ed, &ta).is_some(),
+            "multi-line ex → bottom row"
+        );
+
+        let mut term = Terminal::new(TestBackend::new(40, 3)).unwrap();
+        term.draw(|f| draw(f, &ta, &ed, Some(1))).unwrap();
+        let buf = term.backend().buffer();
+        let row = |y: u16| -> String {
+            (0..40)
+                .map(|x| buf.cell((x, y)).unwrap().symbol().to_string())
+                .collect::<String>()
+        };
+        assert!(
+            row(2).starts_with(":wq"),
+            "command on the bottom row: {:?}",
+            row(2)
+        );
+        assert!(
+            row(0).contains("hello"),
+            "message stays on top: {:?}",
+            row(0)
+        );
+        assert!(
+            !row(0).contains(":wq"),
+            "command must NOT be glued to row 0: {:?}",
+            row(0)
+        );
+    }
+
+    #[test]
+    fn vi_ex_command_stays_inline_on_a_single_line() {
+        // Single line keeps the inline chevron↔`:` swap (the part the user likes).
+        let mut ed = vi_editor();
+        let mut ta = TextArea::new(vec!["hi".to_string()]);
+        ed.input(special(KeyCode::Esc), &mut ta);
+        ed.input(key(':'), &mut ta);
+        type_chars(&mut ed, &mut ta, "wq");
+        assert!(
+            ex_bottom_line(&ed, &ta).is_none(),
+            "single-line stays inline"
+        );
+        let line = prompt_line(&ed, true, true);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains(":wq"), "single-line ex is inline: {text:?}");
+    }
+
+    #[test]
+    fn vi_ex_command_bottom_row_in_wide_gutter_mode() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        // Same as the overhang case but through the wide-gutter render path
+        // (gutter >= GUTTER_W) — the `:command` still lands on the bottom row.
+        let mut ed = vi_editor();
+        let mut ta = TextArea::new(vec!["hello".to_string(), "world".to_string()]);
+        ed.input(special(KeyCode::Esc), &mut ta);
+        ed.input(key(':'), &mut ta);
+        type_chars(&mut ed, &mut ta, "wq");
+        let mut term = Terminal::new(TestBackend::new(80, 3)).unwrap();
+        term.draw(|f| draw(f, &ta, &ed, Some(25))).unwrap(); // 25 >= GUTTER_W (19)
+        let buf = term.backend().buffer();
+        let row2: String = (0..80)
+            .map(|x| buf.cell((x, 2)).unwrap().symbol().to_string())
+            .collect();
+        assert!(
+            row2.starts_with(":wq"),
+            "command on the bottom row (wide gutter): {row2:?}"
+        );
+    }
+
+    #[test]
     fn overhang_prompt_is_inline_with_one_space_hanging_continuation() {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
@@ -1606,7 +1732,7 @@ mod tests {
     }
 
     fn row_text(editor: &Editor, active: bool) -> String {
-        prompt_line(editor, active)
+        prompt_line(editor, active, true)
             .spans
             .iter()
             .map(|s| s.content.as_ref())
