@@ -42,11 +42,22 @@ Defender-exclusion step before the toolchain/cache steps. Kept clippy+test in
 one job so the speedup is attributable to these levers alone, against the ~6 min
 baseline.
 
-### Results
+### Results (PR #544)
 
-| Run | Baseline | After iter 1 |
-|---|---|---|
-| `Windows build + test` wall-clock | ~5m56s | _TBD — fill from the PR's CI run_ |
+| Run | `Windows build + test` wall-clock |
+|---|---|
+| Baseline (warm cache, before this PR) | ~5m56s |
+| Iter 1, **cold** first run (env change rotated the cache key) | 6m29s |
+| Iter 1, **warm** cache (re-run, same commit) | **4m50s** |
+
+**~66s / ~18.5% faster in steady state.** Important cache subtlety:
+`Swatinem/rust-cache` folds `CARGO_*` / `RUST*` env vars into its cache key, so
+adding the profile/incremental env vars **rotates the key once** — the first run
+after this change (or after any future `CARGO_*`/lockfile/rustc change) pays a
+one-time cold-build cost (~6.5 min), then steady-state runs land at ~4m50s.
+
+Verdict: keep iter 1. The Defender exclusion + no-debuginfo are the load-bearing
+wins; incremental-off is a small, safe extra.
 
 ## Next, if iteration 1 isn't enough
 
