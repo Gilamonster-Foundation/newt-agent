@@ -51,7 +51,7 @@ pub fn git_tool_definition() -> serde_json::Value {
                 "properties": {
                     "op": {
                         "type": "string",
-                        "enum": ["status", "log", "diff", "add", "commit", "amend", "branch", "rebase"],
+                        "enum": ["status", "log", "diff", "add", "commit", "amend", "branch", "rebase", "checkout", "pull", "fetch", "push", "branch-delete"],
                         "description": "The git operation to run."
                     },
                     "onto": {
