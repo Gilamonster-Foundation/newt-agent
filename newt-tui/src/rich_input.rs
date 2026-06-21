@@ -723,14 +723,17 @@ impl Editor {
         }
         if ctrl {
             match key.code {
-                // Ctrl-C abandons the current line (clear it, fresh start) and
-                // stays in the session — it does NOT exit. Exit is C-x C-c
-                // (emacs) / ^X (nano) / `:q` (vi) / `/exit`. This matches a
-                // shell's "^C gives me a clean line" reflex.
+                // Ctrl-C at the prompt abandons the current line (clear it, fresh
+                // start) and stays in the session — it does NOT exit. During a
+                // turn Ctrl-C interrupts (see `watch_for_interrupt`); exit is
+                // Ctrl-D / `:q` / `/exit`. The hint makes the mapping discoverable
+                // (repeated Ctrl-C just re-shows it). Matches a shell's "^C gives
+                // me a clean line" reflex.
                 KeyCode::Char('c') => {
                     *ta = new_textarea(self.edit);
                     self.vi = Vi::new();
                     self.cx_pending = false;
+                    self.vi.msg = Some("Ctrl-C to interrupt · Ctrl-D to exit".to_string());
                     return Step::Continue;
                 }
                 KeyCode::Char('d') => {
@@ -826,11 +829,15 @@ impl Editor {
     fn mode_hint(&self) -> &'static str {
         match self.edit {
             Edit::Vi => match self.vi.mode {
-                Mode::Insert => "vi INSERT — Esc: NORMAL · :help · /nano /emacs available",
-                Mode::Normal => "vi NORMAL — i: insert · :cmd · /nano /emacs available",
+                Mode::Insert => {
+                    "vi INSERT — Esc: NORMAL · :help · /nano /emacs · ^C interrupt · ^D exit"
+                }
+                Mode::Normal => {
+                    "vi NORMAL — i: insert · :cmd · /nano /emacs · ^C interrupt · ^D exit"
+                }
             },
-            Edit::Emacs => "emacs — Enter sends · Ctrl-h help · /vi /nano available",
-            Edit::Nano => "nano — Enter sends · ^G help · /vi /emacs available",
+            Edit::Emacs => "emacs — Enter sends · Ctrl-h help · /vi /nano · ^C interrupt · ^D exit",
+            Edit::Nano => "nano — Enter sends · ^G help · /vi /emacs · ^C interrupt · ^D exit",
         }
     }
 
