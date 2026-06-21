@@ -14,13 +14,21 @@ slice — `newt-tui/src/forge_context.rs` + `newt-core/src/forge_resolvers.rs`
 ## TL;DR
 
 newt can recognize a family of well-known invocations — forge URLs, and CLI
-calls like `gh`, `glab`, `git`, `curl`, `wget`, `find`, `grep`, `python`, … —
-**parse them structurally (AST)**, and **handle them transparently** so the
-model isn't tripped up by which tools are embedded vs. shelled-out (the #552
-confusion). The non-negotiable constraint: this convenience layer must **not**
-reintroduce ambient authority. It is a **parser + capability router**, never an
-authority *source*. Ambient `python`/`bash` — unconfined code execution — is the
-limit case and is **out by construction**.
+calls **whose intent is parseable** — `gh`, `glab`, `git`, `curl`, `wget`,
+`find`, `grep`, … — **parse them structurally (AST)**, and **handle them
+transparently** so the model isn't tripped up by which tools are embedded vs.
+shelled-out (the #552 confusion). The non-negotiable constraint: this convenience
+layer must **not** reintroduce ambient authority. It is a **parser + capability
+router**, never an authority *source*.
+
+**Inclusion criterion:** a command belongs in this layer *iff its authority is
+determinable from a structural parse of the invocation* (which host it reaches,
+which path it reads, which operation it performs) — so the layer can bound it.
+General-purpose interpreters (`python`, `bash`, `node`, …) **fail this test and
+are excluded**: no parse of `python script.py` reveals what the script will do.
+They are not "in the layer but confined" — they are not candidates at all, and
+keep going through the existing confined-exec capability (agent-bridle), governed
+there. See *Excluded* below.
 
 ## The opportunity
 
@@ -45,7 +53,10 @@ newt is an object-capability system: the agent may do only what its capabilities
 permit. A transparent layer that simply *runs* whatever CLI the model emits is
 **ambient authority** — the exact confused-deputy failure OCAP exists to prevent.
 `python` is the limit case: ambient `python` is arbitrary code execution, i.e.
-unbounded authority. "Abstracting the functionality" must not smuggle that back in.
+unbounded authority. "Abstracting the functionality" must not smuggle that back
+in — which is exactly why interpreters are *excluded* from the layer rather than
+"handled carefully" (see Principle §4): the safe move is to not claim what you
+cannot bound.
 
 ## The principle
 
@@ -68,27 +79,46 @@ authority boundary is an authority bypass. (See the structural-parsing ADR.)
 
 ### 3. Commands tier by the authority they request
 
+The layer handles exactly two tiers — both with authority you can read off the
+parse:
+
 | Tier | Examples | Routing | Governance |
 |------|----------|---------|------------|
-| **Read-only** | `git status/diff/log`, `grep`, `find`, `gh/glab … view` | embedded / confined read impl | cheap read caveat |
+| **Read-only** | `git status/diff/log`, `grep`, `find`, `gh/glab … view` | embedded / confined read impl | read caveat; **path-fenced to the workspace** — e.g. `find <path>` parses its path and is refused unless it resolves under cwd (the same fence the fs tools enforce) |
 | **Egress** | `curl`, `wget`, `git push/fetch`, `gh/glab … create` | out-of-band fetch / embedded writer | egress caveat: host allow-list, write scope (the forge resolver's host-allowlist + HTTPS-only + no-redirect *is* this) |
-| **Arbitrary execution** | `python`, `bash`, `sh`, `node`, `perl` | confined executor (brush) only | strong, explicit capability — or **deny** |
 
-### 4. Ambient `python` is out by construction
+### 4. Excluded: general-purpose interpreters
 
-The layer recognizes `python …` via the AST and routes it into the **confined**
-executor (brush, capability-limited venv/exec), or refuses when no such
-capability was granted. It never becomes an ambient-python provider. The
-convenience is "the model can say `python` and it routes uniformly"; the
-authority is "still confined, or denied." Abstracting the interface grants no new
-power.
+`python`, `bash`, `sh`, `node`, `perl`, `ruby`, … are **not in this layer.** They
+fail the inclusion criterion: their authority is *not* determinable from the
+invocation — `python script.py` can do anything the process can, so there is
+nothing to parse, tier, or bound. Pretending to "route them to a confined
+executor" would smuggle the unparseable case back into a layer whose whole value
+is parseability.
+
+So arbitrary execution stays where it already belongs: the **confined-exec
+capability** (agent-bridle / the captured shell), governed by an explicit caveat
+there, default-deny. The transparent layer neither recognizes nor handles
+interpreters — it simply doesn't claim them. This keeps the layer's guarantee
+honest: *everything it touches, it can bound.*
+
+For Python specifically, that governed path already exists: **`newt --venv
+<path>`** (and `[tui.permissions] extra_exec`). It is an explicit human grant —
+inject a chosen venv, prepend its `bin/` to `PATH` in the confined shell, and
+grant exec *only* for that venv's executables. That is the OCAP-correct shape:
+python is a **capability you grant** (a specific, bounded venv), not ambient
+authority the layer assumes. Excluding `python` from the transparent layer
+therefore costs nothing — it points at the right mechanism instead of duplicating
+or bypassing it.
 
 ### The one-line rule
 
 > The transparent command layer is a **structural parser + capability router**,
-> not an authority source. Agent-initiated invocations land on a
+> not an authority source. It claims a command only when the parse reveals (and
+> can bound) its authority; agent-initiated invocations land on a
 > capability-checked implementation; user-initiated ones carry the user's own
-> authority; ambient anything — especially `python`/`bash` — is out.
+> authority. Anything unparseable — general-purpose interpreters above all — is
+> **not claimed**, and goes to the confined-exec path instead.
 
 ## Architecture
 
@@ -101,7 +131,7 @@ power.
                         ┌──────────── handler registry ────────────┐
                         │  trigger (host+path | command+arg shape)  │
                         │  tier (read | egress | exec)              │
-                        │  action (fetch | embedded tool | confined)│
+                        │  action (fetch | embedded tool, host/path-fenced)│
                         └───────────────────┬───────────────────────┘
               user-authority ▼                         ▼ agent-authority
         transparent (deputy of the user)        leashed (caveat-checked) — deny by default
@@ -127,9 +157,12 @@ PR. Delivery is therefore phased, each phase reusing the shared primitive:
 3. **`curl`/`wget`** — egress handlers reusing the URL AST + the egress caveat.
 4. **`gh`/`glab` command-form + the leashed `forge_fetch` tool** — agent-initiated
    forge access, OCAP-governed.
-5. **`find`/`grep`/… read-only** — confined read impls.
-6. **`python`/`bash`/exec** — confined executor only; default-deny. The guard-rail
-   case; never ambient.
+5. **`find`/`grep`/… read-only** — confined read impls, **path-fenced to the
+   workspace** (`find <path>` refused unless it resolves under cwd).
+
+**Not a phase: interpreters.** `python`/`bash`/`node`/… are excluded from the
+layer entirely (Principle §4) — they remain on the existing confined-exec
+capability (agent-bridle), default-deny. There is no "exec phase" here, by design.
 
 ## Consequences
 
