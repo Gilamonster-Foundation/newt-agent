@@ -537,6 +537,38 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
                     None
                 }
             };
+            // Sticky last-active selections (#545): the provider/model the user
+            // last chose via `/backends`/`/model` are restored from
+            // ~/.newt/settings.toml so the next start picks up where they left
+            // off. LOWEST precedence — an explicit NEWT_PROVIDER/NEWT_DGX_MODEL
+            // (env) or a --loadout axis (set just above) always wins, and a
+            // provider naming a since-removed [[backends]] entry is ignored.
+            {
+                let session = newt_core::settings::load();
+                if !session.is_empty() {
+                    let cfg = newt_core::Config::resolve().ok();
+                    let current_provider = std::env::var("NEWT_PROVIDER")
+                        .ok()
+                        .filter(|s| !s.is_empty());
+                    let restore = session.restore(
+                        current_provider.as_deref(),
+                        std::env::var_os("NEWT_DGX_MODEL").is_some(),
+                        |name| {
+                            cfg.as_ref()
+                                .is_some_and(|c| c.backends.iter().any(|b| b.name == name))
+                        },
+                    );
+                    // SAFETY: single-threaded before the TUI starts async work.
+                    unsafe {
+                        if let Some(provider) = restore.provider {
+                            std::env::set_var("NEWT_PROVIDER", provider);
+                        }
+                        if let Some(model) = restore.model {
+                            std::env::set_var("NEWT_DGX_MODEL", model);
+                        }
+                    }
+                }
+            }
             // --ephemeral threads to the TUI the same way (Step 17.7): the
             // session start resolution reads NEWT_EPHEMERAL once.
             if cli.ephemeral {

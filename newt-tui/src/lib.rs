@@ -3129,6 +3129,14 @@ fn should_extract_on_close(enabled: bool, ephemeral: bool, turns: usize) -> bool
     enabled && !ephemeral && turns > 0
 }
 
+/// Whether the current process is an ephemeral session (`--ephemeral` /
+/// `NEWT_EPHEMERAL`). Such sessions must leave no trace on disk, so the sticky
+/// `/backends`/`/model` writers ([`newt_core::settings`]) are skipped — the
+/// same "no trace" invariant that gates [`should_extract_on_close`].
+fn is_ephemeral_session() -> bool {
+    std::env::var_os("NEWT_EPHEMERAL").is_some()
+}
+
 /// One honest line about what the close-time extraction wrote. Scan- or
 /// budget-rejected bullets are dropped (never retried) and disclosed here;
 /// the cause goes to `tracing::warn`, so the visible line stays
@@ -6807,10 +6815,11 @@ live in [model_tuning] (see /config)."
         }
         "model" => {
             "\
-/model <name> — switch the model for THIS session
+/model <name> — switch the model on the active backend
 
-Changes the model newt talks to until you exit or switch again; it does not edit
-config. Tab through what's installed with /models.
+Changes the model newt talks to. The choice sticks across runs (saved to
+~/.newt/settings.toml) but does not edit config; switching backends clears it.
+Tab through what's installed with /models.
   /model qwen3:30b"
         }
         "backend" => {
@@ -6820,7 +6829,10 @@ config. Tab through what's installed with /models.
 Repoint the session at an Ollama or OpenAI-compatible endpoint, optionally
 naming a model in one step. Endpoints/keys come from config ([[backends]]).
   /backend ollama deepseek-r1
-  /backend openai gpt-4.1"
+  /backend openai gpt-4.1
+
+Transient session-only kind toggle — it does NOT stick across runs. Use
+/backends <name> or /model <name> to make a choice persist."
         }
         "backends" => {
             "\
@@ -6832,7 +6844,8 @@ protocol — the single-coder \"which box am I talking to\" switch.
   /backends            list every configured backend, ◀ the active one
   /backends dgx1       repoint this session at the 'dgx1' backend
 
-Session-only (sets NEWT_PROVIDER); edit [[backends]] or a loadout to persist."
+Your choice sticks across runs (saved to ~/.newt/settings.toml); an explicit
+NEWT_PROVIDER or a --loadout still overrides it. Edit [[backends]] to add one."
         }
         "crew" => {
             "\
@@ -7082,7 +7095,7 @@ fn help_lines() -> &'static [&'static str] {
     &[
         "  /models                  - list models on the active endpoint",
         "  /models capabilities     - tool-conformance matrix (cached)",
-        "  /model <name>            - switch model for this session",
+        "  /model <name>            - switch model on the active backend (sticks across runs)",
         "  /backend <openai|ollama> [model] - switch backend (e.g. /backend ollama deepseek-r1)",
         "  /backends [name]         - list configured backends; /backends <name> switches (e.g. dgx1, gnuc)",
         "  /thinking <on|off>       - toggle the reasoning spinner for this session",
@@ -7511,13 +7524,11 @@ fn dispatch_slash(
                     verbose,
                 );
             } else {
-                // Session-only model override on the ACTIVE backend — whatever it
-                // is. A pinned [[backends]] entry, an OpenAI backend, and the
-                // historical DGX path all read NEWT_DGX_MODEL in
-                // `resolve_backend_choice`, so this one axis switches the model
-                // everywhere. This matches the documented intent ("switch the
-                // model for THIS session; it does not edit config") and how
-                // `/backend ollama <model>` already works.
+                // Model override on the ACTIVE backend — whatever it is. A pinned
+                // [[backends]] entry, an OpenAI backend, and the historical DGX
+                // path all read NEWT_DGX_MODEL in `resolve_backend_choice`, so
+                // this one axis switches the model everywhere, and it does not
+                // edit config. Mirrors how `/backend ollama <model>` works.
                 //
                 // The old `newt dgx use <model>` persist was the bug the user hit:
                 // it wrote the DGX `active_model`, but a pinned named backend
@@ -7525,6 +7536,15 @@ fn dispatch_slash(
                 // consulted and the switch silently did nothing.
                 // SAFETY: single-threaded REPL; the post-command re-resolve reads it.
                 unsafe { std::env::set_var("NEWT_DGX_MODEL", arg1) };
+                // Persist the choice so it sticks across runs (#545): records
+                // `model` in ~/.newt/settings.toml (provider left as-is), to be
+                // restored next start at the lowest precedence (an explicit
+                // NEWT_DGX_MODEL or a --loadout model still wins). Skipped in an
+                // ephemeral session, which must leave no trace; the live switch
+                // above still applies. Best-effort — a write never blocks it.
+                if newt_core::settings::should_persist(is_ephemeral_session()) {
+                    newt_core::settings::record_model(arg1);
+                }
                 let cfg = newt_core::Config::resolve().unwrap_or_default();
                 let choice = resolve_backend_choice(&cfg);
                 // Warm-up only applies to Ollama: vLLM and OpenAI-compatible
@@ -7640,12 +7660,20 @@ fn dispatch_slash(
             } else if cfg.backends.iter().any(|b| b.name == arg1) {
                 // SAFETY: single-threaded REPL. The post-command re-resolve in the
                 // session loop reads NEWT_PROVIDER and repoints the session at this
-                // named backend. Session-only — does NOT persist; edit [[backends]]
-                // or a loadout to make it permanent. Clear any stale per-session
-                // model override so the named backend's own default model applies.
+                // named backend. Clear any stale per-session model override so the
+                // named backend's own default model applies.
                 unsafe {
                     std::env::set_var("NEWT_PROVIDER", arg1);
                     std::env::remove_var("NEWT_DGX_MODEL");
+                }
+                // Persist the choice so it sticks across runs (#545): records
+                // `provider` and clears `model` in ~/.newt/settings.toml, to be
+                // restored next start at the lowest precedence (an explicit
+                // NEWT_PROVIDER or a --loadout still wins). Skipped in an
+                // ephemeral session, which must leave no trace; the live switch
+                // above still applies. Best-effort — a write never blocks it.
+                if newt_core::settings::should_persist(is_ephemeral_session()) {
+                    newt_core::settings::record_provider(arg1);
                 }
                 let choice =
                     resolve_backend_choice(&newt_core::Config::resolve().unwrap_or_default());
