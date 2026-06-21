@@ -4939,94 +4939,98 @@ fn run_chat(
                             .map(|_| {
                                 std::cell::RefCell::new(newt_core::verify_gate::WriteLedger::new())
                             });
-                    // Esc-to-interrupt: a sibling thread watches the keyboard
-                    // while the turn runs and trips `turn_cancel`; the loop
-                    // checks it at its await checkpoints and abandons the turn.
+                    // Ctrl-C / Esc to interrupt: a sibling thread watches the
+                    // keyboard while the turn runs and trips `turn_cancel` (1st
+                    // press) / `turn_hard` (2nd Ctrl-C); the loop checks cancel
+                    // at its await checkpoints and abandons the turn, handing the
+                    // prompt back. Ctrl-D (EOF) is the exit, not Ctrl-C.
                     let turn_cancel = std::sync::atomic::AtomicBool::new(false);
+                    let turn_hard = std::sync::atomic::AtomicBool::new(false);
                     let interruptible = io::stdin().is_terminal() && io::stdout().is_terminal();
-                    let response = with_interrupt_watch(interruptible, &turn_cancel, || {
-                        tokio::task::block_in_place(|| {
-                            rt.block_on(chat_complete(
-                                ChatCtx {
-                                    url: &inf_url,
-                                    model: &inf_model,
-                                    kind: inf_kind,
-                                    api_key: inf_key.as_deref(),
-                                    messages: &messages,
-                                    task: &task,
-                                    workspace,
-                                    color,
-                                    // #307: the clamped effective caveats (base ∩
-                                    // preset). Identical to `cap.caveats()` when no
-                                    // mode is active.
-                                    caveats: &turn_caveats,
-                                    max_tool_rounds: eff_max_tool_rounds,
-                                    tool_output_lines: tool_output_lines(&cfg),
-                                    debug: debug_mode(&cfg),
-                                    trace: trace_mode(&cfg),
-                                    num_ctx: eff_num_ctx,
-                                    connect_timeout_secs: connect_timeout_secs(&cfg),
-                                    inference_timeout_secs: inference_timeout_secs(&cfg),
-                                    mid_loop_trim_threshold: eff_mid_loop_trim,
-                                    mid_loop_trim_tokens: eff_mid_loop_trim_tokens,
-                                    max_ok_input: eff_max_ok_input,
-                                    build_check_cmd: build_check_cmd(&cfg),
-                                    safe_context: eff_safe_context,
-                                    // The TUI recovers hard context-window 400s by
-                                    // parsing the endpoint's real limit and persisting
-                                    // it to model-capabilities.json (the probe cache
-                                    // stays TUI-side). See issue #223.
-                                    recover_cw_400: Some(recover_context_window_400),
-                                    note_sink: Some(&mut note_sink),
-                                    note_nudge: Some(&mut note_nudge),
-                                    // Recall over past conversations (Step 17.5).
-                                    recall_source: recall_source
-                                        .as_ref()
-                                        .map(|source| source as &dyn newt_core::RecallSource),
-                                    // Progressive-disclosure memory_fetch (#319):
-                                    // present only under disclosure = "index"; None
-                                    // (the default) keeps the loop bit-for-bit.
-                                    memory_source: memory_source
-                                        .as_ref()
-                                        .map(|s| s as &dyn newt_core::MemorySource),
-                                    // Summarize-don't-discard (Step 18.4, #247).
-                                    summarizer: Some(&*loop_summarizer),
-                                    compress_state: Some(&mut compress_state),
-                                    tool_events: Some(&mut turn_tool_events),
-                                    // #263: present only when prompting is on —
-                                    // the loop blocks on the prompt like a long
-                                    // tool call; None keeps denials verbatim.
-                                    permission_gate: permission_gate
-                                        .as_mut()
-                                        .map(|g| g as &mut dyn newt_core::PermissionGate),
-                                    // Phase 20: per-round capability evidence +
-                                    // the learned estimate calibration.
-                                    on_round_usage: Some(&mut on_obs),
-                                    estimate_ratio: eff_estimate_ratio,
-                                    // #307: the active preset's exec floor — the
-                                    // ceiling the --disable-ocap bypass cannot
-                                    // cross. None when no mode is active.
-                                    exec_floor: exec_floor.as_ref(),
-                                    // retry technique: the per-turn write ledger (Some
-                                    // only under a `retry` profile). The write tools
-                                    // record into it; the post-turn gate reverts from it.
-                                    write_ledger: retry_ledger.as_ref(),
-                                    // Esc-to-interrupt flag, tripped by the watcher.
-                                    cancel: Some(&turn_cancel),
-                                    // PR4 (#461): the embedded git tool, present
-                                    // only when this workspace is a git repo.
-                                    git_tool: session_git_tool
-                                        .as_ref()
-                                        .map(|g| g as &dyn newt_core::agentic::GitTool),
-                                    // #479 part 2: the crew/team runner, injected by
-                                    // the binary (newt-cli) — advertises + dispatches
-                                    // the `/team` tools when present.
-                                    crew_runner,
-                                },
-                                &mut mcp,
-                            ))
-                        })
-                    });
+                    let response =
+                        with_interrupt_watch(interruptible, &turn_cancel, &turn_hard, || {
+                            tokio::task::block_in_place(|| {
+                                rt.block_on(chat_complete(
+                                    ChatCtx {
+                                        url: &inf_url,
+                                        model: &inf_model,
+                                        kind: inf_kind,
+                                        api_key: inf_key.as_deref(),
+                                        messages: &messages,
+                                        task: &task,
+                                        workspace,
+                                        color,
+                                        // #307: the clamped effective caveats (base ∩
+                                        // preset). Identical to `cap.caveats()` when no
+                                        // mode is active.
+                                        caveats: &turn_caveats,
+                                        max_tool_rounds: eff_max_tool_rounds,
+                                        tool_output_lines: tool_output_lines(&cfg),
+                                        debug: debug_mode(&cfg),
+                                        trace: trace_mode(&cfg),
+                                        num_ctx: eff_num_ctx,
+                                        connect_timeout_secs: connect_timeout_secs(&cfg),
+                                        inference_timeout_secs: inference_timeout_secs(&cfg),
+                                        mid_loop_trim_threshold: eff_mid_loop_trim,
+                                        mid_loop_trim_tokens: eff_mid_loop_trim_tokens,
+                                        max_ok_input: eff_max_ok_input,
+                                        build_check_cmd: build_check_cmd(&cfg),
+                                        safe_context: eff_safe_context,
+                                        // The TUI recovers hard context-window 400s by
+                                        // parsing the endpoint's real limit and persisting
+                                        // it to model-capabilities.json (the probe cache
+                                        // stays TUI-side). See issue #223.
+                                        recover_cw_400: Some(recover_context_window_400),
+                                        note_sink: Some(&mut note_sink),
+                                        note_nudge: Some(&mut note_nudge),
+                                        // Recall over past conversations (Step 17.5).
+                                        recall_source: recall_source
+                                            .as_ref()
+                                            .map(|source| source as &dyn newt_core::RecallSource),
+                                        // Progressive-disclosure memory_fetch (#319):
+                                        // present only under disclosure = "index"; None
+                                        // (the default) keeps the loop bit-for-bit.
+                                        memory_source: memory_source
+                                            .as_ref()
+                                            .map(|s| s as &dyn newt_core::MemorySource),
+                                        // Summarize-don't-discard (Step 18.4, #247).
+                                        summarizer: Some(&*loop_summarizer),
+                                        compress_state: Some(&mut compress_state),
+                                        tool_events: Some(&mut turn_tool_events),
+                                        // #263: present only when prompting is on —
+                                        // the loop blocks on the prompt like a long
+                                        // tool call; None keeps denials verbatim.
+                                        permission_gate: permission_gate
+                                            .as_mut()
+                                            .map(|g| g as &mut dyn newt_core::PermissionGate),
+                                        // Phase 20: per-round capability evidence +
+                                        // the learned estimate calibration.
+                                        on_round_usage: Some(&mut on_obs),
+                                        estimate_ratio: eff_estimate_ratio,
+                                        // #307: the active preset's exec floor — the
+                                        // ceiling the --disable-ocap bypass cannot
+                                        // cross. None when no mode is active.
+                                        exec_floor: exec_floor.as_ref(),
+                                        // retry technique: the per-turn write ledger (Some
+                                        // only under a `retry` profile). The write tools
+                                        // record into it; the post-turn gate reverts from it.
+                                        write_ledger: retry_ledger.as_ref(),
+                                        // Esc-to-interrupt flag, tripped by the watcher.
+                                        cancel: Some(&turn_cancel),
+                                        // PR4 (#461): the embedded git tool, present
+                                        // only when this workspace is a git repo.
+                                        git_tool: session_git_tool
+                                            .as_ref()
+                                            .map(|g| g as &dyn newt_core::agentic::GitTool),
+                                        // #479 part 2: the crew/team runner, injected by
+                                        // the binary (newt-cli) — advertises + dispatches
+                                        // the `/team` tools when present.
+                                        crew_runner,
+                                    },
+                                    &mut mcp,
+                                ))
+                            })
+                        });
 
                     let elapsed = t0.elapsed();
                     erase_line();
@@ -5034,7 +5038,12 @@ fn run_chat(
                     // reply. Abandon it — print a notice and skip all post-turn
                     // processing (no save, no gates, turn not counted).
                     if turn_cancel.load(std::sync::atomic::Ordering::Relaxed) {
-                        print_newt("⊘ interrupted — back to you", color, verbose);
+                        let note = if turn_hard.load(std::sync::atomic::Ordering::Relaxed) {
+                            "⊘ stopped — back to you"
+                        } else {
+                            "⊘ interrupted — back to you"
+                        };
+                        print_newt(note, color, verbose);
                         println!();
                     } else {
                         match response {
@@ -6963,9 +6972,17 @@ fn is_lone_esc(bytes: &[u8]) -> bool {
     bytes == [0x1b]
 }
 
+/// Ctrl-C arrives as a lone `ETX` (`0x03`) once ISIG is off (see `CbreakGuard`).
+/// A standalone press is a single byte; anything longer is typed-ahead, not an
+/// interrupt. Unix-only: the keyboard watcher (its sole caller) needs termios.
+#[cfg(unix)]
+fn is_ctrl_c(bytes: &[u8]) -> bool {
+    bytes == [0x03]
+}
+
 #[cfg(all(test, unix))]
 mod interrupt_tests {
-    use super::is_lone_esc;
+    use super::{is_ctrl_c, is_lone_esc};
 
     #[test]
     fn lone_esc_interrupts_but_sequences_and_chords_do_not() {
@@ -6978,6 +6995,18 @@ mod interrupt_tests {
         assert!(!is_lone_esc(b"hello"), "typed text");
         assert!(!is_lone_esc(&[]), "nothing");
     }
+
+    #[test]
+    fn ctrl_c_is_a_lone_etx_byte() {
+        assert!(is_ctrl_c(&[0x03]), "a bare Ctrl-C press interrupts");
+        assert!(
+            !is_ctrl_c(&[0x03, b'x']),
+            "Ctrl-C + typed-ahead is not lone"
+        );
+        assert!(!is_ctrl_c(&[0x1b]), "Esc is not Ctrl-C");
+        assert!(!is_ctrl_c(b"c"), "the letter c is not Ctrl-C");
+        assert!(!is_ctrl_c(&[]), "nothing");
+    }
 }
 
 /// Run `f` (the in-place turn) with an Esc watcher active, returning `f`'s value.
@@ -6988,6 +7017,7 @@ mod interrupt_tests {
 fn with_interrupt_watch<T>(
     enabled: bool,
     cancel: &std::sync::atomic::AtomicBool,
+    hard: &std::sync::atomic::AtomicBool,
     f: impl FnOnce() -> T,
 ) -> T {
     use std::sync::atomic::Ordering;
@@ -6999,7 +7029,7 @@ fn with_interrupt_watch<T>(
     };
     let stop = std::sync::atomic::AtomicBool::new(false);
     std::thread::scope(|s| {
-        s.spawn(|| watch_for_interrupt(cancel, &stop));
+        s.spawn(|| watch_for_interrupt(cancel, hard, &stop));
         let out = f();
         // Tell the watcher to exit; it polls with a 100 ms timeout, so it wakes
         // and returns promptly, and the scope joins it before restoring the tty.
@@ -7012,23 +7042,27 @@ fn with_interrupt_watch<T>(
 fn with_interrupt_watch<T>(
     _enabled: bool,
     _cancel: &std::sync::atomic::AtomicBool,
+    _hard: &std::sync::atomic::AtomicBool,
     f: impl FnOnce() -> T,
 ) -> T {
     // No termios on non-unix; the interrupt watcher is unix-only for now.
     f()
 }
 
-/// Poll stdin while the turn runs; trip `cancel` on a lone Esc. Exits when
-/// `stop` is set (the turn finished) — polling with a 100 ms timeout so it
-/// never blocks past the turn's end.
+/// Poll stdin while the turn runs; trip `cancel` on the first interrupt (a lone
+/// Esc or Ctrl-C) and `hard` on a second Ctrl-C (force-stop). Keeps watching so
+/// a follow-up press escalates, until `stop` is set (the turn finished) —
+/// polling with a 100 ms timeout so it never blocks past the turn's end.
 #[cfg(unix)]
 fn watch_for_interrupt(
     cancel: &std::sync::atomic::AtomicBool,
+    hard: &std::sync::atomic::AtomicBool,
     stop: &std::sync::atomic::AtomicBool,
 ) {
     use std::sync::atomic::Ordering;
     let fd = libc::STDIN_FILENO;
     let mut buf = [0u8; 64];
+    let mut presses = 0u32;
     while !stop.load(Ordering::Relaxed) {
         let mut pfd = libc::pollfd {
             fd,
@@ -7044,10 +7078,11 @@ fn watch_for_interrupt(
             continue;
         }
         let bytes = &buf[..r as usize];
-        if is_lone_esc(bytes) {
+        let mut interrupt = is_ctrl_c(bytes);
+        if !interrupt && is_lone_esc(bytes) {
             // Guard against a split escape sequence (Esc arriving in a separate
             // read from its `[A` tail under load): wait briefly for a
-            // continuation. None arriving → it was a real Esc press.
+            // continuation. None arriving → a real Esc press.
             let mut pfd2 = libc::pollfd {
                 fd,
                 events: libc::POLLIN,
@@ -7055,19 +7090,33 @@ fn watch_for_interrupt(
             };
             let m = unsafe { libc::poll(&mut pfd2, 1, 30) };
             if m <= 0 {
-                cancel.store(true, Ordering::Relaxed);
-                return;
+                interrupt = true;
+            } else {
+                // A continuation arrived — drain it and treat the burst as a
+                // sequence (ignore), keep watching.
+                let _ = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
             }
-            // A continuation arrived — drain it and treat the burst as a
-            // sequence (ignore), keep watching.
-            let _ = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+        }
+        if interrupt {
+            presses += 1;
+            if presses == 1 {
+                // 1st: graceful interrupt — the turn stops at its next
+                // checkpoint and hands control back to the prompt.
+                cancel.store(true, Ordering::Relaxed);
+            } else {
+                // 2nd+ Ctrl-C: force-stop. Repeated presses are absorbed; the
+                // prompt returns either way.
+                hard.store(true, Ordering::Relaxed);
+            }
         }
     }
 }
 
-/// RAII cbreak: ICANON + ECHO off (per-keystroke, no echo); ISIG + OPOST left ON
-/// so Ctrl-C still signals and streamed output keeps CR-NL translation. Restores
-/// the saved attributes on drop.
+/// RAII cbreak: ICANON + ECHO + ISIG off (per-keystroke, no echo, and Ctrl-C
+/// delivered as a raw `0x03` byte rather than a SIGINT) so the keyboard watcher
+/// can treat Ctrl-C as a tiered *interrupt* (#530-followup) instead of letting
+/// it kill the process mid-turn. OPOST stays ON so streamed output keeps CR-NL
+/// translation. Restores the saved attributes on drop.
 #[cfg(unix)]
 struct CbreakGuard {
     fd: libc::c_int,
@@ -7084,7 +7133,7 @@ impl CbreakGuard {
                 return Err(io::Error::last_os_error());
             }
             let mut raw = orig;
-            raw.c_lflag &= !(libc::ICANON | libc::ECHO);
+            raw.c_lflag &= !(libc::ICANON | libc::ECHO | libc::ISIG);
             raw.c_cc[libc::VMIN] = 0;
             raw.c_cc[libc::VTIME] = 0;
             if libc::tcsetattr(fd, libc::TCSANOW, &raw) != 0 {
@@ -7730,9 +7779,12 @@ fn dispatch_slash(
                 // we check at each model boundary (a single model still finishes;
                 // the remaining ones are skipped). Only on a TTY.
                 let probe_cancel = std::sync::atomic::AtomicBool::new(false);
+                // The probe sweep only needs graceful cancel; a 2nd Ctrl-C trips
+                // this (ignored here) and cancel already stops the sweep.
+                let probe_hard = std::sync::atomic::AtomicBool::new(false);
                 let probe_interruptible = io::stdin().is_terminal() && io::stdout().is_terminal();
                 let mut probed = 0usize;
-                with_interrupt_watch(probe_interruptible, &probe_cancel, || {
+                with_interrupt_watch(probe_interruptible, &probe_cancel, &probe_hard, || {
                     for model in &targets {
                         if probe_cancel.load(std::sync::atomic::Ordering::Relaxed) {
                             print_newt(
