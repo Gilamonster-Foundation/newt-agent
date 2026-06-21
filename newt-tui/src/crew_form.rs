@@ -336,6 +336,7 @@ mod tests {
         assert!(!is_yes("garbage", false));
     }
 
+    #[serial_test::serial(real_fs)]
     #[test]
     fn new_crew_is_built_field_by_field_and_saved() {
         let dir = tempfile::tempdir().unwrap();
@@ -369,6 +370,7 @@ mod tests {
         assert_eq!(b.require_human_review_on, vec!["auth", "crypto"]);
     }
 
+    #[serial_test::serial(real_fs)]
     #[test]
     fn editing_keeps_current_values_on_blank_and_clears_on_dash() {
         let dir = tempfile::tempdir().unwrap();
@@ -408,6 +410,7 @@ mod tests {
         assert_eq!(saved.budgets.unwrap().max_attempts, Some(5));
     }
 
+    #[serial_test::serial(real_fs)]
     #[test]
     fn abort_writes_nothing() {
         let dir = tempfile::tempdir().unwrap();
@@ -424,6 +427,7 @@ mod tests {
             .any(|l| l.contains("Nothing written")));
     }
 
+    #[serial_test::serial(real_fs)]
     #[test]
     fn unknown_loadout_is_flagged_but_still_saved() {
         let dir = tempfile::tempdir().unwrap();
@@ -440,6 +444,7 @@ mod tests {
         );
     }
 
+    #[serial_test::serial(real_fs)]
     #[test]
     fn invalid_number_reprompts_then_accepts() {
         let dir = tempfile::tempdir().unwrap();

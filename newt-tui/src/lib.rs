@@ -2387,6 +2387,7 @@ mod permission_prompt_tests {
     /// Every prompted decision lands in the JSONL record, keyed by the
     /// conversation id, with the issue's `(ts_claim, tool, kind, target,
     /// decision, scope)` shape.
+    #[serial_test::serial(real_fs)]
     #[test]
     fn decisions_are_recorded_to_the_session_log() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -2448,6 +2449,7 @@ mod permission_prompt_tests {
     /// identity path: the returned caveats are the enforced caveats of a
     /// fresh key rooted in the user key — and the baseline value the session
     /// enforces is untouched (attenuation-only, #263).
+    #[serial_test::serial(real_fs)]
     #[test]
     fn allow_remints_from_the_user_root_and_never_widens_the_baseline() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -2488,6 +2490,7 @@ mod permission_prompt_tests {
     /// The full TUI seam: execute_tool consults the gate on an fs_read
     /// denial. Allow-once reads the file exactly once and the next identical
     /// call re-prompts; the decisions are in the session state.
+    #[serial_test::serial(real_fs)]
     #[tokio::test]
     async fn execute_tool_with_tui_gate_allow_once_then_reprompt() {
         let ws = tempfile::TempDir::new().unwrap();
@@ -2557,6 +2560,7 @@ mod permission_prompt_tests {
     /// The full TUI seam, session scope: one prompt, then the same denial
     /// auto-allows for the rest of the session (across gate rebuilds, i.e.
     /// turns).
+    #[serial_test::serial(real_fs)]
     #[tokio::test]
     async fn execute_tool_with_tui_gate_session_allow_holds_across_turns() {
         let ws = tempfile::TempDir::new().unwrap();
@@ -2773,6 +2777,7 @@ mod caveat_policy_tests {
         );
     }
 
+    #[serial_test::serial(real_fs)]
     #[test]
     fn establish_unconfigured_is_signed_read_only() {
         // Serialize against env-mutating tests: policy_for reads NEWT_EXEC_PATHS
@@ -2806,6 +2811,7 @@ mod caveat_policy_tests {
     /// `UserKey` from `~/.newt/identity.pem`. This pins the chain-
     /// rooting property end to end through `SessionCapability`'s
     /// envelope-mint chokepoint.
+    #[serial_test::serial(real_fs)]
     #[test]
     fn plugin_envelope_chain_roots_at_operator_userkey() {
         // Serialize against env-mutating tests: policy_for reads NEWT_EXEC_PATHS
@@ -2865,6 +2871,7 @@ mod caveat_policy_tests {
         );
     }
 
+    #[serial_test::serial(real_fs)]
     #[test]
     fn establish_configured_is_workspace_dev() {
         // Serialize against env-mutating tests: policy_for reads NEWT_EXEC_PATHS
@@ -2880,6 +2887,7 @@ mod caveat_policy_tests {
         assert!(!cap.caveats().permits_exec("rm"), "dangerous cmds denied");
     }
 
+    #[serial_test::serial(real_fs)]
     #[test]
     fn reapply_narrows_but_cannot_widen() {
         // Serialize against env-mutating tests: policy_for reads NEWT_EXEC_PATHS
@@ -2915,6 +2923,7 @@ mod caveat_policy_tests {
         );
     }
 
+    #[serial_test::serial(real_fs)]
     #[test]
     fn reapply_without_key_still_narrows() {
         // Serialize against env-mutating tests: policy_for reads NEWT_EXEC_PATHS
@@ -8040,6 +8049,7 @@ mod tests {
         assert!(!shell.is_empty(), "a shell is always resolved");
     }
 
+    #[serial_test::serial(real_fs)]
     #[test]
     #[cfg(windows)]
     fn bang_shell_is_a_windows_shell_with_slash_c() {
@@ -8060,6 +8070,7 @@ mod tests {
         .unwrap();
     }
 
+    #[serial_test::serial(real_fs)]
     #[test]
     fn verify_gate_summary_flags_fabrication_and_passes_clean() {
         use newt_core::verify_gate::SurfaceMatch;
@@ -8086,6 +8097,7 @@ mod tests {
         assert!(verify_gate_summary(ws, SurfaceMatch::Exact).is_none());
     }
 
+    #[serial_test::serial(real_fs)]
     #[test]
     fn verify_gate_summary_noops_without_pyo3_surface() {
         use newt_core::verify_gate::SurfaceMatch;
@@ -8095,6 +8107,7 @@ mod tests {
         assert!(verify_gate_summary(dir.path().to_str().unwrap(), SurfaceMatch::Exact).is_none());
     }
 
+    #[serial_test::serial(real_fs)]
     #[tokio::test]
     async fn retry_revert_undoes_only_newts_writes() {
         use newt_core::verify_gate::{SurfaceMatch, WriteLedger};
@@ -8286,6 +8299,7 @@ mod tests {
         assert!(matches!(art, Cow::Borrowed(_)));
     }
 
+    #[serial_test::serial(real_fs)]
     #[test]
     fn brand_logo_reads_override_file() {
         // A host (gilamonster) points the dir at its own `<prefix>-<stem>.txt`.
@@ -8300,6 +8314,7 @@ mod tests {
         assert_eq!(art.as_ref(), "GILA-ART");
     }
 
+    #[serial_test::serial(real_fs)]
     #[test]
     fn brand_logo_missing_override_falls_back() {
         // Override dir set but the requested stem is absent → compiled default.
@@ -8702,6 +8717,7 @@ mod run_command_confinement_tests {
     /// Restore the original two tests from git history once brush support lands.
     /// See: https://github.com/Gilamonster-Foundation/agent-bridle/issues/20
     #[cfg(unix)]
+    #[serial_test::serial(real_fs)]
     #[tokio::test]
     async fn run_command_allowed_external_succeeds() {
         let _env = crate::test_env_guard::env_read_guard_async().await;
@@ -8737,6 +8753,7 @@ mod run_command_confinement_tests {
     /// Restore from git history once brush support lands.
     /// See: https://github.com/Gilamonster-Foundation/agent-bridle/issues/20
     #[cfg(unix)]
+    #[serial_test::serial(real_fs)]
     #[tokio::test]
     async fn run_command_out_of_scope_is_denied() {
         let _env = crate::test_env_guard::env_read_guard_async().await;
@@ -8773,6 +8790,7 @@ mod run_command_confinement_tests {
     /// `sh -c` path the `echo` check passed and `rm` then ran directly, deleting
     /// the victim. Full-command confinement is what stops it here.
     #[cfg(unix)]
+    #[serial_test::serial(real_fs)]
     #[tokio::test]
     async fn compound_command_denies_ungranted_rm_and_victim_survives() {
         // Serialize against env-mutating tests: run_command's confined shell
@@ -8819,6 +8837,7 @@ mod run_command_confinement_tests {
 
     /// read_file still enforces fs_read and returns contents (no regression
     /// from the run_command rewrite).
+    #[serial_test::serial(real_fs)]
     #[tokio::test]
     async fn read_file_still_works() {
         let ws = tempfile::TempDir::new().unwrap();
@@ -8856,6 +8875,7 @@ mod run_command_confinement_tests {
     /// write_file still enforces fs_write and writes the file (no regression).
     /// fs_write is scoped to the workspace (not `Scope::All`) so the y/N prompt
     /// is skipped — the preset is the consent.
+    #[serial_test::serial(real_fs)]
     #[tokio::test]
     async fn write_file_still_works() {
         let ws = tempfile::TempDir::new().unwrap();
@@ -8897,6 +8917,7 @@ mod run_command_confinement_tests {
     }
 
     /// list_dir still enforces fs_read and lists entries (no regression).
+    #[serial_test::serial(real_fs)]
     #[tokio::test]
     async fn list_dir_still_works() {
         let ws = tempfile::TempDir::new().unwrap();
@@ -8992,6 +9013,7 @@ mod disable_ocap_session_tests {
     /// The session record carries the issue's shape — `decision:
     /// "ocap-disabled"`, `scope: "session"` — and lands in the same #263
     /// jsonl log as prompted decisions, one line, lossless round-trip.
+    #[serial_test::serial(real_fs)]
     #[test]
     fn ocap_disabled_record_is_the_issue_shape_and_appends() {
         let rec = ocap_disabled_record("conv-297");
@@ -9031,6 +9053,7 @@ mod disable_ocap_session_tests {
     /// on the host shell and returns real output — while a workspace-escape
     /// write is STILL denied: yolo is unconfined exec, fenced fs.
     #[cfg(unix)]
+    #[serial_test::serial(real_fs)]
     #[tokio::test]
     async fn yolo_runs_exec_unconfined_but_keeps_the_fs_fence() {
         let _env = crate::test_env_guard::env_write_guard_async().await;
@@ -9089,6 +9112,7 @@ mod disable_ocap_session_tests {
     /// prompts exactly as before. `--disable-ocap` >
     /// `--prompt-for-permissions` for exec; fs prompting unaffected.
     #[cfg(unix)]
+    #[serial_test::serial(real_fs)]
     #[tokio::test]
     async fn yolo_exec_never_prompts_but_fs_prompting_still_works() {
         let _env = crate::test_env_guard::env_write_guard_async().await;
@@ -9183,6 +9207,7 @@ mod disable_ocap_session_tests {
     /// the command does NOT run unconfined — it falls to the confined dispatch
     /// (stub-shell ⇒ error). A triage mode is NOT un-clamped by `--yolo`.
     #[cfg(unix)]
+    #[serial_test::serial(real_fs)]
     #[tokio::test]
     async fn floor_wins_over_disable_ocap_at_the_tui_seam() {
         let _env = crate::test_env_guard::env_write_guard_async().await;
@@ -9246,6 +9271,7 @@ mod note_sink_wiring_tests {
         memory
     }
 
+    #[serial_test::serial(real_fs)]
     #[tokio::test]
     async fn remember_and_save_note_hit_the_same_store() {
         // The note path is a tempdir, but the scan/curator + prompt assembly
@@ -9290,6 +9316,7 @@ mod note_sink_wiring_tests {
         );
     }
 
+    #[serial_test::serial(real_fs)]
     #[tokio::test]
     async fn sink_surfaces_scan_and_curator_errors_verbatim() {
         let dir = tempfile::tempdir().unwrap();
@@ -9322,6 +9349,7 @@ mod note_sink_wiring_tests {
         assert!(err.contains("1. a short fact"), "full list: {err}");
     }
 
+    #[serial_test::serial(real_fs)]
     #[tokio::test]
     async fn sink_usage_line_reports_notes_usage() {
         let dir = tempfile::tempdir().unwrap();
@@ -9352,6 +9380,7 @@ mod note_sink_wiring_tests {
         assert!(err.contains("no note-capable memory provider"), "{err}");
     }
 
+    #[serial_test::serial(real_fs)]
     #[tokio::test]
     async fn mid_session_save_does_not_change_the_frozen_prompt() {
         // Frozen-snapshot stays frozen (notes.rs contract): a save_note write
@@ -9497,6 +9526,7 @@ mod close_extraction_tests {
         assert!(render_extraction_transcript(&[newt_core::MemMessage::system("s")]).is_none());
     }
 
+    #[serial_test::serial(real_fs)]
     #[test]
     fn notice_wording_counts_saved_and_rejected() {
         assert_eq!(close_extraction_notice(1, 0), "extracted 1 note on close");
@@ -9683,6 +9713,7 @@ mod skills_integration_tests {
         .unwrap();
     }
 
+    #[serial_test::serial(real_fs)]
     #[test]
     fn system_prompt_index_includes_discovered_skill_name_and_description() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -9695,12 +9726,14 @@ mod skills_integration_tests {
         assert!(!block.contains("Full body of commit-style."));
     }
 
+    #[serial_test::serial(real_fs)]
     #[test]
     fn system_prompt_index_is_none_when_no_skills() {
         let tmp = tempfile::TempDir::new().unwrap();
         assert!(skills_index_for_prompt(&[tmp.path().to_path_buf()]).is_none());
     }
 
+    #[serial_test::serial(real_fs)]
     #[test]
     fn system_prompt_index_unions_search_path_first_dir_wins() {
         // A skill of the same name in two dirs: the first dir on the path wins.
@@ -9719,6 +9752,7 @@ mod skills_integration_tests {
         assert!(block.contains("judge: scoring"));
     }
 
+    #[serial_test::serial(real_fs)]
     #[test]
     fn system_prompt_fallback_uses_canonical_default_soul() {
         // Regression: the no-soul fallback used to be a private copy of the
@@ -9733,6 +9767,7 @@ mod skills_integration_tests {
         );
     }
 
+    #[serial_test::serial(real_fs)]
     #[test]
     fn system_prompt_names_the_per_session_plan_path() {
         // Issue #220: the plan instruction must reference the per-session path
@@ -9761,6 +9796,7 @@ mod skills_integration_tests {
         );
     }
 
+    #[serial_test::serial(real_fs)]
     #[test]
     fn default_soul_no_longer_hardcodes_a_plan_path() {
         // The plan path moved out of the const so it can be per-session and so
@@ -9777,6 +9813,7 @@ mod skills_integration_tests {
         assert!(prompt.contains(".newt/sessions/xyz/plan.md"));
     }
 
+    #[serial_test::serial(real_fs)]
     #[tokio::test]
     async fn registered_agents_provider_block_reaches_prompt() {
         // A registered AgentsProvider should compose its instruction block into
@@ -9802,6 +9839,7 @@ mod skills_integration_tests {
         assert!(prompt.contains("Run just check before PRs."));
     }
 
+    #[serial_test::serial(real_fs)]
     #[test]
     fn system_prompt_includes_active_persona_overlay() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -9875,6 +9913,7 @@ mod skills_integration_tests {
         );
     }
 
+    #[serial_test::serial(real_fs)]
     #[test]
     fn persona_store_writes_coder_default_only_when_loaded() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -9897,6 +9936,7 @@ mod skills_integration_tests {
         );
     }
 
+    #[serial_test::serial(real_fs)]
     #[test]
     fn persona_store_does_not_seed_non_empty_persona_dir() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -9912,6 +9952,7 @@ mod skills_integration_tests {
         assert!(!dir.join("coder.md").exists());
     }
 
+    #[serial_test::serial(real_fs)]
     #[tokio::test]
     async fn persona_set_starts_fresh_conversation_with_overlay() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -9955,6 +9996,7 @@ mod skills_integration_tests {
         assert!(!messages.iter().any(|m| m.content == "old reply"));
     }
 
+    #[serial_test::serial(real_fs)]
     #[tokio::test]
     async fn new_conversation_preserves_active_persona() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -10038,6 +10080,7 @@ mod skills_integration_tests {
         );
     }
 
+    #[serial_test::serial(real_fs)]
     #[test]
     fn help_documents_conversation_rm_alias() {
         assert!(help_lines()
@@ -10539,6 +10582,7 @@ mod skills_integration_tests {
             .any(|line| line.contains("/compress [focus]")));
     }
 
+    #[serial_test::serial(real_fs)]
     #[test]
     fn save_successful_turn_creates_and_reuses_active_conversation() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -10600,6 +10644,7 @@ mod skills_integration_tests {
         assert_eq!(record.turns[1].events, events);
     }
 
+    #[serial_test::serial(real_fs)]
     #[tokio::test]
     async fn conversation_restore_replaces_memory_and_restores_persona() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -10696,6 +10741,7 @@ mod skills_integration_tests {
         );
     }
 
+    #[serial_test::serial(real_fs)]
     #[test]
     fn should_auto_resume_only_for_latest_and_never_after_new() {
         // Config off / ephemeral / exact-id sessions never auto-resume.
@@ -10847,6 +10893,7 @@ mod skills_integration_tests {
         assert!(!messages.iter().any(|m| m.content == "other task"));
     }
 
+    #[serial_test::serial(real_fs)]
     #[test]
     fn resume_exact_errors_on_missing_and_foreign_workspace_ids() {
         let (state, workspace, store, persona_store) = resume_fixture();
@@ -10966,6 +11013,7 @@ mod skills_integration_tests {
     /// path; a fresh session restoring it gets the summary message back in
     /// the working set (recognizable by the pipeline's marker) instead of
     /// the raw pre-compression history — the memory.rs:919-class bug.
+    #[serial_test::serial(real_fs)]
     #[tokio::test]
     async fn compressed_session_round_trips_summary_through_save_and_restore() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -11121,6 +11169,7 @@ mod mode_command_tests {
     /// The acceptance criterion: `/mode <name>` loads the skill body AND
     /// applies the preset clamp in ONE invocation. Uses the real `use_skill`
     /// loader (`load_body_from`) over a mock skills dir — no reimplementation.
+    #[serial_test::serial(real_fs)]
     #[test]
     fn build_mode_loads_skill_body_and_applies_preset_atomically() {
         // `skill_search_dirs()` appends the HOME-relative `~/.newt/skills`, so
@@ -11156,6 +11205,7 @@ mod mode_command_tests {
 
     /// Atomic-or-nothing: a mode naming a missing preset is an ERROR — never a
     /// silent skill-load without the clamp (that would be a false claim).
+    #[serial_test::serial(real_fs)]
     #[test]
     fn build_mode_errors_when_the_preset_is_missing() {
         let _env = crate::test_env_guard::env_read_guard(); // HOME-stable: see sibling above
@@ -11177,6 +11227,7 @@ mod mode_command_tests {
 
     /// A mode naming a missing skill is an ERROR for the same reason — the
     /// clamp must not apply without the guidance the mode promised.
+    #[serial_test::serial(real_fs)]
     #[test]
     fn build_mode_errors_when_the_skill_is_missing() {
         let _env = crate::test_env_guard::env_read_guard(); // HOME-stable: see sibling above
@@ -11259,6 +11310,7 @@ mod tool_round_cap_tests {
     ///
     /// Before the fix, the 400 propagated out of `with_backoff_notify(...).await?`
     /// and the whole turn died with `error: inference endpoint 400: …`.
+    #[serial_test::serial(real_fs)]
     #[test]
     fn openai_loop_recovers_from_context_window_400() {
         struct CwResponder {
@@ -11730,6 +11782,7 @@ mod persona_helper_tests {
         assert!(status.contains("/p/terse.md"));
     }
 
+    #[serial_test::serial(real_fs)]
     #[test]
     fn store_load_unknown_persona_lists_available() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -11742,6 +11795,7 @@ mod persona_helper_tests {
         assert!(err.contains("reviewer"), "lists what IS available: {err}");
     }
 
+    #[serial_test::serial(real_fs)]
     #[test]
     fn store_load_rejects_invalid_name_and_empty_file() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -11755,6 +11809,7 @@ mod persona_helper_tests {
         assert!(err.contains("persona `empty` is empty"), "got: {err}");
     }
 
+    #[serial_test::serial(real_fs)]
     #[test]
     fn store_list_skips_empty_and_non_markdown_files() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -11770,6 +11825,7 @@ mod persona_helper_tests {
         assert_eq!(listed[0].description, "Real persona");
     }
 
+    #[serial_test::serial(real_fs)]
     #[test]
     fn store_list_message_shows_none_when_all_personas_empty() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -11783,6 +11839,7 @@ mod persona_helper_tests {
         assert!(msg.contains("(none)"), "got: {msg}");
     }
 
+    #[serial_test::serial(real_fs)]
     #[tokio::test]
     async fn handle_persona_command_show_and_clear() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -11836,6 +11893,7 @@ mod persona_helper_tests {
     /// Writing a role-bound persona file and loading it must surface the
     /// front-matter (role/tools/caveats), and a swap must change more than the
     /// prompt versus the prompt-only `coder` default.
+    #[serial_test::serial(real_fs)]
     #[test]
     fn role_bound_persona_loads_tools_and_caveats() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -11875,6 +11933,7 @@ mod persona_helper_tests {
 
     /// `/persona set <name> --keep-context` swaps the role WITHOUT discarding
     /// conversation history (persistent-actor principle); the default resets.
+    #[serial_test::serial(real_fs)]
     #[tokio::test]
     async fn persona_set_keep_context_preserves_history() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -12498,6 +12557,7 @@ mod env_resolution_tests {
     }
 
     #[cfg(unix)]
+    #[serial_test::serial(real_fs)]
     #[test]
     fn scan_cli_exec_grants_collects_only_executables() {
         use std::os::unix::fs::PermissionsExt;

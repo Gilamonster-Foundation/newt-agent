@@ -193,6 +193,7 @@ mod tests {
         assert!(c[0].contains("myhost.local"));
     }
 
+    #[serial_test::serial(real_fs)]
     #[test]
     fn save_config_writes_endpoint_and_model() {
         let dir = tempfile::tempdir().unwrap();
