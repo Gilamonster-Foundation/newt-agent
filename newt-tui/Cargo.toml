@@ -66,6 +66,12 @@ agent-mesh-protocol = { workspace = true }
 # HTTP mocking for the tool-call loop tests (cap honoured + graceful cap-exit
 # issuing a final tools-disabled completion). Mirrors newt-inference's pattern.
 wiremock.workspace = true
+# Serialize the real-filesystem tests so no two tempdir ops run concurrently
+# (issue #514): under heavy parallel load the sandbox intermittently returns
+# `Permission denied (os error 13)` creating tempdirs, which aborts the whole
+# test binary. `#[serial_test::serial(real_fs)]` gates them onto one lane while
+# the ~370 fs-free tests stay fully parallel. Mirrors newt-mesh's serial_test use.
+serial_test = "3"
 
 [lints]
 workspace = true

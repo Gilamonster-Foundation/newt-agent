@@ -594,6 +594,7 @@ mod tests {
 
     // --- full driver flows ------------------------------------------------
 
+    #[serial_test::serial(real_fs)]
     #[tokio::test]
     async fn ollama_flow_writes_config() {
         let server = MockServer::start().await;
@@ -617,6 +618,7 @@ mod tests {
         assert_eq!(dgx.nodes[0].ollama.as_deref(), Some(server.uri().as_str()));
     }
 
+    #[serial_test::serial(real_fs)]
     #[tokio::test]
     async fn dgx_vllm_flow_writes_openai_backend() {
         let server = MockServer::start().await;
@@ -641,6 +643,7 @@ mod tests {
         assert_eq!(b.endpoint, server.uri());
     }
 
+    #[serial_test::serial(real_fs)]
     #[tokio::test]
     async fn manual_model_when_endpoint_unreachable() {
         let dir = tempfile::tempdir().unwrap();
@@ -661,6 +664,7 @@ mod tests {
         assert_eq!(cfg.dgx.unwrap().active_model.as_deref(), Some("phi3:mini"));
     }
 
+    #[serial_test::serial(real_fs)]
     #[tokio::test]
     async fn decline_overwrite_keeps_existing() {
         let dir = tempfile::tempdir().unwrap();
@@ -674,6 +678,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "# sentinel\n");
     }
 
+    #[serial_test::serial(real_fs)]
     #[tokio::test]
     async fn decline_final_write_leaves_no_file() {
         let server = MockServer::start().await;
@@ -693,6 +698,7 @@ mod tests {
         assert!(!path.exists());
     }
 
+    #[serial_test::serial(real_fs)]
     #[tokio::test]
     async fn dgx_requires_a_host() {
         let server = MockServer::start().await;

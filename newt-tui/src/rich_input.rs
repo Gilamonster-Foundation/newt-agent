@@ -1898,6 +1898,7 @@ mod tests {
         assert_eq!(history_step(0, 0, false), None);
     }
 
+    #[serial_test::serial(real_fs)]
     #[test]
     fn load_history_reads_nonblank_lines_oldest_first() {
         let dir = tempfile::tempdir().unwrap();
@@ -2451,6 +2452,7 @@ mod tests {
         assert!(ed.take_msg().is_none(), "note is one-shot");
     }
 
+    #[serial_test::serial(real_fs)]
     #[test]
     fn history_appends_unsaved_entries_to_file() {
         let dir = tempfile::tempdir().unwrap();
