@@ -68,7 +68,7 @@ pub use agentic::{
 pub use agents::AgentsProvider;
 pub use caveats::{CaveatsExt, CountBoundExt, ScopeExt};
 pub use config::{
-    AgentsConfig, BackendConfig, BackendKind, BundleConfig, ChatStyle, ColorsConfig, Config,
+    AgentsConfig, BackendConfig, BackendKind, BundleConfig, ChatStyle, ColorMode, Config,
     ConversationsConfig, EditMode, FooterMode, Loadout, LoadoutSettings, LogConfig, MemoryConfig,
     MemoryDisclosure, MemoryProviderKind, OpenAiApi, PermissionPreset, PickVia, ProfilePick,
     ProviderConfig, SkillsConfig, ThinkingMode, ToolPermissions, TuiConfig,

@@ -554,8 +554,8 @@ pub enum MemoryDisclosure {
 /// Prompt richness — the `[tui] footer` key. Selects the *default* prompt
 /// template when `[tui] prompt` is unset; an explicit `[tui] prompt` always
 /// wins. The rich default folds a timestamp + status into the prompt line
-/// itself (`[<ts> · <model> · <ws> · <mode> ] ❯ `), so rustyline floats it at
-/// the bottom while idle (like cargo's progress line) and it doubles as a
+/// itself (`[<ts> · <model> · <ws> · <mode> ] ❯ `), so the input surface floats
+/// it at the bottom while idle (like cargo's progress line) and it doubles as a
 /// greppable per-turn log marker — no region, no cursor games.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -569,6 +569,93 @@ pub enum FooterMode {
     On,
     /// Always use the plain bare prompt. Equivalent to `--plain`.
     Off,
+}
+
+/// Color / theme mode — the `[tui] color` key and the `--color` CLI flag
+/// (issue #527). Selects whether — and eventually how — ANSI color is emitted
+/// for the interactive prompt and chat surface. The default is `auto`: color on
+/// a TTY, none in pipes / under `NO_COLOR` / `TERM=dumb`.
+///
+/// `dark`/`light`/`inverted`/`minimal` are accepted and parse today; their
+/// palettes are initial mappings (currently the chromatic default) tuned in a
+/// later pass. The terminal-aware *resolution* lives in the TUI layer — newt-core
+/// has no business probing the terminal — so this enum only exposes the pure
+/// pieces ([`from_keyword`](Self::from_keyword) / [`keyword`](Self::keyword) /
+/// [`forced`](Self::forced) / [`is_mono`](Self::is_mono)).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ColorMode {
+    /// Color on a TTY; none off one or under `NO_COLOR`/`TERM=dumb` (default).
+    #[default]
+    Auto,
+    /// Always emit color — even off a TTY (screenshots, captured logs). An
+    /// explicit `--color=always` also overrides `NO_COLOR` (documented deviation).
+    Always,
+    /// Never emit color.
+    Never,
+    /// Reduced color: structure only, no bright accents. (Initial mapping:
+    /// chromatic; tuned later.)
+    Minimal,
+    /// Swapped foreground/background accents for high-contrast terminals.
+    /// (Initial mapping: chromatic; tuned later.)
+    Inverted,
+    /// Palette tuned for a dark background — the current chromatic default.
+    Dark,
+    /// Palette tuned for a light background. (Initial mapping: chromatic; tuned later.)
+    Light,
+    /// Force monochrome — no color, ASCII glyph fallbacks. Equivalent to `--mono`.
+    Mono,
+}
+
+impl ColorMode {
+    /// Parse a CLI/config keyword (case-insensitive) into a mode. `on`/`off` are
+    /// accepted as aliases of `always`/`never`; `monochrome` aliases `mono`.
+    pub fn from_keyword(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "auto" => Some(Self::Auto),
+            "always" | "on" => Some(Self::Always),
+            "never" | "off" => Some(Self::Never),
+            "minimal" => Some(Self::Minimal),
+            "inverted" => Some(Self::Inverted),
+            "dark" => Some(Self::Dark),
+            "light" => Some(Self::Light),
+            "mono" | "monochrome" => Some(Self::Mono),
+            _ => None,
+        }
+    }
+
+    /// The canonical lowercase keyword for this mode (round-trips `from_keyword`
+    /// and matches the serde representation).
+    pub fn keyword(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Always => "always",
+            Self::Never => "never",
+            Self::Minimal => "minimal",
+            Self::Inverted => "inverted",
+            Self::Dark => "dark",
+            Self::Light => "light",
+            Self::Mono => "mono",
+        }
+    }
+
+    /// Whether this mode forces a color decision regardless of the terminal:
+    /// `Some(true)` = force color on, `Some(false)` = force off, `None` = defer
+    /// to terminal detection (`Auto`).
+    pub fn forced(self) -> Option<bool> {
+        match self {
+            Self::Always | Self::Minimal | Self::Inverted | Self::Dark | Self::Light => Some(true),
+            Self::Never | Self::Mono => Some(false),
+            Self::Auto => None,
+        }
+    }
+
+    /// Whether color is fully disabled in monochrome form. `Mono` additionally
+    /// signals ASCII-glyph fallbacks (`>` for `❯`) to callers; `Never` just
+    /// drops color.
+    pub fn is_mono(self) -> bool {
+        matches!(self, Self::Mono)
+    }
 }
 
 /// How a thinking model's streamed reasoning is surfaced — the `[tui] thinking`
@@ -682,7 +769,7 @@ pub struct TuiConfig {
     /// width, else a stacked prompt row). `0` turns the gutter off (prompt on
     /// its own row, input flush-left); a positive value indents the input that
     /// many columns (a value wide enough to hold the prompt renders it inline).
-    /// No effect on the plain rustyline surface.
+    /// No effect on the lean surface.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gutter: Option<u16>,
 
@@ -692,6 +779,14 @@ pub struct TuiConfig {
     /// (the `--plain` CLI flag, or `NEWT_FOOTER=off`).
     #[serde(default)]
     pub footer: FooterMode,
+
+    /// Color / theme mode (issue #527): `"auto"` (default), `"always"`,
+    /// `"never"`, `"minimal"`, `"inverted"`, `"dark"`, `"light"`, `"mono"`.
+    /// The `--color` CLI flag and `--mono` override this; `NO_COLOR` /
+    /// `TERM=dumb` force it off unless an explicit `--color` is given. This is
+    /// the on/off + theme *mode*; `[tui.colors]` below is the palette.
+    #[serde(default)]
+    pub color: ColorMode,
 
     /// How a thinking model's streamed reasoning is shown: `"stream"` (default
     /// — dim reasoning + a cargo-style spinner, TTY only) or `"off"`.
@@ -843,33 +938,6 @@ pub struct TuiConfig {
     /// this only governs the human. See `docs/decisions/plain_scroller_tui.md`.
     #[serde(default = "default_allow_bang_escape")]
     pub allow_bang_escape: bool,
-
-    /// A small semantic color palette for the interactive prompt. Each slot is
-    /// an optional color spec — a named color (`orange`, `cyan`, `grey`, …) or a
-    /// `#rrggbb` hex — that overrides a built-in default. An unset slot keeps the
-    /// default; `NO_COLOR` / a non-TTY drops all color regardless. See
-    /// `docs/decisions/plain_scroller_tui.md`.
-    #[serde(default)]
-    pub colors: ColorsConfig,
-}
-
-/// `[tui.colors]` — a deliberately small set of semantic color slots. Kept
-/// minimal on purpose (no palette registry, no per-element theming): the
-/// interactive prompt is a plain scroller, so this exists to flag the `!`
-/// host-shell mode and tune the prompt accent, nothing more.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ColorsConfig {
-    /// Brand/prompt accent (default: newt orange). Used for the bold `!`
-    /// bang-mode sigil.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub accent: Option<String>,
-    /// The `!` host-shell-escape line (default: newt orange). Colors the typed
-    /// command so it is unmistakably *not* a chat message.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub shell_mode: Option<String>,
-    /// Dim text — the prompt status line / log marker (default: grey).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub dim: Option<String>,
 }
 
 fn default_tool_output_lines() -> usize {
@@ -1556,9 +1624,9 @@ pub enum EditMode {
     /// Vi / vim-style bindings — Esc for normal mode, i for insert.
     Vi,
     /// Nano-style: modeless, emacs-like bindings (the **default** — the most
-    /// broadly approachable). Behaves like `Emacs` today (rustyline has no nano
-    /// mode); it is a distinct, selectable label, and the rich-tui surface shows
-    /// the nano `^G` help hint for it.
+    /// broadly approachable). Behaves like `Emacs` on the lean surface; it is a
+    /// distinct, selectable label, and the rich-tui surface shows the nano `^G`
+    /// help hint for it.
     #[default]
     Nano,
 }
@@ -1592,6 +1660,7 @@ impl Default for TuiConfig {
             edit_mode: EditMode::Nano,
             gutter: None,
             footer: FooterMode::Auto,
+            color: ColorMode::Auto,
             thinking: ThinkingMode::Stream,
             tool_output_lines: default_tool_output_lines(),
             max_tool_rounds: default_max_tool_rounds(),
@@ -1609,7 +1678,6 @@ impl Default for TuiConfig {
             sanitize_mcp_server_names: default_sanitize_mcp_server_names(),
             mcp_allow_insecure_hosts: Vec::new(),
             allow_bang_escape: default_allow_bang_escape(),
-            colors: ColorsConfig::default(),
         }
     }
 }
@@ -2365,19 +2433,68 @@ mod tests {
         }
     }
 
+    // ── color / theme mode (issue #527) ─────────────────────────────────
+
     #[test]
-    fn colors_config_defaults_empty_and_round_trips() {
-        // Absent table → all slots unset (each falls back to its built-in).
+    fn color_mode_defaults_to_auto_and_round_trips() {
+        // Absent key → Auto (color on a TTY, none off one).
         let cfg: TuiConfig = toml::from_str("").unwrap();
-        assert_eq!(cfg.colors, ColorsConfig::default());
-        // Named + hex specs parse into the slots.
-        let cfg: TuiConfig = toml::from_str(
-            "[colors]\naccent = \"#dc3c14\"\nshell_mode = \"orange\"\ndim = \"grey\"",
-        )
-        .unwrap();
-        assert_eq!(cfg.colors.accent.as_deref(), Some("#dc3c14"));
-        assert_eq!(cfg.colors.shell_mode.as_deref(), Some("orange"));
-        assert_eq!(cfg.colors.dim.as_deref(), Some("grey"));
+        assert_eq!(cfg.color, ColorMode::Auto);
+        // Every keyword parses from its serde (lowercase) key.
+        for (key, want) in [
+            ("auto", ColorMode::Auto),
+            ("always", ColorMode::Always),
+            ("never", ColorMode::Never),
+            ("minimal", ColorMode::Minimal),
+            ("inverted", ColorMode::Inverted),
+            ("dark", ColorMode::Dark),
+            ("light", ColorMode::Light),
+            ("mono", ColorMode::Mono),
+        ] {
+            let cfg: TuiConfig = toml::from_str(&format!("color = \"{key}\"")).unwrap();
+            assert_eq!(cfg.color, want, "color = {key}");
+        }
+    }
+
+    #[test]
+    fn color_mode_keyword_round_trips_and_aliases_parse() {
+        // keyword() is the inverse of from_keyword() for every canonical variant.
+        for m in [
+            ColorMode::Auto,
+            ColorMode::Always,
+            ColorMode::Never,
+            ColorMode::Minimal,
+            ColorMode::Inverted,
+            ColorMode::Dark,
+            ColorMode::Light,
+            ColorMode::Mono,
+        ] {
+            assert_eq!(ColorMode::from_keyword(m.keyword()), Some(m));
+        }
+        // Case-insensitive + aliases.
+        assert_eq!(ColorMode::from_keyword("ALWAYS"), Some(ColorMode::Always));
+        assert_eq!(ColorMode::from_keyword(" on "), Some(ColorMode::Always));
+        assert_eq!(ColorMode::from_keyword("off"), Some(ColorMode::Never));
+        assert_eq!(ColorMode::from_keyword("monochrome"), Some(ColorMode::Mono));
+        // Unknown keyword is rejected (the CLI value_parser surfaces this).
+        assert_eq!(ColorMode::from_keyword("rainbow"), None);
+    }
+
+    #[test]
+    fn color_mode_forced_and_is_mono() {
+        // forced(): Some(true) = color on, Some(false) = off, None = defer to TTY.
+        assert_eq!(ColorMode::Always.forced(), Some(true));
+        assert_eq!(ColorMode::Dark.forced(), Some(true));
+        assert_eq!(ColorMode::Light.forced(), Some(true));
+        assert_eq!(ColorMode::Inverted.forced(), Some(true));
+        assert_eq!(ColorMode::Minimal.forced(), Some(true));
+        assert_eq!(ColorMode::Never.forced(), Some(false));
+        assert_eq!(ColorMode::Mono.forced(), Some(false));
+        assert_eq!(ColorMode::Auto.forced(), None);
+        // is_mono distinguishes the ASCII-fallback mode from plain Never.
+        assert!(ColorMode::Mono.is_mono());
+        assert!(!ColorMode::Never.is_mono());
+        assert!(!ColorMode::Auto.is_mono());
     }
 
     #[test]
