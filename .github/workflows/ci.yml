@@ -188,8 +188,36 @@ jobs:
     # and exercises the `#[cfg(windows)]` code paths the Linux jobs never see;
     # without it, Windows support silently rots. clippy + test mirror the bar
     # the lint/test jobs set on Linux.
+    #
+    # PERF: this job is the slowest in CI (~6 min vs ~1.5 min for the Linux
+    # jobs). The job-level env below + the Defender-exclusion step trim the
+    # Windows-specific tax (AV scanning of build artifacts, PDB I/O,
+    # incremental bookkeeping) without changing what is verified. See
+    # docs/decisions/windows_ci_speedup.md for the lever inventory + results.
+    env:
+      # Tests and clippy don't need debuginfo; generating + linking PDBs on
+      # Windows (and letting Defender scan them) is a large slice of the time.
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+      # Clean CI build — incremental only adds bookkeeping + extra small-file
+      # churn that NTFS + Defender make expensive.
+      CARGO_INCREMENTAL: 0
     steps:
       - uses: actions/checkout@v4
+      # Exclude the build/toolchain dirs (and the compiler/linker processes)
+      # from Windows Defender real-time scanning. Defender scans every .rlib,
+      # .pdb, and .exe the toolchain writes, which dominates Windows Rust CI
+      # time; the runner is admin, so the exclusions apply. Best-effort —
+      # never fail the job if Defender is unavailable.
+      - name: Exclude build dirs from Defender real-time scanning
+        shell: pwsh
+        run: |
+          $paths = @("${{ github.workspace }}", "$env:USERPROFILE\.cargo", "$env:USERPROFILE\.rustup")
+          foreach ($p in $paths) { Add-MpPreference -ExclusionPath $p -ErrorAction SilentlyContinue }
+          Add-MpPreference -ExclusionProcess "cargo.exe" -ErrorAction SilentlyContinue
+          Add-MpPreference -ExclusionProcess "rustc.exe" -ErrorAction SilentlyContinue
+          Add-MpPreference -ExclusionProcess "link.exe"  -ErrorAction SilentlyContinue
+          Write-Output "Defender exclusions applied (best-effort)."
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
