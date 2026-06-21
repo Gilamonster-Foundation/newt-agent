@@ -55,17 +55,32 @@ pub struct Cli {
     )]
     pub splash: bool,
 
-    /// Disable the input footer (the transient multi-line `❯` block + status
-    /// header) and use a plain bash-like prompt. Equivalent to `NEWT_FOOTER=off`
-    /// or `[tui] footer = "off"`. By default the footer shows on a TTY and
-    /// auto-degrades to a plain scroller off one (pipes, `newt worker`).
+    /// Lean / flight / wyvern mode (issue #527): drop the rich footer and use the
+    /// dead-simple LeanTUI text box, where each prompt renders as a timestamped
+    /// server-log line (`[ts] ❯ <prompt>`). Equivalent to `NEWT_FOOTER=off` /
+    /// `[tui] footer = "off"`. By default the rich footer shows on a TTY and
+    /// auto-degrades to this lean morphology off one (pipes, `newt worker`).
+    /// `-n` / `--neat` / `--lite` (vi's "no-swap" spirit) are the same switch.
     #[arg(
+        short = 'n',
         long,
-        visible_alias = "no-footer",
+        visible_aliases = ["neat", "lite", "lean", "flight", "no-footer"],
         global = true,
         default_value_t = false
     )]
     pub plain: bool,
+
+    /// Color / theme (issue #527): always|never|auto|minimal|inverted|dark|
+    /// light|mono. Controls whether — and how — ANSI color is emitted.
+    /// Precedence: this flag > NO_COLOR / TERM=dumb > `[tui] color` > auto. An
+    /// explicit `--color` also overrides NO_COLOR. Equivalent to `NEWT_COLOR`.
+    #[arg(long, global = true, value_name = "MODE", value_parser = parse_color_mode)]
+    pub color: Option<newt_core::ColorMode>,
+
+    /// Force monochrome output (no color). Sugar for `--color=mono`; wins over
+    /// `--color` when both are given.
+    #[arg(long, global = true, default_value_t = false)]
+    pub mono: bool,
 
     /// Enable per-round agent-loop diagnostics: prints each round's content
     /// excerpt, tool-call count, and token usage. Also enables fallback
@@ -309,6 +324,17 @@ pub enum Command {
     },
 }
 
+/// clap `value_parser` for `--color`: parse a keyword into a
+/// [`newt_core::ColorMode`] (keeps newt-core clap-free — no `ValueEnum` derive).
+fn parse_color_mode(s: &str) -> Result<newt_core::ColorMode, String> {
+    newt_core::ColorMode::from_keyword(s).ok_or_else(|| {
+        format!(
+            "invalid color mode '{s}' (expected one of: \
+             always, never, auto, minimal, inverted, dark, light, mono)"
+        )
+    })
+}
+
 /// Resolve the user's home directory cross-platform: `$HOME` (set on Unix and
 /// many Windows shells) first, then `%USERPROFILE%` (the Windows default). Empty
 /// values are treated as unset.
@@ -405,6 +431,20 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
                 "warning: ignoring --write grants (path contains the path separator): {e}"
             ),
         }
+    }
+
+    // --color / --mono (issue #527): thread the color mode to every surface via
+    // NEWT_COLOR (global flags, so set before the command match). --mono wins
+    // over --color. Resolution (flag > NO_COLOR/TERM=dumb > [tui] color > auto)
+    // happens in the TUI color layer.
+    let color_kw = if cli.mono {
+        Some("mono")
+    } else {
+        cli.color.map(|c| c.keyword())
+    };
+    if let Some(kw) = color_kw {
+        // SAFETY: single-threaded before the TUI starts any async work.
+        unsafe { std::env::set_var("NEWT_COLOR", kw) };
     }
 
     match cli.command.unwrap_or(Command::Code { path: None }) {
@@ -810,6 +850,77 @@ mod tests {
         let cli = Cli::try_parse_from(["newt", "--trace"]).unwrap();
 
         assert!(cli.trace);
+    }
+
+    // ── color / theme flags (issue #527) ────────────────────────────────
+
+    #[test]
+    fn parses_color_mode_global() {
+        // Works bare (default `code`) and after the subcommand; off by default.
+        let cli = Cli::try_parse_from(["newt", "--color", "always"]).unwrap();
+        assert_eq!(cli.color, Some(newt_core::ColorMode::Always));
+        let cli = Cli::try_parse_from(["newt", "code", "--color", "dark"]).unwrap();
+        assert_eq!(cli.color, Some(newt_core::ColorMode::Dark));
+        let cli = Cli::try_parse_from(["newt"]).unwrap();
+        assert_eq!(cli.color, None);
+    }
+
+    #[test]
+    fn rejects_unknown_color_mode() {
+        // The value_parser surfaces a clap error for an unknown keyword.
+        assert!(Cli::try_parse_from(["newt", "--color", "rainbow"]).is_err());
+    }
+
+    #[test]
+    fn parses_mono_global() {
+        let cli = Cli::try_parse_from(["newt", "--mono"]).unwrap();
+        assert!(cli.mono);
+        let cli = Cli::try_parse_from(["newt"]).unwrap();
+        assert!(!cli.mono);
+    }
+
+    #[test]
+    fn mono_and_color_can_coexist_mono_wins_in_dispatch() {
+        // Both parse; dispatch resolves --mono ahead of --color (mono wins).
+        let cli = Cli::try_parse_from(["newt", "--mono", "--color", "always"]).unwrap();
+        assert!(cli.mono);
+        assert_eq!(cli.color, Some(newt_core::ColorMode::Always));
+        let color_kw = if cli.mono {
+            Some("mono")
+        } else {
+            cli.color.map(|c| c.keyword())
+        };
+        assert_eq!(color_kw, Some("mono"));
+    }
+
+    #[test]
+    fn parse_color_mode_accepts_aliases_and_rejects_garbage() {
+        assert_eq!(parse_color_mode("on"), Ok(newt_core::ColorMode::Always));
+        assert_eq!(parse_color_mode("OFF"), Ok(newt_core::ColorMode::Never));
+        assert!(parse_color_mode("chartreuse").is_err());
+    }
+
+    // ── lean / flight flag (issue #527) ─────────────────────────────────
+
+    #[test]
+    fn parses_lean_flag_and_all_aliases() {
+        // -n / --neat / --lite / --lean / --flight / --plain / --no-footer all
+        // set the same `plain` switch (lean morphology), bare or after `code`.
+        for argv in [
+            vec!["newt", "-n"],
+            vec!["newt", "--neat"],
+            vec!["newt", "--lite"],
+            vec!["newt", "--lean"],
+            vec!["newt", "--flight"],
+            vec!["newt", "--plain"],
+            vec!["newt", "--no-footer"],
+            vec!["newt", "code", "-n"],
+        ] {
+            let cli = Cli::try_parse_from(argv.clone()).unwrap();
+            assert!(cli.plain, "{argv:?} should set the lean/plain switch");
+        }
+        // Off by default.
+        assert!(!Cli::try_parse_from(["newt"]).unwrap().plain);
     }
 
     #[test]

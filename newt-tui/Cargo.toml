@@ -24,7 +24,6 @@ anyhow.workspace = true
 # async trait — see newt-tui/src/mcp.rs.
 async-trait.workspace = true
 libc.workspace = true
-rustyline.workspace = true
 tokio.workspace = true
 reqwest.workspace = true
 serde.workspace = true
@@ -49,8 +48,8 @@ tui-textarea = { version = "0.7.0", optional = true }
 [features]
 # The TTY rich inline input surface (ratatui Viewport::Inline + tui-textarea):
 # status row, live clock, multi-line vi/emacs editing. OFF by default — the
-# rustyline surface is the only one compiled unless this is enabled, and the
-# `is_terminal()` runtime gate still applies on top of the feature.
+# lean crossterm box is the only surface compiled unless this is enabled, and
+# the `is_terminal()` runtime gate still applies on top of the feature.
 rich-tui = ["dep:tui-textarea"]
 
 # NOTE (Step 9.7): the direct agent-bridle dependency moved to newt-core with

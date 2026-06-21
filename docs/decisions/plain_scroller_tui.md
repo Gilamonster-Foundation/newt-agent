@@ -2,9 +2,11 @@
 
 **Status:** Accepted (decided by Shawn Hartsock, 2026-06-12); **amended
 2026-06-17** by #416 — a two-mode deviation adds an opt-in rich inline input
-surface on a TTY (see the carve-out below). The plain-scroller rule still
+surface on a TTY (see the carve-out below); **refined 2026-06-20** by #527 — the
+chat surface now wears two presentation morphologies (LeanTUI / RichTUI), see
+`docs/decisions/lean_rich_tui_morphologies.md`. The plain-scroller rule still
 governs the piped/headless path and all output.
-**Date:** 2026-06-12 (amended 2026-06-17)
+**Date:** 2026-06-12 (amended 2026-06-17, refined 2026-06-20)
 **Related:** newt-agent#89 ("is a rich interactive TUI in-scope for newt's
 'sharp minimal binary' identity?" — closed by the newt / gilamonster-agent
 split; this doc records the standing answer), PR #301 (the preamble always
