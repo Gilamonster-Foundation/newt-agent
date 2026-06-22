@@ -53,6 +53,9 @@ agent-bridle = { version = "0.1", features = ["shell", "web"] }
 # (the headless wyvern tier) by the passthrough shim in `agentic::markdown`.
 pulldown-cmark = { workspace = true, optional = true }
 unicode-width = { workspace = true, optional = true }
+# Step 25.5 (#568 follow-on): optional plain-text GFM-table-pipe alignment for
+# the headless wyvern tier. Off by default (pulls comrak + wasm-bindgen).
+markdown-table-formatter = { workspace = true, optional = true }
 
 # Issue #95: the `Caveats` / `CountBound` / `Scope` types are re-exported
 # straight from the published `agent-mesh-protocol` crate (registry pin,
@@ -94,6 +97,10 @@ default = ["markdown"]
 # the human-facing binaries; compiled out (passthrough shim) for the headless
 # wyvern strip via --no-default-features.
 markdown = ["dep:pulldown-cmark", "dep:unicode-width"]
+# Step 25.5: plain-text GFM-table-pipe alignment for the headless wyvern tier.
+# Off by default — only wyvern/headless consumers opt in (pulls comrak +
+# wasm-bindgen). `tidy_markdown_tables` is identity without this feature.
+markdown-table-formatter = ["dep:markdown-table-formatter"]
 pyo3 = ["dep:pyo3"]
 
 [dev-dependencies]

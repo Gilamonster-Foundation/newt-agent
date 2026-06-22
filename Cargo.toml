@@ -159,6 +159,12 @@ crossterm = "0.28"
 pulldown-cmark = { version = "0.12", default-features = false }
 unicode-width = "0.2"
 
+# Wyvern markdown source-tidy (newt-core, behind the optional
+# `markdown-table-formatter` feature — Step 25.5). Aligns GFM table pipes in
+# plain-text source for the headless tier (no ANSI). Pulls comrak + wasm-bindgen,
+# so it is NEVER a default dependency — only the wyvern/headless consumers opt in.
+markdown-table-formatter = "0.3"
+
 # Test utilities (dev-only)
 tempfile = "3"
 # Resolves the cargo target directory the way cargo itself does (env var >

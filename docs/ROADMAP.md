@@ -1269,8 +1269,10 @@ surface or a non-CommonMark parser). One PR per step.
   `/markdown [on|off|auto]` command with a per-session override + non-stream
   fallback render; effective = `session ?? [tui].markdown.forced() ?? color`,
   then ∧ color. Cowork driver opts out (renders into its own frame).
-- **25.5** Wyvern source-tidy: optional `markdown-table-formatter` feature
-  (plain-text pipe alignment; comrak/wasm-bindgen never default).
+- **25.5** ✅ **done** — Wyvern source-tidy: `tidy_markdown_tables(src)` aligns
+  GFM table pipes in plain-text source for the headless tier, behind the optional
+  `markdown-table-formatter` feature (identity when off; comrak/wasm-bindgen never
+  in the default graph). Independent of the `markdown` feature (wyvern strips it).
 - **25.6** *(follow-on)* `markdown-syntect` code highlighting behind a feature;
   off by default to keep the binary lean.
 
