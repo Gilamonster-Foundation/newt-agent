@@ -940,6 +940,19 @@ pub struct TuiConfig {
     #[serde(default = "default_keep_alive")]
     pub keep_alive: String,
 
+    /// Per-request timeout (seconds) for the compression summarizer (Step 24.2,
+    /// #559). Default 60. The summary is the largest single request of the
+    /// session; cold-loading a big model can legitimately exceed 60s, so raise
+    /// this when the summarizer falls back to the static marker on a slow box.
+    #[serde(default = "default_summarizer_timeout_secs")]
+    pub summarizer_timeout_secs: u64,
+
+    /// Number of retry attempts for the compression summarizer before it falls
+    /// back to the static marker (Step 24.2, #559). Default 2. Many summarizer
+    /// failures are transient (eviction reload, momentary OOM).
+    #[serde(default = "default_summarizer_retries")]
+    pub summarizer_retries: u32,
+
     /// Markdown rendering of assistant output (Step 25.4, #568). `auto`
     /// (default) renders whenever color is active; `on`/`off` force it. The
     /// `/markdown [on|off]` command overrides this for the session.
@@ -1012,6 +1025,14 @@ fn default_inference_timeout_secs() -> u64 {
 
 fn default_keep_alive() -> String {
     "5m".to_string()
+}
+
+fn default_summarizer_timeout_secs() -> u64 {
+    60
+}
+
+fn default_summarizer_retries() -> u32 {
+    2
 }
 
 fn default_mid_loop_trim_threshold() -> usize {
@@ -1727,6 +1748,8 @@ impl Default for TuiConfig {
             connect_timeout_secs: default_connect_timeout_secs(),
             inference_timeout_secs: default_inference_timeout_secs(),
             keep_alive: default_keep_alive(),
+            summarizer_timeout_secs: default_summarizer_timeout_secs(),
+            summarizer_retries: default_summarizer_retries(),
             markdown: MarkdownMode::default(),
             mid_loop_trim_threshold: default_mid_loop_trim_threshold(),
             mid_loop_trim_tokens: None,
@@ -2578,6 +2601,17 @@ mod tests {
         assert_eq!(cfg.markdown, MarkdownMode::Off);
         let default: TuiConfig = toml::from_str("").unwrap();
         assert_eq!(default.markdown, MarkdownMode::Auto);
+    }
+
+    #[test]
+    fn tui_summarizer_timeout_and_retries_default_and_parse() {
+        let d = TuiConfig::default();
+        assert_eq!(d.summarizer_timeout_secs, 60);
+        assert_eq!(d.summarizer_retries, 2);
+        let cfg: TuiConfig =
+            toml::from_str("summarizer_timeout_secs = 180\nsummarizer_retries = 4").unwrap();
+        assert_eq!(cfg.summarizer_timeout_secs, 180);
+        assert_eq!(cfg.summarizer_retries, 4);
     }
 
     #[test]
