@@ -1223,13 +1223,12 @@ surface or a non-CommonMark parser). One PR per step.
 - **24.2** ✅ **done** — GFM tables: box-drawing (dim borders, bold header),
   per-column display-width fit against `cols` (shrink-widest), left/center/right
   alignment, CJK/emoji width, overflow truncation with `…`. `table.rs`.
-- **24.3** *(writer ✅ done; live wiring pending)* `MarkdownStreamWriter` —
-  block-aware streaming: inline lines render per completed line, multi-line
-  blocks (fence/table/list/quote) hold until they close, split markers reunite
-  in the line buffer. `stream.rs` + the `newt-core` `render_md` example (`--stream`).
-  **Remaining:** replace the raw per-token `print!` in `stream_response` with the
-  writer (threads `markdown` via `ChatCtx`) — done after visual sign-off, since
-  it only manifests against a live model.
+- **24.3** ✅ **done** — `MarkdownStreamWriter` block-aware streaming: inline
+  lines render per completed line, multi-line blocks (fence/table/list/quote)
+  hold until they close, split markers reunite in the line buffer. `stream.rs` +
+  the `newt-core` `render_md` example (`--stream`). Wired into `stream_response`
+  (the raw per-token `print!` now routes through the writer; the persisted `full`
+  stays raw); activation rule is "markdown ⇒ color" until the 24.4 toggle.
 - **24.4** `[tui].markdown` (`MarkdownMode`) config + `/markdown [on|off]`
   command + non-stream fallback render; effective = config ∧ `color_supported()`.
 - **24.5** Wyvern source-tidy: optional `markdown-table-formatter` feature
