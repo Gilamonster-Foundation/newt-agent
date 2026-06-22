@@ -658,6 +658,54 @@ impl ColorMode {
     }
 }
 
+/// Markdown rendering mode — the `[tui] markdown` key and the `/markdown`
+/// command (Step 25.4, #568). `Auto` renders Markdown whenever color is active;
+/// `On`/`Off` force the choice (`On` still needs color to emit ANSI). The
+/// effective decision is `mode.forced().unwrap_or(color_on) && color_on`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum MarkdownMode {
+    /// Render Markdown whenever color is active (default).
+    #[default]
+    Auto,
+    /// Force Markdown rendering on (still gated by color support).
+    On,
+    /// Disable Markdown rendering — stream raw text.
+    Off,
+}
+
+impl MarkdownMode {
+    /// Parse a CLI/config/command keyword (case-insensitive). `always`/`never`
+    /// alias `on`/`off`.
+    pub fn from_keyword(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "auto" => Some(Self::Auto),
+            "on" | "always" => Some(Self::On),
+            "off" | "never" => Some(Self::Off),
+            _ => None,
+        }
+    }
+
+    /// The canonical lowercase keyword (round-trips `from_keyword` + serde).
+    pub fn keyword(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::On => "on",
+            Self::Off => "off",
+        }
+    }
+
+    /// `Some(true)`/`Some(false)` force the decision; `None` (`Auto`) defers to
+    /// color detection.
+    pub fn forced(self) -> Option<bool> {
+        match self {
+            Self::On => Some(true),
+            Self::Off => Some(false),
+            Self::Auto => None,
+        }
+    }
+}
+
 /// How a thinking model's streamed reasoning is surfaced — the `[tui] thinking`
 /// key. Newt strips `<think>…</think>` from the reply regardless (#385); this
 /// only controls the live human display.
@@ -891,6 +939,12 @@ pub struct TuiConfig {
     /// of a reload on each turn). Use `"-1"` to keep forever.
     #[serde(default = "default_keep_alive")]
     pub keep_alive: String,
+
+    /// Markdown rendering of assistant output (Step 25.4, #568). `auto`
+    /// (default) renders whenever color is active; `on`/`off` force it. The
+    /// `/markdown [on|off]` command overrides this for the session.
+    #[serde(default)]
+    pub markdown: MarkdownMode,
 
     /// Maximum number of messages in the in-progress tool-call message list
     /// before the agent trims the middle to prevent context overflow.
@@ -1673,6 +1727,7 @@ impl Default for TuiConfig {
             connect_timeout_secs: default_connect_timeout_secs(),
             inference_timeout_secs: default_inference_timeout_secs(),
             keep_alive: default_keep_alive(),
+            markdown: MarkdownMode::default(),
             mid_loop_trim_threshold: default_mid_loop_trim_threshold(),
             mid_loop_trim_tokens: None,
             sanitize_mcp_server_names: default_sanitize_mcp_server_names(),
@@ -2495,6 +2550,34 @@ mod tests {
         assert!(ColorMode::Mono.is_mono());
         assert!(!ColorMode::Never.is_mono());
         assert!(!ColorMode::Auto.is_mono());
+    }
+
+    #[test]
+    fn markdown_mode_defaults_to_auto_round_trips_and_forces() {
+        assert_eq!(MarkdownMode::default(), MarkdownMode::Auto);
+        for m in [MarkdownMode::Auto, MarkdownMode::On, MarkdownMode::Off] {
+            assert_eq!(MarkdownMode::from_keyword(m.keyword()), Some(m));
+        }
+        // Case-insensitive + always/never aliases.
+        assert_eq!(MarkdownMode::from_keyword("ON"), Some(MarkdownMode::On));
+        assert_eq!(
+            MarkdownMode::from_keyword(" always "),
+            Some(MarkdownMode::On)
+        );
+        assert_eq!(MarkdownMode::from_keyword("never"), Some(MarkdownMode::Off));
+        assert_eq!(MarkdownMode::from_keyword("rainbow"), None);
+        // forced(): On = Some(true), Off = Some(false), Auto = defer.
+        assert_eq!(MarkdownMode::On.forced(), Some(true));
+        assert_eq!(MarkdownMode::Off.forced(), Some(false));
+        assert_eq!(MarkdownMode::Auto.forced(), None);
+    }
+
+    #[test]
+    fn tui_markdown_parses_from_toml_and_defaults_to_auto() {
+        let cfg: TuiConfig = toml::from_str("markdown = \"off\"").unwrap();
+        assert_eq!(cfg.markdown, MarkdownMode::Off);
+        let default: TuiConfig = toml::from_str("").unwrap();
+        assert_eq!(default.markdown, MarkdownMode::Auto);
     }
 
     #[test]

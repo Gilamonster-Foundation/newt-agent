@@ -1264,9 +1264,11 @@ surface or a non-CommonMark parser). One PR per step.
   the `newt-core` `render_md` example (`--stream`). Wired into `stream_response`
   (the raw per-token `print!` now routes through the writer; the persisted `full`
   stays raw); activation rule is "markdown ⇒ color" until the 25.4 toggle.
-- **25.4** `[tui].markdown` (`MarkdownMode`) config + `/markdown [on|off|auto]`
-  command + a per-session override + non-stream fallback render; effective =
-  `session ?? [tui].markdown.forced() ?? color`, then ∧ color.
+- **25.4** ✅ **done** — `[tui].markdown` (`MarkdownMode`) config + a resolved
+  `markdown` bool threaded through `ChatCtx` (replacing the 25.3 hardcode) +
+  `/markdown [on|off|auto]` command with a per-session override + non-stream
+  fallback render; effective = `session ?? [tui].markdown.forced() ?? color`,
+  then ∧ color. Cowork driver opts out (renders into its own frame).
 - **25.5** Wyvern source-tidy: optional `markdown-table-formatter` feature
   (plain-text pipe alignment; comrak/wasm-bindgen never default).
 - **25.6** *(follow-on)* `markdown-syntect` code highlighting behind a feature;

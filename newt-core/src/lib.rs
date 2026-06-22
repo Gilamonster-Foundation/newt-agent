@@ -70,9 +70,9 @@ pub use agents::AgentsProvider;
 pub use caveats::{CaveatsExt, CountBoundExt, ScopeExt};
 pub use config::{
     AgentsConfig, BackendConfig, BackendKind, BundleConfig, ChatStyle, ColorMode, Config,
-    ConversationsConfig, EditMode, FooterMode, Loadout, LoadoutSettings, LogConfig, MemoryConfig,
-    MemoryDisclosure, MemoryProviderKind, OpenAiApi, PermissionPreset, PickVia, ProfilePick,
-    ProviderConfig, SkillsConfig, ThinkingMode, ToolPermissions, TuiConfig,
+    ConversationsConfig, EditMode, FooterMode, Loadout, LoadoutSettings, LogConfig, MarkdownMode,
+    MemoryConfig, MemoryDisclosure, MemoryProviderKind, OpenAiApi, PermissionPreset, PickVia,
+    ProfilePick, ProviderConfig, SkillsConfig, ThinkingMode, ToolPermissions, TuiConfig,
 };
 pub use conversation::{
     new_conversation_id, session_plan_dir, session_plan_path, ConversationRecord,
