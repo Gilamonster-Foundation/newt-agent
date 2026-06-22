@@ -29,9 +29,12 @@ mod markdown;
 #[cfg(not(feature = "markdown"))]
 mod markdown {
     //! Passthrough shim used when the `markdown` feature is disabled (the
-    //! headless wyvern strip). Keeps `render_markdown` / `RenderOpts` in the
-    //! public API with zero markdown dependencies; output is the source
-    //! verbatim — identical to color-off behavior in the full renderer.
+    //! headless wyvern strip). Keeps `render_markdown` / `RenderOpts` /
+    //! `MarkdownStreamWriter` in the public API with zero markdown
+    //! dependencies; output is the source verbatim — identical to color-off
+    //! behavior in the full renderer.
+    use std::io::{self, Write};
+
     #[derive(Debug, Clone, Copy)]
     pub struct RenderOpts {
         pub color: bool,
@@ -39,6 +42,22 @@ mod markdown {
     }
     pub fn render_markdown(src: &str, _opts: RenderOpts) -> String {
         src.to_string()
+    }
+
+    /// Raw passthrough writer — bytes through, unchanged.
+    pub struct MarkdownStreamWriter<W: Write> {
+        out: W,
+    }
+    impl<W: Write> MarkdownStreamWriter<W> {
+        pub fn new(out: W, _opts: RenderOpts) -> Self {
+            Self { out }
+        }
+        pub fn push(&mut self, delta: &str) -> io::Result<()> {
+            self.out.write_all(delta.as_bytes())
+        }
+        pub fn finish(&mut self) -> io::Result<()> {
+            self.out.flush()
+        }
     }
 }
 mod mcp;
@@ -64,7 +83,7 @@ pub use driver::{
     VISIBLE_TRANSCRIPT_ROLES,
 };
 pub use git_tool::{git_tool_definition, GitTool};
-pub use markdown::{render_markdown, RenderOpts};
+pub use markdown::{render_markdown, MarkdownStreamWriter, RenderOpts};
 pub use mcp::{McpTools, NoMcp};
 pub use memory_fetch::{
     memory_fetch_tool_definition, MemAddr, MemPayload, MemorySource, StoreMemorySource,

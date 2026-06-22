@@ -16,8 +16,11 @@
 
 mod emitter;
 mod inline;
+mod stream;
 mod table;
 mod width;
+
+pub use stream::MarkdownStreamWriter;
 
 use emitter::Emitter;
 use pulldown_cmark::{Options, Parser};
