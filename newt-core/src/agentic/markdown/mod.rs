@@ -9,13 +9,14 @@
 //! renderer is replaced by a passthrough shim, so the headless wyvern tier
 //! carries no markdown dependencies).
 //!
-//! This step renders inline emphasis, headings, lists (bullet/ordered/task),
-//! blockquotes, thematic breaks, and fenced code (dim, un-highlighted). GFM
-//! tables (24.2), block-aware streaming (24.3), config + `/markdown` (24.4),
-//! the wyvern source-tidy (24.5), and syntect highlighting (24.6) follow.
+//! Renders inline emphasis, headings, lists (bullet/ordered/task), blockquotes,
+//! thematic breaks, fenced code (dim, un-highlighted), and GFM tables
+//! (box-drawing, width-fit). Block-aware streaming (24.3), config + `/markdown`
+//! (24.4), the wyvern source-tidy (24.5), and syntect highlighting (24.6) follow.
 
 mod emitter;
 mod inline;
+mod table;
 mod width;
 
 use emitter::Emitter;
@@ -42,6 +43,7 @@ pub fn render_markdown(src: &str, opts: RenderOpts) -> String {
     let mut options = Options::empty();
     options.insert(Options::ENABLE_STRIKETHROUGH);
     options.insert(Options::ENABLE_TASKLISTS);
+    options.insert(Options::ENABLE_TABLES);
     let parser = Parser::new_ext(src, options);
     let mut em = Emitter::new(opts.cols);
     for ev in parser {
@@ -193,5 +195,93 @@ mod tests {
     #[test]
     fn empty_input_renders_empty() {
         assert_eq!(r(""), "");
+    }
+
+    // ---- Step 24.2: GFM tables ----
+
+    /// Strip SGR escape sequences so the box-drawing skeleton can be asserted
+    /// independently of the styling.
+    fn strip(s: &str) -> String {
+        let mut out = String::new();
+        let mut chars = s.chars();
+        while let Some(c) = chars.next() {
+            if c == '\x1b' {
+                for n in chars.by_ref() {
+                    if n == 'm' {
+                        break;
+                    }
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn table_box_drawing_skeleton() {
+        let t = "| a | b |\n|---|---|\n| 1 | 2 |";
+        assert_eq!(
+            strip(&r(t)),
+            "┌───┬───┐\n│ a │ b │\n├───┼───┤\n│ 1 │ 2 │\n└───┴───┘"
+        );
+    }
+
+    #[test]
+    fn table_header_is_bold_borders_are_dim() {
+        let out = r("| a |\n|---|\n| 1 |");
+        assert!(
+            out.contains(&format!("{BOLD}a")),
+            "header cell must be bold"
+        );
+        assert!(out.contains(FADE), "borders must be dim");
+        // A body cell carries no styling.
+        assert!(strip(&out).contains("│ 1 │"));
+    }
+
+    #[test]
+    fn table_right_alignment_pads_on_the_left() {
+        // `:--` would be left, `--:` is right. Column width 2 ("ab"); "x" → " x".
+        let t = "| ab |\n|---:|\n| x |";
+        assert!(
+            strip(&r(t)).contains("│  x │"),
+            "right-aligned cell pads left"
+        );
+    }
+
+    #[test]
+    fn table_overflow_truncates_with_ellipsis() {
+        // Narrow budget forces the 8-wide cell down; it truncates to `abcde…`.
+        let t = "| name |\n|------|\n| abcdefgh |";
+        assert!(
+            strip(&rw(t, 10)).contains("abcde…"),
+            "overflowing cell truncates with an ellipsis"
+        );
+    }
+
+    #[test]
+    fn table_column_width_counts_cjk_display_width() {
+        // 日本語 = 6 display cols → top rule spans 6+2 = 8 dashes (not 3+2 = 5).
+        let t = "| 日本語 |\n|--------|\n| x |";
+        assert!(
+            strip(&r(t)).contains("┌────────┐"),
+            "CJK header sized by display width, not char count"
+        );
+    }
+
+    #[test]
+    fn table_inside_blockquote_is_prefixed_with_the_bar() {
+        let out = r("> | a |\n> |---|\n> | 1 |");
+        // Every rendered table line opens with the quote bar, then the box.
+        for line in out.lines() {
+            let plain = strip(line);
+            assert!(
+                plain.starts_with("│ ┌")
+                    || plain.starts_with("│ │")
+                    || plain.starts_with("│ ├")
+                    || plain.starts_with("│ └"),
+                "quoted table line must open with the bar then box: {plain:?}"
+            );
+        }
     }
 }

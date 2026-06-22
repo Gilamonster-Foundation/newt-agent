@@ -14,6 +14,7 @@
 //!   parser yet, so pipe rows render as ordinary paragraphs for now.
 
 use super::inline::{render_cells, sgr_fg, wrap_cells, Cell, Style, RESET};
+use super::table::{render_table, TableBuilder};
 use super::width::str_width;
 use crossterm::style::Color as CtColor;
 use pulldown_cmark::{Event, Tag, TagEnd};
@@ -58,6 +59,11 @@ pub(super) struct Emitter {
 
     /// Destination of the currently-open link, appended dimly on `End(Link)`.
     link_url: Option<String>,
+
+    // GFM table accumulation (Step 24.2). `in_cell` routes inline content into
+    // the current cell via `cur_cells` and tames hard breaks within a cell.
+    table: Option<TableBuilder>,
+    in_cell: bool,
 }
 
 impl Emitter {
@@ -80,6 +86,8 @@ impl Emitter {
             in_code: false,
             code_buf: String::new(),
             link_url: None,
+            table: None,
+            in_cell: false,
         }
     }
 
@@ -110,6 +118,7 @@ impl Emitter {
             Event::SoftBreak if !self.in_code => {
                 self.push_text(" ", Style::default());
             }
+            Event::HardBreak if self.in_cell => self.push_text(" ", Style::default()),
             Event::HardBreak if !self.in_code => {
                 self.block_lines.push(std::mem::take(&mut self.cur_cells));
             }
@@ -156,6 +165,14 @@ impl Emitter {
                 self.lists.push(start);
             }
             Tag::Item => self.start_item(),
+            Tag::Table(aligns) => {
+                self.flush_inline();
+                self.table = Some(TableBuilder::new(aligns));
+            }
+            Tag::TableCell => {
+                self.in_cell = true;
+                self.cur_cells.clear();
+            }
             Tag::Emphasis => self.italic += 1,
             Tag::Strong => self.bold += 1,
             Tag::Strikethrough => self.strike += 1,
@@ -190,6 +207,29 @@ impl Emitter {
                     self.indent = prev;
                 }
                 self.pending_first = None;
+            }
+            TagEnd::TableCell => {
+                self.in_cell = false;
+                let cell = std::mem::take(&mut self.cur_cells);
+                if let Some(b) = self.table.as_mut() {
+                    b.cur_row.push(cell);
+                }
+            }
+            TagEnd::TableHead => {
+                if let Some(b) = self.table.as_mut() {
+                    b.header = std::mem::take(&mut b.cur_row);
+                }
+            }
+            TagEnd::TableRow => {
+                if let Some(b) = self.table.as_mut() {
+                    let row = std::mem::take(&mut b.cur_row);
+                    b.rows.push(row);
+                }
+            }
+            TagEnd::Table => {
+                if let Some(b) = self.table.take() {
+                    self.emit_table(b);
+                }
             }
             TagEnd::Emphasis => self.italic = self.italic.saturating_sub(1),
             TagEnd::Strong => self.bold = self.bold.saturating_sub(1),
@@ -326,6 +366,23 @@ impl Emitter {
             self.out.push('\n');
         }
         self.code_buf.clear();
+    }
+
+    /// Flush an accumulated GFM table as box-drawing lines, each prefixed with
+    /// the container bars/indent.
+    fn emit_table(&mut self, b: TableBuilder) {
+        self.block_break_if_top();
+        let budget = self
+            .cols
+            .saturating_sub(self.quote_width() + str_width(&self.indent))
+            .max(8);
+        let bars = self.render_quote();
+        for line in render_table(&b.aligns, &b.header, &b.rows, budget) {
+            self.out.push_str(&bars);
+            self.out.push_str(&self.indent);
+            self.out.push_str(&line);
+            self.out.push('\n');
+        }
     }
 
     /// Flush a thematic break as a dim full-width rule.

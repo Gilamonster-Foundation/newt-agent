@@ -1220,8 +1220,9 @@ surface or a non-CommonMark parser). One PR per step.
   breaks, fenced code (dim, un-highlighted), display-width word wrap. Color-off
   and the `--no-default-features` wyvern strip are byte-for-byte passthrough.
   `render_markdown(src, RenderOpts{color, cols})` in `newt-core::agentic::markdown`.
-- **24.2** GFM tables: box-drawing, column width-fit against `cols`, alignment,
-  CJK/emoji width.
+- **24.2** ✅ **done** — GFM tables: box-drawing (dim borders, bold header),
+  per-column display-width fit against `cols` (shrink-widest), left/center/right
+  alignment, CJK/emoji width, overflow truncation with `…`. `table.rs`.
 - **24.3** `MarkdownStreamWriter` — block-aware streaming; replace the raw
   per-token `print!` in `stream_response` so inline styles emit per completed
   line and multi-line blocks (fences/tables) buffer until they close.
