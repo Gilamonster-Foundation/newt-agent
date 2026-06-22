@@ -56,6 +56,9 @@ unicode-width = { workspace = true, optional = true }
 # Step 25.5 (#568 follow-on): optional plain-text GFM-table-pipe alignment for
 # the headless wyvern tier. Off by default (pulls comrak + wasm-bindgen).
 markdown-table-formatter = { workspace = true, optional = true }
+# Step 25.6 (#568 follow-on): optional syntect code-block highlighting. Off by
+# default (heavy syntax/theme assets); pure-Rust (default-fancy, no onig C dep).
+syntect = { workspace = true, optional = true }
 
 # Issue #95: the `Caveats` / `CountBound` / `Scope` types are re-exported
 # straight from the published `agent-mesh-protocol` crate (registry pin,
@@ -101,6 +104,10 @@ markdown = ["dep:pulldown-cmark", "dep:unicode-width"]
 # Off by default — only wyvern/headless consumers opt in (pulls comrak +
 # wasm-bindgen). `tidy_markdown_tables` is identity without this feature.
 markdown-table-formatter = ["dep:markdown-table-formatter"]
+# Step 25.6: per-language syntax highlighting in fenced code blocks via syntect.
+# Requires `markdown` (the code-block renderer lives in the markdown module).
+# Off by default to keep the binary lean.
+markdown-syntect = ["markdown", "dep:syntect"]
 pyo3 = ["dep:pyo3"]
 
 [dev-dependencies]
