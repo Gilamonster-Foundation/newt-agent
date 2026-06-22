@@ -969,7 +969,13 @@ fn status_options() -> Option<String> {
 /// live (the event loop redraws every frame). `active` (the line has content)
 /// brightens the mode word; colors favor light/high-luminance tones (the
 /// accessibility default).
-fn header_line(editor: &Editor, model: &str, endpoint: &str, active: bool) -> Line<'static> {
+fn header_line(
+    editor: &Editor,
+    model: &str,
+    endpoint: &str,
+    gauge: Option<(u32, u32)>,
+    active: bool,
+) -> Line<'static> {
     let accent = Color::Rgb(255, 165, 90);
     let dim = Color::DarkGray;
     let stamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
@@ -988,6 +994,20 @@ fn header_line(editor: &Editor, model: &str, endpoint: &str, active: bool) -> Li
     }
     if let Some(opts) = status_options() {
         spans.push(Span::styled(format!(" [{opts}]"), Style::default().fg(dim)));
+    }
+    // Step 24.6 (#559): the context-budget gauge — `used/budget` (e.g.
+    // `899k/1024k`) colored by fill, so the operator sees context pressure
+    // BEFORE compression fires. Hidden until the budget is known.
+    if let Some((used, budget)) = gauge {
+        if budget > 0 {
+            let g = newt_core::agentic::fmt_token_gauge(used, budget);
+            let c = match newt_core::agentic::gauge_level(used, budget) {
+                newt_core::agentic::GaugeLevel::Ok => Color::Green,
+                newt_core::agentic::GaugeLevel::Warn => Color::Rgb(200, 140, 0),
+                newt_core::agentic::GaugeLevel::Critical => Color::Red,
+            };
+            spans.push(Span::styled(format!("  {g}"), Style::default().fg(c)));
+        }
     }
     Line::from(spans)
 }
@@ -1041,6 +1061,7 @@ fn draw(
     gutter: Option<u16>,
     model: &str,
     endpoint: &str,
+    gauge: Option<(u32, u32)>,
 ) {
     let area = f.area();
     // "active" = the line has content, so the header mode word brightens and the
@@ -1050,7 +1071,7 @@ fn draw(
     let [header_area, input_area] =
         Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(area);
     f.render_widget(
-        Paragraph::new(header_line(editor, model, endpoint, !empty)),
+        Paragraph::new(header_line(editor, model, endpoint, gauge, !empty)),
         header_area,
     );
     let g = resolve_gutter(gutter, input_area.width);
@@ -1303,6 +1324,8 @@ pub(crate) struct RichSurface {
     /// is reflected. Empty until the first turn sets them.
     model: String,
     endpoint: String,
+    /// Context-budget gauge `(used, budget)` for the header (Step 24.6, #559).
+    gauge: Option<(u32, u32)>,
 }
 
 impl RichSurface {
@@ -1315,6 +1338,7 @@ impl RichSurface {
             pending_end_quit: Cell::new(false),
             model: String::new(),
             endpoint: String::new(),
+            gauge: None,
         })
     }
 
@@ -1401,6 +1425,7 @@ impl RichSurface {
                     self.gutter,
                     &self.model,
                     &self.endpoint,
+                    self.gauge,
                 );
             })?;
 
@@ -1537,11 +1562,13 @@ impl InputSurface for RichSurface {
         Ok(())
     }
 
-    fn set_runtime_context(&mut self, model: &str, endpoint: &str) {
+    fn set_runtime_context(&mut self, model: &str, endpoint: &str, gauge: Option<(u32, u32)>) {
         // Refresh the status-header model @ endpoint each turn (#527) so a
-        // mid-session `/model` switch shows up on the next prompt.
+        // mid-session `/model` switch shows up on the next prompt. The
+        // context-budget gauge (24.6) rides the same per-turn refresh.
         self.model = model.to_string();
         self.endpoint = endpoint.to_string();
+        self.gauge = gauge;
     }
 }
 
@@ -1710,7 +1737,8 @@ mod tests {
         // Two-line layout (#527): row 0 is the status header; the message renders
         // below it, and the `:`-command on the last (bottom) row.
         let mut term = Terminal::new(TestBackend::new(40, 4)).unwrap();
-        term.draw(|f| draw(f, &ta, &ed, Some(1), "", "")).unwrap();
+        term.draw(|f| draw(f, &ta, &ed, Some(1), "", "", None))
+            .unwrap();
         let buf = term.backend().buffer();
         let row = |y: u16| -> String {
             (0..40)
@@ -1762,7 +1790,8 @@ mod tests {
         ed.input(key(':'), &mut ta);
         type_chars(&mut ed, &mut ta, "wq");
         let mut term = Terminal::new(TestBackend::new(80, 4)).unwrap();
-        term.draw(|f| draw(f, &ta, &ed, Some(25), "", "")).unwrap(); // 25 >= GUTTER_W (19)
+        term.draw(|f| draw(f, &ta, &ed, Some(25), "", "", None))
+            .unwrap(); // 25 >= GUTTER_W (19)
         let buf = term.backend().buffer();
         let last: String = (0..80)
             .map(|x| buf.cell((x, 3)).unwrap().symbol().to_string())
@@ -1784,7 +1813,7 @@ mod tests {
         // height 3: row 0 = status header (#527), rows 1-2 = the input.
         let mut term = Terminal::new(TestBackend::new(80, 3)).unwrap();
         // gutter = 1 → the overhang layout (the default).
-        term.draw(|f| draw(f, &ta, &editor, Some(1), "m", "http://e:1"))
+        term.draw(|f| draw(f, &ta, &editor, Some(1), "m", "http://e:1", None))
             .unwrap();
         let buf = term.backend().buffer();
         let row = |y: u16| -> String {
@@ -1821,11 +1850,35 @@ mod tests {
     }
 
     fn header_text(editor: &Editor, model: &str, endpoint: &str) -> String {
-        header_line(editor, model, endpoint, true)
+        header_line(editor, model, endpoint, None, true)
             .spans
             .iter()
             .map(|s| s.content.as_ref())
             .collect()
+    }
+
+    #[test]
+    fn header_shows_context_budget_gauge_when_known() {
+        let ed = vi_editor();
+        let text = |g| -> String {
+            header_line(&ed, "m", "e", g, true)
+                .spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect()
+        };
+        assert!(
+            text(Some((972_000, 1_024_000))).contains("972k/1024k"),
+            "the gauge shows used/budget once the budget is known"
+        );
+        assert!(
+            !text(None).contains("k/"),
+            "no gauge until a budget is known"
+        );
+        assert!(
+            !text(Some((100, 0))).contains("k/"),
+            "a zero budget shows no gauge (no divide-by-zero, no noise)"
+        );
     }
 
     #[test]
