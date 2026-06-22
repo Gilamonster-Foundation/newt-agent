@@ -1273,8 +1273,11 @@ surface or a non-CommonMark parser). One PR per step.
   GFM table pipes in plain-text source for the headless tier, behind the optional
   `markdown-table-formatter` feature (identity when off; comrak/wasm-bindgen never
   in the default graph). Independent of the `markdown` feature (wyvern strips it).
-- **25.6** *(follow-on)* `markdown-syntect` code highlighting behind a feature;
-  off by default to keep the binary lean.
+- **25.6** ✅ **done** — `markdown-syntect` per-language code-block highlighting
+  via syntect (foreground-only, theme bg suppressed), behind a feature, off by
+  default. Pure-Rust (`default-fancy` = fancy-regex, no onig C dep); not in the
+  default graph. `syntect.rs` seam: dim stub without the feature, real
+  highlighting with it. **Phase 25 complete.**
 
 ---
 

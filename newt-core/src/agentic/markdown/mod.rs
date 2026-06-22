@@ -10,13 +10,16 @@
 //! carries no markdown dependencies).
 //!
 //! Renders inline emphasis, headings, lists (bullet/ordered/task), blockquotes,
-//! thematic breaks, fenced code (dim, un-highlighted), and GFM tables
-//! (box-drawing, width-fit). Block-aware streaming (25.3), config + `/markdown`
-//! (25.4), the wyvern source-tidy (25.5), and syntect highlighting (25.6) follow.
+//! thematic breaks, fenced code (dim by default; syntect-highlighted under the
+//! optional `markdown-syntect` feature, 25.6), and GFM tables (box-drawing,
+//! width-fit). Block-aware streaming is in `stream.rs` (25.3); the config +
+//! `/markdown` toggle (25.4) lives in newt-tui; the wyvern source-tidy is
+//! `agentic::tidy_markdown_tables` (25.5).
 
 mod emitter;
 mod inline;
 mod stream;
+mod syntect;
 mod table;
 mod width;
 
@@ -154,6 +157,27 @@ mod tests {
         assert_eq!(
             r("```\nlet x = 1;\n```"),
             format!("  {FADE}let x = 1;{RESET}")
+        );
+    }
+
+    // Step 25.6: with the feature, a fenced block is syntect-highlighted rather
+    // than uniformly dim. Only compiles/runs under `--features markdown-syntect`.
+    #[cfg(feature = "markdown-syntect")]
+    #[test]
+    fn syntect_highlights_a_rust_code_block() {
+        let out = r("```rust\nfn main() {}\n```");
+        // Color codes interleave tokens, so check content after stripping ANSI.
+        assert!(
+            strip(&out).contains("fn main"),
+            "content preserved: {out:?}"
+        );
+        // Real per-token colors → 24-bit fg escapes beyond the uniform FADE dim,
+        // so it is NOT the plain stub rendering.
+        assert!(out.contains("\x1b[38;2;"), "has 24-bit color: {out:?}");
+        assert_ne!(
+            out,
+            format!("  {FADE}fn main() {{}}{RESET}"),
+            "not the plain dim stub"
         );
     }
 
