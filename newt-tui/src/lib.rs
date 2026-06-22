@@ -2985,19 +2985,73 @@ impl newt_core::NoteSink for ManagerNoteSink<'_> {
 /// largest single message of the session, and without the cap Ollama
 /// silently truncates it at the model's default window (F5).
 /// OpenAI-compatible endpoints configure context server-side — ignored.
+/// Summarizer knobs (Step 24.2, #559). Consolidated into one struct so new knobs
+/// (24.3's fallback model, …) add a field rather than another positional param
+/// at every `make_loop_summarizer` call site. `Default` lets a call site set
+/// only what it cares about (`..Default::default()`).
+#[derive(Clone)]
+struct SummarizerOpts {
+    /// Effective `num_ctx` cap sent to Ollama (F5); `None` = model default.
+    num_ctx: Option<u32>,
+    /// Ollama `keep_alive` for the warm + summary requests (Step 24.1).
+    keep_alive: String,
+    /// Per-request timeout in seconds (Step 24.2; `[tui].summarizer_timeout_secs`).
+    timeout_secs: u64,
+    /// Retry attempts before falling back to the static marker (Step 24.2).
+    retries: u32,
+}
+
+impl Default for SummarizerOpts {
+    fn default() -> Self {
+        Self {
+            num_ctx: None,
+            keep_alive: "5m".to_string(),
+            timeout_secs: 60,
+            retries: 2,
+        }
+    }
+}
+
+/// One summary attempt: send, check status, parse the content.
+async fn summarize_attempt(
+    client: &reqwest::Client,
+    chat_url: &str,
+    body: &serde_json::Value,
+    api_key: &Option<String>,
+    openai: bool,
+) -> anyhow::Result<String> {
+    let mut req = client.post(chat_url).json(body);
+    if let Some(key) = api_key {
+        req = req.bearer_auth(key);
+    }
+    let resp = req.send().await?;
+    if !resp.status().is_success() {
+        anyhow::bail!("summarizer endpoint {}", resp.status());
+    }
+    let json: serde_json::Value = resp.json().await?;
+    let content = if openai {
+        json["choices"][0]["message"]["content"].as_str()
+    } else {
+        json["message"]["content"].as_str()
+    };
+    match content {
+        Some(s) if !s.trim().is_empty() => Ok(s.to_string()),
+        _ => anyhow::bail!("summarizer returned empty content"),
+    }
+}
+
 fn make_loop_summarizer(
     url: String,
     model: String,
     kind: newt_core::BackendKind,
     api_key: Option<String>,
-    num_ctx: Option<u32>,
-    keep_alive: String,
+    opts: SummarizerOpts,
 ) -> newt_core::Summarizer {
     Box::new(move |prompt: String| {
         let url = url.clone();
         let model = model.clone();
         let api_key = api_key.clone();
-        let keep_alive = keep_alive.clone();
+        let opts = opts.clone();
         let openai = kind == newt_core::BackendKind::Openai;
         Box::pin(async move {
             let chat_url = if openai {
@@ -3015,7 +3069,7 @@ fn make_loop_summarizer(
                 let warm_url = format!("{}/api/generate", url.trim_end_matches('/'));
                 let warm_body = serde_json::json!({
                     "model": model,
-                    "keep_alive": keep_alive,
+                    "keep_alive": opts.keep_alive,
                     "stream": false,
                 });
                 if let Ok(warm_client) = reqwest::Client::builder()
@@ -3043,35 +3097,34 @@ fn make_loop_summarizer(
                     "model": model,
                     "messages": [{"role": "user", "content": prompt}],
                     "stream": false,
-                    "keep_alive": keep_alive,
+                    "keep_alive": opts.keep_alive,
                 });
-                if let Some(ctx_size) = num_ctx {
+                if let Some(ctx_size) = opts.num_ctx {
                     b["options"] = serde_json::json!({ "num_ctx": ctx_size });
                 }
                 b
             };
-            let mut req = reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(60))
-                .build()?
-                .post(&chat_url)
-                .json(&body);
-            if let Some(key) = api_key {
-                req = req.bearer_auth(key);
+            // Step 24.2 (#559): retry the summary request (configurable count)
+            // with backoff before giving up to the static-marker fallback —
+            // many failures (eviction reload, momentary OOM, transient
+            // transport) recover on a second try. The per-request timeout is
+            // configurable (`[tui].summarizer_timeout_secs`).
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(opts.timeout_secs))
+                .build()?;
+            let mut last_err: Option<anyhow::Error> = None;
+            for attempt in 0..=opts.retries {
+                if attempt > 0 {
+                    // Exponential backoff capped at ~4s: 250ms, 500ms, 1s, …
+                    let backoff = std::time::Duration::from_millis(250u64 << (attempt - 1).min(4));
+                    tokio::time::sleep(backoff).await;
+                }
+                match summarize_attempt(&client, &chat_url, &body, &api_key, openai).await {
+                    Ok(s) => return Ok(s),
+                    Err(e) => last_err = Some(e),
+                }
             }
-            let resp = req.send().await?;
-            if !resp.status().is_success() {
-                anyhow::bail!("summarizer endpoint {}", resp.status());
-            }
-            let json: serde_json::Value = resp.json().await?;
-            let content = if openai {
-                json["choices"][0]["message"]["content"].as_str()
-            } else {
-                json["message"]["content"].as_str()
-            };
-            match content {
-                Some(s) if !s.trim().is_empty() => Ok(s.to_string()),
-                _ => anyhow::bail!("summarizer returned empty content"),
-            }
+            Err(last_err.unwrap_or_else(|| anyhow::anyhow!("summarizer failed")))
         })
     })
 }
@@ -3827,8 +3880,7 @@ fn run_chat(
                         // The same capability-derived context figure the
                         // provider budget uses — the summary request must not
                         // be silently truncated at Ollama's default window (F5).
-                        Some(mem_budget),
-                        keep_alive_str(&cfg),
+                        summarizer_opts(&cfg, Some(mem_budget)),
                     ));
                 mgr.add_provider(s);
             }
@@ -4131,8 +4183,7 @@ fn run_chat(
                             // Same capability-derived cap the Summarizing
                             // provider injects — the summary request must not
                             // be silently truncated (F5).
-                            Some(mem_budget),
-                            keep_alive_str(&cfg),
+                            summarizer_opts(&cfg, Some(mem_budget)),
                         );
                         let outcome = tokio::task::block_in_place(|| {
                             rt.block_on(newt_core::compress_user_initiated(
@@ -4229,8 +4280,7 @@ fn run_chat(
                             inf_model.clone(),
                             inf_kind,
                             inf_key.clone(),
-                            Some(mem_budget),
-                            keep_alive_str(&cfg),
+                            summarizer_opts(&cfg, Some(mem_budget)),
                         );
                         if let Some(notice) = tokio::task::block_in_place(|| {
                             rt.block_on(run_close_extraction(
@@ -4581,8 +4631,7 @@ fn run_chat(
                         // The same effective context cap the main loop sends —
                         // the summary request must not be silently truncated
                         // at Ollama's default window (F5).
-                        eff_num_ctx,
-                        keep_alive_str(&cfg),
+                        summarizer_opts(&cfg, eff_num_ctx),
                     );
                     // Per-turn tool-event recorder (Step 17.6, #246): the
                     // loop pushes one event per tool call; the save site
@@ -4960,8 +5009,7 @@ fn run_chat(
             inf_model.clone(),
             inf_kind,
             inf_key.clone(),
-            Some(mem_budget),
-            keep_alive_str(&cfg),
+            summarizer_opts(&cfg, Some(mem_budget)),
         );
         if let Some(notice) = tokio::task::block_in_place(|| {
             rt.block_on(run_close_extraction(
@@ -6636,6 +6684,29 @@ fn keep_alive_str(cfg: &newt_core::Config) -> String {
         .as_ref()
         .map(|t| t.keep_alive.clone())
         .unwrap_or_else(|| "5m".to_string())
+}
+
+/// Summarizer per-request timeout from `[tui].summarizer_timeout_secs` (Step 24.2).
+fn summarizer_timeout_secs(cfg: &newt_core::Config) -> u64 {
+    cfg.tui
+        .as_ref()
+        .map(|t| t.summarizer_timeout_secs)
+        .unwrap_or(60)
+}
+
+/// Summarizer retry count from `[tui].summarizer_retries` (Step 24.2).
+fn summarizer_retries(cfg: &newt_core::Config) -> u32 {
+    cfg.tui.as_ref().map(|t| t.summarizer_retries).unwrap_or(2)
+}
+
+/// Build `SummarizerOpts` from config for a session summarizer (Step 24.2).
+fn summarizer_opts(cfg: &newt_core::Config, num_ctx: Option<u32>) -> SummarizerOpts {
+    SummarizerOpts {
+        num_ctx,
+        keep_alive: keep_alive_str(cfg),
+        timeout_secs: summarizer_timeout_secs(cfg),
+        retries: summarizer_retries(cfg),
+    }
 }
 
 /// Whether to render assistant Markdown this turn (Step 25.4, #568). The
@@ -9579,8 +9650,7 @@ mod close_extraction_tests {
             "test-model".to_string(),
             newt_core::BackendKind::Ollama,
             None,
-            None,
-            "5m".to_string(),
+            SummarizerOpts::default(),
         )
     }
 
@@ -13018,8 +13088,10 @@ mod http_loop_tests {
             "test-model".into(),
             newt_core::BackendKind::Ollama,
             None,
-            Some(4_096),
-            "5m".to_string(),
+            SummarizerOpts {
+                num_ctx: Some(4_096),
+                ..Default::default()
+            },
         );
         let out = s("summarize the middle".into()).await.unwrap();
         assert_eq!(out, "SUM");
@@ -13043,8 +13115,7 @@ mod http_loop_tests {
             "test-model".into(),
             newt_core::BackendKind::Ollama,
             None,
-            None,
-            "5m".to_string(),
+            SummarizerOpts::default(),
         );
         s_none("summarize".into()).await.unwrap();
         let captured = body.lock().unwrap().clone().unwrap();
@@ -13090,8 +13161,7 @@ mod http_loop_tests {
             "test-model".into(),
             newt_core::BackendKind::Ollama,
             None,
-            None,
-            "5m".to_string(),
+            SummarizerOpts::default(),
         );
         let out = s("summarize".into()).await.unwrap();
         assert_eq!(out, "SUM");
@@ -13102,6 +13172,82 @@ mod http_loop_tests {
             .expect("warm request was made before the summary");
         assert_eq!(warm_body["model"], "test-model", "warm targets the model");
         assert_eq!(warm_body["keep_alive"], "5m", "warm carries keep_alive");
+    }
+
+    /// Step 24.2 (#559): a transient summarizer failure is retried (with
+    /// backoff) before giving up to the static-marker fallback.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn loop_summarizer_retries_then_succeeds() {
+        use std::sync::{Arc, Mutex};
+        use wiremock::{Request, Respond};
+
+        struct Flaky {
+            calls: Arc<Mutex<u32>>,
+        }
+        impl Respond for Flaky {
+            fn respond(&self, _req: &Request) -> ResponseTemplate {
+                let mut n = self.calls.lock().unwrap();
+                *n += 1;
+                if *n == 1 {
+                    ResponseTemplate::new(500) // first attempt fails
+                } else {
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({"message": {"content": "SUM"}}))
+                }
+            }
+        }
+
+        let server = MockServer::start().await;
+        let calls = Arc::new(Mutex::new(0));
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(Flaky {
+                calls: calls.clone(),
+            })
+            .mount(&server)
+            .await;
+
+        let s = make_loop_summarizer(
+            server.uri(),
+            "test-model".into(),
+            newt_core::BackendKind::Ollama,
+            None,
+            SummarizerOpts {
+                retries: 2,
+                ..Default::default()
+            },
+        );
+        let out = s("summarize".into()).await.unwrap();
+        assert_eq!(out, "SUM");
+        assert_eq!(*calls.lock().unwrap(), 2, "retried once after the 500");
+    }
+
+    /// Step 24.2: after exhausting retries the summarizer returns an error
+    /// (which the compression pipeline turns into the static marker).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn loop_summarizer_gives_up_after_retries() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let s = make_loop_summarizer(
+            server.uri(),
+            "test-model".into(),
+            newt_core::BackendKind::Ollama,
+            None,
+            SummarizerOpts {
+                retries: 1,
+                ..Default::default()
+            },
+        );
+        let err = s("summarize".into()).await.unwrap_err();
+        assert!(
+            err.to_string().contains("summarizer endpoint 500"),
+            "exhausted error surfaces the last failure: {err}"
+        );
     }
 
     /// F5 mirror: OpenAI-compatible endpoints configure context server-side
@@ -13136,8 +13282,10 @@ mod http_loop_tests {
             "test-model".into(),
             newt_core::BackendKind::Openai,
             Some("sk-test".into()),
-            Some(4_096),
-            "5m".to_string(),
+            SummarizerOpts {
+                num_ctx: Some(4_096),
+                ..Default::default()
+            },
         );
         let out = s("summarize the middle".into()).await.unwrap();
         assert_eq!(out, "SUM");
@@ -13189,8 +13337,10 @@ mod http_loop_tests {
                 "test-model".into(),
                 newt_core::BackendKind::Ollama,
                 None,
-                Some(100),
-                "5m".to_string(),
+                SummarizerOpts {
+                    num_ctx: Some(100),
+                    ..Default::default()
+                },
             ),
         ));
         let metrics = |input_tokens: u32| newt_core::TurnMetrics {
