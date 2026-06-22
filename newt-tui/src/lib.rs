@@ -2991,11 +2991,13 @@ fn make_loop_summarizer(
     kind: newt_core::BackendKind,
     api_key: Option<String>,
     num_ctx: Option<u32>,
+    keep_alive: String,
 ) -> newt_core::Summarizer {
     Box::new(move |prompt: String| {
         let url = url.clone();
         let model = model.clone();
         let api_key = api_key.clone();
+        let keep_alive = keep_alive.clone();
         let openai = kind == newt_core::BackendKind::Openai;
         Box::pin(async move {
             let chat_url = if openai {
@@ -3003,19 +3005,50 @@ fn make_loop_summarizer(
             } else {
                 format!("{}/api/chat", url.trim_end_matches('/'))
             };
-            // No `tools` key => the model cannot emit tool calls.
-            let body = match num_ctx {
-                Some(ctx_size) if !openai => serde_json::json!({
+            // Step 24.1 (#559): for Ollama, warm the model under a generous
+            // timeout BEFORE the short-timeout summary request. The summary is
+            // the largest single request of the session and the most likely to
+            // hit an evicted/cold model, so a cold reload is absorbed here
+            // instead of blowing the summary timeout. Best-effort: warm errors
+            // are ignored (the real request surfaces a hard failure).
+            if !openai {
+                let warm_url = format!("{}/api/generate", url.trim_end_matches('/'));
+                let warm_body = serde_json::json!({
+                    "model": model,
+                    "keep_alive": keep_alive,
+                    "stream": false,
+                });
+                if let Ok(warm_client) = reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(600))
+                    .build()
+                {
+                    let mut wreq = warm_client.post(&warm_url).json(&warm_body);
+                    if let Some(key) = &api_key {
+                        wreq = wreq.bearer_auth(key);
+                    }
+                    let _ = wreq.send().await;
+                }
+            }
+            // No `tools` key => the model cannot emit tool calls. Ollama also
+            // gets `keep_alive` (mirroring the main loop) so the summary request
+            // doesn't reset the model's residency to Ollama's default.
+            let body = if openai {
+                serde_json::json!({
                     "model": model,
                     "messages": [{"role": "user", "content": prompt}],
                     "stream": false,
-                    "options": { "num_ctx": ctx_size },
-                }),
-                _ => serde_json::json!({
+                })
+            } else {
+                let mut b = serde_json::json!({
                     "model": model,
                     "messages": [{"role": "user", "content": prompt}],
                     "stream": false,
-                }),
+                    "keep_alive": keep_alive,
+                });
+                if let Some(ctx_size) = num_ctx {
+                    b["options"] = serde_json::json!({ "num_ctx": ctx_size });
+                }
+                b
             };
             let mut req = reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(60))
@@ -3795,6 +3828,7 @@ fn run_chat(
                         // provider budget uses — the summary request must not
                         // be silently truncated at Ollama's default window (F5).
                         Some(mem_budget),
+                        keep_alive_str(&cfg),
                     ));
                 mgr.add_provider(s);
             }
@@ -4098,6 +4132,7 @@ fn run_chat(
                             // provider injects — the summary request must not
                             // be silently truncated (F5).
                             Some(mem_budget),
+                            keep_alive_str(&cfg),
                         );
                         let outcome = tokio::task::block_in_place(|| {
                             rt.block_on(newt_core::compress_user_initiated(
@@ -4195,6 +4230,7 @@ fn run_chat(
                             inf_kind,
                             inf_key.clone(),
                             Some(mem_budget),
+                            keep_alive_str(&cfg),
                         );
                         if let Some(notice) = tokio::task::block_in_place(|| {
                             rt.block_on(run_close_extraction(
@@ -4546,6 +4582,7 @@ fn run_chat(
                         // the summary request must not be silently truncated
                         // at Ollama's default window (F5).
                         eff_num_ctx,
+                        keep_alive_str(&cfg),
                     );
                     // Per-turn tool-event recorder (Step 17.6, #246): the
                     // loop pushes one event per tool call; the save site
@@ -4924,6 +4961,7 @@ fn run_chat(
             inf_kind,
             inf_key.clone(),
             Some(mem_budget),
+            keep_alive_str(&cfg),
         );
         if let Some(notice) = tokio::task::block_in_place(|| {
             rt.block_on(run_close_extraction(
@@ -9542,6 +9580,7 @@ mod close_extraction_tests {
             newt_core::BackendKind::Ollama,
             None,
             None,
+            "5m".to_string(),
         )
     }
 
@@ -9688,9 +9727,15 @@ mod close_extraction_tests {
         // The one request the model saw has NO `tools` key — the cap-exit
         // pattern: the model structurally cannot emit tool calls — and the
         // bounded transcript rides in a single user message.
+        // 24.1: the summarizer warms the model first (POST /api/generate), so
+        // count only the actual completion (/api/chat) requests.
         let reqs = server.received_requests().await.unwrap();
-        assert_eq!(reqs.len(), 1, "exactly one completion per close");
-        let body: serde_json::Value = serde_json::from_slice(&reqs[0].body).unwrap();
+        let completions: Vec<_> = reqs
+            .iter()
+            .filter(|r| r.url.path() == "/api/chat")
+            .collect();
+        assert_eq!(completions.len(), 1, "exactly one completion per close");
+        let body: serde_json::Value = serde_json::from_slice(&completions[0].body).unwrap();
         assert!(
             body.get("tools").is_none(),
             "the extraction request must never carry a tools key: {body}"
@@ -12974,6 +13019,7 @@ mod http_loop_tests {
             newt_core::BackendKind::Ollama,
             None,
             Some(4_096),
+            "5m".to_string(),
         );
         let out = s("summarize the middle".into()).await.unwrap();
         assert_eq!(out, "SUM");
@@ -12981,6 +13027,10 @@ mod http_loop_tests {
         assert_eq!(
             captured["options"]["num_ctx"], 4_096,
             "the summarizer request must cap Ollama's window like the main loop"
+        );
+        assert_eq!(
+            captured["keep_alive"], "5m",
+            "summary request carries keep_alive (24.1, mirrors the main loop)"
         );
         assert!(
             captured.get("tools").is_none(),
@@ -12994,10 +13044,64 @@ mod http_loop_tests {
             newt_core::BackendKind::Ollama,
             None,
             None,
+            "5m".to_string(),
         );
         s_none("summarize".into()).await.unwrap();
         let captured = body.lock().unwrap().clone().unwrap();
         assert!(captured.get("options").is_none());
+    }
+
+    /// Step 24.1 (#559): for Ollama, the summarizer warms the model
+    /// (POST /api/generate, model + keep_alive) BEFORE the summary request, so a
+    /// cold reload is absorbed off the (short) summary timeout.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn loop_summarizer_warms_the_model_first() {
+        use std::sync::{Arc, Mutex};
+        use wiremock::{Request, Respond};
+
+        struct WarmCapture {
+            body: Arc<Mutex<Option<serde_json::Value>>>,
+        }
+        impl Respond for WarmCapture {
+            fn respond(&self, req: &Request) -> ResponseTemplate {
+                *self.body.lock().unwrap() = serde_json::from_slice(&req.body).ok();
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"done": true}))
+            }
+        }
+
+        let server = MockServer::start().await;
+        let warm = Arc::new(Mutex::new(None));
+        Mock::given(method("POST"))
+            .and(path("/api/generate"))
+            .respond_with(WarmCapture { body: warm.clone() })
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"message": {"content": "SUM"}})),
+            )
+            .mount(&server)
+            .await;
+
+        let s = make_loop_summarizer(
+            server.uri(),
+            "test-model".into(),
+            newt_core::BackendKind::Ollama,
+            None,
+            None,
+            "5m".to_string(),
+        );
+        let out = s("summarize".into()).await.unwrap();
+        assert_eq!(out, "SUM");
+        let warm_body = warm
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("warm request was made before the summary");
+        assert_eq!(warm_body["model"], "test-model", "warm targets the model");
+        assert_eq!(warm_body["keep_alive"], "5m", "warm carries keep_alive");
     }
 
     /// F5 mirror: OpenAI-compatible endpoints configure context server-side
@@ -13033,6 +13137,7 @@ mod http_loop_tests {
             newt_core::BackendKind::Openai,
             Some("sk-test".into()),
             Some(4_096),
+            "5m".to_string(),
         );
         let out = s("summarize the middle".into()).await.unwrap();
         assert_eq!(out, "SUM");
@@ -13085,6 +13190,7 @@ mod http_loop_tests {
                 newt_core::BackendKind::Ollama,
                 None,
                 Some(100),
+                "5m".to_string(),
             ),
         ));
         let metrics = |input_tokens: u32| newt_core::TurnMetrics {
