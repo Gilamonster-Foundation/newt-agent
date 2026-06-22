@@ -1220,7 +1220,7 @@ this is the next free cluster.)* **Design: #559.**
 
 **Reliability (Part 1)**
 
-- **24.1** `keep_alive` + warmup on the summarizer request (mirror the main loop; reuse `warmup_if_cold`) — smallest, highest-leverage fix for the eviction/cold-reload timeout.
+- **24.1** ✅ **done** — the summarizer request now carries `keep_alive` (mirroring the main loop, threaded from `[tui].keep_alive`) and, for Ollama, **warms the model** (POST `/api/generate` under a 600s timeout) BEFORE the short-timeout summary request, so a cold reload is absorbed off the summary timeout. Best-effort warm (errors ignored). The fix for the #548 eviction/cold-reload timeout.
 - **24.2** configurable `[tui].summarizer_timeout_secs` (default 60, replacing the hard-coded 60s) + retry-with-backoff (N attempts, default ~2) before fallback.
 - **24.3** optional `[tui].summarizer_model` — a small/fast fallback model summarizes when the main model is unavailable/too heavy (a rung above the static marker).
 - **24.4** chunked / hierarchical summarization (segment → summarize segments → summarize the summaries) to attack the OOM root cause; largest reliability PR — ship last.
