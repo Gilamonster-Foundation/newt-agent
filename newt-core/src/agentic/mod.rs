@@ -21,6 +21,60 @@ mod git_tool;
 // and the redaction-gated ShellObservation seam (observation). All additive;
 // they wrap/precede `chat_complete` and never touch its internals.
 mod driver;
+// Step 25.1 (#568): Markdown → ANSI rendering of assistant output. Behind the
+// default `markdown` feature; a passthrough shim takes its place under
+// --no-default-features so the headless wyvern strip carries no markdown deps.
+#[cfg(feature = "markdown")]
+mod markdown;
+#[cfg(not(feature = "markdown"))]
+mod markdown {
+    //! Passthrough shim used when the `markdown` feature is disabled (the
+    //! headless wyvern strip). Keeps `render_markdown` / `RenderOpts` /
+    //! `MarkdownStreamWriter` in the public API with zero markdown
+    //! dependencies; output is the source verbatim — identical to color-off
+    //! behavior in the full renderer.
+    use std::io::{self, Write};
+
+    #[derive(Debug, Clone, Copy)]
+    pub struct RenderOpts {
+        pub color: bool,
+        pub cols: usize,
+    }
+    pub fn render_markdown(src: &str, _opts: RenderOpts) -> String {
+        src.to_string()
+    }
+
+    /// Raw passthrough writer — bytes through unchanged, with a trailing newline
+    /// at `finish` if the stream didn't end with one (matching the raw token
+    /// path's closing `println!`).
+    pub struct MarkdownStreamWriter<W: Write> {
+        out: W,
+        wrote: bool,
+        ended_nl: bool,
+    }
+    impl<W: Write> MarkdownStreamWriter<W> {
+        pub fn new(out: W, _opts: RenderOpts) -> Self {
+            Self {
+                out,
+                wrote: false,
+                ended_nl: true,
+            }
+        }
+        pub fn push(&mut self, delta: &str) -> io::Result<()> {
+            if let Some(&last) = delta.as_bytes().last() {
+                self.wrote = true;
+                self.ended_nl = last == b'\n';
+            }
+            self.out.write_all(delta.as_bytes())
+        }
+        pub fn finish(&mut self) -> io::Result<()> {
+            if self.wrote && !self.ended_nl {
+                self.out.write_all(b"\n")?;
+            }
+            self.out.flush()
+        }
+    }
+}
 mod mcp;
 mod memory_fetch;
 mod note_sink;
@@ -44,6 +98,7 @@ pub use driver::{
     VISIBLE_TRANSCRIPT_ROLES,
 };
 pub use git_tool::{git_tool_definition, GitTool};
+pub use markdown::{render_markdown, MarkdownStreamWriter, RenderOpts};
 pub use mcp::{McpTools, NoMcp};
 pub use memory_fetch::{
     memory_fetch_tool_definition, MemAddr, MemPayload, MemorySource, StoreMemorySource,
@@ -1399,8 +1454,19 @@ pub async fn chat_complete(
             // need the filter to start inside the reasoning block so the closer
             // and the reasoning it follows don't leak into the reply.
             let leading_reasoning = crate::reasoning::emits_leading_reasoning(model);
-            let (streamed, stream_usage) =
-                stream_response(sresp, color, show_thinking, leading_reasoning, cancel).await?;
+            // Step 25.3 (#568): render assistant Markdown whenever color is on.
+            // The dedicated `[tui].markdown` config + `/markdown` toggle land in
+            // 25.4; until then the activation rule is simply "markdown ⇒ color".
+            let markdown = color;
+            let (streamed, stream_usage) = stream_response(
+                sresp,
+                color,
+                show_thinking,
+                leading_reasoning,
+                cancel,
+                markdown,
+            )
+            .await?;
 
             if streamed.is_empty() {
                 // The streaming re-issue produced no tokens. Fall back to the
@@ -3081,11 +3147,20 @@ async fn stream_response(
     show_thinking: bool,
     leading_reasoning: bool,
     cancel: Option<&std::sync::atomic::AtomicBool>,
+    markdown: bool,
 ) -> anyhow::Result<(String, Option<crate::TokenUsage>)> {
     let mut spinner = show_thinking.then(|| ThinkingSpinner::new(color));
     let mut full = String::new();
     let mut started = false;
     let mut usage: Option<crate::TokenUsage> = None;
+    // Step 25.3 (#568): when markdown is active, route the *visible* token stream
+    // through the block-aware writer (inline lines render per completed line;
+    // fences/tables hold until they close). The accumulated `full` stays RAW —
+    // it is persisted and re-sent to the model, so it must carry no ANSI. The
+    // caller gates `markdown` on `color`, so the writer renders with `color: true`.
+    let cols = display::term_cols();
+    let mut md =
+        markdown.then(|| MarkdownStreamWriter::new(io::stdout(), RenderOpts { color: true, cols }));
     // #385: suppress inline <think>…</think> reasoning from the live stream + the
     // accumulated reply, even when a tag is split across token boundaries.
     // #528: models that emit a lone leading `</think>` (no opener) start the
@@ -3145,8 +3220,12 @@ async fn stream_response(
                     }
                     started = true;
                 }
-                print!("{token}");
-                io::stdout().flush().ok();
+                if let Some(w) = md.as_mut() {
+                    w.push(token).ok();
+                } else {
+                    print!("{token}");
+                    io::stdout().flush().ok();
+                }
                 full.push_str(token);
             }
             if json["done"].as_bool().unwrap_or(false) {
@@ -3172,8 +3251,12 @@ async fn stream_response(
             print!("▸  ");
             started = true;
         }
-        print!("{tail}");
-        io::stdout().flush().ok();
+        if let Some(w) = md.as_mut() {
+            w.push(&tail).ok();
+        } else {
+            print!("{tail}");
+            io::stdout().flush().ok();
+        }
         full.push_str(&tail);
     }
     // All-reasoning response (no clean content): tear the spinner down anyway so
@@ -3181,7 +3264,12 @@ async fn stream_response(
     if let Some(sp) = spinner.as_mut() {
         sp.finish();
     }
-    if started {
+    // The markdown writer newline-terminates each line it emits, so it owns the
+    // trailing newline; only the raw path needs the closing `println!`.
+    if let Some(w) = md.as_mut() {
+        w.finish().ok();
+    }
+    if started && md.is_none() {
         println!();
     }
     Ok((full, usage))
