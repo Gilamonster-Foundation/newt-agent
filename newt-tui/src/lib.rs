@@ -2999,6 +2999,10 @@ struct SummarizerOpts {
     timeout_secs: u64,
     /// Retry attempts before falling back to the static marker (Step 24.2).
     retries: u32,
+    /// Optional fallback model (Step 24.3; `[tui].summarizer_model`). When the
+    /// primary model's attempts all fail, the summary is retried once on this
+    /// model — a rung above the static marker. `None` = no fallback.
+    fallback_model: Option<String>,
 }
 
 impl Default for SummarizerOpts {
@@ -3008,6 +3012,7 @@ impl Default for SummarizerOpts {
             keep_alive: "5m".to_string(),
             timeout_secs: 60,
             retries: 2,
+            fallback_model: None,
         }
     }
 }
@@ -3040,6 +3045,84 @@ async fn summarize_attempt(
     }
 }
 
+/// Warm (Ollama), build the body, and run the retry loop for ONE model. Used
+/// for the primary model and, on total failure, the optional fallback (24.3).
+async fn summarize_one_model(
+    url: &str,
+    model: &str,
+    openai: bool,
+    prompt: &str,
+    opts: &SummarizerOpts,
+    api_key: &Option<String>,
+) -> anyhow::Result<String> {
+    let chat_url = if openai {
+        format!("{}/v1/chat/completions", url.trim_end_matches('/'))
+    } else {
+        format!("{}/api/chat", url.trim_end_matches('/'))
+    };
+    // Step 24.1 (#559): for Ollama, warm the model under a generous timeout
+    // BEFORE the short-timeout summary request, so a cold reload is absorbed
+    // here instead of blowing the summary timeout. Best-effort: warm errors are
+    // ignored (the real request surfaces a hard failure).
+    if !openai {
+        let warm_url = format!("{}/api/generate", url.trim_end_matches('/'));
+        let warm_body = serde_json::json!({
+            "model": model,
+            "keep_alive": opts.keep_alive,
+            "stream": false,
+        });
+        if let Ok(warm_client) = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(600))
+            .build()
+        {
+            let mut wreq = warm_client.post(&warm_url).json(&warm_body);
+            if let Some(key) = api_key {
+                wreq = wreq.bearer_auth(key);
+            }
+            let _ = wreq.send().await;
+        }
+    }
+    // No `tools` key => the model cannot emit tool calls. Ollama also gets
+    // `keep_alive` (mirroring the main loop) so the summary request doesn't
+    // reset the model's residency to Ollama's default.
+    let body = if openai {
+        serde_json::json!({
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": false,
+        })
+    } else {
+        let mut b = serde_json::json!({
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": false,
+            "keep_alive": opts.keep_alive,
+        });
+        if let Some(ctx_size) = opts.num_ctx {
+            b["options"] = serde_json::json!({ "num_ctx": ctx_size });
+        }
+        b
+    };
+    // Step 24.2 (#559): retry with backoff before giving up. The per-request
+    // timeout is configurable (`[tui].summarizer_timeout_secs`).
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(opts.timeout_secs))
+        .build()?;
+    let mut last_err: Option<anyhow::Error> = None;
+    for attempt in 0..=opts.retries {
+        if attempt > 0 {
+            // Exponential backoff capped at ~4s: 250ms, 500ms, 1s, …
+            let backoff = std::time::Duration::from_millis(250u64 << (attempt - 1).min(4));
+            tokio::time::sleep(backoff).await;
+        }
+        match summarize_attempt(&client, &chat_url, &body, api_key, openai).await {
+            Ok(s) => return Ok(s),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("summarizer failed")))
+}
+
 fn make_loop_summarizer(
     url: String,
     model: String,
@@ -3054,77 +3137,20 @@ fn make_loop_summarizer(
         let opts = opts.clone();
         let openai = kind == newt_core::BackendKind::Openai;
         Box::pin(async move {
-            let chat_url = if openai {
-                format!("{}/v1/chat/completions", url.trim_end_matches('/'))
-            } else {
-                format!("{}/api/chat", url.trim_end_matches('/'))
-            };
-            // Step 24.1 (#559): for Ollama, warm the model under a generous
-            // timeout BEFORE the short-timeout summary request. The summary is
-            // the largest single request of the session and the most likely to
-            // hit an evicted/cold model, so a cold reload is absorbed here
-            // instead of blowing the summary timeout. Best-effort: warm errors
-            // are ignored (the real request surfaces a hard failure).
-            if !openai {
-                let warm_url = format!("{}/api/generate", url.trim_end_matches('/'));
-                let warm_body = serde_json::json!({
-                    "model": model,
-                    "keep_alive": opts.keep_alive,
-                    "stream": false,
-                });
-                if let Ok(warm_client) = reqwest::Client::builder()
-                    .timeout(std::time::Duration::from_secs(600))
-                    .build()
-                {
-                    let mut wreq = warm_client.post(&warm_url).json(&warm_body);
-                    if let Some(key) = &api_key {
-                        wreq = wreq.bearer_auth(key);
+            match summarize_one_model(&url, &model, openai, &prompt, &opts, &api_key).await {
+                Ok(s) => Ok(s),
+                // Step 24.3 (#559): the primary model's attempts all failed — try
+                // the optional fallback model once (a rung above the static
+                // marker). Surface the primary error if the fallback fails too.
+                Err(primary_err) => match &opts.fallback_model {
+                    Some(fb) if fb != &model => {
+                        summarize_one_model(&url, fb, openai, &prompt, &opts, &api_key)
+                            .await
+                            .map_err(|_| primary_err)
                     }
-                    let _ = wreq.send().await;
-                }
+                    _ => Err(primary_err),
+                },
             }
-            // No `tools` key => the model cannot emit tool calls. Ollama also
-            // gets `keep_alive` (mirroring the main loop) so the summary request
-            // doesn't reset the model's residency to Ollama's default.
-            let body = if openai {
-                serde_json::json!({
-                    "model": model,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "stream": false,
-                })
-            } else {
-                let mut b = serde_json::json!({
-                    "model": model,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "stream": false,
-                    "keep_alive": opts.keep_alive,
-                });
-                if let Some(ctx_size) = opts.num_ctx {
-                    b["options"] = serde_json::json!({ "num_ctx": ctx_size });
-                }
-                b
-            };
-            // Step 24.2 (#559): retry the summary request (configurable count)
-            // with backoff before giving up to the static-marker fallback —
-            // many failures (eviction reload, momentary OOM, transient
-            // transport) recover on a second try. The per-request timeout is
-            // configurable (`[tui].summarizer_timeout_secs`).
-            let client = reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(opts.timeout_secs))
-                .build()?;
-            let mut last_err: Option<anyhow::Error> = None;
-            for attempt in 0..=opts.retries {
-                if attempt > 0 {
-                    // Exponential backoff capped at ~4s: 250ms, 500ms, 1s, …
-                    let backoff = std::time::Duration::from_millis(250u64 << (attempt - 1).min(4));
-                    tokio::time::sleep(backoff).await;
-                }
-                match summarize_attempt(&client, &chat_url, &body, &api_key, openai).await {
-                    Ok(s) => return Ok(s),
-                    Err(e) => last_err = Some(e),
-                }
-            }
-            Err(last_err.unwrap_or_else(|| anyhow::anyhow!("summarizer failed")))
         })
     })
 }
@@ -6706,6 +6732,7 @@ fn summarizer_opts(cfg: &newt_core::Config, num_ctx: Option<u32>) -> SummarizerO
         keep_alive: keep_alive_str(cfg),
         timeout_secs: summarizer_timeout_secs(cfg),
         retries: summarizer_retries(cfg),
+        fallback_model: cfg.tui.as_ref().and_then(|t| t.summarizer_model.clone()),
     }
 }
 
@@ -13248,6 +13275,48 @@ mod http_loop_tests {
             err.to_string().contains("summarizer endpoint 500"),
             "exhausted error surfaces the last failure: {err}"
         );
+    }
+
+    /// Step 24.3 (#559): when the primary model's attempts all fail, the summary
+    /// falls back to the configured secondary model (a rung above the static
+    /// marker) rather than failing outright.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn loop_summarizer_falls_back_to_secondary_model() {
+        use wiremock::{Request, Respond};
+
+        struct ByModel;
+        impl Respond for ByModel {
+            fn respond(&self, req: &Request) -> ResponseTemplate {
+                let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
+                if body["model"] == "fallback-model" {
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({"message": {"content": "FB SUM"}}))
+                } else {
+                    ResponseTemplate::new(500) // the primary model always fails
+                }
+            }
+        }
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(ByModel)
+            .mount(&server)
+            .await;
+
+        let s = make_loop_summarizer(
+            server.uri(),
+            "test-model".into(),
+            newt_core::BackendKind::Ollama,
+            None,
+            SummarizerOpts {
+                retries: 0,
+                fallback_model: Some("fallback-model".into()),
+                ..Default::default()
+            },
+        );
+        let out = s("summarize".into()).await.unwrap();
+        assert_eq!(out, "FB SUM", "fell back to the secondary model");
     }
 
     /// F5 mirror: OpenAI-compatible endpoints configure context server-side
