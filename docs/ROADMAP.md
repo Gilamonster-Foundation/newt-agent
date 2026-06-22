@@ -1222,7 +1222,7 @@ this is the next free cluster.)* **Design: #559.**
 
 - **24.1** ✅ **done** — the summarizer request now carries `keep_alive` (mirroring the main loop, threaded from `[tui].keep_alive`) and, for Ollama, **warms the model** (POST `/api/generate` under a 600s timeout) BEFORE the short-timeout summary request, so a cold reload is absorbed off the summary timeout. Best-effort warm (errors ignored). The fix for the #548 eviction/cold-reload timeout.
 - **24.2** ✅ **done** — `[tui].summarizer_timeout_secs` (default 60, replacing the hard-coded 60s) + `[tui].summarizer_retries` (default 2): the summary request retries with exponential backoff before giving up to the static marker. Summarizer knobs are consolidated into a `SummarizerOpts` struct (with `Default`) so future knobs don't re-thread the call sites.
-- **24.3** optional `[tui].summarizer_model` — a small/fast fallback model summarizes when the main model is unavailable/too heavy (a rung above the static marker).
+- **24.3** ✅ **done** — optional `[tui].summarizer_model`: when the primary model's summary attempts all fail, the summary is retried once on this small/fast model (a rung above the static marker), surfacing the primary error only if the fallback fails too. Added as a `SummarizerOpts.fallback_model` field — no call-site churn.
 - **24.4** chunked / hierarchical summarization (segment → summarize segments → summarize the summaries) to attack the OOM root cause; largest reliability PR — ship last.
 
 **UX (Part 2)**
