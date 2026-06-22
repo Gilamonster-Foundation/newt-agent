@@ -2,7 +2,9 @@
 
 **Status:** Design / proposed (Shawn Hartsock, 2026-06-21)
 **Related:** `docs/decisions/structural_parsing_over_regex.md` (the AST rule this
-relies on), `docs/decisions/agentic_object_capability_security.md` (the OCAP
+relies on), `docs/decisions/ocap_confinement_model.md` (what "confined" honestly
+buys — and the `--yolo` caveat),
+`docs/decisions/agentic_object_capability_security.md` (the OCAP
 leash this must not break), `docs/design/captured-shell-ocap.md`,
 `docs/security/ocap-deviations.md`, brush `feat/shell-extensions-cap-hook` (the
 tool-call hook), issue #552 (hide/route embedded git), and the first shipped
@@ -102,41 +104,52 @@ there, default-deny. The transparent layer neither recognizes nor handles
 interpreters — it simply doesn't claim them. This keeps the layer's guarantee
 honest: *everything it touches, it can bound.*
 
-For Python specifically, that governed path already exists: **`newt --venv
-<path>`** (and `[tui.permissions] extra_exec`). It is an explicit human grant —
-inject a chosen venv, prepend its `bin/` to `PATH` in the confined shell, and
-grant exec *only* for that venv's executables. That is the OCAP-correct shape:
-python is a **capability you grant** (a specific, bounded venv), not ambient
-authority the layer assumes. Excluding `python` from the transparent layer
-therefore costs nothing — it points at the right mechanism instead of duplicating
-or bypassing it.
+For Python specifically, a governed path already exists: **`newt --venv <path>`**
+(and `[tui.permissions] extra_exec`) — an explicit human grant that injects a
+chosen venv, prepends its `bin/` to `PATH` in the confined shell, and permits
+exec of that venv's executables. **But be precise about what that buys** (see
+`docs/decisions/ocap_confinement_model.md`): granting exec to *everything in a
+directory* is not a tight capability — a venv `bin/` is mutable and plant-able,
+so `--venv`'s safety is **the fence, not the allow-list**. It is *region-fenced
+ambient exec* — the coarse floor — not a bounded capability over which code runs.
+The genuinely tight surface is the curated, escape-hatch-free toolbox exposed as
+**delegated capability services** (above), which the agent invokes rather than
+holds. Excluding `python` from the layer costs nothing: it points at the floor
+(`--venv`, fenced) for the unwrapped case and at delegation for everything we do
+wrap — never at ambient authority.
 
 ### 5. File access is fenced where it executes, not by parsing arguments
 
 "Fence every file-accessing command" — `find`, `grep`, `cat`, `ls`, `git`,
 `curl -o`, … — is **not** done by teaching the layer each command's
 path-argument grammar. That is fragile: a missed flag, a path named in a config
-file, a symlink, or a `$(…)` would slip the fence. It is done at the
-**execution boundary**: every command the layer routes to run executes inside
-newt's existing workspace fence —
+file, a symlink, or a `$(…)` would slip the fence. The right place is the
+**execution boundary**. What that *buys* depends on what is built — and we are
+honest about the gap (see `docs/decisions/ocap_confinement_model.md`):
 
-- **`lock_fs_to_workspace`** (`newt-core::caveats`): confine fs access to the
-  workspace, widened only by explicit grants `newt --read <path>` / `--write
-  <path>` (the `NEWT_READ_PATHS` / `NEWT_WRITE_PATHS` the CLI sets), and
-- enforced by **OS-level isolation** — the `b1-os-isolation` invariant
-  (`newt-core::ocap`): **Landlock** (Linux), **Seatbelt** (macOS),
-  **AppContainer** (Windows).
+- **The target** is an OS sandbox — `b1-os-isolation` (`newt-core::ocap`:
+  Landlock/Seatbelt/AppContainer + seccomp/netns), widened only by explicit
+  `--read`/`--write` grants — which *would* deny a spawned process any access
+  outside the fence regardless of how it names its paths. **This is UNBUILT
+  today:** `verify_b1()` returns `Absent` (`sandbox_kind = none`).
+- **What's built today** is the in-process monitor: `lock_fs_to_workspace`
+  (`newt-core::caveats`) enforces the fs scope at `tui_permits_path` for newt's
+  **native** tools (`read_file`/`write_file`/`list`) — *not* for a spawned
+  subprocess. So a file-accessing **command** run via the confined shell is, in
+  this build, fail-closed (stubbed, "unavailable"); under `--yolo` it runs on the
+  host shell with **no fs fence over the subprocess at all**.
 
-The kernel/OS denies any access outside the fence **regardless of how the
-command names its paths**. So fencing *all* file-accessing commands is mostly
-*already true*: they inherit the fence by running confined; the layer's job is to
-make sure file-touching commands route into that environment, never around it.
+So "fence all file-accessing commands" is the **design target** (it arrives with
+the OS sandbox), not a present guarantee over subprocesses. Until `b1` lands:
+native-tool fs is in-process-fenced; a routed command is confined-shell-stubbed
+or `--yolo`-unfenced. The honest doctrine: *fence at the execution boundary once
+the sandbox exists, prefer delegated services meanwhile, and never claim a
+containment the verifier marks `Absent`.*
 
-Per-command path parsing (the earlier `find <path>` → cwd check) is kept only as
+Per-command path parsing (the earlier `find <path>` → cwd check) is kept as
 **defense-in-depth / fast-fail** — a clear "that path is outside the workspace"
-error before the OS would deny it anyway — never as the boundary. This is the
-ADR's posture exactly: the parse improves UX and catches the obvious case; the OS
-fence is what *guarantees* containment.
+error — useful both before the OS fence exists and after; never the boundary by
+itself.
 
 ### The one-line rule
 

@@ -3,7 +3,9 @@
 **Status:** Design / proposed (Shawn Hartsock, 2026-06-21)
 **Related:** `docs/design/transparent_command_layer.md` (the parse·route·govern
 model this realizes), `docs/decisions/structural_parsing_over_regex.md` (AST not
-regex at boundaries), `docs/decisions/agentic_object_capability_security.md`
+regex at boundaries), `docs/decisions/ocap_confinement_model.md` (confined
+execution vs. paths vs. delegated execution — why a "kind" is delegated, not
+ambient), `docs/decisions/agentic_object_capability_security.md`
 (OCAP), issue #548 (`/help` rollups — the command list this de-clutters),
 `newt-tui::forge_context` + `newt-core::forge_resolvers` (the forge resolver,
 which becomes the first command-plugin).

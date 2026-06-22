@@ -3,7 +3,8 @@
 **Status:** Accepted (decided by Shawn Hartsock, 2026-06-21)
 **Date:** 2026-06-21
 **Related:** `docs/decisions/agentic_object_capability_security.md` (the OCAP
-leash this protects), `docs/decisions/mcp_transport_security.md`,
+leash this protects), `docs/decisions/ocap_confinement_model.md` (the honest
+confinement model this parsing serves), `docs/decisions/mcp_transport_security.md`,
 `docs/security/ocap-deviations.md`, and the first application —
 `newt-tui/src/forge_context.rs` + `newt-core/src/forge_resolvers.rs` (the
 harness forge-URL resolver, which parses links with the `url` crate and matches
