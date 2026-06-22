@@ -1,6 +1,6 @@
 //! Display-width primitives for the Markdown renderer.
 //!
-//! Wrapping and (in Step 24.2) table layout count *display columns*, not bytes
+//! Wrapping and (in Step 25.2) table layout count *display columns*, not bytes
 //! or `char`s — a CJK ideograph or a wide emoji occupies two cells, a
 //! combining mark zero. `unicode-width` encodes the Unicode East-Asian-Width
 //! table that the terminal itself uses, so our wrap points line up with what

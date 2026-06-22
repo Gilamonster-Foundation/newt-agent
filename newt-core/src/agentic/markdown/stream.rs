@@ -1,4 +1,4 @@
-//! Block-aware streaming writer (Step 24.3).
+//! Block-aware streaming writer (Step 25.3).
 //!
 //! The agentic loop streams the model's reply token-by-token. We cannot render
 //! a half-open code fence or a table mid-arrival, so this writer line-buffers:

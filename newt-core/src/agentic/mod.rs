@@ -21,7 +21,7 @@ mod git_tool;
 // and the redaction-gated ShellObservation seam (observation). All additive;
 // they wrap/precede `chat_complete` and never touch its internals.
 mod driver;
-// Step 24.1 (#559): Markdown → ANSI rendering of assistant output. Behind the
+// Step 25.1 (#568): Markdown → ANSI rendering of assistant output. Behind the
 // default `markdown` feature; a passthrough shim takes its place under
 // --no-default-features so the headless wyvern strip carries no markdown deps.
 #[cfg(feature = "markdown")]
@@ -1454,9 +1454,9 @@ pub async fn chat_complete(
             // need the filter to start inside the reasoning block so the closer
             // and the reasoning it follows don't leak into the reply.
             let leading_reasoning = crate::reasoning::emits_leading_reasoning(model);
-            // Step 24.3 (#559): render assistant Markdown whenever color is on.
+            // Step 25.3 (#568): render assistant Markdown whenever color is on.
             // The dedicated `[tui].markdown` config + `/markdown` toggle land in
-            // 24.4; until then the activation rule is simply "markdown ⇒ color".
+            // 25.4; until then the activation rule is simply "markdown ⇒ color".
             let markdown = color;
             let (streamed, stream_usage) = stream_response(
                 sresp,
@@ -3153,7 +3153,7 @@ async fn stream_response(
     let mut full = String::new();
     let mut started = false;
     let mut usage: Option<crate::TokenUsage> = None;
-    // Step 24.3 (#559): when markdown is active, route the *visible* token stream
+    // Step 25.3 (#568): when markdown is active, route the *visible* token stream
     // through the block-aware writer (inline lines render per completed line;
     // fences/tables hold until they close). The accumulated `full` stays RAW —
     // it is persisted and re-sent to the model, so it must carry no ANSI. The

@@ -1,4 +1,4 @@
-//! Markdown → ANSI rendering for assistant chat output (Step 24.1, #559).
+//! Markdown → ANSI rendering for assistant chat output (Step 25.1, #568).
 //!
 //! newt's chat surface is a **plain scroller** (`docs/decisions/plain_scroller_tui.md`):
 //! no alternate screen, no widgets, no repainting already-scrolled lines. So we
@@ -11,8 +11,8 @@
 //!
 //! Renders inline emphasis, headings, lists (bullet/ordered/task), blockquotes,
 //! thematic breaks, fenced code (dim, un-highlighted), and GFM tables
-//! (box-drawing, width-fit). Block-aware streaming (24.3), config + `/markdown`
-//! (24.4), the wyvern source-tidy (24.5), and syntect highlighting (24.6) follow.
+//! (box-drawing, width-fit). Block-aware streaming (25.3), config + `/markdown`
+//! (25.4), the wyvern source-tidy (25.5), and syntect highlighting (25.6) follow.
 
 mod emitter;
 mod inline;
@@ -200,7 +200,7 @@ mod tests {
         assert_eq!(r(""), "");
     }
 
-    // ---- Step 24.2: GFM tables ----
+    // ---- Step 25.2: GFM tables ----
 
     /// Strip SGR escape sequences so the box-drawing skeleton can be asserted
     /// independently of the styling.

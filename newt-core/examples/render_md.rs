@@ -1,4 +1,4 @@
-//! Visual smoke test for the Markdown → ANSI renderer (Steps 24.1–24.2, #559).
+//! Visual smoke test for the Markdown → ANSI renderer (Steps 25.1–25.2, #568).
 //!
 //! Renders a sample document the way newt will render assistant output in the
 //! chat scroller — styled, word-wrapped, plain-scrolled (no widgets).

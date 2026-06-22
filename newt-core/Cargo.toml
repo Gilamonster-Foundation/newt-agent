@@ -48,7 +48,7 @@ reqwest.workspace = true
 tokio.workspace = true
 agent-bridle = { version = "0.1", features = ["shell", "web"] }
 
-# Step 24.1 (#559 follow-on): Markdown → ANSI rendering for assistant output,
+# Step 25.1 (#568 follow-on): Markdown → ANSI rendering for assistant output,
 # behind the default `markdown` feature. Stripped under --no-default-features
 # (the headless wyvern tier) by the passthrough shim in `agentic::markdown`.
 pulldown-cmark = { workspace = true, optional = true }
@@ -90,7 +90,7 @@ pyo3 = { workspace = true, optional = true }
 
 [features]
 default = ["markdown"]
-# Markdown → ANSI rendering of assistant output (Step 24.1). On by default for
+# Markdown → ANSI rendering of assistant output (Step 25.1). On by default for
 # the human-facing binaries; compiled out (passthrough shim) for the headless
 # wyvern strip via --no-default-features.
 markdown = ["dep:pulldown-cmark", "dep:unicode-width"]

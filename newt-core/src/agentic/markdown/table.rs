@@ -1,4 +1,4 @@
-//! GFM table rendering (Step 24.2): box-drawing layout with display-width
+//! GFM table rendering (Step 25.2): box-drawing layout with display-width
 //! column fit and per-column alignment.
 //!
 //! Borders are dim (`FADE`); header cells are bold. Column widths are the max

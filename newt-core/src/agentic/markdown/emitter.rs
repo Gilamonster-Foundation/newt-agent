@@ -1,7 +1,7 @@
 //! The block-level event walker: pulldown-cmark `Event`s → an ANSI string of
 //! scrolled lines.
 //!
-//! Design notes (Step 24.1):
+//! Design notes (Step 25.1):
 //! - **No repaint.** Output is append-only scrolled text; once a physical line
 //!   is written it is final. Wrapping therefore happens *before* emit, at
 //!   completed-line granularity.
@@ -9,8 +9,8 @@
 //!   computed from the container stacks and prepended to every physical line of
 //!   a block; a list item's marker (`• ` / `N. `) decorates only the first
 //!   physical line via `pending_first`.
-//! - **Out of scope here (later steps):** streaming (24.3 wraps this), GFM
-//!   tables (24.2), syntax highlighting (24.6). Tables are not enabled in the
+//! - **Out of scope here (later steps):** streaming (25.3 wraps this), GFM
+//!   tables (25.2), syntax highlighting (25.6). Tables are not enabled in the
 //!   parser yet, so pipe rows render as ordinary paragraphs for now.
 
 use super::inline::{render_cells, sgr_fg, wrap_cells, Cell, Style, RESET};
@@ -60,7 +60,7 @@ pub(super) struct Emitter {
     /// Destination of the currently-open link, appended dimly on `End(Link)`.
     link_url: Option<String>,
 
-    // GFM table accumulation (Step 24.2). `in_cell` routes inline content into
+    // GFM table accumulation (Step 25.2). `in_cell` routes inline content into
     // the current cell via `cur_cells` and tames hard breaks within a cell.
     table: Option<TableBuilder>,
     in_cell: bool,

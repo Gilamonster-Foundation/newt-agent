@@ -1204,7 +1204,42 @@ red-team **prerequisite fixes** + the real WebAuthn/CTAP2 verifier + the server-
 
 ---
 
-## Phase 24 — Markdown rendering for assistant output (#559)
+# Phase 24 — Context-manager reliability + UX (bulletproof summarizer · indicators · configurable managers)
+
+The compression summarizer is the single most failure-prone LLM call in newt and
+it fails *silently* into a lossy static marker (observed in the #548 session: a
+DGX cold-reload blew the 60s timeout → the conversation middle was replaced by a
+one-line marker, irrecoverably). This cluster hardens that call, adds the missing
+context-budget TUI indicators, and adds a named-strategy selector seam that
+**#546** plugs into. **Umbrella: #559** (decomposition by Beaver). The
+`progressive`/`distributed` managers and the retrievable-card store are **owned by
+#546** — this phase owns only the reliability (Part 1), the indicators (Part 2),
+and the `standard` selector seam (Part 3). *(Numbered 24.x: #559's comment
+proposed 23.x assuming 22.x was the top, but Phase 23 is Crew/Team/Overseer —
+this is the next free cluster.)* **Design: #559.**
+
+**Reliability (Part 1)**
+
+- **24.1** `keep_alive` + warmup on the summarizer request (mirror the main loop; reuse `warmup_if_cold`) — smallest, highest-leverage fix for the eviction/cold-reload timeout.
+- **24.2** configurable `[tui].summarizer_timeout_secs` (default 60, replacing the hard-coded 60s) + retry-with-backoff (N attempts, default ~2) before fallback.
+- **24.3** optional `[tui].summarizer_model` — a small/fast fallback model summarizes when the main model is unavailable/too heavy (a rung above the static marker).
+- **24.4** chunked / hierarchical summarization (segment → summarize segments → summarize the summaries) to attack the OOM root cause; largest reliability PR — ship last.
+
+**UX (Part 2)**
+
+- **24.5** `fmt_tokens` gauge formatting (pure / table-driven): `1M` vs `1024k` vs `899k/1024k` (1M = 1024k) + threshold colors. Formatter + tests only, no wiring.
+- **24.6** live context-budget gauge in the header — wire 24.5 into `header_text` against `safe_context`/`max_ok_input`.
+- **24.7** summarizer-state surface — promote `summarizing… → ✓ summarized / ↻ retrying / ⚠ fallback model / ⛔ static marker` out of the scrollback; make the static-marker last resort loud.
+
+**Selector seam (Part 3 — `progressive`/`distributed` delegated to #546)**
+
+- **24.8** `/context manager <name>` + `[context].manager`: dispatch + config resolution, only `standard` implemented; `progressive`/`distributed` return "not yet available, see #546". The seam #546 plugs into — its `store-raw-for-lookup` rung is what makes the static marker *recoverable* (deferred retrieval, not loss).
+
+**Recommended order:** 24.1 → 24.2 → 24.5 → 24.6 → 24.3 → 24.7 → 24.8 → 24.4. (24.1 alone likely eliminates most real-world failures; everything after is depth.) Each step is one PR with the acceptance contract (What / Test plan / Out of scope), a fully-mocked unit tier (wiremock the summarizer endpoint), and the coverage ratchet. Refs: #559 (umbrella), #546 (progressive/distributed substrate + the fallback rung), #548 (surfaced), #166 (DGX OOM history).
+
+---
+
+# Phase 25 — Markdown rendering for assistant output (#568)
 
 Local models emit Markdown; the plain-scroller chat path showed it raw
 (`**asterisks**`, pipe tables, ` ``` ` fences). Render it as styled ANSI
@@ -1214,31 +1249,51 @@ headless wyvern tier. Engine: `pulldown-cmark` parse + our own crossterm ANSI
 emitter (surveyed termimad/tui-markdown/treemd/comrak — all target a widget
 surface or a non-CommonMark parser). One PR per step.
 
-- **24.1** ✅ **done** — whole-string ANSI emitter + the `markdown` default
+- **25.1** ✅ **done** — whole-string ANSI emitter + the `markdown` default
   feature. Inline emphasis (bold/italic/strike/underline), inline code,
   headings, bullet/ordered/task lists with nesting, blockquotes, thematic
   breaks, fenced code (dim, un-highlighted), display-width word wrap. Color-off
   and the `--no-default-features` wyvern strip are byte-for-byte passthrough.
   `render_markdown(src, RenderOpts{color, cols})` in `newt-core::agentic::markdown`.
-- **24.2** ✅ **done** — GFM tables: box-drawing (dim borders, bold header),
+- **25.2** ✅ **done** — GFM tables: box-drawing (dim borders, bold header),
   per-column display-width fit against `cols` (shrink-widest), left/center/right
   alignment, CJK/emoji width, overflow truncation with `…`. `table.rs`.
-- **24.3** ✅ **done** — `MarkdownStreamWriter` block-aware streaming: inline
+- **25.3** ✅ **done** — `MarkdownStreamWriter` block-aware streaming: inline
   lines render per completed line, multi-line blocks (fence/table/list/quote)
   hold until they close, split markers reunite in the line buffer. `stream.rs` +
   the `newt-core` `render_md` example (`--stream`). Wired into `stream_response`
   (the raw per-token `print!` now routes through the writer; the persisted `full`
-  stays raw); activation rule is "markdown ⇒ color" until the 24.4 toggle.
-- **24.4** `[tui].markdown` (`MarkdownMode`) config + `/markdown [on|off]`
-  command + non-stream fallback render; effective = config ∧ `color_supported()`.
-- **24.5** Wyvern source-tidy: optional `markdown-table-formatter` feature
+  stays raw); activation rule is "markdown ⇒ color" until the 25.4 toggle.
+- **25.4** `[tui].markdown` (`MarkdownMode`) config + `/markdown [on|off|auto]`
+  command + a per-session override + non-stream fallback render; effective =
+  `session ?? [tui].markdown.forced() ?? color`, then ∧ color.
+- **25.5** Wyvern source-tidy: optional `markdown-table-formatter` feature
   (plain-text pipe alignment; comrak/wasm-bindgen never default).
-- **24.6** *(follow-on)* `markdown-syntect` code highlighting behind a feature;
+- **25.6** *(follow-on)* `markdown-syntect` code highlighting behind a feature;
   off by default to keep the binary lean.
 
 ---
 
-# Cross-cutting notes
+# Backlog — unscheduled candidates
+
+Filed and triaged, not yet sequenced into a phase. Each entry links the issue and
+the threads it must build *on*, so we don't grow parallel mechanisms — promote to a
+phase when it's ready to schedule.
+
+- **#565 — project skill-packs** (`enhancement`): first-class support for richer
+  skill-pack layouts — `.claude/skills/<name>/SKILL.md` bridge stubs, `loads:`
+  frontmatter resolving to source skills, project source trees, and `/skill-name
+  args` slash dispatch — without rewriting them into a newt-specific format.
+  Build *on*, don't duplicate:
+  - **slash dispatch** → the command-plugin runtime's slash-registry
+    (`docs/design/command_plugin_runtime.md`); `/skill-name` should route through
+    that registry, not a parallel dispatcher.
+  - **progressive disclosure** (index-first, bodies on demand, bridge→source) →
+    coordinate with #546's `lookup`/skill-base substrate.
+  - **authority** → `docs/decisions/ocap_confinement_model.md` + #560: a
+    skill-pack's declared permissions/MCP are a *request*, granted only by the
+    human; `loads:` must reject paths escaping the pack root (path-fence).
+  - extends the existing `docs/decisions/agent-skills.md` foundation.
 
 - **drake-foreman dispatch:** each step's branch is the unit of work. The
   goal posted to drake should be the contents of that step's section. The
