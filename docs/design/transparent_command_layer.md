@@ -84,7 +84,7 @@ parse:
 
 | Tier | Examples | Routing | Governance |
 |------|----------|---------|------------|
-| **Read-only** | `git status/diff/log`, `grep`, `find`, `gh/glab … view` | embedded / confined read impl | read caveat; **path-fenced to the workspace** — e.g. `find <path>` parses its path and is refused unless it resolves under cwd (the same fence the fs tools enforce) |
+| **Read-only** | `git status/diff/log`, `grep`, `find`, `cat`, `ls`, `gh/glab … view` | embedded / confined read impl | read caveat; **fenced to the workspace at the execution boundary** (§5) — not by parsing each command's path flags |
 | **Egress** | `curl`, `wget`, `git push/fetch`, `gh/glab … create` | out-of-band fetch / embedded writer | egress caveat: host allow-list, write scope (the forge resolver's host-allowlist + HTTPS-only + no-redirect *is* this) |
 
 ### 4. Excluded: general-purpose interpreters
@@ -110,6 +110,33 @@ python is a **capability you grant** (a specific, bounded venv), not ambient
 authority the layer assumes. Excluding `python` from the transparent layer
 therefore costs nothing — it points at the right mechanism instead of duplicating
 or bypassing it.
+
+### 5. File access is fenced where it executes, not by parsing arguments
+
+"Fence every file-accessing command" — `find`, `grep`, `cat`, `ls`, `git`,
+`curl -o`, … — is **not** done by teaching the layer each command's
+path-argument grammar. That is fragile: a missed flag, a path named in a config
+file, a symlink, or a `$(…)` would slip the fence. It is done at the
+**execution boundary**: every command the layer routes to run executes inside
+newt's existing workspace fence —
+
+- **`lock_fs_to_workspace`** (`newt-core::caveats`): confine fs access to the
+  workspace, widened only by explicit grants `newt --read <path>` / `--write
+  <path>` (the `NEWT_READ_PATHS` / `NEWT_WRITE_PATHS` the CLI sets), and
+- enforced by **OS-level isolation** — the `b1-os-isolation` invariant
+  (`newt-core::ocap`): **Landlock** (Linux), **Seatbelt** (macOS),
+  **AppContainer** (Windows).
+
+The kernel/OS denies any access outside the fence **regardless of how the
+command names its paths**. So fencing *all* file-accessing commands is mostly
+*already true*: they inherit the fence by running confined; the layer's job is to
+make sure file-touching commands route into that environment, never around it.
+
+Per-command path parsing (the earlier `find <path>` → cwd check) is kept only as
+**defense-in-depth / fast-fail** — a clear "that path is outside the workspace"
+error before the OS would deny it anyway — never as the boundary. This is the
+ADR's posture exactly: the parse improves UX and catches the obvious case; the OS
+fence is what *guarantees* containment.
 
 ### The one-line rule
 
