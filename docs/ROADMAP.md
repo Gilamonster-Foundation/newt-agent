@@ -1239,6 +1239,41 @@ this is the next free cluster.)* **Design: #559.**
 
 ---
 
+# Phase 25 — Markdown rendering for assistant output (#568)
+
+Local models emit Markdown; the plain-scroller chat path showed it raw
+(`**asterisks**`, pipe tables, ` ``` ` fences). Render it as styled ANSI
+**scrolled lines** — never a ratatui/widget surface (the chat path is a plain
+scroller per `docs/decisions/plain_scroller_tui.md`), and strippable for the
+headless wyvern tier. Engine: `pulldown-cmark` parse + our own crossterm ANSI
+emitter (surveyed termimad/tui-markdown/treemd/comrak — all target a widget
+surface or a non-CommonMark parser). One PR per step.
+
+- **25.1** ✅ **done** — whole-string ANSI emitter + the `markdown` default
+  feature. Inline emphasis (bold/italic/strike/underline), inline code,
+  headings, bullet/ordered/task lists with nesting, blockquotes, thematic
+  breaks, fenced code (dim, un-highlighted), display-width word wrap. Color-off
+  and the `--no-default-features` wyvern strip are byte-for-byte passthrough.
+  `render_markdown(src, RenderOpts{color, cols})` in `newt-core::agentic::markdown`.
+- **25.2** ✅ **done** — GFM tables: box-drawing (dim borders, bold header),
+  per-column display-width fit against `cols` (shrink-widest), left/center/right
+  alignment, CJK/emoji width, overflow truncation with `…`. `table.rs`.
+- **25.3** ✅ **done** — `MarkdownStreamWriter` block-aware streaming: inline
+  lines render per completed line, multi-line blocks (fence/table/list/quote)
+  hold until they close, split markers reunite in the line buffer. `stream.rs` +
+  the `newt-core` `render_md` example (`--stream`). Wired into `stream_response`
+  (the raw per-token `print!` now routes through the writer; the persisted `full`
+  stays raw); activation rule is "markdown ⇒ color" until the 25.4 toggle.
+- **25.4** `[tui].markdown` (`MarkdownMode`) config + `/markdown [on|off|auto]`
+  command + a per-session override + non-stream fallback render; effective =
+  `session ?? [tui].markdown.forced() ?? color`, then ∧ color.
+- **25.5** Wyvern source-tidy: optional `markdown-table-formatter` feature
+  (plain-text pipe alignment; comrak/wasm-bindgen never default).
+- **25.6** *(follow-on)* `markdown-syntect` code highlighting behind a feature;
+  off by default to keep the binary lean.
+
+---
+
 # Backlog — unscheduled candidates
 
 Filed and triaged, not yet sequenced into a phase. Each entry links the issue and
