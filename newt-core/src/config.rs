@@ -953,6 +953,13 @@ pub struct TuiConfig {
     #[serde(default = "default_summarizer_retries")]
     pub summarizer_retries: u32,
 
+    /// Optional fallback summarizer model (Step 24.3, #559). When the primary
+    /// model's summary attempts all fail (too heavy / unavailable on a loaded
+    /// box), a small/fast model named here summarizes instead — a rung above the
+    /// static marker. `None` (default) = no fallback.
+    #[serde(default)]
+    pub summarizer_model: Option<String>,
+
     /// Markdown rendering of assistant output (Step 25.4, #568). `auto`
     /// (default) renders whenever color is active; `on`/`off` force it. The
     /// `/markdown [on|off]` command overrides this for the session.
@@ -1750,6 +1757,7 @@ impl Default for TuiConfig {
             keep_alive: default_keep_alive(),
             summarizer_timeout_secs: default_summarizer_timeout_secs(),
             summarizer_retries: default_summarizer_retries(),
+            summarizer_model: None,
             markdown: MarkdownMode::default(),
             mid_loop_trim_threshold: default_mid_loop_trim_threshold(),
             mid_loop_trim_tokens: None,
@@ -2608,10 +2616,14 @@ mod tests {
         let d = TuiConfig::default();
         assert_eq!(d.summarizer_timeout_secs, 60);
         assert_eq!(d.summarizer_retries, 2);
-        let cfg: TuiConfig =
-            toml::from_str("summarizer_timeout_secs = 180\nsummarizer_retries = 4").unwrap();
+        assert_eq!(d.summarizer_model, None);
+        let cfg: TuiConfig = toml::from_str(
+            "summarizer_timeout_secs = 180\nsummarizer_retries = 4\nsummarizer_model = \"qwen:0.5b\"",
+        )
+        .unwrap();
         assert_eq!(cfg.summarizer_timeout_secs, 180);
         assert_eq!(cfg.summarizer_retries, 4);
+        assert_eq!(cfg.summarizer_model.as_deref(), Some("qwen:0.5b"));
     }
 
     #[test]
