@@ -56,6 +56,8 @@ pub(super) struct Emitter {
     // Fenced/indented code block accumulation.
     in_code: bool,
     code_buf: String,
+    /// Info-string language of the current fenced block (for 25.6 highlighting).
+    code_lang: String,
 
     /// Destination of the currently-open link, appended dimly on `End(Link)`.
     link_url: Option<String>,
@@ -85,6 +87,7 @@ impl Emitter {
             pending_first: None,
             in_code: false,
             code_buf: String::new(),
+            code_lang: String::new(),
             link_url: None,
             table: None,
             in_cell: false,
@@ -154,10 +157,17 @@ impl Emitter {
                 self.block_break_if_top();
                 self.quote_depth += 1;
             }
-            Tag::CodeBlock(_) => {
+            Tag::CodeBlock(kind) => {
                 self.flush_inline();
                 self.in_code = true;
                 self.code_buf.clear();
+                // First token of a fenced block's info string is the language.
+                self.code_lang = match kind {
+                    pulldown_cmark::CodeBlockKind::Fenced(info) => {
+                        info.split_whitespace().next().unwrap_or("").to_string()
+                    }
+                    pulldown_cmark::CodeBlockKind::Indented => String::new(),
+                };
             }
             Tag::List(start) => {
                 self.flush_inline();
@@ -357,15 +367,16 @@ impl Emitter {
         let bars = self.render_quote();
         let prefix = format!("{}  ", self.indent);
         let body = self.code_buf.strip_suffix('\n').unwrap_or(&self.code_buf);
-        for line in body.split('\n') {
+        // The highlight seam returns one rendered ANSI line per source line
+        // (plain dim by default; syntect-colored under `markdown-syntect`).
+        for rendered in super::syntect::highlight(&self.code_lang, body) {
             self.out.push_str(&bars);
             self.out.push_str(&prefix);
-            self.out.push_str(&sgr_fg(FADE));
-            self.out.push_str(line);
-            self.out.push_str(RESET);
+            self.out.push_str(&rendered);
             self.out.push('\n');
         }
         self.code_buf.clear();
+        self.code_lang.clear();
     }
 
     /// Flush an accumulated GFM table as box-drawing lines, each prefixed with

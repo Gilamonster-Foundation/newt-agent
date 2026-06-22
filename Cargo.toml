@@ -165,6 +165,12 @@ unicode-width = "0.2"
 # so it is NEVER a default dependency — only the wyvern/headless consumers opt in.
 markdown-table-formatter = "0.3"
 
+# Syntax highlighting for fenced code blocks (newt-core, behind the optional
+# `markdown-syntect` feature — Step 25.6). `default-fancy` uses fancy-regex
+# (pure Rust) instead of the onig C dependency, so even when enabled there is no
+# C toolchain requirement. Off by default — heavy (syntax + theme assets).
+syntect = { version = "5", default-features = false, features = ["default-fancy"] }
+
 # Test utilities (dev-only)
 tempfile = "3"
 # Resolves the cargo target directory the way cargo itself does (env var >
