@@ -1239,7 +1239,26 @@ this is the next free cluster.)* **Design: #559.**
 
 ---
 
-# Cross-cutting notes
+# Backlog — unscheduled candidates
+
+Filed and triaged, not yet sequenced into a phase. Each entry links the issue and
+the threads it must build *on*, so we don't grow parallel mechanisms — promote to a
+phase when it's ready to schedule.
+
+- **#565 — project skill-packs** (`enhancement`): first-class support for richer
+  skill-pack layouts — `.claude/skills/<name>/SKILL.md` bridge stubs, `loads:`
+  frontmatter resolving to source skills, project source trees, and `/skill-name
+  args` slash dispatch — without rewriting them into a newt-specific format.
+  Build *on*, don't duplicate:
+  - **slash dispatch** → the command-plugin runtime's slash-registry
+    (`docs/design/command_plugin_runtime.md`); `/skill-name` should route through
+    that registry, not a parallel dispatcher.
+  - **progressive disclosure** (index-first, bodies on demand, bridge→source) →
+    coordinate with #546's `lookup`/skill-base substrate.
+  - **authority** → `docs/decisions/ocap_confinement_model.md` + #560: a
+    skill-pack's declared permissions/MCP are a *request*, granted only by the
+    human; `loads:` must reject paths escaping the pack root (path-fence).
+  - extends the existing `docs/decisions/agent-skills.md` foundation.
 
 - **drake-foreman dispatch:** each step's branch is the unit of work. The
   goal posted to drake should be the contents of that step's section. The
