@@ -100,6 +100,56 @@ pub use driver::{
 pub use git_tool::{git_tool_definition, GitTool};
 pub use markdown::{render_markdown, MarkdownStreamWriter, RenderOpts};
 pub use mcp::{McpTools, NoMcp};
+
+/// Align GFM table pipes in Markdown **source** (Step 25.5, #568) — plain text,
+/// no ANSI. The headless **wyvern** tier keeps Markdown as source (no rendering),
+/// so this tidies ragged pipe tables for transcripts other agents read. It is
+/// **independent of the `markdown` feature** (wyvern builds `--no-default-features`)
+/// and gated on the optional `markdown-table-formatter` feature: identity unless
+/// enabled, so it never pulls comrak/wasm-bindgen into a default build.
+#[cfg(feature = "markdown-table-formatter")]
+pub fn tidy_markdown_tables(src: &str) -> String {
+    markdown_table_formatter::format_tables(src)
+}
+
+/// Identity passthrough when the `markdown-table-formatter` feature is off.
+#[cfg(not(feature = "markdown-table-formatter"))]
+pub fn tidy_markdown_tables(src: &str) -> String {
+    src.to_string()
+}
+
+#[cfg(test)]
+mod tidy_tables_tests {
+    #[cfg(not(feature = "markdown-table-formatter"))]
+    #[test]
+    fn identity_without_the_feature() {
+        // The default build (and the wyvern strip without the opt-in) leaves the
+        // source untouched.
+        let ragged = "| a | bb |\n|---|---|\n| ccc | d |";
+        assert_eq!(super::tidy_markdown_tables(ragged), ragged);
+    }
+
+    #[cfg(feature = "markdown-table-formatter")]
+    #[test]
+    fn aligns_pipes_with_the_feature() {
+        let ragged = "| a | bb |\n| --- | --- |\n| ccc | d |\n";
+        let tidy = super::tidy_markdown_tables(ragged);
+        assert_ne!(tidy, ragged, "the table should be reformatted");
+        assert!(tidy.contains("ccc"), "content preserved");
+        // Every pipe-bearing row lines its pipes up at the same columns.
+        let pipe_cols = |s: &str| {
+            s.char_indices()
+                .filter(|(_, c)| *c == '|')
+                .map(|(i, _)| i)
+                .collect::<Vec<_>>()
+        };
+        let rows: Vec<&str> = tidy.lines().filter(|l| l.contains('|')).collect();
+        let first = pipe_cols(rows[0]);
+        for r in &rows {
+            assert_eq!(pipe_cols(r), first, "pipes aligned across rows: {r:?}");
+        }
+    }
+}
 pub use memory_fetch::{
     memory_fetch_tool_definition, MemAddr, MemPayload, MemorySource, StoreMemorySource,
 };
