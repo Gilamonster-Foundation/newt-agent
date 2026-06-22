@@ -465,6 +465,10 @@ pub struct ChatCtx<'a> {
     pub task: &'a str,
     pub workspace: &'a str,
     pub color: bool,
+    /// Render assistant Markdown as ANSI in the live stream (Step 25.4, #568).
+    /// Resolved by the caller as `[tui].markdown` (∧ `/markdown` override) ∧
+    /// color. The loop only renders when this is true.
+    pub markdown: bool,
     pub caveats: &'a crate::caveats::Caveats,
     /// Maximum tool-call rounds before forcing a final tools-disabled
     /// completion (from `[tui].max_tool_rounds`, default 25).
@@ -848,6 +852,9 @@ pub async fn chat_complete(
         }
         return openai_chat_complete(ctx, mcp).await;
     }
+    // Step 25.4 (#568): capture the markdown decision before `ctx` is consumed
+    // by the destructure (the destructures ignore it via `markdown: _`).
+    let markdown = ctx.markdown;
     let ChatCtx {
         url,
         model,
@@ -857,6 +864,7 @@ pub async fn chat_complete(
         task,
         workspace,
         color,
+        markdown: _,
         caveats,
         max_tool_rounds,
         tool_output_lines,
@@ -1454,10 +1462,9 @@ pub async fn chat_complete(
             // need the filter to start inside the reasoning block so the closer
             // and the reasoning it follows don't leak into the reply.
             let leading_reasoning = crate::reasoning::emits_leading_reasoning(model);
-            // Step 25.3 (#568): render assistant Markdown whenever color is on.
-            // The dedicated `[tui].markdown` config + `/markdown` toggle land in
-            // 25.4; until then the activation rule is simply "markdown ⇒ color".
-            let markdown = color;
+            // Step 25.4 (#568): `markdown` is now resolved by the caller
+            // (`[tui].markdown` ∧ `/markdown` override ∧ color) and read off the
+            // ctx above — no longer hardcoded to `color`.
             let (streamed, stream_usage) = stream_response(
                 sresp,
                 color,
@@ -2065,6 +2072,7 @@ pub async fn openai_chat_complete(
         task,
         workspace,
         color,
+        markdown: _,
         caveats,
         max_tool_rounds,
         tool_output_lines,
@@ -2749,6 +2757,7 @@ pub async fn openai_responses_complete(
         task: _,
         workspace,
         color,
+        markdown: _,
         caveats,
         max_tool_rounds,
         tool_output_lines,
@@ -3469,6 +3478,7 @@ mod tool_round_cap_tests {
                 task: "do the thing",
                 workspace: ".",
                 color: false,
+                markdown: false,
                 caveats: &caveats,
                 max_tool_rounds: cap,
                 tool_output_lines: 20,
@@ -3532,6 +3542,7 @@ mod tool_round_cap_tests {
                 task: "do the thing",
                 workspace: ".",
                 color: false,
+                markdown: false,
                 caveats: &caveats,
                 max_tool_rounds: 5,
                 tool_output_lines: 20,
@@ -3660,6 +3671,7 @@ mod tool_round_cap_tests {
                 task: "do the thing",
                 workspace: ".",
                 color: false,
+                markdown: false,
                 caveats: &caveats,
                 max_tool_rounds: 5,
                 tool_output_lines: 20,
@@ -3725,6 +3737,7 @@ mod tool_round_cap_tests {
                 task: "do the thing",
                 workspace: ".",
                 color: false,
+                markdown: false,
                 caveats: &caveats,
                 max_tool_rounds: cap,
                 tool_output_lines: 20,
@@ -3813,6 +3826,7 @@ mod tool_round_cap_tests {
                 task: "do the thing",
                 workspace: &workspace,
                 color: false,
+                markdown: false,
                 caveats: &caveats,
                 max_tool_rounds: 1,
                 tool_output_lines: 20,
@@ -3913,6 +3927,7 @@ mod tool_round_cap_tests {
                 task: "do the thing",
                 workspace: &workspace,
                 color: false,
+                markdown: false,
                 caveats: &caveats,
                 max_tool_rounds: 1,
                 tool_output_lines: 20,
@@ -4005,6 +4020,7 @@ mod tool_round_cap_tests {
                 task: "do the thing",
                 workspace: ".",
                 color: false,
+                markdown: false,
                 caveats: &caveats,
                 max_tool_rounds: 2,
                 tool_output_lines: 20,
@@ -4134,6 +4150,7 @@ mod tool_round_cap_tests {
                 task: "do the thing",
                 workspace: ".",
                 color: false,
+                markdown: false,
                 caveats: &caveats,
                 max_tool_rounds: cap,
                 tool_output_lines: 20,
@@ -4277,6 +4294,7 @@ mod tool_round_cap_tests {
                 task: "list all files",
                 workspace: ".",
                 color: false,
+                markdown: false,
                 caveats: &caveats,
                 max_tool_rounds: 10,
                 tool_output_lines: 5,
@@ -4359,6 +4377,7 @@ mod http_loop_tests {
             task: "do the thing",
             workspace: ".",
             color: false,
+            markdown: false,
             caveats,
             max_tool_rounds: 8,
             tool_output_lines: 20,
@@ -5237,6 +5256,7 @@ mod save_note_loop_tests {
             task: "do the thing",
             workspace: ".",
             color: false,
+            markdown: false,
             caveats,
             max_tool_rounds: 6,
             tool_output_lines: 20,
@@ -5709,6 +5729,7 @@ mod compression_loop_tests {
             task: TASK,
             workspace,
             color: false,
+            markdown: false,
             caveats,
             max_tool_rounds: 12,
             tool_output_lines: 2,
@@ -6836,6 +6857,7 @@ mod observation_hook_tests {
             task: "do the thing",
             workspace: ".",
             color: false,
+            markdown: false,
             caveats,
             max_tool_rounds: 8,
             tool_output_lines: 20,

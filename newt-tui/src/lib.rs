@@ -3577,6 +3577,9 @@ fn run_chat(
     // ⇒ no mode active ⇒ effective authority is the session base, exactly as
     // before. Set by `/mode <name>`; lives for the rest of the session.
     let mut active_mode: Option<ActiveMode> = None;
+    // Step 25.4 (#568): per-session Markdown override set by `/markdown on|off`.
+    // `None` defers to `[tui].markdown`; `Some(b)` forces it for the session.
+    let mut markdown_override: Option<bool> = None;
     // Prompted ocap grants (issue #263), resolved ONCE per session: the flag
     // (env, set by `--prompt-for-permissions`) or `[tui.permissions] prompt`,
     // AND a real terminal on stdin — a piped/headless invocation must never
@@ -4120,6 +4123,49 @@ fn run_chat(
                         println!();
                         continue;
                     }
+                    // Step 25.4 (#568): `/markdown [on|off|auto]` — session override
+                    // of `[tui].markdown`. No arg reports the effective state.
+                    let slash_md = task.trim_start_matches('/');
+                    if slash_md == "markdown" || slash_md.starts_with("markdown ") {
+                        let arg = slash_md.strip_prefix("markdown").unwrap_or("").trim();
+                        if arg.is_empty() {
+                            let on = markdown_enabled(&cfg, color, markdown_override);
+                            let src = if markdown_override.is_some() {
+                                "session"
+                            } else {
+                                "config"
+                            };
+                            print_newt(
+                                &format!(
+                                    "markdown is {} ({src}) — use /markdown on|off|auto",
+                                    if on { "on" } else { "off" }
+                                ),
+                                color,
+                                verbose,
+                            );
+                        } else if let Some(mode) = newt_core::MarkdownMode::from_keyword(arg) {
+                            markdown_override = mode.forced();
+                            let on = markdown_enabled(&cfg, color, markdown_override);
+                            print_newt(
+                                &format!(
+                                    "markdown → {} (now {})",
+                                    mode.keyword(),
+                                    if on { "on" } else { "off" }
+                                ),
+                                color,
+                                verbose,
+                            );
+                        } else {
+                            print_newt(
+                                &format!("unknown /markdown arg '{arg}' — use on|off|auto"),
+                                color,
+                                verbose,
+                            );
+                        }
+                        surface.save_history();
+                        println!();
+                        continue;
+                    }
                     if let Some(fact) = task.trim_start_matches('/').strip_prefix("remember ") {
                         // Route the fact through MemoryManager::add_note —
                         // the first note-capable provider (NoteStore) wins.
@@ -4598,6 +4644,9 @@ fn run_chat(
                                         task: &task,
                                         workspace,
                                         color,
+                                        // Step 25.4 (#568): `[tui].markdown` ∧
+                                        // `/markdown` override ∧ color.
+                                        markdown: markdown_enabled(&cfg, color, markdown_override),
                                         // #307: the clamped effective caveats (base ∩
                                         // preset). Identical to `cap.caveats()` when no
                                         // mode is active.
@@ -4687,7 +4736,28 @@ fn run_chat(
                         match response {
                             Ok((reply, was_streamed, usage, hallucinations)) => {
                                 if !was_streamed {
-                                    print_newt(&reply, color, verbose);
+                                    // Step 25.4 (#568): the non-stream fallback also
+                                    // renders Markdown when it is active.
+                                    if markdown_enabled(&cfg, color, markdown_override) {
+                                        let cols = crossterm::terminal::size()
+                                            .map(|(c, _)| c as usize)
+                                            .unwrap_or(80)
+                                            .max(20);
+                                        print!("▸  ");
+                                        print!(
+                                            "{}",
+                                            newt_core::agentic::render_markdown(
+                                                &reply,
+                                                newt_core::agentic::RenderOpts {
+                                                    color: true,
+                                                    cols
+                                                },
+                                            )
+                                        );
+                                        println!();
+                                    } else {
+                                        print_newt(&reply, color, verbose);
+                                    }
                                 }
                                 // Profile techniques, post-turn (R2). `retry` supersedes
                                 // `verify_gate`: it runs the same gate but *acts* —
@@ -6528,6 +6598,23 @@ fn keep_alive_str(cfg: &newt_core::Config) -> String {
         .as_ref()
         .map(|t| t.keep_alive.clone())
         .unwrap_or_else(|| "5m".to_string())
+}
+
+/// Whether to render assistant Markdown this turn (Step 25.4, #568). The
+/// session `/markdown` override wins over `[tui].markdown`; either way the
+/// result is gated by `color` (Markdown emits ANSI, so it is off without color).
+fn markdown_enabled(cfg: &newt_core::Config, color: bool, session: Option<bool>) -> bool {
+    let base = match session {
+        Some(forced) => forced,
+        None => cfg
+            .tui
+            .as_ref()
+            .map(|t| t.markdown)
+            .unwrap_or_default()
+            .forced()
+            .unwrap_or(color),
+    };
+    base && color
 }
 
 /// Mid-loop message-trim threshold from `[tui].mid_loop_trim_threshold` (default 40).
@@ -11372,6 +11459,7 @@ mod tool_round_cap_tests {
                     task: "do the thing",
                     workspace: ".",
                     color: false,
+                    markdown: false,
                     caveats: &caveats,
                     max_tool_rounds: 5,
                     tool_output_lines: 20,
@@ -11610,6 +11698,46 @@ mod helper_fn_tests {
             ..Default::default()
         };
         assert_eq!(keep_alive_str(&cfg), "30m");
+    }
+
+    #[test]
+    fn markdown_enabled_resolves_config_session_and_color() {
+        use newt_core::MarkdownMode;
+        let cfg_with = |m: MarkdownMode| newt_core::Config {
+            tui: Some(newt_core::TuiConfig {
+                markdown: m,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        // Default (auto): follows color.
+        assert!(markdown_enabled(&newt_core::Config::default(), true, None));
+        assert!(!markdown_enabled(
+            &newt_core::Config::default(),
+            false,
+            None
+        ));
+        // Config off: never renders, even with color.
+        assert!(!markdown_enabled(&cfg_with(MarkdownMode::Off), true, None));
+        // Config on: still gated by color (ANSI needs color).
+        assert!(markdown_enabled(&cfg_with(MarkdownMode::On), true, None));
+        assert!(!markdown_enabled(&cfg_with(MarkdownMode::On), false, None));
+        // Session override wins over config, still color-gated.
+        assert!(!markdown_enabled(
+            &cfg_with(MarkdownMode::On),
+            true,
+            Some(false)
+        ));
+        assert!(markdown_enabled(
+            &cfg_with(MarkdownMode::Off),
+            true,
+            Some(true)
+        ));
+        assert!(!markdown_enabled(
+            &cfg_with(MarkdownMode::Off),
+            false,
+            Some(true)
+        ));
     }
 
     #[test]
