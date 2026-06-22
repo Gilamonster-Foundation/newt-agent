@@ -1204,6 +1204,36 @@ red-team **prerequisite fixes** + the real WebAuthn/CTAP2 verifier + the server-
 
 ---
 
+## Phase 24 — Markdown rendering for assistant output (#559)
+
+Local models emit Markdown; the plain-scroller chat path showed it raw
+(`**asterisks**`, pipe tables, ` ``` ` fences). Render it as styled ANSI
+**scrolled lines** — never a ratatui/widget surface (the chat path is a plain
+scroller per `docs/decisions/plain_scroller_tui.md`), and strippable for the
+headless wyvern tier. Engine: `pulldown-cmark` parse + our own crossterm ANSI
+emitter (surveyed termimad/tui-markdown/treemd/comrak — all target a widget
+surface or a non-CommonMark parser). One PR per step.
+
+- **24.1** ✅ **done** — whole-string ANSI emitter + the `markdown` default
+  feature. Inline emphasis (bold/italic/strike/underline), inline code,
+  headings, bullet/ordered/task lists with nesting, blockquotes, thematic
+  breaks, fenced code (dim, un-highlighted), display-width word wrap. Color-off
+  and the `--no-default-features` wyvern strip are byte-for-byte passthrough.
+  `render_markdown(src, RenderOpts{color, cols})` in `newt-core::agentic::markdown`.
+- **24.2** GFM tables: box-drawing, column width-fit against `cols`, alignment,
+  CJK/emoji width.
+- **24.3** `MarkdownStreamWriter` — block-aware streaming; replace the raw
+  per-token `print!` in `stream_response` so inline styles emit per completed
+  line and multi-line blocks (fences/tables) buffer until they close.
+- **24.4** `[tui].markdown` (`MarkdownMode`) config + `/markdown [on|off]`
+  command + non-stream fallback render; effective = config ∧ `color_supported()`.
+- **24.5** Wyvern source-tidy: optional `markdown-table-formatter` feature
+  (plain-text pipe alignment; comrak/wasm-bindgen never default).
+- **24.6** *(follow-on)* `markdown-syntect` code highlighting behind a feature;
+  off by default to keep the binary lean.
+
+---
+
 # Cross-cutting notes
 
 - **drake-foreman dispatch:** each step's branch is the unit of work. The

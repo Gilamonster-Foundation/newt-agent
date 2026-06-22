@@ -151,6 +151,14 @@ jsonrpc-core = "18"
 ratatui = "0.29"
 crossterm = "0.28"
 
+# Markdown rendering (newt-core, behind the `markdown` feature — Step 24.1).
+# pulldown-cmark parses; we render ANSI ourselves on crossterm (no widget
+# surface — the chat path is a plain scroller per plain_scroller_tui.md).
+# default-features off drops the unused `getopts` CLI bits. unicode-width gives
+# correct display widths for wrapping (and table fit in 24.2): CJK + emoji.
+pulldown-cmark = { version = "0.12", default-features = false }
+unicode-width = "0.2"
+
 # Test utilities (dev-only)
 tempfile = "3"
 # Resolves the cargo target directory the way cargo itself does (env var >

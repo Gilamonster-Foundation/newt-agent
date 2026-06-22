@@ -21,6 +21,26 @@ mod git_tool;
 // and the redaction-gated ShellObservation seam (observation). All additive;
 // they wrap/precede `chat_complete` and never touch its internals.
 mod driver;
+// Step 24.1 (#559): Markdown → ANSI rendering of assistant output. Behind the
+// default `markdown` feature; a passthrough shim takes its place under
+// --no-default-features so the headless wyvern strip carries no markdown deps.
+#[cfg(feature = "markdown")]
+mod markdown;
+#[cfg(not(feature = "markdown"))]
+mod markdown {
+    //! Passthrough shim used when the `markdown` feature is disabled (the
+    //! headless wyvern strip). Keeps `render_markdown` / `RenderOpts` in the
+    //! public API with zero markdown dependencies; output is the source
+    //! verbatim — identical to color-off behavior in the full renderer.
+    #[derive(Debug, Clone, Copy)]
+    pub struct RenderOpts {
+        pub color: bool,
+        pub cols: usize,
+    }
+    pub fn render_markdown(src: &str, _opts: RenderOpts) -> String {
+        src.to_string()
+    }
+}
 mod mcp;
 mod memory_fetch;
 mod note_sink;
@@ -44,6 +64,7 @@ pub use driver::{
     VISIBLE_TRANSCRIPT_ROLES,
 };
 pub use git_tool::{git_tool_definition, GitTool};
+pub use markdown::{render_markdown, RenderOpts};
 pub use mcp::{McpTools, NoMcp};
 pub use memory_fetch::{
     memory_fetch_tool_definition, MemAddr, MemPayload, MemorySource, StoreMemorySource,
