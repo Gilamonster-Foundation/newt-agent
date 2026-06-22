@@ -359,6 +359,9 @@ async fn run_one_turn(
         // The driver is headless: the loop's inline progress prints are
         // suppressed so nothing fights the consumer's ratatui frame.
         color: false,
+        // Cowork renders into the consumer's frame, not the scroller — no
+        // markdown ANSI here (it would fight the host UI).
+        markdown: false,
         caveats: &config.caveats,
         max_tool_rounds: config.max_tool_rounds,
         tool_output_lines: config.tool_output_lines,
