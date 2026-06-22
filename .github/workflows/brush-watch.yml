@@ -1,0 +1,72 @@
+# Watch crates.io for the brush release that carries the confined-shell API,
+# so we can wire the capability handshake (docs/decisions/brush_confined_shell_handshake.md).
+#
+# This is a NOTIFIER, not a gate — it does not block any merge and has no
+# pre-push-hook counterpart. It polls the crates.io API on a schedule and opens
+# a single tracking issue once brush reaches the target version.
+name: brush-watch
+
+on:
+  schedule:
+    # Weekly, Mondays 13:17 UTC (off the top of the hour to avoid the rush).
+    - cron: "17 13 * * 1"
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "brush version to watch for (the release carrying the confined-shell patch)"
+        required: false
+        default: "0.5.0"
+
+permissions:
+  issues: write
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Poll crates.io for brush >= target
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TARGET: ${{ github.event.inputs.target || '0.5.0' }}
+        run: |
+          set -euo pipefail
+          MAX=$(curl -fsSL "https://crates.io/api/v1/crates/brush" \
+            -H "User-Agent: newt-agent brush-watch (github.com/${GH_REPO})" \
+            | jq -r '.crate.max_version')
+          echo "brush max_version on crates.io: ${MAX:-<none>} (target: ${TARGET})"
+
+          if [ -z "${MAX}" ] || [ "${MAX}" = "null" ]; then
+            echo "could not read brush max_version; will retry next run."
+            exit 0
+          fi
+
+          # MAX >= TARGET  ⟺  the smaller of the two (by version sort) is TARGET.
+          smaller=$(printf '%s\n%s\n' "${TARGET}" "${MAX}" | sort -V | head -1)
+          if [ "${smaller}" != "${TARGET}" ]; then
+            echo "target not yet published — nothing to do."
+            exit 0
+          fi
+
+          # Idempotent: only one open tracking issue at a time.
+          open=$(gh issue list --search 'in:title "brush confined-shell handshake" state:open' --json number --jq 'length')
+          if [ "${open}" != "0" ]; then
+            echo "tracking issue already open — nothing to do."
+            exit 0
+          fi
+
+          gh issue create \
+            --title "brush ${MAX} on crates.io — wire the confined-shell handshake" \
+            --label enhancement \
+            --body "brush \`${MAX}\` (>= target \`${TARGET}\`) is published on crates.io.
+
+          Time to switch agent-bridle to the crates.io brush and enable the
+          build-script capability handshake so the confined shell auto-enables:
+
+          - Plan: \`docs/decisions/brush_confined_shell_handshake.md\`
+          - Upstream integration: agent-bridle#28
+
+          Verify this version actually carries the confined-shell API before
+          flipping. Then retire \`just shell-real\` / \`shell-stub\` / \`shell-check\`.
+
+          _Opened automatically by the \`brush-watch\` workflow._"
