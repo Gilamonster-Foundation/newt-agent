@@ -4372,8 +4372,12 @@ fn run_chat(
                             // counters), so it's handled here, not in the pure
                             // dispatch helper.
                             let manager = context_manager(&cfg, context_manager_override);
-                            let features =
-                                context_features(&cfg, manager, &context_features_override);
+                            let features = context_features(
+                                &cfg,
+                                manager,
+                                &context_features_override,
+                                inf_kind,
+                            );
                             // Step 26.3: surface tool_offload's measured impact.
                             let impact = features.tool_offload.then(|| {
                                 use newt_core::SpillStore;
@@ -4419,6 +4423,7 @@ fn run_chat(
                                 &cfg,
                                 context_manager_override,
                                 &context_features_override,
+                                inf_kind,
                             );
                             for line in &result.lines {
                                 print_newt(line, color, verbose);
@@ -4776,6 +4781,7 @@ fn run_chat(
                         &cfg,
                         context_manager(&cfg, context_manager_override),
                         &context_features_override,
+                        inf_kind,
                     );
                     let tool_offload_on = turn_features.tool_offload;
                     let scratchpad_on = turn_features.scratchpad;
@@ -4793,6 +4799,26 @@ fn run_chat(
                         {
                             turn_system = format!("{block}\n\n{turn_system}");
                         }
+                    }
+                    // Step 27.4: nudge a weak local model to actually USE the
+                    // cross-round working-memory tools when they're on, so it
+                    // keeps a checklist/state instead of re-deriving everything
+                    // each round. Ephemeral (rides turn_system), never persisted.
+                    if turn_features.scheduled || scratchpad_on {
+                        let mut hints: Vec<&str> = Vec::new();
+                        if turn_features.scheduled {
+                            hints.push(
+                                "For multi-step work, FIRST call plan_set([...]) with the steps, \
+                                 then plan_advance() as you finish each one.",
+                            );
+                        }
+                        if scratchpad_on {
+                            hints.push(
+                                "Record durable facts (paths, decisions) with state_set so they \
+                                 survive context compaction; read them back with state_get.",
+                            );
+                        }
+                        turn_system = format!("{}\n\n{turn_system}", hints.join(" "));
                     }
                     // Step 26.5.4 (#582): semantic RAG — index the repo's code once
                     // (lazily, on the first active turn), then inject a
@@ -7107,13 +7133,19 @@ fn context_features(
     cfg: &newt_core::Config,
     manager: newt_core::ContextManager,
     session: &newt_core::ContextFeatures,
+    kind: newt_core::BackendKind,
 ) -> newt_core::ContextFeatureSet {
+    // Step 27.4: the base depends on the backend — local (Ollama) sessions
+    // default the cross-round working-memory features (scratchpad + scheduled)
+    // ON; cloud keeps the all-off preset baseline. `[context.features]` config
+    // then session overrides still layer on top and win.
+    let base = newt_core::ContextFeatureSet::base_for(manager, kind);
     let with_config = cfg
         .context
         .as_ref()
         .map(|c| c.features)
         .unwrap_or_default()
-        .apply_to(manager.base_features());
+        .apply_to(base);
     session.apply_to(with_config)
 }
 
@@ -7136,10 +7168,11 @@ fn handle_context_command(
     cfg: &newt_core::Config,
     manager_override: Option<newt_core::ContextManager>,
     feature_override: &newt_core::ContextFeatures,
+    kind: newt_core::BackendKind,
 ) -> ContextCommandResult {
     use newt_core::{ContextFeature, ContextManager};
     let manager = context_manager(cfg, manager_override);
-    let features = context_features(cfg, manager, feature_override);
+    let features = context_features(cfg, manager, feature_override, kind);
     let mgr_src = if manager_override.is_some() {
         "session"
     } else {
@@ -12565,12 +12598,15 @@ mod helper_fn_tests {
 
     #[test]
     fn context_features_resolves_preset_config_session() {
-        use newt_core::{ContextConfig, ContextFeature as F, ContextFeatures, ContextManager};
-        // No [context] → the preset base bundle (all off today).
+        use newt_core::{
+            BackendKind, ContextConfig, ContextFeature as F, ContextFeatures, ContextManager,
+        };
+        // Cloud (Openai) base: no [context] → the preset base bundle (all off).
         assert!(context_features(
             &newt_core::Config::default(),
             ContextManager::Standard,
             &ContextFeatures::default(),
+            BackendKind::Openai,
         )
         .enabled()
         .is_empty());
@@ -12585,22 +12621,69 @@ mod helper_fn_tests {
             }),
             ..Default::default()
         };
-        assert!(
-            context_features(&cfg, ContextManager::Standard, &ContextFeatures::default())
-                .get(F::Semantic)
-        );
+        assert!(context_features(
+            &cfg,
+            ContextManager::Standard,
+            &ContextFeatures::default(),
+            BackendKind::Openai,
+        )
+        .get(F::Semantic));
         // Session override wins over config (forces it back off).
         let mut sess = ContextFeatures::default();
         sess.set(F::Semantic, Some(false));
-        assert!(!context_features(&cfg, ContextManager::Standard, &sess).get(F::Semantic));
+        assert!(
+            !context_features(&cfg, ContextManager::Standard, &sess, BackendKind::Openai)
+                .get(F::Semantic)
+        );
+    }
+
+    #[test]
+    fn context_features_local_backend_defaults_plan_ledger_on() {
+        use newt_core::{
+            BackendKind, ContextConfig, ContextFeature as F, ContextFeatures, ContextManager,
+        };
+        // Step 27.4: a local (Ollama) session defaults scratchpad + scheduled ON
+        // with no config at all.
+        let local = context_features(
+            &newt_core::Config::default(),
+            ContextManager::Standard,
+            &ContextFeatures::default(),
+            BackendKind::Ollama,
+        );
+        assert!(local.get(F::Scratchpad));
+        assert!(local.get(F::Scheduled));
+        // An explicit [context.features] scheduled = false still wins.
+        let mut off = ContextFeatures::default();
+        off.set(F::Scheduled, Some(false));
+        let cfg = newt_core::Config {
+            context: Some(ContextConfig {
+                manager: ContextManager::Standard,
+                features: off,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let resolved = context_features(
+            &cfg,
+            ContextManager::Standard,
+            &ContextFeatures::default(),
+            BackendKind::Ollama,
+        );
+        assert!(
+            !resolved.get(F::Scheduled),
+            "explicit off overrides the local default"
+        );
+        assert!(resolved.get(F::Scratchpad), "untouched feature stays on");
     }
 
     #[test]
     fn handle_context_command_dispatch() {
-        use newt_core::{ContextFeatures, ContextManager};
+        use newt_core::{BackendKind, ContextFeatures, ContextManager};
         let cfg = newt_core::Config::default();
         let none = ContextFeatures::default();
-        let run = |rest: &str| handle_context_command(rest, &cfg, None, &none);
+        // Cloud kind keeps the all-off base so these assertions isolate the
+        // dispatch logic from the Step 27.4 local default.
+        let run = |rest: &str| handle_context_command(rest, &cfg, None, &none, BackendKind::Openai);
 
         // bare status: manager + features summary, no mutation
         let r = run("");
@@ -12666,7 +12749,13 @@ mod helper_fn_tests {
             }),
             ..Default::default()
         };
-        let r = handle_context_command("feature provenance off", &cfg_on, None, &none);
+        let r = handle_context_command(
+            "feature provenance off",
+            &cfg_on,
+            None,
+            &none,
+            BackendKind::Openai,
+        );
         assert!(
             r.set_feature.is_none(),
             "an unavailable feature is never applied"
@@ -12677,7 +12766,7 @@ mod helper_fn_tests {
             r.lines[0]
         );
         assert!(
-            handle_context_command("", &cfg_on, None, &none).lines[0]
+            handle_context_command("", &cfg_on, None, &none, BackendKind::Openai).lines[0]
                 .contains("provenance (pending #584)"),
             "bare status annotates a config-on-but-unavailable feature as pending"
         );

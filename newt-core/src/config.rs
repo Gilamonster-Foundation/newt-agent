@@ -897,6 +897,27 @@ impl ContextFeatureSet {
             .filter(|&f| self.get(f))
             .collect()
     }
+
+    /// The base feature set *before* `[context.features]` / session overrides:
+    /// the `manager` preset's bundle, with the cross-round working-memory
+    /// features (`scratchpad` + `scheduled`) defaulted ON for local
+    /// (`BackendKind::Ollama`) backends. A weak local model needs the
+    /// `<plan>` / `<state>` ledger to carry a checklist across tool-call rounds
+    /// instead of re-deriving state each round (Step 27.4). Cloud
+    /// (OpenAI-compatible) backends keep the all-off preset baseline; explicit
+    /// overrides still win — they layer on top via [`ContextFeatures::apply_to`].
+    ///
+    /// Note: a *local* vLLM / llama.cpp server reports as `Openai` (that's the
+    /// wire protocol, not the host), so those users opt in via
+    /// `[context.features]` rather than getting it by default.
+    pub fn base_for(manager: ContextManager, kind: BackendKind) -> Self {
+        let mut base = manager.base_features();
+        if matches!(kind, BackendKind::Ollama) {
+            base.scratchpad = true;
+            base.scheduled = true;
+        }
+        base
+    }
 }
 
 /// Per-feature overrides under `[context.features]` (config) and `/context
@@ -3041,6 +3062,24 @@ mod tests {
         assert_eq!(c.features.get(F::Semantic), Some(true));
         assert_eq!(c.features.get(F::Scratchpad), Some(false));
         assert_eq!(c.features.get(F::ToolOffload), None);
+    }
+
+    #[test]
+    fn base_for_local_defaults_plan_and_state_on_cloud_stays_off() {
+        use ContextFeature as F;
+        // Step 27.4: local (Ollama) backends default scratchpad + scheduled ON.
+        let local = ContextFeatureSet::base_for(ContextManager::Standard, BackendKind::Ollama);
+        assert!(local.get(F::Scratchpad));
+        assert!(local.get(F::Scheduled));
+        assert!(!local.get(F::Semantic)); // only the working-memory pair flips
+                                          // Cloud (OpenAI-compatible) keeps the all-off preset baseline.
+        let cloud = ContextFeatureSet::base_for(ContextManager::Standard, BackendKind::Openai);
+        assert!(cloud.enabled().is_empty());
+        // An explicit override still wins over the local default (force off).
+        let mut ov = ContextFeatures::default();
+        ov.set(F::Scheduled, Some(false));
+        assert!(!ov.apply_to(local).get(F::Scheduled));
+        assert!(ov.apply_to(local).get(F::Scratchpad)); // untouched feature stays on
     }
 
     #[test]
