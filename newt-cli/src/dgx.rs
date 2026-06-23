@@ -31,9 +31,12 @@ use std::io::Write as _;
 
 use clap::Subcommand;
 use newt_core::dgx::{DgxConfig, DgxNode, EndpointKind};
+use newt_core::retry::{with_backoff, RetryPolicy};
 use newt_core::router::Classification;
 use newt_core::{Config, Router, Tier};
 use newt_inference::local::LocalVllmBackend;
+
+use crate::dgx_vllm;
 
 /// `newt dgx <cmd>` subcommands.
 #[derive(Subcommand, Debug)]
@@ -128,6 +131,108 @@ pub enum DgxCmd {
     },
     /// List models currently loaded on the active Ollama endpoint (`/api/ps`).
     Ps,
+    /// Manage a vLLM OpenAI-compatible server on the DGX node.
+    ///
+    /// Stands up (`up`) / tears down (`down`) a `vllm serve` process over SSH,
+    /// reports the served models (`ps`), prints the resolved launch plan
+    /// (`config`), or tails the server log (`logs`). Pure planning lives in
+    /// [`crate::dgx_vllm`]; SSH/HTTP execution is injectable so tests never
+    /// touch the network or a real node.
+    Vllm {
+        #[command(subcommand)]
+        cmd: VllmCmd,
+    },
+}
+
+/// Planning knobs shared by `dgx vllm up` and `dgx vllm config`.
+#[derive(clap::Args, Debug)]
+pub struct VllmPlanArgs {
+    /// Override the OpenAI `served-model-name` (default: sanitized model name).
+    #[arg(long)]
+    pub served_name: Option<String>,
+    /// Quant/dtype (auto|nvfp4|fp8|bf16|awq|gptq); inferred from the model name
+    /// when omitted.
+    #[arg(long)]
+    pub dtype: Option<String>,
+    /// `--tensor-parallel-size` (number of GPUs). Default 1; >1 is meaningless
+    /// on a single unified-memory GB10.
+    #[arg(long, default_value_t = 1)]
+    pub tensor_parallel: u8,
+    /// Cap the context window; otherwise the planner default is used.
+    #[arg(long)]
+    pub max_model_len: Option<u32>,
+    /// `--gpu-memory-utilization` fraction (0.0..=1.0). Default 0.90.
+    #[arg(long, default_value_t = 0.90)]
+    pub gpu_mem_util: f64,
+    /// Listen port on the node. Default 8000.
+    #[arg(long, default_value_t = 8000)]
+    pub port: u16,
+    /// Render the `docker run vllm/vllm-openai` argv instead of native
+    /// `vllm serve` (native is the only launcher executed in this step).
+    #[arg(long)]
+    pub docker: bool,
+    /// Extra args appended verbatim to the vLLM command line.
+    #[arg(long)]
+    pub extra: Vec<String>,
+}
+
+/// `newt dgx vllm <cmd>` subcommands.
+#[derive(Subcommand, Debug)]
+pub enum VllmCmd {
+    /// Launch a vLLM server on the node for `model` (HF id or local path).
+    ///
+    /// Runs a fit pre-flight against the node's *available* memory, renders the
+    /// `vllm serve` argv, launches it detached with `nohup`, polls
+    /// `/v1/models` until ready, then persists the endpoint + active model.
+    Up {
+        /// Model to serve (HuggingFace `<org>/<repo>` or an on-node path).
+        model: String,
+        /// SSH node name (defaults to the active node).
+        #[arg(long)]
+        node: Option<String>,
+        #[command(flatten)]
+        plan: VllmPlanArgs,
+        /// Proceed even when the model exceeds the memory budget.
+        #[arg(long)]
+        force: bool,
+        /// Print the resolved plan + remote script without SSHing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Stop the vLLM server for `served_name` (default: the active model).
+    Down {
+        /// Served model name whose pidfile to kill (default: active model).
+        served_name: Option<String>,
+        /// SSH node name (defaults to the active node).
+        #[arg(long)]
+        node: Option<String>,
+        /// Print the kill command without SSHing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Probe the configured vLLM endpoint and list its models (`/v1/models`).
+    Ps,
+    /// Print the resolved launch plan (argv) for `model`. Pure: no SSH/network.
+    Config {
+        /// Model to plan for.
+        model: String,
+        #[command(flatten)]
+        plan: VllmPlanArgs,
+    },
+    /// Tail the vLLM server log on the node (`tail -f` over SSH).
+    Logs {
+        /// Served model name whose log to tail (default: active model).
+        served_name: Option<String>,
+        /// SSH node name (defaults to the active node).
+        #[arg(long)]
+        node: Option<String>,
+        /// Number of trailing lines before following. Default 50.
+        #[arg(long, default_value_t = 50)]
+        lines: u32,
+        /// Print the remote command without SSHing.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 /// Dispatch a `newt dgx` subcommand.
@@ -172,6 +277,45 @@ pub async fn run(cmd: DgxCmd, config_path: Option<&Path>) -> anyhow::Result<()> 
         }
         DgxCmd::Rm { model } => rm(config_path, &model).await,
         DgxCmd::Ps => ps(config_path).await,
+        DgxCmd::Vllm { cmd } => match cmd {
+            VllmCmd::Up {
+                model,
+                node,
+                plan,
+                force,
+                dry_run,
+            } => vllm_up(config_path, &model, node.as_deref(), &plan, force, dry_run).await,
+            VllmCmd::Down {
+                served_name,
+                node,
+                dry_run,
+            } => {
+                vllm_down(
+                    config_path,
+                    served_name.as_deref(),
+                    node.as_deref(),
+                    dry_run,
+                )
+                .await
+            }
+            VllmCmd::Ps => vllm_ps(config_path).await,
+            VllmCmd::Config { model, plan } => vllm_config(&model, &plan),
+            VllmCmd::Logs {
+                served_name,
+                node,
+                lines,
+                dry_run,
+            } => {
+                vllm_logs(
+                    config_path,
+                    served_name.as_deref(),
+                    node.as_deref(),
+                    lines,
+                    dry_run,
+                )
+                .await
+            }
+        },
     }
 }
 
@@ -659,16 +803,32 @@ impl SshExec for RealSsh {
     }
 }
 
-/// Detect total node RAM in bytes via `free -b | awk '/Mem:/{print $2}'`.
-/// Best-effort: returns `None` (rather than erroring) if SSH or parsing fails.
-fn detect_node_mem(user: &str, host: &str, port: Option<u16>) -> Option<u64> {
-    let argv = dgx_pull::ssh_argv(user, host, port, "free -b | awk '/Mem:/{print $2}'");
+/// `free -b` awk column for total RAM (`MemTotal`).
+const MEM_TOTAL_AWK: &str = "$2";
+/// `free -b` awk column for available RAM (`MemAvailable`).
+const MEM_AVAILABLE_AWK: &str = "$7";
+
+/// The remote command that prints one memory figure from `free -b` (pure).
+fn node_mem_probe(awk_field: &str) -> String {
+    format!("free -b | awk '/Mem:/{{print {awk_field}}}'")
+}
+
+/// Detect node RAM (bytes) via `free -b`, selecting the awk column. Best-effort:
+/// `None` if SSH or parsing fails.
+fn detect_node_mem_col(user: &str, host: &str, port: Option<u16>, awk_field: &str) -> Option<u64> {
+    let argv = dgx_pull::ssh_argv(user, host, port, &node_mem_probe(awk_field));
     let (prog, rest) = argv.split_first()?;
     let out = std::process::Command::new(prog).args(rest).output().ok()?;
     if !out.status.success() {
         return None;
     }
     dgx_pull::parse_free_bytes(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Detect total node RAM (`MemTotal`). Used by the Ollama `pull` fit pre-flight,
+/// whose semantics deliberately stay unchanged in this step.
+fn detect_node_mem(user: &str, host: &str, port: Option<u16>) -> Option<u64> {
+    detect_node_mem_col(user, host, port, MEM_TOTAL_AWK)
 }
 
 /// GET `<hf_base>/api/models/<org>/<repo>?blobs=true` → the `.gguf` siblings.
@@ -955,6 +1115,343 @@ fn extract_ps(models: &serde_json::Value) -> Vec<(String, Option<u64>)> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+// ---------------------------------------------------------------------------
+// vllm — stand up / tear down a vLLM server on the node (Step 14.11)
+// ---------------------------------------------------------------------------
+
+/// Available node RAM (`MemAvailable`, column 7). vLLM's fit budget must net out
+/// memory the *other* engine (Ollama) already holds resident — see
+/// [`crate::dgx_vllm::vllm_fit_check`] — so it sizes against available, not
+/// total RAM.
+fn detect_node_mem_available(user: &str, host: &str, port: Option<u16>) -> Option<u64> {
+    detect_node_mem_col(user, host, port, MEM_AVAILABLE_AWK)
+}
+
+/// GET `<hf_base>/api/models/<org>/<repo>?blobs=true` → raw JSON (for sizing
+/// safetensors weights; same endpoint as the GGUF sibling fetch).
+async fn fetch_hf_model_json(
+    client: &reqwest::Client,
+    hf_base: &str,
+    org: &str,
+    repo: &str,
+) -> anyhow::Result<serde_json::Value> {
+    let url = format!(
+        "{}/api/models/{org}/{repo}?blobs=true",
+        hf_base.trim_end_matches('/')
+    );
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("HF API request failed: {e}"))?;
+    if !resp.status().is_success() {
+        anyhow::bail!("HF API returned HTTP {}", resp.status());
+    }
+    Ok(resp.json().await?)
+}
+
+/// Best-effort vLLM weight size: sum the repo's weight files (`.safetensors` /
+/// `.bin`) when `model` is an HF id; `None` for a local path, a fetch/parse
+/// failure, or a repo with no sized weights.
+async fn fetch_vllm_weight_bytes(model: &str) -> Option<u64> {
+    let (org, repo) = dgx_vllm::hf_repo_parts(model)?;
+    let client = http_client_long();
+    let json = fetch_hf_model_json(&client, &hf_api_base(), &org, &repo)
+        .await
+        .ok()?;
+    let bytes = dgx_vllm::sum_weight_bytes(&json);
+    (bytes > 0).then_some(bytes)
+}
+
+/// Docker execution isn't wired yet (the remote script wraps native
+/// `vllm serve` only), so `up --docker` must refuse clearly rather than silently
+/// launch native. `dgx vllm config --docker` still previews the docker argv.
+fn ensure_executable_runtime(runtime: dgx_vllm::VllmRuntime) -> anyhow::Result<()> {
+    if matches!(runtime, dgx_vllm::VllmRuntime::Docker) {
+        anyhow::bail!(
+            "--docker is preview-only here: `dgx vllm config --docker` prints the docker \
+             argv, but native `vllm serve` is the only launcher `up` executes in this step. \
+             Omit --docker to launch (docker execution is a follow-up)."
+        );
+    }
+    Ok(())
+}
+
+/// Build a resolved [`dgx_vllm::VllmPlan`] from CLI args (shared by `up`/`config`).
+fn build_plan_from_args(model: &str, a: &VllmPlanArgs) -> anyhow::Result<dgx_vllm::VllmPlan> {
+    let dtype = match a.dtype.as_deref() {
+        Some(s) => Some(dgx_vllm::Dtype::parse(s).ok_or_else(|| {
+            anyhow::anyhow!(
+                "unknown --dtype {s:?}; expected one of: auto, nvfp4, fp8, bf16, awq, gptq"
+            )
+        })?),
+        None => None,
+    };
+    let runtime = if a.docker {
+        dgx_vllm::VllmRuntime::Docker
+    } else {
+        dgx_vllm::VllmRuntime::Native
+    };
+    Ok(dgx_vllm::resolve_plan(dgx_vllm::PlanInputs {
+        model,
+        served_name: a.served_name.as_deref(),
+        dtype,
+        tensor_parallel: a.tensor_parallel,
+        max_model_len: a.max_model_len,
+        gpu_mem_util: a.gpu_mem_util,
+        port: a.port,
+        runtime,
+        extra: a.extra.clone(),
+    }))
+}
+
+/// Execute (or dry-run) a vLLM launch over SSH. Injection seam: `ssh` is
+/// `&RealSsh` in prod, `&RecordingSsh` in tests.
+fn execute_vllm_plan(
+    ssh: &dyn SshExec,
+    user: &str,
+    host: &str,
+    plan: &dgx_vllm::VllmPlan,
+    dry_run: bool,
+) -> anyhow::Result<()> {
+    let script = dgx_vllm::vllm_remote_script(plan);
+    let summary = format!(
+        "VllmPlan: serve {:?} as {:?} ({:?}, tp={}, max_len={}, util={:.2}, port={})",
+        plan.model,
+        plan.served_name,
+        plan.dtype,
+        plan.tensor_parallel,
+        plan.max_model_len,
+        plan.gpu_mem_util(),
+        plan.port,
+    );
+    run_or_dryrun(ssh, user, host, None, &script, dry_run, &summary)
+}
+
+/// Poll the freshly-launched server's `/v1/models` with bounded backoff. Cold
+/// model loads can take minutes, hence the generous `for_local_inference`
+/// policy in production; tests inject `RetryPolicy::immediate`.
+async fn poll_vllm_ready(endpoint: &str, policy: &RetryPolicy) -> anyhow::Result<()> {
+    let backend = LocalVllmBackend::new(endpoint, "");
+    with_backoff(policy, || async { backend.list_models().await.map(|_| ()) })
+        .await
+        .map(|_| ())
+        .map_err(|e| anyhow::anyhow!("vLLM did not become ready at {endpoint}: {e}"))
+}
+
+/// Pure in-memory mutation for persist-on-`up`: point the active endpoint at the
+/// freshly-launched vLLM server and write its URL onto the target node. No IO —
+/// the disk write lives in [`persist_vllm_endpoint`].
+///
+/// Returns `true` when the URL was written onto a matching node. `false` means
+/// no node matched (the target name isn't in `nodes[]`) — the active endpoint is
+/// still flipped to vLLM, but the URL wasn't recorded, so the caller warns
+/// rather than leaving the user with a silently incomplete config.
+#[must_use]
+fn apply_vllm_persist(
+    config: &mut Config,
+    node_name: Option<&str>,
+    endpoint_url: &str,
+    served_name: &str,
+) -> bool {
+    let dgx = config.dgx.get_or_insert_with(Default::default);
+    dgx.active_endpoint = EndpointKind::Vllm;
+    dgx.active_model = Some(served_name.to_string());
+    let target = node_name
+        .map(str::to_string)
+        .or_else(|| dgx.active_node.clone());
+    if let Some(name) = target {
+        if let Some(node) = dgx.nodes.iter_mut().find(|n| n.name == name) {
+            node.vllm = Some(endpoint_url.to_string());
+            return true;
+        }
+    }
+    false
+}
+
+/// Persist the vLLM endpoint to config (load → [`apply_vllm_persist`] → save).
+fn persist_vllm_endpoint(
+    config_path: Option<&Path>,
+    node_name: Option<&str>,
+    endpoint_url: &str,
+    served_name: &str,
+) -> anyhow::Result<()> {
+    let mut config = load_config(config_path)?;
+    let node_recorded = apply_vllm_persist(&mut config, node_name, endpoint_url, served_name);
+    let save_path = config_path
+        .map(std::path::PathBuf::from)
+        .or_else(newt_core::Config::user_config_path)
+        .ok_or_else(|| anyhow::anyhow!("cannot determine config file path"))?;
+    config.save(&save_path)?;
+    println!("vLLM endpoint {endpoint_url} active; model {served_name}");
+    println!("Saved → {}", save_path.display());
+    if !node_recorded {
+        eprintln!(
+            "  WARNING: active endpoint set to vLLM, but no matching node was found to \
+             record {endpoint_url} on — configure the node (`dgx setup` / `dgx node`) so \
+             the URL resolves without env fallback."
+        );
+    }
+    Ok(())
+}
+
+/// The served name to act on: an explicit arg, else the active model.
+fn resolve_served_name(dgx: &DgxConfig, served_name: Option<&str>) -> anyhow::Result<String> {
+    match served_name {
+        Some(s) => Ok(s.to_string()),
+        None => Ok(dgx.resolve_active_model()?),
+    }
+}
+
+/// `dgx vllm up <model>` — fit pre-flight, launch, wait for readiness, persist.
+async fn vllm_up(
+    config_path: Option<&Path>,
+    model: &str,
+    node: Option<&str>,
+    plan_args: &VllmPlanArgs,
+    force: bool,
+    dry_run: bool,
+) -> anyhow::Result<()> {
+    let mut dgx = dgx_config(config_path)?;
+    if let Some(n) = node {
+        dgx.active_node = Some(n.to_string());
+    }
+    let user = dgx.ssh_user();
+    let host = dgx.ssh_host()?;
+
+    let plan = build_plan_from_args(model, plan_args)?;
+    ensure_executable_runtime(plan.runtime)?;
+
+    // Fit pre-flight (the GLM-5.2 lesson, ported). Skipped on dry-run — no
+    // network: dry-run only shows the plan + remote script.
+    if !dry_run {
+        let mem = detect_node_mem_available(&user, &host, None);
+        match fetch_vllm_weight_bytes(model).await {
+            Some(weight) => report_fit(
+                dgx_vllm::vllm_fit_check(weight, mem, plan_args.gpu_mem_util),
+                force,
+            )?,
+            None => eprintln!(
+                "  WARNING: could not size weights for {model:?} (local path, HF lookup \
+                 failed, or no sized .safetensors/.bin) — skipping the fit pre-flight; the \
+                 model may exceed node memory."
+            ),
+        }
+    }
+
+    execute_vllm_plan(&RealSsh, &user, &host, &plan, dry_run)?;
+
+    if !dry_run {
+        let endpoint = format!("http://{host}:{}", plan.port);
+        println!("Waiting for vLLM at {endpoint}/v1/models (cold load can take minutes) …");
+        poll_vllm_ready(&endpoint, &RetryPolicy::for_local_inference()).await?;
+        persist_vllm_endpoint(config_path, node, &endpoint, &plan.served_name)?;
+    }
+    Ok(())
+}
+
+/// `dgx vllm down [served_name]` — kill the recorded server PID on the node.
+async fn vllm_down(
+    config_path: Option<&Path>,
+    served_name: Option<&str>,
+    node: Option<&str>,
+    dry_run: bool,
+) -> anyhow::Result<()> {
+    let mut dgx = dgx_config(config_path)?;
+    if let Some(n) = node {
+        dgx.active_node = Some(n.to_string());
+    }
+    let user = dgx.ssh_user();
+    let host = dgx.ssh_host()?;
+    let served = resolve_served_name(&dgx, served_name)?;
+    let command = dgx_vllm::vllm_stop_command(&served);
+    run_or_dryrun(
+        &RealSsh,
+        &user,
+        &host,
+        None,
+        &command,
+        dry_run,
+        &format!("vLLM down: {served:?}"),
+    )
+}
+
+/// `dgx vllm logs [served_name]` — tail and follow the server log on the node.
+async fn vllm_logs(
+    config_path: Option<&Path>,
+    served_name: Option<&str>,
+    node: Option<&str>,
+    lines: u32,
+    dry_run: bool,
+) -> anyhow::Result<()> {
+    let mut dgx = dgx_config(config_path)?;
+    if let Some(n) = node {
+        dgx.active_node = Some(n.to_string());
+    }
+    let user = dgx.ssh_user();
+    let host = dgx.ssh_host()?;
+    let served = resolve_served_name(&dgx, served_name)?;
+    let command = dgx_vllm::vllm_logs_command(&served, lines);
+    run_or_dryrun(
+        &RealSsh,
+        &user,
+        &host,
+        None,
+        &command,
+        dry_run,
+        &format!("vLLM logs: {served:?} (tail -f)"),
+    )
+}
+
+/// `dgx vllm config <model>` — print the resolved launch argv. Pure (no SSH).
+fn vllm_config(model: &str, plan_args: &VllmPlanArgs) -> anyhow::Result<()> {
+    let plan = build_plan_from_args(model, plan_args)?;
+    let argv = if matches!(plan.runtime, dgx_vllm::VllmRuntime::Docker) {
+        dgx_vllm::vllm_docker_argv(&plan)
+    } else {
+        dgx_vllm::render_vllm_argv(&plan)
+    };
+    println!("Resolved vLLM launch plan for {model:?}:");
+    println!("  served-model-name: {}", plan.served_name);
+    println!(
+        "  dtype={:?}  tensor-parallel={}  max-model-len={}  gpu-mem-util={:.2}  port={}",
+        plan.dtype,
+        plan.tensor_parallel,
+        plan.max_model_len,
+        plan.gpu_mem_util(),
+        plan.port,
+    );
+    println!("  argv: {}", argv.join(" "));
+    Ok(())
+}
+
+/// `dgx vllm ps` — GET the configured vLLM endpoint's `/v1/models`.
+async fn vllm_ps(config_path: Option<&Path>) -> anyhow::Result<()> {
+    let dgx = dgx_config(config_path)?;
+    let base = dgx.resolve_endpoint_for(EndpointKind::Vllm)?;
+    let models = fetch_vllm_models(&base).await?;
+    println!("vLLM models on {base}:");
+    if models.is_empty() {
+        println!("  (none)");
+    }
+    for m in &models {
+        println!("  {m}");
+    }
+    Ok(())
+}
+
+/// GET `<base>/v1/models` → served model ids (OpenAI-compatible). `base` is the
+/// injection seam: tests pass a `wiremock` `MockServer::uri()`.
+async fn fetch_vllm_models(base: &str) -> anyhow::Result<Vec<String>> {
+    let backend = LocalVllmBackend::new(base, "");
+    Ok(backend
+        .list_models()
+        .await?
+        .into_iter()
+        .map(|m| m.id)
+        .collect())
 }
 
 #[cfg(test)]
@@ -1505,5 +2002,245 @@ tiers = ["FAST", "STANDARD"]
         assert!(fetch_ollama_ps(&http_client(), &server.uri())
             .await
             .is_err());
+    }
+
+    // --- vllm wiring (Step 14.11) -----------------------------------------
+
+    fn sample_vllm_plan() -> dgx_vllm::VllmPlan {
+        dgx_vllm::resolve_plan(dgx_vllm::PlanInputs {
+            model: "nvidia/Qwen3.6-35B-A3B-NVFP4",
+            served_name: Some("qwen3.6-35b"),
+            dtype: Some(dgx_vllm::Dtype::Nvfp4),
+            tensor_parallel: 1,
+            max_model_len: Some(262144),
+            gpu_mem_util: 0.90,
+            port: 8000,
+            runtime: dgx_vllm::VllmRuntime::Native,
+            extra: vec![],
+        })
+    }
+
+    fn plan_args() -> VllmPlanArgs {
+        VllmPlanArgs {
+            served_name: None,
+            dtype: None,
+            tensor_parallel: 1,
+            max_model_len: None,
+            gpu_mem_util: 0.90,
+            port: 8000,
+            docker: false,
+            extra: vec![],
+        }
+    }
+
+    #[test]
+    fn vllm_up_dry_run_does_not_ssh() {
+        let ssh = RecordingSsh::new();
+        execute_vllm_plan(&ssh, "bob", "dgx", &sample_vllm_plan(), true).unwrap();
+        assert!(ssh.calls.borrow().is_empty(), "dry-run must not SSH");
+    }
+
+    #[test]
+    fn vllm_up_records_nohup_serve_command() {
+        let ssh = RecordingSsh::new();
+        execute_vllm_plan(&ssh, "bob", "dgx", &sample_vllm_plan(), false).unwrap();
+        let calls = ssh.calls.borrow();
+        assert_eq!(calls.len(), 1);
+        let cmd = &calls[0].3;
+        assert!(cmd.contains("nohup"));
+        assert!(cmd.contains("vllm") && cmd.contains("serve"));
+        // Model id shell-quoted; port + pidfile present.
+        assert!(cmd.contains("'nvidia/Qwen3.6-35B-A3B-NVFP4'"));
+        assert!(cmd.contains("--port"));
+        assert!(cmd.contains("echo $! >") && cmd.contains(".pid"));
+    }
+
+    #[test]
+    fn vllm_down_records_kill_pidfile() {
+        let ssh = RecordingSsh::new();
+        let cmd = dgx_vllm::vllm_stop_command("qwen3.6-35b");
+        run_or_dryrun(&ssh, "bob", "dgx", None, &cmd, false, "down").unwrap();
+        let calls = ssh.calls.borrow();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].3.contains("qwen3.6-35b.pid"));
+        assert!(calls[0].3.contains("kill"));
+    }
+
+    #[test]
+    fn vllm_logs_records_tail_command() {
+        let ssh = RecordingSsh::new();
+        let cmd = dgx_vllm::vllm_logs_command("qwen3.6-35b", 50);
+        run_or_dryrun(&ssh, "bob", "dgx", None, &cmd, false, "logs").unwrap();
+        assert!(ssh.calls.borrow()[0].3.contains("tail -n 50 -f"));
+    }
+
+    #[test]
+    fn vllm_config_renders_argv_without_ssh() {
+        // Pure: builds + prints the plan, returns Ok, never SSHes.
+        assert!(vllm_config("nvidia/Qwen3.6-35B-A3B-NVFP4", &plan_args()).is_ok());
+        let mut docker = plan_args();
+        docker.docker = true;
+        assert!(vllm_config("org/model", &docker).is_ok());
+    }
+
+    #[test]
+    fn vllm_config_rejects_unknown_dtype() {
+        let mut bad = plan_args();
+        bad.dtype = Some("nonsense".to_string());
+        let err = vllm_config("org/model", &bad).unwrap_err().to_string();
+        // The error must name the valid set so the user can self-correct.
+        assert!(
+            err.contains("nvfp4") && err.contains("gptq"),
+            "unhelpful error: {err}"
+        );
+    }
+
+    #[test]
+    fn vllm_up_refuses_docker_execution() {
+        // `up --docker` must refuse (preview-only); native is the only launcher.
+        let err = ensure_executable_runtime(dgx_vllm::VllmRuntime::Docker)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--docker") && err.contains("config"));
+        assert!(ensure_executable_runtime(dgx_vllm::VllmRuntime::Native).is_ok());
+    }
+
+    #[tokio::test]
+    async fn vllm_ps_parses_v1_models() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{ "id": "m1" }, { "id": "m2" }]
+            })))
+            .mount(&server)
+            .await;
+        let models = fetch_vllm_models(&server.uri()).await.unwrap();
+        assert_eq!(models, vec!["m1".to_string(), "m2".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn poll_vllm_ready_succeeds_on_first_ok() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path("/v1/models"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "data": [] })),
+            )
+            .mount(&server)
+            .await;
+        assert!(poll_vllm_ready(&server.uri(), &RetryPolicy::immediate(0))
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn poll_vllm_ready_retries_then_succeeds() {
+        let server = MockServer::start().await;
+        // wiremock matches the FIRST-mounted mock of equal priority, so mount the
+        // 503 (capped at 2 hits) FIRST and the success SECOND: requests 1-2 hit
+        // the exhausting 503, request 3 falls through to the 200. (Asserting the
+        // request count guards against a trivially-passing single-request test.)
+        Mock::given(method("GET"))
+            .and(wm_path("/v1/models"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(wm_path("/v1/models"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "data": [] })),
+            )
+            .mount(&server)
+            .await;
+        // 503 is a retryable 5xx; 3 retries cover the two failures + success.
+        assert!(poll_vllm_ready(&server.uri(), &RetryPolicy::immediate(3))
+            .await
+            .is_ok());
+        // The retry path was actually exercised: 2 failures + 1 success = 3.
+        let received = server.received_requests().await.unwrap();
+        assert_eq!(
+            received.len(),
+            3,
+            "expected retry-then-succeed (2x503 + 1x200)"
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_vllm_ready_gives_up_when_never_ready() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path("/v1/models"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        assert!(poll_vllm_ready(&server.uri(), &RetryPolicy::immediate(1))
+            .await
+            .is_err());
+    }
+
+    fn config_with_nodes(active: &str, names: &[&str]) -> Config {
+        Config {
+            dgx: Some(DgxConfig {
+                active_node: Some(active.to_string()),
+                nodes: names
+                    .iter()
+                    .map(|n| DgxNode {
+                        name: n.to_string(),
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn apply_vllm_persist_falls_back_to_active_node() {
+        let mut config = config_with_nodes("home", &["home"]);
+        let recorded = apply_vllm_persist(&mut config, None, "http://dgx:8000", "qwen3.6-35b");
+        assert!(recorded);
+        let dgx = config.dgx.unwrap();
+        assert_eq!(dgx.active_endpoint, EndpointKind::Vllm);
+        assert_eq!(dgx.active_model.as_deref(), Some("qwen3.6-35b"));
+        assert_eq!(dgx.nodes[0].vllm.as_deref(), Some("http://dgx:8000"));
+    }
+
+    #[test]
+    fn apply_vllm_persist_targets_explicit_node_over_active() {
+        let mut config = config_with_nodes("home", &["home", "other"]);
+        let recorded = apply_vllm_persist(&mut config, Some("other"), "http://other:8000", "m");
+        assert!(recorded);
+        let dgx = config.dgx.unwrap();
+        // The named node gets the URL; the active node is left untouched.
+        assert_eq!(
+            dgx.node("other").unwrap().vllm.as_deref(),
+            Some("http://other:8000")
+        );
+        assert_eq!(dgx.node("home").unwrap().vllm, None);
+    }
+
+    #[test]
+    fn apply_vllm_persist_reports_false_when_node_missing() {
+        let mut config = config_with_nodes("home", &["home"]);
+        let recorded = apply_vllm_persist(&mut config, Some("ghost"), "http://ghost:8000", "m");
+        // No matching node: URL not recorded (caller warns), but endpoint flips.
+        assert!(!recorded);
+        let dgx = config.dgx.unwrap();
+        assert_eq!(dgx.active_endpoint, EndpointKind::Vllm);
+        assert_eq!(dgx.nodes[0].vllm, None);
+    }
+
+    #[test]
+    fn vllm_probe_uses_memavailable_pull_uses_memtotal() {
+        // Regression: the vLLM fit probe must read MemAvailable (awk $7) so it
+        // nets out a resident Ollama model, while the Ollama pull path stays on
+        // MemTotal ($2) — unchanged behavior in this step.
+        assert_eq!(MEM_AVAILABLE_AWK, "$7");
+        assert_eq!(MEM_TOTAL_AWK, "$2");
+        assert!(node_mem_probe(MEM_AVAILABLE_AWK).contains("print $7"));
+        assert!(node_mem_probe(MEM_TOTAL_AWK).contains("print $2"));
     }
 }

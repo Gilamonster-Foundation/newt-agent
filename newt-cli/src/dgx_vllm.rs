@@ -12,7 +12,12 @@
 //! Reuses `dgx_pull::{FitVerdict, fit_check, ssh_argv, parse_free_bytes,
 //! sh_quote}` rather than duplicating them.
 
-use crate::dgx_pull::{fit_check, sh_quote, FitVerdict};
+use crate::dgx_pull::{fit_check, sanitize_ollama_name, sh_quote, staging_component, FitVerdict};
+
+/// Default context window when the caller does not pass `--max-model-len` and no
+/// KV-cost estimator is wired yet (deriving the true fit-clamped window from the
+/// model's architecture is a follow-on — see `derive_max_model_len`).
+pub const DEFAULT_MAX_MODEL_LEN: u32 = 262_144;
 
 // ---------------------------------------------------------------------------
 // Runtime + dtype
@@ -55,6 +60,20 @@ impl Dtype {
             Self::Awq => Some("awq"),
             Self::Gptq => Some("gptq"),
             Self::Auto | Self::Bf16 => None,
+        }
+    }
+
+    /// Parse a `--dtype` CLI value. `None` for an unrecognized token (the caller
+    /// turns that into a user-facing error naming the valid set).
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "auto" => Some(Self::Auto),
+            "nvfp4" | "fp4" => Some(Self::Nvfp4),
+            "fp8" => Some(Self::Fp8),
+            "bf16" | "bfloat16" => Some(Self::Bf16),
+            "awq" => Some(Self::Awq),
+            "gptq" => Some(Self::Gptq),
+            _ => None,
         }
     }
 }
@@ -130,6 +149,96 @@ impl VllmPlan {
     pub fn gpu_mem_util(&self) -> f64 {
         self.gpu_mem_util_milli as f64 / 1000.0
     }
+}
+
+/// Raw, mostly-CLI-shaped inputs for [`resolve_plan`]. Optional fields carry the
+/// "derive a default" intent (`None` → inferred/defaulted inside `resolve_plan`).
+pub struct PlanInputs<'a> {
+    pub model: &'a str,
+    pub served_name: Option<&'a str>,
+    pub dtype: Option<Dtype>,
+    pub tensor_parallel: u8,
+    pub max_model_len: Option<u32>,
+    pub gpu_mem_util: f64,
+    pub port: u16,
+    pub runtime: VllmRuntime,
+    pub extra: Vec<String>,
+}
+
+/// Resolve every derived default into a concrete [`VllmPlan`]: served name from
+/// the model's short name, dtype inferred from the checkpoint when not forced,
+/// context window defaulted, and the gpu-mem-util fraction stored as milli.
+/// Pure — no IO.
+pub fn resolve_plan(inp: PlanInputs) -> VllmPlan {
+    let served_name = inp
+        .served_name
+        .map(str::to_string)
+        .unwrap_or_else(|| default_served_name(inp.model));
+    let dtype = inp.dtype.unwrap_or_else(|| infer_dtype(inp.model, None));
+    let max_model_len = inp.max_model_len.unwrap_or(DEFAULT_MAX_MODEL_LEN);
+    let gpu_mem_util_milli = (inp.gpu_mem_util.clamp(0.0, 1.0) * 1000.0).round() as u16;
+    VllmPlan {
+        model: inp.model.to_string(),
+        served_name,
+        dtype,
+        tensor_parallel: inp.tensor_parallel,
+        max_model_len,
+        gpu_mem_util_milli,
+        port: inp.port,
+        runtime: inp.runtime,
+        extra: inp.extra,
+    }
+}
+
+/// Derive the OpenAI `served-model-name` from a checkpoint id: the part after
+/// the last `/`, sanitized to a safe token (reusing the pull path's sanitizer).
+pub fn default_served_name(model: &str) -> String {
+    let last = model.rsplit('/').next().unwrap_or(model);
+    sanitize_ollama_name(last)
+}
+
+/// Treat `model` as an HF `<org>/<repo>` when it has exactly one `/` and is not
+/// a filesystem path. Returns `None` for absolute/relative/home paths or any id
+/// with extra slashes — those size as `Undetectable` (a local on-node path).
+pub fn hf_repo_parts(model: &str) -> Option<(String, String)> {
+    if model.starts_with('/') || model.starts_with('.') || model.starts_with('~') {
+        return None;
+    }
+    let (org, repo) = model.split_once('/')?;
+    if org.is_empty() || repo.is_empty() || repo.contains('/') {
+        return None;
+    }
+    Some((org.to_string(), repo.to_string()))
+}
+
+/// Sum the byte sizes of every weight sibling (`*.safetensors` or PyTorch
+/// `*.bin`) in an HF model-API JSON (`GET /api/models/<org>/<repo>?blobs=true`).
+/// Tolerates `size` or `lfs.size`, mirroring
+/// [`crate::dgx_pull::parse_gguf_siblings`]. Returns 0 when the repo has no
+/// sized weight files (→ the caller treats it as undetectable). Counting `.bin`
+/// matters because a PyTorch-only checkpoint would otherwise size as 0 and
+/// silently skip the fit pre-flight.
+pub fn sum_weight_bytes(json: &serde_json::Value) -> u64 {
+    let Some(siblings) = json.get("siblings").and_then(|s| s.as_array()) else {
+        return 0;
+    };
+    siblings
+        .iter()
+        .filter_map(|s| {
+            let path = s
+                .get("rfilename")
+                .and_then(|v| v.as_str())?
+                .to_ascii_lowercase();
+            if !(path.ends_with(".safetensors") || path.ends_with(".bin")) {
+                return None;
+            }
+            s.get("size").and_then(|v| v.as_u64()).or_else(|| {
+                s.get("lfs")
+                    .and_then(|l| l.get("size"))
+                    .and_then(|v| v.as_u64())
+            })
+        })
+        .sum()
 }
 
 // ---------------------------------------------------------------------------
@@ -254,32 +363,77 @@ pub fn vllm_docker_argv(plan: &VllmPlan) -> Vec<String> {
     argv
 }
 
-/// The on-node pidfile path for a served model (under `~/.newt/dgx/vllm`).
+/// The on-node state directory for vLLM pidfiles + logs. Returned unquoted with
+/// a literal `$HOME` so the *remote* shell expands it; callers wrap it in
+/// [`dq`] (double quotes) — never [`sh_quote`] (single quotes would freeze
+/// `$HOME` as a literal directory name).
+pub fn vllm_state_dir() -> &'static str {
+    "$HOME/.newt/dgx/vllm"
+}
+
+/// The on-node pidfile path for a served model (under [`vllm_state_dir`]).
 pub fn vllm_pidfile(served_name: &str) -> String {
     format!(
-        "$HOME/.newt/dgx/vllm/{}.pid",
-        crate::dgx_pull::staging_component(served_name)
+        "{}/{}.pid",
+        vllm_state_dir(),
+        staging_component(served_name)
     )
 }
 
+/// The on-node log path for a served model (under [`vllm_state_dir`]). `up`
+/// redirects into it; `logs` tails it — both derive it from the served name so
+/// they always agree.
+pub fn vllm_log_path(served_name: &str) -> String {
+    format!(
+        "{}/{}.log",
+        vllm_state_dir(),
+        staging_component(served_name)
+    )
+}
+
+/// Double-quote a path that contains a literal `$HOME` (or other intended shell
+/// expansion) and whose remaining components are already shell-safe (the
+/// sanitized served name). Unlike [`sh_quote`], this lets `$HOME` expand.
+fn dq(path: &str) -> String {
+    format!("\"{path}\"")
+}
+
 /// Generate the native remote script: ensure the state dir, launch the server
-/// detached with `nohup`, and record its PID. `log_path` is where stdout/stderr
-/// is redirected (the `logs` verb tails it). The argv is shell-quoted so a model
-/// id or `--extra` arg with spaces survives the remote shell.
-pub fn vllm_remote_script(plan: &VllmPlan, log_path: &str) -> String {
+/// detached with `nohup`, redirect into the served-model log, and record its
+/// PID. The vLLM argv is single-quoted (a model id / `--extra` arg may contain
+/// spaces and has no `$` to expand); the `$HOME`-rooted state paths are
+/// double-quoted so the remote shell expands `$HOME`.
+pub fn vllm_remote_script(plan: &VllmPlan) -> String {
     let argv = render_vllm_argv(plan);
     let quoted: Vec<String> = argv.iter().map(|a| sh_quote(a)).collect();
     let pidfile = vllm_pidfile(&plan.served_name);
+    let log_path = vllm_log_path(&plan.served_name);
     let mut s = String::new();
     s.push_str("set -eu\n");
-    s.push_str("mkdir -p \"$HOME/.newt/dgx/vllm\"\n");
+    s.push_str(&format!("mkdir -p {}\n", dq(vllm_state_dir())));
     s.push_str(&format!(
         "nohup {cmd} > {log} 2>&1 &\n",
         cmd = quoted.join(" "),
-        log = sh_quote(log_path),
+        log = dq(&log_path),
     ));
-    s.push_str(&format!("echo $! > {pid}\n", pid = sh_quote(&pidfile)));
+    s.push_str(&format!("echo $! > {pid}\n", pid = dq(&pidfile)));
     s
+}
+
+/// Remote command for `dgx vllm down`: kill the recorded PID and remove the
+/// pidfile, tolerating an already-stopped server (no pidfile → a clear message,
+/// not an error).
+pub fn vllm_stop_command(served_name: &str) -> String {
+    let pid = dq(&vllm_pidfile(served_name));
+    format!(
+        "if [ -f {pid} ]; then kill \"$(cat {pid})\" 2>/dev/null || true; rm -f {pid}; \
+         echo 'stopped vllm server'; else echo 'no vllm pidfile (already stopped?)'; fi"
+    )
+}
+
+/// Remote command for `dgx vllm logs`: tail the served-model log and follow.
+pub fn vllm_logs_command(served_name: &str, lines: u32) -> String {
+    format!("tail -n {lines} -f {}", dq(&vllm_log_path(served_name)))
 }
 
 #[cfg(test)]
@@ -498,30 +652,191 @@ mod tests {
 
     #[test]
     fn remote_script_launches_detached_and_records_pid() {
-        let s = vllm_remote_script(&sample_plan(), "$HOME/.newt/dgx/vllm/qwen3.6-35b.log");
+        let s = vllm_remote_script(&sample_plan());
         assert!(s.starts_with("set -eu\n"));
         assert!(s.contains("mkdir -p \"$HOME/.newt/dgx/vllm\""));
         assert!(s.contains("nohup "));
         assert!(s.contains("echo $! >"));
-        // Pidfile derives from the served name.
+        // Pidfile + log derive from the served name and live under the state dir.
         assert!(s.contains("qwen3.6-35b.pid"));
+        assert!(s.contains("qwen3.6-35b.log"));
         // The model id is shell-quoted inside the nohup line.
         assert!(s.contains("'nvidia/Qwen3.6-35B-A3B-NVFP4'"));
     }
 
     #[test]
-    fn pidfile_sanitizes_served_name() {
-        // Slashes / metachars in the served name must not escape the path: the
-        // filename component (after the last '/') is the sanitized name + .pid.
+    fn remote_script_double_quotes_home_so_it_expands() {
+        // Regression: the state paths MUST be double-quoted, never single-quoted
+        // — single quotes freeze `$HOME` as a literal directory name and the
+        // redirect/pidfile write fails on the node.
+        let s = vllm_remote_script(&sample_plan());
+        assert!(
+            s.contains("\"$HOME/.newt/dgx/vllm/qwen3.6-35b.log\""),
+            "log path must be double-quoted for $HOME expansion: {s}"
+        );
+        assert!(
+            s.contains("\"$HOME/.newt/dgx/vllm/qwen3.6-35b.pid\""),
+            "pidfile must be double-quoted for $HOME expansion: {s}"
+        );
+        // The single-quoted (frozen) form must NOT appear.
+        assert!(!s.contains("'$HOME"), "must not single-quote $HOME: {s}");
+    }
+
+    #[test]
+    fn pidfile_and_log_share_state_dir_and_sanitize() {
+        // Slashes / metachars in the served name must not escape the path.
         let p = vllm_pidfile("org/weird name");
-        assert!(p.ends_with(".pid"));
-        assert!(p.contains(".newt/dgx/vllm/"));
+        let l = vllm_log_path("org/weird name");
+        assert!(p.ends_with(".pid") && l.ends_with(".log"));
+        assert!(p.starts_with(vllm_state_dir()) && l.starts_with(vllm_state_dir()));
         let filename = p.rsplit('/').next().unwrap();
         assert!(
             !filename.contains(' '),
             "name must be sanitized: {filename}"
         );
-        let stem = filename.trim_end_matches(".pid");
-        assert!(!stem.is_empty());
+        assert!(!filename.trim_end_matches(".pid").is_empty());
+    }
+
+    #[test]
+    fn stop_command_guards_missing_pidfile() {
+        let c = vllm_stop_command("qwen3.6-35b");
+        assert!(c.contains("if [ -f \"$HOME/.newt/dgx/vllm/qwen3.6-35b.pid\" ]"));
+        assert!(c.contains("kill \"$(cat "));
+        assert!(c.contains("rm -f"));
+        // No error when already stopped.
+        assert!(c.contains("already stopped"));
+        assert!(!c.contains("'$HOME"));
+    }
+
+    #[test]
+    fn logs_command_tails_and_follows() {
+        let c = vllm_logs_command("qwen3.6-35b", 50);
+        assert!(c.contains("tail -n 50 -f \"$HOME/.newt/dgx/vllm/qwen3.6-35b.log\""));
+        assert!(!c.contains("'$HOME"));
+    }
+
+    // --- dtype parsing / plan resolution ----------------------------------
+
+    #[test]
+    fn dtype_parse_accepts_known_tokens() {
+        assert_eq!(Dtype::parse("auto"), Some(Dtype::Auto));
+        assert_eq!(Dtype::parse("NVFP4"), Some(Dtype::Nvfp4));
+        assert_eq!(Dtype::parse("fp4"), Some(Dtype::Nvfp4));
+        assert_eq!(Dtype::parse("bfloat16"), Some(Dtype::Bf16));
+        assert_eq!(Dtype::parse("gptq"), Some(Dtype::Gptq));
+        assert_eq!(Dtype::parse("nonsense"), None);
+    }
+
+    #[test]
+    fn resolve_plan_defaults_served_name_and_infers_dtype() {
+        let plan = resolve_plan(PlanInputs {
+            model: "nvidia/Qwen3.6-35B-A3B-NVFP4",
+            served_name: None,
+            dtype: None,
+            tensor_parallel: 1,
+            max_model_len: None,
+            gpu_mem_util: 0.90,
+            port: 8000,
+            runtime: VllmRuntime::Native,
+            extra: vec![],
+        });
+        // Served name derived from the repo short name (sanitized).
+        assert_eq!(
+            plan.served_name,
+            default_served_name("nvidia/Qwen3.6-35B-A3B-NVFP4")
+        );
+        // Dtype inferred NVFP4 from the name.
+        assert_eq!(plan.dtype, Dtype::Nvfp4);
+        // Window defaulted; util stored as milli.
+        assert_eq!(plan.max_model_len, DEFAULT_MAX_MODEL_LEN);
+        assert_eq!(plan.gpu_mem_util_milli, 900);
+    }
+
+    #[test]
+    fn resolve_plan_honors_explicit_overrides() {
+        let plan = resolve_plan(PlanInputs {
+            model: "org/whatever",
+            served_name: Some("my-name"),
+            dtype: Some(Dtype::Fp8),
+            tensor_parallel: 2,
+            max_model_len: Some(131072),
+            gpu_mem_util: 0.95,
+            port: 9001,
+            runtime: VllmRuntime::Docker,
+            extra: vec!["--x".to_string()],
+        });
+        assert_eq!(plan.served_name, "my-name");
+        assert_eq!(plan.dtype, Dtype::Fp8);
+        assert_eq!(plan.tensor_parallel, 2);
+        assert_eq!(plan.max_model_len, 131072);
+        assert_eq!(plan.gpu_mem_util_milli, 950);
+        assert_eq!(plan.port, 9001);
+        assert_eq!(plan.runtime, VllmRuntime::Docker);
+    }
+
+    #[test]
+    fn gpu_mem_util_is_clamped_to_unit_interval() {
+        let plan = resolve_plan(PlanInputs {
+            model: "org/m",
+            served_name: None,
+            dtype: Some(Dtype::Auto),
+            tensor_parallel: 1,
+            max_model_len: Some(1),
+            gpu_mem_util: 1.5, // nonsense > 1.0
+            port: 8000,
+            runtime: VllmRuntime::Native,
+            extra: vec![],
+        });
+        assert_eq!(plan.gpu_mem_util_milli, 1000);
+    }
+
+    // --- HF repo detection / weight sizing --------------------------------
+
+    #[test]
+    fn hf_repo_parts_accepts_org_repo_only() {
+        assert_eq!(
+            hf_repo_parts("nvidia/Qwen3.6-35B-A3B-NVFP4"),
+            Some(("nvidia".to_string(), "Qwen3.6-35B-A3B-NVFP4".to_string()))
+        );
+        // Filesystem paths and extra-slash ids are not HF repos.
+        assert_eq!(hf_repo_parts("/data/models/foo"), None);
+        assert_eq!(hf_repo_parts("./local"), None);
+        assert_eq!(hf_repo_parts("~/m"), None);
+        assert_eq!(hf_repo_parts("org/sub/repo"), None);
+        assert_eq!(hf_repo_parts("bareword"), None);
+    }
+
+    #[test]
+    fn sum_weight_bytes_sums_safetensors_and_bin() {
+        let json = json!({
+            "siblings": [
+                {"rfilename": "model-00001-of-00002.safetensors", "size": 1000},
+                {"rfilename": "model-00002-of-00002.safetensors", "lfs": {"size": 2000}},
+                {"rfilename": "config.json", "size": 50},
+                {"rfilename": "tokenizer.json", "size": 99},
+            ]
+        });
+        assert_eq!(sum_weight_bytes(&json), 3000);
+    }
+
+    #[test]
+    fn sum_weight_bytes_counts_pytorch_bin_only_repo() {
+        // A PyTorch-only checkpoint (no safetensors) must still size, or the
+        // fit pre-flight would silently skip it.
+        let json = json!({
+            "siblings": [
+                {"rfilename": "pytorch_model-00001-of-00002.bin", "size": 4000},
+                {"rfilename": "pytorch_model-00002-of-00002.bin", "lfs": {"size": 5000}},
+                {"rfilename": "config.json", "size": 50},
+            ]
+        });
+        assert_eq!(sum_weight_bytes(&json), 9000);
+    }
+
+    #[test]
+    fn sum_weight_bytes_zero_when_none() {
+        let json = json!({"siblings": [{"rfilename": "README.md", "size": 10}]});
+        assert_eq!(sum_weight_bytes(&json), 0);
+        assert_eq!(sum_weight_bytes(&json!({})), 0);
     }
 }
