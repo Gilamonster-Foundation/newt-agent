@@ -1916,13 +1916,20 @@ pub async fn chat_complete(
     // summary request doesn't overflow the model's context window, then
     // make ONE tools-disabled completion so the user gets a real partial answer.
     let trimmed = trim_for_summary(&messages, 2, 6);
+    // Step 27.5: salvage the plan/state ledger + the failed-call count so the
+    // summary reflects progress and the fallback advice is honest.
+    let progress = cap_exit_progress(step_ledger, scratchpad_store);
     let (text, streamed, usage) = final_summary_ollama(
         &client,
         &chat_url,
         model,
         trimmed,
-        max_tool_rounds,
-        accumulated_usage,
+        CapExit {
+            max_tool_rounds,
+            accumulated: accumulated_usage,
+            wasted_calls: failed_calls.total_failures(),
+            progress,
+        },
     )
     .await?;
     Ok((text, streamed, usage, hallucination_count))
@@ -1993,6 +2000,25 @@ impl FailedCallGuard {
             *self.fails_by_tool.entry(name.to_string()).or_default() += 1;
         }
     }
+
+    /// Total failed tool executions this run (across all tools) — a signal that
+    /// a cap exit was thrash, not lack of rounds (Step 27.5).
+    fn total_failures(&self) -> usize {
+        self.fails_by_tool.values().sum()
+    }
+}
+
+/// Render the agent's working-memory progress (`<plan>` checklist + `<state>`)
+/// at a cap exit, so partial work is salvaged into the final summary / fallback
+/// instead of being lost (Step 27.5). `None` when both are empty.
+fn cap_exit_progress(
+    step_ledger: Option<&dyn scheduled::StepLedger>,
+    scratchpad_store: Option<&dyn scratchpad::ScratchpadStore>,
+) -> Option<String> {
+    let plan = step_ledger.and_then(scheduled::plan_block);
+    let state = scratchpad_store.and_then(scratchpad::scratchpad_state_block);
+    let parts: Vec<String> = [plan, state].into_iter().flatten().collect();
+    (!parts.is_empty()).then(|| parts.join("\n\n"))
 }
 
 fn is_read_only_tool(name: &str) -> bool {
@@ -2080,18 +2106,31 @@ fn suspicious_empty_ollama_diagnostic(json: &serde_json::Value) -> String {
 }
 
 /// Build the nudge appended to the message list when the tool-round cap is hit.
-fn cap_exit_nudge(max_tool_rounds: usize) -> String {
-    format!(
+/// `progress` (the `<plan>`/`<state>` working memory, Step 27.5) is folded in so
+/// the model summarizes against what it actually accomplished.
+fn cap_exit_nudge(max_tool_rounds: usize, progress: Option<&str>) -> String {
+    let base = format!(
         "You have reached the tool-call limit ({max_tool_rounds} rounds). \
          Do NOT call any more tools. Summarize what you found across the tool \
          calls above and give your best final answer now."
-    )
+    );
+    match progress {
+        Some(p) => format!("{base}\n\nYour progress so far:\n{p}"),
+        None => base,
+    }
 }
 
 /// Fallback message returned when even the final tools-disabled completion
-/// fails. Includes accumulated token counts so the user knows what was consumed,
-/// and gives actionable advice rather than just naming the limit.
-fn cap_exit_fallback(max_tool_rounds: usize, accumulated: Option<crate::TokenUsage>) -> String {
+/// fails. Includes accumulated token counts, salvages the `<plan>`/`<state>`
+/// progress so partial work survives (Step 27.5), and gives HONEST advice: a run
+/// dominated by failed tool calls is a tooling/permissions problem, not too few
+/// rounds, so we don't blindly tell the user to raise the cap.
+fn cap_exit_fallback(
+    max_tool_rounds: usize,
+    accumulated: Option<crate::TokenUsage>,
+    wasted_calls: usize,
+    progress: Option<&str>,
+) -> String {
     let tokens_hint = match accumulated {
         Some(u) => format!(
             " ({} in / {} out tokens consumed across {max_tool_rounds} rounds)",
@@ -2099,29 +2138,56 @@ fn cap_exit_fallback(max_tool_rounds: usize, accumulated: Option<crate::TokenUsa
         ),
         None => String::new(),
     };
+    // If at least one failed tool call per round, the cap was thrash, not a
+    // genuine need for more rounds.
+    let advice = if wasted_calls >= max_tool_rounds.max(1) {
+        "most of those rounds were spent on tool calls that failed — the model \
+         could not find a working edit/shell path, which is usually a tooling or \
+         permissions issue rather than too few rounds; check `newt doctor`"
+    } else {
+        "raise [tui].max_tool_rounds in your config, or ask a more focused question"
+    };
+    let salvaged = match progress {
+        Some(p) => format!("\n\nProgress captured before the summary failed:\n{p}"),
+        None => String::new(),
+    };
     format!(
         "(reached the tool-call limit of {max_tool_rounds} rounds{tokens_hint}, \
-         and the final summarization request also failed — \
-         raise [tui].max_tool_rounds in your config, or ask a more focused question)"
+         and the final summarization request also failed — {advice}){salvaged}"
     )
+}
+
+/// The cap-exit context threaded into a final tools-disabled summary (Step
+/// 27.5): the round limit, accumulated usage, the count of failed tool calls
+/// (drives honest advice), and the salvaged `<plan>`/`<state>` progress.
+struct CapExit {
+    max_tool_rounds: usize,
+    accumulated: Option<crate::TokenUsage>,
+    wasted_calls: usize,
+    progress: Option<String>,
 }
 
 /// Final tools-disabled completion for the Ollama (`/api/chat`) path.
 ///
 /// `messages` is the already-trimmed list (caller uses `trim_for_summary`).
-/// `accumulated` carries usage from the preceding tool-call rounds so it
+/// `cap.accumulated` carries usage from the preceding tool-call rounds so it
 /// survives even when this summary request fails.
 async fn final_summary_ollama(
     client: &reqwest::Client,
     chat_url: &str,
     model: &str,
     mut messages: Vec<serde_json::Value>,
-    max_tool_rounds: usize,
-    accumulated: Option<crate::TokenUsage>,
+    cap: CapExit,
 ) -> anyhow::Result<(String, bool, Option<crate::TokenUsage>)> {
+    let CapExit {
+        max_tool_rounds,
+        accumulated,
+        wasted_calls,
+        progress,
+    } = cap;
     messages.push(serde_json::json!({
         "role": "user",
-        "content": cap_exit_nudge(max_tool_rounds),
+        "content": cap_exit_nudge(max_tool_rounds, progress.as_deref()),
     }));
     // No `tools` key => the model cannot emit tool calls.
     let body = serde_json::json!({
@@ -2162,7 +2228,12 @@ async fn final_summary_ollama(
             let total = merge_round_usage(accumulated, ollama_usage(&json));
             if content.is_empty() {
                 Ok((
-                    cap_exit_fallback(max_tool_rounds, accumulated),
+                    cap_exit_fallback(
+                        max_tool_rounds,
+                        accumulated,
+                        wasted_calls,
+                        progress.as_deref(),
+                    ),
                     false,
                     accumulated,
                 ))
@@ -2173,7 +2244,12 @@ async fn final_summary_ollama(
         // On any failure (including exhausted retries), still return the
         // accumulated usage so the caller can log the tokens consumed.
         Err(_) => Ok((
-            cap_exit_fallback(max_tool_rounds, accumulated),
+            cap_exit_fallback(
+                max_tool_rounds,
+                accumulated,
+                wasted_calls,
+                progress.as_deref(),
+            ),
             false,
             accumulated,
         )),
@@ -2190,12 +2266,17 @@ async fn final_summary_openai(
     model: &str,
     api_key: Option<&str>,
     mut messages: Vec<serde_json::Value>,
-    max_tool_rounds: usize,
-    accumulated: Option<crate::TokenUsage>,
+    cap: CapExit,
 ) -> anyhow::Result<(String, bool, Option<crate::TokenUsage>)> {
+    let CapExit {
+        max_tool_rounds,
+        accumulated,
+        wasted_calls,
+        progress,
+    } = cap;
     messages.push(serde_json::json!({
         "role": "user",
-        "content": cap_exit_nudge(max_tool_rounds),
+        "content": cap_exit_nudge(max_tool_rounds, progress.as_deref()),
     }));
     // Omit `tools` / `tool_choice` => the model cannot emit tool calls.
     let body = serde_json::json!({
@@ -2238,7 +2319,12 @@ async fn final_summary_openai(
             let total = merge_round_usage(accumulated, openai_usage(&json["usage"]));
             if content.is_empty() {
                 Ok((
-                    cap_exit_fallback(max_tool_rounds, accumulated),
+                    cap_exit_fallback(
+                        max_tool_rounds,
+                        accumulated,
+                        wasted_calls,
+                        progress.as_deref(),
+                    ),
                     false,
                     accumulated,
                 ))
@@ -2247,7 +2333,12 @@ async fn final_summary_openai(
             }
         }
         Err(_) => Ok((
-            cap_exit_fallback(max_tool_rounds, accumulated),
+            cap_exit_fallback(
+                max_tool_rounds,
+                accumulated,
+                wasted_calls,
+                progress.as_deref(),
+            ),
             false,
             accumulated,
         )),
@@ -2856,14 +2947,20 @@ pub async fn openai_chat_complete(
     // Reached the round cap. Trim the message list and make ONE final
     // tools-disabled completion (matches the Ollama path).
     let trimmed = trim_for_summary(&messages, 2, 6);
+    // Step 27.5: salvage progress + failed-call count (matches the Ollama path).
+    let progress = cap_exit_progress(step_ledger, scratchpad_store);
     let (text, streamed, usage) = final_summary_openai(
         &client,
         &chat_url,
         model,
         api_key,
         trimmed,
-        max_tool_rounds,
-        accumulated_usage,
+        CapExit {
+            max_tool_rounds,
+            accumulated: accumulated_usage,
+            wasted_calls: failed_calls.total_failures(),
+            progress,
+        },
     )
     .await?;
     Ok((text, streamed, usage, hallucination_count))
@@ -3633,10 +3730,39 @@ mod cap_exit_unit_tests {
     use super::*;
 
     #[test]
-    fn cap_exit_nudge_names_the_limit() {
-        let nudge = cap_exit_nudge(5);
+    fn cap_exit_nudge_names_the_limit_and_folds_in_progress() {
+        let nudge = cap_exit_nudge(5, None);
         assert!(nudge.contains("5 rounds"), "got: {nudge}");
         assert!(nudge.contains("Do NOT call any more tools"));
+        assert!(
+            !nudge.contains("progress so far"),
+            "no block when None: {nudge}"
+        );
+        // Step 27.5: the <plan>/<state> progress is folded into the nudge.
+        let with = cap_exit_nudge(5, Some("<plan>1. [x] foo</plan>"));
+        assert!(with.contains("Your progress so far"), "got: {with}");
+        assert!(with.contains("<plan>1. [x] foo</plan>"), "got: {with}");
+    }
+
+    #[test]
+    fn cap_exit_progress_renders_plan_and_state_or_none() {
+        use crate::agentic::scheduled::{SessionStepLedger, StepLedger};
+        use crate::agentic::scratchpad::{ScratchpadStore, SessionScratchpadStore};
+        let ledger = SessionStepLedger::default();
+        let pad = SessionScratchpadStore::default();
+        // Both empty → nothing to salvage.
+        assert!(cap_exit_progress(Some(&ledger), Some(&pad)).is_none());
+        assert!(cap_exit_progress(None, None).is_none());
+        // Populated → a combined block naming both.
+        ledger.set_plan(&["build it".to_string(), "test it".to_string()]);
+        pad.set("cwd", "/work".to_string());
+        let p = cap_exit_progress(
+            Some(&ledger as &dyn StepLedger),
+            Some(&pad as &dyn ScratchpadStore),
+        )
+        .expect("non-empty progress");
+        assert!(p.contains("build it"), "{p}");
+        assert!(p.contains("cwd"), "{p}");
     }
 
     #[test]
@@ -3659,20 +3785,40 @@ mod cap_exit_unit_tests {
     }
 
     #[test]
-    fn cap_exit_fallback_includes_usage_when_present() {
+    fn cap_exit_fallback_usage_advice_and_salvage() {
+        // wasted_calls < rounds → the standard "raise max_tool_rounds" advice.
         let with = cap_exit_fallback(
             4,
             Some(crate::TokenUsage {
                 input_tokens: 12,
                 output_tokens: 34,
             }),
+            0,
+            None,
         );
         assert!(with.contains("12 in / 34 out tokens"), "got: {with}");
-        assert!(with.contains("max_tool_rounds"));
+        assert!(with.contains("max_tool_rounds"), "got: {with}");
 
-        let without = cap_exit_fallback(4, None);
+        let without = cap_exit_fallback(4, None, 0, None);
         assert!(!without.contains("tokens consumed"), "got: {without}");
-        assert!(without.contains("tool-call limit of 4"));
+        assert!(without.contains("tool-call limit of 4"), "got: {without}");
+
+        // Step 27.5: a thrash run (≥ one failed call per round) gets HONEST
+        // advice — a tooling problem, not "raise the cap".
+        let thrash = cap_exit_fallback(4, None, 6, None);
+        assert!(thrash.contains("tool calls that failed"), "got: {thrash}");
+        assert!(
+            !thrash.contains("raise [tui].max_tool_rounds"),
+            "thrash advice must not blame the cap: {thrash}"
+        );
+
+        // Step 27.5: progress is salvaged even when the summary failed.
+        let salvaged = cap_exit_fallback(4, None, 0, Some("<state>cwd=/x</state>"));
+        assert!(salvaged.contains("Progress captured"), "got: {salvaged}");
+        assert!(
+            salvaged.contains("<state>cwd=/x</state>"),
+            "got: {salvaged}"
+        );
     }
 
     #[test]
