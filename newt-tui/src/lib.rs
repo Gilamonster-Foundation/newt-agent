@@ -3728,6 +3728,9 @@ fn run_chat(
     // Step 25.4 (#568): per-session Markdown override set by `/markdown on|off`.
     // `None` defers to `[tui].markdown`; `Some(b)` forces it for the session.
     let mut markdown_override: Option<bool> = None;
+    // Step 24.8 (#559): per-session context-manager override from
+    // `/context manager <name>`. `None` defers to `[context].manager`.
+    let mut context_manager_override: Option<newt_core::ContextManager> = None;
     // Step 24.6 (#559): the latest context-budget gauge `(used, budget)`, set
     // after each turn from the turn's input tokens + the resolved send budget,
     // and shown in the rich header for the NEXT prompt. `None` until known.
@@ -4310,6 +4313,74 @@ fn run_chat(
                         } else {
                             print_newt(
                                 &format!("unknown /markdown arg '{arg}' — use on|off|auto"),
+                                color,
+                                verbose,
+                            );
+                        }
+                        surface.save_history();
+                        println!();
+                        continue;
+                    }
+                    if slash_md == "context" || slash_md.starts_with("context ") {
+                        // Step 24.8 (#559): the context-manager selector seam.
+                        // Only `standard` is implemented; progressive/distributed
+                        // are owned by #546 and report "not yet available".
+                        let rest = slash_md.strip_prefix("context").unwrap_or("").trim();
+                        if rest.is_empty() || rest == "manager" {
+                            let cur = context_manager(&cfg, context_manager_override);
+                            let src = if context_manager_override.is_some() {
+                                "session"
+                            } else {
+                                "config"
+                            };
+                            print_newt(
+                                &format!(
+                                    "context manager: {} ({src}) — \
+                                     use /context manager standard|progressive|distributed",
+                                    cur.keyword()
+                                ),
+                                color,
+                                verbose,
+                            );
+                        } else if let Some(name) = rest.strip_prefix("manager ") {
+                            match newt_core::ContextManager::from_keyword(name.trim()) {
+                                Some(m) if m.available() => {
+                                    context_manager_override = Some(m);
+                                    print_newt(
+                                        &format!("context manager → {}", m.keyword()),
+                                        color,
+                                        verbose,
+                                    );
+                                }
+                                Some(m) => {
+                                    print_newt(
+                                        &format!(
+                                            "context manager '{}' is not yet available \
+                                             (see #546) — staying on {}",
+                                            m.keyword(),
+                                            context_manager(&cfg, context_manager_override)
+                                                .keyword()
+                                        ),
+                                        color,
+                                        verbose,
+                                    );
+                                }
+                                None => print_newt(
+                                    &format!(
+                                        "unknown context manager '{}' — \
+                                         use standard|progressive|distributed",
+                                        name.trim()
+                                    ),
+                                    color,
+                                    verbose,
+                                ),
+                            }
+                        } else {
+                            print_newt(
+                                &format!(
+                                    "unknown /context subcommand '{rest}' — \
+                                     use /context manager <name>"
+                                ),
                                 color,
                                 verbose,
                             );
@@ -6800,6 +6871,17 @@ fn markdown_enabled(cfg: &newt_core::Config, color: bool, session: Option<bool>)
     base && color
 }
 
+/// Resolve the active context manager (Step 24.8, #559): session override
+/// (`/context manager`) → `[context].manager` → `standard`.
+fn context_manager(
+    cfg: &newt_core::Config,
+    session: Option<newt_core::ContextManager>,
+) -> newt_core::ContextManager {
+    session
+        .or_else(|| cfg.context.as_ref().map(|c| c.manager))
+        .unwrap_or_default()
+}
+
 /// Mid-loop message-trim threshold from `[tui].mid_loop_trim_threshold` (default 40).
 ///
 /// Clamped to `max_tool_rounds - 3` so the safety valve always fires before the
@@ -7383,6 +7465,7 @@ fn help_lines() -> &'static [&'static str] {
         "  /probe reset             - wipe all learned probe values (conformance, windows, calibration)",
         "  /memory                  - show context window / notes usage",
         "  /compress [focus]        - compress context now, optionally focused on a topic",
+        "  /context manager [name]  - show or set the context-management strategy (standard; progressive/distributed pending #546)",
         "  /remember <fact>         - add a fact to persistent NOTES.md",
         "  /new                     - start a fresh conversation (ends the current one; it won't auto-resume)",
         "  /end  /restart           - aliases for /new — close out this conversation and start fresh",
@@ -11927,6 +12010,33 @@ mod helper_fn_tests {
             false,
             Some(true)
         ));
+    }
+
+    #[test]
+    fn context_manager_resolves_session_config_default() {
+        use newt_core::{ContextConfig, ContextManager};
+        let cfg_with = |m: ContextManager| newt_core::Config {
+            context: Some(ContextConfig { manager: m }),
+            ..Default::default()
+        };
+        // No [context] → standard.
+        assert_eq!(
+            context_manager(&newt_core::Config::default(), None),
+            ContextManager::Standard
+        );
+        // Config value when no session override.
+        assert_eq!(
+            context_manager(&cfg_with(ContextManager::Progressive), None),
+            ContextManager::Progressive
+        );
+        // Session override wins over config.
+        assert_eq!(
+            context_manager(
+                &cfg_with(ContextManager::Progressive),
+                Some(ContextManager::Standard)
+            ),
+            ContextManager::Standard
+        );
     }
 
     #[test]

@@ -53,6 +53,10 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tui: Option<TuiConfig>,
 
+    /// `[context]` — context-management strategy selection (Step 24.8, #559).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<ContextConfig>,
+
     /// Inference cost modeling. `None` → built-in rate table only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pricing: Option<crate::pricing::PricingConfig>,
@@ -704,6 +708,61 @@ impl MarkdownMode {
             Self::Auto => None,
         }
     }
+}
+
+/// Context-management strategy — the `[context] manager` key and the
+/// `/context manager <name>` command (Step 24.8, #559). `standard` is the
+/// current prune → summary → static-marker pipeline. `progressive` and
+/// `distributed` are the retrievable-card managers **owned by #546** and not
+/// yet available — selecting them reports that and stays on `standard`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ContextManager {
+    /// Prune → summarize → static-marker (today's behavior). The only one
+    /// implemented; the selector seam for the others.
+    #[default]
+    Standard,
+    /// Leave a lookup marker; retrieve cards on demand (ephemeral → local DB).
+    /// Owned by #546 — not yet available.
+    Progressive,
+    /// Agent-mesh-shared card store across a swarm. Owned by #546 — not yet
+    /// available.
+    Distributed,
+}
+
+impl ContextManager {
+    /// Parse a CLI/config/command keyword (case-insensitive).
+    pub fn from_keyword(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "standard" => Some(Self::Standard),
+            "progressive" => Some(Self::Progressive),
+            "distributed" => Some(Self::Distributed),
+            _ => None,
+        }
+    }
+
+    /// The canonical lowercase keyword (round-trips `from_keyword` + serde).
+    pub fn keyword(self) -> &'static str {
+        match self {
+            Self::Standard => "standard",
+            Self::Progressive => "progressive",
+            Self::Distributed => "distributed",
+        }
+    }
+
+    /// Whether this manager is implemented. Only `standard` today; the others
+    /// are owned by #546 (the selector reports "not yet available").
+    pub fn available(self) -> bool {
+        matches!(self, Self::Standard)
+    }
+}
+
+/// `[context]` config section (Step 24.8, #559).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextConfig {
+    /// Context-management strategy. Default `standard`.
+    #[serde(default)]
+    pub manager: ContextManager,
 }
 
 /// How a thinking model's streamed reasoning is surfaced — the `[tui] thinking`
@@ -1938,6 +1997,7 @@ impl Default for Config {
             default_tier_order: vec![Tier::Fast, Tier::Standard, Tier::Complex, Tier::Review],
             dgx: None,
             tui: None,
+            context: None,
             pricing: None,
             memory: None,
             agents: AgentsConfig::default(),
@@ -2624,6 +2684,38 @@ mod tests {
         assert_eq!(cfg.summarizer_timeout_secs, 180);
         assert_eq!(cfg.summarizer_retries, 4);
         assert_eq!(cfg.summarizer_model.as_deref(), Some("qwen:0.5b"));
+    }
+
+    #[test]
+    fn context_manager_keyword_roundtrip_and_availability() {
+        for m in [
+            ContextManager::Standard,
+            ContextManager::Progressive,
+            ContextManager::Distributed,
+        ] {
+            assert_eq!(ContextManager::from_keyword(m.keyword()), Some(m));
+        }
+        assert_eq!(
+            ContextManager::from_keyword("  STANDARD "),
+            Some(ContextManager::Standard),
+            "case/space-insensitive"
+        );
+        assert_eq!(ContextManager::from_keyword("nope"), None);
+        // Only standard is implemented today; the others are pending #546.
+        assert!(ContextManager::Standard.available());
+        assert!(!ContextManager::Progressive.available());
+        assert!(!ContextManager::Distributed.available());
+        assert_eq!(ContextManager::default(), ContextManager::Standard);
+    }
+
+    #[test]
+    fn context_section_defaults_and_parses() {
+        // Absent [context] → None on Config; the resolver falls back to standard.
+        let cfg: Config = toml::from_str("").unwrap();
+        assert!(cfg.context.is_none());
+        let c: ContextConfig = toml::from_str("manager = \"progressive\"").unwrap();
+        assert_eq!(c.manager, ContextManager::Progressive);
+        assert_eq!(ContextConfig::default().manager, ContextManager::Standard);
     }
 
     #[test]
