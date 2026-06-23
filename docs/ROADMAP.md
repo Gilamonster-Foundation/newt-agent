@@ -1233,7 +1233,7 @@ this is the next free cluster.)* **Design: #559.**
 
 **Selector seam (Part 3 — `progressive`/`distributed` delegated to #546)**
 
-- **24.8** `/context manager <name>` + `[context].manager`: dispatch + config resolution, only `standard` implemented; `progressive`/`distributed` return "not yet available, see #546". The seam #546 plugs into — its `store-raw-for-lookup` rung is what makes the static marker *recoverable* (deferred retrieval, not loss).
+- **24.8** ✅ **done** — `ContextManager` {standard, progressive, distributed} + `[context].manager` config + `/context manager [name]` command (session override → config → `standard`). Only `standard` is implemented; progressive/distributed report "not yet available (see #546)" and stay on standard. The seam #546 plugs into — its `store-raw-for-lookup` rung is what makes the static marker *recoverable* (deferred retrieval, not loss). Additional modes to add are mined from the research in #13 (paper + `docs/research/notes.txt`).
 
 **Recommended order:** 24.1 → 24.2 → 24.5 → 24.6 → 24.3 → 24.7 → 24.8 → 24.4. (24.1 alone likely eliminates most real-world failures; everything after is depth.) Each step is one PR with the acceptance contract (What / Test plan / Out of scope), a fully-mocked unit tier (wiremock the summarizer endpoint), and the coverage ratchet. Refs: #559 (umbrella), #546 (progressive/distributed substrate + the fallback rung), #548 (surfaced), #166 (DGX OOM history).
 
