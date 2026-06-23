@@ -1157,11 +1157,12 @@ pub(crate) trait InputSurface {
     /// Rebuild the editor from fresh config — used after a `/vi` · `/emacs`
     /// edit-mode switch so the next read reflects the new mode.
     fn reload(&mut self) -> anyhow::Result<()>;
-    /// Update the runtime context (active model + endpoint) shown in the rich
-    /// status header (issue #527). Called once per turn before `read_line` so a
-    /// `/model` switch is reflected. Default no-op: only the rich surface renders
-    /// it; the lean surface carries it in the prompt string (or not).
-    fn set_runtime_context(&mut self, _model: &str, _endpoint: &str) {}
+    /// Update the runtime context (active model + endpoint + the context-budget
+    /// gauge `(used, budget)`) shown in the rich status header (issues #527 /
+    /// #559). Called once per turn before `read_line` so a `/model` switch and
+    /// the latest fill are reflected. Default no-op: only the rich surface
+    /// renders it; the lean surface carries model in the prompt string (or not).
+    fn set_runtime_context(&mut self, _model: &str, _endpoint: &str, _gauge: Option<(u32, u32)>) {}
 }
 
 #[cfg(test)]
@@ -3692,6 +3693,10 @@ fn run_chat(
     // Step 25.4 (#568): per-session Markdown override set by `/markdown on|off`.
     // `None` defers to `[tui].markdown`; `Some(b)` forces it for the session.
     let mut markdown_override: Option<bool> = None;
+    // Step 24.6 (#559): the latest context-budget gauge `(used, budget)`, set
+    // after each turn from the turn's input tokens + the resolved send budget,
+    // and shown in the rich header for the NEXT prompt. `None` until known.
+    let mut token_gauge: Option<(u32, u32)> = None;
     // Prompted ocap grants (issue #263), resolved ONCE per session: the flag
     // (env, set by `--prompt-for-permissions`) or `[tui.permissions] prompt`,
     // AND a real terminal on stdin — a piped/headless invocation must never
@@ -4087,7 +4092,7 @@ fn run_chat(
             let prompt = prompt_str(workspace, is_vi, &inf_model, footer_on);
             // Refresh the rich status header's model @ endpoint each turn (#527)
             // so a mid-session `/model` switch is reflected (no-op for lean).
-            surface.set_runtime_context(&inf_model, &inf_url);
+            surface.set_runtime_context(&inf_model, &inf_url, token_gauge);
             surface.read_line(&prompt)?
         };
         match outcome {
@@ -4997,6 +5002,12 @@ fn run_chat(
                                         if dirty {
                                             probe::save_cache(&cap_cache);
                                         }
+                                    }
+                                    // Step 24.6 (#559): refresh the context-budget
+                                    // gauge for the next header — this turn's input
+                                    // tokens against the resolved send budget.
+                                    if let Some(budget) = eff_max_ok_input.or(eff_safe_context) {
+                                        token_gauge = Some((input_tokens, budget));
                                     }
                                 }
                             }
