@@ -57,15 +57,16 @@ pub use agent_mesh_protocol::{Caveats, CountBound, Scope};
 // Issue #263: the prompted-ocap-grant seam (PermissionGate + friends) joins
 // the surface — the TUI implements the gate; headless callers pass None.
 pub use agentic::{
-    chat_complete, compress_user_initiated, execute_tool, memory_fetch_tool_definition,
-    openai_chat_complete, transcript_lines, transcript_lines_styled, trim_for_summary,
-    widen_caveats, ChatCtx, CompressCounters, CompressState, DenialKind, ManualCompressOutcome,
-    McpTools, MemAddr, MemPayload, MemorySource, NoMcp, NoteNudge, NoteSink, PermissionDecision,
+    chat_complete, compress_user_initiated, execute_tool, gather_code_files, index_files,
+    memory_fetch_tool_definition, openai_chat_complete, retrieve_evidence, transcript_lines,
+    transcript_lines_styled, trim_for_summary, widen_caveats, ChatCtx, CompressCounters,
+    CompressState, DenialKind, Embedder, EmbeddingsClient, ManualCompressOutcome, McpTools,
+    MemAddr, MemPayload, MemorySource, NoMcp, NoteNudge, NoteSink, PermissionDecision,
     PermissionGate, PermissionRecord, PermissionRequest, RecallSource, RoundObservation,
-    ScratchpadStore, SessionScratchpadStore, SessionSpillStore, ShellObservation, SpillStore,
-    StoreMemorySource, StoreRecallSource, SummarizeFn, SummarizeFuture, Summarizer, TranscriptLine,
-    TranscriptRole, TranscriptStyle, TurnDriver, TurnDriverConfig, TurnDriverError, TurnOutcome,
-    TurnStatus,
+    ScratchpadStore, SemanticIndex, SessionScratchpadStore, SessionSemanticIndex,
+    SessionSpillStore, ShellObservation, SpillStore, StoreMemorySource, StoreRecallSource,
+    SummarizeFn, SummarizeFuture, Summarizer, TranscriptLine, TranscriptRole, TranscriptStyle,
+    TurnDriver, TurnDriverConfig, TurnDriverError, TurnOutcome, TurnStatus,
 };
 pub use agents::AgentsProvider;
 pub use caveats::{CaveatsExt, CountBoundExt, ScopeExt};
@@ -74,7 +75,8 @@ pub use config::{
     ContextConfig, ContextFeature, ContextFeatureSet, ContextFeatures, ContextManager,
     ConversationsConfig, EditMode, FooterMode, Loadout, LoadoutSettings, LogConfig, MarkdownMode,
     MemoryConfig, MemoryDisclosure, MemoryProviderKind, OpenAiApi, PermissionPreset, PickVia,
-    ProfilePick, ProviderConfig, SkillsConfig, ThinkingMode, ToolPermissions, TuiConfig,
+    ProfilePick, ProviderConfig, SemanticConfig, SkillsConfig, ThinkingMode, ToolPermissions,
+    TuiConfig,
 };
 pub use conversation::{
     new_conversation_id, session_plan_dir, session_plan_path, ConversationRecord,
