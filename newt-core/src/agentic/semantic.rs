@@ -615,6 +615,13 @@ mod tests {
             0,
         );
         assert_eq!(c.embed("hello").await.unwrap(), vec![0.5f32, 0.6]);
+        // The request body must use OpenAI's `input` field, not Ollama's
+        // `prompt` (guards against a body-shape regression the path match alone
+        // wouldn't catch).
+        let reqs = server.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&reqs[0].body).unwrap();
+        assert_eq!(body["input"], "hello");
+        assert!(body.get("prompt").is_none());
     }
 
     /// The batch must keep input order. The mock encodes each prompt's length
