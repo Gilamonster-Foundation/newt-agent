@@ -22,6 +22,8 @@ pub(crate) mod scratchpad;
 pub(crate) mod semantic;
 // Step 26.6a (#585): experiential memory — the `experiential` context feature.
 pub(crate) mod experiential;
+// Step 26.6b (#586): scheduled per-step compiled view — the `scheduled` feature.
+pub(crate) mod scheduled;
 // Step 26.3 (#584): tool-output offloading — the `tool_offload` context feature.
 pub(crate) mod spill;
 // Issue #308 — the cowork foundation: a non-blocking turn driver around
@@ -114,6 +116,7 @@ pub use experiential::{
 pub use git_tool::{git_tool_definition, GitTool};
 pub use markdown::{render_markdown, MarkdownStreamWriter, RenderOpts};
 pub use mcp::{McpTools, NoMcp};
+pub use scheduled::{plan_block, SessionStepLedger, StepLedger};
 pub use scratchpad::{scratchpad_state_block, ScratchpadStore, SessionScratchpadStore};
 pub use semantic::{
     chunk_source, code_evidence_block, code_search_tool_definition, cosine, gather_code_files,
@@ -560,6 +563,9 @@ pub struct ChatCtx<'a> {
     /// Experiential store for the record/recall tools (Step 26.6a). `None` = the
     /// tools are not advertised (experiential off). Shared `&dyn` (interior mut).
     pub experience_store: Option<&'a dyn crate::agentic::experiential::ExperienceStore>,
+    /// Plan ledger for the plan_set/plan_advance tools (Step 26.6b). `None` = the
+    /// tools are not advertised (scheduled off). Shared `&dyn` (interior mut).
+    pub step_ledger: Option<&'a dyn crate::agentic::scheduled::StepLedger>,
     pub caveats: &'a crate::caveats::Caveats,
     /// Maximum tool-call rounds before forcing a final tools-disabled
     /// completion (from `[tui].max_tool_rounds`, default 25).
@@ -962,6 +968,7 @@ pub async fn chat_complete(
         scratchpad_store,
         code_search,
         experience_store,
+        step_ledger,
         caveats,
         max_tool_rounds,
         tool_output_lines,
@@ -1017,6 +1024,8 @@ pub async fn chat_complete(
     let advertise_code_search = code_search.is_some();
     // Step 26.6a (#585): the experiential tools when a store is present.
     let advertise_experiential = experience_store.is_some();
+    // Step 26.6b (#586): the scheduled plan tools when a ledger is present.
+    let advertise_scheduled = step_ledger.is_some();
     let advertise_git = git_tool.is_some();
     let advertise_team = crew_runner.is_some();
 
@@ -1077,6 +1086,7 @@ pub async fn chat_complete(
         advertise_scratchpad,
         advertise_code_search,
         advertise_experiential,
+        advertise_scheduled,
     );
     let tool_tokens = estimate_value_tokens(&tools);
     // Phase 20 §2.3: one sanitized calibration ratio per turn. The
@@ -1859,6 +1869,7 @@ pub async fn chat_complete(
                 scratchpad_store,
                 code_search,
                 experience_store,
+                step_ledger,
             )
             .await;
             // 17.6: record the call for the turn's events column — args are
@@ -2192,6 +2203,7 @@ pub async fn openai_chat_complete(
         scratchpad_store,
         code_search,
         experience_store,
+        step_ledger,
         caveats,
         max_tool_rounds,
         tool_output_lines,
@@ -2246,6 +2258,8 @@ pub async fn openai_chat_complete(
     let advertise_code_search = code_search.is_some();
     // Step 26.6a (#585): the experiential tools when a store is present.
     let advertise_experiential = experience_store.is_some();
+    // Step 26.6b (#586): the scheduled plan tools when a ledger is present.
+    let advertise_scheduled = step_ledger.is_some();
     let advertise_git = git_tool.is_some();
     let advertise_team = crew_runner.is_some();
 
@@ -2291,6 +2305,7 @@ pub async fn openai_chat_complete(
         advertise_scratchpad,
         advertise_code_search,
         advertise_experiential,
+        advertise_scheduled,
     );
     let tool_tokens = estimate_value_tokens(&tools);
     // Phase 20 §2.3: per-turn calibration ratio + real-token schema overhead
@@ -2715,6 +2730,7 @@ pub async fn openai_chat_complete(
                 scratchpad_store,
                 code_search,
                 experience_store,
+                step_ledger,
             )
             .await;
             if debug {
@@ -2898,6 +2914,7 @@ pub async fn openai_responses_complete(
         scratchpad_store,
         code_search,
         experience_store,
+        step_ledger,
         caveats,
         max_tool_rounds,
         tool_output_lines,
@@ -2944,6 +2961,8 @@ pub async fn openai_responses_complete(
     let advertise_code_search = code_search.is_some();
     // Step 26.6a (#585): the experiential tools when a store is present.
     let advertise_experiential = experience_store.is_some();
+    // Step 26.6b (#586): the scheduled plan tools when a ledger is present.
+    let advertise_scheduled = step_ledger.is_some();
     let advertise_git = git_tool.is_some();
     let advertise_team = crew_runner.is_some();
 
@@ -2962,6 +2981,7 @@ pub async fn openai_responses_complete(
         advertise_scratchpad,
         advertise_code_search,
         advertise_experiential,
+        advertise_scheduled,
     );
     let tools = tools_to_responses(&tools_chat);
 
@@ -3115,6 +3135,7 @@ pub async fn openai_responses_complete(
                 scratchpad_store,
                 code_search,
                 experience_store,
+                step_ledger,
             )
             .await;
             if debug {
@@ -3638,6 +3659,7 @@ mod tool_round_cap_tests {
                 scratchpad_store: None,
                 code_search: None,
                 experience_store: None,
+                step_ledger: None,
                 caveats: &caveats,
                 max_tool_rounds: cap,
                 tool_output_lines: 20,
@@ -3708,6 +3730,7 @@ mod tool_round_cap_tests {
                 scratchpad_store: None,
                 code_search: None,
                 experience_store: None,
+                step_ledger: None,
                 caveats: &caveats,
                 max_tool_rounds: 5,
                 tool_output_lines: 20,
@@ -3843,6 +3866,7 @@ mod tool_round_cap_tests {
                 scratchpad_store: None,
                 code_search: None,
                 experience_store: None,
+                step_ledger: None,
                 caveats: &caveats,
                 max_tool_rounds: 5,
                 tool_output_lines: 20,
@@ -3915,6 +3939,7 @@ mod tool_round_cap_tests {
                 scratchpad_store: None,
                 code_search: None,
                 experience_store: None,
+                step_ledger: None,
                 caveats: &caveats,
                 max_tool_rounds: cap,
                 tool_output_lines: 20,
@@ -4010,6 +4035,7 @@ mod tool_round_cap_tests {
                 scratchpad_store: None,
                 code_search: None,
                 experience_store: None,
+                step_ledger: None,
                 caveats: &caveats,
                 max_tool_rounds: 1,
                 tool_output_lines: 20,
@@ -4117,6 +4143,7 @@ mod tool_round_cap_tests {
                 scratchpad_store: None,
                 code_search: None,
                 experience_store: None,
+                step_ledger: None,
                 caveats: &caveats,
                 max_tool_rounds: 1,
                 tool_output_lines: 20,
@@ -4216,6 +4243,7 @@ mod tool_round_cap_tests {
                 scratchpad_store: None,
                 code_search: None,
                 experience_store: None,
+                step_ledger: None,
                 caveats: &caveats,
                 max_tool_rounds: 2,
                 tool_output_lines: 20,
@@ -4290,6 +4318,7 @@ mod tool_round_cap_tests {
                 None, // scratchpad_store
                 None, // code_search
                 None, // experience_store
+                None, // step_ledger
             )
             .await;
             assert!(
@@ -4355,6 +4384,7 @@ mod tool_round_cap_tests {
                 scratchpad_store: None,
                 code_search: None,
                 experience_store: None,
+                step_ledger: None,
                 caveats: &caveats,
                 max_tool_rounds: cap,
                 tool_output_lines: 20,
@@ -4505,6 +4535,7 @@ mod tool_round_cap_tests {
                 scratchpad_store: None,
                 code_search: None,
                 experience_store: None,
+                step_ledger: None,
                 caveats: &caveats,
                 max_tool_rounds: 10,
                 tool_output_lines: 5,
@@ -4594,6 +4625,7 @@ mod http_loop_tests {
             scratchpad_store: None,
             code_search: None,
             experience_store: None,
+            step_ledger: None,
             caveats,
             max_tool_rounds: 8,
             tool_output_lines: 20,
@@ -5479,6 +5511,7 @@ mod save_note_loop_tests {
             scratchpad_store: None,
             code_search: None,
             experience_store: None,
+            step_ledger: None,
             caveats,
             max_tool_rounds: 6,
             tool_output_lines: 20,
@@ -5958,6 +5991,7 @@ mod compression_loop_tests {
             scratchpad_store: None,
             code_search: None,
             experience_store: None,
+            step_ledger: None,
             caveats,
             max_tool_rounds: 12,
             tool_output_lines: 2,
@@ -7099,6 +7133,7 @@ mod observation_hook_tests {
             scratchpad_store: None,
             code_search: None,
             experience_store: None,
+            step_ledger: None,
             caveats,
             max_tool_rounds: 8,
             tool_output_lines: 20,
