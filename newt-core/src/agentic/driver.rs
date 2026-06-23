@@ -367,6 +367,7 @@ async fn run_one_turn(
         spill_store: None,
         scratchpad: false,
         scratchpad_store: None,
+        code_search: None,
         caveats: &config.caveats,
         max_tool_rounds: config.max_tool_rounds,
         tool_output_lines: config.tool_output_lines,

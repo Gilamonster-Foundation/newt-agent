@@ -160,6 +160,7 @@ pub fn tool_definitions() -> serde_json::Value {
 /// definition (progressive-disclosure memory, Workstream A MVP, #319) the same
 /// way on a supplied `MemorySource` — `None` ⇒ the tool is never advertised,
 /// so eval / headless / ACP sessions are unaffected bit-for-bit.
+#[allow(clippy::too_many_arguments)] // presence-gated tool advertisers (one bool each)
 pub(crate) fn merged_tool_definitions(
     mcp: &dyn McpTools,
     with_save_note: bool,
@@ -168,6 +169,7 @@ pub(crate) fn merged_tool_definitions(
     with_git: bool,
     with_team: bool,
     with_scratchpad: bool,
+    with_code_search: bool,
 ) -> serde_json::Value {
     let mut defs = match tool_definitions() {
         serde_json::Value::Array(a) => a,
@@ -199,6 +201,11 @@ pub(crate) fn merged_tool_definitions(
         defs.push(super::scratchpad::state_set_tool_definition());
         defs.push(super::scratchpad::state_get_tool_definition());
         defs.push(super::scratchpad::state_clear_tool_definition());
+    }
+    // Step 26.5.5 (#582): the code_search tool — advertised only when the
+    // `semantic` feature is on AND an index is present (presence gate).
+    if with_code_search {
+        defs.push(super::semantic::code_search_tool_definition());
     }
     defs.extend(mcp.tool_defs());
     serde_json::Value::Array(defs)
@@ -252,6 +259,7 @@ pub(crate) fn is_hallucination(tool_name: &str, args: &serde_json::Value) -> boo
             | "state_set"
             | "state_get"
             | "state_clear"
+            | "code_search"
     )
 }
 
@@ -935,6 +943,7 @@ pub async fn execute_tool(
     git_tool: Option<&dyn GitTool>,
     crew_runner: Option<&dyn CrewRunner>,
     scratchpad_store: Option<&dyn super::scratchpad::ScratchpadStore>,
+    code_search: Option<super::semantic::CodeSearch<'_>>,
 ) -> String {
     // Remote MCP tools (namespaced `server__tool`) route to their server before
     // the built-in match. They carry no Caveats leash in this build.
@@ -991,6 +1000,17 @@ pub async fn execute_tool(
         "state_clear" => match scratchpad_store {
             Some(s) => super::scratchpad::execute_state_clear(s, color, tool_output_lines),
             None => "unknown tool: state_clear (no scratchpad in this session)".to_string(),
+        },
+
+        // Step 26.5.5 (#582): semantic code search — presence-gated on the
+        // injected searcher (advertised only when the `semantic` feature is on).
+        "code_search" => match code_search {
+            Some(search) => {
+                super::semantic::execute_code_search(args, search, color, tool_output_lines).await
+            }
+            None => {
+                "unknown tool: code_search (semantic retrieval is off this session)".to_string()
+            }
         },
 
         // Embedded git (PR4, #461): dispatch through the injected GitTool
@@ -1616,7 +1636,8 @@ mod tests {
 
     #[test]
     fn merged_tool_definitions_with_empty_mcp_is_builtin_set() {
-        let merged = merged_tool_definitions(&NoMcp, false, false, false, false, false, false);
+        let merged =
+            merged_tool_definitions(&NoMcp, false, false, false, false, false, false, false);
         let names: Vec<&str> = merged
             .as_array()
             .unwrap()
@@ -1654,10 +1675,11 @@ mod tests {
         let base = tool_definitions();
         assert!(!names(&base).contains(&"save_note"), "got: {base}");
         // … nor in the merged set without a sink …
-        let without = merged_tool_definitions(&NoMcp, false, false, false, false, false, false);
+        let without =
+            merged_tool_definitions(&NoMcp, false, false, false, false, false, false, false);
         assert!(!names(&without).contains(&"save_note"));
         // … but a sink advertises it.
-        let with = merged_tool_definitions(&NoMcp, true, false, false, false, false, false);
+        let with = merged_tool_definitions(&NoMcp, true, false, false, false, false, false, false);
         assert!(names(&with).contains(&"save_note"), "got: {with}");
     }
 
@@ -1675,12 +1697,13 @@ mod tests {
         }
         let base = tool_definitions();
         assert!(!names(&base).contains(&"recall"), "got: {base}");
-        let without = merged_tool_definitions(&NoMcp, false, false, false, false, false, false);
+        let without =
+            merged_tool_definitions(&NoMcp, false, false, false, false, false, false, false);
         assert!(!names(&without).contains(&"recall"));
-        let with = merged_tool_definitions(&NoMcp, false, true, false, false, false, false);
+        let with = merged_tool_definitions(&NoMcp, false, true, false, false, false, false, false);
         assert!(names(&with).contains(&"recall"), "got: {with}");
         // The two gates are independent: both on advertises both.
-        let both = merged_tool_definitions(&NoMcp, true, true, false, false, false, false);
+        let both = merged_tool_definitions(&NoMcp, true, true, false, false, false, false, false);
         assert!(names(&both).contains(&"save_note"));
         assert!(names(&both).contains(&"recall"));
     }
@@ -1700,13 +1723,14 @@ mod tests {
         let base = tool_definitions();
         assert!(!names(&base).contains(&"memory_fetch"), "got: {base}");
         // Flag off (every existing caller, the inert default) → not advertised.
-        let without = merged_tool_definitions(&NoMcp, false, false, false, false, false, false);
+        let without =
+            merged_tool_definitions(&NoMcp, false, false, false, false, false, false, false);
         assert!(!names(&without).contains(&"memory_fetch"));
         // Flag on → advertised.
-        let with = merged_tool_definitions(&NoMcp, false, false, true, false, false, false);
+        let with = merged_tool_definitions(&NoMcp, false, false, true, false, false, false, false);
         assert!(names(&with).contains(&"memory_fetch"), "got: {with}");
         // Independent of the save_note / recall gates: all three on lists all.
-        let all = merged_tool_definitions(&NoMcp, true, true, true, false, false, false);
+        let all = merged_tool_definitions(&NoMcp, true, true, true, false, false, false, false);
         assert!(names(&all).contains(&"save_note"));
         assert!(names(&all).contains(&"recall"));
         assert!(names(&all).contains(&"memory_fetch"));
@@ -2017,12 +2041,13 @@ mod tests {
                 .filter_map(|d| d["function"]["name"].as_str())
                 .collect()
         }
-        let with = merged_tool_definitions(&NoMcp, false, false, false, true, false, false);
+        let with = merged_tool_definitions(&NoMcp, false, false, false, true, false, false, false);
         assert!(names(&with).contains(&"git"), "with_git advertises git");
-        let without = merged_tool_definitions(&NoMcp, false, false, false, false, false, false);
+        let without =
+            merged_tool_definitions(&NoMcp, false, false, false, false, false, false, false);
         assert!(!names(&without).contains(&"git"), "no git without the gate");
         // #479: the /team toggle advertises both crew tools, and only then.
-        let team = merged_tool_definitions(&NoMcp, false, false, false, false, true, false);
+        let team = merged_tool_definitions(&NoMcp, false, false, false, false, true, false, false);
         assert!(
             names(&team).contains(&"crew") && names(&team).contains(&"compose_roster"),
             "with_team advertises crew + compose_roster"
@@ -2032,7 +2057,8 @@ mod tests {
             "no crew without the gate"
         );
         // Step 26.4 (#583): the scratchpad state tools, only with the gate on.
-        let scratch = merged_tool_definitions(&NoMcp, false, false, false, false, false, true);
+        let scratch =
+            merged_tool_definitions(&NoMcp, false, false, false, false, false, true, false);
         for t in ["state_set", "state_get", "state_clear"] {
             assert!(
                 names(&scratch).contains(&t),
@@ -2044,6 +2070,17 @@ mod tests {
                 "{t} is a real tool"
             );
         }
+        // Step 26.5.5 (#582): the code_search tool, only with its gate on.
+        let code = merged_tool_definitions(&NoMcp, false, false, false, false, false, false, true);
+        assert!(
+            names(&code).contains(&"code_search"),
+            "code_search advertised"
+        );
+        assert!(
+            !names(&without).contains(&"code_search"),
+            "code_search hidden without the gate"
+        );
+        assert!(!is_hallucination("code_search", &serde_json::json!({})));
     }
 
     #[tokio::test]
@@ -2060,6 +2097,7 @@ mod tests {
             20,
             &caveats,
             &mut NoMcp,
+            None,
             None,
             None,
             None,
@@ -2091,10 +2129,75 @@ mod tests {
             None,
             None,
             Some(&store as &dyn ScratchpadStore),
+            None,
         )
         .await;
         assert_eq!(set, "stored: k");
         assert_eq!(store.get("k").as_deref(), Some("v"));
+    }
+
+    #[tokio::test]
+    async fn code_search_dispatch_only_with_a_searcher() {
+        use crate::agentic::semantic::{CodeSearch, Embedder, SessionSemanticIndex};
+        struct E;
+        #[async_trait::async_trait]
+        impl Embedder for E {
+            async fn embed(&self, _t: &str) -> anyhow::Result<Vec<f32>> {
+                Ok(vec![1.0])
+            }
+        }
+        let caveats = crate::caveats::Caveats::top();
+        let args = serde_json::json!({ "query": "find it" });
+        // Step 26.5.5: no searcher → unknown tool (presence-gate parity).
+        let none = execute_tool(
+            "code_search",
+            &args,
+            ".",
+            false,
+            20,
+            &caveats,
+            &mut NoMcp,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(none.starts_with("unknown tool: code_search"), "{none}");
+        // with a searcher (empty index) → routes to the executor (labelled no-match).
+        let idx = SessionSemanticIndex::default();
+        let search = CodeSearch {
+            embedder: &E,
+            index: &idx,
+            top_k: 1,
+        };
+        let out = execute_tool(
+            "code_search",
+            &args,
+            ".",
+            false,
+            20,
+            &caveats,
+            &mut NoMcp,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(search),
+        )
+        .await;
+        assert!(out.contains("no code matched"), "{out}");
     }
 
     #[test]
@@ -2183,6 +2286,7 @@ mod execute_tool_branch_tests {
             git,
             None, // crew_runner
             None, // scratchpad_store
+            None, // code_search
         )
         .await
     }
@@ -2271,6 +2375,7 @@ mod execute_tool_branch_tests {
             None, // git_tool
             crew,
             None, // scratchpad_store
+            None, // code_search
         )
         .await
     }
@@ -2593,6 +2698,7 @@ mod execute_tool_branch_tests {
             None, // git_tool
             None, // crew_runner
             None, // scratchpad_store
+            None, // code_search
         )
         .await
     }
@@ -2912,6 +3018,7 @@ mod execute_tool_branch_tests {
             None, // git_tool
             None, // crew_runner
             None, // scratchpad_store
+            None, // code_search
         )
         .await
     }
@@ -3136,6 +3243,7 @@ mod execute_tool_branch_tests {
             None, // git_tool
             None, // crew_runner
             None, // scratchpad_store
+            None, // code_search
         )
         .await;
         assert_eq!(
@@ -3231,6 +3339,7 @@ mod execute_tool_branch_tests {
             None, // git_tool
             None, // crew_runner
             None, // scratchpad_store
+            None, // code_search
         )
         .await;
         assert_eq!(sink.calls, vec!["add:workspace builds with just check"]);
@@ -3289,6 +3398,7 @@ mod execute_tool_branch_tests {
             None, // git_tool
             None, // crew_runner
             None, // scratchpad_store
+            None, // code_search
         )
         .await;
         assert_eq!(
@@ -3350,6 +3460,7 @@ mod execute_tool_branch_tests {
             None, // git_tool
             None, // crew_runner
             None, // scratchpad_store
+            None, // code_search
         )
         .await;
         assert_eq!(out, "the exact note body");
@@ -3465,6 +3576,7 @@ mod disable_ocap_tests {
             None, // git_tool
             None, // crew_runner
             None, // scratchpad_store
+            None, // code_search
         )
         .await
     }
@@ -3876,6 +3988,7 @@ mod disable_ocap_tests {
             None, // git_tool
             None, // crew_runner
             None, // scratchpad_store
+            None, // code_search
         )
         .await;
         assert_eq!(out, "no-prompt\n");

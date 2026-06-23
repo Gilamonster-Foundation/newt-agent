@@ -9,6 +9,7 @@
 //! the whole subsystem in the fully-mocked unit tier. The real
 //! [`EmbeddingsClient`] (Ollama `/api/embeddings`) is wiremock-tested here.
 
+use super::display::{print_tool_call, print_tool_output};
 use async_trait::async_trait;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -416,6 +417,64 @@ pub fn gather_code_files(workspace: &str) -> Vec<(String, String)> {
     out
 }
 
+// --- Step 26.5.5: the code_search tool (model-callable retrieval) -----------
+
+/// The semantic searcher handed to the `code_search` tool (Step 26.5.5): an
+/// embedder + the session index + the default top_k, bundled into ONE `ChatCtx`
+/// field (both members are shared refs, so this is `Copy`).
+#[derive(Clone, Copy)]
+pub struct CodeSearch<'a> {
+    pub embedder: &'a dyn Embedder,
+    pub index: &'a dyn SemanticIndex,
+    pub top_k: usize,
+}
+
+/// The `code_search` tool definition (Step 26.5.5) — advertised only when the
+/// `semantic` feature is on and an index is present.
+pub fn code_search_tool_definition() -> serde_json::Value {
+    serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": "code_search",
+            "description": "Search the indexed codebase for the most relevant code by MEANING \
+                            (semantic/embedding search, not keyword) — use it to find where \
+                            something is implemented when you don't have a file path, e.g. \
+                            'where is the retry backoff computed'. Returns the top matching \
+                            code chunks with their file:line; then read_file the ones you need.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "What to find, in natural language or a symbol name." }
+                },
+                "required": ["query"]
+            }
+        }
+    })
+}
+
+/// Execute a `code_search` call (Step 26.5.5): embed the query, search the
+/// index, return the matching `<code_evidence>` (or a labelled no-match).
+pub(crate) async fn execute_code_search(
+    args: &serde_json::Value,
+    search: CodeSearch<'_>,
+    color: bool,
+    tool_output_lines: usize,
+) -> String {
+    let query = args["query"].as_str().unwrap_or("").trim();
+    print_tool_call("code_search", query, color);
+    if query.is_empty() {
+        return "error: code_search requires a non-empty `query`".to_string();
+    }
+    let out = match retrieve_evidence(query, search.embedder, search.index, search.top_k).await {
+        Some(block) => block,
+        None => "no code matched — the semantic index may be empty or the embedding model \
+                 unavailable; use read_file/find if you already know the path"
+            .to_string(),
+    };
+    print_tool_output(&out, tool_output_lines, color);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -800,5 +859,49 @@ class Dog:
         assert!(retrieve_evidence("aaa", &MockEmbedder, &empty, 1)
             .await
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn code_search_tool_embeds_searches_and_coaches() {
+        let files = vec![("a.rs".to_string(), "fn aaa() {}\nfn bbb() {}".to_string())];
+        let idx = SessionSemanticIndex::default();
+        index_files(&files, &MockEmbedder, &idx).await;
+        let search = CodeSearch {
+            embedder: &MockEmbedder,
+            index: &idx,
+            top_k: 1,
+        };
+        // a query → the matching <code_evidence>
+        let out =
+            execute_code_search(&serde_json::json!({"query": "aaaaa"}), search, false, 20).await;
+        assert!(
+            out.contains("<code_evidence>") && out.contains("aaa"),
+            "{out}"
+        );
+        // empty query → coaching, not a search
+        assert!(
+            execute_code_search(&serde_json::json!({}), search, false, 20)
+                .await
+                .starts_with("error:")
+        );
+        // empty index → a labelled no-match (never an empty string)
+        let empty = SessionSemanticIndex::default();
+        let s2 = CodeSearch {
+            embedder: &MockEmbedder,
+            index: &empty,
+            top_k: 1,
+        };
+        assert!(
+            execute_code_search(&serde_json::json!({"query": "x"}), s2, false, 20)
+                .await
+                .contains("no code matched")
+        );
+    }
+
+    #[test]
+    fn code_search_tool_definition_shape() {
+        let def = code_search_tool_definition();
+        assert_eq!(def["function"]["name"], "code_search");
+        assert!(def["function"]["parameters"]["properties"]["query"].is_object());
     }
 }
