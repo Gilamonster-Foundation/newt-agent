@@ -196,6 +196,68 @@ pub(crate) fn fmt_tokens(n: u32) -> String {
     out.chars().rev().collect()
 }
 
+// --- Context-budget gauge formatting (Step 24.5, #559) ---------------------
+//
+// The token gauge shows how full the context window is BEFORE compression
+// fires. Two display registers: a `used/budget` fraction in `k` (thousands) for
+// the live header — `899k/1024k` — and a single compact figure that rolls a
+// round window up to `M` (where **1M = 1024k**) for summary contexts.
+
+/// Tokens as a rounded `k` (thousands) figure, e.g. `899_000 → "899k"`. The
+/// fraction register used by the live gauge.
+pub(crate) fn fmt_tokens_k(n: u32) -> String {
+    format!("{}k", (n + 500) / 1000)
+}
+
+/// Tokens as a compact figure: `"Nk"` below 1024k, otherwise `"N[.N]M"` with
+/// **1M = 1024k** (so a 1,024,000-token window reads `1M`, 1,536,000 → `1.5M`).
+pub fn fmt_tokens_compact(n: u32) -> String {
+    let k = (n + 500) / 1000;
+    if k >= 1024 {
+        let m = k as f64 / 1024.0;
+        if (m - m.round()).abs() < 0.05 {
+            format!("{}M", m.round() as u64)
+        } else {
+            format!("{m:.1}M")
+        }
+    } else {
+        format!("{k}k")
+    }
+}
+
+/// `used/budget` gauge in `k`, e.g. `"899k/1024k"`.
+pub fn fmt_token_gauge(used: u32, budget: u32) -> String {
+    format!("{}/{}", fmt_tokens_k(used), fmt_tokens_k(budget))
+}
+
+/// Fill-level band for the gauge — color-type-agnostic so each caller maps it to
+/// its own palette (crossterm for the scroller, ratatui for the rich header).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GaugeLevel {
+    /// Under 75% — comfortable.
+    Ok,
+    /// 75–90% — approaching the send budget.
+    Warn,
+    /// 90%+ — compression is imminent.
+    Critical,
+}
+
+/// Classify a `used/budget` fill into a [`GaugeLevel`] (green / amber / red).
+pub fn gauge_level(used: u32, budget: u32) -> GaugeLevel {
+    let pct = if budget == 0 {
+        0
+    } else {
+        (used as u64 * 100 / budget as u64) as u32
+    };
+    if pct >= 90 {
+        GaugeLevel::Critical
+    } else if pct >= 75 {
+        GaugeLevel::Warn
+    } else {
+        GaugeLevel::Ok
+    }
+}
+
 /// Print a context-overflow adaptation notice to the TUI stream.
 pub(crate) fn emit_overflow_notice(
     color: bool,
@@ -413,6 +475,65 @@ mod tests {
         assert_eq!(fmt_tokens(999), "999");
         assert_eq!(fmt_tokens(1_000), "1,000");
         assert_eq!(fmt_tokens(1_234_567), "1,234,567");
+    }
+
+    #[test]
+    fn gauge_formatting_k_compact_fraction_and_level() {
+        use super::{fmt_token_gauge, fmt_tokens_compact, fmt_tokens_k, gauge_level, GaugeLevel};
+        // k (rounded thousands)
+        assert_eq!(fmt_tokens_k(899_000), "899k");
+        assert_eq!(fmt_tokens_k(1_024_000), "1024k");
+        assert_eq!(fmt_tokens_k(512_400), "512k");
+        // compact: 1M = 1024k; round M drops the .0
+        assert_eq!(fmt_tokens_compact(899_000), "899k");
+        assert_eq!(fmt_tokens_compact(1_024_000), "1M");
+        assert_eq!(fmt_tokens_compact(2_048_000), "2M");
+        assert_eq!(fmt_tokens_compact(1_536_000), "1.5M");
+        // fraction
+        assert_eq!(fmt_token_gauge(899_000, 1_024_000), "899k/1024k");
+        // level bands: <75 Ok, 75–90 Warn, ≥90 Critical
+        assert_eq!(gauge_level(100, 1000), GaugeLevel::Ok);
+        assert_eq!(gauge_level(740, 1000), GaugeLevel::Ok);
+        assert_eq!(gauge_level(750, 1000), GaugeLevel::Warn);
+        assert_eq!(gauge_level(890, 1000), GaugeLevel::Warn);
+        assert_eq!(gauge_level(900, 1000), GaugeLevel::Critical);
+        assert_eq!(gauge_level(0, 0), GaugeLevel::Ok); // no budget → no panic
+    }
+
+    /// Visual preview for UX review (run with `--nocapture`). Not an assertion —
+    /// prints the gauge at several fills with colors so the format/thresholds
+    /// can be eyeballed. Ignored by default so it never adds CI noise.
+    #[test]
+    #[ignore = "visual preview; run with --ignored --nocapture"]
+    fn gauge_visual_preview() {
+        use super::{fmt_token_gauge, fmt_tokens_compact, gauge_level, GaugeLevel};
+        use crossterm::style::Color;
+        let color = |lvl: GaugeLevel| match lvl {
+            GaugeLevel::Ok => Color::Green,
+            GaugeLevel::Warn => Color::DarkYellow,
+            GaugeLevel::Critical => Color::Red,
+        };
+        let paint = |c: Color, s: &str| match c {
+            Color::Green => format!("\x1b[32m{s}\x1b[0m"),
+            Color::DarkYellow => format!("\x1b[33m{s}\x1b[0m"),
+            Color::Red => format!("\x1b[31m{s}\x1b[0m"),
+            _ => s.to_string(),
+        };
+        let budget = 1_024_000;
+        println!("\n  context-budget gauge — fraction form (live header):");
+        for used in [102_000u32, 512_000, 800_000, 972_000, 1_010_000] {
+            let lvl = gauge_level(used, budget);
+            let g = fmt_token_gauge(used, budget);
+            println!("    {:<14} {:?}", paint(color(lvl), &g), lvl);
+        }
+        println!("\n  compact budget form (1M = 1024k):");
+        for n in [899_000u32, 1_024_000, 1_536_000, 2_048_000] {
+            println!("    {n:>9} → {}", fmt_tokens_compact(n));
+        }
+        println!(
+            "\n  mock header:\n    [2026-06-22 14:32:01] vi --INSERT-- nemotron @ dgx1.home.lab   {}\n",
+            paint(color(gauge_level(972_000, budget)), &fmt_token_gauge(972_000, budget)),
+        );
     }
 
     /// The narrator + list-item printers write to stdout (hard to capture here),

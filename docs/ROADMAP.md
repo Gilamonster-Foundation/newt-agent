@@ -1227,8 +1227,8 @@ this is the next free cluster.)* **Design: #559.**
 
 **UX (Part 2)**
 
-- **24.5** `fmt_tokens` gauge formatting (pure / table-driven): `1M` vs `1024k` vs `899k/1024k` (1M = 1024k) + threshold colors. Formatter + tests only, no wiring.
-- **24.6** live context-budget gauge in the header — wire 24.5 into `header_text` against `safe_context`/`max_ok_input`.
+- **24.5** ✅ **done** — `display.rs` gauge formatters: `fmt_token_gauge` (`899k/1024k`), `fmt_tokens_compact` (`1M` = 1024k), `gauge_level` (🟢<75% / 🟡75–90% / 🔴≥90%). Pure + table-driven tests; re-exported from `newt_core::agentic`.
+- **24.6** ✅ **done** — the gauge is wired into the RichTUI `header_line`: `set_runtime_context` threads `(used, budget)` (last turn's input tokens vs the resolved send budget = `max_ok_input`/`safe_context`), refreshed per turn, colored by fill. Hidden until the budget is known.
 - **24.7** summarizer-state surface — promote `summarizing… → ✓ summarized / ↻ retrying / ⚠ fallback model / ⛔ static marker` out of the scrollback; make the static-marker last resort loud.
 
 **Selector seam (Part 3 — `progressive`/`distributed` delegated to #546)**
