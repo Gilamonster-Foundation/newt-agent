@@ -239,6 +239,35 @@ const DIRECT_TOOL_NAMES: &[&str] = &[
     "git",
 ];
 
+/// Every tool newt can dispatch by name — the base tools plus all
+/// presence-gated ones. Single source of truth for [`is_hallucination`] (which
+/// names are real) and [`nearest_tool_name`] (suggestion candidates). MCP
+/// `server__tool` names contain `__` and are matched separately.
+const ALL_TOOL_NAMES: &[&str] = &[
+    "run_command",
+    "read_file",
+    "write_file",
+    "edit_file",
+    "list_dir",
+    "find",
+    "use_skill",
+    "web_fetch",
+    "save_note",
+    "recall",
+    "memory_fetch",
+    "git",
+    "compose_roster",
+    "crew",
+    "state_set",
+    "state_get",
+    "state_clear",
+    "code_search",
+    "experience_record",
+    "experience_recall",
+    "plan_set",
+    "plan_advance",
+];
+
 /// Returns `true` if a tool call looks like a hallucination:
 /// - `run_command` called with a tool name as the shell command, or
 /// - An unknown tool name (excluding MCP-namespaced `server__tool` names).
@@ -252,31 +281,109 @@ pub(crate) fn is_hallucination(tool_name: &str, args: &serde_json::Value) -> boo
     if tool_name.contains("__") {
         return false;
     }
-    !matches!(
-        tool_name,
-        "run_command"
-            | "list_dir"
-            | "read_file"
-            | "write_file"
-            | "edit_file"
-            | "use_skill"
-            | "web_fetch"
-            | "find"
-            | "save_note"
-            | "recall"
-            | "memory_fetch"
-            | "git"
-            | "compose_roster"
-            | "crew"
-            | "state_set"
-            | "state_get"
-            | "state_clear"
-            | "code_search"
-            | "experience_record"
-            | "experience_recall"
-            | "plan_set"
-            | "plan_advance"
-    )
+    !ALL_TOOL_NAMES.contains(&tool_name)
+}
+
+/// Outcome of resolving a foreign / hallucinated tool name against newt's real
+/// tools (Step 27.1). Weak local models routinely emit tool names learned from
+/// other agent harnesses (`str_replace_editor`, `execute`, `bash`); without a
+/// resolution layer each such call is a flat "unknown tool" that burns a whole
+/// tool-call round, so the model narrates instead of acting (the #215 advisory
+/// drift). Resolving them turns a wasted round into a self-correcting one.
+enum AliasOutcome {
+    /// A foreign name whose argument shape matches a real newt tool: rewrite the
+    /// call to this canonical name and dispatch it transparently.
+    Rewrite(&'static str),
+    /// A foreign name whose arguments do NOT match the real tool: return this
+    /// correction (naming the right tool + its signature) so the model retries.
+    Correct(String),
+}
+
+/// Map a non-newt tool name to a real tool, when we recognize it. Real tool
+/// names and MCP `server__tool` names return `None` and dispatch unchanged.
+fn resolve_tool_alias(name: &str) -> Option<AliasOutcome> {
+    match name {
+        // Shell aliases — same single `command` arg shape as run_command, so we
+        // rewrite and dispatch. (If the shell is unavailable this build, the
+        // run_command arm reports that — Step 27.3 presence-gates it.)
+        "execute" | "exec" | "bash" | "shell" | "sh" | "zsh" | "terminal" | "run_shell_command"
+        | "shell_command" | "system" => Some(AliasOutcome::Rewrite("run_command")),
+        // Edit aliases — different arg shape; point at edit_file's signature.
+        "str_replace_editor" | "str_replace" | "str-replace-editor" | "apply_patch" | "edit"
+        | "editor" | "replace_in_file" | "search_replace" => Some(AliasOutcome::Correct(format!(
+            "'{name}' is not a newt tool. To change an existing file, call \
+                 edit_file with {{\"path\", \"old_string\", \"new_string\"}} \
+                 (replaces one exact occurrence). For a new file or a full \
+                 rewrite, call write_file with {{\"path\", \"content\"}}."
+        ))),
+        // Create-file aliases — point at write_file.
+        "create_file" | "new_file" | "createfile" | "add_file" | "touch" => {
+            Some(AliasOutcome::Correct(format!(
+                "'{name}' is not a newt tool. To create or overwrite a file, call \
+                 write_file with {{\"path\", \"content\"}}. To change part of an \
+                 existing file, call edit_file with \
+                 {{\"path\", \"old_string\", \"new_string\"}}."
+            )))
+        }
+        // Read / list aliases — point at read_file / list_dir.
+        "cat" | "open_file" | "view_file" | "view" | "open" => {
+            Some(AliasOutcome::Correct(format!(
+                "'{name}' is not a newt tool. To read a file, call read_file with \
+                 {{\"path\"}}. To list a directory, call list_dir with {{\"path\"}}."
+            )))
+        }
+        _ => None,
+    }
+}
+
+/// Classic Levenshtein edit distance (pure two-row DP). Inputs are tool names
+/// (short), so the simple version is plenty — for fuzzy suggestions only.
+fn levenshtein(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0usize; b.len() + 1];
+    for (i, ca) in a.iter().enumerate() {
+        cur[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let cost = usize::from(ca != cb);
+            cur[j + 1] = (prev[j + 1] + 1).min(cur[j] + 1).min(prev[j] + cost);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
+}
+
+/// The closest real tool name to `name`, if one is near enough to be a likely
+/// typo/variant (distance ≤ ⌈len/3⌉, min 1). Returns `None` when nothing is
+/// close, so we never suggest a wildly-unrelated tool.
+fn nearest_tool_name(name: &str) -> Option<&'static str> {
+    let threshold = (name.chars().count() / 3).max(1);
+    ALL_TOOL_NAMES
+        .iter()
+        .map(|&t| (levenshtein(name, t), t))
+        .filter(|(d, _)| *d <= threshold)
+        .min_by_key(|(d, _)| *d)
+        .map(|(_, t)| t)
+}
+
+/// Corrective message for a genuinely-unknown tool name: name the real base
+/// tools and, when one is close, suggest it — so a weak model that missed the
+/// catalog gets a path back instead of a dead end (Step 27.1). Kept
+/// `unknown tool: {name}`-prefixed so existing `starts_with` checks hold.
+fn unknown_tool_message(name: &str) -> String {
+    const BASE: &str =
+        "run_command, read_file, write_file, edit_file, list_dir, find, use_skill, web_fetch";
+    match nearest_tool_name(name) {
+        Some(sugg) => format!(
+            "unknown tool: {name}. Did you mean '{sugg}'? Available tools include: \
+             {BASE} (plus git and any memory/plan tools enabled this session)."
+        ),
+        None => format!(
+            "unknown tool: {name}. Available tools include: {BASE} (plus git and \
+             any memory/plan tools enabled this session)."
+        ),
+    }
 }
 
 /// Build a shell prefix that exports venv/exec-path vars into the agent-bridle
@@ -972,6 +1079,17 @@ pub async fn execute_tool(
         return out;
     }
 
+    // Step 27.1: resolve foreign / hallucinated tool names (str_replace_editor,
+    // execute, bash, …) BEFORE the dispatch match. Compatible-arg aliases
+    // rewrite to the canonical name and dispatch transparently; the rest return
+    // a correction that names the right tool. Real names (and MCP `server__tool`
+    // names, handled above) fall through unchanged.
+    let name = match resolve_tool_alias(name) {
+        Some(AliasOutcome::Rewrite(canonical)) => canonical,
+        Some(AliasOutcome::Correct(msg)) => return msg,
+        None => name,
+    };
+
     match name {
         // Model-curated memory (Step 19.3): routes add / replace / remove
         // through the caller's NoteSink — the same MemoryManager → NoteStore
@@ -1605,7 +1723,7 @@ pub async fn execute_tool(
             }
         }
 
-        other => format!("unknown tool: {other}"),
+        other => unknown_tool_message(other),
     }
 }
 
@@ -3146,7 +3264,128 @@ mod execute_tool_branch_tests {
             None,
         )
         .await;
-        assert_eq!(out, "unknown tool: definitely_not_a_tool");
+        // Step 27.1: the bare "unknown tool: X" is now a corrective message that
+        // still leads with the same prefix but also names the real catalog.
+        assert!(
+            out.starts_with("unknown tool: definitely_not_a_tool"),
+            "got: {out}"
+        );
+        assert!(out.contains("Available tools include:"), "got: {out}");
+    }
+
+    // -- Step 27.1: tool-alias resolution + corrective feedback -------------
+
+    #[test]
+    fn alias_rewrites_shell_names_to_run_command() {
+        for n in [
+            "execute",
+            "exec",
+            "bash",
+            "shell",
+            "sh",
+            "zsh",
+            "terminal",
+            "run_shell_command",
+            "shell_command",
+            "system",
+        ] {
+            assert!(
+                matches!(
+                    resolve_tool_alias(n),
+                    Some(AliasOutcome::Rewrite("run_command"))
+                ),
+                "{n} should rewrite to run_command"
+            );
+        }
+    }
+
+    #[test]
+    fn alias_corrects_edit_and_create_names() {
+        for n in [
+            "str_replace_editor",
+            "str_replace",
+            "apply_patch",
+            "edit",
+            "replace_in_file",
+        ] {
+            let Some(AliasOutcome::Correct(msg)) = resolve_tool_alias(n) else {
+                panic!("{n} should produce a Correct outcome");
+            };
+            assert!(msg.contains("edit_file"), "{n}: {msg}");
+            assert!(msg.contains("write_file"), "{n}: {msg}");
+        }
+        for n in ["create_file", "new_file", "touch"] {
+            let Some(AliasOutcome::Correct(msg)) = resolve_tool_alias(n) else {
+                panic!("{n} should produce a Correct outcome");
+            };
+            assert!(msg.contains("write_file"), "{n}: {msg}");
+        }
+    }
+
+    #[test]
+    fn alias_passes_through_real_and_mcp_names() {
+        for n in [
+            "run_command",
+            "read_file",
+            "write_file",
+            "edit_file",
+            "git",
+            "plan_set",
+            "server__do_thing",
+        ] {
+            assert!(
+                resolve_tool_alias(n).is_none(),
+                "{n} must dispatch unchanged"
+            );
+        }
+    }
+
+    #[test]
+    fn levenshtein_matches_known_distances() {
+        assert_eq!(levenshtein("kitten", "sitting"), 3);
+        assert_eq!(levenshtein("read_file", "read_file"), 0);
+        assert_eq!(levenshtein("read_fil", "read_file"), 1);
+        assert_eq!(levenshtein("", "abc"), 3);
+    }
+
+    #[test]
+    fn nearest_tool_name_suggests_close_only() {
+        assert_eq!(nearest_tool_name("read_fil"), Some("read_file"));
+        assert_eq!(nearest_tool_name("edit_fil"), Some("edit_file"));
+        assert_eq!(nearest_tool_name("memory_fetchh"), Some("memory_fetch"));
+        assert_eq!(nearest_tool_name("definitely_not_a_tool"), None);
+    }
+
+    #[test]
+    fn unknown_tool_message_names_catalog_and_suggestion() {
+        let m = unknown_tool_message("read_fil");
+        assert!(m.starts_with("unknown tool: read_fil"), "{m}");
+        assert!(m.contains("Did you mean 'read_file'"), "{m}");
+        assert!(m.contains("Available tools include:"), "{m}");
+
+        let m2 = unknown_tool_message("zzzzzzzzzzzz");
+        assert!(m2.starts_with("unknown tool: zzzzzzzzzzzz"), "{m2}");
+        assert!(!m2.contains("Did you mean"), "{m2}");
+        assert!(m2.contains("Available tools include:"), "{m2}");
+    }
+
+    /// An incompatible-arg alias is corrected (not dead-ended) by execute_tool:
+    /// a model that emits `str_replace_editor` is told to use edit_file. The
+    /// correction returns before any fs/caveat work, so this is deterministic.
+    #[tokio::test]
+    async fn execute_tool_corrects_str_replace_editor_alias() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let caveats = caveats_rw(ws.path());
+        let out = run_tool(
+            "str_replace_editor",
+            serde_json::json!({"command": "str_replace", "path": "f.txt"}),
+            ws.path(),
+            &caveats,
+            None,
+        )
+        .await;
+        assert!(out.contains("edit_file"), "got: {out}");
+        assert!(!out.starts_with("unknown tool"), "got: {out}");
     }
 
     // -- #263 prompted permission grants through execute_tool ---------------

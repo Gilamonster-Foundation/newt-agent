@@ -1281,6 +1281,60 @@ surface or a non-CommonMark parser). One PR per step.
 
 ---
 
+# Phase 27 — Loop hardening for weak local models
+
+Promotes the unscheduled **"Loop hardening"** track named after Step 9.7
+(#214 TextMode salvage, #215 advisory drift — "the agent narrates instead of
+editing", #216 effective `num_ctx`). Driven by a real failure: against a local
+`nemotron-3-nano:30b` (Ollama @ dgx1), multi-step coding tasks die at the
+`max_tool_rounds` cap. Forensics (`~/.newt` turns 165–167) show the model *can*
+use tools (`read_file`/`find`/`list_dir`/`git status` all succeed) but **every
+path to *acting* is broken or hidden**, so it thrashes and narrates: the generic
+`run_command` shell is dead in this build yet advertised first; the real editor
+`edit_file` is never found because the model emits `str_replace_editor` and gets
+a flat "unknown tool"; `git checkout` is advertised but unimplemented. Raising
+`max_tool_rounds` only lets it thrash longer. This cluster makes each round
+*productive*. Home: `newt-core::agentic` (benefits TUI + ACP). One PR per step,
+fully-mocked unit tier, coverage ratchet.
+
+- **27.1** — **Tool-alias resolution + corrective catalog feedback**
+  (`newt-core/src/agentic/tools.rs`). A `resolve_tool_alias` layer ahead of the
+  dispatch match: compatible-arg aliases (`execute`/`exec`/`bash`/`shell`/… →
+  `run_command`) rewrite and dispatch transparently; incompatible-arg aliases
+  (`str_replace_editor`/`apply_patch`/`edit` → `edit_file`;
+  `create_file`/`new_file` → `write_file`) return a correction naming the right
+  tool + signature; a genuinely-unknown name returns the real tool catalog plus
+  a nearest-name (Levenshtein) suggestion instead of a dead-end "unknown tool".
+  `ALL_TOOL_NAMES` becomes the single source of truth for `is_hallucination`.
+- **27.2** — **`git checkout` (create+switch) + `branch-delete`; drop net ops**
+  (`newt-git/src/lib.rs`, `newt-core/src/agentic/git_tool.rs`). Implement the
+  advertised-but-missing ops the model reaches for; remove `pull`/`fetch`/`push`
+  from the schema (newt is local-only); fix the "unknown git op" help to list
+  the ops actually supported.
+- **27.3** — **Loop/dup guard + dead-shell suppression**
+  (`newt-core/src/agentic/mod.rs`, `tools.rs`). Track failed `(tool, args)` and
+  short-circuit exact repeats with a redirect nudge (mirrors the existing
+  `read_only_rounds` nudge); presence-gate `run_command` out of the catalog when
+  the shell is unavailable so the model isn't dangled a dead tool.
+- **27.4** — **Default-on `<plan>` + `<state>` for the local loadout + plan
+  nudge** (`newt-core/src/config.rs`, `newt-tui/src/lib.rs`). Make the Phase 26
+  scratchpad + scheduled-plan features default-on for local/Ollama loadouts
+  (cloud unchanged; explicit `[context.features]` still wins) and nudge
+  `plan_set`/`plan_advance`/`state_set`, so the weak model keeps a cross-round
+  checklist instead of re-deriving state every round.
+- **27.5** — **Plan-aware, honest cap-exit**
+  (`newt-core/src/agentic/mod.rs`, `compress.rs`). Salvage the `<plan>`/`<state>`
+  ledger into the final summary; when rounds were hallucination/dead-tool
+  dominated, say so rather than advising "raise max_tool_rounds".
+
+**Recommended order:** 27.1 → 27.2 → 27.4 → 27.3 → 27.5. Each step carries the
+acceptance contract (What / Test plan / Out of scope), wiremock'd Ollama mocks,
+in-memory store fakes, and the coverage ratchet. A `newt-eval` BAT/UAT case
+replays the real failing scenario ("persist context settings, then create the
+branch") against a scripted model as the durable regression gate.
+
+---
+
 # Backlog — unscheduled candidates
 
 Filed and triaged, not yet sequenced into a phase. Each entry links the issue and
