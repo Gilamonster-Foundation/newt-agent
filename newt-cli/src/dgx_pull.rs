@@ -334,7 +334,7 @@ pub fn bytes_to_gib(bytes: u64) -> f64 {
 // ---------------------------------------------------------------------------
 
 /// Single-quote a string for safe embedding in a POSIX shell command.
-fn sh_quote(s: &str) -> String {
+pub(crate) fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
