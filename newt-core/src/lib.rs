@@ -57,16 +57,17 @@ pub use agent_mesh_protocol::{Caveats, CountBound, Scope};
 // Issue #263: the prompted-ocap-grant seam (PermissionGate + friends) joins
 // the surface — the TUI implements the gate; headless callers pass None.
 pub use agentic::{
-    chat_complete, compress_user_initiated, execute_tool, gather_code_files, index_files,
-    memory_fetch_tool_definition, openai_chat_complete, retrieve_evidence, transcript_lines,
-    transcript_lines_styled, trim_for_summary, widen_caveats, ChatCtx, CodeSearch,
-    CompressCounters, CompressState, DenialKind, Embedder, EmbeddingsClient, ManualCompressOutcome,
-    McpTools, MemAddr, MemPayload, MemorySource, NoMcp, NoteNudge, NoteSink, PermissionDecision,
-    PermissionGate, PermissionRecord, PermissionRequest, RecallSource, RoundObservation,
-    ScratchpadStore, SemanticIndex, SessionScratchpadStore, SessionSemanticIndex,
-    SessionSpillStore, ShellObservation, SpillStore, StoreMemorySource, StoreRecallSource,
-    SummarizeFn, SummarizeFuture, Summarizer, TranscriptLine, TranscriptRole, TranscriptStyle,
-    TurnDriver, TurnDriverConfig, TurnDriverError, TurnOutcome, TurnStatus,
+    chat_complete, compress_user_initiated, execute_tool, experience_block, gather_code_files,
+    index_files, memory_fetch_tool_definition, openai_chat_complete, retrieve_evidence,
+    transcript_lines, transcript_lines_styled, trim_for_summary, widen_caveats, ChatCtx,
+    CodeSearch, CompressCounters, CompressState, DenialKind, Embedder, EmbeddingsClient,
+    ExperienceStore, ManualCompressOutcome, McpTools, MemAddr, MemPayload, MemorySource, NoMcp,
+    NoteNudge, NoteSink, PermissionDecision, PermissionGate, PermissionRecord, PermissionRequest,
+    RecallSource, RoundObservation, ScratchpadStore, SemanticIndex, SessionExperienceStore,
+    SessionScratchpadStore, SessionSemanticIndex, SessionSpillStore, ShellObservation, SpillStore,
+    StoreMemorySource, StoreRecallSource, SummarizeFn, SummarizeFuture, Summarizer, TranscriptLine,
+    TranscriptRole, TranscriptStyle, TurnDriver, TurnDriverConfig, TurnDriverError, TurnOutcome,
+    TurnStatus, EXPERIENCE_TOP_K,
 };
 pub use agents::AgentsProvider;
 pub use caveats::{CaveatsExt, CountBoundExt, ScopeExt};

@@ -170,6 +170,7 @@ pub(crate) fn merged_tool_definitions(
     with_team: bool,
     with_scratchpad: bool,
     with_code_search: bool,
+    with_experiential: bool,
 ) -> serde_json::Value {
     let mut defs = match tool_definitions() {
         serde_json::Value::Array(a) => a,
@@ -206,6 +207,11 @@ pub(crate) fn merged_tool_definitions(
     // `semantic` feature is on AND an index is present (presence gate).
     if with_code_search {
         defs.push(super::semantic::code_search_tool_definition());
+    }
+    // Step 26.6a (#585): the experiential record/recall tools, only with the gate.
+    if with_experiential {
+        defs.push(super::experiential::experience_record_tool_definition());
+        defs.push(super::experiential::experience_recall_tool_definition());
     }
     defs.extend(mcp.tool_defs());
     serde_json::Value::Array(defs)
@@ -260,6 +266,8 @@ pub(crate) fn is_hallucination(tool_name: &str, args: &serde_json::Value) -> boo
             | "state_get"
             | "state_clear"
             | "code_search"
+            | "experience_record"
+            | "experience_recall"
     )
 }
 
@@ -944,6 +952,7 @@ pub async fn execute_tool(
     crew_runner: Option<&dyn CrewRunner>,
     scratchpad_store: Option<&dyn super::scratchpad::ScratchpadStore>,
     code_search: Option<super::semantic::CodeSearch<'_>>,
+    experience_store: Option<&dyn super::experiential::ExperienceStore>,
 ) -> String {
     // Remote MCP tools (namespaced `server__tool`) route to their server before
     // the built-in match. They carry no Caveats leash in this build.
@@ -1011,6 +1020,25 @@ pub async fn execute_tool(
             None => {
                 "unknown tool: code_search (semantic retrieval is off this session)".to_string()
             }
+        },
+
+        // Step 26.6a (#585): experiential record/recall — presence-gated on the
+        // store (advertised only when the `experiential` feature is on).
+        "experience_record" => match experience_store {
+            Some(s) => {
+                super::experiential::execute_experience_record(args, s, color, tool_output_lines)
+            }
+            None => "unknown tool: experience_record (experiential memory is off)".to_string(),
+        },
+        "experience_recall" => match experience_store {
+            Some(s) => super::experiential::execute_experience_recall(
+                args,
+                s,
+                super::experiential::EXPERIENCE_TOP_K,
+                color,
+                tool_output_lines,
+            ),
+            None => "unknown tool: experience_recall (experiential memory is off)".to_string(),
         },
 
         // Embedded git (PR4, #461): dispatch through the injected GitTool
@@ -1636,8 +1664,9 @@ mod tests {
 
     #[test]
     fn merged_tool_definitions_with_empty_mcp_is_builtin_set() {
-        let merged =
-            merged_tool_definitions(&NoMcp, false, false, false, false, false, false, false);
+        let merged = merged_tool_definitions(
+            &NoMcp, false, false, false, false, false, false, false, false,
+        );
         let names: Vec<&str> = merged
             .as_array()
             .unwrap()
@@ -1675,11 +1704,14 @@ mod tests {
         let base = tool_definitions();
         assert!(!names(&base).contains(&"save_note"), "got: {base}");
         // … nor in the merged set without a sink …
-        let without =
-            merged_tool_definitions(&NoMcp, false, false, false, false, false, false, false);
+        let without = merged_tool_definitions(
+            &NoMcp, false, false, false, false, false, false, false, false,
+        );
         assert!(!names(&without).contains(&"save_note"));
         // … but a sink advertises it.
-        let with = merged_tool_definitions(&NoMcp, true, false, false, false, false, false, false);
+        let with = merged_tool_definitions(
+            &NoMcp, true, false, false, false, false, false, false, false,
+        );
         assert!(names(&with).contains(&"save_note"), "got: {with}");
     }
 
@@ -1697,13 +1729,17 @@ mod tests {
         }
         let base = tool_definitions();
         assert!(!names(&base).contains(&"recall"), "got: {base}");
-        let without =
-            merged_tool_definitions(&NoMcp, false, false, false, false, false, false, false);
+        let without = merged_tool_definitions(
+            &NoMcp, false, false, false, false, false, false, false, false,
+        );
         assert!(!names(&without).contains(&"recall"));
-        let with = merged_tool_definitions(&NoMcp, false, true, false, false, false, false, false);
+        let with = merged_tool_definitions(
+            &NoMcp, false, true, false, false, false, false, false, false,
+        );
         assert!(names(&with).contains(&"recall"), "got: {with}");
         // The two gates are independent: both on advertises both.
-        let both = merged_tool_definitions(&NoMcp, true, true, false, false, false, false, false);
+        let both =
+            merged_tool_definitions(&NoMcp, true, true, false, false, false, false, false, false);
         assert!(names(&both).contains(&"save_note"));
         assert!(names(&both).contains(&"recall"));
     }
@@ -1723,14 +1759,18 @@ mod tests {
         let base = tool_definitions();
         assert!(!names(&base).contains(&"memory_fetch"), "got: {base}");
         // Flag off (every existing caller, the inert default) → not advertised.
-        let without =
-            merged_tool_definitions(&NoMcp, false, false, false, false, false, false, false);
+        let without = merged_tool_definitions(
+            &NoMcp, false, false, false, false, false, false, false, false,
+        );
         assert!(!names(&without).contains(&"memory_fetch"));
         // Flag on → advertised.
-        let with = merged_tool_definitions(&NoMcp, false, false, true, false, false, false, false);
+        let with = merged_tool_definitions(
+            &NoMcp, false, false, true, false, false, false, false, false,
+        );
         assert!(names(&with).contains(&"memory_fetch"), "got: {with}");
         // Independent of the save_note / recall gates: all three on lists all.
-        let all = merged_tool_definitions(&NoMcp, true, true, true, false, false, false, false);
+        let all =
+            merged_tool_definitions(&NoMcp, true, true, true, false, false, false, false, false);
         assert!(names(&all).contains(&"save_note"));
         assert!(names(&all).contains(&"recall"));
         assert!(names(&all).contains(&"memory_fetch"));
@@ -2041,13 +2081,18 @@ mod tests {
                 .filter_map(|d| d["function"]["name"].as_str())
                 .collect()
         }
-        let with = merged_tool_definitions(&NoMcp, false, false, false, true, false, false, false);
+        let with = merged_tool_definitions(
+            &NoMcp, false, false, false, true, false, false, false, false,
+        );
         assert!(names(&with).contains(&"git"), "with_git advertises git");
-        let without =
-            merged_tool_definitions(&NoMcp, false, false, false, false, false, false, false);
+        let without = merged_tool_definitions(
+            &NoMcp, false, false, false, false, false, false, false, false,
+        );
         assert!(!names(&without).contains(&"git"), "no git without the gate");
         // #479: the /team toggle advertises both crew tools, and only then.
-        let team = merged_tool_definitions(&NoMcp, false, false, false, false, true, false, false);
+        let team = merged_tool_definitions(
+            &NoMcp, false, false, false, false, true, false, false, false,
+        );
         assert!(
             names(&team).contains(&"crew") && names(&team).contains(&"compose_roster"),
             "with_team advertises crew + compose_roster"
@@ -2057,8 +2102,9 @@ mod tests {
             "no crew without the gate"
         );
         // Step 26.4 (#583): the scratchpad state tools, only with the gate on.
-        let scratch =
-            merged_tool_definitions(&NoMcp, false, false, false, false, false, true, false);
+        let scratch = merged_tool_definitions(
+            &NoMcp, false, false, false, false, false, true, false, false,
+        );
         for t in ["state_set", "state_get", "state_clear"] {
             assert!(
                 names(&scratch).contains(&t),
@@ -2071,7 +2117,9 @@ mod tests {
             );
         }
         // Step 26.5.5 (#582): the code_search tool, only with its gate on.
-        let code = merged_tool_definitions(&NoMcp, false, false, false, false, false, false, true);
+        let code = merged_tool_definitions(
+            &NoMcp, false, false, false, false, false, false, true, false,
+        );
         assert!(
             names(&code).contains(&"code_search"),
             "code_search advertised"
@@ -2081,6 +2129,18 @@ mod tests {
             "code_search hidden without the gate"
         );
         assert!(!is_hallucination("code_search", &serde_json::json!({})));
+        // Step 26.6a (#585): the experiential record/recall tools, only with the gate.
+        let exp = merged_tool_definitions(
+            &NoMcp, false, false, false, false, false, false, false, true,
+        );
+        for t in ["experience_record", "experience_recall"] {
+            assert!(names(&exp).contains(&t), "{t} advertised with_experiential");
+            assert!(!names(&without).contains(&t), "{t} hidden without the gate");
+            assert!(
+                !is_hallucination(t, &serde_json::json!({})),
+                "{t} is a real tool"
+            );
+        }
     }
 
     #[tokio::test]
@@ -2097,6 +2157,7 @@ mod tests {
             20,
             &caveats,
             &mut NoMcp,
+            None,
             None,
             None,
             None,
@@ -2129,6 +2190,7 @@ mod tests {
             None,
             None,
             Some(&store as &dyn ScratchpadStore),
+            None,
             None,
         )
         .await;
@@ -2167,6 +2229,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await;
         assert!(none.starts_with("unknown tool: code_search"), "{none}");
@@ -2195,9 +2258,53 @@ mod tests {
             None,
             None,
             Some(search),
+            None,
         )
         .await;
         assert!(out.contains("no code matched"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn experiential_dispatch_only_with_a_store() {
+        use crate::agentic::experiential::{ExperienceStore, SessionExperienceStore};
+        let caveats = crate::caveats::Caveats::top();
+        let args = serde_json::json!({
+            "task": "ci flake", "outcome": "fixed", "lesson": "pin the seed for the fuzz test"
+        });
+        // Step 26.6a: no store → unknown tool for BOTH arms (presence-gate parity).
+        for name in ["experience_record", "experience_recall"] {
+            let out = execute_tool(
+                name, &args, ".", false, 20, &caveats, &mut NoMcp, None, None, None, None, None,
+                None, None, None, None, None, None,
+            )
+            .await;
+            assert!(out.starts_with(&format!("unknown tool: {name}")), "{out}");
+        }
+        // with a store → record routes to the executor and mutates it.
+        let store = SessionExperienceStore::default();
+        let out = execute_tool(
+            "experience_record",
+            &args,
+            ".",
+            false,
+            20,
+            &caveats,
+            &mut NoMcp,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&store as &dyn ExperienceStore),
+        )
+        .await;
+        assert_eq!(out, "recorded experience");
+        assert_eq!(store.count(), 1);
     }
 
     #[test]
@@ -2287,6 +2394,7 @@ mod execute_tool_branch_tests {
             None, // crew_runner
             None, // scratchpad_store
             None, // code_search
+            None, // experience_store
         )
         .await
     }
@@ -2376,6 +2484,7 @@ mod execute_tool_branch_tests {
             crew,
             None, // scratchpad_store
             None, // code_search
+            None, // experience_store
         )
         .await
     }
@@ -2699,6 +2808,7 @@ mod execute_tool_branch_tests {
             None, // crew_runner
             None, // scratchpad_store
             None, // code_search
+            None, // experience_store
         )
         .await
     }
@@ -3019,6 +3129,7 @@ mod execute_tool_branch_tests {
             None, // crew_runner
             None, // scratchpad_store
             None, // code_search
+            None, // experience_store
         )
         .await
     }
@@ -3244,6 +3355,7 @@ mod execute_tool_branch_tests {
             None, // crew_runner
             None, // scratchpad_store
             None, // code_search
+            None, // experience_store
         )
         .await;
         assert_eq!(
@@ -3340,6 +3452,7 @@ mod execute_tool_branch_tests {
             None, // crew_runner
             None, // scratchpad_store
             None, // code_search
+            None, // experience_store
         )
         .await;
         assert_eq!(sink.calls, vec!["add:workspace builds with just check"]);
@@ -3399,6 +3512,7 @@ mod execute_tool_branch_tests {
             None, // crew_runner
             None, // scratchpad_store
             None, // code_search
+            None, // experience_store
         )
         .await;
         assert_eq!(
@@ -3461,6 +3575,7 @@ mod execute_tool_branch_tests {
             None, // crew_runner
             None, // scratchpad_store
             None, // code_search
+            None, // experience_store
         )
         .await;
         assert_eq!(out, "the exact note body");
@@ -3577,6 +3692,7 @@ mod disable_ocap_tests {
             None, // crew_runner
             None, // scratchpad_store
             None, // code_search
+            None, // experience_store
         )
         .await
     }
@@ -3989,6 +4105,7 @@ mod disable_ocap_tests {
             None, // crew_runner
             None, // scratchpad_store
             None, // code_search
+            None, // experience_store
         )
         .await;
         assert_eq!(out, "no-prompt\n");

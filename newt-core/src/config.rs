@@ -826,11 +826,11 @@ impl ContextFeature {
 
     /// Whether this feature is implemented yet. Flips true per feature as it
     /// lands (26.3–26.6). `tool_offload` 26.3 (#584); `scratchpad` 26.4 (#583);
-    /// `semantic` 26.5 (#582).
+    /// `semantic` 26.5 (#582); `experiential` 26.6a (#585).
     pub fn available(self) -> bool {
         match self {
-            Self::ToolOffload | Self::Scratchpad | Self::Semantic => true,
-            Self::Provenance | Self::Experiential | Self::Scheduled => false,
+            Self::ToolOffload | Self::Scratchpad | Self::Semantic | Self::Experiential => true,
+            Self::Provenance | Self::Scheduled => false,
         }
     }
 
@@ -2986,16 +2986,20 @@ mod tests {
             Some(ContextFeature::Scratchpad)
         );
         assert_eq!(ContextFeature::from_keyword("nope"), None);
-        // tool_offload (26.3), scratchpad (26.4), semantic (26.5) shipped; the
-        // other three are still pending.
+        // tool_offload (26.3), scratchpad (26.4), semantic (26.5), experiential
+        // (26.6a) shipped; provenance + scheduled are still pending.
         assert!(ContextFeature::ToolOffload.available());
         assert!(ContextFeature::Scratchpad.available());
         assert!(ContextFeature::Semantic.available());
+        assert!(ContextFeature::Experiential.available());
         assert!(ContextFeature::ALL
             .iter()
             .filter(|f| !matches!(
                 f,
-                ContextFeature::ToolOffload | ContextFeature::Scratchpad | ContextFeature::Semantic
+                ContextFeature::ToolOffload
+                    | ContextFeature::Scratchpad
+                    | ContextFeature::Semantic
+                    | ContextFeature::Experiential
             ))
             .all(|f| !f.available()));
         // issues route to the right tracking ticket
