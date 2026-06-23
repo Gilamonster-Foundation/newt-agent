@@ -4020,6 +4020,117 @@ mod tool_round_cap_tests {
         assert!(!streamed);
     }
 
+    /// UAT (Step 27.3 + 27.5, simulated integration): a thrash run — a DISTINCT
+    /// failing tool call every round (so the failed-call count climbs to the
+    /// cap) AND a final summary that also errors. The cap-exit must be HONEST:
+    /// name the tooling problem, never advise "raise max_tool_rounds".
+    struct ThrashResponder {
+        round: AtomicUsize,
+    }
+
+    impl Respond for ThrashResponder {
+        fn respond(&self, req: &Request) -> ResponseTemplate {
+            if request_has_tools(req) {
+                let n = self.round.fetch_add(1, Ordering::SeqCst);
+                // A distinct unknown tool each round → each fails and is NOT a
+                // repeat, so the guard records every one (wasted_calls climbs to
+                // the cap, which is what flips the cap-exit to honest advice).
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "message": {
+                        "content": "",
+                        "tool_calls": [{
+                            "function": { "name": format!("bogus_tool_{n}"), "arguments": {} }
+                        }]
+                    }
+                }))
+            } else {
+                // The final tools-disabled summary request ALSO fails (500),
+                // forcing the cap_exit_fallback path.
+                ResponseTemplate::new(500).set_body_string("model exploded")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn uat_thrash_run_gets_honest_cap_exit_not_raise_the_limit() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(ThrashResponder {
+                round: AtomicUsize::new(0),
+            })
+            .mount(&server)
+            .await;
+
+        let messages = msgs();
+        let caveats = Caveats::top();
+        let cap = 3;
+        let (reply, _streamed, _usage, hallu) = chat_complete(
+            ChatCtx {
+                url: &server.uri(),
+                model: "test-model",
+                kind: BackendKind::Ollama,
+                api_key: None,
+                messages: &messages,
+                task: "do the thing",
+                workspace: ".",
+                color: false,
+                markdown: false,
+                tool_offload: false,
+                spill_store: None,
+                scratchpad: false,
+                scratchpad_store: None,
+                code_search: None,
+                experience_store: None,
+                step_ledger: None,
+                caveats: &caveats,
+                max_tool_rounds: cap,
+                tool_output_lines: 20,
+                debug: false,
+                trace: false,
+                num_ctx: None,
+                connect_timeout_secs: 5,
+                inference_timeout_secs: 120,
+                mid_loop_trim_threshold: 40,
+                mid_loop_trim_tokens: None,
+                max_ok_input: None,
+                build_check_cmd: None,
+                safe_context: None,
+                recover_cw_400: None,
+                note_sink: None,
+                note_nudge: None,
+                recall_source: None,
+                memory_source: None,
+                summarizer: None,
+                compress_state: None,
+                tool_events: None,
+                permission_gate: None,
+                on_round_usage: None,
+                estimate_ratio: None,
+                exec_floor: None,
+                write_ledger: None,
+                cancel: None,
+                git_tool: None,
+                crew_runner: None,
+            },
+            &mut NoMcp,
+        )
+        .await
+        .expect("chat_complete should succeed even when the summary fails");
+
+        // Every round emitted a (distinct) bogus call → counted as a hallucination.
+        assert_eq!(hallu, cap as u32, "each round hallucinated a tool");
+        // Step 27.5: the cap-exit is HONEST — a tooling problem, NOT "raise the cap".
+        assert!(
+            reply.contains("tool calls that failed"),
+            "honest advice expected, got: {reply}"
+        );
+        assert!(
+            !reply.contains("raise [tui].max_tool_rounds"),
+            "must not blame the round cap on a thrash run: {reply}"
+        );
+    }
+
     #[tokio::test]
     async fn a_set_cancel_flag_abandons_the_turn_before_any_network_call() {
         // The interrupt checkpoint at the round-loop top runs before the first
