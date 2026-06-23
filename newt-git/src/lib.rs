@@ -26,7 +26,7 @@ use grit_lib::merge_trees::{
 };
 use grit_lib::objects::{parse_commit, serialize_commit, CommitData, ObjectId, ObjectKind};
 use grit_lib::porcelain::status::{collect_untracked_and_ignored, IgnoredMode};
-use grit_lib::refs::{read_head, write_ref};
+use grit_lib::refs::{delete_ref, read_head, resolve_ref, write_ref, write_symbolic_ref};
 use grit_lib::repo::Repository;
 use grit_lib::state::{resolve_head, HeadState};
 use grit_lib::write_tree::write_tree_from_index;
@@ -47,6 +47,11 @@ pub enum GitError {
     /// detached/unborn HEAD).
     #[error("unsupported: {0}")]
     Unsupported(&'static str),
+    /// The operation was refused for a runtime reason that carries a dynamic
+    /// message — e.g. deleting the current branch, or switching to a branch at a
+    /// different commit (no working-tree updater here). No side effects.
+    #[error("{0}")]
+    Refused(String),
     /// A rebase step produced a merge conflict; the rebase was aborted and the
     /// branch ref was left untouched (no side effects).
     #[error("rebase conflict at {0} — aborted, branch unchanged")]
@@ -572,6 +577,79 @@ impl GitEngine {
         write_ref(&self.repo.git_dir, &refname, &oid)?;
         Ok(refname)
     }
+
+    /// `git checkout [-b] <name>` — point HEAD at branch `<name>`, creating it at
+    /// the current commit first when `create` is set (the `-b` case the model
+    /// reaches for). Requires `refs` to permit the branch ref.
+    ///
+    /// newt is local-only and has no working-tree updater, so this only moves
+    /// HEAD when the target branch is at the SAME commit as the current HEAD
+    /// (always true for a freshly-created branch). Switching to a branch at a
+    /// different commit is *refused* rather than silently leaving the worktree
+    /// stale — no side effects on refusal.
+    pub fn checkout(
+        &self,
+        caps: &GitCaveats,
+        name: &str,
+        create: bool,
+    ) -> Result<String, GitError> {
+        let refname = format!("refs/heads/{name}");
+        if !caps.permits_ref(&refname) {
+            return Err(GitError::Denied("refs"));
+        }
+        let head = self.head_oid()?;
+        let existing = resolve_ref(&self.repo.git_dir, &refname).ok();
+        let (target, created) = match (existing, create) {
+            (Some(oid), _) => (Some(oid), false),
+            (None, true) => {
+                let oid = head.ok_or(GitError::Unsupported(
+                    "cannot create a branch from an unborn HEAD",
+                ))?;
+                write_ref(&self.repo.git_dir, &refname, &oid)?;
+                (Some(oid), true)
+            }
+            (None, false) => {
+                return Err(GitError::Refused(format!(
+                    "branch '{name}' does not exist (pass create=true to make it)"
+                )));
+            }
+        };
+        if target != head {
+            return Err(GitError::Refused(format!(
+                "refusing to switch to '{name}': it points at a different commit \
+                 than HEAD and newt cannot update the working tree (local-only). \
+                 Commit or stash first, or create a new branch at HEAD."
+            )));
+        }
+        write_symbolic_ref(&self.repo.git_dir, "HEAD", &refname)?;
+        Ok(if created {
+            format!("created and switched to branch '{name}'")
+        } else {
+            format!("switched to branch '{name}'")
+        })
+    }
+
+    /// `git branch -d <name>` — delete `refs/heads/<name>`. Requires `refs` to
+    /// permit the ref. Refuses to delete the branch HEAD is currently on, or a
+    /// branch that does not exist (no side effects on refusal).
+    pub fn branch_delete(&self, caps: &GitCaveats, name: &str) -> Result<String, GitError> {
+        let refname = format!("refs/heads/{name}");
+        if !caps.permits_ref(&refname) {
+            return Err(GitError::Denied("refs"));
+        }
+        if let HeadState::Branch { short_name, .. } = resolve_head(&self.repo.git_dir)? {
+            if short_name == name {
+                return Err(GitError::Refused(format!(
+                    "cannot delete branch '{name}': it is the current branch"
+                )));
+            }
+        }
+        if resolve_ref(&self.repo.git_dir, &refname).is_err() {
+            return Err(GitError::Refused(format!("branch '{name}' does not exist")));
+        }
+        delete_ref(&self.repo.git_dir, &refname)?;
+        Ok(format!("deleted branch '{name}'"))
+    }
 }
 
 fn short_oid(oid: &ObjectId) -> String {
@@ -734,8 +812,29 @@ impl newt_core::agentic::GitTool for LocalGitTool {
                 let r = eng.branch(caps, name).map_err(s)?;
                 Ok(format!("created {r}"))
             }
+            "checkout" => {
+                let name = args
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .filter(|n| !n.trim().is_empty())
+                    .ok_or("checkout: 'name' (the branch to switch to) is required")?;
+                // Default to creating the branch when absent — the `checkout -b`
+                // the model reaches for to start work. Pass create=false for a
+                // plain switch to an existing branch.
+                let create = args.get("create").and_then(|v| v.as_bool()).unwrap_or(true);
+                eng.checkout(caps, name, create).map_err(s)
+            }
+            "branch-delete" => {
+                let name = args
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .filter(|n| !n.trim().is_empty())
+                    .ok_or("branch-delete: 'name' is required")?;
+                eng.branch_delete(caps, name).map_err(s)
+            }
             other => Err(format!(
-                "unknown git op '{other}' (use status|log|diff|add|commit|branch)"
+                "unknown git op '{other}' \
+                 (use status|log|diff|add|commit|amend|rebase|branch|checkout|branch-delete)"
             )),
         }
     }
@@ -939,6 +1038,117 @@ mod tests {
         assert!(d.files.iter().any(|f| f.path == "a.txt"));
     }
 
+    // -- Step 27.2: checkout (create+switch) + branch-delete ----------------
+
+    #[test]
+    fn checkout_creates_and_switches_to_a_new_branch() {
+        let dir = repo_with_commit();
+        let eng = GitEngine::open(dir.path()).unwrap();
+        let msg = eng.checkout(&GitCaveats::top(), "feat/y", true).unwrap();
+        assert!(msg.contains("created and switched"), "{msg}");
+        // The system git agrees HEAD now points at the new branch.
+        let out = Command::new("git")
+            .current_dir(dir.path())
+            .args(["symbolic-ref", "--short", "HEAD"])
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "feat/y");
+    }
+
+    #[test]
+    fn checkout_switches_to_existing_branch_at_same_commit() {
+        let dir = repo_with_commit();
+        let eng = GitEngine::open(dir.path()).unwrap();
+        eng.branch(&GitCaveats::top(), "feat/z").unwrap(); // ref at HEAD, HEAD stays main
+        let msg = eng.checkout(&GitCaveats::top(), "feat/z", false).unwrap();
+        assert_eq!(msg, "switched to branch 'feat/z'");
+    }
+
+    #[test]
+    fn checkout_refuses_existing_branch_at_a_different_commit() {
+        let dir = repo_with_commit();
+        let p = dir.path();
+        // 'ahead' is one commit past main; switching there would need a worktree
+        // update, which newt does not do — it must refuse with no side effects.
+        git(p, &["checkout", "-q", "-b", "ahead"]);
+        std::fs::write(p.join("a.txt"), "v2\n").unwrap();
+        git(p, &["add", "a.txt"]);
+        git(
+            p,
+            &[
+                "-c",
+                "user.name=T",
+                "-c",
+                "user.email=t@e.c",
+                "commit",
+                "-q",
+                "-m",
+                "c2",
+            ],
+        );
+        git(p, &["checkout", "-q", "main"]);
+        let eng = GitEngine::open(p).unwrap();
+        let err = eng
+            .checkout(&GitCaveats::top(), "ahead", false)
+            .unwrap_err();
+        assert!(matches!(err, GitError::Refused(_)), "{err}");
+        let out = Command::new("git")
+            .current_dir(p)
+            .args(["symbolic-ref", "--short", "HEAD"])
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "main");
+    }
+
+    #[test]
+    fn checkout_missing_branch_without_create_is_refused() {
+        let dir = repo_with_commit();
+        let eng = GitEngine::open(dir.path()).unwrap();
+        let err = eng.checkout(&GitCaveats::top(), "nope", false).unwrap_err();
+        assert!(matches!(err, GitError::Refused(_)), "{err}");
+    }
+
+    #[test]
+    fn branch_delete_removes_a_non_current_branch() {
+        let dir = repo_with_commit();
+        let eng = GitEngine::open(dir.path()).unwrap();
+        eng.branch(&GitCaveats::top(), "scratch").unwrap();
+        let msg = eng.branch_delete(&GitCaveats::top(), "scratch").unwrap();
+        assert_eq!(msg, "deleted branch 'scratch'");
+        let exists = Command::new("git")
+            .current_dir(dir.path())
+            .args(["rev-parse", "--verify", "--quiet", "refs/heads/scratch"])
+            .status()
+            .unwrap()
+            .success();
+        assert!(!exists, "ref must be gone after branch-delete");
+    }
+
+    #[test]
+    fn branch_delete_refuses_current_branch_and_missing() {
+        let dir = repo_with_commit();
+        let eng = GitEngine::open(dir.path()).unwrap();
+        let cur = eng.branch_delete(&GitCaveats::top(), "main").unwrap_err();
+        assert!(matches!(cur, GitError::Refused(_)), "{cur}");
+        let missing = eng.branch_delete(&GitCaveats::top(), "ghost").unwrap_err();
+        assert!(matches!(missing, GitError::Refused(_)), "{missing}");
+    }
+
+    #[test]
+    fn checkout_and_branch_delete_fail_closed_without_refs() {
+        let dir = repo_with_commit();
+        let eng = GitEngine::open(dir.path()).unwrap();
+        let ro = GitCaveats::read_only();
+        assert!(matches!(
+            eng.checkout(&ro, "x", true),
+            Err(GitError::Denied("refs"))
+        ));
+        assert!(matches!(
+            eng.branch_delete(&ro, "x"),
+            Err(GitError::Denied("refs"))
+        ));
+    }
+
     #[test]
     fn read_ops_fail_closed_without_read_capability() {
         let dir = repo_with_commit();
@@ -1066,6 +1276,49 @@ mod tests {
                 "Co-authored-by: qwen3:30b (newt-agent v0.6.8) <noreply@newt-agent.com>".into(),
             ),
         }
+    }
+
+    #[test]
+    fn dispatch_checkout_creates_branch_and_branch_delete_removes_it() {
+        let dir = repo_with_commit();
+        let t = tool(dir.path());
+        // checkout defaults create=true → `checkout -b`.
+        let out = t
+            .dispatch(
+                "checkout",
+                &serde_json::json!({"name": "feat/dispatch"}),
+                &GitCaveats::top(),
+            )
+            .unwrap();
+        assert!(out.contains("created and switched"), "{out}");
+        // Switch back to main (same commit), then delete the scratch branch.
+        t.dispatch(
+            "checkout",
+            &serde_json::json!({"name": "main", "create": false}),
+            &GitCaveats::top(),
+        )
+        .unwrap();
+        let del = t
+            .dispatch(
+                "branch-delete",
+                &serde_json::json!({"name": "feat/dispatch"}),
+                &GitCaveats::top(),
+            )
+            .unwrap();
+        assert_eq!(del, "deleted branch 'feat/dispatch'");
+    }
+
+    #[test]
+    fn dispatch_unknown_op_lists_the_supported_ops() {
+        let dir = repo_with_commit();
+        let t = tool(dir.path());
+        // 'pull' is no longer advertised or implemented (local-only).
+        let err = t
+            .dispatch("pull", &serde_json::json!({}), &GitCaveats::top())
+            .unwrap_err();
+        assert!(err.contains("unknown git op 'pull'"), "{err}");
+        assert!(err.contains("checkout"), "{err}");
+        assert!(err.contains("branch-delete"), "{err}");
     }
 
     #[test]
