@@ -1048,6 +1048,8 @@ pub async fn chat_complete(
 
     let mut accumulated_usage: Option<crate::TokenUsage> = None;
     let mut hallucination_count: u32 = 0;
+    // Step 27.3: guard against looping on a call that already failed this run.
+    let mut failed_calls = FailedCallGuard::default();
     let mut overflow_retries: u32 = 0;
     let mut suspicious_empty_retries: u32 = 0;
     // Hard context-window 400s recovered (parse limit → trim → retry). See #223.
@@ -1825,6 +1827,16 @@ pub async fn chat_complete(
             if is_hallucination(name, &args) {
                 hallucination_count += 1;
             }
+            // Step 27.3: short-circuit an exact repeat of a call that already
+            // failed this run — steer instead of re-executing the dead call. The
+            // bogus emission is still counted above; we just don't run it again.
+            if let Some(steer) = failed_calls.repeat_steer(name, &args) {
+                if let Some(rec) = tool_events.as_deref_mut() {
+                    rec.push(crate::ToolEvent::from_call(name, &args, false, Some(0)));
+                }
+                messages.push(serde_json::json!({ "role": "tool", "content": steer }));
+                continue;
+            }
             if !is_read_only_tool(name) {
                 round_wrote = true;
             }
@@ -1874,11 +1886,15 @@ pub async fn chat_complete(
             .await;
             // 17.6: record the call for the turn's events column — args are
             // digested (never stored raw), duration is a display claim.
+            // Step 27.3: classify once; remember failures so an exact repeat is
+            // short-circuited next round and the steer can escalate.
+            let ok = tools::tool_result_ok(&result);
+            failed_calls.record(name, &args, ok, &result);
             if let Some(rec) = tool_events.as_deref_mut() {
                 rec.push(crate::ToolEvent::from_call(
                     name,
                     &args,
-                    tools::tool_result_ok(&result),
+                    ok,
                     u64::try_from(tool_t0.elapsed().as_millis()).ok(),
                 ));
             }
@@ -1917,6 +1933,68 @@ pub async fn chat_complete(
 /// `save_note` writes *memory*, not the workspace — a round that only saved
 /// a note must not suppress the stop-exploring-start-writing nudge; `recall`
 /// (17.5) reads past conversations and is likewise pure exploration.
+/// First line of a tool result, capped — used as the remembered error reason in
+/// [`FailedCallGuard`] so the steering message is short.
+fn first_line(s: &str) -> String {
+    s.lines().next().unwrap_or("").chars().take(200).collect()
+}
+
+/// Per-run guard against a weak model looping on a tool call that already failed
+/// (Step 27.3). The forensic session showed the model re-issuing the *identical*
+/// failed `run_command` three times and re-reading the same file ~8×, burning
+/// rounds. Keyed by `(name, canonical args)`, it short-circuits an exact repeat
+/// with steering instead of re-executing it, and counts failures per tool name
+/// so the steer can escalate ("stop using `run_command` — it keeps failing this
+/// session; use the embedded tools"). This handles ANY persistently-failing tool
+/// — a dead shell, a denied command, an unimplemented op — without needing to
+/// know *why* it fails (shell availability is a build/config property with no
+/// clean runtime signal; see `tools::ocap_disabled` docs).
+#[derive(Default)]
+struct FailedCallGuard {
+    /// `(name + canonical args)` → first line of the error it last returned.
+    last_error: std::collections::HashMap<String, String>,
+    /// `name` → how many times it has failed this run (any args).
+    fails_by_tool: std::collections::HashMap<String, usize>,
+}
+
+impl FailedCallGuard {
+    /// How many consecutive failures of one tool before the steer escalates to
+    /// "stop using it".
+    const ESCALATE_AFTER: usize = 2;
+
+    fn key(name: &str, args: &serde_json::Value) -> String {
+        // The model emits byte-identical args when it loops (confirmed by the
+        // identical forensic args digests), so the compact JSON is a stable key.
+        format!("{name}\u{1}{args}")
+    }
+
+    /// Steering message if this exact `(name, args)` already failed this run,
+    /// else `None` (let it execute).
+    fn repeat_steer(&self, name: &str, args: &serde_json::Value) -> Option<String> {
+        let prev = self.last_error.get(&Self::key(name, args))?;
+        let mut msg = format!(
+            "You already called `{name}` with these exact arguments and it failed: {prev}. \
+             Do NOT repeat the same call — use a different tool or different arguments."
+        );
+        if self.fails_by_tool.get(name).copied().unwrap_or(0) >= Self::ESCALATE_AFTER {
+            msg.push_str(&format!(
+                " `{name}` has failed repeatedly this session; stop using it and prefer the \
+                 embedded tools (read_file, edit_file, write_file, find, git)."
+            ));
+        }
+        Some(msg)
+    }
+
+    /// Record a just-executed call's outcome (only failures are remembered).
+    fn record(&mut self, name: &str, args: &serde_json::Value, ok: bool, result: &str) {
+        if !ok {
+            self.last_error
+                .insert(Self::key(name, args), first_line(result));
+            *self.fails_by_tool.entry(name.to_string()).or_default() += 1;
+        }
+    }
+}
+
 fn is_read_only_tool(name: &str) -> bool {
     matches!(
         name,
@@ -2277,6 +2355,8 @@ pub async fn openai_chat_complete(
 
     let mut accumulated_usage: Option<crate::TokenUsage> = None;
     let mut hallucination_count: u32 = 0;
+    // Step 27.3: guard against looping on a call that already failed this run.
+    let mut failed_calls = FailedCallGuard::default();
     // Hard context-window 400s recovered (parse limit → trim → retry). See #223.
     let mut cw_retries: u32 = 0;
     // No-tools recovery (mirrors the Ollama path): a model that rejects the
@@ -2689,6 +2769,20 @@ pub async fn openai_chat_complete(
             if is_hallucination(name, &args) {
                 hallucination_count += 1;
             }
+            // Step 27.3: short-circuit an exact repeat of a failed call (mirrors
+            // the Ollama path; Responses uses function_call_output). Counted as a
+            // hallucination above first when applicable.
+            if let Some(steer) = failed_calls.repeat_steer(name, &args) {
+                if let Some(rec) = tool_events.as_deref_mut() {
+                    rec.push(crate::ToolEvent::from_call(name, &args, false, Some(0)));
+                }
+                messages.push(serde_json::json!({
+                    "role": "tool",
+                    "tool_call_id": id,
+                    "content": steer,
+                }));
+                continue;
+            }
             // Organic save_note use resets the memory-nudge counter (mirrors
             // the Ollama path).
             if name == "save_note" && note_sink.is_some() {
@@ -2739,11 +2833,14 @@ pub async fn openai_chat_complete(
             }
             // 17.6: record the call for the turn's events column (mirrors
             // the Ollama path) — digested args, duration as a display claim.
+            // Step 27.3: classify once; remember failures (mirrors Ollama path).
+            let ok = tools::tool_result_ok(&result);
+            failed_calls.record(name, &args, ok, &result);
             if let Some(rec) = tool_events.as_deref_mut() {
                 rec.push(crate::ToolEvent::from_call(
                     name,
                     &args,
-                    tools::tool_result_ok(&result),
+                    ok,
                     u64::try_from(tool_t0.elapsed().as_millis()).ok(),
                 ));
             }
@@ -2987,6 +3084,8 @@ pub async fn openai_responses_complete(
 
     let mut accumulated_usage: Option<crate::TokenUsage> = None;
     let mut hallucination_count: u32 = 0;
+    // Step 27.3: guard against looping on a call that already failed this run.
+    let mut failed_calls = FailedCallGuard::default();
     let mut tools_supported = true;
     let mut tools_unsupported_notified = false;
 
@@ -3105,6 +3204,20 @@ pub async fn openai_responses_complete(
             if is_hallucination(name, &args) {
                 hallucination_count += 1;
             }
+            // Step 27.3: short-circuit an exact repeat of a failed call
+            // (Responses shape: echo a function_call_output with the steer).
+            // Counted as a hallucination above first when applicable.
+            if let Some(steer) = failed_calls.repeat_steer(name, &args) {
+                if let Some(rec) = tool_events.as_deref_mut() {
+                    rec.push(crate::ToolEvent::from_call(name, &args, false, Some(0)));
+                }
+                input.push(serde_json::json!({
+                    "type": "function_call_output",
+                    "call_id": call_id,
+                    "output": steer,
+                }));
+                continue;
+            }
             if name == "save_note" && note_sink.is_some() {
                 if let Some(n) = note_nudge.as_deref_mut() {
                     n.note_saved();
@@ -3142,11 +3255,14 @@ pub async fn openai_responses_complete(
                 let excerpt: String = result.chars().take(120).collect();
                 print_debug(&format!("tool result: {excerpt:?}"), color);
             }
+            // Step 27.3: classify once; remember failures (mirrors Ollama path).
+            let ok = tools::tool_result_ok(&result);
+            failed_calls.record(name, &args, ok, &result);
             if let Some(rec) = tool_events.as_deref_mut() {
                 rec.push(crate::ToolEvent::from_call(
                     name,
                     &args,
-                    tools::tool_result_ok(&result),
+                    ok,
                     u64::try_from(tool_t0.elapsed().as_millis()).ok(),
                 ));
             }
@@ -3456,6 +3572,60 @@ async fn stream_response(
         println!();
     }
     Ok((full, usage))
+}
+
+#[cfg(test)]
+mod failed_call_guard_tests {
+    use super::*;
+
+    #[test]
+    fn short_circuits_exact_repeat_and_escalates() {
+        let mut g = FailedCallGuard::default();
+        let args = serde_json::json!({"command": "mkdir x"});
+        // First sight of the call → let it run (no steer).
+        assert!(g.repeat_steer("run_command", &args).is_none());
+        // After a failure, an exact repeat is steered, quoting the prior error.
+        g.record("run_command", &args, false, "error: shell unavailable");
+        let s = g.repeat_steer("run_command", &args).expect("repeat steers");
+        assert!(s.contains("already called"), "{s}");
+        assert!(s.contains("error: shell unavailable"), "{s}");
+        assert!(
+            !s.contains("stop using"),
+            "one failure → no escalation yet: {s}"
+        );
+        // A second (distinct-args) failure of the same tool crosses ESCALATE_AFTER.
+        g.record(
+            "run_command",
+            &serde_json::json!({"command": "ls"}),
+            false,
+            "error: denied",
+        );
+        let s2 = g.repeat_steer("run_command", &args).expect("still steers");
+        assert!(s2.contains("stop using"), "escalates: {s2}");
+    }
+
+    #[test]
+    fn ignores_successes_and_distinct_calls() {
+        let mut g = FailedCallGuard::default();
+        let a = serde_json::json!({"path": "f.rs"});
+        g.record("read_file", &a, true, "file contents"); // success → not remembered
+        assert!(g.repeat_steer("read_file", &a).is_none());
+        // A failure under different args does not short-circuit a distinct call.
+        let b = serde_json::json!({"path": "g.rs"});
+        g.record("read_file", &b, false, "error reading g.rs");
+        assert!(
+            g.repeat_steer("read_file", &a).is_none(),
+            "distinct args still run"
+        );
+        assert!(g.repeat_steer("read_file", &b).is_some());
+    }
+
+    #[test]
+    fn first_line_caps_and_takes_first() {
+        assert_eq!(first_line("one\ntwo\nthree"), "one");
+        assert_eq!(first_line(""), "");
+        assert_eq!(first_line(&"x".repeat(500)).chars().count(), 200);
+    }
 }
 
 #[cfg(test)]
