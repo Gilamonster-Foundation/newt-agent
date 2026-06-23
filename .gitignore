@@ -48,6 +48,10 @@ tsconfig.json
 package.json
 package-lock.json
 
+# Research source PDFs — large binaries; we commit the synthesis notes, not the
+# papers themselves (cite the arXiv id instead). See docs/research/*.md.
+docs/research/*.pdf
+
 # Local config / secrets — never commit
 .env
 .env.local
