@@ -555,4 +555,165 @@ Would you like to extend this engine to automatically build a complete visual de
 
 
 
+===
+Scholarly research at the intersection of context management and Retrieval-Augmented Generation (RAG) focuses on bridging the gap between unlimited context windows and strict token economies. Academic papers in this domain primarily address how to efficiently ingest, compress, and route both historical dialogue and external data. [1, 2, 3, 4, 5]  
+Key Scholarly Articles and Frameworks 
+
+• L-RAG (Lazy Retrieval-Augmented Generation): Explores how to balance available context with adaptive retrieval. The authors utilize hierarchical context management through entropy-based rules to dynamically switch between raw long-context prompting and targeted RAG retrieval, aiming to reduce execution costs while maintaining accuracy. 
+• Adaptive Context Management in RAG Systems: This paper investigates dialogue context management for personalized AI assistants. It demonstrates how integrating compression strategies alongside adaptive windowing reduces off-topic repetition from dialogue history, leaving room for targeted amplification of retrieved knowledge documents. 
+• Leveraging Long Context in Retrieval Augmented Language Models: This study (published in npj Digital Medicine) examines how RAG models and long-context Large Language Models intersect. It provides a map-reduce strategy known as BriefContext to combat retrieval density drop-offs (the "lost-in-the-middle" problem) without modifying underlying model weights. 
+• Self-Route Framework: This work details a benchmark comparison between RAG and long-context (LC) strategies. The research introduces an algorithmic method—Self-Route—that relies on model self-reflection to dynamically route queries to either a brute-force long-context model or a constrained RAG system depending on the needed complexity. 
+• A Survey of Context Engineering: A macro-analysis of over 1,400 research papers, this survey decomposes Context Engineering and outlines modern multi-agent, modular RAG, and memory-persistent architectural implementations. [2]  
+
+Primary Approaches to RAG-Based Context Management 
+Current literature categorizes context-management systems integrating full RAG into several specific architectures: 
+
+1. Semantic Routing & Self-Reflection: Systems use an initial context manager (such as a Critic Language Model) to determine whether an answer requires external knowledge or can be deduced from historical, in-session conversation. 
+2. Hierarchical Caching: Rather than executing full RAG retrievals on every single prompt turn, systems maintain a dynamic trace (e.g., FULL, COMPRESSED, or PLACEHOLDER) of previous data, retrieving full documents selectively only when semantic thresholds are met. 
+3. Graph-Augmented RAG (GraphRAG): Evaluated across numerous technical safety domains, this approach replaces or enhances vector embeddings with Knowledge Graphs (KG) to feed interconnected, semantically organized facts into the context window. [25]  
+
+If you would like, I can:Provide digital object identifiers (DOIs) or full abstract summaries for any of these specific articles.Detail the mathematical modeling used to calculate token trade-offs in context management.Explain how specific industries (like healthcare) implement these context-aware agents.Let me know which area you'd like to explore further. 
+AI responses may include mistakes.
+
+[1] https://arxiv.org/abs/2507.13334
+[2] https://arxiv.org/html/2507.13334v1
+[3] https://medium.com/@ronit.patil.16.2001/long-context-windows-vs-retrieval-augmented-generation-27ec1850a67a
+[4] https://medium.com/@ethanbrooks42/rag-is-dead-why-retrieval-augmented-generation-is-no-longer-the-future-of-ai-27734ba456a1
+[5] https://www.researchgate.net/publication/388966180_Knowledge_Graph_Combined_with_Retrieval-Augmented_Generation_for_Enhancing_LMs_Reasoning_A_Survey
+[6] https://arxiv.org/abs/2601.06551
+[7] https://arxiv.org/html/2601.06551v1
+[8] https://levelup.gitconnected.com/step-by-step-guide-to-building-your-first-rag-application-using-llamaindex-6b0aa35983cb
+[9] https://www.mdpi.com/1999-4893/15/2/70
+[10] https://www.researchgate.net/publication/405412171_Adaptive_context_management_in_RAG_systems_for_personalized_AI_assistants
+[11] https://www.nature.com/articles/s41746-025-01651-w
+[12] https://www.nature.com/articles/s41746-025-01651-w
+[13] https://pubmed.ncbi.nlm.nih.gov/40316710/
+[14] https://arxiv.org/pdf/2508.00476
+[15] https://arxiv.org/abs/2407.16833
+[16] https://aclanthology.org/2024.emnlp-industry.66.pdf
+[17] https://ai.plainenglish.io/rag-is-not-dead-but-blindly-using-it-might-be-415cb79da9b2
+[18] https://www.linkedin.com/pulse/advancing-retrieval-augmented-generation-rag-future-ai-ramachandran-ffsve
+[19] https://arxiv.org/html/2506.10408v1
+[20] https://huggingface.co/papers?q=trajectory+evidence
+[21] https://arxiv.org/html/2606.02245v1
+[22] https://huggingface.co/papers?q=context+relevance
+[23] https://www.emergentmind.com/topics/hierarchical-retrieval-augmented-generation-hierarchical-rag
+[24] https://www.emergentmind.com/topics/multi-turn-rag-conversations
+[25] https://arxiv.org/html/2604.13101v1
+
+===
+
+https://arxiv.org/abs/2601.06551
+
+
+[Submitted on 10 Jan 2026]
+L-RAG: Balancing Context and Retrieval with Entropy-Based Lazy Loading
+Sergii Voloshyn
+Retrieval-Augmented Generation (RAG) has emerged as the predominant paradigm for grounding Large Language Model outputs in factual knowledge, effectively mitigating hallucinations. However, conventional RAG systems operate under a "retrieve-always" assumption, querying vector databases for every input regardless of query complexity. This static approach incurs substantial computational overhead and inference latency, particularly problematic for high-throughput production deployments. We introduce L-RAG (Lazy Retrieval-Augmented Generation), an adaptive framework that implements hierarchical context management through entropy-based gating. L-RAG employs a two-tier architecture: queries are first processed with a compact document summary, and expensive chunk retrieval is triggered only when the model's predictive entropy exceeds a calibrated threshold, signaling genuine uncertainty. Through experiments on SQuAD 2.0 (N=500) using the Phi-2 model, we demonstrate that L-RAG provides a tunable accuracy-efficiency trade-off: at a conservative threshold (tau=0.5), L-RAG achieves 78.2% accuracy, matching Standard RAG (77.8%), with 8% retrieval reduction; at a balanced threshold (tau=1.0), retrieval reduction increases to 26% with modest accuracy trade-off (76.0%). Latency analysis shows that L-RAG saves 80-210ms per query when retrieval latency exceeds 500ms. Analysis of entropy distributions reveals statistically significant separation (p < 0.001) between correct predictions (H=1.72) and errors (H=2.20), validating entropy as a reliable uncertainty signal. L-RAG offers a practical, training-free approach toward more efficient RAG deployment, providing system architects with a configurable knob to balance accuracy and throughput requirements.
+Subjects:	Information Retrieval (cs.IR); Artificial Intelligence (cs.AI); Computation and Language (cs.CL)
+Cite as:	arXiv:2601.06551 [cs.IR]
+ 	(or arXiv:2601.06551v1 [cs.IR] for this version)
+ 
+https://doi.org/10.48550/arXiv.2601.06551
+Focus to learn more
+Submission history
+From: Sergii Voloshyn [view email]
+[v1] Sat, 10 Jan 2026 12:25:19 UTC (185 KB)
+
+===
+
+Bayesian-Agent: Posterior-Guided Skill Evolution for LLM Agent Harnesses
+Published on Jun 5
+·
+Submitted by
+wuxiaojun
+on Jun 9
+·
+IDEA-FinAI
+IDEA FinAI
+Authors:
+Xiaojun Wu
+,
+Cehao Yang
+,
+Honghao Liu
+,
+Xueyuan Lin
+,
+Wenjie Zhang
+,
+Zhichao Shi
+,
+Xuhui Jiang
+,
+Chengjin Xu
+,
+Jia Li
+,
+Jian Guo
+Abstract
+Bayesian-Agent presents a framework that treats reusable skills and SOPs as hypotheses for model success, using Bayesian inference to guide agent behavior and improve task performance through posterior-guided harness optimization.
+
+LLM agents increasingly rely on external inference conditions: prompts, tools, memory, SOPs, skills, and harness feedback. These assets can improve task execution without changing model weights, but they are often revised by heuristic reflection or by reusing observed successes and failures as if counts alone were reliable belief. We introduce Bayesian-Agent, a native and cross-harness framework that treats reusable skills and SOPs as hypotheses about whether a frozen model will succeed under a particular prompt, context, and harness environment. Bayesian-Agent records verified trajectory evidence, maintains a feature-conditioned categorical posterior over each skill, and maps posterior state into inspectable actions such as patch, split, compress, retire, and explore. Model-facing prompts receive executable guardrails and failure-mode patches, while posterior summaries remain available for audit. With deepseek-v4-flash, incremental repair improves SOP-Bench from 80\% to 95\%, Lifelong AgentBench from 90\% to 100\%, and RealFin-Bench from 45\% to 65\%. We further evaluate Bayesian-Agent's native backend and optional GenericAgent, mini-swe-agent, and Claude Code backends. The results include positive, negative, saturated, and case-study settings, suggesting that agent skill evolution is best viewed as posterior-guided harness optimization rather than uncalibrated prompt accumulation. The source code is available at https://github.com/DataArcTech/Bayesian-Agent.
+
+https://arxiv.org/abs/2606.08348
+
+===
+
+AgentSwing: Adaptive Parallel Context Management Routing for Long-Horizon Web Agents
+Published on Mar 28
+·
+Submitted by
+Zhaopeng Feng
+on Apr 13
+·
+Alibaba-NLP
+Alibaba-NLP
+Authors:
+Zhaopeng Feng
+,
+Liangcai Su
+,
+Zhen Zhang
+,
+Xinyu Wang
+,
+Xiaotian Zhang
+,
+Xiaobin Wang
+,
+Runnan Fang
+,
+Qi Zhang
+,
+Baixuan Li
+,
+Shihao Cai
+,
+Rui Ye
+,
+Hui Chen
+,
+Jiang Yong
+,
+Joey Tianyi Zhou
+,
+Chenxiong Qian
+,
+Pengjun Xie
+,
+Bryan Hooi
+,
+Zuozhu Liu
+,
+Jingren Zhou
+Abstract
+AgentSwing is a state-aware adaptive framework that improves long-horizon information-seeking by dynamically managing context through parallel branching and lookahead routing, outperforming static methods while reducing interaction requirements.
+
+As large language models (LLMs) evolve into autonomous agents for long-horizon information-seeking, managing finite context capacity has become a critical bottleneck. Existing context management methods typically commit to a single fixed strategy throughout the entire trajectory. Such static designs may work well in some states, but they cannot adapt as the usefulness and reliability of the accumulated context evolve during long-horizon search. To formalize this challenge, we introduce a probabilistic framework that characterizes long-horizon success through two complementary dimensions: search efficiency and terminal precision. Building on this perspective, we propose AgentSwing, a state-aware adaptive parallel context management routing framework. At each trigger point, AgentSwing expands multiple context-managed branches in parallel and uses lookahead routing to select the most promising continuation. Experiments across diverse benchmarks and agent backbones show that AgentSwing consistently outperforms strong static context management methods, often matching or exceeding their performance with up to 3times fewer interaction turns while also improving the ultimate performance ceiling of long-horizon web agents. Beyond the empirical gains, the proposed probabilistic framework provides a principled lens for analyzing and designing future context management strategies for long-horizon agents.
+
+https://arxiv.org/abs/2603.27490
+
+===
+
 

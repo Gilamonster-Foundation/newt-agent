@@ -18,6 +18,8 @@ mod display;
 mod git_tool;
 // Step 26.4 (#583): scratchpad structured-state — the `scratchpad` context feature.
 pub(crate) mod scratchpad;
+// Step 26.5 (#582): semantic repo-evidence retrieval (embedding RAG-for-code).
+pub(crate) mod semantic;
 // Step 26.3 (#584): tool-output offloading — the `tool_offload` context feature.
 pub(crate) mod spill;
 // Issue #308 — the cowork foundation: a non-blocking turn driver around
@@ -108,6 +110,10 @@ pub use git_tool::{git_tool_definition, GitTool};
 pub use markdown::{render_markdown, MarkdownStreamWriter, RenderOpts};
 pub use mcp::{McpTools, NoMcp};
 pub use scratchpad::{scratchpad_state_block, ScratchpadStore, SessionScratchpadStore};
+pub use semantic::{
+    chunk_source, code_evidence_block, cosine, CodeChunk, Embedder, EmbeddingsClient,
+    SemanticIndex, SessionSemanticIndex,
+};
 pub use spill::{SessionSpillStore, SpillStore};
 
 /// Align GFM table pipes in Markdown **source** (Step 25.5, #568) — plain text,
