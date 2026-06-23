@@ -111,8 +111,9 @@ pub use markdown::{render_markdown, MarkdownStreamWriter, RenderOpts};
 pub use mcp::{McpTools, NoMcp};
 pub use scratchpad::{scratchpad_state_block, ScratchpadStore, SessionScratchpadStore};
 pub use semantic::{
-    chunk_source, code_evidence_block, cosine, gather_code_files, index_files, retrieve_evidence,
-    CodeChunk, Embedder, EmbeddingsClient, SemanticIndex, SessionSemanticIndex,
+    chunk_source, code_evidence_block, code_search_tool_definition, cosine, gather_code_files,
+    index_files, retrieve_evidence, CodeChunk, CodeSearch, Embedder, EmbeddingsClient,
+    SemanticIndex, SessionSemanticIndex,
 };
 pub use spill::{SessionSpillStore, SpillStore};
 
@@ -548,6 +549,9 @@ pub struct ChatCtx<'a> {
     /// Session scratchpad store (Step 26.4). `None` = state tools not advertised
     /// and no `<state>` injected. Shared `&dyn` (interior mutability).
     pub scratchpad_store: Option<&'a dyn crate::agentic::scratchpad::ScratchpadStore>,
+    /// Semantic searcher for the `code_search` tool (Step 26.5.5). `None` = the
+    /// tool is not advertised (semantic off / no index). Bundles embedder+index.
+    pub code_search: Option<crate::agentic::semantic::CodeSearch<'a>>,
     pub caveats: &'a crate::caveats::Caveats,
     /// Maximum tool-call rounds before forcing a final tools-disabled
     /// completion (from `[tui].max_tool_rounds`, default 25).
@@ -948,6 +952,7 @@ pub async fn chat_complete(
         spill_store,
         scratchpad,
         scratchpad_store,
+        code_search,
         caveats,
         max_tool_rounds,
         tool_output_lines,
@@ -999,6 +1004,8 @@ pub async fn chat_complete(
     let advertise_memory_fetch = memory_source.is_some();
     // Step 26.4 (#583): state tools only when the feature is on AND a store exists.
     let advertise_scratchpad = scratchpad_store.is_some() && scratchpad;
+    // Step 26.5.5 (#582): the code_search tool when a searcher is present.
+    let advertise_code_search = code_search.is_some();
     let advertise_git = git_tool.is_some();
     let advertise_team = crew_runner.is_some();
 
@@ -1057,6 +1064,7 @@ pub async fn chat_complete(
         advertise_git,
         advertise_team,
         advertise_scratchpad,
+        advertise_code_search,
     );
     let tool_tokens = estimate_value_tokens(&tools);
     // Phase 20 §2.3: one sanitized calibration ratio per turn. The
@@ -1837,6 +1845,7 @@ pub async fn chat_complete(
                 // #479: the injected crew/team orchestration (None for headless).
                 crew_runner,
                 scratchpad_store,
+                code_search,
             )
             .await;
             // 17.6: record the call for the turn's events column — args are
@@ -2168,6 +2177,7 @@ pub async fn openai_chat_complete(
         spill_store,
         scratchpad,
         scratchpad_store,
+        code_search,
         caveats,
         max_tool_rounds,
         tool_output_lines,
@@ -2218,6 +2228,8 @@ pub async fn openai_chat_complete(
     let advertise_memory_fetch = memory_source.is_some();
     // Step 26.4 (#583): state tools only when the feature is on AND a store exists.
     let advertise_scratchpad = scratchpad_store.is_some() && scratchpad;
+    // Step 26.5.5 (#582): the code_search tool when a searcher is present.
+    let advertise_code_search = code_search.is_some();
     let advertise_git = git_tool.is_some();
     let advertise_team = crew_runner.is_some();
 
@@ -2261,6 +2273,7 @@ pub async fn openai_chat_complete(
         advertise_git,
         advertise_team,
         advertise_scratchpad,
+        advertise_code_search,
     );
     let tool_tokens = estimate_value_tokens(&tools);
     // Phase 20 §2.3: per-turn calibration ratio + real-token schema overhead
@@ -2683,6 +2696,7 @@ pub async fn openai_chat_complete(
                 // #479: the injected crew/team orchestration (None for headless).
                 crew_runner,
                 scratchpad_store,
+                code_search,
             )
             .await;
             if debug {
@@ -2864,6 +2878,7 @@ pub async fn openai_responses_complete(
         spill_store,
         scratchpad,
         scratchpad_store,
+        code_search,
         caveats,
         max_tool_rounds,
         tool_output_lines,
@@ -2906,6 +2921,8 @@ pub async fn openai_responses_complete(
     let advertise_memory_fetch = memory_source.is_some();
     // Step 26.4 (#583): state tools only when the feature is on AND a store exists.
     let advertise_scratchpad = scratchpad_store.is_some() && scratchpad;
+    // Step 26.5.5 (#582): the code_search tool when a searcher is present.
+    let advertise_code_search = code_search.is_some();
     let advertise_git = git_tool.is_some();
     let advertise_team = crew_runner.is_some();
 
@@ -2922,6 +2939,7 @@ pub async fn openai_responses_complete(
         advertise_git,
         advertise_team,
         advertise_scratchpad,
+        advertise_code_search,
     );
     let tools = tools_to_responses(&tools_chat);
 
@@ -3073,6 +3091,7 @@ pub async fn openai_responses_complete(
                 git_tool,
                 crew_runner,
                 scratchpad_store,
+                code_search,
             )
             .await;
             if debug {
@@ -3594,6 +3613,7 @@ mod tool_round_cap_tests {
                 spill_store: None,
                 scratchpad: false,
                 scratchpad_store: None,
+                code_search: None,
                 caveats: &caveats,
                 max_tool_rounds: cap,
                 tool_output_lines: 20,
@@ -3662,6 +3682,7 @@ mod tool_round_cap_tests {
                 spill_store: None,
                 scratchpad: false,
                 scratchpad_store: None,
+                code_search: None,
                 caveats: &caveats,
                 max_tool_rounds: 5,
                 tool_output_lines: 20,
@@ -3795,6 +3816,7 @@ mod tool_round_cap_tests {
                 spill_store: None,
                 scratchpad: false,
                 scratchpad_store: None,
+                code_search: None,
                 caveats: &caveats,
                 max_tool_rounds: 5,
                 tool_output_lines: 20,
@@ -3865,6 +3887,7 @@ mod tool_round_cap_tests {
                 spill_store: None,
                 scratchpad: false,
                 scratchpad_store: None,
+                code_search: None,
                 caveats: &caveats,
                 max_tool_rounds: cap,
                 tool_output_lines: 20,
@@ -3958,6 +3981,7 @@ mod tool_round_cap_tests {
                 spill_store: None,
                 scratchpad: false,
                 scratchpad_store: None,
+                code_search: None,
                 caveats: &caveats,
                 max_tool_rounds: 1,
                 tool_output_lines: 20,
@@ -4063,6 +4087,7 @@ mod tool_round_cap_tests {
                 spill_store: None,
                 scratchpad: false,
                 scratchpad_store: None,
+                code_search: None,
                 caveats: &caveats,
                 max_tool_rounds: 1,
                 tool_output_lines: 20,
@@ -4160,6 +4185,7 @@ mod tool_round_cap_tests {
                 spill_store: None,
                 scratchpad: false,
                 scratchpad_store: None,
+                code_search: None,
                 caveats: &caveats,
                 max_tool_rounds: 2,
                 tool_output_lines: 20,
@@ -4232,6 +4258,7 @@ mod tool_round_cap_tests {
                 None, // git_tool
                 None, // crew_runner
                 None, // scratchpad_store
+                None, // code_search
             )
             .await;
             assert!(
@@ -4295,6 +4322,7 @@ mod tool_round_cap_tests {
                 spill_store: None,
                 scratchpad: false,
                 scratchpad_store: None,
+                code_search: None,
                 caveats: &caveats,
                 max_tool_rounds: cap,
                 tool_output_lines: 20,
@@ -4443,6 +4471,7 @@ mod tool_round_cap_tests {
                 spill_store: None,
                 scratchpad: false,
                 scratchpad_store: None,
+                code_search: None,
                 caveats: &caveats,
                 max_tool_rounds: 10,
                 tool_output_lines: 5,
@@ -4530,6 +4559,7 @@ mod http_loop_tests {
             spill_store: None,
             scratchpad: false,
             scratchpad_store: None,
+            code_search: None,
             caveats,
             max_tool_rounds: 8,
             tool_output_lines: 20,
@@ -5413,6 +5443,7 @@ mod save_note_loop_tests {
             spill_store: None,
             scratchpad: false,
             scratchpad_store: None,
+            code_search: None,
             caveats,
             max_tool_rounds: 6,
             tool_output_lines: 20,
@@ -5890,6 +5921,7 @@ mod compression_loop_tests {
             spill_store: None,
             scratchpad: false,
             scratchpad_store: None,
+            code_search: None,
             caveats,
             max_tool_rounds: 12,
             tool_output_lines: 2,
@@ -7029,6 +7061,7 @@ mod observation_hook_tests {
             spill_store: None,
             scratchpad: false,
             scratchpad_store: None,
+            code_search: None,
             caveats,
             max_tool_rounds: 8,
             tool_output_lines: 20,
