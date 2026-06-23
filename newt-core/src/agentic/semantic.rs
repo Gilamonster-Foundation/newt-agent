@@ -299,22 +299,16 @@ pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
     }
 }
 
-/// Render the `<code_evidence>` block injected at the head of a turn (Step
-/// 26.5.3). `None` when the index has no hits — the OFF/empty bit-for-bit
-/// guarantee (mirror `scratchpad::build_state_block`). Hard-capped at
-/// `total_cap` chars so retrieval can't blow the send budget.
-pub(crate) fn build_code_evidence_block(
-    index: &dyn SemanticIndex,
-    query: &[f32],
-    top_k: usize,
-    total_cap: usize,
-) -> Option<String> {
-    let hits = index.search(query, top_k);
+/// Render a `<code_evidence>` block from already-ranked `hits` (Step 26.5.3).
+/// `None` when there are no hits — the OFF/empty bit-for-bit guarantee (mirror
+/// `scratchpad::build_state_block`). Hard-capped at `total_cap` chars so
+/// retrieval can't blow the send budget.
+fn render_hits(hits: &[(f32, CodeChunk)], total_cap: usize) -> Option<String> {
     if hits.is_empty() {
         return None;
     }
     let mut body = String::from("<code_evidence>\n");
-    for (score, chunk) in &hits {
+    for (score, chunk) in hits {
         let piece = format!(
             "// {}:{}-{} ({}, score {score:.2})\n{}\n\n",
             chunk.file, chunk.start_line, chunk.end_line, chunk.kind, chunk.text
@@ -327,6 +321,19 @@ pub(crate) fn build_code_evidence_block(
     }
     body.push_str("</code_evidence>");
     Some(body)
+}
+
+/// Render the `<code_evidence>` block for a query VECTOR (Step 26.5.3): search
+/// by cosine, render the top_k. The raw-cosine path (no rerank) behind the
+/// vector-only `code_evidence_block` entry — `retrieve_evidence` is the reranked
+/// path. `None` when the index has no hits.
+pub(crate) fn build_code_evidence_block(
+    index: &dyn SemanticIndex,
+    query: &[f32],
+    top_k: usize,
+    total_cap: usize,
+) -> Option<String> {
+    render_hits(&index.search(query, top_k), total_cap)
 }
 
 /// Render the `<code_evidence>` block with the default budget cap (Step 26.5) —
@@ -369,10 +376,52 @@ pub async fn index_files(
     indexed
 }
 
-/// Retrieve a `<code_evidence>` block for `query` (Step 26.5.4): embed the
-/// query, search `index`, render. `None` when the query can't embed, the index
-/// is empty, or nothing matches — so an absent embedding model is a silent
-/// no-op, not a turn failure.
+// --- Step 26.5.6: rerank (cheap, deterministic re-scoring) ------------------
+
+/// Over-fetch factor: retrieval pulls `top_k * RERANK_OVERFETCH` cosine
+/// candidates so the rerank can promote a slightly-lower-cosine but
+/// structurally-better chunk into the final top_k.
+const RERANK_OVERFETCH: usize = 3;
+/// A real definition outranks a raw line-window at near-equal similarity.
+const DEF_BOOST: f32 = 0.05;
+/// A chunk whose file path contains a query term is nudged up.
+const PATH_BOOST: f32 = 0.05;
+
+/// Re-score cosine `hits` with cheap, deterministic boosts (Step 26.5.6): a
+/// definition beats a raw window, and a file path matching a query term gets a
+/// nudge — then a STABLE re-sort by `(cosine + boost)` descending. The boosts
+/// are small, so they only reorder near-ties; with no boost applicable the
+/// cosine order is preserved bit-for-bit (a stable sort on already-cosine-sorted
+/// input). Pure + deterministic — no clock, no allocation beyond the term split.
+fn rerank(query: &str, hits: &mut [(f32, CodeChunk)]) {
+    let terms: Vec<String> = query
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| t.len() >= 3)
+        .map(str::to_lowercase)
+        .collect();
+    let boost = |chunk: &CodeChunk| -> f32 {
+        let mut b = 0.0;
+        if chunk.kind != "window" {
+            b += DEF_BOOST;
+        }
+        let file_lc = chunk.file.to_lowercase();
+        if terms.iter().any(|t| file_lc.contains(t.as_str())) {
+            b += PATH_BOOST;
+        }
+        b
+    };
+    hits.sort_by(|a, b| {
+        let sb = b.0 + boost(&b.1);
+        let sa = a.0 + boost(&a.1);
+        sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+    });
+}
+
+/// Retrieve a reranked `<code_evidence>` block for `query` (Step 26.5.4 +
+/// 26.5.6): embed the query, over-fetch cosine candidates, rerank with the cheap
+/// structural boosts, take the top_k, render. `None` when the query can't embed,
+/// the index is empty, or nothing matches — so an absent embedding model is a
+/// silent no-op, not a turn failure.
 pub async fn retrieve_evidence(
     query: &str,
     embedder: &dyn Embedder,
@@ -380,7 +429,10 @@ pub async fn retrieve_evidence(
     top_k: usize,
 ) -> Option<String> {
     let qv = embedder.embed(query).await.ok()?;
-    code_evidence_block(index, &qv, top_k)
+    let mut hits = index.search(&qv, top_k.saturating_mul(RERANK_OVERFETCH));
+    rerank(query, &mut hits);
+    hits.truncate(top_k);
+    render_hits(&hits, CODE_EVIDENCE_CAP)
 }
 
 /// Walk `workspace` for indexable code files (Step 26.5.4) — gitignore-aware,
@@ -903,5 +955,50 @@ class Dog:
         let def = code_search_tool_definition();
         assert_eq!(def["function"]["name"], "code_search");
         assert!(def["function"]["parameters"]["properties"]["query"].is_object());
+    }
+
+    #[test]
+    fn rerank_boosts_defs_and_paths_and_stays_stable() {
+        let c = |file: &str, kind: &str| CodeChunk {
+            file: file.to_string(),
+            start_line: 1,
+            end_line: 2,
+            kind: kind.to_string(),
+            text: "x".to_string(),
+        };
+        // a real def beats a raw window at EQUAL cosine
+        let mut hits = vec![(0.5, c("a.rs", "window")), (0.5, c("b.rs", "function"))];
+        rerank("anything", &mut hits);
+        assert_eq!(hits[0].1.kind, "function", "def promoted over window");
+        // a file-path term match (+0.05) overtakes a 0.02 cosine gap
+        let mut hits = vec![
+            (0.50, c("other.rs", "window")),
+            (0.48, c("retry.rs", "window")),
+        ];
+        rerank("where is retry handled", &mut hits);
+        assert_eq!(hits[0].1.file, "retry.rs", "path-term match promoted");
+        // a LARGE cosine gap is NOT overridden by the small boost
+        let mut hits = vec![(0.90, c("x.rs", "window")), (0.50, c("y.rs", "function"))];
+        rerank("anything", &mut hits);
+        assert_eq!(
+            hits[0].1.file, "x.rs",
+            "strong cosine wins over a small boost"
+        );
+        // no applicable boost → a cosine-sorted input is preserved bit-for-bit
+        let mut hits = vec![
+            (0.9, c("a.rs", "window")),
+            (0.6, c("b.rs", "window")),
+            (0.4, c("c.rs", "window")),
+        ];
+        let before = hits.clone();
+        rerank("zz", &mut hits); // "zz" < 3 chars → no terms → no boost
+        assert_eq!(hits, before, "no boost → cosine order unchanged");
+        // stable on ties: equal final score keeps input order
+        let mut hits = vec![
+            (0.5, c("first.rs", "window")),
+            (0.5, c("second.rs", "window")),
+        ];
+        rerank("zz", &mut hits);
+        assert_eq!(hits[0].1.file, "first.rs", "stable: ties keep input order");
     }
 }
