@@ -755,14 +755,213 @@ impl ContextManager {
     pub fn available(self) -> bool {
         matches!(self, Self::Standard)
     }
+
+    /// The default feature bundle this preset turns on (Phase 26, #588). A
+    /// preset is a named bundle of composable [`ContextFeature`]s; config and
+    /// `/context feature` overrides layer on top (see [`ContextFeatures`]).
+    /// Every preset currently resolves to the all-off baseline (today's
+    /// `standard` behavior) because no composable feature is implemented yet;
+    /// presets gain features as 26.3–26.6 land.
+    pub fn base_features(self) -> ContextFeatureSet {
+        ContextFeatureSet::default()
+    }
 }
 
-/// `[context]` config section (Step 24.8, #559).
+/// A composable context-management feature (Phase 26, #588) — an independent
+/// on/off technique under `[context.features]` and the `/context feature <name>
+/// on|off` command. None are implemented yet (`available()` is false for all);
+/// they land in 26.3–26.6 and report "not yet available" until then (same
+/// pattern as the `ContextManager` presets under #546).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextFeature {
+    /// Cap oversized tool outputs; spill the full payload to a re-readable store (#584).
+    ToolOffload,
+    /// Structured `<state>` store mutated via tools, kept out of the log (#583).
+    Scratchpad,
+    /// Structure-aligned retrieval of repo evidence (#582).
+    Semantic,
+    /// Provenance-preserving compaction with retrievable handles (#584).
+    Provenance,
+    /// Write-gated cross-task experience memory (#585).
+    Experiential,
+    /// Per-step compiled context view instead of a rolling buffer (#586).
+    Scheduled,
+}
+
+impl ContextFeature {
+    /// Every feature, in display order.
+    pub const ALL: [Self; 6] = [
+        Self::ToolOffload,
+        Self::Scratchpad,
+        Self::Semantic,
+        Self::Provenance,
+        Self::Experiential,
+        Self::Scheduled,
+    ];
+
+    /// Parse a keyword (case-insensitive; `-`/`_` interchangeable; short aliases).
+    pub fn from_keyword(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+            "tool_offload" | "tooloffload" | "offload" => Some(Self::ToolOffload),
+            "scratchpad" | "state" => Some(Self::Scratchpad),
+            "semantic" | "retrieval" => Some(Self::Semantic),
+            "provenance" | "handles" => Some(Self::Provenance),
+            "experiential" | "experience" => Some(Self::Experiential),
+            "scheduled" | "compiled" => Some(Self::Scheduled),
+            _ => None,
+        }
+    }
+
+    /// The canonical lowercase keyword (matches the `[context.features]` key).
+    pub fn keyword(self) -> &'static str {
+        match self {
+            Self::ToolOffload => "tool_offload",
+            Self::Scratchpad => "scratchpad",
+            Self::Semantic => "semantic",
+            Self::Provenance => "provenance",
+            Self::Experiential => "experiential",
+            Self::Scheduled => "scheduled",
+        }
+    }
+
+    /// Whether this feature is implemented yet. All false in the 26.1 foundation;
+    /// each flips true as it lands (26.3–26.6).
+    pub fn available(self) -> bool {
+        match self {
+            Self::ToolOffload
+            | Self::Scratchpad
+            | Self::Semantic
+            | Self::Provenance
+            | Self::Experiential
+            | Self::Scheduled => false,
+        }
+    }
+
+    /// The tracking issue for this feature (cited in "not yet available").
+    pub fn issue(self) -> u32 {
+        match self {
+            Self::ToolOffload | Self::Provenance => 584,
+            Self::Scratchpad => 583,
+            Self::Semantic => 582,
+            Self::Experiential => 585,
+            Self::Scheduled => 586,
+        }
+    }
+}
+
+/// The resolved on/off state of every context feature (Phase 26, #588) — the
+/// effective set after a `manager` preset's defaults and config/session
+/// overrides are applied.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ContextFeatureSet {
+    pub tool_offload: bool,
+    pub scratchpad: bool,
+    pub semantic: bool,
+    pub provenance: bool,
+    pub experiential: bool,
+    pub scheduled: bool,
+}
+
+impl ContextFeatureSet {
+    /// Read one feature's resolved state.
+    pub fn get(&self, f: ContextFeature) -> bool {
+        match f {
+            ContextFeature::ToolOffload => self.tool_offload,
+            ContextFeature::Scratchpad => self.scratchpad,
+            ContextFeature::Semantic => self.semantic,
+            ContextFeature::Provenance => self.provenance,
+            ContextFeature::Experiential => self.experiential,
+            ContextFeature::Scheduled => self.scheduled,
+        }
+    }
+
+    /// Set one feature's resolved state.
+    pub fn set(&mut self, f: ContextFeature, on: bool) {
+        match f {
+            ContextFeature::ToolOffload => self.tool_offload = on,
+            ContextFeature::Scratchpad => self.scratchpad = on,
+            ContextFeature::Semantic => self.semantic = on,
+            ContextFeature::Provenance => self.provenance = on,
+            ContextFeature::Experiential => self.experiential = on,
+            ContextFeature::Scheduled => self.scheduled = on,
+        }
+    }
+
+    /// The features currently on, in display order.
+    pub fn enabled(self) -> Vec<ContextFeature> {
+        ContextFeature::ALL
+            .into_iter()
+            .filter(|&f| self.get(f))
+            .collect()
+    }
+}
+
+/// Per-feature overrides under `[context.features]` (config) and `/context
+/// feature` (session) (Phase 26, #588). `None` inherits the `manager` preset's
+/// default; `Some(b)` forces the feature on/off.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextFeatures {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_offload: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scratchpad: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub experiential: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduled: Option<bool>,
+}
+
+impl ContextFeatures {
+    /// Read one feature's override (`None` = inherit the preset).
+    pub fn get(&self, f: ContextFeature) -> Option<bool> {
+        match f {
+            ContextFeature::ToolOffload => self.tool_offload,
+            ContextFeature::Scratchpad => self.scratchpad,
+            ContextFeature::Semantic => self.semantic,
+            ContextFeature::Provenance => self.provenance,
+            ContextFeature::Experiential => self.experiential,
+            ContextFeature::Scheduled => self.scheduled,
+        }
+    }
+
+    /// Set one feature's override.
+    pub fn set(&mut self, f: ContextFeature, v: Option<bool>) {
+        match f {
+            ContextFeature::ToolOffload => self.tool_offload = v,
+            ContextFeature::Scratchpad => self.scratchpad = v,
+            ContextFeature::Semantic => self.semantic = v,
+            ContextFeature::Provenance => self.provenance = v,
+            ContextFeature::Experiential => self.experiential = v,
+            ContextFeature::Scheduled => self.scheduled = v,
+        }
+    }
+
+    /// Layer these overrides onto a base set (a preset's defaults).
+    pub fn apply_to(&self, mut base: ContextFeatureSet) -> ContextFeatureSet {
+        for f in ContextFeature::ALL {
+            if let Some(v) = self.get(f) {
+                base.set(f, v);
+            }
+        }
+        base
+    }
+}
+
+/// `[context]` config section (Step 24.8, #559; features added Phase 26, #588).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextConfig {
-    /// Context-management strategy. Default `standard`.
+    /// Context-management strategy preset. Default `standard`.
     #[serde(default)]
     pub manager: ContextManager,
+
+    /// Per-feature overrides under `[context.features]` — each inherits the
+    /// `manager` preset's default unless explicitly set (Phase 26, #588).
+    #[serde(default)]
+    pub features: ContextFeatures,
 }
 
 /// How a thinking model's streamed reasoning is surfaced — the `[tui] thinking`
@@ -2716,6 +2915,64 @@ mod tests {
         let c: ContextConfig = toml::from_str("manager = \"progressive\"").unwrap();
         assert_eq!(c.manager, ContextManager::Progressive);
         assert_eq!(ContextConfig::default().manager, ContextManager::Standard);
+    }
+
+    #[test]
+    fn context_feature_keyword_alias_availability_and_issue() {
+        // canonical keyword round-trips
+        for f in ContextFeature::ALL {
+            assert_eq!(ContextFeature::from_keyword(f.keyword()), Some(f));
+        }
+        // aliases + hyphen/underscore/case
+        assert_eq!(
+            ContextFeature::from_keyword("TOOL-OFFLOAD"),
+            Some(ContextFeature::ToolOffload)
+        );
+        assert_eq!(
+            ContextFeature::from_keyword("offload"),
+            Some(ContextFeature::ToolOffload)
+        );
+        assert_eq!(
+            ContextFeature::from_keyword(" state "),
+            Some(ContextFeature::Scratchpad)
+        );
+        assert_eq!(ContextFeature::from_keyword("nope"), None);
+        // None are implemented yet — the whole point of the foundation.
+        assert!(ContextFeature::ALL.iter().all(|f| !f.available()));
+        // issues route to the right tracking ticket
+        assert_eq!(ContextFeature::Semantic.issue(), 582);
+        assert_eq!(ContextFeature::Scratchpad.issue(), 583);
+        assert_eq!(ContextFeature::ToolOffload.issue(), 584);
+        assert_eq!(ContextFeature::Provenance.issue(), 584);
+        assert_eq!(ContextFeature::Experiential.issue(), 585);
+        assert_eq!(ContextFeature::Scheduled.issue(), 586);
+    }
+
+    #[test]
+    fn context_features_override_layering_and_parse() {
+        use ContextFeature as F;
+        // Every preset resolves to all-off today (standard behavior).
+        let base = ContextManager::Standard.base_features();
+        assert!(base.enabled().is_empty());
+        // An override layers on top of the base, leaving others untouched.
+        let mut ov = ContextFeatures::default();
+        ov.set(F::Scratchpad, Some(true));
+        let resolved = ov.apply_to(base);
+        assert!(resolved.get(F::Scratchpad));
+        assert!(!resolved.get(F::Semantic));
+        assert_eq!(resolved.enabled(), vec![F::Scratchpad]);
+        // None override = inherit (no change); Some(false) = force off.
+        let mut ov2 = ContextFeatures::default();
+        ov2.set(F::Scratchpad, Some(false));
+        assert!(!ov2.apply_to(resolved).get(F::Scratchpad));
+        // [context.features] parses keyed by canonical keyword.
+        let c: ContextConfig = toml::from_str(
+            "manager = \"standard\"\n[features]\nsemantic = true\nscratchpad = false",
+        )
+        .unwrap();
+        assert_eq!(c.features.get(F::Semantic), Some(true));
+        assert_eq!(c.features.get(F::Scratchpad), Some(false));
+        assert_eq!(c.features.get(F::ToolOffload), None);
     }
 
     #[test]

@@ -3731,6 +3731,10 @@ fn run_chat(
     // Step 24.8 (#559): per-session context-manager override from
     // `/context manager <name>`. `None` defers to `[context].manager`.
     let mut context_manager_override: Option<newt_core::ContextManager> = None;
+    // Step 26.1 (#588): per-session context-FEATURE overrides from
+    // `/context feature <name> on|off`. Each `None` defers to `[context.features]`
+    // then the `manager` preset default.
+    let mut context_features_override = newt_core::ContextFeatures::default();
     // Step 24.6 (#559): the latest context-budget gauge `(used, budget)`, set
     // after each turn from the turn's input tokens + the resolved send budget,
     // and shown in the rich header for the NEXT prompt. `None` until known.
@@ -4322,68 +4326,26 @@ fn run_chat(
                         continue;
                     }
                     if slash_md == "context" || slash_md.starts_with("context ") {
-                        // Step 24.8 (#559): the context-manager selector seam.
-                        // Only `standard` is implemented; progressive/distributed
-                        // are owned by #546 and report "not yet available".
+                        // Step 24.8 (#559) / Step 26.1 (#588): the context-manager
+                        // preset selector + composable feature toggles. Only
+                        // `standard` / no features are implemented yet; the rest
+                        // report "not yet available" (#546 / #582–#586). Dispatch
+                        // is a pure, unit-tested helper.
                         let rest = slash_md.strip_prefix("context").unwrap_or("").trim();
-                        if rest.is_empty() || rest == "manager" {
-                            let cur = context_manager(&cfg, context_manager_override);
-                            let src = if context_manager_override.is_some() {
-                                "session"
-                            } else {
-                                "config"
-                            };
-                            print_newt(
-                                &format!(
-                                    "context manager: {} ({src}) — \
-                                     use /context manager standard|progressive|distributed",
-                                    cur.keyword()
-                                ),
-                                color,
-                                verbose,
-                            );
-                        } else if let Some(name) = rest.strip_prefix("manager ") {
-                            match newt_core::ContextManager::from_keyword(name.trim()) {
-                                Some(m) if m.available() => {
-                                    context_manager_override = Some(m);
-                                    print_newt(
-                                        &format!("context manager → {}", m.keyword()),
-                                        color,
-                                        verbose,
-                                    );
-                                }
-                                Some(m) => {
-                                    print_newt(
-                                        &format!(
-                                            "context manager '{}' is not yet available \
-                                             (see #546) — staying on {}",
-                                            m.keyword(),
-                                            context_manager(&cfg, context_manager_override)
-                                                .keyword()
-                                        ),
-                                        color,
-                                        verbose,
-                                    );
-                                }
-                                None => print_newt(
-                                    &format!(
-                                        "unknown context manager '{}' — \
-                                         use standard|progressive|distributed",
-                                        name.trim()
-                                    ),
-                                    color,
-                                    verbose,
-                                ),
-                            }
-                        } else {
-                            print_newt(
-                                &format!(
-                                    "unknown /context subcommand '{rest}' — \
-                                     use /context manager <name>"
-                                ),
-                                color,
-                                verbose,
-                            );
+                        let result = handle_context_command(
+                            rest,
+                            &cfg,
+                            context_manager_override,
+                            &context_features_override,
+                        );
+                        for line in &result.lines {
+                            print_newt(line, color, verbose);
+                        }
+                        if let Some(m) = result.set_manager {
+                            context_manager_override = Some(m);
+                        }
+                        if let Some((f, on)) = result.set_feature {
+                            context_features_override.set(f, Some(on));
                         }
                         surface.save_history();
                         println!();
@@ -6882,6 +6844,169 @@ fn context_manager(
         .unwrap_or_default()
 }
 
+/// Resolve the effective context-feature set (Step 26.1, #588): the `manager`
+/// preset's base bundle → `[context.features]` config overrides → session
+/// (`/context feature`) overrides.
+fn context_features(
+    cfg: &newt_core::Config,
+    manager: newt_core::ContextManager,
+    session: &newt_core::ContextFeatures,
+) -> newt_core::ContextFeatureSet {
+    let with_config = cfg
+        .context
+        .as_ref()
+        .map(|c| c.features)
+        .unwrap_or_default()
+        .apply_to(manager.base_features());
+    session.apply_to(with_config)
+}
+
+/// Outcome of a `/context …` command (Step 26.1, #588). Pure — no stdout, no
+/// mutation — so the dispatch logic is unit-testable: the caller prints `lines`
+/// and applies any `set_manager` / `set_feature` to the session overrides.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ContextCommandResult {
+    lines: Vec<String>,
+    set_manager: Option<newt_core::ContextManager>,
+    set_feature: Option<(newt_core::ContextFeature, bool)>,
+}
+
+/// Dispatch `/context [manager <preset> | feature <name> [on|off]]` against the
+/// current config + session overrides (Step 26.1, #588). `rest` is the text
+/// after `context`. Unavailable presets/features report "not yet available" and
+/// are NOT applied.
+fn handle_context_command(
+    rest: &str,
+    cfg: &newt_core::Config,
+    manager_override: Option<newt_core::ContextManager>,
+    feature_override: &newt_core::ContextFeatures,
+) -> ContextCommandResult {
+    use newt_core::{ContextFeature, ContextManager};
+    let manager = context_manager(cfg, manager_override);
+    let features = context_features(cfg, manager, feature_override);
+    let mgr_src = if manager_override.is_some() {
+        "session"
+    } else {
+        "config"
+    };
+    let feat_summary = || {
+        let on = features.enabled();
+        if on.is_empty() {
+            "none".to_string()
+        } else {
+            // Honest: a feature can be config-forced on before it's implemented;
+            // mark those as pending so "on" never implies "actually running".
+            on.iter()
+                .map(|f| {
+                    if f.available() {
+                        f.keyword().to_string()
+                    } else {
+                        format!("{} (pending #{})", f.keyword(), f.issue())
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+    };
+    let mut out = ContextCommandResult::default();
+
+    if rest.is_empty() {
+        out.lines.push(format!(
+            "context manager: {} ({mgr_src}); features on: {}",
+            manager.keyword(),
+            feat_summary()
+        ));
+        out.lines
+            .push("  /context manager <preset>  ·  /context feature <name> [on|off]".to_string());
+    } else if rest == "manager" {
+        out.lines.push(format!(
+            "context manager: {} ({mgr_src}) — \
+             use /context manager standard|progressive|distributed",
+            manager.keyword()
+        ));
+    } else if let Some(name) = rest.strip_prefix("manager ") {
+        match ContextManager::from_keyword(name.trim()) {
+            Some(m) if m.available() => {
+                out.set_manager = Some(m);
+                out.lines.push(format!("context manager → {}", m.keyword()));
+            }
+            Some(m) => out.lines.push(format!(
+                "context manager '{}' is not yet available (see #546) — staying on {}",
+                m.keyword(),
+                manager.keyword()
+            )),
+            None => out.lines.push(format!(
+                "unknown context manager '{}' — use standard|progressive|distributed",
+                name.trim()
+            )),
+        }
+    } else if rest == "feature" || rest == "features" {
+        out.lines.push("context features:".to_string());
+        for f in ContextFeature::ALL {
+            let state = if features.get(f) { "on " } else { "off" };
+            let tail = if f.available() {
+                String::new()
+            } else {
+                format!("  (not yet available — #{})", f.issue())
+            };
+            out.lines.push(format!("  [{state}] {}{tail}", f.keyword()));
+        }
+    } else if let Some(arg) = rest.strip_prefix("feature ") {
+        let mut parts = arg.split_whitespace();
+        let name = parts.next().unwrap_or("");
+        let toggle = parts.next();
+        match ContextFeature::from_keyword(name) {
+            Some(f) => match toggle {
+                None => {
+                    let state = if features.get(f) { "on" } else { "off" };
+                    let tail = if f.available() {
+                        String::new()
+                    } else {
+                        format!(" (not yet available — #{})", f.issue())
+                    };
+                    out.lines
+                        .push(format!("context feature {}: {state}{tail}", f.keyword()));
+                }
+                Some(t @ ("on" | "off")) => {
+                    let want = t == "on";
+                    if f.available() {
+                        out.set_feature = Some((f, want));
+                        out.lines
+                            .push(format!("context feature {} → {t}", f.keyword()));
+                    } else {
+                        // Report the ACTUAL resolved state, not a hardcoded
+                        // "off" — config can force an unimplemented feature on,
+                        // and the toggle (which we refuse) doesn't change it.
+                        let state = if features.get(f) { "on" } else { "off" };
+                        out.lines.push(format!(
+                            "context feature '{}' is not yet available (see #{}) — staying {state}",
+                            f.keyword(),
+                            f.issue()
+                        ));
+                    }
+                }
+                Some(other) => out.lines.push(format!(
+                    "unknown toggle '{other}' for /context feature — use on|off"
+                )),
+            },
+            None => out.lines.push(format!(
+                "unknown context feature '{name}' — use {}",
+                ContextFeature::ALL
+                    .iter()
+                    .map(|f| f.keyword())
+                    .collect::<Vec<_>>()
+                    .join("|")
+            )),
+        }
+    } else {
+        out.lines.push(format!(
+            "unknown /context subcommand '{rest}' — \
+             use /context [manager <preset> | feature <name> [on|off]]"
+        ));
+    }
+    out
+}
+
 /// Mid-loop message-trim threshold from `[tui].mid_loop_trim_threshold` (default 40).
 ///
 /// Clamped to `max_tool_rounds - 3` so the safety valve always fires before the
@@ -7465,7 +7590,9 @@ fn help_lines() -> &'static [&'static str] {
         "  /probe reset             - wipe all learned probe values (conformance, windows, calibration)",
         "  /memory                  - show context window / notes usage",
         "  /compress [focus]        - compress context now, optionally focused on a topic",
-        "  /context manager [name]  - show or set the context-management strategy (standard; progressive/distributed pending #546)",
+        "  /context                 - show the active context manager + features",
+        "  /context manager [preset] - show or set the strategy preset (standard; progressive/distributed pending #546)",
+        "  /context feature <name> [on|off] - toggle a composable context feature (all pending #582-#586)",
         "  /remember <fact>         - add a fact to persistent NOTES.md",
         "  /new                     - start a fresh conversation (ends the current one; it won't auto-resume)",
         "  /end  /restart           - aliases for /new — close out this conversation and start fresh",
@@ -12016,7 +12143,10 @@ mod helper_fn_tests {
     fn context_manager_resolves_session_config_default() {
         use newt_core::{ContextConfig, ContextManager};
         let cfg_with = |m: ContextManager| newt_core::Config {
-            context: Some(ContextConfig { manager: m }),
+            context: Some(ContextConfig {
+                manager: m,
+                ..Default::default()
+            }),
             ..Default::default()
         };
         // No [context] → standard.
@@ -12036,6 +12166,121 @@ mod helper_fn_tests {
                 Some(ContextManager::Standard)
             ),
             ContextManager::Standard
+        );
+    }
+
+    #[test]
+    fn context_features_resolves_preset_config_session() {
+        use newt_core::{ContextConfig, ContextFeature as F, ContextFeatures, ContextManager};
+        // No [context] → the preset base bundle (all off today).
+        assert!(context_features(
+            &newt_core::Config::default(),
+            ContextManager::Standard,
+            &ContextFeatures::default(),
+        )
+        .enabled()
+        .is_empty());
+        // [context.features] override layers over the preset base.
+        let mut cfg_feats = ContextFeatures::default();
+        cfg_feats.set(F::Semantic, Some(true));
+        let cfg = newt_core::Config {
+            context: Some(ContextConfig {
+                manager: ContextManager::Standard,
+                features: cfg_feats,
+            }),
+            ..Default::default()
+        };
+        assert!(
+            context_features(&cfg, ContextManager::Standard, &ContextFeatures::default())
+                .get(F::Semantic)
+        );
+        // Session override wins over config (forces it back off).
+        let mut sess = ContextFeatures::default();
+        sess.set(F::Semantic, Some(false));
+        assert!(!context_features(&cfg, ContextManager::Standard, &sess).get(F::Semantic));
+    }
+
+    #[test]
+    fn handle_context_command_dispatch() {
+        use newt_core::{ContextFeatures, ContextManager};
+        let cfg = newt_core::Config::default();
+        let none = ContextFeatures::default();
+        let run = |rest: &str| handle_context_command(rest, &cfg, None, &none);
+
+        // bare status: manager + features summary, no mutation
+        let r = run("");
+        assert!(r.lines[0].contains("context manager: standard"));
+        assert!(r.lines[0].contains("features on: none"));
+        assert!(r.set_manager.is_none() && r.set_feature.is_none());
+
+        // manager set (standard is available)
+        assert_eq!(
+            run("manager standard").set_manager,
+            Some(ContextManager::Standard)
+        );
+
+        // unavailable manager → reported, NOT applied
+        let r = run("manager progressive");
+        assert!(r.set_manager.is_none());
+        assert!(r.lines[0].contains("not yet available"));
+
+        // unknown manager
+        assert!(run("manager bogus").lines[0].contains("unknown context manager"));
+
+        // feature list: all six, each not-yet-available
+        let r = run("feature");
+        assert!(r.lines.iter().any(|l| l.contains("scratchpad")));
+        assert_eq!(
+            r.lines
+                .iter()
+                .filter(|l| l.contains("not yet available"))
+                .count(),
+            6
+        );
+
+        // toggling an unavailable feature → reported with its issue, NOT applied
+        let r = run("feature scratchpad on");
+        assert!(r.set_feature.is_none());
+        assert!(r.lines[0].contains("not yet available") && r.lines[0].contains("#583"));
+
+        // alias + hyphen still resolve
+        assert!(run("feature offload on").lines[0].contains("not yet available"));
+
+        // unknown feature / bad toggle / unknown subcommand
+        assert!(run("feature bogus on").lines[0].contains("unknown context feature"));
+        assert!(run("feature scratchpad maybe").lines[0].contains("unknown toggle"));
+        assert!(run("wat").lines[0].contains("unknown /context subcommand"));
+
+        // feature query (no toggle) shows state + availability
+        assert!(run("feature semantic").lines[0].contains("context feature semantic: off"));
+
+        // A feature FORCED on via [context.features] (allowed even before it's
+        // implemented): toggling it off is still refused, and the message +
+        // bare status report the REAL state (config-forced on), not a hardcoded
+        // "off" — the review-flagged honesty edge.
+        let mut feats = ContextFeatures::default();
+        feats.set(newt_core::ContextFeature::Semantic, Some(true));
+        let cfg_on = newt_core::Config {
+            context: Some(newt_core::ContextConfig {
+                manager: ContextManager::Standard,
+                features: feats,
+            }),
+            ..Default::default()
+        };
+        let r = handle_context_command("feature semantic off", &cfg_on, None, &none);
+        assert!(
+            r.set_feature.is_none(),
+            "an unavailable feature is never applied"
+        );
+        assert!(
+            r.lines[0].contains("staying on"),
+            "message reflects the config-forced ON state: {:?}",
+            r.lines[0]
+        );
+        assert!(
+            handle_context_command("", &cfg_on, None, &none).lines[0]
+                .contains("semantic (pending #582)"),
+            "bare status annotates a config-on-but-unavailable feature as pending"
         );
     }
 
