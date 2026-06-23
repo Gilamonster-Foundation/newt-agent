@@ -142,6 +142,14 @@ pub enum DgxCmd {
         #[command(subcommand)]
         cmd: VllmCmd,
     },
+    /// Cross-engine GPU residency snapshot: what Ollama and vLLM each hold on
+    /// the node right now, plus available memory.
+    ///
+    /// On the unified-memory GB10 both engines draw from one ~117 GiB pool and
+    /// neither negotiates, so this is the operator's window into contention.
+    /// Live-queried (Ollama `/api/ps` + vLLM `/v1/models` + `MemAvailable`) —
+    /// ground truth, not a cached lease file.
+    Gpu,
 }
 
 /// Planning knobs shared by `dgx vllm up` and `dgx vllm config`.
@@ -195,6 +203,10 @@ pub enum VllmCmd {
         /// Proceed even when the model exceeds the memory budget.
         #[arg(long)]
         force: bool,
+        /// Before launching, unload any models resident on the active Ollama
+        /// endpoint to free the shared unified-memory pool (the eval-loop swap).
+        #[arg(long)]
+        evict_ollama: bool,
         /// Print the resolved plan + remote script without SSHing.
         #[arg(long)]
         dry_run: bool,
@@ -283,8 +295,20 @@ pub async fn run(cmd: DgxCmd, config_path: Option<&Path>) -> anyhow::Result<()> 
                 node,
                 plan,
                 force,
+                evict_ollama,
                 dry_run,
-            } => vllm_up(config_path, &model, node.as_deref(), &plan, force, dry_run).await,
+            } => {
+                vllm_up(
+                    config_path,
+                    &model,
+                    node.as_deref(),
+                    &plan,
+                    force,
+                    evict_ollama,
+                    dry_run,
+                )
+                .await
+            }
             VllmCmd::Down {
                 served_name,
                 node,
@@ -316,6 +340,7 @@ pub async fn run(cmd: DgxCmd, config_path: Option<&Path>) -> anyhow::Result<()> 
                 .await
             }
         },
+        DgxCmd::Gpu => gpu(config_path).await,
     }
 }
 
@@ -1312,6 +1337,7 @@ async fn vllm_up(
     node: Option<&str>,
     plan_args: &VllmPlanArgs,
     force: bool,
+    evict_ollama: bool,
     dry_run: bool,
 ) -> anyhow::Result<()> {
     let mut dgx = dgx_config(config_path)?;
@@ -1327,6 +1353,11 @@ async fn vllm_up(
     // Fit pre-flight (the GLM-5.2 lesson, ported). Skipped on dry-run — no
     // network: dry-run only shows the plan + remote script.
     if !dry_run {
+        // The eval-loop swap: free the shared pool first so the fit probe below
+        // sees the reclaimed memory.
+        if evict_ollama {
+            evict_ollama_models(&dgx).await?;
+        }
         let mem = detect_node_mem_available(&user, &host, None);
         match fetch_vllm_weight_bytes(model).await {
             Some(weight) => report_fit(
@@ -1452,6 +1483,158 @@ async fn fetch_vllm_models(base: &str) -> anyhow::Result<Vec<String>> {
         .into_iter()
         .map(|m| m.id)
         .collect())
+}
+
+// ---------------------------------------------------------------------------
+// gpu — cross-engine residency view + eviction (Step 14.12)
+// ---------------------------------------------------------------------------
+
+/// A ground-truth snapshot of what each engine holds on the node, plus the
+/// headroom. Assembled from live probes (`/api/ps`, `/v1/models`,
+/// `MemAvailable`) rather than a cached lease file.
+struct Residency {
+    /// Ollama resident models: `(name, size_bytes)` from `/api/ps`.
+    ollama: Vec<(String, Option<u64>)>,
+    /// vLLM served model ids from `/v1/models`.
+    vllm: Vec<String>,
+    /// `MemAvailable` in bytes, or `None` when the probe failed.
+    mem_available: Option<u64>,
+}
+
+impl Residency {
+    /// Both engines hold something → they're sharing the one unified pool.
+    fn is_contended(&self) -> bool {
+        !self.ollama.is_empty() && !self.vllm.is_empty()
+    }
+}
+
+/// The Ollama models to unload to free the GPU (every currently-resident one).
+fn ollama_evict_targets(res: &Residency) -> Vec<String> {
+    res.ollama.iter().map(|(name, _)| name.clone()).collect()
+}
+
+/// Ollama unload request body: `keep_alive: 0` unloads the model immediately
+/// (the inverse of `warm`'s positive keep-alive). Pure.
+fn ollama_unload_body(model: &str) -> serde_json::Value {
+    serde_json::json!({ "model": model, "keep_alive": 0 })
+}
+
+/// Render the residency snapshot for `dgx gpu`. Pure → unit-tested directly.
+fn render_residency(res: &Residency) -> String {
+    let mut s = String::new();
+    match res.mem_available {
+        // bytes_to_gib divides by 1024^3 (gibibytes); the codebase labels these
+        // "GB" throughout (fit verdict, `ps`), so match that convention here.
+        Some(b) => s.push_str(&format!(
+            "  MemAvailable: {:.1} GB\n",
+            dgx_pull::bytes_to_gib(b)
+        )),
+        None => s.push_str("  MemAvailable: (undetected)\n"),
+    }
+    s.push_str("  Ollama resident:\n");
+    if res.ollama.is_empty() {
+        s.push_str("    (none)\n");
+    }
+    for (name, size) in &res.ollama {
+        match size {
+            Some(b) => s.push_str(&format!(
+                "    {name}  ({:.1} GB)\n",
+                dgx_pull::bytes_to_gib(*b)
+            )),
+            None => s.push_str(&format!("    {name}\n")),
+        }
+    }
+    s.push_str("  vLLM served:\n");
+    if res.vllm.is_empty() {
+        s.push_str("    (none)\n");
+    }
+    for m in &res.vllm {
+        s.push_str(&format!("    {m}\n"));
+    }
+    if res.is_contended() {
+        s.push_str(
+            "  ⚠ both engines are resident and share one unified pool — \
+             use `dgx vllm up --evict-ollama` to free it before a large vLLM serve.\n",
+        );
+    }
+    s
+}
+
+/// `dgx gpu` — print the cross-engine residency snapshot. Each side is
+/// best-effort: an unconfigured/unreachable engine simply shows nothing.
+async fn gpu(config_path: Option<&Path>) -> anyhow::Result<()> {
+    let dgx = dgx_config(config_path)?;
+    let client = http_client();
+    let ollama = match dgx.resolve_endpoint_for(EndpointKind::Ollama) {
+        Ok(base) => fetch_ollama_ps(&client, &base).await.unwrap_or_default(),
+        Err(_) => Vec::new(),
+    };
+    let vllm = match dgx.resolve_endpoint_for(EndpointKind::Vllm) {
+        Ok(base) => fetch_vllm_models(&base).await.unwrap_or_default(),
+        Err(_) => Vec::new(),
+    };
+    let mem_available = match dgx.ssh_host() {
+        Ok(host) => detect_node_mem_available(&dgx.ssh_user(), &host, None),
+        Err(_) => None,
+    };
+    let res = Residency {
+        ollama,
+        vllm,
+        mem_available,
+    };
+    println!("GPU residency:");
+    print!("{}", render_residency(&res));
+    Ok(())
+}
+
+/// POST an `/api/generate` unload (`keep_alive: 0`) to the Ollama endpoint.
+async fn unload_ollama_model(
+    client: &reqwest::Client,
+    base: &str,
+    model: &str,
+) -> anyhow::Result<()> {
+    let url = format!("{}/api/generate", base.trim_end_matches('/'));
+    let resp = client
+        .post(&url)
+        .json(&ollama_unload_body(model))
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("request failed: {e}"))?;
+    if !resp.status().is_success() {
+        anyhow::bail!("HTTP {}", resp.status());
+    }
+    Ok(())
+}
+
+/// Unload every model resident on the active Ollama endpoint (the
+/// `--evict-ollama` swap). Best-effort: a missing endpoint or a single failed
+/// unload warns rather than aborting the launch.
+async fn evict_ollama_models(dgx: &DgxConfig) -> anyhow::Result<()> {
+    let base = match dgx.resolve_endpoint_for(EndpointKind::Ollama) {
+        Ok(b) => b,
+        Err(_) => {
+            eprintln!("  --evict-ollama: no Ollama endpoint configured; nothing to evict");
+            return Ok(());
+        }
+    };
+    let client = http_client();
+    let resident = fetch_ollama_ps(&client, &base).await.unwrap_or_default();
+    let targets = ollama_evict_targets(&Residency {
+        ollama: resident,
+        vllm: Vec::new(),
+        mem_available: None,
+    });
+    if targets.is_empty() {
+        println!("  --evict-ollama: no resident Ollama models to free");
+        return Ok(());
+    }
+    for m in &targets {
+        match unload_ollama_model(&client, &base, m).await {
+            Ok(()) => println!("  evicted Ollama model {m}"),
+            Err(e) => eprintln!("  WARNING: failed to evict Ollama model {m}: {e}"),
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2242,5 +2425,166 @@ tiers = ["FAST", "STANDARD"]
         assert_eq!(MEM_TOTAL_AWK, "$2");
         assert!(node_mem_probe(MEM_AVAILABLE_AWK).contains("print $7"));
         assert!(node_mem_probe(MEM_TOTAL_AWK).contains("print $2"));
+    }
+
+    // --- gpu residency + eviction (Step 14.12) ----------------------------
+
+    fn residency(ollama: &[(&str, Option<u64>)], vllm: &[&str], mem: Option<u64>) -> Residency {
+        Residency {
+            ollama: ollama.iter().map(|(n, s)| (n.to_string(), *s)).collect(),
+            vllm: vllm.iter().map(|s| s.to_string()).collect(),
+            mem_available: mem,
+        }
+    }
+
+    #[test]
+    fn ollama_unload_body_uses_keep_alive_zero() {
+        // keep_alive: 0 is the unload signal (the inverse of `warm`).
+        let body = ollama_unload_body("qwen3-coder:30b");
+        assert_eq!(body["model"], "qwen3-coder:30b");
+        assert_eq!(body["keep_alive"], 0);
+    }
+
+    #[test]
+    fn ollama_evict_targets_lists_resident_names() {
+        let res = residency(&[("a", Some(100)), ("b", None)], &[], None);
+        assert_eq!(
+            ollama_evict_targets(&res),
+            vec!["a".to_string(), "b".to_string()]
+        );
+        assert!(ollama_evict_targets(&residency(&[], &[], None)).is_empty());
+    }
+
+    #[test]
+    fn residency_is_contended_only_when_both_resident() {
+        assert!(residency(&[("a", None)], &["v"], None).is_contended());
+        assert!(!residency(&[("a", None)], &[], None).is_contended());
+        assert!(!residency(&[], &["v"], None).is_contended());
+    }
+
+    #[test]
+    fn render_residency_shows_both_engines_mem_and_contention() {
+        let gib = 1024 * 1024 * 1024;
+        let out = render_residency(&residency(
+            &[("qwen3-coder:30b", Some(38 * gib))],
+            &["qwen3.6-35b"],
+            Some(105 * gib),
+        ));
+        assert!(out.contains("MemAvailable: 105.0 GB"));
+        assert!(out.contains("qwen3-coder:30b") && out.contains("38.0 GB"));
+        assert!(out.contains("qwen3.6-35b"));
+        // Both resident → the contention warning fires.
+        assert!(out.contains("--evict-ollama"));
+    }
+
+    #[test]
+    fn render_residency_empty_shows_none_and_no_warning() {
+        let out = render_residency(&residency(&[], &[], None));
+        assert!(out.contains("MemAvailable: (undetected)"));
+        assert_eq!(out.matches("(none)").count(), 2); // both engines empty
+        assert!(!out.contains("⚠"));
+    }
+
+    #[tokio::test]
+    async fn unload_ollama_model_posts_keep_alive_zero() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(wm_path("/api/generate"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&server)
+            .await;
+        unload_ollama_model(&http_client(), &server.uri(), "qwen3-coder:30b")
+            .await
+            .unwrap();
+        let reqs = server.received_requests().await.unwrap();
+        assert_eq!(reqs.len(), 1);
+        let body: serde_json::Value = reqs[0].body_json().unwrap();
+        assert_eq!(body["keep_alive"], 0);
+    }
+
+    #[tokio::test]
+    async fn unload_ollama_model_http_error_is_err() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(wm_path("/api/generate"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        assert!(unload_ollama_model(&http_client(), &server.uri(), "m")
+            .await
+            .is_err());
+    }
+
+    /// A DgxConfig whose active node's Ollama endpoint points at `uri`.
+    fn ollama_config_at(uri: &str) -> DgxConfig {
+        DgxConfig {
+            active_node: Some("home".to_string()),
+            active_endpoint: EndpointKind::Ollama,
+            nodes: vec![DgxNode {
+                name: "home".to_string(),
+                ollama: Some(uri.to_string()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn evict_ollama_models_unloads_each_resident() {
+        let server = MockServer::start().await;
+        // Two resident models from /api/ps.
+        Mock::given(method("GET"))
+            .and(wm_path("/api/ps"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "models": [{ "name": "a", "size": 100 }, { "name": "b", "size": 200 }]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(wm_path("/api/generate"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&server)
+            .await;
+        evict_ollama_models(&ollama_config_at(&server.uri()))
+            .await
+            .unwrap();
+        let reqs = server.received_requests().await.unwrap();
+        // One /api/ps probe + one unload POST per resident model.
+        assert_eq!(reqs.iter().filter(|r| r.url.path() == "/api/ps").count(), 1);
+        assert_eq!(
+            reqs.iter()
+                .filter(|r| r.url.path() == "/api/generate")
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn evict_ollama_models_ok_when_none_resident() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path("/api/ps"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "models": [] })),
+            )
+            .mount(&server)
+            .await;
+        evict_ollama_models(&ollama_config_at(&server.uri()))
+            .await
+            .unwrap();
+        // No resident models → no unload POSTs issued.
+        let reqs = server.received_requests().await.unwrap();
+        assert_eq!(
+            reqs.iter()
+                .filter(|r| r.url.path() == "/api/generate")
+                .count(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn evict_ollama_models_ok_when_no_endpoint() {
+        // No nodes / no Ollama endpoint → best-effort no-op, not an error.
+        assert!(evict_ollama_models(&DgxConfig::default()).await.is_ok());
     }
 }
