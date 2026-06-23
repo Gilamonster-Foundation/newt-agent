@@ -4332,20 +4332,37 @@ fn run_chat(
                         // report "not yet available" (#546 / #582–#586). Dispatch
                         // is a pure, unit-tested helper.
                         let rest = slash_md.strip_prefix("context").unwrap_or("").trim();
-                        let result = handle_context_command(
-                            rest,
-                            &cfg,
-                            context_manager_override,
-                            &context_features_override,
-                        );
-                        for line in &result.lines {
-                            print_newt(line, color, verbose);
-                        }
-                        if let Some(m) = result.set_manager {
-                            context_manager_override = Some(m);
-                        }
-                        if let Some((f, on)) = result.set_feature {
-                            context_features_override.set(f, Some(on));
+                        if rest == "stats" {
+                            // Step 26.2 (#588): the experimentation dashboard —
+                            // needs runtime state (live gauge + compression
+                            // counters), so it's handled here, not in the pure
+                            // dispatch helper.
+                            let manager = context_manager(&cfg, context_manager_override);
+                            let features =
+                                context_features(&cfg, manager, &context_features_override);
+                            for line in context_stats_text(
+                                token_gauge,
+                                &compress_state.counters(),
+                                features,
+                            ) {
+                                print_newt(&line, color, verbose);
+                            }
+                        } else {
+                            let result = handle_context_command(
+                                rest,
+                                &cfg,
+                                context_manager_override,
+                                &context_features_override,
+                            );
+                            for line in &result.lines {
+                                print_newt(line, color, verbose);
+                            }
+                            if let Some(m) = result.set_manager {
+                                context_manager_override = Some(m);
+                            }
+                            if let Some((f, on)) = result.set_feature {
+                                context_features_override.set(f, Some(on));
+                            }
                         }
                         surface.save_history();
                         println!();
@@ -6916,8 +6933,10 @@ fn handle_context_command(
             manager.keyword(),
             feat_summary()
         ));
-        out.lines
-            .push("  /context manager <preset>  ·  /context feature <name> [on|off]".to_string());
+        out.lines.push(
+            "  /context manager <preset>  ·  /context feature <name> [on|off]  ·  /context stats"
+                .to_string(),
+        );
     } else if rest == "manager" {
         out.lines.push(format!(
             "context manager: {} ({mgr_src}) — \
@@ -7001,10 +7020,51 @@ fn handle_context_command(
     } else {
         out.lines.push(format!(
             "unknown /context subcommand '{rest}' — \
-             use /context [manager <preset> | feature <name> [on|off]]"
+             use /context [manager <preset> | feature <name> [on|off] | stats]"
         ));
     }
     out
+}
+
+/// Render the `/context stats` experimentation dashboard (Step 26.2, #588).
+/// Composes the live context budget (the 24.5/24.6 gauge state), the
+/// compression counters, and the resolved feature set. Pure → unit-testable.
+/// Per-feature token-impact numbers populate here as features instrument them
+/// (26.3+); today every feature is off/pending so the table shows state only.
+fn context_stats_text(
+    gauge: Option<(u32, u32)>,
+    counters: &newt_core::CompressCounters,
+    features: newt_core::ContextFeatureSet,
+) -> Vec<String> {
+    let mut lines = vec!["context stats".to_string()];
+    // Live send-budget fill (None until a turn has reported usage).
+    match gauge {
+        Some((used, budget)) if budget > 0 => {
+            let pct = (u64::from(used) * 100 / u64::from(budget)) as u32;
+            lines.push(format!(
+                "  budget: {} ({pct}% of the send window)",
+                newt_core::agentic::fmt_token_gauge(used, budget)
+            ));
+        }
+        _ => lines.push("  budget: not yet measured (no completed turn)".to_string()),
+    }
+    // Compression activity — reuse the /memory anti-thrash section verbatim.
+    for l in memory_compress_section(counters).lines() {
+        lines.push(l.to_string());
+    }
+    // Feature states. Token impact lands per-feature as each is implemented.
+    lines.push("  features:".to_string());
+    for f in newt_core::ContextFeature::ALL {
+        let state = if features.get(f) { "on " } else { "off" };
+        let tail = if f.available() {
+            String::new()
+        } else {
+            format!("  (pending #{})", f.issue())
+        };
+        lines.push(format!("    [{state}] {}{tail}", f.keyword()));
+    }
+    lines.push("  per-feature token impact appears here as features land (26.3+)".to_string());
+    lines
 }
 
 /// Mid-loop message-trim threshold from `[tui].mid_loop_trim_threshold` (default 40).
@@ -7593,6 +7653,7 @@ fn help_lines() -> &'static [&'static str] {
         "  /context                 - show the active context manager + features",
         "  /context manager [preset] - show or set the strategy preset (standard; progressive/distributed pending #546)",
         "  /context feature <name> [on|off] - toggle a composable context feature (all pending #582-#586)",
+        "  /context stats           - experimentation dashboard: budget, compression, feature states",
         "  /remember <fact>         - add a fact to persistent NOTES.md",
         "  /new                     - start a fresh conversation (ends the current one; it won't auto-resume)",
         "  /end  /restart           - aliases for /new — close out this conversation and start fresh",
@@ -12282,6 +12343,45 @@ mod helper_fn_tests {
                 .contains("semantic (pending #582)"),
             "bare status annotates a config-on-but-unavailable feature as pending"
         );
+    }
+
+    #[test]
+    fn context_stats_text_composes_budget_compression_and_features() {
+        use newt_core::{CompressCounters, ContextFeatureSet};
+        let counters = CompressCounters {
+            compressions: 3,
+            strikes: 1,
+            disabled: false,
+            last_reclaim: Some(0.42),
+        };
+        let features = ContextFeatureSet::default();
+
+        // No gauge yet → "not yet measured".
+        let none = context_stats_text(None, &counters, features);
+        assert_eq!(none[0], "context stats");
+        assert!(none.iter().any(|l| l.contains("budget: not yet measured")));
+
+        // With a gauge → budget line shows the fraction + percent.
+        let s = context_stats_text(Some((899_000, 1_024_000)), &counters, features);
+        let joined = s.join("\n");
+        assert!(joined.contains("899k/1024k"), "{joined}");
+        assert!(joined.contains("% of the send window"), "{joined}");
+        // Compression telemetry is reused from the /memory section.
+        assert!(joined.contains("compressions this session: 3"), "{joined}");
+        assert!(joined.contains("reclaimed 42%"), "{joined}");
+        // Every feature is listed, off + pending (none implemented yet).
+        for f in newt_core::ContextFeature::ALL {
+            assert!(joined.contains(f.keyword()), "missing {}", f.keyword());
+        }
+        assert_eq!(
+            s.iter().filter(|l| l.contains("(pending #")).count(),
+            6,
+            "all six features pending"
+        );
+        // A zero budget renders the unmeasured line (no divide-by-zero).
+        assert!(context_stats_text(Some((10, 0)), &counters, features)
+            .iter()
+            .any(|l| l.contains("not yet measured")));
     }
 
     #[test]
