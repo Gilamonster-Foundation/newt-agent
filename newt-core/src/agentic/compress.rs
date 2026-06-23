@@ -562,25 +562,18 @@ pub(crate) async fn compress(
         // (3) LLM summary of the middle, redaction applied to the input.
         let body = match summarizer {
             Some(f) => {
-                // Cap the total rendered middle so the summary request itself
-                // cannot blow the summarizer's context window — per-message
-                // caps alone do not bound the total (F5). The cap is the
-                // compression budget in chars (4 chars/token): the budget is
-                // what the *conversation* must fit after compression, so a
-                // request of the same order fits any window the compressed
-                // conversation will. Floored at 8 KiB so tight budgets still
-                // give the summarizer enough material to work with.
+                // Cap each summary request so it cannot blow the summarizer's
+                // context window — per-message caps alone do not bound the total
+                // (F5). The cap is the compression budget in chars (4 chars/
+                // token): the budget is what the *conversation* must fit after
+                // compression, so a request of the same order fits any window
+                // the compressed conversation will. Floored at 8 KiB so tight
+                // budgets still give the summarizer enough material. Step 24.4
+                // (#559): a middle larger than the cap is summarized in bounded
+                // chunks and hierarchically reduced — every request stays under
+                // the cap (no OOM) and no middle message is dropped.
                 let middle_cap = req.budget.saturating_mul(4).max(8_192);
-                let request =
-                    redact_secrets(&summary_request(req.task, middle, middle_cap, req.focus));
-                match f(request).await {
-                    Ok(s) if !s.trim().is_empty() => Some(s),
-                    Ok(_) => None,
-                    Err(e) => {
-                        tracing::warn!(error = %e, "compression summarizer failed — static marker fallback");
-                        None
-                    }
-                }
+                summarize_middle(f, req.task, middle, middle_cap, req.focus).await
             }
             None => None,
         };
@@ -1022,41 +1015,21 @@ fn summary_message(body: &str) -> Value {
 /// Step 18.6) appends emphasis guidance; it is redacted here — the same
 /// pass the rendered middle gets — and again by the request-level
 /// [`redact_secrets`] at the call site.
-fn summary_request(
-    task: &str,
-    middle: &[Value],
-    middle_cap_chars: usize,
-    focus: Option<&str>,
-) -> String {
-    // Keep the most recent suffix of the middle that fits the cap: the
-    // recent middle is closest to the active work, and the verbatim task is
-    // injected separately so nothing load-bearing rides on the oldest part.
-    let rendered: Vec<String> = middle.iter().map(render_message).collect();
-    let mut start = rendered.len();
-    let mut total = 0usize;
-    while start > 0 {
-        let len = rendered[start - 1].chars().count();
-        if start < rendered.len() && total + len > middle_cap_chars {
-            break;
-        }
-        total += len;
-        start -= 1;
-    }
-
+/// Build the structured-summary prompt for an already-rendered `body` of
+/// conversation middle. `note` is an optional bracketed line shown before the
+/// body (an omission notice, or a `[part i/n]` chunk label in the chunked path).
+/// Shared by the single-request path and the chunked path (Step 24.4, #559).
+fn summary_prompt_for(task: &str, body: &str, focus: Option<&str>, note: Option<&str>) -> String {
     let mut p = String::with_capacity(1024);
     p.push_str("You are compressing the middle of a coding-agent conversation.\n\n");
     p.push_str("## Original Task (copy this VERBATIM into \"## Active Task\")\n");
     p.push_str(task);
     p.push_str("\n\n## Conversation middle to summarise\n");
-    if start > 0 {
-        p.push_str(&format!(
-            "[{start} older message(s) omitted from this summary input to fit \
-             the summarizer's window]\n"
-        ));
+    if let Some(note) = note {
+        p.push_str(note);
+        p.push('\n');
     }
-    for r in &rendered[start..] {
-        p.push_str(r);
-    }
+    p.push_str(body);
     p.push_str(
         "\nProduce a concise structured summary with sections:\n\
          ## Active Task\n## Completed Actions\n## In Progress\n## Key Decisions\n\
@@ -1078,6 +1051,156 @@ fn summary_request(
         }
     }
     p
+}
+
+fn summary_request(
+    task: &str,
+    middle: &[Value],
+    middle_cap_chars: usize,
+    focus: Option<&str>,
+) -> String {
+    // Keep the most recent suffix of the middle that fits the cap: the
+    // recent middle is closest to the active work, and the verbatim task is
+    // injected separately so nothing load-bearing rides on the oldest part.
+    let rendered: Vec<String> = middle.iter().map(render_message).collect();
+    let mut start = rendered.len();
+    let mut total = 0usize;
+    while start > 0 {
+        let len = rendered[start - 1].chars().count();
+        if start < rendered.len() && total + len > middle_cap_chars {
+            break;
+        }
+        total += len;
+        start -= 1;
+    }
+    let note = (start > 0).then(|| {
+        format!(
+            "[{start} older message(s) omitted from this summary input to fit \
+             the summarizer's window]"
+        )
+    });
+    let body: String = rendered[start..].concat();
+    summary_prompt_for(task, &body, focus, note.as_deref())
+}
+
+/// Summarize the conversation `middle` within a per-request char cap, chunking
+/// hierarchically when it doesn't fit one request (Step 24.4, #559).
+///
+/// A middle that fits the cap is one request — the established path. A larger
+/// middle is split into ≤cap chunks, each summarized in its own bounded request
+/// (sequentially — a flaky/OOM-prone box never sees the whole middle at once;
+/// and a single failed chunk just drops, the others still land), then the chunk
+/// summaries are reduced into one. So every request stays bounded AND no middle
+/// message is silently dropped (the old single-request path omitted the oldest).
+async fn summarize_middle(
+    summarizer: &SummarizeFn,
+    task: &str,
+    middle: &[Value],
+    cap_chars: usize,
+    focus: Option<&str>,
+) -> Option<String> {
+    let rendered: Vec<String> = middle.iter().map(render_message).collect();
+    let total: usize = rendered.iter().map(|r| r.chars().count()).sum();
+    if total <= cap_chars {
+        // Fits one request — the established single-call path (suffix-fit is a
+        // no-op here since the whole middle fits).
+        let req = redact_secrets(&summary_request(task, middle, cap_chars, focus));
+        return run_summary(summarizer, req).await;
+    }
+    let chunks = chunk_strings(&rendered, cap_chars);
+    let n = chunks.len();
+    let mut partials = Vec::with_capacity(n);
+    for (i, chunk) in chunks.iter().enumerate() {
+        let note = format!("[part {}/{} of the conversation middle]", i + 1, n);
+        let req = redact_secrets(&summary_prompt_for(task, chunk, focus, Some(&note)));
+        if let Some(s) = run_summary(summarizer, req).await {
+            partials.push(s);
+        }
+    }
+    reduce_partials(summarizer, task, partials, cap_chars, focus).await
+}
+
+/// Group consecutive rendered strings into chunks each ≤ `cap` chars. A single
+/// string longer than `cap` becomes its own over-cap chunk — `render_message`
+/// already excerpts per-message content, so this stays bounded in practice.
+fn chunk_strings(parts: &[String], cap: usize) -> Vec<String> {
+    let mut chunks = Vec::new();
+    let mut cur = String::new();
+    let mut cur_len = 0usize;
+    for p in parts {
+        let len = p.chars().count();
+        if cur_len > 0 && cur_len + len > cap {
+            chunks.push(std::mem::take(&mut cur));
+            cur_len = 0;
+        }
+        cur.push_str(p);
+        cur_len += len;
+    }
+    if !cur.is_empty() {
+        chunks.push(cur);
+    }
+    chunks
+}
+
+/// Reduce chunk summaries into one (Step 24.4): a single consolidation pass when
+/// they fit the cap, else re-chunk + reduce again — with a progress guard so a
+/// non-converging input (each partial already ~cap) joins rather than looping.
+fn reduce_partials<'a>(
+    summarizer: &'a SummarizeFn,
+    task: &'a str,
+    partials: Vec<String>,
+    cap_chars: usize,
+    focus: Option<&'a str>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send + 'a>> {
+    Box::pin(async move {
+        match partials.len() {
+            0 => None,
+            1 => partials.into_iter().next(),
+            _ => {
+                let joined_len: usize = partials.iter().map(|p| p.chars().count() + 2).sum();
+                if joined_len <= cap_chars {
+                    let body = partials.join("\n\n");
+                    let note = format!(
+                        "[{} partial summaries of ONE conversation — consolidate into one]",
+                        partials.len()
+                    );
+                    let req = redact_secrets(&summary_prompt_for(task, &body, focus, Some(&note)));
+                    return run_summary(summarizer, req).await;
+                }
+                let groups = chunk_strings(&partials, cap_chars);
+                if groups.len() >= partials.len() {
+                    // No progress possible — return what we have rather than loop.
+                    return Some(partials.join("\n\n"));
+                }
+                let mut next = Vec::with_capacity(groups.len());
+                for g in &groups {
+                    let req = redact_secrets(&summary_prompt_for(
+                        task,
+                        g,
+                        focus,
+                        Some("[partial summaries — consolidate]"),
+                    ));
+                    if let Some(s) = run_summary(summarizer, req).await {
+                        next.push(s);
+                    }
+                }
+                reduce_partials(summarizer, task, next, cap_chars, focus).await
+            }
+        }
+    })
+}
+
+/// Run one summary request: empty/whitespace output → `None`; error → logged and
+/// `None` (degrades to the static marker, never aborts compression).
+async fn run_summary(summarizer: &SummarizeFn, req: String) -> Option<String> {
+    match summarizer(req).await {
+        Ok(s) if !s.trim().is_empty() => Some(s),
+        Ok(_) => None,
+        Err(e) => {
+            tracing::warn!(error = %e, "compression summarizer failed — static marker fallback");
+            None
+        }
+    }
 }
 
 /// Render one wire-shape message as a line of summarizer input.
@@ -2747,6 +2870,85 @@ mod tests {
         let uncapped = summary_request("the task", &middle, usize::MAX, None);
         assert!(uncapped.chars().count() > 90_000);
         assert!(!uncapped.contains("older message(s) omitted"));
+    }
+
+    // -- chunked / hierarchical summarization (Step 24.4, #559) -------------------
+
+    #[test]
+    fn chunk_strings_groups_consecutive_within_cap() {
+        let parts: Vec<String> = ["aaa", "bbb", "ccc", "ddddddd"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        // cap 6: aaa+bbb=6 ok; +ccc would be 9>6 → new chunk; ccc(3)+ddddddd(7)=10
+        // >6 → new chunk; ddddddd alone is its own over-cap chunk.
+        assert_eq!(
+            chunk_strings(&parts, 6),
+            vec![
+                "aaabbb".to_string(),
+                "ccc".to_string(),
+                "ddddddd".to_string()
+            ]
+        );
+        // Everything fits → a single chunk.
+        assert_eq!(chunk_strings(&parts, 1_000).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn summarize_middle_single_request_when_it_fits() {
+        let prompts = Arc::new(Mutex::new(Vec::new()));
+        let s = recording_summarizer(prompts.clone(), "SUMMARY");
+        let middle = vec![user("alpha"), user("beta")];
+        let out = summarize_middle(&*s, "do the task", &middle, 100_000, None).await;
+        assert_eq!(out.as_deref(), Some("SUMMARY"));
+        assert_eq!(prompts.lock().unwrap().len(), 1, "fits → one request");
+    }
+
+    #[tokio::test]
+    async fn summarize_middle_chunks_and_reduces_when_over_cap() {
+        let prompts = Arc::new(Mutex::new(Vec::new()));
+        let s = recording_summarizer(prompts.clone(), "PART");
+        // Six ~1000-char messages (~6k rendered) against a 2,500-char cap →
+        // several bounded chunks + a reduce pass, covering the WHOLE middle.
+        let big = "x".repeat(1_000);
+        let middle: Vec<Value> = (0..6).map(|_| user(&big)).collect();
+        let out = summarize_middle(&*s, "do the task", &middle, 2_500, None).await;
+        assert_eq!(out.as_deref(), Some("PART"), "result is the reduce output");
+        let p = prompts.lock().unwrap();
+        assert!(
+            p.len() > 1,
+            "over-cap middle is chunked: {} requests",
+            p.len()
+        );
+        assert!(
+            p.iter().any(|r| r.contains("[part 1/")),
+            "chunks carry part labels"
+        );
+        assert!(
+            p.iter().any(|r| r.contains("consolidate")),
+            "a reduce/consolidation pass ran"
+        );
+        // Every request stays bounded (cap + prompt-template overhead) — the
+        // whole point: no single request can OOM the summarizer.
+        assert!(
+            p.iter().all(|r| r.chars().count() < 2_500 + 2_000),
+            "each request stays under the cap (+ template)"
+        );
+    }
+
+    #[tokio::test]
+    async fn summarize_middle_all_chunks_fail_degrades_to_none() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let s = failing_summarizer(calls.clone());
+        let big = "x".repeat(1_000);
+        let middle: Vec<Value> = (0..6).map(|_| user(&big)).collect();
+        let out = summarize_middle(&*s, "task", &middle, 2_500, None).await;
+        assert!(out.is_none(), "all chunks failing → None (→ static marker)");
+        assert!(
+            calls.load(Ordering::SeqCst) >= 3,
+            "every chunk was attempted, got {}",
+            calls.load(Ordering::SeqCst)
+        );
     }
 
     // -- rendering ---------------------------------------------------------------

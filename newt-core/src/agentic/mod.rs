@@ -6077,8 +6077,15 @@ mod compression_loop_tests {
 
         // Compression fired BEFORE the first dispatch: the summarizer ran,
         // and the VERY FIRST request the backend ever saw already carried
-        // the compaction marker.
-        assert_eq!(prompts.lock().unwrap().len(), 1, "one pre-send compression");
+        // the compaction marker. Step 24.4 (#559): this ~34k-char middle now
+        // exceeds the per-request cap, so the ONE compression event issues
+        // several BOUNDED chunk + reduce summary requests instead of a single
+        // truncated one — assert ≥1 (the before-dispatch guarantee is the
+        // `first_had_marker` check below), not exactly one.
+        assert!(
+            !prompts.lock().unwrap().is_empty(),
+            "compression ran before the first dispatch (≥1 bounded summary request)"
+        );
         let log = log.lock().unwrap();
         let (first_had_marker, first_tokens) =
             *log.first().expect("at least one request dispatched");
