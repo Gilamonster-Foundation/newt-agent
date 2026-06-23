@@ -2163,6 +2163,18 @@ pub enum BackendKind {
     Openai,
 }
 
+impl BackendKind {
+    /// Short human label for the wire protocol — shown in the ready preamble and
+    /// the `/backends` list. Note newt models the *protocol*, so vLLM, llama.cpp,
+    /// and hosted OpenAI all read as `openai` (vLLM has no distinct wire form).
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Ollama => "ollama",
+            Self::Openai => "openai",
+        }
+    }
+}
+
 /// Which OpenAI HTTP surface a `kind = "openai"` backend speaks.
 ///
 /// `chat_completions` (the default) is the classic `POST /v1/chat/completions`.
@@ -4517,6 +4529,12 @@ max_tool_rounds = 25
             let cfg: Config = toml::from_str(&toml).unwrap();
             assert_eq!(cfg.backends[0].kind, BackendKind::Openai, "kind={kind_str}");
         }
+    }
+
+    #[test]
+    fn backend_kind_label_is_protocol_name() {
+        assert_eq!(BackendKind::Ollama.label(), "ollama");
+        assert_eq!(BackendKind::Openai.label(), "openai");
     }
 
     #[test]
