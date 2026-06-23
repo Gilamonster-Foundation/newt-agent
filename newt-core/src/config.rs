@@ -825,15 +825,12 @@ impl ContextFeature {
     }
 
     /// Whether this feature is implemented yet. Flips true per feature as it
-    /// lands (26.3–26.6). `tool_offload` shipped in 26.3 (#584).
+    /// lands (26.3–26.6). `tool_offload` shipped in 26.3 (#584); `scratchpad`
+    /// in 26.4 (#583).
     pub fn available(self) -> bool {
         match self {
-            Self::ToolOffload => true,
-            Self::Scratchpad
-            | Self::Semantic
-            | Self::Provenance
-            | Self::Experiential
-            | Self::Scheduled => false,
+            Self::ToolOffload | Self::Scratchpad => true,
+            Self::Semantic | Self::Provenance | Self::Experiential | Self::Scheduled => false,
         }
     }
 
@@ -2937,11 +2934,13 @@ mod tests {
             Some(ContextFeature::Scratchpad)
         );
         assert_eq!(ContextFeature::from_keyword("nope"), None);
-        // tool_offload shipped in 26.3 (#584); the other five are still pending.
+        // tool_offload (26.3, #584) + scratchpad (26.4, #583) shipped; the other
+        // four are still pending.
         assert!(ContextFeature::ToolOffload.available());
+        assert!(ContextFeature::Scratchpad.available());
         assert!(ContextFeature::ALL
             .iter()
-            .filter(|f| **f != ContextFeature::ToolOffload)
+            .filter(|f| !matches!(f, ContextFeature::ToolOffload | ContextFeature::Scratchpad))
             .all(|f| !f.available()));
         // issues route to the right tracking ticket
         assert_eq!(ContextFeature::Semantic.issue(), 582);
