@@ -20,6 +20,8 @@ mod git_tool;
 pub(crate) mod scratchpad;
 // Step 26.5 (#582): semantic repo-evidence retrieval (embedding RAG-for-code).
 pub(crate) mod semantic;
+// Step 26.6a (#585): experiential memory — the `experiential` context feature.
+pub(crate) mod experiential;
 // Step 26.3 (#584): tool-output offloading — the `tool_offload` context feature.
 pub(crate) mod spill;
 // Issue #308 — the cowork foundation: a non-blocking turn driver around
@@ -105,6 +107,9 @@ pub use display::{
 pub use driver::{
     TurnDriver, TurnDriverConfig, TurnDriverError, TurnOutcome, TurnStatus,
     VISIBLE_TRANSCRIPT_ROLES,
+};
+pub use experiential::{
+    experience_block, ExperienceStore, SessionExperienceStore, EXPERIENCE_TOP_K,
 };
 pub use git_tool::{git_tool_definition, GitTool};
 pub use markdown::{render_markdown, MarkdownStreamWriter, RenderOpts};
@@ -552,6 +557,9 @@ pub struct ChatCtx<'a> {
     /// Semantic searcher for the `code_search` tool (Step 26.5.5). `None` = the
     /// tool is not advertised (semantic off / no index). Bundles embedder+index.
     pub code_search: Option<crate::agentic::semantic::CodeSearch<'a>>,
+    /// Experiential store for the record/recall tools (Step 26.6a). `None` = the
+    /// tools are not advertised (experiential off). Shared `&dyn` (interior mut).
+    pub experience_store: Option<&'a dyn crate::agentic::experiential::ExperienceStore>,
     pub caveats: &'a crate::caveats::Caveats,
     /// Maximum tool-call rounds before forcing a final tools-disabled
     /// completion (from `[tui].max_tool_rounds`, default 25).
@@ -953,6 +961,7 @@ pub async fn chat_complete(
         scratchpad,
         scratchpad_store,
         code_search,
+        experience_store,
         caveats,
         max_tool_rounds,
         tool_output_lines,
@@ -1006,6 +1015,8 @@ pub async fn chat_complete(
     let advertise_scratchpad = scratchpad_store.is_some() && scratchpad;
     // Step 26.5.5 (#582): the code_search tool when a searcher is present.
     let advertise_code_search = code_search.is_some();
+    // Step 26.6a (#585): the experiential tools when a store is present.
+    let advertise_experiential = experience_store.is_some();
     let advertise_git = git_tool.is_some();
     let advertise_team = crew_runner.is_some();
 
@@ -1065,6 +1076,7 @@ pub async fn chat_complete(
         advertise_team,
         advertise_scratchpad,
         advertise_code_search,
+        advertise_experiential,
     );
     let tool_tokens = estimate_value_tokens(&tools);
     // Phase 20 §2.3: one sanitized calibration ratio per turn. The
@@ -1846,6 +1858,7 @@ pub async fn chat_complete(
                 crew_runner,
                 scratchpad_store,
                 code_search,
+                experience_store,
             )
             .await;
             // 17.6: record the call for the turn's events column — args are
@@ -2178,6 +2191,7 @@ pub async fn openai_chat_complete(
         scratchpad,
         scratchpad_store,
         code_search,
+        experience_store,
         caveats,
         max_tool_rounds,
         tool_output_lines,
@@ -2230,6 +2244,8 @@ pub async fn openai_chat_complete(
     let advertise_scratchpad = scratchpad_store.is_some() && scratchpad;
     // Step 26.5.5 (#582): the code_search tool when a searcher is present.
     let advertise_code_search = code_search.is_some();
+    // Step 26.6a (#585): the experiential tools when a store is present.
+    let advertise_experiential = experience_store.is_some();
     let advertise_git = git_tool.is_some();
     let advertise_team = crew_runner.is_some();
 
@@ -2274,6 +2290,7 @@ pub async fn openai_chat_complete(
         advertise_team,
         advertise_scratchpad,
         advertise_code_search,
+        advertise_experiential,
     );
     let tool_tokens = estimate_value_tokens(&tools);
     // Phase 20 §2.3: per-turn calibration ratio + real-token schema overhead
@@ -2697,6 +2714,7 @@ pub async fn openai_chat_complete(
                 crew_runner,
                 scratchpad_store,
                 code_search,
+                experience_store,
             )
             .await;
             if debug {
@@ -2879,6 +2897,7 @@ pub async fn openai_responses_complete(
         scratchpad,
         scratchpad_store,
         code_search,
+        experience_store,
         caveats,
         max_tool_rounds,
         tool_output_lines,
@@ -2923,6 +2942,8 @@ pub async fn openai_responses_complete(
     let advertise_scratchpad = scratchpad_store.is_some() && scratchpad;
     // Step 26.5.5 (#582): the code_search tool when a searcher is present.
     let advertise_code_search = code_search.is_some();
+    // Step 26.6a (#585): the experiential tools when a store is present.
+    let advertise_experiential = experience_store.is_some();
     let advertise_git = git_tool.is_some();
     let advertise_team = crew_runner.is_some();
 
@@ -2940,6 +2961,7 @@ pub async fn openai_responses_complete(
         advertise_team,
         advertise_scratchpad,
         advertise_code_search,
+        advertise_experiential,
     );
     let tools = tools_to_responses(&tools_chat);
 
@@ -3092,6 +3114,7 @@ pub async fn openai_responses_complete(
                 crew_runner,
                 scratchpad_store,
                 code_search,
+                experience_store,
             )
             .await;
             if debug {
@@ -3614,6 +3637,7 @@ mod tool_round_cap_tests {
                 scratchpad: false,
                 scratchpad_store: None,
                 code_search: None,
+                experience_store: None,
                 caveats: &caveats,
                 max_tool_rounds: cap,
                 tool_output_lines: 20,
@@ -3683,6 +3707,7 @@ mod tool_round_cap_tests {
                 scratchpad: false,
                 scratchpad_store: None,
                 code_search: None,
+                experience_store: None,
                 caveats: &caveats,
                 max_tool_rounds: 5,
                 tool_output_lines: 20,
@@ -3817,6 +3842,7 @@ mod tool_round_cap_tests {
                 scratchpad: false,
                 scratchpad_store: None,
                 code_search: None,
+                experience_store: None,
                 caveats: &caveats,
                 max_tool_rounds: 5,
                 tool_output_lines: 20,
@@ -3888,6 +3914,7 @@ mod tool_round_cap_tests {
                 scratchpad: false,
                 scratchpad_store: None,
                 code_search: None,
+                experience_store: None,
                 caveats: &caveats,
                 max_tool_rounds: cap,
                 tool_output_lines: 20,
@@ -3982,6 +4009,7 @@ mod tool_round_cap_tests {
                 scratchpad: false,
                 scratchpad_store: None,
                 code_search: None,
+                experience_store: None,
                 caveats: &caveats,
                 max_tool_rounds: 1,
                 tool_output_lines: 20,
@@ -4088,6 +4116,7 @@ mod tool_round_cap_tests {
                 scratchpad: false,
                 scratchpad_store: None,
                 code_search: None,
+                experience_store: None,
                 caveats: &caveats,
                 max_tool_rounds: 1,
                 tool_output_lines: 20,
@@ -4186,6 +4215,7 @@ mod tool_round_cap_tests {
                 scratchpad: false,
                 scratchpad_store: None,
                 code_search: None,
+                experience_store: None,
                 caveats: &caveats,
                 max_tool_rounds: 2,
                 tool_output_lines: 20,
@@ -4259,6 +4289,7 @@ mod tool_round_cap_tests {
                 None, // crew_runner
                 None, // scratchpad_store
                 None, // code_search
+                None, // experience_store
             )
             .await;
             assert!(
@@ -4323,6 +4354,7 @@ mod tool_round_cap_tests {
                 scratchpad: false,
                 scratchpad_store: None,
                 code_search: None,
+                experience_store: None,
                 caveats: &caveats,
                 max_tool_rounds: cap,
                 tool_output_lines: 20,
@@ -4472,6 +4504,7 @@ mod tool_round_cap_tests {
                 scratchpad: false,
                 scratchpad_store: None,
                 code_search: None,
+                experience_store: None,
                 caveats: &caveats,
                 max_tool_rounds: 10,
                 tool_output_lines: 5,
@@ -4560,6 +4593,7 @@ mod http_loop_tests {
             scratchpad: false,
             scratchpad_store: None,
             code_search: None,
+            experience_store: None,
             caveats,
             max_tool_rounds: 8,
             tool_output_lines: 20,
@@ -5444,6 +5478,7 @@ mod save_note_loop_tests {
             scratchpad: false,
             scratchpad_store: None,
             code_search: None,
+            experience_store: None,
             caveats,
             max_tool_rounds: 6,
             tool_output_lines: 20,
@@ -5922,6 +5957,7 @@ mod compression_loop_tests {
             scratchpad: false,
             scratchpad_store: None,
             code_search: None,
+            experience_store: None,
             caveats,
             max_tool_rounds: 12,
             tool_output_lines: 2,
@@ -7062,6 +7098,7 @@ mod observation_hook_tests {
             scratchpad: false,
             scratchpad_store: None,
             code_search: None,
+            experience_store: None,
             caveats,
             max_tool_rounds: 8,
             tool_output_lines: 20,

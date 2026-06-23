@@ -2529,6 +2529,7 @@ mod permission_prompt_tests {
             None, // crew_runner
             None, // scratchpad_store
             None, // code_search
+            None, // experience_store
         )
         .await;
         assert_eq!(out, "gated contents", "allow-once executed the real read");
@@ -2553,6 +2554,7 @@ mod permission_prompt_tests {
             None, // crew_runner
             None, // scratchpad_store
             None, // code_search
+            None, // experience_store
         )
         .await;
         assert_eq!(
@@ -2605,6 +2607,7 @@ mod permission_prompt_tests {
                 None, // crew_runner
                 None, // scratchpad_store
                 None, // code_search
+                None, // experience_store
             )
             .await;
             assert_eq!(out, "gated contents");
@@ -4003,6 +4006,9 @@ fn run_chat(
     // re-walk + re-embed the repo every turn — reset on /new to re-index.
     let semantic_index = newt_core::SessionSemanticIndex::default();
     let mut semantic_indexed = false;
+    // Step 26.6a (#585): session-scoped experiential ledger. Unlike the others it
+    // SURVIVES /new (cross-task reuse within the session) — see the /new handler.
+    let experience_store = newt_core::SessionExperienceStore::default();
     let ctx = newt_core::SessionContext {
         workspace: workspace.to_string(),
         session_id: format!(
@@ -4381,6 +4387,10 @@ fn run_chat(
                                     semantic_index.indexed_chars(),
                                 )
                             });
+                            let exp_impact = features.experiential.then(|| {
+                                use newt_core::ExperienceStore;
+                                (experience_store.count(), experience_store.total_chars())
+                            });
                             for line in context_stats_text(
                                 token_gauge,
                                 &compress_state.counters(),
@@ -4388,6 +4398,7 @@ fn run_chat(
                                 impact,
                                 scratch_impact,
                                 sem_impact,
+                                exp_impact,
                             ) {
                                 print_newt(&line, color, verbose);
                             }
@@ -4494,6 +4505,9 @@ fn run_chat(
                             semantic_index.clear();
                         }
                         semantic_indexed = false;
+                        // Step 26.6a (#585): the experiential ledger is INTENTIONALLY
+                        // NOT cleared here — it is cross-task by design (a later task
+                        // reuses earlier lessons). It is dropped only at session end.
                         // `/new` keeps its historical message verbatim; the
                         // end/restart aliases say so explicitly (the previous
                         // conversation won't resume next launch).
@@ -4837,6 +4851,19 @@ fn run_chat(
                             turn_system = format!("{block}\n\n{turn_system}");
                         }
                     }
+                    // Step 26.6a (#585): inject the <experience> block (relevant
+                    // past lessons for this task) at the turn head — ephemeral
+                    // message[0], never persisted (like <state> / <code_evidence>).
+                    let experiential_on = turn_features.experiential;
+                    if experiential_on {
+                        if let Some(block) = newt_core::experience_block(
+                            &experience_store,
+                            &task,
+                            newt_core::EXPERIENCE_TOP_K,
+                        ) {
+                            turn_system = format!("{block}\n\n{turn_system}");
+                        }
+                    }
                     let messages = memory.build_messages(&turn_system, &task);
                     // The save_note sink borrows the manager for this call
                     // only; `/remember` and `save_note` share its NoteStore
@@ -5026,6 +5053,11 @@ fn run_chat(
                                                 top_k: semantic_cfg.top_k,
                                             }
                                         }),
+                                        // Step 26.6a (#585): the experiential store
+                                        // for record/recall — Some only when on.
+                                        experience_store: experiential_on.then_some(
+                                            &experience_store as &dyn newt_core::ExperienceStore,
+                                        ),
                                         // #307: the clamped effective caveats (base ∩
                                         // preset). Identical to `cap.caveats()` when no
                                         // mode is active.
@@ -7216,6 +7248,7 @@ fn context_stats_text(
     tool_offload_impact: Option<(u64, u64)>,
     scratchpad_impact: Option<(u64, u64)>,
     semantic_impact: Option<(u64, u64)>,
+    experiential_impact: Option<(u64, u64)>,
 ) -> Vec<String> {
     let mut lines = vec!["context stats".to_string()];
     // Live send-budget fill (None until a turn has reported usage).
@@ -7265,6 +7298,12 @@ fn context_stats_text(
                     "  — {chunks} chunks indexed (~{}k chars)",
                     chars / 1000
                 ));
+            }
+        }
+        // Step 26.6a: experiential's measured impact this session.
+        if f == newt_core::ContextFeature::Experiential {
+            if let Some((n, chars)) = experiential_impact {
+                line.push_str(&format!("  — {n} experiences (~{}k chars)", chars / 1000));
             }
         }
         lines.push(line);
@@ -9488,6 +9527,7 @@ mod run_command_confinement_tests {
             None, // crew_runner
             None, // scratchpad_store
             None, // code_search
+            None, // experience_store
         )
         .await;
         assert!(
@@ -9526,6 +9566,7 @@ mod run_command_confinement_tests {
             None, // crew_runner
             None, // scratchpad_store
             None, // code_search
+            None, // experience_store
         )
         .await;
         assert!(
@@ -9575,6 +9616,7 @@ mod run_command_confinement_tests {
             None, // crew_runner
             None, // scratchpad_store
             None, // code_search
+            None, // experience_store
         )
         .await;
 
@@ -9621,6 +9663,7 @@ mod run_command_confinement_tests {
             None, // crew_runner
             None, // scratchpad_store
             None, // code_search
+            None, // experience_store
         )
         .await;
         assert_eq!(out, "hello", "read_file must still return file contents");
@@ -9660,6 +9703,7 @@ mod run_command_confinement_tests {
             None, // crew_runner
             None, // scratchpad_store
             None, // code_search
+            None, // experience_store
         )
         .await;
         assert!(
@@ -9706,6 +9750,7 @@ mod run_command_confinement_tests {
             None, // crew_runner
             None, // scratchpad_store
             None, // code_search
+            None, // experience_store
         )
         .await;
         assert!(out.contains("one.txt") && out.contains("two.txt"));
@@ -9837,6 +9882,7 @@ mod disable_ocap_session_tests {
             None, // crew_runner
             None, // scratchpad_store
             None, // code_search
+            None, // experience_store
         )
         .await;
         assert_eq!(out, "yolo-through\n");
@@ -9860,6 +9906,7 @@ mod disable_ocap_session_tests {
             None, // crew_runner
             None, // scratchpad_store
             None, // code_search
+            None, // experience_store
         )
         .await;
         assert_eq!(
@@ -9920,6 +9967,7 @@ mod disable_ocap_session_tests {
             None, // crew_runner
             None, // scratchpad_store
             None, // code_search
+            None, // experience_store
         )
         .await;
         assert_eq!(out, "no-prompt\n");
@@ -9960,6 +10008,7 @@ mod disable_ocap_session_tests {
             None, // crew_runner
             None, // scratchpad_store
             None, // code_search
+            None, // experience_store
         )
         .await;
         assert_eq!(out, "gated contents");
@@ -10007,6 +10056,7 @@ mod disable_ocap_session_tests {
             None, // crew_runner
             None, // scratchpad_store
             None, // code_search
+            None, // experience_store
         )
         .await;
         assert_ne!(out, "should-not-run\n", "the floor must block --yolo");
@@ -12152,6 +12202,7 @@ mod tool_round_cap_tests {
                     scratchpad: false,
                     scratchpad_store: None,
                     code_search: None,
+                    experience_store: None,
                     caveats: &caveats,
                     max_tool_rounds: 5,
                     tool_output_lines: 20,
@@ -12521,8 +12572,8 @@ mod helper_fn_tests {
         // unknown manager
         assert!(run("manager bogus").lines[0].contains("unknown context manager"));
 
-        // feature list: all six listed; three not-yet-available (tool_offload,
-        // scratchpad, semantic shipped in 26.3/26.4/26.5).
+        // feature list: all six listed; two not-yet-available (tool_offload,
+        // scratchpad, semantic, experiential shipped in 26.3/26.4/26.5/26.6a).
         let r = run("feature");
         assert!(r.lines.iter().any(|l| l.contains("scratchpad")));
         assert!(r.lines.iter().any(|l| l.contains("tool_offload")));
@@ -12531,17 +12582,17 @@ mod helper_fn_tests {
                 .iter()
                 .filter(|l| l.contains("not yet available"))
                 .count(),
-            3
+            2
         );
 
         // toggling a still-unavailable feature → reported with its issue, NOT
-        // applied (experiential = #585, pending until 26.6).
-        let r = run("feature experiential on");
+        // applied (scheduled = #586, pending until 26.6b).
+        let r = run("feature scheduled on");
         assert!(r.set_feature.is_none());
-        assert!(r.lines[0].contains("not yet available") && r.lines[0].contains("#585"));
+        assert!(r.lines[0].contains("not yet available") && r.lines[0].contains("#586"));
 
-        // alias still resolves ("experience" = experiential, still pending)
-        assert!(run("feature experience on").lines[0].contains("not yet available"));
+        // alias still resolves ("compiled" = scheduled, still pending)
+        assert!(run("feature compiled on").lines[0].contains("not yet available"));
 
         // unknown feature / bad toggle / unknown subcommand
         assert!(run("feature bogus on").lines[0].contains("unknown context feature"));
@@ -12556,7 +12607,7 @@ mod helper_fn_tests {
         // bare status report the REAL state (config-forced on), not a hardcoded
         // "off" — the review-flagged honesty edge.
         let mut feats = ContextFeatures::default();
-        feats.set(newt_core::ContextFeature::Experiential, Some(true));
+        feats.set(newt_core::ContextFeature::Scheduled, Some(true));
         let cfg_on = newt_core::Config {
             context: Some(newt_core::ContextConfig {
                 manager: ContextManager::Standard,
@@ -12565,7 +12616,7 @@ mod helper_fn_tests {
             }),
             ..Default::default()
         };
-        let r = handle_context_command("feature experiential off", &cfg_on, None, &none);
+        let r = handle_context_command("feature scheduled off", &cfg_on, None, &none);
         assert!(
             r.set_feature.is_none(),
             "an unavailable feature is never applied"
@@ -12577,7 +12628,7 @@ mod helper_fn_tests {
         );
         assert!(
             handle_context_command("", &cfg_on, None, &none).lines[0]
-                .contains("experiential (pending #585)"),
+                .contains("scheduled (pending #586)"),
             "bare status annotates a config-on-but-unavailable feature as pending"
         );
 
@@ -12602,6 +12653,12 @@ mod helper_fn_tests {
             run("feature retrieval on").set_feature,
             Some((newt_core::ContextFeature::Semantic, true))
         );
+
+        // experiential shipped in 26.6a → toggles ON (alias "experience" too).
+        assert_eq!(
+            run("feature experience on").set_feature,
+            Some((newt_core::ContextFeature::Experiential, true))
+        );
     }
 
     #[test]
@@ -12616,7 +12673,7 @@ mod helper_fn_tests {
         let features = ContextFeatureSet::default();
 
         // No gauge yet → "not yet measured".
-        let none = context_stats_text(None, &counters, features, None, None, None);
+        let none = context_stats_text(None, &counters, features, None, None, None, None);
         assert_eq!(none[0], "context stats");
         assert!(none.iter().any(|l| l.contains("budget: not yet measured")));
 
@@ -12628,6 +12685,7 @@ mod helper_fn_tests {
             None,
             None,
             None,
+            None,
         );
         let joined = s.join("\n");
         assert!(joined.contains("899k/1024k"), "{joined}");
@@ -12635,15 +12693,15 @@ mod helper_fn_tests {
         // Compression telemetry is reused from the /memory section.
         assert!(joined.contains("compressions this session: 3"), "{joined}");
         assert!(joined.contains("reclaimed 42%"), "{joined}");
-        // Every feature is listed; tool_offload/scratchpad/semantic are available,
-        // the other three are still pending.
+        // Every feature is listed; tool_offload/scratchpad/semantic/experiential
+        // are available, the other two are still pending.
         for f in newt_core::ContextFeature::ALL {
             assert!(joined.contains(f.keyword()), "missing {}", f.keyword());
         }
         assert_eq!(
             s.iter().filter(|l| l.contains("(pending #")).count(),
-            3,
-            "three features still pending (tool_offload + scratchpad + semantic shipped)"
+            2,
+            "two features still pending (tool_offload+scratchpad+semantic+experiential shipped)"
         );
 
         // each available feature renders its impact on its row when on.
@@ -12651,6 +12709,7 @@ mod helper_fn_tests {
         on.set(newt_core::ContextFeature::ToolOffload, true);
         on.set(newt_core::ContextFeature::Scratchpad, true);
         on.set(newt_core::ContextFeature::Semantic, true);
+        on.set(newt_core::ContextFeature::Experiential, true);
         let imp = context_stats_text(
             None,
             &counters,
@@ -12658,6 +12717,7 @@ mod helper_fn_tests {
             Some((3, 48_000)),
             Some((5, 12_000)),
             Some((42, 60_000)),
+            Some((7, 9_000)),
         )
         .join("\n");
         assert!(
@@ -12672,10 +12732,14 @@ mod helper_fn_tests {
             imp.contains("[on ] semantic  — 42 chunks indexed (~60k chars)"),
             "{imp}"
         );
+        assert!(
+            imp.contains("[on ] experiential  — 7 experiences (~9k chars)"),
+            "{imp}"
+        );
 
         // A zero budget renders the unmeasured line (no divide-by-zero).
         assert!(
-            context_stats_text(Some((10, 0)), &counters, features, None, None, None)
+            context_stats_text(Some((10, 0)), &counters, features, None, None, None, None)
                 .iter()
                 .any(|l| l.contains("not yet measured"))
         );
