@@ -997,13 +997,32 @@ pub struct ContextConfig {
 /// 26.5.4, #582).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SemanticConfig {
-    /// Ollama embedding model used to index the repo + embed queries. Default
-    /// `nomic-embed-text`; if it isn't pulled, retrieval degrades to a no-op.
+    /// Embedding model used to index the repo + embed queries. Default
+    /// `nomic-embed-text`. The model must exist on the embeddings endpoint
+    /// (see `embeddings_endpoint`); when it can't be reached the feature
+    /// follows `on_embed_failure`.
     #[serde(default = "default_embedding_model")]
     pub embedding_model: String,
     /// How many code chunks to retrieve per turn. Default 5.
     #[serde(default = "default_semantic_top_k")]
     pub top_k: usize,
+    /// Dedicated endpoint that serves embeddings (e.g. an Ollama
+    /// `http://host:11434`). `None` (default) reuses the active inference
+    /// backend — which only works if that backend actually serves embeddings,
+    /// so set this to a real embeddings host when chat runs on a backend that
+    /// doesn't (e.g. a vLLM coder server). Decouples embeddings from chat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embeddings_endpoint: Option<String>,
+    /// Wire protocol of `embeddings_endpoint` — `ollama` (`/api/embeddings`) or
+    /// `openai` (`/v1/embeddings`). `None` (default) means: infer from the
+    /// active backend when `embeddings_endpoint` is unset, else assume `ollama`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embeddings_api: Option<BackendKind>,
+    /// What to do when embedding fails structurally (wrong endpoint / model
+    /// absent): `disable` (default) stops indexing after the first failure with
+    /// one actionable message; `warn` logs per-chunk and keeps trying.
+    #[serde(default)]
+    pub on_embed_failure: OnEmbedFailure,
 }
 
 impl Default for SemanticConfig {
@@ -1011,8 +1030,24 @@ impl Default for SemanticConfig {
         Self {
             embedding_model: default_embedding_model(),
             top_k: default_semantic_top_k(),
+            embeddings_endpoint: None,
+            embeddings_api: None,
+            on_embed_failure: OnEmbedFailure::default(),
         }
     }
+}
+
+/// Policy when an embedding request fails structurally during indexing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum OnEmbedFailure {
+    /// Stop indexing on the first failure and log one actionable error — a
+    /// structural failure (wrong endpoint / missing model) is total, not
+    /// transient, so degrading per-chunk just produces an empty index quietly.
+    #[default]
+    Disable,
+    /// Log every failed chunk and keep going (the historical behaviour).
+    Warn,
 }
 
 fn default_embedding_model() -> String {
@@ -2978,16 +3013,32 @@ mod tests {
 
     #[test]
     fn semantic_config_defaults_and_parses() {
-        // Defaults (Step 26.5.4): nomic-embed-text, top_k 5.
+        // Defaults (Step 26.5.4): nomic-embed-text, top_k 5, no decoupled
+        // endpoint, and on_embed_failure = disable (the safe default).
         let d = SemanticConfig::default();
         assert_eq!(d.embedding_model, "nomic-embed-text");
         assert_eq!(d.top_k, 5);
-        // `[context.semantic]` parses + overrides.
-        let c: ContextConfig =
-            toml::from_str("[semantic]\nembedding_model = \"mxbai-embed-large\"\ntop_k = 8")
-                .unwrap();
+        assert_eq!(d.embeddings_endpoint, None);
+        assert_eq!(d.embeddings_api, None);
+        assert_eq!(d.on_embed_failure, OnEmbedFailure::Disable);
+        // `[context.semantic]` parses + overrides, incl. the new fields.
+        let c: ContextConfig = toml::from_str(
+            "[semantic]\nembedding_model = \"mxbai-embed-large\"\ntop_k = 8\n\
+             embeddings_endpoint = \"http://REDACTED-HOST:11434\"\n\
+             embeddings_api = \"ollama\"\non_embed_failure = \"warn\"",
+        )
+        .unwrap();
         assert_eq!(c.semantic.embedding_model, "mxbai-embed-large");
         assert_eq!(c.semantic.top_k, 8);
+        assert_eq!(
+            c.semantic.embeddings_endpoint.as_deref(),
+            Some("http://REDACTED-HOST:11434")
+        );
+        assert_eq!(c.semantic.embeddings_api, Some(BackendKind::Ollama));
+        assert_eq!(c.semantic.on_embed_failure, OnEmbedFailure::Warn);
+        // `embeddings_api = "vllm"` aliases to the OpenAI protocol.
+        let v: ContextConfig = toml::from_str("[semantic]\nembeddings_api = \"vllm\"").unwrap();
+        assert_eq!(v.semantic.embeddings_api, Some(BackendKind::Openai));
         // an absent [context.semantic] still yields the defaults
         let bare: ContextConfig = toml::from_str("manager = \"standard\"").unwrap();
         assert_eq!(bare.semantic, SemanticConfig::default());
