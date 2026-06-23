@@ -362,6 +362,9 @@ async fn run_one_turn(
         // Cowork renders into the consumer's frame, not the scroller — no
         // markdown ANSI here (it would fight the host UI).
         markdown: false,
+        // Headless: no tool-offload (Step 26.3) — bit-for-bit unchanged.
+        tool_offload: false,
+        spill_store: None,
         caveats: &config.caveats,
         max_tool_rounds: config.max_tool_rounds,
         tool_output_lines: config.tool_output_lines,

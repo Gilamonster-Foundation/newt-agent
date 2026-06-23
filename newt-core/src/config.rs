@@ -824,12 +824,12 @@ impl ContextFeature {
         }
     }
 
-    /// Whether this feature is implemented yet. All false in the 26.1 foundation;
-    /// each flips true as it lands (26.3–26.6).
+    /// Whether this feature is implemented yet. Flips true per feature as it
+    /// lands (26.3–26.6). `tool_offload` shipped in 26.3 (#584).
     pub fn available(self) -> bool {
         match self {
-            Self::ToolOffload
-            | Self::Scratchpad
+            Self::ToolOffload => true,
+            Self::Scratchpad
             | Self::Semantic
             | Self::Provenance
             | Self::Experiential
@@ -2937,8 +2937,12 @@ mod tests {
             Some(ContextFeature::Scratchpad)
         );
         assert_eq!(ContextFeature::from_keyword("nope"), None);
-        // None are implemented yet — the whole point of the foundation.
-        assert!(ContextFeature::ALL.iter().all(|f| !f.available()));
+        // tool_offload shipped in 26.3 (#584); the other five are still pending.
+        assert!(ContextFeature::ToolOffload.available());
+        assert!(ContextFeature::ALL
+            .iter()
+            .filter(|f| **f != ContextFeature::ToolOffload)
+            .all(|f| !f.available()));
         // issues route to the right tracking ticket
         assert_eq!(ContextFeature::Semantic.issue(), 582);
         assert_eq!(ContextFeature::Scratchpad.issue(), 583);

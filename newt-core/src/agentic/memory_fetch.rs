@@ -48,6 +48,9 @@ pub enum MemAddr {
     /// `compaction:<id>` — DEFERRED (the follow-up PR's retention surface).
     /// Parsed so the executor can name it precisely as unsupported here.
     Compaction { id: String },
+    /// `spill:<id>` — the full (redacted) payload of a tool result that was
+    /// offloaded by the `tool_offload` feature (Step 26.3, #584). Session-scoped.
+    Spill { id: String },
 }
 
 impl MemAddr {
@@ -83,6 +86,13 @@ impl MemAddr {
                 return None;
             }
             return Some(Self::Compaction { id: id.to_string() });
+        }
+        if let Some(id) = raw.strip_prefix("spill:") {
+            let id = id.trim();
+            if id.is_empty() {
+                return None;
+            }
+            return Some(Self::Spill { id: id.to_string() });
         }
         None
     }
@@ -128,6 +138,10 @@ pub trait MemorySource: Send + Sync {
 pub struct StoreMemorySource<'a> {
     notes: &'a crate::notes::NoteStore,
     store: &'a crate::store::ConversationStore,
+    /// Session spill store for `spill:` re-reads (Step 26.3, #584). `None` when
+    /// the `tool_offload` feature is off / headless — `spill:` then resolves to
+    /// a labelled absence, never a panic.
+    spill: Option<&'a dyn super::spill::SpillStore>,
 }
 
 impl<'a> StoreMemorySource<'a> {
@@ -135,7 +149,18 @@ impl<'a> StoreMemorySource<'a> {
         notes: &'a crate::notes::NoteStore,
         store: &'a crate::store::ConversationStore,
     ) -> Self {
-        Self { notes, store }
+        Self {
+            notes,
+            store,
+            spill: None,
+        }
+    }
+
+    /// Attach a session spill store so `spill:<id>` re-reads resolve (Step 26.3).
+    #[must_use]
+    pub fn with_spill_store(mut self, spill: &'a dyn super::spill::SpillStore) -> Self {
+        self.spill = Some(spill);
+        self
     }
 }
 
@@ -173,6 +198,17 @@ impl MemorySource for StoreMemorySource<'_> {
                      re-read the file the breadcrumb names, or `recall` the topic"
                 ),
             }),
+            // Step 26.3 (#584): the offloaded (redacted) tool payload, if the
+            // session spill store still holds it.
+            MemAddr::Spill { id } => match self.spill.and_then(|s| s.fetch(id)) {
+                Some(body) => Ok(MemPayload::Found(body)),
+                None => Ok(MemPayload::NotFound {
+                    reason: format!(
+                        "no spilled payload with id {id:?} — spills are session-scoped \
+                         and may have expired (re-run the tool if you still need it)"
+                    ),
+                }),
+            },
         }
     }
 }
@@ -209,7 +245,9 @@ const MEMORY_FETCH_DESCRIPTION: &str =
      INDEX line or a recall snippet for, instead of guessing its content. \
      Addresses look like `note:3` (a numbered note from the memory index) or \
      `turn:<conversation-id>#<seq>` (one past turn, e.g. \
-     `turn:174856320012#7` — copy the id and `seq N` from a recall hit). \
+     `turn:174856320012#7` — copy the id and `seq N` from a recall hit), \
+     or `spill:<id>` (the full secret-redacted body of a tool output that was \
+     truncated for length — the `[… truncated …]` marker carries the id). \
      Reach for memory_fetch when you have an address but not the body; \
      re-read the file with read_file if the content is a file still on disk; \
      use recall to SEARCH past conversations when you don't have an address \
@@ -231,9 +269,9 @@ pub fn memory_fetch_tool_definition() -> serde_json::Value {
                     "address": {
                         "type": "string",
                         "description": "The tagged address to fetch, e.g. \
-                                        'note:3' or 'turn:174856320012#7' — \
-                                        copy it exactly as the index or a recall \
-                                        hit showed it"
+                                        'note:3', 'turn:174856320012#7', or \
+                                        'spill:s3' — copy it exactly as the index, \
+                                        a recall hit, or a truncation marker showed it"
                     }
                 },
                 "required": ["address"]
@@ -360,6 +398,12 @@ pub(crate) mod tests {
             MemAddr::parse("compaction:abc"),
             Some(MemAddr::Compaction { id: "abc".into() })
         );
+        // Step 26.3 (#584): the spill: form (trims; non-empty).
+        assert_eq!(
+            MemAddr::parse("  spill:s3 "),
+            Some(MemAddr::Spill { id: "s3".into() })
+        );
+        assert_eq!(MemAddr::parse("spill:"), None);
     }
 
     #[test]
@@ -510,6 +554,45 @@ pub(crate) mod tests {
         );
         assert!(out.starts_with("no such memory item:"), "got: {out}");
         assert!(out.contains("not fetchable in this build"), "got: {out}");
+    }
+
+    #[test]
+    fn spill_address_resolves_via_the_session_spill_store() {
+        use crate::agentic::spill::{SessionSpillStore, SpillStore};
+        // Step 26.3 (#584): a `spill:` address returns the offloaded (redacted)
+        // payload while the session store holds it; unknown / no-store → NotFound.
+        let dir = tempfile::tempdir().unwrap();
+        let notes = crate::notes::NoteStore::new(dir.path().join("NOTES.md"), 2_200);
+        let store = test_store(&dir);
+        let spill = SessionSpillStore::default();
+        let id = spill.store("the full redacted payload".to_string());
+
+        let source = StoreMemorySource::new(&notes, &store).with_spill_store(&spill);
+        let hit = execute_memory_fetch(
+            &serde_json::json!({ "address": format!("spill:{id}") }),
+            &source,
+            false,
+            20,
+        );
+        assert_eq!(hit, "the full redacted payload");
+
+        let miss = execute_memory_fetch(
+            &serde_json::json!({"address": "spill:s99"}),
+            &source,
+            false,
+            20,
+        );
+        assert!(miss.contains("session-scoped"), "got: {miss}");
+
+        // No spill store attached → labelled absence, never a panic.
+        let no_store = StoreMemorySource::new(&notes, &store);
+        let none = execute_memory_fetch(
+            &serde_json::json!({"address": "spill:s0"}),
+            &no_store,
+            false,
+            20,
+        );
+        assert!(none.starts_with("no such memory item:"), "got: {none}");
     }
 
     // -- StoreMemorySource against real surfaces (tempdir) -------------------

@@ -16,6 +16,8 @@ mod crew_attest;
 mod crew_tool;
 mod display;
 mod git_tool;
+// Step 26.3 (#584): tool-output offloading — the `tool_offload` context feature.
+pub(crate) mod spill;
 // Issue #308 — the cowork foundation: a non-blocking turn driver around
 // `chat_complete` (driver), a renderer-agnostic transcript render (transcript),
 // and the redaction-gated ShellObservation seam (observation). All additive;
@@ -103,6 +105,7 @@ pub use driver::{
 pub use git_tool::{git_tool_definition, GitTool};
 pub use markdown::{render_markdown, MarkdownStreamWriter, RenderOpts};
 pub use mcp::{McpTools, NoMcp};
+pub use spill::{SessionSpillStore, SpillStore};
 
 /// Align GFM table pipes in Markdown **source** (Step 25.5, #568) — plain text,
 /// no ANSI. The headless **wyvern** tier keeps Markdown as source (no rendering),
@@ -522,6 +525,14 @@ pub struct ChatCtx<'a> {
     /// Resolved by the caller as `[tui].markdown` (∧ `/markdown` override) ∧
     /// color. The loop only renders when this is true.
     pub markdown: bool,
+    /// Offload oversized tool results to the session spill store (Step 26.3,
+    /// #584). The resolved `tool_offload` composable feature (Step 26.1); false
+    /// for headless/eval callers (bit-for-bit unchanged when off).
+    pub tool_offload: bool,
+    /// Session spill store for `tool_offload` (Step 26.3). `None` = no offload
+    /// (and `spill:` re-reads resolve to a labelled absence). Shared `&dyn`
+    /// (interior mutability) so it serves both the write path and `memory_fetch`.
+    pub spill_store: Option<&'a dyn crate::agentic::spill::SpillStore>,
     pub caveats: &'a crate::caveats::Caveats,
     /// Maximum tool-call rounds before forcing a final tools-disabled
     /// completion (from `[tui].max_tool_rounds`, default 25).
@@ -918,6 +929,8 @@ pub async fn chat_complete(
         workspace,
         color,
         markdown: _,
+        tool_offload,
+        spill_store,
         caveats,
         max_tool_rounds,
         tool_output_lines,
@@ -1817,7 +1830,9 @@ pub async fn chat_complete(
             }
             messages.push(serde_json::json!({
                 "role": "tool",
-                "content": result
+                // Step 26.3 (#584): offload an oversized result (redact → spill →
+                // teaser+handle) when tool_offload is on; unchanged otherwise.
+                "content": spill::maybe_offload(result, tool_offload, spill_store)
             }));
         }
         if round_wrote {
@@ -2128,6 +2143,8 @@ pub async fn openai_chat_complete(
         workspace,
         color,
         markdown: _,
+        tool_offload,
+        spill_store,
         caveats,
         max_tool_rounds,
         tool_output_lines,
@@ -2658,7 +2675,8 @@ pub async fn openai_chat_complete(
             messages.push(serde_json::json!({
                 "role": "tool",
                 "tool_call_id": id,
-                "content": result,
+                // Step 26.3 (#584): see the Ollama path.
+                "content": spill::maybe_offload(result, tool_offload, spill_store),
             }));
         }
     }
@@ -2815,6 +2833,8 @@ pub async fn openai_responses_complete(
         workspace,
         color,
         markdown: _,
+        tool_offload,
+        spill_store,
         caveats,
         max_tool_rounds,
         tool_output_lines,
@@ -3037,7 +3057,8 @@ pub async fn openai_responses_complete(
             input.push(serde_json::json!({
                 "type": "function_call_output",
                 "call_id": call_id,
-                "output": result,
+                // Step 26.3 (#584): see the Ollama path (Responses output shape).
+                "output": spill::maybe_offload(result, tool_offload, spill_store),
             }));
         }
     }
@@ -3536,6 +3557,8 @@ mod tool_round_cap_tests {
                 workspace: ".",
                 color: false,
                 markdown: false,
+                tool_offload: false,
+                spill_store: None,
                 caveats: &caveats,
                 max_tool_rounds: cap,
                 tool_output_lines: 20,
@@ -3600,6 +3623,8 @@ mod tool_round_cap_tests {
                 workspace: ".",
                 color: false,
                 markdown: false,
+                tool_offload: false,
+                spill_store: None,
                 caveats: &caveats,
                 max_tool_rounds: 5,
                 tool_output_lines: 20,
@@ -3729,6 +3754,8 @@ mod tool_round_cap_tests {
                 workspace: ".",
                 color: false,
                 markdown: false,
+                tool_offload: false,
+                spill_store: None,
                 caveats: &caveats,
                 max_tool_rounds: 5,
                 tool_output_lines: 20,
@@ -3795,6 +3822,8 @@ mod tool_round_cap_tests {
                 workspace: ".",
                 color: false,
                 markdown: false,
+                tool_offload: false,
+                spill_store: None,
                 caveats: &caveats,
                 max_tool_rounds: cap,
                 tool_output_lines: 20,
@@ -3884,6 +3913,8 @@ mod tool_round_cap_tests {
                 workspace: &workspace,
                 color: false,
                 markdown: false,
+                tool_offload: false,
+                spill_store: None,
                 caveats: &caveats,
                 max_tool_rounds: 1,
                 tool_output_lines: 20,
@@ -3985,6 +4016,8 @@ mod tool_round_cap_tests {
                 workspace: &workspace,
                 color: false,
                 markdown: false,
+                tool_offload: false,
+                spill_store: None,
                 caveats: &caveats,
                 max_tool_rounds: 1,
                 tool_output_lines: 20,
@@ -4078,6 +4111,8 @@ mod tool_round_cap_tests {
                 workspace: ".",
                 color: false,
                 markdown: false,
+                tool_offload: false,
+                spill_store: None,
                 caveats: &caveats,
                 max_tool_rounds: 2,
                 tool_output_lines: 20,
@@ -4208,6 +4243,8 @@ mod tool_round_cap_tests {
                 workspace: ".",
                 color: false,
                 markdown: false,
+                tool_offload: false,
+                spill_store: None,
                 caveats: &caveats,
                 max_tool_rounds: cap,
                 tool_output_lines: 20,
@@ -4352,6 +4389,8 @@ mod tool_round_cap_tests {
                 workspace: ".",
                 color: false,
                 markdown: false,
+                tool_offload: false,
+                spill_store: None,
                 caveats: &caveats,
                 max_tool_rounds: 10,
                 tool_output_lines: 5,
@@ -4435,6 +4474,8 @@ mod http_loop_tests {
             workspace: ".",
             color: false,
             markdown: false,
+            tool_offload: false,
+            spill_store: None,
             caveats,
             max_tool_rounds: 8,
             tool_output_lines: 20,
@@ -5314,6 +5355,8 @@ mod save_note_loop_tests {
             workspace: ".",
             color: false,
             markdown: false,
+            tool_offload: false,
+            spill_store: None,
             caveats,
             max_tool_rounds: 6,
             tool_output_lines: 20,
@@ -5787,6 +5830,8 @@ mod compression_loop_tests {
             workspace,
             color: false,
             markdown: false,
+            tool_offload: false,
+            spill_store: None,
             caveats,
             max_tool_rounds: 12,
             tool_output_lines: 2,
@@ -6922,6 +6967,8 @@ mod observation_hook_tests {
             workspace: ".",
             color: false,
             markdown: false,
+            tool_offload: false,
+            spill_store: None,
             caveats,
             max_tool_rounds: 8,
             tool_output_lines: 20,
