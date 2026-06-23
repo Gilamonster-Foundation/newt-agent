@@ -3770,7 +3770,7 @@ fn run_chat(
     let permission_log_path =
         newt_core::Config::user_config_path().map(|p| p.with_file_name("permission-log.jsonl"));
     print_newt(
-        &format!("v{VERSION} ready — {inf_model} @ {inf_url}  (Ctrl-D or /exit to quit)"),
+        &ready_line(VERSION, &inf_model, &inf_url, inf_kind),
         color,
         verbose,
     );
@@ -5475,6 +5475,17 @@ struct BackendChoice {
     api: newt_core::OpenAiApi,
 }
 
+/// The session-start ready preamble. Includes the backend wire protocol
+/// (`ollama`/`openai`) so it's unambiguous which engine the endpoint speaks —
+/// e.g. an Ollama `:11434` vs an OpenAI-compatible (vLLM) endpoint. Pure for
+/// testing.
+fn ready_line(version: &str, model: &str, url: &str, kind: newt_core::BackendKind) -> String {
+    format!(
+        "v{version} ready — {model} @ {url} ({})  (Ctrl-D or /exit to quit)",
+        kind.label()
+    )
+}
+
 /// Resolve where the semantic embedder sends requests: `(url, protocol, key)`.
 /// An explicit `embeddings_endpoint` (with its protocol; no inherited key)
 /// decouples embeddings from chat — point it at a real embeddings host while
@@ -5552,11 +5563,13 @@ fn backends_list_items(cfg: &newt_core::Config, active: Option<&str>) -> Vec<(St
     cfg.backends
         .iter()
         .map(|b| {
-            let kind = match b.kind {
-                newt_core::BackendKind::Openai => "openai",
-                _ => "ollama",
-            };
-            let label = format!("{} · {} · {} @ {}", b.name, kind, b.model, b.endpoint);
+            let label = format!(
+                "{} · {} · {} @ {}",
+                b.name,
+                b.kind.label(),
+                b.model,
+                b.endpoint
+            );
             (label, active == Some(b.name.as_str()))
         })
         .collect()
@@ -8471,10 +8484,7 @@ fn dispatch_slash(
                 .backends
                 .iter()
                 .any(|b| b.kind == newt_core::BackendKind::Openai);
-            let kind_name = |c: &BackendChoice| match c.kind {
-                newt_core::BackendKind::Openai => "openai",
-                _ => "ollama",
-            };
+            let kind_name = |c: &BackendChoice| c.kind.label();
             if arg1.is_empty() {
                 let choice = resolve_backend_choice(&cfg);
                 print_newt(
@@ -13021,6 +13031,29 @@ mod helper_fn_tests {
         assert!(!prefer_openai(None, false));
         // An unknown value falls back to the default too.
         assert!(prefer_openai(Some("weird"), true));
+    }
+
+    #[test]
+    fn ready_line_names_the_backend_protocol() {
+        // Ollama endpoint (e.g. :11434) is labeled ollama …
+        let l = ready_line(
+            "0.6.8",
+            "qwen3.6:27b",
+            "http://dgx1.home.lab:11434",
+            newt_core::BackendKind::Ollama,
+        );
+        assert!(
+            l.contains("qwen3.6:27b @ http://dgx1.home.lab:11434 (ollama)"),
+            "{l}"
+        );
+        // … an OpenAI-compatible (vLLM) endpoint is labeled openai.
+        let v = ready_line(
+            "0.6.8",
+            "m",
+            "http://dgx1:8000",
+            newt_core::BackendKind::Openai,
+        );
+        assert!(v.contains("@ http://dgx1:8000 (openai)"), "{v}");
     }
 
     #[test]
