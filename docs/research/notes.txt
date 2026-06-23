@@ -1,0 +1,558 @@
+Building your own custom agent harness is the best way to maintain absolute control over costs, telemetry, and system reliability. In a custom framework, the language model serves as your CPU, and your context manager acts as the operating system's RAM controller. It determines exactly what high-signal tokens enter, remain in, or get evicted from the active attention window. [1, 2, 3, 4, 5] 
+The most effective, production-grade context management design patterns for custom harnesses include:
+------------------------------
+## 1. The Head-and-Tail Sliding Window (FIFO+Pinning)
+A standard First-In, First-Out (FIFO) buffer will cause the agent to lose its system guidelines and core task directives when tokens overflow. [6] 
+
+* The Setup: Partition your context array into three blocks: System Block (pinned), Buffer Block (evictable FIFO), and Active Horizon (the last 3-5 turns).
+* The Logic: When total tokens hit a threshold (e.g., 75% of the window), evict messages from the middle Buffer Block rather than the oldest system instructions.
+* Implementation Tip: Always preserve the original User Goal and the immediate preceding Turn in their entirety to prevent the model from drifting into context confusion. [7] 
+
+## 2. Tool Output Offloading (Head & Tail Slicing)
+Giant tool payloads (like raw terminal dumps, massive database returns, or large file outputs) will instantly pollute your context window. [6, 8] 
+
+* The Strategy: Set a maximum byte/token threshold for any individual tool response. [6, 8] 
+* The Execution: If a tool call exceeds the limit, the harness strips out the middle data, writes the full payload to a temporary file on disk, and passes a truncated snippet to the LLM context:
+
+[TOOL OUTPUT TRUNCATED]
+... first 50 lines of output ...
+[... 4,200 lines offloaded to /tmp/run_412.log. Use file_reader tool to inspect details ...]
+... last 50 lines of output ...
+
+[6, 8] 
+* The Result: This forces the agent to read selectively via a specific file_reader tool if it truly needs the full data stack, shielding it from noise. [6, 8] 
+
+## 3. Dynamic Compaction & Prompt Caching
+Modern LLM APIs offer substantial cost reductions for exact prefix matching through Prompt Caching. [9] 
+
+* The Strategy: Keep static system environments, tool definitions, and global rules at the very top of your prompt stack.
+* The Execution: Design your harness loop to group your historical conversation messages. When token limits near capacity, run an asynchronous background process that prompts a cheaper, fast model to turn those messages into a highly compressed, bulleted markdown Workspace Summary.
+* The Architecture: Replace the bloated historical turns with this single text blob, creating a highly efficient state structure:
+$$\text{Prompt} = \underbrace{\text{Static System Rules + Tools}}_{\text{Cached Prefix (Cheap)}} + \underbrace{\text{Workspace Summary}}_{\text{Compact State}} + \underbrace{\text{Current Turn Output}}_{\text{Dynamic Working Memory}}$$ 
+
+## 4. Episodic State Persistability (The Scratchpad Pattern)
+Instead of forcing the LLM to store its tracking variables and task progress directly inside a chaotic conversation history, separate the conversation from the State Store. [4] 
+
+* The Strategy: Maintain a lightweight state object (a local JSON database or Key-Value store) that tracks sub-task status, open file paths, and current variables. [10] 
+* The Execution: Inject this structured JSON directly into a designated <scratchpad> or <state> XML tag at the beginning of each turn.
+* The Advantage: The agent can mutate this state via specific state-updating tool calls rather than relying on the messy, token-heavy conversation log to infer where it left off. [10] 
+
+## 5. Multi-Agent Context Isolation (Sub-Agent Spawning)
+When an agent attempts a highly specialized, deeply technical nested loop (such as debugging an obscure script error or testing code blocks), do not force the main orchestrator to experience that chaos. [11] 
+
+* The Strategy: Isolate the context of sub-routines.
+* The Execution: The harness spins up a completely separate, short-lived Sub-Agent worker with its own fresh, isolated context window.
+* The Cleanup: The sub-agent performs the intense trial-and-error debugging loop. Once it succeeds, it returns only the final solution message to the parent orchestrator. The parent's primary context remains clean and focused. [11] 
+
+------------------------------
+## 🏛️ Structural Summary of a Production Context Layer
+
+| Strategy | Primary Benefit | Technical Trade-off |
+|---|---|---|
+| Sliding Window (FIFO) | Prevents context overflow crashes | May lose middle execution details |
+| Tool Offloading | Eradicates massive log noise | Adds minor file I/O operations |
+| Compaction Summary | Massive token savings | Extra LLM inference token cost to generate summaries |
+| State Scratchpad | Perfect task tracking across loops | Requires strict JSON/XML parsing constraints |
+| Isolated Sub-Agents | Keeps master context completely clean | Increases total active API concurrency |
+
+If you'd like to dive deeper, let me know:
+
+* What programming language are you using to write your harness?
+* Does your agent interact with external streaming data, large files, or heavy API payloads?
+* Do the models you plan to use support native prompt caching? [8] 
+
+I can provide code implementations or exact prompt structure layout schemas for your context stack.
+
+[1] [https://www.langchain.com](https://www.langchain.com/blog/context-engineering-for-agents)
+[2] [https://heeki.medium.com](https://heeki.medium.com/building-an-agent-harness-31942331d605)
+[3] [https://drata.com](https://drata.com/blog/building-harness-engineering)
+[4] [https://arize.com](https://arize.com/blog/context-management-in-agent-harnesses/)
+[5] [https://github.com](https://github.com/muratcankoylan/agent-skills-for-context-engineering)
+[6] [https://www.langchain.com](https://www.langchain.com/blog/the-anatomy-of-an-agent-harness)
+[7] [https://weaviate.io](https://weaviate.io/blog/context-engineering)
+[8] [https://arize.com](https://arize.com/blog/context-management-in-agent-harnesses/)
+[9] [https://atlan.com](https://atlan.com/know/context-architecture-for-ai-agents/)
+[10] [https://boringbot.substack.com](https://boringbot.substack.com/p/ai-agent-harnesses-explained-architecture)
+[11] [https://www.youtube.com](https://www.youtube.com/watch?v=ulNsa0sD8N0)
+
+Yes, this specific design pattern has rapidly become an industry standard in AI engineering, typically formalized under the terms "Agent Skills," "Tool Search," or "Context Cataloging." [1, 2, 3, 4] 
+Prominent engineering teams—including Anthropic (via Claude Agent Skills), Cloudflare, and frameworks like AgentGateway—have shifted entirely toward this architecture. They did this to solve a massive problem: loading hundreds of tools, library documentations, or files simultaneously bloats the context window with 50,000+ tokens of metadata before the model even begins reasoning. [1, 5, 6, 7] 
+The Card Catalog pattern for progressive disclosure operates through a highly organized, dual-layer system structure. [1, 3] 
+------------------------------
+## 🗂️ The Architecture: "The Card Catalog"
+Instead of forcing the model to hold all raw data in its prompt, your harness maintains a clean, decoupled layout: [1, 8, 9] 
+
+[ The Metadata Catalog ] -> Embedded in the Primary Context Window (Low Token Count)
+       │
+       ├── Card 01: "Fetch Academic Metrics" (UUID_A) -> Schema description only
+       ├── Card 02: "Extract Chemical Formulas" (UUID_B) -> Schema description only
+       └── Card 03: "PDF Section Reader" (UUID_C) -> Schema description only
+       
+[ The Vault / Filesystem ] -> Kept outside the LLM Context Window entirely
+       │
+       ├── Full MCP tool schemas / massive API payloads [Off-loaded]
+       └── Raw PDF text chunks / dense literature tables [Off-loaded]
+
+## 🛠️ Step-by-Step Execution Loop## Step 1: The Front Matter Injection
+At the start of the execution turn, the harness injects only the "Cards"—lightweight, highly compressed markdown summaries of the available knowledge bases, skills, or tools. [1, 2] 
+
+<available_resources>
+  <card id="skill_pdf_extractor">
+    <purpose>Extracts high-density tables and figures from Chapter 4 of the target paper.</purpose>
+    <token_cost_to_load>45,000 tokens</token_cost_to_load>
+  </card>
+  <card id="doc_ieee_formatting">
+    <purpose>Full publisher citation standards for late-stage bibliography compilation.</purpose>
+    <token_cost_to_load>12,000 tokens</token_cost_to_load>
+  </card>
+</available_resources>
+
+## Step 2: The Lookup Tool Trigger (request_resource)
+The agent realizes it needs to extract a table from the target paper. Because it only has the skill_pdf_extractor card visible, it cannot see the actual tool properties or raw paper chunks. It must call a deterministic lookup tool provided by your harness: [1, 2, 7, 10] 
+
+{
+  "tool": "request_resource",
+  "arguments": {
+    "card_id": "skill_pdf_extractor"
+  }
+}
+
+## Step 3: Progressive Disclosure Hydration
+Your harness catches this tool call, halts the loop, and goes to your local storage or filesytem. It retrieves the massive payload mapped to that specific card ID and "hydrates" it directly into the next prompt turn. [1, 2, 11, 12] 
+## Step 4: Ephemeral Eviction (The Cleanup)
+Once the agent finishes executing that specific sub-task and returns its high-level answer, your harness actively evicts the heavy tool definition or document block from the prompt. The context window returns to its clean, low-token state, leaving only the card index and the final answer behind. [12, 13, 14, 15] 
+------------------------------
+## 📈 Why This Pattern Wins (The Metrics)
+
+* 90%+ Token Reductions: Platforms like AgentGateway demonstrated that switching from pre-loaded tools to card-catalog progressive disclosure cuts Model Context Protocol (MCP) token overhead by up to 91%. [6] 
+* No "Lost-in-the-Middle" Drop-offs: LLMs reliably miss critical details when buried inside massive prompts. Keeping the workspace lean keeps attention focus exceptionally sharp. [3, 7] 
+* Dramatic Cost Savings: By maintaining a short, static, predictable front-matter card catalog, you maximize the efficiency of Prompt Caching systems. [1] 
+
+## 💻 Simple Python Harness Schema to Start
+If you are writing this from scratch, map out a local dictionary tracker inside your harness state class:
+
+class ContextHarness:
+    def __init__(self):
+        # The Card Catalog index (Always visible to the agent)
+        self.card_catalog = {
+            "fetch_metrics": "Use this card to load the citation parser tool.",
+            "arxiv_search": "Use this card to load the ArXiv paper downloader tool."
+        }
+        # The hidden Vault payloads (Loaded dynamically on demand)
+        self._vault = {
+            "fetch_metrics": {"name": "fetch_metrics", "description": "...", "input_schema": {...}},
+            "arxiv_search": {"name": "arxiv_search", "description": "...", "input_schema": {...}}
+        }
+        self.active_context = []
+
+    def inject_catalog(self):
+        # Renders your lightweight card index strings into the prompt setup
+        return f"Available Cards for Lookup: {str(self.card_catalog)}"
+
+Would you like an example of the exact system instructions needed to teach an LLM how to navigate a card catalog, or would you like to see how to implement the ephemeral eviction logic in code so it drops the data after a tool executes?
+
+[1] [https://www.youtube.com](https://www.youtube.com/watch?v=DQHFow2NoQc)
+[2] [https://github.com](https://github.com/muratcankoylan/agent-skills-for-context-engineering)
+[3] [https://www.newsletter.swirlai.com](https://www.newsletter.swirlai.com/p/agent-skills-progressive-disclosure)
+[4] [https://atlan.com](https://atlan.com/know/context-catalog/)
+[5] [https://www.reddit.com](https://www.reddit.com/r/mcp/comments/1oby72x/progressive_disclosure_might_replace_the_need_for/)
+[6] [https://www.solo.io](https://www.solo.io/blog/keeping-context-and-tokens-low-with-progressive-disclosure-in-agentgateway)
+[7] [https://www.newsletter.swirlai.com](https://www.newsletter.swirlai.com/p/agent-skills-progressive-disclosure)
+[8] [https://www.langchain.com](https://www.langchain.com/blog/your-harness-your-memory)
+[9] [https://www.mindstudio.ai](https://www.mindstudio.ai/blog/progressive-disclosure-ai-agent-skill-design)
+[10] [https://blog.getzep.com](https://blog.getzep.com/three-decisions-that-shape-every-agents-context-architecture/)
+[11] [https://medium.com](https://medium.com/design-bootcamp/the-anatomy-of-an-agent-harness-85b97d73cf96)
+[12] [https://www.mindstudio.ai](https://www.mindstudio.ai/blog/progressive-disclosure-ai-agents-context-management)
+[13] [https://www.anthropic.com](https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents)
+[14] [https://www.mindstudio.ai](https://www.mindstudio.ai/blog/progressive-disclosure-ai-agents-context-management)
+[15] [https://www.oracle.com](https://www.oracle.com/webfolder/technetwork/slackimages/devrel/slides-devcoach-040226.pdf?elqTrackId=7a7d2ac032514a669b9f2e635f3bc353&elqaid=152842&elqat=2&elqak=8AF50BCA0367108AD23D779DD94A31808CA723D89A93BF14D7741BB2C054C7ACA2C2)
+
+
+Yes, several open-source libraries and production engineering concepts actively implement this "card catalog" and progressive disclosure lookup pattern.
+The industry has unified around two main ways to implement this: production frameworks that solve this out-of-the-box, and a custom Python architecture that you can build yourself.
+------------------------------
+## 1. Real-World Framework Implementations## Anthropic’s Model Context Protocol (MCP) & Dynamic Tooling
+The most notable implementation is Anthropic's Model Context Protocol (MCP). Instead of stuffing every tool schema into the initial prompt, servers use a discovery protocol. Modern agent platforms built on top of MCP implement a lookup step:
+
+* The agent is given a simple list_resources() or search_tools() tool (the "Card Catalog").
+* The agent inspects the light descriptions, then calls a get_resource() tool.
+* This dynamically "hydrates" the prompt with the massive schema or data chunk only for the specific turn it is needed.
+
+## LangChain / LangGraph "Custom Tool Choice & Routing"
+In advanced LangGraph workflows, developers implement a pattern called Dynamic Tool Ingestion. They create a router node where the primary supervisor agent views a markdown list of available tools. The supervisor agent emits a string identifier, which a Python function interceptor catches to inject the true schema into the downstream worker node's context.
+------------------------------
+## 2. Custom Python Implementation Blueprint
+If you are building your own harness, you can implement this with a stateful event loop. This concrete Python implementation uses a three-tier architecture: The Catalog Index, The Hydrator, and The Evictor.
+
+import osimport json
+class ProgressiveContextHarness:
+    def __init__(self):
+        # 1. THE CARD CATALOG: Lightweight index always visible to the LLM
+        self.card_catalog = {
+            "card_pubmed_api": "Enables querying of PubMed medical databases. Cost: Heavy.",
+            "card_arxiv_parser": "Enables extraction of mathematical formulas from LaTeX source text. Cost: Critical.",
+            "card_ieee_styler": "Formats raw bibliography JSON into final IEEE text structures. Cost: Medium."
+        }
+        
+        # 2. THE VAULT: Heavy, multi-kilotoken tool schemas kept out of context
+        self._vault = {
+            "card_pubmed_api": {
+                "name": "query_pubmed_database",
+                "description": "Deep API integration parsing mesh headings and metadata...",
+                "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}
+            },
+            "card_arxiv_parser": {
+                "name": "parse_arxiv_latex_math",
+                "description": "Runs a massive regex and AST parser over raw text files to pull equations...",
+                "parameters": {"type": "object", "properties": {"file_path": {"type": "string"}}, "required": ["file_path"]}
+            }
+        }
+        
+        # System state
+        self.conversation_history = []
+        self.hydrated_tool_key = None
+
+    def get_system_prompt(self) -> str:
+        """Generates the base prompt with the Card Catalog included."""
+        catalog_str = "\n".join([f"- [{k}]: {v}" for k, v in self.card_catalog.items()])
+        return (
+            "You are an academic research agent. To minimize context bloat, your advanced tools "
+            "are hidden. You only see their metadata tags below. If you need a tool, you MUST "
+            "first call the tool `request_resource` with the exact card ID.\n\n"
+            f"AVAILABLE CARD CATALOG:\n{catalog_str}"
+        )
+
+    def execute_agent_turn(self, user_message: str):
+        """Simulates one complete loop turn with Hydration and Eviction."""
+        # 1. Base Setup: Inject System Prompt & Clean Catalog
+        messages = [
+            {"role": "system", "content": self.get_system_prompt()},
+            *self.conversation_history,
+            {"role": "user", "content": user_message}
+        ]
+        
+        # 2. THE HYDRATION PHASE
+        # If the agent previously requested a card, inject the full heavy schema now
+        if self.hydrated_tool_key and self.hydrated_tool_key in self._vault:
+            full_schema = self._vault[self.hydrated_tool_key]
+            messages.append({
+                "role": "system", 
+                "content": f"[HYDRATION ACTIVE] You requested access to {self.hydrated_tool_key}. "
+                           f"The full tool schema is now available for this turn only:\n{json.dumps(full_schema)}"
+            })
+            print(f"⚙️ [Harness Log]: Hydrated '{self.hydrated_tool_key}' into active context.")
+
+        # --- SIMULATED LLM INFERENCE (Mocking the LLM output for demonstration) ---
+        # Turn A: LLM realizes it needs the PubMed tool
+        if not self.hydrated_tool_key and "PubMed" in user_message:
+            llm_response = {
+                "role": "assistant",
+                "tool_calls": [{"name": "request_resource", "args": {"card_id": "card_pubmed_api"}}]
+            }
+        # Turn B: LLM has the tool, so it actually uses it
+        else:
+            llm_response = {
+                "role": "assistant",
+                "content": "I have successfully fetched and analyzed the metrics from PubMed."
+            }
+        # -------------------------------------------------------------------------
+
+        # 3. INTERCEPT AND PROCESS
+        if "tool_calls" in llm_response:
+            for call in llm_response["tool_calls"]:
+                if call["name"] == "request_resource":
+                    # Set the state flag to lock this card for the next turn
+                    self.hydrated_tool_key = call["args"]["card_id"]
+                    self.conversation_history.append(llm_response)
+                    print(f"📥 [Harness Log]: Agent requested '{self.hydrated_tool_key}'. Triggering loop cycle.")
+                    return "Looping to hydrate..."
+
+        # 4. THE EVICTION PHASE
+        # The agent completed its thought or tool action using the payload. 
+        # Clear the flag so the heavy data is dropped on the next turn.
+        if self.hydrated_tool_key:
+            print(f"🗑️ [Harness Log]: Evicting '{self.hydrated_tool_key}' to protect context window.")
+            self.hydrated_tool_key = None
+            
+        self.conversation_history.append(llm_response)
+        return llm_response["content"]
+# --- Run the execution simulation ---harness = ProgressiveContextHarness()
+
+print("--- TURN 1: User asks for a search ---")
+harness.execute_agent_turn("Can you look up cancer immunotherapy trials on PubMed?")
+
+print("\n--- TURN 2: Next turn executes (Hydrated context active) ---")final_output = harness.execute_agent_turn("Proceed with the search.")
+
+## 🔍 How this code runs under the hood:
+
+   1. Turn 1 (Discovery): The LLM receives only the system prompt + the card_catalog dict (extremely lightweight). It sees card_pubmed_api matches its goals and calls request_resource.
+   2. Harness Interception: The harness catches the call, blocks execution, and caches self.hydrated_tool_key = "card_pubmed_api".
+   3. Turn 2 (Hydration & Execution): On the next turn, the harness injects the massive JSON definition from self._vault into the prompt. The LLM sees the schema, runs the tool smoothly, and outputs its response.
+   4. Eviction: As soon as Turn 2 completes, the harness resets self.hydrated_tool_key = None. The large schema disappears, preventing it from polluting Turn 3.
+
+Would you like to look at the state management strategy for preserving actual data results across loops, or would you like to see how to wrap this into an asynchronous web API?
+
+Yes, the card catalog and progressive disclosure pattern has officially crossed over into distributed systems architectures. [1, 2] 
+When you scale a single-agent harness into a distributed enterprise or multi-node cluster, a central Python script cannot hold all tool registrations. If thousands of nodes register complex capabilities, the orchestration network experiences immediate context collapse. [2] 
+Several cutting-edge frameworks and engineering designs specifically handle progressive context disclosure at a distributed network scale.
+------------------------------
+## 1. OpenAaaS (Open Agent-as-a-Service)
+The [OpenAaaS Framework](https://arxiv.org/html/2605.13618v1) was explicitly designed to solve context overflow across distributed multi-agent networks. [2] 
+
+* The Distributed Card Catalog: It utilizes a SKILL.md design pattern. Instead of services broadcasting their massive APIs, schemas, or data tables to a central orchestrator, they register a highly compressed markdown "card" summarizing what they do. [2] 
+* The Architecture: Data and tool definitions stay locally in situ on the edge nodes. When a master routing agent needs a specific node's skill, the framework uses an MCP adapter to progressively pull the schema from that remote node. This hydrates the context on demand and evicts it immediately after execution. [1, 2] 
+
+## 2. Apache Flink Agents
+In heavy data streaming and enterprise cluster computing, [Apache Flink Agents](https://www.alibabacloud.com/blog/whats-coming-in-apache-flink-agents-0-3_603036) handles distributed agent deployments over Kubernetes or YARN. [3] 
+
+* The Distributed Challenge: If you have jobs running across an entire server cluster, passing massive reference documents or dense structural parsing code directly in the job initialization payload breaks performance. [3] 
+* The Implementation: Flink Agents utilizes a progressive disclosure mechanism modeled after Agent Skills. A central manager distributes a lightweight indexing graph. When a specific worker pod hits a condition requiring an intricate script, it downloads the Standard Operating Procedure (SOP) via an underlying vector layer, injects it into that localized container's execution loop, and drops it post-computation. [3, 4] 
+
+## 3. Nexus (Distributed "Soul Spec" Personas)
+The open-source [Nexus Distributed Agent Architecture](https://github.com/niclydon/nexus-public) implements a production-grade DB-backed progressive disclosure setup. [5] 
+
+* Level-Based Context Looping: Instead of storing configuration in static files, all agent definitions are written into Git-tracked markdown personas. [5] 
+* The Logic: The orchestrator runs light loops using only Level 2 (Core Behavior) context. Distributed coordination context (Level 3) is entirely withheld from the window. The harness only queries the database to load and hydrate Level 3 routing data when a specific message queue or inter-agent event triggers it. [5] 
+
+------------------------------
+## 🔀 Distributed Design Choice: Choreography vs. Orchestration
+When moving the card catalog pattern to distributed infrastructure, your harness must choose between two network topologies: [6] 
+
+ORCHESTRATION (Central Broker)           CHOREOGRAPHY (Event-Driven)
+
+   ┌───────────────────┐                    ┌──────────────┐
+   │ Master Router /   │                    │  Agent Node  │◄───┐
+   │  Context Catalog  │                    └──────┬───────┘    │
+   └─┬───────┬───────┬─┘                           │            │ Event 
+     │       │       │                             ▼            │ Mesh
+     ▼       ▼       ▼                      ┌──────────────┐    │ (Kafka/
+   NodeA   NodeB   NodeC                    │  Agent Node  │◄───┘ RabbitMQ)
+ (Hydrated on Demand by Broker)             └──────────────┘
+
+| Distributed Pattern [1, 2, 6, 7, 8] | Context Management Mechanism | Best For |
+|---|---|---|
+| Centralized Orchestration | A master service gateway maintains the entire database of cards. It acts as a reverse-proxy, selectively hydrating agent prompts before pushing payloads to workers. | Strict control, audit logs, and highly deterministic multi-step workflows. |
+| Decentralized Choreography | Nodes broadcast small metadata messages across an event mesh (like Kafka or RabbitMQ). Agents dynamically fetch structural schemas from each other via peer-to-peer API lookups. | Massively scalable, parallel, and highly autonomous agent swarms. |
+
+Are you planning to run your custom harness across multiple distributed worker containers (e.g., Docker/Kubernetes), or are you looking to implement a multi-agent message bus on a single server machine? [9] 
+
+[1] [https://www.mindstudio.ai](https://www.mindstudio.ai/blog/progressive-disclosure-ai-agents-context-management)
+[2] [https://arxiv.org](https://arxiv.org/html/2605.13618v1)
+[3] [https://www.alibabacloud.com](https://www.alibabacloud.com/blog/whats-coming-in-apache-flink-agents-0-3_603036)
+[4] [https://atlan.com](https://atlan.com/know/best-ai-agent-harness-tools-2026/)
+[5] [https://github.com](https://github.com/niclydon/nexus-public)
+[6] [https://www.youtube.com](https://www.youtube.com/watch?v=2czYyrTzILg)
+[7] [https://arxiv.org](https://arxiv.org/html/2601.13671v1)
+[8] [https://www.salesforce.com](https://www.salesforce.com/agentforce/ai-agents/ai-agent-orchestration/)
+[9] [https://developer.harness.io](https://developer.harness.io/docs/platform/harness-ai/harness-agents)
+
+
+Yes, managing context for source code introduces a unique set of challenges compared to raw text. Code has rigid dependencies, import trees, syntax structures, and hierarchical architecture. If you treat source code like a flat text document, your agent will experience immediate "context rot" due to missing imports, broken scope paths, and massive token pollution from deep file nesting.
+To solve this, several open-source frameworks and specific algorithmic abstractions have emerged to serve as context managers custom-built for software engineering codebases.
+------------------------------
+## 1. Production Context Databases & Tooling for Code## OpenViking (Filesystem Paradigm Context Database)
+[OpenViking](https://github.com/volcengine/OpenViking) is an open-source context database designed specifically to escape the pitfalls of traditional vector RAG for code bases. [1] 
+
+* How it works: It uses a Three-Tier Context Loading (L0/L1/L2) filesystem paradigm. Instead of cutting code into arbitrary token chunks that break logical loops, it tracks the codebase as a native tree. [1] 
+* The Progressive Disclosure: It combines directory positioning with recursive semantic search. The agent can explore folder paths dynamically using a progressive disclosure model, only hydrating the actual code lines when navigating into a specific functional node. [1, 2] 
+
+## CTX (Codebase-to-LLM Structured Context Generator)
+[CTX](https://github.com/context-hub/generator) is a developer utility framework designed to eliminate the context gap when feeding code to LLM engines. [3] 
+
+* How it works: Instead of relying on an agent guessing what files to read, ctx dynamically analyzes import statements, configuration contracts, and function dependencies to "compile" highly structured, minimized markdown documents representing the codebase's logical layout. [3] 
+
+## CLAUDE.md / AGENTS.md / copilot-instructions.md (Context Specifications)
+The industry has standardized specialized meta-files (like Anthropic’s CLAUDE.md, GitHub's copilot-instructions.md, and the Linux Foundation’s AGENTS.md). [4] 
+
+* How it works: These are developer-maintained, version-controlled context spec anchors. Rather than your harness stuffing entire style guides into the system prompt, these files act as a "card catalog" map of constraints, explicit coding boundaries, and architectural patterns. The harness reads this file at turn zero to learn how to crawl the rest of the project. [4, 5, 6, 7] 
+
+------------------------------
+## 2. Core Code-Specific Context Patterns
+If you are implementing logic in your custom harness, you should employ these source-code-specific strategies rather than standard text truncation:
+## Abstract Syntax Tree (AST) Chunking
+
+* The Problem: Token-based chunking breaks code mid-loop or cuts a function in half, rendering it unparseable to an LLM.
+* The Solution: Use an AST parser (like tree-sitter in Python/Rust) to split files based on code blocks (classes, methods, functions). Your context manager targets precise lexical elements rather than arbitrary character lengths.
+
+## The "Skeleton Code" Summary (Stubbing)
+
+* The Strategy: When an agent inspects an unfamiliar code directory, do not expose raw logic lines. Provide only a stub representation.
+* The Implementation: Strip out function bodies and replace them with comments, keeping only class signatures, parameters, and docstrings:
+
+class AcademicDataParser:
+    def __init__(self, storage_path: str):
+        """Initializes the database connection."""
+        pass
+
+    def extract_tables_from_pdf(self, pdf_bytes: bytes) -> list:
+        """Parses dense tabular datasets. [Hidden: 140 lines of logic]"""
+        pass
+
+* The Value: The model maps out the API structure of your codebase with negligible token consumption, only calling a tool to hydrate the full method body if it explicitly needs to rewrite that single function.
+
+## Context compilation / View Generation
+Rather than looking at context as a rolling chat buffer, advanced coding frameworks treat it as a compiled view over a stateful system. [8] 
+
+   1. The Source Material: Your raw project workspace files.
+   2. The Compiler Pass: An AST/Dependency tracking engine maps out file interactions.
+   3. The Target Output: A pristine, read-only static snapshot injected into the LLM context for just one processing turn, which is completely cleared out and re-compiled on the next step. [8] 
+
+Would you like to see a Python code example using an AST parser to create skeleton/stub code summaries for your harness, or are you looking to integrate CLAUDE.md/AGENTS.md constraint parsers?
+
+[1] [https://github.com](https://github.com/volcengine/OpenViking)
+[2] [https://github.com](https://github.com/musistudio/claude-code-router/blob/main/blog/en/progressive-disclosure-of-agent-tools-from-the-perspective-of-cli-tool-style.md)
+[3] [https://github.com](https://github.com/context-hub/generator)
+[4] [https://arxiv.org](https://arxiv.org/html/2510.21413v3)
+[5] [https://openai.com](https://openai.com/index/harness-engineering/)
+[6] [https://www.reddit.com](https://www.reddit.com/r/ContextEngineering/comments/1u6alj5/building_an_open_source_context_management_layer/)
+[7] [https://arxiv.org](https://arxiv.org/html/2510.21413v1)
+[8] [https://developers.googleblog.com](https://developers.googleblog.com/architecting-efficient-context-aware-multi-agent-framework-for-production/)
+
+
+
+To build a code-specific context manager for your harness, you need an engine that can analyze files, map their relationships (dependencies), and strip them down to functional skeletons (AST parsing).
+Below is a complete, production-ready Python implementation using two standard libraries: ast (built into Python) to extract code skeletons, and modulefinder / string scanning to track dependencies.
+------------------------------
+## 💻 Python Code: AST Skeleton & Dependency Engine
+This code provides two main capabilities for your harness:
+
+   1. generate_skeleton(code_text): Uses the AST to remove all logic bodies and return a lightweight code map.
+   2. get_dependencies(file_path): Scans for local internal file imports to build a dependency graph.
+
+import astimport osimport re
+class CodeContextEngine:
+    def __init__(self, root_dir: str):
+        self.root_dir = os.path.abspath(root_dir)
+
+    def generate_skeleton(self, source_code: str) -> str:
+        """
+        Parses source code using Python's built-in AST framework.
+        Replaces code bodies with '...' (stubs) while preserving signatures, 
+        arguments, and docstrings to minimize context tokens.
+        """
+        try:
+            tree = ast.parse(source_code)
+        except SyntaxError as e:
+            return f"# [SYNTAX ERROR: Could not parse AST - {e}]"
+
+        skeleton_lines = []
+
+        for node in tree.body:
+            # Handle Class Definitions
+            if isinstance(node, ast.ClassDef):
+                skeleton_lines.append(f"\nclass {node.name}:")
+                # Grab class-level docstring if it exists
+                docstring = ast.get_docstring(node)
+                if docstring:
+                    skeleton_lines.append(f'    """{docstring}"""')
+                
+                # Parse methods inside the class
+                for subnode in node.body:
+                    if isinstance(subnode, ast.FunctionDef):
+                        args = ast.unparse(subnode.args)
+                        skeleton_lines.append(f"    def {subnode.name}({args}):")
+                        func_doc = ast.get_docstring(subnode)
+                        if func_doc:
+                            skeleton_lines.append(f'        """{func_doc}"""')
+                        skeleton_lines.append("        ... # [Logic Body Hidden]")
+
+            # Handle Top-level Global Functions
+            elif isinstance(node, ast.FunctionDef):
+                args = ast.unparse(node.args)
+                skeleton_lines.append(f"\ndef {node.name}({args}):")
+                func_doc = ast.get_docstring(node)
+                if func_doc:
+                    skeleton_lines.append(f'    """{func_doc}"""')
+                skeleton_lines.append("    ... # [Logic Body Hidden]")
+
+            # Handle explicit high-level Imports to keep architectural hints
+            elif isinstance(node, (ast.Import, ast.ImportFrom)):
+                skeleton_lines.append(ast.unparse(node))
+
+        return "\n".join(skeleton_lines)
+
+    def get_dependencies(self, target_file_path: str) -> list:
+        """
+        Analyzes a code file to find internal local dependencies within 
+        the project root, mapping out which files it imports.
+        """
+        abs_target = os.path.abspath(target_file_path)
+        if not os.path.exists(abs_target):
+            return []
+
+        with open(abs_target, 'r', encoding='utf-8') as f:
+            content = f.read()
+
+        # Regular expressions to catch simple internal 'import' and 'from ... import'
+        # Filters out external third-party packages by verifying local file existence
+        internal_imports = []
+        import_patterns = [
+            r'^import\s+([a-zA-Z0-9_\.]+)',
+            r'^from\s+([a-zA-Z0-9_\.]+)\s+import'
+        ]
+
+        for line in content.splitlines():
+            for pattern in import_patterns:
+                match = re.match(pattern, line.strip())
+                if match:
+                    module_name = match.group(1)
+                    # Convert dot notation (my_package.my_module) to file system path
+                    potential_path = os.path.join(self.root_dir, module_name.replace('.', '/') + '.py')
+                    
+                    if os.path.exists(potential_path):
+                        internal_imports.append(potential_path)
+                    elif os.path.exists(os.path.join(self.root_dir, module_name + '.py')):
+                        internal_imports.append(os.path.join(self.root_dir, module_name + '.py'))
+
+        return list(set(internal_imports))
+# ==========================================# 🛠️ EXECUTING THE SIMULATION RUN# ==========================================if __name__ == "__main__":
+    # 1. Create a dummy codebase scenario
+    mock_source = """
+import os
+import sys
+from utils.helpers import calculate_hash
+
+class ResearchPaperParser:
+    \"\"\"Core processor for evaluating academic documents and PDF blocks.\"\"\"
+    
+    def __init__(self, storage_path: str, max_tokens: int = 4096):
+        self.path = storage_path
+        self.max = max_tokens
+        
+    def stream_sections(self, raw_bytes: bytes) -> list:
+        \"\"\"Extracts chapters, headers, and dense semantic chunks directly.\"\"\"
+        # Imagine 250 lines of complex extraction code here...
+        processed_data = []
+        for block in raw_bytes:
+            processed_data.append(block)
+        return processed_data
+
+def global_cleanup_routine(job_id: str):
+    \"\"\"Flushes cached structures from memory.\"\"\"
+    print(f"Purging workspace {job_id}")
+    return True"""
+
+    # Instantiate our framework engine
+    engine = CodeContextEngine(root_dir=".")
+
+    print("=== Original Source Code Token Bloat ===")
+    print(f"Lines of code: {len(mock_source.splitlines())}")
+
+    print("\n=== Generated AST Progressive Disclosure Skeleton ===")
+    skeleton_output = engine.generate_skeleton(mock_source)
+    print(skeleton_output)
+    print(f"\nLines of skeleton: {len(skeleton_output.splitlines())}")
+
+------------------------------
+## 🔍 How to Integrate This in Your Progressive Card Catalog
+To fully plug this into the progressive disclosure architecture discussed earlier, use this engine inside your main harness file-reading tools:
+
+   1. The Discovery Phase (list_directory): When the agent asks to explore a folder, your harness calls get_dependencies() across the folder's files. It hands the LLM a clean dependency graph map showing how files connect.
+   2. The Inspection Phase (peek_file): When the agent wants to see inside parser.py, your harness intercepts the file read. Instead of pushing 2,000 lines of code, it passes the output of generate_skeleton().
+   3. The Hydration Phase (read_function_body): If the agent explicitly identifies that it needs to alter or debug a specific method (e.g., stream_sections), it passes the method name to a precise tool. Your harness then extracts and hydrates only those hidden 250 lines of code for that single target turn.
+
+Would you like to extend this engine to automatically build a complete visual dependency map string across an entire directory, or do you want to see how to handle Tree-Sitter multi-language support (for codebases written in TypeScript or Go)?
+
+
+
+
