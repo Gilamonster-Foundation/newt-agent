@@ -57,15 +57,25 @@ jobs:
     name: live eval (${{ matrix.model }})
     # Self-hosted runner on the gnuc home box (label set on the runner).
     runs-on: [self-hosted, gnuc]
+    # Capability-tracker semantics: a general-purpose model is INFORMATIONAL —
+    # its scores are recorded but a miss does NOT fail the weekly run (no
+    # general 7B/8B aces every case). Only a GATING coder model's failure turns
+    # the run red, so "red" means "a coder model regressed", not "a general
+    # model flubbed a hard refactor". `continue-on-error` reads the per-leg flag.
+    continue-on-error: ${{ matrix.informational }}
     # Don't let one flaky model abort the others — collect every model's result.
     strategy:
       fail-fast: false
       matrix:
-        # Default test LLMs. Keep these small/fast and pulled on gnuc. Edit the
-        # list (or use the workflow_dispatch `model` input) to track your rig.
-        model:
-          - "qwen2.5-coder:7b"
-          - "llama3.1:8b"
+        # Each leg carries its own gating flag. Coder models (informational:
+        # false) GATE the run; general-purpose models (informational: true) are
+        # tracked-only. Edit this list (or use the workflow_dispatch `model`
+        # input) to match your rig — keep models small/fast and pulled on gnuc.
+        include:
+          - model: "qwen2.5-coder:7b"   # purpose-built coder → gates the run
+            informational: false
+          - model: "llama3.1:8b"        # general-purpose → tracked, non-gating
+            informational: true
     steps:
       - uses: actions/checkout@v4
 

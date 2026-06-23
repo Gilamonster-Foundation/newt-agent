@@ -47,6 +47,14 @@ The expensive end of the pyramid. `.github/workflows/eval-live.yml` replays the
   release gate). Never per-PR — too slow/flaky for a push gate.
 - **Runner:** a self-hosted GitHub Actions runner labelled `gnuc`. The matrix
   models must be pulled there (`ollama pull <model>`).
+- **Gating vs informational (capability tracker):** each matrix leg carries an
+  `informational` flag. **Coder** models (`informational: false`, e.g.
+  `qwen2.5-coder:7b`) **gate** the run. **General-purpose** models
+  (`informational: true`, e.g. `llama3.1:8b`) are **tracked-only** via
+  `continue-on-error` — their scores are recorded but a miss does NOT fail the
+  weekly run. So "red" means a coder model **regressed**, not that a general
+  model flubbed a hard case (no 7B/8B general model aces every case). Add a model
+  as a `matrix.include` entry with its flag.
 - **Serial by design:** the eval driver runs cases one at a time (no parallel
   flag) and the worker talks to a real model — satisfying the
   "real-resource tests run single-threaded" rule.
