@@ -2528,6 +2528,7 @@ mod permission_prompt_tests {
             None, // git_tool
             None, // crew_runner
             None, // scratchpad_store
+            None, // code_search
         )
         .await;
         assert_eq!(out, "gated contents", "allow-once executed the real read");
@@ -2551,6 +2552,7 @@ mod permission_prompt_tests {
             None, // git_tool
             None, // crew_runner
             None, // scratchpad_store
+            None, // code_search
         )
         .await;
         assert_eq!(
@@ -2602,6 +2604,7 @@ mod permission_prompt_tests {
                 None, // git_tool
                 None, // crew_runner
                 None, // scratchpad_store
+                None, // code_search
             )
             .await;
             assert_eq!(out, "gated contents");
@@ -4764,19 +4767,25 @@ fn run_chat(
                     // (lazily, on the first active turn), then inject a
                     // <code_evidence> block at the turn head (also ephemeral, never
                     // persisted). An absent embedding model degrades to a no-op.
-                    if semantic_on {
-                        let sem = cfg
-                            .context
-                            .as_ref()
-                            .map(|c| c.semantic.clone())
-                            .unwrap_or_default();
-                        let embedder = newt_core::EmbeddingsClient::new(
+                    // Step 26.5: build the embedder once when semantic is on — it
+                    // serves the turn-head indexing/injection (26.5.4) AND the
+                    // code_search tool's ChatCtx searcher (26.5.5), so it must
+                    // outlive the ChatCtx below.
+                    let semantic_cfg = cfg
+                        .context
+                        .as_ref()
+                        .map(|c| c.semantic.clone())
+                        .unwrap_or_default();
+                    let semantic_embedder = semantic_on.then(|| {
+                        newt_core::EmbeddingsClient::new(
                             inf_url.clone(),
-                            sem.embedding_model.clone(),
+                            semantic_cfg.embedding_model.clone(),
                             inf_key.clone(),
                             60,
                             2,
-                        );
+                        )
+                    });
+                    if let Some(embedder) = semantic_embedder.as_ref() {
                         if !semantic_indexed {
                             // Attempt indexing ONCE per session (reset on /new),
                             // whether or not it yields chunks — so a missing
@@ -4795,7 +4804,7 @@ fn run_chat(
                                 let n = tokio::task::block_in_place(|| {
                                     rt.block_on(newt_core::index_files(
                                         &files,
-                                        &embedder,
+                                        embedder,
                                         &semantic_index,
                                     ))
                                 });
@@ -4804,7 +4813,7 @@ fn run_chat(
                                         &format!(
                                             "semantic: indexed 0 chunks — is the embedding model \
                                              '{}' pulled in Ollama? (retrieval is a no-op until it is)",
-                                            sem.embedding_model
+                                            semantic_cfg.embedding_model
                                         ),
                                         color,
                                     );
@@ -4820,9 +4829,9 @@ fn run_chat(
                         if let Some(block) = tokio::task::block_in_place(|| {
                             rt.block_on(newt_core::retrieve_evidence(
                                 &task,
-                                &embedder,
+                                embedder,
                                 &semantic_index,
-                                sem.top_k,
+                                semantic_cfg.top_k,
                             ))
                         }) {
                             turn_system = format!("{block}\n\n{turn_system}");
@@ -5008,6 +5017,15 @@ fn run_chat(
                                         scratchpad_store: Some(
                                             &scratchpad_store as &dyn newt_core::ScratchpadStore,
                                         ),
+                                        // Step 26.5.5 (#582): the code_search tool's
+                                        // searcher — Some only when semantic is on.
+                                        code_search: semantic_embedder.as_ref().map(|e| {
+                                            newt_core::CodeSearch {
+                                                embedder: e,
+                                                index: &semantic_index,
+                                                top_k: semantic_cfg.top_k,
+                                            }
+                                        }),
                                         // #307: the clamped effective caveats (base ∩
                                         // preset). Identical to `cap.caveats()` when no
                                         // mode is active.
@@ -9469,6 +9487,7 @@ mod run_command_confinement_tests {
             None, // git_tool
             None, // crew_runner
             None, // scratchpad_store
+            None, // code_search
         )
         .await;
         assert!(
@@ -9506,6 +9525,7 @@ mod run_command_confinement_tests {
             None, // git_tool
             None, // crew_runner
             None, // scratchpad_store
+            None, // code_search
         )
         .await;
         assert!(
@@ -9554,6 +9574,7 @@ mod run_command_confinement_tests {
             None, // git_tool
             None, // crew_runner
             None, // scratchpad_store
+            None, // code_search
         )
         .await;
 
@@ -9599,6 +9620,7 @@ mod run_command_confinement_tests {
             None, // git_tool
             None, // crew_runner
             None, // scratchpad_store
+            None, // code_search
         )
         .await;
         assert_eq!(out, "hello", "read_file must still return file contents");
@@ -9637,6 +9659,7 @@ mod run_command_confinement_tests {
             None, // git_tool
             None, // crew_runner
             None, // scratchpad_store
+            None, // code_search
         )
         .await;
         assert!(
@@ -9682,6 +9705,7 @@ mod run_command_confinement_tests {
             None, // git_tool
             None, // crew_runner
             None, // scratchpad_store
+            None, // code_search
         )
         .await;
         assert!(out.contains("one.txt") && out.contains("two.txt"));
@@ -9812,6 +9836,7 @@ mod disable_ocap_session_tests {
             None, // git_tool
             None, // crew_runner
             None, // scratchpad_store
+            None, // code_search
         )
         .await;
         assert_eq!(out, "yolo-through\n");
@@ -9834,6 +9859,7 @@ mod disable_ocap_session_tests {
             None, // git_tool
             None, // crew_runner
             None, // scratchpad_store
+            None, // code_search
         )
         .await;
         assert_eq!(
@@ -9893,6 +9919,7 @@ mod disable_ocap_session_tests {
             None, // git_tool
             None, // crew_runner
             None, // scratchpad_store
+            None, // code_search
         )
         .await;
         assert_eq!(out, "no-prompt\n");
@@ -9932,6 +9959,7 @@ mod disable_ocap_session_tests {
             None, // git_tool
             None, // crew_runner
             None, // scratchpad_store
+            None, // code_search
         )
         .await;
         assert_eq!(out, "gated contents");
@@ -9978,6 +10006,7 @@ mod disable_ocap_session_tests {
             None, // git_tool
             None, // crew_runner
             None, // scratchpad_store
+            None, // code_search
         )
         .await;
         assert_ne!(out, "should-not-run\n", "the floor must block --yolo");
@@ -12122,6 +12151,7 @@ mod tool_round_cap_tests {
                     spill_store: None,
                     scratchpad: false,
                     scratchpad_store: None,
+                    code_search: None,
                     caveats: &caveats,
                     max_tool_rounds: 5,
                     tool_output_lines: 20,

@@ -59,9 +59,9 @@ pub use agent_mesh_protocol::{Caveats, CountBound, Scope};
 pub use agentic::{
     chat_complete, compress_user_initiated, execute_tool, gather_code_files, index_files,
     memory_fetch_tool_definition, openai_chat_complete, retrieve_evidence, transcript_lines,
-    transcript_lines_styled, trim_for_summary, widen_caveats, ChatCtx, CompressCounters,
-    CompressState, DenialKind, Embedder, EmbeddingsClient, ManualCompressOutcome, McpTools,
-    MemAddr, MemPayload, MemorySource, NoMcp, NoteNudge, NoteSink, PermissionDecision,
+    transcript_lines_styled, trim_for_summary, widen_caveats, ChatCtx, CodeSearch,
+    CompressCounters, CompressState, DenialKind, Embedder, EmbeddingsClient, ManualCompressOutcome,
+    McpTools, MemAddr, MemPayload, MemorySource, NoMcp, NoteNudge, NoteSink, PermissionDecision,
     PermissionGate, PermissionRecord, PermissionRequest, RecallSource, RoundObservation,
     ScratchpadStore, SemanticIndex, SessionScratchpadStore, SessionSemanticIndex,
     SessionSpillStore, ShellObservation, SpillStore, StoreMemorySource, StoreRecallSource,
