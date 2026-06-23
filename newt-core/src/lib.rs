@@ -62,9 +62,10 @@ pub use agentic::{
     widen_caveats, ChatCtx, CompressCounters, CompressState, DenialKind, ManualCompressOutcome,
     McpTools, MemAddr, MemPayload, MemorySource, NoMcp, NoteNudge, NoteSink, PermissionDecision,
     PermissionGate, PermissionRecord, PermissionRequest, RecallSource, RoundObservation,
-    SessionSpillStore, ShellObservation, SpillStore, StoreMemorySource, StoreRecallSource,
-    SummarizeFn, SummarizeFuture, Summarizer, TranscriptLine, TranscriptRole, TranscriptStyle,
-    TurnDriver, TurnDriverConfig, TurnDriverError, TurnOutcome, TurnStatus,
+    ScratchpadStore, SessionScratchpadStore, SessionSpillStore, ShellObservation, SpillStore,
+    StoreMemorySource, StoreRecallSource, SummarizeFn, SummarizeFuture, Summarizer, TranscriptLine,
+    TranscriptRole, TranscriptStyle, TurnDriver, TurnDriverConfig, TurnDriverError, TurnOutcome,
+    TurnStatus,
 };
 pub use agents::AgentsProvider;
 pub use caveats::{CaveatsExt, CountBoundExt, ScopeExt};

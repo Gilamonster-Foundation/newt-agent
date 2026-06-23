@@ -2525,6 +2525,7 @@ mod permission_prompt_tests {
             None,
             None, // git_tool
             None, // crew_runner
+            None, // scratchpad_store
         )
         .await;
         assert_eq!(out, "gated contents", "allow-once executed the real read");
@@ -2547,6 +2548,7 @@ mod permission_prompt_tests {
             None,
             None, // git_tool
             None, // crew_runner
+            None, // scratchpad_store
         )
         .await;
         assert_eq!(
@@ -2597,6 +2599,7 @@ mod permission_prompt_tests {
                 None,
                 None, // git_tool
                 None, // crew_runner
+                None, // scratchpad_store
             )
             .await;
             assert_eq!(out, "gated contents");
@@ -3985,6 +3988,9 @@ fn run_chat(
     // `tool_offload` feature). Session-lived so `spill:` re-reads work across
     // rounds; pure in-memory, discarded at session end / `/new`.
     let spill_store = newt_core::SessionSpillStore::default();
+    // Step 26.4 (#583): session-scoped scratchpad <state> store. Session-lived;
+    // cleared on /new so a fresh task never inherits stale state.
+    let scratchpad_store = newt_core::SessionScratchpadStore::default();
     let ctx = newt_core::SessionContext {
         workspace: workspace.to_string(),
         session_id: format!(
@@ -4349,11 +4355,19 @@ fn run_chat(
                                 use newt_core::SpillStore;
                                 (spill_store.spills(), spill_store.offloaded_chars())
                             });
+                            let scratch_impact = features.scratchpad.then(|| {
+                                use newt_core::ScratchpadStore;
+                                (
+                                    scratchpad_store.keys_count(),
+                                    scratchpad_store.state_chars(),
+                                )
+                            });
                             for line in context_stats_text(
                                 token_gauge,
                                 &compress_state.counters(),
                                 features,
                                 impact,
+                                scratch_impact,
                             ) {
                                 print_newt(&line, color, verbose);
                             }
@@ -4447,6 +4461,12 @@ fn run_chat(
                             &mut compress_state,
                             &mut session_opted_fresh,
                         );
+                        // Step 26.4 (#583): drop scratchpad state so a fresh task
+                        // never inherits the previous conversation's variables.
+                        {
+                            use newt_core::ScratchpadStore;
+                            scratchpad_store.clear();
+                        }
                         // `/new` keeps its historical message verbatim; the
                         // end/restart aliases say so explicitly (the previous
                         // conversation won't resume next launch).
@@ -4692,10 +4712,29 @@ fn run_chat(
                     // identity for commit attribution). build_messages only uses
                     // the system string to fill message[0], so per-turn variation
                     // is safe.
-                    let turn_system = format!(
+                    // Step 26.3/26.4: resolve the per-turn feature set once (used
+                    // for the <state> injection here and the ChatCtx fields below).
+                    let turn_features = context_features(
+                        &cfg,
+                        context_manager(&cfg, context_manager_override),
+                        &context_features_override,
+                    );
+                    let tool_offload_on = turn_features.tool_offload;
+                    let scratchpad_on = turn_features.scratchpad;
+                    let mut turn_system = format!(
                         "{}\n{system}",
                         runtime_context_block(&inf_model, &inf_url, inf_kind)
                     );
+                    // Step 26.4 (#583): inject the <state> block at the HEAD of the
+                    // turn — it rides the ephemeral message[0] (regenerated each
+                    // turn from turn_system) and is NEVER persisted to the log.
+                    if scratchpad_on {
+                        if let Some(block) =
+                            newt_core::agentic::scratchpad_state_block(&scratchpad_store)
+                        {
+                            turn_system = format!("{block}\n\n{turn_system}");
+                        }
+                    }
                     let messages = memory.build_messages(&turn_system, &task);
                     // The save_note sink borrows the manager for this call
                     // only; `/remember` and `save_note` share its NoteStore
@@ -4848,14 +4887,7 @@ fn run_chat(
                     let turn_cancel = std::sync::atomic::AtomicBool::new(false);
                     let turn_hard = std::sync::atomic::AtomicBool::new(false);
                     let interruptible = io::stdin().is_terminal() && io::stdout().is_terminal();
-                    // Step 26.3 (#584): resolve the tool_offload feature for this
-                    // turn (preset → [context.features] → /context feature).
-                    let tool_offload_on = context_features(
-                        &cfg,
-                        context_manager(&cfg, context_manager_override),
-                        &context_features_override,
-                    )
-                    .tool_offload;
+                    // (tool_offload_on / scratchpad_on resolved at the turn head.)
                     let response =
                         with_interrupt_watch(interruptible, &turn_cancel, &turn_hard, || {
                             tokio::task::block_in_place(|| {
@@ -4877,6 +4909,11 @@ fn run_chat(
                                         tool_offload: tool_offload_on,
                                         spill_store: Some(
                                             &spill_store as &dyn newt_core::SpillStore,
+                                        ),
+                                        // Step 26.4 (#583): scratchpad state.
+                                        scratchpad: scratchpad_on,
+                                        scratchpad_store: Some(
+                                            &scratchpad_store as &dyn newt_core::ScratchpadStore,
                                         ),
                                         // #307: the clamped effective caveats (base ∩
                                         // preset). Identical to `cap.caveats()` when no
@@ -7066,6 +7103,7 @@ fn context_stats_text(
     counters: &newt_core::CompressCounters,
     features: newt_core::ContextFeatureSet,
     tool_offload_impact: Option<(u64, u64)>,
+    scratchpad_impact: Option<(u64, u64)>,
 ) -> Vec<String> {
     let mut lines = vec!["context stats".to_string()];
     // Live send-budget fill (None until a turn has reported usage).
@@ -7100,6 +7138,12 @@ fn context_stats_text(
                     "  — {spills} offloaded (~{}k chars elided)",
                     chars / 1000
                 ));
+            }
+        }
+        // Step 26.4: scratchpad's measured impact this session.
+        if f == newt_core::ContextFeature::Scratchpad {
+            if let Some((keys, chars)) = scratchpad_impact {
+                line.push_str(&format!("  — {keys} keys (~{}k chars)", chars / 1000));
             }
         }
         lines.push(line);
@@ -9321,6 +9365,7 @@ mod run_command_confinement_tests {
             None,
             None, // git_tool
             None, // crew_runner
+            None, // scratchpad_store
         )
         .await;
         assert!(
@@ -9357,6 +9402,7 @@ mod run_command_confinement_tests {
             None,
             None, // git_tool
             None, // crew_runner
+            None, // scratchpad_store
         )
         .await;
         assert!(
@@ -9404,6 +9450,7 @@ mod run_command_confinement_tests {
             None,
             None, // git_tool
             None, // crew_runner
+            None, // scratchpad_store
         )
         .await;
 
@@ -9448,6 +9495,7 @@ mod run_command_confinement_tests {
             None,
             None, // git_tool
             None, // crew_runner
+            None, // scratchpad_store
         )
         .await;
         assert_eq!(out, "hello", "read_file must still return file contents");
@@ -9485,6 +9533,7 @@ mod run_command_confinement_tests {
             None,
             None, // git_tool
             None, // crew_runner
+            None, // scratchpad_store
         )
         .await;
         assert!(
@@ -9529,6 +9578,7 @@ mod run_command_confinement_tests {
             None,
             None, // git_tool
             None, // crew_runner
+            None, // scratchpad_store
         )
         .await;
         assert!(out.contains("one.txt") && out.contains("two.txt"));
@@ -9658,6 +9708,7 @@ mod disable_ocap_session_tests {
             None,
             None, // git_tool
             None, // crew_runner
+            None, // scratchpad_store
         )
         .await;
         assert_eq!(out, "yolo-through\n");
@@ -9679,6 +9730,7 @@ mod disable_ocap_session_tests {
             None,
             None, // git_tool
             None, // crew_runner
+            None, // scratchpad_store
         )
         .await;
         assert_eq!(
@@ -9737,6 +9789,7 @@ mod disable_ocap_session_tests {
             None,
             None, // git_tool
             None, // crew_runner
+            None, // scratchpad_store
         )
         .await;
         assert_eq!(out, "no-prompt\n");
@@ -9775,6 +9828,7 @@ mod disable_ocap_session_tests {
             None,
             None, // git_tool
             None, // crew_runner
+            None, // scratchpad_store
         )
         .await;
         assert_eq!(out, "gated contents");
@@ -9820,6 +9874,7 @@ mod disable_ocap_session_tests {
             Some(&clamp.exec),
             None, // git_tool
             None, // crew_runner
+            None, // scratchpad_store
         )
         .await;
         assert_ne!(out, "should-not-run\n", "the floor must block --yolo");
@@ -11962,6 +12017,8 @@ mod tool_round_cap_tests {
                     markdown: false,
                     tool_offload: false,
                     spill_store: None,
+                    scratchpad: false,
+                    scratchpad_store: None,
                     caveats: &caveats,
                     max_tool_rounds: 5,
                     tool_output_lines: 20,
@@ -12340,16 +12397,17 @@ mod helper_fn_tests {
                 .iter()
                 .filter(|l| l.contains("not yet available"))
                 .count(),
-            5
+            4
         );
 
-        // toggling an unavailable feature → reported with its issue, NOT applied
-        let r = run("feature scratchpad on");
+        // toggling a still-unavailable feature → reported with its issue, NOT
+        // applied (semantic = #582, pending until 26.5).
+        let r = run("feature semantic on");
         assert!(r.set_feature.is_none());
-        assert!(r.lines[0].contains("not yet available") && r.lines[0].contains("#583"));
+        assert!(r.lines[0].contains("not yet available") && r.lines[0].contains("#582"));
 
-        // alias + hyphen still resolve ("state" = scratchpad, still pending)
-        assert!(run("feature state on").lines[0].contains("not yet available"));
+        // alias still resolves ("retrieval" = semantic, still pending)
+        assert!(run("feature retrieval on").lines[0].contains("not yet available"));
 
         // unknown feature / bad toggle / unknown subcommand
         assert!(run("feature bogus on").lines[0].contains("unknown context feature"));
@@ -12396,6 +12454,13 @@ mod helper_fn_tests {
             Some((newt_core::ContextFeature::ToolOffload, true))
         );
         assert!(!r.lines[0].contains("not yet available"), "{:?}", r.lines);
+
+        // scratchpad shipped in 26.4 → its alias "state" toggles ON too.
+        let r = run("feature state on");
+        assert_eq!(
+            r.set_feature,
+            Some((newt_core::ContextFeature::Scratchpad, true))
+        );
     }
 
     #[test]
@@ -12410,42 +12475,50 @@ mod helper_fn_tests {
         let features = ContextFeatureSet::default();
 
         // No gauge yet → "not yet measured".
-        let none = context_stats_text(None, &counters, features, None);
+        let none = context_stats_text(None, &counters, features, None, None);
         assert_eq!(none[0], "context stats");
         assert!(none.iter().any(|l| l.contains("budget: not yet measured")));
 
         // With a gauge → budget line shows the fraction + percent.
-        let s = context_stats_text(Some((899_000, 1_024_000)), &counters, features, None);
+        let s = context_stats_text(Some((899_000, 1_024_000)), &counters, features, None, None);
         let joined = s.join("\n");
         assert!(joined.contains("899k/1024k"), "{joined}");
         assert!(joined.contains("% of the send window"), "{joined}");
         // Compression telemetry is reused from the /memory section.
         assert!(joined.contains("compressions this session: 3"), "{joined}");
         assert!(joined.contains("reclaimed 42%"), "{joined}");
-        // Every feature is listed; tool_offload is now available (26.3), the
-        // other five are still pending.
+        // Every feature is listed; tool_offload (26.3) + scratchpad (26.4) are
+        // available, the other four are still pending.
         for f in newt_core::ContextFeature::ALL {
             assert!(joined.contains(f.keyword()), "missing {}", f.keyword());
         }
         assert_eq!(
             s.iter().filter(|l| l.contains("(pending #")).count(),
-            5,
-            "five features still pending (tool_offload shipped in 26.3)"
+            4,
+            "four features still pending (tool_offload + scratchpad shipped)"
         );
 
-        // tool_offload impact renders on its row when the feature is on.
+        // tool_offload + scratchpad impact render on their rows when on.
         let mut on = ContextFeatureSet::default();
         on.set(newt_core::ContextFeature::ToolOffload, true);
-        let imp = context_stats_text(None, &counters, on, Some((3, 48_000))).join("\n");
+        on.set(newt_core::ContextFeature::Scratchpad, true);
+        let imp = context_stats_text(None, &counters, on, Some((3, 48_000)), Some((5, 12_000)))
+            .join("\n");
         assert!(
             imp.contains("[on ] tool_offload  — 3 offloaded (~48k chars elided)"),
             "{imp}"
         );
+        assert!(
+            imp.contains("[on ] scratchpad  — 5 keys (~12k chars)"),
+            "{imp}"
+        );
 
         // A zero budget renders the unmeasured line (no divide-by-zero).
-        assert!(context_stats_text(Some((10, 0)), &counters, features, None)
-            .iter()
-            .any(|l| l.contains("not yet measured")));
+        assert!(
+            context_stats_text(Some((10, 0)), &counters, features, None, None)
+                .iter()
+                .any(|l| l.contains("not yet measured"))
+        );
     }
 
     #[test]

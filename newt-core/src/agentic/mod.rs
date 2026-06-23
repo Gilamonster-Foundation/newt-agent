@@ -16,6 +16,8 @@ mod crew_attest;
 mod crew_tool;
 mod display;
 mod git_tool;
+// Step 26.4 (#583): scratchpad structured-state — the `scratchpad` context feature.
+pub(crate) mod scratchpad;
 // Step 26.3 (#584): tool-output offloading — the `tool_offload` context feature.
 pub(crate) mod spill;
 // Issue #308 — the cowork foundation: a non-blocking turn driver around
@@ -105,6 +107,7 @@ pub use driver::{
 pub use git_tool::{git_tool_definition, GitTool};
 pub use markdown::{render_markdown, MarkdownStreamWriter, RenderOpts};
 pub use mcp::{McpTools, NoMcp};
+pub use scratchpad::{scratchpad_state_block, ScratchpadStore, SessionScratchpadStore};
 pub use spill::{SessionSpillStore, SpillStore};
 
 /// Align GFM table pipes in Markdown **source** (Step 25.5, #568) — plain text,
@@ -533,6 +536,12 @@ pub struct ChatCtx<'a> {
     /// (and `spill:` re-reads resolve to a labelled absence). Shared `&dyn`
     /// (interior mutability) so it serves both the write path and `memory_fetch`.
     pub spill_store: Option<&'a dyn crate::agentic::spill::SpillStore>,
+    /// Inject the `<state>` scratchpad block + advertise the state tools (Step
+    /// 26.4, #583). The resolved `scratchpad` feature; false for headless/eval.
+    pub scratchpad: bool,
+    /// Session scratchpad store (Step 26.4). `None` = state tools not advertised
+    /// and no `<state>` injected. Shared `&dyn` (interior mutability).
+    pub scratchpad_store: Option<&'a dyn crate::agentic::scratchpad::ScratchpadStore>,
     pub caveats: &'a crate::caveats::Caveats,
     /// Maximum tool-call rounds before forcing a final tools-disabled
     /// completion (from `[tui].max_tool_rounds`, default 25).
@@ -931,6 +940,8 @@ pub async fn chat_complete(
         markdown: _,
         tool_offload,
         spill_store,
+        scratchpad,
+        scratchpad_store,
         caveats,
         max_tool_rounds,
         tool_output_lines,
@@ -980,6 +991,8 @@ pub async fn chat_complete(
     let advertise_save_note = note_sink.is_some();
     let advertise_recall = recall_source.is_some();
     let advertise_memory_fetch = memory_source.is_some();
+    // Step 26.4 (#583): state tools only when the feature is on AND a store exists.
+    let advertise_scratchpad = scratchpad_store.is_some() && scratchpad;
     let advertise_git = git_tool.is_some();
     let advertise_team = crew_runner.is_some();
 
@@ -1037,6 +1050,7 @@ pub async fn chat_complete(
         advertise_memory_fetch,
         advertise_git,
         advertise_team,
+        advertise_scratchpad,
     );
     let tool_tokens = estimate_value_tokens(&tools);
     // Phase 20 §2.3: one sanitized calibration ratio per turn. The
@@ -1816,6 +1830,7 @@ pub async fn chat_complete(
                 git_tool,
                 // #479: the injected crew/team orchestration (None for headless).
                 crew_runner,
+                scratchpad_store,
             )
             .await;
             // 17.6: record the call for the turn's events column — args are
@@ -2145,6 +2160,8 @@ pub async fn openai_chat_complete(
         markdown: _,
         tool_offload,
         spill_store,
+        scratchpad,
+        scratchpad_store,
         caveats,
         max_tool_rounds,
         tool_output_lines,
@@ -2193,6 +2210,8 @@ pub async fn openai_chat_complete(
     let advertise_save_note = note_sink.is_some();
     let advertise_recall = recall_source.is_some();
     let advertise_memory_fetch = memory_source.is_some();
+    // Step 26.4 (#583): state tools only when the feature is on AND a store exists.
+    let advertise_scratchpad = scratchpad_store.is_some() && scratchpad;
     let advertise_git = git_tool.is_some();
     let advertise_team = crew_runner.is_some();
 
@@ -2235,6 +2254,7 @@ pub async fn openai_chat_complete(
         advertise_memory_fetch,
         advertise_git,
         advertise_team,
+        advertise_scratchpad,
     );
     let tool_tokens = estimate_value_tokens(&tools);
     // Phase 20 §2.3: per-turn calibration ratio + real-token schema overhead
@@ -2656,6 +2676,7 @@ pub async fn openai_chat_complete(
                 git_tool,
                 // #479: the injected crew/team orchestration (None for headless).
                 crew_runner,
+                scratchpad_store,
             )
             .await;
             if debug {
@@ -2835,6 +2856,8 @@ pub async fn openai_responses_complete(
         markdown: _,
         tool_offload,
         spill_store,
+        scratchpad,
+        scratchpad_store,
         caveats,
         max_tool_rounds,
         tool_output_lines,
@@ -2875,6 +2898,8 @@ pub async fn openai_responses_complete(
     let advertise_save_note = note_sink.is_some();
     let advertise_recall = recall_source.is_some();
     let advertise_memory_fetch = memory_source.is_some();
+    // Step 26.4 (#583): state tools only when the feature is on AND a store exists.
+    let advertise_scratchpad = scratchpad_store.is_some() && scratchpad;
     let advertise_git = git_tool.is_some();
     let advertise_team = crew_runner.is_some();
 
@@ -2890,6 +2915,7 @@ pub async fn openai_responses_complete(
         advertise_memory_fetch,
         advertise_git,
         advertise_team,
+        advertise_scratchpad,
     );
     let tools = tools_to_responses(&tools_chat);
 
@@ -3040,6 +3066,7 @@ pub async fn openai_responses_complete(
                 exec_floor,
                 git_tool,
                 crew_runner,
+                scratchpad_store,
             )
             .await;
             if debug {
@@ -3559,6 +3586,8 @@ mod tool_round_cap_tests {
                 markdown: false,
                 tool_offload: false,
                 spill_store: None,
+                scratchpad: false,
+                scratchpad_store: None,
                 caveats: &caveats,
                 max_tool_rounds: cap,
                 tool_output_lines: 20,
@@ -3625,6 +3654,8 @@ mod tool_round_cap_tests {
                 markdown: false,
                 tool_offload: false,
                 spill_store: None,
+                scratchpad: false,
+                scratchpad_store: None,
                 caveats: &caveats,
                 max_tool_rounds: 5,
                 tool_output_lines: 20,
@@ -3756,6 +3787,8 @@ mod tool_round_cap_tests {
                 markdown: false,
                 tool_offload: false,
                 spill_store: None,
+                scratchpad: false,
+                scratchpad_store: None,
                 caveats: &caveats,
                 max_tool_rounds: 5,
                 tool_output_lines: 20,
@@ -3824,6 +3857,8 @@ mod tool_round_cap_tests {
                 markdown: false,
                 tool_offload: false,
                 spill_store: None,
+                scratchpad: false,
+                scratchpad_store: None,
                 caveats: &caveats,
                 max_tool_rounds: cap,
                 tool_output_lines: 20,
@@ -3915,6 +3950,8 @@ mod tool_round_cap_tests {
                 markdown: false,
                 tool_offload: false,
                 spill_store: None,
+                scratchpad: false,
+                scratchpad_store: None,
                 caveats: &caveats,
                 max_tool_rounds: 1,
                 tool_output_lines: 20,
@@ -4018,6 +4055,8 @@ mod tool_round_cap_tests {
                 markdown: false,
                 tool_offload: false,
                 spill_store: None,
+                scratchpad: false,
+                scratchpad_store: None,
                 caveats: &caveats,
                 max_tool_rounds: 1,
                 tool_output_lines: 20,
@@ -4113,6 +4152,8 @@ mod tool_round_cap_tests {
                 markdown: false,
                 tool_offload: false,
                 spill_store: None,
+                scratchpad: false,
+                scratchpad_store: None,
                 caveats: &caveats,
                 max_tool_rounds: 2,
                 tool_output_lines: 20,
@@ -4184,6 +4225,7 @@ mod tool_round_cap_tests {
                 None,
                 None, // git_tool
                 None, // crew_runner
+                None, // scratchpad_store
             )
             .await;
             assert!(
@@ -4245,6 +4287,8 @@ mod tool_round_cap_tests {
                 markdown: false,
                 tool_offload: false,
                 spill_store: None,
+                scratchpad: false,
+                scratchpad_store: None,
                 caveats: &caveats,
                 max_tool_rounds: cap,
                 tool_output_lines: 20,
@@ -4391,6 +4435,8 @@ mod tool_round_cap_tests {
                 markdown: false,
                 tool_offload: false,
                 spill_store: None,
+                scratchpad: false,
+                scratchpad_store: None,
                 caveats: &caveats,
                 max_tool_rounds: 10,
                 tool_output_lines: 5,
@@ -4476,6 +4522,8 @@ mod http_loop_tests {
             markdown: false,
             tool_offload: false,
             spill_store: None,
+            scratchpad: false,
+            scratchpad_store: None,
             caveats,
             max_tool_rounds: 8,
             tool_output_lines: 20,
@@ -5357,6 +5405,8 @@ mod save_note_loop_tests {
             markdown: false,
             tool_offload: false,
             spill_store: None,
+            scratchpad: false,
+            scratchpad_store: None,
             caveats,
             max_tool_rounds: 6,
             tool_output_lines: 20,
@@ -5832,6 +5882,8 @@ mod compression_loop_tests {
             markdown: false,
             tool_offload: false,
             spill_store: None,
+            scratchpad: false,
+            scratchpad_store: None,
             caveats,
             max_tool_rounds: 12,
             tool_output_lines: 2,
@@ -6969,6 +7021,8 @@ mod observation_hook_tests {
             markdown: false,
             tool_offload: false,
             spill_store: None,
+            scratchpad: false,
+            scratchpad_store: None,
             caveats,
             max_tool_rounds: 8,
             tool_output_lines: 20,
