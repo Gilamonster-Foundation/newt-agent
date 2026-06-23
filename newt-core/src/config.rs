@@ -825,12 +825,12 @@ impl ContextFeature {
     }
 
     /// Whether this feature is implemented yet. Flips true per feature as it
-    /// lands (26.3–26.6). `tool_offload` shipped in 26.3 (#584); `scratchpad`
-    /// in 26.4 (#583).
+    /// lands (26.3–26.6). `tool_offload` 26.3 (#584); `scratchpad` 26.4 (#583);
+    /// `semantic` 26.5 (#582).
     pub fn available(self) -> bool {
         match self {
-            Self::ToolOffload | Self::Scratchpad => true,
-            Self::Semantic | Self::Provenance | Self::Experiential | Self::Scheduled => false,
+            Self::ToolOffload | Self::Scratchpad | Self::Semantic => true,
+            Self::Provenance | Self::Experiential | Self::Scheduled => false,
         }
     }
 
@@ -959,6 +959,41 @@ pub struct ContextConfig {
     /// `manager` preset's default unless explicitly set (Phase 26, #588).
     #[serde(default)]
     pub features: ContextFeatures,
+
+    /// `[context.semantic]` — settings for the `semantic` RAG feature (Step
+    /// 26.5, #582).
+    #[serde(default)]
+    pub semantic: SemanticConfig,
+}
+
+/// `[context.semantic]` — the embedding RAG-for-code feature's settings (Step
+/// 26.5.4, #582).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SemanticConfig {
+    /// Ollama embedding model used to index the repo + embed queries. Default
+    /// `nomic-embed-text`; if it isn't pulled, retrieval degrades to a no-op.
+    #[serde(default = "default_embedding_model")]
+    pub embedding_model: String,
+    /// How many code chunks to retrieve per turn. Default 5.
+    #[serde(default = "default_semantic_top_k")]
+    pub top_k: usize,
+}
+
+impl Default for SemanticConfig {
+    fn default() -> Self {
+        Self {
+            embedding_model: default_embedding_model(),
+            top_k: default_semantic_top_k(),
+        }
+    }
+}
+
+fn default_embedding_model() -> String {
+    "nomic-embed-text".to_string()
+}
+
+fn default_semantic_top_k() -> usize {
+    5
 }
 
 /// How a thinking model's streamed reasoning is surfaced — the `[tui] thinking`
@@ -2915,6 +2950,23 @@ mod tests {
     }
 
     #[test]
+    fn semantic_config_defaults_and_parses() {
+        // Defaults (Step 26.5.4): nomic-embed-text, top_k 5.
+        let d = SemanticConfig::default();
+        assert_eq!(d.embedding_model, "nomic-embed-text");
+        assert_eq!(d.top_k, 5);
+        // `[context.semantic]` parses + overrides.
+        let c: ContextConfig =
+            toml::from_str("[semantic]\nembedding_model = \"mxbai-embed-large\"\ntop_k = 8")
+                .unwrap();
+        assert_eq!(c.semantic.embedding_model, "mxbai-embed-large");
+        assert_eq!(c.semantic.top_k, 8);
+        // an absent [context.semantic] still yields the defaults
+        let bare: ContextConfig = toml::from_str("manager = \"standard\"").unwrap();
+        assert_eq!(bare.semantic, SemanticConfig::default());
+    }
+
+    #[test]
     fn context_feature_keyword_alias_availability_and_issue() {
         // canonical keyword round-trips
         for f in ContextFeature::ALL {
@@ -2934,13 +2986,17 @@ mod tests {
             Some(ContextFeature::Scratchpad)
         );
         assert_eq!(ContextFeature::from_keyword("nope"), None);
-        // tool_offload (26.3, #584) + scratchpad (26.4, #583) shipped; the other
-        // four are still pending.
+        // tool_offload (26.3), scratchpad (26.4), semantic (26.5) shipped; the
+        // other three are still pending.
         assert!(ContextFeature::ToolOffload.available());
         assert!(ContextFeature::Scratchpad.available());
+        assert!(ContextFeature::Semantic.available());
         assert!(ContextFeature::ALL
             .iter()
-            .filter(|f| !matches!(f, ContextFeature::ToolOffload | ContextFeature::Scratchpad))
+            .filter(|f| !matches!(
+                f,
+                ContextFeature::ToolOffload | ContextFeature::Scratchpad | ContextFeature::Semantic
+            ))
             .all(|f| !f.available()));
         // issues route to the right tracking ticket
         assert_eq!(ContextFeature::Semantic.issue(), 582);

@@ -111,8 +111,8 @@ pub use markdown::{render_markdown, MarkdownStreamWriter, RenderOpts};
 pub use mcp::{McpTools, NoMcp};
 pub use scratchpad::{scratchpad_state_block, ScratchpadStore, SessionScratchpadStore};
 pub use semantic::{
-    chunk_source, code_evidence_block, cosine, CodeChunk, Embedder, EmbeddingsClient,
-    SemanticIndex, SessionSemanticIndex,
+    chunk_source, code_evidence_block, cosine, gather_code_files, index_files, retrieve_evidence,
+    CodeChunk, Embedder, EmbeddingsClient, SemanticIndex, SessionSemanticIndex,
 };
 pub use spill::{SessionSpillStore, SpillStore};
 

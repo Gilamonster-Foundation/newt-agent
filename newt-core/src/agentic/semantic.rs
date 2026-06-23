@@ -338,6 +338,84 @@ pub fn code_evidence_block(
     build_code_evidence_block(index, query, top_k, CODE_EVIDENCE_CAP)
 }
 
+// --- Step 26.5.4: indexing + retrieval (Embedder-driven, mockable) ----------
+
+/// Index a set of `(file, source)` pairs (Step 26.5.4): chunk each file and
+/// embed each chunk via the injected [`Embedder`], populating `index`. Returns
+/// the count indexed. Best-effort — an embed failure SKIPS that chunk (the rest
+/// still index), so a flaky/absent embedder degrades to fewer-or-no results
+/// rather than aborting. fs/net-free here: the caller supplies the files and the
+/// `Embedder` is the seam (tests inject a deterministic fake).
+pub async fn index_files(
+    files: &[(String, String)],
+    embedder: &dyn Embedder,
+    index: &dyn SemanticIndex,
+) -> usize {
+    let mut indexed = 0;
+    for (file, source) in files {
+        for chunk in chunk_source(file, source) {
+            match embedder.embed(&chunk.text).await {
+                Ok(v) => {
+                    index.index_chunk(chunk, v);
+                    indexed += 1;
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, file = file.as_str(), "embed failed; skipping chunk");
+                }
+            }
+        }
+    }
+    indexed
+}
+
+/// Retrieve a `<code_evidence>` block for `query` (Step 26.5.4): embed the
+/// query, search `index`, render. `None` when the query can't embed, the index
+/// is empty, or nothing matches — so an absent embedding model is a silent
+/// no-op, not a turn failure.
+pub async fn retrieve_evidence(
+    query: &str,
+    embedder: &dyn Embedder,
+    index: &dyn SemanticIndex,
+    top_k: usize,
+) -> Option<String> {
+    let qv = embedder.embed(query).await.ok()?;
+    code_evidence_block(index, &qv, top_k)
+}
+
+/// Walk `workspace` for indexable code files (Step 26.5.4) — gitignore-aware,
+/// `.rs`/`.py` only (what the chunker understands), bounded for responsiveness.
+/// Returns `(relative-path, source)` pairs. **Runtime fs glue** (NOT unit-tier:
+/// it reads the real filesystem); the pure chunk/embed/index logic it feeds is
+/// the fully-mocked part above. Reuses the `ignore` crate (newt-core's `find`
+/// tool already depends on it).
+pub fn gather_code_files(workspace: &str) -> Vec<(String, String)> {
+    const MAX_FILES: usize = 400;
+    const MAX_BYTES: u64 = 200_000;
+    let mut out = Vec::new();
+    for entry in ignore::WalkBuilder::new(workspace).build().flatten() {
+        if out.len() >= MAX_FILES {
+            break;
+        }
+        let path = entry.path();
+        let ext = path.extension().and_then(|e| e.to_str());
+        if !matches!(ext, Some("rs") | Some("py")) {
+            continue;
+        }
+        if path.metadata().map(|m| m.len()).unwrap_or(u64::MAX) > MAX_BYTES {
+            continue;
+        }
+        if let Ok(src) = std::fs::read_to_string(path) {
+            let rel = path
+                .strip_prefix(workspace)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .to_string();
+            out.push((rel, src));
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -659,5 +737,68 @@ class Dog:
         // total cap truncates: tiny cap → the omitted marker, bounded length
         let capped = build_code_evidence_block(&idx, &[1.0, 0.0], 5, 30).unwrap();
         assert!(capped.contains("omitted to fit"), "{capped}");
+    }
+
+    // --- 26.5.4 index_files + retrieve_evidence (mock Embedder, no fs/net) --
+
+    /// Deterministic fake: embed text → [count('a'), count('b'), len]. Lets the
+    /// retrieval assertions be exact without any network.
+    struct MockEmbedder;
+    #[async_trait]
+    impl Embedder for MockEmbedder {
+        async fn embed(&self, text: &str) -> anyhow::Result<Vec<f32>> {
+            Ok(vec![
+                text.matches('a').count() as f32,
+                text.matches('b').count() as f32,
+                text.chars().count() as f32,
+            ])
+        }
+    }
+
+    /// An embedder that always fails — stands in for an unpulled model.
+    struct FailEmbedder;
+    #[async_trait]
+    impl Embedder for FailEmbedder {
+        async fn embed(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
+            anyhow::bail!("embeddings model not available")
+        }
+    }
+
+    #[tokio::test]
+    async fn index_files_chunks_embeds_and_skips_failures() {
+        let files = vec![("a.rs".to_string(), "fn add() {}\nfn sub() {}".to_string())];
+        // happy path: two fns chunked + embedded
+        let idx = SessionSemanticIndex::default();
+        let n = index_files(&files, &MockEmbedder, &idx).await;
+        assert_eq!(n, idx.chunks_indexed() as usize);
+        assert!(n >= 2, "two fns indexed, got {n}");
+        // all embeds fail → nothing indexed, no panic (graceful degrade)
+        let empty = SessionSemanticIndex::default();
+        assert_eq!(index_files(&files, &FailEmbedder, &empty).await, 0);
+        assert_eq!(empty.chunks_indexed(), 0);
+    }
+
+    #[tokio::test]
+    async fn retrieve_evidence_embeds_query_ranks_and_degrades() {
+        let files = vec![("a.rs".to_string(), "fn aaa() {}\nfn bbb() {}".to_string())];
+        let idx = SessionSemanticIndex::default();
+        index_files(&files, &MockEmbedder, &idx).await;
+        // query rich in 'a' → the aaa chunk outranks bbb (cosine on the a-axis)
+        let block = retrieve_evidence("aaaaa", &MockEmbedder, &idx, 1)
+            .await
+            .unwrap();
+        assert!(
+            block.contains("<code_evidence>") && block.contains("aaa"),
+            "{block}"
+        );
+        // a failed query embed → None (absent model = silent no-op, not a crash)
+        assert!(retrieve_evidence("x", &FailEmbedder, &idx, 1)
+            .await
+            .is_none());
+        // empty index → None
+        let empty = SessionSemanticIndex::default();
+        assert!(retrieve_evidence("aaa", &MockEmbedder, &empty, 1)
+            .await
+            .is_none());
     }
 }
