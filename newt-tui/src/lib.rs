@@ -4834,10 +4834,17 @@ fn run_chat(
                         .map(|c| c.semantic.clone())
                         .unwrap_or_default();
                     let semantic_embedder = semantic_on.then(|| {
+                        let (emb_url, emb_kind, emb_key) = resolve_embeddings_target(
+                            &semantic_cfg,
+                            &inf_url,
+                            inf_kind,
+                            inf_key.as_deref(),
+                        );
                         newt_core::EmbeddingsClient::new(
-                            inf_url.clone(),
+                            emb_url,
                             semantic_cfg.embedding_model.clone(),
-                            inf_key.clone(),
+                            emb_kind,
+                            emb_key,
                             60,
                             2,
                         )
@@ -4863,6 +4870,7 @@ fn run_chat(
                                         &files,
                                         embedder,
                                         &semantic_index,
+                                        semantic_cfg.on_embed_failure,
                                     ))
                                 });
                                 if n == 0 {
@@ -5476,6 +5484,28 @@ fn ready_line(version: &str, model: &str, url: &str, kind: newt_core::BackendKin
         "v{version} ready — {model} @ {url} ({})  (Ctrl-D or /exit to quit)",
         kind.label()
     )
+}
+
+/// Resolve where the semantic embedder sends requests: `(url, protocol, key)`.
+/// An explicit `embeddings_endpoint` (with its protocol; no inherited key)
+/// decouples embeddings from chat — point it at a real embeddings host while
+/// chat runs on a vLLM coder. Unset → fall back to the active backend
+/// (back-compat), now protocol-aware so an OpenAI backend uses `/v1/embeddings`.
+/// Pure for testing.
+fn resolve_embeddings_target(
+    cfg: &newt_core::SemanticConfig,
+    inf_url: &str,
+    inf_kind: newt_core::BackendKind,
+    inf_key: Option<&str>,
+) -> (String, newt_core::BackendKind, Option<String>) {
+    match cfg.embeddings_endpoint.clone() {
+        Some(url) => (
+            url,
+            cfg.embeddings_api.unwrap_or(newt_core::BackendKind::Ollama),
+            None,
+        ),
+        None => (inf_url.to_string(), inf_kind, inf_key.map(str::to_string)),
+    }
 }
 
 /// Whether to use the OpenAI backend, given a `NEWT_BACKEND` override and
@@ -13024,6 +13054,31 @@ mod helper_fn_tests {
             newt_core::BackendKind::Openai,
         );
         assert!(v.contains("@ http://dgx1:8000 (openai)"), "{v}");
+    }
+
+    #[test]
+    fn resolve_embeddings_target_decouples_or_falls_back() {
+        use newt_core::BackendKind;
+        // Unset endpoint → fall back to the active backend (url, protocol, key)
+        // — back-compat, and protocol-aware (carries inf_kind).
+        let mut cfg = newt_core::SemanticConfig::default();
+        let (url, kind, key) =
+            resolve_embeddings_target(&cfg, "http://dgx1:8000", BackendKind::Openai, Some("sk-x"));
+        assert_eq!(url, "http://dgx1:8000");
+        assert_eq!(kind, BackendKind::Openai);
+        assert_eq!(key.as_deref(), Some("sk-x"));
+        // Explicit endpoint → used as-is, no inherited key; protocol defaults to
+        // Ollama when embeddings_api is unset.
+        cfg.embeddings_endpoint = Some("http://dgx1.home.lab:11434".to_string());
+        let (url, kind, key) =
+            resolve_embeddings_target(&cfg, "http://dgx1:8000", BackendKind::Openai, Some("sk-x"));
+        assert_eq!(url, "http://dgx1.home.lab:11434");
+        assert_eq!(kind, BackendKind::Ollama);
+        assert_eq!(key, None);
+        // ...and honors an explicit embeddings_api.
+        cfg.embeddings_api = Some(BackendKind::Openai);
+        let (_, kind, _) = resolve_embeddings_target(&cfg, "http://x", BackendKind::Ollama, None);
+        assert_eq!(kind, BackendKind::Openai);
     }
 
     #[test]

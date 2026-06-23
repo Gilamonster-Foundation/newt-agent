@@ -31,9 +31,12 @@ use std::io::Write as _;
 
 use clap::Subcommand;
 use newt_core::dgx::{DgxConfig, DgxNode, EndpointKind};
+use newt_core::retry::{with_backoff, RetryPolicy};
 use newt_core::router::Classification;
 use newt_core::{Config, Router, Tier};
 use newt_inference::local::LocalVllmBackend;
+
+use crate::dgx_vllm;
 
 /// `newt dgx <cmd>` subcommands.
 #[derive(Subcommand, Debug)]
@@ -92,6 +95,12 @@ pub enum DgxCmd {
         /// How long Ollama keeps the model resident after warming.
         #[arg(long, default_value = "30m")]
         keep_alive: String,
+        /// First stop any running vLLM server to free the shared unified pool,
+        /// then warm against the Ollama endpoint (the reverse of
+        /// `vllm up --evict-ollama`). Implies the Ollama endpoint even if the
+        /// active endpoint was vLLM.
+        #[arg(long)]
+        evict_vllm: bool,
     },
     /// Pull a model onto the DGX node.
     ///
@@ -128,6 +137,139 @@ pub enum DgxCmd {
     },
     /// List models currently loaded on the active Ollama endpoint (`/api/ps`).
     Ps,
+    /// Manage a vLLM OpenAI-compatible server on the DGX node.
+    ///
+    /// Stands up (`up`) / tears down (`down`) a `vllm serve` process over SSH,
+    /// reports the served models (`ps`), prints the resolved launch plan
+    /// (`config`), or tails the server log (`logs`). Pure planning lives in
+    /// [`crate::dgx_vllm`]; SSH/HTTP execution is injectable so tests never
+    /// touch the network or a real node.
+    Vllm {
+        #[command(subcommand)]
+        cmd: VllmCmd,
+    },
+    /// Cross-engine GPU residency snapshot: what Ollama and vLLM each hold on
+    /// the node right now, plus available memory.
+    ///
+    /// On the unified-memory GB10 both engines draw from one ~117 GiB pool and
+    /// neither negotiates, so this is the operator's window into contention.
+    /// Live-queried (Ollama `/api/ps` + vLLM `/v1/models` + `MemAvailable`) —
+    /// ground truth, not a cached lease file.
+    Gpu,
+    /// Flip the node to a target engine + model, evicting the other engine.
+    ///
+    /// `switch vllm <model>` unloads any resident Ollama models, launches the
+    /// vLLM server, and points newt at it. `switch ollama <model>` stops the
+    /// vLLM server, verifies the model is pulled (refusing with a hint if not),
+    /// points newt at Ollama, and warms it. Composes the `vllm up`/`warm`
+    /// eviction swaps into one atomic flip.
+    Switch {
+        /// Target engine: `ollama` or `vllm`.
+        engine: String,
+        /// Model to activate on the target engine.
+        model: String,
+        /// SSH node name (defaults to the active node).
+        #[arg(long)]
+        node: Option<String>,
+        /// Print the plan without evicting, launching, or persisting.
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
+/// Planning knobs shared by `dgx vllm up` and `dgx vllm config`.
+#[derive(clap::Args, Debug)]
+pub struct VllmPlanArgs {
+    /// Override the OpenAI `served-model-name` (default: sanitized model name).
+    #[arg(long)]
+    pub served_name: Option<String>,
+    /// Quant/dtype (auto|nvfp4|fp8|bf16|awq|gptq); inferred from the model name
+    /// when omitted.
+    #[arg(long)]
+    pub dtype: Option<String>,
+    /// `--tensor-parallel-size` (number of GPUs). Default 1; >1 is meaningless
+    /// on a single unified-memory GB10.
+    #[arg(long, default_value_t = 1)]
+    pub tensor_parallel: u8,
+    /// Cap the context window; otherwise the planner default is used.
+    #[arg(long)]
+    pub max_model_len: Option<u32>,
+    /// `--gpu-memory-utilization` fraction (0.0..=1.0). Default 0.90.
+    #[arg(long, default_value_t = 0.90)]
+    pub gpu_mem_util: f64,
+    /// Listen port on the node. Default 8000.
+    #[arg(long, default_value_t = 8000)]
+    pub port: u16,
+    /// Render the `docker run vllm/vllm-openai` argv instead of native
+    /// `vllm serve` (native is the only launcher executed in this step).
+    #[arg(long)]
+    pub docker: bool,
+    /// Extra args appended verbatim to the vLLM command line.
+    #[arg(long)]
+    pub extra: Vec<String>,
+}
+
+/// `newt dgx vllm <cmd>` subcommands.
+#[derive(Subcommand, Debug)]
+pub enum VllmCmd {
+    /// Launch a vLLM server on the node for `model` (HF id or local path).
+    ///
+    /// Runs a fit pre-flight against the node's *available* memory, renders the
+    /// `vllm serve` argv, launches it detached with `nohup`, polls
+    /// `/v1/models` until ready, then persists the endpoint + active model.
+    Up {
+        /// Model to serve (HuggingFace `<org>/<repo>` or an on-node path).
+        model: String,
+        /// SSH node name (defaults to the active node).
+        #[arg(long)]
+        node: Option<String>,
+        #[command(flatten)]
+        plan: VllmPlanArgs,
+        /// Proceed even when the model exceeds the memory budget.
+        #[arg(long)]
+        force: bool,
+        /// Before launching, unload any models resident on the active Ollama
+        /// endpoint to free the shared unified-memory pool (the eval-loop swap).
+        #[arg(long)]
+        evict_ollama: bool,
+        /// Print the resolved plan + remote script without SSHing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Stop the vLLM server for `served_name` (default: the active model).
+    Down {
+        /// Served model name whose pidfile to kill (default: active model).
+        served_name: Option<String>,
+        /// SSH node name (defaults to the active node).
+        #[arg(long)]
+        node: Option<String>,
+        /// Print the kill command without SSHing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Probe the configured vLLM endpoint and list its models (`/v1/models`).
+    Ps,
+    /// Print the resolved launch plan (argv) for `model`. Pure: no SSH/network.
+    Config {
+        /// Model to plan for.
+        model: String,
+        #[command(flatten)]
+        plan: VllmPlanArgs,
+    },
+    /// Tail the vLLM server log on the node (`tail -f` over SSH).
+    Logs {
+        /// Served model name whose log to tail (default: active model).
+        served_name: Option<String>,
+        /// SSH node name (defaults to the active node).
+        #[arg(long)]
+        node: Option<String>,
+        /// Number of trailing lines before following. Default 50.
+        #[arg(long, default_value_t = 50)]
+        lines: u32,
+        /// Print the remote command without SSHing.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 /// Dispatch a `newt dgx` subcommand.
@@ -152,7 +294,11 @@ pub async fn run(cmd: DgxCmd, config_path: Option<&Path>) -> anyhow::Result<()> 
         DgxCmd::Models => models(config_path).await,
         DgxCmd::Doctor => doctor(config_path).await,
         DgxCmd::Use { model } => use_model(config_path, &model),
-        DgxCmd::Warm { model, keep_alive } => warm(config_path, model, &keep_alive).await,
+        DgxCmd::Warm {
+            model,
+            keep_alive,
+            evict_vllm,
+        } => warm(config_path, model, &keep_alive, evict_vllm).await,
         DgxCmd::Pull {
             model,
             node,
@@ -172,6 +318,64 @@ pub async fn run(cmd: DgxCmd, config_path: Option<&Path>) -> anyhow::Result<()> 
         }
         DgxCmd::Rm { model } => rm(config_path, &model).await,
         DgxCmd::Ps => ps(config_path).await,
+        DgxCmd::Vllm { cmd } => match cmd {
+            VllmCmd::Up {
+                model,
+                node,
+                plan,
+                force,
+                evict_ollama,
+                dry_run,
+            } => {
+                vllm_up(
+                    config_path,
+                    &model,
+                    node.as_deref(),
+                    &plan,
+                    force,
+                    evict_ollama,
+                    dry_run,
+                )
+                .await
+            }
+            VllmCmd::Down {
+                served_name,
+                node,
+                dry_run,
+            } => {
+                vllm_down(
+                    config_path,
+                    served_name.as_deref(),
+                    node.as_deref(),
+                    dry_run,
+                )
+                .await
+            }
+            VllmCmd::Ps => vllm_ps(config_path).await,
+            VllmCmd::Config { model, plan } => vllm_config(&model, &plan),
+            VllmCmd::Logs {
+                served_name,
+                node,
+                lines,
+                dry_run,
+            } => {
+                vllm_logs(
+                    config_path,
+                    served_name.as_deref(),
+                    node.as_deref(),
+                    lines,
+                    dry_run,
+                )
+                .await
+            }
+        },
+        DgxCmd::Gpu => gpu(config_path).await,
+        DgxCmd::Switch {
+            engine,
+            model,
+            node,
+            dry_run,
+        } => switch(config_path, &engine, &model, node.as_deref(), dry_run).await,
     }
 }
 
@@ -593,24 +797,58 @@ async fn warm_model(
     Ok(json["load_duration"].as_u64().map(|ns| ns as f64 / 1e9))
 }
 
+/// Resolve which model `warm` should load. An explicit arg always wins. With no
+/// arg, `--evict-vllm` requires an explicit Ollama model — the persisted active
+/// model is the just-stopped vLLM served name, which Ollama doesn't have (it
+/// would 404), so refuse with an actionable message rather than that confusion.
+/// Otherwise fall back to the active model. Pure → unit-tested.
+fn resolve_warm_model(
+    model: Option<String>,
+    evict_vllm: bool,
+    dgx: &DgxConfig,
+) -> anyhow::Result<String> {
+    if let Some(m) = model {
+        return Ok(m);
+    }
+    if evict_vllm {
+        anyhow::bail!(
+            "--evict-vllm needs an explicit Ollama model to warm (the active model {:?} \
+             is the vLLM served name, now stopped) — e.g. \
+             `dgx warm --evict-vllm qwen2.5-coder:32b`",
+            dgx.active_model.as_deref().unwrap_or("<none>")
+        );
+    }
+    Ok(dgx.resolve_active_model()?)
+}
+
 async fn warm(
     config_path: Option<&Path>,
     model: Option<String>,
     keep_alive: &str,
+    evict_vllm: bool,
 ) -> anyhow::Result<()> {
     let dgx = dgx_config(config_path)?;
-    let kind = dgx.active_endpoint;
-    if kind.is_openai_compatible() {
-        anyhow::bail!(
-            "`newt dgx warm` targets Ollama endpoints; the active endpoint is vLLM \
-             (vLLM keeps its served model resident already)"
-        );
-    }
-    let base = dgx.resolve_endpoint()?;
-    let model = match model {
-        Some(m) => m,
-        None => dgx.resolve_active_model()?,
+    // `--evict-vllm`: free the shared pool first, then target the Ollama
+    // endpoint explicitly — the flag is an explicit "switch to Ollama" intent,
+    // so it bypasses the active-endpoint guard below.
+    let (kind, base) = if evict_vllm {
+        evict_vllm_server(&RealSsh, &dgx).await?;
+        (
+            EndpointKind::Ollama,
+            dgx.resolve_endpoint_for(EndpointKind::Ollama)?,
+        )
+    } else {
+        let kind = dgx.active_endpoint;
+        if kind.is_openai_compatible() {
+            anyhow::bail!(
+                "`newt dgx warm` targets Ollama endpoints; the active endpoint is vLLM \
+                 (vLLM keeps its served model resident already). Pass --evict-vllm to stop \
+                 the vLLM server and warm an Ollama model instead."
+            );
+        }
+        (kind, dgx.resolve_endpoint()?)
     };
+    let model = resolve_warm_model(model, evict_vllm, &dgx)?;
     println!("Warming {model} on {kind} endpoint ({base}) — keep_alive={keep_alive}");
 
     // Cold loads of large models can take tens of seconds; give warm its own
@@ -659,16 +897,32 @@ impl SshExec for RealSsh {
     }
 }
 
-/// Detect total node RAM in bytes via `free -b | awk '/Mem:/{print $2}'`.
-/// Best-effort: returns `None` (rather than erroring) if SSH or parsing fails.
-fn detect_node_mem(user: &str, host: &str, port: Option<u16>) -> Option<u64> {
-    let argv = dgx_pull::ssh_argv(user, host, port, "free -b | awk '/Mem:/{print $2}'");
+/// `free -b` awk column for total RAM (`MemTotal`).
+const MEM_TOTAL_AWK: &str = "$2";
+/// `free -b` awk column for available RAM (`MemAvailable`).
+const MEM_AVAILABLE_AWK: &str = "$7";
+
+/// The remote command that prints one memory figure from `free -b` (pure).
+fn node_mem_probe(awk_field: &str) -> String {
+    format!("free -b | awk '/Mem:/{{print {awk_field}}}'")
+}
+
+/// Detect node RAM (bytes) via `free -b`, selecting the awk column. Best-effort:
+/// `None` if SSH or parsing fails.
+fn detect_node_mem_col(user: &str, host: &str, port: Option<u16>, awk_field: &str) -> Option<u64> {
+    let argv = dgx_pull::ssh_argv(user, host, port, &node_mem_probe(awk_field));
     let (prog, rest) = argv.split_first()?;
     let out = std::process::Command::new(prog).args(rest).output().ok()?;
     if !out.status.success() {
         return None;
     }
     dgx_pull::parse_free_bytes(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Detect total node RAM (`MemTotal`). Used by the Ollama `pull` fit pre-flight,
+/// whose semantics deliberately stay unchanged in this step.
+fn detect_node_mem(user: &str, host: &str, port: Option<u16>) -> Option<u64> {
+    detect_node_mem_col(user, host, port, MEM_TOTAL_AWK)
 }
 
 /// GET `<hf_base>/api/models/<org>/<repo>?blobs=true` → the `.gguf` siblings.
@@ -955,6 +1209,675 @@ fn extract_ps(models: &serde_json::Value) -> Vec<(String, Option<u64>)> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+// ---------------------------------------------------------------------------
+// vllm — stand up / tear down a vLLM server on the node (Step 14.11)
+// ---------------------------------------------------------------------------
+
+/// Available node RAM (`MemAvailable`, column 7). vLLM's fit budget must net out
+/// memory the *other* engine (Ollama) already holds resident — see
+/// [`crate::dgx_vllm::vllm_fit_check`] — so it sizes against available, not
+/// total RAM.
+fn detect_node_mem_available(user: &str, host: &str, port: Option<u16>) -> Option<u64> {
+    detect_node_mem_col(user, host, port, MEM_AVAILABLE_AWK)
+}
+
+/// GET `<hf_base>/api/models/<org>/<repo>?blobs=true` → raw JSON (for sizing
+/// safetensors weights; same endpoint as the GGUF sibling fetch).
+async fn fetch_hf_model_json(
+    client: &reqwest::Client,
+    hf_base: &str,
+    org: &str,
+    repo: &str,
+) -> anyhow::Result<serde_json::Value> {
+    let url = format!(
+        "{}/api/models/{org}/{repo}?blobs=true",
+        hf_base.trim_end_matches('/')
+    );
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("HF API request failed: {e}"))?;
+    if !resp.status().is_success() {
+        anyhow::bail!("HF API returned HTTP {}", resp.status());
+    }
+    Ok(resp.json().await?)
+}
+
+/// Best-effort vLLM weight size: sum the repo's weight files (`.safetensors` /
+/// `.bin`) when `model` is an HF id; `None` for a local path, a fetch/parse
+/// failure, or a repo with no sized weights.
+async fn fetch_vllm_weight_bytes(model: &str) -> Option<u64> {
+    let (org, repo) = dgx_vllm::hf_repo_parts(model)?;
+    let client = http_client_long();
+    let json = fetch_hf_model_json(&client, &hf_api_base(), &org, &repo)
+        .await
+        .ok()?;
+    let bytes = dgx_vllm::sum_weight_bytes(&json);
+    (bytes > 0).then_some(bytes)
+}
+
+/// Docker execution isn't wired yet (the remote script wraps native
+/// `vllm serve` only), so `up --docker` must refuse clearly rather than silently
+/// launch native. `dgx vllm config --docker` still previews the docker argv.
+fn ensure_executable_runtime(runtime: dgx_vllm::VllmRuntime) -> anyhow::Result<()> {
+    if matches!(runtime, dgx_vllm::VllmRuntime::Docker) {
+        anyhow::bail!(
+            "--docker is preview-only here: `dgx vllm config --docker` prints the docker \
+             argv, but native `vllm serve` is the only launcher `up` executes in this step. \
+             Omit --docker to launch (docker execution is a follow-up)."
+        );
+    }
+    Ok(())
+}
+
+/// Build a resolved [`dgx_vllm::VllmPlan`] from CLI args (shared by `up`/`config`).
+fn build_plan_from_args(model: &str, a: &VllmPlanArgs) -> anyhow::Result<dgx_vllm::VllmPlan> {
+    let dtype = match a.dtype.as_deref() {
+        Some(s) => Some(dgx_vllm::Dtype::parse(s).ok_or_else(|| {
+            anyhow::anyhow!(
+                "unknown --dtype {s:?}; expected one of: auto, nvfp4, fp8, bf16, awq, gptq"
+            )
+        })?),
+        None => None,
+    };
+    let runtime = if a.docker {
+        dgx_vllm::VllmRuntime::Docker
+    } else {
+        dgx_vllm::VllmRuntime::Native
+    };
+    Ok(dgx_vllm::resolve_plan(dgx_vllm::PlanInputs {
+        model,
+        served_name: a.served_name.as_deref(),
+        dtype,
+        tensor_parallel: a.tensor_parallel,
+        max_model_len: a.max_model_len,
+        gpu_mem_util: a.gpu_mem_util,
+        port: a.port,
+        runtime,
+        extra: a.extra.clone(),
+    }))
+}
+
+/// Execute (or dry-run) a vLLM launch over SSH. Injection seam: `ssh` is
+/// `&RealSsh` in prod, `&RecordingSsh` in tests.
+fn execute_vllm_plan(
+    ssh: &dyn SshExec,
+    user: &str,
+    host: &str,
+    plan: &dgx_vllm::VllmPlan,
+    dry_run: bool,
+) -> anyhow::Result<()> {
+    let script = dgx_vllm::vllm_remote_script(plan);
+    let summary = format!(
+        "VllmPlan: serve {:?} as {:?} ({:?}, tp={}, max_len={}, util={:.2}, port={})",
+        plan.model,
+        plan.served_name,
+        plan.dtype,
+        plan.tensor_parallel,
+        plan.max_model_len,
+        plan.gpu_mem_util(),
+        plan.port,
+    );
+    run_or_dryrun(ssh, user, host, None, &script, dry_run, &summary)
+}
+
+/// Poll the freshly-launched server's `/v1/models` with bounded backoff. Cold
+/// model loads can take minutes, hence the generous `for_local_inference`
+/// policy in production; tests inject `RetryPolicy::immediate`.
+async fn poll_vllm_ready(endpoint: &str, policy: &RetryPolicy) -> anyhow::Result<()> {
+    let backend = LocalVllmBackend::new(endpoint, "");
+    with_backoff(policy, || async { backend.list_models().await.map(|_| ()) })
+        .await
+        .map(|_| ())
+        .map_err(|e| anyhow::anyhow!("vLLM did not become ready at {endpoint}: {e}"))
+}
+
+/// Pure in-memory mutation for persist-on-`up`: point the active endpoint at the
+/// freshly-launched vLLM server and write its URL onto the target node. No IO —
+/// the disk write lives in [`persist_vllm_endpoint`].
+///
+/// Returns `true` when the URL was written onto a matching node. `false` means
+/// no node matched (the target name isn't in `nodes[]`) — the active endpoint is
+/// still flipped to vLLM, but the URL wasn't recorded, so the caller warns
+/// rather than leaving the user with a silently incomplete config.
+#[must_use]
+fn apply_vllm_persist(
+    config: &mut Config,
+    node_name: Option<&str>,
+    endpoint_url: &str,
+    served_name: &str,
+) -> bool {
+    let dgx = config.dgx.get_or_insert_with(Default::default);
+    dgx.active_endpoint = EndpointKind::Vllm;
+    dgx.active_model = Some(served_name.to_string());
+    let target = node_name
+        .map(str::to_string)
+        .or_else(|| dgx.active_node.clone());
+    if let Some(name) = target {
+        if let Some(node) = dgx.nodes.iter_mut().find(|n| n.name == name) {
+            node.vllm = Some(endpoint_url.to_string());
+            return true;
+        }
+    }
+    false
+}
+
+/// Persist the vLLM endpoint to config (load → [`apply_vllm_persist`] → save).
+fn persist_vllm_endpoint(
+    config_path: Option<&Path>,
+    node_name: Option<&str>,
+    endpoint_url: &str,
+    served_name: &str,
+) -> anyhow::Result<()> {
+    let mut config = load_config(config_path)?;
+    let node_recorded = apply_vllm_persist(&mut config, node_name, endpoint_url, served_name);
+    let save_path = config_path
+        .map(std::path::PathBuf::from)
+        .or_else(newt_core::Config::user_config_path)
+        .ok_or_else(|| anyhow::anyhow!("cannot determine config file path"))?;
+    config.save(&save_path)?;
+    println!("vLLM endpoint {endpoint_url} active; model {served_name}");
+    println!("Saved → {}", save_path.display());
+    if !node_recorded {
+        eprintln!(
+            "  WARNING: active endpoint set to vLLM, but no matching node was found to \
+             record {endpoint_url} on — configure the node (`dgx setup` / `dgx node`) so \
+             the URL resolves without env fallback."
+        );
+    }
+    Ok(())
+}
+
+/// The served name to act on: an explicit arg, else the active model.
+fn resolve_served_name(dgx: &DgxConfig, served_name: Option<&str>) -> anyhow::Result<String> {
+    match served_name {
+        Some(s) => Ok(s.to_string()),
+        None => Ok(dgx.resolve_active_model()?),
+    }
+}
+
+/// `dgx vllm up <model>` — fit pre-flight, launch, wait for readiness, persist.
+async fn vllm_up(
+    config_path: Option<&Path>,
+    model: &str,
+    node: Option<&str>,
+    plan_args: &VllmPlanArgs,
+    force: bool,
+    evict_ollama: bool,
+    dry_run: bool,
+) -> anyhow::Result<()> {
+    let mut dgx = dgx_config(config_path)?;
+    if let Some(n) = node {
+        dgx.active_node = Some(n.to_string());
+    }
+    let user = dgx.ssh_user();
+    let host = dgx.ssh_host()?;
+
+    let plan = build_plan_from_args(model, plan_args)?;
+    ensure_executable_runtime(plan.runtime)?;
+
+    // Fit pre-flight (the GLM-5.2 lesson, ported). Skipped on dry-run — no
+    // network: dry-run only shows the plan + remote script.
+    if !dry_run {
+        // The eval-loop swap: free the shared pool first so the fit probe below
+        // sees the reclaimed memory.
+        if evict_ollama {
+            evict_ollama_models(&dgx).await?;
+        }
+        let mem = detect_node_mem_available(&user, &host, None);
+        match fetch_vllm_weight_bytes(model).await {
+            Some(weight) => report_fit(
+                dgx_vllm::vllm_fit_check(weight, mem, plan_args.gpu_mem_util),
+                force,
+            )?,
+            None => eprintln!(
+                "  WARNING: could not size weights for {model:?} (local path, HF lookup \
+                 failed, or no sized .safetensors/.bin) — skipping the fit pre-flight; the \
+                 model may exceed node memory."
+            ),
+        }
+    }
+
+    execute_vllm_plan(&RealSsh, &user, &host, &plan, dry_run)?;
+
+    if !dry_run {
+        let endpoint = format!("http://{host}:{}", plan.port);
+        println!("Waiting for vLLM at {endpoint}/v1/models (cold load can take minutes) …");
+        poll_vllm_ready(&endpoint, &RetryPolicy::for_local_inference()).await?;
+        persist_vllm_endpoint(config_path, node, &endpoint, &plan.served_name)?;
+    }
+    Ok(())
+}
+
+/// `dgx vllm down [served_name]` — kill the recorded server PID on the node.
+async fn vllm_down(
+    config_path: Option<&Path>,
+    served_name: Option<&str>,
+    node: Option<&str>,
+    dry_run: bool,
+) -> anyhow::Result<()> {
+    let mut dgx = dgx_config(config_path)?;
+    if let Some(n) = node {
+        dgx.active_node = Some(n.to_string());
+    }
+    let user = dgx.ssh_user();
+    let host = dgx.ssh_host()?;
+    let served = resolve_served_name(&dgx, served_name)?;
+    let command = dgx_vllm::vllm_stop_command(&served);
+    run_or_dryrun(
+        &RealSsh,
+        &user,
+        &host,
+        None,
+        &command,
+        dry_run,
+        &format!("vLLM down: {served:?}"),
+    )
+}
+
+/// `dgx vllm logs [served_name]` — tail and follow the server log on the node.
+async fn vllm_logs(
+    config_path: Option<&Path>,
+    served_name: Option<&str>,
+    node: Option<&str>,
+    lines: u32,
+    dry_run: bool,
+) -> anyhow::Result<()> {
+    let mut dgx = dgx_config(config_path)?;
+    if let Some(n) = node {
+        dgx.active_node = Some(n.to_string());
+    }
+    let user = dgx.ssh_user();
+    let host = dgx.ssh_host()?;
+    let served = resolve_served_name(&dgx, served_name)?;
+    let command = dgx_vllm::vllm_logs_command(&served, lines);
+    run_or_dryrun(
+        &RealSsh,
+        &user,
+        &host,
+        None,
+        &command,
+        dry_run,
+        &format!("vLLM logs: {served:?} (tail -f)"),
+    )
+}
+
+/// `dgx vllm config <model>` — print the resolved launch argv. Pure (no SSH).
+fn vllm_config(model: &str, plan_args: &VllmPlanArgs) -> anyhow::Result<()> {
+    let plan = build_plan_from_args(model, plan_args)?;
+    let argv = if matches!(plan.runtime, dgx_vllm::VllmRuntime::Docker) {
+        dgx_vllm::vllm_docker_argv(&plan)
+    } else {
+        dgx_vllm::render_vllm_argv(&plan)
+    };
+    println!("Resolved vLLM launch plan for {model:?}:");
+    println!("  served-model-name: {}", plan.served_name);
+    println!(
+        "  dtype={:?}  tensor-parallel={}  max-model-len={}  gpu-mem-util={:.2}  port={}",
+        plan.dtype,
+        plan.tensor_parallel,
+        plan.max_model_len,
+        plan.gpu_mem_util(),
+        plan.port,
+    );
+    println!("  argv: {}", argv.join(" "));
+    Ok(())
+}
+
+/// `dgx vllm ps` — GET the configured vLLM endpoint's `/v1/models`.
+async fn vllm_ps(config_path: Option<&Path>) -> anyhow::Result<()> {
+    let dgx = dgx_config(config_path)?;
+    let base = dgx.resolve_endpoint_for(EndpointKind::Vllm)?;
+    let models = fetch_vllm_models(&base).await?;
+    println!("vLLM models on {base}:");
+    if models.is_empty() {
+        println!("  (none)");
+    }
+    for m in &models {
+        println!("  {m}");
+    }
+    Ok(())
+}
+
+/// GET `<base>/v1/models` → served model ids (OpenAI-compatible). `base` is the
+/// injection seam: tests pass a `wiremock` `MockServer::uri()`.
+async fn fetch_vllm_models(base: &str) -> anyhow::Result<Vec<String>> {
+    let backend = LocalVllmBackend::new(base, "");
+    Ok(backend
+        .list_models()
+        .await?
+        .into_iter()
+        .map(|m| m.id)
+        .collect())
+}
+
+// ---------------------------------------------------------------------------
+// gpu — cross-engine residency view + eviction (Step 14.12)
+// ---------------------------------------------------------------------------
+
+/// A ground-truth snapshot of what each engine holds on the node, plus the
+/// headroom. Assembled from live probes (`/api/ps`, `/v1/models`,
+/// `MemAvailable`) rather than a cached lease file.
+struct Residency {
+    /// Ollama resident models: `(name, size_bytes)` from `/api/ps`.
+    ollama: Vec<(String, Option<u64>)>,
+    /// vLLM served model ids from `/v1/models`.
+    vllm: Vec<String>,
+    /// `MemAvailable` in bytes, or `None` when the probe failed.
+    mem_available: Option<u64>,
+}
+
+impl Residency {
+    /// Both engines hold something → they're sharing the one unified pool.
+    fn is_contended(&self) -> bool {
+        !self.ollama.is_empty() && !self.vllm.is_empty()
+    }
+}
+
+/// The Ollama models to unload to free the GPU (every currently-resident one).
+fn ollama_evict_targets(res: &Residency) -> Vec<String> {
+    res.ollama.iter().map(|(name, _)| name.clone()).collect()
+}
+
+/// Ollama unload request body: `keep_alive: 0` unloads the model immediately
+/// (the inverse of `warm`'s positive keep-alive). Pure.
+fn ollama_unload_body(model: &str) -> serde_json::Value {
+    serde_json::json!({ "model": model, "keep_alive": 0 })
+}
+
+/// Render the residency snapshot for `dgx gpu`. Pure → unit-tested directly.
+fn render_residency(res: &Residency) -> String {
+    let mut s = String::new();
+    match res.mem_available {
+        // bytes_to_gib divides by 1024^3 (gibibytes); the codebase labels these
+        // "GB" throughout (fit verdict, `ps`), so match that convention here.
+        Some(b) => s.push_str(&format!(
+            "  MemAvailable: {:.1} GB\n",
+            dgx_pull::bytes_to_gib(b)
+        )),
+        None => s.push_str("  MemAvailable: (undetected)\n"),
+    }
+    s.push_str("  Ollama resident:\n");
+    if res.ollama.is_empty() {
+        s.push_str("    (none)\n");
+    }
+    for (name, size) in &res.ollama {
+        match size {
+            Some(b) => s.push_str(&format!(
+                "    {name}  ({:.1} GB)\n",
+                dgx_pull::bytes_to_gib(*b)
+            )),
+            None => s.push_str(&format!("    {name}\n")),
+        }
+    }
+    s.push_str("  vLLM served:\n");
+    if res.vllm.is_empty() {
+        s.push_str("    (none)\n");
+    }
+    for m in &res.vllm {
+        s.push_str(&format!("    {m}\n"));
+    }
+    if res.is_contended() {
+        s.push_str(
+            "  ⚠ both engines are resident and share one unified pool — \
+             use `dgx vllm up --evict-ollama` to free it before a large vLLM serve.\n",
+        );
+    }
+    s
+}
+
+/// `dgx gpu` — print the cross-engine residency snapshot. Each side is
+/// best-effort: an unconfigured/unreachable engine simply shows nothing.
+async fn gpu(config_path: Option<&Path>) -> anyhow::Result<()> {
+    let dgx = dgx_config(config_path)?;
+    let client = http_client();
+    let ollama = match dgx.resolve_endpoint_for(EndpointKind::Ollama) {
+        Ok(base) => fetch_ollama_ps(&client, &base).await.unwrap_or_default(),
+        Err(_) => Vec::new(),
+    };
+    let vllm = match dgx.resolve_endpoint_for(EndpointKind::Vllm) {
+        Ok(base) => fetch_vllm_models(&base).await.unwrap_or_default(),
+        Err(_) => Vec::new(),
+    };
+    let mem_available = match dgx.ssh_host() {
+        Ok(host) => detect_node_mem_available(&dgx.ssh_user(), &host, None),
+        Err(_) => None,
+    };
+    let res = Residency {
+        ollama,
+        vllm,
+        mem_available,
+    };
+    println!("GPU residency:");
+    print!("{}", render_residency(&res));
+    Ok(())
+}
+
+/// POST an `/api/generate` unload (`keep_alive: 0`) to the Ollama endpoint.
+async fn unload_ollama_model(
+    client: &reqwest::Client,
+    base: &str,
+    model: &str,
+) -> anyhow::Result<()> {
+    let url = format!("{}/api/generate", base.trim_end_matches('/'));
+    let resp = client
+        .post(&url)
+        .json(&ollama_unload_body(model))
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("request failed: {e}"))?;
+    if !resp.status().is_success() {
+        anyhow::bail!("HTTP {}", resp.status());
+    }
+    Ok(())
+}
+
+/// Unload every model resident on the active Ollama endpoint (the
+/// `--evict-ollama` swap). Best-effort: a missing endpoint or a single failed
+/// unload warns rather than aborting the launch.
+async fn evict_ollama_models(dgx: &DgxConfig) -> anyhow::Result<()> {
+    let base = match dgx.resolve_endpoint_for(EndpointKind::Ollama) {
+        Ok(b) => b,
+        Err(_) => {
+            eprintln!("  --evict-ollama: no Ollama endpoint configured; nothing to evict");
+            return Ok(());
+        }
+    };
+    let client = http_client();
+    let resident = fetch_ollama_ps(&client, &base).await.unwrap_or_default();
+    let targets = ollama_evict_targets(&Residency {
+        ollama: resident,
+        vllm: Vec::new(),
+        mem_available: None,
+    });
+    if targets.is_empty() {
+        println!("  --evict-ollama: no resident Ollama models to free");
+        return Ok(());
+    }
+    for m in &targets {
+        match unload_ollama_model(&client, &base, m).await {
+            Ok(()) => println!("  evicted Ollama model {m}"),
+            Err(e) => eprintln!("  WARNING: failed to evict Ollama model {m}: {e}"),
+        }
+    }
+    Ok(())
+}
+
+/// Stop the running vLLM server(s) to free the unified pool (the `--evict-vllm`
+/// swap, the mirror of [`evict_ollama_models`]). Queries `/v1/models` for the
+/// served id(s) and kills each via the pidfile-based stop command over SSH —
+/// vLLM has no HTTP unload, so the server *is* the residency. Best-effort: a
+/// missing endpoint, no running server, or an unresolvable SSH host is a no-op,
+/// not an error. `ssh` is injectable so tests never touch a real node.
+async fn evict_vllm_server(ssh: &dyn SshExec, dgx: &DgxConfig) -> anyhow::Result<()> {
+    let base = match dgx.resolve_endpoint_for(EndpointKind::Vllm) {
+        Ok(b) => b,
+        Err(_) => {
+            eprintln!("  --evict-vllm: no vLLM endpoint configured; nothing to evict");
+            return Ok(());
+        }
+    };
+    let served = fetch_vllm_models(&base).await.unwrap_or_default();
+    if served.is_empty() {
+        println!("  --evict-vllm: no vLLM server running");
+        return Ok(());
+    }
+    let user = dgx.ssh_user();
+    let host = match dgx.ssh_host() {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("  --evict-vllm: cannot resolve SSH host ({e}); skipping eviction");
+            return Ok(());
+        }
+    };
+    for id in &served {
+        let cmd = dgx_vllm::vllm_stop_command(id);
+        match ssh.run(&user, &host, None, &cmd) {
+            Ok(()) => println!("  stopped vLLM server {id}"),
+            Err(e) => eprintln!("  WARNING: failed to stop vLLM server {id}: {e}"),
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// switch — flip the node between engines + models (Step 14.14)
+// ---------------------------------------------------------------------------
+
+/// Parse the `switch <engine>` token. Only `ollama` and `vllm` are switchable
+/// node-local engines (the load-balancer / in-cluster kinds aren't).
+fn parse_switch_engine(engine: &str) -> anyhow::Result<EndpointKind> {
+    match engine.to_ascii_lowercase().as_str() {
+        "ollama" => Ok(EndpointKind::Ollama),
+        "vllm" => Ok(EndpointKind::Vllm),
+        other => anyhow::bail!("`dgx switch` targets `ollama` or `vllm`, not {other:?}"),
+    }
+}
+
+/// Default vLLM launch knobs for `switch vllm <model>` (use `dgx vllm up` for
+/// fine control over dtype / port / context / tensor-parallel).
+fn default_vllm_plan_args() -> VllmPlanArgs {
+    VllmPlanArgs {
+        served_name: None,
+        dtype: None,
+        tensor_parallel: 1,
+        max_model_len: None,
+        gpu_mem_util: 0.90,
+        port: 8000,
+        docker: false,
+        extra: Vec::new(),
+    }
+}
+
+/// Is `model` present in the Ollama endpoint's installed list? Pure.
+fn ollama_has_model(installed: &[String], model: &str) -> bool {
+    installed.iter().any(|m| m == model)
+}
+
+/// Pure: set the active endpoint + model in config (no URL — the endpoint's URL
+/// is already configured on its node).
+fn apply_active(config: &mut Config, kind: EndpointKind, model: &str) {
+    let dgx = config.dgx.get_or_insert_with(Default::default);
+    dgx.active_endpoint = kind;
+    dgx.active_model = Some(model.to_string());
+}
+
+/// Persist the active endpoint + model to config (load → mutate → save).
+fn persist_active(
+    config_path: Option<&Path>,
+    kind: EndpointKind,
+    model: &str,
+) -> anyhow::Result<()> {
+    let mut config = load_config(config_path)?;
+    apply_active(&mut config, kind, model);
+    let save_path = config_path
+        .map(std::path::PathBuf::from)
+        .or_else(newt_core::Config::user_config_path)
+        .ok_or_else(|| anyhow::anyhow!("cannot determine config file path"))?;
+    config.save(&save_path)?;
+    println!("Active endpoint {kind}; model {model}");
+    println!("Saved → {}", save_path.display());
+    Ok(())
+}
+
+/// `dgx switch <engine> <model>` — atomic engine+model flip, evicting the other.
+async fn switch(
+    config_path: Option<&Path>,
+    engine: &str,
+    model: &str,
+    node: Option<&str>,
+    dry_run: bool,
+) -> anyhow::Result<()> {
+    match parse_switch_engine(engine)? {
+        EndpointKind::Vllm => {
+            // Evict Ollama, launch vLLM, persist — exactly `vllm up --evict-ollama`.
+            println!("Switching → vLLM serving {model:?} (evicting Ollama)…");
+            vllm_up(
+                config_path,
+                model,
+                node,
+                &default_vllm_plan_args(),
+                false,
+                true,
+                dry_run,
+            )
+            .await
+        }
+        EndpointKind::Ollama => switch_to_ollama(config_path, model, node, dry_run).await,
+        // parse_switch_engine only yields Ollama / Vllm.
+        other => anyhow::bail!("cannot switch to endpoint kind {other}"),
+    }
+}
+
+/// The `switch ollama <model>` direction: stop vLLM, verify the model is pulled,
+/// point newt at Ollama, and warm it.
+async fn switch_to_ollama(
+    config_path: Option<&Path>,
+    model: &str,
+    node: Option<&str>,
+    dry_run: bool,
+) -> anyhow::Result<()> {
+    let mut dgx = dgx_config(config_path)?;
+    if let Some(n) = node {
+        dgx.active_node = Some(n.to_string());
+    }
+    println!("Switching → Ollama serving {model:?} (stopping any vLLM server)…");
+    if dry_run {
+        println!(
+            "  [dry-run] would: stop the vLLM server, verify {model:?} is pulled, \
+             set active=ollama:{model}, and warm it"
+        );
+        return Ok(());
+    }
+    // 1. Stop any running vLLM server (best-effort — frees the unified pool).
+    evict_vllm_server(&RealSsh, &dgx).await?;
+    // 2. Refuse with a hint when the model isn't pulled (the GLM-5.2 lesson —
+    //    never silently pull multi-GB onto the node).
+    let base = dgx.resolve_endpoint_for(EndpointKind::Ollama)?;
+    let installed = fetch_ollama_models(&http_client(), &base)
+        .await
+        .unwrap_or_default();
+    if !ollama_has_model(&installed, model) {
+        anyhow::bail!(
+            "{model:?} is not pulled on the Ollama endpoint — run `newt dgx pull {model}` first"
+        );
+    }
+    // 3. Point newt at Ollama + the model.
+    persist_active(config_path, EndpointKind::Ollama, model)?;
+    // 4. Warm it (best-effort; a generous timeout for a cold load).
+    let warm_client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(600))
+        .build()
+        .expect("build reqwest client");
+    match warm_model(&warm_client, &base, model, "30m").await {
+        Ok(Some(secs)) => println!("  warmed {model} in {secs:.1}s — now resident"),
+        Ok(None) => println!("  {model} ready (already resident)"),
+        Err(e) => eprintln!("  WARNING: warm failed: {e}"),
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1505,5 +2428,548 @@ tiers = ["FAST", "STANDARD"]
         assert!(fetch_ollama_ps(&http_client(), &server.uri())
             .await
             .is_err());
+    }
+
+    // --- vllm wiring (Step 14.11) -----------------------------------------
+
+    fn sample_vllm_plan() -> dgx_vllm::VllmPlan {
+        dgx_vllm::resolve_plan(dgx_vllm::PlanInputs {
+            model: "nvidia/Qwen3.6-35B-A3B-NVFP4",
+            served_name: Some("qwen3.6-35b"),
+            dtype: Some(dgx_vllm::Dtype::Nvfp4),
+            tensor_parallel: 1,
+            max_model_len: Some(262144),
+            gpu_mem_util: 0.90,
+            port: 8000,
+            runtime: dgx_vllm::VllmRuntime::Native,
+            extra: vec![],
+        })
+    }
+
+    fn plan_args() -> VllmPlanArgs {
+        VllmPlanArgs {
+            served_name: None,
+            dtype: None,
+            tensor_parallel: 1,
+            max_model_len: None,
+            gpu_mem_util: 0.90,
+            port: 8000,
+            docker: false,
+            extra: vec![],
+        }
+    }
+
+    #[test]
+    fn vllm_up_dry_run_does_not_ssh() {
+        let ssh = RecordingSsh::new();
+        execute_vllm_plan(&ssh, "bob", "dgx", &sample_vllm_plan(), true).unwrap();
+        assert!(ssh.calls.borrow().is_empty(), "dry-run must not SSH");
+    }
+
+    #[test]
+    fn vllm_up_records_nohup_serve_command() {
+        let ssh = RecordingSsh::new();
+        execute_vllm_plan(&ssh, "bob", "dgx", &sample_vllm_plan(), false).unwrap();
+        let calls = ssh.calls.borrow();
+        assert_eq!(calls.len(), 1);
+        let cmd = &calls[0].3;
+        assert!(cmd.contains("nohup"));
+        assert!(cmd.contains("vllm") && cmd.contains("serve"));
+        // Model id shell-quoted; port + pidfile present.
+        assert!(cmd.contains("'nvidia/Qwen3.6-35B-A3B-NVFP4'"));
+        assert!(cmd.contains("--port"));
+        assert!(cmd.contains("echo $! >") && cmd.contains(".pid"));
+    }
+
+    #[test]
+    fn vllm_down_records_kill_pidfile() {
+        let ssh = RecordingSsh::new();
+        let cmd = dgx_vllm::vllm_stop_command("qwen3.6-35b");
+        run_or_dryrun(&ssh, "bob", "dgx", None, &cmd, false, "down").unwrap();
+        let calls = ssh.calls.borrow();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].3.contains("qwen3.6-35b.pid"));
+        assert!(calls[0].3.contains("kill"));
+    }
+
+    #[test]
+    fn vllm_logs_records_tail_command() {
+        let ssh = RecordingSsh::new();
+        let cmd = dgx_vllm::vllm_logs_command("qwen3.6-35b", 50);
+        run_or_dryrun(&ssh, "bob", "dgx", None, &cmd, false, "logs").unwrap();
+        assert!(ssh.calls.borrow()[0].3.contains("tail -n 50 -f"));
+    }
+
+    #[test]
+    fn vllm_config_renders_argv_without_ssh() {
+        // Pure: builds + prints the plan, returns Ok, never SSHes.
+        assert!(vllm_config("nvidia/Qwen3.6-35B-A3B-NVFP4", &plan_args()).is_ok());
+        let mut docker = plan_args();
+        docker.docker = true;
+        assert!(vllm_config("org/model", &docker).is_ok());
+    }
+
+    #[test]
+    fn vllm_config_rejects_unknown_dtype() {
+        let mut bad = plan_args();
+        bad.dtype = Some("nonsense".to_string());
+        let err = vllm_config("org/model", &bad).unwrap_err().to_string();
+        // The error must name the valid set so the user can self-correct.
+        assert!(
+            err.contains("nvfp4") && err.contains("gptq"),
+            "unhelpful error: {err}"
+        );
+    }
+
+    #[test]
+    fn vllm_up_refuses_docker_execution() {
+        // `up --docker` must refuse (preview-only); native is the only launcher.
+        let err = ensure_executable_runtime(dgx_vllm::VllmRuntime::Docker)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--docker") && err.contains("config"));
+        assert!(ensure_executable_runtime(dgx_vllm::VllmRuntime::Native).is_ok());
+    }
+
+    #[tokio::test]
+    async fn vllm_ps_parses_v1_models() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{ "id": "m1" }, { "id": "m2" }]
+            })))
+            .mount(&server)
+            .await;
+        let models = fetch_vllm_models(&server.uri()).await.unwrap();
+        assert_eq!(models, vec!["m1".to_string(), "m2".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn poll_vllm_ready_succeeds_on_first_ok() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path("/v1/models"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "data": [] })),
+            )
+            .mount(&server)
+            .await;
+        assert!(poll_vllm_ready(&server.uri(), &RetryPolicy::immediate(0))
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn poll_vllm_ready_retries_then_succeeds() {
+        let server = MockServer::start().await;
+        // wiremock matches the FIRST-mounted mock of equal priority, so mount the
+        // 503 (capped at 2 hits) FIRST and the success SECOND: requests 1-2 hit
+        // the exhausting 503, request 3 falls through to the 200. (Asserting the
+        // request count guards against a trivially-passing single-request test.)
+        Mock::given(method("GET"))
+            .and(wm_path("/v1/models"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(wm_path("/v1/models"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "data": [] })),
+            )
+            .mount(&server)
+            .await;
+        // 503 is a retryable 5xx; 3 retries cover the two failures + success.
+        assert!(poll_vllm_ready(&server.uri(), &RetryPolicy::immediate(3))
+            .await
+            .is_ok());
+        // The retry path was actually exercised: 2 failures + 1 success = 3.
+        let received = server.received_requests().await.unwrap();
+        assert_eq!(
+            received.len(),
+            3,
+            "expected retry-then-succeed (2x503 + 1x200)"
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_vllm_ready_gives_up_when_never_ready() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path("/v1/models"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        assert!(poll_vllm_ready(&server.uri(), &RetryPolicy::immediate(1))
+            .await
+            .is_err());
+    }
+
+    fn config_with_nodes(active: &str, names: &[&str]) -> Config {
+        Config {
+            dgx: Some(DgxConfig {
+                active_node: Some(active.to_string()),
+                nodes: names
+                    .iter()
+                    .map(|n| DgxNode {
+                        name: n.to_string(),
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn apply_vllm_persist_falls_back_to_active_node() {
+        let mut config = config_with_nodes("home", &["home"]);
+        let recorded = apply_vllm_persist(&mut config, None, "http://dgx:8000", "qwen3.6-35b");
+        assert!(recorded);
+        let dgx = config.dgx.unwrap();
+        assert_eq!(dgx.active_endpoint, EndpointKind::Vllm);
+        assert_eq!(dgx.active_model.as_deref(), Some("qwen3.6-35b"));
+        assert_eq!(dgx.nodes[0].vllm.as_deref(), Some("http://dgx:8000"));
+    }
+
+    #[test]
+    fn apply_vllm_persist_targets_explicit_node_over_active() {
+        let mut config = config_with_nodes("home", &["home", "other"]);
+        let recorded = apply_vllm_persist(&mut config, Some("other"), "http://other:8000", "m");
+        assert!(recorded);
+        let dgx = config.dgx.unwrap();
+        // The named node gets the URL; the active node is left untouched.
+        assert_eq!(
+            dgx.node("other").unwrap().vllm.as_deref(),
+            Some("http://other:8000")
+        );
+        assert_eq!(dgx.node("home").unwrap().vllm, None);
+    }
+
+    #[test]
+    fn apply_vllm_persist_reports_false_when_node_missing() {
+        let mut config = config_with_nodes("home", &["home"]);
+        let recorded = apply_vllm_persist(&mut config, Some("ghost"), "http://ghost:8000", "m");
+        // No matching node: URL not recorded (caller warns), but endpoint flips.
+        assert!(!recorded);
+        let dgx = config.dgx.unwrap();
+        assert_eq!(dgx.active_endpoint, EndpointKind::Vllm);
+        assert_eq!(dgx.nodes[0].vllm, None);
+    }
+
+    #[test]
+    fn vllm_probe_uses_memavailable_pull_uses_memtotal() {
+        // Regression: the vLLM fit probe must read MemAvailable (awk $7) so it
+        // nets out a resident Ollama model, while the Ollama pull path stays on
+        // MemTotal ($2) — unchanged behavior in this step.
+        assert_eq!(MEM_AVAILABLE_AWK, "$7");
+        assert_eq!(MEM_TOTAL_AWK, "$2");
+        assert!(node_mem_probe(MEM_AVAILABLE_AWK).contains("print $7"));
+        assert!(node_mem_probe(MEM_TOTAL_AWK).contains("print $2"));
+    }
+
+    // --- gpu residency + eviction (Step 14.12) ----------------------------
+
+    fn residency(ollama: &[(&str, Option<u64>)], vllm: &[&str], mem: Option<u64>) -> Residency {
+        Residency {
+            ollama: ollama.iter().map(|(n, s)| (n.to_string(), *s)).collect(),
+            vllm: vllm.iter().map(|s| s.to_string()).collect(),
+            mem_available: mem,
+        }
+    }
+
+    #[test]
+    fn ollama_unload_body_uses_keep_alive_zero() {
+        // keep_alive: 0 is the unload signal (the inverse of `warm`).
+        let body = ollama_unload_body("qwen3-coder:30b");
+        assert_eq!(body["model"], "qwen3-coder:30b");
+        assert_eq!(body["keep_alive"], 0);
+    }
+
+    #[test]
+    fn ollama_evict_targets_lists_resident_names() {
+        let res = residency(&[("a", Some(100)), ("b", None)], &[], None);
+        assert_eq!(
+            ollama_evict_targets(&res),
+            vec!["a".to_string(), "b".to_string()]
+        );
+        assert!(ollama_evict_targets(&residency(&[], &[], None)).is_empty());
+    }
+
+    #[test]
+    fn residency_is_contended_only_when_both_resident() {
+        assert!(residency(&[("a", None)], &["v"], None).is_contended());
+        assert!(!residency(&[("a", None)], &[], None).is_contended());
+        assert!(!residency(&[], &["v"], None).is_contended());
+    }
+
+    #[test]
+    fn render_residency_shows_both_engines_mem_and_contention() {
+        let gib = 1024 * 1024 * 1024;
+        let out = render_residency(&residency(
+            &[("qwen3-coder:30b", Some(38 * gib))],
+            &["qwen3.6-35b"],
+            Some(105 * gib),
+        ));
+        assert!(out.contains("MemAvailable: 105.0 GB"));
+        assert!(out.contains("qwen3-coder:30b") && out.contains("38.0 GB"));
+        assert!(out.contains("qwen3.6-35b"));
+        // Both resident → the contention warning fires.
+        assert!(out.contains("--evict-ollama"));
+    }
+
+    #[test]
+    fn render_residency_empty_shows_none_and_no_warning() {
+        let out = render_residency(&residency(&[], &[], None));
+        assert!(out.contains("MemAvailable: (undetected)"));
+        assert_eq!(out.matches("(none)").count(), 2); // both engines empty
+        assert!(!out.contains("⚠"));
+    }
+
+    #[tokio::test]
+    async fn unload_ollama_model_posts_keep_alive_zero() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(wm_path("/api/generate"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&server)
+            .await;
+        unload_ollama_model(&http_client(), &server.uri(), "qwen3-coder:30b")
+            .await
+            .unwrap();
+        let reqs = server.received_requests().await.unwrap();
+        assert_eq!(reqs.len(), 1);
+        let body: serde_json::Value = reqs[0].body_json().unwrap();
+        assert_eq!(body["keep_alive"], 0);
+    }
+
+    #[tokio::test]
+    async fn unload_ollama_model_http_error_is_err() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(wm_path("/api/generate"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        assert!(unload_ollama_model(&http_client(), &server.uri(), "m")
+            .await
+            .is_err());
+    }
+
+    /// A DgxConfig whose active node's Ollama endpoint points at `uri`.
+    fn ollama_config_at(uri: &str) -> DgxConfig {
+        DgxConfig {
+            active_node: Some("home".to_string()),
+            active_endpoint: EndpointKind::Ollama,
+            nodes: vec![DgxNode {
+                name: "home".to_string(),
+                ollama: Some(uri.to_string()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn evict_ollama_models_unloads_each_resident() {
+        let server = MockServer::start().await;
+        // Two resident models from /api/ps.
+        Mock::given(method("GET"))
+            .and(wm_path("/api/ps"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "models": [{ "name": "a", "size": 100 }, { "name": "b", "size": 200 }]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(wm_path("/api/generate"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&server)
+            .await;
+        evict_ollama_models(&ollama_config_at(&server.uri()))
+            .await
+            .unwrap();
+        let reqs = server.received_requests().await.unwrap();
+        // One /api/ps probe + one unload POST per resident model.
+        assert_eq!(reqs.iter().filter(|r| r.url.path() == "/api/ps").count(), 1);
+        assert_eq!(
+            reqs.iter()
+                .filter(|r| r.url.path() == "/api/generate")
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn evict_ollama_models_ok_when_none_resident() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path("/api/ps"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "models": [] })),
+            )
+            .mount(&server)
+            .await;
+        evict_ollama_models(&ollama_config_at(&server.uri()))
+            .await
+            .unwrap();
+        // No resident models → no unload POSTs issued.
+        let reqs = server.received_requests().await.unwrap();
+        assert_eq!(
+            reqs.iter()
+                .filter(|r| r.url.path() == "/api/generate")
+                .count(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn evict_ollama_models_ok_when_no_endpoint() {
+        // No nodes / no Ollama endpoint → best-effort no-op, not an error.
+        assert!(evict_ollama_models(&DgxConfig::default()).await.is_ok());
+    }
+
+    /// A DgxConfig whose active node serves vLLM at `uri` and is SSH-reachable.
+    fn vllm_config_at(uri: &str) -> DgxConfig {
+        DgxConfig {
+            active_node: Some("home".to_string()),
+            active_endpoint: EndpointKind::Vllm,
+            nodes: vec![DgxNode {
+                name: "home".to_string(),
+                vllm: Some(uri.to_string()),
+                ssh_host: Some("dgx.test".to_string()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn evict_vllm_server_stops_each_served_model() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{ "id": "qwen3.6-35b" }]
+            })))
+            .mount(&server)
+            .await;
+        let ssh = RecordingSsh::new();
+        evict_vllm_server(&ssh, &vllm_config_at(&server.uri()))
+            .await
+            .unwrap();
+        let calls = ssh.calls.borrow();
+        assert_eq!(calls.len(), 1, "one stop command per served model");
+        // The kill targets the served model's pidfile, over the node's SSH host.
+        assert_eq!(calls[0].1, "dgx.test");
+        assert!(calls[0].3.contains("qwen3.6-35b.pid"));
+        assert!(calls[0].3.contains("kill"));
+    }
+
+    #[tokio::test]
+    async fn evict_vllm_server_noop_when_no_server() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path("/v1/models"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "data": [] })),
+            )
+            .mount(&server)
+            .await;
+        let ssh = RecordingSsh::new();
+        evict_vllm_server(&ssh, &vllm_config_at(&server.uri()))
+            .await
+            .unwrap();
+        assert!(ssh.calls.borrow().is_empty(), "no server → no SSH kill");
+    }
+
+    #[tokio::test]
+    async fn evict_vllm_server_ok_when_no_endpoint() {
+        // No vLLM endpoint configured → best-effort no-op, no SSH.
+        let ssh = RecordingSsh::new();
+        assert!(evict_vllm_server(&ssh, &DgxConfig::default()).await.is_ok());
+        assert!(ssh.calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn resolve_warm_model_explicit_arg_wins() {
+        let dgx = DgxConfig::default();
+        assert_eq!(
+            resolve_warm_model(Some("qwen2.5-coder:32b".to_string()), true, &dgx).unwrap(),
+            "qwen2.5-coder:32b"
+        );
+    }
+
+    #[test]
+    fn resolve_warm_model_evict_vllm_requires_explicit_model() {
+        // After `vllm up`, active_model is the vLLM served name; warming it on
+        // Ollama would 404, so --evict-vllm with no arg must refuse helpfully.
+        let mut dgx = DgxConfig {
+            active_endpoint: EndpointKind::Vllm,
+            active_model: Some("qwen3.6-35b".to_string()),
+            ..Default::default()
+        };
+        let err = resolve_warm_model(None, true, &dgx)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--evict-vllm") && err.contains("qwen3.6-35b"));
+        // Without --evict-vllm, the active model is used as before.
+        dgx.active_endpoint = EndpointKind::Ollama;
+        dgx.active_model = Some("llama3.1:8b".to_string());
+        assert_eq!(
+            resolve_warm_model(None, false, &dgx).unwrap(),
+            "llama3.1:8b"
+        );
+    }
+
+    #[test]
+    fn resolve_warm_model_errors_when_no_active_and_no_arg() {
+        // No arg, no --evict-vllm, no active model → the usual NoActiveModel.
+        assert!(resolve_warm_model(None, false, &DgxConfig::default()).is_err());
+    }
+
+    // --- switch (Step 14.14) ----------------------------------------------
+
+    #[test]
+    fn parse_switch_engine_accepts_ollama_and_vllm() {
+        assert_eq!(parse_switch_engine("ollama").unwrap(), EndpointKind::Ollama);
+        assert_eq!(parse_switch_engine("VLLM").unwrap(), EndpointKind::Vllm);
+        // The non-node-local kinds (and junk) are refused.
+        assert!(parse_switch_engine("ollama_lb").is_err());
+        assert!(parse_switch_engine("openai").is_err());
+    }
+
+    #[test]
+    fn ollama_has_model_matches_exact_tag() {
+        let installed = vec!["nemotron3:33b".to_string(), "qwen2.5-coder:32b".to_string()];
+        assert!(ollama_has_model(&installed, "nemotron3:33b"));
+        // No fuzzy / prefix match — a different tag is absent.
+        assert!(!ollama_has_model(&installed, "nemotron3:8b"));
+        assert!(!ollama_has_model(&installed, "nemotron3"));
+    }
+
+    #[test]
+    fn apply_active_sets_endpoint_and_model() {
+        let mut config = Config::default();
+        apply_active(&mut config, EndpointKind::Vllm, "qwen3.6-35b");
+        let dgx = config.dgx.as_ref().unwrap();
+        assert_eq!(dgx.active_endpoint, EndpointKind::Vllm);
+        assert_eq!(dgx.active_model.as_deref(), Some("qwen3.6-35b"));
+        // Flipping back to Ollama updates both in place.
+        apply_active(&mut config, EndpointKind::Ollama, "nemotron3:33b");
+        let dgx = config.dgx.as_ref().unwrap();
+        assert_eq!(dgx.active_endpoint, EndpointKind::Ollama);
+        assert_eq!(dgx.active_model.as_deref(), Some("nemotron3:33b"));
+    }
+
+    #[test]
+    fn default_vllm_plan_args_are_sane() {
+        let a = default_vllm_plan_args();
+        assert_eq!(a.tensor_parallel, 1);
+        assert_eq!(a.port, 8000);
+        assert!((a.gpu_mem_util - 0.90).abs() < f64::EPSILON);
+        assert!(!a.docker && a.dtype.is_none() && a.max_model_len.is_none());
     }
 }
