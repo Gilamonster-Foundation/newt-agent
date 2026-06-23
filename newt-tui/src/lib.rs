@@ -3981,6 +3981,10 @@ fn run_chat(
     // lent to the loop each turn (same pattern as `note_nudge`). Two
     // consecutive <10% reclaims disable auto-compression until restart.
     let mut compress_state = newt_core::CompressState::new();
+    // Step 26.3 (#584): session-scoped store for offloaded tool payloads (the
+    // `tool_offload` feature). Session-lived so `spill:` re-reads work across
+    // rounds; pure in-memory, discarded at session end / `/new`.
+    let spill_store = newt_core::SessionSpillStore::default();
     let ctx = newt_core::SessionContext {
         workspace: workspace.to_string(),
         session_id: format!(
@@ -4340,10 +4344,16 @@ fn run_chat(
                             let manager = context_manager(&cfg, context_manager_override);
                             let features =
                                 context_features(&cfg, manager, &context_features_override);
+                            // Step 26.3: surface tool_offload's measured impact.
+                            let impact = features.tool_offload.then(|| {
+                                use newt_core::SpillStore;
+                                (spill_store.spills(), spill_store.offloaded_chars())
+                            });
                             for line in context_stats_text(
                                 token_gauge,
                                 &compress_state.counters(),
                                 features,
+                                impact,
                             ) {
                                 print_newt(&line, color, verbose);
                             }
@@ -4732,7 +4742,12 @@ fn run_chat(
                     let memory_source =
                         match (mem_fetch_notes.as_ref(), conversation_store.as_ref()) {
                             (Some(notes), Some(store)) => {
-                                Some(newt_core::StoreMemorySource::new(notes, store))
+                                // Step 26.3 (#584): attach the spill store so the
+                                // model can re-read offloaded payloads via `spill:`.
+                                Some(
+                                    newt_core::StoreMemorySource::new(notes, store)
+                                        .with_spill_store(&spill_store),
+                                )
                             }
                             _ => None,
                         };
@@ -4833,6 +4848,14 @@ fn run_chat(
                     let turn_cancel = std::sync::atomic::AtomicBool::new(false);
                     let turn_hard = std::sync::atomic::AtomicBool::new(false);
                     let interruptible = io::stdin().is_terminal() && io::stdout().is_terminal();
+                    // Step 26.3 (#584): resolve the tool_offload feature for this
+                    // turn (preset → [context.features] → /context feature).
+                    let tool_offload_on = context_features(
+                        &cfg,
+                        context_manager(&cfg, context_manager_override),
+                        &context_features_override,
+                    )
+                    .tool_offload;
                     let response =
                         with_interrupt_watch(interruptible, &turn_cancel, &turn_hard, || {
                             tokio::task::block_in_place(|| {
@@ -4849,6 +4872,12 @@ fn run_chat(
                                         // Step 25.4 (#568): `[tui].markdown` ∧
                                         // `/markdown` override ∧ color.
                                         markdown: markdown_enabled(&cfg, color, markdown_override),
+                                        // Step 26.3 (#584): offload oversized tool
+                                        // results to the session spill store.
+                                        tool_offload: tool_offload_on,
+                                        spill_store: Some(
+                                            &spill_store as &dyn newt_core::SpillStore,
+                                        ),
                                         // #307: the clamped effective caveats (base ∩
                                         // preset). Identical to `cap.caveats()` when no
                                         // mode is active.
@@ -7028,13 +7057,15 @@ fn handle_context_command(
 
 /// Render the `/context stats` experimentation dashboard (Step 26.2, #588).
 /// Composes the live context budget (the 24.5/24.6 gauge state), the
-/// compression counters, and the resolved feature set. Pure → unit-testable.
-/// Per-feature token-impact numbers populate here as features instrument them
-/// (26.3+); today every feature is off/pending so the table shows state only.
+/// compression counters, and the resolved feature set with per-feature impact.
+/// Pure → unit-testable. `tool_offload_impact` = `(spills, offloaded_chars)`
+/// from the session spill store (Step 26.3); other features instrument as they
+/// land (26.4+).
 fn context_stats_text(
     gauge: Option<(u32, u32)>,
     counters: &newt_core::CompressCounters,
     features: newt_core::ContextFeatureSet,
+    tool_offload_impact: Option<(u64, u64)>,
 ) -> Vec<String> {
     let mut lines = vec!["context stats".to_string()];
     // Live send-budget fill (None until a turn has reported usage).
@@ -7052,7 +7083,7 @@ fn context_stats_text(
     for l in memory_compress_section(counters).lines() {
         lines.push(l.to_string());
     }
-    // Feature states. Token impact lands per-feature as each is implemented.
+    // Feature states + per-feature impact (the experimentation payoff).
     lines.push("  features:".to_string());
     for f in newt_core::ContextFeature::ALL {
         let state = if features.get(f) { "on " } else { "off" };
@@ -7061,9 +7092,18 @@ fn context_stats_text(
         } else {
             format!("  (pending #{})", f.issue())
         };
-        lines.push(format!("    [{state}] {}{tail}", f.keyword()));
+        let mut line = format!("    [{state}] {}{tail}", f.keyword());
+        // Step 26.3: tool_offload's measured impact this session.
+        if f == newt_core::ContextFeature::ToolOffload {
+            if let Some((spills, chars)) = tool_offload_impact {
+                line.push_str(&format!(
+                    "  — {spills} offloaded (~{}k chars elided)",
+                    chars / 1000
+                ));
+            }
+        }
+        lines.push(line);
     }
-    lines.push("  per-feature token impact appears here as features land (26.3+)".to_string());
     lines
 }
 
@@ -11920,6 +11960,8 @@ mod tool_round_cap_tests {
                     workspace: ".",
                     color: false,
                     markdown: false,
+                    tool_offload: false,
+                    spill_store: None,
                     caveats: &caveats,
                     max_tool_rounds: 5,
                     tool_output_lines: 20,
@@ -12288,15 +12330,17 @@ mod helper_fn_tests {
         // unknown manager
         assert!(run("manager bogus").lines[0].contains("unknown context manager"));
 
-        // feature list: all six, each not-yet-available
+        // feature list: all six listed; five not-yet-available (tool_offload
+        // shipped in 26.3).
         let r = run("feature");
         assert!(r.lines.iter().any(|l| l.contains("scratchpad")));
+        assert!(r.lines.iter().any(|l| l.contains("tool_offload")));
         assert_eq!(
             r.lines
                 .iter()
                 .filter(|l| l.contains("not yet available"))
                 .count(),
-            6
+            5
         );
 
         // toggling an unavailable feature → reported with its issue, NOT applied
@@ -12304,8 +12348,8 @@ mod helper_fn_tests {
         assert!(r.set_feature.is_none());
         assert!(r.lines[0].contains("not yet available") && r.lines[0].contains("#583"));
 
-        // alias + hyphen still resolve
-        assert!(run("feature offload on").lines[0].contains("not yet available"));
+        // alias + hyphen still resolve ("state" = scratchpad, still pending)
+        assert!(run("feature state on").lines[0].contains("not yet available"));
 
         // unknown feature / bad toggle / unknown subcommand
         assert!(run("feature bogus on").lines[0].contains("unknown context feature"));
@@ -12343,6 +12387,15 @@ mod helper_fn_tests {
                 .contains("semantic (pending #582)"),
             "bare status annotates a config-on-but-unavailable feature as pending"
         );
+
+        // tool_offload shipped in 26.3 → toggling it ON is now APPLIED (no
+        // "not yet available"); proves the availability gate flips correctly.
+        let r = run("feature tool_offload on");
+        assert_eq!(
+            r.set_feature,
+            Some((newt_core::ContextFeature::ToolOffload, true))
+        );
+        assert!(!r.lines[0].contains("not yet available"), "{:?}", r.lines);
     }
 
     #[test]
@@ -12357,29 +12410,40 @@ mod helper_fn_tests {
         let features = ContextFeatureSet::default();
 
         // No gauge yet → "not yet measured".
-        let none = context_stats_text(None, &counters, features);
+        let none = context_stats_text(None, &counters, features, None);
         assert_eq!(none[0], "context stats");
         assert!(none.iter().any(|l| l.contains("budget: not yet measured")));
 
         // With a gauge → budget line shows the fraction + percent.
-        let s = context_stats_text(Some((899_000, 1_024_000)), &counters, features);
+        let s = context_stats_text(Some((899_000, 1_024_000)), &counters, features, None);
         let joined = s.join("\n");
         assert!(joined.contains("899k/1024k"), "{joined}");
         assert!(joined.contains("% of the send window"), "{joined}");
         // Compression telemetry is reused from the /memory section.
         assert!(joined.contains("compressions this session: 3"), "{joined}");
         assert!(joined.contains("reclaimed 42%"), "{joined}");
-        // Every feature is listed, off + pending (none implemented yet).
+        // Every feature is listed; tool_offload is now available (26.3), the
+        // other five are still pending.
         for f in newt_core::ContextFeature::ALL {
             assert!(joined.contains(f.keyword()), "missing {}", f.keyword());
         }
         assert_eq!(
             s.iter().filter(|l| l.contains("(pending #")).count(),
-            6,
-            "all six features pending"
+            5,
+            "five features still pending (tool_offload shipped in 26.3)"
         );
+
+        // tool_offload impact renders on its row when the feature is on.
+        let mut on = ContextFeatureSet::default();
+        on.set(newt_core::ContextFeature::ToolOffload, true);
+        let imp = context_stats_text(None, &counters, on, Some((3, 48_000))).join("\n");
+        assert!(
+            imp.contains("[on ] tool_offload  — 3 offloaded (~48k chars elided)"),
+            "{imp}"
+        );
+
         // A zero budget renders the unmeasured line (no divide-by-zero).
-        assert!(context_stats_text(Some((10, 0)), &counters, features)
+        assert!(context_stats_text(Some((10, 0)), &counters, features, None)
             .iter()
             .any(|l| l.contains("not yet measured")));
     }
