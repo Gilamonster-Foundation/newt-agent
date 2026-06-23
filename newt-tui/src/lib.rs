@@ -24,7 +24,9 @@ use mcp::Mcp;
 // Step 9.7: the agentic loop (ChatCtx / chat_complete / execute_tool and their
 // dependency closure) lives in `newt_core::agentic` now — the TUI is a thin
 // wrapper that resolves config + caveats per turn and threads them in.
-use newt_core::agentic::{chat_complete, print_newt, warmup_if_cold, ChatCtx, NEWT_ORANGE_CT};
+use newt_core::agentic::{
+    chat_complete, print_harness_notice, print_newt, warmup_if_cold, ChatCtx, NEWT_ORANGE_CT,
+};
 use std::borrow::Cow;
 
 /// Run the (non-interactive) setup wizard unconditionally — used by `newt init`.
@@ -3991,6 +3993,13 @@ fn run_chat(
     // Step 26.4 (#583): session-scoped scratchpad <state> store. Session-lived;
     // cleared on /new so a fresh task never inherits stale state.
     let scratchpad_store = newt_core::SessionScratchpadStore::default();
+    // Step 26.5.4 (#582): session-scoped semantic index (embedding RAG). Built
+    // lazily on the first semantic-active turn; cleared (re-indexed) on /new.
+    // `semantic_indexed` records that indexing was ATTEMPTED (not that it found
+    // chunks) so a total embed failure (e.g. the model isn't pulled) doesn't
+    // re-walk + re-embed the repo every turn — reset on /new to re-index.
+    let semantic_index = newt_core::SessionSemanticIndex::default();
+    let mut semantic_indexed = false;
     let ctx = newt_core::SessionContext {
         workspace: workspace.to_string(),
         session_id: format!(
@@ -4362,12 +4371,20 @@ fn run_chat(
                                     scratchpad_store.state_chars(),
                                 )
                             });
+                            let sem_impact = features.semantic.then(|| {
+                                use newt_core::SemanticIndex;
+                                (
+                                    semantic_index.chunks_indexed(),
+                                    semantic_index.indexed_chars(),
+                                )
+                            });
                             for line in context_stats_text(
                                 token_gauge,
                                 &compress_state.counters(),
                                 features,
                                 impact,
                                 scratch_impact,
+                                sem_impact,
                             ) {
                                 print_newt(&line, color, verbose);
                             }
@@ -4467,6 +4484,13 @@ fn run_chat(
                             use newt_core::ScratchpadStore;
                             scratchpad_store.clear();
                         }
+                        // Step 26.5.4 (#582): drop the semantic index + re-arm
+                        // indexing so the next task re-indexes (picks up edits).
+                        {
+                            use newt_core::SemanticIndex;
+                            semantic_index.clear();
+                        }
+                        semantic_indexed = false;
                         // `/new` keeps its historical message verbatim; the
                         // end/restart aliases say so explicitly (the previous
                         // conversation won't resume next launch).
@@ -4721,6 +4745,7 @@ fn run_chat(
                     );
                     let tool_offload_on = turn_features.tool_offload;
                     let scratchpad_on = turn_features.scratchpad;
+                    let semantic_on = turn_features.semantic;
                     let mut turn_system = format!(
                         "{}\n{system}",
                         runtime_context_block(&inf_model, &inf_url, inf_kind)
@@ -4732,6 +4757,74 @@ fn run_chat(
                         if let Some(block) =
                             newt_core::agentic::scratchpad_state_block(&scratchpad_store)
                         {
+                            turn_system = format!("{block}\n\n{turn_system}");
+                        }
+                    }
+                    // Step 26.5.4 (#582): semantic RAG — index the repo's code once
+                    // (lazily, on the first active turn), then inject a
+                    // <code_evidence> block at the turn head (also ephemeral, never
+                    // persisted). An absent embedding model degrades to a no-op.
+                    if semantic_on {
+                        let sem = cfg
+                            .context
+                            .as_ref()
+                            .map(|c| c.semantic.clone())
+                            .unwrap_or_default();
+                        let embedder = newt_core::EmbeddingsClient::new(
+                            inf_url.clone(),
+                            sem.embedding_model.clone(),
+                            inf_key.clone(),
+                            60,
+                            2,
+                        );
+                        if !semantic_indexed {
+                            // Attempt indexing ONCE per session (reset on /new),
+                            // whether or not it yields chunks — so a missing
+                            // embedding model doesn't re-walk + re-embed every turn.
+                            semantic_indexed = true;
+                            let files = newt_core::gather_code_files(workspace);
+                            if !files.is_empty() {
+                                print_newt(
+                                    &format!(
+                                        "indexing {} files for semantic retrieval…",
+                                        files.len()
+                                    ),
+                                    color,
+                                    verbose,
+                                );
+                                let n = tokio::task::block_in_place(|| {
+                                    rt.block_on(newt_core::index_files(
+                                        &files,
+                                        &embedder,
+                                        &semantic_index,
+                                    ))
+                                });
+                                if n == 0 {
+                                    print_harness_notice(
+                                        &format!(
+                                            "semantic: indexed 0 chunks — is the embedding model \
+                                             '{}' pulled in Ollama? (retrieval is a no-op until it is)",
+                                            sem.embedding_model
+                                        ),
+                                        color,
+                                    );
+                                } else {
+                                    print_newt(
+                                        &format!("semantic: indexed {n} code chunks"),
+                                        color,
+                                        verbose,
+                                    );
+                                }
+                            }
+                        }
+                        if let Some(block) = tokio::task::block_in_place(|| {
+                            rt.block_on(newt_core::retrieve_evidence(
+                                &task,
+                                &embedder,
+                                &semantic_index,
+                                sem.top_k,
+                            ))
+                        }) {
                             turn_system = format!("{block}\n\n{turn_system}");
                         }
                     }
@@ -7104,6 +7197,7 @@ fn context_stats_text(
     features: newt_core::ContextFeatureSet,
     tool_offload_impact: Option<(u64, u64)>,
     scratchpad_impact: Option<(u64, u64)>,
+    semantic_impact: Option<(u64, u64)>,
 ) -> Vec<String> {
     let mut lines = vec!["context stats".to_string()];
     // Live send-budget fill (None until a turn has reported usage).
@@ -7144,6 +7238,15 @@ fn context_stats_text(
         if f == newt_core::ContextFeature::Scratchpad {
             if let Some((keys, chars)) = scratchpad_impact {
                 line.push_str(&format!("  — {keys} keys (~{}k chars)", chars / 1000));
+            }
+        }
+        // Step 26.5: semantic's measured impact this session.
+        if f == newt_core::ContextFeature::Semantic {
+            if let Some((chunks, chars)) = semantic_impact {
+                line.push_str(&format!(
+                    "  — {chunks} chunks indexed (~{}k chars)",
+                    chars / 1000
+                ));
             }
         }
         lines.push(line);
@@ -12347,6 +12450,7 @@ mod helper_fn_tests {
             context: Some(ContextConfig {
                 manager: ContextManager::Standard,
                 features: cfg_feats,
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -12387,8 +12491,8 @@ mod helper_fn_tests {
         // unknown manager
         assert!(run("manager bogus").lines[0].contains("unknown context manager"));
 
-        // feature list: all six listed; five not-yet-available (tool_offload
-        // shipped in 26.3).
+        // feature list: all six listed; three not-yet-available (tool_offload,
+        // scratchpad, semantic shipped in 26.3/26.4/26.5).
         let r = run("feature");
         assert!(r.lines.iter().any(|l| l.contains("scratchpad")));
         assert!(r.lines.iter().any(|l| l.contains("tool_offload")));
@@ -12397,17 +12501,17 @@ mod helper_fn_tests {
                 .iter()
                 .filter(|l| l.contains("not yet available"))
                 .count(),
-            4
+            3
         );
 
         // toggling a still-unavailable feature → reported with its issue, NOT
-        // applied (semantic = #582, pending until 26.5).
-        let r = run("feature semantic on");
+        // applied (experiential = #585, pending until 26.6).
+        let r = run("feature experiential on");
         assert!(r.set_feature.is_none());
-        assert!(r.lines[0].contains("not yet available") && r.lines[0].contains("#582"));
+        assert!(r.lines[0].contains("not yet available") && r.lines[0].contains("#585"));
 
-        // alias still resolves ("retrieval" = semantic, still pending)
-        assert!(run("feature retrieval on").lines[0].contains("not yet available"));
+        // alias still resolves ("experience" = experiential, still pending)
+        assert!(run("feature experience on").lines[0].contains("not yet available"));
 
         // unknown feature / bad toggle / unknown subcommand
         assert!(run("feature bogus on").lines[0].contains("unknown context feature"));
@@ -12422,15 +12526,16 @@ mod helper_fn_tests {
         // bare status report the REAL state (config-forced on), not a hardcoded
         // "off" — the review-flagged honesty edge.
         let mut feats = ContextFeatures::default();
-        feats.set(newt_core::ContextFeature::Semantic, Some(true));
+        feats.set(newt_core::ContextFeature::Experiential, Some(true));
         let cfg_on = newt_core::Config {
             context: Some(newt_core::ContextConfig {
                 manager: ContextManager::Standard,
                 features: feats,
+                ..Default::default()
             }),
             ..Default::default()
         };
-        let r = handle_context_command("feature semantic off", &cfg_on, None, &none);
+        let r = handle_context_command("feature experiential off", &cfg_on, None, &none);
         assert!(
             r.set_feature.is_none(),
             "an unavailable feature is never applied"
@@ -12442,7 +12547,7 @@ mod helper_fn_tests {
         );
         assert!(
             handle_context_command("", &cfg_on, None, &none).lines[0]
-                .contains("semantic (pending #582)"),
+                .contains("experiential (pending #585)"),
             "bare status annotates a config-on-but-unavailable feature as pending"
         );
 
@@ -12461,6 +12566,12 @@ mod helper_fn_tests {
             r.set_feature,
             Some((newt_core::ContextFeature::Scratchpad, true))
         );
+
+        // semantic shipped in 26.5 → toggles ON (alias "retrieval" too).
+        assert_eq!(
+            run("feature retrieval on").set_feature,
+            Some((newt_core::ContextFeature::Semantic, true))
+        );
     }
 
     #[test]
@@ -12475,35 +12586,50 @@ mod helper_fn_tests {
         let features = ContextFeatureSet::default();
 
         // No gauge yet → "not yet measured".
-        let none = context_stats_text(None, &counters, features, None, None);
+        let none = context_stats_text(None, &counters, features, None, None, None);
         assert_eq!(none[0], "context stats");
         assert!(none.iter().any(|l| l.contains("budget: not yet measured")));
 
         // With a gauge → budget line shows the fraction + percent.
-        let s = context_stats_text(Some((899_000, 1_024_000)), &counters, features, None, None);
+        let s = context_stats_text(
+            Some((899_000, 1_024_000)),
+            &counters,
+            features,
+            None,
+            None,
+            None,
+        );
         let joined = s.join("\n");
         assert!(joined.contains("899k/1024k"), "{joined}");
         assert!(joined.contains("% of the send window"), "{joined}");
         // Compression telemetry is reused from the /memory section.
         assert!(joined.contains("compressions this session: 3"), "{joined}");
         assert!(joined.contains("reclaimed 42%"), "{joined}");
-        // Every feature is listed; tool_offload (26.3) + scratchpad (26.4) are
-        // available, the other four are still pending.
+        // Every feature is listed; tool_offload/scratchpad/semantic are available,
+        // the other three are still pending.
         for f in newt_core::ContextFeature::ALL {
             assert!(joined.contains(f.keyword()), "missing {}", f.keyword());
         }
         assert_eq!(
             s.iter().filter(|l| l.contains("(pending #")).count(),
-            4,
-            "four features still pending (tool_offload + scratchpad shipped)"
+            3,
+            "three features still pending (tool_offload + scratchpad + semantic shipped)"
         );
 
-        // tool_offload + scratchpad impact render on their rows when on.
+        // each available feature renders its impact on its row when on.
         let mut on = ContextFeatureSet::default();
         on.set(newt_core::ContextFeature::ToolOffload, true);
         on.set(newt_core::ContextFeature::Scratchpad, true);
-        let imp = context_stats_text(None, &counters, on, Some((3, 48_000)), Some((5, 12_000)))
-            .join("\n");
+        on.set(newt_core::ContextFeature::Semantic, true);
+        let imp = context_stats_text(
+            None,
+            &counters,
+            on,
+            Some((3, 48_000)),
+            Some((5, 12_000)),
+            Some((42, 60_000)),
+        )
+        .join("\n");
         assert!(
             imp.contains("[on ] tool_offload  — 3 offloaded (~48k chars elided)"),
             "{imp}"
@@ -12512,10 +12638,14 @@ mod helper_fn_tests {
             imp.contains("[on ] scratchpad  — 5 keys (~12k chars)"),
             "{imp}"
         );
+        assert!(
+            imp.contains("[on ] semantic  — 42 chunks indexed (~60k chars)"),
+            "{imp}"
+        );
 
         // A zero budget renders the unmeasured line (no divide-by-zero).
         assert!(
-            context_stats_text(Some((10, 0)), &counters, features, None, None)
+            context_stats_text(Some((10, 0)), &counters, features, None, None, None)
                 .iter()
                 .any(|l| l.contains("not yet measured"))
         );
