@@ -156,6 +156,25 @@ pub enum DgxCmd {
     /// Live-queried (Ollama `/api/ps` + vLLM `/v1/models` + `MemAvailable`) —
     /// ground truth, not a cached lease file.
     Gpu,
+    /// Flip the node to a target engine + model, evicting the other engine.
+    ///
+    /// `switch vllm <model>` unloads any resident Ollama models, launches the
+    /// vLLM server, and points newt at it. `switch ollama <model>` stops the
+    /// vLLM server, verifies the model is pulled (refusing with a hint if not),
+    /// points newt at Ollama, and warms it. Composes the `vllm up`/`warm`
+    /// eviction swaps into one atomic flip.
+    Switch {
+        /// Target engine: `ollama` or `vllm`.
+        engine: String,
+        /// Model to activate on the target engine.
+        model: String,
+        /// SSH node name (defaults to the active node).
+        #[arg(long)]
+        node: Option<String>,
+        /// Print the plan without evicting, launching, or persisting.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 /// Planning knobs shared by `dgx vllm up` and `dgx vllm config`.
@@ -351,6 +370,12 @@ pub async fn run(cmd: DgxCmd, config_path: Option<&Path>) -> anyhow::Result<()> 
             }
         },
         DgxCmd::Gpu => gpu(config_path).await,
+        DgxCmd::Switch {
+            engine,
+            model,
+            node,
+            dry_run,
+        } => switch(config_path, &engine, &model, node.as_deref(), dry_run).await,
     }
 }
 
@@ -1718,6 +1743,143 @@ async fn evict_vllm_server(ssh: &dyn SshExec, dgx: &DgxConfig) -> anyhow::Result
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// switch — flip the node between engines + models (Step 14.14)
+// ---------------------------------------------------------------------------
+
+/// Parse the `switch <engine>` token. Only `ollama` and `vllm` are switchable
+/// node-local engines (the load-balancer / in-cluster kinds aren't).
+fn parse_switch_engine(engine: &str) -> anyhow::Result<EndpointKind> {
+    match engine.to_ascii_lowercase().as_str() {
+        "ollama" => Ok(EndpointKind::Ollama),
+        "vllm" => Ok(EndpointKind::Vllm),
+        other => anyhow::bail!("`dgx switch` targets `ollama` or `vllm`, not {other:?}"),
+    }
+}
+
+/// Default vLLM launch knobs for `switch vllm <model>` (use `dgx vllm up` for
+/// fine control over dtype / port / context / tensor-parallel).
+fn default_vllm_plan_args() -> VllmPlanArgs {
+    VllmPlanArgs {
+        served_name: None,
+        dtype: None,
+        tensor_parallel: 1,
+        max_model_len: None,
+        gpu_mem_util: 0.90,
+        port: 8000,
+        docker: false,
+        extra: Vec::new(),
+    }
+}
+
+/// Is `model` present in the Ollama endpoint's installed list? Pure.
+fn ollama_has_model(installed: &[String], model: &str) -> bool {
+    installed.iter().any(|m| m == model)
+}
+
+/// Pure: set the active endpoint + model in config (no URL — the endpoint's URL
+/// is already configured on its node).
+fn apply_active(config: &mut Config, kind: EndpointKind, model: &str) {
+    let dgx = config.dgx.get_or_insert_with(Default::default);
+    dgx.active_endpoint = kind;
+    dgx.active_model = Some(model.to_string());
+}
+
+/// Persist the active endpoint + model to config (load → mutate → save).
+fn persist_active(
+    config_path: Option<&Path>,
+    kind: EndpointKind,
+    model: &str,
+) -> anyhow::Result<()> {
+    let mut config = load_config(config_path)?;
+    apply_active(&mut config, kind, model);
+    let save_path = config_path
+        .map(std::path::PathBuf::from)
+        .or_else(newt_core::Config::user_config_path)
+        .ok_or_else(|| anyhow::anyhow!("cannot determine config file path"))?;
+    config.save(&save_path)?;
+    println!("Active endpoint {kind}; model {model}");
+    println!("Saved → {}", save_path.display());
+    Ok(())
+}
+
+/// `dgx switch <engine> <model>` — atomic engine+model flip, evicting the other.
+async fn switch(
+    config_path: Option<&Path>,
+    engine: &str,
+    model: &str,
+    node: Option<&str>,
+    dry_run: bool,
+) -> anyhow::Result<()> {
+    match parse_switch_engine(engine)? {
+        EndpointKind::Vllm => {
+            // Evict Ollama, launch vLLM, persist — exactly `vllm up --evict-ollama`.
+            println!("Switching → vLLM serving {model:?} (evicting Ollama)…");
+            vllm_up(
+                config_path,
+                model,
+                node,
+                &default_vllm_plan_args(),
+                false,
+                true,
+                dry_run,
+            )
+            .await
+        }
+        EndpointKind::Ollama => switch_to_ollama(config_path, model, node, dry_run).await,
+        // parse_switch_engine only yields Ollama / Vllm.
+        other => anyhow::bail!("cannot switch to endpoint kind {other}"),
+    }
+}
+
+/// The `switch ollama <model>` direction: stop vLLM, verify the model is pulled,
+/// point newt at Ollama, and warm it.
+async fn switch_to_ollama(
+    config_path: Option<&Path>,
+    model: &str,
+    node: Option<&str>,
+    dry_run: bool,
+) -> anyhow::Result<()> {
+    let mut dgx = dgx_config(config_path)?;
+    if let Some(n) = node {
+        dgx.active_node = Some(n.to_string());
+    }
+    println!("Switching → Ollama serving {model:?} (stopping any vLLM server)…");
+    if dry_run {
+        println!(
+            "  [dry-run] would: stop the vLLM server, verify {model:?} is pulled, \
+             set active=ollama:{model}, and warm it"
+        );
+        return Ok(());
+    }
+    // 1. Stop any running vLLM server (best-effort — frees the unified pool).
+    evict_vllm_server(&RealSsh, &dgx).await?;
+    // 2. Refuse with a hint when the model isn't pulled (the GLM-5.2 lesson —
+    //    never silently pull multi-GB onto the node).
+    let base = dgx.resolve_endpoint_for(EndpointKind::Ollama)?;
+    let installed = fetch_ollama_models(&http_client(), &base)
+        .await
+        .unwrap_or_default();
+    if !ollama_has_model(&installed, model) {
+        anyhow::bail!(
+            "{model:?} is not pulled on the Ollama endpoint — run `newt dgx pull {model}` first"
+        );
+    }
+    // 3. Point newt at Ollama + the model.
+    persist_active(config_path, EndpointKind::Ollama, model)?;
+    // 4. Warm it (best-effort; a generous timeout for a cold load).
+    let warm_client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(600))
+        .build()
+        .expect("build reqwest client");
+    match warm_model(&warm_client, &base, model, "30m").await {
+        Ok(Some(secs)) => println!("  warmed {model} in {secs:.1}s — now resident"),
+        Ok(None) => println!("  {model} ready (already resident)"),
+        Err(e) => eprintln!("  WARNING: warm failed: {e}"),
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2766,5 +2928,48 @@ tiers = ["FAST", "STANDARD"]
     fn resolve_warm_model_errors_when_no_active_and_no_arg() {
         // No arg, no --evict-vllm, no active model → the usual NoActiveModel.
         assert!(resolve_warm_model(None, false, &DgxConfig::default()).is_err());
+    }
+
+    // --- switch (Step 14.14) ----------------------------------------------
+
+    #[test]
+    fn parse_switch_engine_accepts_ollama_and_vllm() {
+        assert_eq!(parse_switch_engine("ollama").unwrap(), EndpointKind::Ollama);
+        assert_eq!(parse_switch_engine("VLLM").unwrap(), EndpointKind::Vllm);
+        // The non-node-local kinds (and junk) are refused.
+        assert!(parse_switch_engine("ollama_lb").is_err());
+        assert!(parse_switch_engine("openai").is_err());
+    }
+
+    #[test]
+    fn ollama_has_model_matches_exact_tag() {
+        let installed = vec!["nemotron3:33b".to_string(), "qwen2.5-coder:32b".to_string()];
+        assert!(ollama_has_model(&installed, "nemotron3:33b"));
+        // No fuzzy / prefix match — a different tag is absent.
+        assert!(!ollama_has_model(&installed, "nemotron3:8b"));
+        assert!(!ollama_has_model(&installed, "nemotron3"));
+    }
+
+    #[test]
+    fn apply_active_sets_endpoint_and_model() {
+        let mut config = Config::default();
+        apply_active(&mut config, EndpointKind::Vllm, "qwen3.6-35b");
+        let dgx = config.dgx.as_ref().unwrap();
+        assert_eq!(dgx.active_endpoint, EndpointKind::Vllm);
+        assert_eq!(dgx.active_model.as_deref(), Some("qwen3.6-35b"));
+        // Flipping back to Ollama updates both in place.
+        apply_active(&mut config, EndpointKind::Ollama, "nemotron3:33b");
+        let dgx = config.dgx.as_ref().unwrap();
+        assert_eq!(dgx.active_endpoint, EndpointKind::Ollama);
+        assert_eq!(dgx.active_model.as_deref(), Some("nemotron3:33b"));
+    }
+
+    #[test]
+    fn default_vllm_plan_args_are_sane() {
+        let a = default_vllm_plan_args();
+        assert_eq!(a.tensor_parallel, 1);
+        assert_eq!(a.port, 8000);
+        assert!((a.gpu_mem_util - 0.90).abs() < f64::EPSILON);
+        assert!(!a.docker && a.dtype.is_none() && a.max_model_len.is_none());
     }
 }
