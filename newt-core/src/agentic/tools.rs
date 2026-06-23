@@ -171,6 +171,7 @@ pub(crate) fn merged_tool_definitions(
     with_scratchpad: bool,
     with_code_search: bool,
     with_experiential: bool,
+    with_scheduled: bool,
 ) -> serde_json::Value {
     let mut defs = match tool_definitions() {
         serde_json::Value::Array(a) => a,
@@ -212,6 +213,11 @@ pub(crate) fn merged_tool_definitions(
     if with_experiential {
         defs.push(super::experiential::experience_record_tool_definition());
         defs.push(super::experiential::experience_recall_tool_definition());
+    }
+    // Step 26.6b (#586): the scheduled plan_set/plan_advance tools, only with the gate.
+    if with_scheduled {
+        defs.push(super::scheduled::plan_set_tool_definition());
+        defs.push(super::scheduled::plan_advance_tool_definition());
     }
     defs.extend(mcp.tool_defs());
     serde_json::Value::Array(defs)
@@ -268,6 +274,8 @@ pub(crate) fn is_hallucination(tool_name: &str, args: &serde_json::Value) -> boo
             | "code_search"
             | "experience_record"
             | "experience_recall"
+            | "plan_set"
+            | "plan_advance"
     )
 }
 
@@ -953,6 +961,7 @@ pub async fn execute_tool(
     scratchpad_store: Option<&dyn super::scratchpad::ScratchpadStore>,
     code_search: Option<super::semantic::CodeSearch<'_>>,
     experience_store: Option<&dyn super::experiential::ExperienceStore>,
+    step_ledger: Option<&dyn super::scheduled::StepLedger>,
 ) -> String {
     // Remote MCP tools (namespaced `server__tool`) route to their server before
     // the built-in match. They carry no Caveats leash in this build.
@@ -1039,6 +1048,17 @@ pub async fn execute_tool(
                 tool_output_lines,
             ),
             None => "unknown tool: experience_recall (experiential memory is off)".to_string(),
+        },
+
+        // Step 26.6b (#586): scheduled plan_set/plan_advance — presence-gated on
+        // the ledger (advertised only when the `scheduled` feature is on).
+        "plan_set" => match step_ledger {
+            Some(l) => super::scheduled::execute_plan_set(args, l, color, tool_output_lines),
+            None => "unknown tool: plan_set (scheduled planning is off)".to_string(),
+        },
+        "plan_advance" => match step_ledger {
+            Some(l) => super::scheduled::execute_plan_advance(l, color, tool_output_lines),
+            None => "unknown tool: plan_advance (scheduled planning is off)".to_string(),
         },
 
         // Embedded git (PR4, #461): dispatch through the injected GitTool
@@ -1665,7 +1685,7 @@ mod tests {
     #[test]
     fn merged_tool_definitions_with_empty_mcp_is_builtin_set() {
         let merged = merged_tool_definitions(
-            &NoMcp, false, false, false, false, false, false, false, false,
+            &NoMcp, false, false, false, false, false, false, false, false, false,
         );
         let names: Vec<&str> = merged
             .as_array()
@@ -1705,12 +1725,12 @@ mod tests {
         assert!(!names(&base).contains(&"save_note"), "got: {base}");
         // … nor in the merged set without a sink …
         let without = merged_tool_definitions(
-            &NoMcp, false, false, false, false, false, false, false, false,
+            &NoMcp, false, false, false, false, false, false, false, false, false,
         );
         assert!(!names(&without).contains(&"save_note"));
         // … but a sink advertises it.
         let with = merged_tool_definitions(
-            &NoMcp, true, false, false, false, false, false, false, false,
+            &NoMcp, true, false, false, false, false, false, false, false, false,
         );
         assert!(names(&with).contains(&"save_note"), "got: {with}");
     }
@@ -1730,16 +1750,17 @@ mod tests {
         let base = tool_definitions();
         assert!(!names(&base).contains(&"recall"), "got: {base}");
         let without = merged_tool_definitions(
-            &NoMcp, false, false, false, false, false, false, false, false,
+            &NoMcp, false, false, false, false, false, false, false, false, false,
         );
         assert!(!names(&without).contains(&"recall"));
         let with = merged_tool_definitions(
-            &NoMcp, false, true, false, false, false, false, false, false,
+            &NoMcp, false, true, false, false, false, false, false, false, false,
         );
         assert!(names(&with).contains(&"recall"), "got: {with}");
         // The two gates are independent: both on advertises both.
-        let both =
-            merged_tool_definitions(&NoMcp, true, true, false, false, false, false, false, false);
+        let both = merged_tool_definitions(
+            &NoMcp, true, true, false, false, false, false, false, false, false,
+        );
         assert!(names(&both).contains(&"save_note"));
         assert!(names(&both).contains(&"recall"));
     }
@@ -1760,17 +1781,18 @@ mod tests {
         assert!(!names(&base).contains(&"memory_fetch"), "got: {base}");
         // Flag off (every existing caller, the inert default) → not advertised.
         let without = merged_tool_definitions(
-            &NoMcp, false, false, false, false, false, false, false, false,
+            &NoMcp, false, false, false, false, false, false, false, false, false,
         );
         assert!(!names(&without).contains(&"memory_fetch"));
         // Flag on → advertised.
         let with = merged_tool_definitions(
-            &NoMcp, false, false, true, false, false, false, false, false,
+            &NoMcp, false, false, true, false, false, false, false, false, false,
         );
         assert!(names(&with).contains(&"memory_fetch"), "got: {with}");
         // Independent of the save_note / recall gates: all three on lists all.
-        let all =
-            merged_tool_definitions(&NoMcp, true, true, true, false, false, false, false, false);
+        let all = merged_tool_definitions(
+            &NoMcp, true, true, true, false, false, false, false, false, false,
+        );
         assert!(names(&all).contains(&"save_note"));
         assert!(names(&all).contains(&"recall"));
         assert!(names(&all).contains(&"memory_fetch"));
@@ -2082,16 +2104,16 @@ mod tests {
                 .collect()
         }
         let with = merged_tool_definitions(
-            &NoMcp, false, false, false, true, false, false, false, false,
+            &NoMcp, false, false, false, true, false, false, false, false, false,
         );
         assert!(names(&with).contains(&"git"), "with_git advertises git");
         let without = merged_tool_definitions(
-            &NoMcp, false, false, false, false, false, false, false, false,
+            &NoMcp, false, false, false, false, false, false, false, false, false,
         );
         assert!(!names(&without).contains(&"git"), "no git without the gate");
         // #479: the /team toggle advertises both crew tools, and only then.
         let team = merged_tool_definitions(
-            &NoMcp, false, false, false, false, true, false, false, false,
+            &NoMcp, false, false, false, false, true, false, false, false, false,
         );
         assert!(
             names(&team).contains(&"crew") && names(&team).contains(&"compose_roster"),
@@ -2103,7 +2125,7 @@ mod tests {
         );
         // Step 26.4 (#583): the scratchpad state tools, only with the gate on.
         let scratch = merged_tool_definitions(
-            &NoMcp, false, false, false, false, false, true, false, false,
+            &NoMcp, false, false, false, false, false, true, false, false, false,
         );
         for t in ["state_set", "state_get", "state_clear"] {
             assert!(
@@ -2118,7 +2140,7 @@ mod tests {
         }
         // Step 26.5.5 (#582): the code_search tool, only with its gate on.
         let code = merged_tool_definitions(
-            &NoMcp, false, false, false, false, false, false, true, false,
+            &NoMcp, false, false, false, false, false, false, true, false, false,
         );
         assert!(
             names(&code).contains(&"code_search"),
@@ -2131,10 +2153,22 @@ mod tests {
         assert!(!is_hallucination("code_search", &serde_json::json!({})));
         // Step 26.6a (#585): the experiential record/recall tools, only with the gate.
         let exp = merged_tool_definitions(
-            &NoMcp, false, false, false, false, false, false, false, true,
+            &NoMcp, false, false, false, false, false, false, false, true, false,
         );
         for t in ["experience_record", "experience_recall"] {
             assert!(names(&exp).contains(&t), "{t} advertised with_experiential");
+            assert!(!names(&without).contains(&t), "{t} hidden without the gate");
+            assert!(
+                !is_hallucination(t, &serde_json::json!({})),
+                "{t} is a real tool"
+            );
+        }
+        // Step 26.6b (#586): the scheduled plan_set/plan_advance tools, only with the gate.
+        let sched = merged_tool_definitions(
+            &NoMcp, false, false, false, false, false, false, false, false, true,
+        );
+        for t in ["plan_set", "plan_advance"] {
+            assert!(names(&sched).contains(&t), "{t} advertised with_scheduled");
             assert!(!names(&without).contains(&t), "{t} hidden without the gate");
             assert!(
                 !is_hallucination(t, &serde_json::json!({})),
@@ -2168,6 +2202,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await;
         assert!(none.starts_with("unknown tool: state_set"), "{none}");
@@ -2190,6 +2225,7 @@ mod tests {
             None,
             None,
             Some(&store as &dyn ScratchpadStore),
+            None,
             None,
             None,
         )
@@ -2230,6 +2266,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await;
         assert!(none.starts_with("unknown tool: code_search"), "{none}");
@@ -2259,6 +2296,7 @@ mod tests {
             None,
             Some(search),
             None,
+            None,
         )
         .await;
         assert!(out.contains("no code matched"), "{out}");
@@ -2275,7 +2313,7 @@ mod tests {
         for name in ["experience_record", "experience_recall"] {
             let out = execute_tool(
                 name, &args, ".", false, 20, &caveats, &mut NoMcp, None, None, None, None, None,
-                None, None, None, None, None, None,
+                None, None, None, None, None, None, None,
             )
             .await;
             assert!(out.starts_with(&format!("unknown tool: {name}")), "{out}");
@@ -2301,10 +2339,53 @@ mod tests {
             None,
             None,
             Some(&store as &dyn ExperienceStore),
+            None,
         )
         .await;
         assert_eq!(out, "recorded experience");
         assert_eq!(store.count(), 1);
+    }
+
+    #[tokio::test]
+    async fn scheduled_dispatch_only_with_a_ledger() {
+        use crate::agentic::scheduled::{SessionStepLedger, StepLedger};
+        let caveats = crate::caveats::Caveats::top();
+        let args = serde_json::json!({ "steps": ["a", "b"] });
+        // Step 26.6b: no ledger → unknown tool for BOTH arms (presence-gate parity).
+        for name in ["plan_set", "plan_advance"] {
+            let out = execute_tool(
+                name, &args, ".", false, 20, &caveats, &mut NoMcp, None, None, None, None, None,
+                None, None, None, None, None, None, None,
+            )
+            .await;
+            assert!(out.starts_with(&format!("unknown tool: {name}")), "{out}");
+        }
+        // with a ledger → plan_set routes to the executor and mutates it.
+        let ledger = SessionStepLedger::default();
+        let out = execute_tool(
+            "plan_set",
+            &args,
+            ".",
+            false,
+            20,
+            &caveats,
+            &mut NoMcp,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&ledger as &dyn StepLedger),
+        )
+        .await;
+        assert_eq!(out, "plan set: 2 steps");
+        assert_eq!(ledger.count(), 2);
     }
 
     #[test]
@@ -2395,6 +2476,7 @@ mod execute_tool_branch_tests {
             None, // scratchpad_store
             None, // code_search
             None, // experience_store
+            None, // step_ledger
         )
         .await
     }
@@ -2485,6 +2567,7 @@ mod execute_tool_branch_tests {
             None, // scratchpad_store
             None, // code_search
             None, // experience_store
+            None, // step_ledger
         )
         .await
     }
@@ -2809,6 +2892,7 @@ mod execute_tool_branch_tests {
             None, // scratchpad_store
             None, // code_search
             None, // experience_store
+            None, // step_ledger
         )
         .await
     }
@@ -3130,6 +3214,7 @@ mod execute_tool_branch_tests {
             None, // scratchpad_store
             None, // code_search
             None, // experience_store
+            None, // step_ledger
         )
         .await
     }
@@ -3356,6 +3441,7 @@ mod execute_tool_branch_tests {
             None, // scratchpad_store
             None, // code_search
             None, // experience_store
+            None, // step_ledger
         )
         .await;
         assert_eq!(
@@ -3453,6 +3539,7 @@ mod execute_tool_branch_tests {
             None, // scratchpad_store
             None, // code_search
             None, // experience_store
+            None, // step_ledger
         )
         .await;
         assert_eq!(sink.calls, vec!["add:workspace builds with just check"]);
@@ -3513,6 +3600,7 @@ mod execute_tool_branch_tests {
             None, // scratchpad_store
             None, // code_search
             None, // experience_store
+            None, // step_ledger
         )
         .await;
         assert_eq!(
@@ -3576,6 +3664,7 @@ mod execute_tool_branch_tests {
             None, // scratchpad_store
             None, // code_search
             None, // experience_store
+            None, // step_ledger
         )
         .await;
         assert_eq!(out, "the exact note body");
@@ -3693,6 +3782,7 @@ mod disable_ocap_tests {
             None, // scratchpad_store
             None, // code_search
             None, // experience_store
+            None, // step_ledger
         )
         .await
     }
@@ -4106,6 +4196,7 @@ mod disable_ocap_tests {
             None, // scratchpad_store
             None, // code_search
             None, // experience_store
+            None, // step_ledger
         )
         .await;
         assert_eq!(out, "no-prompt\n");

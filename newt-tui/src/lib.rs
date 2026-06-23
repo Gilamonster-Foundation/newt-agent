@@ -2530,6 +2530,7 @@ mod permission_prompt_tests {
             None, // scratchpad_store
             None, // code_search
             None, // experience_store
+            None, // step_ledger
         )
         .await;
         assert_eq!(out, "gated contents", "allow-once executed the real read");
@@ -2555,6 +2556,7 @@ mod permission_prompt_tests {
             None, // scratchpad_store
             None, // code_search
             None, // experience_store
+            None, // step_ledger
         )
         .await;
         assert_eq!(
@@ -2608,6 +2610,7 @@ mod permission_prompt_tests {
                 None, // scratchpad_store
                 None, // code_search
                 None, // experience_store
+                None, // step_ledger
             )
             .await;
             assert_eq!(out, "gated contents");
@@ -4009,6 +4012,9 @@ fn run_chat(
     // Step 26.6a (#585): session-scoped experiential ledger. Unlike the others it
     // SURVIVES /new (cross-task reuse within the session) — see the /new handler.
     let experience_store = newt_core::SessionExperienceStore::default();
+    // Step 26.6b (#586): session-scoped plan ledger for the scheduled view.
+    // Task-specific → CLEARED on /new (like the scratchpad).
+    let step_ledger = newt_core::SessionStepLedger::default();
     let ctx = newt_core::SessionContext {
         workspace: workspace.to_string(),
         session_id: format!(
@@ -4391,6 +4397,10 @@ fn run_chat(
                                 use newt_core::ExperienceStore;
                                 (experience_store.count(), experience_store.total_chars())
                             });
+                            let plan_impact = features.scheduled.then(|| {
+                                use newt_core::StepLedger;
+                                (step_ledger.count(), step_ledger.done_count())
+                            });
                             for line in context_stats_text(
                                 token_gauge,
                                 &compress_state.counters(),
@@ -4399,6 +4409,7 @@ fn run_chat(
                                 scratch_impact,
                                 sem_impact,
                                 exp_impact,
+                                plan_impact,
                             ) {
                                 print_newt(&line, color, verbose);
                             }
@@ -4508,6 +4519,12 @@ fn run_chat(
                         // Step 26.6a (#585): the experiential ledger is INTENTIONALLY
                         // NOT cleared here — it is cross-task by design (a later task
                         // reuses earlier lessons). It is dropped only at session end.
+                        // Step 26.6b (#586): the plan ledger IS cleared — it is
+                        // task-specific (a new task gets a fresh plan).
+                        {
+                            use newt_core::StepLedger;
+                            step_ledger.clear();
+                        }
                         // `/new` keeps its historical message verbatim; the
                         // end/restart aliases say so explicitly (the previous
                         // conversation won't resume next launch).
@@ -4864,6 +4881,15 @@ fn run_chat(
                             turn_system = format!("{block}\n\n{turn_system}");
                         }
                     }
+                    // Step 26.6b (#586): inject the compiled <plan> checklist at the
+                    // turn head — ephemeral message[0], never persisted (like the
+                    // other feature blocks).
+                    let scheduled_on = turn_features.scheduled;
+                    if scheduled_on {
+                        if let Some(block) = newt_core::plan_block(&step_ledger) {
+                            turn_system = format!("{block}\n\n{turn_system}");
+                        }
+                    }
                     let messages = memory.build_messages(&turn_system, &task);
                     // The save_note sink borrows the manager for this call
                     // only; `/remember` and `save_note` share its NoteStore
@@ -5058,6 +5084,10 @@ fn run_chat(
                                         experience_store: experiential_on.then_some(
                                             &experience_store as &dyn newt_core::ExperienceStore,
                                         ),
+                                        // Step 26.6b (#586): the plan ledger for
+                                        // plan_set/plan_advance — Some only when on.
+                                        step_ledger: scheduled_on
+                                            .then_some(&step_ledger as &dyn newt_core::StepLedger),
                                         // #307: the clamped effective caveats (base ∩
                                         // preset). Identical to `cap.caveats()` when no
                                         // mode is active.
@@ -7241,6 +7271,7 @@ fn handle_context_command(
 /// Pure → unit-testable. `tool_offload_impact` = `(spills, offloaded_chars)`
 /// from the session spill store (Step 26.3); other features instrument as they
 /// land (26.4+).
+#[allow(clippy::too_many_arguments)] // gauge + counters + features + one impact tuple per feature
 fn context_stats_text(
     gauge: Option<(u32, u32)>,
     counters: &newt_core::CompressCounters,
@@ -7249,6 +7280,7 @@ fn context_stats_text(
     scratchpad_impact: Option<(u64, u64)>,
     semantic_impact: Option<(u64, u64)>,
     experiential_impact: Option<(u64, u64)>,
+    scheduled_impact: Option<(u64, u64)>,
 ) -> Vec<String> {
     let mut lines = vec!["context stats".to_string()];
     // Live send-budget fill (None until a turn has reported usage).
@@ -7304,6 +7336,12 @@ fn context_stats_text(
         if f == newt_core::ContextFeature::Experiential {
             if let Some((n, chars)) = experiential_impact {
                 line.push_str(&format!("  — {n} experiences (~{}k chars)", chars / 1000));
+            }
+        }
+        // Step 26.6b: scheduled's plan progress this session.
+        if f == newt_core::ContextFeature::Scheduled {
+            if let Some((steps, done)) = scheduled_impact {
+                line.push_str(&format!("  — {done}/{steps} plan steps done"));
             }
         }
         lines.push(line);
@@ -9528,6 +9566,7 @@ mod run_command_confinement_tests {
             None, // scratchpad_store
             None, // code_search
             None, // experience_store
+            None, // step_ledger
         )
         .await;
         assert!(
@@ -9567,6 +9606,7 @@ mod run_command_confinement_tests {
             None, // scratchpad_store
             None, // code_search
             None, // experience_store
+            None, // step_ledger
         )
         .await;
         assert!(
@@ -9617,6 +9657,7 @@ mod run_command_confinement_tests {
             None, // scratchpad_store
             None, // code_search
             None, // experience_store
+            None, // step_ledger
         )
         .await;
 
@@ -9664,6 +9705,7 @@ mod run_command_confinement_tests {
             None, // scratchpad_store
             None, // code_search
             None, // experience_store
+            None, // step_ledger
         )
         .await;
         assert_eq!(out, "hello", "read_file must still return file contents");
@@ -9704,6 +9746,7 @@ mod run_command_confinement_tests {
             None, // scratchpad_store
             None, // code_search
             None, // experience_store
+            None, // step_ledger
         )
         .await;
         assert!(
@@ -9751,6 +9794,7 @@ mod run_command_confinement_tests {
             None, // scratchpad_store
             None, // code_search
             None, // experience_store
+            None, // step_ledger
         )
         .await;
         assert!(out.contains("one.txt") && out.contains("two.txt"));
@@ -9883,6 +9927,7 @@ mod disable_ocap_session_tests {
             None, // scratchpad_store
             None, // code_search
             None, // experience_store
+            None, // step_ledger
         )
         .await;
         assert_eq!(out, "yolo-through\n");
@@ -9907,6 +9952,7 @@ mod disable_ocap_session_tests {
             None, // scratchpad_store
             None, // code_search
             None, // experience_store
+            None, // step_ledger
         )
         .await;
         assert_eq!(
@@ -9968,6 +10014,7 @@ mod disable_ocap_session_tests {
             None, // scratchpad_store
             None, // code_search
             None, // experience_store
+            None, // step_ledger
         )
         .await;
         assert_eq!(out, "no-prompt\n");
@@ -10009,6 +10056,7 @@ mod disable_ocap_session_tests {
             None, // scratchpad_store
             None, // code_search
             None, // experience_store
+            None, // step_ledger
         )
         .await;
         assert_eq!(out, "gated contents");
@@ -10057,6 +10105,7 @@ mod disable_ocap_session_tests {
             None, // scratchpad_store
             None, // code_search
             None, // experience_store
+            None, // step_ledger
         )
         .await;
         assert_ne!(out, "should-not-run\n", "the floor must block --yolo");
@@ -12203,6 +12252,7 @@ mod tool_round_cap_tests {
                     scratchpad_store: None,
                     code_search: None,
                     experience_store: None,
+                    step_ledger: None,
                     caveats: &caveats,
                     max_tool_rounds: 5,
                     tool_output_lines: 20,
@@ -12572,8 +12622,8 @@ mod helper_fn_tests {
         // unknown manager
         assert!(run("manager bogus").lines[0].contains("unknown context manager"));
 
-        // feature list: all six listed; two not-yet-available (tool_offload,
-        // scratchpad, semantic, experiential shipped in 26.3/26.4/26.5/26.6a).
+        // feature list: all six listed; only provenance not-yet-available (the
+        // other five shipped in 26.3/26.4/26.5/26.6a/26.6b).
         let r = run("feature");
         assert!(r.lines.iter().any(|l| l.contains("scratchpad")));
         assert!(r.lines.iter().any(|l| l.contains("tool_offload")));
@@ -12582,17 +12632,17 @@ mod helper_fn_tests {
                 .iter()
                 .filter(|l| l.contains("not yet available"))
                 .count(),
-            2
+            1
         );
 
-        // toggling a still-unavailable feature → reported with its issue, NOT
-        // applied (scheduled = #586, pending until 26.6b).
-        let r = run("feature scheduled on");
+        // toggling the one still-unavailable feature → reported with its issue,
+        // NOT applied (provenance = #584, the remaining pending feature).
+        let r = run("feature provenance on");
         assert!(r.set_feature.is_none());
-        assert!(r.lines[0].contains("not yet available") && r.lines[0].contains("#586"));
+        assert!(r.lines[0].contains("not yet available") && r.lines[0].contains("#584"));
 
-        // alias still resolves ("compiled" = scheduled, still pending)
-        assert!(run("feature compiled on").lines[0].contains("not yet available"));
+        // alias still resolves ("handles" = provenance, still pending)
+        assert!(run("feature handles on").lines[0].contains("not yet available"));
 
         // unknown feature / bad toggle / unknown subcommand
         assert!(run("feature bogus on").lines[0].contains("unknown context feature"));
@@ -12607,7 +12657,7 @@ mod helper_fn_tests {
         // bare status report the REAL state (config-forced on), not a hardcoded
         // "off" — the review-flagged honesty edge.
         let mut feats = ContextFeatures::default();
-        feats.set(newt_core::ContextFeature::Scheduled, Some(true));
+        feats.set(newt_core::ContextFeature::Provenance, Some(true));
         let cfg_on = newt_core::Config {
             context: Some(newt_core::ContextConfig {
                 manager: ContextManager::Standard,
@@ -12616,7 +12666,7 @@ mod helper_fn_tests {
             }),
             ..Default::default()
         };
-        let r = handle_context_command("feature scheduled off", &cfg_on, None, &none);
+        let r = handle_context_command("feature provenance off", &cfg_on, None, &none);
         assert!(
             r.set_feature.is_none(),
             "an unavailable feature is never applied"
@@ -12628,7 +12678,7 @@ mod helper_fn_tests {
         );
         assert!(
             handle_context_command("", &cfg_on, None, &none).lines[0]
-                .contains("scheduled (pending #586)"),
+                .contains("provenance (pending #584)"),
             "bare status annotates a config-on-but-unavailable feature as pending"
         );
 
@@ -12659,6 +12709,12 @@ mod helper_fn_tests {
             run("feature experience on").set_feature,
             Some((newt_core::ContextFeature::Experiential, true))
         );
+
+        // scheduled shipped in 26.6b → toggles ON (alias "compiled" too).
+        assert_eq!(
+            run("feature compiled on").set_feature,
+            Some((newt_core::ContextFeature::Scheduled, true))
+        );
     }
 
     #[test]
@@ -12673,7 +12729,7 @@ mod helper_fn_tests {
         let features = ContextFeatureSet::default();
 
         // No gauge yet → "not yet measured".
-        let none = context_stats_text(None, &counters, features, None, None, None, None);
+        let none = context_stats_text(None, &counters, features, None, None, None, None, None);
         assert_eq!(none[0], "context stats");
         assert!(none.iter().any(|l| l.contains("budget: not yet measured")));
 
@@ -12686,6 +12742,7 @@ mod helper_fn_tests {
             None,
             None,
             None,
+            None,
         );
         let joined = s.join("\n");
         assert!(joined.contains("899k/1024k"), "{joined}");
@@ -12693,15 +12750,15 @@ mod helper_fn_tests {
         // Compression telemetry is reused from the /memory section.
         assert!(joined.contains("compressions this session: 3"), "{joined}");
         assert!(joined.contains("reclaimed 42%"), "{joined}");
-        // Every feature is listed; tool_offload/scratchpad/semantic/experiential
-        // are available, the other two are still pending.
+        // Every feature is listed; all but provenance are available — only one
+        // feature is still pending.
         for f in newt_core::ContextFeature::ALL {
             assert!(joined.contains(f.keyword()), "missing {}", f.keyword());
         }
         assert_eq!(
             s.iter().filter(|l| l.contains("(pending #")).count(),
-            2,
-            "two features still pending (tool_offload+scratchpad+semantic+experiential shipped)"
+            1,
+            "only provenance still pending (the other five shipped)"
         );
 
         // each available feature renders its impact on its row when on.
@@ -12710,6 +12767,7 @@ mod helper_fn_tests {
         on.set(newt_core::ContextFeature::Scratchpad, true);
         on.set(newt_core::ContextFeature::Semantic, true);
         on.set(newt_core::ContextFeature::Experiential, true);
+        on.set(newt_core::ContextFeature::Scheduled, true);
         let imp = context_stats_text(
             None,
             &counters,
@@ -12718,6 +12776,7 @@ mod helper_fn_tests {
             Some((5, 12_000)),
             Some((42, 60_000)),
             Some((7, 9_000)),
+            Some((4, 2)),
         )
         .join("\n");
         assert!(
@@ -12736,13 +12795,24 @@ mod helper_fn_tests {
             imp.contains("[on ] experiential  — 7 experiences (~9k chars)"),
             "{imp}"
         );
+        assert!(
+            imp.contains("[on ] scheduled  — 2/4 plan steps done"),
+            "{imp}"
+        );
 
         // A zero budget renders the unmeasured line (no divide-by-zero).
-        assert!(
-            context_stats_text(Some((10, 0)), &counters, features, None, None, None, None)
-                .iter()
-                .any(|l| l.contains("not yet measured"))
-        );
+        assert!(context_stats_text(
+            Some((10, 0)),
+            &counters,
+            features,
+            None,
+            None,
+            None,
+            None,
+            None
+        )
+        .iter()
+        .any(|l| l.contains("not yet measured")));
     }
 
     #[test]
