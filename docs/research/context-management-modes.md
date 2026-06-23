@@ -4,10 +4,12 @@ Synthesis of two sources against newt's actual code, to feed the
 `/context manager <name>` selector seam (Step 24.8) and #546.
 
 **Sources**
-- `2605.18747v1.pdf` — *Code as Agent Harness: Toward Executable, Verifiable,
-  and Stateful Agent Systems* (arXiv:2605.18747v1, 2026-05-18; a ~66-page
-  survey/position paper). Context-management taxonomy in **§3.2 "Memory and
-  Context Engineering"** (pp.21–24, Fig.6, Table 5); shared-substrate
+- *Code as Agent Harness: Toward Executable, Verifiable, and Stateful Agent
+  Systems* — [arXiv:2605.18747](https://arxiv.org/abs/2605.18747) (v1,
+  2026-05-18; a ~66-page survey/position paper). Reference card:
+  [`2605.18747-code-as-agent-harness.md`](./2605.18747-code-as-agent-harness.md)
+  (the PDF itself is gitignored). Context-management taxonomy in **§3.2 "Memory
+  and Context Engineering"** (pp.21–24, Fig.6, Table 5); shared-substrate
   representations in **§4.3** (pp.43–48).
 - `notes.txt` — 5 distilled production patterns (sliding-window+pinning,
   tool-output offloading, dynamic compaction + prompt-cache, scratchpad,
