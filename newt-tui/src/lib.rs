@@ -4834,10 +4834,27 @@ fn run_chat(
                         .map(|c| c.semantic.clone())
                         .unwrap_or_default();
                     let semantic_embedder = semantic_on.then(|| {
+                        // Decouple embeddings from chat: an explicit
+                        // embeddings_endpoint (with its protocol) is used as-is;
+                        // otherwise fall back to the active backend (back-compat)
+                        // — now protocol-aware, so an OpenAI backend correctly
+                        // uses /v1/embeddings instead of Ollama's /api/embeddings.
+                        let (emb_url, emb_kind, emb_key) =
+                            match semantic_cfg.embeddings_endpoint.clone() {
+                                Some(url) => (
+                                    url,
+                                    semantic_cfg
+                                        .embeddings_api
+                                        .unwrap_or(newt_core::BackendKind::Ollama),
+                                    None,
+                                ),
+                                None => (inf_url.clone(), inf_kind, inf_key.clone()),
+                            };
                         newt_core::EmbeddingsClient::new(
-                            inf_url.clone(),
+                            emb_url,
                             semantic_cfg.embedding_model.clone(),
-                            inf_key.clone(),
+                            emb_kind,
+                            emb_key,
                             60,
                             2,
                         )
@@ -4863,6 +4880,7 @@ fn run_chat(
                                         &files,
                                         embedder,
                                         &semantic_index,
+                                        semantic_cfg.on_embed_failure,
                                     ))
                                 });
                                 if n == 0 {

@@ -23,13 +23,17 @@ pub trait Embedder: Send + Sync {
     async fn embed(&self, text: &str) -> anyhow::Result<Vec<f32>>;
 }
 
-/// The real [`Embedder`]: Ollama `POST /api/embeddings` (`{model, prompt}` →
-/// `{embedding: [f32]}`). Mirrors the summarizer's HTTP discipline — a
-/// configurable timeout, optional bearer auth, and exponential-backoff retry
-/// (embedding a whole repo is many requests; transient failures recover).
+/// The real [`Embedder`], protocol-aware over the two wire APIs newt speaks:
+/// Ollama `POST /api/embeddings` (`{model, prompt}` → `{embedding: [f32]}`) and
+/// OpenAI-compatible `POST /v1/embeddings` (`{model, input}` →
+/// `{data: [{embedding: [f32]}]}`, e.g. vLLM serving an embedding model).
+/// Mirrors the summarizer's HTTP discipline — a configurable timeout, optional
+/// bearer auth, and exponential-backoff retry (embedding a whole repo is many
+/// requests; transient failures recover).
 pub struct EmbeddingsClient {
     url: String,
     model: String,
+    kind: crate::BackendKind,
     api_key: Option<String>,
     timeout_secs: u64,
     retries: u32,
@@ -39,6 +43,7 @@ impl EmbeddingsClient {
     pub fn new(
         url: impl Into<String>,
         model: impl Into<String>,
+        kind: crate::BackendKind,
         api_key: Option<String>,
         timeout_secs: u64,
         retries: u32,
@@ -46,6 +51,7 @@ impl EmbeddingsClient {
         Self {
             url: url.into(),
             model: model.into(),
+            kind,
             api_key,
             timeout_secs,
             retries,
@@ -62,10 +68,20 @@ impl EmbeddingsClient {
         Ok(out)
     }
 
-    /// One embeddings request (no retry — the retry loop wraps this).
+    /// One embeddings request (no retry — the retry loop wraps this). The path,
+    /// request shape, and response shape follow `self.kind`'s wire protocol.
     async fn embed_once(&self, text: &str) -> anyhow::Result<Vec<f32>> {
-        let endpoint = format!("{}/api/embeddings", self.url.trim_end_matches('/'));
-        let body = serde_json::json!({ "model": self.model, "prompt": text });
+        let base = self.url.trim_end_matches('/');
+        let (endpoint, body) = match self.kind {
+            crate::BackendKind::Ollama => (
+                format!("{base}/api/embeddings"),
+                serde_json::json!({ "model": self.model, "prompt": text }),
+            ),
+            crate::BackendKind::Openai => (
+                format!("{base}/v1/embeddings"),
+                serde_json::json!({ "model": self.model, "input": text }),
+            ),
+        };
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(self.timeout_secs))
             .build()?;
@@ -75,12 +91,15 @@ impl EmbeddingsClient {
         }
         let resp = req.send().await?;
         if !resp.status().is_success() {
-            anyhow::bail!("embeddings endpoint {}", resp.status());
+            anyhow::bail!("embeddings endpoint {endpoint} returned {}", resp.status());
         }
         let json: serde_json::Value = resp.json().await?;
-        let arr = json["embedding"]
-            .as_array()
-            .ok_or_else(|| anyhow::anyhow!("embeddings response missing `embedding` array"))?;
+        // Ollama: `{embedding: [..]}`; OpenAI: `{data: [{embedding: [..]}]}`.
+        let arr = match self.kind {
+            crate::BackendKind::Ollama => json["embedding"].as_array(),
+            crate::BackendKind::Openai => json["data"][0]["embedding"].as_array(),
+        }
+        .ok_or_else(|| anyhow::anyhow!("embeddings response missing `embedding` array"))?;
         let vec: Vec<f32> = arr
             .iter()
             .map(|v| v.as_f64().unwrap_or(0.0) as f32)
@@ -358,6 +377,7 @@ pub async fn index_files(
     files: &[(String, String)],
     embedder: &dyn Embedder,
     index: &dyn SemanticIndex,
+    on_failure: crate::OnEmbedFailure,
 ) -> usize {
     let mut indexed = 0;
     for (file, source) in files {
@@ -367,9 +387,26 @@ pub async fn index_files(
                     index.index_chunk(chunk, v);
                     indexed += 1;
                 }
-                Err(e) => {
-                    tracing::warn!(error = %e, file = file.as_str(), "embed failed; skipping chunk");
-                }
+                Err(e) => match on_failure {
+                    // A structural failure (wrong endpoint / missing model) is
+                    // total, not transient — degrading per-chunk would silently
+                    // build an empty index. Stop once with an actionable error.
+                    crate::OnEmbedFailure::Disable => {
+                        tracing::error!(
+                            error = %e,
+                            file = file.as_str(),
+                            "semantic indexing disabled: embeddings failed. Point \
+                             [context.semantic].embeddings_endpoint at an endpoint that serves \
+                             the embedding model (e.g. an Ollama host with the model pulled), or \
+                             set on_embed_failure = \"warn\" to keep trying per-chunk. Indexed \
+                             {indexed} chunk(s) before stopping."
+                        );
+                        return indexed;
+                    }
+                    crate::OnEmbedFailure::Warn => {
+                        tracing::warn!(error = %e, file = file.as_str(), "embed failed; skipping chunk");
+                    }
+                },
             }
         }
     }
@@ -546,8 +583,38 @@ mod tests {
             )
             .mount(&server)
             .await;
-        let c = EmbeddingsClient::new(server.uri(), "nomic-embed-text", None, 30, 0);
+        let c = EmbeddingsClient::new(
+            server.uri(),
+            "nomic-embed-text",
+            crate::BackendKind::Ollama,
+            None,
+            30,
+            0,
+        );
         assert_eq!(c.embed("hello").await.unwrap(), vec![0.1f32, 0.2, 0.3]);
+    }
+
+    #[tokio::test]
+    async fn embed_openai_protocol_hits_v1_and_parses_data() {
+        // An OpenAI-compatible endpoint (e.g. vLLM serving an embedding model):
+        // POST /v1/embeddings with `{input}`, response `{data:[{embedding}]}`.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{ "embedding": [0.5, 0.6] }]
+            })))
+            .mount(&server)
+            .await;
+        let c = EmbeddingsClient::new(
+            server.uri(),
+            "bge-m3",
+            crate::BackendKind::Openai,
+            None,
+            30,
+            0,
+        );
+        assert_eq!(c.embed("hello").await.unwrap(), vec![0.5f32, 0.6]);
     }
 
     /// The batch must keep input order. The mock encodes each prompt's length
@@ -568,7 +635,7 @@ mod tests {
             .respond_with(ByLen)
             .mount(&server)
             .await;
-        let c = EmbeddingsClient::new(server.uri(), "m", None, 30, 0);
+        let c = EmbeddingsClient::new(server.uri(), "m", crate::BackendKind::Ollama, None, 30, 0);
         let out = c
             .embed_batch(&["a".into(), "bbb".into(), "cc".into()])
             .await
@@ -596,7 +663,7 @@ mod tests {
             .respond_with(FailOnce(calls.clone()))
             .mount(&server)
             .await;
-        let c = EmbeddingsClient::new(server.uri(), "m", None, 30, 2);
+        let c = EmbeddingsClient::new(server.uri(), "m", crate::BackendKind::Ollama, None, 30, 2);
         assert_eq!(c.embed("x").await.unwrap(), vec![1.0f32, 2.0]);
         assert_eq!(calls.load(Ordering::SeqCst), 2, "one failure, one success");
     }
@@ -609,9 +676,9 @@ mod tests {
             .respond_with(ResponseTemplate::new(500))
             .mount(&server)
             .await;
-        let c = EmbeddingsClient::new(server.uri(), "m", None, 30, 1);
+        let c = EmbeddingsClient::new(server.uri(), "m", crate::BackendKind::Ollama, None, 30, 1);
         let err = c.embed("x").await.unwrap_err();
-        assert!(err.to_string().contains("embeddings endpoint 500"), "{err}");
+        assert!(err.to_string().contains("returned 500"), "{err}");
     }
 
     #[tokio::test]
@@ -625,7 +692,7 @@ mod tests {
             )
             .mount(&server)
             .await;
-        let c = EmbeddingsClient::new(server.uri(), "m", None, 30, 0);
+        let c = EmbeddingsClient::new(server.uri(), "m", crate::BackendKind::Ollama, None, 30, 0);
         assert!(c
             .embed("x")
             .await
@@ -652,7 +719,7 @@ mod tests {
             .respond_with(Count(calls.clone()))
             .mount(&server)
             .await;
-        let c = EmbeddingsClient::new(server.uri(), "m", None, 30, 0);
+        let c = EmbeddingsClient::new(server.uri(), "m", crate::BackendKind::Ollama, None, 30, 0);
         assert!(c.embed("x").await.is_err());
         assert_eq!(
             calls.load(Ordering::SeqCst),
@@ -675,7 +742,14 @@ mod tests {
             )
             .mount(&server)
             .await;
-        let c = EmbeddingsClient::new(server.uri(), "m", Some("sk-test".into()), 30, 0);
+        let c = EmbeddingsClient::new(
+            server.uri(),
+            "m",
+            crate::BackendKind::Ollama,
+            Some("sk-test".into()),
+            30,
+            0,
+        );
         // The request only matches (and 200s) if the Authorization header is sent.
         assert_eq!(c.embed("x").await.unwrap(), vec![1.0f32]);
     }
@@ -875,17 +949,70 @@ class Dog:
         }
     }
 
+    /// Always-failing embedder that counts attempts — distinguishes the
+    /// `Disable` (stop after one) and `Warn` (try every chunk) policies.
+    struct CountingFailEmbedder(Arc<AtomicUsize>);
+    #[async_trait]
+    impl Embedder for CountingFailEmbedder {
+        async fn embed(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            anyhow::bail!("embeddings endpoint returned 404")
+        }
+    }
+
+    #[tokio::test]
+    async fn index_files_disable_stops_on_first_failure() {
+        // Two chunks; a structural failure under Disable must stop after the
+        // FIRST embed attempt (not spam one per chunk) and index nothing.
+        let files = vec![("a.rs".to_string(), "fn add() {}\nfn sub() {}".to_string())];
+        let idx = SessionSemanticIndex::default();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let n = index_files(
+            &files,
+            &CountingFailEmbedder(calls.clone()),
+            &idx,
+            crate::OnEmbedFailure::Disable,
+        )
+        .await;
+        assert_eq!(n, 0);
+        assert_eq!(idx.chunks_indexed(), 0);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "Disable must short-circuit after the first failure"
+        );
+
+        // Warn, by contrast, attempts every chunk (>= 2 here).
+        let calls2 = Arc::new(AtomicUsize::new(0));
+        index_files(
+            &files,
+            &CountingFailEmbedder(calls2.clone()),
+            &SessionSemanticIndex::default(),
+            crate::OnEmbedFailure::Warn,
+        )
+        .await;
+        assert!(
+            calls2.load(Ordering::SeqCst) >= 2,
+            "Warn keeps trying per-chunk, got {}",
+            calls2.load(Ordering::SeqCst)
+        );
+    }
+
     #[tokio::test]
     async fn index_files_chunks_embeds_and_skips_failures() {
         let files = vec![("a.rs".to_string(), "fn add() {}\nfn sub() {}".to_string())];
         // happy path: two fns chunked + embedded
         let idx = SessionSemanticIndex::default();
-        let n = index_files(&files, &MockEmbedder, &idx).await;
+        let n = index_files(&files, &MockEmbedder, &idx, crate::OnEmbedFailure::Disable).await;
         assert_eq!(n, idx.chunks_indexed() as usize);
         assert!(n >= 2, "two fns indexed, got {n}");
-        // all embeds fail → nothing indexed, no panic (graceful degrade)
+        // Warn policy: all embeds fail → nothing indexed, no panic (it keeps
+        // going per-chunk, the historical degrade).
         let empty = SessionSemanticIndex::default();
-        assert_eq!(index_files(&files, &FailEmbedder, &empty).await, 0);
+        assert_eq!(
+            index_files(&files, &FailEmbedder, &empty, crate::OnEmbedFailure::Warn).await,
+            0
+        );
         assert_eq!(empty.chunks_indexed(), 0);
     }
 
@@ -893,7 +1020,7 @@ class Dog:
     async fn retrieve_evidence_embeds_query_ranks_and_degrades() {
         let files = vec![("a.rs".to_string(), "fn aaa() {}\nfn bbb() {}".to_string())];
         let idx = SessionSemanticIndex::default();
-        index_files(&files, &MockEmbedder, &idx).await;
+        index_files(&files, &MockEmbedder, &idx, crate::OnEmbedFailure::Disable).await;
         // query rich in 'a' → the aaa chunk outranks bbb (cosine on the a-axis)
         let block = retrieve_evidence("aaaaa", &MockEmbedder, &idx, 1)
             .await
@@ -917,7 +1044,7 @@ class Dog:
     async fn code_search_tool_embeds_searches_and_coaches() {
         let files = vec![("a.rs".to_string(), "fn aaa() {}\nfn bbb() {}".to_string())];
         let idx = SessionSemanticIndex::default();
-        index_files(&files, &MockEmbedder, &idx).await;
+        index_files(&files, &MockEmbedder, &idx, crate::OnEmbedFailure::Disable).await;
         let search = CodeSearch {
             embedder: &MockEmbedder,
             index: &idx,
