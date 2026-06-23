@@ -95,6 +95,12 @@ pub enum DgxCmd {
         /// How long Ollama keeps the model resident after warming.
         #[arg(long, default_value = "30m")]
         keep_alive: String,
+        /// First stop any running vLLM server to free the shared unified pool,
+        /// then warm against the Ollama endpoint (the reverse of
+        /// `vllm up --evict-ollama`). Implies the Ollama endpoint even if the
+        /// active endpoint was vLLM.
+        #[arg(long)]
+        evict_vllm: bool,
     },
     /// Pull a model onto the DGX node.
     ///
@@ -269,7 +275,11 @@ pub async fn run(cmd: DgxCmd, config_path: Option<&Path>) -> anyhow::Result<()> 
         DgxCmd::Models => models(config_path).await,
         DgxCmd::Doctor => doctor(config_path).await,
         DgxCmd::Use { model } => use_model(config_path, &model),
-        DgxCmd::Warm { model, keep_alive } => warm(config_path, model, &keep_alive).await,
+        DgxCmd::Warm {
+            model,
+            keep_alive,
+            evict_vllm,
+        } => warm(config_path, model, &keep_alive, evict_vllm).await,
         DgxCmd::Pull {
             model,
             node,
@@ -762,24 +772,58 @@ async fn warm_model(
     Ok(json["load_duration"].as_u64().map(|ns| ns as f64 / 1e9))
 }
 
+/// Resolve which model `warm` should load. An explicit arg always wins. With no
+/// arg, `--evict-vllm` requires an explicit Ollama model — the persisted active
+/// model is the just-stopped vLLM served name, which Ollama doesn't have (it
+/// would 404), so refuse with an actionable message rather than that confusion.
+/// Otherwise fall back to the active model. Pure → unit-tested.
+fn resolve_warm_model(
+    model: Option<String>,
+    evict_vllm: bool,
+    dgx: &DgxConfig,
+) -> anyhow::Result<String> {
+    if let Some(m) = model {
+        return Ok(m);
+    }
+    if evict_vllm {
+        anyhow::bail!(
+            "--evict-vllm needs an explicit Ollama model to warm (the active model {:?} \
+             is the vLLM served name, now stopped) — e.g. \
+             `dgx warm --evict-vllm qwen2.5-coder:32b`",
+            dgx.active_model.as_deref().unwrap_or("<none>")
+        );
+    }
+    Ok(dgx.resolve_active_model()?)
+}
+
 async fn warm(
     config_path: Option<&Path>,
     model: Option<String>,
     keep_alive: &str,
+    evict_vllm: bool,
 ) -> anyhow::Result<()> {
     let dgx = dgx_config(config_path)?;
-    let kind = dgx.active_endpoint;
-    if kind.is_openai_compatible() {
-        anyhow::bail!(
-            "`newt dgx warm` targets Ollama endpoints; the active endpoint is vLLM \
-             (vLLM keeps its served model resident already)"
-        );
-    }
-    let base = dgx.resolve_endpoint()?;
-    let model = match model {
-        Some(m) => m,
-        None => dgx.resolve_active_model()?,
+    // `--evict-vllm`: free the shared pool first, then target the Ollama
+    // endpoint explicitly — the flag is an explicit "switch to Ollama" intent,
+    // so it bypasses the active-endpoint guard below.
+    let (kind, base) = if evict_vllm {
+        evict_vllm_server(&RealSsh, &dgx).await?;
+        (
+            EndpointKind::Ollama,
+            dgx.resolve_endpoint_for(EndpointKind::Ollama)?,
+        )
+    } else {
+        let kind = dgx.active_endpoint;
+        if kind.is_openai_compatible() {
+            anyhow::bail!(
+                "`newt dgx warm` targets Ollama endpoints; the active endpoint is vLLM \
+                 (vLLM keeps its served model resident already). Pass --evict-vllm to stop \
+                 the vLLM server and warm an Ollama model instead."
+            );
+        }
+        (kind, dgx.resolve_endpoint()?)
     };
+    let model = resolve_warm_model(model, evict_vllm, &dgx)?;
     println!("Warming {model} on {kind} endpoint ({base}) — keep_alive={keep_alive}");
 
     // Cold loads of large models can take tens of seconds; give warm its own
@@ -1632,6 +1676,43 @@ async fn evict_ollama_models(dgx: &DgxConfig) -> anyhow::Result<()> {
         match unload_ollama_model(&client, &base, m).await {
             Ok(()) => println!("  evicted Ollama model {m}"),
             Err(e) => eprintln!("  WARNING: failed to evict Ollama model {m}: {e}"),
+        }
+    }
+    Ok(())
+}
+
+/// Stop the running vLLM server(s) to free the unified pool (the `--evict-vllm`
+/// swap, the mirror of [`evict_ollama_models`]). Queries `/v1/models` for the
+/// served id(s) and kills each via the pidfile-based stop command over SSH —
+/// vLLM has no HTTP unload, so the server *is* the residency. Best-effort: a
+/// missing endpoint, no running server, or an unresolvable SSH host is a no-op,
+/// not an error. `ssh` is injectable so tests never touch a real node.
+async fn evict_vllm_server(ssh: &dyn SshExec, dgx: &DgxConfig) -> anyhow::Result<()> {
+    let base = match dgx.resolve_endpoint_for(EndpointKind::Vllm) {
+        Ok(b) => b,
+        Err(_) => {
+            eprintln!("  --evict-vllm: no vLLM endpoint configured; nothing to evict");
+            return Ok(());
+        }
+    };
+    let served = fetch_vllm_models(&base).await.unwrap_or_default();
+    if served.is_empty() {
+        println!("  --evict-vllm: no vLLM server running");
+        return Ok(());
+    }
+    let user = dgx.ssh_user();
+    let host = match dgx.ssh_host() {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("  --evict-vllm: cannot resolve SSH host ({e}); skipping eviction");
+            return Ok(());
+        }
+    };
+    for id in &served {
+        let cmd = dgx_vllm::vllm_stop_command(id);
+        match ssh.run(&user, &host, None, &cmd) {
+            Ok(()) => println!("  stopped vLLM server {id}"),
+            Err(e) => eprintln!("  WARNING: failed to stop vLLM server {id}: {e}"),
         }
     }
     Ok(())
@@ -2586,5 +2667,104 @@ tiers = ["FAST", "STANDARD"]
     async fn evict_ollama_models_ok_when_no_endpoint() {
         // No nodes / no Ollama endpoint → best-effort no-op, not an error.
         assert!(evict_ollama_models(&DgxConfig::default()).await.is_ok());
+    }
+
+    /// A DgxConfig whose active node serves vLLM at `uri` and is SSH-reachable.
+    fn vllm_config_at(uri: &str) -> DgxConfig {
+        DgxConfig {
+            active_node: Some("home".to_string()),
+            active_endpoint: EndpointKind::Vllm,
+            nodes: vec![DgxNode {
+                name: "home".to_string(),
+                vllm: Some(uri.to_string()),
+                ssh_host: Some("dgx.test".to_string()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn evict_vllm_server_stops_each_served_model() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{ "id": "qwen3.6-35b" }]
+            })))
+            .mount(&server)
+            .await;
+        let ssh = RecordingSsh::new();
+        evict_vllm_server(&ssh, &vllm_config_at(&server.uri()))
+            .await
+            .unwrap();
+        let calls = ssh.calls.borrow();
+        assert_eq!(calls.len(), 1, "one stop command per served model");
+        // The kill targets the served model's pidfile, over the node's SSH host.
+        assert_eq!(calls[0].1, "dgx.test");
+        assert!(calls[0].3.contains("qwen3.6-35b.pid"));
+        assert!(calls[0].3.contains("kill"));
+    }
+
+    #[tokio::test]
+    async fn evict_vllm_server_noop_when_no_server() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path("/v1/models"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "data": [] })),
+            )
+            .mount(&server)
+            .await;
+        let ssh = RecordingSsh::new();
+        evict_vllm_server(&ssh, &vllm_config_at(&server.uri()))
+            .await
+            .unwrap();
+        assert!(ssh.calls.borrow().is_empty(), "no server → no SSH kill");
+    }
+
+    #[tokio::test]
+    async fn evict_vllm_server_ok_when_no_endpoint() {
+        // No vLLM endpoint configured → best-effort no-op, no SSH.
+        let ssh = RecordingSsh::new();
+        assert!(evict_vllm_server(&ssh, &DgxConfig::default()).await.is_ok());
+        assert!(ssh.calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn resolve_warm_model_explicit_arg_wins() {
+        let dgx = DgxConfig::default();
+        assert_eq!(
+            resolve_warm_model(Some("qwen2.5-coder:32b".to_string()), true, &dgx).unwrap(),
+            "qwen2.5-coder:32b"
+        );
+    }
+
+    #[test]
+    fn resolve_warm_model_evict_vllm_requires_explicit_model() {
+        // After `vllm up`, active_model is the vLLM served name; warming it on
+        // Ollama would 404, so --evict-vllm with no arg must refuse helpfully.
+        let mut dgx = DgxConfig {
+            active_endpoint: EndpointKind::Vllm,
+            active_model: Some("qwen3.6-35b".to_string()),
+            ..Default::default()
+        };
+        let err = resolve_warm_model(None, true, &dgx)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--evict-vllm") && err.contains("qwen3.6-35b"));
+        // Without --evict-vllm, the active model is used as before.
+        dgx.active_endpoint = EndpointKind::Ollama;
+        dgx.active_model = Some("llama3.1:8b".to_string());
+        assert_eq!(
+            resolve_warm_model(None, false, &dgx).unwrap(),
+            "llama3.1:8b"
+        );
+    }
+
+    #[test]
+    fn resolve_warm_model_errors_when_no_active_and_no_arg() {
+        // No arg, no --evict-vllm, no active model → the usual NoActiveModel.
+        assert!(resolve_warm_model(None, false, &DgxConfig::default()).is_err());
     }
 }
