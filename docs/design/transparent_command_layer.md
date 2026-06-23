@@ -2,7 +2,9 @@
 
 **Status:** Design / proposed (Shawn Hartsock, 2026-06-21)
 **Related:** `docs/decisions/structural_parsing_over_regex.md` (the AST rule this
-relies on), `docs/decisions/ocap_confinement_model.md` (what "confined" honestly
+relies on), `docs/decisions/host_command_confinement.md` (the decision: fence the
+host suite, don't reimplement GNU, allow/attest/deny × presence on top),
+`docs/decisions/ocap_confinement_model.md` (what "confined" honestly
 buys — and the `--yolo` caveat),
 `docs/decisions/agentic_object_capability_security.md` (the OCAP
 leash this must not break), `docs/design/captured-shell-ocap.md`,

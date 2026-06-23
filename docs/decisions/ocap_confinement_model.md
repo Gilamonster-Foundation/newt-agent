@@ -3,7 +3,9 @@
 **Status:** Accepted (decided by Shawn Hartsock, 2026-06-21)
 **Date:** 2026-06-21
 **Related:** `docs/decisions/agentic_object_capability_security.md` (the OCAP
-leash), `docs/security/ocap-deviations.md` (the **authoritative** deviation
+leash), `docs/decisions/host_command_confinement.md` (how we give the agent CLI
+tools — fence the host suite, allow/attest/deny × presence on top),
+`docs/security/ocap-deviations.md` (the **authoritative** deviation
 register — this doc must agree with it), `docs/design/captured-shell-ocap.md`
 and `docs/design/captured-shell-cross-platform.md` (the unbuilt OS-sandbox
 matrix), `docs/decisions/structural_parsing_over_regex.md`,
