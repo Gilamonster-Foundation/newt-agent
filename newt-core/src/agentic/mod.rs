@@ -1185,15 +1185,17 @@ pub async fn chat_complete(
                     // cw-400/overflow recovery bounds it), but visibly. The
                     // comparison is in the SAME (chars/4) currency the
                     // pipeline measured `tokens_after` in (Phase 20 §2.3).
-                    let mut how = outcome.action.describe().to_string();
-                    if trigger.hard_budget && outcome.tokens_after > pipeline_budget {
-                        how.push_str(", still over budget");
-                    }
+                    let suffix = if trigger.hard_budget && outcome.tokens_after > pipeline_budget {
+                        ", still over budget"
+                    } else {
+                        ""
+                    };
                     emit_compression_notice(
                         color,
                         outcome.tokens_before,
                         outcome.tokens_after,
-                        &how,
+                        outcome.action,
+                        suffix,
                     );
                     if debug {
                         print_debug(
@@ -2305,15 +2307,17 @@ pub async fn openai_chat_complete(
                     // N2 (mirrors the Ollama path): flag a still-over-budget
                     // assembly in the notice — compared in the pipeline's
                     // own chars/4 currency (Phase 20 §2.3).
-                    let mut how = outcome.action.describe().to_string();
-                    if trigger.hard_budget && outcome.tokens_after > pipeline_budget {
-                        how.push_str(", still over budget");
-                    }
+                    let suffix = if trigger.hard_budget && outcome.tokens_after > pipeline_budget {
+                        ", still over budget"
+                    } else {
+                        ""
+                    };
                     emit_compression_notice(
                         color,
                         outcome.tokens_before,
                         outcome.tokens_after,
-                        &how,
+                        outcome.action,
+                        suffix,
                     );
                     if debug {
                         print_debug(

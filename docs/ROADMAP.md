@@ -1229,7 +1229,7 @@ this is the next free cluster.)* **Design: #559.**
 
 - **24.5** ✅ **done** — `display.rs` gauge formatters: `fmt_token_gauge` (`899k/1024k`), `fmt_tokens_compact` (`1M` = 1024k), `gauge_level` (🟢<75% / 🟡75–90% / 🔴≥90%). Pure + table-driven tests; re-exported from `newt_core::agentic`.
 - **24.6** ✅ **done** — the gauge is wired into the RichTUI `header_line`: `set_runtime_context` threads `(used, budget)` (last turn's input tokens vs the resolved send budget = `max_ok_input`/`safe_context`), refreshed per turn, colored by fill. Hidden until the budget is known.
-- **24.7** summarizer-state surface — promote `summarizing… → ✓ summarized / ↻ retrying / ⚠ fallback model / ⛔ static marker` out of the scrollback; make the static-marker last resort loud.
+- **24.7** ✅ **done** — the compression notice now renders per-outcome: `✓ summarized` / `⧉ pruned` (amber) and a **loud red `⛔` static-marker last resort** (`summary unavailable — context compacted to a marker; re-read files if needed`) — the #548 silent-context-loss fix. The summarizer also surfaces **live** `↻ retrying (n/m)` and `⚠ falling back to <model>` notices (Option B: they clear the `compressing context…` spinner line and scroll into history, so the recovery is honest).
 
 **Selector seam (Part 3 — `progressive`/`distributed` delegated to #546)**
 

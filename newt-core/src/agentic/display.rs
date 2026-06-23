@@ -292,16 +292,60 @@ pub(crate) fn emit_overflow_notice(
 /// Print a one-line compression notice (Step 18.4, #247). Always visible —
 /// the B6 baseline's failure mode was context loss with *no event anywhere*;
 /// "visibly degrades" is the acceptance bar.
-pub(crate) fn emit_compression_notice(color: bool, before: usize, after: usize, how: &str) {
-    let msg = format!(
-        "⧉  context compressed: ~{} → ~{} est. tokens ({how})",
-        fmt_tokens(before.min(u32::MAX as usize) as u32),
-        fmt_tokens(after.min(u32::MAX as usize) as u32),
-    );
+/// The compression-notice text + whether it is the **loud static-marker last
+/// resort** (Step 24.7, #559). Pure → testable; `emit_compression_notice`
+/// prints it. Distinct registers per outcome: `✓` summarized, `⧉` pruned, and a
+/// loud `⛔` for the static marker — the #548 "silent context loss" fix.
+pub(crate) fn compression_notice_text(
+    action: super::compress::CompressAction,
+    before: usize,
+    after: usize,
+    suffix: &str,
+) -> (String, bool) {
+    use super::compress::CompressAction;
+    let b = fmt_tokens(before.min(u32::MAX as usize) as u32);
+    let a = fmt_tokens(after.min(u32::MAX as usize) as u32);
+    match action {
+        CompressAction::StaticFallback => (
+            format!(
+                "⛔  summary unavailable — context compacted to a marker \
+                 (~{b} → ~{a} est. tokens{suffix}). Re-read files if needed."
+            ),
+            true,
+        ),
+        CompressAction::Summarized => (
+            format!("✓  context summarized: ~{b} → ~{a} est. tokens{suffix}"),
+            false,
+        ),
+        other => (
+            format!(
+                "⧉  context compressed: ~{b} → ~{a} est. tokens ({}{suffix})",
+                other.describe()
+            ),
+            false,
+        ),
+    }
+}
+
+pub(crate) fn emit_compression_notice(
+    color: bool,
+    before: usize,
+    after: usize,
+    action: super::compress::CompressAction,
+    suffix: &str,
+) {
+    let (msg, loud) = compression_notice_text(action, before, after, suffix);
+    // The static-marker last resort is RED + loud (24.7) so it can't be missed;
+    // other outcomes stay amber.
+    let hue = if loud {
+        CtColor::Red
+    } else {
+        CtColor::DarkYellow
+    };
     if color {
         execute!(
             io::stdout(),
-            SetForegroundColor(CtColor::DarkYellow),
+            SetForegroundColor(hue),
             Print(format!("{msg}\n")),
             ResetColor,
         )
@@ -498,6 +542,63 @@ mod tests {
         assert_eq!(gauge_level(890, 1000), GaugeLevel::Warn);
         assert_eq!(gauge_level(900, 1000), GaugeLevel::Critical);
         assert_eq!(gauge_level(0, 0), GaugeLevel::Ok); // no budget → no panic
+    }
+
+    #[test]
+    fn compression_notice_text_registers_per_outcome() {
+        use super::compression_notice_text;
+        use crate::agentic::compress::CompressAction;
+        // The static-marker last resort is LOUD and degraded-sounding (24.7).
+        let (msg, loud) =
+            compression_notice_text(CompressAction::StaticFallback, 10_000, 6_000, "");
+        assert!(loud, "static marker is the loud last resort");
+        assert!(msg.starts_with("⛔"), "{msg}");
+        assert!(msg.contains("summary unavailable"), "{msg}");
+        assert!(msg.contains("Re-read files"), "{msg}");
+        // Success and prune are calm, distinct glyphs.
+        let (msg, loud) = compression_notice_text(CompressAction::Summarized, 10_000, 6_000, "");
+        assert!(!loud);
+        assert!(msg.starts_with("✓") && msg.contains("summarized"), "{msg}");
+        let (msg, loud) = compression_notice_text(CompressAction::Pruned, 10_000, 6_000, "");
+        assert!(!loud);
+        assert!(
+            msg.starts_with("⧉") && msg.contains("structural prune"),
+            "{msg}"
+        );
+        // The over-budget suffix rides along.
+        let (msg, _) = compression_notice_text(
+            CompressAction::Summarized,
+            10_000,
+            6_000,
+            ", still over budget",
+        );
+        assert!(msg.contains(", still over budget"), "{msg}");
+    }
+
+    /// Visual preview for UX review (run with `--ignored --nocapture`): the three
+    /// compression-notice registers with their colors.
+    #[test]
+    #[ignore = "visual preview; run with --ignored --nocapture"]
+    fn compression_notice_visual_preview() {
+        use super::compression_notice_text;
+        use crate::agentic::compress::CompressAction;
+        let paint = |loud: bool, s: &str| {
+            if loud {
+                format!("\x1b[31m{s}\x1b[0m") // red, loud
+            } else {
+                format!("\x1b[33m{s}\x1b[0m") // amber
+            }
+        };
+        println!("\n  compression-notice registers (24.7):");
+        for action in [
+            CompressAction::Pruned,
+            CompressAction::Summarized,
+            CompressAction::StaticFallback,
+        ] {
+            let (msg, loud) = compression_notice_text(action, 1_024_000, 600_000, "");
+            println!("    {}", paint(loud, &msg));
+        }
+        println!();
     }
 
     /// Visual preview for UX review (run with `--nocapture`). Not an assertion —

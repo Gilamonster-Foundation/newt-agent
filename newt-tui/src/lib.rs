@@ -3004,6 +3004,9 @@ struct SummarizerOpts {
     /// primary model's attempts all fail, the summary is retried once on this
     /// model — a rung above the static marker. `None` = no fallback.
     fallback_model: Option<String>,
+    /// Whether to surface live retry/fallback notices (Step 24.7). On only in
+    /// interactive color sessions — off (default) for headless/captured streams.
+    color: bool,
 }
 
 impl Default for SummarizerOpts {
@@ -3014,8 +3017,31 @@ impl Default for SummarizerOpts {
             timeout_secs: 60,
             retries: 2,
             fallback_model: None,
+            color: false,
         }
     }
+}
+
+/// Live summarizer-progress notices (Step 24.7, #559). The summarizer runs under
+/// the `compressing context…` spinner; clearing the spinner line (`\r\x1b[K`)
+/// before each notice lets it scroll into history while the spinner redraws
+/// cleanly below — so the operator *watches* a retry/fallback happen.
+fn retry_progress_msg(attempt: u32, total: u32) -> String {
+    format!("↻ summarizer retrying (attempt {attempt}/{total})…")
+}
+fn fallback_progress_msg(model: &str) -> String {
+    format!("⚠ summarizer falling back to {model}…")
+}
+fn summarizer_progress(msg: &str, color: bool) {
+    use std::io::Write as _;
+    let mut out = std::io::stdout();
+    if color {
+        // Clear the spinner line, then an amber notice that scrolls into history.
+        let _ = write!(out, "\r\x1b[K\x1b[33m{msg}\x1b[0m\n");
+    } else {
+        let _ = write!(out, "\r\x1b[K{msg}\n");
+    }
+    let _ = out.flush();
 }
 
 /// One summary attempt: send, check status, parse the content.
@@ -3112,6 +3138,11 @@ async fn summarize_one_model(
     let mut last_err: Option<anyhow::Error> = None;
     for attempt in 0..=opts.retries {
         if attempt > 0 {
+            // Step 24.7 (#559): surface the retry live (scrolls above the
+            // `compressing context…` spinner) so the recovery is honest.
+            if opts.color {
+                summarizer_progress(&retry_progress_msg(attempt + 1, opts.retries + 1), true);
+            }
             // Exponential backoff capped at ~4s: 250ms, 500ms, 1s, …
             let backoff = std::time::Duration::from_millis(250u64 << (attempt - 1).min(4));
             tokio::time::sleep(backoff).await;
@@ -3145,6 +3176,10 @@ fn make_loop_summarizer(
                 // marker). Surface the primary error if the fallback fails too.
                 Err(primary_err) => match &opts.fallback_model {
                     Some(fb) if fb != &model => {
+                        // Step 24.7 (#559): announce the fallback live.
+                        if opts.color {
+                            summarizer_progress(&fallback_progress_msg(fb), true);
+                        }
                         summarize_one_model(&url, fb, openai, &prompt, &opts, &api_key)
                             .await
                             .map_err(|_| primary_err)
@@ -3911,7 +3946,7 @@ fn run_chat(
                         // The same capability-derived context figure the
                         // provider budget uses — the summary request must not
                         // be silently truncated at Ollama's default window (F5).
-                        summarizer_opts(&cfg, Some(mem_budget)),
+                        summarizer_opts(&cfg, Some(mem_budget), color),
                     ));
                 mgr.add_provider(s);
             }
@@ -4214,7 +4249,7 @@ fn run_chat(
                             // Same capability-derived cap the Summarizing
                             // provider injects — the summary request must not
                             // be silently truncated (F5).
-                            summarizer_opts(&cfg, Some(mem_budget)),
+                            summarizer_opts(&cfg, Some(mem_budget), color),
                         );
                         let outcome = tokio::task::block_in_place(|| {
                             rt.block_on(newt_core::compress_user_initiated(
@@ -4311,7 +4346,7 @@ fn run_chat(
                             inf_model.clone(),
                             inf_kind,
                             inf_key.clone(),
-                            summarizer_opts(&cfg, Some(mem_budget)),
+                            summarizer_opts(&cfg, Some(mem_budget), color),
                         );
                         if let Some(notice) = tokio::task::block_in_place(|| {
                             rt.block_on(run_close_extraction(
@@ -4662,7 +4697,7 @@ fn run_chat(
                         // The same effective context cap the main loop sends —
                         // the summary request must not be silently truncated
                         // at Ollama's default window (F5).
-                        summarizer_opts(&cfg, eff_num_ctx),
+                        summarizer_opts(&cfg, eff_num_ctx, color),
                     );
                     // Per-turn tool-event recorder (Step 17.6, #246): the
                     // loop pushes one event per tool call; the save site
@@ -5046,7 +5081,7 @@ fn run_chat(
             inf_model.clone(),
             inf_kind,
             inf_key.clone(),
-            summarizer_opts(&cfg, Some(mem_budget)),
+            summarizer_opts(&cfg, Some(mem_budget), color),
         );
         if let Some(notice) = tokio::task::block_in_place(|| {
             rt.block_on(run_close_extraction(
@@ -6737,13 +6772,14 @@ fn summarizer_retries(cfg: &newt_core::Config) -> u32 {
 }
 
 /// Build `SummarizerOpts` from config for a session summarizer (Step 24.2).
-fn summarizer_opts(cfg: &newt_core::Config, num_ctx: Option<u32>) -> SummarizerOpts {
+fn summarizer_opts(cfg: &newt_core::Config, num_ctx: Option<u32>, color: bool) -> SummarizerOpts {
     SummarizerOpts {
         num_ctx,
         keep_alive: keep_alive_str(cfg),
         timeout_secs: summarizer_timeout_secs(cfg),
         retries: summarizer_retries(cfg),
         fallback_model: cfg.tui.as_ref().and_then(|t| t.summarizer_model.clone()),
+        color,
     }
 }
 
@@ -13328,6 +13364,19 @@ mod http_loop_tests {
         );
         let out = s("summarize".into()).await.unwrap();
         assert_eq!(out, "FB SUM", "fell back to the secondary model");
+    }
+
+    /// Step 24.7 (#559): the live retry/fallback notice text.
+    #[test]
+    fn summarizer_progress_message_text() {
+        assert_eq!(
+            super::retry_progress_msg(2, 3),
+            "↻ summarizer retrying (attempt 2/3)…"
+        );
+        assert_eq!(
+            super::fallback_progress_msg("qwen:0.5b"),
+            "⚠ summarizer falling back to qwen:0.5b…"
+        );
     }
 
     /// F5 mirror: OpenAI-compatible endpoints configure context server-side
