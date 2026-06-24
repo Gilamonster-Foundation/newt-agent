@@ -133,6 +133,48 @@ impl Plan {
                     .all(|d| matches!(self.subtask(d).map(|t| t.status), Some(SubtaskStatus::Done)))
         })
     }
+
+    /// The next leaf to **dispatch**, as `(id, CrewTask)` — [`next_ready_leaf`]
+    /// projected through [`Subtask::to_crew_task`]. This is the drive loop's read
+    /// step: dispatch the `CrewTask`, then [`mark`](Plan::mark) the `id`
+    /// `Done`/`Failed` and call again. `None` when the plan is complete or stalled
+    /// (every remaining leaf blocked by a non-`Done` dep). The `id` is returned
+    /// because the projected `CrewTask` deliberately drops it (it is the plan's
+    /// bookkeeping, not the child's).
+    ///
+    /// [`next_ready_leaf`]: Plan::next_ready_leaf
+    #[must_use]
+    pub fn next_dispatch(&self, parent: &Caveats) -> Option<(String, CrewTask)> {
+        self.next_ready_leaf()
+            .map(|s| (s.id.clone(), s.to_crew_task(parent)))
+    }
+
+    /// Record a leaf's outcome — set its [`status`](Subtask::status) and, when
+    /// `result` is `Some`, its [`result`](Subtask::result). No-op if `id` is
+    /// absent. The drive loop calls this after each dispatch; marking a leaf
+    /// `Done` may unblock its dependents on the next [`next_dispatch`], and
+    /// marking it `Failed` leaves them blocked (deps require `Done`), so the run
+    /// stops honestly at the first failure without a separate "stop" flag.
+    ///
+    /// [`next_dispatch`]: Plan::next_dispatch
+    pub fn mark(&mut self, id: &str, status: SubtaskStatus, result: Option<String>) {
+        if let Some(s) = self.subtasks.iter_mut().find(|s| s.id == id) {
+            s.status = status;
+            if result.is_some() {
+                s.result = result;
+            }
+        }
+    }
+
+    /// Every leaf is `Done` — the plan finished successfully (branches are
+    /// grouping nodes, so only leaf completion is load-bearing). An empty plan is
+    /// trivially complete.
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        self.leaves()
+            .iter()
+            .all(|s| s.status == SubtaskStatus::Done)
+    }
 }
 
 /// One unit of work in a [`Plan`] — the serialized form of a single scheduler
@@ -635,5 +677,79 @@ fs_read = "all"
         };
         let task = plan.subtasks[0].to_crew_task(&parent);
         assert_eq!(task.caveats.fs_read, Scope::only(["a/".to_string()]));
+    }
+
+    #[test]
+    fn plan_is_a_drivable_execution_state_machine() {
+        // An overseer-authored DAG: a → b(deps a) → c(deps b), all under "epic".
+        let toml = r#"
+[[subtask]]
+id = "epic"
+instruction = "branch"
+
+[[subtask]]
+id = "a"
+instruction = "step a"
+parent = "epic"
+
+[[subtask]]
+id = "b"
+instruction = "step b"
+parent = "epic"
+deps = ["a"]
+
+[[subtask]]
+id = "c"
+instruction = "step c"
+parent = "epic"
+deps = ["b"]
+"#;
+        let mut plan = Plan::from_toml_str(toml).unwrap();
+        let top = Caveats::top();
+        // The drive loop a real executor runs: dispatch the next ready leaf,
+        // mark it Done, repeat. (Here the "dispatch" is a no-op; a CrewRunner
+        // would run inference. The state machine is what's under test.)
+        let mut order = Vec::new();
+        while let Some((id, task)) = plan.next_dispatch(&top) {
+            assert!(!task.goal.is_empty());
+            plan.mark(&id, SubtaskStatus::Running, None);
+            plan.mark(&id, SubtaskStatus::Done, Some(format!("ran {id}")));
+            order.push(id);
+        }
+        // Walked a → b → c in dependency order; epic (a branch) never dispatched.
+        assert_eq!(order, vec!["a", "b", "c"]);
+        assert!(plan.is_complete());
+        assert_eq!(plan.subtask("a").unwrap().result.as_deref(), Some("ran a"));
+    }
+
+    #[test]
+    fn a_failed_leaf_blocks_its_dependents_and_stops_the_run() {
+        let toml = r#"
+[[subtask]]
+id = "a"
+instruction = "x"
+
+[[subtask]]
+id = "b"
+instruction = "y"
+deps = ["a"]
+"#;
+        let mut plan = Plan::from_toml_str(toml).unwrap();
+        let top = Caveats::top();
+        let (id, _task) = plan.next_dispatch(&top).expect("a is ready");
+        assert_eq!(id, "a");
+        plan.mark(&id, SubtaskStatus::Failed, Some("boom".into()));
+        // b deps on a (now Failed, not Done) → not ready → nothing to dispatch,
+        // so the run stops honestly at the first failure (no separate stop flag).
+        assert!(plan.next_dispatch(&top).is_none());
+        assert!(!plan.is_complete());
+    }
+
+    #[test]
+    fn mark_is_a_noop_for_an_absent_id_and_empty_plan_is_complete() {
+        let mut plan = Plan::from_toml_str("[[subtask]]\nid=\"a\"\ninstruction=\"x\"\n").unwrap();
+        plan.mark("nope", SubtaskStatus::Done, Some("ignored".into()));
+        assert_eq!(plan.subtask("a").unwrap().status, SubtaskStatus::Pending);
+        assert!(Plan::from_toml_str("").unwrap().is_complete());
     }
 }
