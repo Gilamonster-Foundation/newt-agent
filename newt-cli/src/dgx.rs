@@ -1940,29 +1940,40 @@ enum ReconcileVerdict {
     NoLiveState,
 }
 
-/// Compare configured (endpoint, model) against the derived live state. Pure.
+/// Compare configured (endpoint, model) against the node's live residency. In
+/// sync when the configured engine+model is *actually serving* — even if the
+/// other engine is also resident (a contended node is not a mismatch as long as
+/// newt's configured target is live). Otherwise a mismatch against the primary
+/// live engine (a running vLLM server, else a resident Ollama model), or
+/// no-live when nothing runs. Pure.
 fn reconcile(
     cfg_kind: EndpointKind,
     cfg_model: Option<&str>,
-    live: Option<(EndpointKind, String)>,
+    vllm: &[String],
+    ollama: &[(String, Option<u64>)],
 ) -> ReconcileVerdict {
-    match live {
+    // Is the configured engine+model genuinely serving right now?
+    let configured_is_live = match (cfg_kind, cfg_model) {
+        (EndpointKind::Vllm, Some(m)) => vllm.iter().any(|x| x == m),
+        (EndpointKind::Ollama, Some(m)) => ollama.iter().any(|(x, _)| x == m),
+        // OllamaLb/InCluster or no configured model → can't confirm against the
+        // node-local probes; fall through to the primary-live comparison.
+        _ => false,
+    };
+    if let (true, Some(m)) = (configured_is_live, cfg_model) {
+        return ReconcileVerdict::InSync {
+            kind: cfg_kind,
+            model: m.to_string(),
+        };
+    }
+    match derive_live_state(vllm, ollama) {
         None => ReconcileVerdict::NoLiveState,
-        Some((live_kind, live_model)) => {
-            if cfg_kind == live_kind && cfg_model == Some(live_model.as_str()) {
-                ReconcileVerdict::InSync {
-                    kind: live_kind,
-                    model: live_model,
-                }
-            } else {
-                ReconcileVerdict::Mismatch {
-                    cfg_kind,
-                    cfg_model: cfg_model.map(str::to_string),
-                    live_kind,
-                    live_model,
-                }
-            }
-        }
+        Some((live_kind, live_model)) => ReconcileVerdict::Mismatch {
+            cfg_kind,
+            cfg_model: cfg_model.map(str::to_string),
+            live_kind,
+            live_model,
+        },
     }
 }
 
@@ -2020,10 +2031,14 @@ async fn adopt_cmd(
         Ok(base) => fetch_vllm_models(&base).await.unwrap_or_default(),
         Err(_) => Vec::new(),
     };
-    let live = derive_live_state(&vllm, &ollama);
-    match reconcile(dgx.active_endpoint, dgx.active_model.as_deref(), live) {
+    match reconcile(
+        dgx.active_endpoint,
+        dgx.active_model.as_deref(),
+        &vllm,
+        &ollama,
+    ) {
         ReconcileVerdict::InSync { kind, model } => {
-            println!("dgx1 in sync: config and node both have {kind} serving {model:?}.");
+            println!("dgx1 in sync: the configured {kind} model {model:?} is serving on the node.");
             Ok(())
         }
         ReconcileVerdict::NoLiveState => {
@@ -2063,6 +2078,14 @@ async fn adopt_cmd(
                     persist_active(config_path, live_kind, &live_model)
                 }
                 ReconcileAction::Enforce => {
+                    // Validate switchability BEFORE promising anything — `switch`
+                    // only manages local ollama/vllm, not the lb/in-cluster kinds.
+                    if !matches!(cfg_kind, EndpointKind::Ollama | EndpointKind::Vllm) {
+                        anyhow::bail!(
+                            "cannot enforce a non-local endpoint ({cfg_kind}) — `dgx switch` only \
+                             manages ollama/vllm on the node; adopt the node's state instead"
+                        );
+                    }
                     let model = cfg_model.ok_or_else(|| {
                         anyhow::anyhow!(
                             "cannot enforce: no active_model configured — set one (`dgx use`) \
@@ -3199,24 +3222,45 @@ tiers = ["FAST", "STANDARD"]
 
     #[test]
     fn reconcile_classifies_sync_mismatch_and_no_live() {
-        // In sync: same engine + model.
+        let no_vllm: Vec<String> = vec![];
+        let no_ollama: Vec<(String, Option<u64>)> = vec![];
+        let ollama_nemo = vec![("nemotron3:33b".to_string(), Some(38))];
+        let vllm_qwen = vec!["qwen3.6-35b".to_string()];
+
+        // In sync: the configured Ollama model is resident.
         assert_eq!(
             reconcile(
                 EndpointKind::Ollama,
                 Some("nemotron3:33b"),
-                Some((EndpointKind::Ollama, "nemotron3:33b".to_string()))
+                &no_vllm,
+                &ollama_nemo
             ),
             ReconcileVerdict::InSync {
                 kind: EndpointKind::Ollama,
                 model: "nemotron3:33b".to_string()
             }
         );
-        // Mismatch: config says Ollama, node runs vLLM.
+        // Coexistence is NOT a mismatch: config wants ollama:nemotron, it's
+        // resident, and a vLLM server is ALSO up — the configured target is live.
         assert_eq!(
             reconcile(
                 EndpointKind::Ollama,
                 Some("nemotron3:33b"),
-                Some((EndpointKind::Vllm, "qwen3.6-35b".to_string()))
+                &vllm_qwen,
+                &ollama_nemo
+            ),
+            ReconcileVerdict::InSync {
+                kind: EndpointKind::Ollama,
+                model: "nemotron3:33b".to_string()
+            }
+        );
+        // Mismatch: config says ollama:nemotron, it's NOT resident, vLLM is up.
+        assert_eq!(
+            reconcile(
+                EndpointKind::Ollama,
+                Some("nemotron3:33b"),
+                &vllm_qwen,
+                &no_ollama
             ),
             ReconcileVerdict::Mismatch {
                 cfg_kind: EndpointKind::Ollama,
@@ -3225,18 +3269,19 @@ tiers = ["FAST", "STANDARD"]
                 live_model: "qwen3.6-35b".to_string(),
             }
         );
-        // Same engine, different model → still a mismatch.
+        // Same engine, configured model NOT among those served → mismatch.
         assert!(matches!(
             reconcile(
                 EndpointKind::Vllm,
                 Some("a"),
-                Some((EndpointKind::Vllm, "b".to_string()))
+                &["b".to_string()],
+                &no_ollama
             ),
             ReconcileVerdict::Mismatch { .. }
         ));
         // Nothing live.
         assert_eq!(
-            reconcile(EndpointKind::Ollama, Some("x"), None),
+            reconcile(EndpointKind::Ollama, Some("x"), &no_vllm, &no_ollama),
             ReconcileVerdict::NoLiveState
         );
     }
