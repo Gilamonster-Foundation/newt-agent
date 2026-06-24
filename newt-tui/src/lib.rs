@@ -3016,7 +3016,9 @@ struct SummarizerOpts {
     retries: u32,
     /// Optional fallback model (Step 24.3; `[tui].summarizer_model`). When the
     /// primary model's attempts all fail, the summary is retried once on this
-    /// model — a rung above the static marker. `None` = no fallback.
+    /// model — a rung above the static marker. `None` = no explicit fallback;
+    /// for an Ollama backend the first installed [`FALLBACK_MODEL_PREFERENCES`]
+    /// model is auto-picked instead (Step 24.9), probed lazily on first failure.
     fallback_model: Option<String>,
     /// Whether to surface live retry/fallback notices (Step 24.7). On only in
     /// interactive color sessions — off (default) for headless/captured streams.
@@ -3169,6 +3171,81 @@ async fn summarize_one_model(
     Err(last_err.unwrap_or_else(|| anyhow::anyhow!("summarizer failed")))
 }
 
+/// Built-in small/fast models tried, in order, as the summarizer fallback when
+/// no `summarizer_model` is configured (Step 24.9, #559). The first one
+/// installed on the Ollama summarizer backend is used. All are small enough to
+/// land a summary well under `summarizer_timeout_secs` on a box where the slow
+/// primary model blew it — the #548 189s-to-static-marker shape. Order is
+/// smallest-capable-first; coding-tuned models lead since the summarized middle
+/// is a coding-agent conversation.
+const FALLBACK_MODEL_PREFERENCES: &[&str] = &[
+    "qwen2.5-coder:3b",
+    "nemotron-mini:4b",
+    "qwen2.5:3b",
+    "gemma:2b",
+    "phi3:mini",
+];
+
+/// Probe an Ollama backend's installed models (`GET /api/tags`) and return the
+/// first [`FALLBACK_MODEL_PREFERENCES`] entry present by exact tag, or `None`.
+/// Best-effort: any transport/non-2xx/parse error yields `None` (the caller
+/// degrades to the static marker — a probe failure never aborts compression).
+async fn probe_fallback_model(
+    client: &reqwest::Client,
+    url: &str,
+    api_key: &Option<String>,
+) -> Option<String> {
+    let tags_url = format!("{}/api/tags", url.trim_end_matches('/'));
+    let mut req = client.get(&tags_url);
+    if let Some(key) = api_key {
+        req = req.bearer_auth(key);
+    }
+    let resp = req.send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let json: serde_json::Value = resp.json().await.ok()?;
+    let installed = json["models"].as_array()?;
+    let has = |name: &str| installed.iter().any(|m| m["name"].as_str() == Some(name));
+    FALLBACK_MODEL_PREFERENCES
+        .iter()
+        .find(|pref| has(pref))
+        .map(|pref| pref.to_string())
+}
+
+/// Resolve the fallback summarizer model: an explicit `summarizer_model` wins;
+/// otherwise, for an Ollama backend, the first installed preference-list model,
+/// probed at most once per session via `cache` (Step 24.9). OpenAI-compatible
+/// backends skip the probe (no safe `/api/tags` enumeration) and return `None`.
+async fn resolve_fallback_model(
+    cache: &tokio::sync::OnceCell<Option<String>>,
+    opts: &SummarizerOpts,
+    openai: bool,
+    url: &str,
+    api_key: &Option<String>,
+) -> Option<String> {
+    if let Some(fb) = &opts.fallback_model {
+        return Some(fb.clone());
+    }
+    if openai {
+        return None;
+    }
+    cache
+        .get_or_init(|| async {
+            // A short, bounded probe — the fallback's value is speed, so don't
+            // spend the full summary timeout discovering it.
+            match reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(opts.timeout_secs.min(10)))
+                .build()
+            {
+                Ok(client) => probe_fallback_model(&client, url, api_key).await,
+                Err(_) => None,
+            }
+        })
+        .await
+        .clone()
+}
+
 fn make_loop_summarizer(
     url: String,
     model: String,
@@ -3176,30 +3253,43 @@ fn make_loop_summarizer(
     api_key: Option<String>,
     opts: SummarizerOpts,
 ) -> newt_core::Summarizer {
+    // Session-scoped, probe-once cache for the auto-picked fallback model
+    // (Step 24.9). Resolved lazily on the FIRST primary failure — a session
+    // whose primary summarizer never fails never probes `/api/tags`.
+    let fallback_cache: std::sync::Arc<tokio::sync::OnceCell<Option<String>>> =
+        std::sync::Arc::new(tokio::sync::OnceCell::new());
     Box::new(move |prompt: String| {
         let url = url.clone();
         let model = model.clone();
         let api_key = api_key.clone();
         let opts = opts.clone();
+        let fallback_cache = fallback_cache.clone();
         let openai = kind == newt_core::BackendKind::Openai;
         Box::pin(async move {
             match summarize_one_model(&url, &model, openai, &prompt, &opts, &api_key).await {
                 Ok(s) => Ok(s),
                 // Step 24.3 (#559): the primary model's attempts all failed — try
-                // the optional fallback model once (a rung above the static
-                // marker). Surface the primary error if the fallback fails too.
-                Err(primary_err) => match &opts.fallback_model {
-                    Some(fb) if fb != &model => {
-                        // Step 24.7 (#559): announce the fallback live.
-                        if opts.color {
-                            summarizer_progress(&fallback_progress_msg(fb), true);
+                // the fallback model once (a rung above the static marker). The
+                // fallback is the explicit `summarizer_model` or, when unset, the
+                // first installed preference-list model (Step 24.9). Surface the
+                // primary error if the fallback is absent or also fails.
+                Err(primary_err) => {
+                    let fallback =
+                        resolve_fallback_model(&fallback_cache, &opts, openai, &url, &api_key)
+                            .await;
+                    match fallback {
+                        Some(fb) if fb != model => {
+                            // Step 24.7 (#559): announce the fallback live.
+                            if opts.color {
+                                summarizer_progress(&fallback_progress_msg(&fb), true);
+                            }
+                            summarize_one_model(&url, &fb, openai, &prompt, &opts, &api_key)
+                                .await
+                                .map_err(|_| primary_err)
                         }
-                        summarize_one_model(&url, fb, openai, &prompt, &opts, &api_key)
-                            .await
-                            .map_err(|_| primary_err)
+                        _ => Err(primary_err),
                     }
-                    _ => Err(primary_err),
-                },
+                }
             }
         })
     })
@@ -7124,9 +7214,10 @@ fn summarizer_timeout_secs(cfg: &newt_core::Config) -> u64 {
         .unwrap_or(60)
 }
 
-/// Summarizer retry count from `[tui].summarizer_retries` (Step 24.2).
+/// Summarizer retry count from `[tui].summarizer_retries` (Step 24.2; default
+/// lowered to 1 in Step 24.9 — each attempt can cost the full timeout).
 fn summarizer_retries(cfg: &newt_core::Config) -> u32 {
-    cfg.tui.as_ref().map(|t| t.summarizer_retries).unwrap_or(2)
+    cfg.tui.as_ref().map(|t| t.summarizer_retries).unwrap_or(1)
 }
 
 /// Build `SummarizerOpts` from config for a session summarizer (Step 24.2).
@@ -14427,6 +14518,112 @@ mod http_loop_tests {
         );
         let out = s("summarize".into()).await.unwrap();
         assert_eq!(out, "FB SUM", "fell back to the secondary model");
+    }
+
+    /// Step 24.9 (#559): with no `summarizer_model` configured, an Ollama
+    /// summarizer backend auto-picks the first installed preference-list model
+    /// (probed via `/api/tags`) as the fallback when the primary model fails.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn summarizer_auto_picks_preference_fallback_when_unset() {
+        use wiremock::{Request, Respond};
+
+        struct ByModel;
+        impl Respond for ByModel {
+            fn respond(&self, req: &Request) -> ResponseTemplate {
+                let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
+                // "nemotron-mini:4b" is the only installed preference model below.
+                if body["model"] == "nemotron-mini:4b" {
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({"message": {"content": "AUTO FB"}}))
+                } else {
+                    ResponseTemplate::new(500) // the primary model always fails
+                }
+            }
+        }
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(ByModel)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "models": [{"name": "session-model:27b"}, {"name": "nemotron-mini:4b"}]
+            })))
+            .mount(&server)
+            .await;
+
+        let s = make_loop_summarizer(
+            server.uri(),
+            "session-model:27b".into(),
+            newt_core::BackendKind::Ollama,
+            None,
+            SummarizerOpts {
+                retries: 0,
+                fallback_model: None, // <- unset: auto-pick path
+                ..Default::default()
+            },
+        );
+        let out = s("summarize".into()).await.unwrap();
+        assert_eq!(out, "AUTO FB", "auto-picked the installed preference model");
+    }
+
+    /// Step 24.9: the probe honors preference ORDER, not the order `/api/tags`
+    /// lists models in — `nemotron-mini:4b` outranks `gemma:2b` even when listed
+    /// after it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn probe_fallback_model_respects_preference_order() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "models": [{"name": "gemma:2b"}, {"name": "nemotron-mini:4b"}]
+            })))
+            .mount(&server)
+            .await;
+        let client = reqwest::Client::new();
+        let picked = super::probe_fallback_model(&client, &server.uri(), &None).await;
+        assert_eq!(picked.as_deref(), Some("nemotron-mini:4b"));
+    }
+
+    /// Step 24.9: no installed model matches the preference list ⇒ `None` (the
+    /// caller then surfaces the primary error → static marker).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn probe_fallback_model_none_when_no_preference_installed() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/tags"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "models": [{"name": "llama3.1:8b"}, {"name": "custom:99b"}]
+            })))
+            .mount(&server)
+            .await;
+        let client = reqwest::Client::new();
+        let picked = super::probe_fallback_model(&client, &server.uri(), &None).await;
+        assert_eq!(picked, None);
+    }
+
+    /// Step 24.9: OpenAI-compatible backends have no `/api/tags` to enumerate —
+    /// `resolve_fallback_model` short-circuits to `None` without any probe (the
+    /// unroutable URL would error if it were hit).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resolve_fallback_model_skips_probe_for_openai() {
+        let cache = tokio::sync::OnceCell::new();
+        let opts = SummarizerOpts {
+            fallback_model: None,
+            ..Default::default()
+        };
+        let picked = super::resolve_fallback_model(
+            &cache,
+            &opts,
+            true, // openai
+            "http://127.0.0.1:1",
+            &None,
+        )
+        .await;
+        assert_eq!(picked, None);
     }
 
     /// Step 24.7 (#559): the live retry/fallback notice text.
