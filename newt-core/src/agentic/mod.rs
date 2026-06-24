@@ -25,6 +25,8 @@ pub(crate) mod experiential;
 // Step 26.6b (#586): scheduled per-step compiled view — the `scheduled` feature.
 pub(crate) mod scheduled;
 // Step 26.3 (#584): tool-output offloading — the `tool_offload` context feature.
+/// Drive an overseer-authored plan through a `CrewRunner` (#628 P2 execute side).
+pub(crate) mod plan_exec;
 pub(crate) mod spill;
 /// Recover tool calls a weak model emitted in CONTENT instead of the native
 /// `tool_calls` field (the #1 weak-model failure — see the module docs).
@@ -119,6 +121,7 @@ pub use experiential::{
 pub use git_tool::{git_tool_definition, GitTool};
 pub use markdown::{render_markdown, MarkdownStreamWriter, RenderOpts};
 pub use mcp::{McpTools, NoMcp};
+pub use plan_exec::{run_plan, PlanRun};
 pub use scheduled::{plan_block, plan_reseat_pointer, SessionStepLedger, StepLedger};
 pub use scratchpad::{scratchpad_state_block, ScratchpadStore, SessionScratchpadStore};
 pub use semantic::{
