@@ -70,6 +70,69 @@ impl Plan {
     pub fn to_toml_string(&self) -> Result<String, toml::ser::Error> {
         toml::to_string_pretty(self)
     }
+
+    /// The subtask with id `id`, if present.
+    #[must_use]
+    pub fn subtask(&self, id: &str) -> Option<&Subtask> {
+        self.subtasks.iter().find(|s| s.id == id)
+    }
+
+    /// Root subtasks — those with no [`Subtask::parent`] (the top of the
+    /// decomposition tree).
+    #[must_use]
+    pub fn roots(&self) -> Vec<&Subtask> {
+        self.subtasks
+            .iter()
+            .filter(|s| s.parent.is_none())
+            .collect()
+    }
+
+    /// Direct children of `id` — subtasks whose `parent` is `id`.
+    #[must_use]
+    pub fn children(&self, id: &str) -> Vec<&Subtask> {
+        self.subtasks
+            .iter()
+            .filter(|s| s.parent.as_deref() == Some(id))
+            .collect()
+    }
+
+    /// Leaves — subtasks that no other subtask names as `parent`. A leaf is the
+    /// dispatch/execute unit (a leaf *is* a `CrewTask`); a non-leaf is a branch
+    /// (grouping / aggregation). In a flat, single-level plan *every* subtask is a
+    /// leaf, so this degrades to "all subtasks" — the pre-tree behaviour, so
+    /// existing flat plans are unaffected.
+    #[must_use]
+    pub fn leaves(&self) -> Vec<&Subtask> {
+        let parented: std::collections::HashSet<&str> = self
+            .subtasks
+            .iter()
+            .filter_map(|s| s.parent.as_deref())
+            .collect();
+        self.subtasks
+            .iter()
+            .filter(|s| !parented.contains(s.id.as_str()))
+            .collect()
+    }
+
+    /// The next **ready leaf** to dispatch — the execution cursor. A [`leaf`] that
+    /// is [`SubtaskStatus::Pending`] and whose every [`dep`] is
+    /// [`SubtaskStatus::Done`]. `None` when nothing is ready (all done, every
+    /// pending leaf is dep-blocked, or work is in flight). A `dep` counts as
+    /// satisfied iff the named subtask exists and is `Done`; an absent (e.g.
+    /// cross-fragment) dep is treated as unsatisfied, so a plan never runs a leaf
+    /// ahead of a prerequisite it cannot see.
+    ///
+    /// [`leaf`]: Plan::leaves
+    /// [`dep`]: Subtask::deps
+    #[must_use]
+    pub fn next_ready_leaf(&self) -> Option<&Subtask> {
+        self.leaves().into_iter().find(|s| {
+            s.status == SubtaskStatus::Pending
+                && s.deps
+                    .iter()
+                    .all(|d| matches!(self.subtask(d).map(|t| t.status), Some(SubtaskStatus::Done)))
+        })
+    }
 }
 
 /// One unit of work in a [`Plan`] — the serialized form of a single scheduler
@@ -103,6 +166,17 @@ pub struct Subtask {
     /// `None` until the subtask has run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<String>,
+    /// The id of the subtask this one decomposes — `None` for a root. This is how
+    /// a flat `[[subtask]]` list expresses a task→sub-task **tree** (exactly as
+    /// [`Subtask::deps`] expresses a DAG via id-pointers, not nesting). A subtask
+    /// that no other subtask names as its `parent` is a **leaf** — the unit that
+    /// dispatches/executes (a leaf *is* a `CrewTask`); a subtask that *is* named
+    /// is a **branch** (a grouping / aggregation node). Kept flat on purpose: a
+    /// nested `Vec<Subtask>` would break the fragment handoff (one leaf slice =
+    /// one dispatch). `None` is also fine in a fragment whose parent lives outside
+    /// the slice (the pointer is soft, like a cross-fragment `dep`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
     /// The authority this subtask declares it needs. **Default-deny**: an
     /// omitted policy denies every capability axis (see [`CaveatPolicy`]).
     ///
@@ -328,6 +402,7 @@ instruction = "x"
                 },
                 status: SubtaskStatus::Done,
                 result: Some("done".to_string()),
+                parent: Some("epic".to_string()),
             }],
         };
         let text = plan.to_toml_string().unwrap();
@@ -370,5 +445,113 @@ bogus_field = "should fail"
         assert!(plan.goal.is_none());
         assert!(plan.subtasks.is_empty());
         assert_eq!(plan.aggregation, Aggregation::Concat);
+    }
+
+    #[test]
+    fn parent_pointers_build_a_tree() {
+        // A root branch "epic" decomposes into two leaves; plus a top-level leaf.
+        let toml = r#"
+[[subtask]]
+id = "epic"
+instruction = "the big task"
+
+[[subtask]]
+id = "a"
+instruction = "sub-task a"
+parent = "epic"
+
+[[subtask]]
+id = "b"
+instruction = "sub-task b"
+parent = "epic"
+
+[[subtask]]
+id = "solo"
+instruction = "a top-level leaf"
+"#;
+        let plan = Plan::from_toml_str(toml).unwrap();
+        let ids = |v: Vec<&Subtask>| v.iter().map(|s| s.id.clone()).collect::<Vec<_>>();
+        assert_eq!(ids(plan.roots()), vec!["epic", "solo"]);
+        assert_eq!(ids(plan.children("epic")), vec!["a", "b"]);
+        // epic is a branch (named as a parent) → not a leaf; a, b, solo are leaves.
+        assert_eq!(ids(plan.leaves()), vec!["a", "b", "solo"]);
+        assert_eq!(plan.subtask("a").unwrap().parent.as_deref(), Some("epic"));
+    }
+
+    #[test]
+    fn flat_plan_has_every_subtask_as_a_leaf() {
+        // Pre-tree behaviour preserved: no parents → every subtask is a leaf.
+        let plan = Plan::from_toml_str(
+            "[[subtask]]\nid=\"s1\"\ninstruction=\"x\"\n[[subtask]]\nid=\"s2\"\ninstruction=\"y\"\n",
+        )
+        .unwrap();
+        assert_eq!(plan.leaves().len(), 2);
+        assert_eq!(plan.roots().len(), 2);
+    }
+
+    #[test]
+    fn next_ready_leaf_is_the_execution_cursor() {
+        // a Done; b Pending with dep a (Done) → b is the ready leaf. c is
+        // dep-blocked (b not Done); epic is a branch, never a dispatch unit.
+        let toml = r#"
+[[subtask]]
+id = "epic"
+instruction = "branch"
+
+[[subtask]]
+id = "a"
+instruction = "first leaf"
+parent = "epic"
+status = "done"
+
+[[subtask]]
+id = "b"
+instruction = "second leaf"
+parent = "epic"
+deps = ["a"]
+
+[[subtask]]
+id = "c"
+instruction = "third leaf"
+parent = "epic"
+deps = ["b"]
+"#;
+        let plan = Plan::from_toml_str(toml).unwrap();
+        assert_eq!(plan.next_ready_leaf().expect("b ready").id, "b");
+    }
+
+    #[test]
+    fn next_ready_leaf_none_when_all_done_or_blocked() {
+        // a Done, b blocked on an absent dep → no ready leaf.
+        let toml = r#"
+[[subtask]]
+id = "a"
+instruction = "done"
+status = "done"
+
+[[subtask]]
+id = "b"
+instruction = "blocked"
+deps = ["never_exists"]
+"#;
+        let plan = Plan::from_toml_str(toml).unwrap();
+        assert!(plan.next_ready_leaf().is_none());
+    }
+
+    #[test]
+    fn parent_defaults_none_and_fragment_stays_valid() {
+        // Fragment-validity: a bare subtask whose parent lives outside the slice
+        // still parses (the pointer is soft); an omitted parent defaults to None.
+        let frag = Plan::from_toml_str(
+            "[[subtask]]\nid=\"leaf\"\ninstruction=\"x\"\nparent=\"outside_the_slice\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            frag.subtasks[0].parent.as_deref(),
+            Some("outside_the_slice")
+        );
+        let root = Plan::from_toml_str("[[subtask]]\nid=\"r\"\ninstruction=\"y\"\n").unwrap();
+        assert!(root.subtasks[0].parent.is_none());
+        assert_eq!(root.roots().len(), 1);
     }
 }
