@@ -19,20 +19,25 @@ track of it over time.* Date: 2026-06-24. Runner/rig: `docs/testing/uat-tool-loo
    forms out of content and re-dispatch them) is the highest-leverage weak-model
    fix — above any plan work.
 
-2. **"Re-seat the plan every round" is NOT validated, and mildly *hurts* when
-   there's no drift.** On an 8-step task `devstral-small-2:24b` baseline scored
-   **8/8 every run (13–21 rounds)**; the re-seat arm scored **7/8 and hit the
-   24-round cap every run** — the per-round plan reminder added context and made
-   it churn. The simple hypothesis ("re-inject the plan each round → weak model
-   codes better") is unsupported in the no-drift regime. → **P1: re-seat must be
-   CONDITIONAL** (only on plan mutation / show the active-step delta), and tested
-   under *genuine* drift, not assumed.
+2. **Re-seating the live plan FIXES drift where drift exists — and only adds
+   mild overhead where it doesn't.** One env-gated arm, two task sizes
+   (`devstral-small-2:24b`, N=3):
+   - *8-step (no drift):* baseline **8/8 every run (13–21 rounds)**; re-seat
+     **7/8 and 24-round cap every run** — mild overhead; the per-round reminder
+     makes it churn with no deficit to close.
+   - *12-step (induces drift):* baseline **8.00/12 (runs 6, 6, 12)** — drops half
+     the later steps in 2 of 3 runs (the user's "loses track"); re-seat
+     **12.00/12 (12, 12, 12)** — every step, every run, **zero variance**.
+   → **P1: re-seat is VALIDATED for the drift regime (the user's actual
+   problem); make it CONDITIONAL** (gate on a drift signal / re-seat on
+   plan-mutation) so the big win on hard tasks doesn't cost overhead on easy ones.
 
 3. **A capable model adapts; the drift only emerges at higher task complexity.**
    The 8-step task was too easy to reproduce the user's "loses track" (baseline
-   aced it). A harder **12-step** fair-test *does* induce baseline drift
-   (`devstral` baseline run 1 = 6/12) — **[re-seat-under-drift verdict: fair-test
-   in progress; appended below when complete].** Concluding "re-seat doesn't
+   aced it). The harder **12-step** fair-test induces baseline drift (mean
+   **8.00/12**, runs 6/6/12) and **re-seat closes it completely (12.00/12, all
+   runs)** — re-seat's value is real but *conditional on drift existing*.
+   Concluding "re-seat doesn't
    help" from a task the baseline already aces would be wrong; the fair-test is
    built to give re-seat a deficit to close.
 
@@ -64,7 +69,15 @@ proxy — later steps drop when the model forgets).
 | devstral-small-2:24b | **8.00** (13–21 rounds) | 7.00 (24-round cap every run) |
 | qwen3-coder:30b | 6.67 (one 4/8) | (one valid 8/8; 2 runs lost to `<function=>` format failure at round 0) |
 
-**12-step fair-test (devstral):** *in progress — verdict appended below.*
+**12-step fair-test (devstral, the drift regime), mean steps / 12, N=3:**
+
+| arm | runs | mean |
+|---|---|---|
+| baseline | 6, 6, 12 | **8.00** (drifts 2/3) |
+| re-seat | 12, 12, 12 | **12.00** (perfect, zero variance) |
+
+Re-seat completed every step in every run where the baseline dropped half the
+later steps — the keystone fixes the user's "loses track" exactly when it occurs.
 
 ## Rig methodology (hardened — three confounds defeated)
 
@@ -88,7 +101,9 @@ The experiment was wrong three times before it was right; the fixes are the rig:
   the next code task. Re-enters the existing `resolve_tool_alias`/`is_hallucination`
   path (`tools.rs:274/304`).
 - **P1 — conditional re-seat** (on plan mutation / active-step delta, *not* every
-  round). Keep only if the 12-step fair-test shows lift under genuine drift.
+  round). **VALIDATED under drift** — 12-step fair-test: re-seat **12/12** vs
+  baseline **8/12** (drifts 2/3). Keep it, **gated on a drift signal** (or
+  re-seat on plan-mutation) so easy tasks skip the mild overhead it costs there.
 - **P2 — the overseer/crew split is the safe weak-model story** (a stronger seat
   authors the DAG; the weak model executes one bounded leaf, with templated tool
   calls that sidestep the format risk). Untouched by this data; still the most
