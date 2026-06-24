@@ -2821,8 +2821,33 @@ pub async fn openai_chat_complete(
 
         let message = &json["choices"][0]["message"];
 
-        let tool_calls = message["tool_calls"].as_array();
+        let oa_content = message["content"].as_str().unwrap_or("").to_string();
+        let native_calls = message["tool_calls"].as_array();
+        // Recover tool calls emitted as content instead of the native field —
+        // the #1 weak-model failure (see `tool_recovery`). Mirror of the Ollama
+        // loop: a local vLLM/llama.cpp server reports OpenAI-wire, so weak models
+        // there drop content-emitted calls too. Recovered calls are native-shaped
+        // and flow into the executor + is_hallucination path below.
+        let recovered = if native_calls.map(|t| t.is_empty()).unwrap_or(true) {
+            tool_recovery::recover_tool_calls(&oa_content)
+        } else {
+            tool_recovery::Recovery::default()
+        };
+        let tool_calls: Option<&Vec<serde_json::Value>> = match native_calls {
+            Some(t) if !t.is_empty() => Some(t),
+            _ if !recovered.calls.is_empty() => Some(&recovered.calls),
+            _ => None,
+        };
         let has_tools = tool_calls.map(|tc| !tc.is_empty()).unwrap_or(false);
+        if debug && !recovered.calls.is_empty() {
+            print_debug(
+                &format!(
+                    "recovered {} tool call(s) from content (non-native emission)",
+                    recovered.calls.len()
+                ),
+                color,
+            );
+        }
 
         if debug {
             let content = message["content"].as_str().unwrap_or("");
@@ -2841,6 +2866,17 @@ pub async fn openai_chat_complete(
         }
 
         if !has_tools {
+            // Format-hallucination tracker (mirror of the Ollama loop): content
+            // that looked like a tool call but couldn't be recovered is counted.
+            if recovered.tool_shaped {
+                hallucination_count += 1;
+                if debug {
+                    print_debug(
+                        "format-hallucination: tool call emitted as unrecoverable text",
+                        color,
+                    );
+                }
+            }
             let content = message["content"].as_str().unwrap_or("").to_string();
             if content.is_empty() && debug {
                 print_debug(
