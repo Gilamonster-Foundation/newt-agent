@@ -1235,7 +1235,29 @@ this is the next free cluster.)* **Design: #559.**
 
 - **24.8** ✅ **done** — `ContextManager` {standard, progressive, distributed} + `[context].manager` config + `/context manager [name]` command (session override → config → `standard`). Only `standard` is implemented; progressive/distributed report "not yet available (see #546)" and stay on standard. The seam #546 plugs into — its `store-raw-for-lookup` rung is what makes the static marker *recoverable* (deferred retrieval, not loss). Additional modes to add are mined from the research in #13 (paper + `docs/research/notes.txt`).
 
-**Recommended order:** 24.1 → 24.2 → 24.5 → 24.6 → 24.3 → 24.7 → 24.8 → 24.4. (24.1 alone likely eliminates most real-world failures; everything after is depth.) Each step is one PR with the acceptance contract (What / Test plan / Out of scope), a fully-mocked unit tier (wiremock the summarizer endpoint), and the coverage ratchet. Refs: #559 (umbrella), #546 (progressive/distributed substrate + the fallback rung), #548 (surfaced), #166 (DGX OOM history).
+**Addendum — auto-configured fallback + dedicated backend (#548 field report)**
+
+A field incident (#548): a 27B/120B primary summarizer on a loaded box blew the
+60s timeout 3× (≈189s) and fell to the static marker, with `summarizer_model`
+unset so the 24.3 fallback never engaged. Two follow-ups make the good config
+the *default*:
+
+- **24.9** — when `[tui].summarizer_model` is unset and the summarizer backend
+  is Ollama, auto-pick the first installed model from a built-in small-model
+  preference list (`qwen2.5-coder:3b` → `nemotron-mini:4b` → `qwen2.5:3b` →
+  `gemma:2b` → `phi3:mini`) as the fallback, probed at most once per session via
+  `/api/tags` and **lazily on first primary failure** (a session whose primary
+  never fails never probes). OpenAI-compatible backends skip the probe (no safe
+  enumeration). `summarizer_retries` default drops **2 → 1** (each attempt can
+  cost the full timeout; one retry balances transient recovery against the
+  stall). Fully mocked (wiremock `/api/tags` + `/api/chat`).
+- **24.10** — move all summarizer config into a dedicated `~/.newt/summarizer.toml`
+  with its **own backend** (`endpoint`/`model`/`kind`/`api_key_file`), so the
+  summarizer can run on a *different, fast* box than the session model (e.g. a
+  small model on a second node) instead of contending with the primary. The
+  `[tui].summarizer_*` keys move there (breaking change; documented migration).
+
+**Recommended order:** 24.1 → 24.2 → 24.5 → 24.6 → 24.3 → 24.7 → 24.8 → 24.4 → 24.9 → 24.10. (24.1 alone likely eliminates most real-world failures; everything after is depth.) Each step is one PR with the acceptance contract (What / Test plan / Out of scope), a fully-mocked unit tier (wiremock the summarizer endpoint), and the coverage ratchet. Refs: #559 (umbrella), #546 (progressive/distributed substrate + the fallback rung), #548 (surfaced), #166 (DGX OOM history).
 
 ---
 
