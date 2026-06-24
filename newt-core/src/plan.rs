@@ -186,6 +186,43 @@ pub struct Subtask {
     pub caveat_policy: CaveatPolicy,
 }
 
+/// A leaf [`Subtask`] projected into the unit a `CrewRunner` dispatches — the
+/// concrete realization of *"a leaf is a CrewTask"*. Produced by
+/// [`Subtask::to_crew_task`]; the runner adds placement (a `workspace_ref`) when
+/// it actually spawns the work, so it isn't carried here. No `id`/`deps`/`status`
+/// either — those are the plan's bookkeeping, not the child's concern.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CrewTask {
+    /// What the child agent is asked to do (the subtask's instruction).
+    pub goal: String,
+    /// The authority the child runs under — the parent's grant **met** with the
+    /// subtask's declared policy. `meet` is the greatest lower bound, so this can
+    /// only *narrow* the parent (attenuation, never amplify): a model-proposed
+    /// plan can never widen the grant it was handed.
+    pub caveats: Caveats,
+    /// Files the subtask nominated as curated context (stamped verbatim by the
+    /// runner at dispatch).
+    pub context: Vec<String>,
+}
+
+impl Subtask {
+    /// Project this subtask into the [`CrewTask`] the active topology's
+    /// `CrewRunner` dispatches — the *same* projection for `/mode
+    /// single|crew|mesh|remote`, so a plan authored once lifts across runners
+    /// unchanged. `caveats = parent.meet(self.caveat_policy.to_caveats())`: the
+    /// plan *requests*, the parent *grants*, `meet` *enforces ⊑* (attenuation
+    /// only). Intended for a **leaf** (see [`Plan::leaves`]); a branch is a
+    /// grouping node, not a dispatch unit.
+    #[must_use]
+    pub fn to_crew_task(&self, parent: &Caveats) -> CrewTask {
+        CrewTask {
+            goal: self.instruction.clone(),
+            caveats: parent.meet(&self.caveat_policy.to_caveats()),
+            context: self.context.clone(),
+        }
+    }
+}
+
 /// How child results combine back into the plan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -553,5 +590,50 @@ deps = ["never_exists"]
         let root = Plan::from_toml_str("[[subtask]]\nid=\"r\"\ninstruction=\"y\"\n").unwrap();
         assert!(root.subtasks[0].parent.is_none());
         assert_eq!(root.roots().len(), 1);
+    }
+
+    #[test]
+    fn to_crew_task_projects_goal_context_and_attenuated_caveats() {
+        // A leaf declaring fs_write=["src/"] only; the parent grants everything.
+        let toml = r#"
+[[subtask]]
+id = "leaf"
+instruction = "write the module"
+context = ["src/lib.rs"]
+
+[subtask.caveat_policy]
+fs_write = ["src/"]
+"#;
+        let plan = Plan::from_toml_str(toml).unwrap();
+        let task = plan.subtasks[0].to_crew_task(&Caveats::top());
+        assert_eq!(task.goal, "write the module");
+        assert_eq!(task.context, vec!["src/lib.rs".to_string()]);
+        // The child gets exactly what it declared (parent=top allows all):
+        assert_eq!(task.caveats.fs_write, Scope::only(["src/".to_string()]));
+        // Everything else stays DENIED (default-deny leaf) — never widened to top.
+        assert_eq!(task.caveats.fs_read, Scope::none());
+        assert_eq!(task.caveats.exec, Scope::none());
+        assert_eq!(task.caveats.net, Scope::none());
+    }
+
+    #[test]
+    fn to_crew_task_never_widens_past_the_parent() {
+        // The leaf REQUESTS fs_read=all, but the parent only GRANTS fs_read=["a/"];
+        // meet clamps the request to the grant — attenuation, never amplify.
+        let toml = r#"
+[[subtask]]
+id = "leaf"
+instruction = "x"
+
+[subtask.caveat_policy]
+fs_read = "all"
+"#;
+        let plan = Plan::from_toml_str(toml).unwrap();
+        let parent = Caveats {
+            fs_read: Scope::only(["a/".to_string()]),
+            ..Caveats::top()
+        };
+        let task = plan.subtasks[0].to_crew_task(&parent);
+        assert_eq!(task.caveats.fs_read, Scope::only(["a/".to_string()]));
     }
 }
