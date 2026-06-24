@@ -635,6 +635,10 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             } else {
                 None
             };
+            // Best-effort: if the DGX node has drifted from [dgx] config, print a
+            // one-line notice (→ `newt dgx adopt`) before the session. Never
+            // blocks startup; silent when dgx is unconfigured or unreachable.
+            dgx::startup_drift_notice(cli.config.as_deref()).await;
             newt_tui::run_code(
                 path.as_deref(),
                 no_splash,
