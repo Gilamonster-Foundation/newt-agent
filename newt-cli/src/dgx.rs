@@ -2107,6 +2107,66 @@ async fn adopt_cmd(
     }
 }
 
+/// The one-line session-start drift notice for a reconcile verdict — `Some` only
+/// on a mismatch (in-sync / no-live / unreachable stay silent at startup). Pure.
+fn drift_notice_line(verdict: &ReconcileVerdict) -> Option<String> {
+    match verdict {
+        ReconcileVerdict::Mismatch {
+            cfg_kind,
+            cfg_model,
+            live_kind,
+            live_model,
+        } => Some(format!(
+            "dgx note: the node is running {live_kind}:{live_model}, but config expects \
+             {cfg_kind}:{} — run `newt dgx adopt` to reconcile.",
+            cfg_model.as_deref().unwrap_or("<none>")
+        )),
+        _ => None,
+    }
+}
+
+/// Best-effort session-start notice: if the node's live engine/model has drifted
+/// from `[dgx]` config, print one line (to stderr) pointing at `dgx adopt`.
+/// Never errors and never blocks startup — it's skipped when dgx isn't in use,
+/// and the whole probe is bounded by a short timeout so a slow/unreachable node
+/// is a silent no-op. The chosen "startup notice + `dgx adopt`" UX (Step 14.16).
+pub(crate) async fn startup_drift_notice(config_path: Option<&Path>) {
+    let Ok(dgx) = dgx_config(config_path) else {
+        return;
+    };
+    // Only when dgx is actually configured/in use — never probe otherwise.
+    if dgx.nodes.is_empty() && dgx.active_model.is_none() {
+        return;
+    }
+    let client = http_client();
+    let probe = async {
+        let ollama = match dgx.resolve_endpoint_for(EndpointKind::Ollama) {
+            Ok(base) => fetch_ollama_ps(&client, &base).await.unwrap_or_default(),
+            Err(_) => Vec::new(),
+        };
+        let vllm = match dgx.resolve_endpoint_for(EndpointKind::Vllm) {
+            Ok(base) => fetch_vllm_models(&base).await.unwrap_or_default(),
+            Err(_) => Vec::new(),
+        };
+        (ollama, vllm)
+    };
+    // Bound the whole interrogation so a down node never delays the session.
+    let (ollama, vllm) =
+        match tokio::time::timeout(std::time::Duration::from_millis(2500), probe).await {
+            Ok(r) => r,
+            Err(_) => return,
+        };
+    let verdict = reconcile(
+        dgx.active_endpoint,
+        dgx.active_model.as_deref(),
+        &vllm,
+        &ollama,
+    );
+    if let Some(line) = drift_notice_line(&verdict) {
+        eprintln!("{line}");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3319,5 +3379,27 @@ tiers = ["FAST", "STANDARD"]
             reconcile_action(false, false, true, None),
             ReconcileAction::Report
         );
+    }
+
+    #[test]
+    fn drift_notice_line_only_on_mismatch() {
+        // Mismatch → a one-line notice naming the node, the config, and the fix.
+        let line = drift_notice_line(&ReconcileVerdict::Mismatch {
+            cfg_kind: EndpointKind::Ollama,
+            cfg_model: Some("nemotron3:33b".to_string()),
+            live_kind: EndpointKind::Vllm,
+            live_model: "qwen3.6-35b".to_string(),
+        })
+        .unwrap();
+        assert!(line.contains("vllm:qwen3.6-35b"));
+        assert!(line.contains("ollama:nemotron3:33b"));
+        assert!(line.contains("dgx adopt"));
+        // In-sync / no-live stay silent — no startup noise.
+        assert!(drift_notice_line(&ReconcileVerdict::InSync {
+            kind: EndpointKind::Vllm,
+            model: "m".to_string()
+        })
+        .is_none());
+        assert!(drift_notice_line(&ReconcileVerdict::NoLiveState).is_none());
     }
 }
