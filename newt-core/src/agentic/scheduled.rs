@@ -170,6 +170,37 @@ pub fn plan_block(ledger: &dyn StepLedger) -> Option<String> {
     build_plan_block(ledger, PLAN_TOTAL_CAP)
 }
 
+/// A COMPACT per-round re-seat pointer — the active step + progress on one line.
+///
+/// `None` unless a MULTI-STEP plan is in progress (≥2 steps and an Active step
+/// remains). This is the conditional re-seat validated by the dgx1 12-step A/B
+/// (re-seat **12/12** vs baseline **8/12** under drift; see
+/// `docs/research/weak-model-plan-mode-findings.md`): the round-0 `<plan>`
+/// snapshot goes stale across the up-to-N tool rounds, so a weak model "loses
+/// track of its plan over time". Re-showing only the active step each round keeps
+/// it on course at a fraction of the token cost of re-injecting the full `<plan>`
+/// (which mildly *hurt* on no-drift tasks). Gated to multi-step in-progress plans
+/// so trivial/single-step turns pay nothing.
+#[must_use]
+pub fn plan_reseat_pointer(ledger: &dyn StepLedger) -> Option<String> {
+    let steps = ledger.steps();
+    if steps.len() < 2 {
+        return None; // no plan, or a single-step plan that needs no re-seat
+    }
+    let active = steps.iter().position(|s| s.status == StepStatus::Active)?;
+    let done = steps
+        .iter()
+        .filter(|s| s.status == StepStatus::Done)
+        .count();
+    Some(format!(
+        "[Plan progress: {done}/{} done. ACTIVE \u{2192} step {}: {}. Keep working \
+         THIS step; earlier steps are already done — do not restart or re-plan them.]",
+        steps.len(),
+        active + 1,
+        truncate(&steps[active].description, STEP_DESC_CAP)
+    ))
+}
+
 // ---------------------------------------------------------------------------
 // Tool schemas (advertised only when the feature is on + a ledger is present)
 // ---------------------------------------------------------------------------
@@ -302,6 +333,28 @@ mod tests {
         // advancing an empty plan → None
         let empty = SessionStepLedger::default();
         assert_eq!(empty.advance(), None);
+    }
+
+    #[test]
+    fn reseat_pointer_compact_and_gated_to_multistep_in_progress() {
+        let l = SessionStepLedger::default();
+        assert!(plan_reseat_pointer(&l).is_none(), "empty → none");
+        l.set_plan(&["only".to_string()]);
+        assert!(plan_reseat_pointer(&l).is_none(), "single step → none");
+        l.set_plan(&["a".to_string(), "b".to_string(), "c".to_string()]);
+        let p = plan_reseat_pointer(&l).expect("multi-step → pointer");
+        assert!(p.contains("step 1: a"), "names the active step: {p}");
+        assert!(p.contains("0/3 done"), "shows progress: {p}");
+        assert_eq!(p.lines().count(), 1, "compact (one line): {p}");
+        l.advance(); // a Done, b Active
+        let ptr = plan_reseat_pointer(&l).unwrap();
+        assert!(
+            ptr.contains("step 2: b") && ptr.contains("1/3 done"),
+            "{ptr}"
+        );
+        l.advance();
+        l.advance(); // all done, no Active
+        assert!(plan_reseat_pointer(&l).is_none(), "complete plan → none");
     }
 
     #[test]

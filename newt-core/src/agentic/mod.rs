@@ -116,7 +116,7 @@ pub use experiential::{
 pub use git_tool::{git_tool_definition, GitTool};
 pub use markdown::{render_markdown, MarkdownStreamWriter, RenderOpts};
 pub use mcp::{McpTools, NoMcp};
-pub use scheduled::{plan_block, SessionStepLedger, StepLedger};
+pub use scheduled::{plan_block, plan_reseat_pointer, SessionStepLedger, StepLedger};
 pub use scratchpad::{scratchpad_state_block, ScratchpadStore, SessionScratchpadStore};
 pub use semantic::{
     chunk_source, code_evidence_block, code_search_tool_definition, cosine, gather_code_files,
@@ -1131,6 +1131,16 @@ pub async fn chat_complete(
                     ResetColor
                 )
                 .ok();
+            }
+        }
+
+        // Conditional plan re-seat (#630 b): re-show the ACTIVE step each round
+        // so a weak model doesn't lose track of a multi-step plan as the round-0
+        // <plan> snapshot goes stale (validated on dgx1: re-seat 12/12 vs baseline
+        // 8/12 under drift). Compact + gated to multi-step in-progress plans.
+        if round > 0 {
+            if let Some(ptr) = step_ledger.and_then(plan_reseat_pointer) {
+                messages.push(serde_json::json!({ "role": "user", "content": ptr }));
             }
         }
 
@@ -2505,6 +2515,14 @@ pub async fn openai_chat_complete(
                 ResetColor
             )
             .ok();
+        }
+
+        // Conditional plan re-seat (#630 b) — mirror of the Ollama path: re-show
+        // the active step each round so a multi-step plan doesn't go stale.
+        if round > 0 {
+            if let Some(ptr) = step_ledger.and_then(plan_reseat_pointer) {
+                messages.push(serde_json::json!({ "role": "user", "content": ptr }));
+            }
         }
 
         // Context compression (Step 18.4, #247 — mirrors the Ollama path):
