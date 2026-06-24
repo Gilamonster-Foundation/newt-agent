@@ -27,7 +27,7 @@
 
 use std::path::Path;
 
-use std::io::Write as _;
+use std::io::{IsTerminal as _, Write as _};
 
 use clap::Subcommand;
 use newt_core::dgx::{DgxConfig, DgxNode, EndpointKind};
@@ -174,6 +174,25 @@ pub enum DgxCmd {
         /// Print the plan without evicting, launching, or persisting.
         #[arg(long)]
         dry_run: bool,
+    },
+    /// Reconcile newt's configured endpoint/model with what the node is
+    /// ACTUALLY running.
+    ///
+    /// Interrogates the node (vLLM `/v1/models` + Ollama `/api/ps`), derives the
+    /// live engine+model, and compares it to `[dgx].active_endpoint`/`active_model`.
+    /// On a mismatch you choose: **adopt** the live state into config (point newt
+    /// at reality, no eviction) or **enforce** the config onto the node (`switch`
+    /// it). Interactive on a TTY; `--adopt`/`--enforce` resolve non-interactively.
+    Adopt {
+        /// Non-interactively adopt the live state into config.
+        #[arg(long, conflicts_with = "enforce")]
+        adopt: bool,
+        /// Non-interactively enforce the config onto the node (runs `switch`).
+        #[arg(long, conflicts_with = "adopt")]
+        enforce: bool,
+        /// SSH node name (defaults to the active node).
+        #[arg(long)]
+        node: Option<String>,
     },
 }
 
@@ -376,6 +395,11 @@ pub async fn run(cmd: DgxCmd, config_path: Option<&Path>) -> anyhow::Result<()> 
             node,
             dry_run,
         } => switch(config_path, &engine, &model, node.as_deref(), dry_run).await,
+        DgxCmd::Adopt {
+            adopt,
+            enforce,
+            node,
+        } => adopt_cmd(config_path, adopt, enforce, node.as_deref()).await,
     }
 }
 
@@ -1880,6 +1904,186 @@ async fn switch_to_ollama(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// adopt — reconcile config vs the node's live state (Step 14.15)
+// ---------------------------------------------------------------------------
+
+/// The node's actual active engine + model from live probes: a running vLLM
+/// server wins (it holds the pool), else a resident Ollama model, else nothing.
+/// Pure.
+fn derive_live_state(
+    vllm: &[String],
+    ollama: &[(String, Option<u64>)],
+) -> Option<(EndpointKind, String)> {
+    if let Some(m) = vllm.first() {
+        Some((EndpointKind::Vllm, m.clone()))
+    } else {
+        ollama
+            .first()
+            .map(|(m, _)| (EndpointKind::Ollama, m.clone()))
+    }
+}
+
+/// The reconcile verdict between newt's config and the node's live state.
+#[derive(Debug, PartialEq, Eq)]
+enum ReconcileVerdict {
+    InSync {
+        kind: EndpointKind,
+        model: String,
+    },
+    Mismatch {
+        cfg_kind: EndpointKind,
+        cfg_model: Option<String>,
+        live_kind: EndpointKind,
+        live_model: String,
+    },
+    NoLiveState,
+}
+
+/// Compare configured (endpoint, model) against the derived live state. Pure.
+fn reconcile(
+    cfg_kind: EndpointKind,
+    cfg_model: Option<&str>,
+    live: Option<(EndpointKind, String)>,
+) -> ReconcileVerdict {
+    match live {
+        None => ReconcileVerdict::NoLiveState,
+        Some((live_kind, live_model)) => {
+            if cfg_kind == live_kind && cfg_model == Some(live_model.as_str()) {
+                ReconcileVerdict::InSync {
+                    kind: live_kind,
+                    model: live_model,
+                }
+            } else {
+                ReconcileVerdict::Mismatch {
+                    cfg_kind,
+                    cfg_model: cfg_model.map(str::to_string),
+                    live_kind,
+                    live_model,
+                }
+            }
+        }
+    }
+}
+
+/// How a reconcile mismatch is resolved.
+#[derive(Debug, PartialEq, Eq)]
+enum ReconcileAction {
+    Adopt,
+    Enforce,
+    Report,
+}
+
+/// Pick the action from the flags + terminal state. `--adopt`/`--enforce` are
+/// explicit; otherwise the TTY answer decides; a piped/headless run with no flag
+/// only reports (never changes state silently). Pure.
+fn reconcile_action(
+    adopt: bool,
+    enforce: bool,
+    is_tty: bool,
+    tty_answer: Option<&str>,
+) -> ReconcileAction {
+    if adopt {
+        return ReconcileAction::Adopt;
+    }
+    if enforce {
+        return ReconcileAction::Enforce;
+    }
+    if !is_tty {
+        return ReconcileAction::Report;
+    }
+    match tty_answer.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+        Some("a") | Some("adopt") => ReconcileAction::Adopt,
+        Some("e") | Some("enforce") => ReconcileAction::Enforce,
+        _ => ReconcileAction::Report,
+    }
+}
+
+/// `dgx adopt` — interrogate the node, compare to config, and reconcile.
+async fn adopt_cmd(
+    config_path: Option<&Path>,
+    adopt: bool,
+    enforce: bool,
+    node: Option<&str>,
+) -> anyhow::Result<()> {
+    let mut dgx = dgx_config(config_path)?;
+    if let Some(n) = node {
+        dgx.active_node = Some(n.to_string());
+    }
+    // Interrogate the node (best-effort, like `dgx gpu`).
+    let client = http_client();
+    let ollama = match dgx.resolve_endpoint_for(EndpointKind::Ollama) {
+        Ok(base) => fetch_ollama_ps(&client, &base).await.unwrap_or_default(),
+        Err(_) => Vec::new(),
+    };
+    let vllm = match dgx.resolve_endpoint_for(EndpointKind::Vllm) {
+        Ok(base) => fetch_vllm_models(&base).await.unwrap_or_default(),
+        Err(_) => Vec::new(),
+    };
+    let live = derive_live_state(&vllm, &ollama);
+    match reconcile(dgx.active_endpoint, dgx.active_model.as_deref(), live) {
+        ReconcileVerdict::InSync { kind, model } => {
+            println!("dgx1 in sync: config and node both have {kind} serving {model:?}.");
+            Ok(())
+        }
+        ReconcileVerdict::NoLiveState => {
+            println!(
+                "Nothing is running on the node (no vLLM server, no resident Ollama model). \
+                 Config wants {} serving {:?}; start it with `dgx switch` / `vllm up` / `warm`.",
+                dgx.active_endpoint,
+                dgx.active_model.as_deref().unwrap_or("<none>")
+            );
+            Ok(())
+        }
+        ReconcileVerdict::Mismatch {
+            cfg_kind,
+            cfg_model,
+            live_kind,
+            live_model,
+        } => {
+            println!("dgx1 mismatch — config and the node disagree:");
+            println!(
+                "  config: {cfg_kind} : {}",
+                cfg_model.as_deref().unwrap_or("<none>")
+            );
+            println!("  node:   {live_kind} : {live_model}");
+            let is_tty = std::io::stdin().is_terminal();
+            let answer = if !adopt && !enforce && is_tty {
+                print!("Adopt the node's state into config [a], enforce config onto the node [e], or cancel [c]? ");
+                std::io::stdout().flush().ok();
+                let mut line = String::new();
+                std::io::stdin().read_line(&mut line).ok();
+                Some(line)
+            } else {
+                None
+            };
+            match reconcile_action(adopt, enforce, is_tty, answer.as_deref()) {
+                ReconcileAction::Adopt => {
+                    println!("Adopting: pointing newt at {live_kind} : {live_model}.");
+                    persist_active(config_path, live_kind, &live_model)
+                }
+                ReconcileAction::Enforce => {
+                    let model = cfg_model.ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "cannot enforce: no active_model configured — set one (`dgx use`) \
+                             or adopt the node's state instead"
+                        )
+                    })?;
+                    println!("Enforcing: switching the node to {cfg_kind} : {model}.");
+                    switch(config_path, cfg_kind.as_str(), &model, node, false).await
+                }
+                ReconcileAction::Report => {
+                    println!(
+                        "No change. Re-run with --adopt (point newt at the node) or \
+                         --enforce (switch the node to the config)."
+                    );
+                    Ok(())
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2971,5 +3175,104 @@ tiers = ["FAST", "STANDARD"]
         assert_eq!(a.port, 8000);
         assert!((a.gpu_mem_util - 0.90).abs() < f64::EPSILON);
         assert!(!a.docker && a.dtype.is_none() && a.max_model_len.is_none());
+    }
+
+    // --- adopt (Step 14.15) -----------------------------------------------
+
+    #[test]
+    fn derive_live_state_prefers_vllm_then_ollama() {
+        // A running vLLM server wins (it holds the pool).
+        let vllm = vec!["qwen3.6-35b".to_string()];
+        let ollama = vec![("nemotron3:33b".to_string(), Some(38))];
+        assert_eq!(
+            derive_live_state(&vllm, &ollama),
+            Some((EndpointKind::Vllm, "qwen3.6-35b".to_string()))
+        );
+        // No vLLM → the resident Ollama model.
+        assert_eq!(
+            derive_live_state(&[], &ollama),
+            Some((EndpointKind::Ollama, "nemotron3:33b".to_string()))
+        );
+        // Nothing running → None.
+        assert_eq!(derive_live_state(&[], &[]), None);
+    }
+
+    #[test]
+    fn reconcile_classifies_sync_mismatch_and_no_live() {
+        // In sync: same engine + model.
+        assert_eq!(
+            reconcile(
+                EndpointKind::Ollama,
+                Some("nemotron3:33b"),
+                Some((EndpointKind::Ollama, "nemotron3:33b".to_string()))
+            ),
+            ReconcileVerdict::InSync {
+                kind: EndpointKind::Ollama,
+                model: "nemotron3:33b".to_string()
+            }
+        );
+        // Mismatch: config says Ollama, node runs vLLM.
+        assert_eq!(
+            reconcile(
+                EndpointKind::Ollama,
+                Some("nemotron3:33b"),
+                Some((EndpointKind::Vllm, "qwen3.6-35b".to_string()))
+            ),
+            ReconcileVerdict::Mismatch {
+                cfg_kind: EndpointKind::Ollama,
+                cfg_model: Some("nemotron3:33b".to_string()),
+                live_kind: EndpointKind::Vllm,
+                live_model: "qwen3.6-35b".to_string(),
+            }
+        );
+        // Same engine, different model → still a mismatch.
+        assert!(matches!(
+            reconcile(
+                EndpointKind::Vllm,
+                Some("a"),
+                Some((EndpointKind::Vllm, "b".to_string()))
+            ),
+            ReconcileVerdict::Mismatch { .. }
+        ));
+        // Nothing live.
+        assert_eq!(
+            reconcile(EndpointKind::Ollama, Some("x"), None),
+            ReconcileVerdict::NoLiveState
+        );
+    }
+
+    #[test]
+    fn reconcile_action_flags_win_then_tty_then_report() {
+        // Explicit flags win regardless of TTY.
+        assert_eq!(
+            reconcile_action(true, false, false, None),
+            ReconcileAction::Adopt
+        );
+        assert_eq!(
+            reconcile_action(false, true, false, None),
+            ReconcileAction::Enforce
+        );
+        // No flag + not a TTY → only report (never change state silently).
+        assert_eq!(
+            reconcile_action(false, false, false, None),
+            ReconcileAction::Report
+        );
+        // TTY answers.
+        assert_eq!(
+            reconcile_action(false, false, true, Some("a\n")),
+            ReconcileAction::Adopt
+        );
+        assert_eq!(
+            reconcile_action(false, false, true, Some("enforce")),
+            ReconcileAction::Enforce
+        );
+        assert_eq!(
+            reconcile_action(false, false, true, Some("c")),
+            ReconcileAction::Report
+        );
+        assert_eq!(
+            reconcile_action(false, false, true, None),
+            ReconcileAction::Report
+        );
     }
 }
