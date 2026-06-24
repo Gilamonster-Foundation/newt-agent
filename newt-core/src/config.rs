@@ -1300,15 +1300,20 @@ pub struct TuiConfig {
     pub summarizer_timeout_secs: u64,
 
     /// Number of retry attempts for the compression summarizer before it falls
-    /// back to the static marker (Step 24.2, #559). Default 2. Many summarizer
-    /// failures are transient (eviction reload, momentary OOM).
+    /// back to the static marker (Step 24.2, #559). Default 1. Many summarizer
+    /// failures are transient (eviction reload, momentary OOM), but each attempt
+    /// can cost the full `summarizer_timeout_secs`; one retry balances transient
+    /// recovery against the long stall a slow primary model otherwise produces
+    /// (the #548 189s incident was 3 × 60s before the marker). Step 24.9.
     #[serde(default = "default_summarizer_retries")]
     pub summarizer_retries: u32,
 
     /// Optional fallback summarizer model (Step 24.3, #559). When the primary
     /// model's summary attempts all fail (too heavy / unavailable on a loaded
     /// box), a small/fast model named here summarizes instead — a rung above the
-    /// static marker. `None` (default) = no fallback.
+    /// static marker. `None` (default): for an Ollama summarizer backend, newt
+    /// auto-picks the first installed model from a built-in small-model
+    /// preference list (Step 24.9, #559); for other backends, no fallback.
     #[serde(default)]
     pub summarizer_model: Option<String>,
 
@@ -1391,7 +1396,7 @@ fn default_summarizer_timeout_secs() -> u64 {
 }
 
 fn default_summarizer_retries() -> u32 {
-    2
+    1
 }
 
 fn default_mid_loop_trim_threshold() -> usize {
@@ -2980,7 +2985,7 @@ mod tests {
     fn tui_summarizer_timeout_and_retries_default_and_parse() {
         let d = TuiConfig::default();
         assert_eq!(d.summarizer_timeout_secs, 60);
-        assert_eq!(d.summarizer_retries, 2);
+        assert_eq!(d.summarizer_retries, 1);
         assert_eq!(d.summarizer_model, None);
         let cfg: TuiConfig = toml::from_str(
             "summarizer_timeout_secs = 180\nsummarizer_retries = 4\nsummarizer_model = \"qwen:0.5b\"",
