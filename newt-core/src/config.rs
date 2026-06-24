@@ -1292,31 +1292,11 @@ pub struct TuiConfig {
     #[serde(default = "default_keep_alive")]
     pub keep_alive: String,
 
-    /// Per-request timeout (seconds) for the compression summarizer (Step 24.2,
-    /// #559). Default 60. The summary is the largest single request of the
-    /// session; cold-loading a big model can legitimately exceed 60s, so raise
-    /// this when the summarizer falls back to the static marker on a slow box.
-    #[serde(default = "default_summarizer_timeout_secs")]
-    pub summarizer_timeout_secs: u64,
-
-    /// Number of retry attempts for the compression summarizer before it falls
-    /// back to the static marker (Step 24.2, #559). Default 1. Many summarizer
-    /// failures are transient (eviction reload, momentary OOM), but each attempt
-    /// can cost the full `summarizer_timeout_secs`; one retry balances transient
-    /// recovery against the long stall a slow primary model otherwise produces
-    /// (the #548 189s incident was 3 × 60s before the marker). Step 24.9.
-    #[serde(default = "default_summarizer_retries")]
-    pub summarizer_retries: u32,
-
-    /// Optional fallback summarizer model (Step 24.3, #559). When the primary
-    /// model's summary attempts all fail (too heavy / unavailable on a loaded
-    /// box), a small/fast model named here summarizes instead — a rung above the
-    /// static marker. `None` (default): for an Ollama summarizer backend, newt
-    /// auto-picks the first installed model from a built-in small-model
-    /// preference list (Step 24.9, #559); for other backends, no fallback.
-    #[serde(default)]
-    pub summarizer_model: Option<String>,
-
+    // Summarizer knobs (timeout / retries / fallback model) moved to the
+    // dedicated `~/.newt/summarizer.toml` ([`SummarizerConfig`]) in Step 24.10
+    // (#559), so the summarizer can run on its own backend. Old `[tui]` keys
+    // (`summarizer_timeout_secs` / `summarizer_retries` / `summarizer_model`)
+    // are no longer read — `#[serde(default)]` ignores them in stale configs.
     /// Markdown rendering of assistant output (Step 25.4, #568). `auto`
     /// (default) renders whenever color is active; `on`/`off` force it. The
     /// `/markdown [on|off]` command overrides this for the session.
@@ -2112,9 +2092,6 @@ impl Default for TuiConfig {
             connect_timeout_secs: default_connect_timeout_secs(),
             inference_timeout_secs: default_inference_timeout_secs(),
             keep_alive: default_keep_alive(),
-            summarizer_timeout_secs: default_summarizer_timeout_secs(),
-            summarizer_retries: default_summarizer_retries(),
-            summarizer_model: None,
             markdown: MarkdownMode::default(),
             mid_loop_trim_threshold: default_mid_loop_trim_threshold(),
             mid_loop_trim_tokens: None,
@@ -2245,6 +2222,127 @@ impl BackendConfig {
     /// variable), then [`api_key_file`](Self::api_key_file) (first
     /// non-empty line of the file, trimmed). Returns `None` when neither
     /// is configured or neither resolves to a non-empty value.
+    pub fn resolve_api_key(&self) -> Option<String> {
+        if let Some(var) = &self.api_key_env {
+            if let Ok(val) = std::env::var(var) {
+                let val = val.trim();
+                if !val.is_empty() {
+                    return Some(val.to_string());
+                }
+            }
+        }
+        if let Some(path) = &self.api_key_file {
+            let expanded = expand_tilde(path);
+            if let Ok(contents) = std::fs::read_to_string(&expanded) {
+                if let Some(token) = contents.lines().map(str::trim).find(|l| !l.is_empty()) {
+                    return Some(token.to_string());
+                }
+            }
+        }
+        None
+    }
+}
+
+/// Dedicated configuration for the compression summarizer, loaded from
+/// `~/.newt/summarizer.toml` (Step 24.10, #559). An absent file means
+/// `SummarizerConfig::default()` — every field falls back to the session
+/// backend, so behavior is unchanged from "summarizer reuses the session
+/// model".
+///
+/// The point of the separate file is the **own-backend** fields
+/// (`endpoint`/`model`/`kind`/`api_key_file`): a summarizer can run on a
+/// different, fast box than the session model instead of contending with it
+/// (the #548 field incident — a slow primary summarizer stalled ~189s before
+/// the static marker). `timeout_secs` / `retries` / `fallback_model` are the
+/// knobs that used to live under `[tui]` (moved here in 24.10).
+///
+/// Example `~/.newt/summarizer.toml`:
+/// ```toml
+/// endpoint = "http://REDACTED-HOST:11434"  # default: session backend URL
+/// model    = "qwen2.5-coder:3b"            # default: session model
+/// kind     = "ollama"                      # "ollama" | "openai"
+/// timeout_secs   = 45
+/// retries        = 1
+/// fallback_model = "nemotron-mini:4b"      # else preference-list auto-pick (24.9)
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SummarizerConfig {
+    /// Summarizer endpoint URL. `None` ⇒ reuse the session backend's URL.
+    pub endpoint: Option<String>,
+    /// Summarizer model. `None` ⇒ reuse the session backend's model.
+    pub model: Option<String>,
+    /// Backend protocol. `None` ⇒ reuse the session backend's kind.
+    pub kind: Option<BackendKind>,
+    /// Bearer-token file (first non-empty line). `None` ⇒ reuse the session key.
+    pub api_key_file: Option<String>,
+    /// Bearer-token environment variable (checked before `api_key_file`).
+    pub api_key_env: Option<String>,
+    /// Per-request timeout (seconds). Default 60 — cold-loading a big model can
+    /// legitimately exceed it; raise on a slow box that falls back to the marker.
+    #[serde(default = "default_summarizer_timeout_secs")]
+    pub timeout_secs: u64,
+    /// Retry attempts before the static marker. Default 1 — each attempt can
+    /// cost the full `timeout_secs` (the #548 189s incident was 3 × 60s).
+    #[serde(default = "default_summarizer_retries")]
+    pub retries: u32,
+    /// Explicit fallback model. `None` ⇒ for an Ollama summarizer backend, the
+    /// first installed small-model-preference-list entry is auto-picked (24.9).
+    pub fallback_model: Option<String>,
+    /// `keep_alive` for the warm + summary requests. `None` ⇒ inherit
+    /// `[tui].keep_alive`.
+    pub keep_alive: Option<String>,
+}
+
+impl Default for SummarizerConfig {
+    fn default() -> Self {
+        Self {
+            endpoint: None,
+            model: None,
+            kind: None,
+            api_key_file: None,
+            api_key_env: None,
+            timeout_secs: default_summarizer_timeout_secs(),
+            retries: default_summarizer_retries(),
+            fallback_model: None,
+            keep_alive: None,
+        }
+    }
+}
+
+impl SummarizerConfig {
+    /// Parse a `summarizer.toml` body. Pure — fully unit-testable without disk.
+    pub fn from_toml_str(text: &str) -> Result<Self> {
+        toml::from_str(text).map_err(|e| NewtError::Config(e.to_string()))
+    }
+
+    /// Load `~/.newt/summarizer.toml` (or `$NEWT_SUMMARIZER_CONFIG`). A missing
+    /// file is not an error — it yields [`SummarizerConfig::default`] (reuse the
+    /// session backend). Only a present-but-malformed file errors.
+    pub fn resolve() -> Result<Self> {
+        for path in Self::candidate_paths() {
+            if path.is_file() {
+                let text = std::fs::read_to_string(&path)?;
+                return Self::from_toml_str(&text);
+            }
+        }
+        Ok(Self::default())
+    }
+
+    /// Ordered candidate paths for `summarizer.toml`.
+    fn candidate_paths() -> Vec<PathBuf> {
+        let mut paths = Vec::new();
+        if let Ok(p) = std::env::var("NEWT_SUMMARIZER_CONFIG") {
+            paths.push(PathBuf::from(p));
+        }
+        if let Some(home) = home_dir() {
+            paths.push(home.join(".newt").join("summarizer.toml"));
+        }
+        paths
+    }
+
+    /// Resolve this summarizer's bearer token (env var first, then file), or
+    /// `None` — mirrors [`BackendConfig::resolve_api_key`].
     pub fn resolve_api_key(&self) -> Option<String> {
         if let Some(var) = &self.api_key_env {
             if let Ok(val) = std::env::var(var) {
@@ -2981,19 +3079,46 @@ mod tests {
         assert_eq!(default.markdown, MarkdownMode::Auto);
     }
 
+    /// Step 24.10 (#559): summarizer knobs live in `summarizer.toml` now.
+    /// Defaults (absent file) reuse the session backend; timeout 60 / retries 1.
     #[test]
-    fn tui_summarizer_timeout_and_retries_default_and_parse() {
-        let d = TuiConfig::default();
-        assert_eq!(d.summarizer_timeout_secs, 60);
-        assert_eq!(d.summarizer_retries, 1);
-        assert_eq!(d.summarizer_model, None);
-        let cfg: TuiConfig = toml::from_str(
-            "summarizer_timeout_secs = 180\nsummarizer_retries = 4\nsummarizer_model = \"qwen:0.5b\"",
+    fn summarizer_config_defaults_and_parse() {
+        let d = SummarizerConfig::default();
+        assert_eq!(d.endpoint, None);
+        assert_eq!(d.model, None);
+        assert_eq!(d.kind, None);
+        assert_eq!(d.timeout_secs, 60);
+        assert_eq!(d.retries, 1);
+        assert_eq!(d.fallback_model, None);
+
+        let cfg = SummarizerConfig::from_toml_str(
+            "endpoint = \"http://REDACTED-HOST:11434\"\n\
+             model = \"qwen2.5-coder:3b\"\n\
+             kind = \"openai\"\n\
+             timeout_secs = 45\n\
+             retries = 2\n\
+             fallback_model = \"nemotron-mini:4b\"\n\
+             keep_alive = \"10m\"",
         )
         .unwrap();
-        assert_eq!(cfg.summarizer_timeout_secs, 180);
-        assert_eq!(cfg.summarizer_retries, 4);
-        assert_eq!(cfg.summarizer_model.as_deref(), Some("qwen:0.5b"));
+        assert_eq!(cfg.endpoint.as_deref(), Some("http://REDACTED-HOST:11434"));
+        assert_eq!(cfg.model.as_deref(), Some("qwen2.5-coder:3b"));
+        assert_eq!(cfg.kind, Some(BackendKind::Openai));
+        assert_eq!(cfg.timeout_secs, 45);
+        assert_eq!(cfg.retries, 2);
+        assert_eq!(cfg.fallback_model.as_deref(), Some("nemotron-mini:4b"));
+        assert_eq!(cfg.keep_alive.as_deref(), Some("10m"));
+    }
+
+    /// A partial file fills only the keys present; the rest stay at defaults
+    /// (so an `endpoint`-only file reuses the session model but a fast box).
+    #[test]
+    fn summarizer_config_partial_keeps_defaults() {
+        let cfg = SummarizerConfig::from_toml_str("endpoint = \"http://fast.box:11434\"").unwrap();
+        assert_eq!(cfg.endpoint.as_deref(), Some("http://fast.box:11434"));
+        assert_eq!(cfg.model, None); // reuse session model
+        assert_eq!(cfg.timeout_secs, 60); // default
+        assert_eq!(cfg.retries, 1); // default
     }
 
     #[test]

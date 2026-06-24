@@ -1242,7 +1242,8 @@ A field incident (#548): a 27B/120B primary summarizer on a loaded box blew the
 unset so the 24.3 fallback never engaged. Two follow-ups make the good config
 the *default*:
 
-- **24.9** — when `[tui].summarizer_model` is unset and the summarizer backend
+- **24.9** ✅ **done** — when `summarizer.toml` `model`/`fallback_model` is unset
+  and the summarizer backend
   is Ollama, auto-pick the first installed model from a built-in small-model
   preference list (`qwen2.5-coder:3b` → `nemotron-mini:4b` → `qwen2.5:3b` →
   `gemma:2b` → `phi3:mini`) as the fallback, probed at most once per session via
@@ -1251,11 +1252,19 @@ the *default*:
   enumeration). `summarizer_retries` default drops **2 → 1** (each attempt can
   cost the full timeout; one retry balances transient recovery against the
   stall). Fully mocked (wiremock `/api/tags` + `/api/chat`).
-- **24.10** — move all summarizer config into a dedicated `~/.newt/summarizer.toml`
-  with its **own backend** (`endpoint`/`model`/`kind`/`api_key_file`), so the
-  summarizer can run on a *different, fast* box than the session model (e.g. a
-  small model on a second node) instead of contending with the primary. The
-  `[tui].summarizer_*` keys move there (breaking change; documented migration).
+- **24.10** ✅ **done** — all summarizer config now lives in a dedicated
+  `~/.newt/summarizer.toml` ([`SummarizerConfig`]) with its **own backend**
+  (`endpoint`/`model`/`kind`/`api_key_file`/`api_key_env`), so the summarizer can
+  run on a *different, fast* box than the session model (e.g. a small model on a
+  second node) instead of contending with the primary. Each field present
+  overrides the session backend; absent ⇒ reuse it (and a `/backend` switch still
+  carries the summarizer when no endpoint is pinned). A pinned endpoint never
+  inherits the session bearer token. `timeout_secs`/`retries`/`fallback_model`/
+  `keep_alive` knobs moved here from `[tui]` (breaking change — `[tui]`
+  `summarizer_*` keys are now ignored; `#[serde(default)]` means stale configs
+  still parse). Resolved once per session via `SummarizerConfig::resolve()`
+  (`$NEWT_SUMMARIZER_CONFIG` → `~/.newt/summarizer.toml`); a missing file is not
+  an error. Fully mocked unit tier (pure parse + backend-resolution tests).
 
 **Recommended order:** 24.1 → 24.2 → 24.5 → 24.6 → 24.3 → 24.7 → 24.8 → 24.4 → 24.9 → 24.10. (24.1 alone likely eliminates most real-world failures; everything after is depth.) Each step is one PR with the acceptance contract (What / Test plan / Out of scope), a fully-mocked unit tier (wiremock the summarizer endpoint), and the coverage ratchet. Refs: #559 (umbrella), #546 (progressive/distributed substrate + the fallback rung), #548 (surfaced), #166 (DGX OOM history).
 

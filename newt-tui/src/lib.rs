@@ -3010,11 +3010,11 @@ struct SummarizerOpts {
     num_ctx: Option<u32>,
     /// Ollama `keep_alive` for the warm + summary requests (Step 24.1).
     keep_alive: String,
-    /// Per-request timeout in seconds (Step 24.2; `[tui].summarizer_timeout_secs`).
+    /// Per-request timeout in seconds (Step 24.2; `summarizer.toml` `timeout_secs`).
     timeout_secs: u64,
     /// Retry attempts before falling back to the static marker (Step 24.2).
     retries: u32,
-    /// Optional fallback model (Step 24.3; `[tui].summarizer_model`). When the
+    /// Optional fallback model (Step 24.3; `summarizer.toml` `fallback_model`). When the
     /// primary model's attempts all fail, the summary is retried once on this
     /// model — a rung above the static marker. `None` = no explicit fallback;
     /// for an Ollama backend the first installed [`FALLBACK_MODEL_PREFERENCES`]
@@ -3147,7 +3147,7 @@ async fn summarize_one_model(
         b
     };
     // Step 24.2 (#559): retry with backoff before giving up. The per-request
-    // timeout is configurable (`[tui].summarizer_timeout_secs`).
+    // timeout is configurable (`summarizer.toml` `timeout_secs`).
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(opts.timeout_secs))
         .build()?;
@@ -3822,6 +3822,13 @@ fn run_chat(
     };
     let mut inf_kind = choice.kind;
     let mut inf_key = choice.api_key.clone();
+    // Step 24.10 (#559): dedicated summarizer config (`~/.newt/summarizer.toml`).
+    // Absent/malformed → defaults that reuse the session backend, so behavior is
+    // unchanged unless the user opts the summarizer onto its own backend.
+    let sum_cfg = newt_core::SummarizerConfig::resolve().unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "failed to load ~/.newt/summarizer.toml — using defaults (reuse session backend)");
+        newt_core::SummarizerConfig::default()
+    });
     apply_openai_api_env(choice.api);
     let key_path = newt_identity::default_key_path().ok();
     let mut cap = SessionCapability::establish(resolve_tui(&cfg), key_path.as_deref(), workspace);
@@ -4049,15 +4056,18 @@ fn run_chat(
                 // — the contract violation this step deletes.) Captured at
                 // session start; model switches apply on next session.
                 let s =
-                    newt_core::Summarizing::new(mem_budget).with_summarizer(make_loop_summarizer(
-                        inf_url.clone(),
-                        inf_model.clone(),
+                    // The same capability-derived context figure the provider
+                    // budget uses — the summary request must not be silently
+                    // truncated at Ollama's default window (F5).
+                    newt_core::Summarizing::new(mem_budget).with_summarizer(build_session_summarizer(
+                        &sum_cfg,
+                        &cfg,
+                        &inf_url,
+                        &inf_model,
                         inf_kind,
-                        inf_key.clone(),
-                        // The same capability-derived context figure the
-                        // provider budget uses — the summary request must not
-                        // be silently truncated at Ollama's default window (F5).
-                        summarizer_opts(&cfg, Some(mem_budget), color),
+                        &inf_key,
+                        Some(mem_budget),
+                        color,
                     ));
                 mgr.add_provider(s);
             }
@@ -4372,15 +4382,18 @@ fn run_chat(
                         // the same summarizer wiring the loop uses.
                         let focus = parse_compress_command(&task).unwrap_or(None);
                         let wire = session_wire_view(&memory, &system);
-                        let summarizer = make_loop_summarizer(
-                            inf_url.clone(),
-                            inf_model.clone(),
+                        // Same capability-derived cap the Summarizing provider
+                        // injects — the summary request must not be silently
+                        // truncated (F5).
+                        let summarizer = build_session_summarizer(
+                            &sum_cfg,
+                            &cfg,
+                            &inf_url,
+                            &inf_model,
                             inf_kind,
-                            inf_key.clone(),
-                            // Same capability-derived cap the Summarizing
-                            // provider injects — the summary request must not
-                            // be silently truncated (F5).
-                            summarizer_opts(&cfg, Some(mem_budget), color),
+                            &inf_key,
+                            Some(mem_budget),
+                            color,
                         );
                         let outcome = tokio::task::block_in_place(|| {
                             rt.block_on(newt_core::compress_user_initiated(
@@ -4552,12 +4565,15 @@ fn run_chat(
                     if let Some(reason) = close_word {
                         // 19.4: extraction runs BEFORE the reset below wipes
                         // the history it reads. Failure never blocks the reset.
-                        let close_complete = make_loop_summarizer(
-                            inf_url.clone(),
-                            inf_model.clone(),
+                        let close_complete = build_session_summarizer(
+                            &sum_cfg,
+                            &cfg,
+                            &inf_url,
+                            &inf_model,
                             inf_kind,
-                            inf_key.clone(),
-                            summarizer_opts(&cfg, Some(mem_budget), color),
+                            &inf_key,
+                            Some(mem_budget),
+                            color,
                         );
                         if let Some(notice) = tokio::task::block_in_place(|| {
                             rt.block_on(run_close_extraction(
@@ -5072,15 +5088,18 @@ fn run_chat(
                     // Compression summarizer (Step 18.4, #247): rebuilt per
                     // turn so a mid-session `/backend` or model switch takes
                     // effect immediately.
-                    let loop_summarizer = make_loop_summarizer(
-                        inf_url.clone(),
-                        inf_model.clone(),
+                    // The same effective context cap the main loop sends — the
+                    // summary request must not be silently truncated at Ollama's
+                    // default window (F5).
+                    let loop_summarizer = build_session_summarizer(
+                        &sum_cfg,
+                        &cfg,
+                        &inf_url,
+                        &inf_model,
                         inf_kind,
-                        inf_key.clone(),
-                        // The same effective context cap the main loop sends —
-                        // the summary request must not be silently truncated
-                        // at Ollama's default window (F5).
-                        summarizer_opts(&cfg, eff_num_ctx, color),
+                        &inf_key,
+                        eff_num_ctx,
+                        color,
                     );
                     // Per-turn tool-event recorder (Step 17.6, #246): the
                     // loop pushes one event per tool call; the save site
@@ -5489,12 +5508,15 @@ fn run_chat(
     // crash breaks above leave `clean_exit` false (a degraded terminal does
     // not need one more network round-trip). Failure never blocks exit.
     if clean_exit {
-        let close_complete = make_loop_summarizer(
-            inf_url.clone(),
-            inf_model.clone(),
+        let close_complete = build_session_summarizer(
+            &sum_cfg,
+            &cfg,
+            &inf_url,
+            &inf_model,
             inf_kind,
-            inf_key.clone(),
-            summarizer_opts(&cfg, Some(mem_budget), color),
+            &inf_key,
+            Some(mem_budget),
+            color,
         );
         if let Some(notice) = tokio::task::block_in_place(|| {
             rt.block_on(run_close_extraction(
@@ -7206,30 +7228,85 @@ fn keep_alive_str(cfg: &newt_core::Config) -> String {
         .unwrap_or_else(|| "5m".to_string())
 }
 
-/// Summarizer per-request timeout from `[tui].summarizer_timeout_secs` (Step 24.2).
-fn summarizer_timeout_secs(cfg: &newt_core::Config) -> u64 {
-    cfg.tui
-        .as_ref()
-        .map(|t| t.summarizer_timeout_secs)
-        .unwrap_or(60)
-}
-
-/// Summarizer retry count from `[tui].summarizer_retries` (Step 24.2; default
-/// lowered to 1 in Step 24.9 — each attempt can cost the full timeout).
-fn summarizer_retries(cfg: &newt_core::Config) -> u32 {
-    cfg.tui.as_ref().map(|t| t.summarizer_retries).unwrap_or(1)
-}
-
-/// Build `SummarizerOpts` from config for a session summarizer (Step 24.2).
-fn summarizer_opts(cfg: &newt_core::Config, num_ctx: Option<u32>, color: bool) -> SummarizerOpts {
+/// Build `SummarizerOpts` from the dedicated [`newt_core::SummarizerConfig`]
+/// (Step 24.10; the timeout / retries / fallback knobs moved out of `[tui]`).
+/// `keep_alive` falls back to `[tui].keep_alive` when the summarizer file does
+/// not pin its own.
+fn summarizer_opts(
+    sum_cfg: &newt_core::SummarizerConfig,
+    cfg: &newt_core::Config,
+    num_ctx: Option<u32>,
+    color: bool,
+) -> SummarizerOpts {
     SummarizerOpts {
         num_ctx,
-        keep_alive: keep_alive_str(cfg),
-        timeout_secs: summarizer_timeout_secs(cfg),
-        retries: summarizer_retries(cfg),
-        fallback_model: cfg.tui.as_ref().and_then(|t| t.summarizer_model.clone()),
+        keep_alive: sum_cfg
+            .keep_alive
+            .clone()
+            .unwrap_or_else(|| keep_alive_str(cfg)),
+        timeout_secs: sum_cfg.timeout_secs,
+        retries: sum_cfg.retries,
+        fallback_model: sum_cfg.fallback_model.clone(),
         color,
     }
+}
+
+/// Resolve the summarizer's effective backend (Step 24.10, #559): each
+/// `summarizer.toml` field present overrides the corresponding session value;
+/// absent ⇒ reuse the session backend. The session params are read live, so
+/// when `summarizer.toml` does NOT pin a backend a mid-session `/backend`
+/// switch still carries the summarizer along.
+fn resolve_summarizer_backend(
+    sum_cfg: &newt_core::SummarizerConfig,
+    inf_url: &str,
+    inf_model: &str,
+    inf_kind: newt_core::BackendKind,
+    inf_key: &Option<String>,
+) -> (String, String, newt_core::BackendKind, Option<String>) {
+    let url = sum_cfg
+        .endpoint
+        .clone()
+        .unwrap_or_else(|| inf_url.to_string());
+    let model = sum_cfg
+        .model
+        .clone()
+        .unwrap_or_else(|| inf_model.to_string());
+    let kind = sum_cfg.kind.unwrap_or(inf_kind);
+    // A bearer token authenticates a specific host. Only inherit the session
+    // key when the summarizer reuses the session endpoint; a summarizer pinned
+    // to its own endpoint uses its own key (or none) — never leak the session
+    // token to a different host.
+    let key = if sum_cfg.endpoint.is_some() {
+        sum_cfg.resolve_api_key()
+    } else {
+        sum_cfg.resolve_api_key().or_else(|| inf_key.clone())
+    };
+    (url, model, kind, key)
+}
+
+/// Build a loop summarizer for the current session backend, applying any
+/// `~/.newt/summarizer.toml` backend + knob overrides (Step 24.10). The single
+/// seam every summarizer call site goes through.
+#[allow(clippy::too_many_arguments)]
+fn build_session_summarizer(
+    sum_cfg: &newt_core::SummarizerConfig,
+    cfg: &newt_core::Config,
+    inf_url: &str,
+    inf_model: &str,
+    inf_kind: newt_core::BackendKind,
+    inf_key: &Option<String>,
+    num_ctx: Option<u32>,
+    color: bool,
+) -> newt_core::Summarizer {
+    let (url, model, kind, key) =
+        resolve_summarizer_backend(sum_cfg, inf_url, inf_model, inf_kind, inf_key);
+    make_loop_summarizer(
+        url,
+        model,
+        kind,
+        key,
+        summarizer_opts(sum_cfg, cfg, num_ctx, color),
+    )
 }
 
 /// Whether to render assistant Markdown this turn (Step 25.4, #568). The
@@ -14624,6 +14701,69 @@ mod http_loop_tests {
         )
         .await;
         assert_eq!(picked, None);
+    }
+
+    /// Step 24.10 (#559): a `summarizer.toml` with its own backend overrides
+    /// every session backend field; an explicit key is used for the pinned host.
+    #[test]
+    fn resolve_summarizer_backend_overrides_when_set() {
+        let sum_cfg = newt_core::SummarizerConfig {
+            endpoint: Some("http://REDACTED-HOST:11434".into()),
+            model: Some("qwen2.5-coder:3b".into()),
+            kind: Some(newt_core::BackendKind::Openai),
+            ..Default::default()
+        };
+        let (url, model, kind, key) = super::resolve_summarizer_backend(
+            &sum_cfg,
+            "http://REDACTED-HOST:11434",
+            "session-model:27b",
+            newt_core::BackendKind::Ollama,
+            &Some("session-key".into()),
+        );
+        assert_eq!(url, "http://REDACTED-HOST:11434");
+        assert_eq!(model, "qwen2.5-coder:3b");
+        assert_eq!(kind, newt_core::BackendKind::Openai);
+        // No key configured on the pinned endpoint → the session key is NOT
+        // leaked to the different host.
+        assert_eq!(key, None);
+    }
+
+    /// Step 24.10: an absent/default `summarizer.toml` reuses the session
+    /// backend verbatim (unchanged behavior), session key included.
+    #[test]
+    fn resolve_summarizer_backend_reuses_session_when_unset() {
+        let sum_cfg = newt_core::SummarizerConfig::default();
+        let (url, model, kind, key) = super::resolve_summarizer_backend(
+            &sum_cfg,
+            "http://REDACTED-HOST:11434",
+            "session-model:27b",
+            newt_core::BackendKind::Ollama,
+            &Some("session-key".into()),
+        );
+        assert_eq!(url, "http://REDACTED-HOST:11434");
+        assert_eq!(model, "session-model:27b");
+        assert_eq!(kind, newt_core::BackendKind::Ollama);
+        assert_eq!(key.as_deref(), Some("session-key"));
+    }
+
+    /// Step 24.10: the timeout / retries / fallback knobs come from
+    /// `SummarizerConfig`; `keep_alive` falls back to `[tui].keep_alive`.
+    #[test]
+    fn summarizer_opts_reads_from_summarizer_config() {
+        let sum_cfg = newt_core::SummarizerConfig {
+            timeout_secs: 45,
+            retries: 2,
+            fallback_model: Some("nemotron-mini:4b".into()),
+            ..Default::default()
+        };
+        let cfg = newt_core::Config::default();
+        let opts = super::summarizer_opts(&sum_cfg, &cfg, Some(8192), false);
+        assert_eq!(opts.timeout_secs, 45);
+        assert_eq!(opts.retries, 2);
+        assert_eq!(opts.fallback_model.as_deref(), Some("nemotron-mini:4b"));
+        assert_eq!(opts.num_ctx, Some(8192));
+        // No summarizer-specific keep_alive → inherits the [tui] default ("5m").
+        assert_eq!(opts.keep_alive, "5m");
     }
 
     /// Step 24.7 (#559): the live retry/fallback notice text.
