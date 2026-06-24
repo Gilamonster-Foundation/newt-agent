@@ -245,6 +245,10 @@ pub struct CrewTask {
     /// Files the subtask nominated as curated context (stamped verbatim by the
     /// runner at dispatch).
     pub context: Vec<String>,
+    /// The optional verify command that gates this task — forwarded to the crew
+    /// op so the child's work is checked before it is accepted (the #332
+    /// per-subtask gate). `None` = no per-task check.
+    pub verify: Option<String>,
 }
 
 impl Subtask {
@@ -261,6 +265,7 @@ impl Subtask {
             goal: self.instruction.clone(),
             caveats: parent.meet(&self.caveat_policy.to_caveats()),
             context: self.context.clone(),
+            verify: self.verify.clone(),
         }
     }
 }
