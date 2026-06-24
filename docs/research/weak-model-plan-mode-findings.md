@@ -79,6 +79,21 @@ proxy — later steps drop when the model forgets).
 Re-seat completed every step in every run where the baseline dropped half the
 later steps — the keystone fixes the user's "loses track" exactly when it occurs.
 
+**Recovery handler re-validation (option c, the recovery binary on the same task,
+N=3):**
+
+| model (recovery build) | functions / 8 | recovery fired |
+|---|---|---|
+| `qwen2.5-coder:14b` | **8, 8, 7** | 19–24 rounds/run |
+| `qwen3-coder:30b` | 4, 4, 7 | 0 (used native calls these runs) |
+
+`qwen2.5-coder:14b` went from **~0/8 (baseline — text-dumped JSON, never
+executed)** to **~7.7/8** with the recovery handler firing every round: a model
+that was *completely non-functional* now completes the task. That is the live
+proof of the **P0** fix. (`qwen3-coder` didn't emit the `<function=>` form in
+these runs, so recovery wasn't needed — recovery=0; its 4/8 is *drift*, i.e. the
+re-seat's job, not the recovery's.)
+
 ## Rig methodology (hardened — three confounds defeated)
 
 The experiment was wrong three times before it was right; the fixes are the rig:
@@ -95,15 +110,17 @@ The experiment was wrong three times before it was right; the fixes are the rig:
 
 ## Refined plan-mode design (priority-ordered by evidence)
 
-- **P0 — tool-call-format recovery handler + hallucination tracker.** Recover
-  fenced-JSON and `<function=>` tool calls from content; count/track
-  non-recoverable emissions as hallucinations. This is the evidence-#1 fix and
-  the next code task. Re-enters the existing `resolve_tool_alias`/`is_hallucination`
-  path (`tools.rs:274/304`).
-- **P1 — conditional re-seat** (on plan mutation / active-step delta, *not* every
-  round). **VALIDATED under drift** — 12-step fair-test: re-seat **12/12** vs
-  baseline **8/12** (drifts 2/3). Keep it, **gated on a drift signal** (or
-  re-seat on plan-mutation) so easy tasks skip the mild overhead it costs there.
+- **P0 — tool-call-format recovery handler + hallucination tracker → BUILT &
+  VALIDATED (#629; OpenAI parity merged).** Recovers fenced-JSON and `<function=>`
+  tool calls from content into native shape; counts non-recoverable emissions as
+  format-hallucinations. Live re-validation: `qwen2.5-coder:14b` 0/8 → ~7.7/8 (see
+  *Recovery handler re-validation* above). Re-enters the existing
+  `resolve_tool_alias`/`is_hallucination` path (`tools.rs:274/304`).
+- **P1 — conditional re-seat → BUILT (#631).** **VALIDATED under drift** —
+  12-step fair-test: re-seat **12/12** vs baseline **8/12** (drifts 2/3). Shipped
+  as a compact one-line active-step pointer, **gated to multi-step in-progress
+  plans** so easy tasks skip the mild overhead it costs there. (#631 also
+  supersedes the env-gated experiment that #629 carried to main by accident.)
 - **P2 — the overseer/crew split is the safe weak-model story** (a stronger seat
   authors the DAG; the weak model executes one bounded leaf, with templated tool
   calls that sidestep the format risk). Untouched by this data; still the most
