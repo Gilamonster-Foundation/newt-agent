@@ -70,6 +70,69 @@ impl Plan {
     pub fn to_toml_string(&self) -> Result<String, toml::ser::Error> {
         toml::to_string_pretty(self)
     }
+
+    /// The subtask with id `id`, if present.
+    #[must_use]
+    pub fn subtask(&self, id: &str) -> Option<&Subtask> {
+        self.subtasks.iter().find(|s| s.id == id)
+    }
+
+    /// Root subtasks — those with no [`Subtask::parent`] (the top of the
+    /// decomposition tree).
+    #[must_use]
+    pub fn roots(&self) -> Vec<&Subtask> {
+        self.subtasks
+            .iter()
+            .filter(|s| s.parent.is_none())
+            .collect()
+    }
+
+    /// Direct children of `id` — subtasks whose `parent` is `id`.
+    #[must_use]
+    pub fn children(&self, id: &str) -> Vec<&Subtask> {
+        self.subtasks
+            .iter()
+            .filter(|s| s.parent.as_deref() == Some(id))
+            .collect()
+    }
+
+    /// Leaves — subtasks that no other subtask names as `parent`. A leaf is the
+    /// dispatch/execute unit (a leaf *is* a `CrewTask`); a non-leaf is a branch
+    /// (grouping / aggregation). In a flat, single-level plan *every* subtask is a
+    /// leaf, so this degrades to "all subtasks" — the pre-tree behaviour, so
+    /// existing flat plans are unaffected.
+    #[must_use]
+    pub fn leaves(&self) -> Vec<&Subtask> {
+        let parented: std::collections::HashSet<&str> = self
+            .subtasks
+            .iter()
+            .filter_map(|s| s.parent.as_deref())
+            .collect();
+        self.subtasks
+            .iter()
+            .filter(|s| !parented.contains(s.id.as_str()))
+            .collect()
+    }
+
+    /// The next **ready leaf** to dispatch — the execution cursor. A [`leaf`] that
+    /// is [`SubtaskStatus::Pending`] and whose every [`dep`] is
+    /// [`SubtaskStatus::Done`]. `None` when nothing is ready (all done, every
+    /// pending leaf is dep-blocked, or work is in flight). A `dep` counts as
+    /// satisfied iff the named subtask exists and is `Done`; an absent (e.g.
+    /// cross-fragment) dep is treated as unsatisfied, so a plan never runs a leaf
+    /// ahead of a prerequisite it cannot see.
+    ///
+    /// [`leaf`]: Plan::leaves
+    /// [`dep`]: Subtask::deps
+    #[must_use]
+    pub fn next_ready_leaf(&self) -> Option<&Subtask> {
+        self.leaves().into_iter().find(|s| {
+            s.status == SubtaskStatus::Pending
+                && s.deps
+                    .iter()
+                    .all(|d| matches!(self.subtask(d).map(|t| t.status), Some(SubtaskStatus::Done)))
+        })
+    }
 }
 
 /// One unit of work in a [`Plan`] — the serialized form of a single scheduler
@@ -103,6 +166,17 @@ pub struct Subtask {
     /// `None` until the subtask has run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<String>,
+    /// The id of the subtask this one decomposes — `None` for a root. This is how
+    /// a flat `[[subtask]]` list expresses a task→sub-task **tree** (exactly as
+    /// [`Subtask::deps`] expresses a DAG via id-pointers, not nesting). A subtask
+    /// that no other subtask names as its `parent` is a **leaf** — the unit that
+    /// dispatches/executes (a leaf *is* a `CrewTask`); a subtask that *is* named
+    /// is a **branch** (a grouping / aggregation node). Kept flat on purpose: a
+    /// nested `Vec<Subtask>` would break the fragment handoff (one leaf slice =
+    /// one dispatch). `None` is also fine in a fragment whose parent lives outside
+    /// the slice (the pointer is soft, like a cross-fragment `dep`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
     /// The authority this subtask declares it needs. **Default-deny**: an
     /// omitted policy denies every capability axis (see [`CaveatPolicy`]).
     ///
@@ -110,6 +184,43 @@ pub struct Subtask {
     /// requires values before tables within a `[[subtask]]` entry.
     #[serde(default)]
     pub caveat_policy: CaveatPolicy,
+}
+
+/// A leaf [`Subtask`] projected into the unit a `CrewRunner` dispatches — the
+/// concrete realization of *"a leaf is a CrewTask"*. Produced by
+/// [`Subtask::to_crew_task`]; the runner adds placement (a `workspace_ref`) when
+/// it actually spawns the work, so it isn't carried here. No `id`/`deps`/`status`
+/// either — those are the plan's bookkeeping, not the child's concern.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CrewTask {
+    /// What the child agent is asked to do (the subtask's instruction).
+    pub goal: String,
+    /// The authority the child runs under — the parent's grant **met** with the
+    /// subtask's declared policy. `meet` is the greatest lower bound, so this can
+    /// only *narrow* the parent (attenuation, never amplify): a model-proposed
+    /// plan can never widen the grant it was handed.
+    pub caveats: Caveats,
+    /// Files the subtask nominated as curated context (stamped verbatim by the
+    /// runner at dispatch).
+    pub context: Vec<String>,
+}
+
+impl Subtask {
+    /// Project this subtask into the [`CrewTask`] the active topology's
+    /// `CrewRunner` dispatches — the *same* projection for `/mode
+    /// single|crew|mesh|remote`, so a plan authored once lifts across runners
+    /// unchanged. `caveats = parent.meet(self.caveat_policy.to_caveats())`: the
+    /// plan *requests*, the parent *grants*, `meet` *enforces ⊑* (attenuation
+    /// only). Intended for a **leaf** (see [`Plan::leaves`]); a branch is a
+    /// grouping node, not a dispatch unit.
+    #[must_use]
+    pub fn to_crew_task(&self, parent: &Caveats) -> CrewTask {
+        CrewTask {
+            goal: self.instruction.clone(),
+            caveats: parent.meet(&self.caveat_policy.to_caveats()),
+            context: self.context.clone(),
+        }
+    }
 }
 
 /// How child results combine back into the plan.
@@ -328,6 +439,7 @@ instruction = "x"
                 },
                 status: SubtaskStatus::Done,
                 result: Some("done".to_string()),
+                parent: Some("epic".to_string()),
             }],
         };
         let text = plan.to_toml_string().unwrap();
@@ -370,5 +482,158 @@ bogus_field = "should fail"
         assert!(plan.goal.is_none());
         assert!(plan.subtasks.is_empty());
         assert_eq!(plan.aggregation, Aggregation::Concat);
+    }
+
+    #[test]
+    fn parent_pointers_build_a_tree() {
+        // A root branch "epic" decomposes into two leaves; plus a top-level leaf.
+        let toml = r#"
+[[subtask]]
+id = "epic"
+instruction = "the big task"
+
+[[subtask]]
+id = "a"
+instruction = "sub-task a"
+parent = "epic"
+
+[[subtask]]
+id = "b"
+instruction = "sub-task b"
+parent = "epic"
+
+[[subtask]]
+id = "solo"
+instruction = "a top-level leaf"
+"#;
+        let plan = Plan::from_toml_str(toml).unwrap();
+        let ids = |v: Vec<&Subtask>| v.iter().map(|s| s.id.clone()).collect::<Vec<_>>();
+        assert_eq!(ids(plan.roots()), vec!["epic", "solo"]);
+        assert_eq!(ids(plan.children("epic")), vec!["a", "b"]);
+        // epic is a branch (named as a parent) → not a leaf; a, b, solo are leaves.
+        assert_eq!(ids(plan.leaves()), vec!["a", "b", "solo"]);
+        assert_eq!(plan.subtask("a").unwrap().parent.as_deref(), Some("epic"));
+    }
+
+    #[test]
+    fn flat_plan_has_every_subtask_as_a_leaf() {
+        // Pre-tree behaviour preserved: no parents → every subtask is a leaf.
+        let plan = Plan::from_toml_str(
+            "[[subtask]]\nid=\"s1\"\ninstruction=\"x\"\n[[subtask]]\nid=\"s2\"\ninstruction=\"y\"\n",
+        )
+        .unwrap();
+        assert_eq!(plan.leaves().len(), 2);
+        assert_eq!(plan.roots().len(), 2);
+    }
+
+    #[test]
+    fn next_ready_leaf_is_the_execution_cursor() {
+        // a Done; b Pending with dep a (Done) → b is the ready leaf. c is
+        // dep-blocked (b not Done); epic is a branch, never a dispatch unit.
+        let toml = r#"
+[[subtask]]
+id = "epic"
+instruction = "branch"
+
+[[subtask]]
+id = "a"
+instruction = "first leaf"
+parent = "epic"
+status = "done"
+
+[[subtask]]
+id = "b"
+instruction = "second leaf"
+parent = "epic"
+deps = ["a"]
+
+[[subtask]]
+id = "c"
+instruction = "third leaf"
+parent = "epic"
+deps = ["b"]
+"#;
+        let plan = Plan::from_toml_str(toml).unwrap();
+        assert_eq!(plan.next_ready_leaf().expect("b ready").id, "b");
+    }
+
+    #[test]
+    fn next_ready_leaf_none_when_all_done_or_blocked() {
+        // a Done, b blocked on an absent dep → no ready leaf.
+        let toml = r#"
+[[subtask]]
+id = "a"
+instruction = "done"
+status = "done"
+
+[[subtask]]
+id = "b"
+instruction = "blocked"
+deps = ["never_exists"]
+"#;
+        let plan = Plan::from_toml_str(toml).unwrap();
+        assert!(plan.next_ready_leaf().is_none());
+    }
+
+    #[test]
+    fn parent_defaults_none_and_fragment_stays_valid() {
+        // Fragment-validity: a bare subtask whose parent lives outside the slice
+        // still parses (the pointer is soft); an omitted parent defaults to None.
+        let frag = Plan::from_toml_str(
+            "[[subtask]]\nid=\"leaf\"\ninstruction=\"x\"\nparent=\"outside_the_slice\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            frag.subtasks[0].parent.as_deref(),
+            Some("outside_the_slice")
+        );
+        let root = Plan::from_toml_str("[[subtask]]\nid=\"r\"\ninstruction=\"y\"\n").unwrap();
+        assert!(root.subtasks[0].parent.is_none());
+        assert_eq!(root.roots().len(), 1);
+    }
+
+    #[test]
+    fn to_crew_task_projects_goal_context_and_attenuated_caveats() {
+        // A leaf declaring fs_write=["src/"] only; the parent grants everything.
+        let toml = r#"
+[[subtask]]
+id = "leaf"
+instruction = "write the module"
+context = ["src/lib.rs"]
+
+[subtask.caveat_policy]
+fs_write = ["src/"]
+"#;
+        let plan = Plan::from_toml_str(toml).unwrap();
+        let task = plan.subtasks[0].to_crew_task(&Caveats::top());
+        assert_eq!(task.goal, "write the module");
+        assert_eq!(task.context, vec!["src/lib.rs".to_string()]);
+        // The child gets exactly what it declared (parent=top allows all):
+        assert_eq!(task.caveats.fs_write, Scope::only(["src/".to_string()]));
+        // Everything else stays DENIED (default-deny leaf) — never widened to top.
+        assert_eq!(task.caveats.fs_read, Scope::none());
+        assert_eq!(task.caveats.exec, Scope::none());
+        assert_eq!(task.caveats.net, Scope::none());
+    }
+
+    #[test]
+    fn to_crew_task_never_widens_past_the_parent() {
+        // The leaf REQUESTS fs_read=all, but the parent only GRANTS fs_read=["a/"];
+        // meet clamps the request to the grant — attenuation, never amplify.
+        let toml = r#"
+[[subtask]]
+id = "leaf"
+instruction = "x"
+
+[subtask.caveat_policy]
+fs_read = "all"
+"#;
+        let plan = Plan::from_toml_str(toml).unwrap();
+        let parent = Caveats {
+            fs_read: Scope::only(["a/".to_string()]),
+            ..Caveats::top()
+        };
+        let task = plan.subtasks[0].to_crew_task(&parent);
+        assert_eq!(task.caveats.fs_read, Scope::only(["a/".to_string()]));
     }
 }
