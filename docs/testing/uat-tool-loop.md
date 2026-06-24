@@ -91,6 +91,25 @@ run through `newt code` in an isolated sandbox `HOME`, with a **dual assertion**
 S1–S4 are capability/correctness UAT; **S5–S7 are the adversarial failure-mode
 UAT** that exercise the loop guards the golden-diff cases never trigger.
 
+## Prerequisite — real shell (`just install-real`)
+
+`run_command` (the confined brush shell) is a **fail-closed stub** on the
+default/release build — the crates.io-safe build returns *"temporarily unavailable
+in this build"* yet still advertises the tool. So **any scenario that exercises
+`run_command` (S6/S7, and `run`-shaped prompts) must first install the real
+shell**, or it is testing dead-tool handling rather than the shell:
+
+```bash
+just install-real     # swaps in the real brush OCAP shell (clean + shell-real + install)
+# … run the UAT against $HOME/bin/newt …
+just shell-stub       # restore the stub before committing (the CI shell-check guard rejects the git dep)
+```
+
+This is a **standing stopgap until reubeno/brush#1184** (the upstream
+`CommandInterceptor`) is accepted; then the real shell is the default and
+`install-real` is unnecessary. The non-shell scenarios (S1–S5) run fine on the
+stub build, so a capability-only pass needs no `install-real`.
+
 ## Running it
 
 ```bash

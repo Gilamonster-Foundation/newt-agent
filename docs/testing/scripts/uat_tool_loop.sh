@@ -31,6 +31,11 @@ NEWT_BIN="${NEWT_BIN:-${CARGO_TARGET_DIR:-target}/release/newt}"
 R="${UAT_WORKDIR:-/tmp/newt-uat-tool-loop}"
 mkdir -p "$R"
 [ -x "$NEWT_BIN" ] || { echo "newt binary not found at $NEWT_BIN (build: cargo build --release --bin newt)"; exit 2; }
+# Shell-dependent scenarios (S6/S7, run-shaped prompts) need the REAL brush shell:
+# run `just install-real` first (and point NEWT_BIN at $HOME/bin/newt) until
+# reubeno/brush#1184 lands, else run_command is the dead stub. S1-S5 are fine on
+# the default build. (See docs/testing/uat-tool-loop.md → Prerequisite.)
+echo "[uat] note: run_command needs 'just install-real' (real brush shell) until brush#1184; S1-S5 are fine on the stub build." >&2
 
 run(){ # $1=ws  $2=promptfile  $3=max_tool_rounds(optional)
   local ws=$1 pf=$2 cap=${3:-} SB; SB=$(mktemp -d "$R/home.XXXXXX")
