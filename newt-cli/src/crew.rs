@@ -30,6 +30,15 @@ pub fn infer_test_command(dir: &Path) -> Option<String> {
     }
 }
 
+/// Is `path` a safe in-worktree edit target — relative, with no `..` escape?
+/// `Path::join` discards the base for an absolute path, so this guard (not the
+/// `fs_write` caveat, which is `Scope::All` on the crew/plan path) is the real
+/// worktree boundary on the apply path.
+fn is_safe_worktree_path(path: &str) -> bool {
+    let p = Path::new(path);
+    !p.is_absolute() && !p.components().any(|c| c == std::path::Component::ParentDir)
+}
+
 /// Run `git <args>` in `dir`, returning trimmed stdout on success.
 fn git(dir: &Path, args: &[&str]) -> anyhow::Result<String> {
     let out = Command::new("git").args(args).current_dir(dir).output()?;
@@ -173,6 +182,15 @@ impl Workspace for WorktreeWorkspace {
     fn apply(&mut self, edits: &[Edit]) -> Vec<String> {
         let mut written = Vec::new();
         for e in edits {
+            // STRUCTURAL worktree boundary: refuse an absolute or `..`-escaping
+            // edit path. `Path::join` silently discards the base for an absolute
+            // path (`worktree.join("/etc/passwd") == "/etc/passwd"`), so the
+            // fs_write caveat — often `Scope::All` on the crew/plan path — is NOT
+            // the boundary; this guard is. Closes the escape for `newt crew` and
+            // `newt plan` alike.
+            if !is_safe_worktree_path(&e.path) {
+                continue;
+            }
             let full = self.worktree.join(&e.path);
             if let Some(parent) = full.parent() {
                 let _ = std::fs::create_dir_all(parent);
@@ -239,6 +257,136 @@ pub struct CrewArgs {
 pub async fn run_cli(args: CrewArgs) -> anyhow::Result<i32> {
     let cfg = Config::resolve().map_err(|e| anyhow::anyhow!("config: {e}"))?;
     run_with(&cfg, args, &LocalDispatcher).await
+}
+
+/// Args for `newt plan <file>` — preview, or `--execute` an overseer-authored plan.
+pub struct PlanArgs {
+    pub file: PathBuf,
+    pub dir: Option<PathBuf>,
+    /// Actually dispatch the crews. The default is preview-only, so autonomous
+    /// multi-crew execution always needs this second, explicit affirmation.
+    pub execute: bool,
+    /// Refuse to execute a plan with more leaves than this without an explicit
+    /// raise — each leaf is an autonomous crew with no per-leaf human review.
+    pub max_leaves: usize,
+}
+
+/// A one-screen preview of a plan: goal, subtask count, and the **leaves** (the
+/// dispatch units) with their deps. A dep that names a non-leaf (a branch, never
+/// dispatched) or an absent id is flagged `[will stall]` — it can never reach
+/// `Done`, so a leaf waiting on it would never run. Pure (no fs, no dispatch) so
+/// the preview and the unit tests share it.
+pub fn render_plan_preview(plan: &newt_core::plan::Plan) -> String {
+    use std::collections::HashSet;
+    let leaves = plan.leaves();
+    let leaf_ids: HashSet<&str> = leaves.iter().map(|s| s.id.as_str()).collect();
+    let mut out = String::new();
+    if let Some(g) = &plan.goal {
+        out.push_str(&format!("goal: {g}\n"));
+    }
+    out.push_str(&format!(
+        "{} subtask(s); {} leaf/leaves to dispatch:\n",
+        plan.subtasks.len(),
+        leaves.len()
+    ));
+    for leaf in &leaves {
+        let after = if leaf.deps.is_empty() {
+            String::new()
+        } else {
+            let deps: Vec<String> = leaf
+                .deps
+                .iter()
+                .map(|d| {
+                    if leaf_ids.contains(d.as_str()) {
+                        d.clone()
+                    } else {
+                        // not a leaf (a branch, or an absent id) → never Done.
+                        format!("{d} [will stall]")
+                    }
+                })
+                .collect();
+            format!("  (after {})", deps.join(", "))
+        };
+        out.push_str(&format!("  • {} — {}{after}\n", leaf.id, leaf.instruction));
+    }
+    out
+}
+
+/// `newt plan <file>` — PREVIEW an overseer-authored plan, or (`--execute`)
+/// dispatch it leaf-by-leaf via a crew (each leaf in its own worktree, through the
+/// same `LocalCrewRunner` the in-session `crew` tool uses).
+///
+/// Preview is the **default** because `--execute` runs an autonomous DAG of crews
+/// with no per-leaf human review (the per-leaf `verify` is the only gate); it is
+/// bounded by `--max-leaves`. The run-log (statuses + results) is written to a
+/// sibling `<file>.run.toml` — the authored source file is **never modified**.
+/// Exit 0 = preview / complete, 1 = incomplete (failed or stalled).
+pub async fn run_plan_cli(args: PlanArgs) -> anyhow::Result<i32> {
+    let toml = std::fs::read_to_string(&args.file)
+        .map_err(|e| anyhow::anyhow!("read {}: {e}", args.file.display()))?;
+    let mut plan = newt_core::plan::Plan::from_toml_str(&toml)
+        .map_err(|e| anyhow::anyhow!("parse plan {}: {e}", args.file.display()))?;
+    println!("plan: {}", args.file.display());
+    print!("{}", render_plan_preview(&plan));
+    if !args.execute {
+        println!("\n(preview only — re-run with --execute to dispatch one crew per leaf)");
+        return Ok(0);
+    }
+    // Autonomy bound: refuse an oversized autonomous fan-out unless the human
+    // explicitly raises the cap (each leaf runs with no per-leaf review).
+    let leaf_count = plan.leaves().len();
+    if leaf_count > args.max_leaves {
+        return Err(anyhow::anyhow!(
+            "plan has {leaf_count} leaves (> --max-leaves {}); each is an autonomous crew with no \
+             per-leaf review. Re-run with `--max-leaves {leaf_count}` to confirm you intend to run \
+             them all.",
+            args.max_leaves
+        ));
+    }
+    let cfg = Config::resolve().map_err(|e| anyhow::anyhow!("config: {e}"))?;
+    let dir = args
+        .dir
+        .clone()
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    println!("executing {leaf_count} leaf/leaves autonomously (one crew each; per-leaf verify gates each)…");
+    // Honest, non-top session caveats (mirrors `newt crew`): fs_write=All — the
+    // real boundary is the per-leaf worktree + the apply-path guard
+    // (`is_safe_worktree_path`), NOT this caveat — exec/net locked, so a
+    // plan-authored `verify` needing exec is dropped fail-closed (#634). Invoking
+    // `--execute` is the human gesture, modelled as `Presence::Prompt` (the BOOT
+    // attest ceremony is #472).
+    let caveats = newt_acp_worker::worker_session_caveats(None);
+    let runner =
+        crate::crew_runner::LocalCrewRunner::new(cfg, dir, newt_core::agentic::Presence::Prompt);
+    let run = newt_core::agentic::run_plan(&mut plan, &caveats, &runner).await;
+    for id in &run.dispatched {
+        if let Some(s) = plan.subtask(id) {
+            println!("  [{:?}] {}", s.status, id);
+        }
+    }
+    if let Some(e) = &run.failed {
+        println!("✗ stopped at a failed leaf: {e}");
+    }
+    if !run.remaining.is_empty() {
+        println!("remaining (blocked/stalled): {}", run.remaining.join(", "));
+    }
+    println!(
+        "{}",
+        if run.complete {
+            "✓ plan complete"
+        } else {
+            "plan incomplete"
+        }
+    );
+    // Write the run-log (statuses + results) to a SIBLING artifact — never modify
+    // the authored source file — and only when work actually ran.
+    if !run.dispatched.is_empty() {
+        let log = args.file.with_extension("run.toml");
+        std::fs::write(&log, plan.to_toml_string()?)
+            .map_err(|e| anyhow::anyhow!("write run-log {}: {e}", log.display()))?;
+        println!("run-log → {}", log.display());
+    }
+    Ok(i32::from(!run.complete))
 }
 
 /// The testable core: same as [`run_cli`] but with the inference `Dispatcher`
@@ -409,6 +557,64 @@ fn render(o: &CrewOutcome, worktree: &Path) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plan_preview_lists_leaves_and_their_deps() {
+        // Pure (in-memory plan, no fs): the preview shows the goal, the subtask
+        // count, and the LEAVES (dispatch units) — a branch is not listed.
+        let plan = newt_core::plan::Plan::from_toml_str(
+            "goal = \"ship it\"\n\
+             [[subtask]]\nid=\"epic\"\ninstruction=\"big\"\n\
+             [[subtask]]\nid=\"a\"\ninstruction=\"do a\"\nparent=\"epic\"\n\
+             [[subtask]]\nid=\"b\"\ninstruction=\"do b\"\nparent=\"epic\"\ndeps=[\"a\"]\n",
+        )
+        .unwrap();
+        let preview = render_plan_preview(&plan);
+        assert!(preview.contains("goal: ship it"), "{preview}");
+        assert!(preview.contains("3 subtask(s); 2 leaf"), "{preview}");
+        assert!(preview.contains("• a — do a"), "{preview}");
+        assert!(preview.contains("• b — do b  (after a)"), "{preview}");
+        assert!(
+            !preview.contains("• epic"),
+            "a branch is not a dispatch unit"
+        );
+        assert!(!preview.contains("will stall"), "a-leaf dep is satisfiable");
+    }
+
+    #[test]
+    fn plan_preview_flags_deps_that_will_stall() {
+        // A leaf depending on a BRANCH (epic, never dispatched) or an ABSENT id
+        // can never reach Done → flag it so the preview reveals an unrunnable plan.
+        let plan = newt_core::plan::Plan::from_toml_str(
+            "[[subtask]]\nid=\"epic\"\ninstruction=\"branch\"\n\
+             [[subtask]]\nid=\"a\"\ninstruction=\"do a\"\nparent=\"epic\"\ndeps=[\"epic\"]\n\
+             [[subtask]]\nid=\"b\"\ninstruction=\"do b\"\nparent=\"epic\"\ndeps=[\"ghost\"]\n",
+        )
+        .unwrap();
+        let preview = render_plan_preview(&plan);
+        assert!(
+            preview.contains("epic [will stall]"),
+            "branch dep: {preview}"
+        );
+        assert!(
+            preview.contains("ghost [will stall]"),
+            "absent dep: {preview}"
+        );
+    }
+
+    #[test]
+    fn worktree_path_guard_refuses_absolute_and_dotdot() {
+        // The structural worktree boundary (Path::join discards the base for an
+        // absolute path, so fs_write=All is not the boundary — this guard is).
+        assert!(is_safe_worktree_path("src/lib.rs"));
+        assert!(is_safe_worktree_path("a/b/c.txt"));
+        assert!(!is_safe_worktree_path("/etc/passwd"), "absolute escapes");
+        assert!(
+            !is_safe_worktree_path("../../../etc/cron.d/x"),
+            ".. escapes"
+        );
+        assert!(!is_safe_worktree_path("a/../../b"), "embedded .. escapes");
+    }
 
     /// A throwaway git repo with one committed file at `name` containing `body`.
     fn git_repo() -> tempfile::TempDir {

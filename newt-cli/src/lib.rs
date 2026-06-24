@@ -271,6 +271,28 @@ pub enum Command {
         #[arg(long, default_value_t = false)]
         dry_run: bool,
     },
+    /// PREVIEW an overseer-authored plan (a `plan::Plan` TOML), or `--execute` it
+    /// leaf-by-leaf via a crew — each leaf in its own worktree, in dependency
+    /// order, stopping at the first failure. Preview is the default: `--execute`
+    /// runs an autonomous DAG of crews with no per-leaf review (bounded by
+    /// `--max-leaves`). The run-log lands in a sibling `<file>.run.toml`; the
+    /// source is never modified. Exit 0 = preview/complete, 1 = incomplete.
+    Plan {
+        /// The plan TOML file: a `[[subtask]]` list, optionally a tree (`parent`)
+        /// and a DAG (`deps`). Each subtask may declare `caveat_policy` + `verify`.
+        file: PathBuf,
+        /// Target repo dir (default: current dir). Must be a git repo.
+        #[arg(long)]
+        dir: Option<PathBuf>,
+        /// Actually dispatch the crews. Without this, `newt plan` only PREVIEWS —
+        /// autonomous multi-crew execution needs this explicit second affirmation.
+        #[arg(long, default_value_t = false)]
+        execute: bool,
+        /// Refuse to execute a plan with more leaves than this without an explicit
+        /// raise (each leaf is an autonomous crew with no per-leaf review).
+        #[arg(long, default_value_t = 8)]
+        max_leaves: usize,
+    },
     /// Health-check local backends + provider plugins.
     Doctor,
     /// Print resolved config.
@@ -680,6 +702,24 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
                 test,
                 max_attempts,
                 dry_run,
+            })
+            .await?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(())
+        }
+        Command::Plan {
+            file,
+            dir,
+            execute,
+            max_leaves,
+        } => {
+            let code = crew::run_plan_cli(crew::PlanArgs {
+                file,
+                dir,
+                execute,
+                max_leaves,
             })
             .await?;
             if code != 0 {
