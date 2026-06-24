@@ -30,13 +30,20 @@ pub fn infer_test_command(dir: &Path) -> Option<String> {
     }
 }
 
-/// Is `path` a safe in-worktree edit target — relative, with no `..` escape?
-/// `Path::join` discards the base for an absolute path, so this guard (not the
-/// `fs_write` caveat, which is `Scope::All` on the crew/plan path) is the real
-/// worktree boundary on the apply path.
+/// Is `path` a safe in-worktree edit target — built only from `Normal` (and `.`)
+/// components, so no root/drive prefix and no `..` escape? `Path::join` discards
+/// the base for an absolute path, so this guard (not the `fs_write` caveat, which
+/// is `Scope::All` on the crew/plan path) is the real worktree boundary.
+///
+/// Checked by components, NOT `is_absolute()`: on Windows `/etc/passwd` is
+/// root-relative and `is_absolute()` is `false`, so an `is_absolute` guard would
+/// wrongly admit it. A `RootDir` / drive `Prefix` / `ParentDir` component is
+/// refused on every platform.
 fn is_safe_worktree_path(path: &str) -> bool {
-    let p = Path::new(path);
-    !p.is_absolute() && !p.components().any(|c| c == std::path::Component::ParentDir)
+    use std::path::Component;
+    Path::new(path)
+        .components()
+        .all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
 }
 
 /// Run `git <args>` in `dir`, returning trimmed stdout on success.
