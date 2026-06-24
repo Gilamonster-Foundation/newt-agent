@@ -26,6 +26,9 @@ pub(crate) mod experiential;
 pub(crate) mod scheduled;
 // Step 26.3 (#584): tool-output offloading — the `tool_offload` context feature.
 pub(crate) mod spill;
+/// Recover tool calls a weak model emitted in CONTENT instead of the native
+/// `tool_calls` field (the #1 weak-model failure — see the module docs).
+pub(crate) mod tool_recovery;
 // Issue #308 — the cowork foundation: a non-blocking turn driver around
 // `chat_complete` (driver), a renderer-agnostic transcript render (transcript),
 // and the redaction-gated ShellObservation seam (observation). All additive;
@@ -1134,6 +1137,36 @@ pub async fn chat_complete(
             }
         }
 
+        // EXPERIMENT (A/B, env-gated NEWT_RESEAT_PLAN=1): re-seat the LIVE
+        // plan/state every round so a weak model doesn't lose track of its plan.
+        // Baseline injects <plan> once at turn-0 and it goes stale; this re-shows
+        // the current ACTIVE step + state each round. Ollama-loop only. Not merged.
+        if round > 0 && std::env::var("NEWT_RESEAT_PLAN").as_deref() == Ok("1") {
+            let mut reseat = String::new();
+            if let Some(led) = step_ledger {
+                if let Some(p) = plan_block(led) {
+                    reseat.push_str(&p);
+                }
+            }
+            if let Some(sc) = scratchpad_store {
+                if let Some(s) = scratchpad_state_block(sc) {
+                    if !reseat.is_empty() {
+                        reseat.push('\n');
+                    }
+                    reseat.push_str(&s);
+                }
+            }
+            if !reseat.is_empty() {
+                messages.push(serde_json::json!({
+                    "role": "user",
+                    "content": format!(
+                        "[Reminder — your current plan and state. Keep working the ACTIVE \
+                         step; do not restart or forget earlier steps.]\n{reseat}"
+                    )
+                }));
+            }
+        }
+
         // Read-only round nudge: if the model has spent several consecutive
         // rounds only reading (list_dir / read_file / web_fetch / search /
         // use_skill) without writing anything, inject a brief reminder to
@@ -1476,8 +1509,32 @@ pub async fn chat_complete(
         // model's reply if the subsequent streaming re-issue returns empty.
         let probe_content = message["content"].as_str().unwrap_or("").to_string();
 
-        let tool_calls = message["tool_calls"].as_array();
+        let native_calls = message["tool_calls"].as_array();
+        // Recover tool calls a weak model emitted in CONTENT instead of the
+        // native `tool_calls` field — the #1 weak-model failure (see
+        // `tool_recovery`). Only attempted when the native array is empty;
+        // recovered calls are produced in native shape and flow unchanged into
+        // the executor + `is_hallucination` + dup-guard + caveat path below.
+        let recovered = if native_calls.map(|t| t.is_empty()).unwrap_or(true) {
+            tool_recovery::recover_tool_calls(&probe_content)
+        } else {
+            tool_recovery::Recovery::default()
+        };
+        let tool_calls: Option<&Vec<serde_json::Value>> = match native_calls {
+            Some(t) if !t.is_empty() => Some(t),
+            _ if !recovered.calls.is_empty() => Some(&recovered.calls),
+            _ => None,
+        };
         let has_tools = tool_calls.map(|tc| !tc.is_empty()).unwrap_or(false);
+        if debug && !recovered.calls.is_empty() {
+            print_debug(
+                &format!(
+                    "recovered {} tool call(s) from content (non-native emission)",
+                    recovered.calls.len()
+                ),
+                color,
+            );
+        }
 
         if debug {
             let content_excerpt = if probe_content.is_empty() {
@@ -1504,6 +1561,18 @@ pub async fn chat_complete(
         }
 
         if !has_tools {
+            // Format-hallucination tracker: the content looked like a tool-call
+            // attempt but could not be recovered into one — count it so cap-exit
+            // and metrics see a tooling failure, not a clean final answer.
+            if recovered.tool_shaped {
+                hallucination_count += 1;
+                if debug {
+                    print_debug(
+                        "format-hallucination: tool call emitted as unrecoverable text",
+                        color,
+                    );
+                }
+            }
             // No tool calls — re-issue with stream:true so the user sees tokens.
             // `messages` already contains the task; just replay with streaming.
             //
@@ -2752,8 +2821,33 @@ pub async fn openai_chat_complete(
 
         let message = &json["choices"][0]["message"];
 
-        let tool_calls = message["tool_calls"].as_array();
+        let oa_content = message["content"].as_str().unwrap_or("").to_string();
+        let native_calls = message["tool_calls"].as_array();
+        // Recover tool calls emitted as content instead of the native field —
+        // the #1 weak-model failure (see `tool_recovery`). Mirror of the Ollama
+        // loop: a local vLLM/llama.cpp server reports OpenAI-wire, so weak models
+        // there drop content-emitted calls too. Recovered calls are native-shaped
+        // and flow into the executor + is_hallucination path below.
+        let recovered = if native_calls.map(|t| t.is_empty()).unwrap_or(true) {
+            tool_recovery::recover_tool_calls(&oa_content)
+        } else {
+            tool_recovery::Recovery::default()
+        };
+        let tool_calls: Option<&Vec<serde_json::Value>> = match native_calls {
+            Some(t) if !t.is_empty() => Some(t),
+            _ if !recovered.calls.is_empty() => Some(&recovered.calls),
+            _ => None,
+        };
         let has_tools = tool_calls.map(|tc| !tc.is_empty()).unwrap_or(false);
+        if debug && !recovered.calls.is_empty() {
+            print_debug(
+                &format!(
+                    "recovered {} tool call(s) from content (non-native emission)",
+                    recovered.calls.len()
+                ),
+                color,
+            );
+        }
 
         if debug {
             let content = message["content"].as_str().unwrap_or("");
@@ -2772,6 +2866,17 @@ pub async fn openai_chat_complete(
         }
 
         if !has_tools {
+            // Format-hallucination tracker (mirror of the Ollama loop): content
+            // that looked like a tool call but couldn't be recovered is counted.
+            if recovered.tool_shaped {
+                hallucination_count += 1;
+                if debug {
+                    print_debug(
+                        "format-hallucination: tool call emitted as unrecoverable text",
+                        color,
+                    );
+                }
+            }
             let content = message["content"].as_str().unwrap_or("").to_string();
             if content.is_empty() && debug {
                 print_debug(
