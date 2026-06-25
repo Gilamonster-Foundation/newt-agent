@@ -174,6 +174,23 @@ audit:
     fi
     cargo audit
 
+# --- MSRV (A2) ---
+
+# MSRV gate: the workspace must compile on the declared rust-version (1.88,
+# [workspace.package] in Cargo.toml). PIPELINE PARITY: mirrors the "MSRV
+# (Rust 1.88)" job in .github/workflows/ci.yml and the .githooks/pre-push hook.
+# Local best-effort: needs rustup + the 1.88 toolchain; skips (with a note)
+# otherwise — CI is the hard gate.
+msrv:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    if ! rustup toolchain list 2>/dev/null | grep -q '^1\.88'; then
+        echo "[msrv] rust 1.88 toolchain not installed — skipping locally (CI enforces it)."
+        echo "        install: rustup toolchain install 1.88"
+        exit 0
+    fi
+    cargo +1.88 check --workspace
+
 # --- Coverage ---
 #
 # Coverage is gated at 80% workspace-wide from Step 0.3 onward. The
