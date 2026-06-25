@@ -1,0 +1,24 @@
+# cargo-audit config — the A1 security gate's ignore-list.
+#
+# PIPELINE PARITY: consumed by `just audit`, mirrored by the "Security audit" job
+# in .github/workflows/ci.yml and the .githooks/pre-push hook. When editing this
+# list, the gate behavior changes everywhere at once (one source of truth).
+#
+# These are PRE-EXISTING advisories in the TRANSITIVE dependency tree, accepted-
+# and-TRACKED in issue #656 — surfaced, NOT hidden, and scheduled for remediation.
+# The gate stays meaningful: ANY new advisory outside this list fails the build.
+# Trim entries as #656 lands dep bumps.
+[advisories]
+ignore = [
+    # real vulns — tracked in #656 (remediate via dep bumps / reachability review)
+    "RUSTSEC-2023-0071", # rsa: Marvin timing sidechannel; no fixed upstream release yet
+    "RUSTSEC-2026-0119", # hickory-proto: DoS (O(n^2) name compression)
+    "RUSTSEC-2026-0176", # pyo3: OOB read in PyList/PyTuple iterators (wheel only)
+    "RUSTSEC-2026-0177", # pyo3: missing Sync bound on new_closure (wheel only)
+    "RUSTSEC-2026-0185", # quinn-proto: remote memory exhaustion (QUIC transitive)
+    # unmaintained / unsound — deep transitive, no drop-in fix
+    "RUSTSEC-2025-0141", # bincode unmaintained
+    "RUSTSEC-2024-0436", # paste unmaintained
+    "RUSTSEC-2024-0320", # yaml-rust unmaintained
+    "RUSTSEC-2026-0002", # lru unsound (IterMut stacked-borrows)
+]

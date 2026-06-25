@@ -157,6 +157,23 @@ check-mesh:
     cargo clippy --manifest-path newt-mesh/Cargo.toml --all-targets -- -D warnings
     cargo test --manifest-path newt-mesh/Cargo.toml
 
+# --- Security audit (A1) ---
+
+# Security advisory gate. Fails on any RustSec advisory NOT in the tracked
+# ignore-list (.cargo/audit.toml — pre-existing transitive advisories, issue
+# #656). PIPELINE PARITY: mirrors the "Security audit (cargo-audit)" job in
+# .github/workflows/ci.yml and the .githooks/pre-push hook. Local best-effort:
+# skips (with a note) if cargo-audit isn't installed — CI is the hard gate.
+audit:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    if ! cargo audit --version >/dev/null 2>&1; then
+        echo "[audit] cargo-audit not installed — skipping locally (CI enforces it)."
+        echo "        install: cargo install cargo-audit"
+        exit 0
+    fi
+    cargo audit
+
 # --- Coverage ---
 #
 # Coverage is gated at 80% workspace-wide from Step 0.3 onward. The
