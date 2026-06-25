@@ -73,14 +73,16 @@ pub struct WorktreeWorkspace {
 }
 
 impl WorktreeWorkspace {
-    /// Create a detached worktree at `<base>/.newt/worktrees/<id>` off `HEAD`.
-    /// `base` must be a git repo with at least one commit.
-    pub fn create(base: &Path, id: &str, test_cmd: String) -> anyhow::Result<Self> {
+    /// Create a detached worktree at `<base>/.newt/worktrees/<id>` off
+    /// `base_ref` (any git commit-ish — a sha, branch, or `HEAD`). `base` must be
+    /// a git repo with at least one commit.
+    pub fn create(base: &Path, id: &str, base_ref: &str, test_cmd: String) -> anyhow::Result<Self> {
         let worktree = base.join(".newt").join("worktrees").join(id);
         if let Some(parent) = worktree.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        // --detach: a free-floating checkout of HEAD, not a new branch.
+        // --detach: a free-floating checkout of `base_ref` (the cumulative chain
+        // tip), not a new branch.
         git(
             base,
             &[
@@ -88,7 +90,7 @@ impl WorktreeWorkspace {
                 "add",
                 "--detach",
                 worktree.to_str().unwrap_or_default(),
-                "HEAD",
+                base_ref,
             ],
         )?;
         Ok(Self {
@@ -790,7 +792,7 @@ async fn run_with(
     // drives failover (an unreachable backend errors → next candidate → `None`),
     // which keeps the loop honest without a probe round-trip.
     let pool = BackendPool::from_source(&StaticSource::from_configs(cfg.backends.iter()));
-    let mut ws = WorktreeWorkspace::create(&dir, &worktree_id(), test_cmd)?;
+    let mut ws = WorktreeWorkspace::create(&dir, &worktree_id(), "HEAD", test_cmd)?;
     let crew_cfg = CrewConfig {
         navigator_model,
         planner_model,
@@ -1011,7 +1013,8 @@ mod tests {
         // #521: a crew read is fenced to the worktree — an absolute / `..` path
         // can't escape to the host, while a legitimate relative read still works.
         let repo = git_repo();
-        let ws = WorktreeWorkspace::create(repo.path(), &worktree_id(), "true".into()).unwrap();
+        let ws =
+            WorktreeWorkspace::create(repo.path(), &worktree_id(), "HEAD", "true".into()).unwrap();
         assert_eq!(ws.read("hello.txt").as_deref(), Some("world\n"));
         assert!(ws.read("/etc/hostname").is_none(), "absolute read refused");
         assert!(
@@ -1146,7 +1149,8 @@ mod tests {
     #[test]
     fn commit_to_branch_lands_work_visible_to_base() {
         let repo = git_repo();
-        let mut ws = WorktreeWorkspace::create(repo.path(), "land1", "true".into()).unwrap();
+        let mut ws =
+            WorktreeWorkspace::create(repo.path(), "land1", "HEAD", "true".into()).unwrap();
         ws.apply(&[Edit {
             path: "added.rs".into(),
             new_content: "pub fn f() {}\n".into(),
@@ -1172,9 +1176,51 @@ mod tests {
     }
 
     #[test]
+    fn leaf_chains_off_prior_landed_tip() {
+        // Leaf composition (#646): leaf B forks off leaf A's LANDED tip, so it
+        // SEES A's work and its branch consolidates both — the property that
+        // makes a multi-leaf one-shot run produce one coherent change instead of
+        // N scattered single-step branches. (Real-fs tier; migrate per #514.)
+        let repo = git_repo();
+
+        // Leaf A: edit a.txt off HEAD, land crew/a.
+        let mut wsa = WorktreeWorkspace::create(repo.path(), "a", "HEAD", "true".into()).unwrap();
+        wsa.apply(&[Edit {
+            path: "a.txt".into(),
+            new_content: "A\n".into(),
+        }]);
+        let (_a, sha_a) = wsa.commit_to_branch("crew/a", "n", "n@b", "a").unwrap();
+        drop(wsa);
+
+        // Leaf B forks off A's landed sha — it MUST see a.txt (the chain).
+        let mut wsb = WorktreeWorkspace::create(repo.path(), "b", &sha_a, "true".into()).unwrap();
+        assert!(
+            wsb.read("a.txt").is_some(),
+            "leaf B forked off A's tip sees A's file"
+        );
+        wsb.apply(&[Edit {
+            path: "b.txt".into(),
+            new_content: "B\n".into(),
+        }]);
+        wsb.commit_to_branch("crew/b", "n", "n@b", "b").unwrap();
+        drop(wsb);
+
+        // crew/b is the single CONSOLIDATED tip — it carries BOTH leaves' work.
+        let files = git(repo.path(), &["ls-tree", "-r", "--name-only", "crew/b"]).unwrap();
+        assert!(
+            files.lines().any(|l| l == "a.txt"),
+            "consolidated tip has a.txt: {files}"
+        );
+        assert!(
+            files.lines().any(|l| l == "b.txt"),
+            "consolidated tip has b.txt: {files}"
+        );
+    }
+
+    #[test]
     fn commit_to_branch_errs_with_no_changes() {
         let repo = git_repo();
-        let ws = WorktreeWorkspace::create(repo.path(), "land2", "true".into()).unwrap();
+        let ws = WorktreeWorkspace::create(repo.path(), "land2", "HEAD", "true".into()).unwrap();
         assert!(
             ws.commit_to_branch("crew/land2", "n", "n@b", "noop")
                 .is_err(),
@@ -1185,7 +1231,7 @@ mod tests {
     #[test]
     fn worktree_isolates_reads_and_writes() {
         let repo = git_repo();
-        let mut ws = WorktreeWorkspace::create(repo.path(), "t1", "true".into()).unwrap();
+        let mut ws = WorktreeWorkspace::create(repo.path(), "t1", "HEAD", "true".into()).unwrap();
 
         // files() lists tracked files; read() reads them (line-ending-tolerant).
         assert!(ws.files().iter().any(|f| f == "hello.txt"));
@@ -1214,9 +1260,10 @@ mod tests {
     #[test]
     fn run_test_passes_and_reports_failure() {
         let repo = git_repo();
-        let ok = WorktreeWorkspace::create(repo.path(), "t2a", "test -f hello.txt".into()).unwrap();
+        let ok = WorktreeWorkspace::create(repo.path(), "t2a", "HEAD", "test -f hello.txt".into())
+            .unwrap();
         assert!(ok.run_test().0, "committed file present → pass");
-        let bad = WorktreeWorkspace::create(repo.path(), "t2b", "exit 3".into()).unwrap();
+        let bad = WorktreeWorkspace::create(repo.path(), "t2b", "HEAD", "exit 3".into()).unwrap();
         assert!(!bad.run_test().0, "non-zero exit → fail");
     }
 
@@ -1224,7 +1271,7 @@ mod tests {
     fn cleanup_removes_the_worktree() {
         let repo = git_repo();
         let path = {
-            let ws = WorktreeWorkspace::create(repo.path(), "t3", "true".into()).unwrap();
+            let ws = WorktreeWorkspace::create(repo.path(), "t3", "HEAD", "true".into()).unwrap();
             let p = ws.path().to_path_buf();
             assert!(p.exists());
             p
