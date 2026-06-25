@@ -1016,6 +1016,20 @@ pub async fn chat_complete(
         .connect_timeout(std::time::Duration::from_secs(connect_timeout_secs))
         .timeout(std::time::Duration::from_secs(inference_timeout_secs))
         .build()?;
+    // #643: the streaming re-issue (the final-text round consumed token-by-token
+    // by `stream_response`) must NOT use a whole-request `.timeout()`. That bounds
+    // connect + headers + the ENTIRE body, so a slow-but-progressing token stream
+    // is aborted mid-flight the instant total time crosses the deadline, and the
+    // retry envelope then restarts the full prefill — the DGX retry-storm wedge.
+    // An IDLE `read_timeout` is the right bound: it caps the gap between chunks and
+    // resets on every token, so a progressing stream runs as long as it keeps
+    // producing while a genuinely stalled connection still bails after
+    // `inference_timeout_secs` of silence. The one-shot `stream:false` probe below
+    // keeps `client` (a whole-request bound is correct for a single-shot response).
+    let stream_client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(connect_timeout_secs))
+        .read_timeout(std::time::Duration::from_secs(inference_timeout_secs))
+        .build()?;
     let chat_url = format!("{}/api/chat", url.trim_end_matches('/'));
     let retry = tui_retry_policy();
     // The save_note tool is advertised only when a sink exists (Step 19.3);
@@ -1597,7 +1611,7 @@ pub async fn chat_complete(
                 with_backoff_notify(
                     &retry,
                     || async {
-                        client
+                        stream_client
                             .post(&chat_url)
                             .json(&body_stream)
                             .send()
