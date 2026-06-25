@@ -295,6 +295,13 @@ pub enum Command {
         /// autonomous multi-crew execution needs this explicit second affirmation.
         #[arg(long, default_value_t = false)]
         execute: bool,
+        /// One-shot: AUTHOR (with `--goal`) **and** execute the plan autonomously
+        /// in a single gesture, or one-shot an existing plan FILE end-to-end. Like
+        /// `--execute`, the flag IS the approval — the plan runs with no per-leaf
+        /// review (bounded by `--max-leaves`). The headless autonomous drive (e.g.
+        /// the #548 evaluator): `newt plan --goal "…" --one-shot`.
+        #[arg(long = "one-shot", default_value_t = false)]
+        one_shot: bool,
         /// Cap on leaves to execute (and subtasks to author) without an explicit
         /// raise — each leaf is an autonomous crew with no per-leaf review.
         #[arg(long, default_value_t = 8)]
@@ -722,16 +729,24 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             output,
             dir,
             execute,
+            one_shot,
             max_leaves,
         } => {
             let code = if let Some(goal) = goal {
-                // Author a plan from the goal (a strong model decomposes it).
-                crew::author_plan_cli(goal, output, max_leaves).await?
+                if one_shot {
+                    // One gesture: author the plan AND execute it autonomously.
+                    crew::one_shot_goal_cli(&goal, dir, max_leaves).await?
+                } else {
+                    // Author a plan from the goal (a strong model decomposes it).
+                    crew::author_plan_cli(goal, output, max_leaves).await?
+                }
             } else if let Some(file) = file {
+                // `--one-shot` on a FILE is the approval to run it end-to-end
+                // (equivalent to `--execute`).
                 crew::run_plan_cli(crew::PlanArgs {
                     file,
                     dir,
-                    execute,
+                    execute: execute || one_shot,
                     max_leaves,
                 })
                 .await?
@@ -1027,6 +1042,42 @@ mod tests {
         assert!(cli.ephemeral);
         let cli = Cli::try_parse_from(["newt"]).unwrap();
         assert!(!cli.ephemeral);
+    }
+
+    // ── plan --one-shot (#646) ──────────────────────────────────────────
+    #[test]
+    fn parses_plan_one_shot_flag() {
+        // `--goal … --one-shot`: author AND execute in one gesture. Distinct from
+        // `--execute` (the flag carries its own approval).
+        let cli = Cli::try_parse_from(["newt", "plan", "--goal", "do X", "--one-shot"]).unwrap();
+        match cli.command {
+            Some(Command::Plan {
+                one_shot,
+                goal,
+                execute,
+                ..
+            }) => {
+                assert!(one_shot, "--one-shot should set one_shot");
+                assert_eq!(goal.as_deref(), Some("do X"));
+                assert!(!execute, "--one-shot is its own flag, not --execute");
+            }
+            other => panic!("expected Command::Plan, got {other:?}"),
+        }
+        // `--one-shot` on a FILE one-shots the existing plan end-to-end.
+        let cli = Cli::try_parse_from(["newt", "plan", "plan.toml", "--one-shot"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Plan { one_shot: true, .. })
+        ));
+        // Off by default.
+        let cli = Cli::try_parse_from(["newt", "plan", "plan.toml"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Plan {
+                one_shot: false,
+                ..
+            })
+        ));
     }
 
     #[test]
