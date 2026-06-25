@@ -396,6 +396,177 @@ pub async fn run_plan_cli(args: PlanArgs) -> anyhow::Result<i32> {
     Ok(i32::from(!run.complete))
 }
 
+// ── Plan authoring (the overseer's decompose step) ────────────────────────────
+
+/// The overseer's decompose prompt: turn a goal into a dependency-ordered
+/// `plan::Plan`. It asks for the WORK only — never authority — so an authored
+/// plan carries default-deny caveats the human grants by editing the TOML.
+const PLAN_AUTHOR_SYSTEM: &str = "You are a planning lead. Decompose the GOAL into a \
+    dependency-ordered plan of small, independently-verifiable engineering subtasks. Reply \
+    with ONLY JSON: {\"goal\":\"<the goal>\",\"subtasks\":[{\"id\":\"<short-kebab-id>\",\
+    \"instruction\":\"<imperative step>\",\"deps\":[\"<id of a step that must finish first>\"],\
+    \"verify\":\"<shell command that exits 0 once THIS step is done; omit if none>\"}]}. Use \
+    `deps` for ordering (a step lists the ids it waits on). Ids: short, stable, unique. \
+    Smallest-first. Do NOT grant permissions or describe authority — only the work.";
+
+/// The first balanced `{…}` span in `s` (string-aware), so a model reply wrapped
+/// in ```json fences or prose still parses. `None` if there is no balanced object.
+fn extract_json_object(s: &str) -> Option<&str> {
+    let start = s.find('{')?;
+    let bytes = s.as_bytes();
+    let (mut depth, mut in_str, mut esc) = (0i32, false, false);
+    for i in start..bytes.len() {
+        let c = bytes[i];
+        if in_str {
+            match c {
+                b'\\' if !esc => esc = true,
+                b'"' if !esc => in_str = false,
+                _ => esc = false,
+            }
+        } else if c == b'"' {
+            in_str = true;
+        } else if c == b'{' {
+            depth += 1;
+        } else if c == b'}' {
+            depth -= 1;
+            if depth == 0 {
+                return Some(&s[start..=i]);
+            }
+        }
+    }
+    None
+}
+
+/// Parse a model-authored plan (tolerating fences/prose) into a `plan::Plan`.
+/// Every subtask gets **default-deny** caveats — the model proposes the WORK, never
+/// the authority; the human grants it by editing the TOML. `None` when no parseable
+/// `{…}` object with a non-empty `subtasks` list (each with `id` + `instruction`)
+/// is found. Parsed with `serde_json::Value` (newt-cli has no `serde` derive dep).
+fn parse_authored_plan(raw: &str) -> Option<newt_core::plan::Plan> {
+    use newt_core::plan::{Aggregation, CaveatPolicy, Plan, Subtask, SubtaskStatus};
+    use std::collections::HashSet;
+    let v: serde_json::Value = serde_json::from_str(extract_json_object(raw)?).ok()?;
+    let arr = v.get("subtasks")?.as_array()?;
+    if arr.is_empty() {
+        return None;
+    }
+    let mut seen = HashSet::new();
+    let mut subtasks = Vec::with_capacity(arr.len());
+    for s in arr {
+        // Reject empty / whitespace-only ids+instructions, and DUPLICATE ids.
+        // ids must be unique: `Plan::mark` updates the first match while
+        // `next_ready_leaf` finds the next unmarked one, so duplicate ids would
+        // desync the execute-time cursor into an unbounded re-dispatch loop.
+        let id = s.get("id")?.as_str()?.trim().to_string();
+        let instruction = s.get("instruction")?.as_str()?.trim().to_string();
+        if id.is_empty() || instruction.is_empty() || !seen.insert(id.clone()) {
+            return None;
+        }
+        let deps = s
+            .get("deps")
+            .and_then(|d| d.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        subtasks.push(Subtask {
+            id,
+            instruction,
+            deps,
+            parallel_ok: false,
+            context: Vec::new(),
+            verify: s.get("verify").and_then(|x| x.as_str()).map(str::to_string),
+            status: SubtaskStatus::Pending,
+            result: None,
+            parent: None,
+            caveat_policy: CaveatPolicy::default(), // default-DENY: model proposes work, not authority
+        });
+    }
+    Some(Plan {
+        goal: v.get("goal").and_then(|x| x.as_str()).map(str::to_string),
+        aggregation: Aggregation::default(),
+        subtasks,
+    })
+}
+
+/// Decompose `goal` into a `plan::Plan` by asking `model` (the overseer seat).
+/// The model proposes the work; caveats stay default-deny.
+pub async fn author_plan(
+    pool: &newt_scheduler::BackendPool,
+    dispatcher: &dyn Dispatcher,
+    model: &str,
+    goal: &str,
+    max_subtasks: usize,
+) -> anyhow::Result<newt_core::plan::Plan> {
+    let req = newt_scheduler::ChatRequest::new()
+        .system(PLAN_AUTHOR_SYSTEM)
+        .user(format!("GOAL:\n{goal}\n\nAt most {max_subtasks} subtasks."));
+    let reply = pool
+        .run_role(dispatcher, newt_core::Tier::Complex, model, req)
+        .await
+        .ok_or_else(|| {
+            anyhow::anyhow!("no live model reachable to author the plan (model {model})")
+        })?;
+    parse_authored_plan(&reply.result.content).ok_or_else(|| {
+        anyhow::anyhow!(
+            "the model did not return a parseable JSON plan. Raw reply:\n{}",
+            reply.result.content
+        )
+    })
+}
+
+/// `newt plan --goal "<g>"` — author a plan from a goal, write it (or print it),
+/// and show the preview. Does NOT execute: the human reviews/edits, then runs
+/// `newt plan <file> --execute`.
+pub async fn author_plan_cli(
+    goal: String,
+    output: Option<PathBuf>,
+    max_subtasks: usize,
+) -> anyhow::Result<i32> {
+    let cfg = Config::resolve().map_err(|e| anyhow::anyhow!("config: {e}"))?;
+    let model = cfg
+        .backends
+        .first()
+        .map(|b| b.model.clone())
+        .ok_or_else(|| {
+            anyhow::anyhow!("no backend configured to author a plan (add a [[backends]])")
+        })?;
+    let pool = BackendPool::from_source(&StaticSource::from_configs(cfg.backends.iter()));
+    println!("authoring a plan for: {goal}  (model {model})…");
+    let plan = author_plan(&pool, &LocalDispatcher, &model, &goal, max_subtasks).await?;
+    let toml = plan
+        .to_toml_string()
+        .map_err(|e| anyhow::anyhow!("serialize plan: {e}"))?;
+    print!("{}", render_plan_preview(&plan));
+    match &output {
+        Some(path) => {
+            // Don't clobber an existing plan the human may have edited (granted
+            // caveats into). Authoring writes a fresh draft only.
+            if path.exists() {
+                anyhow::bail!(
+                    "{} already exists — choose another -o path or remove it first \
+                     (authoring won't overwrite a plan you may have edited)",
+                    path.display()
+                );
+            }
+            std::fs::write(path, &toml)
+                .map_err(|e| anyhow::anyhow!("write {}: {e}", path.display()))?;
+            println!(
+                "\nwrote plan → {} — review/edit (grant caveats where needed), then \
+                 `newt plan {} --execute`",
+                path.display(),
+                path.display()
+            );
+        }
+        None => println!(
+            "\n--- plan.toml (write to a file, then `newt plan <file> --execute`) ---\n{toml}"
+        ),
+    }
+    Ok(0)
+}
+
 /// The testable core: same as [`run_cli`] but with the inference `Dispatcher`
 /// and resolved `cfg` injected (tests pass an in-memory config + a mock).
 async fn run_with(
@@ -621,6 +792,91 @@ mod tests {
             ".. escapes"
         );
         assert!(!is_safe_worktree_path("a/../../b"), "embedded .. escapes");
+    }
+
+    #[test]
+    fn parse_authored_plan_maps_json_to_a_default_deny_plan() {
+        // Tolerates fences/prose; maps deps/verify; authority is NOT model-granted.
+        let raw = "Sure! ```json\n{\"goal\":\"g\",\"subtasks\":[\
+            {\"id\":\"a\",\"instruction\":\"do a\",\"verify\":\"just check\"},\
+            {\"id\":\"b\",\"instruction\":\"do b\",\"deps\":[\"a\"]}]}\n``` (done)";
+        let plan = parse_authored_plan(raw).expect("parsed a plan");
+        assert_eq!(plan.goal.as_deref(), Some("g"));
+        assert_eq!(plan.subtasks.len(), 2);
+        assert_eq!(plan.subtasks[1].deps, vec!["a"]);
+        assert_eq!(plan.subtasks[0].verify.as_deref(), Some("just check"));
+        assert!(plan.subtasks[0].parent.is_none());
+        // default-DENY: the model proposes work, never authority.
+        assert_eq!(
+            plan.subtasks[0].caveat_policy,
+            newt_core::plan::CaveatPolicy::default()
+        );
+    }
+
+    #[test]
+    fn parse_authored_plan_rejects_empty_or_unparseable() {
+        assert!(parse_authored_plan("no json at all").is_none());
+        assert!(
+            parse_authored_plan("{\"goal\":\"g\",\"subtasks\":[]}").is_none(),
+            "empty subtasks → not a usable plan"
+        );
+        assert!(parse_authored_plan("{not json}").is_none());
+        // DUPLICATE ids → rejected (they would desync the execute-time cursor into
+        // an unbounded re-dispatch loop).
+        assert!(
+            parse_authored_plan(
+                "{\"subtasks\":[{\"id\":\"a\",\"instruction\":\"x\"},{\"id\":\"a\",\"instruction\":\"y\"}]}"
+            )
+            .is_none(),
+            "duplicate ids"
+        );
+        // Empty / whitespace id or instruction → rejected.
+        assert!(
+            parse_authored_plan("{\"subtasks\":[{\"id\":\"  \",\"instruction\":\"x\"}]}").is_none(),
+            "blank id"
+        );
+        assert!(
+            parse_authored_plan("{\"subtasks\":[{\"id\":\"a\",\"instruction\":\"\"}]}").is_none(),
+            "empty instruction"
+        );
+    }
+
+    #[tokio::test]
+    async fn author_plan_decomposes_a_goal_via_the_model() {
+        struct PlanMock;
+        #[async_trait::async_trait]
+        impl Dispatcher for PlanMock {
+            async fn dispatch(
+                &self,
+                _b: &newt_scheduler::PoolBackend,
+                _m: &str,
+                _r: newt_scheduler::ChatRequest,
+            ) -> anyhow::Result<newt_scheduler::ChatReply> {
+                Ok(newt_scheduler::ChatReply {
+                    content: "```json\n{\"goal\":\"ship\",\"subtasks\":[\
+                        {\"id\":\"a\",\"instruction\":\"do a\",\"verify\":\"cargo test\"},\
+                        {\"id\":\"b\",\"instruction\":\"do b\",\"deps\":[\"a\"]}]}\n```"
+                        .to_string(),
+                    model_id: "m".into(),
+                    usage: None,
+                })
+            }
+        }
+        let cfg: Config = toml::from_str(
+            "[[backends]]\nname=\"x\"\nendpoint=\"http://x:11434\"\nmodel=\"m\"\ntiers=[]\n",
+        )
+        .unwrap();
+        let pool = BackendPool::from_source(&StaticSource::from_configs(cfg.backends.iter()));
+        let plan = author_plan(&pool, &PlanMock, "m", "ship the thing", 8)
+            .await
+            .expect("authored a plan");
+        assert_eq!(plan.goal.as_deref(), Some("ship"));
+        assert_eq!(plan.subtasks.len(), 2);
+        assert_eq!(plan.subtasks[1].deps, vec!["a"]);
+        assert_eq!(
+            plan.subtasks[0].caveat_policy,
+            newt_core::plan::CaveatPolicy::default()
+        );
     }
 
     /// A throwaway git repo with one committed file at `name` containing `body`.

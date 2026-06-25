@@ -271,16 +271,23 @@ pub enum Command {
         #[arg(long, default_value_t = false)]
         dry_run: bool,
     },
-    /// PREVIEW an overseer-authored plan (a `plan::Plan` TOML), or `--execute` it
-    /// leaf-by-leaf via a crew — each leaf in its own worktree, in dependency
-    /// order, stopping at the first failure. Preview is the default: `--execute`
+    /// AUTHOR a plan from a goal (`--goal`), or PREVIEW / `--execute` an existing
+    /// plan TOML file leaf-by-leaf via a crew. Authoring asks a strong model to
+    /// decompose the goal into a `plan::Plan` (default-deny caveats) for you to
+    /// review/edit — it never executes. Execution is preview-by-default; `--execute`
     /// runs an autonomous DAG of crews with no per-leaf review (bounded by
-    /// `--max-leaves`). The run-log lands in a sibling `<file>.run.toml`; the
-    /// source is never modified. Exit 0 = preview/complete, 1 = incomplete.
+    /// `--max-leaves`), writing a sibling `<file>.run.toml` (source untouched).
     Plan {
-        /// The plan TOML file: a `[[subtask]]` list, optionally a tree (`parent`)
-        /// and a DAG (`deps`). Each subtask may declare `caveat_policy` + `verify`.
-        file: PathBuf,
+        /// The plan TOML file to preview/execute: a `[[subtask]]` list, optionally
+        /// a tree (`parent`) + a DAG (`deps`). Omit when authoring with `--goal`.
+        file: Option<PathBuf>,
+        /// Author a plan FROM this goal (a strong model decomposes it) instead of
+        /// reading a file; writes to `--output` (or stdout). Never executes.
+        #[arg(long, conflicts_with = "file")]
+        goal: Option<String>,
+        /// Where to write the authored plan (with `--goal`). Default: stdout.
+        #[arg(long, short = 'o', value_name = "FILE")]
+        output: Option<PathBuf>,
         /// Target repo dir (default: current dir). Must be a git repo.
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -288,8 +295,8 @@ pub enum Command {
         /// autonomous multi-crew execution needs this explicit second affirmation.
         #[arg(long, default_value_t = false)]
         execute: bool,
-        /// Refuse to execute a plan with more leaves than this without an explicit
-        /// raise (each leaf is an autonomous crew with no per-leaf review).
+        /// Cap on leaves to execute (and subtasks to author) without an explicit
+        /// raise — each leaf is an autonomous crew with no per-leaf review.
         #[arg(long, default_value_t = 8)]
         max_leaves: usize,
     },
@@ -711,17 +718,28 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         }
         Command::Plan {
             file,
+            goal,
+            output,
             dir,
             execute,
             max_leaves,
         } => {
-            let code = crew::run_plan_cli(crew::PlanArgs {
-                file,
-                dir,
-                execute,
-                max_leaves,
-            })
-            .await?;
+            let code = if let Some(goal) = goal {
+                // Author a plan from the goal (a strong model decomposes it).
+                crew::author_plan_cli(goal, output, max_leaves).await?
+            } else if let Some(file) = file {
+                crew::run_plan_cli(crew::PlanArgs {
+                    file,
+                    dir,
+                    execute,
+                    max_leaves,
+                })
+                .await?
+            } else {
+                anyhow::bail!(
+                    "pass a plan FILE to preview/execute, or --goal \"<text>\" to author one"
+                );
+            };
             if code != 0 {
                 std::process::exit(code);
             }
