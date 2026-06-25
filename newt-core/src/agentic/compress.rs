@@ -106,8 +106,15 @@ const TAIL_MIN_MESSAGES: usize = 3;
 /// Per-message cap (chars) on content rendered into the summary request.
 const SUMMARY_INPUT_MSG_CAP: usize = 2_000;
 
-/// Reclaim fraction below which a compression counts as ineffective.
+/// Relative reclaim fraction below which a compression looks ineffective. Now
+/// only ONE of several budget-aware effectiveness tests (see `record`).
 const THRASH_MIN_SAVINGS: f32 = 0.10;
+/// A pass also counts as effective if it shrank the over-budget GAP by at least
+/// this fraction — on a tight budget the irreducible head+tail dominates, so the
+/// *relative* reclaim looks small even when real work was done (#661 wedge).
+const GAP_MIN_PROGRESS: f32 = 0.25;
+/// ...or if it reclaimed at least this many tokens outright.
+const ABS_MIN_RECLAIM_TOKENS: usize = 200;
 
 // ---------------------------------------------------------------------------
 // Anti-thrash state
@@ -119,8 +126,12 @@ const THRASH_MIN_SAVINGS: f32 = 0.10;
 /// per-turn state.
 #[derive(Debug)]
 pub struct CompressState {
-    /// Reclaim fractions of the last two attempted compressions.
+    /// Reclaim fractions of the last two attempted compressions (for display).
     last_savings: [f32; 2],
+    /// Whether each of the last two passes was *effective* (budget-aware — see
+    /// [`record`](Self::record)). The strike/disable decision reads this, not
+    /// `last_savings`.
+    last_effective: [bool; 2],
     attempts: usize,
     disabled: bool,
     notified: bool,
@@ -140,6 +151,7 @@ impl CompressState {
     pub fn new() -> Self {
         Self {
             last_savings: [1.0, 1.0],
+            last_effective: [true, true],
             attempts: 0,
             disabled: false,
             notified: false,
@@ -147,17 +159,33 @@ impl CompressState {
         }
     }
 
-    /// Record one attempted compression's before/after estimate. Two
-    /// consecutive sub-10% reclaims disable auto-compression for the session.
-    fn record(&mut self, tokens_before: usize, tokens_after: usize) {
-        let saved = if tokens_before > 0 {
+    /// Record one attempted compression's before/after estimate against the
+    /// `budget` it was trying to reach. Two consecutive **ineffective** passes
+    /// disable auto-compression for the session.
+    ///
+    /// Effectiveness is **budget-aware** (#661): a pass is effective if it
+    /// reached fit, OR shrank the over-budget gap by ≥[`GAP_MIN_PROGRESS`], OR
+    /// reclaimed ≥[`ABS_MIN_RECLAIM_TOKENS`] outright, OR cleared the relative
+    /// [`THRASH_MIN_SAVINGS`] bar. On a tight budget the irreducible head+tail
+    /// fills most of the window, so the old relative-only test scored real work
+    /// as `<10%` and disabled compression exactly when it mattered most.
+    fn record(&mut self, tokens_before: usize, tokens_after: usize, budget: usize) {
+        let relative = if tokens_before > 0 {
             1.0 - (tokens_after as f32 / tokens_before as f32)
         } else {
             0.0
         };
-        self.last_savings = [self.last_savings[1], saved];
+        let gap_before = tokens_before.saturating_sub(budget);
+        let gap_after = tokens_after.saturating_sub(budget);
+        let effective = tokens_after <= budget
+            || (gap_before > 0
+                && (gap_after as f32) <= (gap_before as f32) * (1.0 - GAP_MIN_PROGRESS))
+            || tokens_before.saturating_sub(tokens_after) >= ABS_MIN_RECLAIM_TOKENS
+            || relative >= THRASH_MIN_SAVINGS;
+        self.last_savings = [self.last_savings[1], relative];
+        self.last_effective = [self.last_effective[1], effective];
         self.attempts += 1;
-        if self.attempts >= 2 && self.last_savings.iter().all(|&s| s < THRASH_MIN_SAVINGS) {
+        if self.attempts >= 2 && !self.last_effective[0] && !self.last_effective[1] {
             self.disabled = true;
         }
     }
@@ -192,9 +220,9 @@ impl CompressState {
         // consecutively ineffective (<10% reclaim) — 0, 1, or 2; two is the
         // latch condition. The [1.0, 1.0] sentinel never counts because a
         // slot only holds a real figure once an attempt recorded into it.
-        let strikes = if self.attempts == 0 || self.last_savings[1] >= THRASH_MIN_SAVINGS {
+        let strikes = if self.attempts == 0 || self.last_effective[1] {
             0
-        } else if self.attempts >= 2 && self.last_savings[0] < THRASH_MIN_SAVINGS {
+        } else if self.attempts >= 2 && !self.last_effective[0] {
             2
         } else {
             1
@@ -213,7 +241,7 @@ impl CompressState {
         if self.disabled && !self.notified {
             self.notified = true;
             Some(
-                "context compression reclaimed <10% twice in a row — auto-compression \
+                "context compression was ineffective twice in a row — auto-compression \
                  is disabled for this session; start a new conversation to reset"
                     .to_string(),
             )
@@ -538,7 +566,7 @@ pub(crate) async fn compress(
     let after_prune = estimate_tokens(&pruned);
     if !over(after_prune, pruned.len()) {
         if tokens_over_entry {
-            state.record(tokens_before, after_prune);
+            state.record(tokens_before, after_prune, req.budget);
         }
         return CompressOutcome {
             messages: pruned,
@@ -652,7 +680,7 @@ pub(crate) async fn compress(
     let fired =
         prune_changed || assembled.len() != req.messages.len() || tokens_after != tokens_before;
     if tokens_over_entry {
-        state.record(tokens_before, tokens_after);
+        state.record(tokens_before, tokens_after, req.budget);
     }
     CompressOutcome {
         messages: assembled,
@@ -728,7 +756,12 @@ pub async fn compress_user_initiated(
     )
     .await;
     if outcome.fired {
-        state.record(outcome.tokens_before, outcome.tokens_after);
+        // The manual (user-initiated) budget is aim-to-halve (tokens/2).
+        state.record(
+            outcome.tokens_before,
+            outcome.tokens_after,
+            outcome.tokens_before / 2,
+        );
     }
     let notice = outcome.notice.or_else(|| state.take_notice());
     ManualCompressOutcome {
@@ -1019,7 +1052,13 @@ fn summary_message(body: &str) -> Value {
 /// conversation middle. `note` is an optional bracketed line shown before the
 /// body (an omission notice, or a `[part i/n]` chunk label in the chunked path).
 /// Shared by the single-request path and the chunked path (Step 24.4, #559).
-fn summary_prompt_for(task: &str, body: &str, focus: Option<&str>, note: Option<&str>) -> String {
+fn summary_prompt_for(
+    task: &str,
+    body: &str,
+    focus: Option<&str>,
+    note: Option<&str>,
+    target_chars: usize,
+) -> String {
     let mut p = String::with_capacity(1024);
     p.push_str("You are compressing the middle of a coding-agent conversation.\n\n");
     p.push_str("## Original Task (copy this VERBATIM into \"## Active Task\")\n");
@@ -1030,15 +1069,21 @@ fn summary_prompt_for(task: &str, body: &str, focus: Option<&str>, note: Option<
         p.push('\n');
     }
     p.push_str(body);
-    p.push_str(
+    // A1 (#661): give the model an explicit, budget-derived LENGTH target so a
+    // verbose summary can't reclaim <10% — chars→words ≈ /6, chars→tokens ≈ /4.
+    let words = (target_chars / 6).max(40);
+    let tokens = (target_chars / 4).max(60);
+    p.push_str(&format!(
         "\nProduce a concise structured summary with sections:\n\
          ## Active Task\n## Completed Actions\n## In Progress\n## Key Decisions\n\
          ## Relevant Files\n## Critical Context\n\
          Start \"## Active Task\" with the original task copied verbatim. \
-         Be terse. Preserve specifics (file names, error messages, decisions). \
+         Keep the WHOLE summary under ~{words} words (~{tokens} tokens); if it \
+         cannot all fit, drop low-salience detail — NEVER the Active Task. \
+         Preserve specifics (file names, error messages, decisions). \
          NEVER include API keys, tokens, passwords, or other credentials — \
          write [REDACTED] instead.",
-    );
+    ));
     if let Some(focus) = focus {
         let focus = redact_secrets(focus);
         let focus = focus.trim();
@@ -1080,7 +1125,7 @@ fn summary_request(
         )
     });
     let body: String = rendered[start..].concat();
-    summary_prompt_for(task, &body, focus, note.as_deref())
+    summary_prompt_for(task, &body, focus, note.as_deref(), middle_cap_chars / 3)
 }
 
 /// Summarize the conversation `middle` within a per-request char cap, chunking
@@ -1112,7 +1157,13 @@ async fn summarize_middle(
     let mut partials = Vec::with_capacity(n);
     for (i, chunk) in chunks.iter().enumerate() {
         let note = format!("[part {}/{} of the conversation middle]", i + 1, n);
-        let req = redact_secrets(&summary_prompt_for(task, chunk, focus, Some(&note)));
+        let req = redact_secrets(&summary_prompt_for(
+            task,
+            chunk,
+            focus,
+            Some(&note),
+            cap_chars / 3,
+        ));
         if let Some(s) = run_summary(summarizer, req).await {
             partials.push(s);
         }
@@ -1164,7 +1215,13 @@ fn reduce_partials<'a>(
                         "[{} partial summaries of ONE conversation — consolidate into one]",
                         partials.len()
                     );
-                    let req = redact_secrets(&summary_prompt_for(task, &body, focus, Some(&note)));
+                    let req = redact_secrets(&summary_prompt_for(
+                        task,
+                        &body,
+                        focus,
+                        Some(&note),
+                        cap_chars / 3,
+                    ));
                     return run_summary(summarizer, req).await;
                 }
                 let groups = chunk_strings(&partials, cap_chars);
@@ -1179,6 +1236,7 @@ fn reduce_partials<'a>(
                         g,
                         focus,
                         Some("[partial summaries — consolidate]"),
+                        cap_chars / 3,
                     ));
                     if let Some(s) = run_summary(summarizer, req).await {
                         next.push(s);
@@ -2506,12 +2564,33 @@ mod tests {
     #[test]
     fn thrash_window_requires_consecutive_poor_savings() {
         let mut state = CompressState::new();
-        state.record(1_000, 990); // poor
-        state.record(1_000, 400); // good
-        state.record(1_000, 990); // poor
+        state.record(1_000, 990, 500); // poor
+        state.record(1_000, 400, 500); // good
+        state.record(1_000, 990, 500); // poor
         assert!(!state.disabled, "non-consecutive poor passes never disable");
-        state.record(1_000, 950); // poor — now two in a row
+        state.record(1_000, 950, 500); // poor — now two in a row
         assert!(state.disabled);
+    }
+
+    #[test]
+    fn budget_aware_gap_progress_is_not_a_strike() {
+        // #661 regression: a pass reclaiming <10% RELATIVE but shrinking the
+        // over-budget GAP meaningfully is EFFECTIVE — the old relative-only gate
+        // disabled compression on a tight budget exactly when it mattered.
+        let mut state = CompressState::new();
+        // 1000→920 against budget 800: relative 8% (<10%), but gap 200→120 (−40%).
+        state.record(1_000, 920, 800);
+        state.record(1_000, 920, 800);
+        assert!(
+            !state.is_disabled(),
+            "gap-shrinking passes must not latch the disable"
+        );
+        // A genuinely useless pass (no fit, no gap progress, no abs floor, <10%)
+        // still strikes twice and latches.
+        let mut dead = CompressState::new();
+        dead.record(1_000, 995, 500);
+        dead.record(1_000, 996, 500);
+        assert!(dead.is_disabled(), "truly ineffective passes still latch");
     }
 
     // -- user-initiated (`/compress`, Step 18.6) ------------------------------
@@ -2648,16 +2727,16 @@ mod tests {
         assert_eq!((c.compressions, c.strikes, c.disabled), (0, 0, false));
         assert_eq!(c.last_reclaim, None);
 
-        state.record(1_000, 400); // good: 60% reclaim
+        state.record(1_000, 400, 500); // good: 60% reclaim
         let c = state.counters();
         assert_eq!((c.compressions, c.strikes, c.disabled), (1, 0, false));
         assert!((c.last_reclaim.unwrap() - 0.6).abs() < 0.01);
 
-        state.record(1_000, 990); // poor — one strike
+        state.record(1_000, 990, 500); // poor — one strike
         let c = state.counters();
         assert_eq!((c.compressions, c.strikes, c.disabled), (2, 1, false));
 
-        state.record(1_000, 950); // poor — two in a row latches
+        state.record(1_000, 950, 500); // poor — two in a row latches
         let c = state.counters();
         assert_eq!((c.compressions, c.strikes, c.disabled), (3, 2, true));
         assert!(c.last_reclaim.unwrap() < THRASH_MIN_SAVINGS);
@@ -2668,7 +2747,7 @@ mod tests {
     #[test]
     fn counters_first_poor_attempt_is_one_strike() {
         let mut state = CompressState::new();
-        state.record(1_000, 990);
+        state.record(1_000, 990, 500);
         assert_eq!(state.counters().strikes, 1);
     }
 
