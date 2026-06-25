@@ -1,7 +1,8 @@
 name: CI
 
-# HOOK PARITY: The lint/test/lean-build/coverage jobs are mirrored by
-# .githooks/pre-push (via `just check` + `just cov-ci`).
+# HOOK PARITY: The lint/test/lean-build/coverage/security jobs are mirrored by
+# .githooks/pre-push (via `just shell-check` + `just check` + `just cov-ci` +
+# `just audit`).
 # When editing those, update the push hook to match.
 # EXCEPTION: the `windows` job is CI-only — it cannot be mirrored locally (no
 # Windows dev box), so it is deliberately outside hook parity.
@@ -178,6 +179,22 @@ jobs:
           path: lcov.info
           if-no-files-found: warn
           retention-days: 14
+
+  security:
+    name: Security audit (cargo-audit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      # PIPELINE PARITY: mirrored by `just audit` + .githooks/pre-push. Reads the
+      # tracked ignore-list in .cargo/audit.toml (pre-existing advisories, #656);
+      # fails on ANY new RustSec advisory outside that list.
+      - name: cargo audit
+        run: cargo audit
 
   windows:
     name: Windows build + test
