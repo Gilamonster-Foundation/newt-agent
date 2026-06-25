@@ -969,6 +969,34 @@ fn static_fallback_text(removed: usize) -> String {
 }
 
 /// Wrap a summary body in the compaction markers as a `user` message.
+/// The shape of the conversation middle being compressed (A4, #661). Drives the
+/// summary section template: a tool-using (coding) middle gets file/action-centric
+/// sections; a tool-free (Q&A / discussion) middle gets prose sections.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConvShape {
+    /// The middle contains tool calls — file edits, command runs, etc.
+    Coding,
+    /// No tool calls — plain question-answering / discussion / research.
+    General,
+}
+
+/// Classify the middle by a signal already on the wire: the presence of
+/// `tool_calls`. A middle that issued tools is coding work; one that is pure
+/// assistant/user prose is a Q&A/discussion. Coding is the conservative bias —
+/// the only cost of a misclassification is a slightly-off (still valid) section
+/// template, never a crash, and the load-bearing `## Active Task` /
+/// `## Critical Context` slots exist in both shapes.
+fn middle_shape(middle: &[Value]) -> ConvShape {
+    let has_tools = middle
+        .iter()
+        .any(|m| m["tool_calls"].as_array().is_some_and(|t| !t.is_empty()));
+    if has_tools {
+        ConvShape::Coding
+    } else {
+        ConvShape::General
+    }
+}
+
 /// #319: list the files read or edited in the summarized span, with a re-read
 /// directive. The middle is replaced by a PROSE summary that does not preserve
 /// verbatim signatures/types/lines; a coding model recalling an API from that
@@ -1058,9 +1086,13 @@ fn summary_prompt_for(
     focus: Option<&str>,
     note: Option<&str>,
     target_chars: usize,
+    shape: ConvShape,
 ) -> String {
     let mut p = String::with_capacity(1024);
-    p.push_str("You are compressing the middle of a coding-agent conversation.\n\n");
+    p.push_str(match shape {
+        ConvShape::Coding => "You are compressing the middle of a coding-agent conversation.\n\n",
+        ConvShape::General => "You are compressing the middle of a conversation.\n\n",
+    });
     p.push_str("## Original Task (copy this VERBATIM into \"## Active Task\")\n");
     p.push_str(task);
     p.push_str("\n\n## Conversation middle to summarise\n");
@@ -1073,10 +1105,21 @@ fn summary_prompt_for(
     // verbose summary can't reclaim <10% — chars→words ≈ /6, chars→tokens ≈ /4.
     let words = (target_chars / 6).max(40);
     let tokens = (target_chars / 4).max(60);
+    // A4 (#661): shape-adaptive sections — a coding middle gets file/action-centric
+    // slots; a Q&A/discussion middle gets prose slots, so the model doesn't pad
+    // empty "Relevant Files"/"Completed Actions" (the off-task low-reclaim case).
+    let sections = match shape {
+        ConvShape::Coding => {
+            "## Active Task\n## Completed Actions\n## In Progress\n## Key Decisions\n\
+             ## Relevant Files\n## Critical Context\n"
+        }
+        ConvShape::General => {
+            "## Active Task\n## Discussion\n## Key Points\n## Open Questions\n\
+             ## Critical Context\n"
+        }
+    };
     p.push_str(&format!(
-        "\nProduce a concise structured summary with sections:\n\
-         ## Active Task\n## Completed Actions\n## In Progress\n## Key Decisions\n\
-         ## Relevant Files\n## Critical Context\n\
+        "\nProduce a concise structured summary with sections:\n{sections}\
          Start \"## Active Task\" with the original task copied verbatim. \
          Keep the WHOLE summary under ~{words} words (~{tokens} tokens); if it \
          cannot all fit, drop low-salience detail — NEVER the Active Task. \
@@ -1103,6 +1146,7 @@ fn summary_request(
     middle: &[Value],
     middle_cap_chars: usize,
     focus: Option<&str>,
+    shape: ConvShape,
 ) -> String {
     // Keep the most recent suffix of the middle that fits the cap: the
     // recent middle is closest to the active work, and the verbatim task is
@@ -1125,7 +1169,14 @@ fn summary_request(
         )
     });
     let body: String = rendered[start..].concat();
-    summary_prompt_for(task, &body, focus, note.as_deref(), middle_cap_chars / 3)
+    summary_prompt_for(
+        task,
+        &body,
+        focus,
+        note.as_deref(),
+        middle_cap_chars / 3,
+        shape,
+    )
 }
 
 /// Summarize the conversation `middle` within a per-request char cap, chunking
@@ -1144,12 +1195,14 @@ async fn summarize_middle(
     cap_chars: usize,
     focus: Option<&str>,
 ) -> Option<String> {
+    // A4 (#661): classify the whole middle once; every chunk + the reduce share it.
+    let shape = middle_shape(middle);
     let rendered: Vec<String> = middle.iter().map(render_message).collect();
     let total: usize = rendered.iter().map(|r| r.chars().count()).sum();
     if total <= cap_chars {
         // Fits one request — the established single-call path (suffix-fit is a
         // no-op here since the whole middle fits).
-        let req = redact_secrets(&summary_request(task, middle, cap_chars, focus));
+        let req = redact_secrets(&summary_request(task, middle, cap_chars, focus, shape));
         return run_summary(summarizer, req).await;
     }
     let chunks = chunk_strings(&rendered, cap_chars);
@@ -1163,12 +1216,13 @@ async fn summarize_middle(
             focus,
             Some(&note),
             cap_chars / 3,
+            shape,
         ));
         if let Some(s) = run_summary(summarizer, req).await {
             partials.push(s);
         }
     }
-    reduce_partials(summarizer, task, partials, cap_chars, focus).await
+    reduce_partials(summarizer, task, partials, cap_chars, focus, shape).await
 }
 
 /// Group consecutive rendered strings into chunks each ≤ `cap` chars. A single
@@ -1202,6 +1256,7 @@ fn reduce_partials<'a>(
     partials: Vec<String>,
     cap_chars: usize,
     focus: Option<&'a str>,
+    shape: ConvShape,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send + 'a>> {
     Box::pin(async move {
         match partials.len() {
@@ -1221,6 +1276,7 @@ fn reduce_partials<'a>(
                         focus,
                         Some(&note),
                         cap_chars / 3,
+                        shape,
                     ));
                     return run_summary(summarizer, req).await;
                 }
@@ -1237,12 +1293,13 @@ fn reduce_partials<'a>(
                         focus,
                         Some("[partial summaries — consolidate]"),
                         cap_chars / 3,
+                        shape,
                     ));
                     if let Some(s) = run_summary(summarizer, req).await {
                         next.push(s);
                     }
                 }
-                reduce_partials(summarizer, task, next, cap_chars, focus).await
+                reduce_partials(summarizer, task, next, cap_chars, focus, shape).await
             }
         }
     })
@@ -2879,10 +2936,47 @@ mod tests {
         let middle = vec![tool_result(
             "config: api_key=9f8e7d6c5b4a32100ffee and more text",
         )];
-        let request = redact_secrets(&summary_request("the task", &middle, usize::MAX, None));
+        let request = redact_secrets(&summary_request(
+            "the task",
+            &middle,
+            usize::MAX,
+            None,
+            ConvShape::Coding,
+        ));
         assert!(!request.contains("9f8e7d6c5b4a32100ffee"), "{request}");
         assert!(request.contains("api_key=[REDACTED]"), "{request}");
         assert!(request.contains("the task"), "task still present verbatim");
+    }
+
+    #[test]
+    fn middle_shape_detects_coding_vs_general() {
+        // A4 (#661): a middle that issued tool calls is Coding; pure prose is General.
+        let coding = vec![serde_json::json!({
+            "role": "assistant",
+            "tool_calls": [{"function": {"name": "edit_file", "arguments": "{}"}}],
+        })];
+        assert_eq!(middle_shape(&coding), ConvShape::Coding);
+        let general = vec![
+            serde_json::json!({"role": "user", "content": "what is a monad?"}),
+            serde_json::json!({"role": "assistant", "content": "a monoid in ..."}),
+        ];
+        assert_eq!(middle_shape(&general), ConvShape::General);
+    }
+
+    #[test]
+    fn general_shape_swaps_the_section_template() {
+        // A4 (#661): the General template drops file/action-centric slots for prose,
+        // but both shapes keep the load-bearing Active Task / Critical Context.
+        let coding = summary_prompt_for("t", "body", None, None, 600, ConvShape::Coding);
+        assert!(coding.contains("## Completed Actions") && coding.contains("## Relevant Files"));
+        let general = summary_prompt_for("t", "body", None, None, 600, ConvShape::General);
+        assert!(general.contains("## Discussion") && general.contains("## Open Questions"));
+        assert!(
+            !general.contains("## Relevant Files"),
+            "no file-centric slot for a Q&A middle"
+        );
+        assert!(general.contains("## Active Task") && general.contains("## Critical Context"));
+        assert!(general.starts_with("You are compressing the middle of a conversation."));
     }
 
     /// F6: tool-call args reach the summarizer rendered AS JSON — the
@@ -2934,7 +3028,7 @@ mod tests {
         let middle: Vec<Value> = (0..50)
             .map(|i| tool_result(&format!("MSG{i} {}", "m".repeat(1_900))))
             .collect();
-        let capped = summary_request("the task", &middle, 8_192, None);
+        let capped = summary_request("the task", &middle, 8_192, None, ConvShape::Coding);
         assert!(
             capped.chars().count() < 12_000,
             "total must be capped, got {}",
@@ -2946,7 +3040,7 @@ mod tests {
         assert!(capped.contains("the task"), "task always present");
 
         // Uncapped baseline for contrast: same middle, no cap.
-        let uncapped = summary_request("the task", &middle, usize::MAX, None);
+        let uncapped = summary_request("the task", &middle, usize::MAX, None, ConvShape::Coding);
         assert!(uncapped.chars().count() > 90_000);
         assert!(!uncapped.contains("older message(s) omitted"));
     }
