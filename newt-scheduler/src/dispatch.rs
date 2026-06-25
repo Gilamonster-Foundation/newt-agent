@@ -64,6 +64,13 @@ impl Dispatcher for LocalDispatcher {
                     .complete(req)
                     .await
             }
+            // The in-process embedded backend (#639) is for the summarizer / small
+            // auxiliary calls, resolved via the own-backend path — it is not an
+            // HTTP pool backend the crew/team dispatcher fields.
+            BackendKind::Embedded => anyhow::bail!(
+                "the embedded (in-process) backend is summarizer-only, not dispatchable from the \
+                 crew/team pool; use an ollama/openai backend here"
+            ),
         }
     }
 }
