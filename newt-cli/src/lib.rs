@@ -747,6 +747,7 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
                     file,
                     dir,
                     execute: execute || one_shot,
+                    one_shot,
                     max_leaves,
                 })
                 .await?
