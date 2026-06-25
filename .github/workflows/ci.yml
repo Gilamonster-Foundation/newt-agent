@@ -1,8 +1,8 @@
 name: CI
 
-# HOOK PARITY: The lint/test/lean-build/coverage/security jobs are mirrored by
-# .githooks/pre-push (via `just shell-check` + `just check` + `just cov-ci` +
-# `just audit`).
+# HOOK PARITY: The lint/test/lean-build/coverage/security/msrv jobs are mirrored
+# by .githooks/pre-push (via `just shell-check` + `just check` + `just cov-ci` +
+# `just audit` + `just msrv`).
 # When editing those, update the push hook to match.
 # EXCEPTION: the `windows` job is CI-only — it cannot be mirrored locally (no
 # Windows dev box), so it is deliberately outside hook parity.
@@ -195,6 +195,20 @@ jobs:
       # fails on ANY new RustSec advisory outside that list.
       - name: cargo audit
         run: cargo audit
+
+  msrv:
+    name: MSRV (Rust 1.88)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      # PIPELINE PARITY: mirrored by `just msrv` + .githooks/pre-push. Verifies the
+      # declared `rust-version` ([workspace.package] in Cargo.toml) actually
+      # compiles — a dep bump can't silently raise the floor (it drifted once
+      # under stable-only CI; see the Cargo.toml MSRV comment block).
+      - name: cargo check (MSRV 1.88)
+        run: cargo check --workspace
 
   windows:
     name: Windows build + test
