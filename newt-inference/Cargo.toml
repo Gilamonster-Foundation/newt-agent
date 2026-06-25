@@ -33,6 +33,12 @@ pyo3-async-runtimes = { workspace = true, optional = true }
 
 [features]
 default = []
+# In-process inference backend (#639): the `EmbeddedBackend` over a `palette`
+# mini model. DEFAULT-OFF so the lean / headless (wyvern) build pulls nothing
+# extra. The candle/Metal generation-engine deps land under THIS feature with the
+# engine increment, so the switch is in place now and the heavy deps never reach
+# the default build.
+embedded = []
 pyo3 = [
     "dep:pyo3",
     "dep:pyo3-async-runtimes",

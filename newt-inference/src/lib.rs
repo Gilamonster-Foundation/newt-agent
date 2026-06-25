@@ -8,7 +8,12 @@
 //!   Anthropic, etc. join via opt-in plugin installs.
 
 pub mod backend;
+/// In-process inference backend (#639) — opt-in behind the `embedded` feature.
+#[cfg(feature = "embedded")]
+pub mod embedded;
 pub mod local;
+/// Curated palette of mini models for in-process inference (always available).
+pub mod palette;
 pub mod provider_plugin;
 pub mod registry;
 pub mod stream;

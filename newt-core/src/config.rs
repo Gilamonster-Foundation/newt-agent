@@ -2143,6 +2143,13 @@ pub enum BackendKind {
     /// [`BackendConfig::api_key_env`]).
     #[serde(alias = "vllm", alias = "openai-compatible")]
     Openai,
+    /// An **in-process** inference backend — no HTTP, no external server. Loads a
+    /// small quantized (GGUF) model and runs it in-tree (Metal-accelerated on
+    /// Apple Silicon). Opt-in behind the `embedded` cargo feature (default-off);
+    /// when the feature is absent, selecting it is a clear build-time-off error,
+    /// never a silent fallback. Intended for the summarizer + small auxiliary
+    /// calls so they never contend with the primary model (#639).
+    Embedded,
 }
 
 impl BackendKind {
@@ -2153,6 +2160,7 @@ impl BackendKind {
         match self {
             Self::Ollama => "ollama",
             Self::Openai => "openai",
+            Self::Embedded => "embedded",
         }
     }
 }
@@ -3081,6 +3089,19 @@ mod tests {
 
     /// Step 24.10 (#559): summarizer knobs live in `summarizer.toml` now.
     /// Defaults (absent file) reuse the session backend; timeout 60 / retries 1.
+    #[test]
+    fn backend_kind_embedded_parses_and_labels() {
+        // #639: the config accepts `kind = "embedded"` so the summarizer (and a
+        // backend) can select the in-process backend.
+        #[derive(serde::Deserialize)]
+        struct K {
+            kind: BackendKind,
+        }
+        let k: K = toml::from_str("kind = \"embedded\"").unwrap();
+        assert_eq!(k.kind, BackendKind::Embedded);
+        assert_eq!(k.kind.label(), "embedded");
+    }
+
     #[test]
     fn summarizer_config_defaults_and_parse() {
         let d = SummarizerConfig::default();
