@@ -346,33 +346,47 @@ pub async fn run_plan_cli(args: PlanArgs) -> anyhow::Result<i32> {
         println!("\n(preview only — re-run with --execute to dispatch one crew per leaf)");
         return Ok(0);
     }
+    // Run-log lands in a SIBLING artifact — never modify the authored source.
+    let log_path = args.file.with_extension("run.toml");
+    execute_plan(&mut plan, args.dir, args.max_leaves, Some(log_path)).await
+}
+
+/// Execute a parsed/authored plan autonomously: enforce the `--max-leaves`
+/// autonomy bound, then drive `run_plan` via a `LocalCrewRunner`
+/// (`Presence::Prompt` — the human's `--execute`/`--one-shot` gesture). Prints
+/// per-leaf progress; writes a run-log to `log_path` when work actually ran.
+/// Returns 0 = plan complete, 1 = incomplete. The source is never modified.
+pub async fn execute_plan(
+    plan: &mut newt_core::plan::Plan,
+    dir: Option<PathBuf>,
+    max_leaves: usize,
+    log_path: Option<PathBuf>,
+) -> anyhow::Result<i32> {
     // Autonomy bound: refuse an oversized autonomous fan-out unless the human
     // explicitly raises the cap (each leaf runs with no per-leaf review).
     let leaf_count = plan.leaves().len();
-    if leaf_count > args.max_leaves {
+    if leaf_count > max_leaves {
         return Err(anyhow::anyhow!(
-            "plan has {leaf_count} leaves (> --max-leaves {}); each is an autonomous crew with no \
-             per-leaf review. Re-run with `--max-leaves {leaf_count}` to confirm you intend to run \
-             them all.",
-            args.max_leaves
+            "plan has {leaf_count} leaves (> --max-leaves {max_leaves}); each is an autonomous \
+             crew with no per-leaf review. Re-run with `--max-leaves {leaf_count}` to confirm you \
+             intend to run them all."
         ));
     }
     let cfg = Config::resolve().map_err(|e| anyhow::anyhow!("config: {e}"))?;
-    let dir = args
-        .dir
-        .clone()
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-    println!("executing {leaf_count} leaf/leaves autonomously (one crew each; per-leaf verify gates each)…");
+    let dir = dir.unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    println!(
+        "executing {leaf_count} leaf/leaves autonomously (one crew each; per-leaf verify gates each)…"
+    );
     // Honest, non-top session caveats (mirrors `newt crew`): fs_write=All — the
     // real boundary is the per-leaf worktree + the apply-path guard
     // (`is_safe_worktree_path`), NOT this caveat — exec/net locked, so a
-    // plan-authored `verify` needing exec is dropped fail-closed (#634). Invoking
-    // `--execute` is the human gesture, modelled as `Presence::Prompt` (the BOOT
-    // attest ceremony is #472).
+    // plan-authored `verify` needing exec is dropped fail-closed (#634). The
+    // `--execute`/`--one-shot` gesture is modelled as `Presence::Prompt` (the
+    // BOOT attest ceremony is #472).
     let caveats = newt_acp_worker::worker_session_caveats(None);
     let runner =
         crate::crew_runner::LocalCrewRunner::new(cfg, dir, newt_core::agentic::Presence::Prompt);
-    let run = newt_core::agentic::run_plan(&mut plan, &caveats, &runner).await;
+    let run = newt_core::agentic::run_plan(plan, &caveats, &runner).await;
     for id in &run.dispatched {
         if let Some(s) = plan.subtask(id) {
             println!("  [{:?}] {}", s.status, id);
@@ -392,13 +406,13 @@ pub async fn run_plan_cli(args: PlanArgs) -> anyhow::Result<i32> {
             "plan incomplete"
         }
     );
-    // Write the run-log (statuses + results) to a SIBLING artifact — never modify
-    // the authored source file — and only when work actually ran.
+    // Write the run-log only when work actually ran.
     if !run.dispatched.is_empty() {
-        let log = args.file.with_extension("run.toml");
-        std::fs::write(&log, plan.to_toml_string()?)
-            .map_err(|e| anyhow::anyhow!("write run-log {}: {e}", log.display()))?;
-        println!("run-log → {}", log.display());
+        if let Some(log) = log_path {
+            std::fs::write(&log, plan.to_toml_string()?)
+                .map_err(|e| anyhow::anyhow!("write run-log {}: {e}", log.display()))?;
+            println!("run-log → {}", log.display());
+        }
     }
     Ok(i32::from(!run.complete))
 }
@@ -527,11 +541,13 @@ pub async fn author_plan(
 /// `newt plan --goal "<g>"` — author a plan from a goal, write it (or print it),
 /// and show the preview. Does NOT execute: the human reviews/edits, then runs
 /// `newt plan <file> --execute`.
-pub async fn author_plan_cli(
-    goal: String,
-    output: Option<PathBuf>,
+/// Author a plan from a goal (the overseer's decompose step) and RETURN it.
+/// Shared by [`author_plan_cli`] (which writes/prints it) and
+/// [`one_shot_goal_cli`] (which executes it).
+pub async fn author_plan_to_plan(
+    goal: &str,
     max_subtasks: usize,
-) -> anyhow::Result<i32> {
+) -> anyhow::Result<newt_core::plan::Plan> {
     let cfg = Config::resolve().map_err(|e| anyhow::anyhow!("config: {e}"))?;
     let model = cfg
         .backends
@@ -542,7 +558,36 @@ pub async fn author_plan_cli(
         })?;
     let pool = BackendPool::from_source(&StaticSource::from_configs(cfg.backends.iter()));
     println!("authoring a plan for: {goal}  (model {model})…");
-    let plan = author_plan(&pool, &LocalDispatcher, &model, &goal, max_subtasks).await?;
+    author_plan(&pool, &LocalDispatcher, &model, goal, max_subtasks).await
+}
+
+/// `newt plan --goal "<text>" --one-shot`: author a plan from the goal AND
+/// execute it autonomously in one gesture — the headless autonomous drive (e.g.
+/// the #548 evaluator). The `--one-shot` flag is the approval, like `--execute`.
+pub async fn one_shot_goal_cli(
+    goal: &str,
+    dir: Option<PathBuf>,
+    max_leaves: usize,
+) -> anyhow::Result<i32> {
+    let mut plan = author_plan_to_plan(goal, max_leaves).await?;
+    print!("{}", render_plan_preview(&plan));
+    println!("\n--one-shot: executing the authored plan autonomously…");
+    // No source file to shadow — write the run-log into the cwd.
+    execute_plan(
+        &mut plan,
+        dir,
+        max_leaves,
+        Some(PathBuf::from("plan.run.toml")),
+    )
+    .await
+}
+
+pub async fn author_plan_cli(
+    goal: String,
+    output: Option<PathBuf>,
+    max_subtasks: usize,
+) -> anyhow::Result<i32> {
+    let plan = author_plan_to_plan(&goal, max_subtasks).await?;
     let toml = plan
         .to_toml_string()
         .map_err(|e| anyhow::anyhow!("serialize plan: {e}"))?;
