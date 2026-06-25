@@ -57,6 +57,12 @@ tracing-subscriber.workspace = true
 default = ["rich-tui"]
 rich-tui = ["newt-tui/rich-tui"]
 
+# In-process candle inference (#639), opt-in/default-off. CPU by default;
+# accelerators are opt-in and adapt to the host (NEWT_EMBEDDED_DEVICE).
+embedded = ["newt-scheduler/embedded"]
+embedded-metal = ["embedded", "newt-inference/embedded-metal"] # Apple Silicon
+embedded-cuda = ["embedded", "newt-inference/embedded-cuda"]   # NVIDIA
+
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
 

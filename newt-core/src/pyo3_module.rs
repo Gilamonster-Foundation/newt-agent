@@ -307,6 +307,7 @@ impl PyBackendConfig {
                 name,
                 endpoint,
                 model,
+                model_path: None,
                 tiers: tiers.into_iter().map(PyTier::to_inner).collect(),
                 kind: Default::default(),
                 api: Default::default(),

@@ -411,6 +411,7 @@ fn build_openai_config(
         name: name.to_string(),
         endpoint: endpoint.to_string(),
         model: model.to_string(),
+        model_path: None,
         tiers: vec![Tier::Fast, Tier::Standard, Tier::Complex, Tier::Review],
         kind: BackendKind::Openai,
         api: Default::default(),

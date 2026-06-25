@@ -2195,8 +2195,15 @@ pub struct BackendConfig {
     /// stem, so the file body may omit it.
     #[serde(default)]
     pub name: String,
+    /// HTTP endpoint URL (Ollama / OpenAI). Defaulted so a `kind = "embedded"`
+    /// backend — which runs in-process and has no URL — can omit it.
+    #[serde(default)]
     pub endpoint: String,
     pub model: String,
+    /// For `kind = "embedded"`: the local GGUF model file (the in-process engine
+    /// has no `endpoint`). `~/` is expanded at use. Ignored for HTTP backends.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_path: Option<String>,
     #[serde(default)]
     pub tiers: Vec<Tier>,
     /// Which wire protocol this backend speaks. Defaults to `ollama`
@@ -2397,6 +2404,7 @@ fn fallback_localhost_backend() -> BackendConfig {
         name: "ollama".into(),
         endpoint: "http://127.0.0.1:11434".into(),
         model: "llama3.1:8b".into(),
+        model_path: None,
         tiers: vec![Tier::Fast, Tier::Standard, Tier::Complex, Tier::Review],
         kind: BackendKind::Ollama,
         api: Default::default(),
@@ -2564,6 +2572,18 @@ impl Config {
             };
             match std::fs::read_to_string(&path).map(|t| toml::from_str::<BackendConfig>(&t)) {
                 Ok(Ok(mut backend)) => {
+                    // A backend needs a destination: an HTTP `endpoint`, or — for
+                    // `kind = "embedded"` — a local `model_path`. Skip those with
+                    // neither (the "malformed → skip, not fatal" contract; before
+                    // `endpoint` became defaultable, the missing-endpoint case was
+                    // a parse error).
+                    if backend.endpoint.is_empty() && backend.model_path.is_none() {
+                        tracing::warn!(
+                            path = %path.display(),
+                            "skipping backend with neither endpoint nor model_path"
+                        );
+                        continue;
+                    }
                     // The filename is authoritative for the name (collision-free).
                     backend.name = stem.to_string();
                     match self.backends.iter_mut().find(|b| b.name == backend.name) {
@@ -3806,6 +3826,7 @@ mod tests {
                     name: "dgx1".into(),
                     endpoint: "http://stale:11434".into(),
                     model: "old-model".into(),
+                    model_path: None,
                     tiers: vec![],
                     kind: BackendKind::Ollama,
                     api: Default::default(),
@@ -3816,6 +3837,7 @@ mod tests {
                     name: "gnuc".into(),
                     endpoint: "http://gnuc:11434".into(),
                     model: "qwen2.5-coder:14b".into(),
+                    model_path: None,
                     tiers: vec![],
                     kind: BackendKind::Ollama,
                     api: Default::default(),
@@ -4648,6 +4670,7 @@ max_tool_rounds = 25
             name: "remote".into(),
             endpoint: "https://example.test".into(),
             model: "some-model".into(),
+            model_path: None,
             tiers: vec![Tier::Fast],
             kind: BackendKind::Openai,
             api: Default::default(),
