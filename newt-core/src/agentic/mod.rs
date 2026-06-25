@@ -1653,7 +1653,7 @@ pub async fn chat_complete(
             // Step 25.4 (#568): `markdown` is now resolved by the caller
             // (`[tui].markdown` ∧ `/markdown` override ∧ color) and read off the
             // ctx above — no longer hardcoded to `color`.
-            let (streamed, stream_usage) = stream_response(
+            let (streamed, stream_usage) = match stream_response(
                 sresp,
                 color,
                 show_thinking,
@@ -1661,7 +1661,39 @@ pub async fn chat_complete(
                 cancel,
                 markdown,
             )
-            .await?;
+            .await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    // #640: the stream connected (2xx) but the BODY broke
+                    // mid-response — the backend dropped/truncated the stream, or
+                    // an idle gap exceeded the read timeout. `stream_response`'s
+                    // only fallible step is the `resp.chunk()` body read, so any
+                    // error here IS a mid-stream break; left to `?` it surfaces as
+                    // an opaque "error decoding response body" and ends the whole
+                    // turn. It is recoverable, not fatal: the `stream:false` probe
+                    // above already produced the full answer in `probe_content`.
+                    // Warn and fall back to it — the SAME recovery as the non-2xx
+                    // path above. (Tiers 2+ of the ladder — retry / shrink /
+                    // fallback-model / prompt-and-save-preference — are #640.)
+                    print_harness_notice(
+                        &format!(
+                            "stream broke mid-response ({e}) — recovered the answer \
+                             from the non-streamed probe"
+                        ),
+                        color,
+                    );
+                    if !probe_content.is_empty() {
+                        emit_accepted(
+                            &mut on_round_usage,
+                            round_usage,
+                            truncation_suspect,
+                            round_est_raw,
+                        );
+                    }
+                    return Ok((probe_content, false, accumulated_usage, hallucination_count));
+                }
+            };
 
             if streamed.is_empty() {
                 // The streaming re-issue produced no tokens. Fall back to the
