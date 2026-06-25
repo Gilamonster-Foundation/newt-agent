@@ -280,6 +280,11 @@ pub struct PlanArgs {
     /// Actually dispatch the crews. The default is preview-only, so autonomous
     /// multi-crew execution always needs this second, explicit affirmation.
     pub execute: bool,
+    /// `--one-shot`: this run carries the human's tacit approval, so grant each
+    /// leaf the fs authority it needs (`grant_one_shot_authority`). A plain
+    /// `--execute` of a reviewed file does NOT — the human granted caveats by
+    /// editing the TOML.
+    pub one_shot: bool,
     /// Refuse to execute a plan with more leaves than this without an explicit
     /// raise — each leaf is an autonomous crew with no per-leaf human review.
     pub max_leaves: usize,
@@ -346,9 +351,32 @@ pub async fn run_plan_cli(args: PlanArgs) -> anyhow::Result<i32> {
         println!("\n(preview only — re-run with --execute to dispatch one crew per leaf)");
         return Ok(0);
     }
+    // `--one-shot` on a FILE is tacit approval to grant the leaves their fs
+    // authority; a plain `--execute` respects the caveats the human reviewed in.
+    if args.one_shot {
+        grant_one_shot_authority(&mut plan);
+    }
     // Run-log lands in a SIBLING artifact — never modify the authored source.
     let log_path = args.file.with_extension("run.toml");
     execute_plan(&mut plan, args.dir, args.max_leaves, Some(log_path)).await
+}
+
+/// `--one-shot`'s tacit approval, made real: grant every subtask the filesystem
+/// authority an autonomous run needs — `fs_read` + `fs_write` (worktree-bounded
+/// by the runner's apply-path guard). `exec` + `net` stay DENIED: verification
+/// runs via the runner's TRUSTED inferred command (`just check` / `cargo test`),
+/// not the model-authored `verify` shell, and the crew needs no network. Without
+/// this, every authored leaf is default-deny and can edit nothing.
+fn grant_one_shot_authority(plan: &mut newt_core::plan::Plan) {
+    use newt_core::role_profile::ScopeSpec;
+    for s in &mut plan.subtasks {
+        s.caveat_policy.fs_read = ScopeSpec::default(); // "all"
+        s.caveat_policy.fs_write = ScopeSpec::default(); // "all"
+    }
+    println!(
+        "--one-shot: granted each leaf fs_read + fs_write (worktree-bounded); \
+         exec + net stay denied (verify runs via the runner's trusted command)."
+    );
 }
 
 /// Execute a parsed/authored plan autonomously: enforce the `--max-leaves`
@@ -659,6 +687,7 @@ pub async fn one_shot_goal_cli(
 ) -> anyhow::Result<i32> {
     let mut plan = author_plan_to_plan(goal, max_leaves).await?;
     print!("{}", render_plan_preview(&plan));
+    grant_one_shot_authority(&mut plan);
     println!("\n--one-shot: executing the authored plan autonomously…");
     // No source file to shadow — write the run-log into the cwd.
     execute_plan(
@@ -897,6 +926,26 @@ mod tests {
         assert_eq!(refs[0].3, "12");
         // No GitHub URL ⇒ nothing (authoring just uses the goal text).
         assert!(github_refs("implement the thing").is_empty());
+    }
+
+    #[test]
+    fn one_shot_authority_grants_fs_keeps_exec_and_net_denied() {
+        use newt_core::role_profile::{ScopeKeyword, ScopeSpec};
+        let denied = ScopeSpec::Keyword(ScopeKeyword::None);
+        let all = ScopeSpec::Keyword(ScopeKeyword::All);
+        let mut plan = newt_core::plan::Plan::from_toml_str(
+            "goal = \"g\"\n[[subtask]]\nid = \"a\"\ninstruction = \"do a thing\"\n",
+        )
+        .unwrap();
+        // Authored default is fully denied on every axis.
+        assert_eq!(plan.subtasks[0].caveat_policy.fs_write, denied);
+        grant_one_shot_authority(&mut plan);
+        let pol = &plan.subtasks[0].caveat_policy;
+        assert_eq!(pol.fs_read, all, "fs_read granted");
+        assert_eq!(pol.fs_write, all, "fs_write granted");
+        // No shell or network authority is handed out.
+        assert_eq!(pol.exec, denied, "exec stays denied");
+        assert_eq!(pol.net, denied, "net stays denied");
     }
 
     #[test]
