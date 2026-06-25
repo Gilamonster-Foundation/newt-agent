@@ -737,8 +737,9 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
                     // One gesture: author the plan AND execute it autonomously.
                     crew::one_shot_goal_cli(&goal, dir, max_leaves).await?
                 } else {
-                    // Author a plan from the goal (a strong model decomposes it).
-                    crew::author_plan_cli(goal, output, max_leaves).await?
+                    // Author a plan from the goal (a strong model decomposes it),
+                    // grounded in the target repo (`--dir`, else cwd).
+                    crew::author_plan_cli(goal, output, max_leaves, dir).await?
                 }
             } else if let Some(file) = file {
                 // `--one-shot` on a FILE is the approval to run it end-to-end
