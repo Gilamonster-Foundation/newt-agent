@@ -39,6 +39,14 @@ pub struct LocalCrewRunner {
     /// the `/team` enable maps to `Presence::Prompt` (a soft affirmation); a
     /// `Passkey`-required action surfaces `NeedsAttest` until BOOT's verifier (#472).
     established: Presence,
+    /// The cumulative chaining cursor (#646): the git commit-ish of the last
+    /// successfully-landed leaf. Interior-mutable because `dispatch` takes
+    /// `&self`; each leaf forks its worktree off this, then advances it on a
+    /// successful land — so the LAST leaf's branch transitively contains every
+    /// prior leaf's work (one consolidated result). Seeded to `HEAD`. Correct
+    /// only because `run_plan` drives leaves SEQUENTIALLY (one at a time);
+    /// parallel fan-out would need a per-sibling base (a follow-up).
+    base_ref: std::sync::Mutex<String>,
 }
 
 impl LocalCrewRunner {
@@ -47,6 +55,7 @@ impl LocalCrewRunner {
             cfg,
             dir,
             established,
+            base_ref: std::sync::Mutex::new("HEAD".to_string()),
         }
     }
 
@@ -236,7 +245,12 @@ impl CrewRunner for LocalCrewRunner {
                             .to_string()
                     })?;
                 let id = worktree_id();
-                let mut ws = WorktreeWorkspace::create(&self.dir, &id, test_cmd)
+                // Leaf composition (#646): fork the worktree off the cumulative
+                // chain tip (the last landed leaf), not bare HEAD, so each leaf
+                // builds on its predecessors. Clone the cursor out of the guard so
+                // the lock is NOT held across the blocking git call below.
+                let base = self.base_ref.lock().unwrap().clone();
+                let mut ws = WorktreeWorkspace::create(&self.dir, &id, &base, test_cmd)
                     .map_err(|e| e.to_string())?;
                 let (body, passed) = if as_team {
                     let team_cfg = TeamConfig {
@@ -266,10 +280,17 @@ impl CrewRunner for LocalCrewRunner {
                         .unwrap_or_default()
                         .git_author();
                     match ws.commit_to_branch(&format!("crew/{id}"), &name, &email, task) {
-                        Ok((branch, sha)) => format!(
-                            "\n✓ LANDED on branch `{branch}` @ {sha} — review with \
-                             `git diff main..{branch}`, then merge with the `git` tool.\n"
-                        ),
+                        Ok((branch, sha)) => {
+                            // Advance the chain cursor to this landed tip so the
+                            // NEXT leaf forks off it. ONLY on a real land — a
+                            // failed / nothing-to-land leaf leaves the cursor at
+                            // the last GOOD tip.
+                            *self.base_ref.lock().unwrap() = sha.clone();
+                            format!(
+                                "\n✓ LANDED on branch `{branch}` @ {sha} — review with \
+                                 `git diff main..{branch}`, then merge with the `git` tool.\n"
+                            )
+                        }
                         Err(e) => format!("\n⚠ verified but nothing to land: {e}\n"),
                     }
                 } else {
