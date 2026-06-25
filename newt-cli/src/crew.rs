@@ -183,6 +183,13 @@ impl Workspace for WorktreeWorkspace {
     }
 
     fn read(&self, path: &str) -> Option<String> {
+        // Confine reads to the worktree (#521): refuse absolute / `..`-escaping
+        // paths — the same structural boundary as `apply` (#637). `Path::join`
+        // discards the base for an absolute path, so without this guard
+        // `read("/etc/passwd")` would escape the worktree and read the host.
+        if !is_safe_worktree_path(path) {
+            return None;
+        }
         std::fs::read_to_string(self.worktree.join(path)).ok()
     }
 
@@ -792,6 +799,20 @@ mod tests {
             ".. escapes"
         );
         assert!(!is_safe_worktree_path("a/../../b"), "embedded .. escapes");
+    }
+
+    #[test]
+    fn worktree_read_is_confined_to_the_worktree() {
+        // #521: a crew read is fenced to the worktree — an absolute / `..` path
+        // can't escape to the host, while a legitimate relative read still works.
+        let repo = git_repo();
+        let ws = WorktreeWorkspace::create(repo.path(), &worktree_id(), "true".into()).unwrap();
+        assert_eq!(ws.read("hello.txt").as_deref(), Some("world\n"));
+        assert!(ws.read("/etc/hostname").is_none(), "absolute read refused");
+        assert!(
+            ws.read("../../../../etc/hostname").is_none(),
+            ".. read refused"
+        );
     }
 
     #[test]
