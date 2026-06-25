@@ -577,6 +577,7 @@ pub async fn author_plan(
 pub async fn author_plan_to_plan(
     goal: &str,
     max_subtasks: usize,
+    repo_dir: &Path,
 ) -> anyhow::Result<newt_core::plan::Plan> {
     let cfg = Config::resolve().map_err(|e| anyhow::anyhow!("config: {e}"))?;
     let model = cfg
@@ -587,24 +588,31 @@ pub async fn author_plan_to_plan(
             anyhow::anyhow!("no backend configured to author a plan (add a [[backends]])")
         })?;
     let pool = BackendPool::from_source(&StaticSource::from_configs(cfg.backends.iter()));
-    // Phase 1 (#646): READ any GitHub issue/PR the goal references, via `gh` (a
+    let mut effective_goal = goal.to_string();
+    // Phase 1a (#646): READ any GitHub issue/PR the goal references, via `gh` (a
     // harness-available tool), so the planner decomposes the ACTUAL document
     // instead of a bare link it cannot fetch. Best-effort — a missing /
     // unauthenticated `gh` just leaves the goal text alone.
     let docs = fetch_referenced_docs(goal);
-    let effective_goal = if docs.is_empty() {
-        goal.to_string()
-    } else {
+    if !docs.is_empty() {
         println!(
             "read referenced GitHub doc(s) via gh ({} chars)",
             docs.len()
         );
-        format!(
-            "{goal}\n\nThe referenced document(s) below are the TASK to implement — \
+        effective_goal.push_str(&format!(
+            "\n\nThe referenced document(s) below are the TASK to implement — \
              decompose THESE into concrete engineering subtasks:{docs}"
-        )
-    };
-    // Phase 2: decompose the (doc-augmented) goal into a plan.
+        ));
+    }
+    // Phase 1b: READ the TARGET REPO's structure (language, build, layout) so the
+    // planner authors subtasks that fit THIS codebase — e.g. Rust crates, not a
+    // hallucinated Python stack. Best-effort: a non-repo dir adds nothing.
+    let repo = fetch_repo_context(repo_dir);
+    if !repo.is_empty() {
+        println!("read target-repo context ({} chars)", repo.len());
+        effective_goal.push_str(&repo);
+    }
+    // Phase 2: decompose the (doc + repo-augmented) goal into a plan.
     println!("authoring a plan for: {goal}  (model {model})…");
     author_plan(
         &pool,
@@ -614,6 +622,42 @@ pub async fn author_plan_to_plan(
         max_subtasks,
     )
     .await
+}
+
+/// Bounded structural context about the target repo at `dir` — its language /
+/// build system and top-level layout — so the planner authors subtasks that fit
+/// THIS codebase (e.g. Rust crates `newt-cli`/`newt-core`, not a hallucinated
+/// FastAPI/Django stack). Best-effort: a non-repo / unreadable `dir` yields "".
+fn fetch_repo_context(dir: &Path) -> String {
+    let mut facts: Vec<String> = Vec::new();
+    if dir.join("Cargo.toml").exists() {
+        facts.push("Language/build: Rust (a cargo workspace).".into());
+    } else if dir.join("package.json").exists() {
+        facts.push("Language/build: JavaScript/TypeScript (npm).".into());
+    } else if dir.join("pyproject.toml").exists() || dir.join("setup.py").exists() {
+        facts.push("Language/build: Python.".into());
+    } else if dir.join("go.mod").exists() {
+        facts.push("Language/build: Go.".into());
+    }
+    if let Some(cmd) = infer_test_command(dir) {
+        facts.push(format!("Verify/build command: `{cmd}`."));
+    }
+    // Top-level tracked entries (the crate / dir layout), bounded.
+    if let Ok(top) = git(dir, &["ls-tree", "--name-only", "HEAD"]) {
+        let entries: Vec<&str> = top.lines().filter(|l| !l.is_empty()).take(40).collect();
+        if !entries.is_empty() {
+            facts.push(format!("Top-level entries: {}.", entries.join(", ")));
+        }
+    }
+    if facts.is_empty() {
+        return String::new();
+    }
+    format!(
+        "\n\nTarget repository context — author subtasks that fit THIS codebase \
+         (use its real language, build command, and directories; do NOT invent a \
+         different stack):\n- {}",
+        facts.join("\n- ")
+    )
 }
 
 /// GitHub issue/PR references in `goal`: `(owner, repo, kind, number)` for each
@@ -687,7 +731,11 @@ pub async fn one_shot_goal_cli(
     dir: Option<PathBuf>,
     max_leaves: usize,
 ) -> anyhow::Result<i32> {
-    let mut plan = author_plan_to_plan(goal, max_leaves).await?;
+    // The repo we're about to modify IS the planning context (--dir, else cwd).
+    let repo_dir = dir
+        .clone()
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    let mut plan = author_plan_to_plan(goal, max_leaves, &repo_dir).await?;
     print!("{}", render_plan_preview(&plan));
     grant_one_shot_authority(&mut plan);
     println!("\n--one-shot: executing the authored plan autonomously…");
@@ -705,8 +753,10 @@ pub async fn author_plan_cli(
     goal: String,
     output: Option<PathBuf>,
     max_subtasks: usize,
+    dir: Option<PathBuf>,
 ) -> anyhow::Result<i32> {
-    let plan = author_plan_to_plan(&goal, max_subtasks).await?;
+    let repo_dir = dir.unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    let plan = author_plan_to_plan(&goal, max_subtasks, &repo_dir).await?;
     let toml = plan
         .to_toml_string()
         .map_err(|e| anyhow::anyhow!("serialize plan: {e}"))?;
@@ -1109,6 +1159,25 @@ mod tests {
     }
 
     /// A throwaway git repo with one committed file at `name` containing `body`.
+    #[test]
+    fn repo_context_detects_language_layout_and_skips_non_repo() {
+        let repo = git_repo();
+        std::fs::write(repo.path().join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+        std::fs::write(repo.path().join("main.rs"), "fn main() {}\n").unwrap();
+        git(repo.path(), &["add", "-A"]).unwrap();
+        git(repo.path(), &["commit", "-qm", "add cargo"]).unwrap();
+        let ctx = fetch_repo_context(repo.path());
+        assert!(ctx.contains("Rust"), "detects Rust: {ctx}");
+        assert!(
+            ctx.contains("cargo test"),
+            "infers the build command: {ctx}"
+        );
+        assert!(ctx.contains("Cargo.toml"), "lists top-level entries: {ctx}");
+        // A non-repo dir contributes nothing (authoring uses the goal text alone).
+        let empty = tempfile::tempdir().unwrap();
+        assert!(fetch_repo_context(empty.path()).is_empty());
+    }
+
     fn git_repo() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path();
