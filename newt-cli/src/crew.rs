@@ -557,8 +557,96 @@ pub async fn author_plan_to_plan(
             anyhow::anyhow!("no backend configured to author a plan (add a [[backends]])")
         })?;
     let pool = BackendPool::from_source(&StaticSource::from_configs(cfg.backends.iter()));
+    // Phase 1 (#646): READ any GitHub issue/PR the goal references, via `gh` (a
+    // harness-available tool), so the planner decomposes the ACTUAL document
+    // instead of a bare link it cannot fetch. Best-effort — a missing /
+    // unauthenticated `gh` just leaves the goal text alone.
+    let docs = fetch_referenced_docs(goal);
+    let effective_goal = if docs.is_empty() {
+        goal.to_string()
+    } else {
+        println!(
+            "read referenced GitHub doc(s) via gh ({} chars)",
+            docs.len()
+        );
+        format!(
+            "{goal}\n\nThe referenced document(s) below are the TASK to implement — \
+             decompose THESE into concrete engineering subtasks:{docs}"
+        )
+    };
+    // Phase 2: decompose the (doc-augmented) goal into a plan.
     println!("authoring a plan for: {goal}  (model {model})…");
-    author_plan(&pool, &LocalDispatcher, &model, goal, max_subtasks).await
+    author_plan(
+        &pool,
+        &LocalDispatcher,
+        &model,
+        &effective_goal,
+        max_subtasks,
+    )
+    .await
+}
+
+/// GitHub issue/PR references in `goal`: `(owner, repo, kind, number)` for each
+/// `github.com/<owner>/<repo>/(issues|pull)/<n>` URL. Tolerant of trailing
+/// punctuation on the number and of the URL sitting in surrounding prose.
+fn github_refs(goal: &str) -> Vec<(String, String, String, String)> {
+    let mut refs = Vec::new();
+    for token in goal.split_whitespace() {
+        let Some(idx) = token.find("github.com/") else {
+            continue;
+        };
+        let parts: Vec<&str> = token[idx + "github.com/".len()..].split('/').collect();
+        if parts.len() < 4 {
+            continue;
+        }
+        let num: String = parts[3]
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        if !num.is_empty() && (parts[2] == "issues" || parts[2] == "pull") {
+            refs.push((
+                parts[0].to_string(),
+                parts[1].to_string(),
+                parts[2].to_string(),
+                num,
+            ));
+        }
+    }
+    refs
+}
+
+/// Read each GitHub issue/PR referenced in `goal` with `gh … view --json
+/// title,body` and return their text. Best-effort: a `gh` that is missing,
+/// unauthenticated, or errors contributes nothing (and prints a note), so
+/// authoring still proceeds from the goal text alone.
+fn fetch_referenced_docs(goal: &str) -> String {
+    let mut out = String::new();
+    for (owner, repo, kind, num) in github_refs(goal) {
+        let sub = if kind == "pull" { "pr" } else { "issue" };
+        let slug = format!("{owner}/{repo}");
+        match std::process::Command::new("gh")
+            .args([sub, "view", &num, "--repo", &slug, "--json", "title,body"])
+            .output()
+        {
+            Ok(o) if o.status.success() => {
+                if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&o.stdout) {
+                    let title = v["title"].as_str().unwrap_or("");
+                    let body = v["body"].as_str().unwrap_or("");
+                    out.push_str(&format!(
+                        "\n\n--- {sub} {slug}#{num}: {title} ---\n{body}\n"
+                    ));
+                }
+            }
+            Ok(o) => eprintln!(
+                "note: `gh {sub} view {num}` failed ({}) — planning from the goal text alone",
+                String::from_utf8_lossy(&o.stderr).trim()
+            ),
+            Err(e) => {
+                eprintln!("note: could not run `gh` ({e}) — planning from the goal text alone");
+            }
+        }
+    }
+    out
 }
 
 /// `newt plan --goal "<text>" --one-shot`: author a plan from the goal AND
@@ -787,6 +875,29 @@ fn render(o: &CrewOutcome, worktree: &Path) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn github_refs_parses_issue_and_pr_urls_in_prose() {
+        // The exact prompt shape from the #548 exercise: a URL in surrounding prose.
+        let refs = github_refs(
+            "https://github.com/Gilamonster-Foundation/newt-agent/issues/548 <- take a look",
+        );
+        assert_eq!(
+            refs,
+            vec![(
+                "Gilamonster-Foundation".to_string(),
+                "newt-agent".to_string(),
+                "issues".to_string(),
+                "548".to_string(),
+            )]
+        );
+        // PR URLs (kind = pull) and trailing punctuation on the number.
+        let refs = github_refs("see https://github.com/o/r/pull/12).");
+        assert_eq!(refs[0].2, "pull");
+        assert_eq!(refs[0].3, "12");
+        // No GitHub URL ⇒ nothing (authoring just uses the goal text).
+        assert!(github_refs("implement the thing").is_empty());
+    }
 
     #[test]
     fn plan_preview_lists_leaves_and_their_deps() {
