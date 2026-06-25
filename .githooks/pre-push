@@ -17,6 +17,8 @@
 #   - `just audit` matches the "Security audit" job (cargo audit against the
 #     tracked ignore-list in .cargo/audit.toml; local best-effort if cargo-audit
 #     is absent — CI is the hard gate)
+#   - `just msrv` matches the "MSRV (Rust 1.88)" job (cargo +1.88 check; local
+#     best-effort, needs rustup + the 1.88 toolchain — CI is the hard gate)
 # When editing this hook, update the workflow to match.
 # When editing the workflow, update this hook to match.
 #
@@ -107,6 +109,9 @@ just check
 
 echo "[pre-push] running just audit..."
 just audit
+
+echo "[pre-push] running just msrv..."
+just msrv
 
 if [ "$SKIP_COV" -eq 0 ]; then
     echo "[pre-push] running just cov-ci..."
