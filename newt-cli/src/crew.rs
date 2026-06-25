@@ -612,6 +612,18 @@ pub async fn author_plan_to_plan(
         println!("read target-repo context ({} chars)", repo.len());
         effective_goal.push_str(&repo);
     }
+    // Phase 1c (B2): GREP the repo for the commands/symbols the TASK references
+    // (slash-commands, backtick-quoted identifiers), so the planner targets REAL
+    // files instead of guessing paths. Greps the goal+issue text, not the repo
+    // layout. Best-effort: a non-repo dir / no matches adds nothing.
+    let hits = fetch_code_grep_hits(&format!("{goal}{docs}"), repo_dir);
+    if !hits.is_empty() {
+        println!(
+            "found relevant code location(s) via grep ({} chars)",
+            hits.len()
+        );
+        effective_goal.push_str(&hits);
+    }
     // Phase 2: decompose the (doc + repo-augmented) goal into a plan.
     println!("authoring a plan for: {goal}  (model {model})…");
     author_plan(
@@ -687,6 +699,74 @@ fn github_refs(goal: &str) -> Vec<(String, String, String, String)> {
         }
     }
     refs
+}
+
+/// High-signal code-ish terms in `text` to grep for: slash-commands (`/dgx`)
+/// and backtick-quoted single tokens (`help_lines`). Distinctive enough to
+/// locate real code without the noise a bare word like "help" would drown it in.
+fn grep_terms(text: &str) -> Vec<String> {
+    let mut terms: Vec<String> = Vec::new();
+    // Backtick-quoted single tokens.
+    let mut rest = text;
+    while let Some(open) = rest.find('`') {
+        rest = &rest[open + 1..];
+        let Some(close) = rest.find('`') else { break };
+        let span = rest[..close].trim();
+        if (3..=40).contains(&span.chars().count())
+            && span.split_whitespace().count() == 1
+            && span.chars().any(|c| c.is_ascii_alphanumeric())
+        {
+            terms.push(span.to_string());
+        }
+        rest = &rest[close + 1..];
+    }
+    // Slash-commands: `/word`.
+    for tok in text.split(|c: char| c.is_whitespace() || "()[]{}<>,;:\"'".contains(c)) {
+        if let Some(after) = tok.strip_prefix('/') {
+            let cmd: String = after
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+                .collect();
+            if cmd.len() >= 2 {
+                terms.push(format!("/{cmd}"));
+            }
+        }
+    }
+    terms.sort();
+    terms.dedup();
+    terms.truncate(12);
+    terms
+}
+
+/// Grep the target repo for the task's high-signal terms and return where they
+/// already appear (bounded), so the planner implements AT real sites instead of
+/// guessing paths. Best-effort: a non-repo `dir` / no matches yields "".
+fn fetch_code_grep_hits(task: &str, dir: &Path) -> String {
+    let mut out = String::new();
+    let mut total = 0usize;
+    for term in grep_terms(task) {
+        if total >= 25 {
+            break;
+        }
+        let Ok(hits) = git(dir, &["grep", "-n", "-F", "-e", &term, "--", "*.rs"]) else {
+            continue;
+        };
+        for line in hits.lines().take(3) {
+            if total >= 25 {
+                break;
+            }
+            let trimmed: String = line.chars().take(160).collect();
+            out.push_str(&format!("  {term}: {trimmed}\n"));
+            total += 1;
+        }
+    }
+    if out.is_empty() {
+        return String::new();
+    }
+    format!(
+        "\n\nRelevant existing code — these task terms already appear here; \
+         implement AT these sites, do NOT invent file paths:\n{out}"
+    )
 }
 
 /// Read each GitHub issue/PR referenced in `goal` with `gh … view --json
@@ -1159,6 +1239,17 @@ mod tests {
     }
 
     /// A throwaway git repo with one committed file at `name` containing `body`.
+    #[test]
+    fn grep_terms_extracts_slash_commands_and_backtick_tokens_only() {
+        let terms =
+            grep_terms("roll up `/dgx` help; refactor `help_lines` and /models — but not help");
+        assert!(terms.contains(&"/dgx".to_string()), "{terms:?}");
+        assert!(terms.contains(&"/models".to_string()), "{terms:?}");
+        assert!(terms.contains(&"help_lines".to_string()), "{terms:?}");
+        // Bare common words (like "help") are NOT extracted — too noisy to grep.
+        assert!(!terms.iter().any(|t| t == "help"), "{terms:?}");
+    }
+
     #[test]
     fn repo_context_detects_language_layout_and_skips_non_repo() {
         let repo = git_repo();
