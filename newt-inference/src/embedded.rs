@@ -3,8 +3,10 @@
 //! An [`EmbeddedBackend`] runs a small quantized model from the
 //! [`palette`](crate::palette) **in process** (no HTTP — `endpoint() -> None`),
 //! so the summarizer + small auxiliary calls never contend with the primary
-//! model. The generation engine is pure-Rust **candle**; on Apple Silicon the
-//! `embedded-metal` sub-feature selects the Metal device (CPU otherwise).
+//! model. The generation engine is pure-Rust **candle** with **adaptive,
+//! non-contending** device selection: **CPU by default** (never fights the GPU
+//! the primary uses), with `embedded-metal` / `embedded-cuda` accelerators opt-in
+//! via `NEWT_EMBEDDED_DEVICE = cpu|metal|cuda|auto`.
 //!
 //! Engine scope (first increment): the **Qwen2** architecture (`qwen2.5-*`, the
 //! default summarizer picks). Other palette arches load to a clear "not yet
@@ -139,17 +141,56 @@ mod engine {
     use crate::backend::Message;
     use crate::palette::ModelArch;
 
-    /// Pick the inference device: Metal on Apple Silicon (`embedded-metal`), else
-    /// CPU. Metal is just an accelerator — the generation logic is identical.
-    fn device() -> anyhow::Result<Device> {
+    /// The CUDA device, if the `embedded-cuda` feature is compiled and it inits.
+    fn cuda_device() -> Option<Device> {
+        #[cfg(feature = "embedded-cuda")]
+        {
+            return Device::new_cuda(0).ok();
+        }
+        #[allow(unreachable_code)]
+        None
+    }
+
+    /// The Metal device, if the `embedded-metal` feature is compiled and it inits.
+    fn metal_device() -> Option<Device> {
         #[cfg(feature = "embedded-metal")]
         {
-            return Device::new_metal(0).context("failed to open the Metal device");
+            return Device::new_metal(0).ok();
         }
-        #[cfg(not(feature = "embedded-metal"))]
-        {
-            Ok(Device::Cpu)
-        }
+        #[allow(unreachable_code)]
+        None
+    }
+
+    /// Pick the inference device with **smart, non-contending defaults**. The
+    /// default is **CPU** — guaranteed not to fight whatever GPU the primary model
+    /// (or another agent) uses, which is the whole point of #639. An accelerator
+    /// is opt-in, the same code adapting to whatever the box provides:
+    ///
+    /// `NEWT_EMBEDDED_DEVICE = cpu (default) | metal | cuda | auto`
+    ///
+    /// `auto` uses the first compiled accelerator that initializes (CUDA, then
+    /// Metal), else CPU. A named accelerator that isn't compiled-in or fails to
+    /// init falls back to CPU (the small summarizer must always run) — it never
+    /// errors out of an inference call over device choice.
+    fn device() -> anyhow::Result<Device> {
+        let want = std::env::var("NEWT_EMBEDDED_DEVICE").unwrap_or_else(|_| "cpu".into());
+        let want = want.trim().to_ascii_lowercase();
+        let chosen = match want.as_str() {
+            "cuda" => cuda_device(),
+            "metal" => metal_device(),
+            "auto" => cuda_device().or_else(metal_device),
+            // "cpu" or anything unrecognized → the safe, non-contending default.
+            _ => Some(Device::Cpu),
+        };
+        Ok(chosen.unwrap_or_else(|| {
+            if want != "cpu" {
+                tracing::warn!(
+                    requested = %want,
+                    "embedded inference: requested device unavailable; using CPU"
+                );
+            }
+            Device::Cpu
+        }))
     }
 
     /// Format chat messages as Qwen2's ChatML prompt, ending at the assistant turn.

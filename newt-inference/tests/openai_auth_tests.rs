@@ -122,6 +122,7 @@ async fn from_config_wires_bearer_auth_from_env() {
         name: "remote".into(),
         endpoint: server.uri(),
         model: "m".into(),
+        model_path: None,
         tiers: vec![Tier::Fast],
         kind: BackendKind::Openai,
         api: Default::default(),

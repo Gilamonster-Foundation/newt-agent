@@ -48,8 +48,11 @@ default = []
 # headless (wyvern) build pulls nothing extra; the heavy candle deps never reach
 # the default build. This is also the per-agent add/remove switch.
 embedded = ["dep:candle-core", "dep:candle-transformers", "dep:tokenizers"]
-# Metal acceleration on Apple Silicon (the M4 target); CPU otherwise.
-embedded-metal = ["embedded", "candle-core/metal"]
+# GPU acceleration — opt-in. The default (`embedded`) runs on CPU, which never
+# contends the GPU the primary model uses. `device()` adapts to whichever
+# accelerator is compiled + available (NEWT_EMBEDDED_DEVICE=cpu|metal|cuda|auto).
+embedded-metal = ["embedded", "candle-core/metal"] # Apple Silicon
+embedded-cuda = ["embedded", "candle-core/cuda"]   # NVIDIA (Linux / Windows)
 pyo3 = [
     "dep:pyo3",
     "dep:pyo3-async-runtimes",

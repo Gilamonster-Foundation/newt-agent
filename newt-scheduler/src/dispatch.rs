@@ -64,13 +64,32 @@ impl Dispatcher for LocalDispatcher {
                     .complete(req)
                     .await
             }
-            // The in-process embedded backend (#639) is for the summarizer / small
-            // auxiliary calls, resolved via the own-backend path — it is not an
-            // HTTP pool backend the crew/team dispatcher fields.
-            BackendKind::Embedded => anyhow::bail!(
-                "the embedded (in-process) backend is summarizer-only, not dispatchable from the \
-                 crew/team pool; use an ollama/openai backend here"
-            ),
+            // The in-process embedded backend (#639): a first-class backend that
+            // loads a local GGUF (no endpoint) and runs candle. Behind the
+            // `embedded` feature so the lean/headless build never pulls candle.
+            BackendKind::Embedded => {
+                #[cfg(feature = "embedded")]
+                {
+                    let path = backend.model_path.as_deref().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "embedded backend '{}' needs a model_path (the local GGUF file)",
+                            backend.name
+                        )
+                    })?;
+                    newt_inference::embedded::EmbeddedBackend::new(model, path)?
+                        .complete(req)
+                        .await
+                }
+                #[cfg(not(feature = "embedded"))]
+                {
+                    let _ = req;
+                    anyhow::bail!(
+                        "backend '{}' is kind=embedded, but this build lacks the `embedded` \
+                         feature — rebuild with --features embedded (or use an ollama/openai backend)",
+                        backend.name
+                    )
+                }
+            }
         }
     }
 }
