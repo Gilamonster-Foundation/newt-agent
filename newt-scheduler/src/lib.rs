@@ -69,6 +69,9 @@ pub struct PoolBackend {
     /// Bearer token for a hosted/OpenAI-compatible backend (`Authorization:
     /// Bearer …`), resolved from config. `None` for keyless local endpoints.
     pub api_key: Option<String>,
+    /// For `kind = "embedded"`: the local GGUF model file path (the in-process
+    /// engine has no `endpoint`). `None` for HTTP backends.
+    pub model_path: Option<String>,
 }
 
 impl PoolBackend {
@@ -82,7 +85,15 @@ impl PoolBackend {
             models: Vec::new(),
             health: Health::Up,
             api_key: None,
+            model_path: None,
         }
+    }
+
+    /// Builder: the local GGUF model file for an `embedded` backend.
+    #[must_use]
+    pub fn with_model_path(mut self, model_path: Option<String>) -> Self {
+        self.model_path = model_path.filter(|p| !p.is_empty());
+        self
     }
 
     /// Builder: a bearer token for a hosted/OpenAI-compatible endpoint.
@@ -137,6 +148,7 @@ impl From<&BackendConfig> for PoolBackend {
             .with_tiers(c.tiers.clone())
             .with_models([c.model.clone()])
             .with_api_key(c.resolve_api_key())
+            .with_model_path(c.model_path.clone())
     }
 }
 
@@ -431,6 +443,7 @@ mod tests {
             name: "remote".into(),
             endpoint: "http://remote:8000".into(),
             model: "qwen3:32b".into(),
+            model_path: None,
             tiers: vec![Tier::Standard],
             kind: BackendKind::Openai,
             api: Default::default(),
@@ -444,6 +457,19 @@ mod tests {
         assert!(
             !pb.serves(Tier::Complex, None),
             "only the Standard tier was declared"
+        );
+        assert_eq!(pb.model_path, None, "HTTP backend has no model_path");
+        // An embedded backend carries its GGUF path through to the pool entry.
+        let emb = BackendConfig {
+            kind: BackendKind::Embedded,
+            endpoint: String::new(),
+            model: "qwen2.5-1.5b".into(),
+            model_path: Some("/models/qwen.gguf".into()),
+            ..cfg.clone()
+        };
+        assert_eq!(
+            PoolBackend::from(&emb).model_path.as_deref(),
+            Some("/models/qwen.gguf")
         );
         // StaticSource::from_configs round-trips a config slice.
         let src = StaticSource::from_configs([&cfg]);

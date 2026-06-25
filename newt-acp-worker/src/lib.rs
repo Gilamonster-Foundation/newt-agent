@@ -191,6 +191,7 @@ mod backend_selection_tests {
             name: name.into(),
             endpoint: "http://e".into(),
             model: "m".into(),
+            model_path: None,
             tiers: vec![Tier::Fast],
             kind,
             api: Default::default(),

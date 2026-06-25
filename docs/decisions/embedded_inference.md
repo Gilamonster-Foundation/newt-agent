@@ -32,8 +32,36 @@ into the existing own-backend resolution.
 | mlx-rs (Apple MLX) | Apple-native | ✅ native | fastest on M-series, but Rust bindings still early |
 
 Pure Rust (candle) keeps the build, the lint, and the coverage gate intact with
-no C++ toolchain. Metal acceleration is an Apple-only cargo sub-feature; the
-engine also runs on CPU (slower) for non-Metal hosts and CI compile-checks.
+no C++ toolchain.
+
+## Device selection — adaptive, non-contending, smart defaults
+
+The guiding ethos: **the code does the right thing wherever it's deployed via
+smart defaults, and lets the expert (human or LLM) opt into more.** Device choice
+follows that:
+
+- **Default = CPU.** A small summarizer on a few CPU cores is fast enough, and —
+  critically — it **never contends the GPU** the primary model (or another agent)
+  is using. That is the whole point of #639: *decouple from the contended
+  resource.*
+- **Accelerators are opt-in, and the same code adapts** to whatever the box
+  provides. Cargo sub-features compile them in: `embedded-metal` (Apple Silicon),
+  `embedded-cuda` (NVIDIA, Linux *and* Windows). A runtime knob selects without
+  recompiling: `NEWT_EMBEDDED_DEVICE = cpu (default) | metal | cuda | auto`.
+  `auto` uses the first compiled accelerator that initializes, else CPU. A named
+  accelerator that isn't compiled-in or fails to init **falls back to CPU** — the
+  summarizer must always run, never error out over device choice.
+
+## A first-class, general backend
+
+`EmbeddedBackend` is a plain `impl InferenceBackend` and `kind = "embedded"` is a
+first-class `BackendKind`. A `[[backends]] kind="embedded"` entry carries a local
+GGUF via **`model_path`** (the in-process engine has no `endpoint`) and is
+selectable *anywhere a backend is* — the crew/team pool dispatch builds it (behind
+the `embedded` feature), not just the summarizer. The primitive is intentionally
+small and wrappable: a future project can compose `EmbeddedBackend` under an
+OpenAI/Ollama shim or something not-yet-imagined, and we'll expose it via PyO3 for
+exactly that.
 
 ## Feature-gating (non-negotiable)
 

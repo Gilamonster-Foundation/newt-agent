@@ -26,6 +26,16 @@ tracing.workspace = true
 futures-core.workspace = true
 tokio-stream.workspace = true
 
+# Embedded in-process inference engine (#639) — pulled ONLY by the `embedded`
+# feature (default-off), so the default/headless build never sees them. Pure-Rust
+# candle (no C++ toolchain); Metal acceleration via the `embedded-metal`
+# sub-feature on Apple Silicon.
+candle-core = { version = "0.8", optional = true }
+candle-transformers = { version = "0.8", optional = true }
+tokenizers = { version = "0.20", optional = true, default-features = false, features = [
+    "onig",
+] }
+
 # Optional PyO3 bindings — opt in only via the umbrella `newt-agent-py`
 # crate; default builds stay Python-free.
 pyo3 = { workspace = true, optional = true }
@@ -34,11 +44,15 @@ pyo3-async-runtimes = { workspace = true, optional = true }
 [features]
 default = []
 # In-process inference backend (#639): the `EmbeddedBackend` over a `palette`
-# mini model. DEFAULT-OFF so the lean / headless (wyvern) build pulls nothing
-# extra. The candle/Metal generation-engine deps land under THIS feature with the
-# engine increment, so the switch is in place now and the heavy deps never reach
-# the default build.
-embedded = []
+# mini model, with the candle generation engine. DEFAULT-OFF so the lean /
+# headless (wyvern) build pulls nothing extra; the heavy candle deps never reach
+# the default build. This is also the per-agent add/remove switch.
+embedded = ["dep:candle-core", "dep:candle-transformers", "dep:tokenizers"]
+# GPU acceleration — opt-in. The default (`embedded`) runs on CPU, which never
+# contends the GPU the primary model uses. `device()` adapts to whichever
+# accelerator is compiled + available (NEWT_EMBEDDED_DEVICE=cpu|metal|cuda|auto).
+embedded-metal = ["embedded", "candle-core/metal"] # Apple Silicon
+embedded-cuda = ["embedded", "candle-core/cuda"]   # NVIDIA (Linux / Windows)
 pyo3 = [
     "dep:pyo3",
     "dep:pyo3-async-runtimes",
