@@ -333,6 +333,36 @@ pub fn render_plan_preview(plan: &newt_core::plan::Plan) -> String {
     out
 }
 
+/// Pre-execution structural sanity (B3): the problems that would doom an
+/// autonomous run — a dep naming a non-existent subtask (stalls forever), an
+/// empty-instruction leaf, or a plan with no dispatchable leaves (nothing runs).
+/// Empty result = structurally runnable. Pure (no fs / dispatch).
+fn plan_sanity(plan: &newt_core::plan::Plan) -> Vec<String> {
+    use std::collections::HashSet;
+    let ids: HashSet<&str> = plan.subtasks.iter().map(|s| s.id.as_str()).collect();
+    let mut problems = Vec::new();
+    for s in &plan.subtasks {
+        for d in &s.deps {
+            if !ids.contains(d.as_str()) {
+                problems.push(format!(
+                    "subtask `{}` depends on `{}`, which no subtask defines — it can never run",
+                    s.id, d
+                ));
+            }
+        }
+        if s.instruction.trim().is_empty() {
+            problems.push(format!("subtask `{}` has an empty instruction", s.id));
+        }
+    }
+    if plan.leaves().is_empty() && !plan.subtasks.is_empty() {
+        problems.push(
+            "the plan has no dispatchable leaves (every subtask is a parent) — nothing would run"
+                .to_string(),
+        );
+    }
+    problems
+}
+
 /// `newt plan <file>` — PREVIEW an overseer-authored plan, or (`--execute`)
 /// dispatch it leaf-by-leaf via a crew (each leaf in its own worktree, through the
 /// same `LocalCrewRunner` the in-session `crew` tool uses).
@@ -392,6 +422,17 @@ pub async fn execute_plan(
     max_leaves: usize,
     log_path: Option<PathBuf>,
 ) -> anyhow::Result<i32> {
+    // B3: refuse a structurally-doomed plan BEFORE spending crew runs on it — a
+    // dep on a non-existent subtask, an empty-instruction leaf, or no
+    // dispatchable leaves all guarantee a stall / wasted dispatch.
+    let problems = plan_sanity(plan);
+    if !problems.is_empty() {
+        eprintln!("✗ plan is not structurally runnable — refusing to dispatch:");
+        for p in &problems {
+            eprintln!("  - {p}");
+        }
+        return Ok(2);
+    }
     // Autonomy bound: refuse an oversized autonomous fan-out unless the human
     // explicitly raises the cap (each leaf runs with no per-leaf review).
     let leaf_count = plan.leaves().len();
@@ -1248,6 +1289,24 @@ mod tests {
         assert!(terms.contains(&"help_lines".to_string()), "{terms:?}");
         // Bare common words (like "help") are NOT extracted — too noisy to grep.
         assert!(!terms.iter().any(|t| t == "help"), "{terms:?}");
+    }
+
+    #[test]
+    fn plan_sanity_flags_dangling_deps_and_passes_clean_plans() {
+        // Clean: b depends on a, both defined.
+        let ok = newt_core::plan::Plan::from_toml_str(
+            "goal = \"g\"\n[[subtask]]\nid = \"a\"\ninstruction = \"do a\"\n\
+             [[subtask]]\nid = \"b\"\ninstruction = \"do b\"\ndeps = [\"a\"]\n",
+        )
+        .unwrap();
+        assert!(plan_sanity(&ok).is_empty(), "{:?}", plan_sanity(&ok));
+        // Dangling: b depends on a `ghost` no subtask defines.
+        let bad = newt_core::plan::Plan::from_toml_str(
+            "goal = \"g\"\n[[subtask]]\nid = \"b\"\ninstruction = \"do b\"\ndeps = [\"ghost\"]\n",
+        )
+        .unwrap();
+        let probs = plan_sanity(&bad);
+        assert!(probs.iter().any(|p| p.contains("ghost")), "{probs:?}");
     }
 
     #[test]
