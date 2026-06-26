@@ -414,6 +414,11 @@ pub(crate) struct CompressRequest<'a> {
     /// summary_input_cap_floor_chars`. A tight budget would otherwise starve the
     /// summarizer of material.
     pub summary_input_cap_floor_chars: usize,
+    /// Session compaction store (#661 group B). When `Some`, the evicted middle
+    /// span is stored (redacted) and a `compaction:<id>` retrieval handle is
+    /// named in the marker — progressive disclosure. `None` (headless / off)
+    /// keeps today's lossy-only behavior.
+    pub compaction_store: Option<&'a dyn crate::agentic::spill::SpillStore>,
 }
 
 impl<'a> CompressRequest<'a> {
@@ -445,6 +450,9 @@ impl<'a> CompressRequest<'a> {
             focus,
             est,
             summary_input_cap_floor_chars,
+            // The manual `/compress` path stays lossy-only for the MVP; the
+            // auto-loop is the progressive-disclosure surface (#661 group B).
+            compaction_store: None,
         }
     }
 }
@@ -643,6 +651,26 @@ pub(crate) async fn compress(
         if let Some(crumb) = reread_breadcrumb(middle) {
             body.push_str("\n\n");
             body.push_str(&crumb);
+        }
+        // #661 group B (progressive disclosure): store the verbatim (redacted)
+        // evicted middle in the session compaction store and name its handle, so
+        // the model can losslessly recover an exact detail the lossy summary
+        // dropped — `memory_fetch("compaction:<id>")`. Redact-on-store (the same
+        // closed `redact_secrets` table `spill:` uses): only the redacted span is
+        // ever retained. The summary is demoted from sole replacement to a
+        // catalog card over a retrievable span.
+        if let Some(store) = req.compaction_store {
+            let verbatim: String = middle
+                .iter()
+                .map(render_message)
+                .collect::<Vec<_>>()
+                .join("\n");
+            let id = store.store(redact_secrets(&verbatim));
+            body.push_str(&format!(
+                "\n\n[the full verbatim text of this compacted span is retrievable with \
+                 memory_fetch(\"compaction:{id}\") — use it to recover an exact detail \
+                 this summary dropped, instead of guessing]"
+            ));
         }
         // (4) Assembly with the REFERENCE-ONLY prefix + end marker.
         let mut out = Vec::with_capacity(boundary.head + 1 + (pruned.len() - boundary.tail_start));
@@ -1568,6 +1596,7 @@ mod tests {
                 focus: None,
                 est: EST,
                 summary_input_cap_floor_chars: 8_192,
+                compaction_store: None,
             },
             summarizer,
             state,
@@ -1596,6 +1625,7 @@ mod tests {
                 focus: None,
                 est: EST,
                 summary_input_cap_floor_chars: 8_192,
+                compaction_store: None,
             },
             summarizer,
             state,
@@ -1623,6 +1653,7 @@ mod tests {
                 focus: None,
                 est: EST,
                 summary_input_cap_floor_chars: 8_192,
+                compaction_store: None,
             },
             summarizer,
             state,
@@ -1800,6 +1831,7 @@ mod tests {
                 focus: None,
                 est: EST,
                 summary_input_cap_floor_chars: 8_192,
+                compaction_store: None,
             },
             Some(&*s),
             &mut state,
@@ -2696,6 +2728,58 @@ mod tests {
             out.tokens_after
         );
         assert!(out.fired, "the marker compaction changed the working set");
+    }
+
+    #[tokio::test]
+    async fn compaction_store_captures_redacted_span_and_names_the_handle() {
+        use crate::agentic::spill::{SessionSpillStore, SpillStore};
+        // #661 group B: with a compaction store, the evicted middle is stored
+        // (redacted) and the marker names a `compaction:<id>` retrieval handle —
+        // progressive disclosure. A secret in the middle is redacted on store.
+        let compaction = SessionSpillStore::default();
+        let mut msgs = vec![sys("sys"), user("task")];
+        // An early-middle message carrying a secret — it will be evicted + stored.
+        msgs.push(user("config api_key=9f8e7d6c5b4a32100ffee and more"));
+        for i in 0..24 {
+            msgs.push(user(&format!("middle note {i} {}", "m".repeat(200))));
+        }
+        msgs.push(user("recent tail"));
+        let mut state = CompressState::new();
+        let out = compress(
+            CompressRequest {
+                messages: &msgs,
+                budget: 300,
+                max_messages: None,
+                task: "task",
+                hard_budget: true,
+                authoritative: true,
+                focus: None,
+                est: EST,
+                summary_input_cap_floor_chars: 8_192,
+                compaction_store: Some(&compaction),
+            },
+            None, // no summarizer → static marker; the handle still rides
+            &mut state,
+        )
+        .await;
+        assert!(out.fired);
+        // The marker names compaction:s0 so the model can fault the span in.
+        assert!(
+            out.messages.iter().any(|m| m["content"]
+                .as_str()
+                .is_some_and(|c| c.contains("compaction:s0"))),
+            "the marker must name the compaction handle"
+        );
+        // The store holds the verbatim span — with the secret REDACTED on store.
+        let span = compaction.fetch("s0").expect("span must be stored");
+        assert!(
+            !span.contains("9f8e7d6c5b4a32100ffee"),
+            "the secret must be redacted before store: {span}"
+        );
+        assert!(
+            span.contains("[REDACTED]"),
+            "redaction marker present: {span}"
+        );
     }
 
     /// Effective compressions never trip the anti-thrash switch.

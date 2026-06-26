@@ -557,6 +557,12 @@ pub struct ChatCtx<'a> {
     /// (and `spill:` re-reads resolve to a labelled absence). Shared `&dyn`
     /// (interior mutability) so it serves both the write path and `memory_fetch`.
     pub spill_store: Option<&'a dyn crate::agentic::spill::SpillStore>,
+    /// Session compaction store (#661 group B): the compressor stores each
+    /// evicted (redacted) middle span here and names a `compaction:<id>` handle
+    /// in the marker, so the model can losslessly recover a detail the summary
+    /// dropped. SEPARATE store from `spill_store` (own id space). `None` =
+    /// lossy-only compaction (headless / progressive disclosure off).
+    pub compaction_store: Option<&'a dyn crate::agentic::spill::SpillStore>,
     /// Inject the `<state>` scratchpad block + advertise the state tools (Step
     /// 26.4, #583). The resolved `scratchpad` feature; false for headless/eval.
     pub scratchpad: bool,
@@ -977,6 +983,7 @@ pub async fn chat_complete(
         markdown: _,
         tool_offload,
         spill_store,
+        compaction_store,
         scratchpad,
         scratchpad_store,
         code_search,
@@ -1258,6 +1265,7 @@ pub async fn chat_complete(
                                 focus: None,
                                 est: estimation,
                                 summary_input_cap_floor_chars,
+                                compaction_store,
                             },
                             summarizer,
                             compress_state,
@@ -1455,6 +1463,7 @@ pub async fn chat_complete(
                                 focus: None,
                                 est: estimation,
                                 summary_input_cap_floor_chars,
+                                compaction_store,
                             },
                             summarizer,
                             compress_state,
@@ -1812,6 +1821,7 @@ pub async fn chat_complete(
                                 focus: None,
                                 est: estimation,
                                 summary_input_cap_floor_chars,
+                                compaction_store,
                             },
                             summarizer,
                             compress_state,
@@ -2483,6 +2493,7 @@ pub async fn openai_chat_complete(
         markdown: _,
         tool_offload,
         spill_store,
+        compaction_store,
         scratchpad,
         scratchpad_store,
         code_search,
@@ -2673,6 +2684,7 @@ pub async fn openai_chat_complete(
                         focus: None,
                         est: estimation,
                         summary_input_cap_floor_chars,
+                        compaction_store,
                     },
                     summarizer,
                     compress_state,
@@ -2827,6 +2839,7 @@ pub async fn openai_chat_complete(
                                 focus: None,
                                 est: estimation,
                                 summary_input_cap_floor_chars,
+                                compaction_store,
                             },
                             summarizer,
                             compress_state,
@@ -3269,6 +3282,7 @@ pub async fn openai_responses_complete(
         markdown: _,
         tool_offload,
         spill_store,
+        compaction_store,
         scratchpad,
         scratchpad_store,
         code_search,
@@ -3306,6 +3320,9 @@ pub async fn openai_responses_complete(
         git_tool,
         crew_runner,
     } = ctx;
+    // The OpenAI-Responses loop offloads tool output (spill_store) but does not
+    // run the compressor, so it never stores compaction spans.
+    let _ = compaction_store;
 
     let client = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(connect_timeout_secs))
@@ -4138,6 +4155,7 @@ mod tool_round_cap_tests {
                 markdown: false,
                 tool_offload: false,
                 spill_store: None,
+                compaction_store: None,
                 scratchpad: false,
                 scratchpad_store: None,
                 code_search: None,
@@ -4247,6 +4265,7 @@ mod tool_round_cap_tests {
                 markdown: false,
                 tool_offload: false,
                 spill_store: None,
+                compaction_store: None,
                 scratchpad: false,
                 scratchpad_store: None,
                 code_search: None,
@@ -4324,6 +4343,7 @@ mod tool_round_cap_tests {
                 markdown: false,
                 tool_offload: false,
                 spill_store: None,
+                compaction_store: None,
                 scratchpad: false,
                 scratchpad_store: None,
                 code_search: None,
@@ -4462,6 +4482,7 @@ mod tool_round_cap_tests {
                 markdown: false,
                 tool_offload: false,
                 spill_store: None,
+                compaction_store: None,
                 scratchpad: false,
                 scratchpad_store: None,
                 code_search: None,
@@ -4537,6 +4558,7 @@ mod tool_round_cap_tests {
                 markdown: false,
                 tool_offload: false,
                 spill_store: None,
+                compaction_store: None,
                 scratchpad: false,
                 scratchpad_store: None,
                 code_search: None,
@@ -4635,6 +4657,7 @@ mod tool_round_cap_tests {
                 markdown: false,
                 tool_offload: false,
                 spill_store: None,
+                compaction_store: None,
                 scratchpad: false,
                 scratchpad_store: None,
                 code_search: None,
@@ -4745,6 +4768,7 @@ mod tool_round_cap_tests {
                 markdown: false,
                 tool_offload: false,
                 spill_store: None,
+                compaction_store: None,
                 scratchpad: false,
                 scratchpad_store: None,
                 code_search: None,
@@ -4847,6 +4871,7 @@ mod tool_round_cap_tests {
                 markdown: false,
                 tool_offload: false,
                 spill_store: None,
+                compaction_store: None,
                 scratchpad: false,
                 scratchpad_store: None,
                 code_search: None,
@@ -4990,6 +5015,7 @@ mod tool_round_cap_tests {
                 markdown: false,
                 tool_offload: false,
                 spill_store: None,
+                compaction_store: None,
                 scratchpad: false,
                 scratchpad_store: None,
                 code_search: None,
@@ -5143,6 +5169,7 @@ mod tool_round_cap_tests {
                 markdown: false,
                 tool_offload: false,
                 spill_store: None,
+                compaction_store: None,
                 scratchpad: false,
                 scratchpad_store: None,
                 code_search: None,
@@ -5235,6 +5262,7 @@ mod http_loop_tests {
             markdown: false,
             tool_offload: false,
             spill_store: None,
+            compaction_store: None,
             scratchpad: false,
             scratchpad_store: None,
             code_search: None,
@@ -6123,6 +6151,7 @@ mod save_note_loop_tests {
             markdown: false,
             tool_offload: false,
             spill_store: None,
+            compaction_store: None,
             scratchpad: false,
             scratchpad_store: None,
             code_search: None,
@@ -6605,6 +6634,7 @@ mod compression_loop_tests {
             markdown: false,
             tool_offload: false,
             spill_store: None,
+            compaction_store: None,
             scratchpad: false,
             scratchpad_store: None,
             code_search: None,
@@ -7752,6 +7782,7 @@ mod observation_hook_tests {
             markdown: false,
             tool_offload: false,
             spill_store: None,
+            compaction_store: None,
             scratchpad: false,
             scratchpad_store: None,
             code_search: None,
