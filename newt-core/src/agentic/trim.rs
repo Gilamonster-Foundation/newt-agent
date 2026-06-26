@@ -9,6 +9,8 @@
 //! by the [`super::compress`] pipeline. `trim_for_summary` survives for the
 //! cap-exit summary request only.
 
+use crate::tokens::TokenEstimation;
+
 /// Trim a message list for the cap-exit summary: keep the first `head` messages
 /// (system prompt + original task) and the last `tail` messages (recent rounds).
 /// Inserts a single placeholder when the middle is dropped so the model knows
@@ -42,12 +44,13 @@ pub fn trim_for_summary(
     result
 }
 
-/// `(len + 3) / 4` ceiling-divide token estimate of one serialized JSON value.
+/// Ceiling-divide token estimate of one serialized JSON value under the
+/// configured [`TokenEstimation`] heuristic.
 ///
 /// Ceiling (not floor) so a 1-char fragment never estimates to zero tokens —
 /// the fallback must err on the side of counting, not undercounting (18.1).
-pub(crate) fn estimate_value_tokens(v: &serde_json::Value) -> usize {
-    v.to_string().chars().count().div_ceil(4)
+pub(crate) fn estimate_value_tokens(v: &serde_json::Value, est: TokenEstimation) -> usize {
+    est.tokens_for_chars(v.to_string().chars().count())
 }
 
 /// Estimate the input token count of a serialized message list.
@@ -61,8 +64,8 @@ pub(crate) fn estimate_value_tokens(v: &serde_json::Value) -> usize {
 /// estimate only needs to be good enough to fire compression *before* a
 /// request would blow past the model's context window — see
 /// [`super::compress`] and issue #223.
-pub(crate) fn estimate_tokens(messages: &[serde_json::Value]) -> usize {
-    messages.iter().map(estimate_value_tokens).sum()
+pub(crate) fn estimate_tokens(messages: &[serde_json::Value], est: TokenEstimation) -> usize {
+    messages.iter().map(|m| estimate_value_tokens(m, est)).sum()
 }
 
 /// Estimate the token count of a full request: messages **plus** the
@@ -73,8 +76,9 @@ pub(crate) fn estimate_tokens(messages: &[serde_json::Value]) -> usize {
 pub(crate) fn estimate_request_tokens(
     messages: &[serde_json::Value],
     tools: Option<&serde_json::Value>,
+    est: TokenEstimation,
 ) -> usize {
-    estimate_tokens(messages) + tools.map(estimate_value_tokens).unwrap_or(0)
+    estimate_tokens(messages, est) + tools.map(|t| estimate_value_tokens(t, est)).unwrap_or(0)
 }
 
 /// Tracks the truthful "how full is the context" figure across the rounds of
@@ -127,12 +131,14 @@ impl PromptTracker {
         messages: &[serde_json::Value],
         tools: Option<&serde_json::Value>,
         ratio: f32,
+        est: TokenEstimation,
     ) -> usize {
         match self.anchor {
             Some((tokens, count)) if count <= messages.len() => {
-                tokens as usize + super::calibrate_up(estimate_tokens(&messages[count..]), ratio)
+                tokens as usize
+                    + super::calibrate_up(estimate_tokens(&messages[count..], est), ratio)
             }
-            _ => super::calibrate_up(estimate_request_tokens(messages, tools), ratio),
+            _ => super::calibrate_up(estimate_request_tokens(messages, tools, est), ratio),
         }
     }
 }
@@ -276,6 +282,9 @@ pub(crate) fn openai_usage(usage: &serde_json::Value) -> Option<crate::TokenUsag
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Default estimation (chars_per_token = 4) for the unit tests.
+    const EST: TokenEstimation = TokenEstimation { chars_per_token: 4 };
     use serde_json::json;
 
     /// `trim_for_summary` keeps head + tail and inserts a placeholder for
@@ -324,8 +333,8 @@ mod tests {
     fn estimate_tokens_scales_with_content_size() {
         let small = vec![serde_json::json!({"role": "user", "content": "hi"})];
         let big = vec![serde_json::json!({"role": "user", "content": "x".repeat(4000)})];
-        let s = estimate_tokens(&small);
-        let b = estimate_tokens(&big);
+        let s = estimate_tokens(&small, EST);
+        let b = estimate_tokens(&big, EST);
         // ~4000 chars / 4 ≈ 1000 tokens for the big message.
         assert!(
             b >= 900,
@@ -532,11 +541,11 @@ mod tests {
     #[test]
     fn estimate_value_tokens_ceiling_divides() {
         // json!("x") serializes to `"x"` — 3 chars → ceil(3/4) = 1, floor = 0.
-        assert_eq!(estimate_value_tokens(&serde_json::json!("x")), 1);
+        assert_eq!(estimate_value_tokens(&serde_json::json!("x"), EST), 1);
         // `"xxxxx"` — 7 chars → ceil(7/4) = 2.
-        assert_eq!(estimate_value_tokens(&serde_json::json!("xxxxx")), 2);
+        assert_eq!(estimate_value_tokens(&serde_json::json!("xxxxx"), EST), 2);
         // Exactly divisible: `"xx"` — 4 chars → 1.
-        assert_eq!(estimate_value_tokens(&serde_json::json!("xx")), 1);
+        assert_eq!(estimate_value_tokens(&serde_json::json!("xx"), EST), 1);
     }
 
     #[test]
@@ -546,10 +555,10 @@ mod tests {
             "type": "function",
             "function": {"name": "list_dir", "description": "x".repeat(400)}
         }]);
-        let without = estimate_request_tokens(&msgs, None);
-        let with = estimate_request_tokens(&msgs, Some(&tools));
-        assert_eq!(without, estimate_tokens(&msgs));
-        assert_eq!(with, without + estimate_value_tokens(&tools));
+        let without = estimate_request_tokens(&msgs, None, EST);
+        let with = estimate_request_tokens(&msgs, Some(&tools), EST);
+        assert_eq!(without, estimate_tokens(&msgs, EST));
+        assert_eq!(with, without + estimate_value_tokens(&tools, EST));
         assert!(
             with - without >= 100,
             "the ~400-char schema must add ~100 tokens, got {}",
@@ -572,8 +581,8 @@ mod tests {
         let tools = fixture_tools();
         let tracker = PromptTracker::new();
         assert_eq!(
-            tracker.current(&msgs, Some(&tools), 1.0),
-            estimate_request_tokens(&msgs, Some(&tools)),
+            tracker.current(&msgs, Some(&tools), 1.0, EST),
+            estimate_request_tokens(&msgs, Some(&tools), EST),
             "no report yet → chars/4 of messages + tool-schema tokens"
         );
     }
@@ -590,15 +599,18 @@ mod tests {
         // (schemas + template included — far above any chars/4 guess).
         tracker.record(1_000, msgs.len());
         assert_eq!(
-            tracker.current(&msgs, Some(&tools), 1.0),
+            tracker.current(&msgs, Some(&tools), 1.0, EST),
             1_000,
             "anchored: schema tokens NOT re-added — the report includes them"
         );
         // Two messages appended since the report add their chars/4 estimate.
         msgs.push(serde_json::json!({"role": "assistant", "content": "a".repeat(400)}));
         msgs.push(serde_json::json!({"role": "tool", "content": "b".repeat(400)}));
-        let appended = estimate_tokens(&msgs[2..]);
-        assert_eq!(tracker.current(&msgs, Some(&tools), 1.0), 1_000 + appended);
+        let appended = estimate_tokens(&msgs[2..], EST);
+        assert_eq!(
+            tracker.current(&msgs, Some(&tools), 1.0, EST),
+            1_000 + appended
+        );
     }
 
     /// Phase 20 §2.3: a non-1.0 calibration ratio scales only the chars/4
@@ -615,22 +627,22 @@ mod tests {
         // Unanchored: the whole request estimate scales up.
         let tracker = PromptTracker::new();
         assert_eq!(
-            tracker.current(&msgs, Some(&tools), ratio),
-            super::super::calibrate_up(estimate_request_tokens(&msgs, Some(&tools)), ratio)
+            tracker.current(&msgs, Some(&tools), ratio, EST),
+            super::super::calibrate_up(estimate_request_tokens(&msgs, Some(&tools), EST), ratio)
         );
         // Anchored: the 1,000-token report stays as-is; only the appended
         // messages' estimate scales.
         let mut tracker = PromptTracker::new();
         tracker.record(1_000, msgs.len());
         assert_eq!(
-            tracker.current(&msgs, Some(&tools), ratio),
+            tracker.current(&msgs, Some(&tools), ratio, EST),
             1_000,
             "no appended messages → the real-token anchor alone, unscaled"
         );
         msgs.push(serde_json::json!({"role": "tool", "content": "b".repeat(400)}));
-        let appended = estimate_tokens(&msgs[2..]);
+        let appended = estimate_tokens(&msgs[2..], EST);
         assert_eq!(
-            tracker.current(&msgs, Some(&tools), ratio),
+            tracker.current(&msgs, Some(&tools), ratio, EST),
             1_000 + super::super::calibrate_up(appended, ratio)
         );
     }
@@ -642,14 +654,17 @@ mod tests {
         tracker.record(1_000, 1);
         tracker.invalidate();
         assert_eq!(
-            tracker.current(&msgs, None, 1.0),
-            estimate_tokens(&msgs),
+            tracker.current(&msgs, None, 1.0, EST),
+            estimate_tokens(&msgs, EST),
             "invalidated anchor → fallback estimate"
         );
         // A stale anchor (more messages at report time than exist now — a trim
         // shrank the list) must also fall back, never index out of bounds.
         tracker.record(1_000, 5);
-        assert_eq!(tracker.current(&msgs, None, 1.0), estimate_tokens(&msgs));
+        assert_eq!(
+            tracker.current(&msgs, None, 1.0, EST),
+            estimate_tokens(&msgs, EST)
+        );
     }
 
     #[test]

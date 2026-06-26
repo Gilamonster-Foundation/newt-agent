@@ -9,6 +9,7 @@
 
 use std::sync::Mutex;
 
+use newt_core::TokenEstimation;
 use newt_tui::probe::{
     ensure_context_window, fetch_context_window, fetch_ollama_models, load_cache,
     probe_input_boundary, probe_thinking, probe_tool_conformance,
@@ -17,6 +18,9 @@ use newt_tui::probe::{
 };
 use wiremock::matchers::{body_partial_json, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
+
+/// Default estimation (chars_per_token = 4) for the probe integration tests.
+const EST: TokenEstimation = TokenEstimation { chars_per_token: 4 };
 
 /// An endpoint nothing listens on — connection refused, fast failure.
 const DEAD_ENDPOINT: &str = "http://127.0.0.1:1";
@@ -349,7 +353,7 @@ async fn probe_thinking_detects_thinking_only_and_returns_calibration() {
         .mount(&server)
         .await;
 
-    let pt = probe_thinking(&server.uri(), "thinker").expect("probe should succeed");
+    let pt = probe_thinking(&server.uri(), "thinker", EST).expect("probe should succeed");
     assert!(
         pt.emits_thinking,
         "empty content + thinking → quirk detected"
@@ -371,7 +375,7 @@ async fn probe_thinking_clean_content_leaves_quirk_false() {
         .mount(&server)
         .await;
 
-    let pt = probe_thinking(&server.uri(), "clean").unwrap();
+    let pt = probe_thinking(&server.uri(), "clean", EST).unwrap();
     assert!(!pt.emits_thinking);
     assert!(pt.calibration.is_none(), "no prompt_eval_count → no sample");
 }
@@ -429,7 +433,7 @@ async fn probe_input_boundary_converges_near_threshold_and_marks_high() {
     e.context_window = Some(32_768); // declared — caps the search (VRAM)
     e.safe_context = Some(8_192); // low bound start
 
-    let outcome = probe_input_boundary(&server.uri(), "m", &mut e, |_s| {}, "2026-06-13")
+    let outcome = probe_input_boundary(&server.uri(), "m", &mut e, |_s| {}, "2026-06-13", EST)
         .expect("boundary search runs");
 
     // Highest accepted should be just under the threshold (within the
@@ -488,7 +492,7 @@ async fn probe_input_boundary_doubles_to_bracket_when_window_unknown() {
     e.context_window = None; // unknown → forces the doubling-bracket path
     e.safe_context = Some(4_096); // low-bound start
 
-    let outcome = probe_input_boundary(&server.uri(), "m", &mut e, |_s| {}, "2026-06-13")
+    let outcome = probe_input_boundary(&server.uri(), "m", &mut e, |_s| {}, "2026-06-13", EST)
         .expect("boundary search runs without a declared window");
 
     // It must have climbed well past the first doubling candidate (8_192) by
@@ -544,7 +548,8 @@ async fn probe_input_boundary_truncation_lowers_high_bound() {
     e.context_window = Some(32_768);
     e.safe_context = Some(8_192);
 
-    let outcome = probe_input_boundary(&server.uri(), "m", &mut e, |_s| {}, "2026-06-13").unwrap();
+    let outcome =
+        probe_input_boundary(&server.uri(), "m", &mut e, |_s| {}, "2026-06-13", EST).unwrap();
 
     assert_eq!(outcome.highest_accepted, None, "nothing was accepted");
     assert_eq!(e.max_ok_input, None, "no false boundary recorded");
@@ -585,7 +590,7 @@ async fn probe_classifies_native_tool_calls() {
         .mount(&server)
         .await;
 
-    let c = probe_tool_conformance(&server.uri(), "good-model")
+    let c = probe_tool_conformance(&server.uri(), "good-model", EST)
         .await
         .unwrap();
     assert_eq!(c, ToolConformance::Native);
@@ -614,7 +619,7 @@ async fn probe_conformance_calibrated_harvests_prompt_eval_count() {
         .mount(&server)
         .await;
 
-    let pc = probe_tool_conformance_calibrated(&server.uri(), "good-model")
+    let pc = probe_tool_conformance_calibrated(&server.uri(), "good-model", EST)
         .await
         .expect("probe should succeed");
     assert_eq!(pc.conformance, ToolConformance::Native);
@@ -641,7 +646,7 @@ async fn probe_conformance_calibrated_absent_when_no_prompt_eval_count() {
         .mount(&server)
         .await;
 
-    let pc = probe_tool_conformance_calibrated(&server.uri(), "m")
+    let pc = probe_tool_conformance_calibrated(&server.uri(), "m", EST)
         .await
         .unwrap();
     assert_eq!(pc.conformance, ToolConformance::NoTools);
@@ -662,7 +667,9 @@ async fn probe_classifies_text_mode_json_in_content() {
         .mount(&server)
         .await;
 
-    let c = probe_tool_conformance(&server.uri(), "m").await.unwrap();
+    let c = probe_tool_conformance(&server.uri(), "m", EST)
+        .await
+        .unwrap();
     assert_eq!(c, ToolConformance::TextMode);
 }
 
@@ -677,7 +684,9 @@ async fn probe_classifies_no_tools_plain_text() {
         .mount(&server)
         .await;
 
-    let c = probe_tool_conformance(&server.uri(), "m").await.unwrap();
+    let c = probe_tool_conformance(&server.uri(), "m", EST)
+        .await
+        .unwrap();
     assert_eq!(c, ToolConformance::NoTools);
 }
 
@@ -697,7 +706,9 @@ async fn probe_empty_tool_calls_array_falls_through_to_content() {
         .mount(&server)
         .await;
 
-    let c = probe_tool_conformance(&server.uri(), "m").await.unwrap();
+    let c = probe_tool_conformance(&server.uri(), "m", EST)
+        .await
+        .unwrap();
     assert_eq!(c, ToolConformance::TextMode);
 }
 
@@ -710,7 +721,7 @@ async fn probe_errors_on_http_failure() {
         .mount(&server)
         .await;
 
-    let err = probe_tool_conformance(&server.uri(), "m")
+    let err = probe_tool_conformance(&server.uri(), "m", EST)
         .await
         .expect_err("HTTP 503 must be an error");
     assert!(err.to_string().contains("Ollama returned"), "got: {err}");
@@ -718,7 +729,7 @@ async fn probe_errors_on_http_failure() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn probe_errors_when_unreachable() {
-    let err = probe_tool_conformance(DEAD_ENDPOINT, "m")
+    let err = probe_tool_conformance(DEAD_ENDPOINT, "m", EST)
         .await
         .expect_err("connection refused must be an error");
     assert!(err.to_string().contains("request failed"), "got: {err}");

@@ -35,6 +35,7 @@ pub mod settings;
 pub mod ssh_caveats;
 pub mod store;
 pub mod symbols;
+pub mod tokens;
 pub mod tuning;
 pub mod verify_gate;
 pub mod workspace_key;
@@ -108,4 +109,5 @@ pub use role_profile::{
 pub use router::{Router, Tier};
 pub use session::SessionId;
 pub use store::{sanitize_fts5_query, ConversationStore, SearchHit};
+pub use tokens::TokenEstimation;
 pub use workspace_key::workspace_key_v2;

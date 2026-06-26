@@ -696,6 +696,13 @@ pub struct ChatCtx<'a> {
     /// the tool-schema overhead. `None` or out-of-clamp values degrade to
     /// 1.0 (no calibration; pre-Phase-20 behavior).
     pub estimate_ratio: Option<f32>,
+    /// `[context.estimation]` token-estimation heuristic (chars-per-token),
+    /// extracted from config so the loop never re-reads it — drives every
+    /// chars→token estimate and the budget→chars summary-cap conversion.
+    pub estimation: crate::tokens::TokenEstimation,
+    /// `[context] summary_input_cap_floor_chars` — floor for the summarizer
+    /// input cap so a tight budget never starves the summarizer of material.
+    pub summary_input_cap_floor_chars: usize,
     /// #307 named-permission-preset exec FLOOR. When a `/mode` preset is active
     /// its exec clamp is threaded here so the `--disable-ocap` / `--yolo`
     /// bypass in `execute_tool` cannot raise exec authority above the preset:
@@ -999,6 +1006,8 @@ pub async fn chat_complete(
         mut permission_gate,
         mut on_round_usage,
         estimate_ratio,
+        estimation,
+        summary_input_cap_floor_chars,
         exec_floor,
         write_ledger,
         cancel,
@@ -1110,7 +1119,7 @@ pub async fn chat_complete(
         advertise_experiential,
         advertise_scheduled,
     );
-    let tool_tokens = estimate_value_tokens(&tools);
+    let tool_tokens = estimate_value_tokens(&tools, estimation);
     // Phase 20 §2.3: one sanitized calibration ratio per turn. The
     // tool-schema overhead converts to real-token space once — the schema
     // set is stable for the whole turn, and the send budget it is subtracted
@@ -1200,12 +1209,12 @@ pub async fn chat_complete(
             // Phase 20 §2.3: `current` is calibrated into real-token space —
             // the same currency as the (backend-derived) send budget and the
             // configured token threshold it is compared against.
-            let current = prompt_tracker.current(&messages, Some(&tools), cal);
+            let current = prompt_tracker.current(&messages, Some(&tools), cal, estimation);
             // The count-only budget is priced in message-token space — the
             // same chars/4 currency the pipeline compares its budget against
             // (F1); `current` (schema/template-inclusive) still drives the
             // token triggers.
-            let message_tokens = estimate_tokens(&messages);
+            let message_tokens = estimate_tokens(&messages, estimation);
             if let Some(trigger) = compression_trigger(
                 messages.len(),
                 current,
@@ -1247,6 +1256,8 @@ pub async fn chat_complete(
                                 hard_budget: trigger.hard_budget,
                                 authoritative: token_fired || send_budget_authoritative,
                                 focus: None,
+                                est: estimation,
+                                summary_input_cap_floor_chars,
                             },
                             summarizer,
                             compress_state,
@@ -1316,7 +1327,7 @@ pub async fn chat_complete(
         // dispatched (the message list as sent, plus tool schemas) — paired
         // with the backend's reported prompt size in the `Accepted`
         // observation so the caller can learn the calibration ratio.
-        let round_est_raw = estimate_request_tokens(&messages, Some(&tools));
+        let round_est_raw = estimate_request_tokens(&messages, Some(&tools), estimation);
 
         // Tool-call rounds: stream:false (fast, just JSON).
         // Final text round: stream:true so the user sees tokens arrive.
@@ -1442,6 +1453,8 @@ pub async fn chat_complete(
                                 hard_budget: true,
                                 authoritative: true,
                                 focus: None,
+                                est: estimation,
+                                summary_input_cap_floor_chars,
                             },
                             summarizer,
                             compress_state,
@@ -1797,6 +1810,8 @@ pub async fn chat_complete(
                                 // signal — refuse semantics apply (Step 20.3).
                                 authoritative: true,
                                 focus: None,
+                                est: estimation,
+                                summary_input_cap_floor_chars,
                             },
                             summarizer,
                             compress_state,
@@ -2497,6 +2512,8 @@ pub async fn openai_chat_complete(
         mut permission_gate,
         mut on_round_usage,
         estimate_ratio,
+        estimation,
+        summary_input_cap_floor_chars,
         exec_floor,
         write_ledger,
         cancel,
@@ -2578,7 +2595,7 @@ pub async fn openai_chat_complete(
         advertise_experiential,
         advertise_scheduled,
     );
-    let tool_tokens = estimate_value_tokens(&tools);
+    let tool_tokens = estimate_value_tokens(&tools, estimation);
     // Phase 20 §2.3: per-turn calibration ratio + real-token schema overhead
     // (mirrors the Ollama path).
     let cal = sanitize_estimate_ratio(estimate_ratio);
@@ -2621,10 +2638,10 @@ pub async fn openai_chat_complete(
         {
             // Phase 20 §2.3: calibrated `current` (real-token space) —
             // mirrors the Ollama path.
-            let current = prompt_tracker.current(&messages, Some(&tools), cal);
+            let current = prompt_tracker.current(&messages, Some(&tools), cal, estimation);
             // Count-only budget priced in message-token space (F1) — mirrors
             // the Ollama path.
-            let message_tokens = estimate_tokens(&messages);
+            let message_tokens = estimate_tokens(&messages, estimation);
             if let Some(trigger) = compression_trigger(
                 messages.len(),
                 current,
@@ -2654,6 +2671,8 @@ pub async fn openai_chat_complete(
                         hard_budget: trigger.hard_budget,
                         authoritative: token_fired || send_budget_authoritative,
                         focus: None,
+                        est: estimation,
+                        summary_input_cap_floor_chars,
                     },
                     summarizer,
                     compress_state,
@@ -2706,7 +2725,7 @@ pub async fn openai_chat_complete(
 
         // Phase 20 §2.2: chars/4 estimate of exactly the request about to be
         // dispatched — mirrors the Ollama path.
-        let round_est_raw = estimate_request_tokens(&messages, Some(&tools));
+        let round_est_raw = estimate_request_tokens(&messages, Some(&tools), estimation);
 
         // OpenAI-compatible endpoints don't use Ollama's `options.num_ctx` —
         // context limits are configured server-side (vLLM --max-model-len).
@@ -2806,6 +2825,8 @@ pub async fn openai_chat_complete(
                                 hard_budget: true,
                                 authoritative: true,
                                 focus: None,
+                                est: estimation,
+                                summary_input_cap_floor_chars,
                             },
                             summarizer,
                             compress_state,
@@ -3277,6 +3298,8 @@ pub async fn openai_responses_complete(
         mut permission_gate,
         on_round_usage: _,
         estimate_ratio: _,
+        estimation: _,
+        summary_input_cap_floor_chars: _,
         exec_floor,
         write_ledger,
         cancel,
@@ -4144,6 +4167,8 @@ mod tool_round_cap_tests {
                 permission_gate: None,
                 on_round_usage: None,
                 estimate_ratio: None,
+                estimation: crate::tokens::TokenEstimation::default(),
+                summary_input_cap_floor_chars: 8_192,
                 exec_floor: None,
                 write_ledger: None,
                 cancel: None,
@@ -4251,6 +4276,8 @@ mod tool_round_cap_tests {
                 permission_gate: None,
                 on_round_usage: None,
                 estimate_ratio: None,
+                estimation: crate::tokens::TokenEstimation::default(),
+                summary_input_cap_floor_chars: 8_192,
                 exec_floor: None,
                 write_ledger: None,
                 cancel: None,
@@ -4326,6 +4353,8 @@ mod tool_round_cap_tests {
                 permission_gate: None,
                 on_round_usage: None,
                 estimate_ratio: None,
+                estimation: crate::tokens::TokenEstimation::default(),
+                summary_input_cap_floor_chars: 8_192,
                 exec_floor: None,
                 write_ledger: None,
                 cancel: Some(&flag),
@@ -4462,6 +4491,8 @@ mod tool_round_cap_tests {
                 permission_gate: None,
                 on_round_usage: None,
                 estimate_ratio: None,
+                estimation: crate::tokens::TokenEstimation::default(),
+                summary_input_cap_floor_chars: 8_192,
                 exec_floor: None,
                 write_ledger: None,
                 cancel: None,
@@ -4535,6 +4566,8 @@ mod tool_round_cap_tests {
                 permission_gate: None,
                 on_round_usage: None,
                 estimate_ratio: None,
+                estimation: crate::tokens::TokenEstimation::default(),
+                summary_input_cap_floor_chars: 8_192,
                 exec_floor: None,
                 write_ledger: None,
                 cancel: None,
@@ -4631,6 +4664,8 @@ mod tool_round_cap_tests {
                 permission_gate: None,
                 on_round_usage: None,
                 estimate_ratio: None,
+                estimation: crate::tokens::TokenEstimation::default(),
+                summary_input_cap_floor_chars: 8_192,
                 exec_floor: None,
                 write_ledger: None,
                 cancel: None,
@@ -4739,6 +4774,8 @@ mod tool_round_cap_tests {
                 permission_gate: None,
                 on_round_usage: None,
                 estimate_ratio: None,
+                estimation: crate::tokens::TokenEstimation::default(),
+                summary_input_cap_floor_chars: 8_192,
                 exec_floor: None,
                 write_ledger: None,
                 cancel: None,
@@ -4839,6 +4876,8 @@ mod tool_round_cap_tests {
                 permission_gate: None,
                 on_round_usage: None,
                 estimate_ratio: None,
+                estimation: crate::tokens::TokenEstimation::default(),
+                summary_input_cap_floor_chars: 8_192,
                 exec_floor: None,
                 write_ledger: None,
                 cancel: None,
@@ -4980,6 +5019,8 @@ mod tool_round_cap_tests {
                 permission_gate: None,
                 on_round_usage: None,
                 estimate_ratio: None,
+                estimation: crate::tokens::TokenEstimation::default(),
+                summary_input_cap_floor_chars: 8_192,
                 exec_floor: None,
                 write_ledger: None,
                 cancel: None,
@@ -5131,6 +5172,8 @@ mod tool_round_cap_tests {
                 permission_gate: None,
                 on_round_usage: None,
                 estimate_ratio: None,
+                estimation: crate::tokens::TokenEstimation::default(),
+                summary_input_cap_floor_chars: 8_192,
                 exec_floor: None,
                 write_ledger: None,
                 cancel: None,
@@ -5221,6 +5264,8 @@ mod http_loop_tests {
             permission_gate: None,
             on_round_usage: None,
             estimate_ratio: None,
+            estimation: crate::tokens::TokenEstimation::default(),
+            summary_input_cap_floor_chars: 8_192,
             exec_floor: None,
             write_ledger: None,
             cancel: None,
@@ -6107,6 +6152,8 @@ mod save_note_loop_tests {
             permission_gate: None,
             on_round_usage: None,
             estimate_ratio: None,
+            estimation: crate::tokens::TokenEstimation::default(),
+            summary_input_cap_floor_chars: 8_192,
             exec_floor: None,
             write_ledger: None,
             cancel: None,
@@ -6589,6 +6636,8 @@ mod compression_loop_tests {
             permission_gate: None,
             on_round_usage: None,
             estimate_ratio: None,
+            estimation: crate::tokens::TokenEstimation::default(),
+            summary_input_cap_floor_chars: 8_192,
             exec_floor: None,
             write_ledger: None,
             cancel: None,
@@ -6630,7 +6679,10 @@ mod compression_loop_tests {
             .as_array()
             .map(|msgs| {
                 msgs.iter()
-                    .map(|m| m.to_string().chars().count().div_ceil(4))
+                    .map(|m| {
+                        crate::tokens::TokenEstimation::default()
+                            .tokens_for_chars(m.to_string().chars().count())
+                    })
                     .sum()
             })
             .unwrap_or(0)
@@ -7729,6 +7781,8 @@ mod observation_hook_tests {
             permission_gate: None,
             on_round_usage: None,
             estimate_ratio: None,
+            estimation: crate::tokens::TokenEstimation::default(),
+            summary_input_cap_floor_chars: 8_192,
             // #307: test ChatCtx carries no preset exec floor (headless default).
             exec_floor: None,
             write_ledger: None,

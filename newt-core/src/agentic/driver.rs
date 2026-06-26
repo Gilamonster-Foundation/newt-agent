@@ -399,6 +399,8 @@ async fn run_one_turn(
         // applied, preserving today's behavior exactly.
         on_round_usage: None,
         estimate_ratio: None,
+        estimation: crate::tokens::TokenEstimation::default(),
+        summary_input_cap_floor_chars: 8_192,
         // #307: the headless driver carries no preset clamp — exec authority is
         // whatever `config.caveats` already grants, exactly like the ACP worker
         // / newt-eval callers. A consumer enforcing a mode clamps `caveats` itself.
