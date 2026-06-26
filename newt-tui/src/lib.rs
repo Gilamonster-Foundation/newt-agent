@@ -4401,6 +4401,14 @@ fn run_chat(
                                 focus.as_deref(),
                                 Some(&*summarizer),
                                 &mut compress_state,
+                                cfg.context
+                                    .as_ref()
+                                    .map(|c| c.estimation)
+                                    .unwrap_or_default(),
+                                cfg.context
+                                    .as_ref()
+                                    .map(|c| c.summary_input_cap_floor_chars)
+                                    .unwrap_or(8_192),
                             ))
                         });
                         if outcome.fired {
@@ -5278,6 +5286,16 @@ fn run_chat(
                                         // the learned estimate calibration.
                                         on_round_usage: Some(&mut on_obs),
                                         estimate_ratio: eff_estimate_ratio,
+                                        estimation: cfg
+                                            .context
+                                            .as_ref()
+                                            .map(|c| c.estimation)
+                                            .unwrap_or_default(),
+                                        summary_input_cap_floor_chars: cfg
+                                            .context
+                                            .as_ref()
+                                            .map(|c| c.summary_input_cap_floor_chars)
+                                            .unwrap_or(8_192),
                                         // #307: the active preset's exec floor — the
                                         // ceiling the --disable-ocap bypass cannot
                                         // cross. None when no mode is active.
@@ -8529,6 +8547,10 @@ fn dispatch_slash(
                             do_window,
                             &today,
                             |line: &str| print_newt(line, color, verbose),
+                            cfg.context
+                                .as_ref()
+                                .map(|c| c.estimation)
+                                .unwrap_or_default(),
                         );
                         cache.insert(model.clone(), entry);
                         probe::save_cache(&cache);
@@ -11488,8 +11510,15 @@ mod skills_integration_tests {
                 Box::pin(async { Ok("## Active Task\nMANUAL SUMMARY".to_string()) })
             });
         let mut state = newt_core::CompressState::new();
-        let outcome =
-            newt_core::compress_user_initiated(&wire, None, Some(&*summarizer), &mut state).await;
+        let outcome = newt_core::compress_user_initiated(
+            &wire,
+            None,
+            Some(&*summarizer),
+            &mut state,
+            newt_core::TokenEstimation::default(),
+            8_192,
+        )
+        .await;
 
         assert!(outcome.fired);
         assert_eq!(outcome.messages_before, before_len);
@@ -11539,7 +11568,15 @@ mod skills_integration_tests {
             .await;
         let wire = session_wire_view(&memory, "you are newt");
         let mut state = newt_core::CompressState::new();
-        let outcome = newt_core::compress_user_initiated(&wire, None, None, &mut state).await;
+        let outcome = newt_core::compress_user_initiated(
+            &wire,
+            None,
+            None,
+            &mut state,
+            newt_core::TokenEstimation::default(),
+            8_192,
+        )
+        .await;
 
         assert!(!outcome.fired);
         let msg = compress_feedback_message(&outcome);
@@ -11589,9 +11626,15 @@ mod skills_integration_tests {
         let mut state = newt_core::CompressState::new();
         let secret = "sk-aaaaaaaaaaaaaaaaaaaaaaaa1234";
         let focus = format!("the login flow around {secret}");
-        let outcome =
-            newt_core::compress_user_initiated(&wire, Some(&focus), Some(&*summarizer), &mut state)
-                .await;
+        let outcome = newt_core::compress_user_initiated(
+            &wire,
+            Some(&focus),
+            Some(&*summarizer),
+            &mut state,
+            newt_core::TokenEstimation::default(),
+            8_192,
+        )
+        .await;
         assert!(outcome.fired, "the summarizer path must have run");
 
         let prompts = prompts.lock().unwrap();
@@ -12519,6 +12562,8 @@ mod tool_round_cap_tests {
                     permission_gate: None,
                     on_round_usage: None,
                     estimate_ratio: None,
+                    estimation: newt_core::TokenEstimation::default(),
+                    summary_input_cap_floor_chars: 8_192,
                     exec_floor: None,
                     write_ledger: None,
                     cancel: None,

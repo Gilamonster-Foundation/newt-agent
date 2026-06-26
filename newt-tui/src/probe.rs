@@ -16,6 +16,8 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use newt_core::TokenEstimation;
+
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
@@ -731,7 +733,11 @@ pub struct ProbeThinking {
 /// same request. 60 s timeout; the model must already be warm. Mirrors
 /// [`fetch_context_window`]'s `block_in_place` + `Handle::block_on` pattern so
 /// it runs from inside the synchronous slash dispatcher.
-pub fn probe_thinking(endpoint: &str, model: &str) -> anyhow::Result<ProbeThinking> {
+pub fn probe_thinking(
+    endpoint: &str,
+    model: &str,
+    est: TokenEstimation,
+) -> anyhow::Result<ProbeThinking> {
     let url = format!("{}/api/chat", endpoint.trim_end_matches('/'));
     let prompt = "Reply with the single word: ok";
     let body = serde_json::json!({
@@ -742,8 +748,8 @@ pub fn probe_thinking(endpoint: &str, model: &str) -> anyhow::Result<ProbeThinki
     // chars/4 estimate of the serialized request body (same currency the
     // agentic loop estimates in) — paired with the backend's real count.
     let estimated = serde_json::to_string(&body)
-        .map(|s| s.chars().count() / 4)
-        .unwrap_or(prompt.chars().count() / 4);
+        .map(|s| est.tokens_for_chars(s.chars().count()))
+        .unwrap_or(est.tokens_for_chars(prompt.chars().count()));
 
     let json: serde_json::Value = tokio::task::block_in_place(|| {
         tokio::runtime::Handle::current().block_on(async {
@@ -894,6 +900,7 @@ fn boundary_probe_request(
     model: &str,
     prompt: &str,
     num_ctx: u32,
+    est: TokenEstimation,
 ) -> (anyhow::Result<serde_json::Value>, usize) {
     let url = format!("{}/api/chat", endpoint.trim_end_matches('/'));
     let body = serde_json::json!({
@@ -903,8 +910,8 @@ fn boundary_probe_request(
         "options": {"num_ctx": num_ctx, "num_predict": 8},
     });
     let sent_chars4 = serde_json::to_string(&body)
-        .map(|s| s.chars().count() / 4)
-        .unwrap_or(prompt.chars().count() / 4);
+        .map(|s| est.tokens_for_chars(s.chars().count()))
+        .unwrap_or(est.tokens_for_chars(prompt.chars().count()));
 
     let result = tokio::task::block_in_place(|| {
         tokio::runtime::Handle::current().block_on(async {
@@ -974,6 +981,7 @@ pub fn probe_input_boundary(
     entry: &mut CapabilityEntry,
     mut progress: impl FnMut(&str),
     today: &str,
+    est: TokenEstimation,
 ) -> anyhow::Result<BoundarySearchOutcome> {
     const STEP_CAP: u32 = 12;
     const REPLY_MARGIN: u32 = 256;
@@ -996,7 +1004,8 @@ pub fn probe_input_boundary(
                 None => n + REPLY_MARGIN,
             };
             let prompt = build_padded_prompt(n, ratio);
-            let (http, sent_chars4) = boundary_probe_request(endpoint, model, &prompt, num_ctx);
+            let (http, sent_chars4) =
+                boundary_probe_request(endpoint, model, &prompt, num_ctx, est);
             let class = classify_boundary_probe(http.as_ref(), n);
             match &class {
                 BoundaryClass::Accepted { prompt_tokens } => {
@@ -1173,6 +1182,7 @@ pub fn full_probe(
     do_window: bool,
     today: &str,
     mut progress: impl FnMut(&str),
+    est: TokenEstimation,
 ) -> FullProbeReport {
     let mut notes = Vec::new();
 
@@ -1181,7 +1191,7 @@ pub fn full_probe(
     //    prompt_eval_count is the most informative of the cheap-probe samples.
     let conformance = match tokio::task::block_in_place(|| {
         tokio::runtime::Handle::current()
-            .block_on(probe_tool_conformance_calibrated(endpoint, model))
+            .block_on(probe_tool_conformance_calibrated(endpoint, model, est))
     }) {
         Ok(pc) => {
             if let Some((observed, estimated)) = pc.calibration {
@@ -1205,7 +1215,7 @@ pub fn full_probe(
 
     // 3. Thinking probe + calibration bootstrap (§4.3 / §4.4).
     let mut emits_thinking = entry.emits_thinking.unwrap_or(false);
-    match probe_thinking(endpoint, model) {
+    match probe_thinking(endpoint, model, est) {
         Ok(pt) => {
             if pt.emits_thinking {
                 entry.record_thinking_only();
@@ -1220,7 +1230,7 @@ pub fn full_probe(
 
     // 4. Optional empirical boundary search (§4.5).
     let boundary = if do_window {
-        match probe_input_boundary(endpoint, model, entry, &mut progress, today) {
+        match probe_input_boundary(endpoint, model, entry, &mut progress, today, est) {
             Ok(outcome) => Some(outcome),
             Err(e) => {
                 notes.push(format!("boundary search failed: {e}"));
@@ -1369,6 +1379,7 @@ fn classify_conformance(message: &serde_json::Value) -> ToolConformance {
 pub async fn probe_tool_conformance_calibrated(
     endpoint: &str,
     model: &str,
+    est: TokenEstimation,
 ) -> anyhow::Result<ProbeConformance> {
     let url = format!("{}/api/chat", endpoint.trim_end_matches('/'));
     let body = serde_json::json!({
@@ -1384,7 +1395,7 @@ pub async fn probe_tool_conformance_calibrated(
     // chars/4 estimate of the serialized request body (same currency the
     // agentic loop estimates in) — paired with the backend's real count.
     let estimated = serde_json::to_string(&body)
-        .map(|s| s.chars().count() / 4)
+        .map(|s| est.tokens_for_chars(s.chars().count()))
         .unwrap_or(0);
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(120))
@@ -1420,8 +1431,9 @@ pub async fn probe_tool_conformance_calibrated(
 pub async fn probe_tool_conformance(
     endpoint: &str,
     model: &str,
+    est: TokenEstimation,
 ) -> anyhow::Result<ToolConformance> {
-    probe_tool_conformance_calibrated(endpoint, model)
+    probe_tool_conformance_calibrated(endpoint, model, est)
         .await
         .map(|p| p.conformance)
 }
