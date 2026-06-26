@@ -4100,7 +4100,10 @@ fn run_chat(
             .as_ref()
             .is_some_and(|p| p.enables("knowledge_base"))
         {
+            // The PyO3/FFI import surface (#74) + the general workspace API
+            // surface (#669) — both stable bases in the protected system prompt.
             mgr.add_provider(newt_core::FfiSurfaceProvider::new());
+            mgr.add_provider(newt_core::ApiSurfaceProvider::new());
         }
         // History provider based on config.
         match mem_cfg.provider {
