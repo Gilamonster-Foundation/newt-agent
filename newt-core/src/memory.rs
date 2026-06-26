@@ -531,9 +531,10 @@ struct TurnRecord {
     est_tokens: u32,
 }
 
-/// `(len + 3) / 4` ceiling estimate of one turn's content contribution.
-fn turn_content_estimate(user: &str, assistant: &str) -> u32 {
-    (user.len().div_ceil(4) + assistant.len().div_ceil(4)) as u32
+/// Ceiling estimate of one turn's content contribution under the configured
+/// [`TokenEstimation`](crate::tokens::TokenEstimation) heuristic.
+fn turn_content_estimate(user: &str, assistant: &str, est: crate::tokens::TokenEstimation) -> u32 {
+    (est.tokens_for_chars(user.len()) + est.tokens_for_chars(assistant.len())) as u32
 }
 
 /// Column-first token anchor for restored history (Step 18.5, #247).
@@ -549,13 +550,16 @@ fn turn_content_estimate(user: &str, assistant: &str) -> u32 {
 /// estimate is never presented as a measurement (18.1 semantics). No
 /// measured turn at all → `(None, 0)`, and the provider falls back to
 /// summing per-turn content estimates exactly as before.
-fn restored_token_anchor(turns: &[crate::ConversationTurn]) -> (Option<u32>, i64) {
+fn restored_token_anchor(
+    turns: &[crate::ConversationTurn],
+    est: crate::tokens::TokenEstimation,
+) -> (Option<u32>, i64) {
     let Some(pos) = turns.iter().rposition(|t| t.tokens_in.is_some()) else {
         return (None, 0);
     };
-    let mut delta = turns[pos].assistant.len().div_ceil(4) as i64;
+    let mut delta = est.tokens_for_chars(turns[pos].assistant.len()) as i64;
     for t in &turns[pos + 1..] {
-        delta += i64::from(turn_content_estimate(&t.user, &t.assistant));
+        delta += i64::from(turn_content_estimate(&t.user, &t.assistant, est));
     }
     (turns[pos].tokens_in, delta)
 }
@@ -595,6 +599,9 @@ pub struct TokenBudget {
     last_prompt_tokens: Option<u32>,
     /// Estimated tokens added (+) / removed (−) relative to that anchor.
     delta_since_prompt: i64,
+    /// `[context.estimation]` token-estimation heuristic (config-set via
+    /// [`TokenBudget::with_estimation`]); drives every chars→token estimate here.
+    est: crate::tokens::TokenEstimation,
 }
 
 impl TokenBudget {
@@ -606,7 +613,15 @@ impl TokenBudget {
             pruned_count: 0,
             last_prompt_tokens: None,
             delta_since_prompt: 0,
+            est: crate::tokens::TokenEstimation::default(),
         }
+    }
+
+    /// Builder: set the token-estimation heuristic from `[context.estimation]`.
+    #[must_use]
+    pub fn with_estimation(mut self, est: crate::tokens::TokenEstimation) -> Self {
+        self.est = est;
+        self
     }
 
     /// Inject a resolved token budget (builder form of the `max_tokens`
@@ -671,7 +686,7 @@ impl MemoryProvider for TokenBudget {
     }
 
     async fn sync_turn(&mut self, user: &str, assistant: &str, metrics: &TurnMetrics) {
-        let est = turn_content_estimate(user, assistant);
+        let est = turn_content_estimate(user, assistant, self.est);
         self.history.push(TurnRecord {
             user: user.to_string(),
             assistant: assistant.to_string(),
@@ -684,7 +699,7 @@ impl MemoryProvider for TokenBudget {
                 // system prompt, all prior turns, and this user message. The
                 // only content not yet inside any prompt is the new reply.
                 self.last_prompt_tokens = Some(u.input_tokens);
-                self.delta_since_prompt = (assistant.len().div_ceil(4)) as i64;
+                self.delta_since_prompt = self.est.tokens_for_chars(assistant.len()) as i64;
             }
             // No backend report this turn: the whole turn is unaccounted
             // relative to the (possibly absent) anchor.
@@ -715,7 +730,7 @@ impl MemoryProvider for TokenBudget {
             .map(|t| TurnRecord {
                 user: t.user.clone(),
                 assistant: t.assistant.clone(),
-                est_tokens: turn_content_estimate(&t.user, &t.assistant),
+                est_tokens: turn_content_estimate(&t.user, &t.assistant, self.est),
             })
             .collect();
         // Step 18.5 (#247): column-first restore — re-anchor on the last
@@ -723,7 +738,7 @@ impl MemoryProvider for TokenBudget {
         // re-estimating the whole history at chars/4. NULL columns fall
         // back to the estimate sum (anchor stays None — an estimate is
         // never presented as a measurement).
-        let (anchor, delta) = restored_token_anchor(turns);
+        let (anchor, delta) = restored_token_anchor(turns, self.est);
         self.last_prompt_tokens = anchor;
         self.delta_since_prompt = delta;
         self.pruned_count = self.prune_to_budget();
@@ -896,10 +911,14 @@ struct SumTurn {
 }
 
 impl SumTurn {
-    fn new(user: impl Into<String>, assistant: impl Into<String>) -> Self {
+    fn new(
+        user: impl Into<String>,
+        assistant: impl Into<String>,
+        est: crate::tokens::TokenEstimation,
+    ) -> Self {
         let user = user.into();
         let assistant = assistant.into();
-        let est_tokens = turn_content_estimate(&user, &assistant);
+        let est_tokens = turn_content_estimate(&user, &assistant, est);
         Self {
             user,
             assistant,
@@ -925,12 +944,15 @@ impl SumTurn {
 /// Rebuild pair-shaped history from the pipeline's assembled wire messages.
 /// A compaction message (and any other unpaired side) becomes a lone-sided
 /// entry; `system`/`tool` roles never occur in the provider's wire view.
-fn wire_to_history(messages: &[serde_json::Value]) -> Vec<SumTurn> {
+fn wire_to_history(
+    messages: &[serde_json::Value],
+    est: crate::tokens::TokenEstimation,
+) -> Vec<SumTurn> {
     let mut out: Vec<SumTurn> = Vec::new();
     for m in messages {
         let content = m["content"].as_str().unwrap_or_default();
         match m["role"].as_str() {
-            Some("user") => out.push(SumTurn::new(content, "")),
+            Some("user") => out.push(SumTurn::new(content, "", est)),
             Some("assistant") => {
                 match out.last_mut() {
                     // Pair with the preceding reply-less user entry — unless
@@ -941,9 +963,9 @@ fn wire_to_history(messages: &[serde_json::Value]) -> Vec<SumTurn> {
                             && !is_compaction_text(&last.user) =>
                     {
                         last.assistant = content.to_string();
-                        last.est_tokens = turn_content_estimate(&last.user, &last.assistant);
+                        last.est_tokens = turn_content_estimate(&last.user, &last.assistant, est);
                     }
-                    _ => out.push(SumTurn::new("", content)),
+                    _ => out.push(SumTurn::new("", content, est)),
                 }
             }
             _ => {}
@@ -1003,6 +1025,12 @@ pub struct Summarizing {
     /// Compaction message minted by the last compression, awaiting durable
     /// persistence via `take_compaction_record` (Step 18.5).
     pending_record: Option<String>,
+    /// `[context.estimation]` token-estimation heuristic, and the summarizer
+    /// input-cap floor (`[context] summary_input_cap_floor_chars`). Default to
+    /// the universal values; the TUI sets them from config via
+    /// [`Summarizing::with_estimation`].
+    est: crate::tokens::TokenEstimation,
+    summary_input_cap_floor_chars: usize,
 }
 
 impl Summarizing {
@@ -1018,7 +1046,22 @@ impl Summarizing {
             last_prompt_tokens: None,
             delta_since_prompt: 0,
             pending_record: None,
+            est: crate::tokens::TokenEstimation::default(),
+            summary_input_cap_floor_chars: 8_192,
         }
+    }
+
+    /// Builder: set the token-estimation heuristic + summarizer cap floor from
+    /// config (`[context.estimation]` / `[context] summary_input_cap_floor_chars`).
+    #[must_use]
+    pub fn with_estimation(
+        mut self,
+        est: crate::tokens::TokenEstimation,
+        summary_input_cap_floor_chars: usize,
+    ) -> Self {
+        self.est = est;
+        self.summary_input_cap_floor_chars = summary_input_cap_floor_chars;
+        self
     }
 
     /// Inject a resolved token budget (builder form of the `max_tokens`
@@ -1086,6 +1129,8 @@ impl Summarizing {
                 // refuse semantics are preserved here (Step 20.3).
                 authoritative: true,
                 focus: None,
+                est: self.est,
+                summary_input_cap_floor_chars: self.summary_input_cap_floor_chars,
             },
             self.summarizer.as_deref(),
             &mut self.state,
@@ -1094,7 +1139,7 @@ impl Summarizing {
         if !outcome.fired {
             return;
         }
-        self.history = wire_to_history(&outcome.messages);
+        self.history = wire_to_history(&outcome.messages, self.est);
         // Reflect the content change against the backend anchor. The
         // pipeline's figures are chars/4 estimates over the wire shape —
         // the same currency the delta already tracks.
@@ -1142,14 +1187,14 @@ impl MemoryProvider for Summarizing {
     }
 
     async fn sync_turn(&mut self, user: &str, assistant: &str, metrics: &TurnMetrics) {
-        let est = turn_content_estimate(user, assistant);
-        self.history.push(SumTurn::new(user, assistant));
+        let est = turn_content_estimate(user, assistant, self.est);
+        self.history.push(SumTurn::new(user, assistant, self.est));
         match metrics.usage {
             Some(u) => {
                 // Anchor on the largest single prompt the backend evaluated
                 // this turn (Step 18.1); only the reply is not yet inside it.
                 self.last_prompt_tokens = Some(u.input_tokens);
-                self.delta_since_prompt = (assistant.len().div_ceil(4)) as i64;
+                self.delta_since_prompt = self.est.tokens_for_chars(assistant.len()) as i64;
             }
             None => self.delta_since_prompt += i64::from(est),
         }
@@ -1189,11 +1234,14 @@ impl MemoryProvider for Summarizing {
         self.history.clear();
         self.prev_summary.clear();
         if let Some(k) = cut {
-            self.history.push(SumTurn::new(turns[k].user.clone(), ""));
+            self.history
+                .push(SumTurn::new(turns[k].user.clone(), "", self.est));
             self.prev_summary = turns[k].user.clone();
         }
-        self.history
-            .extend(live.iter().map(|t| SumTurn::new(&*t.user, &*t.assistant)));
+        self.history.extend(
+            live.iter()
+                .map(|t| SumTurn::new(&*t.user, &*t.assistant, self.est)),
+        );
         self.compress_count = 0;
         self.pending_record = None;
         // A restore is a conversation boundary — re-arm anti-thrash (F4).
@@ -1205,7 +1253,7 @@ impl MemoryProvider for Summarizing {
         // becoming the anchor. NO re-compression here: re-summarizing on
         // restore is exactly the from-scratch behavior this step removes;
         // the next live turn compresses if genuinely over budget.
-        let (anchor, delta) = restored_token_anchor(live);
+        let (anchor, delta) = restored_token_anchor(live, self.est);
         self.last_prompt_tokens = anchor;
         self.delta_since_prompt = delta;
     }

@@ -58,6 +58,7 @@ use std::sync::OnceLock;
 use crate::prune::{prune, PruneConfig};
 
 use super::trim::{estimate_tokens, estimate_value_tokens, repair_orphaned_tool_calls};
+use crate::tokens::TokenEstimation;
 
 /// Future returned by an injected [`SummarizeFn`].
 pub type SummarizeFuture = Pin<Box<dyn Future<Output = anyhow::Result<String>> + Send>>;
@@ -406,6 +407,13 @@ pub(crate) struct CompressRequest<'a> {
     /// type a credential into the focus. The loop's automatic triggers pass
     /// `None`.
     pub focus: Option<&'a str>,
+    /// The token-estimation heuristic setting (`[context.estimation]`), threaded
+    /// so every estimate + the budget→chars cap conversion share one ratio.
+    pub est: crate::tokens::TokenEstimation,
+    /// Floor (chars) for the summarizer input cap — `[context]
+    /// summary_input_cap_floor_chars`. A tight budget would otherwise starve the
+    /// summarizer of material.
+    pub summary_input_cap_floor_chars: usize,
 }
 
 impl<'a> CompressRequest<'a> {
@@ -422,10 +430,12 @@ impl<'a> CompressRequest<'a> {
         messages: &'a [Value],
         task: &'a str,
         focus: Option<&'a str>,
+        est: TokenEstimation,
+        summary_input_cap_floor_chars: usize,
     ) -> Self {
         Self {
             messages,
-            budget: estimate_tokens(messages) / 2,
+            budget: estimate_tokens(messages, est) / 2,
             max_messages: None,
             task,
             hard_budget: false,
@@ -433,6 +443,8 @@ impl<'a> CompressRequest<'a> {
             // reaches the refuse branch — but kept truthful (Step 20.3).
             authoritative: true,
             focus,
+            est,
+            summary_input_cap_floor_chars,
         }
     }
 }
@@ -497,7 +509,7 @@ pub(crate) async fn compress(
     summarizer: Option<&SummarizeFn>,
     state: &mut CompressState,
 ) -> CompressOutcome {
-    let tokens_before = estimate_tokens(req.messages);
+    let tokens_before = estimate_tokens(req.messages, req.est);
     // Anti-thrash protects the hard token budget (the correctness guard);
     // count-only invocations (the VRAM guard) neither consult nor feed it —
     // `hard_budget` carries the trigger kind so this holds even when the
@@ -566,7 +578,7 @@ pub(crate) async fn compress(
     let pruned = prune(req.messages, &PruneConfig::default());
     let prune_changed = pruned.chars_reclaimed > 0;
     let pruned = pruned.messages;
-    let after_prune = estimate_tokens(&pruned);
+    let after_prune = estimate_tokens(&pruned, req.est);
     if !over(after_prune, pruned.len()) {
         if tokens_over_entry {
             state.record(tokens_before, after_prune, req.budget);
@@ -583,7 +595,7 @@ pub(crate) async fn compress(
 
     // (2) Boundary: head + token-budgeted (and, for the count trigger,
     // count-capped) tail, last-user anchored, tool-pair aligned.
-    let boundary = compute_boundary(&pruned, req.budget, req.max_messages);
+    let boundary = compute_boundary(&pruned, req.budget, req.max_messages, req.est);
     let middle = &pruned[boundary.head..boundary.tail_start];
 
     let (mut assembled, mut action) = if middle.is_empty() {
@@ -608,7 +620,10 @@ pub(crate) async fn compress(
                     // (#559): a middle larger than the cap is summarized in bounded
                     // chunks and hierarchically reduced — every request stays under
                     // the cap (no OOM) and no middle message is dropped.
-                    let middle_cap = req.budget.saturating_mul(4).max(8_192);
+                    let middle_cap = req
+                        .est
+                        .chars_for_tokens(req.budget)
+                        .max(req.summary_input_cap_floor_chars);
                     summarize_middle(f, req.task, middle, middle_cap, req.focus).await
                 }
                 None => None,
@@ -653,7 +668,7 @@ pub(crate) async fn compress(
     // messages, which any interleaved user message (the read-only nudge, a
     // compaction notice) zeroed, flooring `keep_last` at 2 and one-lining
     // older unseen results for a round (#270).
-    if estimate_tokens(&assembled) > req.budget {
+    if estimate_tokens(&assembled, req.est) > req.budget {
         let aggressive = prune(
             &assembled,
             &PruneConfig {
@@ -677,8 +692,8 @@ pub(crate) async fn compress(
         // reach this: missing an aim-to-halve target is not a correctness
         // problem, so the F1c protection stays absolute there.
         if req.hard_budget
-            && estimate_tokens(&assembled) > req.budget
-            && reclaim_within_trailing_group(&mut assembled, req.budget)
+            && estimate_tokens(&assembled, req.est) > req.budget
+            && reclaim_within_trailing_group(&mut assembled, req.budget, req.est)
             && action == CompressAction::Fit
         {
             action = CompressAction::Pruned;
@@ -689,7 +704,7 @@ pub(crate) async fn compress(
     // exceed the budget (truly irreducible — the loop must still terminate rather
     // than dispatch an infinite over-budget send). Otherwise the marker compaction
     // is a valid fit, returned below instead of erroring the turn.
-    if force_marker && estimate_tokens(&assembled) > req.budget {
+    if force_marker && estimate_tokens(&assembled, req.est) > req.budget {
         return CompressOutcome {
             messages: req.messages.to_vec(),
             action: CompressAction::Refused,
@@ -700,7 +715,7 @@ pub(crate) async fn compress(
         };
     }
 
-    let tokens_after = estimate_tokens(&assembled);
+    let tokens_after = estimate_tokens(&assembled, req.est);
     let fired =
         prune_changed || assembled.len() != req.messages.len() || tokens_after != tokens_before;
     // A forced marker compaction (already latched off) does not feed effectiveness
@@ -768,6 +783,8 @@ pub async fn compress_user_initiated(
     focus: Option<&str>,
     summarizer: Option<&SummarizeFn>,
     state: &mut CompressState,
+    est: crate::tokens::TokenEstimation,
+    summary_input_cap_floor_chars: usize,
 ) -> ManualCompressOutcome {
     let task = messages
         .iter()
@@ -776,7 +793,7 @@ pub async fn compress_user_initiated(
         .unwrap_or_default()
         .to_string();
     let outcome = compress(
-        CompressRequest::user_initiated(messages, &task, focus),
+        CompressRequest::user_initiated(messages, &task, focus, est, summary_input_cap_floor_chars),
         summarizer,
         state,
     )
@@ -820,7 +837,12 @@ struct Boundary {
 /// caps the tail by count so the assembled `head + summary + tail` actually
 /// lands at or under the ceiling — a token-budgeted tail alone can swallow
 /// an entire small-message conversation and leave nothing to summarize.
-fn compute_boundary(messages: &[Value], budget: usize, max_messages: Option<usize>) -> Boundary {
+fn compute_boundary(
+    messages: &[Value],
+    budget: usize,
+    max_messages: Option<usize>,
+    est: TokenEstimation,
+) -> Boundary {
     let head = head_len(messages);
     let max_tail = max_messages.map(|m| m.saturating_sub(head + 1).max(1));
 
@@ -834,7 +856,7 @@ fn compute_boundary(messages: &[Value], budget: usize, max_messages: Option<usiz
         if max_tail.is_some_and(|m| kept >= m) {
             break;
         }
-        let t = estimate_value_tokens(&messages[tail_start - 1]);
+        let t = estimate_value_tokens(&messages[tail_start - 1], est);
         if kept >= TAIL_MIN_MESSAGES && acc + t > tail_budget {
             break;
         }
@@ -944,14 +966,18 @@ fn trailing_tool_group_len(messages: &[Value]) -> usize {
 /// the dispatch proceeds truthfully over budget (the loop's N2 notice
 /// reports real numbers); clipping inside a single result is out of scope.
 /// Returns true when any member was rewritten.
-fn reclaim_within_trailing_group(assembled: &mut Vec<Value>, budget: usize) -> bool {
+fn reclaim_within_trailing_group(
+    assembled: &mut Vec<Value>,
+    budget: usize,
+    est: TokenEstimation,
+) -> bool {
     let group_len = trailing_tool_group_len(assembled);
     if group_len == 0 {
         return false;
     }
     let group_start = assembled.len() - group_len;
-    let outside = estimate_tokens(&assembled[..group_start]);
-    let group_tokens = estimate_tokens(&assembled[group_start..]);
+    let outside = estimate_tokens(&assembled[..group_start], est);
+    let group_tokens = estimate_tokens(&assembled[group_start..], est);
     if group_tokens <= budget.saturating_sub(outside) {
         // The group fits in its share of the budget — the overage is not
         // the group's, so the F1c protection holds unconditionally.
@@ -977,7 +1003,7 @@ fn reclaim_within_trailing_group(assembled: &mut Vec<Value>, budget: usize) -> b
             *assembled = pass.messages;
             changed = true;
         }
-        if estimate_tokens(assembled) <= budget {
+        if estimate_tokens(assembled, est) <= budget {
             break;
         }
     }
@@ -1461,6 +1487,9 @@ pub(crate) fn redact_secrets(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Default estimation (chars_per_token = 4) for the unit tests.
+    const EST: TokenEstimation = TokenEstimation { chars_per_token: 4 };
     use serde_json::json;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
@@ -1537,6 +1566,8 @@ mod tests {
                 hard_budget: true,
                 authoritative: true,
                 focus: None,
+                est: EST,
+                summary_input_cap_floor_chars: 8_192,
             },
             summarizer,
             state,
@@ -1563,6 +1594,8 @@ mod tests {
                 hard_budget: true,
                 authoritative: false,
                 focus: None,
+                est: EST,
+                summary_input_cap_floor_chars: 8_192,
             },
             summarizer,
             state,
@@ -1588,6 +1621,8 @@ mod tests {
                 hard_budget: false,
                 authoritative: false,
                 focus: None,
+                est: EST,
+                summary_input_cap_floor_chars: 8_192,
             },
             summarizer,
             state,
@@ -1627,7 +1662,7 @@ mod tests {
         for i in 0..10 {
             msgs.push(user(&format!("filler {i}")));
         }
-        let before = estimate_tokens(&msgs);
+        let before = estimate_tokens(&msgs, EST);
         let budget = before - 1_000; // prune reclaims ~4k tokens — plenty
         let prompts = Arc::new(Mutex::new(Vec::new()));
         let s = recording_summarizer(prompts.clone(), "SUMMARY");
@@ -1648,7 +1683,7 @@ mod tests {
     #[tokio::test]
     async fn summarizes_middle_with_markers_when_prune_insufficient() {
         let msgs = tool_heavy("ACTIVE TASK GAUNTLET-7f3d9c: do the thing", 6, 4_000);
-        let before = estimate_tokens(&msgs);
+        let before = estimate_tokens(&msgs, EST);
         let prompts = Arc::new(Mutex::new(Vec::new()));
         let s = recording_summarizer(prompts.clone(), "## Active Task\nGAUNTLET summary");
         let mut state = CompressState::new();
@@ -1706,7 +1741,7 @@ mod tests {
                 "filler line\n".repeat(150)
             )));
         }
-        let before = estimate_tokens(&msgs);
+        let before = estimate_tokens(&msgs, EST);
         let prompts = Arc::new(Mutex::new(Vec::new()));
         // The real summarizer returns PROSE, never code — model that.
         let s = recording_summarizer(
@@ -1750,7 +1785,7 @@ mod tests {
         let task = "ACTIVE TASK GAUNTLET-7f3d9c: read ten files then report";
         let mut msgs = tool_heavy(task, 6, 4_000);
         msgs[1] = user(task);
-        let before = estimate_tokens(&msgs);
+        let before = estimate_tokens(&msgs, EST);
         let prompts = Arc::new(Mutex::new(Vec::new()));
         let s = recording_summarizer(prompts.clone(), "SUMMARY");
         let mut state = CompressState::new();
@@ -1763,6 +1798,8 @@ mod tests {
                 hard_budget: true,
                 authoritative: true,
                 focus: None,
+                est: EST,
+                summary_input_cap_floor_chars: 8_192,
             },
             Some(&*s),
             &mut state,
@@ -1792,7 +1829,7 @@ mod tests {
     #[tokio::test]
     async fn no_summarizer_uses_static_fallback_marker() {
         let msgs = tool_heavy("task", 6, 4_000);
-        let before = estimate_tokens(&msgs);
+        let before = estimate_tokens(&msgs, EST);
         let mut state = CompressState::new();
         let out = run(&msgs, before / 3, None, None, &mut state).await;
         assert_eq!(out.action, CompressAction::StaticFallback);
@@ -1814,7 +1851,7 @@ mod tests {
     #[tokio::test]
     async fn summarizer_failure_falls_back_to_static_marker() {
         let msgs = tool_heavy("task", 6, 4_000);
-        let before = estimate_tokens(&msgs);
+        let before = estimate_tokens(&msgs, EST);
         let calls = Arc::new(AtomicUsize::new(0));
         let s = failing_summarizer(calls.clone());
         let mut state = CompressState::new();
@@ -1829,7 +1866,7 @@ mod tests {
     #[tokio::test]
     async fn empty_summary_falls_back_to_static_marker() {
         let msgs = tool_heavy("task", 6, 4_000);
-        let before = estimate_tokens(&msgs);
+        let before = estimate_tokens(&msgs, EST);
         let prompts = Arc::new(Mutex::new(Vec::new()));
         let s = recording_summarizer(prompts.clone(), "  \n ");
         let mut state = CompressState::new();
@@ -2096,25 +2133,25 @@ mod tests {
         // Under-budget group: untouched, returns false (the F1c property).
         let mut fits = group(&[&small, &small, &small]);
         let before = fits.clone();
-        assert!(!reclaim_within_trailing_group(&mut fits, 10_000));
+        assert!(!reclaim_within_trailing_group(&mut fits, 10_000, EST));
         assert_eq!(fits, before, "a group within its share is never touched");
 
         // No group at all: no-op.
         let mut no_group = vec![sys("s"), user(&big)];
-        assert!(!reclaim_within_trailing_group(&mut no_group, 100));
+        assert!(!reclaim_within_trailing_group(&mut no_group, 100, EST));
 
         // Single-member group over budget: the newest IS the only member —
         // untouched, truthful over-budget residual (clipping inside one
         // result is out of scope).
         let mut single = group(&[&big]);
         let before = single.clone();
-        assert!(!reclaim_within_trailing_group(&mut single, 1_000));
+        assert!(!reclaim_within_trailing_group(&mut single, 1_000, EST));
         assert_eq!(single, before);
 
         // Oversized group, early stop: one-lining the OLDEST member alone
         // fits the budget — the middle and newest members stay whole.
         let mut early = group(&[&big, &small, &small]);
-        assert!(reclaim_within_trailing_group(&mut early, 1_500));
+        assert!(reclaim_within_trailing_group(&mut early, 1_500, EST));
         let results: Vec<&str> = early
             .iter()
             .filter(|m| m["role"].as_str() == Some("tool"))
@@ -2127,12 +2164,12 @@ mod tests {
         );
         assert_eq!(results[1], small, "middle untouched after early stop");
         assert_eq!(results[2], small, "newest untouched");
-        assert!(estimate_tokens(&early) <= 1_500, "the list now fits");
+        assert!(estimate_tokens(&early, EST) <= 1_500, "the list now fits");
 
         // Newest alone exceeds the budget: all older members one-lined, the
         // newest still whole, the list honestly stays over.
         let mut residual = group(&[&small, &small, &big]);
-        assert!(reclaim_within_trailing_group(&mut residual, 1_000));
+        assert!(reclaim_within_trailing_group(&mut residual, 1_000, EST));
         let results: Vec<&str> = residual
             .iter()
             .filter(|m| m["role"].as_str() == Some("tool"))
@@ -2142,7 +2179,7 @@ mod tests {
         assert!(results[1].starts_with("[read_file] read 'f1.txt'"));
         assert_eq!(results[2], big, "the newest member is never a candidate");
         assert!(
-            estimate_tokens(&residual) > 1_000,
+            estimate_tokens(&residual, EST) > 1_000,
             "single-result-too-big: truthfully still over budget"
         );
     }
@@ -2260,7 +2297,7 @@ mod tests {
     #[tokio::test]
     async fn max_messages_forces_summary_stage() {
         let msgs = tool_heavy("task", 8, 50); // small payloads: tokens fit
-        let before = estimate_tokens(&msgs);
+        let before = estimate_tokens(&msgs, EST);
         let prompts = Arc::new(Mutex::new(Vec::new()));
         let s = recording_summarizer(prompts.clone(), "SUMMARY");
         let mut state = CompressState::new();
@@ -2281,7 +2318,7 @@ mod tests {
         let prompts = Arc::new(Mutex::new(Vec::new()));
         let s = recording_summarizer(prompts.clone(), "SUMMARY ONE");
         let mut state = CompressState::new();
-        let budget = estimate_tokens(&msgs) / 2;
+        let budget = estimate_tokens(&msgs, EST) / 2;
         let first = run_count_only(&msgs, budget, Some(8), Some(&*s), &mut state).await;
         assert!(first.messages.len() < msgs.len(), "first pass shrinks");
         assert!(first.messages.iter().any(is_compaction_message));
@@ -2299,7 +2336,7 @@ mod tests {
             .as_str()
             .unwrap()
             .to_string();
-        let budget2 = estimate_tokens(&grown) / 2;
+        let budget2 = estimate_tokens(&grown, EST) / 2;
         let second = run_count_only(&grown, budget2, Some(8), Some(&*s), &mut state).await;
         assert!(
             second.messages.len() < grown.len(),
@@ -2341,7 +2378,7 @@ mod tests {
         }
         let mut state = CompressState::new();
         for _ in 0..4 {
-            let budget = estimate_tokens(&msgs) / 2;
+            let budget = estimate_tokens(&msgs, EST) / 2;
             let out = run_count_only(&msgs, budget, Some(6), None, &mut state).await;
             assert_ne!(out.action, CompressAction::Refused);
         }
@@ -2352,7 +2389,7 @@ mod tests {
         let mut latched = CompressState::new();
         latched.disabled = true;
         latched.notified = true;
-        let budget = estimate_tokens(&msgs) / 2;
+        let budget = estimate_tokens(&msgs, EST) / 2;
         let out = run_count_only(&msgs, budget, Some(6), None, &mut latched).await;
         assert_ne!(out.action, CompressAction::Refused);
         assert!(
@@ -2366,21 +2403,24 @@ mod tests {
     #[test]
     fn boundary_head_is_system_plus_original_task() {
         let msgs = tool_heavy("the task", 6, 1_000);
-        let b = compute_boundary(&msgs, 1_000, None);
+        let b = compute_boundary(&msgs, 1_000, None, EST);
         assert_eq!(b.head, 2, "system + original task");
 
         // Multiple system messages all land in the head.
         let mut msgs2 = vec![sys("a"), sys("b"), user("task"), user("more")];
         msgs2.extend(tool_heavy("x", 4, 1_000).split_off(2));
-        assert_eq!(compute_boundary(&msgs2, 1_000, None).head, 3);
+        assert_eq!(compute_boundary(&msgs2, 1_000, None, EST).head, 3);
     }
 
     #[test]
     fn boundary_tail_is_token_budgeted_with_minimum() {
         // 10 rounds of ~250-token results; budget 4_000 → tail budget 1_000.
         let msgs = tool_heavy("task", 10, 1_000);
-        let b = compute_boundary(&msgs, 4_000, None);
-        let tail_tokens: usize = msgs[b.tail_start..].iter().map(estimate_value_tokens).sum();
+        let b = compute_boundary(&msgs, 4_000, None, EST);
+        let tail_tokens: usize = msgs[b.tail_start..]
+            .iter()
+            .map(|m| estimate_value_tokens(m, EST))
+            .sum();
         assert!(
             tail_tokens <= 1_500,
             "tail stays near the token budget, got {tail_tokens}"
@@ -2393,7 +2433,7 @@ mod tests {
 
         // Huge results: the minimum still applies even over the token budget.
         let msgs = tool_heavy("task", 6, 40_000);
-        let b = compute_boundary(&msgs, 4_000, None);
+        let b = compute_boundary(&msgs, 4_000, None, EST);
         assert!(msgs.len() - b.tail_start >= TAIL_MIN_MESSAGES);
     }
 
@@ -2411,7 +2451,7 @@ mod tests {
             ));
             msgs.push(tool_result(&"q".repeat(4_000)));
         }
-        let b = compute_boundary(&msgs, 2_000, None);
+        let b = compute_boundary(&msgs, 2_000, None, EST);
         assert!(
             b.tail_start <= follow_up,
             "tail (start {}) must include the last user message at {follow_up}",
@@ -2433,7 +2473,7 @@ mod tests {
             ));
             msgs.push(tool_result(&"q".repeat(4_000)));
         }
-        let b = compute_boundary(&msgs, 2_000, None);
+        let b = compute_boundary(&msgs, 2_000, None, EST);
         assert!(
             b.tail_start > 2,
             "the tail must not pin to the compaction message at index 2 \
@@ -2448,7 +2488,7 @@ mod tests {
             msgs2.push(assistant_call("read_file", json!({"path": "g"})));
             msgs2.push(tool_result(&"q".repeat(4_000)));
         }
-        let b2 = compute_boundary(&msgs2, 2_000, None);
+        let b2 = compute_boundary(&msgs2, 2_000, None, EST);
         assert!(
             b2.tail_start <= follow_up,
             "a real user message still anchors the tail"
@@ -2477,7 +2517,7 @@ mod tests {
             ));
             msgs.push(tool_result(&"q".repeat(2_000)));
         }
-        let b = compute_boundary(&msgs, 4_000, Some(10));
+        let b = compute_boundary(&msgs, 4_000, Some(10), EST);
         let assembled = b.head + 1 + (msgs.len() - b.tail_start);
         assert!(
             assembled <= 12,
@@ -2489,7 +2529,7 @@ mod tests {
             b.tail_start
         );
         // Without a count ceiling the anchor still wins.
-        let b_token = compute_boundary(&msgs, 4_000, None);
+        let b_token = compute_boundary(&msgs, 4_000, None, EST);
         assert!(b_token.tail_start <= task_idx);
     }
 
@@ -2497,7 +2537,7 @@ mod tests {
     fn boundary_never_splits_a_tool_pair() {
         for budget in [1_000usize, 2_000, 4_000, 8_000, 16_000] {
             let msgs = tool_heavy("task", 8, 2_000);
-            let b = compute_boundary(&msgs, budget, None);
+            let b = compute_boundary(&msgs, budget, None, EST);
             assert_ne!(
                 msgs[b.tail_start]["role"].as_str(),
                 Some("tool"),
@@ -2664,7 +2704,7 @@ mod tests {
         let mut state = CompressState::new();
         for _ in 0..4 {
             let msgs = tool_heavy("task", 6, 4_000);
-            let before = estimate_tokens(&msgs);
+            let before = estimate_tokens(&msgs, EST);
             let out = run(&msgs, before / 3, None, None, &mut state).await;
             assert_ne!(out.action, CompressAction::Refused);
             assert!(out.notice.is_none());
@@ -2728,7 +2768,7 @@ mod tests {
         let prompts = Arc::new(Mutex::new(Vec::new()));
         let s = recording_summarizer(prompts.clone(), "## Active Task\nMANUAL SUMMARY");
         let mut state = CompressState::new();
-        let out = compress_user_initiated(&msgs, None, Some(&*s), &mut state).await;
+        let out = compress_user_initiated(&msgs, None, Some(&*s), &mut state, EST, 8_192).await;
 
         assert!(out.fired);
         assert_eq!(out.how, CompressAction::Summarized.describe());
@@ -2766,7 +2806,8 @@ mod tests {
         let mut state = CompressState::new();
         let secret = "sk-aaaaaaaaaaaaaaaaaaaaaaaa1234";
         let focus = format!("the auth flow around {secret} handling");
-        let out = compress_user_initiated(&msgs, Some(&focus), Some(&*s), &mut state).await;
+        let out =
+            compress_user_initiated(&msgs, Some(&focus), Some(&*s), &mut state, EST, 8_192).await;
         assert!(out.fired);
 
         let p = prompts.lock().unwrap();
@@ -2792,7 +2833,7 @@ mod tests {
         let prompts = Arc::new(Mutex::new(Vec::new()));
         let s = recording_summarizer(prompts.clone(), "SUMMARY");
         let mut state = CompressState::new();
-        compress_user_initiated(&msgs, None, Some(&*s), &mut state).await;
+        compress_user_initiated(&msgs, None, Some(&*s), &mut state, EST, 8_192).await;
         assert!(!prompts.lock().unwrap()[0].contains("emphasize anything about"));
     }
 
@@ -2804,7 +2845,7 @@ mod tests {
         let msgs = vec![sys("you are newt"), user("task"), user("note")];
         let mut state = CompressState::new();
         for _ in 0..3 {
-            let out = compress_user_initiated(&msgs, None, None, &mut state).await;
+            let out = compress_user_initiated(&msgs, None, None, &mut state, EST, 8_192).await;
             assert!(!out.fired, "nothing to reclaim — must not fire");
             assert_eq!(out.messages, msgs);
             assert_eq!(out.tokens_before, out.tokens_after);
@@ -2825,7 +2866,7 @@ mod tests {
         let msgs = chat_history(10, 400);
         let mut state = CompressState::new();
         state.latch_disabled_for_tests();
-        let out = compress_user_initiated(&msgs, None, None, &mut state).await;
+        let out = compress_user_initiated(&msgs, None, None, &mut state, EST, 8_192).await;
         assert!(out.fired, "an explicit ask must bypass the latch");
         assert_eq!(out.how, CompressAction::StaticFallback.describe());
         assert!(state.is_disabled(), "the latch itself stays set");

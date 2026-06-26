@@ -976,7 +976,7 @@ impl ContextFeatures {
 }
 
 /// `[context]` config section (Step 24.8, #559; features added Phase 26, #588).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextConfig {
     /// Context-management strategy preset. Default `standard`.
     #[serde(default)]
@@ -991,6 +991,34 @@ pub struct ContextConfig {
     /// 26.5, #582).
     #[serde(default)]
     pub semantic: SemanticConfig,
+
+    /// `[context.estimation]` — the cheap token-estimation heuristic
+    /// (`chars_per_token`, default 4). Threaded through the estimators; the
+    /// per-model calibration ratio scales the result on top.
+    #[serde(default)]
+    pub estimation: crate::tokens::TokenEstimation,
+
+    /// Floor (chars) for the whole-middle summarizer input cap. The cap is
+    /// normally the compression budget converted to chars, but a tight budget
+    /// would starve the summarizer of material — never give it less than this.
+    #[serde(default = "default_summary_input_cap_floor_chars")]
+    pub summary_input_cap_floor_chars: usize,
+}
+
+fn default_summary_input_cap_floor_chars() -> usize {
+    8_192
+}
+
+impl Default for ContextConfig {
+    fn default() -> Self {
+        Self {
+            manager: ContextManager::default(),
+            features: ContextFeatures::default(),
+            semantic: SemanticConfig::default(),
+            estimation: crate::tokens::TokenEstimation::default(),
+            summary_input_cap_floor_chars: default_summary_input_cap_floor_chars(),
+        }
+    }
 }
 
 /// `[context.semantic]` — the embedding RAG-for-code feature's settings (Step
