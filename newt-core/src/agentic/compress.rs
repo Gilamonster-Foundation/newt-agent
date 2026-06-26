@@ -517,46 +517,49 @@ pub(crate) async fn compress(
             notice: None,
         };
     }
+    // #6 (D, #661): a forced static-marker compaction replaces the dead-end
+    // Refused when compression is latched off but we're over an authoritative
+    // hard budget — set here, honored in the assembly + the post-assembly check.
+    let mut force_marker = false;
     if state.disabled && req.hard_budget {
         if tokens_over_entry {
             if req.authoritative {
-                // The hard guard stays: better to refuse the send than let the
-                // backend silently truncate the head (B6's 9/10 failure mode).
+                // #6: do NOT dead-end on Refused. A static-marker compaction
+                // always reclaims the whole middle deterministically (no
+                // summarizer needed), keeping head+task+tail intact under budget
+                // — strictly better than erroring the turn and forcing /new. Force
+                // that path below; refuse ONLY if even head+tail alone exceed the
+                // budget (truly irreducible), checked after assembly.
+                force_marker = true;
+            } else {
+                // Step 20.3: the budget rests on the proven-good high-water mark
+                // alone — no authoritative window is known for this model (the
+                // cloud / no-`/api/show` case). The HWM is a floor of known-good,
+                // not a cap; refusing here is the death spiral — it discards the
+                // very acceptance evidence that would raise the HWM out of the
+                // hole. Fail OPEN: dispatch over budget and let the backend rule.
                 return CompressOutcome {
                     messages: req.messages.to_vec(),
-                    action: CompressAction::Refused,
+                    action: CompressAction::DispatchedOverBudget,
                     fired: false,
                     tokens_before,
                     tokens_after: tokens_before,
-                    notice: state.take_notice(),
+                    notice: state.take_failopen_notice(),
                 };
             }
-            // Step 20.3: the budget rests on the proven-good high-water mark
-            // alone — no authoritative window is known for this model (the
-            // cloud / no-`/api/show` case). The HWM is a floor of known-good,
-            // not a cap; refusing here is the death spiral — it discards the
-            // very acceptance evidence that would raise the HWM out of the
-            // hole. Fail OPEN: dispatch over budget and let the backend rule.
+        } else {
+            // A hard trigger fired but the message estimate fits its budget
+            // (e.g. mixed with the count trigger): compression is disabled —
+            // pass through unchanged.
             return CompressOutcome {
                 messages: req.messages.to_vec(),
-                action: CompressAction::DispatchedOverBudget,
+                action: CompressAction::Fit,
                 fired: false,
                 tokens_before,
                 tokens_after: tokens_before,
-                notice: state.take_failopen_notice(),
+                notice: state.take_notice(),
             };
         }
-        // A hard trigger fired but the message estimate fits its budget
-        // (e.g. mixed with the count trigger): compression is disabled —
-        // pass through unchanged.
-        return CompressOutcome {
-            messages: req.messages.to_vec(),
-            action: CompressAction::Fit,
-            fired: false,
-            tokens_before,
-            tokens_after: tokens_before,
-            notice: state.take_notice(),
-        };
     }
 
     // (1) Structural prune — zero LLM cost (Step 18.3's passes).
@@ -588,22 +591,28 @@ pub(crate) async fn compress(
         (pruned.clone(), CompressAction::Pruned)
     } else {
         // (3) LLM summary of the middle, redaction applied to the input.
-        let body = match summarizer {
-            Some(f) => {
-                // Cap each summary request so it cannot blow the summarizer's
-                // context window — per-message caps alone do not bound the total
-                // (F5). The cap is the compression budget in chars (4 chars/
-                // token): the budget is what the *conversation* must fit after
-                // compression, so a request of the same order fits any window
-                // the compressed conversation will. Floored at 8 KiB so tight
-                // budgets still give the summarizer enough material. Step 24.4
-                // (#559): a middle larger than the cap is summarized in bounded
-                // chunks and hierarchically reduced — every request stays under
-                // the cap (no OOM) and no middle message is dropped.
-                let middle_cap = req.budget.saturating_mul(4).max(8_192);
-                summarize_middle(f, req.task, middle, middle_cap, req.focus).await
+        // #6 (D): the forced-marker path skips the (disabled) summarizer entirely
+        // and uses the deterministic static marker below.
+        let body = if force_marker {
+            None
+        } else {
+            match summarizer {
+                Some(f) => {
+                    // Cap each summary request so it cannot blow the summarizer's
+                    // context window — per-message caps alone do not bound the total
+                    // (F5). The cap is the compression budget in chars (4 chars/
+                    // token): the budget is what the *conversation* must fit after
+                    // compression, so a request of the same order fits any window
+                    // the compressed conversation will. Floored at 8 KiB so tight
+                    // budgets still give the summarizer enough material. Step 24.4
+                    // (#559): a middle larger than the cap is summarized in bounded
+                    // chunks and hierarchically reduced — every request stays under
+                    // the cap (no OOM) and no middle message is dropped.
+                    let middle_cap = req.budget.saturating_mul(4).max(8_192);
+                    summarize_middle(f, req.task, middle, middle_cap, req.focus).await
+                }
+                None => None,
             }
-            None => None,
         };
         let action = if body.is_some() {
             CompressAction::Summarized
@@ -676,10 +685,27 @@ pub(crate) async fn compress(
         }
     }
 
+    // #6 (D): the forced-marker path refuses ONLY when even head+tail alone still
+    // exceed the budget (truly irreducible — the loop must still terminate rather
+    // than dispatch an infinite over-budget send). Otherwise the marker compaction
+    // is a valid fit, returned below instead of erroring the turn.
+    if force_marker && estimate_tokens(&assembled) > req.budget {
+        return CompressOutcome {
+            messages: req.messages.to_vec(),
+            action: CompressAction::Refused,
+            fired: false,
+            tokens_before,
+            tokens_after: tokens_before,
+            notice: state.take_notice(),
+        };
+    }
+
     let tokens_after = estimate_tokens(&assembled);
     let fired =
         prune_changed || assembled.len() != req.messages.len() || tokens_after != tokens_before;
-    if tokens_over_entry {
+    // A forced marker compaction (already latched off) does not feed effectiveness
+    // accounting — it is a guaranteed-fit fallback, not a measured pass.
+    if tokens_over_entry && !force_marker {
         state.record(tokens_before, tokens_after, req.budget);
     }
     CompressOutcome {
@@ -2544,6 +2570,35 @@ mod tests {
             CompressAction::Refused,
             "an authoritative ceiling must still refuse, not truncate"
         );
+    }
+
+    /// #6 (D, #661): the complement of the test above — when the middle IS
+    /// reducible (small head+tail, large summarizable middle), a latched
+    /// authoritative over-budget call performs a forced static-marker compaction
+    /// that fits, instead of the dead-end Refused. Refusal is reserved for the
+    /// truly-irreducible (head+tail alone over budget) case.
+    #[tokio::test]
+    async fn latched_authoritative_compacts_to_marker_instead_of_refusing() {
+        let mut msgs = vec![sys("sys"), user("task")];
+        for i in 0..24 {
+            msgs.push(user(&format!("middle note {i} {}", "m".repeat(200))));
+        }
+        msgs.push(user("recent tail"));
+        let mut state = CompressState::new();
+        state.latch_disabled_for_tests();
+        let budget = 300; // far below the whole conversation; head+tail+marker fit
+        let out = run(&msgs, budget, None, None, &mut state).await;
+        assert_ne!(
+            out.action,
+            CompressAction::Refused,
+            "a reducible middle must compact to a marker, not dead-end"
+        );
+        assert!(
+            out.tokens_after <= budget,
+            "forced marker compaction must fit the budget ({} > {budget})",
+            out.tokens_after
+        );
+        assert!(out.fired, "the marker compaction changed the working set");
     }
 
     /// Effective compressions never trip the anti-thrash switch.
