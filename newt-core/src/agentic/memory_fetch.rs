@@ -23,19 +23,19 @@
 //!
 //! ## MVP scope (#319, the design note's §9 MVP)
 //!
-//! Resolves only `note:<id>` (a [`crate::notes::NoteStore`] body) and
-//! `turn:<conv>#<seq>` (a [`crate::store::ConversationStore`] turn) — both read
-//! EXISTING surfaces, **no new persistence**. The `compaction:<id>` address and
-//! its retention store are deliberately DEFERRED to the follow-up PR (they
-//! carry the secret-retention adversarial review); a `compaction:` address here
-//! resolves to coaching that names it as unsupported in this build, never a
-//! crash.
+//! Resolves `note:<id>` (a [`crate::notes::NoteStore`] body), `turn:<conv>#<seq>`
+//! (a [`crate::store::ConversationStore`] turn), `spill:<id>` (an offloaded tool
+//! payload), and — #661 group B — `compaction:<id>` (the verbatim, redacted
+//! middle span the compressor evicted, retrievable losslessly from the session
+//! compaction store). Compaction spans are redacted on store (the same closed
+//! `redact_secrets` table `spill:` uses) and session-scoped; an absent/expired
+//! id resolves to labelled coaching, never a crash.
 
 use super::display::{print_tool_call, print_tool_output};
 
-/// A parsed, tagged memory address. The MVP resolves [`Self::Note`] and
-/// [`Self::Turn`]; [`Self::Compaction`] is recognized (so the executor can
-/// coach precisely) but resolution is deferred to the follow-up PR.
+/// A parsed, tagged memory address. Each variant resolves against its own
+/// surface ([`Self::Note`]/[`Self::Turn`] read existing stores; [`Self::Spill`]/
+/// [`Self::Compaction`] read session-scoped redacted stores).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MemAddr {
     /// `note:<id>` — the verbatim body of one [`crate::notes::NoteStore`]
@@ -45,8 +45,9 @@ pub enum MemAddr {
     /// turn's verbatim user/assistant text, §6-ordered by `seq` (never
     /// re-sorted by clock).
     Turn { conversation: String, seq: i64 },
-    /// `compaction:<id>` — DEFERRED (the follow-up PR's retention surface).
-    /// Parsed so the executor can name it precisely as unsupported here.
+    /// `compaction:<id>` — the verbatim (redacted) middle span the compressor
+    /// evicted, retrievable losslessly from the session compaction store
+    /// (#661 group B). Session-scoped; expires at `/new`.
     Compaction { id: String },
     /// `spill:<id>` — the full (redacted) payload of a tool result that was
     /// offloaded by the `tool_offload` feature (Step 26.3, #584). Session-scoped.
@@ -142,6 +143,12 @@ pub struct StoreMemorySource<'a> {
     /// the `tool_offload` feature is off / headless — `spill:` then resolves to
     /// a labelled absence, never a panic.
     spill: Option<&'a dyn super::spill::SpillStore>,
+    /// Session store for `compaction:` re-reads (#661 group B): the verbatim
+    /// (redacted) middle span the compressor evicted, retrievable losslessly.
+    /// A SEPARATE store from `spill` (its own id space). `None` headless / when
+    /// progressive disclosure is off — `compaction:` then resolves to a labelled
+    /// absence.
+    compaction: Option<&'a dyn super::spill::SpillStore>,
 }
 
 impl<'a> StoreMemorySource<'a> {
@@ -153,6 +160,7 @@ impl<'a> StoreMemorySource<'a> {
             notes,
             store,
             spill: None,
+            compaction: None,
         }
     }
 
@@ -160,6 +168,14 @@ impl<'a> StoreMemorySource<'a> {
     #[must_use]
     pub fn with_spill_store(mut self, spill: &'a dyn super::spill::SpillStore) -> Self {
         self.spill = Some(spill);
+        self
+    }
+
+    /// Attach the session compaction store so `compaction:<id>` re-reads resolve
+    /// (#661 group B — lossless progressive disclosure of evicted spans).
+    #[must_use]
+    pub fn with_compaction_store(mut self, compaction: &'a dyn super::spill::SpillStore) -> Self {
+        self.compaction = Some(compaction);
         self
     }
 }
@@ -189,15 +205,19 @@ impl MemorySource for StoreMemorySource<'_> {
                     }),
                 }
             }
-            // DEFERRED to the follow-up PR (the retention surface + its
-            // secret-retention review). Recognized so the model gets a precise
-            // answer instead of a "malformed address" misdirection.
-            MemAddr::Compaction { id } => Ok(MemPayload::NotFound {
-                reason: format!(
-                    "compaction spans are not fetchable in this build (id {id:?}); \
-                     re-read the file the breadcrumb names, or `recall` the topic"
-                ),
-            }),
+            // #661 group B: the verbatim (redacted) middle span the compressor
+            // evicted, if the session compaction store still holds it. Redacted
+            // on store (same closed-table contract as `spill:`), session-scoped.
+            MemAddr::Compaction { id } => match self.compaction.and_then(|s| s.fetch(id)) {
+                Some(body) => Ok(MemPayload::Found(body)),
+                None => Ok(MemPayload::NotFound {
+                    reason: format!(
+                        "no compaction span with id {id:?} — spans are session-scoped \
+                         and may have expired; re-read the file the breadcrumb names, \
+                         or `recall` the topic"
+                    ),
+                }),
+            },
             // Step 26.3 (#584): the offloaded (redacted) tool payload, if the
             // session spill store still holds it.
             MemAddr::Spill { id } => match self.spill.and_then(|s| s.fetch(id)) {
@@ -247,7 +267,10 @@ const MEMORY_FETCH_DESCRIPTION: &str =
      `turn:<conversation-id>#<seq>` (one past turn, e.g. \
      `turn:174856320012#7` — copy the id and `seq N` from a recall hit), \
      or `spill:<id>` (the full secret-redacted body of a tool output that was \
-     truncated for length — the `[… truncated …]` marker carries the id). \
+     truncated for length — the `[… truncated …]` marker carries the id), \
+     or `compaction:<id>` (the full secret-redacted text of an earlier \
+     conversation span the compressor summarized away — the compaction summary \
+     names the id; use it to recover an exact detail the summary dropped). \
      Reach for memory_fetch when you have an address but not the body; \
      re-read the file with read_file if the content is a file still on disk; \
      use recall to SEARCH past conversations when you don't have an address \
@@ -269,9 +292,10 @@ pub fn memory_fetch_tool_definition() -> serde_json::Value {
                     "address": {
                         "type": "string",
                         "description": "The tagged address to fetch, e.g. \
-                                        'note:3', 'turn:174856320012#7', or \
-                                        'spill:s3' — copy it exactly as the index, \
-                                        a recall hit, or a truncation marker showed it"
+                                        'note:3', 'turn:174856320012#7', 'spill:s3', \
+                                        or 'compaction:s1' — copy it exactly as the \
+                                        index, a recall hit, a truncation marker, or \
+                                        a compaction summary showed it"
                     }
                 },
                 "required": ["address"]
@@ -539,21 +563,46 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn compaction_address_is_recognized_but_unsupported_in_mvp() {
-        // The real StoreMemorySource returns a precise NotFound for
-        // `compaction:` (deferred surface) — never a malformed-address answer.
+    fn compaction_address_resolves_via_the_session_compaction_store() {
+        use crate::agentic::spill::{SessionSpillStore, SpillStore};
+        // #661 group B: a `compaction:` address returns the verbatim (redacted)
+        // evicted span while the session store holds it; unknown / no-store →
+        // labelled absence, never a malformed-address answer or a panic.
         let dir = tempfile::tempdir().unwrap();
         let notes = crate::notes::NoteStore::new(dir.path().join("NOTES.md"), 2_200);
         let store = test_store(&dir);
-        let source = StoreMemorySource::new(&notes, &store);
-        let out = execute_memory_fetch(
-            &serde_json::json!({"address": "compaction:xyz#1"}),
+        let compaction = SessionSpillStore::default();
+        let id = compaction.store("the verbatim evicted middle".to_string());
+
+        let source = StoreMemorySource::new(&notes, &store).with_compaction_store(&compaction);
+        let hit = execute_memory_fetch(
+            &serde_json::json!({ "address": format!("compaction:{id}") }),
             &source,
             false,
             20,
         );
-        assert!(out.starts_with("no such memory item:"), "got: {out}");
-        assert!(out.contains("not fetchable in this build"), "got: {out}");
+        assert_eq!(hit, "the verbatim evicted middle");
+
+        let miss = execute_memory_fetch(
+            &serde_json::json!({"address": "compaction:s99"}),
+            &source,
+            false,
+            20,
+        );
+        assert!(miss.contains("session-scoped"), "got: {miss}");
+
+        // The compaction store is SEPARATE from the spill store (own id space):
+        // a `compaction:` address never resolves against `with_spill_store`.
+        let spill = SessionSpillStore::default();
+        spill.store("a tool payload".to_string()); // id s0 in the SPILL space
+        let wrong = StoreMemorySource::new(&notes, &store).with_spill_store(&spill);
+        let none = execute_memory_fetch(
+            &serde_json::json!({"address": "compaction:s0"}),
+            &wrong,
+            false,
+            20,
+        );
+        assert!(none.starts_with("no such memory item:"), "got: {none}");
     }
 
     #[test]

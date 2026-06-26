@@ -365,6 +365,7 @@ async fn run_one_turn(
         // Headless: no tool-offload (26.3) / scratchpad (26.4) — bit-for-bit.
         tool_offload: false,
         spill_store: None,
+        compaction_store: None,
         scratchpad: false,
         scratchpad_store: None,
         code_search: None,

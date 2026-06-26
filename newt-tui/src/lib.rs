@@ -4099,6 +4099,11 @@ fn run_chat(
     // `tool_offload` feature). Session-lived so `spill:` re-reads work across
     // rounds; pure in-memory, discarded at session end / `/new`.
     let spill_store = newt_core::SessionSpillStore::default();
+    // #661 group B: session-scoped compaction store — the compressor stores each
+    // evicted (redacted) middle span here and names a `compaction:<id>` handle so
+    // the model can losslessly recover a dropped detail via memory_fetch. A
+    // SEPARATE store from `spill_store` (own id space). Discarded at `/new`.
+    let compaction_store = newt_core::SessionSpillStore::default();
     // Step 26.4 (#583): session-scoped scratchpad <state> store. Session-lived;
     // cleared on /new so a fresh task never inherits stale state.
     let scratchpad_store = newt_core::SessionScratchpadStore::default();
@@ -5088,7 +5093,8 @@ fn run_chat(
                                 // model can re-read offloaded payloads via `spill:`.
                                 Some(
                                     newt_core::StoreMemorySource::new(notes, store)
-                                        .with_spill_store(&spill_store),
+                                        .with_spill_store(&spill_store)
+                                        .with_compaction_store(&compaction_store),
                                 )
                             }
                             _ => None,
@@ -5215,6 +5221,9 @@ fn run_chat(
                                         tool_offload: tool_offload_on,
                                         spill_store: Some(
                                             &spill_store as &dyn newt_core::SpillStore,
+                                        ),
+                                        compaction_store: Some(
+                                            &compaction_store as &dyn newt_core::SpillStore,
                                         ),
                                         // Step 26.4 (#583): scratchpad state.
                                         scratchpad: scratchpad_on,
@@ -12532,6 +12541,7 @@ mod tool_round_cap_tests {
                     markdown: false,
                     tool_offload: false,
                     spill_store: None,
+                    compaction_store: None,
                     scratchpad: false,
                     scratchpad_store: None,
                     code_search: None,
