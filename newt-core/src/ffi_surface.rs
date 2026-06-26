@@ -8,6 +8,15 @@
 //! same provider seam as [`crate::AgentsProvider`], so the block survives every
 //! system-prompt rebuild. A **no-op on a non-PyO3 workspace** (empty manifest → no
 //! block) — the technique generalizes safely.
+//!
+//! **Compression role (#661 group E).** Because the surface lives in the frozen
+//! system prompt — the compressor's protected head ([`super::agentic::compress`]
+//! `head_len`) — it is a **stable base that is NEVER summarized away**: the model
+//! keeps an exact import surface even after the middle is compacted, so the lossy
+//! summary has less it must preserve, and an import detail can't be lost to
+//! compression. This is the "inject the authoritative import surface as a stable
+//! base so there's less to summarize" half of the summarizer-effectiveness suite,
+//! verified by `compress::tests::knowledge_base_stable_base_survives_compression`.
 
 use async_trait::async_trait;
 use std::path::Path;

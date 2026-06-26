@@ -2782,6 +2782,34 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn knowledge_base_stable_base_survives_compression() {
+        // #661 group E: the knowledge_base technique (FfiSurfaceProvider) injects
+        // the authoritative import surface into the FROZEN system prompt. head_len
+        // always protects leading system messages, so that stable base is NEVER
+        // summarized — the summarizer has less to preserve, and the model keeps an
+        // exact import surface to ground against. This guards that invariant
+        // against a future boundary change that might evict the system prompt.
+        let kb = "## Authoritative import surface\n\
+                  from newt_agent._newt_agent.core import Router  # real path, not a guess";
+        let mut msgs = vec![sys(kb), user("task")];
+        for i in 0..24 {
+            msgs.push(user(&format!("middle note {i} {}", "m".repeat(200))));
+        }
+        msgs.push(user("recent tail"));
+        let mut state = CompressState::new();
+        let out = run(&msgs, 300, None, None, &mut state).await;
+        assert!(out.fired, "a large conversation should compress");
+        assert!(
+            out.messages.iter().any(|m| m["role"] == "system"
+                && m["content"]
+                    .as_str()
+                    .is_some_and(|c| c.contains("from newt_agent._newt_agent.core import Router"))),
+            "the knowledge_base import surface must survive compression VERBATIM \
+             (the protected head — the stable base E relies on)"
+        );
+    }
+
     /// Effective compressions never trip the anti-thrash switch.
     #[tokio::test]
     async fn effective_compressions_do_not_disable() {
