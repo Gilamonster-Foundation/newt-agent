@@ -3251,8 +3251,14 @@ fn make_loop_summarizer(
     model: String,
     kind: newt_core::BackendKind,
     api_key: Option<String>,
+    model_path: Option<String>,
     opts: SummarizerOpts,
 ) -> newt_core::Summarizer {
+    // #661 group C: an embedded summarizer runs the in-process candle engine
+    // (#659) instead of an HTTP backend — zero contention with the primary model.
+    if kind == newt_core::BackendKind::Embedded {
+        return make_embedded_summarizer(model, model_path);
+    }
     // Session-scoped, probe-once cache for the auto-picked fallback model
     // (Step 24.9). Resolved lazily on the FIRST primary failure — a session
     // whose primary summarizer never fails never probes `/api/tags`.
@@ -3293,6 +3299,59 @@ fn make_loop_summarizer(
             }
         })
     })
+}
+
+/// A summarizer that always fails with `msg`. The compressor degrades to the
+/// deterministic static marker (group D guarantees a fit), and the failure is
+/// surfaced — used when an embedded summarizer is requested but cannot be built.
+fn failing_summarizer(msg: String) -> newt_core::Summarizer {
+    Box::new(move |_prompt: String| {
+        let msg = msg.clone();
+        Box::pin(async move { Err(anyhow::anyhow!(msg)) })
+    })
+}
+
+/// Build the in-process candle summarizer (#661 group C). The `EmbeddedBackend`
+/// (#659) loads its GGUF and is shared across calls; each summarize is one
+/// `complete` on a blocking thread, so it never contends the async runtime or the
+/// primary model. Falls back to a failing summarizer (→ static marker) when the
+/// model file is missing or the build lacks the `embedded` feature.
+#[cfg_attr(not(feature = "embedded"), allow(unused_variables))]
+fn make_embedded_summarizer(model: String, model_path: Option<String>) -> newt_core::Summarizer {
+    #[cfg(feature = "embedded")]
+    {
+        let Some(path) = model_path else {
+            return failing_summarizer(
+                "summarizer kind=embedded needs `summarizer.model_path` (the local GGUF)"
+                    .to_string(),
+            );
+        };
+        match newt_inference::embedded::EmbeddedBackend::new(&model, &path) {
+            Ok(backend) => {
+                let backend = std::sync::Arc::new(backend);
+                Box::new(move |prompt: String| {
+                    let backend = backend.clone();
+                    Box::pin(async move {
+                        use newt_inference::InferenceBackend;
+                        let req = newt_inference::ChatRequest {
+                            messages: vec![newt_inference::backend::Message::user(prompt)],
+                            max_tokens: Some(1024),
+                        };
+                        backend.complete(req).await.map(|reply| reply.content)
+                    })
+                })
+            }
+            Err(e) => failing_summarizer(format!("embedded summarizer init failed: {e}")),
+        }
+    }
+    #[cfg(not(feature = "embedded"))]
+    {
+        failing_summarizer(
+            "summarizer kind=embedded, but this build lacks the `embedded` feature — \
+             rebuild with --features embedded"
+                .to_string(),
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -7289,7 +7348,13 @@ fn resolve_summarizer_backend(
     inf_model: &str,
     inf_kind: newt_core::BackendKind,
     inf_key: &Option<String>,
-) -> (String, String, newt_core::BackendKind, Option<String>) {
+) -> (
+    String,
+    String,
+    newt_core::BackendKind,
+    Option<String>,
+    Option<String>,
+) {
     let url = sum_cfg
         .endpoint
         .clone()
@@ -7299,6 +7364,9 @@ fn resolve_summarizer_backend(
         .clone()
         .unwrap_or_else(|| inf_model.to_string());
     let kind = sum_cfg.kind.unwrap_or(inf_kind);
+    // The GGUF path for an embedded summarizer (#661 group C); not inherited
+    // from the session backend — an embedded summarizer is explicitly configured.
+    let model_path = sum_cfg.model_path.clone();
     // A bearer token authenticates a specific host. Only inherit the session
     // key when the summarizer reuses the session endpoint; a summarizer pinned
     // to its own endpoint uses its own key (or none) — never leak the session
@@ -7308,7 +7376,7 @@ fn resolve_summarizer_backend(
     } else {
         sum_cfg.resolve_api_key().or_else(|| inf_key.clone())
     };
-    (url, model, kind, key)
+    (url, model, kind, key, model_path)
 }
 
 /// Build a loop summarizer for the current session backend, applying any
@@ -7325,13 +7393,14 @@ fn build_session_summarizer(
     num_ctx: Option<u32>,
     color: bool,
 ) -> newt_core::Summarizer {
-    let (url, model, kind, key) =
+    let (url, model, kind, key, model_path) =
         resolve_summarizer_backend(sum_cfg, inf_url, inf_model, inf_kind, inf_key);
     make_loop_summarizer(
         url,
         model,
         kind,
         key,
+        model_path,
         summarizer_opts(sum_cfg, cfg, num_ctx, color),
     )
 }
@@ -10592,6 +10661,7 @@ mod close_extraction_tests {
             url.to_string(),
             "test-model".to_string(),
             newt_core::BackendKind::Ollama,
+            None,
             None,
             SummarizerOpts::default(),
         )
@@ -14450,6 +14520,7 @@ mod http_loop_tests {
             "test-model".into(),
             newt_core::BackendKind::Ollama,
             None,
+            None,
             SummarizerOpts {
                 num_ctx: Some(4_096),
                 ..Default::default()
@@ -14476,6 +14547,7 @@ mod http_loop_tests {
             server.uri(),
             "test-model".into(),
             newt_core::BackendKind::Ollama,
+            None,
             None,
             SummarizerOpts::default(),
         );
@@ -14522,6 +14594,7 @@ mod http_loop_tests {
             server.uri(),
             "test-model".into(),
             newt_core::BackendKind::Ollama,
+            None,
             None,
             SummarizerOpts::default(),
         );
@@ -14574,6 +14647,7 @@ mod http_loop_tests {
             "test-model".into(),
             newt_core::BackendKind::Ollama,
             None,
+            None,
             SummarizerOpts {
                 retries: 2,
                 ..Default::default()
@@ -14599,6 +14673,7 @@ mod http_loop_tests {
             server.uri(),
             "test-model".into(),
             newt_core::BackendKind::Ollama,
+            None,
             None,
             SummarizerOpts {
                 retries: 1,
@@ -14643,6 +14718,7 @@ mod http_loop_tests {
             server.uri(),
             "test-model".into(),
             newt_core::BackendKind::Ollama,
+            None,
             None,
             SummarizerOpts {
                 retries: 0,
@@ -14693,6 +14769,7 @@ mod http_loop_tests {
             server.uri(),
             "session-model:27b".into(),
             newt_core::BackendKind::Ollama,
+            None,
             None,
             SummarizerOpts {
                 retries: 0,
@@ -14766,11 +14843,12 @@ mod http_loop_tests {
     fn resolve_summarizer_backend_overrides_when_set() {
         let sum_cfg = newt_core::SummarizerConfig {
             endpoint: Some("http://gnuc.home.lab:11434".into()),
-            model: Some("qwen2.5-coder:3b".into()),
-            kind: Some(newt_core::BackendKind::Openai),
+            model: Some("qwen2.5-1.5b".into()),
+            kind: Some(newt_core::BackendKind::Embedded),
+            model_path: Some("/models/qwen.gguf".into()),
             ..Default::default()
         };
-        let (url, model, kind, key) = super::resolve_summarizer_backend(
+        let (url, model, kind, key, model_path) = super::resolve_summarizer_backend(
             &sum_cfg,
             "http://dgx1.home.lab:11434",
             "session-model:27b",
@@ -14778,11 +14856,33 @@ mod http_loop_tests {
             &Some("session-key".into()),
         );
         assert_eq!(url, "http://gnuc.home.lab:11434");
-        assert_eq!(model, "qwen2.5-coder:3b");
-        assert_eq!(kind, newt_core::BackendKind::Openai);
+        assert_eq!(model, "qwen2.5-1.5b");
+        assert_eq!(kind, newt_core::BackendKind::Embedded);
+        // #661 group C: the GGUF path threads through for an embedded summarizer.
+        assert_eq!(model_path.as_deref(), Some("/models/qwen.gguf"));
         // No key configured on the pinned endpoint → the session key is NOT
         // leaked to the different host.
         assert_eq!(key, None);
+    }
+
+    #[tokio::test]
+    async fn embedded_summarizer_without_a_model_fails_cleanly() {
+        // #661 group C: kind=embedded with no model_path (or a build lacking the
+        // `embedded` feature) yields a failing summarizer — the compressor then
+        // degrades to the deterministic static marker (group D), never a panic.
+        let s = make_loop_summarizer(
+            "http://unused".into(),
+            "qwen2.5-1.5b".into(),
+            newt_core::BackendKind::Embedded,
+            None,
+            None, // no model_path
+            SummarizerOpts::default(),
+        );
+        let out = s("summarize this".to_string()).await;
+        assert!(
+            out.is_err(),
+            "an embedded summarizer with no model must fail (→ static marker), not panic"
+        );
     }
 
     /// Step 24.10: an absent/default `summarizer.toml` reuses the session
@@ -14790,7 +14890,7 @@ mod http_loop_tests {
     #[test]
     fn resolve_summarizer_backend_reuses_session_when_unset() {
         let sum_cfg = newt_core::SummarizerConfig::default();
-        let (url, model, kind, key) = super::resolve_summarizer_backend(
+        let (url, model, kind, key, _model_path) = super::resolve_summarizer_backend(
             &sum_cfg,
             "http://dgx1.home.lab:11434",
             "session-model:27b",
@@ -14868,6 +14968,7 @@ mod http_loop_tests {
             "test-model".into(),
             newt_core::BackendKind::Openai,
             Some("sk-test".into()),
+            None,
             SummarizerOpts {
                 num_ctx: Some(4_096),
                 ..Default::default()
@@ -14922,6 +15023,7 @@ mod http_loop_tests {
                 server.uri(),
                 "test-model".into(),
                 newt_core::BackendKind::Ollama,
+                None,
                 None,
                 SummarizerOpts {
                     num_ctx: Some(100),
