@@ -1,0 +1,27 @@
+# Language pack TEMPLATE — copy to ~/.newt/language-packs/<name>.toml or
+# .newt/language-packs/<name>.toml (project-local), or inline under
+# [[context.api_surface.language_packs]] in config.toml.
+#
+# Packs merge by `name`: a built-in's name (rust/python/bash/c_cpp/go/java)
+# REPLACES that built-in; a new name ADDS a language. No rebuild required.
+# See docs/language-packs.md.
+
+name = "mylang"
+
+# File extensions this pack claims (no dot).
+extensions = ["ext"]
+
+# Entry-point file globs — the public-API files, listed first in the surface.
+# Globs: exact ("lib.rs"), suffix ("*.h"), or all ("*"). Optional.
+entry_points = ["*"]
+
+# Public-symbol extraction rules. Each rule's FIRST regex capture group is the
+# symbol name; `kind` is a free-form label shown in the surface.
+# (Regex is the bootstrap engine; an AST/tree-sitter query option is planned.)
+[[symbols]]
+pattern = '^\s*public\s+func\s+(\w+)'
+kind = "fn"
+
+[[symbols]]
+pattern = '^\s*public\s+type\s+(\w+)'
+kind = "type"
