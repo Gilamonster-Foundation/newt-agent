@@ -5,6 +5,16 @@ implement issue #548 (roll up the verbose `/dgx` help into one top-level line +
 keep `/dgx help` as the progressive-disclosure detail page), and isolating the
 effect of features landed on `main`.
 
+> Full **how/why**, calibration, and threats-to-validity: [`../METHODOLOGY.md`](../METHODOLOGY.md).
+
+## At a glance
+
+![3/3 complete, 0/3 implement](chart-summary.png)
+
+The loop is mechanically robust — every run completes and consolidates — but
+**implements #548 in zero of three runs**. The two charts below show the same
+story by the grader metric and by cost.
+
 ## Method
 
 - **Instrument (fixed):** `scripts/eval/grade-548.sh` — a *behavioral* grader. It
@@ -66,6 +76,14 @@ help output; all three correctly FAIL (the rollup is implemented in none).
 | **Grader `top_dgx_subs`** | **8** | **8** | **8** |
 | **Grader `pass`** | **false** | **false** | **false** |
 
+**Grader metric — flat at the FAIL baseline across all three runs:**
+
+![top_dgx_subs: 8/8/8, target 0](chart-top-dgx-subs.png)
+
+**Cost — ~2–2.5 h per run, dominated by per-leaf `just check` builds:**
+
+![wall-clock: B 152 min, C 121 min](chart-wallclock.png)
+
 ```
 top_dgx_subs   (lower is better; 0 = rolled up / PASS, 8 = baseline / FAIL)
   A  ████████  8   FAIL   (orphan module)
@@ -75,6 +93,9 @@ top_dgx_subs   (lower is better; 0 = rolled up / PASS, 8 = baseline / FAIL)
 
 implemented #548 (pass)?     A: ✗     B: ✗     C: ✗     (0 / 3)
 ```
+*(ASCII fallback of the grader chart, for terminal/diff viewing.)*
+
+Charts are regenerated from the recorded run data by `scripts/eval/charts.py`.
 
 ## Learnings (A↔B↔C)
 
