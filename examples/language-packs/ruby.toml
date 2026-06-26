@@ -1,0 +1,19 @@
+# A complete, working example pack: Ruby. Drop at ~/.newt/language-packs/ruby.toml
+# and your .rb files start contributing their public surface — no rebuild.
+name = "ruby"
+extensions = ["rb"]
+entry_points = ["*.rb"]
+
+# Public methods (def) and classes/modules. Ruby has no `pub`, so the convention
+# here is "top-level / public def + class/module"; sharpen as you like.
+[[symbols]]
+pattern = '^\s*def\s+([a-z_]\w*[!?]?)'
+kind = "method"
+
+[[symbols]]
+pattern = '^\s*class\s+(\w+)'
+kind = "class"
+
+[[symbols]]
+pattern = '^\s*module\s+(\w+)'
+kind = "module"

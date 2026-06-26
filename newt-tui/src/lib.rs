@@ -4100,7 +4100,18 @@ fn run_chat(
             .as_ref()
             .is_some_and(|p| p.enables("knowledge_base"))
         {
+            // The PyO3/FFI import surface (#74) + the general workspace API
+            // surface (#669) — both stable bases in the protected system prompt.
             mgr.add_provider(newt_core::FfiSurfaceProvider::new());
+            // Built-in language packs + any inline `[[context.api_surface.
+            // language_packs]]`. (Drop-in `~/.newt/language-packs/*.toml`
+            // auto-discovery uses the public load_packs_from_dir — wired next.)
+            let api_cfg = cfg
+                .context
+                .as_ref()
+                .map(|c| c.api_surface.clone())
+                .unwrap_or_default();
+            mgr.add_provider(newt_core::ApiSurfaceProvider::from_config(&api_cfg));
         }
         // History provider based on config.
         match mem_cfg.provider {
