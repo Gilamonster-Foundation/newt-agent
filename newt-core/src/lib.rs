@@ -7,6 +7,7 @@
 pub mod agent_identity;
 pub mod agentic;
 pub mod agents;
+pub mod api_surface;
 pub mod caveats;
 pub mod config;
 pub mod conversation;
@@ -71,6 +72,7 @@ pub use agentic::{
     TurnDriverConfig, TurnDriverError, TurnOutcome, TurnStatus, EXPERIENCE_TOP_K,
 };
 pub use agents::AgentsProvider;
+pub use api_surface::ApiSurfaceProvider;
 pub use caveats::{CaveatsExt, CountBoundExt, ScopeExt};
 pub use config::{
     AgentsConfig, BackendConfig, BackendKind, BundleConfig, ChatStyle, ColorMode, Config,
