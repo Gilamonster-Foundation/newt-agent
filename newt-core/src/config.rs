@@ -2317,6 +2317,10 @@ pub struct SummarizerConfig {
     pub model: Option<String>,
     /// Backend protocol. `None` ⇒ reuse the session backend's kind.
     pub kind: Option<BackendKind>,
+    /// For `kind = "embedded"` (#661 group C): the local GGUF model file for the
+    /// in-process candle summarizer. Ignored for HTTP backends.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_path: Option<String>,
     /// Bearer-token file (first non-empty line). `None` ⇒ reuse the session key.
     pub api_key_file: Option<String>,
     /// Bearer-token environment variable (checked before `api_key_file`).
@@ -2343,6 +2347,7 @@ impl Default for SummarizerConfig {
             endpoint: None,
             model: None,
             kind: None,
+            model_path: None,
             api_key_file: None,
             api_key_env: None,
             timeout_secs: default_summarizer_timeout_secs(),
