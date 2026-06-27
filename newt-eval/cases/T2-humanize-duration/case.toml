@@ -1,0 +1,34 @@
+name = "T2-humanize-duration"
+description = "Fix humanize_duration's seconds component (multi-file; a same-vocabulary decoy file exists)"
+language = "rust"
+difficulty = "L3"
+prompt = """
+The `humanizes` test fails: `humanize_duration` returns the wrong seconds
+component — for 90 seconds it should produce `"1m 30s"`, but it does not. Fix
+`humanize_duration` so the test passes.
+"""
+
+evaluators = [
+    "diff_nonempty",
+    "diff_applies",
+    "rust_compiles",
+    "tests_pass",
+    "pattern_match",
+]
+
+expected_patterns = [
+    "secs % 60",
+]
+
+[mock_response]
+content = """diff --git a/src/util.rs b/src/util.rs
+index 5cb2c2a..72d5989 100644
+--- a/src/util.rs
++++ b/src/util.rs
+@@ -1,4 +1,4 @@
+ /// Render a duration in seconds as `"<minutes>m <seconds>s"`.
+ pub fn humanize_duration(secs: u64) -> String {
+-    format!("{}m {}s", secs / 60, secs / 60)
++    format!("{}m {}s", secs / 60, secs % 60)
+ }
+"""
