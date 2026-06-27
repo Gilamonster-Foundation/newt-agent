@@ -150,7 +150,7 @@ pub async fn run_case(case: &TestCase, config: &RunnerConfig) -> anyhow::Result<
 }
 
 /// Recursively copy `src` into `dst` (which must exist).
-fn copy_fixture(src: &Path, dst: &Path) -> anyhow::Result<()> {
+pub(crate) fn copy_fixture(src: &Path, dst: &Path) -> anyhow::Result<()> {
     let mut opts = fs_extra::dir::CopyOptions::new();
     opts.content_only = true;
     opts.overwrite = true;
@@ -166,7 +166,7 @@ fn copy_fixture(src: &Path, dst: &Path) -> anyhow::Result<()> {
 /// env so this works when invoked from inside a git hook (e.g. the
 /// pre-push hook that calls `cargo test`). Without this, `git init`
 /// targets the hook's repo instead of `workspace`.
-fn init_baseline_git(workspace: &Path) -> anyhow::Result<()> {
+pub(crate) fn init_baseline_git(workspace: &Path) -> anyhow::Result<()> {
     let run = |args: &[&str]| -> anyhow::Result<()> {
         let output = std::process::Command::new("git")
             .args(args)
