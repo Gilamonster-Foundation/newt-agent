@@ -132,6 +132,68 @@ fn parse<T: serde::de::DeserializeOwned + Default>(content: &str) -> T {
     T::default()
 }
 
+/// Parse a planner emission into whole-file [`Edit`]s, robustly.
+///
+/// Prefers a **marker block** format — content written RAW, with no escaping:
+/// ```text
+/// FILE: <relative/path>
+/// <full updated file content>
+/// END-FILE
+/// ```
+/// This is the shape the standalone coder uses and it lands reliably. The legacy
+/// `{"edits":[{"path","new_content"}]}` JSON shape is **escape-fragile**: a model
+/// embedding multi-line code in a JSON string routinely leaves newlines/quotes
+/// unescaped, which fails strict JSON parsing and silently drops *every* edit (the
+/// crew then "completes" having delivered nothing). We fall back to JSON only when
+/// no marker block is present, so valid-JSON emitters keep working.
+fn parse_edits(content: &str) -> Vec<Edit> {
+    let blocks = parse_file_blocks(content);
+    if !blocks.is_empty() {
+        return blocks;
+    }
+    parse::<PlanOut>(content)
+        .edits
+        .into_iter()
+        .map(|e| Edit {
+            path: e.path,
+            new_content: e.new_content,
+        })
+        .collect()
+}
+
+/// Extract `FILE: <path>` / `END-FILE` blocks; the body between them is the file
+/// content verbatim (no unescaping). Surrounding prose is ignored. A block with no
+/// closing `END-FILE` is dropped (incomplete emission), never half-applied.
+fn parse_file_blocks(content: &str) -> Vec<Edit> {
+    let mut edits = Vec::new();
+    let mut lines = content.lines();
+    while let Some(line) = lines.next() {
+        let path = match line.strip_prefix("FILE:") {
+            Some(p) => p.trim().to_string(),
+            None => continue,
+        };
+        if path.is_empty() {
+            continue;
+        }
+        let mut body: Vec<&str> = Vec::new();
+        let mut closed = false;
+        for l in lines.by_ref() {
+            if l.trim() == "END-FILE" {
+                closed = true;
+                break;
+            }
+            body.push(l);
+        }
+        if closed {
+            edits.push(Edit {
+                path,
+                new_content: body.join("\n"),
+            });
+        }
+    }
+    edits
+}
+
 /// Run the crew's two-pass control loop on `task`, returning the outcome.
 ///
 /// `None` from [`run_role`](BackendPool::run_role) (nothing live serves a pinned
@@ -190,17 +252,23 @@ pub async fn run_crew(
         };
         let plan_req = ChatRequest::new()
             .system(
-                "You are a senior engineer. Reply with ONLY JSON \
-                 {\"edits\":[{\"path\":\"..\",\"new_content\":\"<FULL new file content>\"}]}.",
+                "You are a senior engineer implementing a change. For EACH file you \
+                 modify, emit the COMPLETE updated file in EXACTLY this block format \
+                 — no diffs, no JSON, no code fences, no prose, no explanation:\n\
+                 FILE: <relative/path>\n\
+                 <the full, updated file content, verbatim>\n\
+                 END-FILE\n\
+                 Repeat the block for every changed file. Write the file content \
+                 RAW between the markers — do NOT escape it.",
             )
             .user(format!(
                 "TASK:\n{task}\n\nRELEVANT FILES:\n{curated}{prior}"
             ));
-        let plan: PlanOut = match pool
+        let edits: Vec<Edit> = match pool
             .run_role(dispatcher, Tier::Complex, &cfg.planner_model, plan_req)
             .await
         {
-            Some(f) => parse(&f.result.content),
+            Some(f) => parse_edits(&f.result.content),
             None => {
                 return CrewOutcome {
                     status: CrewStatus::NeedsHumanReview,
@@ -209,14 +277,6 @@ pub async fn run_crew(
                 }
             }
         };
-        let edits: Vec<Edit> = plan
-            .edits
-            .into_iter()
-            .map(|e| Edit {
-                path: e.path,
-                new_content: e.new_content,
-            })
-            .collect();
 
         // 4. APPLY (isolated worktree) + 5. VERIFY (harness runs the check).
         //    Per-member authority (ROADMAP 23.1): only edits the leash permits land;
@@ -278,6 +338,52 @@ mod tests {
     use newt_core::BackendKind;
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn strict_json_parse_drops_unescaped_multiline_content() {
+        // THE BUG: a model embedding a full file in a JSON string routinely leaves
+        // real newlines unescaped — invalid JSON — so the strict parse drops EVERY
+        // edit and the crew silently delivers nothing. (Real newlines below, the
+        // shape a local model actually emits.)
+        let emission =
+            "{\"edits\":[{\"path\":\"src/x.rs\",\"new_content\":\"fn a() {\n  ok\n}\"}]}";
+        let p: PlanOut = parse(emission);
+        assert_eq!(
+            p.edits.len(),
+            0,
+            "unescaped multiline content must fail strict JSON → zero edits (the bug)"
+        );
+    }
+
+    #[test]
+    fn parse_edits_accepts_marker_blocks_with_raw_multiline() {
+        // THE FIX: FILE:/END-FILE markers carry content RAW — no escaping — so a
+        // multi-line file lands as one edit even though the same content fails JSON.
+        let emission = "FILE: src/x.rs\nfn a() {\n  ok\n}\nEND-FILE";
+        let edits = parse_edits(emission);
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].path, "src/x.rs");
+        assert_eq!(edits[0].new_content, "fn a() {\n  ok\n}");
+    }
+
+    #[test]
+    fn parse_edits_ignores_surrounding_prose_and_drops_unclosed_blocks() {
+        // Prose around the block is ignored; a block with no END-FILE is dropped
+        // (never half-applied).
+        let with_prose = "Sure, here is the fix:\nFILE: a.rs\nok\nEND-FILE\nDone!";
+        assert_eq!(parse_edits(with_prose).len(), 1);
+        let unclosed = "FILE: a.rs\nincomplete content with no terminator";
+        assert_eq!(parse_file_blocks(unclosed).len(), 0);
+    }
+
+    #[test]
+    fn parse_edits_falls_back_to_valid_json() {
+        // Models that DO emit valid JSON keep working via the fallback.
+        let emission = "{\"edits\":[{\"path\":\"a.rs\",\"new_content\":\"ok\"}]}";
+        let edits = parse_edits(emission);
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].new_content, "ok");
+    }
 
     /// In-memory workspace. `run_test` passes iff `target.rs` contains "GOOD".
     struct MemWs {
