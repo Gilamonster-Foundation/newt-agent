@@ -360,7 +360,7 @@ impl DgxConfig {
         nonempty(get_env("USER")).unwrap_or_else(|| "dgx".to_string())
     }
 
-    /// A ready-to-write template for the reference `home.lab` DGX topology.
+    /// A ready-to-write template for the reference DGX topology.
     /// `newt dgx setup` offers this as the suggested starting point; it is
     /// never applied automatically.
     pub fn home_template() -> Self {

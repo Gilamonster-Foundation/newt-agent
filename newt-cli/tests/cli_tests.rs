@@ -269,7 +269,7 @@ fn dgx_doctor_unconfigured_shows_guidance() {
         .assert()
         .success()
         .stdout(predicate::str::contains("not set"))
-        .stdout(predicate::str::contains("home.lab"));
+        .stdout(predicate::str::contains("DNS note"));
 }
 
 #[test]

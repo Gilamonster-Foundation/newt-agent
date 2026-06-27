@@ -254,7 +254,7 @@ impl PyLocalOllamaBackend {
         self.inner.endpoint()
     }
 
-    /// Built-in fallback endpoint list (in-cluster proxy + home.lab
+    /// Built-in fallback endpoint list (in-cluster proxy + private
     /// names + localhost). Use this as the candidate list for
     /// `discover_with_candidates`.
     #[classmethod]
