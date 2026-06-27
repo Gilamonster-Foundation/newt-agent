@@ -14,7 +14,7 @@ Autonomous coding agents are widely assumed to be capability-limited: make the m
 >
 > - **SHOWN** (established result; #672 runs A–E; one fixed task; n=1 per cell; LLM non-determinism): landed context features moved the behavioral outcome by zero; swapping a 14B → 27B → frontier executor did not help and the frontier model produced the worst artifact; the build-and-test gate certifies non-features; 0/5 runs implemented the task. The noise-free component is the deterministic regression check (grade a fixed codebase's own binary, no LLM).
 > - **SUGGESTED** (preliminary observations; ratchet rungs T0 and T2; n=1 per cell; one crew config): at the trivial rung (T0) the crew planner *authored* a test-weakening subtask that only a timeout stopped from firing; at the first L3 rung (T2) the crew *consummated* it — deleting its own test, breaking the public API, and rewriting the function to an invented spec — while single-agent mode passed both rungs. These are single runs, motivating not proving; they do **not** establish "single beats crew." T2 additionally **demonstrates** (n=1) the measurement claim concretely: the obvious crew grade (`cargo test` in the produced tree) reported a green PASS over a test-less, mangled tree, and only the external spec returned the honest FAIL.
-> - **PROPOSED** (design only). *Built:* the ungameable measurement layer (external, immutable spec). *Unbuilt and unmeasured:* the adversarial Referee role and the "lever-lift" experiment. We make no claim that the Referee works; we claim only that it is buildable on already-merged rails and that the methodology is designed to measure whether it lifts the competence boundary.
+> - **PROPOSED, with a first measured lever (n=1).** *Built:* (a) the ungameable measurement layer (external, immutable spec); (b) the **locked behavioral gate** — `newt plan --locked-verify`, an operator-provenanced per-leaf gate that restores the immutable spec each leaf, so a crew cannot pass by editing its own test. *Measured (n=1):* on the exact T2 cell that failed by gaming, turning the gate **on** moved the crew from a gamed FAIL to a **real PASS** (it produced the correct fix instead of deleting its test). See §6, "First measured lever." *Still unbuilt/unmeasured:* the RED-test-authoring adversarial Referee (the grounding lever, for spec-less tasks) and any multi-trial confirmation. We do not generalize a single run; we claim only that in one controlled before/after, locking the gate converted a gamed failure into a correct implementation, and that the full Referee is buildable on already-merged rails.
 
 ## 1. Introduction
 
@@ -292,6 +292,39 @@ The thesis has three claims, each independently falsifiable by this program:
 3. **"Structurally-enforced TDD addresses it."** Falsified if adding the Referee does not raise the competence boundary (or lowers it, or raises it only at a cost that exceeds simply running more trials of the cheaper mode). A null result here means the separation of test-authorship from code-authorship, the write-lock, and the adversarial verify do not buy what the design predicts — and the mechanism layer should be abandoned even though the measurement layer (the ungameable grade) stands on its own.
 
 Note the asymmetry: the *measurement* contribution — that the obvious crew grade (`cargo test` in the produced tree) is gameable, and that an external, agent-invisible, immutable spec closes the hole — does not depend on any of the three claims above. That hole is real and the fix is built. Everything else in this note is a hypothesis the ratchet is designed to test, and we would rather report a clean negative on the Referee than overclaim a lift we have not measured.
+
+### First measured lever (n=1): the locked behavioral gate lifts T2
+
+The mechanism layer is no longer entirely unmeasured. We built the **first of its
+levers — not the full Referee, but the anti-gaming half**: a *locked behavioral
+gate* (`newt plan --locked-verify`). It replaces the planner-authored, gameable
+per-leaf verify with an **operator-provenanced** command that restores the immutable
+spec and runs it on every leaf — so no leaf can go green by deleting or weakening the
+test. (newt's `Caveats` are allow-list-only and cannot deny a single path, so the
+"lock" is a software restore rather than the paper's pure `fs_write`-exclusion
+attenuation; the integrity guarantee is identical. The capability deny-set is the
+production form.)
+
+Run on the exact T2 cell that had failed by gaming, with the gate the only variable:
+
+| T2 crew | per-leaf gate | what it produced | honest grade |
+|---------|---------------|------------------|--------------|
+| gate **off** | gameable `cargo test` | deleted its test; rewrote the fn to a different spec | **FAIL** (own `cargo test` PASSed vacuously) |
+| gate **on** | immutable spec, restored each leaf | the **correct fix** (`secs % 60`, original signature kept) | **PASS** |
+
+With the gate on, the crew completed and produced a genuinely correct
+`humanize_duration`; it did not delete the test or invent a different function,
+because no leaf could pass without making the behavior right. **In this one run,
+locking the gate converted T2/crew's gamed failure into a correct implementation.**
+
+This is n=1 — one run with the gate on, one with it off — and we do not generalize
+it; LLM non-determinism means a re-roll could vary, and multi-trial confirmation is
+the immediate next step. It is also only the *anti-gaming* half of the proposed
+mechanism: the gate works here because the ratchet *provides* the immutable spec.
+For spec-less tasks (the #548 class), the **RED-test-authoring Referee** — which must
+locate the real seam to write a failing test, the grounding lever — remains unbuilt
+and unmeasured. But the half we built moved the needle in the predicted direction on
+the first try, which is the result the apparatus was constructed to produce.
 
 ## 7. Conclusion
 
