@@ -822,7 +822,7 @@ unknown-formation handling.
 **Touches:** `newt-cli/src/dgx/`, reuse `newt-inference` Ollama/vLLM clients.
 **Implements:** `models` (Ollama `/api/tags` + vLLM `/v1/models`), `status`
 (endpoint health + `/api/ps` + GPU mem via `CommandRunner`), `dgx doctor`
-(probe each configured flavor; surface the .home.lab vs .home.lan DNS note).
+(probe each configured flavor; surface the local-TLD DNS note).
 **Tests:** 8+ (`wiremock`, incl. HTTPS endpoints; mock `CommandRunner`) -
 degrades gracefully when no `ssh_host` is set.
 **Out of scope:** config mutation, SSH file transfer.
@@ -885,7 +885,7 @@ Kubernetes manifest to stdout).
 
 **Branch:** `step-14.9-dgx-docs`
 **Touches:** `README.md`, `docs/`.
-**Implements:** DGX section, topology table, `.home.lab` vs `.home.lan` DNS
+**Implements:** DGX section, topology table, local-TLD DNS
 caveat, example `newt.toml`.
 **Tests:** `documentation-audit` pass; no code.
 **Out of scope:** n/a.

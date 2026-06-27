@@ -46,7 +46,7 @@ pub enum DgxCmd {
     /// With no arguments, prints setup instructions. With --host, synthesizes
     /// Ollama / vLLM endpoint URLs from the bare hostname or IP and writes the
     /// config (atomically via Config::save). Use --template to dump the
-    /// home.lab reference template as TOML without writing anything.
+    /// reference template as TOML without writing anything.
     Setup {
         /// DGX hostname or IP (e.g. REDACTED-IP or REDACTED-HOST).
         #[arg(long)]
@@ -60,7 +60,7 @@ pub enum DgxCmd {
         #[arg(long)]
         model: Option<String>,
 
-        /// Print the home.lab reference template as TOML and exit without writing.
+        /// Print the reference template as TOML and exit without writing.
         #[arg(long)]
         template: bool,
 
@@ -428,7 +428,7 @@ fn setup(
         let tmpl = DgxConfig::home_template();
         let text = toml::to_string_pretty(&tmpl)
             .map_err(|e| anyhow::anyhow!("TOML serialisation failed: {e}"))?;
-        println!("# [dgx] home.lab reference template");
+        println!("# [dgx] reference template");
         println!("# Copy into ~/.newt/config.toml under [dgx]\n");
         print!("{text}");
         return Ok(());
@@ -680,8 +680,10 @@ async fn doctor(config_path: Option<&Path>) -> anyhow::Result<()> {
         println!("    NEWT_DGX_HOST=<host>          (synthesizes ollama + vllm URLs from a bare hostname)");
         println!("    NEWT_DGX_OLLAMA_URL=<url>     (direct URL, e.g. https://REDACTED-HOST)");
     }
-    println!("\n  DNS note: on the Google-WiFi mesh, .home.lab resolves but .home.lan does");
-    println!("  not (the pucks intercept the .lan TLD). Use .home.lab from a laptop; inside");
+    println!("\n  DNS note: some mesh routers intercept certain local TLDs (e.g. .lan), so a");
+    println!(
+        "  custom DNS suffix may resolve from some hosts but not others; prefer an IP. Inside"
+    );
     println!(
         "  k3s use the in_cluster proxy (http://ollama-proxy.inference.svc.cluster.local:11434)."
     );
