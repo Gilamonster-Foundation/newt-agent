@@ -82,14 +82,28 @@ case "$MODE" in
     leaves="$(cd "$throw" && git branch --list 'crew/*' | wc -l | tr -d ' ')"
     files="$(cd "$throw" && git diff --name-only "$base..$final" | tr '\n' ',' | sed 's/,$//')"
     touched_seam=$(cd "$throw" && git diff "$base..$final" -- src/lib.rs | grep -qE '^[-+]' && echo yes || echo no)
-    # Behavioral grade: does the seed's test pass now? (For T0-style seeds whose
-    # test FAILS until the feature is implemented, this is an honest pass/fail.)
-    if ( cd "$throw" && CARGO_TARGET_DIR="$TARGET" cargo test -q >/dev/null 2>&1 ); then
-      behavioral=PASS
+    # Diagnostic: did the crew edit its OWN test assertion (the #672 gaming move)?
+    edited_test=$(cd "$throw" && git diff "$base..$final" -- src/lib.rs | grep -qE '^[-+].*assert' && echo yes || echo no)
+    # UNGAMEABLE behavioral grade — structurally-enforced TDD, measurement side.
+    # Drop the case's HIDDEN canonical spec (which the agent never saw, so it
+    # could not edit it) into the produced tree and run ONLY that. A crew that
+    # "passed" by rewriting its own assertion still FAILS here unless the code is
+    # actually correct.
+    spec="$CASE_DIR/grade_spec.rs"
+    if [ -f "$spec" ]; then
+      mkdir -p "$throw/tests"; cp "$spec" "$throw/tests/grade_spec.rs"
+      if ( cd "$throw" && CARGO_TARGET_DIR="$TARGET" cargo test --test grade_spec -q >/dev/null 2>&1 ); then
+        behavioral=PASS
+      else
+        behavioral=FAIL
+      fi
     else
-      behavioral=FAIL
+      # No hidden spec → fall back to the seed's own tests (only honest for
+      # fail-until-fixed seeds; gameable by a test-editing agent — flagged).
+      ( cd "$throw" && CARGO_TARGET_DIR="$TARGET" cargo test -q >/dev/null 2>&1 ) \
+        && behavioral="PASS?gameable" || behavioral="FAIL"
     fi
-    emit "$behavioral" "leaves=$leaves touched_src_lib=$touched_seam files=[$files] plan_rc=$plan_rc dir=$throw"
+    emit "$behavioral" "leaves=$leaves touched_src_lib=$touched_seam edited_own_test=$edited_test files=[$files] plan_rc=$plan_rc dir=$throw"
     ;;
   *) echo "ratchet: --mode must be single|crew" >&2; exit 2;;
 esac
