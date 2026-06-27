@@ -60,21 +60,33 @@ variable is the codebase the autonomous loop runs against. Each run:
 4. **Grade** the consolidated result; record JSON + the diff + wall-clock.
 
 ### Held constant across runs
-Prompt; authoring model (`nemotron-3-nano:30b`); crew (`[crews.home]` — planner +
-navigator/triage); `--max-leaves 12`; a warm shared `CARGO_TARGET_DIR` (so
-per-leaf build time is comparable, not cold-vs-warm). Home-network specifics
-(hostnames, GPUs) are intentionally **not** in any committed file — they live in
-the operator's local config only.
+Prompt; `--max-leaves 12`; a warm shared `CARGO_TARGET_DIR` (so per-leaf build
+time is comparable, not cold-vs-warm). In Exp. 1 the whole crew is held constant;
+in Exp. 2 the planner (`nemotron-3-nano:30b`) + triage are held constant and only
+the navigator changes. Home-network specifics (hostnames, GPUs) are intentionally
+**not** in any committed file — they live in the operator's local config only;
+run records name *models* (`qwen3.6:27b`, `gpt-4.1`) as identities, not hosts.
 
 ### The runs (cells)
+Two sub-experiments, one fixed grader. C is the shared cell (it's the last
+codebase cell *and* the baseline executor cell).
+
+**Exp. 1 — codebase as variable** (crew constant):
 | run | commit | feature increment under test |
 |---|---|---|
 | **A** | `68c9b2c` | baseline |
 | **B** | `41cb1de` | + #661 compaction/summarizer series (#666/#667/#668) |
 | **C** | `d25662d` | + #669 workspace-API knowledge base |
 
-Pairwise diffs (**A↔B**, **B↔C**) isolate one feature increment each; **A↔C** is
-the cumulative effect.
+**Exp. 2 — executor (navigator) model as variable** (codebase `d25662d` constant):
+| run | navigator model | kind |
+|---|---|---|
+| **C** | `qwen2.5-coder:14b` | local, coder (shared baseline) |
+| **D** | `qwen3.6:27b` | local, general |
+| **E** | `gpt-4.1` | frontier, external |
+
+Pairwise diffs isolate one variable each: **A↔B**, **B↔C** (one feature
+increment); **C↔D**, **C↔E** (one executor swap).
 
 ## 4. Two readouts per codebase
 
