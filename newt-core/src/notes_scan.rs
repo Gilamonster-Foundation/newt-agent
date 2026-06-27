@@ -525,11 +525,11 @@ mod tests {
             ),
             (
                 "curl to RFC-1918 address",
-                "the DGX exporter: curl http://REDACTED-IP:9400/metrics",
+                "the DGX exporter: curl http://10.0.0.1:9400/metrics",
             ),
             (
                 "curl to .lab-suffixed host",
-                "test inference with curl http://REDACTED-HOST/api/tags",
+                "test inference with curl http://node.lab/api/tags",
             ),
             (
                 "markdown link without query string",

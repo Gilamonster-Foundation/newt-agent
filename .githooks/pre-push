@@ -41,14 +41,13 @@
 
 set -e
 
-# Drain the ref list git writes to the hook's stdin (one
-# "<local-ref> <local-sha> <remote-ref> <remote-sha>" line per ref).
-# We gate the whole workspace regardless of which refs are pushed, so the
-# list's content is unused — but consuming it is standard hook hygiene:
-# git must never take SIGPIPE writing refs to a hook that exited without
-# reading, and the gate commands below must not inherit the list on
-# their stdin.
-cat >/dev/null
+# Capture the ref list git writes to the hook's stdin (one
+# "<local-ref> <local-sha> <remote-ref> <remote-sha>" line per ref). The
+# network-leak guard below scans the pushed range; the cargo/coverage gates
+# ignore it (they gate the whole workspace). Consuming stdin here is also
+# standard hook hygiene: git must never take SIGPIPE writing refs to a hook
+# that exited without reading, and the gate commands must not inherit it.
+REFS="$(cat)"
 
 cd "$(git rev-parse --show-toplevel)"
 
@@ -59,6 +58,45 @@ cd "$(git rev-parse --show-toplevel)"
 # their temp repo and fail. CI never runs under hook env, so parity is
 # unaffected — drop the leak so the gates see the same world CI does.
 unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
+
+# ── Network-leak guard (privacy/security) ─────────────────────────────────────
+# This repo is PUBLIC. Refuse to push internal/private network details — they
+# turn a famous repo into a recon map for attacking the operator's home network,
+# and a history rewrite can't recall what's already cloned/cached. Scans ONLY the
+# ADDED lines in the commits being pushed. Mirrors the `pr-pre-review` skill.
+# Use RFC5737 TEST-NET (192.0.2.x / 198.51.100.x / 203.0.113.x) or a placeholder
+# in examples, and keep real values in ~/.newt. Do NOT bypass with --no-verify.
+NET_LEAK_RE='(\b10\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\b)|(\b192\.168\.[0-9]{1,3}\.[0-9]{1,3}\b)|(\b172\.(1[6-9]|2[0-9]|3[01])\.[0-9]{1,3}\.[0-9]{1,3}\b)|(\b100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.[0-9]{1,3}\.[0-9]{1,3}\b)|(\b169\.254\.[0-9]{1,3}\.[0-9]{1,3}\b)|([A-Za-z0-9_-]+\.(home\.(lan|lab)|ts\.net)\b)|(tail[a-z0-9]+\.ts\.net)'
+# Allowed: RFC5737 TEST-NET, loopback/unspecified, and the canonical generic
+# private examples (10.0.0.1 etc.) that tests/docs legitimately need (e.g. the
+# notes-scanner's RFC-1918 locality fixture). These reveal no home topology.
+NET_LEAK_ALLOW='192\.0\.2\.|198\.51\.100\.|203\.0\.113\.|127\.0\.0\.1|0\.0\.0\.0|\b10\.0\.0\.1\b|\b192\.168\.0\.1\b'
+_leaks=""
+while read -r _lref _lsha _rref _rsha; do
+    [ -z "$_lsha" ] && continue
+    case "$_lsha" in *[!0]*) ;; *) continue ;; esac   # all-zero local = branch delete
+    case "$_rsha" in
+        *[!0]*) _range="$_rsha..$_lsha" ;;            # update: only the new commits
+        *)      _range="origin/main...$_lsha" ;;      # new branch: changes since it forked main
+    esac
+    # Exclude .githooks/ — these scripts legitimately contain the IP/DNS regex.
+    _hits="$(git diff "$_range" -- . ':(exclude).githooks/*' 2>/dev/null \
+             | grep -E '^\+' | grep -vE '^\+\+\+' \
+             | grep -nEi "$NET_LEAK_RE" | grep -vEi "$NET_LEAK_ALLOW" || true)"
+    [ -n "$_hits" ] && _leaks="$_leaks
+[$_lref]
+$_hits"
+done <<EOF
+$REFS
+EOF
+if [ -n "$_leaks" ]; then
+    echo "[pre-push] ✗ NETWORK-LEAK GUARD — refusing to push internal/private network details:"
+    echo "$_leaks" | head -30
+    echo "  → Replace with a TEST-NET example (192.0.2.x) or a placeholder; keep the real"
+    echo "    value in ~/.newt. This repo is public — protect the home network. No --no-verify."
+    exit 1
+fi
+# ──────────────────────────────────────────────────────────────────────────────
 
 # Ensure ~/.cargo/bin is on PATH so cargo sub-commands are found even when
 # the hook is invoked from an editor or GUI that doesn't source ~/.zshrc.

@@ -397,8 +397,8 @@ mod tests {
 
     #[test]
     fn channels_ws_url_swaps_https_to_wss() {
-        let url = channels_ws_url("https://REDACTED-HOST", "k", None).unwrap();
-        assert_eq!(url, "wss://REDACTED-HOST/api/kernels/k/channels");
+        let url = channels_ws_url("https://node.lab", "k", None).unwrap();
+        assert_eq!(url, "wss://node.lab/api/kernels/k/channels");
     }
 
     #[test]
