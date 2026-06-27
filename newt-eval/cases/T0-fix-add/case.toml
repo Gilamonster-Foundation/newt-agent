@@ -1,0 +1,35 @@
+name = "T0-fix-add"
+description = "Fix `add` in src/lib.rs so its failing unit test passes (return the sum)"
+language = "rust"
+difficulty = "L1"
+prompt = """
+The `add` function in src/lib.rs returns the wrong result — its unit test
+`adds` currently fails. Fix `add` so the test passes.
+"""
+
+evaluators = [
+    "diff_nonempty",
+    "diff_applies",
+    "rust_compiles",
+    "tests_pass",
+    "pattern_match",
+]
+
+expected_patterns = [
+    "a \\+ b",
+]
+
+[mock_response]
+content = """diff --git a/src/lib.rs b/src/lib.rs
+index f1548e6..e65281c 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,6 +1,6 @@
+ /// Add two integers and return the sum.
+ pub fn add(a: i32, b: i32) -> i32 {
+-    a - b
++    a + b
+ }
+
+ #[cfg(test)]
+"""
