@@ -306,6 +306,15 @@ pub enum Command {
         /// raise — each leaf is an autonomous crew with no per-leaf review.
         #[arg(long, default_value_t = 8)]
         max_leaves: usize,
+        /// LOCKED behavioral gate (structurally-enforced TDD): an
+        /// operator-supplied verify command that OVERRIDES every leaf's gate.
+        /// Unlike a model-authored `verify`, it is trusted like the repo-inferred
+        /// command (it comes from this human flag, not the model), so a crew
+        /// cannot pass by deleting or weakening its own test. Typically a
+        /// "restore the immutable spec, then run it" command. Only meaningful
+        /// with `--one-shot`.
+        #[arg(long = "locked-verify")]
+        locked_verify: Option<String>,
     },
     /// Health-check local backends + provider plugins.
     Doctor,
@@ -731,11 +740,12 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             execute,
             one_shot,
             max_leaves,
+            locked_verify,
         } => {
             let code = if let Some(goal) = goal {
                 if one_shot {
                     // One gesture: author the plan AND execute it autonomously.
-                    crew::one_shot_goal_cli(&goal, dir, max_leaves).await?
+                    crew::one_shot_goal_cli(&goal, dir, max_leaves, locked_verify).await?
                 } else {
                     // Author a plan from the goal (a strong model decomposes it),
                     // grounded in the target repo (`--dir`, else cwd).
@@ -1077,6 +1087,45 @@ mod tests {
             cli.command,
             Some(Command::Plan {
                 one_shot: false,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn parses_plan_locked_verify_flag() {
+        // `--locked-verify` carries the operator's fixed gate command (the locked
+        // behavioral gate). Defaults to None.
+        let cli = Cli::try_parse_from([
+            "newt",
+            "plan",
+            "--goal",
+            "do X",
+            "--one-shot",
+            "--locked-verify",
+            "cargo test --test grade_spec",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Command::Plan {
+                locked_verify,
+                one_shot,
+                ..
+            }) => {
+                assert!(one_shot);
+                assert_eq!(
+                    locked_verify.as_deref(),
+                    Some("cargo test --test grade_spec")
+                );
+            }
+            other => panic!("expected Command::Plan, got {other:?}"),
+        }
+        // Absent by default.
+        let cli = Cli::try_parse_from(["newt", "plan", "--goal", "y", "--one-shot"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Plan {
+                locked_verify: None,
                 ..
             })
         ));

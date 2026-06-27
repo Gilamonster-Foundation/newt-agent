@@ -47,6 +47,15 @@ pub struct LocalCrewRunner {
     /// only because `run_plan` drives leaves SEQUENTIALLY (one at a time);
     /// parallel fan-out would need a per-sibling base (a follow-up).
     base_ref: std::sync::Mutex<String>,
+    /// A caller-supplied, **operator-provenanced** verify command that overrides
+    /// every leaf's gate (the "locked behavioral gate"). Unlike a model-authored
+    /// `verify`, this comes from a human flag (`newt plan --locked-verify`), so it
+    /// is trusted like the repo-inferred command — it is NOT exec-gated. It is the
+    /// measurement-side of structurally-enforced TDD: the operator supplies a fixed
+    /// command (typically "restore the immutable spec, then run it") so a crew
+    /// cannot pass by deleting or weakening its own test. `None` = today's
+    /// behavior (planner-authored or inferred verify).
+    locked_verify: Option<String>,
 }
 
 impl LocalCrewRunner {
@@ -56,7 +65,16 @@ impl LocalCrewRunner {
             dir,
             established,
             base_ref: std::sync::Mutex::new("HEAD".to_string()),
+            locked_verify: None,
         }
+    }
+
+    /// Set the locked behavioral gate (operator-provenanced; overrides every
+    /// leaf's verify). See the field docs.
+    #[must_use]
+    pub fn with_locked_verify(mut self, cmd: Option<String>) -> Self {
+        self.locked_verify = cmd;
+        self
     }
 
     fn pool(&self) -> BackendPool {
@@ -162,6 +180,26 @@ fn render_team(o: &newt_scheduler::TeamOutcome) -> String {
     out
 }
 
+/// Choose a leaf's verify command by provenance priority:
+/// 1. `locked` — an operator-supplied `--locked-verify` gate: trusted (human
+///    flag), overrides everything, not exec-gated;
+/// 2. `caller` — a model-authored `verify` (already exec-gated by the dispatch):
+///    untrusted origin, used only when no locked gate is set;
+/// 3. the repo-inferred command (`infer_test_command`): repo-provenanced.
+///
+/// Pure (the only impurity is `infer_test_command`, reached solely when both
+/// `locked` and `caller` are `None`), so the priority ordering is unit-testable.
+fn choose_test_cmd(
+    locked: Option<&str>,
+    caller: Option<&str>,
+    dir: &std::path::Path,
+) -> Option<String> {
+    locked
+        .map(String::from)
+        .or_else(|| caller.map(String::from))
+        .or_else(|| infer_test_command(dir))
+}
+
 #[async_trait]
 impl CrewRunner for LocalCrewRunner {
     async fn dispatch(&self, op: &str, args: &Value, caveats: &Caveats) -> Result<String, String> {
@@ -235,15 +273,21 @@ impl CrewRunner for LocalCrewRunner {
                 };
                 let pool = self.pool();
                 let (crew_cfg, lead, rationale) = self.resolve_roster(&pool, args, mode)?;
-                // `caller_verify` was authority-checked above; an inferred command
-                // is repo-provenanced and needs no gate.
-                let test_cmd = caller_verify
-                    .map(String::from)
-                    .or_else(|| infer_test_command(&self.dir))
-                    .ok_or_else(|| {
-                        "no verification command — pass 'verify' or add a justfile / Cargo.toml / pyproject.toml"
-                            .to_string()
-                    })?;
+                // Pick the gate by PROVENANCE priority: an operator-supplied
+                // `--locked-verify` (trusted, overrides all) > the model-authored
+                // `caller_verify` (already exec-gated above) > the repo-inferred
+                // command (repo-provenanced). The locked gate is trusted like the
+                // inferred command — both come from outside the model — so it is
+                // not exec-gated.
+                let test_cmd = choose_test_cmd(
+                    self.locked_verify.as_deref(),
+                    caller_verify,
+                    &self.dir,
+                )
+                .ok_or_else(|| {
+                    "no verification command — pass 'verify' / --locked-verify or add a justfile / Cargo.toml / pyproject.toml"
+                        .to_string()
+                })?;
                 let id = worktree_id();
                 // Leaf composition (#646): fork the worktree off the cumulative
                 // chain tip (the last landed leaf), not bare HEAD, so each leaf
@@ -321,6 +365,33 @@ mod tests {
         // Default Config has no backends → composing finds no live models. The /team
         // enable establishes `Prompt` presence (the dev-escape toggle today).
         LocalCrewRunner::new(Config::default(), std::env::temp_dir(), Presence::Prompt)
+    }
+
+    #[test]
+    fn locked_verify_outranks_caller_and_is_set_by_builder() {
+        use std::path::Path;
+        // A path that is never read: both cases below short-circuit before the
+        // infer fallback (the only fs-touching branch), so this stays fs-free.
+        let dir = Path::new("/this/path/is/never/read");
+        // An operator-supplied locked gate overrides a model-authored caller verify.
+        assert_eq!(
+            choose_test_cmd(Some("locked-cmd"), Some("caller-cmd"), dir).as_deref(),
+            Some("locked-cmd")
+        );
+        // With no locked gate, the (exec-gated) caller verify is used.
+        assert_eq!(
+            choose_test_cmd(None, Some("caller-cmd"), dir).as_deref(),
+            Some("caller-cmd")
+        );
+        // The builder sets the field; the default is None.
+        assert!(runner().locked_verify.is_none());
+        assert_eq!(
+            runner()
+                .with_locked_verify(Some("restore && test".into()))
+                .locked_verify
+                .as_deref(),
+            Some("restore && test")
+        );
     }
 
     #[tokio::test]
