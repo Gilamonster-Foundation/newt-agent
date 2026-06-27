@@ -1,12 +1,36 @@
 # The Capability Ratchet — a (task × mode × model) matrix over the #548 behavioral grader
 
 This generalizes the **autonomous #548 evaluator** (`METHODOLOGY.md`, `grade-548.sh`,
-`grade-run.sh`) from one fixed cell into a **matrix**. #672 held the task fixed (#548) and
-varied the codebase/model and found the loop is *mechanically robust but implements the issue
-in 0/N runs — the bottleneck is crew-execution capability, not planning or context, and a
-bigger general model made it worse.* The ratchet keeps #672's **behavioral-grading
-methodology fixed** and sweeps three axes to locate *where* that execution ceiling sits and
-*what breaks it*.
+`grade-run.sh`) from one fixed cell into a **matrix**. #672's complete A–E experiment is the
+premise: holding the task fixed (#548) and sweeping codebase + executor model from a 14B
+coder to a 27B general local model to **frontier gpt-4.1**, the loop is *mechanically robust
+but implements #548 in **0 of 5** — and **model capability does NOT correlate with success**:
+the frontier model produced the **worst** result (a five-language polyglot hallucination).*
+**The ceiling is the harness mechanism, not the model.** Root cause (precisely diagnosed in
+`results/EXPERIMENT.md`): the planner mis-grounds the target file → the per-leaf worker
+creates **new vacuum files** from abstract leaf text (wrong language, wrong location) instead
+of **editing the real seam** → isolated worktrees never cohere → `just check` passes because
+nothing it wrote is in the build graph.
+
+So the ratchet is **not** a model-ranking benchmark. It keeps #672's **behavioral-grading
+methodology fixed** and sweeps a matrix to do three things E makes urgent:
+
+1. **Locate the mechanism's competence boundary** on a task-difficulty ladder (T0→T5): #548
+   is one hard wire-in; where on the ladder does the autonomous loop start failing?
+2. **Isolate whether decomposition helps or HURTS** — `single` (worker edits the given
+   workspace directly) vs `plan+crew` (decompose → per-leaf vacuum files). E's diagnosis
+   predicts **crew underperforms single on mid/hard tasks**, because decomposition is what
+   introduces the mis-grounding + orphan-file failure mode.
+3. **Measure the lift of the three mechanism levers** (the eventual payoff, per EXPERIMENT.md's
+   bottom line): (a) a **behavioral per-leaf gate** (promote the grader into the crew verify
+   so inert-vacuum leaves can't report success), (b) **ground the worker** in the real repo
+   (target path + language → EDIT the seam, don't invent files), (c) **fix the planner's file
+   grounding**. The ratchet is the instrument that makes "did the lever move `pass` off the
+   floor?" measurable across the whole difficulty ladder, not just #548.
+
+**Model is a CONTROL, not the lever** (E settled this): run the cheap local models for most
+cells, reserve a frontier spot-check to re-confirm capability isn't the boundary. This also
+saves OpenAI spend.
 
 > **North-Star, inherited verbatim from `METHODOLOGY.md` §1:** "Pass" is **the feature works
 > when you run the binary** — not "the loop finished" and not "`just check` is green". An
@@ -18,11 +42,15 @@ methodology fixed** and sweeps three axes to locate *where* that execution ceili
 |---|---|---|
 | **Task** | `T0` basic → `T5` decomposition-heavy (a ladder of small, behaviorally-checkable cases) | a `newt-eval/cases/T*` dir |
 | **Mode** (the ratchet rung) | `single` → `plan` → `plan+crew` | which real CLI the driver runs |
-| **Model × specialization** | gnuc small → dgx **coder** vs **general** (the axis #672 surfaced) → OpenAI frontier | a **named** backend / `[crews.<name>]` in local `~/.newt` |
+| **Mechanism variant** (the eventual primary axis) | `baseline` → `+worker-grounding` → `+behavioral-leaf-gate` → `+planner-grounding` | a newt feature flag / config (downstream; the levers must be built first) |
+| **Model** (a CONTROL, per E) | mostly gnuc small; a frontier spot-check | a **named** backend / `[crews.<name>]` in local `~/.newt` |
 
-**Readout — the staircase:** per model, the lowest **mode** that flips behavioral pass at each
-task rung; plus **mode-lift**, **coder-vs-general**, and **frontier** tables that test #672's
-"execution is the ceiling" thesis directly.
+**Readout — the staircase:** per (mode, mechanism), the highest task rung that still
+behaviorally passes — the mechanism's **competence boundary**. The headline tables:
+(a) **single-vs-crew** at each rung (does decomposition help or hurt? — E predicts hurt);
+(b) **lever-lift** (does `+grounding` / `+behavioral-gate` push the boundary up the ladder, or
+move #548-class `top_dgx_subs` off 8?); (c) a **frontier spot-check** confirming model strength
+does NOT move the boundary (re-validating E so we can stay on cheap models).
 
 ## Modes → real commands (confirmed)
 
@@ -100,11 +128,17 @@ scripts/eval/ratchet.sh --all --tier gnuc            # → results/ratchet-<date
 
 ## Status & build order
 
-- **v1 (gnuc + dgx1-crew):** `single`/`plan` on gnuc small models; `plan+crew` on the mixed
-  roster (planner on a resident dgx coder model). Locate the ceiling on the ladder; quantify
-  mode-lift and coder-vs-general (replicating/refuting #672 run D at smaller scale).
-- **B:** add dgx `single`/`plan` tiers (more named backends). **C:** add OpenAI
-  (`gpt-4o`/`o4-mini`, `gpt-5-codex`) — the generalized #672 Run E across the whole ladder.
+- **v1 — the instrument + the baseline boundary (gnuc, cheap).** `single` vs `plan` vs
+  `plan+crew` across T0→T5 on cheap gnuc small models (model held as a control), mixed crew
+  planner on a resident dgx coder model. **The v1 deliverable is a single-vs-crew competence
+  staircase**: where does the autonomous mechanism stop implementing, and does crew underperform
+  single (testing E's prediction at smaller scale). No OpenAI needed for v1.
+- **v2 — measure the levers (the payoff).** Build the three mechanism fixes (worker grounding,
+  behavioral per-leaf gate, planner file-grounding) behind flags and re-run the matrix; watch
+  the boundary move up the ladder / `top_dgx_subs` come off 8. This is the actionable
+  contribution E points to (mechanism, not model).
+- **Frontier spot-check (minimal spend).** One hard-rung cell on `gpt-4o`/`gpt-5-codex` to
+  re-confirm E (capability isn't the boundary) — not a main axis.
 - **Coordination:** stacked on `eval/548-grader` (additive files only — `ratchet.sh`,
   `RATCHET.md`, `T*` tasks, the `newt-eval grade` subcommand); rebases onto main when #672
   merges. Heavy steps (cargo builds, dgx1/OpenAI live runs) wait until #672 merges so they
