@@ -496,12 +496,18 @@ pub async fn execute_plan(
 /// `plan::Plan`. It asks for the WORK only — never authority — so an authored
 /// plan carries default-deny caveats the human grants by editing the TOML.
 const PLAN_AUTHOR_SYSTEM: &str = "You are a planning lead. Decompose the GOAL into a \
-    dependency-ordered plan of small, independently-verifiable engineering subtasks. Reply \
-    with ONLY JSON: {\"goal\":\"<the goal>\",\"subtasks\":[{\"id\":\"<short-kebab-id>\",\
-    \"instruction\":\"<imperative step>\",\"deps\":[\"<id of a step that must finish first>\"],\
-    \"verify\":\"<shell command that exits 0 once THIS step is done; omit if none>\"}]}. Use \
-    `deps` for ordering (a step lists the ids it waits on). Ids: short, stable, unique. \
-    Smallest-first. Do NOT grant permissions or describe authority — only the work.";
+    dependency-ordered plan of the FEWEST engineering subtasks that accomplish it — each \
+    subtask MUST change code (produce a file edit). Reply with ONLY JSON: \
+    {\"goal\":\"<the goal>\",\"subtasks\":[{\"id\":\"<short-kebab-id>\",\
+    \"instruction\":\"<imperative code-changing step>\",\
+    \"deps\":[\"<id of a step that must finish first>\"],\
+    \"verify\":\"<shell command that exits 0 once THIS step is done; omit if none>\"}]}. \
+    A small, single-file change is ONE subtask. Do NOT create separate \
+    inspect/understand/explore/locate/verify/test/run-tests subtasks — the harness reads \
+    the repo for you and automatically verifies EVERY subtask after it runs (put a step's \
+    own check in its `verify` FIELD, never as a standalone subtask). Use `deps` for \
+    ordering (a step lists the ids it waits on). Ids: short, stable, unique. Do NOT grant \
+    permissions or describe authority — only the work.";
 
 /// The first balanced `{…}` span in `s` (string-aware), so a model reply wrapped
 /// in ```json fences or prose still parses. `None` if there is no balanced object.
@@ -1081,6 +1087,18 @@ fn render(o: &CrewOutcome, worktree: &Path) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plan_author_prompt_steers_to_minimal_action_only_subtasks() {
+        // Regression: the planner must author the FEWEST, code-changing subtasks and
+        // NOT separate inspect/verify/test steps. Those steps land nothing and (after
+        // the crew-honesty fix) are correctly marked Failed — leaving a plan whose fix
+        // DID land falsely reported "incomplete". Steering the prompt is the root fix.
+        assert!(PLAN_AUTHOR_SYSTEM.contains("FEWEST"));
+        assert!(PLAN_AUTHOR_SYSTEM.contains("MUST change code"));
+        assert!(PLAN_AUTHOR_SYSTEM.contains("Do NOT create separate"));
+        assert!(PLAN_AUTHOR_SYSTEM.contains("verifies EVERY subtask"));
+    }
 
     #[test]
     fn github_refs_parses_issue_and_pr_urls_in_prose() {
