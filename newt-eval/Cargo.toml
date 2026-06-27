@@ -48,6 +48,8 @@ wiremock.workspace = true
 assert_cmd.workspace = true
 cargo_metadata.workspace = true
 predicates.workspace = true
+# `grade` integration tests build real fixture/workspace trees on disk.
+tempfile.workspace = true
 
 [lints]
 workspace = true
