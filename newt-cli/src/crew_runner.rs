@@ -200,6 +200,22 @@ fn choose_test_cmd(
         .or_else(|| infer_test_command(dir))
 }
 
+/// Decide a crew leaf's dispatch result by whether it actually LANDED work.
+///
+/// `plan_exec` marks a leaf `Done` on `Ok` and `Failed` on `Err`. A crew that ran
+/// but delivered nothing — verification failed, or it verified yet produced no
+/// commit — must therefore be an `Err`, or the plan reports a vacuous "✓ complete"
+/// over undelivered work (the #672 pathology: the success signal becomes "the
+/// dispatch didn't error" instead of "the work landed"). Only a real land is `Ok`.
+/// The full report (roster + crew steps + diff) rides along either way for review.
+fn crew_dispatch_result(report: String, did_land: bool) -> Result<String, String> {
+    if did_land {
+        Ok(report)
+    } else {
+        Err(report)
+    }
+}
+
 #[async_trait]
 impl CrewRunner for LocalCrewRunner {
     async fn dispatch(&self, op: &str, args: &Value, caveats: &Caveats) -> Result<String, String> {
@@ -319,7 +335,10 @@ impl CrewRunner for LocalCrewRunner {
                 // the base repo can review/merge it with the embedded `git` tool.
                 // Unverified work stays isolated and is discarded. (No file-copy / no
                 // merge ceremony — we have embedded git; work is passed as a commit.)
-                let landed = if passed {
+                // A leaf only truly SUCCEEDS if it LANDED work (verification passed
+                // AND a commit was produced). `did_land` is the structural signal
+                // `plan_exec` needs: anything else delivered nothing.
+                let (landed, did_land) = if passed {
                     let (name, email) = newt_core::AgentIdentity::resolve()
                         .unwrap_or_default()
                         .git_author();
@@ -330,26 +349,33 @@ impl CrewRunner for LocalCrewRunner {
                             // failed / nothing-to-land leaf leaves the cursor at
                             // the last GOOD tip.
                             *self.base_ref.lock().unwrap() = sha.clone();
-                            format!(
-                                "\n✓ LANDED on branch `{branch}` @ {sha} — review with \
-                                 `git diff main..{branch}`, then merge with the `git` tool.\n"
+                            (
+                                format!(
+                                    "\n✓ LANDED on branch `{branch}` @ {sha} — review with \
+                                     `git diff main..{branch}`, then merge with the `git` tool.\n"
+                                ),
+                                true,
                             )
                         }
-                        Err(e) => format!("\n⚠ verified but nothing to land: {e}\n"),
+                        Err(e) => (format!("\n⚠ verified but nothing to land: {e}\n"), false),
                     }
                 } else {
-                    "\n✗ verification did NOT pass — work isolated and discarded, NOT landed.\n"
-                        .to_string()
+                    (
+                        "\n✗ verification did NOT pass — work isolated and discarded, NOT landed.\n"
+                            .to_string(),
+                        false,
+                    )
                 };
                 let diff_block = if diff.trim().is_empty() {
                     "(no changes)".to_string()
                 } else {
                     diff
                 };
-                Ok(format!(
+                let report = format!(
                     "roster: {}\n{body}{landed}--- diff (review) ---\n{diff_block}",
                     rationale.join("; ")
-                ))
+                );
+                crew_dispatch_result(report, did_land)
             }
             other => Err(format!("unknown crew op: {other}")),
         }
@@ -392,6 +418,20 @@ mod tests {
                 .as_deref(),
             Some("restore && test")
         );
+    }
+
+    #[test]
+    fn crew_leaf_succeeds_only_when_it_lands() {
+        // #672 regression: before the fix, the crew dispatch returned Ok even when
+        // verification failed and nothing landed, so plan_exec marked the leaf Done
+        // and the plan reported "✓ complete" over undelivered work.
+        // A real land → Ok → plan_exec marks the leaf Done.
+        assert!(crew_dispatch_result("✓ LANDED on branch crew/x".into(), true).is_ok());
+        // Ran but delivered nothing → Err → plan_exec marks the leaf Failed and the
+        // plan reports INCOMPLETE. The full report still rides along for review.
+        let r = crew_dispatch_result("✗ verification did NOT pass — discarded".into(), false);
+        assert!(r.is_err(), "a non-landing crew leaf must be an Err, not Ok");
+        assert!(r.unwrap_err().contains("did NOT pass"));
     }
 
     #[tokio::test]
