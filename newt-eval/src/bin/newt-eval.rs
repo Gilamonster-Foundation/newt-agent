@@ -60,6 +60,13 @@ enum Command {
     /// with fabricated imports that R2 reverts and retries. Exit 2 if any file
     /// fabricates (an honest gate signal), 0 if the turn is accepted.
     Verify(VerifyArgs),
+
+    /// Grade an arbitrary post-run workspace against a case's structural
+    /// evaluators — decoupled from running. Reconstructs the diff (fixture →
+    /// workspace) and applies the case's `diff_*`/`pattern_match`/`rust_compiles`/
+    /// `tests_pass` evaluators. The ratchet matrix uses this to score plan/crew
+    /// worktrees. Exit 0 if all evaluators pass, 2 if any fails.
+    Grade(GradeArgs),
 }
 
 /// Arguments for the `manifest` subcommand.
@@ -94,6 +101,24 @@ struct ScoreArgs {
     #[arg(long)]
     surface_dir: Option<PathBuf>,
     /// Emit the verdict as JSON instead of a one-line summary.
+    #[arg(long)]
+    json: bool,
+}
+
+/// Arguments for the `grade` subcommand.
+#[derive(Args, Debug)]
+struct GradeArgs {
+    /// Name of the case to grade against (e.g. `007-add-struct-method`).
+    #[arg(long)]
+    case: String,
+    /// The post-run workspace tree to grade (a `crew/*` worktree, a
+    /// hand-edited dir — any produced output).
+    #[arg(long)]
+    workspace: PathBuf,
+    /// Path to the cases directory (defaults to bundled).
+    #[arg(long)]
+    cases_dir: Option<PathBuf>,
+    /// Emit the scorecard as JSON instead of the table.
     #[arg(long)]
     json: bool,
 }
@@ -214,7 +239,34 @@ async fn real_main() -> Result<RunOutcomeStatus> {
         Command::Score(args) => score_command(args),
         Command::Manifest(args) => manifest_command(args),
         Command::Verify(args) => verify_command(args),
+        Command::Grade(args) => grade_command(args),
     }
+}
+
+/// `grade` — score an arbitrary post-run workspace against a case's structural
+/// evaluators, decoupled from running. Loads the named case, reconstructs the
+/// diff (fixture → workspace) via [`newt_eval::grade_workspace`], and renders
+/// the scorecard. Exit 0 if all evaluators pass, 2 otherwise.
+fn grade_command(args: GradeArgs) -> Result<RunOutcomeStatus> {
+    let cases_dir = args.cases_dir.unwrap_or_else(cases::default_cases_dir);
+    let case = cases::load_all(&cases_dir)?
+        .into_iter()
+        .find(|c| c.name == args.case)
+        .ok_or_else(|| {
+            anyhow::anyhow!("case '{}' not found in {}", args.case, cases_dir.display())
+        })?;
+    let mut scorecard = Scorecard::new();
+    scorecard.push(newt_eval::grade_workspace(&case, &args.workspace)?);
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&scorecard)?);
+    } else {
+        print!("{}", scorecard.render_table());
+    }
+    Ok(if scorecard.all_passed() {
+        RunOutcomeStatus::AllPassed
+    } else {
+        RunOutcomeStatus::CaseFailed
+    })
 }
 
 /// `verify` — the R2 gate as a CLI. Build the surface from the R1 manifest, gate

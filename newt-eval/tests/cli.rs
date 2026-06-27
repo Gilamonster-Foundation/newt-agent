@@ -154,3 +154,44 @@ fn run_live_mode_runner_failure_legacy_exit_code() {
         // Pre-#41 behavior: exit 2.
         .code(2);
 }
+
+/// `grade --help` documents the case + workspace flags.
+#[test]
+fn grade_help_shows_case_and_workspace_flags() {
+    Command::cargo_bin("newt-eval")
+        .unwrap()
+        .args(["grade", "--help"])
+        .assert()
+        .success()
+        .stdout(contains("--case"))
+        .stdout(contains("--workspace"));
+}
+
+/// `grade` against an unchanged fixture reconstructs an empty diff, so the
+/// structural evaluators fail and the process exits 2 (the case-failed code).
+#[test]
+fn grade_unchanged_fixture_fails_and_exits_two() {
+    Command::cargo_bin("newt-eval")
+        .unwrap()
+        .args([
+            "grade",
+            "--case",
+            "007-add-struct-method",
+            "--workspace",
+            "cases/007-add-struct-method/workspace",
+        ])
+        .assert()
+        .code(2)
+        .stdout(contains("diff_nonempty"));
+}
+
+/// `grade` reports a clear error when the named case does not exist.
+#[test]
+fn grade_unknown_case_errors() {
+    Command::cargo_bin("newt-eval")
+        .unwrap()
+        .args(["grade", "--case", "no-such-case", "--workspace", "cases"])
+        .assert()
+        .failure()
+        .stderr(contains("not found"));
+}
