@@ -390,7 +390,7 @@ pub async fn run_plan_cli(args: PlanArgs) -> anyhow::Result<i32> {
     }
     // Run-log lands in a SIBLING artifact — never modify the authored source.
     let log_path = args.file.with_extension("run.toml");
-    execute_plan(&mut plan, args.dir, args.max_leaves, Some(log_path)).await
+    execute_plan(&mut plan, args.dir, args.max_leaves, Some(log_path), None).await
 }
 
 /// `--one-shot`'s tacit approval, made real: grant every subtask the filesystem
@@ -421,6 +421,7 @@ pub async fn execute_plan(
     dir: Option<PathBuf>,
     max_leaves: usize,
     log_path: Option<PathBuf>,
+    locked_verify: Option<String>,
 ) -> anyhow::Result<i32> {
     // B3: refuse a structurally-doomed plan BEFORE spending crew runs on it — a
     // dep on a non-existent subtask, an empty-instruction leaf, or no
@@ -456,7 +457,8 @@ pub async fn execute_plan(
     // BOOT attest ceremony is #472).
     let caveats = newt_acp_worker::worker_session_caveats(None);
     let runner =
-        crate::crew_runner::LocalCrewRunner::new(cfg, dir, newt_core::agentic::Presence::Prompt);
+        crate::crew_runner::LocalCrewRunner::new(cfg, dir, newt_core::agentic::Presence::Prompt)
+            .with_locked_verify(locked_verify);
     let run = newt_core::agentic::run_plan(plan, &caveats, &runner).await;
     for id in &run.dispatched {
         if let Some(s) = plan.subtask(id) {
@@ -851,6 +853,7 @@ pub async fn one_shot_goal_cli(
     goal: &str,
     dir: Option<PathBuf>,
     max_leaves: usize,
+    locked_verify: Option<String>,
 ) -> anyhow::Result<i32> {
     // The repo we're about to modify IS the planning context (--dir, else cwd).
     let repo_dir = dir
@@ -866,6 +869,7 @@ pub async fn one_shot_goal_cli(
         dir,
         max_leaves,
         Some(PathBuf::from("plan.run.toml")),
+        locked_verify,
     )
     .await
 }
