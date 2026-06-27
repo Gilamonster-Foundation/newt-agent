@@ -6,6 +6,7 @@ keep `/dgx help` as the progressive-disclosure detail page), and isolating the
 effect of features landed on `main`.
 
 > Full **how/why**, calibration, and threats-to-validity: [`../METHODOLOGY.md`](../METHODOLOGY.md).
+> The prose reflection — *what we learned* — is in [`../FINDINGS.md`](../FINDINGS.md).
 
 ## At a glance
 
