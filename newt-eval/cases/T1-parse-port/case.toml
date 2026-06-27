@@ -1,0 +1,53 @@
+name = "T1-parse-port"
+description = "Make parse_port return Option<u16> (None on invalid input); update + add tests"
+language = "rust"
+difficulty = "L2"
+prompt = """
+`parse_port` in src/lib.rs panics on invalid input — it unwraps the parse.
+Change `parse_port` to return `Option<u16>`, yielding `None` when the input is
+not a valid port number. Update the existing `parses_valid` test accordingly,
+and add a test verifying that invalid input returns `None`.
+"""
+
+evaluators = [
+    "diff_nonempty",
+    "diff_applies",
+    "rust_compiles",
+    "tests_pass",
+    "pattern_match",
+]
+
+expected_patterns = [
+    "Option<u16>",
+    "None",
+]
+
+[mock_response]
+content = """diff --git a/src/lib.rs b/src/lib.rs
+index cfef8f3..1d7db4b 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,6 +1,6 @@
+-/// Parse a port number from a string.
+-pub fn parse_port(s: &str) -> u16 {
+-    s.parse().unwrap()
++/// Parse a port number from a string, returning `None` on invalid input.
++pub fn parse_port(s: &str) -> Option<u16> {
++    s.parse().ok()
+ }
+
+ #[cfg(test)]
+@@ -9,6 +9,11 @@ mod tests {
+
+     #[test]
+     fn parses_valid() {
+-        assert_eq!(parse_port("8080"), 8080);
++        assert_eq!(parse_port("8080"), Some(8080));
++    }
++
++    #[test]
++    fn rejects_invalid() {
++        assert_eq!(parse_port("not-a-port"), None);
+     }
+ }
+"""
