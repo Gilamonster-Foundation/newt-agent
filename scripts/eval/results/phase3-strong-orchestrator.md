@@ -42,7 +42,7 @@ everything else held identical (same task, same locked gate, same `--one-shot`):
 > the result — it makes the comparison *cleaner* (weak and strong ran on the **same
 > box**, so the only variable is the model). It does explain the delivery failures
 > below: they were gnuc thrashing on a local 19 GB model, not a remote machine. The
-> real dgx1 (`REDACTED-IP`, with 120B / Qwen3-Coder-Next) was never used.
+> real (remote) dgx node — which holds the 120B / Qwen3-Coder-Next models — was never used.
 
 This is the cleanest possible isolation: **grounding is decided at plan-authoring,
 upstream of the executor entirely.** The contrast appears in the *authored plan*,
@@ -104,13 +104,13 @@ correct fix named — yet **no fix landed**. The cause was a single one:
 the same gnuc-local ollama — the weak model OOM'd the runner, and the strong 19 GB
 model thrashed a box that can't hold it. The seed file came out unchanged; no
 `crew/*` branch was produced. (The fix: point `[dgx]` at the real dgx1
-`REDACTED-IP`, which has the headroom for a 30B; that both unblocks this delivery
+the real dgx node, which has the headroom for a 30B; that both unblocks this delivery
 grade *and* stops the recurring gnuc memory pressure.)
 
 **Honest status:** the *grounding lift* is established (authoring-level, n≥2 for the
 strong arm including a plan that names the exact fix). The *delivery* lift —
 strong-grounded plan → locked-gate PASS — is **pending a re-run on the real dgx1**
-(point `[dgx]` at `REDACTED-IP` so the 30B has room to execute); it is a re-run, not a redesign. The
+(point `[dgx]` at the real dgx node so the 30B has room to execute); it is a re-run, not a redesign. The
 strong ML2 plan is strong evidence it would pass (it targets the file that, when
 fixed with `{:.1}`, passes `grade_spec` — verified offline), but "would pass" is
 not "did pass," and we mark it pending rather than claim it.
