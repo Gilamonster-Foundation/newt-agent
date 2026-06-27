@@ -1,0 +1,36 @@
+name = "T3-format-temperature"
+description = "Fix format_temperature to round to one decimal (seam buried under units/; a same-vocabulary decoy in format.rs)"
+language = "rust"
+difficulty = "L3"
+prompt = """
+Temperature formatting is wrong: `format_temperature` should render `21.05` as
+`"21.1°C"` — one decimal place — but it truncates to a whole number instead. The
+`formats_temperature_to_one_decimal` test fails because of this. Fix
+`format_temperature` so the test passes.
+"""
+
+evaluators = [
+    "diff_nonempty",
+    "diff_applies",
+    "rust_compiles",
+    "tests_pass",
+    "pattern_match",
+]
+
+expected_patterns = [
+    "\\{:\\.1\\}",
+]
+
+[mock_response]
+content = """diff --git a/src/units/temperature.rs b/src/units/temperature.rs
+index 1bd75c0..8c1700b 100644
+--- a/src/units/temperature.rs
++++ b/src/units/temperature.rs
+@@ -2,5 +2,5 @@
+ /// (e.g. `21.05` → `"21.1°C"`). This is the seam the task is about — NOT
+ /// `crate::format::format_temp`, which is a different (whole-degree) helper.
+ pub fn format_temperature(celsius: f64) -> String {
+-    format!("{}°C", celsius as i64)
++    format!("{:.1}°C", celsius)
+ }
+"""
