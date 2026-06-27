@@ -678,9 +678,7 @@ async fn doctor(config_path: Option<&Path>) -> anyhow::Result<()> {
     if !any {
         println!("\n  No DGX endpoints configured. Set:");
         println!("    NEWT_DGX_HOST=<host>          (synthesizes ollama + vllm URLs from a bare hostname)");
-        println!(
-            "    NEWT_DGX_OLLAMA_URL=<url>     (direct URL, e.g. https://REDACTED-HOST)"
-        );
+        println!("    NEWT_DGX_OLLAMA_URL=<url>     (direct URL, e.g. https://REDACTED-HOST)");
     }
     println!("\n  DNS note: on the Google-WiFi mesh, .home.lab resolves but .home.lan does");
     println!("  not (the pucks intercept the .lan TLD). Use .home.lab from a laptop; inside");
@@ -2497,7 +2495,15 @@ tiers = ["FAST", "STANDARD"]
         let dir = tempfile::tempdir().unwrap();
         let cfg_path = dir.path().join("config.toml");
 
-        setup(Some(&cfg_path), Some("REDACTED-IP"), "lab", None, false, true).unwrap();
+        setup(
+            Some(&cfg_path),
+            Some("REDACTED-IP"),
+            "lab",
+            None,
+            false,
+            true,
+        )
+        .unwrap();
 
         let text = std::fs::read_to_string(&cfg_path).unwrap();
         assert!(
