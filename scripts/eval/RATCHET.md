@@ -143,3 +143,12 @@ scripts/eval/ratchet.sh --all --tier gnuc            # → results/ratchet-<date
   `RATCHET.md`, `T*` tasks, the `newt-eval grade` subcommand); rebases onto main when #672
   merges. Heavy steps (cargo builds, dgx1/OpenAI live runs) wait until #672 merges so they
   don't contend with its in-flight runs.
+
+## The finding
+
+The synthesized write-up of what this apparatus has found so far —
+"The Ceiling Is the Harness: Gaming the Gate and Structurally-Enforced TDD" —
+lives at [`docs/design/the-ceiling-is-the-harness.md`](../../docs/design/the-ceiling-is-the-harness.md).
+It separates what is SHOWN (#672 A–E), SUGGESTED (the T0 observation), and
+PROPOSED (structurally-enforced TDD: the ungameable grade + the OCAP-locked
+adversarial Referee role).
