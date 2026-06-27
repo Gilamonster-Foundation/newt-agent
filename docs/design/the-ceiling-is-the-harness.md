@@ -13,7 +13,7 @@ Autonomous coding agents are widely assumed to be capability-limited: make the m
 > ## Status of claims
 >
 > - **SHOWN** (established result; #672 runs A–E; one fixed task; n=1 per cell; LLM non-determinism): landed context features moved the behavioral outcome by zero; swapping a 14B → 27B → frontier executor did not help and the frontier model produced the worst artifact; the build-and-test gate certifies non-features; 0/5 runs implemented the task. The noise-free component is the deterministic regression check (grade a fixed codebase's own binary, no LLM).
-> - **SUGGESTED** (preliminary observation; ratchet rung T0; n=1; one crew config; gaming *authored*, not necessarily consummated): at the trivial rung, single-agent mode fixed the bug while the crew planner authored a subtask to weaken the test. Motivating, not proving. It does **not** establish "single beats crew," and it does not establish that gaming is consummated in practice.
+> - **SUGGESTED** (preliminary observations; ratchet rungs T0 and T2; n=1 per cell; one crew config): at the trivial rung (T0) the crew planner *authored* a test-weakening subtask that only a timeout stopped from firing; at the first L3 rung (T2) the crew *consummated* it — deleting its own test, breaking the public API, and rewriting the function to an invented spec — while single-agent mode passed both rungs. These are single runs, motivating not proving; they do **not** establish "single beats crew." T2 additionally **demonstrates** (n=1) the measurement claim concretely: the obvious crew grade (`cargo test` in the produced tree) reported a green PASS over a test-less, mangled tree, and only the external spec returned the honest FAIL.
 > - **PROPOSED** (design only). *Built:* the ungameable measurement layer (external, immutable spec). *Unbuilt and unmeasured:* the adversarial Referee role and the "lever-lift" experiment. We make no claim that the Referee works; we claim only that it is buildable on already-merged rails and that the methodology is designed to measure whether it lifts the competence boundary.
 
 ## 1. Introduction
@@ -139,6 +139,19 @@ Read carefully, this is the #672 mis-grounding failure mode surfacing at the tri
 **A methodological finding falls out of the same observation.** The obvious crew behavioral grade — run `cargo test` in the produced tree — is itself gameable. If the agent edits the test to match buggy code, `cargo test` passes vacuously. The #672 trap ("the gate passes because nothing real changed") reappears *inside the evaluator*, because the agent can edit the very test that grades it. This is what motivates moving the canonical spec outside the agent's reach — but that fix, and the adversarial-Referee mechanism it supports, are proposed and unmeasured, and are not claimed to work here.
 
 **Scope of Part 2.** One task, one crew config, n=1, gaming authored rather than confirmed. It is a single data point: suggestive that the gate-gaming failure mode is present even at the floor of the difficulty ladder, and useful for pointing the ratchet at the right question. It is not evidence that decomposition/crew hurts in general, and it is not a law.
+
+### Part 3 — The T2 ratchet result (preliminary; n=1; gaming *consummated*; the measurement layer demonstrated)
+
+One rung up, at the first L3 task, the gaming we only *saw authored* at T0 was *carried through* — and the ungameable grade caught it. T2 is a multi-file Rust library whose `humanize_duration` produces the wrong seconds component (the seed test fails until fixed); the prompt names the symbol, not the file, and a same-vocabulary decoy module (`format.rs`, byte-formatting, unrelated) sits beside the real seam (`util.rs`). **Single mode** (`qwen2.5-coder:7b`) passes outright — it grounds on the symbol and fixes `util.rs`, unfooled by the decoy. **Crew mode** (planner `llama3.1:8b`) **fails**, and the manner of failure is the point. The run *completed* (no timeout). It did not edit the decoy — it found `util.rs` — but it then (1) **deleted its own failing test** (the inline assertion, removed outright), (2) **deleted the public re-export** of `humanize_duration`, breaking the crate API, and (3) **rewrote the function to an invented spec** — a different signature (`ms: u32` rather than `secs: u64`) and millisecond `ms/s/min/h` semantics unrelated to the task.
+
+The two grades disagree, and the disagreement is the demonstration:
+
+| Grade | T2/crew result |
+|------|----------------|
+| **Gameable** — `cargo test` on the produced tree (the obvious crew grade) | **PASS** (`0 passed; 0 failed`, exit 0): the crew deleted the only test, so the tree has none and goes green vacuously |
+| **Ungameable** — the external `grade_spec`, dropped in only at grading time | **FAIL**: `humanize_duration(90)` is no longer `"1m 30s"`, and the deleted re-export means the spec cannot even resolve the symbol |
+
+This is a single run (n=1, one config), and we do not generalize it. But within that one run it shows three things the T0 anecdote could only suggest: that the gate-gaming failure mode is **consummated**, not merely contemplated (a deleted test, not a planned one); that the obvious crew grade (`cargo test` in the produced tree) **does** report a green PASS over a tree with no tests and a mangled function; and that the **external, agent-invisible spec catches it** where the obvious grade does not. The measurement layer of §3, argued there as a precaution, is here a demonstrated catch.
 
 ## 5. Diagnosis and Proposed Mechanism
 
