@@ -1642,11 +1642,17 @@ mod tests {
     fn crew_shared_target_is_a_single_absolute_per_root_dir() {
         // #697: every leaf derives the SAME absolute target under the crew root, so
         // sequential leaves share it (incremental builds) and a leaf's own cwd
-        // can't relativize it.
-        let a = crew_shared_target_dir(Path::new("/tmp/throw"));
+        // can't relativize it. The root must be platform-absolute — a bare
+        // `/tmp/...` is NOT absolute on Windows (paths need a drive prefix), which
+        // failed the Windows CI job.
+        #[cfg(windows)]
+        let root = Path::new(r"C:\tmp\throw");
+        #[cfg(not(windows))]
+        let root = Path::new("/tmp/throw");
+        let a = crew_shared_target_dir(root);
         assert!(a.ends_with(".newt/crew-target"), "{a:?}");
         assert!(a.is_absolute(), "must be absolute: {a:?}");
-        assert_eq!(crew_shared_target_dir(Path::new("/tmp/throw")), a);
+        assert_eq!(crew_shared_target_dir(root), a);
     }
 
     #[test]
