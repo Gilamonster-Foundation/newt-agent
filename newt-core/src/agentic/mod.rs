@@ -121,7 +121,7 @@ pub use experiential::{
 pub use git_tool::{git_tool_definition, GitTool};
 pub use markdown::{render_markdown, MarkdownStreamWriter, RenderOpts};
 pub use mcp::{McpTools, NoMcp};
-pub use plan_exec::{run_plan, PlanRun};
+pub use plan_exec::{run_plan, run_plan_with_reground, NoReground, PlanRun, Reground};
 pub use scheduled::{plan_block, plan_reseat_pointer, SessionStepLedger, StepLedger};
 pub use scratchpad::{scratchpad_state_block, ScratchpadStore, SessionScratchpadStore};
 pub use semantic::{
