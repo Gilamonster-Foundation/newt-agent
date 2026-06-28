@@ -678,6 +678,12 @@ pub struct ChatCtx<'a> {
     /// it into the turn's `events` column. `None` (eval / headless) ⇒
     /// nothing is recorded.
     pub tool_events: Option<&'a mut Vec<crate::ToolEvent>>,
+    /// Per-turn phantom-reach recorder (#717): when present, the loop pushes one
+    /// [`crate::PhantomReach`] for each phantom tool/capability reach (alias
+    /// resolve, hallucination, or a real-tool empty-by-design miss). Lent fresh
+    /// per turn like `tool_events`; persisted into the turn's `phantom_reaches`.
+    /// `None` (eval / headless) ⇒ nothing recorded.
+    pub phantom_reaches: Option<&'a mut Vec<crate::PhantomReach>>,
     /// Prompted ocap grants (issue #263): when present, a capability denial
     /// inside `execute_tool` consults the human — allow once / session allow
     /// / deny — instead of failing outright; the loop blocks like a long
@@ -1010,6 +1016,7 @@ pub async fn chat_complete(
         summarizer,
         compress_state,
         mut tool_events,
+        mut phantom_reaches,
         mut permission_gate,
         mut on_round_usage,
         estimate_ratio,
@@ -2023,6 +2030,17 @@ pub async fn chat_complete(
                     u64::try_from(tool_t0.elapsed().as_millis()).ok(),
                 ));
             }
+            // #717: record any phantom/capability reach (alias / hallucination
+            // / real-tool empty miss) for the alias-seam telemetry.
+            if let Some(pr) = phantom_reaches.as_deref_mut() {
+                if let Some(resolution) = tools::classify_phantom_reach(name, &args, &result, ok) {
+                    pr.push(crate::PhantomReach {
+                        name_as_called: name.to_string(),
+                        resolution,
+                        active_context_features: Vec::new(),
+                    });
+                }
+            }
             messages.push(serde_json::json!({
                 "role": "tool",
                 // Step 26.3 (#584): offload an oversized result (redact → spill →
@@ -2520,6 +2538,7 @@ pub async fn openai_chat_complete(
         summarizer,
         compress_state,
         mut tool_events,
+        mut phantom_reaches,
         mut permission_gate,
         mut on_round_usage,
         estimate_ratio,
@@ -3113,6 +3132,17 @@ pub async fn openai_chat_complete(
                     u64::try_from(tool_t0.elapsed().as_millis()).ok(),
                 ));
             }
+            // #717: record any phantom/capability reach (alias / hallucination
+            // / real-tool empty miss) for the alias-seam telemetry.
+            if let Some(pr) = phantom_reaches.as_deref_mut() {
+                if let Some(resolution) = tools::classify_phantom_reach(name, &args, &result, ok) {
+                    pr.push(crate::PhantomReach {
+                        name_as_called: name.to_string(),
+                        resolution,
+                        active_context_features: Vec::new(),
+                    });
+                }
+            }
             messages.push(serde_json::json!({
                 "role": "tool",
                 "tool_call_id": id,
@@ -3309,6 +3339,7 @@ pub async fn openai_responses_complete(
         summarizer: _,
         compress_state: _,
         mut tool_events,
+        mut phantom_reaches,
         mut permission_gate,
         on_round_usage: _,
         estimate_ratio: _,
@@ -3546,6 +3577,17 @@ pub async fn openai_responses_complete(
                     ok,
                     u64::try_from(tool_t0.elapsed().as_millis()).ok(),
                 ));
+            }
+            // #717: record any phantom/capability reach (alias / hallucination
+            // / real-tool empty miss) for the alias-seam telemetry.
+            if let Some(pr) = phantom_reaches.as_deref_mut() {
+                if let Some(resolution) = tools::classify_phantom_reach(name, &args, &result, ok) {
+                    pr.push(crate::PhantomReach {
+                        name_as_called: name.to_string(),
+                        resolution,
+                        active_context_features: Vec::new(),
+                    });
+                }
             }
             input.push(serde_json::json!({
                 "type": "function_call_output",
@@ -4182,6 +4224,7 @@ mod tool_round_cap_tests {
                 summarizer: None,
                 compress_state: None,
                 tool_events: None,
+                phantom_reaches: None,
                 permission_gate: None,
                 on_round_usage: None,
                 estimate_ratio: None,
@@ -4292,6 +4335,7 @@ mod tool_round_cap_tests {
                 summarizer: None,
                 compress_state: None,
                 tool_events: None,
+                phantom_reaches: None,
                 permission_gate: None,
                 on_round_usage: None,
                 estimate_ratio: None,
@@ -4370,6 +4414,7 @@ mod tool_round_cap_tests {
                 summarizer: None,
                 compress_state: None,
                 tool_events: None,
+                phantom_reaches: None,
                 permission_gate: None,
                 on_round_usage: None,
                 estimate_ratio: None,
@@ -4509,6 +4554,7 @@ mod tool_round_cap_tests {
                 summarizer: None,
                 compress_state: None,
                 tool_events: None,
+                phantom_reaches: None,
                 permission_gate: None,
                 on_round_usage: None,
                 estimate_ratio: None,
@@ -4585,6 +4631,7 @@ mod tool_round_cap_tests {
                 summarizer: None,
                 compress_state: None,
                 tool_events: None,
+                phantom_reaches: None,
                 permission_gate: None,
                 on_round_usage: None,
                 estimate_ratio: None,
@@ -4684,6 +4731,7 @@ mod tool_round_cap_tests {
                 summarizer: None,
                 compress_state: None,
                 tool_events: Some(&mut events),
+                phantom_reaches: None,
                 permission_gate: None,
                 on_round_usage: None,
                 estimate_ratio: None,
@@ -4795,6 +4843,7 @@ mod tool_round_cap_tests {
                 summarizer: None,
                 compress_state: None,
                 tool_events: Some(&mut events),
+                phantom_reaches: None,
                 permission_gate: None,
                 on_round_usage: None,
                 estimate_ratio: None,
@@ -4898,6 +4947,7 @@ mod tool_round_cap_tests {
                 summarizer: None,
                 compress_state: None,
                 tool_events: None,
+                phantom_reaches: None,
                 permission_gate: None,
                 on_round_usage: None,
                 estimate_ratio: None,
@@ -5042,6 +5092,7 @@ mod tool_round_cap_tests {
                 summarizer: None,
                 compress_state: None,
                 tool_events: None,
+                phantom_reaches: None,
                 permission_gate: None,
                 on_round_usage: None,
                 estimate_ratio: None,
@@ -5196,6 +5247,7 @@ mod tool_round_cap_tests {
                 summarizer: None,
                 compress_state: None,
                 tool_events: None,
+                phantom_reaches: None,
                 permission_gate: None,
                 on_round_usage: None,
                 estimate_ratio: None,
@@ -5289,6 +5341,7 @@ mod http_loop_tests {
             summarizer: None,
             compress_state: None,
             tool_events: None,
+            phantom_reaches: None,
             permission_gate: None,
             on_round_usage: None,
             estimate_ratio: None,
@@ -6178,6 +6231,7 @@ mod save_note_loop_tests {
             summarizer: None,
             compress_state: None,
             tool_events: None,
+            phantom_reaches: None,
             permission_gate: None,
             on_round_usage: None,
             estimate_ratio: None,
@@ -6663,6 +6717,7 @@ mod compression_loop_tests {
             summarizer: None,
             compress_state: None,
             tool_events: None,
+            phantom_reaches: None,
             permission_gate: None,
             on_round_usage: None,
             estimate_ratio: None,
@@ -7809,6 +7864,7 @@ mod observation_hook_tests {
             summarizer: None,
             compress_state: None,
             tool_events: None,
+            phantom_reaches: None,
             permission_gate: None,
             on_round_usage: None,
             estimate_ratio: None,

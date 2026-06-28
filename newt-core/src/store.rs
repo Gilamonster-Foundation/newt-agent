@@ -430,7 +430,7 @@ impl ConversationStore {
     /// serializes to `'[]'` and absent tokens to NULL — byte-identical to
     /// the pre-17.6 row shape, so existing callers are unchanged.
     pub fn append_turn(&self, id: &str, user: &str, assistant: &str) -> anyhow::Result<()> {
-        self.append_turn_full(id, user, assistant, &[], None, None)
+        self.append_turn_full(id, user, assistant, &[], &[], None, None)
     }
 
     /// Append one turn with its recorded tool events and backend-reported
@@ -458,18 +458,28 @@ impl ConversationStore {
     /// **FTS:** the 17.3 AFTER INSERT trigger derives `tool_names` /
     /// `tool_args_digest` from the events JSON at index time — recording
     /// events here lights recall up with no schema work.
+    ///
+    /// **Phantom reaches (#717):** the per-turn alias-seam telemetry persists
+    /// alongside `events` in its own `phantom_reaches` column. It is deliberately
+    /// NOT part of the §6 canonical encoding (telemetry, not provenance), so an
+    /// older db gains the column on open and existing content chains verify
+    /// byte-for-byte unchanged. Folding it into the hash would require a v2
+    /// encoding bump — a deliberate follow-up, not this additive change.
+    #[allow(clippy::too_many_arguments)]
     pub fn append_turn_full(
         &self,
         id: &str,
         user: &str,
         assistant: &str,
         events: &[crate::ToolEvent],
+        phantom_reaches: &[crate::PhantomReach],
         tokens_in: Option<u32>,
         tokens_out: Option<u32>,
     ) -> anyhow::Result<()> {
         let id = self.resolve_id(id)?;
         let now = (self.claim_clock)();
         let events_json = serde_json::to_string(events)?;
+        let phantom_reaches_json = serde_json::to_string(phantom_reaches)?;
         let conn = self.lock_conn();
         let tx = rusqlite::Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
         let tick = next_tick(&tx, &self.writer_fingerprint)?;
@@ -495,7 +505,7 @@ impl ConversationStore {
             ts_claim: now,
             encoding_version: TURN_ENCODING_VERSION_CURRENT,
         };
-        insert_turn_row(&tx, &row)?;
+        insert_turn_row(&tx, &row, &phantom_reaches_json)?;
         // Activity tick + chain tip move together; updated_at_claim is a
         // display claim only (§6) — nothing orders by it.
         tx.execute(
@@ -539,7 +549,7 @@ impl ConversationStore {
 
         // §6: turn order is the causal tick, never ts_claim.
         let mut stmt = conn.prepare(
-            "SELECT user, assistant, events, tokens_in, tokens_out FROM turns
+            "SELECT user, assistant, events, tokens_in, tokens_out, phantom_reaches FROM turns
               WHERE conversation_id = ?1
               ORDER BY seq ASC, writer_fingerprint ASC",
         )?;
@@ -550,10 +560,11 @@ impl ConversationStore {
                 row.get::<_, String>(2)?,
                 row.get::<_, Option<i64>>(3)?,
                 row.get::<_, Option<i64>>(4)?,
+                row.get::<_, String>(5)?,
             ))
         })?;
         for turn in turns {
-            let (user, assistant, events_json, tokens_in, tokens_out) = turn?;
+            let (user, assistant, events_json, tokens_in, tokens_out, phantom_reaches_json) = turn?;
             // 17.6: events deserialize strictly — a row whose blob is not
             // ToolEvent-shaped errors clearly (the encoding_version
             // philosophy: never quietly hand back garbage). Pre-17.6 rows
@@ -566,10 +577,19 @@ impl ConversationStore {
                          JSON ({e}); refusing to load garbage"
                     )
                 })?;
+            // #717: same strict decode as events — never hand back garbage.
+            let phantom_reaches: Vec<crate::PhantomReach> =
+                serde_json::from_str(&phantom_reaches_json).map_err(|e| {
+                    anyhow::anyhow!(
+                        "conversation `{id}`: turn phantom_reaches column is not valid \
+                         phantom-reach JSON ({e}); refusing to load garbage"
+                    )
+                })?;
             record.turns.push(ConversationTurn {
                 user,
                 assistant,
                 events,
+                phantom_reaches,
                 tokens_in: tokens_from_sql(tokens_in)?,
                 tokens_out: tokens_from_sql(tokens_out)?,
             });
@@ -600,7 +620,7 @@ impl ConversationStore {
         let conn = self.lock_conn();
         let row = conn
             .query_row(
-                "SELECT t.user, t.assistant, t.events, t.tokens_in, t.tokens_out
+                "SELECT t.user, t.assistant, t.events, t.tokens_in, t.tokens_out, t.phantom_reaches
                    FROM turns t
                    JOIN conversations c
                      ON c.id = t.conversation_id AND c.workspace_key = ?3
@@ -613,11 +633,13 @@ impl ConversationStore {
                         row.get::<_, String>(2)?,
                         row.get::<_, Option<i64>>(3)?,
                         row.get::<_, Option<i64>>(4)?,
+                        row.get::<_, String>(5)?,
                     ))
                 },
             )
             .optional()?;
-        let Some((user, assistant, events_json, tokens_in, tokens_out)) = row else {
+        let Some((user, assistant, events_json, tokens_in, tokens_out, phantom_reaches_json)) = row
+        else {
             return Ok(None);
         };
         // Same strict events decode as `load`: never hand back garbage.
@@ -627,10 +649,19 @@ impl ConversationStore {
                  JSON ({e}); refusing to load garbage"
             )
         })?;
+        // #717: same strict decode for the phantom-reach telemetry column.
+        let phantom_reaches: Vec<crate::PhantomReach> = serde_json::from_str(&phantom_reaches_json)
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "conversation `{id}`: turn phantom_reaches column is not valid \
+                     phantom-reach JSON ({e}); refusing to load garbage"
+                )
+            })?;
         Ok(Some(ConversationTurn {
             user,
             assistant,
             events,
+            phantom_reaches,
             tokens_in: tokens_from_sql(tokens_in)?,
             tokens_out: tokens_from_sql(tokens_out)?,
         }))
@@ -1088,12 +1119,20 @@ fn turn_row_from_sql(row: &rusqlite::Row<'_>) -> rusqlite::Result<TurnRow> {
 
 /// Insert one fully-populated turn row. Must run inside the caller's
 /// transaction (shared by the live append path and the one-time import).
-fn insert_turn_row(conn: &Connection, row: &TurnRow) -> anyhow::Result<()> {
+///
+/// `phantom_reaches_json` (#717) is a separate JSON-string argument, not a
+/// `TurnRow` field, precisely because it is NOT part of the §6 canonical
+/// encoding — keeping it out of `TurnRow` keeps the content hash untouched.
+fn insert_turn_row(
+    conn: &Connection,
+    row: &TurnRow,
+    phantom_reaches_json: &str,
+) -> anyhow::Result<()> {
     conn.execute(
         "INSERT INTO turns
            (conversation_id, writer_fingerprint, seq, prev_hash, user, assistant,
-            events, tokens_in, tokens_out, ts_claim, encoding_version)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            events, tokens_in, tokens_out, ts_claim, encoding_version, phantom_reaches)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         rusqlite::params![
             row.conversation_id,
             row.writer_fingerprint,
@@ -1106,6 +1145,7 @@ fn insert_turn_row(conn: &Connection, row: &TurnRow) -> anyhow::Result<()> {
             row.tokens_out,
             row.ts_claim,
             row.encoding_version,
+            phantom_reaches_json,
         ],
     )?;
     Ok(())
@@ -1264,6 +1304,7 @@ fn create_schema(conn: &Connection) -> anyhow::Result<()> {
              tokens_out         INTEGER,
              ts_claim           INTEGER NOT NULL,         -- DISPLAY ONLY (wall-clock claim, unix nanos)
              encoding_version   INTEGER NOT NULL DEFAULT 1, -- canonical-encoding dispatch (N1 on #261)
+             phantom_reaches    TEXT NOT NULL DEFAULT '[]', -- JSON phantom-reach telemetry (#717); NOT hashed (§6 chain unchanged)
              PRIMARY KEY (conversation_id, writer_fingerprint, seq)
          );
          -- The per-writer Lamport clock (§6 'each agent is its own clock').
@@ -1313,6 +1354,10 @@ const EXPECTED_COLUMNS: &[(&str, &[(&str, &str)])] = &[
             // N1 on #261: rows written before this column exist only as v1,
             // so DEFAULT 1 is the historically-true backfill.
             ("encoding_version", "INTEGER NOT NULL DEFAULT 1"),
+            // #717: phantom-reach telemetry. Additive — an older db gains it on
+            // open with the historically-true empty backfill. NOT part of the §6
+            // canonical encoding, so existing chains verify byte-for-byte.
+            ("phantom_reaches", "TEXT NOT NULL DEFAULT '[]'"),
         ],
     ),
     (
@@ -1788,7 +1833,9 @@ fn import_one_record(
             ts_claim: updated_claim,
             encoding_version: TURN_ENCODING_VERSION_CURRENT,
         };
-        insert_turn_row(&tx, &row)?;
+        // #717: the legacy JSON backend recorded no phantom reaches (it predates
+        // the column), exactly as it recorded no tool events (`events: "[]"`).
+        insert_turn_row(&tx, &row, "[]")?;
         prev_hash = row.content_hash()?;
         last_tick = seq;
     }

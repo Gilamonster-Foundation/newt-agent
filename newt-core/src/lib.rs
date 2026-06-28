@@ -85,7 +85,7 @@ pub use config::{
 };
 pub use conversation::{
     new_conversation_id, session_plan_dir, session_plan_path, ConversationRecord,
-    ConversationSummary, ConversationTurn, ToolEvent,
+    ConversationSummary, ConversationTurn, PhantomReach, PhantomResolution, ToolEvent,
 };
 pub use ffi_surface::FfiSurfaceProvider;
 // `kit::Tier` (Headless|TuiOnly) is *not* re-exported here — it would collide with
