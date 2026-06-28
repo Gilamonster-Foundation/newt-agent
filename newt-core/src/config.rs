@@ -1102,11 +1102,24 @@ fn default_api_surface_max_symbols_per_file() -> usize {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SemanticConfig {
     /// Embedding model used to index the repo + embed queries. Default
-    /// `nomic-embed-text`. The model must exist on the embeddings endpoint
-    /// (see `embeddings_endpoint`); when it can't be reached the feature
+    /// `nomic-embed-text` (the HTTP path). The model must exist on the embeddings
+    /// endpoint (see `embeddings_endpoint`); when it can't be reached the feature
     /// follows `on_embed_failure`.
+    ///
+    /// For the **embedded backend** (`embeddings_api = "embedded"`, #720) this is
+    /// only a label — the model is loaded from `embedding_model_path` — and it
+    /// should name a **candle-clean standard-BERT** model (e.g.
+    /// `bge-small-en-v1.5`), NOT `nomic-embed-text`, which candle 0.8 cannot load.
     #[serde(default = "default_embedding_model")]
     pub embedding_model: String,
+    /// Local model **directory** for the embedded embedder (`embeddings_api =
+    /// "embedded"`, #720): a candle-clean standard-BERT model dir holding
+    /// `config.json` + `tokenizer.json` + `model.safetensors` (e.g. a fetched
+    /// `BAAI/bge-small-en-v1.5`). `None` (default) ⇒ the embedded path can't load
+    /// and reports a clear error. Ignored by the HTTP embeddings path. Mirrors the
+    /// summarizer's `model_path`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_model_path: Option<String>,
     /// How many code chunks to retrieve per turn. Default 5.
     #[serde(default = "default_semantic_top_k")]
     pub top_k: usize,
@@ -1133,6 +1146,7 @@ impl Default for SemanticConfig {
     fn default() -> Self {
         Self {
             embedding_model: default_embedding_model(),
+            embedding_model_path: None,
             top_k: default_semantic_top_k(),
             embeddings_endpoint: None,
             embeddings_api: None,
@@ -3318,14 +3332,21 @@ mod tests {
         assert_eq!(d.embeddings_endpoint, None);
         assert_eq!(d.embeddings_api, None);
         assert_eq!(d.on_embed_failure, OnEmbedFailure::Disable);
+        // #720: the embedded-embedder local model dir defaults to None.
+        assert_eq!(d.embedding_model_path, None);
         // `[context.semantic]` parses + overrides, incl. the new fields.
         let c: ContextConfig = toml::from_str(
             "[semantic]\nembedding_model = \"mxbai-embed-large\"\ntop_k = 8\n\
+             embedding_model_path = \"/models/bge-small-en-v1.5\"\n\
              embeddings_endpoint = \"http://REDACTED-HOST:11434\"\n\
              embeddings_api = \"ollama\"\non_embed_failure = \"warn\"",
         )
         .unwrap();
         assert_eq!(c.semantic.embedding_model, "mxbai-embed-large");
+        assert_eq!(
+            c.semantic.embedding_model_path.as_deref(),
+            Some("/models/bge-small-en-v1.5")
+        );
         assert_eq!(c.semantic.top_k, 8);
         assert_eq!(
             c.semantic.embeddings_endpoint.as_deref(),

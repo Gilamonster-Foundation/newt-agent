@@ -130,7 +130,7 @@ impl InferenceBackend for EmbeddedBackend {
 }
 
 /// The candle generation engine (synchronous; called via `spawn_blocking`).
-mod engine {
+pub(crate) mod engine {
     use anyhow::Context;
     use candle_core::quantized::gguf_file;
     use candle_core::{Device, Tensor};
@@ -172,7 +172,10 @@ mod engine {
     /// Metal), else CPU. A named accelerator that isn't compiled-in or fails to
     /// init falls back to CPU (the small summarizer must always run) — it never
     /// errors out of an inference call over device choice.
-    fn device() -> anyhow::Result<Device> {
+    ///
+    /// Shared (`pub(crate)`) so the embedded [`Embedder`](crate::embed) reuses the
+    /// exact same non-contending device policy — one place decides CPU-vs-GPU.
+    pub(crate) fn device() -> anyhow::Result<Device> {
         let want = std::env::var("NEWT_EMBEDDED_DEVICE").unwrap_or_else(|_| "cpu".into());
         let want = want.trim().to_ascii_lowercase();
         let chosen = match want.as_str() {

@@ -3355,6 +3355,98 @@ fn make_embedded_summarizer(model: String, model_path: Option<String>) -> newt_c
 }
 
 // ---------------------------------------------------------------------------
+// Semantic embedder construction (#720)
+// ---------------------------------------------------------------------------
+
+/// An [`Embedder`](newt_core::Embedder) that always fails with `msg`. Used when an
+/// embedded embedder is requested but cannot be built (no `embedding_model_path`,
+/// the model dir is absent, or the build lacks the `embedded` feature) — semantic
+/// indexing then degrades to a no-op with one actionable message, mirroring the
+/// summarizer's [`failing_summarizer`].
+struct FailingEmbedder {
+    msg: String,
+}
+
+#[async_trait::async_trait]
+impl newt_core::Embedder for FailingEmbedder {
+    async fn embed(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
+        Err(anyhow::anyhow!(self.msg.clone()))
+    }
+}
+
+/// Whether the semantic feature should embed on the **in-process** backend
+/// (`embeddings_api = "embedded"`, #720) rather than over HTTP. Pure for testing.
+fn embeddings_backend_is_embedded(cfg: &newt_core::SemanticConfig) -> bool {
+    cfg.embeddings_api == Some(newt_core::BackendKind::Embedded)
+}
+
+/// Build the semantic embedder (#720). When `embeddings_api = "embedded"`, the
+/// in-process candle embedder runs on the laptop so retrieval never touches the
+/// DGX chat model's VRAM; otherwise the HTTP [`EmbeddingsClient`](newt_core::EmbeddingsClient)
+/// (Ollama / OpenAI) over the resolved target. Always returns a usable
+/// `Box<dyn Embedder>` — a mis-configured embedded path yields a failing embedder
+/// (→ indexing no-op) rather than panicking. Pure for testing.
+fn build_semantic_embedder(
+    semantic_cfg: &newt_core::SemanticConfig,
+    inf_url: &str,
+    inf_kind: newt_core::BackendKind,
+    inf_key: Option<&str>,
+) -> Box<dyn newt_core::Embedder> {
+    if embeddings_backend_is_embedded(semantic_cfg) {
+        return make_embedded_embedder(
+            semantic_cfg.embedding_model.clone(),
+            semantic_cfg.embedding_model_path.clone(),
+        );
+    }
+    let (emb_url, emb_kind, emb_key) =
+        resolve_embeddings_target(semantic_cfg, inf_url, inf_kind, inf_key);
+    Box::new(newt_core::EmbeddingsClient::new(
+        emb_url,
+        semantic_cfg.embedding_model.clone(),
+        emb_kind,
+        emb_key,
+        60,
+        2,
+    ))
+}
+
+/// Build the in-process candle embedder (#720). The `CandleEmbedder` loads a
+/// candle-clean standard-BERT model from `model_path` (a local dir) once and
+/// embeds on a non-contending device (CPU by default). Falls back to a failing
+/// embedder (→ indexing no-op) when `model_path` is unset, the model dir is
+/// absent, or the build lacks the `embedded` feature.
+#[cfg_attr(not(feature = "embedded"), allow(unused_variables))]
+fn make_embedded_embedder(
+    model: String,
+    model_path: Option<String>,
+) -> Box<dyn newt_core::Embedder> {
+    #[cfg(feature = "embedded")]
+    {
+        let Some(path) = model_path else {
+            return Box::new(FailingEmbedder {
+                msg: "embeddings_api=embedded needs `[context.semantic].embedding_model_path` \
+                      (a local candle-clean standard-BERT model dir, e.g. bge-small-en-v1.5)"
+                    .to_string(),
+            });
+        };
+        match newt_inference::embed::CandleEmbedder::new(&model, &path) {
+            Ok(e) => Box::new(e),
+            Err(err) => Box::new(FailingEmbedder {
+                msg: format!("embedded embedder init failed: {err}"),
+            }),
+        }
+    }
+    #[cfg(not(feature = "embedded"))]
+    {
+        Box::new(FailingEmbedder {
+            msg: "embeddings_api=embedded, but this build lacks the `embedded` feature — \
+                  rebuild with --features embedded"
+                .to_string(),
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // End-of-conversation note extraction (Step 19.4, #248)
 // ---------------------------------------------------------------------------
 
@@ -5027,23 +5119,21 @@ fn run_chat(
                         .as_ref()
                         .map(|c| c.semantic.clone())
                         .unwrap_or_default();
-                    let semantic_embedder = semantic_on.then(|| {
-                        let (emb_url, emb_kind, emb_key) = resolve_embeddings_target(
-                            &semantic_cfg,
-                            &inf_url,
-                            inf_kind,
-                            inf_key.as_deref(),
-                        );
-                        newt_core::EmbeddingsClient::new(
-                            emb_url,
-                            semantic_cfg.embedding_model.clone(),
-                            emb_kind,
-                            emb_key,
-                            60,
-                            2,
-                        )
-                    });
-                    if let Some(embedder) = semantic_embedder.as_ref() {
+                    // #720: the embedder is a `Box<dyn Embedder>` so it can be
+                    // EITHER the HTTP `EmbeddingsClient` OR the in-process candle
+                    // embedder (when `embeddings_api = "embedded"`) — the latter
+                    // computes embeddings locally so retrieval never touches the
+                    // DGX chat model's VRAM. The selection is a pure helper.
+                    let semantic_embedder: Option<Box<dyn newt_core::Embedder>> =
+                        semantic_on.then(|| {
+                            build_semantic_embedder(
+                                &semantic_cfg,
+                                &inf_url,
+                                inf_kind,
+                                inf_key.as_deref(),
+                            )
+                        });
+                    if let Some(embedder) = semantic_embedder.as_deref() {
                         if !semantic_indexed {
                             // Attempt indexing ONCE per session (reset on /new),
                             // whether or not it yields chunks — so a missing
@@ -5312,7 +5402,7 @@ fn run_chat(
                                         ),
                                         // Step 26.5.5 (#582): the code_search tool's
                                         // searcher — Some only when semantic is on.
-                                        code_search: semantic_embedder.as_ref().map(|e| {
+                                        code_search: semantic_embedder.as_deref().map(|e| {
                                             newt_core::CodeSearch {
                                                 embedder: e,
                                                 index: &semantic_index,
@@ -13815,6 +13905,69 @@ mod helper_fn_tests {
         cfg.embeddings_api = Some(BackendKind::Openai);
         let (_, kind, _) = resolve_embeddings_target(&cfg, "http://x", BackendKind::Ollama, None);
         assert_eq!(kind, BackendKind::Openai);
+    }
+
+    #[test]
+    fn embeddings_backend_is_embedded_only_for_embedded_api() {
+        // #720: the in-process candle embedder is selected ONLY by
+        // `embeddings_api = "embedded"`; every other (including unset) is HTTP.
+        let mut cfg = newt_core::SemanticConfig::default();
+        assert!(!embeddings_backend_is_embedded(&cfg)); // None (default)
+        cfg.embeddings_api = Some(newt_core::BackendKind::Ollama);
+        assert!(!embeddings_backend_is_embedded(&cfg));
+        cfg.embeddings_api = Some(newt_core::BackendKind::Openai);
+        assert!(!embeddings_backend_is_embedded(&cfg));
+        cfg.embeddings_api = Some(newt_core::BackendKind::Embedded);
+        assert!(embeddings_backend_is_embedded(&cfg));
+    }
+
+    #[tokio::test]
+    async fn build_semantic_embedder_selects_embedded_path() {
+        // #720: with `embeddings_api = "embedded"` the builder takes the embedded
+        // branch. In a build WITHOUT the `embedded` feature that yields a failing
+        // embedder whose error names the missing feature — proving the embedded
+        // path was selected (an HTTP client would attempt a network call, not
+        // return this message). With the feature but no model dir it likewise
+        // fails closed (no model dir / no `embedding_model_path`). Either way the
+        // distinctive "embedded" wording shows the HTTP branch was NOT taken.
+        let cfg = newt_core::SemanticConfig {
+            embeddings_api: Some(newt_core::BackendKind::Embedded),
+            embedding_model_path: Some("/nonexistent/newt-bge-dir".to_string()),
+            ..Default::default()
+        };
+        let embedder = build_semantic_embedder(&cfg, "http://unused", inf_kind_ollama(), None);
+        let err = embedder.embed("x").await.unwrap_err().to_string();
+        assert!(
+            err.contains("embedded"),
+            "expected the embedded path's error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn make_embedded_embedder_without_model_path_fails_closed() {
+        // No `embedding_model_path` → a failing embedder (indexing no-op), not a
+        // panic. The message is actionable.
+        let embedder = make_embedded_embedder("bge-small-en-v1.5".to_string(), None);
+        let err = embedder.embed("x").await.unwrap_err().to_string();
+        #[cfg(feature = "embedded")]
+        assert!(err.contains("embedding_model_path"), "got: {err}");
+        #[cfg(not(feature = "embedded"))]
+        assert!(err.contains("--features embedded"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn build_semantic_embedder_http_branch_constructs() {
+        // The non-embedded branch builds an HTTP EmbeddingsClient (construction is
+        // pure — no network). Exercising it keeps the HTTP path covered.
+        let cfg = newt_core::SemanticConfig::default(); // embeddings_api = None
+        let _embedder =
+            build_semantic_embedder(&cfg, "http://localhost:11434", inf_kind_ollama(), None);
+        // Constructed without panic; embed() is intentionally NOT called (network).
+    }
+
+    /// Local helper: the Ollama backend kind, spelled once for the tests above.
+    fn inf_kind_ollama() -> newt_core::BackendKind {
+        newt_core::BackendKind::Ollama
     }
 
     #[test]

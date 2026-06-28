@@ -8,6 +8,9 @@
 //!   Anthropic, etc. join via opt-in plugin installs.
 
 pub mod backend;
+/// In-process **embedder** (#720) — opt-in behind the `embedded` feature.
+#[cfg(feature = "embedded")]
+pub mod embed;
 /// In-process inference backend (#639) — opt-in behind the `embedded` feature.
 #[cfg(feature = "embedded")]
 pub mod embedded;
