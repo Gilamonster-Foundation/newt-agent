@@ -199,6 +199,40 @@ fn parse_file_blocks(content: &str) -> Vec<Edit> {
     edits
 }
 
+/// Heuristic: does this leaf instruction plausibly require a CODE CHANGE? Defaults
+/// to TRUE (so a zero-edit attempt is re-prompted, #701) UNLESS the task is clearly
+/// verify-only — a verify/validate verb with no change verb — so a validate leaf is
+/// never goaded into a spurious edit (the #701 adversarial review).
+fn task_requires_change(task: &str) -> bool {
+    let t = task.to_ascii_lowercase();
+    const CHANGE: &[&str] = &[
+        "add",
+        "modify",
+        "implement",
+        "refactor",
+        "create",
+        "write",
+        "fix",
+        "change",
+        "update",
+        "remove",
+        "rename",
+        "replace",
+        "introduce",
+        "build",
+        "edit",
+        "delete",
+        "rewrite",
+        "wire",
+        "extract",
+    ];
+    const VERIFY: &[&str] = &["ensure", "verify", "validate", "confirm"];
+    let has_change = CHANGE.iter().any(|v| t.contains(*v));
+    let has_verify = VERIFY.iter().any(|v| t.contains(*v));
+    // Re-prompt by default; skip ONLY a clearly verify-only task.
+    has_change || !has_verify
+}
+
 /// Run the crew's two-pass control loop on `task`, returning the outcome.
 ///
 /// `None` from [`run_role`](BackendPool::run_role) (nothing live serves a pinned
@@ -259,6 +293,7 @@ pub async fn run_crew(
 
     let mut failures: Vec<String> = Vec::new();
     let mut touched: Vec<String> = Vec::new();
+    let mut reprompted_zero_edit = false;
 
     for attempt in 1..=cfg.max_attempts {
         // 3. PLAN — emit full-file edits, told about the prior failure if any.
@@ -334,6 +369,28 @@ pub async fn run_crew(
                  '…unchanged…' placeholders: {}",
                 reasons.join("; ")
             ));
+            continue;
+        }
+        // #701: a CHANGE-required leaf that landed NO edits (and nothing was
+        // leash-refused) would pass verify VACUOUSLY on the unchanged tree and
+        // deliver nothing — the #548 retest failure mode (the model located the
+        // code but emitted no edit). Re-prompt ONCE for the actual edit before
+        // accepting that no-op pass. `task_requires_change` skips a CLEARLY
+        // verify-only leaf so the re-prompt can't goad it into a spurious edit.
+        if touched.is_empty()
+            && refused.is_empty()
+            && !reprompted_zero_edit
+            && attempt < cfg.max_attempts
+            && task_requires_change(task)
+        {
+            reprompted_zero_edit = true;
+            failures.push(
+                "Your reply landed NO file edits. If this task requires changing \
+                 code, emit the COMPLETE file(s) in the edits JSON now — emit the \
+                 change itself, do not just describe it. If NO code change is needed \
+                 (a verify-only task), reply again with no edits to confirm."
+                    .to_string(),
+            );
             continue;
         }
         let (ok, output) = workspace.run_test();
@@ -448,6 +505,14 @@ mod tests {
         fn new() -> Self {
             let mut files = BTreeMap::new();
             files.insert("target.rs".to_string(), "BAD".to_string());
+            files.insert("README.md".to_string(), "docs".to_string());
+            Self { files }
+        }
+        /// Already-passing workspace (`target.rs` = GOOD) — models a verify-only
+        /// leaf whose check is green with no edits needed.
+        fn good() -> Self {
+            let mut files = BTreeMap::new();
+            files.insert("target.rs".to_string(), "GOOD".to_string());
             files.insert("README.md".to_string(), "docs".to_string());
             Self { files }
         }
@@ -715,5 +780,162 @@ mod tests {
         .await;
         assert_eq!(out.status, CrewStatus::NeedsHumanReview);
         assert_eq!(out.attempts, 0);
+    }
+
+    /// Planner emits NO edits on its first call (the #701 / #548 failure mode —
+    /// "located the code but emitted no edit"), then the GOOD edit.
+    struct ZeroEditThenGoodMock {
+        planner_calls: AtomicUsize,
+    }
+    #[async_trait]
+    impl Dispatcher for ZeroEditThenGoodMock {
+        async fn dispatch(
+            &self,
+            _backend: &PoolBackend,
+            model: &str,
+            _req: ChatRequest,
+        ) -> anyhow::Result<ChatReply> {
+            let content = match model {
+                "nav" => r#"{"relevant_files":["target.rs"]}"#.to_string(),
+                "triage" => {
+                    r#"{"summary":"no edits emitted","next_action":"emit the file"}"#.to_string()
+                }
+                "planner" => {
+                    let n = self.planner_calls.fetch_add(1, Ordering::SeqCst);
+                    if n == 0 {
+                        // Prose only — located the code, emitted no edits block.
+                        "I located the change in target.rs and it should be set to GOOD."
+                            .to_string()
+                    } else {
+                        r#"{"edits":[{"path":"target.rs","new_content":"GOOD"}]}"#.to_string()
+                    }
+                }
+                other => panic!("unexpected model {other}"),
+            };
+            Ok(ChatReply {
+                content,
+                model_id: model.to_string(),
+                usage: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn zero_edit_attempt_is_reprompted_and_recovers() {
+        // #701: the first planner reply emits NO edits (the #548 retest failure).
+        // The crew must RE-PROMPT for the edit, not pass vacuously on the
+        // unchanged tree and land nothing.
+        let p = pool();
+        let d = ZeroEditThenGoodMock {
+            planner_calls: AtomicUsize::new(0),
+        };
+        let mut ws = MemWs::new();
+        let out = run_crew(
+            &p,
+            &d,
+            &mut ws,
+            &cfg(3),
+            &newt_core::caveats::Caveats::top(),
+            "modify target.rs to be GOOD",
+        )
+        .await;
+        assert_eq!(out.status, CrewStatus::Passed, "{out:?}");
+        assert_eq!(
+            out.attempts, 2,
+            "re-prompt consumes attempt 1, edit lands on 2"
+        );
+        assert_eq!(
+            out.touched,
+            vec!["target.rs".to_string()],
+            "must land the edit after the re-prompt, not a no-op pass"
+        );
+        assert_eq!(ws.read("target.rs").as_deref(), Some("GOOD"));
+    }
+
+    /// Planner that NEVER emits an edit — proves the re-prompt is bounded.
+    struct AlwaysZeroEditMock;
+    #[async_trait]
+    impl Dispatcher for AlwaysZeroEditMock {
+        async fn dispatch(
+            &self,
+            _backend: &PoolBackend,
+            model: &str,
+            _req: ChatRequest,
+        ) -> anyhow::Result<ChatReply> {
+            let content = match model {
+                "nav" => r#"{"relevant_files":["target.rs"]}"#.to_string(),
+                "triage" => {
+                    r#"{"summary":"still no edits","next_action":"emit the file"}"#.to_string()
+                }
+                "planner" => "Analysis only — no edits.".to_string(),
+                other => panic!("unexpected model {other}"),
+            };
+            Ok(ChatReply {
+                content,
+                model_id: model.to_string(),
+                usage: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn persistent_zero_edit_is_reprompted_once_then_exits_honestly() {
+        // #701: the re-prompt is bounded — a model that NEVER emits an edit is
+        // re-prompted once, then the loop proceeds and exits honestly (no infinite
+        // re-prompt, no vacuous pass on the unchanged BAD tree).
+        let p = pool();
+        let mut ws = MemWs::new();
+        let out = run_crew(
+            &p,
+            &AlwaysZeroEditMock,
+            &mut ws,
+            &cfg(3),
+            &newt_core::caveats::Caveats::top(),
+            "modify target.rs to be GOOD",
+        )
+        .await;
+        assert_eq!(out.status, CrewStatus::NeedsHumanReview, "{out:?}");
+        assert!(out.touched.is_empty());
+    }
+
+    #[tokio::test]
+    async fn verify_only_leaf_is_not_reprompted() {
+        // #701 review: a CLEARLY verify-only leaf that correctly emits no edits and
+        // is already green must NOT be re-prompted (no spurious-edit goading) — it
+        // passes on attempt 1 without consuming a re-prompt.
+        let p = pool();
+        let mut ws = MemWs::good();
+        let out = run_crew(
+            &p,
+            &AlwaysZeroEditMock,
+            &mut ws,
+            &cfg(3),
+            &newt_core::caveats::Caveats::top(),
+            "ensure target.rs still validates",
+        )
+        .await;
+        assert_eq!(out.status, CrewStatus::Passed, "{out:?}");
+        assert_eq!(
+            out.attempts, 1,
+            "verify-only leaf must not consume a re-prompt"
+        );
+        assert!(out.touched.is_empty());
+    }
+
+    #[test]
+    fn task_requires_change_skips_only_clear_verify_only() {
+        assert!(task_requires_change(
+            "Modify the help output in newt-tui/src/lib.rs"
+        ));
+        assert!(task_requires_change("Add a unit test for the rollup"));
+        // Ambiguous (no change verb, no verify verb) defaults to re-prompt.
+        assert!(task_requires_change("Roll up /dgx in the top-level help"));
+        // Clearly verify-only -> skipped.
+        assert!(!task_requires_change(
+            "Ensure /dgx help still lists all subcommands"
+        ));
+        assert!(!task_requires_change(
+            "Verify the rollup behavior via manual check"
+        ));
     }
 }
