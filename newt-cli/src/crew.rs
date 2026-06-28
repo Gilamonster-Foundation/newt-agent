@@ -233,6 +233,12 @@ impl Workspace for WorktreeWorkspace {
             c.arg("/C").arg(&self.test_cmd);
             c
         };
+        // #697: point the leaf's cargo verify at a per-RUN shared target under the
+        // crew root, so the SEQUENTIAL ephemeral leaves build incrementally instead
+        // of each cold (the #548 retests' per-leaf cold builds). Harmless for a
+        // non-cargo verify (it ignores CARGO_TARGET_DIR). This is NOT the dev
+        // worktrees — WORKSPACE_RULES keeps those on their own per-worktree target.
+        cmd.env("CARGO_TARGET_DIR", crew_shared_target_dir(&self.base));
         match cmd.current_dir(&self.worktree).output() {
             Ok(o) => {
                 let out = format!(
@@ -245,6 +251,14 @@ impl Workspace for WorktreeWorkspace {
             Err(e) => (false, format!("failed to run `{}`: {e}", self.test_cmd)),
         }
     }
+}
+
+/// The per-run shared cargo target for crew leaf verifies (#697): one dir under
+/// the crew root that every (sequential, ephemeral) leaf reuses, so verifies build
+/// incrementally instead of each cold. `base` is absolute (the `--dir`/cwd root),
+/// so the path stays absolute and a leaf's own cwd never relativizes it.
+fn crew_shared_target_dir(base: &Path) -> PathBuf {
+    base.join(".newt/crew-target")
 }
 
 // ---------------------------------------------------------------------------
@@ -913,9 +927,33 @@ fn github_refs(goal: &str) -> Vec<(String, String, String, String)> {
     refs
 }
 
-/// High-signal code-ish terms in `text` to grep for: slash-commands (`/dgx`)
-/// and backtick-quoted single tokens (`help_lines`). Distinctive enough to
-/// locate real code without the noise a bare word like "help" would drown it in.
+/// Words that, adjacent to a code-like identifier, mark it as a symbol the
+/// instruction names — so the claim-check (#691) sees "the help_lines function"
+/// the same as a backticked `help_lines`. (#696)
+const DEF_KEYWORDS: &[&str] = &[
+    "function", "fn", "struct", "trait", "enum", "method", "type", "module", "mod", "macro",
+];
+
+/// A code-like identifier: snake_case (`_`), CamelCase (mixed case), or contains a
+/// digit — so plain prose ("the", "parser") isn't mistaken for a symbol. (#696)
+fn looks_like_identifier(t: &str) -> bool {
+    let t = t.trim_matches('`');
+    !t.is_empty()
+        && t.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && t.chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && (t.contains('_')
+            || t.contains(|c: char| c.is_ascii_digit())
+            || (t.chars().any(|c| c.is_ascii_uppercase())
+                && t.chars().any(|c| c.is_ascii_lowercase())))
+}
+
+/// High-signal code-ish terms in `text` to grep for: slash-commands (`/dgx`),
+/// backtick-quoted single tokens (`help_lines`), and — for the claim-check's
+/// recall (#696) — code-like identifiers adjacent to a def keyword ("the
+/// help_lines function", "struct Foo"). Distinctive enough to locate real code
+/// without the noise a bare word like "help" would drown it in.
 fn grep_terms(text: &str) -> Vec<String> {
     let mut terms: Vec<String> = Vec::new();
     // Backtick-quoted single tokens.
@@ -941,6 +979,24 @@ fn grep_terms(text: &str) -> Vec<String> {
                 .collect();
             if cmd.len() >= 2 {
                 terms.push(format!("/{cmd}"));
+            }
+        }
+    }
+    // Code-like identifiers adjacent to a def keyword (#696): "the help_lines
+    // function", "struct Foo", "refactor parse_config" — so the claim-check sees
+    // an unquoted symbol the model named. Guarded to code-like tokens so plain
+    // prose isn't grepped.
+    let words: Vec<&str> = text
+        .split(|c: char| c.is_whitespace() || "()[]{}<>,;:\"'`".contains(c))
+        .collect();
+    for (i, w) in words.iter().enumerate() {
+        if DEF_KEYWORDS.contains(&w.to_ascii_lowercase().as_str()) {
+            let prev = i.checked_sub(1).and_then(|j| words.get(j));
+            let next = words.get(i + 1);
+            for cand in [prev, next].into_iter().flatten() {
+                if looks_like_identifier(cand) {
+                    terms.push((*cand).to_string());
+                }
             }
         }
     }
@@ -1566,6 +1622,40 @@ mod tests {
     }
 
     #[test]
+    fn grep_terms_extracts_unquoted_identifiers_next_to_def_keywords() {
+        // #696: the model often names a symbol unquoted — "the help_lines function".
+        // C (#691) missed exactly this in the #548 retest.
+        let t1 = grep_terms("Refactor the help_lines function in newt-cli/src/crew.rs");
+        assert!(t1.contains(&"help_lines".to_string()), "{t1:?}");
+        let t2 = grep_terms("add a new struct ConfigLoader to hold settings");
+        assert!(t2.contains(&"ConfigLoader".to_string()), "{t2:?}");
+        // Plain prose adjacent to a keyword is NOT a symbol (precision guard).
+        let t3 = grep_terms("this function works well and the parser is fine");
+        assert!(
+            !t3.iter()
+                .any(|x| x == "works" || x == "parser" || x == "the"),
+            "{t3:?}"
+        );
+    }
+
+    #[test]
+    fn crew_shared_target_is_a_single_absolute_per_root_dir() {
+        // #697: every leaf derives the SAME absolute target under the crew root, so
+        // sequential leaves share it (incremental builds) and a leaf's own cwd
+        // can't relativize it. The root must be platform-absolute — a bare
+        // `/tmp/...` is NOT absolute on Windows (paths need a drive prefix), which
+        // failed the Windows CI job.
+        #[cfg(windows)]
+        let root = Path::new(r"C:\tmp\throw");
+        #[cfg(not(windows))]
+        let root = Path::new("/tmp/throw");
+        let a = crew_shared_target_dir(root);
+        assert!(a.ends_with(".newt/crew-target"), "{a:?}");
+        assert!(a.is_absolute(), "must be absolute: {a:?}");
+        assert_eq!(crew_shared_target_dir(root), a);
+    }
+
+    #[test]
     fn plan_sanity_flags_dangling_deps_and_passes_clean_plans() {
         // Clean: b depends on a, both defined.
         let ok = newt_core::plan::Plan::from_toml_str(
@@ -1606,6 +1696,30 @@ mod tests {
             c.iter()
                 .any(|p| p.contains("help_lines") && p.contains("newt-tui/src/lib.rs")),
             "must cite the real def site: {c:?}"
+        );
+    }
+
+    #[test]
+    fn claim_check_refutes_an_unquoted_symbol_in_the_wrong_file() {
+        // #696: the warm #548 retest's subtask named the symbol UNQUOTED ("the
+        // help_lines function"), so C's old backtick-only recall missed it.
+        let plan = newt_core::plan::Plan::from_toml_str(
+            "goal = \"g\"\n[[subtask]]\nid = \"a\"\n\
+             instruction = \"Refactor the help_lines function in newt-cli/src/crew.rs\"\n",
+        )
+        .unwrap();
+        let def_sites = |sym: &str| -> Vec<String> {
+            if sym == "help_lines" {
+                vec!["newt-tui/src/lib.rs:8273:fn help_lines() {".to_string()]
+            } else {
+                vec![]
+            }
+        };
+        let c = plan_grounding_contradictions(&plan, def_sites);
+        assert!(
+            c.iter()
+                .any(|p| p.contains("help_lines") && p.contains("newt-tui")),
+            "unquoted symbol must now be refuted: {c:?}"
         );
     }
 
