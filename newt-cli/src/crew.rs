@@ -913,9 +913,33 @@ fn github_refs(goal: &str) -> Vec<(String, String, String, String)> {
     refs
 }
 
-/// High-signal code-ish terms in `text` to grep for: slash-commands (`/dgx`)
-/// and backtick-quoted single tokens (`help_lines`). Distinctive enough to
-/// locate real code without the noise a bare word like "help" would drown it in.
+/// Words that, adjacent to a code-like identifier, mark it as a symbol the
+/// instruction names — so the claim-check (#691) sees "the help_lines function"
+/// the same as a backticked `help_lines`. (#696)
+const DEF_KEYWORDS: &[&str] = &[
+    "function", "fn", "struct", "trait", "enum", "method", "type", "module", "mod", "macro",
+];
+
+/// A code-like identifier: snake_case (`_`), CamelCase (mixed case), or contains a
+/// digit — so plain prose ("the", "parser") isn't mistaken for a symbol. (#696)
+fn looks_like_identifier(t: &str) -> bool {
+    let t = t.trim_matches('`');
+    !t.is_empty()
+        && t.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && t.chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && (t.contains('_')
+            || t.contains(|c: char| c.is_ascii_digit())
+            || (t.chars().any(|c| c.is_ascii_uppercase())
+                && t.chars().any(|c| c.is_ascii_lowercase())))
+}
+
+/// High-signal code-ish terms in `text` to grep for: slash-commands (`/dgx`),
+/// backtick-quoted single tokens (`help_lines`), and — for the claim-check's
+/// recall (#696) — code-like identifiers adjacent to a def keyword ("the
+/// help_lines function", "struct Foo"). Distinctive enough to locate real code
+/// without the noise a bare word like "help" would drown it in.
 fn grep_terms(text: &str) -> Vec<String> {
     let mut terms: Vec<String> = Vec::new();
     // Backtick-quoted single tokens.
@@ -941,6 +965,24 @@ fn grep_terms(text: &str) -> Vec<String> {
                 .collect();
             if cmd.len() >= 2 {
                 terms.push(format!("/{cmd}"));
+            }
+        }
+    }
+    // Code-like identifiers adjacent to a def keyword (#696): "the help_lines
+    // function", "struct Foo", "refactor parse_config" — so the claim-check sees
+    // an unquoted symbol the model named. Guarded to code-like tokens so plain
+    // prose isn't grepped.
+    let words: Vec<&str> = text
+        .split(|c: char| c.is_whitespace() || "()[]{}<>,;:\"'`".contains(c))
+        .collect();
+    for (i, w) in words.iter().enumerate() {
+        if DEF_KEYWORDS.contains(&w.to_ascii_lowercase().as_str()) {
+            let prev = i.checked_sub(1).and_then(|j| words.get(j));
+            let next = words.get(i + 1);
+            for cand in [prev, next].into_iter().flatten() {
+                if looks_like_identifier(cand) {
+                    terms.push((*cand).to_string());
+                }
             }
         }
     }
@@ -1566,6 +1608,23 @@ mod tests {
     }
 
     #[test]
+    fn grep_terms_extracts_unquoted_identifiers_next_to_def_keywords() {
+        // #696: the model often names a symbol unquoted — "the help_lines function".
+        // C (#691) missed exactly this in the #548 retest.
+        let t1 = grep_terms("Refactor the help_lines function in newt-cli/src/crew.rs");
+        assert!(t1.contains(&"help_lines".to_string()), "{t1:?}");
+        let t2 = grep_terms("add a new struct ConfigLoader to hold settings");
+        assert!(t2.contains(&"ConfigLoader".to_string()), "{t2:?}");
+        // Plain prose adjacent to a keyword is NOT a symbol (precision guard).
+        let t3 = grep_terms("this function works well and the parser is fine");
+        assert!(
+            !t3.iter()
+                .any(|x| x == "works" || x == "parser" || x == "the"),
+            "{t3:?}"
+        );
+    }
+
+    #[test]
     fn plan_sanity_flags_dangling_deps_and_passes_clean_plans() {
         // Clean: b depends on a, both defined.
         let ok = newt_core::plan::Plan::from_toml_str(
@@ -1606,6 +1665,30 @@ mod tests {
             c.iter()
                 .any(|p| p.contains("help_lines") && p.contains("newt-tui/src/lib.rs")),
             "must cite the real def site: {c:?}"
+        );
+    }
+
+    #[test]
+    fn claim_check_refutes_an_unquoted_symbol_in_the_wrong_file() {
+        // #696: the warm #548 retest's subtask named the symbol UNQUOTED ("the
+        // help_lines function"), so C's old backtick-only recall missed it.
+        let plan = newt_core::plan::Plan::from_toml_str(
+            "goal = \"g\"\n[[subtask]]\nid = \"a\"\n\
+             instruction = \"Refactor the help_lines function in newt-cli/src/crew.rs\"\n",
+        )
+        .unwrap();
+        let def_sites = |sym: &str| -> Vec<String> {
+            if sym == "help_lines" {
+                vec!["newt-tui/src/lib.rs:8273:fn help_lines() {".to_string()]
+            } else {
+                vec![]
+            }
+        };
+        let c = plan_grounding_contradictions(&plan, def_sites);
+        assert!(
+            c.iter()
+                .any(|p| p.contains("help_lines") && p.contains("newt-tui")),
+            "unquoted symbol must now be refuted: {c:?}"
         );
     }
 
