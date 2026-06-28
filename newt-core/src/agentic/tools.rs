@@ -12,6 +12,66 @@ use super::permissions::{DenialKind, PermissionDecision, PermissionGate, Permiss
 use super::recall::{execute_recall, recall_tool_definition, RecallSource};
 use crate::caveats::CaveatsExt as _;
 
+/// #719: default line window for `read_file`'s **model-facing** payload. The
+/// on-screen display is capped separately; this bounds what enters the model's
+/// context, so one read of a 15k-line file (e.g. `newt-tui/src/lib.rs`) can no
+/// longer saturate a small local model's window and abandon the task.
+const DEFAULT_READ_LIMIT: usize = 2_000;
+
+/// #719: hard char backstop on the `read_file` payload, independent of the line
+/// window — catches pathological long-line files (minified blobs) that a few
+/// lines can still blow up.
+const MAX_READ_CHARS: usize = 100_000;
+
+/// Window + cap a file's contents for `read_file`'s model-facing payload (#719).
+/// Returns lines `[offset, offset+limit)` (1-based `offset`, default 1; `limit`
+/// default [`DEFAULT_READ_LIMIT`]), truncated to [`MAX_READ_CHARS`], with a
+/// footer pointing at the next window so the model paginates instead of drowning.
+/// A whole-file read that fits both caps is returned verbatim (exact bytes).
+/// Pure (no fs) — unit-tested directly.
+fn paginate_read(contents: &str, offset: Option<usize>, limit: Option<usize>) -> String {
+    let total = contents.lines().count();
+    let start = offset.filter(|&o| o > 0).unwrap_or(1); // 1-based
+    let limit = limit.filter(|&l| l > 0).unwrap_or(DEFAULT_READ_LIMIT);
+    // Common case: a whole-file read that fits both caps → return verbatim.
+    if start == 1 && limit >= total && contents.len() <= MAX_READ_CHARS {
+        return contents.to_string();
+    }
+    let start0 = start - 1;
+    if start0 >= total {
+        return format!("(offset {start} is past end of file — {total} lines total)");
+    }
+    let window: Vec<&str> = contents.lines().skip(start0).take(limit).collect();
+    let end = start0 + window.len(); // 1-based last line shown == end
+    let mut body = window.join("\n");
+    let char_capped = body.len() > MAX_READ_CHARS;
+    if char_capped {
+        let mut cut = MAX_READ_CHARS;
+        while cut > 0 && !body.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        body.truncate(cut);
+    }
+    let footer = if char_capped {
+        Some(format!(
+            "payload truncated to {MAX_READ_CHARS} chars from line {start}; \
+             call read_file with a higher offset (and/or smaller limit) to continue"
+        ))
+    } else if end < total {
+        Some(format!(
+            "showing lines {start}-{end} of {total}; \
+             call read_file with offset={} to continue",
+            end + 1
+        ))
+    } else {
+        None
+    };
+    match footer {
+        Some(f) => format!("{body}\n\n[{f}]"),
+        None => body,
+    }
+}
+
 pub fn tool_definitions() -> serde_json::Value {
     serde_json::json!([
         {
@@ -32,11 +92,17 @@ pub fn tool_definitions() -> serde_json::Value {
             "type": "function",
             "function": {
                 "name": "read_file",
-                "description": "Read the contents of a file in the workspace",
+                "description": "Read a file in the workspace. Returns up to `limit` lines \
+                                (default 2000) starting at 1-based `offset` (default 1). Large \
+                                files come back with a footer pointing at the next window — read \
+                                them in pages with offset/limit rather than all at once, or the \
+                                full file can saturate the context window.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "path": { "type": "string", "description": "File path relative to workspace root" }
+                        "path": { "type": "string", "description": "File path relative to workspace root" },
+                        "offset": { "type": "integer", "description": "1-based line number to start at (default 1)" },
+                        "limit": { "type": "integer", "description": "Maximum number of lines to return (default 2000)" }
                     },
                     "required": ["path"]
                 }
@@ -1346,8 +1412,14 @@ pub async fn execute_tool(
             print_tool_call("read_file", path, color);
             match std::fs::read_to_string(&full) {
                 Ok(contents) => {
-                    print_tool_output(&contents, tool_output_lines, color);
-                    contents
+                    // #719: window + cap the MODEL-facing payload (the on-screen
+                    // display is capped separately) so one read of a large file
+                    // can't saturate the context window and abandon the task.
+                    let offset = args["offset"].as_u64().map(|n| n as usize);
+                    let limit = args["limit"].as_u64().map(|n| n as usize);
+                    let out = paginate_read(&contents, offset, limit);
+                    print_tool_output(&out, tool_output_lines, color);
+                    out
                 }
                 Err(e) => format!("error reading {path}: {e}"),
             }
@@ -1745,6 +1817,68 @@ pub(crate) fn tool_result_ok(result: &str) -> bool {
 mod tests {
     use super::*;
     use crate::agentic::NoMcp;
+
+    // ---- #719: read_file payload window/cap/pagination (pure, no fs) ----
+
+    #[test]
+    fn paginate_read_caps_a_large_file_to_the_default_window() {
+        // A 15k-line file must NOT flood the model: default window is 2000 lines
+        // with a footer to continue (regression for the 12.5k→168k saturation).
+        let body: String = (1..=15_057)
+            .map(|n| format!("line {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let out = paginate_read(&body, None, None);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines[0], "line 1");
+        assert_eq!(lines[1999], "line 2000");
+        assert!(
+            !out.contains("line 2001"),
+            "window stops at 2000: {:?}",
+            &out[..40]
+        );
+        assert!(out.contains("of 15057"), "footer names the total");
+        assert!(
+            out.contains("offset=2001"),
+            "footer points at the next window"
+        );
+    }
+
+    #[test]
+    fn paginate_read_offset_and_limit_return_just_that_window() {
+        let body: String = (1..=100)
+            .map(|n| format!("L{n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let out = paginate_read(&body, Some(10), Some(5));
+        assert!(out.starts_with("L10\nL11\nL12\nL13\nL14"), "{out:?}");
+        assert!(out.contains("offset=15"), "continues at line 15: {out:?}");
+    }
+
+    #[test]
+    fn paginate_read_small_file_is_returned_verbatim_without_a_footer() {
+        // Whole-file read that fits both caps → exact bytes, no footer.
+        assert_eq!(paginate_read("a\nb\nc\n", None, None), "a\nb\nc\n");
+    }
+
+    #[test]
+    fn paginate_read_char_caps_a_pathological_long_line() {
+        // One enormous line: the line window can't help; the char backstop must.
+        let body = "x".repeat(MAX_READ_CHARS + 10_000);
+        let out = paginate_read(&body, None, None);
+        assert!(
+            out.len() < MAX_READ_CHARS + 300,
+            "char-capped: {} bytes",
+            out.len()
+        );
+        assert!(out.contains("truncated"), "marks the truncation");
+    }
+
+    #[test]
+    fn paginate_read_offset_past_end_is_a_clear_message() {
+        let out = paginate_read("a\nb", Some(99), None);
+        assert!(out.contains("past end"), "{out:?}");
+    }
 
     #[test]
     fn find_detail_bare_path_has_no_filters() {
