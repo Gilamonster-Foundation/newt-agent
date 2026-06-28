@@ -38,6 +38,24 @@ pub trait RecallSource: Send + Sync {
     /// Return up to `limit` best-first hits for `query` (plain keywords;
     /// the executor has already pre-flighted the 17.3 sanitizer).
     fn search(&self, query: &str, limit: usize) -> anyhow::Result<Vec<SearchHit>>;
+
+    /// Return up to `limit` of THIS conversation's most recent durable turns —
+    /// the deliberate OPPOSITE of [`Self::search`]'s exclusion filter (#714).
+    ///
+    /// The `recall` contract refuses the active conversation (what's said here
+    /// is already in context); but after an interrupt + auto-resume the early
+    /// turns compaction cut from the live window survive ONLY in the store and
+    /// are reachable ONLY here. The `resume_context` tool uses this to let a
+    /// resumed thread read its own pre-interrupt work. Hits are oldest-first
+    /// (chronological), not bm25-ranked — this is a self-read, not a search.
+    ///
+    /// Default impl returns `Ok(vec![])` so existing mocks and headless callers
+    /// (which have no conversation store) compile and behave unchanged — only
+    /// [`StoreRecallSource`] overrides it.
+    fn this_conversation_recent(&self, limit: usize) -> anyhow::Result<Vec<SearchHit>> {
+        let _ = limit;
+        Ok(Vec::new())
+    }
 }
 
 /// The canonical [`RecallSource`]: [`crate::store::ConversationStore::search`]
@@ -81,6 +99,62 @@ impl RecallSource for StoreRecallSource<'_> {
             .filter(|h| h.conversation_id != self.current_conversation_id)
             .take(limit)
             .collect())
+    }
+
+    fn this_conversation_recent(&self, limit: usize) -> anyhow::Result<Vec<SearchHit>> {
+        // The OPPOSITE of `search`'s filter (#714): load THIS conversation's own
+        // record (the same path `/conversation restore` uses) and hand back its
+        // last `limit` turns. On resume these are the pre-interrupt turns
+        // compaction cut from the live window — durable in the store, refused by
+        // `recall` by design, reachable only here.
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let record = self.store.load(self.current_conversation_id)?;
+        let start = record.turns.len().saturating_sub(limit);
+        Ok(record
+            .turns
+            .iter()
+            .enumerate()
+            .skip(start)
+            .map(|(i, turn)| SearchHit {
+                conversation_id: record.id.clone(),
+                title: record.title.clone(),
+                // Turns load without their §6 per-writer seq, so the 1-based
+                // position is the ordering label shown to the model. This is a
+                // self-read, not a recall rank — no bm25 score applies.
+                seq: (i + 1) as i64,
+                snippet: recent_turn_snippet(&turn.user, &turn.assistant),
+                rank: 0.0,
+            })
+            .collect())
+    }
+}
+
+/// Per-field char cap when compacting a turn into a `resume_context` snippet
+/// (#714) — a long turn must not blow the model's send budget on resume.
+const RESUME_TURN_FIELD_CAP: usize = 600;
+
+/// Compact one turn (the user ask + the assistant reply) into a single readable
+/// snippet for the `resume_context` self-read (#714): whitespace flattened (turn
+/// text is multi-line) and each field length-capped.
+fn recent_turn_snippet(user: &str, assistant: &str) -> String {
+    format!(
+        "you: {}\n    me: {}",
+        flatten_and_cap(user, RESUME_TURN_FIELD_CAP),
+        flatten_and_cap(assistant, RESUME_TURN_FIELD_CAP),
+    )
+}
+
+/// Collapse internal whitespace to single spaces and truncate to `cap` chars
+/// with a `[…]` marker — shared by [`recent_turn_snippet`].
+fn flatten_and_cap(s: &str, cap: usize) -> String {
+    let flat = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() > cap {
+        let head: String = flat.chars().take(cap).collect();
+        format!("{head}[…]")
+    } else {
+        flat
     }
 }
 
@@ -184,8 +258,15 @@ pub(crate) fn execute_recall(
         Err(e) => return format!("error: {e}"),
     };
     if hits.is_empty() {
-        let out =
-            format!("no matches in past conversations for {query:?} — try different keywords");
+        // #714: recall structurally excludes the CURRENT conversation, so on a
+        // freshly-resumed thin context this dead-ends on the one conversation
+        // that matters. Append the redirect off the dead-end. (Must keep the
+        // "no matches in past conversations" prefix — `classify_phantom_reach`
+        // keys the #717 telemetry on it.)
+        let out = format!(
+            "no matches in past conversations for {query:?} — try different keywords. \
+             To recover THIS conversation's own earlier work, call resume_context."
+        );
         print_tool_output(&out, tool_output_lines, color);
         return out;
     }
@@ -416,6 +497,38 @@ pub(crate) mod tests {
         );
         assert!(out.contains("no matches"), "got: {out}");
         assert!(!out.is_empty());
+        // The prefix `classify_phantom_reach` keys on is preserved (#717).
+        assert!(
+            out.starts_with("no matches in past conversations"),
+            "got: {out}"
+        );
+        // #714: the dead-end now redirects to the self-recovery tool.
+        assert!(out.contains("resume_context"), "got: {out}");
+    }
+
+    #[test]
+    fn this_conversation_recent_default_impl_is_empty() {
+        // #714: the trait's default impl returns empty so existing mocks /
+        // headless callers (no conversation store) compile + behave unchanged.
+        let source = MockSource {
+            hits: vec![hit("conv-a", "t", 1, "snip")],
+            ..Default::default()
+        };
+        assert!(
+            source.this_conversation_recent(5).unwrap().is_empty(),
+            "default impl ignores `hits` and returns empty"
+        );
+    }
+
+    #[test]
+    fn recent_turn_snippet_flattens_and_caps() {
+        // #714: multi-line turn text collapses to one line per field.
+        let s = recent_turn_snippet("fix\nthe   bug", "done\nshipping it");
+        assert_eq!(s, "you: fix the bug\n    me: done shipping it");
+        // Over-long fields truncate with the […] marker.
+        let long = recent_turn_snippet(&"x".repeat(RESUME_TURN_FIELD_CAP + 50), "ok");
+        assert!(long.contains("[…]"), "got: {long}");
+        assert!(long.contains("me: ok"), "got: {long}");
     }
 
     #[test]
