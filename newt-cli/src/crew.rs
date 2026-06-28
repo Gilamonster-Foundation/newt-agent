@@ -787,35 +787,124 @@ fn grep_terms(text: &str) -> Vec<String> {
     terms
 }
 
-/// Grep the target repo for the task's high-signal terms and return where they
-/// already appear (bounded), so the planner implements AT real sites instead of
-/// guessing paths. Best-effort: a non-repo `dir` / no matches yields "".
-fn fetch_code_grep_hits(task: &str, dir: &Path) -> String {
+/// One grep block for a single task term: the DEFINITION sites (the real seam)
+/// and the other mention sites, kept apart so [`format_grounding_hits`] can rank
+/// definitions FIRST and never truncate them. The #687 bug was `git grep |
+/// take(3)`: because `git grep` is path-alphabetical, an earlier-sorting
+/// same-named decoy (e.g. `newt-cli/crew.rs` mentions of `help_lines`) buried
+/// the real `fn help_lines()` in `newt-tui`, so the planner was told to edit a
+/// file where the symbol does not exist.
+struct GroundingBlock {
+    term: String,
+    defs: Vec<String>,
+    mentions: Vec<String>,
+}
+
+/// Escape ERE metacharacters so a task term matches literally inside the
+/// definition pattern (grep terms are usually bare symbols, but be safe).
+fn ere_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if "\\.^$*+?()[]{}|".contains(c) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// A POSIX-ERE pattern (for `git grep -E`) matching a Rust DEFINITION of `term`
+/// — `fn`/`struct`/`trait`/`enum`/`type`/`const`/`static`/`union`/`mod`, with an
+/// optional `pub`/`async`/`unsafe`, at line start, the symbol word-bounded — and
+/// NOT a bare mention.
+fn definition_grep_pattern(term: &str) -> String {
+    format!(
+        "^[[:space:]]*(pub[[:space:]]+)?(async[[:space:]]+)?(unsafe[[:space:]]+)?\
+         (fn|struct|trait|enum|type|const|static|union|mod)[[:space:]]+{}([^A-Za-z0-9_]|$)",
+        ere_escape(term)
+    )
+}
+
+fn truncate_grep_line(line: &str) -> String {
+    line.chars().take(160).collect()
+}
+
+/// Render grounding blocks for the plan-author prompt: DEFINITION sites first
+/// (marked `[def]`, never truncated, per-term cap), so the real seam is always
+/// surfaced, then a couple of non-definition mentions for context, under an
+/// overall budget. Pure — unit-testable without git.
+fn format_grounding_hits(blocks: &[GroundingBlock]) -> String {
     let mut out = String::new();
     let mut total = 0usize;
-    for term in grep_terms(task) {
+    for b in blocks {
         if total >= 25 {
             break;
         }
-        let Ok(hits) = git(dir, &["grep", "-n", "-F", "-e", &term, "--", "*.rs"]) else {
-            continue;
-        };
-        for line in hits.lines().take(3) {
+        // Definitions FIRST and untruncated — the real seam can never be buried
+        // by an alphabetically-earlier decoy (the #687 fix).
+        for d in b.defs.iter().take(6) {
             if total >= 25 {
                 break;
             }
-            let trimmed: String = line.chars().take(160).collect();
-            out.push_str(&format!("  {term}: {trimmed}\n"));
+            out.push_str(&format!("  {} [def]: {}\n", b.term, truncate_grep_line(d)));
             total += 1;
+        }
+        // Then a couple of mentions not already shown as definitions.
+        let mut shown_mentions = 0usize;
+        for m in &b.mentions {
+            if total >= 25 || shown_mentions >= 2 {
+                break;
+            }
+            if b.defs.contains(m) {
+                continue;
+            }
+            out.push_str(&format!("  {}: {}\n", b.term, truncate_grep_line(m)));
+            total += 1;
+            shown_mentions += 1;
         }
     }
     if out.is_empty() {
         return String::new();
     }
     format!(
-        "\n\nRelevant existing code — these task terms already appear here; \
-         implement AT these sites, do NOT invent file paths:\n{out}"
+        "\n\nRelevant existing code — task terms already appear here. A `[def]` \
+         line is the DEFINITION site (the real seam to edit); implement AT these \
+         sites, do NOT invent file paths:\n{out}"
     )
+}
+
+/// Grep the target repo for the task's high-signal terms and return where they
+/// already appear (bounded), so the planner implements AT real sites instead of
+/// guessing paths. Definition sites are surfaced first and never truncated
+/// (#687). Best-effort: a non-repo `dir` / no matches yields "".
+fn fetch_code_grep_hits(task: &str, dir: &Path) -> String {
+    let lines = |res: anyhow::Result<String>| -> Vec<String> {
+        res.map(|s| s.lines().map(str::to_string).collect())
+            .unwrap_or_default()
+    };
+    let mut blocks = Vec::new();
+    for term in grep_terms(task) {
+        let defs = lines(git(
+            dir,
+            &[
+                "grep",
+                "-nE",
+                "-e",
+                &definition_grep_pattern(&term),
+                "--",
+                "*.rs",
+            ],
+        ));
+        let mentions = lines(git(dir, &["grep", "-n", "-F", "-e", &term, "--", "*.rs"]));
+        if !defs.is_empty() || !mentions.is_empty() {
+            blocks.push(GroundingBlock {
+                term,
+                defs,
+                mentions,
+            });
+        }
+    }
+    format_grounding_hits(&blocks)
 }
 
 /// Read each GitHub issue/PR referenced in `goal` with `gh … view --json
@@ -1640,5 +1729,73 @@ mod tests {
         let code = run_with(&cfg, args, &RoleMock).await.unwrap();
         assert_eq!(code, 0);
         assert!(!repo.path().join(".newt/worktrees").exists());
+    }
+
+    // -- #687: grounding surfaces the real definition, not an earlier-sorting decoy --
+
+    #[test]
+    fn grounding_surfaces_the_definition_even_when_decoys_sort_first() {
+        // The #548 shape: newt-cli/crew.rs mentions of `help_lines` (decoys) sort
+        // before the real `fn help_lines()` in newt-tui — they must NOT bury it.
+        let blocks = vec![GroundingBlock {
+            term: "help_lines".to_string(),
+            defs: vec![
+                "newt-tui/src/lib.rs:8273:fn help_lines() -> &'static [&'static str] {".to_string(),
+            ],
+            mentions: vec![
+                "newt-cli/src/crew.rs:100:    // help_lines rolls up the dgx block".to_string(),
+                "newt-cli/src/crew.rs:200:    assert!(out.contains(\"help_lines\"));".to_string(),
+                "newt-cli/src/crew.rs:300:    let _ = help_lines_marker;".to_string(),
+            ],
+        }];
+        let out = format_grounding_hits(&blocks);
+        assert!(
+            out.contains("newt-tui/src/lib.rs:8273") && out.contains("[def]"),
+            "the real definition must be surfaced and marked: {out}"
+        );
+    }
+
+    #[test]
+    fn grounding_never_drops_a_definition_under_the_budget() {
+        // Many mentions across many terms must not crowd a definition out.
+        let blocks: Vec<GroundingBlock> = (0..30)
+            .map(|i| GroundingBlock {
+                term: format!("sym{i}"),
+                defs: vec![format!("src/a.rs:{i}:fn sym{i}() {{")],
+                mentions: (0..8)
+                    .map(|j| format!("src/b.rs:{j}:// sym{i} mention {j}"))
+                    .collect(),
+            })
+            .collect();
+        let out = format_grounding_hits(&blocks);
+        assert!(
+            out.contains("[def]"),
+            "definitions surface under the budget: {out}"
+        );
+        // the first hit is a definition, never a mention.
+        let first = out
+            .lines()
+            .find(|l| l.trim_start().starts_with("sym"))
+            .unwrap();
+        assert!(
+            first.contains("[def]"),
+            "first hit must be a definition: {first}"
+        );
+    }
+
+    #[test]
+    fn empty_blocks_yield_empty_grounding() {
+        assert!(format_grounding_hits(&[]).is_empty());
+    }
+
+    #[test]
+    fn definition_grep_pattern_matches_defs_not_mentions() {
+        let re = regex::Regex::new(&definition_grep_pattern("help_lines")).unwrap();
+        assert!(re.is_match("fn help_lines() -> &'static [&'static str] {"));
+        assert!(re.is_match("    pub async fn help_lines() {"));
+        assert!(re.is_match("pub fn help_lines<T>(x: T) {"));
+        assert!(!re.is_match("    // help_lines is the seam"));
+        assert!(!re.is_match("    let v = self.help_lines();"));
+        assert!(!re.is_match("fn help_lines_other() {")); // word-bounded, not a prefix
     }
 }
