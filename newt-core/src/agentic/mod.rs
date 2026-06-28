@@ -2109,6 +2109,11 @@ struct FailedCallGuard {
     last_error: std::collections::HashMap<String, String>,
     /// `name` → how many times it has failed this run (any args).
     fails_by_tool: std::collections::HashMap<String, usize>,
+    /// #718: (name+args) -> reason a SUCCESS result was empty-by-design. These
+    /// pass tool_result_ok (ok=true) so the failure guard misses them, yet the
+    /// model loops the identical call (observed recall x3). Steered on the 2nd
+    /// issuance, separate from hard failures (no escalation).
+    last_empty: std::collections::HashMap<String, String>,
 }
 
 impl FailedCallGuard {
@@ -2122,29 +2127,68 @@ impl FailedCallGuard {
         format!("{name}\u{1}{args}")
     }
 
-    /// Steering message if this exact `(name, args)` already failed this run,
-    /// else `None` (let it execute).
+    /// Steering message if this exact `(name, args)` already failed OR returned a
+    /// no-result this run, else `None` (let it execute). Hard failures
+    /// (`last_error`) take priority over success-shaped no-results (`last_empty`).
     fn repeat_steer(&self, name: &str, args: &serde_json::Value) -> Option<String> {
-        let prev = self.last_error.get(&Self::key(name, args))?;
-        let mut msg = format!(
-            "You already called `{name}` with these exact arguments and it failed: {prev}. \
-             Do NOT repeat the same call — use a different tool or different arguments."
-        );
-        if self.fails_by_tool.get(name).copied().unwrap_or(0) >= Self::ESCALATE_AFTER {
-            msg.push_str(&format!(
-                " `{name}` has failed repeatedly this session; stop using it and prefer the \
-                 embedded tools (read_file, edit_file, write_file, find, git)."
+        let key = Self::key(name, args);
+        // A genuine prior failure: steer hard, and escalate if this tool keeps
+        // failing this session.
+        if let Some(prev) = self.last_error.get(&key) {
+            let mut msg = format!(
+                "You already called `{name}` with these exact arguments and it failed: {prev}. \
+                 Do NOT repeat the same call — use a different tool or different arguments."
+            );
+            if self.fails_by_tool.get(name).copied().unwrap_or(0) >= Self::ESCALATE_AFTER {
+                msg.push_str(&format!(
+                    " `{name}` has failed repeatedly this session; stop using it and prefer the \
+                     embedded tools (read_file, edit_file, write_file, find, git)."
+                ));
+            }
+            return Some(msg);
+        }
+        // #718: a success-shaped no-result the model is re-issuing identically.
+        // Steer on the 2nd call — but no escalation (it is not a hard failure).
+        if let Some(reason) = self.last_empty.get(&key) {
+            return Some(format!(
+                "You already ran `{name}` with these exact arguments this turn and {reason}. \
+                 Don't repeat the identical call — change the arguments, or use a different \
+                 tool (read_file / find)."
             ));
         }
-        Some(msg)
+        None
     }
 
-    /// Record a just-executed call's outcome (only failures are remembered).
+    /// #718: classify a SUCCESS-shaped result that is empty *by design* — it
+    /// passes `tool_result_ok` (ok=true) so the failure path never sees it, yet
+    /// the model loops the identical call. Pure; keyed on the exact result
+    /// prefixes (`recall.rs` keeps "no matches in past conversations";
+    /// `scratchpad.rs` returns "no such key: ..."). `None` when the result
+    /// carries real content (nothing to steer).
+    fn no_result_reason(name: &str, result: &str) -> Option<&'static str> {
+        match name {
+            "recall" if result.starts_with("no matches in past conversations") => Some(
+                "it returned no matches (and recall cannot see the current conversation \
+                 — use resume_context for THIS conversation)",
+            ),
+            "state_get" if result.starts_with("no such key") => {
+                Some("the key is not set (state_get returned \"no such key\")")
+            }
+            _ => None,
+        }
+    }
+
+    /// Record a just-executed call's outcome. Hard failures are remembered (and
+    /// counted, so the steer can escalate); #718 success-shaped no-results are
+    /// remembered separately in `last_empty` (no count — no escalation).
     fn record(&mut self, name: &str, args: &serde_json::Value, ok: bool, result: &str) {
         if !ok {
             self.last_error
                 .insert(Self::key(name, args), first_line(result));
             *self.fails_by_tool.entry(name.to_string()).or_default() += 1;
+        } else if let Some(reason) = Self::no_result_reason(name, result) {
+            self.last_empty
+                .insert(Self::key(name, args), reason.to_string());
         }
     }
 
@@ -3945,6 +3989,94 @@ mod failed_call_guard_tests {
             "distinct args still run"
         );
         assert!(g.repeat_steer("read_file", &b).is_some());
+    }
+
+    #[test]
+    fn steers_no_result_repeats_on_second_issuance() {
+        // #718: a success-shaped no-result that the model re-issues byte-for-byte
+        // is steered on its 2nd call — distinct from a hard failure (no escalation),
+        // distinct from a genuine success (which is never steered).
+        let mut g = FailedCallGuard::default();
+
+        // recall "no matches" — first sight runs; record it; the identical 2nd
+        // issuance is steered before re-execution.
+        let q = serde_json::json!({"query": "newt-tui PyO3 bindings"});
+        assert!(
+            g.repeat_steer("recall", &q).is_none(),
+            "first recall must run"
+        );
+        g.record(
+            "recall",
+            &q,
+            true,
+            "no matches in past conversations for \"newt-tui PyO3 bindings\" — try different keywords.",
+        );
+        let s = g
+            .repeat_steer("recall", &q)
+            .expect("2nd identical recall steers");
+        assert!(s.contains("no matches"), "{s}");
+        assert!(
+            s.contains("resume_context"),
+            "recall steer points at resume_context: {s}"
+        );
+        assert!(
+            !s.contains("stop using"),
+            "a no-result is not a hard failure — no escalation: {s}"
+        );
+
+        // state_get "no such key" — same: 2nd identical probe is steered.
+        let k = serde_json::json!({"key": "current_task"});
+        assert!(g.repeat_steer("state_get", &k).is_none());
+        g.record("state_get", &k, true, "no such key: current_task");
+        assert!(
+            g.repeat_steer("state_get", &k).is_some(),
+            "2nd identical state_get steers"
+        );
+
+        // A genuine success with content is still NEVER steered on repeat.
+        let f = serde_json::json!({"path": "f.rs"});
+        g.record("read_file", &f, true, "file contents");
+        assert!(g.repeat_steer("read_file", &f).is_none());
+
+        // A no-result under DIFFERENT args is a distinct call — let it run.
+        let q2 = serde_json::json!({"query": "something else entirely"});
+        assert!(
+            g.repeat_steer("recall", &q2).is_none(),
+            "distinct recall args still run"
+        );
+    }
+
+    #[test]
+    fn no_result_reason_classifies_and_routes() {
+        // recall / state_get no-result prefixes classify…
+        assert!(FailedCallGuard::no_result_reason(
+            "recall",
+            "no matches in past conversations for \"x\" — try different keywords."
+        )
+        .is_some_and(|r| r.contains("no matches") && r.contains("resume_context")));
+        assert!(
+            FailedCallGuard::no_result_reason("state_get", "no such key: current_task")
+                .is_some_and(|r| r.contains("not set"))
+        );
+        // …a real success with content does not.
+        assert!(
+            FailedCallGuard::no_result_reason("recall", "3 match(es) in past conversations")
+                .is_none()
+        );
+        assert!(FailedCallGuard::no_result_reason("read_file", "file contents").is_none());
+
+        // A recall ERROR (ok=false) goes through the FAILURE path, not last_empty:
+        // it lands in last_error (escalation-eligible), never in last_empty.
+        let mut g = FailedCallGuard::default();
+        let q = serde_json::json!({"query": "x"});
+        g.record("recall", &q, false, "error: index unavailable");
+        assert!(g
+            .last_error
+            .contains_key(&FailedCallGuard::key("recall", &q)));
+        assert!(
+            g.last_empty.is_empty(),
+            "an ok=false recall is a hard failure, never a no-result"
+        );
     }
 
     #[test]
