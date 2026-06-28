@@ -10,6 +10,7 @@
 //! the record/summary/turn types, conversation-id minting, and the
 //! per-session plan paths (issue #220).
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -169,6 +170,18 @@ pub struct ConversationRecord {
     pub persona: Option<String>,
     #[serde(default)]
     pub turns: Vec<ConversationTurn>,
+    /// The conversation's scratchpad `<state>` snapshot (#713, Step 26.4): the
+    /// structured working memory the model keeps via `state_set` / `state_get`.
+    /// Persisted at the conversation/record level so an interrupt + auto-resume
+    /// restores the `<state>` it already restores the transcript for — without
+    /// it, the first `state_get("current_task")` after a resume reads an empty
+    /// live store and the model blind-probes for a task that is simply gone.
+    /// Additive: `#[serde(default)]` keeps legacy records loadable, and an empty
+    /// map is skipped on serialize so it never bloats the on-disk file. **Working
+    /// memory, not provenance** — kept OUT of the §6 content chain (it is NOT a
+    /// turn field and never enters `canonical_encoding_v1`).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub scratchpad: BTreeMap<String, String>,
     pub created_at_unix_nanos: u128,
     pub updated_at_unix_nanos: u128,
 }
