@@ -57,6 +57,11 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<ContextConfig>,
 
+    /// `[tools]` — tool-execution behaviour (#726). `None` → built-in defaults
+    /// (notably `max_output_tokens` = 10000). See [`ToolsConfig`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<ToolsConfig>,
+
     /// Inference cost modeling. `None` → built-in rate table only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pricing: Option<crate::pricing::PricingConfig>,
@@ -1236,6 +1241,42 @@ impl Default for AgentsConfig {
             path: None,
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Tools config
+// ---------------------------------------------------------------------------
+
+/// Tool-execution behaviour stored under `[tools]` in `newt.toml` (#726).
+///
+/// Currently a single knob: the **token budget** that caps every tool's
+/// model-facing output. This bounds what a single tool result can add to the
+/// context window — applied to both `read_file` (its char backstop) and
+/// `run_command` (its shell envelope) — so a verbose command or a huge file
+/// can't saturate a small local model's window and abandon the task. Mirrors
+/// Codex's `exec_command.max_output_tokens`. Distinct from `[tui]
+/// tool_output_lines`, which caps the on-screen DISPLAY by lines.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ToolsConfig {
+    /// Maximum tokens of model-facing output any single tool may return before
+    /// it is truncated (with a marker steering the model to a narrower command /
+    /// a paginated read). Default: 10000. `0` disables the cap. Tokens are
+    /// estimated with the shared chars/token heuristic (see [`crate::tokens`]).
+    #[serde(default = "default_max_output_tokens")]
+    pub max_output_tokens: usize,
+}
+
+impl Default for ToolsConfig {
+    fn default() -> Self {
+        Self {
+            max_output_tokens: default_max_output_tokens(),
+        }
+    }
+}
+
+fn default_max_output_tokens() -> usize {
+    10_000
 }
 
 // ---------------------------------------------------------------------------
@@ -2536,6 +2577,7 @@ impl Default for Config {
             dgx: None,
             tui: None,
             context: None,
+            tools: None,
             pricing: None,
             memory: None,
             agents: AgentsConfig::default(),
@@ -2646,7 +2688,23 @@ impl Config {
         // own file, no inline `[[dgx.nodes]]`. The active selection
         // (active_node/active_endpoint/active_model) stays in `[dgx]`.
         cfg.merge_disk_dgx_nodes();
+        // #726: push the resolved `[tools] max_output_tokens` into the
+        // process-wide model-facing output budget. `Config::resolve` is the
+        // single canonical config-application entry, so every consumer (TUI,
+        // cowork driver, eval) gets the override here without threading a new
+        // `usize` through `ChatCtx` + `execute_tool` + every call site. Idempotent.
+        crate::agentic::set_max_output_tokens(cfg.max_output_tokens());
         Ok(cfg)
+    }
+
+    /// The configured model-facing output token budget (`[tools]
+    /// max_output_tokens`), or the built-in default when `[tools]` is absent
+    /// (#726). `0` means "no cap". See [`ToolsConfig`].
+    pub fn max_output_tokens(&self) -> usize {
+        self.tools
+            .as_ref()
+            .map(|t| t.max_output_tokens)
+            .unwrap_or_else(default_max_output_tokens)
     }
 
     /// Merge per-file backends from the `backends/` dirs next to the config:
@@ -4954,5 +5012,42 @@ max_tool_rounds = 25
         assert_eq!(entry.num_ctx, None);
         assert_eq!(entry.mid_loop_trim_threshold, None);
         assert_eq!(entry.max_tool_rounds, None);
+    }
+
+    // ---- #726: [tools] max_output_tokens ----
+
+    #[test]
+    fn tools_max_output_tokens_defaults_to_10k_when_absent() {
+        // No `[tools]` section ⇒ the built-in default budget.
+        let cfg: Config = toml::from_str("").unwrap();
+        assert!(cfg.tools.is_none());
+        assert_eq!(cfg.max_output_tokens(), 10_000);
+        assert_eq!(Config::default().max_output_tokens(), 10_000);
+    }
+
+    #[test]
+    fn tools_max_output_tokens_parses_an_override() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [tools]
+            max_output_tokens = 4096
+        "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.tools.as_ref().unwrap().max_output_tokens, 4096);
+        assert_eq!(cfg.max_output_tokens(), 4096);
+    }
+
+    #[test]
+    fn tools_config_default_field_is_the_shared_default() {
+        // A `[tools]` table that omits the key falls back to the default fn.
+        let cfg: Config = toml::from_str("[tools]\n").unwrap();
+        assert_eq!(cfg.max_output_tokens(), 10_000);
+    }
+
+    #[test]
+    fn tools_max_output_tokens_zero_is_a_valid_no_cap() {
+        let cfg: Config = toml::from_str("[tools]\nmax_output_tokens = 0\n").unwrap();
+        assert_eq!(cfg.max_output_tokens(), 0);
     }
 }
