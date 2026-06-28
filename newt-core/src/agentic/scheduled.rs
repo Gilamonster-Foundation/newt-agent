@@ -18,10 +18,11 @@
 //! window rather than replacing it — honest + non-invasive.
 
 use super::display::{print_tool_call, print_tool_output};
+use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
 
 /// A plan step's progress.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StepStatus {
     Todo,
     Active,
@@ -29,10 +30,47 @@ pub enum StepStatus {
 }
 
 /// One step in the plan.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Step {
     pub description: String,
     pub status: StepStatus,
+}
+
+/// A serializable full-state snapshot of the plan ledger (#715). Persisted onto
+/// the conversation row so an interrupt + auto-resume can re-hydrate the
+/// in-memory ledger EXACTLY — the ordered steps AND each step's done/active
+/// status — instead of rebuilding it empty (which loses the `<plan>` block and
+/// `plan_get` after a resume). The active step is encoded by its
+/// [`StepStatus::Active`] marker, so the snapshot carries no separate index to
+/// drift out of sync.
+///
+/// Unlike [`StepLedger::set_plan`] (which takes bare step strings and RESETS
+/// every status — the first step Active, the rest Todo), a snapshot/restore
+/// round-trip preserves which steps are Done and which is Active.
+///
+/// Additive + **working memory, not provenance**: it rides the conversation row
+/// (never a turn), is kept OUT of the §6 content chain, and an empty snapshot is
+/// skipped on serialize so it never bloats the on-disk file.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanSnapshot {
+    /// The ordered steps with each one's status. `#[serde(default)]` so the
+    /// historically-true empty backfill (`{}`) on an older db parses cleanly.
+    #[serde(default)]
+    pub steps: Vec<Step>,
+}
+
+impl PlanSnapshot {
+    /// Whether the snapshot holds no steps (the OFF/empty case — used by the
+    /// record's `skip_serializing_if` and the resume banner).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.steps.is_empty()
+    }
+    /// Number of steps in the snapshot.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.steps.len()
+    }
 }
 
 /// Max steps a plan may hold (a guard; extra steps are dropped on set).
@@ -62,6 +100,14 @@ pub trait StepLedger: Send + Sync {
     fn done_count(&self) -> u64;
     /// Drop the plan (`/new`).
     fn clear(&self);
+    /// A full-state [`PlanSnapshot`] for persistence/resume (#715): the ordered
+    /// steps with each one's status, so a later [`Self::restore`] reinstates the
+    /// ledger EXACTLY (unlike [`Self::set_plan`], which resets every status).
+    fn snapshot(&self) -> PlanSnapshot;
+    /// Restore the ledger from a [`PlanSnapshot`] (#715) — replaces the steps
+    /// and their statuses verbatim (a full clear + replace, the inverse of
+    /// [`Self::snapshot`]). An empty snapshot leaves the ledger empty.
+    fn restore(&self, snap: &PlanSnapshot);
 }
 
 /// In-memory, session-scoped [`StepLedger`] — pure (no fs). A `Vec` in plan
@@ -122,6 +168,14 @@ impl StepLedger for SessionStepLedger {
     }
     fn clear(&self) {
         self.steps.lock().unwrap().clear();
+    }
+    fn snapshot(&self) -> PlanSnapshot {
+        PlanSnapshot {
+            steps: self.steps.lock().unwrap().clone(),
+        }
+    }
+    fn restore(&self, snap: &PlanSnapshot) {
+        *self.steps.lock().unwrap() = snap.steps.clone();
     }
 }
 
@@ -363,6 +417,55 @@ mod tests {
         // advancing an empty plan → None
         let empty = SessionStepLedger::default();
         assert_eq!(empty.advance(), None);
+    }
+
+    #[test]
+    fn snapshot_restore_round_trips_full_state_unlike_set_plan() {
+        // #715: a snapshot captures the FULL state (steps + per-step status), so
+        // restore reinstates which steps are Done / Active — the resume-safety
+        // property set_plan lacks (it resets every status).
+        let l = SessionStepLedger::default();
+        l.set_plan(&["a".to_string(), "b".to_string(), "c".to_string()]);
+        l.advance(); // a → Done, b → Active
+        let snap = l.snapshot();
+        assert_eq!(snap.len(), 3);
+        assert!(!snap.is_empty());
+        assert_eq!(snap.steps[0].status, StepStatus::Done);
+        assert_eq!(snap.steps[1].status, StepStatus::Active);
+        assert_eq!(snap.steps[2].status, StepStatus::Todo);
+
+        // It survives a serde round-trip (the persistence path).
+        let json = serde_json::to_string(&snap).unwrap();
+        let decoded: PlanSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, snap, "snapshot must survive serde verbatim");
+        // The `{}` backfill (an older db / OFF feature) parses to an empty plan.
+        assert_eq!(
+            serde_json::from_str::<PlanSnapshot>("{}").unwrap(),
+            PlanSnapshot::default(),
+            "the `{{}}` backfill parses to an empty snapshot"
+        );
+
+        // Restore into a FRESH ledger reinstates the exact state — not a reset.
+        let fresh = SessionStepLedger::default();
+        fresh.restore(&decoded);
+        assert_eq!(fresh.snapshot(), snap, "restore reinstates verbatim");
+        assert_eq!(fresh.done_count(), 1, "the Done step survives restore");
+        let block = build_plan_block(&fresh, 3000).unwrap();
+        assert!(block.contains("✓ 1. a"), "{block}");
+        assert!(block.contains("→ 2. b"), "{block}");
+        assert!(block.contains("☐ 3. c"), "{block}");
+        // Contrast: set_plan would have reset b/c to Active/Todo and lost a's Done.
+        let reset = SessionStepLedger::default();
+        reset.set_plan(&["a".to_string(), "b".to_string(), "c".to_string()]);
+        assert_eq!(reset.done_count(), 0, "set_plan resets — proving the gap");
+
+        // Restoring an empty snapshot clears (a conversation boundary).
+        fresh.restore(&PlanSnapshot::default());
+        assert_eq!(
+            fresh.count(),
+            0,
+            "an empty snapshot leaves the ledger empty"
+        );
     }
 
     #[test]

@@ -66,11 +66,12 @@ pub use agentic::{
     CodeSearch, CompressCounters, CompressState, DenialKind, Embedder, EmbeddingsClient,
     ExperienceStore, ManualCompressOutcome, McpTools, MemAddr, MemPayload, MemorySource, NoMcp,
     NoteNudge, NoteSink, PermissionDecision, PermissionGate, PermissionRecord, PermissionRequest,
-    RecallSource, RoundObservation, ScratchpadStore, SemanticIndex, SessionExperienceStore,
-    SessionScratchpadStore, SessionSemanticIndex, SessionSpillStore, SessionStepLedger,
-    ShellObservation, SpillStore, StepLedger, StoreMemorySource, StoreRecallSource, SummarizeFn,
-    SummarizeFuture, Summarizer, TranscriptLine, TranscriptRole, TranscriptStyle, TurnDriver,
-    TurnDriverConfig, TurnDriverError, TurnOutcome, TurnStatus, EXPERIENCE_TOP_K,
+    PlanSnapshot, RecallSource, RoundObservation, ScratchpadStore, SemanticIndex,
+    SessionExperienceStore, SessionScratchpadStore, SessionSemanticIndex, SessionSpillStore,
+    SessionStepLedger, ShellObservation, SpillStore, Step, StepLedger, StepStatus,
+    StoreMemorySource, StoreRecallSource, SummarizeFn, SummarizeFuture, Summarizer, TranscriptLine,
+    TranscriptRole, TranscriptStyle, TurnDriver, TurnDriverConfig, TurnDriverError, TurnOutcome,
+    TurnStatus, EXPERIENCE_TOP_K,
 };
 pub use agents::AgentsProvider;
 pub use api_surface::ApiSurfaceProvider;

@@ -608,6 +608,10 @@ fn opening_a_drifted_schema_adds_missing_columns() {
     let conn = raw(root.path());
     for (table, column) in [
         ("conversations", "end_reason"),
+        // #713 / #715: the working-memory snapshot columns are additive too —
+        // an older db (this hand-built v1) gains them on open.
+        ("conversations", "scratchpad"),
+        ("conversations", "plan"),
         ("turns", "events"),
         ("turns", "tokens_in"),
         ("turns", "tokens_out"),
@@ -630,7 +634,12 @@ fn opening_a_drifted_schema_adds_missing_columns() {
     let listed = store.list().unwrap();
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].id, "legacy-conv");
-    assert_eq!(store.load("legacy-conv").unwrap().title, "from v1");
+    let legacy = store.load("legacy-conv").unwrap();
+    assert_eq!(legacy.title, "from v1");
+    // #715: the back-filled `plan` column's `{}` default decodes to an empty
+    // snapshot (load would have errored on invalid JSON) — proving the additive
+    // column is loadable, not garbage, on an older db.
+    assert!(legacy.plan.is_empty(), "back-filled plan parses empty");
 
     // …and new activity ticks past the drifted data's max (the rebuilt
     // writer_clock seeds from existing rows; monotonicity survives).
@@ -749,6 +758,7 @@ fn legacy_record(
             .map(|(u, a)| ConversationTurn::new(*u, *a))
             .collect(),
         scratchpad: std::collections::BTreeMap::new(),
+        plan: newt_core::PlanSnapshot::default(),
         created_at_unix_nanos: created,
         updated_at_unix_nanos: updated,
     }
@@ -2057,6 +2067,64 @@ fn scratchpad_round_trips_and_chain_still_verifies() {
         !reloaded.scratchpad.contains_key("open_file"),
         "a fresh snapshot is the whole map, not a merge"
     );
+    store.verify_chain(&id).unwrap();
+}
+
+/// #715: the conversation plan-ledger snapshot persists into its own `plan`
+/// column and reloads VERBATIM — including which steps are Done and which is
+/// Active (the full state `set_plan` would reset), so an interrupt + auto-resume
+/// can re-hydrate the live ledger. Also proves the §6 content chain still
+/// verifies, i.e. the column is additive and NOT folded into the canonical
+/// encoding (working memory, not provenance).
+#[test]
+fn plan_snapshot_round_trips_and_chain_still_verifies() {
+    use newt_core::StepLedger;
+    let root = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let store = ConversationStore::new(root.path(), workspace.path(), 100).unwrap();
+
+    let id = store.create("plan", None).unwrap();
+    // A turn establishes the §6 chain we re-verify after the plan write.
+    store
+        .append_turn(&id, "what is the plan?", "let me set one")
+        .unwrap();
+    let before = store.load(&id).unwrap();
+    assert!(
+        before.plan.is_empty(),
+        "a fresh row carries the empty `{{}}` backfill"
+    );
+
+    // Build an ADVANCED ledger: step 1 Done, step 2 Active, step 3 Todo.
+    let ledger = newt_core::SessionStepLedger::default();
+    ledger.set_plan(&[
+        "read the code".to_string(),
+        "write the fix".to_string(),
+        "test it".to_string(),
+    ]);
+    ledger.advance(); // step 1 → Done, step 2 → Active
+    let snap = ledger.snapshot();
+    store.update_plan_snapshot(&id, &snap).unwrap();
+
+    let record = store.load(&id).unwrap();
+    assert_eq!(
+        record.plan, snap,
+        "plan snapshot must round-trip verbatim (steps + statuses)"
+    );
+    // The active step + done statuses survive — not reset to a fresh plan.
+    assert_eq!(record.plan.len(), 3);
+    assert_eq!(record.plan.steps[0].status, newt_core::StepStatus::Done);
+    assert_eq!(record.plan.steps[1].status, newt_core::StepStatus::Active);
+    assert_eq!(record.plan.steps[2].status, newt_core::StepStatus::Todo);
+    // The plan rides the conversation row, outside the §6 canonical encoding, so
+    // the chain — written before AND independent of the plan — still verifies.
+    store.verify_chain(&id).unwrap();
+
+    // A later snapshot replaces, not merges (the live ledger advancing a step).
+    ledger.advance(); // step 2 → Done, step 3 → Active
+    store.update_plan_snapshot(&id, &ledger.snapshot()).unwrap();
+    let reloaded = store.load(&id).unwrap();
+    assert_eq!(reloaded.plan.steps[1].status, newt_core::StepStatus::Done);
+    assert_eq!(reloaded.plan.steps[2].status, newt_core::StepStatus::Active);
     store.verify_chain(&id).unwrap();
 }
 
