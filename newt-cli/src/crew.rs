@@ -363,6 +363,68 @@ fn plan_sanity(plan: &newt_core::plan::Plan) -> Vec<String> {
     problems
 }
 
+/// Path-like tokens in an instruction (e.g. `newt-cli/src/crew.rs`): a token with
+/// a `/` and a short alphanumeric extension — the file a subtask CLAIMS a symbol
+/// lives in. Used by [`plan_grounding_contradictions`].
+fn path_tokens(text: &str) -> Vec<String> {
+    text.split(|c: char| c.is_whitespace() || "()[]{}<>,;:\"'`".contains(c))
+        .filter(|t| {
+            t.contains('/')
+                && t.rsplit_once('.').is_some_and(|(_, ext)| {
+                    (1..=4).contains(&ext.len()) && ext.chars().all(|c| c.is_ascii_alphanumeric())
+                })
+        })
+        .map(str::to_string)
+        .collect()
+}
+
+/// Claim-check an authored plan against ground truth (#691) — a backstop to the
+/// #687 grounding helper. When a subtask's instruction co-locates a `symbol` and
+/// a `file/path` but the symbol is DEFINED elsewhere, that is a provable
+/// mis-ground. `def_sites(symbol)` returns the symbol's definition grep lines
+/// (`path:line:…`), injected so the contradiction logic stays pure/testable.
+///
+/// Conservative: refutes ONLY on positive contradiction (defined somewhere, but
+/// not at the claimed path). A symbol defined nowhere (to be created) or a
+/// pathless instruction yields nothing — precision over recall.
+fn plan_grounding_contradictions(
+    plan: &newt_core::plan::Plan,
+    def_sites: impl Fn(&str) -> Vec<String>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for s in &plan.subtasks {
+        let paths = path_tokens(&s.instruction);
+        if paths.is_empty() {
+            continue;
+        }
+        for sym in grep_terms(&s.instruction) {
+            let sites = def_sites(&sym);
+            if sites.is_empty() {
+                continue; // defined nowhere — maybe to be created; never refute
+            }
+            let def_files: Vec<String> = sites
+                .iter()
+                .filter_map(|l| l.split(':').next().map(str::to_string))
+                .collect();
+            for claimed in &paths {
+                let agrees = def_files
+                    .iter()
+                    .any(|f| f == claimed || f.ends_with(claimed) || claimed.ends_with(f.as_str()));
+                if !agrees {
+                    out.push(format!(
+                        "subtask `{}`: `{sym}` is defined at {}, not `{claimed}` — make the edit there.",
+                        s.id,
+                        def_files.join(", "),
+                    ));
+                }
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
 /// `newt plan <file>` — PREVIEW an overseer-authored plan, or (`--execute`)
 /// dispatch it leaf-by-leaf via a crew (each leaf in its own worktree, through the
 /// same `LocalCrewRunner` the in-session `crew` tool uses).
@@ -675,6 +737,47 @@ pub async fn author_plan_to_plan(
     }
     // Phase 2: decompose the (doc + repo-augmented) goal into a plan.
     println!("authoring a plan for: {goal}  (model {model})…");
+    let plan = author_plan(
+        &pool,
+        &LocalDispatcher,
+        &model,
+        &effective_goal,
+        max_subtasks,
+    )
+    .await?;
+    // Phase 2b (#691): claim-check the plan against ground truth. A subtask that
+    // targets a symbol's WRONG file (it's defined elsewhere) is a provable
+    // mis-ground — re-author ONCE with the citation. A backstop to the #687
+    // grounding helper; refutes only on positive contradiction, so a clean plan
+    // is never re-authored.
+    let def_sites = |sym: &str| -> Vec<String> {
+        git(
+            repo_dir,
+            &[
+                "grep",
+                "-nE",
+                "-e",
+                &definition_grep_pattern(sym),
+                "--",
+                "*.rs",
+            ],
+        )
+        .map(|s| s.lines().map(str::to_string).collect())
+        .unwrap_or_default()
+    };
+    let contradictions = plan_grounding_contradictions(&plan, def_sites);
+    if contradictions.is_empty() {
+        return Ok(plan);
+    }
+    println!(
+        "plan grounding contradictions — re-authoring with corrections:\n  {}",
+        contradictions.join("\n  ")
+    );
+    effective_goal.push_str(&format!(
+        "\n\nGROUNDING CORRECTIONS — the prior plan targeted the wrong file(s); \
+         fix these and do NOT invent paths:\n{}",
+        contradictions.join("\n")
+    ));
     author_plan(
         &pool,
         &LocalDispatcher,
@@ -1418,6 +1521,69 @@ mod tests {
         .unwrap();
         let probs = plan_sanity(&bad);
         assert!(probs.iter().any(|p| p.contains("ghost")), "{probs:?}");
+    }
+
+    // -- #691: claim-check backstop (refute a subtask targeting a symbol's wrong file) --
+
+    #[test]
+    fn claim_check_refutes_a_subtask_targeting_the_wrong_file() {
+        // The #548 shape: plan says edit `help_lines` in newt-cli/src/crew.rs, but
+        // it's defined in newt-tui/src/lib.rs.
+        let plan = newt_core::plan::Plan::from_toml_str(
+            "goal = \"g\"\n[[subtask]]\nid = \"a\"\n\
+             instruction = \"In newt-cli/src/crew.rs, modify the `help_lines` function\"\n",
+        )
+        .unwrap();
+        let def_sites = |sym: &str| -> Vec<String> {
+            if sym == "help_lines" {
+                vec!["newt-tui/src/lib.rs:8273:fn help_lines() {".to_string()]
+            } else {
+                vec![]
+            }
+        };
+        let c = plan_grounding_contradictions(&plan, def_sites);
+        assert!(
+            c.iter()
+                .any(|p| p.contains("help_lines") && p.contains("newt-tui/src/lib.rs")),
+            "must cite the real def site: {c:?}"
+        );
+    }
+
+    #[test]
+    fn claim_check_passes_when_the_claimed_file_matches_the_def() {
+        let plan = newt_core::plan::Plan::from_toml_str(
+            "goal = \"g\"\n[[subtask]]\nid = \"a\"\n\
+             instruction = \"In newt-tui/src/lib.rs, modify `help_lines`\"\n",
+        )
+        .unwrap();
+        let def_sites = |_: &str| vec!["newt-tui/src/lib.rs:8273:fn help_lines() {".to_string()];
+        assert!(plan_grounding_contradictions(&plan, def_sites).is_empty());
+    }
+
+    #[test]
+    fn claim_check_never_refutes_a_new_symbol_or_pathless_step() {
+        // defined nowhere (to be created) → no refutation
+        let p1 = newt_core::plan::Plan::from_toml_str(
+            "goal = \"g\"\n[[subtask]]\nid = \"a\"\ninstruction = \"create `new_thing` in src/new.rs\"\n",
+        )
+        .unwrap();
+        assert!(plan_grounding_contradictions(&p1, |_| vec![]).is_empty());
+        // no path claimed → nothing to check
+        let p2 = newt_core::plan::Plan::from_toml_str(
+            "goal = \"g\"\n[[subtask]]\nid = \"a\"\ninstruction = \"refactor `help_lines`\"\n",
+        )
+        .unwrap();
+        let def = |_: &str| vec!["newt-tui/src/lib.rs:8273:fn help_lines() {".to_string()];
+        assert!(plan_grounding_contradictions(&p2, def).is_empty());
+    }
+
+    #[test]
+    fn path_tokens_extracts_file_paths_only() {
+        assert_eq!(
+            path_tokens("edit newt-cli/src/crew.rs and call `help_lines`, not foo"),
+            vec!["newt-cli/src/crew.rs".to_string()]
+        );
+        assert!(path_tokens("just a sentence with no paths").is_empty());
     }
 
     #[test]
