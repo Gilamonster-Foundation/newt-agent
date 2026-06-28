@@ -1340,7 +1340,15 @@ Showing code in text is NOT completing a task; calling the tool IS.\n\
 Spend at most three consecutive rounds on exploration before making a write. \
 Once you have read the file you need, stop reading and call edit_file or write_file. \
 Continued reading without writing means you are lost — make your best attempt \
-at the change based on what you have already read, then verify.";
+at the change based on what you have already read, then verify.\n\
+\n\
+**Working code first, then the three Cs.** Make it work, then make it right. \
+Shipping a working result that hardcodes a list or a constant to get there is \
+fine; functional results come first. Then RETURN to the three Cs: lift hardcoded \
+knowledge (keyword lists, magic values, language or domain rules) into pure DATA \
+that is Composed, Configured, and Convention-driven, so a new case is config, \
+not code. Don't let this block shipping; do circle back and de-hardcode once it \
+works.";
 
 /// Loads an agent identity from a Markdown soul file and injects it as a
 /// frozen system-prompt block.
