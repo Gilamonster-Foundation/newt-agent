@@ -243,6 +243,11 @@ pub(crate) fn merged_tool_definitions(
         serde_json::Value::Array(a) => a,
         other => vec![other],
     };
+    // #714: `resume_context` is advertised ALWAYS — it is broadly useful and
+    // degrades gracefully (the executor returns a clear "no history this
+    // session" when its sources are `None`), so unlike the presence-gated tools
+    // it carries no `with_*` flag and rides in every session, headless included.
+    defs.push(super::resume::resume_context_tool_definition());
     if with_save_note {
         defs.push(save_note_tool_definition());
     }
@@ -335,6 +340,9 @@ const ALL_TOOL_NAMES: &[&str] = &[
     "plan_set",
     "plan_advance",
     "plan_get",
+    // #714: always-advertised self-recovery read (degrades gracefully when its
+    // sources are absent), so it is never treated as a hallucination.
+    "resume_context",
 ];
 
 /// Returns `true` if a tool call looks like a hallucination:
@@ -415,8 +423,18 @@ pub(crate) fn resolve_tool_alias(name: &str) -> Option<AliasOutcome> {
         ))),
         // #716 PLAN-READ — read the current plan. plan_get takes no args, so the
         // foreign call's (empty) arg shape matches: safe to silently Rewrite.
+        // `what_was_i_doing` stays here (→ plan_get) — it asks specifically for
+        // the plan; the broader "where were we" reaches go to resume_context.
         "get_plan" | "show_plan" | "read_plan" | "current_plan" | "what_was_i_doing" => {
             Some(AliasOutcome::Rewrite("plan_get"))
+        }
+        // #714 RESUME — the instinctive "where did we leave off" reach. All take
+        // no args (resume_context is a self-read), so the (empty) arg shape
+        // matches: safe to silently Rewrite. Meets the dead-end reach the issue
+        // observed (the model retrying recall) by landing it on the affordance
+        // built for exactly this case.
+        "resume" | "where_were_we" | "where_did_we_leave_off" | "catch_me_up" | "recap" => {
+            Some(AliasOutcome::Rewrite("resume_context"))
         }
         // #716 CREW / DELEGATE — crew/team is the human-only `/team` toggle a
         // model cannot self-enable, and the targets may be unadvertised, so this
@@ -1337,6 +1355,19 @@ pub async fn execute_tool(
             None => "unknown tool: plan_get (scheduled planning is off)".to_string(),
         },
 
+        // #714: self-scoped resume recovery — reads THIS conversation's recent
+        // turns (via the RecallSource's this_conversation_recent, the opposite
+        // of recall's filter), the <plan>, and the <state>. Advertised ALWAYS,
+        // so it reuses the already-present recall_source / step_ledger /
+        // scratchpad_store params and degrades gracefully when they are None.
+        "resume_context" => super::resume::execute_resume_context(
+            recall_source,
+            step_ledger,
+            scratchpad_store,
+            color,
+            tool_output_lines,
+        ),
+
         // Embedded git (PR4, #461): dispatch through the injected GitTool
         // (newt-git's LocalGitTool). `GitCaveats::from_session` projects the
         // session's authority onto the git surface (fail-closed: a read-only
@@ -2002,6 +2033,17 @@ mod tests {
     }
 
     #[test]
+    fn classify_phantom_resume_reach_is_a_rewrite() {
+        // #714 + #717: a "where were we" reach resolves through the alias seam to
+        // a Rewrite, so the telemetry already captures it (no new wiring needed).
+        let got = classify_phantom_reach("where_were_we", &serde_json::json!({}), "ignored", false);
+        assert_eq!(
+            got,
+            Some(crate::PhantomResolution::Rewrite("resume_context".into()))
+        );
+    }
+
+    #[test]
     fn classify_phantom_real_success_is_none() {
         // An ordinary successful real tool call is not phantom telemetry.
         let got = classify_phantom_reach(
@@ -2150,7 +2192,10 @@ mod tests {
                 "list_dir",
                 "find",
                 "use_skill",
-                "web_fetch"
+                "web_fetch",
+                // #714: advertised ALWAYS (no presence gate), so it joins the
+                // base set even with every `with_*` flag off.
+                "resume_context",
             ]
         );
     }
@@ -2859,6 +2904,40 @@ mod tests {
         .await;
         assert!(got.starts_with("<plan>\n"), "{got}");
         assert_eq!(ledger.count(), 2, "plan_get is read-only");
+    }
+
+    #[tokio::test]
+    async fn resume_context_dispatch_degrades_without_a_recall_source() {
+        // #714: advertised ALWAYS, so dispatch never reports "unknown tool" —
+        // with no recall_source (headless) it returns the clear no-history line.
+        let caveats = crate::caveats::Caveats::top();
+        let out = execute_tool(
+            "resume_context",
+            &serde_json::json!({}),
+            ".",
+            false,
+            20,
+            &caveats,
+            &mut NoMcp,
+            None, // build_check_cmd
+            None, // note_sink
+            None, // recall_source
+            None, // memory_source
+            None, // permission_gate
+            None, // exec_floor
+            None, // git_tool
+            None, // crew_runner
+            None, // scratchpad_store
+            None, // code_search
+            None, // experience_store
+            None, // step_ledger
+        )
+        .await;
+        assert!(
+            out.contains("no conversation history available this session"),
+            "{out}"
+        );
+        assert!(!out.starts_with("unknown tool"), "{out}");
     }
 
     #[test]
@@ -3742,6 +3821,42 @@ mod execute_tool_branch_tests {
                 "{n} should rewrite to plan_get"
             );
         }
+    }
+
+    #[test]
+    fn alias_rewrites_resume_reaches_to_resume_context() {
+        // #714: the instinctive "where did we leave off" reaches redirect to the
+        // self-recovery tool, not plan_get.
+        for n in [
+            "resume",
+            "where_were_we",
+            "where_did_we_leave_off",
+            "catch_me_up",
+            "recap",
+        ] {
+            assert!(
+                matches!(
+                    resolve_tool_alias(n),
+                    Some(AliasOutcome::Rewrite("resume_context"))
+                ),
+                "{n} should rewrite to resume_context"
+            );
+        }
+        // The REAL tool name is not an alias: it returns None so a direct
+        // resume_context call dispatches as a real tool and is NOT logged as a
+        // phantom Rewrite by #717 telemetry (real names must return None).
+        assert!(
+            resolve_tool_alias("resume_context").is_none(),
+            "the real tool name must return None, not a self-Rewrite"
+        );
+        // No regression: `what_was_i_doing` still asks specifically for the plan.
+        assert!(
+            matches!(
+                resolve_tool_alias("what_was_i_doing"),
+                Some(AliasOutcome::Rewrite("plan_get"))
+            ),
+            "what_was_i_doing must stay → plan_get"
+        );
     }
 
     #[test]

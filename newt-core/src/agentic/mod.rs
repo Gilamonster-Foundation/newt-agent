@@ -96,6 +96,9 @@ mod note_sink;
 mod observation;
 mod permissions;
 mod recall;
+// #714: the `resume_context` tool — a self-scoped read of THIS conversation's
+// own pre-interrupt work (the affordance `recall` structurally cannot be).
+mod resume;
 mod tools;
 mod transcript;
 mod trim;
@@ -190,6 +193,7 @@ pub use permissions::{
     PermissionRequest,
 };
 pub use recall::{recall_tool_definition, RecallSource, StoreRecallSource};
+pub use resume::resume_context_tool_definition;
 pub use tools::{execute_tool, ocap_disabled, tool_definitions, venv_cmd_prefix};
 pub use transcript::{
     transcript_lines, transcript_lines_styled, TranscriptLine, TranscriptRole, TranscriptStyle,
