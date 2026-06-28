@@ -233,6 +233,12 @@ impl Workspace for WorktreeWorkspace {
             c.arg("/C").arg(&self.test_cmd);
             c
         };
+        // #697: point the leaf's cargo verify at a per-RUN shared target under the
+        // crew root, so the SEQUENTIAL ephemeral leaves build incrementally instead
+        // of each cold (the #548 retests' per-leaf cold builds). Harmless for a
+        // non-cargo verify (it ignores CARGO_TARGET_DIR). This is NOT the dev
+        // worktrees — WORKSPACE_RULES keeps those on their own per-worktree target.
+        cmd.env("CARGO_TARGET_DIR", crew_shared_target_dir(&self.base));
         match cmd.current_dir(&self.worktree).output() {
             Ok(o) => {
                 let out = format!(
@@ -245,6 +251,14 @@ impl Workspace for WorktreeWorkspace {
             Err(e) => (false, format!("failed to run `{}`: {e}", self.test_cmd)),
         }
     }
+}
+
+/// The per-run shared cargo target for crew leaf verifies (#697): one dir under
+/// the crew root that every (sequential, ephemeral) leaf reuses, so verifies build
+/// incrementally instead of each cold. `base` is absolute (the `--dir`/cwd root),
+/// so the path stays absolute and a leaf's own cwd never relativizes it.
+fn crew_shared_target_dir(base: &Path) -> PathBuf {
+    base.join(".newt/crew-target")
 }
 
 // ---------------------------------------------------------------------------
@@ -1622,6 +1636,17 @@ mod tests {
                 .any(|x| x == "works" || x == "parser" || x == "the"),
             "{t3:?}"
         );
+    }
+
+    #[test]
+    fn crew_shared_target_is_a_single_absolute_per_root_dir() {
+        // #697: every leaf derives the SAME absolute target under the crew root, so
+        // sequential leaves share it (incremental builds) and a leaf's own cwd
+        // can't relativize it.
+        let a = crew_shared_target_dir(Path::new("/tmp/throw"));
+        assert!(a.ends_with(".newt/crew-target"), "{a:?}");
+        assert!(a.is_absolute(), "must be absolute: {a:?}");
+        assert_eq!(crew_shared_target_dir(Path::new("/tmp/throw")), a);
     }
 
     #[test]
