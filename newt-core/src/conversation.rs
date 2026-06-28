@@ -182,6 +182,17 @@ pub struct ConversationRecord {
     /// turn field and never enters `canonical_encoding_v1`).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub scratchpad: BTreeMap<String, String>,
+    /// The conversation's plan-ledger snapshot (#715, Step 26.6b): the ordered
+    /// `<plan>` steps with each one's done/active status. Persisted at the
+    /// conversation/record level — exactly like `scratchpad` — so an interrupt +
+    /// auto-resume re-hydrates the in-memory ledger instead of rebuilding it
+    /// empty (which loses the `<plan>` block and `plan_get` after a resume).
+    /// Additive: `#[serde(default)]` keeps legacy records loadable, and an empty
+    /// snapshot is skipped on serialize so it never bloats the on-disk file.
+    /// **Working memory, not provenance** — kept OUT of the §6 content chain (it
+    /// is NOT a turn field and never enters `canonical_encoding_v1`).
+    #[serde(default, skip_serializing_if = "crate::PlanSnapshot::is_empty")]
+    pub plan: crate::PlanSnapshot,
     pub created_at_unix_nanos: u128,
     pub updated_at_unix_nanos: u128,
 }

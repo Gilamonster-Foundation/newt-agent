@@ -524,10 +524,10 @@ impl ConversationStore {
     pub fn load(&self, id: &str) -> anyhow::Result<ConversationRecord> {
         let id = self.resolve_id(id)?;
         let conn = self.lock_conn();
-        let (mut record, scratchpad_json) = conn
+        let (mut record, scratchpad_json, plan_json) = conn
             .query_row(
                 "SELECT id, title, workspace_path, workspace_key, persona,
-                        started_at_claim, updated_at_claim, scratchpad
+                        started_at_claim, updated_at_claim, scratchpad, plan
                    FROM conversations
                   WHERE id = ?1 AND workspace_key = ?2",
                 rusqlite::params![id, self.workspace_id],
@@ -541,10 +541,12 @@ impl ConversationStore {
                             persona: row.get(4)?,
                             turns: Vec::new(),
                             scratchpad: std::collections::BTreeMap::new(),
+                            plan: crate::PlanSnapshot::default(),
                             created_at_unix_nanos: claim_to_u128(row.get(5)?),
                             updated_at_unix_nanos: claim_to_u128(row.get(6)?),
                         },
                         row.get::<_, String>(7)?,
+                        row.get::<_, String>(8)?,
                     ))
                 },
             )
@@ -556,6 +558,14 @@ impl ConversationStore {
         record.scratchpad = serde_json::from_str(&scratchpad_json).map_err(|e| {
             anyhow::anyhow!(
                 "conversation `{id}`: scratchpad column is not valid <state> JSON \
+                 ({e}); refusing to load garbage"
+            )
+        })?;
+        // #715: the plan-ledger snapshot. Same strict decode discipline. A
+        // pre-#715 row carries the `{}` backfill and parses to an empty plan.
+        record.plan = serde_json::from_str(&plan_json).map_err(|e| {
+            anyhow::anyhow!(
+                "conversation `{id}`: plan column is not valid <plan> snapshot JSON \
                  ({e}); refusing to load garbage"
             )
         })?;
@@ -794,6 +804,28 @@ impl ConversationStore {
         let conn = self.lock_conn();
         conn.execute(
             "UPDATE conversations SET scratchpad = ?2 WHERE id = ?1 AND workspace_key = ?3",
+            rusqlite::params![id, json, self.workspace_id],
+        )?;
+        Ok(())
+    }
+
+    /// Persist a conversation's plan-ledger snapshot (#715). The
+    /// [`crate::PlanSnapshot`] is serialized to JSON and written to the
+    /// conversation row's `plan` column so an interrupt + auto-resume can
+    /// re-hydrate the live ledger (the `<plan>` block + `plan_get` survive).
+    ///
+    /// Like [`update_scratchpad`](Self::update_scratchpad) this is metadata, not
+    /// activity: it does **not** tick the §6 clock, so it cannot perturb MRU
+    /// ordering, and the plan is NOT part of the §6 content chain (it rides the
+    /// conversation row, never a turn's canonical encoding) — working memory, not
+    /// provenance. Workspace-fenced and idempotent: an id from another workspace
+    /// resolves as absent and the UPDATE matches nothing.
+    pub fn update_plan_snapshot(&self, id: &str, plan: &crate::PlanSnapshot) -> anyhow::Result<()> {
+        let id = self.resolve_id(id)?;
+        let json = serde_json::to_string(plan)?;
+        let conn = self.lock_conn();
+        conn.execute(
+            "UPDATE conversations SET plan = ?2 WHERE id = ?1 AND workspace_key = ?3",
             rusqlite::params![id, json, self.workspace_id],
         )?;
         Ok(())
@@ -1330,7 +1362,8 @@ fn create_schema(conn: &Connection) -> anyhow::Result<()> {
              tip_hash           TEXT NOT NULL,            -- §6 chain tip (BLAKE3)
              started_at_claim   INTEGER NOT NULL,         -- DISPLAY ONLY (wall-clock claim, unix nanos)
              updated_at_claim   INTEGER NOT NULL,         -- DISPLAY ONLY
-             scratchpad         TEXT NOT NULL DEFAULT '{}' -- JSON scratchpad <state> snapshot (#713); working memory, NOT hashed (§6 chain unchanged)
+             scratchpad         TEXT NOT NULL DEFAULT '{}', -- JSON scratchpad <state> snapshot (#713); working memory, NOT hashed (§6 chain unchanged)
+             plan               TEXT NOT NULL DEFAULT '{}' -- JSON plan-ledger snapshot (#715); working memory, NOT hashed (§6 chain unchanged)
          );
          CREATE TABLE IF NOT EXISTS turns (
              conversation_id    TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
@@ -1381,6 +1414,11 @@ const EXPECTED_COLUMNS: &[(&str, &[(&str, &str)])] = &[
             // the conversation row, NOT a turn, so it is NEVER part of the §6
             // canonical encoding: working memory, not provenance.
             ("scratchpad", "TEXT NOT NULL DEFAULT '{}'"),
+            // #715: plan-ledger snapshot. Additive — an older db gains it on open
+            // with the empty backfill (`{}`, parsed via PlanSnapshot's serde
+            // default). It rides the conversation row, NOT a turn, so it is NEVER
+            // part of the §6 canonical encoding: working memory, not provenance.
+            ("plan", "TEXT NOT NULL DEFAULT '{}'"),
         ],
     ),
     (

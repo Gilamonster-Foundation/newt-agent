@@ -4245,6 +4245,7 @@ fn run_chat(
             active_conversation_id: &mut active_conversation_id,
             compress_state: &mut compress_state,
             scratchpad: &scratchpad_store as &dyn newt_core::ScratchpadStore,
+            step_ledger: &step_ledger as &dyn newt_core::StepLedger,
         };
         match &session_start {
             // NEWT_CONVERSATION_ID: an explicit override — errors are hard
@@ -4750,6 +4751,7 @@ fn run_chat(
                                     compress_state: &mut compress_state,
                                     scratchpad: &scratchpad_store
                                         as &dyn newt_core::ScratchpadStore,
+                                    step_ledger: &step_ledger as &dyn newt_core::StepLedger,
                                 };
                                 match handle_conversation_command(&task, &mut conversation_ctx) {
                                     Ok(msg) => print_newt(&msg, color, verbose),
@@ -5532,6 +5534,13 @@ fn run_chat(
                                     use newt_core::ScratchpadStore;
                                     scratchpad_store.entries()
                                 };
+                                // #715: snapshot the live plan ledger so resume
+                                // can re-hydrate the <plan> (working memory, not
+                                // chained). `snapshot()` is a trait method.
+                                let plan_snapshot = {
+                                    use newt_core::StepLedger;
+                                    step_ledger.snapshot()
+                                };
                                 if let Err(e) = save_turn_if_persistent(
                                     conversation_store.as_ref(),
                                     &active_conversation_id,
@@ -5556,6 +5565,10 @@ fn run_chat(
                                     // persisted onto the conversation row so resume
                                     // re-hydrates it (working memory, not chained).
                                     &scratchpad_snapshot,
+                                    // #715: the live plan-ledger snapshot, persisted
+                                    // onto the conversation row so resume re-hydrates
+                                    // it (working memory, not chained).
+                                    &plan_snapshot,
                                 ) {
                                     print_newt(
                                         &format!("warning: conversation save failed: {e}"),
@@ -6608,6 +6621,7 @@ fn save_successful_conversation_turn(
     usage: Option<newt_core::TokenUsage>,
     compaction: Option<String>,
     scratchpad: &std::collections::BTreeMap<String, String>,
+    plan: &newt_core::PlanSnapshot,
 ) -> anyhow::Result<()> {
     // The id is pre-assigned for the whole session (issue #220), so the first
     // turn creates the record with that id; later turns just append.
@@ -6649,7 +6663,12 @@ fn save_successful_conversation_turn(
     // provenance: it rides the conversation row (NOT a turn) and never enters
     // the §6 content chain. Saved every turn so the row always carries the most
     // recent <state>. Runs AFTER append so the row is guaranteed to exist.
-    store.update_scratchpad(conversation_id, scratchpad)
+    store.update_scratchpad(conversation_id, scratchpad)?;
+    // #715: snapshot the live plan ledger onto the conversation row, alongside
+    // the scratchpad and under the same discipline — working memory, not
+    // provenance (rides the conversation row, never enters the §6 content
+    // chain). Saved every turn so the row always carries the most recent plan.
+    store.update_plan_snapshot(conversation_id, plan)
 }
 
 /// The run loop's per-turn save seam (17.7): persistent sessions route to
@@ -6669,6 +6688,7 @@ fn save_turn_if_persistent(
     usage: Option<newt_core::TokenUsage>,
     compaction: Option<String>,
     scratchpad: &std::collections::BTreeMap<String, String>,
+    plan: &newt_core::PlanSnapshot,
 ) -> anyhow::Result<()> {
     match store {
         Some(store) => save_successful_conversation_turn(
@@ -6682,6 +6702,7 @@ fn save_turn_if_persistent(
             usage,
             compaction,
             scratchpad,
+            plan,
         ),
         None => Ok(()),
     }
@@ -6747,6 +6768,10 @@ struct ConversationCommandContext<'a> {
     /// `record.scratchpad` on restore so a resumed `state_get("current_task")`
     /// returns the saved value instead of "no such key".
     scratchpad: &'a dyn newt_core::ScratchpadStore,
+    /// The live plan ledger (#715). Re-hydrated from `record.plan` on restore so
+    /// a resumed `<plan>` block / `plan_get` returns the saved plan — with the
+    /// correct active step and done statuses — instead of an empty ledger.
+    step_ledger: &'a dyn newt_core::StepLedger,
 }
 
 fn handle_conversation_command(
@@ -6812,6 +6837,13 @@ fn restore_conversation_into_session(
     for (key, value) in &record.scratchpad {
         ctx.scratchpad.set(key, value.clone());
     }
+    // #715: re-hydrate the live plan ledger from the restored record, right next
+    // to the scratchpad re-hydration, so a resumed `<plan>` block / `plan_get`
+    // returns the saved plan instead of an empty ledger. `restore` is a full
+    // clear + replace, so it both drops any prior conversation's steps (a
+    // restore is a conversation boundary) and reinstates the saved active step +
+    // done statuses verbatim.
+    ctx.step_ledger.restore(&record.plan);
     let mut warning = None;
     match record.persona.as_deref() {
         Some(name) => match ctx.persona_store.load(name) {
@@ -6918,6 +6950,15 @@ fn auto_resume_banner(
                 banner.push_str(&format!(" — last task: {shown}{ellipsis}"));
             }
         }
+    }
+    // #715: note a restored plan so the model knows its <plan> / plan_get came
+    // back across the resume. Silent when the plan is empty (the OFF/empty case).
+    let restored_steps = record.plan.len();
+    if restored_steps > 0 {
+        banner.push_str(&format!(
+            " — restored plan ({restored_steps} step{})",
+            if restored_steps == 1 { "" } else { "s" }
+        ));
     }
     if let Some(warning) = warning {
         banner.push_str(&format!("\nwarning: {warning}"));
@@ -11935,6 +11976,7 @@ mod skills_integration_tests {
             }),
             None,
             &std::collections::BTreeMap::new(),
+            &newt_core::PlanSnapshot::default(),
         )
         .unwrap();
         // Second turn: a recorded tool event, no usage (backend silent).
@@ -11955,6 +11997,7 @@ mod skills_integration_tests {
             None,
             None,
             &std::collections::BTreeMap::new(),
+            &newt_core::PlanSnapshot::default(),
         )
         .unwrap();
 
@@ -11995,6 +12038,7 @@ mod skills_integration_tests {
             None,
             None,
             &state,
+            &newt_core::PlanSnapshot::default(),
         )
         .unwrap();
 
@@ -12015,6 +12059,7 @@ mod skills_integration_tests {
             None,
             None,
             &std::collections::BTreeMap::new(),
+            &newt_core::PlanSnapshot::default(),
         )
         .unwrap();
         assert!(
@@ -12053,6 +12098,7 @@ mod skills_integration_tests {
         let mut compress_state = newt_core::CompressState::new();
         compress_state.latch_disabled_for_tests();
         let scratchpad_store = newt_core::SessionScratchpadStore::default();
+        let step_ledger = newt_core::SessionStepLedger::default();
         let mut conversation_ctx = ConversationCommandContext {
             store: &store,
             persona_store: &persona_store,
@@ -12063,6 +12109,7 @@ mod skills_integration_tests {
             active_conversation_id: &mut active_conversation_id,
             compress_state: &mut compress_state,
             scratchpad: &scratchpad_store,
+            step_ledger: &step_ledger,
         };
 
         let message = handle_conversation_command(
@@ -12179,6 +12226,7 @@ mod skills_integration_tests {
         let mut active_conversation_id = newt_core::new_conversation_id();
         let mut compress_state = newt_core::CompressState::new();
         let scratchpad_store = newt_core::SessionScratchpadStore::default();
+        let step_ledger = newt_core::SessionStepLedger::default();
         let mut ctx = ConversationCommandContext {
             store: &store,
             persona_store: &persona_store,
@@ -12189,6 +12237,7 @@ mod skills_integration_tests {
             active_conversation_id: &mut active_conversation_id,
             compress_state: &mut compress_state,
             scratchpad: &scratchpad_store,
+            step_ledger: &step_ledger,
         };
 
         let banner = auto_resume_latest(&mut ctx).unwrap().expect("a banner");
@@ -12222,6 +12271,7 @@ mod skills_integration_tests {
         let fresh_id = active_conversation_id.clone();
         let mut compress_state = newt_core::CompressState::new();
         let scratchpad_store = newt_core::SessionScratchpadStore::default();
+        let step_ledger = newt_core::SessionStepLedger::default();
         let mut ctx = ConversationCommandContext {
             store: &store,
             persona_store: &persona_store,
@@ -12232,6 +12282,7 @@ mod skills_integration_tests {
             active_conversation_id: &mut active_conversation_id,
             compress_state: &mut compress_state,
             scratchpad: &scratchpad_store,
+            step_ledger: &step_ledger,
         };
 
         assert_eq!(auto_resume_latest(&mut ctx).unwrap(), None);
@@ -12259,6 +12310,7 @@ mod skills_integration_tests {
         let mut active_conversation_id = newt_core::new_conversation_id();
         let mut compress_state = newt_core::CompressState::new();
         let scratchpad_store = newt_core::SessionScratchpadStore::default();
+        let step_ledger = newt_core::SessionStepLedger::default();
         let mut ctx = ConversationCommandContext {
             store: &store,
             persona_store: &persona_store,
@@ -12269,6 +12321,7 @@ mod skills_integration_tests {
             active_conversation_id: &mut active_conversation_id,
             compress_state: &mut compress_state,
             scratchpad: &scratchpad_store,
+            step_ledger: &step_ledger,
         };
 
         let banner = resume_exact_conversation(&mut ctx, &target).unwrap();
@@ -12305,6 +12358,7 @@ mod skills_integration_tests {
         let mut active_conversation_id = newt_core::new_conversation_id();
         let mut compress_state = newt_core::CompressState::new();
         let scratchpad_store = newt_core::SessionScratchpadStore::default();
+        let step_ledger = newt_core::SessionStepLedger::default();
         // A stale key from a "prior conversation" the boundary must drop.
         scratchpad_store.set("stale", "from before".to_string());
         let mut ctx = ConversationCommandContext {
@@ -12317,6 +12371,7 @@ mod skills_integration_tests {
             active_conversation_id: &mut active_conversation_id,
             compress_state: &mut compress_state,
             scratchpad: &scratchpad_store,
+            step_ledger: &step_ledger,
         };
 
         let banner = resume_exact_conversation(&mut ctx, &id).unwrap();
@@ -12337,6 +12392,71 @@ mod skills_integration_tests {
         // The banner tells the model its <state> came back so it does not blind-probe.
         assert!(
             banner.contains("— restored 2 <state> keys"),
+            "got: {banner}"
+        );
+    }
+
+    /// #715: resume re-hydrates the plan ledger into the LIVE ledger, so the
+    /// `<plan>` block / `plan_get` returns the saved plan — with the correct
+    /// active step and done statuses, NOT reset — instead of an empty plan after
+    /// an interrupt. Restore is a conversation boundary, so a stale live plan
+    /// from a prior conversation is cleared and replaced, never merged.
+    #[tokio::test]
+    async fn resume_rehydrates_plan_into_live_ledger() {
+        use newt_core::StepLedger;
+        let (_state, workspace, store, persona_store) = resume_fixture();
+        let id = store.create("Resume with plan", None).unwrap();
+        store.append_turn(&id, "set up plan", "done").unwrap();
+        // The model compiled a plan and advanced past step 1; persist that
+        // ADVANCED snapshot (step 1 Done, step 2 Active, step 3 Todo).
+        let source = newt_core::SessionStepLedger::default();
+        source.set_plan(&[
+            "read the code".to_string(),
+            "write the fix".to_string(),
+            "test it".to_string(),
+        ]);
+        source.advance();
+        let saved = source.snapshot();
+        store.update_plan_snapshot(&id, &saved).unwrap();
+
+        let mut memory = newt_core::MemoryManager::new();
+        memory.add_provider(newt_core::RollingWindow::new(5));
+        let workspace_str = workspace.path().to_str().unwrap().to_string();
+        let mut system = rebuild_system_prompt(&workspace_str, &memory, None, "fresh-session");
+        let mut active_persona = None;
+        let mut active_conversation_id = newt_core::new_conversation_id();
+        let mut compress_state = newt_core::CompressState::new();
+        let scratchpad_store = newt_core::SessionScratchpadStore::default();
+        let step_ledger = newt_core::SessionStepLedger::default();
+        // A stale plan from a "prior conversation" the boundary must drop.
+        step_ledger.set_plan(&["stale step".to_string()]);
+        let mut ctx = ConversationCommandContext {
+            store: &store,
+            persona_store: &persona_store,
+            workspace: &workspace_str,
+            memory: &mut memory,
+            system: &mut system,
+            active_persona: &mut active_persona,
+            active_conversation_id: &mut active_conversation_id,
+            compress_state: &mut compress_state,
+            scratchpad: &scratchpad_store,
+            step_ledger: &step_ledger,
+        };
+
+        let banner = resume_exact_conversation(&mut ctx, &id).unwrap();
+
+        // The resumed <plan> / plan_get now returns the saved plan verbatim —
+        // boundary semantics: the stale step is gone, not merged.
+        assert_eq!(step_ledger.snapshot(), saved, "resumed plan lands verbatim");
+        assert_eq!(step_ledger.count(), 3);
+        assert_eq!(step_ledger.done_count(), 1, "the Done step survives");
+        let block = newt_core::plan_block(&step_ledger).expect("a non-empty <plan>");
+        assert!(block.contains("✓ 1. read the code"), "{block}");
+        assert!(block.contains("→ 2. write the fix"), "{block}");
+        assert!(block.contains("☐ 3. test it"), "{block}");
+        // The banner tells the model its plan came back so it does not re-plan.
+        assert!(
+            banner.contains("— restored plan (3 steps)"),
             "got: {banner}"
         );
     }
@@ -12363,6 +12483,7 @@ mod skills_integration_tests {
         let mut active_conversation_id = newt_core::new_conversation_id();
         let mut compress_state = newt_core::CompressState::new();
         let scratchpad_store = newt_core::SessionScratchpadStore::default();
+        let step_ledger = newt_core::SessionStepLedger::default();
         let mut ctx = ConversationCommandContext {
             store: &store,
             persona_store: &persona_store,
@@ -12373,6 +12494,7 @@ mod skills_integration_tests {
             active_conversation_id: &mut active_conversation_id,
             compress_state: &mut compress_state,
             scratchpad: &scratchpad_store,
+            step_ledger: &step_ledger,
         };
 
         for id in [newt_core::new_conversation_id(), foreign_id] {
@@ -12399,6 +12521,7 @@ mod skills_integration_tests {
             persona: None,
             turns: Vec::new(),
             scratchpad: std::collections::BTreeMap::new(),
+            plan: newt_core::PlanSnapshot::default(),
             created_at_unix_nanos: 0,
             // 2026-06-11 00:00:00 UTC in nanos — must render ~-prefixed (§6:
             // a display claim, never the ordering key).
@@ -12471,6 +12594,36 @@ mod skills_integration_tests {
             no_task.contains("— restored 1 <state> key") && !no_task.contains("last task:"),
             "no current_task → no last-task pointer: {no_task}"
         );
+
+        // #715: an empty plan stays silent; a restored plan announces its step
+        // count (singular / plural), so the model knows its <plan> came back.
+        use newt_core::StepLedger;
+        let empty_plan = newt_core::ConversationRecord {
+            scratchpad: std::collections::BTreeMap::new(),
+            plan: newt_core::PlanSnapshot::default(),
+            ..record.clone()
+        };
+        assert!(
+            !auto_resume_banner(&empty_plan, "Fix the parser", None).contains("restored plan"),
+            "empty plan must not mention a restored plan"
+        );
+        let one_step = newt_core::SessionStepLedger::default();
+        one_step.set_plan(&["only step".to_string()]);
+        let mut with_plan = empty_plan.clone();
+        with_plan.plan = one_step.snapshot();
+        let one = auto_resume_banner(&with_plan, "Fix the parser", None);
+        assert!(
+            one.contains("— restored plan (1 step)") && !one.contains("(1 steps)"),
+            "singular step note: {one}"
+        );
+        let three_steps = newt_core::SessionStepLedger::default();
+        three_steps.set_plan(&["a".to_string(), "b".to_string(), "c".to_string()]);
+        with_plan.plan = three_steps.snapshot();
+        let three = auto_resume_banner(&with_plan, "Fix the parser", None);
+        assert!(
+            three.contains("— restored plan (3 steps)"),
+            "plural step note: {three}"
+        );
     }
 
     #[test]
@@ -12489,6 +12642,7 @@ mod skills_integration_tests {
             None,
             None,
             &std::collections::BTreeMap::new(),
+            &newt_core::PlanSnapshot::default(),
         )
         .unwrap();
         assert!(
@@ -12508,6 +12662,7 @@ mod skills_integration_tests {
             None,
             None,
             &std::collections::BTreeMap::new(),
+            &newt_core::PlanSnapshot::default(),
         )
         .unwrap();
         assert_eq!(store.list().unwrap().len(), 1);
@@ -12569,6 +12724,7 @@ mod skills_integration_tests {
                 }),
                 memory.take_compaction_record(),
                 &std::collections::BTreeMap::new(),
+                &newt_core::PlanSnapshot::default(),
             )
             .unwrap();
         }
@@ -12590,6 +12746,7 @@ mod skills_integration_tests {
             }),
             record,
             &std::collections::BTreeMap::new(),
+            &newt_core::PlanSnapshot::default(),
         )
         .unwrap();
 
@@ -12604,6 +12761,7 @@ mod skills_integration_tests {
         let mut active_conversation_id = newt_core::new_conversation_id();
         let mut compress_state = newt_core::CompressState::new();
         let scratchpad_store = newt_core::SessionScratchpadStore::default();
+        let step_ledger = newt_core::SessionStepLedger::default();
         let mut ctx = ConversationCommandContext {
             store: &store,
             persona_store: &persona_store,
@@ -12614,6 +12772,7 @@ mod skills_integration_tests {
             active_conversation_id: &mut active_conversation_id,
             compress_state: &mut compress_state,
             scratchpad: &scratchpad_store,
+            step_ledger: &step_ledger,
         };
         handle_conversation_command(&format!("/conversation restore {id}"), &mut ctx).unwrap();
 
