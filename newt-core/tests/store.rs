@@ -13,7 +13,7 @@
 
 use newt_core::{
     new_conversation_id, session_plan_dir, session_plan_path, ConversationRecord, ConversationTurn,
-    ToolEvent,
+    PhantomReach, PhantomResolution, ToolEvent,
 };
 // The canonical (root re-exported) store IS the SQLite backend as of 17.1a.
 use newt_core::ConversationStore;
@@ -1891,7 +1891,15 @@ fn tool_events_and_tokens_round_trip_through_append_and_load() {
     let id = store.create("tooling", None).unwrap();
     let events = sample_events();
     store
-        .append_turn_full(&id, "fix the bug", "fixed", &events, Some(1_204), Some(892))
+        .append_turn_full(
+            &id,
+            "fix the bug",
+            "fixed",
+            &events,
+            &[],
+            Some(1_204),
+            Some(892),
+        )
         .unwrap();
 
     let record = store.load(&id).unwrap();
@@ -1906,6 +1914,51 @@ fn tool_events_and_tokens_round_trip_through_append_and_load() {
     assert!(turn.events[0].ok);
     assert!(!turn.events[1].ok);
     assert_eq!(turn.events[1].duration_ms, Some(2_500));
+}
+
+/// #717: the per-turn phantom-reach telemetry persists into its own
+/// `phantom_reaches` column and reloads verbatim — distinct from `events`.
+/// Also proves the §6 content chain still verifies, i.e. the new column is
+/// additive and NOT folded into the canonical encoding (telemetry, not
+/// provenance), so existing chains remain valid byte-for-byte.
+#[test]
+fn phantom_reaches_round_trip_and_chain_still_verifies() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let store = ConversationStore::new(root.path(), workspace.path(), 100).unwrap();
+
+    let id = store.create("phantoms", None).unwrap();
+    let phantoms = vec![
+        PhantomReach {
+            name_as_called: "bash".to_string(),
+            resolution: PhantomResolution::Rewrite("run_command".to_string()),
+            active_context_features: Vec::new(),
+        },
+        PhantomReach {
+            name_as_called: "enter_plan_mode".to_string(),
+            resolution: PhantomResolution::Unknown,
+            active_context_features: Vec::new(),
+        },
+    ];
+    store
+        .append_turn_full(&id, "do it", "done", &[], &phantoms, None, None)
+        .unwrap();
+
+    let record = store.load(&id).unwrap();
+    assert_eq!(record.turns.len(), 1);
+    let turn = &record.turns[0];
+    assert_eq!(
+        turn.phantom_reaches, phantoms,
+        "phantom reaches must round-trip verbatim"
+    );
+    // They are distinct telemetry: no tool events were recorded this turn.
+    assert!(
+        turn.events.is_empty(),
+        "phantom reaches are not tool events"
+    );
+    // The new column rides outside the §6 canonical encoding, so the chain
+    // — populated with a non-empty phantom payload — still verifies.
+    store.verify_chain(&id).unwrap();
 }
 
 /// The args digest is keys + hash, never values: feed a secret-looking arg
@@ -1936,7 +1989,7 @@ fn args_digest_never_carries_raw_arg_values() {
     let store = ConversationStore::new(root.path(), workspace.path(), 100).unwrap();
     let id = store.create("secret turn", None).unwrap();
     store
-        .append_turn_full(&id, "write creds", "done", &[event], None, None)
+        .append_turn_full(&id, "write creds", "done", &[event], &[], None, None)
         .unwrap();
     let stored: String = raw(root.path())
         .query_row(
@@ -1970,10 +2023,10 @@ fn absent_backend_usage_stores_null_not_a_guess() {
     let id = store.create("usage", None).unwrap();
 
     store
-        .append_turn_full(&id, "with usage", "ok", &[], Some(100), Some(20))
+        .append_turn_full(&id, "with usage", "ok", &[], &[], Some(100), Some(20))
         .unwrap();
     store
-        .append_turn_full(&id, "backend silent", "ok", &[], None, None)
+        .append_turn_full(&id, "backend silent", "ok", &[], &[], None, None)
         .unwrap();
 
     let record = store.load(&id).unwrap();
@@ -2014,6 +2067,7 @@ fn fts_finds_tool_names_recorded_by_append_turn_full() {
                 true,
                 Some(90),
             )],
+            &[],
             Some(50),
             Some(10),
         )
@@ -2043,7 +2097,7 @@ fn chain_verifies_with_events_and_detects_event_tampering() {
     // Mixed history: plain turn, evented turn, plain turn.
     store.append_turn(&id, "plan", "planned").unwrap();
     store
-        .append_turn_full(&id, "act", "acted", &sample_events(), Some(700), None)
+        .append_turn_full(&id, "act", "acted", &sample_events(), &[], Some(700), None)
         .unwrap();
     store.append_turn(&id, "wrap", "wrapped").unwrap();
     store

@@ -82,6 +82,42 @@ impl ToolEvent {
     }
 }
 
+/// #717: a phantom tool/capability reach — a tool/notion the model grabbed for
+/// that is NOT a real tool (an alias or hallucination), or a real tool that
+/// returned empty-by-design (`state_get` for an unset key, `recall` with no
+/// matches). Distinct from [`ToolEvent`] (which stays for tool-recall): this is
+/// the alias-seam telemetry — *which* foreign notions weak local models reach
+/// for, so the seam is driven by data, not guesses.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PhantomReach {
+    /// The literal tool/notion name the model emitted.
+    pub name_as_called: String,
+    /// How newt resolved the reach.
+    pub resolution: PhantomResolution,
+    /// Context features in effect when the reach happened (so we can see e.g.
+    /// `scheduled` was on but the model still reached for a phantom `plan`).
+    /// Empty when unknown.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub active_context_features: Vec<String>,
+}
+
+/// How a [`PhantomReach`] resolved (#717).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "detail")]
+pub enum PhantomResolution {
+    /// A foreign name rewritten to a real tool (the canonical name).
+    Rewrite(String),
+    /// A foreign name corrected with guidance (the message naming the right tool).
+    Correct(String),
+    /// An unknown name with no alias — a true phantom tool.
+    Unknown,
+    /// A real tool that misfired / returned empty-by-design (the reason).
+    RealToolMiss(String),
+    /// A reach narrated in prose that never became a tool call (reserved; NOT
+    /// emitted in v1 — the narration scanner is a deferred follow-up).
+    NarratedNoCall,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConversationTurn {
     pub user: String,
@@ -90,6 +126,10 @@ pub struct ConversationTurn {
     /// rows and for turns that called no tools.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub events: Vec<ToolEvent>,
+    /// Phantom tool/capability reaches recorded during the turn (#717). Empty
+    /// for pre-#717 turns or turns with no phantom reach. Additive: `#[serde(default)]`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub phantom_reaches: Vec<PhantomReach>,
     /// Backend-reported prompt tokens for the turn (largest single prompt
     /// across the turn's rounds — see `chat_complete`'s Step 18.1 usage
     /// semantics). `None` when the backend reported nothing: absence is
@@ -108,6 +148,7 @@ impl ConversationTurn {
             user: user.into(),
             assistant: assistant.into(),
             events: Vec::new(),
+            phantom_reaches: Vec::new(),
             tokens_in: None,
             tokens_out: None,
         }

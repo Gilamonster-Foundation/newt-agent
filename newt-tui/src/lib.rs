@@ -5189,6 +5189,11 @@ fn run_chat(
                     // loop pushes one event per tool call; the save site
                     // persists them into the turn's `events` column.
                     let mut turn_tool_events: Vec<newt_core::ToolEvent> = Vec::new();
+                    // Per-turn phantom-reach recorder (#717): sibling to
+                    // `turn_tool_events`; the loop pushes one record per phantom
+                    // tool/capability reach; the save site persists them into the
+                    // turn's `phantom_reaches` column.
+                    let mut turn_phantom_reaches: Vec<newt_core::PhantomReach> = Vec::new();
                     // #307: the EFFECTIVE caveats for this turn — the session
                     // base intersected with the active mode's preset clamp (a
                     // FLOOR). This single `meet` is what the gate base, the
@@ -5355,6 +5360,7 @@ fn run_chat(
                                         summarizer: Some(&*loop_summarizer),
                                         compress_state: Some(&mut compress_state),
                                         tool_events: Some(&mut turn_tool_events),
+                                        phantom_reaches: Some(&mut turn_phantom_reaches),
                                         // #263: present only when prompting is on —
                                         // the loop blocks on the prompt like a long
                                         // tool call; None keeps denials verbatim.
@@ -5527,6 +5533,9 @@ fn run_chat(
                                     // backend reported nothing — stored as NULL,
                                     // never an estimate).
                                     &turn_tool_events,
+                                    // #717: the turn's recorded phantom reaches,
+                                    // persisted into the turn's `phantom_reaches`.
+                                    &turn_phantom_reaches,
                                     usage,
                                     // 18.5: a compaction summary minted by the
                                     // memory provider during sync_all persists as
@@ -6581,6 +6590,7 @@ fn save_successful_conversation_turn(
     task: &str,
     reply: &str,
     events: &[newt_core::ToolEvent],
+    phantom_reaches: &[newt_core::PhantomReach],
     usage: Option<newt_core::TokenUsage>,
     compaction: Option<String>,
 ) -> anyhow::Result<()> {
@@ -6603,17 +6613,19 @@ fn save_successful_conversation_turn(
     // rebuilds `[summary] + [turns from the trigger on]` — the same working
     // set the live session kept.
     if let Some(summary) = compaction {
-        store.append_turn_full(conversation_id, &summary, "", &[], None, None)?;
+        store.append_turn_full(conversation_id, &summary, "", &[], &[], None, None)?;
     }
     // 17.6: persist the turn's tool events and the backend-reported token
     // actuals. `usage` is what `chat_complete` returned — input = largest
     // single prompt of the turn, output = sum across rounds (Step 18.1
     // semantics); `None` (backend reported nothing) is stored as NULL.
+    // #717: phantom reaches persist alongside the events column.
     store.append_turn_full(
         conversation_id,
         task,
         reply,
         events,
+        phantom_reaches,
         usage.map(|u| u.input_tokens),
         usage.map(|u| u.output_tokens),
     )
@@ -6632,6 +6644,7 @@ fn save_turn_if_persistent(
     task: &str,
     reply: &str,
     events: &[newt_core::ToolEvent],
+    phantom_reaches: &[newt_core::PhantomReach],
     usage: Option<newt_core::TokenUsage>,
     compaction: Option<String>,
 ) -> anyhow::Result<()> {
@@ -6643,6 +6656,7 @@ fn save_turn_if_persistent(
             task,
             reply,
             events,
+            phantom_reaches,
             usage,
             compaction,
         ),
@@ -11851,6 +11865,7 @@ mod skills_integration_tests {
             "first task",
             "first reply",
             &[],
+            &[],
             Some(newt_core::TokenUsage {
                 input_tokens: 120,
                 output_tokens: 45,
@@ -11872,6 +11887,7 @@ mod skills_integration_tests {
             "second task",
             "second reply",
             &events,
+            &[],
             None,
             None,
         )
@@ -12223,6 +12239,7 @@ mod skills_integration_tests {
             "ephemeral task",
             "ephemeral reply",
             &[],
+            &[],
             None,
             None,
         )
@@ -12239,6 +12256,7 @@ mod skills_integration_tests {
             None,
             "kept task",
             "kept reply",
+            &[],
             &[],
             None,
             None,
@@ -12296,6 +12314,7 @@ mod skills_integration_tests {
                 &task,
                 &big,
                 &[],
+                &[],
                 Some(newt_core::TokenUsage {
                     input_tokens: 10 + i,
                     output_tokens: 9,
@@ -12314,6 +12333,7 @@ mod skills_integration_tests {
             None,
             "final task",
             &big,
+            &[],
             &[],
             Some(newt_core::TokenUsage {
                 input_tokens: 120,
@@ -12650,6 +12670,7 @@ mod tool_round_cap_tests {
                     summarizer: None,
                     compress_state: None,
                     tool_events: None,
+                    phantom_reaches: None,
                     permission_gate: None,
                     on_round_usage: None,
                     estimate_ratio: None,

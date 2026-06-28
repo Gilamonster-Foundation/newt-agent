@@ -356,7 +356,7 @@ pub(crate) fn is_hallucination(tool_name: &str, args: &serde_json::Value) -> boo
 /// resolution layer each such call is a flat "unknown tool" that burns a whole
 /// tool-call round, so the model narrates instead of acting (the #215 advisory
 /// drift). Resolving them turns a wasted round into a self-correcting one.
-enum AliasOutcome {
+pub(crate) enum AliasOutcome {
     /// A foreign name whose argument shape matches a real newt tool: rewrite the
     /// call to this canonical name and dispatch it transparently.
     Rewrite(&'static str),
@@ -367,7 +367,7 @@ enum AliasOutcome {
 
 /// Map a non-newt tool name to a real tool, when we recognize it. Real tool
 /// names and MCP `server__tool` names return `None` and dispatch unchanged.
-fn resolve_tool_alias(name: &str) -> Option<AliasOutcome> {
+pub(crate) fn resolve_tool_alias(name: &str) -> Option<AliasOutcome> {
     match name {
         // Shell aliases — same single `command` arg shape as run_command, so we
         // rewrite and dispatch. (If the shell is unavailable this build, the
@@ -400,6 +400,52 @@ fn resolve_tool_alias(name: &str) -> Option<AliasOutcome> {
         }
         _ => None,
     }
+}
+
+/// #717: classify a single tool/capability reach for the alias-seam telemetry.
+///
+/// Pure: given the name the model called, its args, the tool result string, and
+/// whether the result read as success, decide whether this reach is phantom and
+/// how it resolved. Returns `None` for an ordinary real call (nothing to mine).
+/// See [`crate::PhantomReach`] / [`crate::PhantomResolution`].
+///
+/// `ok` is part of the signature for symmetry with the recording site (it keys
+/// the sibling `ToolEvent`); v1's miss-patterns classify on name + result alone.
+pub(crate) fn classify_phantom_reach(
+    name: &str,
+    args: &serde_json::Value,
+    result: &str,
+    ok: bool,
+) -> Option<crate::PhantomResolution> {
+    let _ = ok;
+    // 1. A recognized foreign/alias name: rewrite to a real tool, or a
+    //    correction naming the right one — the canonical alias-seam signal.
+    match resolve_tool_alias(name) {
+        Some(AliasOutcome::Rewrite(canonical)) => {
+            return Some(crate::PhantomResolution::Rewrite(canonical.to_string()))
+        }
+        Some(AliasOutcome::Correct(msg)) => return Some(crate::PhantomResolution::Correct(msg)),
+        None => {}
+    }
+    // 2. An unknown name with no alias is a true phantom tool (hallucination).
+    if is_hallucination(name, args) {
+        return Some(crate::PhantomResolution::Unknown);
+    }
+    // 3. A real tool that returned empty-by-design — a high-signal "miss" that
+    //    currently logs ok=true. These are the mineable real-tool reaches; the
+    //    loop emits one per call, so a 3x identical-recall loop yields 3 records.
+    let r = result.trim_start();
+    if name == "state_get" && r.starts_with("no such key") {
+        return Some(crate::PhantomResolution::RealToolMiss(
+            "state_get on an unset key".into(),
+        ));
+    }
+    if name == "recall" && r.starts_with("no matches in past conversations") {
+        return Some(crate::PhantomResolution::RealToolMiss(
+            "recall returned no matches".into(),
+        ));
+    }
+    None
 }
 
 /// Classic Levenshtein edit distance (pure two-row DP). Inputs are tool names
@@ -1817,6 +1863,93 @@ pub(crate) fn tool_result_ok(result: &str) -> bool {
 mod tests {
     use super::*;
     use crate::agentic::NoMcp;
+
+    // ---- #717: classify_phantom_reach (pure, no fs) ----
+
+    #[test]
+    fn classify_phantom_rewrite_alias() {
+        // A shell alias resolves to the canonical run_command rewrite.
+        let got = classify_phantom_reach("bash", &serde_json::json!({"command": "ls"}), "ok", true);
+        assert_eq!(
+            got,
+            Some(crate::PhantomResolution::Rewrite("run_command".into()))
+        );
+    }
+
+    #[test]
+    fn classify_phantom_correct_alias() {
+        // An edit alias with the wrong arg shape returns Correct guidance.
+        let got = classify_phantom_reach(
+            "str_replace_editor",
+            &serde_json::json!({}),
+            "ignored",
+            false,
+        );
+        match got {
+            Some(crate::PhantomResolution::Correct(msg)) => {
+                assert!(msg.contains("edit_file"), "guidance names the tool: {msg}");
+            }
+            other => panic!("expected Correct, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_phantom_unknown_name() {
+        // A foreign name with no alias is a true phantom tool.
+        let got = classify_phantom_reach(
+            "enter_plan_mode",
+            &serde_json::json!({}),
+            "unknown tool: enter_plan_mode",
+            false,
+        );
+        assert_eq!(got, Some(crate::PhantomResolution::Unknown));
+    }
+
+    #[test]
+    fn classify_phantom_state_get_miss() {
+        // state_get on an unset key is an empty-by-design real-tool miss.
+        let got = classify_phantom_reach(
+            "state_get",
+            &serde_json::json!({"key": "nope"}),
+            "no such key: nope",
+            true,
+        );
+        assert_eq!(
+            got,
+            Some(crate::PhantomResolution::RealToolMiss(
+                "state_get on an unset key".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn classify_phantom_recall_miss() {
+        // recall with no hits is an empty-by-design real-tool miss.
+        let got = classify_phantom_reach(
+            "recall",
+            &serde_json::json!({"query": "zzz"}),
+            "no matches in past conversations for \"zzz\" — try different keywords",
+            true,
+        );
+        assert_eq!(
+            got,
+            Some(crate::PhantomResolution::RealToolMiss(
+                "recall returned no matches".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn classify_phantom_real_success_is_none() {
+        // An ordinary successful real tool call is not phantom telemetry.
+        let got = classify_phantom_reach(
+            "read_file",
+            &serde_json::json!({"path": "src/lib.rs"}),
+            "line 1\nline 2\n",
+            true,
+        );
+        assert_eq!(got, None);
+    }
 
     // ---- #719: read_file payload window/cap/pagination (pure, no fs) ----
 
