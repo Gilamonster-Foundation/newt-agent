@@ -22,6 +22,7 @@
 
 use crate::{BackendPool, ChatRequest, Dispatcher};
 use newt_core::caveats::{Caveats, CaveatsExt};
+use newt_core::lazy_emission::lazy_emission_reason;
 use newt_core::Tier;
 use serde::Deserialize;
 
@@ -259,7 +260,10 @@ pub async fn run_crew(
                  <the full, updated file content, verbatim>\n\
                  END-FILE\n\
                  Repeat the block for every changed file. Write the file content \
-                 RAW between the markers — do NOT escape it.",
+                 RAW between the markers — do NOT escape it. Emit the COMPLETE \
+                 file — NEVER a diff, an ellipsis, or a placeholder such as \
+                 '<the full file content remains unchanged>' or '… rest of the \
+                 file unchanged …'. If a file is unchanged, omit its block.",
             )
             .user(format!(
                 "TASK:\n{task}\n\nRELEVANT FILES:\n{curated}{prior}"
@@ -286,7 +290,31 @@ pub async fn run_crew(
         let (allowed, refused): (Vec<Edit>, Vec<Edit>) = edits
             .into_iter()
             .partition(|e| caveats.permits_fs_write(&e.path));
-        touched = workspace.apply(&allowed);
+        // Refuse lazy / elided emissions BEFORE apply (#688): applying a
+        // `<the full file content remains unchanged>` placeholder silently
+        // overwrites real code and only surfaces downstream as a compile error.
+        // A lazy body is never applied — feed back a deterministic repair and
+        // retry, so the file keeps its real content.
+        let (clean, lazy): (Vec<Edit>, Vec<Edit>) = allowed
+            .into_iter()
+            .partition(|e| lazy_emission_reason(&e.new_content).is_none());
+        touched = workspace.apply(&clean);
+        if !lazy.is_empty() {
+            let reasons: Vec<String> = lazy
+                .iter()
+                .map(|e| {
+                    let why = lazy_emission_reason(&e.new_content).unwrap_or_default();
+                    format!("{} ({why})", e.path)
+                })
+                .collect();
+            failures.push(format!(
+                "LAZY/ELIDED EMISSION refused — these files were NOT modified; \
+                 re-emit each as the COMPLETE file verbatim, with NO '<…>' or \
+                 '…unchanged…' placeholders: {}",
+                reasons.join("; ")
+            ));
+            continue;
+        }
         let (ok, output) = workspace.run_test();
         if ok {
             return CrewOutcome {
@@ -546,6 +574,58 @@ mod tests {
             "nothing may be written outside the leash"
         );
         assert_eq!(ws.read("target.rs").as_deref(), Some("BAD"), "untouched");
+    }
+
+    /// Planner that always emits a lazy/elided placeholder for the target file.
+    struct LazyMock;
+    #[async_trait]
+    impl Dispatcher for LazyMock {
+        async fn dispatch(
+            &self,
+            _backend: &PoolBackend,
+            model: &str,
+            _req: ChatRequest,
+        ) -> anyhow::Result<ChatReply> {
+            let content = match model {
+                "nav" => r#"{"relevant_files":["target.rs"]}"#.to_string(),
+                "triage" => {
+                    r#"{"summary":"lazy","next_action":"emit the complete file"}"#.to_string()
+                }
+                "planner" => "FILE: target.rs\n<the full file content remains unchanged>\nEND-FILE"
+                    .to_string(),
+                other => panic!("unexpected model {other}"),
+            };
+            Ok(ChatReply {
+                content,
+                model_id: model.to_string(),
+                usage: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn lazy_emission_is_refused_and_never_overwrites_the_file() {
+        // #688 / the #548 second failure: a `<the full file content remains
+        // unchanged>` placeholder must NOT be applied (applying it would delete the
+        // real file), and the run stays honest (never reported as passed).
+        let p = pool();
+        let mut ws = MemWs::new();
+        let out = run_crew(
+            &p,
+            &LazyMock,
+            &mut ws,
+            &cfg(2),
+            &newt_core::caveats::Caveats::top(),
+            "make target.rs GOOD",
+        )
+        .await;
+        assert_eq!(
+            ws.read("target.rs").as_deref(),
+            Some("BAD"),
+            "a lazy placeholder must never overwrite the real file"
+        );
+        assert_eq!(out.status, CrewStatus::NeedsHumanReview);
+        assert!(out.touched.is_empty(), "nothing clean was emitted to apply");
     }
 
     #[tokio::test]

@@ -17,6 +17,7 @@ pub mod ffi_manifest;
 pub mod ffi_surface;
 pub mod git_caveats;
 pub mod kit;
+pub mod lazy_emission;
 pub mod mcp;
 pub mod memory;
 pub mod metrics;
