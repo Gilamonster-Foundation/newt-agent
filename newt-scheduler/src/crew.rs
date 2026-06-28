@@ -85,6 +85,10 @@ pub struct CrewConfig {
     pub triage_model: String,
     /// Maximum planning rounds before an honest `NeedsHumanReview` cap-exit.
     pub max_attempts: u32,
+    /// Per-role dispatch wall-clock bound (#695). `None` ⇒ the env/default
+    /// (`role_dispatch_timeout`). Settable from the crew config so a slow
+    /// loadout can widen it without an env var (review on #698).
+    pub role_timeout: Option<std::time::Duration>,
 }
 
 // --- role output contracts (parsed from each role's JSON reply) ---------------
@@ -220,8 +224,19 @@ pub async fn run_crew(
             "TASK:\n{task}\n\nAVAILABLE FILES:\n{:?}",
             workspace.files()
         ));
+    // #698: per-role dispatch bound — the crew config's `role_timeout` if set,
+    // else the env/default (`NEWT_ROLE_TIMEOUT_SECS` → 600s).
+    let role_bound = cfg
+        .role_timeout
+        .unwrap_or_else(crate::dispatch::role_dispatch_timeout);
     let nav: NavOut = match pool
-        .run_role(dispatcher, Tier::Standard, &cfg.navigator_model, nav_req)
+        .run_role_with_timeout(
+            dispatcher,
+            Tier::Standard,
+            &cfg.navigator_model,
+            nav_req,
+            role_bound,
+        )
         .await
     {
         Some(f) => parse(&f.result.content),
@@ -269,7 +284,13 @@ pub async fn run_crew(
                 "TASK:\n{task}\n\nRELEVANT FILES:\n{curated}{prior}"
             ));
         let edits: Vec<Edit> = match pool
-            .run_role(dispatcher, Tier::Complex, &cfg.planner_model, plan_req)
+            .run_role_with_timeout(
+                dispatcher,
+                Tier::Complex,
+                &cfg.planner_model,
+                plan_req,
+                role_bound,
+            )
             .await
         {
             Some(f) => parse_edits(&f.result.content),
@@ -341,7 +362,13 @@ pub async fn run_crew(
             )
             .user(format!("TASK:\n{task}\n\nVERIFICATION OUTPUT:\n{output}"));
         let tri: TriageOut = match pool
-            .run_role(dispatcher, Tier::Fast, &cfg.triage_model, tri_req)
+            .run_role_with_timeout(
+                dispatcher,
+                Tier::Fast,
+                &cfg.triage_model,
+                tri_req,
+                role_bound,
+            )
             .await
         {
             Some(f) => parse(&f.result.content),
@@ -499,7 +526,46 @@ mod tests {
             planner_model: "planner".into(),
             triage_model: "triage".into(),
             max_attempts,
+            role_timeout: None,
         }
+    }
+
+    /// A dispatch that never returns — models a hung role (#698 test).
+    struct HangingDispatcher;
+    #[async_trait]
+    impl Dispatcher for HangingDispatcher {
+        async fn dispatch(
+            &self,
+            _backend: &PoolBackend,
+            _model: &str,
+            _req: ChatRequest,
+        ) -> anyhow::Result<ChatReply> {
+            tokio::time::sleep(std::time::Duration::from_secs(99_999)).await;
+            unreachable!("a hung dispatch must be cancelled by the role timeout")
+        }
+    }
+
+    #[tokio::test]
+    async fn role_timeout_from_config_bounds_a_hung_dispatch() {
+        // #698: the crew config's role_timeout bounds a hung role dispatch — the
+        // navigator times out, so the crew exits honestly (NeedsHumanReview) fast
+        // instead of hanging on the model.
+        let p = pool();
+        let mut ws = MemWs::new();
+        let cc = CrewConfig {
+            role_timeout: Some(std::time::Duration::from_millis(10)),
+            ..cfg(3)
+        };
+        let out = run_crew(
+            &p,
+            &HangingDispatcher,
+            &mut ws,
+            &cc,
+            &newt_core::caveats::Caveats::top(),
+            "modify target.rs to be GOOD",
+        )
+        .await;
+        assert_eq!(out.status, CrewStatus::NeedsHumanReview, "{out:?}");
     }
 
     /// One backend serving all three role models at every tier.

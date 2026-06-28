@@ -63,6 +63,7 @@ impl RosterSpec {
             planner_model: self.planner.clone(),
             triage_model: self.triage.clone(),
             max_attempts,
+            role_timeout: None,
         }
     }
 

@@ -110,6 +110,7 @@ impl LocalCrewRunner {
                 navigator_model: navigator,
                 triage_model: triage,
                 max_attempts: MAX_ATTEMPTS,
+                role_timeout: crew.role_timeout_secs.map(std::time::Duration::from_secs),
             };
             return Ok((
                 cc,

@@ -1287,6 +1287,7 @@ async fn run_with(
         planner_model,
         triage_model,
         max_attempts,
+        role_timeout: None,
     };
     // Honest, non-top session caveats (the #94 guardrail forbids `Caveats::top()`
     // in dispatch code): exec/net are locked down. The REAL fs boundary here is

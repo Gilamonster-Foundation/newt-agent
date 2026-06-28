@@ -2892,6 +2892,7 @@ dependencies = [
  "newt-tools",
  "newt-tui",
  "predicates",
+ "regex",
  "reqwest",
  "serde_json",
  "tempfile",

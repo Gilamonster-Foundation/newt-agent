@@ -1834,6 +1834,11 @@ pub struct Crew {
     /// Control program (e.g. `"patch-revise"`). Omitted ⇒ the default loop.
     #[serde(default, rename = "loop", skip_serializing_if = "Option::is_none")]
     pub loop_program: Option<String>,
+    /// Per-role dispatch wall-clock bound, seconds (#698). Omitted ⇒ the
+    /// env/default (`NEWT_ROLE_TIMEOUT_SECS` → 600s). Widen it here for a slow
+    /// loadout instead of relying on the env var.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_timeout_secs: Option<u64>,
     /// Verification command override (e.g. `"just check"`). Omitted ⇒ inferred
     /// from the repo (justfile → `just check`, Cargo → `cargo test`, …).
     #[serde(default, skip_serializing_if = "Option::is_none")]

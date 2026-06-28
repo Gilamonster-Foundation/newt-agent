@@ -334,6 +334,7 @@ mod tests {
                 planner_model: "planner".into(),
                 triage_model: "triage".into(),
                 max_attempts: 2,
+                role_timeout: None,
             },
             max_subtasks: 5,
         }
