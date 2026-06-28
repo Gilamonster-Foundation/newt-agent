@@ -281,9 +281,11 @@ pub(crate) fn merged_tool_definitions(
         defs.push(super::experiential::experience_recall_tool_definition());
     }
     // Step 26.6b (#586): the scheduled plan_set/plan_advance tools, only with the gate.
+    // #716: the read-only plan_get joins them under the same scheduled gate.
     if with_scheduled {
         defs.push(super::scheduled::plan_set_tool_definition());
         defs.push(super::scheduled::plan_advance_tool_definition());
+        defs.push(super::scheduled::plan_get_tool_definition());
     }
     defs.extend(mcp.tool_defs());
     serde_json::Value::Array(defs)
@@ -332,6 +334,7 @@ const ALL_TOOL_NAMES: &[&str] = &[
     "experience_recall",
     "plan_set",
     "plan_advance",
+    "plan_get",
 ];
 
 /// Returns `true` if a tool call looks like a hallucination:
@@ -398,6 +401,43 @@ pub(crate) fn resolve_tool_alias(name: &str) -> Option<AliasOutcome> {
                  {{\"path\"}}. To list a directory, call list_dir with {{\"path\"}}."
             )))
         }
+        // #716 PLAN — start/revise a plan. The arg shape is free prose, not the
+        // ordered `{"steps":[…]}` array plan_set wants, so Correct (coach), never
+        // a silent Rewrite. When `scheduled` is off the dispatch arm for plan_set
+        // returns "scheduled planning is off" — the model still gets a coherent
+        // answer rather than a dead end.
+        "enter_plan" | "enter_plan_mode" | "plan_mode" | "start_plan" | "begin_plan"
+        | "make_plan" | "create_plan" | "plan" | "planning" | "update_plan" | "set_plan"
+        | "todo" | "todos" | "todo_write" => Some(AliasOutcome::Correct(format!(
+            "'{name}' is not a newt tool. To start or revise your plan, call plan_set with \
+             {{\"steps\":[...]}} (ordered short imperative phrases); the active step shows in \
+             the <plan> checklist each turn, and call plan_advance when a step is done."
+        ))),
+        // #716 PLAN-READ — read the current plan. plan_get takes no args, so the
+        // foreign call's (empty) arg shape matches: safe to silently Rewrite.
+        "get_plan" | "show_plan" | "read_plan" | "current_plan" | "what_was_i_doing" => {
+            Some(AliasOutcome::Rewrite("plan_get"))
+        }
+        // #716 CREW / DELEGATE — crew/team is the human-only `/team` toggle a
+        // model cannot self-enable, and the targets may be unadvertised, so this
+        // can only ever Correct (never silently Rewrite) and the message must NOT
+        // imply the model can invoke crew itself.
+        "delegate" | "spawn_agent" | "subagent" | "sub_agent" | "crew_dispatch" | "run_crew"
+        | "dispatch_crew" | "fork_agent" | "assign" | "team" => {
+            Some(AliasOutcome::Correct(format!(
+                "'{name}' is not a newt tool. Crew/team delegation is only available once the \
+                 human enables /team this session — you cannot turn it on yourself. When /team \
+                 is on, compose_roster ({{\"mode\"}}) proposes a roster and crew ({{\"task\"}}) \
+                 dispatches it."
+            )))
+        }
+        // #716 WORKFLOW — no workflow/pipeline primitive exists; redirect to the
+        // plan tools (and crew/team, which needs /team).
+        "workflow" | "run_workflow" | "start_workflow" | "pipeline" => Some(AliasOutcome::Correct(
+            "newt has no workflow tool; sequence the work with plan_set + plan_advance, or \
+                 delegate subtasks via crew/team (needs /team)."
+                .to_string(),
+        )),
         _ => None,
     }
 }
@@ -1290,6 +1330,12 @@ pub async fn execute_tool(
             Some(l) => super::scheduled::execute_plan_advance(l, color, tool_output_lines),
             None => "unknown tool: plan_advance (scheduled planning is off)".to_string(),
         },
+        // #716: read-only plan view (the alias target for "what was I doing?"
+        // probes) — same presence gate as plan_set/plan_advance.
+        "plan_get" => match step_ledger {
+            Some(l) => super::scheduled::execute_plan_get(l, color, tool_output_lines),
+            None => "unknown tool: plan_get (scheduled planning is off)".to_string(),
+        },
 
         // Embedded git (PR4, #461): dispatch through the injected GitTool
         // (newt-git's LocalGitTool). `GitCaveats::from_session` projects the
@@ -1895,14 +1941,30 @@ mod tests {
 
     #[test]
     fn classify_phantom_unknown_name() {
-        // A foreign name with no alias is a true phantom tool.
+        // A foreign name with no alias is a true phantom tool. (Note: #716 turned
+        // the plan/crew/workflow notions into recognized aliases, so this uses a
+        // name no family claims.)
         let got = classify_phantom_reach(
-            "enter_plan_mode",
+            "summon_kraken",
             &serde_json::json!({}),
-            "unknown tool: enter_plan_mode",
+            "unknown tool: summon_kraken",
             false,
         );
         assert_eq!(got, Some(crate::PhantomResolution::Unknown));
+    }
+
+    #[test]
+    fn classify_phantom_plan_alias_is_correct() {
+        // #716 + #717: a foreign plan notion now resolves through the alias seam,
+        // so the telemetry classifier records it as a Correct (coach) reach — the
+        // new arms get phantom-reach telemetry for free.
+        let got = classify_phantom_reach("make_plan", &serde_json::json!({}), "ignored", false);
+        match got {
+            Some(crate::PhantomResolution::Correct(msg)) => {
+                assert!(msg.contains("plan_set"), "guidance names the tool: {msg}");
+            }
+            other => panic!("expected Correct, got {other:?}"),
+        }
     }
 
     #[test]
@@ -2552,7 +2614,7 @@ mod tests {
         let sched = merged_tool_definitions(
             &NoMcp, false, false, false, false, false, false, false, false, true,
         );
-        for t in ["plan_set", "plan_advance"] {
+        for t in ["plan_set", "plan_advance", "plan_get"] {
             assert!(names(&sched).contains(&t), "{t} advertised with_scheduled");
             assert!(!names(&without).contains(&t), "{t} hidden without the gate");
             assert!(
@@ -2736,8 +2798,9 @@ mod tests {
         use crate::agentic::scheduled::{SessionStepLedger, StepLedger};
         let caveats = crate::caveats::Caveats::top();
         let args = serde_json::json!({ "steps": ["a", "b"] });
-        // Step 26.6b: no ledger → unknown tool for BOTH arms (presence-gate parity).
-        for name in ["plan_set", "plan_advance"] {
+        // Step 26.6b / #716: no ledger → unknown tool for ALL plan arms (presence
+        // -gate parity, including the read-only plan_get).
+        for name in ["plan_set", "plan_advance", "plan_get"] {
             let out = execute_tool(
                 name, &args, ".", false, 20, &caveats, &mut NoMcp, None, None, None, None, None,
                 None, None, None, None, None, None, None,
@@ -2771,6 +2834,31 @@ mod tests {
         .await;
         assert_eq!(out, "plan set: 2 steps");
         assert_eq!(ledger.count(), 2);
+        // #716: plan_get with a ledger renders the <plan> block, read-only.
+        let got = execute_tool(
+            "plan_get",
+            &serde_json::json!({}),
+            ".",
+            false,
+            20,
+            &caveats,
+            &mut NoMcp,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&ledger as &dyn StepLedger),
+        )
+        .await;
+        assert!(got.starts_with("<plan>\n"), "{got}");
+        assert_eq!(ledger.count(), 2, "plan_get is read-only");
     }
 
     #[test]
@@ -3598,12 +3686,102 @@ mod execute_tool_branch_tests {
             "edit_file",
             "git",
             "plan_set",
+            "plan_advance",
+            "plan_get",
             "server__do_thing",
         ] {
             assert!(
                 resolve_tool_alias(n).is_none(),
                 "{n} must dispatch unchanged"
             );
+        }
+    }
+
+    // -- #716: plan / plan-read / crew / workflow alias families --------------
+
+    #[test]
+    fn alias_corrects_plan_names_to_plan_set() {
+        for n in [
+            "enter_plan",
+            "enter_plan_mode",
+            "plan_mode",
+            "start_plan",
+            "begin_plan",
+            "make_plan",
+            "create_plan",
+            "plan",
+            "planning",
+            "update_plan",
+            "set_plan",
+            "todo",
+            "todos",
+            "todo_write",
+        ] {
+            let Some(AliasOutcome::Correct(msg)) = resolve_tool_alias(n) else {
+                panic!("{n} should produce a Correct outcome");
+            };
+            assert!(msg.contains("plan_set"), "{n}: {msg}");
+            assert!(msg.contains("plan_advance"), "{n}: {msg}");
+        }
+    }
+
+    #[test]
+    fn alias_rewrites_plan_read_names_to_plan_get() {
+        for n in [
+            "get_plan",
+            "show_plan",
+            "read_plan",
+            "current_plan",
+            "what_was_i_doing",
+        ] {
+            assert!(
+                matches!(
+                    resolve_tool_alias(n),
+                    Some(AliasOutcome::Rewrite("plan_get"))
+                ),
+                "{n} should rewrite to plan_get"
+            );
+        }
+    }
+
+    #[test]
+    fn alias_corrects_crew_names_and_flags_team_gating() {
+        for n in [
+            "delegate",
+            "spawn_agent",
+            "subagent",
+            "sub_agent",
+            "crew_dispatch",
+            "run_crew",
+            "dispatch_crew",
+            "fork_agent",
+            "assign",
+            "team",
+        ] {
+            let Some(AliasOutcome::Correct(msg)) = resolve_tool_alias(n) else {
+                panic!("{n} should produce a Correct outcome");
+            };
+            // Names the real targets...
+            assert!(msg.contains("compose_roster"), "{n}: {msg}");
+            assert!(msg.contains("crew"), "{n}: {msg}");
+            // ...but makes clear the model cannot self-enable the /team surface.
+            assert!(msg.contains("/team"), "{n}: {msg}");
+            assert!(
+                msg.contains("human enables") || msg.contains("cannot turn it on yourself"),
+                "crew correction must not imply the model can invoke it: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn alias_corrects_workflow_names_to_plan_plus_crew() {
+        for n in ["workflow", "run_workflow", "start_workflow", "pipeline"] {
+            let Some(AliasOutcome::Correct(msg)) = resolve_tool_alias(n) else {
+                panic!("{n} should produce a Correct outcome");
+            };
+            assert!(msg.contains("no workflow tool"), "{n}: {msg}");
+            assert!(msg.contains("plan_set"), "{n}: {msg}");
+            assert!(msg.contains("plan_advance"), "{n}: {msg}");
         }
     }
 

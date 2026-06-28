@@ -243,6 +243,20 @@ pub fn plan_advance_tool_definition() -> serde_json::Value {
     })
 }
 
+/// `plan_get` tool definition (#716) — a read-only read of the current plan.
+pub fn plan_get_tool_definition() -> serde_json::Value {
+    serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": "plan_get",
+            "description": "Read the current <plan> checklist — the ordered steps and which is \
+                            active. No args. Use it to recover what you were working on, e.g. \
+                            after a resume.",
+            "parameters": { "type": "object", "properties": {}, "required": [] }
+        }
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Executors (every branch returns a tool-result String, never a loop abort)
 // ---------------------------------------------------------------------------
@@ -283,6 +297,22 @@ pub(crate) fn execute_plan_advance(
         Some(next) => format!("advanced — now active: {next}"),
         None => "advanced — plan complete (no steps remaining)".to_string(),
     };
+    print_tool_output(&out, tool_output_lines, color);
+    out
+}
+
+/// Execute a `plan_get` call (#716) — render the current `<plan>` checklist
+/// read-only (no ledger mutation), so a resumed turn can recover "what was I
+/// working on". Empty plan → a hint to start one with `plan_set`.
+pub(crate) fn execute_plan_get(
+    ledger: &dyn StepLedger,
+    color: bool,
+    tool_output_lines: usize,
+) -> String {
+    print_tool_call("plan_get", "", color);
+    let out = plan_block(ledger).unwrap_or_else(|| {
+        "no active plan — call plan_set with {\"steps\":[...]} to start one".to_string()
+    });
     print_tool_output(&out, tool_output_lines, color);
     out
 }
@@ -428,8 +458,33 @@ mod tests {
             plan_advance_tool_definition()["function"]["name"],
             "plan_advance"
         );
+        assert_eq!(plan_get_tool_definition()["function"]["name"], "plan_get");
         assert!(
             plan_set_tool_definition()["function"]["parameters"]["properties"]["steps"].is_object()
         );
+        // #716: plan_get is read-only — no args.
+        assert_eq!(
+            plan_get_tool_definition()["function"]["parameters"]["properties"],
+            serde_json::json!({})
+        );
+    }
+
+    #[test]
+    fn plan_get_renders_plan_or_hints_when_empty() {
+        // #716: empty ledger → a hint to start a plan (no mutation).
+        let l = SessionStepLedger::default();
+        let empty = execute_plan_get(&l, false, 20);
+        assert!(empty.starts_with("no active plan"), "{empty}");
+        assert_eq!(l.count(), 0, "plan_get does not mutate the ledger");
+        // a ledger with steps → the compiled <plan> block, read-only.
+        l.set_plan(&["scope it".to_string(), "build it".to_string()]);
+        let block = execute_plan_get(&l, false, 20);
+        assert!(
+            block.starts_with("<plan>\n") && block.ends_with("</plan>"),
+            "{block}"
+        );
+        assert!(block.contains("→ 1. scope it"), "{block}");
+        assert!(block.contains("☐ 2. build it"), "{block}");
+        assert_eq!(l.count(), 2, "plan_get is read-only");
     }
 }
