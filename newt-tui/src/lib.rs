@@ -4244,6 +4244,7 @@ fn run_chat(
             active_persona: &mut active_persona,
             active_conversation_id: &mut active_conversation_id,
             compress_state: &mut compress_state,
+            scratchpad: &scratchpad_store as &dyn newt_core::ScratchpadStore,
         };
         match &session_start {
             // NEWT_CONVERSATION_ID: an explicit override — errors are hard
@@ -4747,6 +4748,8 @@ fn run_chat(
                                     active_persona: &mut active_persona,
                                     active_conversation_id: &mut active_conversation_id,
                                     compress_state: &mut compress_state,
+                                    scratchpad: &scratchpad_store
+                                        as &dyn newt_core::ScratchpadStore,
                                 };
                                 match handle_conversation_command(&task, &mut conversation_ctx) {
                                     Ok(msg) => print_newt(&msg, color, verbose),
@@ -5522,6 +5525,13 @@ fn run_chat(
                                 // 19.4: this conversation now has extractable
                                 // content — count it for the close-time gate.
                                 turns_this_conversation += 1;
+                                // #713: snapshot the live scratchpad <state> so
+                                // resume can re-hydrate it (working memory, not
+                                // chained). `entries()` is a trait method.
+                                let scratchpad_snapshot = {
+                                    use newt_core::ScratchpadStore;
+                                    scratchpad_store.entries()
+                                };
                                 if let Err(e) = save_turn_if_persistent(
                                     conversation_store.as_ref(),
                                     &active_conversation_id,
@@ -5542,6 +5552,10 @@ fn run_chat(
                                     // its own turn record so restore can rehydrate
                                     // the prev-summary chain.
                                     memory.take_compaction_record(),
+                                    // #713: the live scratchpad <state> snapshot,
+                                    // persisted onto the conversation row so resume
+                                    // re-hydrates it (working memory, not chained).
+                                    &scratchpad_snapshot,
                                 ) {
                                     print_newt(
                                         &format!("warning: conversation save failed: {e}"),
@@ -6593,6 +6607,7 @@ fn save_successful_conversation_turn(
     phantom_reaches: &[newt_core::PhantomReach],
     usage: Option<newt_core::TokenUsage>,
     compaction: Option<String>,
+    scratchpad: &std::collections::BTreeMap<String, String>,
 ) -> anyhow::Result<()> {
     // The id is pre-assigned for the whole session (issue #220), so the first
     // turn creates the record with that id; later turns just append.
@@ -6628,7 +6643,13 @@ fn save_successful_conversation_turn(
         phantom_reaches,
         usage.map(|u| u.input_tokens),
         usage.map(|u| u.output_tokens),
-    )
+    )?;
+    // #713: snapshot the live scratchpad <state> onto the conversation row so a
+    // later interrupt + auto-resume can re-hydrate it. Working memory, not
+    // provenance: it rides the conversation row (NOT a turn) and never enters
+    // the §6 content chain. Saved every turn so the row always carries the most
+    // recent <state>. Runs AFTER append so the row is guaranteed to exist.
+    store.update_scratchpad(conversation_id, scratchpad)
 }
 
 /// The run loop's per-turn save seam (17.7): persistent sessions route to
@@ -6647,6 +6668,7 @@ fn save_turn_if_persistent(
     phantom_reaches: &[newt_core::PhantomReach],
     usage: Option<newt_core::TokenUsage>,
     compaction: Option<String>,
+    scratchpad: &std::collections::BTreeMap<String, String>,
 ) -> anyhow::Result<()> {
     match store {
         Some(store) => save_successful_conversation_turn(
@@ -6659,6 +6681,7 @@ fn save_turn_if_persistent(
             phantom_reaches,
             usage,
             compaction,
+            scratchpad,
         ),
         None => Ok(()),
     }
@@ -6720,6 +6743,10 @@ struct ConversationCommandContext<'a> {
     /// Session compression anti-thrash state — reset on `/conversation
     /// restore`, which is a conversation boundary like `/new` (F4).
     compress_state: &'a mut newt_core::CompressState,
+    /// The live scratchpad `<state>` store (#713). Re-hydrated from
+    /// `record.scratchpad` on restore so a resumed `state_get("current_task")`
+    /// returns the saved value instead of "no such key".
+    scratchpad: &'a dyn newt_core::ScratchpadStore,
 }
 
 fn handle_conversation_command(
@@ -6775,6 +6802,16 @@ fn restore_conversation_into_session(
 ) -> anyhow::Result<(newt_core::ConversationRecord, Option<String>)> {
     let record = ctx.store.load(id)?;
     ctx.memory.restore_turns(&record.turns);
+    // #713: re-hydrate the live scratchpad <state> store from the restored
+    // record, right next to `restore_turns`, so an interrupt + auto-resume gives
+    // the model back its structured working memory — `state_get("current_task")`
+    // survives instead of returning "no such key". A restore is a conversation
+    // boundary, so clear first (the live store may hold a prior conversation's
+    // keys) and then replay the snapshot.
+    ctx.scratchpad.clear();
+    for (key, value) in &record.scratchpad {
+        ctx.scratchpad.set(key, value.clone());
+    }
     let mut warning = None;
     match record.persona.as_deref() {
         Some(name) => match ctx.persona_store.load(name) {
@@ -6856,6 +6893,16 @@ fn auto_resume_banner(
         record.turns.len(),
         claim_timestamp(record.updated_at_unix_nanos),
     );
+    // #713: tell the model its scratchpad <state> came back, so it reads its
+    // task instead of blind-probing `state_get("current_task")` on a store it
+    // assumes is empty. Silent when nothing was restored (the OFF/empty case).
+    let restored_keys = record.scratchpad.len();
+    if restored_keys > 0 {
+        banner.push_str(&format!(
+            " — restored {restored_keys} <state> key{}",
+            if restored_keys == 1 { "" } else { "s" }
+        ));
+    }
     if let Some(warning) = warning {
         banner.push_str(&format!("\nwarning: {warning}"));
     }
@@ -11871,6 +11918,7 @@ mod skills_integration_tests {
                 output_tokens: 45,
             }),
             None,
+            &std::collections::BTreeMap::new(),
         )
         .unwrap();
         // Second turn: a recorded tool event, no usage (backend silent).
@@ -11890,6 +11938,7 @@ mod skills_integration_tests {
             &[],
             None,
             None,
+            &std::collections::BTreeMap::new(),
         )
         .unwrap();
 
@@ -11905,6 +11954,57 @@ mod skills_integration_tests {
         assert!(record.turns[0].events.is_empty());
         assert_eq!(record.turns[1].tokens_in, None, "no report → NULL, never 0");
         assert_eq!(record.turns[1].events, events);
+    }
+
+    /// #713: the per-turn save path threads the live scratchpad `<state>`
+    /// snapshot onto the conversation row, so `store.load()` reads it back —
+    /// the durable half of the resume fix (the restore half re-hydrates it).
+    #[test]
+    fn save_path_persists_scratchpad_snapshot() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let workspace = tempfile::TempDir::new().unwrap();
+        let store = newt_core::ConversationStore::new(tmp.path(), workspace.path(), 100).unwrap();
+        let active_id = newt_core::new_conversation_id();
+
+        let mut state = std::collections::BTreeMap::new();
+        state.insert("current_task".to_string(), "fix the parser".to_string());
+        save_successful_conversation_turn(
+            &store,
+            &active_id,
+            None,
+            "do the task",
+            "did it",
+            &[],
+            &[],
+            None,
+            None,
+            &state,
+        )
+        .unwrap();
+
+        let record = store.load(&active_id).unwrap();
+        assert_eq!(
+            record.scratchpad, state,
+            "the live <state> snapshot must persist onto the conversation row"
+        );
+        // An empty snapshot on a later turn overwrites cleanly (latest wins).
+        save_successful_conversation_turn(
+            &store,
+            &active_id,
+            None,
+            "clear it",
+            "cleared",
+            &[],
+            &[],
+            None,
+            None,
+            &std::collections::BTreeMap::new(),
+        )
+        .unwrap();
+        assert!(
+            store.load(&active_id).unwrap().scratchpad.is_empty(),
+            "a later empty snapshot overwrites the saved <state>"
+        );
     }
 
     #[serial_test::serial(real_fs)]
@@ -11936,6 +12036,7 @@ mod skills_integration_tests {
         // restoring is a conversation boundary exactly like /new.
         let mut compress_state = newt_core::CompressState::new();
         compress_state.latch_disabled_for_tests();
+        let scratchpad_store = newt_core::SessionScratchpadStore::default();
         let mut conversation_ctx = ConversationCommandContext {
             store: &store,
             persona_store: &persona_store,
@@ -11945,6 +12046,7 @@ mod skills_integration_tests {
             active_persona: &mut active_persona,
             active_conversation_id: &mut active_conversation_id,
             compress_state: &mut compress_state,
+            scratchpad: &scratchpad_store,
         };
 
         let message = handle_conversation_command(
@@ -12060,6 +12162,7 @@ mod skills_integration_tests {
         let mut active_persona = None;
         let mut active_conversation_id = newt_core::new_conversation_id();
         let mut compress_state = newt_core::CompressState::new();
+        let scratchpad_store = newt_core::SessionScratchpadStore::default();
         let mut ctx = ConversationCommandContext {
             store: &store,
             persona_store: &persona_store,
@@ -12069,6 +12172,7 @@ mod skills_integration_tests {
             active_persona: &mut active_persona,
             active_conversation_id: &mut active_conversation_id,
             compress_state: &mut compress_state,
+            scratchpad: &scratchpad_store,
         };
 
         let banner = auto_resume_latest(&mut ctx).unwrap().expect("a banner");
@@ -12101,6 +12205,7 @@ mod skills_integration_tests {
         let mut active_conversation_id = newt_core::new_conversation_id();
         let fresh_id = active_conversation_id.clone();
         let mut compress_state = newt_core::CompressState::new();
+        let scratchpad_store = newt_core::SessionScratchpadStore::default();
         let mut ctx = ConversationCommandContext {
             store: &store,
             persona_store: &persona_store,
@@ -12110,6 +12215,7 @@ mod skills_integration_tests {
             active_persona: &mut active_persona,
             active_conversation_id: &mut active_conversation_id,
             compress_state: &mut compress_state,
+            scratchpad: &scratchpad_store,
         };
 
         assert_eq!(auto_resume_latest(&mut ctx).unwrap(), None);
@@ -12136,6 +12242,7 @@ mod skills_integration_tests {
         let mut active_persona = None;
         let mut active_conversation_id = newt_core::new_conversation_id();
         let mut compress_state = newt_core::CompressState::new();
+        let scratchpad_store = newt_core::SessionScratchpadStore::default();
         let mut ctx = ConversationCommandContext {
             store: &store,
             persona_store: &persona_store,
@@ -12145,6 +12252,7 @@ mod skills_integration_tests {
             active_persona: &mut active_persona,
             active_conversation_id: &mut active_conversation_id,
             compress_state: &mut compress_state,
+            scratchpad: &scratchpad_store,
         };
 
         let banner = resume_exact_conversation(&mut ctx, &target).unwrap();
@@ -12154,6 +12262,67 @@ mod skills_integration_tests {
         let messages = memory.build_messages(&system, "next");
         assert!(messages.iter().any(|m| m.content == "target task"));
         assert!(!messages.iter().any(|m| m.content == "other task"));
+    }
+
+    /// #713: resume re-hydrates the scratchpad `<state>` into the LIVE store, so
+    /// `state_get("current_task")` resolves on the first probe after an
+    /// interrupt instead of the round-0 black-hole "no such key". Restore is a
+    /// conversation boundary, so a stale live key from a prior conversation is
+    /// cleared and replaced by the resumed snapshot — never merged.
+    #[tokio::test]
+    async fn resume_rehydrates_scratchpad_state_into_live_store() {
+        use newt_core::ScratchpadStore;
+        let (_state, workspace, store, persona_store) = resume_fixture();
+        let id = store.create("Resume with state", None).unwrap();
+        store.append_turn(&id, "set up state", "done").unwrap();
+        // The model kept its task in <state>; persist that snapshot.
+        let mut saved = std::collections::BTreeMap::new();
+        saved.insert("current_task".to_string(), "fix the parser".to_string());
+        saved.insert("open_file".to_string(), "src/parser.rs:128".to_string());
+        store.update_scratchpad(&id, &saved).unwrap();
+
+        let mut memory = newt_core::MemoryManager::new();
+        memory.add_provider(newt_core::RollingWindow::new(5));
+        let workspace_str = workspace.path().to_str().unwrap().to_string();
+        let mut system = rebuild_system_prompt(&workspace_str, &memory, None, "fresh-session");
+        let mut active_persona = None;
+        let mut active_conversation_id = newt_core::new_conversation_id();
+        let mut compress_state = newt_core::CompressState::new();
+        let scratchpad_store = newt_core::SessionScratchpadStore::default();
+        // A stale key from a "prior conversation" the boundary must drop.
+        scratchpad_store.set("stale", "from before".to_string());
+        let mut ctx = ConversationCommandContext {
+            store: &store,
+            persona_store: &persona_store,
+            workspace: &workspace_str,
+            memory: &mut memory,
+            system: &mut system,
+            active_persona: &mut active_persona,
+            active_conversation_id: &mut active_conversation_id,
+            compress_state: &mut compress_state,
+            scratchpad: &scratchpad_store,
+        };
+
+        let banner = resume_exact_conversation(&mut ctx, &id).unwrap();
+
+        // The exact round-0 probe now resolves from the live store.
+        assert_eq!(
+            scratchpad_store.get("current_task").as_deref(),
+            Some("fix the parser"),
+            "resumed <state> must land in the live store"
+        );
+        assert_eq!(
+            scratchpad_store.get("open_file").as_deref(),
+            Some("src/parser.rs:128")
+        );
+        // Boundary semantics: the stale key is gone, the snapshot is the whole map.
+        assert_eq!(scratchpad_store.get("stale"), None, "restore clears first");
+        assert_eq!(scratchpad_store.keys_count(), 2);
+        // The banner tells the model its <state> came back so it does not blind-probe.
+        assert!(
+            banner.contains("— restored 2 <state> keys"),
+            "got: {banner}"
+        );
     }
 
     #[serial_test::serial(real_fs)]
@@ -12177,6 +12346,7 @@ mod skills_integration_tests {
         let mut active_persona = None;
         let mut active_conversation_id = newt_core::new_conversation_id();
         let mut compress_state = newt_core::CompressState::new();
+        let scratchpad_store = newt_core::SessionScratchpadStore::default();
         let mut ctx = ConversationCommandContext {
             store: &store,
             persona_store: &persona_store,
@@ -12186,6 +12356,7 @@ mod skills_integration_tests {
             active_persona: &mut active_persona,
             active_conversation_id: &mut active_conversation_id,
             compress_state: &mut compress_state,
+            scratchpad: &scratchpad_store,
         };
 
         for id in [newt_core::new_conversation_id(), foreign_id] {
@@ -12204,13 +12375,14 @@ mod skills_integration_tests {
 
     #[test]
     fn auto_resume_banner_renders_claims_and_fresh_hint() {
-        let record = newt_core::ConversationRecord {
+        let mut record = newt_core::ConversationRecord {
             id: "1781136000000000000-abcd".into(),
             title: "Fix the parser".into(),
             workspace: "/ws".into(),
             workspace_id: "key".into(),
             persona: None,
             turns: Vec::new(),
+            scratchpad: std::collections::BTreeMap::new(),
             created_at_unix_nanos: 0,
             // 2026-06-11 00:00:00 UTC in nanos — must render ~-prefixed (§6:
             // a display claim, never the ordering key).
@@ -12222,9 +12394,41 @@ mod skills_integration_tests {
             "resumed conversation 178113600000  Fix the parser  \
              (0 turns, last active ~2026-06-11 00:00 UTC) — /new starts fresh"
         );
+        // An empty scratchpad adds no note (the OFF/empty case stays silent).
+        assert!(
+            !banner.contains("<state>"),
+            "empty scratchpad must not mention <state>: {banner}"
+        );
         // A persona warning rides the banner rather than vanishing.
         let with_warning = auto_resume_banner(&record, "Fix the parser", Some("persona gone"));
         assert!(with_warning.ends_with("\nwarning: persona gone"));
+
+        // #713: a restored scratchpad announces its key count so the model reads
+        // its task instead of blind-probing `state_get("current_task")`.
+        record
+            .scratchpad
+            .insert("current_task".into(), "fix the parser".into());
+        let one = auto_resume_banner(&record, "Fix the parser", None);
+        assert!(
+            one.contains("— restored 1 <state> key") && !one.contains("<state> keys"),
+            "singular key note: {one}"
+        );
+        record
+            .scratchpad
+            .insert("open_file".into(), "src/parser.rs".into());
+        let two = auto_resume_banner(&record, "Fix the parser", None);
+        assert!(
+            two.contains("— restored 2 <state> keys"),
+            "plural key note: {two}"
+        );
+        // The restored-keys note rides BEFORE any persona warning on its own line.
+        let restored_with_warning =
+            auto_resume_banner(&record, "Fix the parser", Some("persona gone"));
+        assert!(
+            restored_with_warning.contains("— restored 2 <state> keys")
+                && restored_with_warning.ends_with("\nwarning: persona gone"),
+            "got: {restored_with_warning}"
+        );
     }
 
     #[test]
@@ -12242,6 +12446,7 @@ mod skills_integration_tests {
             &[],
             None,
             None,
+            &std::collections::BTreeMap::new(),
         )
         .unwrap();
         assert!(
@@ -12260,6 +12465,7 @@ mod skills_integration_tests {
             &[],
             None,
             None,
+            &std::collections::BTreeMap::new(),
         )
         .unwrap();
         assert_eq!(store.list().unwrap().len(), 1);
@@ -12320,6 +12526,7 @@ mod skills_integration_tests {
                     output_tokens: 9,
                 }),
                 memory.take_compaction_record(),
+                &std::collections::BTreeMap::new(),
             )
             .unwrap();
         }
@@ -12340,6 +12547,7 @@ mod skills_integration_tests {
                 output_tokens: 9,
             }),
             record,
+            &std::collections::BTreeMap::new(),
         )
         .unwrap();
 
@@ -12353,6 +12561,7 @@ mod skills_integration_tests {
         let mut active_persona = None;
         let mut active_conversation_id = newt_core::new_conversation_id();
         let mut compress_state = newt_core::CompressState::new();
+        let scratchpad_store = newt_core::SessionScratchpadStore::default();
         let mut ctx = ConversationCommandContext {
             store: &store,
             persona_store: &persona_store,
@@ -12362,6 +12571,7 @@ mod skills_integration_tests {
             active_persona: &mut active_persona,
             active_conversation_id: &mut active_conversation_id,
             compress_state: &mut compress_state,
+            scratchpad: &scratchpad_store,
         };
         handle_conversation_command(&format!("/conversation restore {id}"), &mut ctx).unwrap();
 

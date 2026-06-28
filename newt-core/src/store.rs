@@ -524,28 +524,41 @@ impl ConversationStore {
     pub fn load(&self, id: &str) -> anyhow::Result<ConversationRecord> {
         let id = self.resolve_id(id)?;
         let conn = self.lock_conn();
-        let mut record = conn
+        let (mut record, scratchpad_json) = conn
             .query_row(
                 "SELECT id, title, workspace_path, workspace_key, persona,
-                        started_at_claim, updated_at_claim
+                        started_at_claim, updated_at_claim, scratchpad
                    FROM conversations
                   WHERE id = ?1 AND workspace_key = ?2",
                 rusqlite::params![id, self.workspace_id],
                 |row| {
-                    Ok(ConversationRecord {
-                        id: row.get(0)?,
-                        title: row.get(1)?,
-                        workspace: row.get(2)?,
-                        workspace_id: row.get(3)?,
-                        persona: row.get(4)?,
-                        turns: Vec::new(),
-                        created_at_unix_nanos: claim_to_u128(row.get(5)?),
-                        updated_at_unix_nanos: claim_to_u128(row.get(6)?),
-                    })
+                    Ok((
+                        ConversationRecord {
+                            id: row.get(0)?,
+                            title: row.get(1)?,
+                            workspace: row.get(2)?,
+                            workspace_id: row.get(3)?,
+                            persona: row.get(4)?,
+                            turns: Vec::new(),
+                            scratchpad: std::collections::BTreeMap::new(),
+                            created_at_unix_nanos: claim_to_u128(row.get(5)?),
+                            updated_at_unix_nanos: claim_to_u128(row.get(6)?),
+                        },
+                        row.get::<_, String>(7)?,
+                    ))
                 },
             )
             .optional()?
             .ok_or_else(|| anyhow::anyhow!("conversation `{id}` not found"))?;
+        // #713: the scratchpad <state> snapshot. Strict decode — never hand back
+        // garbage (same discipline as the turn `events`/`phantom_reaches`
+        // columns). A pre-#713 row carries the `{}` backfill and parses empty.
+        record.scratchpad = serde_json::from_str(&scratchpad_json).map_err(|e| {
+            anyhow::anyhow!(
+                "conversation `{id}`: scratchpad column is not valid <state> JSON \
+                 ({e}); refusing to load garbage"
+            )
+        })?;
 
         // §6: turn order is the causal tick, never ts_claim.
         let mut stmt = conn.prepare(
@@ -756,6 +769,32 @@ impl ConversationStore {
         conn.execute(
             "UPDATE conversations SET title = ?2, updated_at_claim = ?3 WHERE id = ?1",
             rusqlite::params![id, title.trim(), now],
+        )?;
+        Ok(())
+    }
+
+    /// Persist a conversation's scratchpad `<state>` snapshot (#713). The map
+    /// is serialized to JSON and written to the conversation row's `scratchpad`
+    /// column so an interrupt + auto-resume can re-hydrate the live store.
+    ///
+    /// Like [`rename`](Self::rename) / [`end_conversation`](Self::end_conversation)
+    /// this is metadata, not activity: it does **not** tick the §6 clock, so it
+    /// cannot perturb MRU ordering, and the scratchpad is NOT part of the §6
+    /// content chain (it rides the conversation row, never a turn's canonical
+    /// encoding) — working memory, not provenance. Workspace-fenced and
+    /// idempotent: an id from another workspace resolves as absent and the
+    /// UPDATE matches nothing.
+    pub fn update_scratchpad(
+        &self,
+        id: &str,
+        scratchpad: &std::collections::BTreeMap<String, String>,
+    ) -> anyhow::Result<()> {
+        let id = self.resolve_id(id)?;
+        let json = serde_json::to_string(scratchpad)?;
+        let conn = self.lock_conn();
+        conn.execute(
+            "UPDATE conversations SET scratchpad = ?2 WHERE id = ?1 AND workspace_key = ?3",
+            rusqlite::params![id, json, self.workspace_id],
         )?;
         Ok(())
     }
@@ -1290,7 +1329,8 @@ fn create_schema(conn: &Connection) -> anyhow::Result<()> {
              activity_tick      INTEGER NOT NULL,         -- §6 ordering key, half 2 (per-writer Lamport tick)
              tip_hash           TEXT NOT NULL,            -- §6 chain tip (BLAKE3)
              started_at_claim   INTEGER NOT NULL,         -- DISPLAY ONLY (wall-clock claim, unix nanos)
-             updated_at_claim   INTEGER NOT NULL          -- DISPLAY ONLY
+             updated_at_claim   INTEGER NOT NULL,         -- DISPLAY ONLY
+             scratchpad         TEXT NOT NULL DEFAULT '{}' -- JSON scratchpad <state> snapshot (#713); working memory, NOT hashed (§6 chain unchanged)
          );
          CREATE TABLE IF NOT EXISTS turns (
              conversation_id    TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
@@ -1336,6 +1376,11 @@ const EXPECTED_COLUMNS: &[(&str, &[(&str, &str)])] = &[
             ("tip_hash", "TEXT NOT NULL DEFAULT ''"),
             ("started_at_claim", "INTEGER NOT NULL DEFAULT 0"),
             ("updated_at_claim", "INTEGER NOT NULL DEFAULT 0"),
+            // #713: scratchpad <state> snapshot. Additive — an older db gains it
+            // on open with the historically-true empty backfill (`{}`). It rides
+            // the conversation row, NOT a turn, so it is NEVER part of the §6
+            // canonical encoding: working memory, not provenance.
+            ("scratchpad", "TEXT NOT NULL DEFAULT '{}'"),
         ],
     ),
     (

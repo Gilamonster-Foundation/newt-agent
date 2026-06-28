@@ -748,6 +748,7 @@ fn legacy_record(
             .iter()
             .map(|(u, a)| ConversationTurn::new(*u, *a))
             .collect(),
+        scratchpad: std::collections::BTreeMap::new(),
         created_at_unix_nanos: created,
         updated_at_unix_nanos: updated,
     }
@@ -1958,6 +1959,64 @@ fn phantom_reaches_round_trip_and_chain_still_verifies() {
     );
     // The new column rides outside the §6 canonical encoding, so the chain
     // — populated with a non-empty phantom payload — still verifies.
+    store.verify_chain(&id).unwrap();
+}
+
+/// #713: the conversation scratchpad `<state>` snapshot persists into its own
+/// `scratchpad` column and reloads verbatim, so an interrupt + auto-resume can
+/// re-hydrate the live store. Also proves the §6 content chain still verifies,
+/// i.e. the column is additive and NOT folded into the canonical encoding
+/// (working memory, not provenance) — existing chains remain valid
+/// byte-for-byte.
+#[test]
+fn scratchpad_round_trips_and_chain_still_verifies() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let store = ConversationStore::new(root.path(), workspace.path(), 100).unwrap();
+
+    let id = store.create("scratchpad", None).unwrap();
+    // A turn establishes the §6 chain we will re-verify after the scratchpad
+    // write — proving the scratchpad rides outside the chain.
+    store
+        .append_turn(&id, "what were we doing?", "fixing the parser")
+        .unwrap();
+    let tip_before = store.load(&id).unwrap();
+    assert!(
+        tip_before.scratchpad.is_empty(),
+        "a fresh row carries the empty `{{}}` backfill"
+    );
+
+    let mut state = std::collections::BTreeMap::new();
+    state.insert("current_task".to_string(), "fix the parser".to_string());
+    state.insert("open_file".to_string(), "src/parser.rs:128".to_string());
+    store.update_scratchpad(&id, &state).unwrap();
+
+    let record = store.load(&id).unwrap();
+    assert_eq!(
+        record.scratchpad, state,
+        "scratchpad <state> must round-trip verbatim through save + load"
+    );
+    // The exact round-0 black-hole probe now resolves from the restored snapshot.
+    assert_eq!(
+        record.scratchpad.get("current_task").map(String::as_str),
+        Some("fix the parser"),
+        "the resumed `state_get(\"current_task\")` survives"
+    );
+    // The scratchpad rides the conversation row, outside the §6 canonical
+    // encoding, so the chain — written before AND independent of the scratchpad
+    // — still verifies byte-for-byte.
+    store.verify_chain(&id).unwrap();
+
+    // An overwrite (the live store mutating across turns) replaces, not merges.
+    let mut state2 = std::collections::BTreeMap::new();
+    state2.insert("current_task".to_string(), "ship the fix".to_string());
+    store.update_scratchpad(&id, &state2).unwrap();
+    let reloaded = store.load(&id).unwrap();
+    assert_eq!(reloaded.scratchpad, state2, "latest snapshot wins");
+    assert!(
+        !reloaded.scratchpad.contains_key("open_file"),
+        "a fresh snapshot is the whole map, not a merge"
+    );
     store.verify_chain(&id).unwrap();
 }
 
