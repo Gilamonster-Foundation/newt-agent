@@ -11,6 +11,26 @@ Long-term it's also the **drake-swarm training ground** — every PR
 review here will be done by an arbiter LLM voting against a real CI
 gate. The gates must be honest. Do not game them.
 
+## Architectural style — the three Cs
+
+Knowledge belongs in **data**, not logic. Prefer **Composition,
+Configuration, and Convention** over hardcoded lists and constants:
+language- or domain-specific knowledge — keyword lists, magic constants,
+recognition rules — should be pure data that is *composed*, *configured*
+(droppable / overridable), and *convention-driven*, so a new language or
+domain is **config, not code**. The canonical example is the
+**language-pack** model (`newt-core/src/api_surface.rs`: pure-data
+`LanguagePack`, merge-by-name, droppable `.toml`) and its sibling lexicon
+for prompt/domain phrase lists.
+
+**But: working code over all.** Functional results come first. It is
+fine — expected — to compromise to a hardcoded / simple implementation to
+*get a feature working*. Then **return to the three Cs**: refactor the
+hardcoded values into pure-data config, composition seams, and conventions
+once it works. Do not let the three Cs block shipping a working result; do
+circle back and de-hardcode. When you spot a hardcoded list that encodes
+language or domain knowledge, flag it as a three-Cs refactor candidate.
+
 ## Where the rules live
 
 - **Acceptance contract for every PR:** `docs/ROADMAP.md` (top
