@@ -98,7 +98,10 @@ impl Dispatcher for LocalDispatcher {
 /// `NEWT_ROLE_TIMEOUT_SECS` (default 600s). The streaming inference client has no
 /// whole-request timeout (so it never bounds an idle stream), so without this a
 /// hung/stalled generation hangs the whole crew until an outer timeout SIGKILLs it.
-fn role_dispatch_timeout() -> std::time::Duration {
+///
+/// `pub(crate)` so [`run_crew`](crate::run_crew) can use it as the fallback when
+/// the crew config sets no explicit `role_timeout` (#698).
+pub(crate) fn role_dispatch_timeout() -> std::time::Duration {
     let secs = std::env::var("NEWT_ROLE_TIMEOUT_SECS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())

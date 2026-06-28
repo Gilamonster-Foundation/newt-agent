@@ -185,6 +185,7 @@ fn edit_fields(console: &mut dyn Console, cur: &Crew) -> io::Result<Crew> {
         loop_program,
         test,
         budgets,
+        role_timeout_secs: None,
     })
 }
 
@@ -379,6 +380,7 @@ mod tests {
             navigator: Some("navigator".into()),
             triage: Some("triage".into()),
             loop_program: Some("patch-revise".into()),
+            role_timeout_secs: None,
             test: Some("just check".into()),
             budgets: Some(CrewBudgets {
                 max_attempts: Some(3),

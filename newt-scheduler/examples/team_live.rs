@@ -89,6 +89,7 @@ async fn main() {
             planner_model: planner.clone(),
             triage_model: small.clone(),
             max_attempts: 2,
+            role_timeout: None,
         },
         max_subtasks: 2,
     };
