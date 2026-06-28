@@ -11,6 +11,7 @@ use super::note_sink::{execute_save_note, save_note_tool_definition, NoteSink};
 use super::permissions::{DenialKind, PermissionDecision, PermissionGate, PermissionRequest};
 use super::recall::{execute_recall, recall_tool_definition, RecallSource};
 use crate::caveats::CaveatsExt as _;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// #719: default line window for `read_file`'s **model-facing** payload. The
 /// on-screen display is capped separately; this bounds what enters the model's
@@ -18,23 +19,91 @@ use crate::caveats::CaveatsExt as _;
 /// longer saturate a small local model's window and abandon the task.
 const DEFAULT_READ_LIMIT: usize = 2_000;
 
-/// #719: hard char backstop on the `read_file` payload, independent of the line
-/// window — catches pathological long-line files (minified blobs) that a few
-/// lines can still blow up.
-const MAX_READ_CHARS: usize = 100_000;
+/// #726: default token budget for any tool's **model-facing** payload, mirroring
+/// Codex's `exec_command.max_output_tokens` (default 10k). One shared budget
+/// caps BOTH `read_file` (via [`paginate_read`]'s char backstop) and
+/// `run_command` (via [`cap_model_output`] around the shell envelope), so a
+/// verbose command can no longer flood the window — the same failure mode #719
+/// closed for `read_file`. Overridable by `[tools] max_output_tokens` in config;
+/// see [`set_max_output_tokens`].
+const DEFAULT_MAX_OUTPUT_TOKENS: usize = 10_000;
 
-/// Window + cap a file's contents for `read_file`'s model-facing payload (#719).
-/// Returns lines `[offset, offset+limit)` (1-based `offset`, default 1; `limit`
-/// default [`DEFAULT_READ_LIMIT`]), truncated to [`MAX_READ_CHARS`], with a
-/// footer pointing at the next window so the model paginates instead of drowning.
-/// A whole-file read that fits both caps is returned verbatim (exact bytes).
-/// Pure (no fs) — unit-tested directly.
-fn paginate_read(contents: &str, offset: Option<usize>, limit: Option<usize>) -> String {
+/// Process-wide model-facing output budget, in tokens. Defaults to
+/// [`DEFAULT_MAX_OUTPUT_TOKENS`]; the resolved `[tools] max_output_tokens`
+/// config value is pushed here once at the config-resolution entry
+/// (`Config::resolve`) so the tool loop never re-reads config from disk. This is
+/// the v1 (three-Cs "working code first") seam: a const default with the config
+/// override wired at the entry, rather than threading a new `usize` through
+/// `ChatCtx` + `execute_tool` + every call site (≈60, mostly tests). Follow-up:
+/// thread it per-session like `tool_output_lines` once warranted.
+static MAX_OUTPUT_TOKENS: AtomicUsize = AtomicUsize::new(DEFAULT_MAX_OUTPUT_TOKENS);
+
+/// Set the process-wide model-facing output budget (tokens). Called once from
+/// `Config::resolve` with the resolved `[tools] max_output_tokens`. `0` means
+/// "no cap" — see [`cap_model_output`] / [`paginate_read`].
+pub fn set_max_output_tokens(max_tokens: usize) {
+    MAX_OUTPUT_TOKENS.store(max_tokens, Ordering::Relaxed);
+}
+
+/// The active model-facing output budget (tokens). [`DEFAULT_MAX_OUTPUT_TOKENS`]
+/// until [`set_max_output_tokens`] overrides it.
+fn max_output_tokens() -> usize {
+    MAX_OUTPUT_TOKENS.load(Ordering::Relaxed)
+}
+
+/// #726: cap a tool's **model-facing** output to `max_tokens`' worth of chars,
+/// estimated with the default chars/token heuristic
+/// ([`crate::tokens::TokenEstimation`], 4 chars/token — the same constant the
+/// context estimator uses). When the text's estimated tokens exceed the budget
+/// it is truncated at a char boundary and a marker is appended pointing the
+/// model at a narrower command / a paginated read. A small output (or
+/// `max_tokens == 0`, meaning no cap) passes through verbatim. Pure (no fs / no
+/// global) — unit-tested directly.
+fn cap_model_output(text: &str, max_tokens: usize) -> String {
+    if max_tokens == 0 {
+        return text.to_string();
+    }
+    let est = crate::tokens::TokenEstimation::default();
+    if est.tokens_for_chars(text.len()) <= max_tokens {
+        return text.to_string();
+    }
+    let max_chars = est.chars_for_tokens(max_tokens);
+    let mut cut = max_chars.min(text.len());
+    while cut > 0 && !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!(
+        "{}\n\n[output truncated to ~{max_tokens} tokens — narrow the command \
+         / use read_file with offset+limit]",
+        &text[..cut]
+    )
+}
+
+/// Window + cap a file's contents for `read_file`'s model-facing payload (#719,
+/// #726). Returns lines `[offset, offset+limit)` (1-based `offset`, default 1;
+/// `limit` default [`DEFAULT_READ_LIMIT`]), with the char backstop derived from
+/// the shared token budget (`max_output_tokens` × chars/token — #726, replacing
+/// #719's hardcoded 100k so both tools share one budget). A footer points at the
+/// next window so the model paginates instead of drowning. A whole-file read
+/// that fits both caps is returned verbatim (exact bytes). `max_output_tokens ==
+/// 0` disables the char backstop (only the line window applies). Pure (no fs) —
+/// unit-tested directly.
+fn paginate_read(
+    contents: &str,
+    offset: Option<usize>,
+    limit: Option<usize>,
+    max_output_tokens: usize,
+) -> String {
+    let max_chars = if max_output_tokens == 0 {
+        usize::MAX
+    } else {
+        crate::tokens::TokenEstimation::default().chars_for_tokens(max_output_tokens)
+    };
     let total = contents.lines().count();
     let start = offset.filter(|&o| o > 0).unwrap_or(1); // 1-based
     let limit = limit.filter(|&l| l > 0).unwrap_or(DEFAULT_READ_LIMIT);
     // Common case: a whole-file read that fits both caps → return verbatim.
-    if start == 1 && limit >= total && contents.len() <= MAX_READ_CHARS {
+    if start == 1 && limit >= total && contents.len() <= max_chars {
         return contents.to_string();
     }
     let start0 = start - 1;
@@ -44,9 +113,9 @@ fn paginate_read(contents: &str, offset: Option<usize>, limit: Option<usize>) ->
     let window: Vec<&str> = contents.lines().skip(start0).take(limit).collect();
     let end = start0 + window.len(); // 1-based last line shown == end
     let mut body = window.join("\n");
-    let char_capped = body.len() > MAX_READ_CHARS;
+    let char_capped = body.len() > max_chars;
     if char_capped {
-        let mut cut = MAX_READ_CHARS;
+        let mut cut = max_chars;
         while cut > 0 && !body.is_char_boundary(cut) {
             cut -= 1;
         }
@@ -54,8 +123,8 @@ fn paginate_read(contents: &str, offset: Option<usize>, limit: Option<usize>) ->
     }
     let footer = if char_capped {
         Some(format!(
-            "payload truncated to {MAX_READ_CHARS} chars from line {start}; \
-             call read_file with a higher offset (and/or smaller limit) to continue"
+            "payload truncated to {max_chars} chars (~{max_output_tokens} tokens) from line \
+             {start}; call read_file with a higher offset (and/or smaller limit) to continue"
         ))
     } else if end < total {
         Some(format!(
@@ -925,6 +994,7 @@ fn shell_envelope_output(
         .and_then(serde_json::Value::as_str)
         .unwrap_or("");
     let out = format!("{stdout}{stderr}");
+    // DISPLAY path: on-screen tool output is capped by LINES (unchanged).
     print_tool_output(&out, tool_output_lines, color);
     if out.trim().is_empty() {
         let code = envelope
@@ -933,7 +1003,10 @@ fn shell_envelope_output(
             .unwrap_or(-1);
         format!("(exit {code})")
     } else {
-        out
+        // #726: the MODEL-facing payload is capped by the shared TOKEN budget so
+        // a verbose command can't flood the context window (the #719 failure
+        // mode, previously uncapped for run_command). Small output is unchanged.
+        cap_model_output(&out, max_output_tokens())
     }
 }
 
@@ -1540,7 +1613,9 @@ pub async fn execute_tool(
                     // can't saturate the context window and abandon the task.
                     let offset = args["offset"].as_u64().map(|n| n as usize);
                     let limit = args["limit"].as_u64().map(|n| n as usize);
-                    let out = paginate_read(&contents, offset, limit);
+                    // #726: char backstop now derives from the shared token
+                    // budget so read_file and run_command share one cap.
+                    let out = paginate_read(&contents, offset, limit, max_output_tokens());
                     print_tool_output(&out, tool_output_lines, color);
                     out
                 }
@@ -2065,7 +2140,7 @@ mod tests {
             .map(|n| format!("line {n}"))
             .collect::<Vec<_>>()
             .join("\n");
-        let out = paginate_read(&body, None, None);
+        let out = paginate_read(&body, None, None, DEFAULT_MAX_OUTPUT_TOKENS);
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines[0], "line 1");
         assert_eq!(lines[1999], "line 2000");
@@ -2087,7 +2162,7 @@ mod tests {
             .map(|n| format!("L{n}"))
             .collect::<Vec<_>>()
             .join("\n");
-        let out = paginate_read(&body, Some(10), Some(5));
+        let out = paginate_read(&body, Some(10), Some(5), DEFAULT_MAX_OUTPUT_TOKENS);
         assert!(out.starts_with("L10\nL11\nL12\nL13\nL14"), "{out:?}");
         assert!(out.contains("offset=15"), "continues at line 15: {out:?}");
     }
@@ -2095,26 +2170,111 @@ mod tests {
     #[test]
     fn paginate_read_small_file_is_returned_verbatim_without_a_footer() {
         // Whole-file read that fits both caps → exact bytes, no footer.
-        assert_eq!(paginate_read("a\nb\nc\n", None, None), "a\nb\nc\n");
+        assert_eq!(
+            paginate_read("a\nb\nc\n", None, None, DEFAULT_MAX_OUTPUT_TOKENS),
+            "a\nb\nc\n"
+        );
     }
 
     #[test]
-    fn paginate_read_char_caps_a_pathological_long_line() {
-        // One enormous line: the line window can't help; the char backstop must.
-        let body = "x".repeat(MAX_READ_CHARS + 10_000);
-        let out = paginate_read(&body, None, None);
+    fn paginate_read_char_backstop_tracks_the_token_budget() {
+        // #726: the char backstop is now token-derived (budget × chars/token),
+        // NOT a hardcoded 100k. One enormous line: the line window can't help;
+        // the token-derived char backstop must. With a 1000-token budget the
+        // backstop is ~4000 chars, so a 50k-char line is truncated near there.
+        let budget = 1_000;
+        let max_chars = crate::tokens::TokenEstimation::default().chars_for_tokens(budget);
+        let body = "x".repeat(50_000);
+        let out = paginate_read(&body, None, None, budget);
         assert!(
-            out.len() < MAX_READ_CHARS + 300,
-            "char-capped: {} bytes",
+            out.len() < max_chars + 300,
+            "char-capped to the token budget (~{max_chars} chars): {} bytes",
             out.len()
         );
         assert!(out.contains("truncated"), "marks the truncation");
+        assert!(
+            out.contains("~1000 tokens"),
+            "footer names the token budget: {out:?}"
+        );
+
+        // A LARGER budget keeps more of the same line — the backstop tracks the
+        // budget rather than a fixed constant.
+        let wide = paginate_read(&body, None, None, 4_000);
+        assert!(
+            wide.len() > out.len(),
+            "a wider token budget keeps more chars: {} vs {}",
+            wide.len(),
+            out.len()
+        );
+    }
+
+    #[test]
+    fn paginate_read_zero_budget_disables_the_char_backstop() {
+        // #726: max_output_tokens == 0 means "no cap" — only the line window
+        // applies, so a single huge line comes back verbatim.
+        let body = "y".repeat(500_000);
+        let out = paginate_read(&body, None, None, 0);
+        assert_eq!(out, body, "zero budget = no char backstop");
     }
 
     #[test]
     fn paginate_read_offset_past_end_is_a_clear_message() {
-        let out = paginate_read("a\nb", Some(99), None);
+        let out = paginate_read("a\nb", Some(99), None, DEFAULT_MAX_OUTPUT_TOKENS);
         assert!(out.contains("past end"), "{out:?}");
+    }
+
+    // ---- #726: shared token-based model-facing output cap ----
+
+    #[test]
+    fn cap_model_output_passes_small_output_through_unchanged() {
+        // Well under budget → exact bytes, no marker.
+        let small = "hello\nworld\n";
+        assert_eq!(cap_model_output(small, DEFAULT_MAX_OUTPUT_TOKENS), small);
+    }
+
+    #[test]
+    fn cap_model_output_truncates_over_budget_with_a_marker() {
+        // ~25k tokens of 'a' against a 1000-token budget → truncated near
+        // budget × chars/token, at a char boundary, with the marker appended.
+        let est = crate::tokens::TokenEstimation::default();
+        let budget = 1_000;
+        let max_chars = est.chars_for_tokens(budget);
+        let big = "a".repeat(100_000);
+        let out = cap_model_output(&big, budget);
+        assert!(out.len() < big.len(), "must shrink: {} bytes", out.len());
+        assert!(
+            out.contains("output truncated to ~1000 tokens"),
+            "marker present: {out:?}"
+        );
+        // The kept body is exactly the char budget (all ASCII → clean boundary).
+        let body = out.split("\n\n[output truncated").next().unwrap();
+        assert_eq!(body.len(), max_chars, "kept ~budget chars");
+    }
+
+    #[test]
+    fn cap_model_output_truncates_at_a_char_boundary() {
+        // A multi-byte char straddling the cut must not be split — the body must
+        // stay valid UTF-8 (no panic, no replacement char).
+        let budget = 10; // ~40 chars
+        let body = "é".repeat(1_000); // 2 bytes each
+        let out = cap_model_output(&body, budget);
+        let kept = out.split("\n\n[output truncated").next().unwrap();
+        assert!(kept.is_char_boundary(kept.len()), "valid boundary");
+        assert!(kept.chars().all(|c| c == 'é'), "no split char: {kept:?}");
+    }
+
+    #[test]
+    fn cap_model_output_zero_budget_is_no_cap() {
+        let body = "z".repeat(500_000);
+        assert_eq!(cap_model_output(&body, 0), body);
+    }
+
+    #[test]
+    fn token_to_char_math_uses_the_default_four_chars_per_token() {
+        // The budget→char conversion is the default 4 chars/token (the shared
+        // estimator constant), so a 10k-token budget is a 40k-char backstop.
+        let est = crate::tokens::TokenEstimation::default();
+        assert_eq!(est.chars_for_tokens(DEFAULT_MAX_OUTPUT_TOKENS), 40_000);
     }
 
     #[test]
@@ -4668,6 +4828,48 @@ mod disable_ocap_tests {
         )
         .await;
         assert_eq!(out, "(exit 3)");
+    }
+
+    /// #726: a verbose `run_command` MUST NOT flood the model's context window.
+    /// Its model-facing output is capped by the shared TOKEN budget (default
+    /// 10k ⇒ ~40k chars) with the same truncation marker `read_file` uses — the
+    /// gap #719 left open for `run_command`. Runs through the real host shell
+    /// (yolo path) so it exercises the actual `shell_envelope_output` → cap
+    /// composition. The global budget is the default 10k in the test binary
+    /// (nothing raises it above default), so the assertions are upper-bounded
+    /// and robust regardless of a smaller racing value.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_command_output_over_budget_is_token_capped() {
+        let _l = env_lock().await;
+        let _on = EnvVar::set("NEWT_DISABLE_OCAP", "1");
+        let ws = tempfile::TempDir::new().unwrap();
+        let caveats = caveats_no_exec(ws.path());
+        // ~350k chars of output — well over the default ~40k-char budget.
+        let out = run_tool(
+            "run_command",
+            serde_json::json!({"command": "seq 1 60000"}),
+            ws.path(),
+            &caveats,
+        )
+        .await;
+        assert!(
+            out.len() < 41_500,
+            "model-facing output capped near the ~40k-char budget, got {} bytes",
+            out.len()
+        );
+        assert!(
+            out.contains("output truncated to"),
+            "carries the truncation marker: {:?}",
+            &out[out.len().saturating_sub(160)..]
+        );
+        assert!(
+            out.ends_with("use read_file with offset+limit]"),
+            "marker steers the model to a narrower read: {:?}",
+            &out[out.len().saturating_sub(160)..]
+        );
+        // Capped early ⇒ the late lines never reach the model.
+        assert!(!out.contains("60000"), "late output dropped by the cap");
     }
 
     // --- #307 floor property: preset clamp WINS over --disable-ocap -------
