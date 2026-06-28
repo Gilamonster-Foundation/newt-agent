@@ -6902,6 +6902,22 @@ fn auto_resume_banner(
             " — restored {restored_keys} <state> key{}",
             if restored_keys == 1 { "" } else { "s" }
         ));
+        // #718: an actionable pointer beats a bare key count. If the restored
+        // scratchpad carries `current_task`, surface its value so the resumed
+        // model reads "where we left off" instead of blind-probing for it.
+        if let Some(task) = record.scratchpad.get("current_task") {
+            let task = task.trim();
+            if !task.is_empty() {
+                const MAX: usize = 80;
+                let shown: String = task.chars().take(MAX).collect();
+                let ellipsis = if task.chars().count() > MAX {
+                    "…"
+                } else {
+                    ""
+                };
+                banner.push_str(&format!(" — last task: {shown}{ellipsis}"));
+            }
+        }
     }
     if let Some(warning) = warning {
         banner.push_str(&format!("\nwarning: {warning}"));
@@ -12413,6 +12429,11 @@ mod skills_integration_tests {
             one.contains("— restored 1 <state> key") && !one.contains("<state> keys"),
             "singular key note: {one}"
         );
+        // #718: a restored `current_task` is surfaced as an actionable pointer.
+        assert!(
+            one.contains("— last task: fix the parser"),
+            "current_task value surfaced: {one}"
+        );
         record
             .scratchpad
             .insert("open_file".into(), "src/parser.rs".into());
@@ -12421,6 +12442,10 @@ mod skills_integration_tests {
             two.contains("— restored 2 <state> keys"),
             "plural key note: {two}"
         );
+        assert!(
+            two.contains("— last task: fix the parser"),
+            "current_task still surfaced alongside other keys: {two}"
+        );
         // The restored-keys note rides BEFORE any persona warning on its own line.
         let restored_with_warning =
             auto_resume_banner(&record, "Fix the parser", Some("persona gone"));
@@ -12428,6 +12453,23 @@ mod skills_integration_tests {
             restored_with_warning.contains("— restored 2 <state> keys")
                 && restored_with_warning.ends_with("\nwarning: persona gone"),
             "got: {restored_with_warning}"
+        );
+        // #718: a long task value is capped (no unbounded banner).
+        record
+            .scratchpad
+            .insert("current_task".into(), "x".repeat(200));
+        let capped = auto_resume_banner(&record, "Fix the parser", None);
+        assert!(
+            capped.contains("— last task: "),
+            "still has the pointer: {capped}"
+        );
+        assert!(capped.contains('…'), "long task value is elided: {capped}");
+        // No `current_task` → no last-task pointer, just the key count.
+        record.scratchpad.remove("current_task");
+        let no_task = auto_resume_banner(&record, "Fix the parser", None);
+        assert!(
+            no_task.contains("— restored 1 <state> key") && !no_task.contains("last task:"),
+            "no current_task → no last-task pointer: {no_task}"
         );
     }
 
