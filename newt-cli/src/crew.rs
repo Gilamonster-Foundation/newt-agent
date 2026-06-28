@@ -473,6 +473,65 @@ fn grant_one_shot_authority(plan: &mut newt_core::plan::Plan) {
     );
 }
 
+/// Re-ground a failed leaf from its build error (#692): parse the unresolved
+/// symbol rustc names, grep its DEFINITION (#687's pattern), and — if the
+/// instruction doesn't already target that file — append a grounding correction
+/// so the retried leaf edits the real seam.
+struct DefGroundReground {
+    dir: std::path::PathBuf,
+}
+impl newt_core::agentic::Reground for DefGroundReground {
+    fn reground(&self, error: &str, instruction: &str) -> Option<String> {
+        let sym = unresolved_symbol(error)?;
+        let sites = git(
+            &self.dir,
+            &[
+                "grep",
+                "-nE",
+                "-e",
+                &definition_grep_pattern(&sym),
+                "--",
+                "*.rs",
+            ],
+        )
+        .ok()?;
+        let file = sites.lines().next()?.split(':').next()?.to_string();
+        if file.is_empty() || instruction.contains(&file) {
+            return None;
+        }
+        Some(format!(
+            "{instruction}\n\nGROUNDING: `{sym}` is defined at {file} — make the edit there, do not invent paths."
+        ))
+    }
+}
+
+/// The unresolved symbol named in a rustc error, if any (#692) — `cannot find
+/// function/value/type` `X`, `no method named` `X`, etc.
+fn unresolved_symbol(error: &str) -> Option<String> {
+    const MARKERS: &[&str] = &[
+        "cannot find function `",
+        "cannot find value `",
+        "cannot find type `",
+        "cannot find macro `",
+        "cannot find struct, variant or union type `",
+        "no method named `",
+        "no function or associated item named `",
+        "use of undeclared `",
+    ];
+    for m in MARKERS {
+        if let Some(i) = error.find(m) {
+            let rest = &error[i + m.len()..];
+            if let Some(j) = rest.find('`') {
+                let sym = &rest[..j];
+                if !sym.is_empty() {
+                    return Some(sym.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Execute a parsed/authored plan autonomously: enforce the `--max-leaves`
 /// autonomy bound, then drive `run_plan` via a `LocalCrewRunner`
 /// (`Presence::Prompt` — the human's `--execute`/`--one-shot` gesture). Prints
@@ -518,10 +577,11 @@ pub async fn execute_plan(
     // `--execute`/`--one-shot` gesture is modelled as `Presence::Prompt` (the
     // BOOT attest ceremony is #472).
     let caveats = newt_acp_worker::worker_session_caveats(None);
+    let reground = DefGroundReground { dir: dir.clone() };
     let runner =
         crate::crew_runner::LocalCrewRunner::new(cfg, dir, newt_core::agentic::Presence::Prompt)
             .with_locked_verify(locked_verify);
-    let run = newt_core::agentic::run_plan(plan, &caveats, &runner).await;
+    let run = newt_core::agentic::run_plan_with_reground(plan, &caveats, &runner, &reground).await;
     for id in &run.dispatched {
         if let Some(s) = plan.subtask(id) {
             println!("  [{:?}] {}", s.status, id);
@@ -1963,5 +2023,18 @@ mod tests {
         assert!(!re.is_match("    // help_lines is the seam"));
         assert!(!re.is_match("    let v = self.help_lines();"));
         assert!(!re.is_match("fn help_lines_other() {")); // word-bounded, not a prefix
+    }
+
+    #[test]
+    fn unresolved_symbol_parses_rustc_errors() {
+        assert_eq!(
+            unresolved_symbol("error[E0425]: cannot find function `help_lines` in this scope"),
+            Some("help_lines".to_string())
+        );
+        assert_eq!(
+            unresolved_symbol("error[E0599]: no method named `roll_up` found for struct"),
+            Some("roll_up".to_string())
+        );
+        assert_eq!(unresolved_symbol("error: mismatched types"), None);
     }
 }

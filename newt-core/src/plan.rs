@@ -166,6 +166,14 @@ impl Plan {
         }
     }
 
+    /// Overwrite a subtask's instruction by id — used by failure-driven
+    /// re-grounding (#692) to steer a retried leaf at the symbol's real file.
+    pub fn set_instruction(&mut self, id: &str, instruction: &str) {
+        if let Some(s) = self.subtasks.iter_mut().find(|s| s.id == id) {
+            s.instruction = instruction.to_string();
+        }
+    }
+
     /// Every leaf is `Done` — the plan finished successfully (branches are
     /// grouping nodes, so only leaf completion is load-bearing). An empty plan is
     /// trivially complete.
