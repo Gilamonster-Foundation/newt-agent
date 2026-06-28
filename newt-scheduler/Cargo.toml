@@ -18,12 +18,12 @@ async-trait.workspace = true
 anyhow.workspace = true
 serde = { workspace = true }
 serde_json.workspace = true
+# #695: a per-role-dispatch wall-clock timeout (tokio::time) so a hung generation
+# can't hang the crew. Promoted from dev-deps to a regular dep for run_role.
+tokio = { workspace = true }
 
 [features]
 default = []
 # Dispatch a `kind = "embedded"` pool backend to the in-process candle engine.
 # Default-off so the lean/headless build never pulls candle (#639).
 embedded = ["newt-inference/embedded"]
-
-[dev-dependencies]
-tokio = { workspace = true }

@@ -94,6 +94,19 @@ impl Dispatcher for LocalDispatcher {
     }
 }
 
+/// Wall-clock bound on a single role dispatch (#695), overridable with
+/// `NEWT_ROLE_TIMEOUT_SECS` (default 600s). The streaming inference client has no
+/// whole-request timeout (so it never bounds an idle stream), so without this a
+/// hung/stalled generation hangs the whole crew until an outer timeout SIGKILLs it.
+fn role_dispatch_timeout() -> std::time::Duration {
+    let secs = std::env::var("NEWT_ROLE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|s| *s > 0)
+        .unwrap_or(600);
+    std::time::Duration::from_secs(secs)
+}
+
 impl BackendPool {
     /// Run a role turn end-to-end: select a live backend that serves `(tier,
     /// model)`, dispatch via the strategy, and **fail over** to the next candidate
@@ -109,17 +122,33 @@ impl BackendPool {
         model: &str,
         req: ChatRequest,
     ) -> Option<Failover<ChatReply>> {
+        self.run_role_with_timeout(dispatcher, tier, model, req, role_dispatch_timeout())
+            .await
+    }
+
+    /// [`run_role`] with an explicit per-dispatch wall-clock bound (#695). On
+    /// expiry the candidate is treated as failed and the loop fails over — the
+    /// leaf then fails honestly instead of blocking the run indefinitely on a
+    /// hung generation.
+    pub async fn run_role_with_timeout(
+        &self,
+        dispatcher: &dyn Dispatcher,
+        tier: Tier,
+        model: &str,
+        req: ChatRequest,
+        bound: std::time::Duration,
+    ) -> Option<Failover<ChatReply>> {
         let mut failed = Vec::new();
         for b in self.ranked_candidates(tier, Some(model)) {
-            match dispatcher.dispatch(b, model, req.clone()).await {
-                Ok(result) => {
+            match tokio::time::timeout(bound, dispatcher.dispatch(b, model, req.clone())).await {
+                Ok(Ok(result)) => {
                     return Some(Failover {
                         chosen: b.name.clone(),
                         result,
                         failed,
                     })
                 }
-                Err(_) => failed.push(b.name.clone()),
+                Ok(Err(_)) | Err(_) => failed.push(b.name.clone()),
             }
         }
         None
@@ -222,6 +251,38 @@ mod tests {
             out.is_none(),
             "no backend has devstral → no dispatch, no pick"
         );
+    }
+
+    /// A dispatch that never returns — models a hung/stalled generation (#695).
+    struct HangingDispatcher;
+    #[async_trait]
+    impl Dispatcher for HangingDispatcher {
+        async fn dispatch(
+            &self,
+            _backend: &PoolBackend,
+            _model: &str,
+            _req: ChatRequest,
+        ) -> anyhow::Result<ChatReply> {
+            tokio::time::sleep(std::time::Duration::from_secs(99_999)).await;
+            unreachable!("a hung dispatch must be cancelled by the role timeout")
+        }
+    }
+
+    #[tokio::test]
+    async fn run_role_times_out_a_hung_dispatch_and_fails_over_to_none() {
+        // #695: a stalled generation must not hang the crew. Every candidate
+        // times out (short bound) => None, instead of blocking forever.
+        let p = pool();
+        let out = p
+            .run_role_with_timeout(
+                &HangingDispatcher,
+                Tier::Complex,
+                "qwen3-coder:30b",
+                ChatRequest::new().user("hi"),
+                std::time::Duration::from_millis(10),
+            )
+            .await;
+        assert!(out.is_none(), "a hung dispatch must time out and fail over");
     }
 
     #[tokio::test]
