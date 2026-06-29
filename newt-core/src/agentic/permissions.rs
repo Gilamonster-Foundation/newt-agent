@@ -78,8 +78,18 @@ pub enum PermissionDecision {
     Deny,
 }
 
-/// The interactive seam (mirrors `NoteSink` / `RecallSource`): present the
-/// denied requests to the human, record the decision, and answer.
+/// The interactive human-interface seam (mirrors `NoteSink` / `RecallSource`):
+/// the one gate the agentic loop consults whenever it must reach the human. It
+/// carries two distinct interactions that share the same operator presence:
+///
+/// * [`PermissionGate::ask`] — decide a capability GRANT (the #263 / #721 ocap
+///   flow). It can WIDEN authority by re-minting caveats.
+/// * [`PermissionGate::ask_question`] — ask a free-text QUESTION and read back
+///   the answer (the #728 `request_user_input` tool). It only gathers text; it
+///   never touches authority.
+///
+/// Keeping both on one gate realizes "both surface to the human" without merging
+/// the tools: grants flow through `ask`, questions through `ask_question`.
 ///
 /// The call blocks the agentic loop like a long tool call (issue #263 §6 of
 /// the design notes). Implementations that auto-allow previously
@@ -89,6 +99,16 @@ pub trait PermissionGate {
     /// can be refused on several targets at once). `Allow` means every
     /// request was allowed; any single deny keeps the whole denial.
     fn ask(&mut self, requests: &[PermissionRequest]) -> PermissionDecision;
+
+    /// #728: ask the human a free-text `question` and return their typed
+    /// answer — the GENERIC ask-the-human primitive behind the
+    /// `request_user_input` tool. Distinct from [`PermissionGate::ask`], which
+    /// decides capability grants: `ask` can widen authority, `ask_question`
+    /// only gathers text. Returns `None` when there is no human to consult
+    /// (no interactive operator this session, or stdin closed) so the caller
+    /// degrades to a recoverable "no human available" result instead of
+    /// blocking — a headless caller must NEVER hang on it.
+    fn ask_question(&mut self, question: &str) -> Option<String>;
 }
 
 /// Build the widened *policy* for a re-mint: `base` with each grant's target

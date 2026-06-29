@@ -306,6 +306,38 @@ pub fn tool_definitions() -> serde_json::Value {
     ])
 }
 
+/// #728: always-advertised `request_user_input` tool definition — the GENERIC
+/// ask-the-human primitive. Pushed unconditionally in [`merged_tool_definitions`]
+/// like `resume_context` / `tool_search` / `get_context_remaining`: a model must
+/// always be able to ask the human a question, and it degrades honestly headless
+/// (the executor answers "no human available this session" when no interactive
+/// gate is present). Question-only for v1 — the multiple-choice `options` hint is
+/// deferred so no advertised arg is left unused.
+fn request_user_input_tool_definition() -> serde_json::Value {
+    serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": "request_user_input",
+            "description": "Ask the human operator a free-text question and get \
+                            their answer. Use this to resolve genuine ambiguity \
+                            instead of guessing or narrating (e.g. 'which database \
+                            should I target?', 'is this the file you meant?'). This \
+                            asks for INFORMATION, not authority — to request a \
+                            capability you were denied, use request_permissions \
+                            instead. In a headless session (no operator) you'll be \
+                            told no human is available — then proceed with your best \
+                            judgment and state your assumption explicitly.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "question": { "type": "string", "description": "The free-text question to ask the human" }
+                },
+                "required": ["question"]
+            }
+        }
+    })
+}
+
 /// The built-in tool definitions plus every connected MCP server's tools
 /// (namespaced `server__tool`). This is what the agent loop advertises to the
 /// model so it can call remote MCP tools alongside the built-ins.
@@ -351,6 +383,12 @@ pub(crate) fn merged_tool_definitions(
     // configured" when num_ctx is unset), so like resume_context it carries no
     // `with_*` gate and rides in every session, headless included.
     defs.push(super::budget::get_context_remaining_tool_definition());
+    // #728: `request_user_input` is advertised ALWAYS — a model must always be
+    // able to ask the human a question, and it degrades honestly headless (the
+    // executor returns "no human available this session" when no interactive
+    // gate is present), so like resume_context it carries no `with_*` gate and
+    // rides in every session.
+    defs.push(request_user_input_tool_definition());
     if with_save_note {
         defs.push(save_note_tool_definition());
     }
@@ -457,6 +495,11 @@ const ALL_TOOL_NAMES: &[&str] = &[
     // conversation estimate are in scope) and renders the budget; it is a real
     // name so it is never treated as a hallucination.
     "get_context_remaining",
+    // #728: always-advertised generic ask-the-human tool (rides the #263
+    // human-interface gate via `ask_question`; degrades to "no human available"
+    // when no gate is present), so a model asking a question is never treated as
+    // a hallucination.
+    "request_user_input",
 ];
 
 /// Returns `true` if a tool call looks like a hallucination:
@@ -616,6 +659,14 @@ pub(crate) fn resolve_tool_alias(name: &str) -> Option<AliasOutcome> {
         | "how_much_context" | "context_budget" | "token_budget" => {
             Some(AliasOutcome::Rewrite("get_context_remaining"))
         }
+        // #728 ASK-THE-HUMAN — the instinctive "ask the user a question" reach.
+        // All mean exactly request_user_input (a `question` arg), so silently
+        // Rewrite: the executor reads `question` and answers via the gate (or the
+        // headless message). The real name `request_user_input` is NOT here — it
+        // falls through to `None` and dispatches unchanged, so it is never an
+        // alias of itself.
+        "ask_user" | "ask_human" | "prompt_user" | "get_user_input" | "ask_question"
+        | "clarify" | "ask" => Some(AliasOutcome::Rewrite("request_user_input")),
         _ => None,
     }
 }
@@ -1266,11 +1317,13 @@ fn parse_capability(s: &str) -> Option<DenialKind> {
 /// declined, and **no gate** (headless / eval / ACP) reports that no operator is
 /// available to grant — a recoverable signal (switch strategy), never a hang.
 ///
-/// Reconciliation with #728: `request_permissions` is the capability-GRANT path
-/// — it mints caveats via the gate (real authority change). #728's future
-/// `request_user_input` will be a GENERIC free-text Q&A to the human. Both
-/// "surface to the human", but they are deliberately DISTINCT and must not be
-/// merged: one widens authority through the ocap gate, the other gathers text.
+/// Reconciliation with #728: `request_permissions` (capability GRANT via
+/// `gate.ask` / the #263 flow) and `request_user_input` (generic free-text Q&A
+/// via `gate.ask_question`) are DISTINCT tools that share the ONE human-interface
+/// gate ([`PermissionGate`]). They realize "both surface to the human" without
+/// being merged: this one widens authority through the ocap gate, the other only
+/// gathers text. `request_permissions` is deliberately NOT routed through
+/// `request_user_input` — it mints caveats, which a free-text answer cannot.
 fn execute_request_permissions(
     args: &serde_json::Value,
     gate: Option<&mut dyn PermissionGate>,
@@ -1333,6 +1386,53 @@ fn execute_request_permissions(
              must be configured by the owner (e.g. [tui.permissions] in newt config); \
              take a different approach for now."
         ),
+    };
+    print_tool_output(&out, tool_output_lines, color);
+    out
+}
+
+/// #728: returned by `request_user_input` when there is no human to ask — either
+/// no interactive gate this session (headless / eval / ACP / piped) or the gate
+/// has no operator available (`ask_question` returned `None`). A recoverable
+/// signal the model can act on, NEVER a hang.
+const HEADLESS_NO_HUMAN: &str = "no human available this session (running headless) \
+    — proceed with your best judgment or state your assumption explicitly.";
+
+/// #728: the model-facing `request_user_input` tool — the GENERIC ask-the-human
+/// path. It surfaces a free-text `question` to the operator through the SAME
+/// human-interface gate a permission prompt uses ([`PermissionGate::ask_question`])
+/// and returns the typed answer. With an operator present the answer is returned
+/// verbatim; with NO gate (headless / eval / ACP / piped) — or when the gate has
+/// no human to consult (`ask_question` returns `None`) — it returns the
+/// [`HEADLESS_NO_HUMAN`] message and NEVER blocks.
+///
+/// Reconciliation with #721: this is the free-text Q&A path; `request_permissions`
+/// is the capability-GRANT path (it mints caveats via the gate). Both surface to
+/// the human through the one gate but are DISTINCT tools — one gathers text
+/// (`ask_question`), the other widens authority (`ask`) — and are not merged.
+fn execute_request_user_input(
+    args: &serde_json::Value,
+    gate: Option<&mut dyn PermissionGate>,
+    color: bool,
+    tool_output_lines: usize,
+) -> String {
+    let question = args["question"].as_str().unwrap_or("").trim();
+    print_tool_call("request_user_input", question, color);
+
+    if question.is_empty() {
+        let out = "request_user_input: 'question' is required — the free-text \
+                   question to ask the human."
+            .to_string();
+        print_tool_output(&out, tool_output_lines, color);
+        return out;
+    }
+
+    // `Some(answer)` from the gate → return it verbatim; a `None` gate (headless)
+    // OR an `ask_question` that returns `None` (no human to consult) → the
+    // recoverable headless message. Either way we never block without an answer.
+    let out = match gate.and_then(|g| g.ask_question(question)) {
+        Some(answer) => answer,
+        None => HEADLESS_NO_HUMAN.to_string(),
     };
     print_tool_output(&out, tool_output_lines, color);
     out
@@ -1722,6 +1822,17 @@ pub async fn execute_tool(
         // run_command / fs arms that also use it — only one arm runs per call).
         "request_permissions" => {
             execute_request_permissions(args, permission_gate, color, tool_output_lines)
+        }
+
+        // #728: the GENERIC ask-the-human tool — surfaces a free-text question to
+        // the operator via the SAME #263 human-interface gate (`ask_question`)
+        // and returns the answer. Advertised always; `permission_gate` is `None`
+        // for headless / eval / ACP, where it answers "no human available this
+        // session" rather than blocking. Consumes the gate (mutually exclusive
+        // with the run_command / fs / request_permissions arms that also use it —
+        // only one arm runs per call).
+        "request_user_input" => {
+            execute_request_user_input(args, permission_gate, color, tool_output_lines)
         }
 
         // #725: tool discovery — search THIS session's advertised catalog by
@@ -2751,6 +2862,9 @@ mod tests {
                 // #727: advertised ALWAYS (read-only budget self-read, no
                 // presence gate), pushed right after resume_context.
                 "get_context_remaining",
+                // #728: advertised ALWAYS (a model must always be able to ask the
+                // human; degrades honestly headless), pushed last.
+                "request_user_input",
             ]
         );
     }
@@ -4648,6 +4762,11 @@ mod execute_tool_branch_tests {
                 super::PermissionDecision::Deny
             }
         }
+        // #728: this gate exercises the GRANT path only; it has no human to
+        // answer free-text questions, so it returns None (a trivial impl).
+        fn ask_question(&mut self, _question: &str) -> Option<String> {
+            None
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4791,6 +4910,176 @@ mod execute_tool_branch_tests {
             true,
         )
         .is_none());
+    }
+
+    // -- #728 request_user_input (generic ask-the-human) --------------------
+
+    /// A gate that answers a free-text question with a scripted answer (or None
+    /// for "no human"). Its grant path (`ask`) is irrelevant here — it denies.
+    struct AskGate {
+        answer: Option<String>,
+        asked: Vec<String>,
+    }
+    impl AskGate {
+        fn new(answer: Option<&str>) -> Self {
+            Self {
+                answer: answer.map(str::to_string),
+                asked: Vec::new(),
+            }
+        }
+    }
+    impl super::PermissionGate for AskGate {
+        fn ask(&mut self, _requests: &[super::PermissionRequest]) -> super::PermissionDecision {
+            super::PermissionDecision::Deny
+        }
+        fn ask_question(&mut self, question: &str) -> Option<String> {
+            self.asked.push(question.to_string());
+            self.answer.clone()
+        }
+    }
+
+    #[test]
+    fn request_user_input_returns_the_human_answer() {
+        // A gate whose ask_question returns Some(answer) → the tool returns that
+        // answer verbatim, and the gate was asked the exact question.
+        let mut gate = AskGate::new(Some("postgres"));
+        let out = execute_request_user_input(
+            &serde_json::json!({"question": "which database should I target?"}),
+            Some(&mut gate),
+            false,
+            20,
+        );
+        assert_eq!(out, "postgres");
+        assert_eq!(
+            gate.asked,
+            vec!["which database should I target?".to_string()]
+        );
+    }
+
+    #[test]
+    fn request_user_input_no_gate_reports_headless_never_hangs() {
+        // No gate (headless / eval / ACP) → the recoverable "no human available"
+        // message — never a hang. (This test completing IS the no-hang proof: it
+        // touches no real stdin.)
+        let out = execute_request_user_input(
+            &serde_json::json!({"question": "are you sure?"}),
+            None,
+            false,
+            20,
+        );
+        assert_eq!(out, HEADLESS_NO_HUMAN);
+        assert!(out.contains("no human available"), "got: {out}");
+    }
+
+    #[test]
+    fn request_user_input_gate_with_no_human_reports_headless() {
+        // A gate present but with no human to consult (ask_question → None) →
+        // the SAME headless message, not a hang or an empty answer.
+        let mut gate = AskGate::new(None);
+        let out = execute_request_user_input(
+            &serde_json::json!({"question": "pick one"}),
+            Some(&mut gate),
+            false,
+            20,
+        );
+        assert_eq!(out, HEADLESS_NO_HUMAN);
+    }
+
+    #[test]
+    fn request_user_input_requires_a_question() {
+        // Missing / blank question → coach; the gate is never consulted.
+        let mut gate = AskGate::new(Some("unused"));
+        let out = execute_request_user_input(
+            &serde_json::json!({"question": "   "}),
+            Some(&mut gate),
+            false,
+            20,
+        );
+        assert!(out.contains("'question' is required"), "got: {out}");
+        assert!(
+            gate.asked.is_empty(),
+            "gate not consulted for a blank question"
+        );
+    }
+
+    #[test]
+    fn request_user_input_is_a_real_tool_not_a_phantom() {
+        // #728: a real, always-advertised tool — never an alias of itself or a
+        // hallucination.
+        assert!(resolve_tool_alias("request_user_input").is_none());
+        assert!(ALL_TOOL_NAMES.contains(&"request_user_input"));
+        assert!(classify_phantom_reach(
+            "request_user_input",
+            &serde_json::json!({"question": "which db?"}),
+            "postgres",
+            true,
+        )
+        .is_none());
+        // The always-advertised def rides in every session (empty MCP).
+        let defs = merged_tool_definitions(
+            &NoMcp, false, false, false, false, false, false, false, false, false,
+        );
+        let names: Vec<&str> = defs
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|d| d["function"]["name"].as_str())
+            .collect();
+        assert!(names.contains(&"request_user_input"), "got: {names:?}");
+    }
+
+    #[test]
+    fn ask_verbs_rewrite_to_request_user_input() {
+        // #728: the instinctive ask-the-human verbs resolve to the real tool.
+        for verb in [
+            "ask_user",
+            "ask_human",
+            "prompt_user",
+            "get_user_input",
+            "ask_question",
+            "clarify",
+            "ask",
+        ] {
+            match resolve_tool_alias(verb) {
+                Some(AliasOutcome::Rewrite(c)) => {
+                    assert_eq!(c, "request_user_input", "verb: {verb}");
+                }
+                _ => panic!("expected Rewrite(request_user_input) for {verb}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn request_user_input_dispatches_through_execute_tool() {
+        // End-to-end through the dispatcher: the question reaches the gate and
+        // the answer flows back. Fully mocked (AskGate, no real stdin).
+        let ws = tempfile::TempDir::new().unwrap();
+        let caveats = Caveats::top();
+        let mut gate = AskGate::new(Some("the answer"));
+        let out = execute_tool(
+            "request_user_input",
+            &serde_json::json!({"question": "what now?"}),
+            &ws.path().to_string_lossy(),
+            false,
+            20,
+            &caveats,
+            &mut NoMcp,
+            None,
+            None,
+            None,
+            None, // memory_source
+            Some(&mut gate),
+            None,
+            None, // git_tool
+            None, // crew_runner
+            None, // scratchpad_store
+            None, // code_search
+            None, // experience_store
+            None, // step_ledger
+        )
+        .await;
+        assert_eq!(out, "the answer");
+        assert_eq!(gate.asked, vec!["what now?".to_string()]);
     }
 
     #[test]
@@ -5042,6 +5331,9 @@ mod execute_tool_branch_tests {
                     max_calls: CountBound::Unlimited,
                     valid_for_generation: Scope::All,
                 })
+            }
+            fn ask_question(&mut self, _question: &str) -> Option<String> {
+                None
             }
         }
         let ws = tempfile::TempDir::new().unwrap();
@@ -5832,6 +6124,9 @@ mod disable_ocap_tests {
         impl super::PermissionGate for PanicGate {
             fn ask(&mut self, requests: &[super::PermissionRequest]) -> super::PermissionDecision {
                 panic!("yolo exec must never prompt, but the gate was asked: {requests:?}");
+            }
+            fn ask_question(&mut self, question: &str) -> Option<String> {
+                panic!("yolo exec must never prompt, but the gate was asked: {question:?}");
             }
         }
         let _l = env_lock().await;

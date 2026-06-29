@@ -1705,6 +1705,31 @@ fn prompt_permission_choice(prompt_text: &str) -> PromptChoice {
     }
 }
 
+/// #728: pure interpreter for one line of free-text human input (the
+/// `request_user_input` tool's answer). A closed stdin (`Ok(0)` = EOF, e.g. a
+/// piped / headless run) or a read error → `None`, so the tool reports "no human
+/// available" rather than hanging; otherwise the trimmed line (an empty answer
+/// is still the human's deliberate answer). Pure — unit-tested like
+/// [`parse_permission_choice`].
+fn interpret_user_line(read: io::Result<usize>, buf: &str) -> Option<String> {
+    match read {
+        Ok(0) | Err(_) => None,
+        Ok(_) => Some(buf.trim().to_string()),
+    }
+}
+
+/// #728: production reader for `request_user_input` — print the question, read
+/// one line from stdin (the same blocking shape as the permission prompt) and
+/// interpret it via [`interpret_user_line`]. Closed stdin / read error → `None`
+/// (no human to answer), never a hang.
+fn prompt_user_input(question: &str) -> Option<String> {
+    print!("? {question}\n> ");
+    io::stdout().flush().ok();
+    let mut answer = String::new();
+    let read = io::stdin().read_line(&mut answer);
+    interpret_user_line(read, &answer)
+}
+
 /// Session-owned prompted-permission state, lent to the gate each turn (the
 /// `note_nudge` ownership pattern). Session grants/denials live HERE — not
 /// in the session's operating key, which is never widened — and evaporate
@@ -1864,6 +1889,16 @@ impl<F: FnMut(&str) -> PromptChoice> newt_core::PermissionGate for PromptPermiss
             }
         }
         Allow(self.mint(&once_grants))
+    }
+
+    /// #728: ask the human a free-text question and read back the answer. This
+    /// is the same operator-present gate the permission prompt uses, so it is
+    /// only constructed for an interactive session (`prompt_permissions_enabled`);
+    /// headless callers hold `None` and never reach here. A closed stdin returns
+    /// `None`, which the `request_user_input` tool renders as "no human
+    /// available" — never a hang.
+    fn ask_question(&mut self, question: &str) -> Option<String> {
+        prompt_user_input(question)
     }
 }
 
@@ -2172,6 +2207,22 @@ mod permission_prompt_tests {
         assert_eq!(parse_permission_choice("yes"), PromptChoice::Deny);
         assert_eq!(parse_permission_choice("A"), PromptChoice::Deny);
         assert_eq!(parse_permission_choice("S"), PromptChoice::Deny);
+    }
+
+    #[test]
+    fn interpret_user_line_maps_eof_and_errors_to_none() {
+        // #728: a normal line → the trimmed answer; EOF/closed stdin (Ok(0)) and
+        // a read error → None (the tool reports "no human available", no hang).
+        assert_eq!(
+            interpret_user_line(Ok(8), "postgres\n"),
+            Some("postgres".to_string())
+        );
+        // An empty line (just Enter) is still the human's deliberate answer.
+        assert_eq!(interpret_user_line(Ok(1), "\n"), Some(String::new()));
+        // Closed stdin / piped-empty → no human.
+        assert_eq!(interpret_user_line(Ok(0), ""), None);
+        // A read error → no human (never an accidental answer).
+        assert_eq!(interpret_user_line(Err(io::Error::other("boom")), ""), None);
     }
 
     #[test]
