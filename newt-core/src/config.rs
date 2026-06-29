@@ -166,6 +166,16 @@ pub struct Config {
     /// names a `[loadouts.<name>]`. Empty by default. See [`Crew`].
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub crews: std::collections::BTreeMap<String, Crew>,
+
+    /// `[crew]` — crew/team **dispatch policy** (#749). Carries the authority
+    /// *clamp* every dispatched crew is met against, so a crew's effective
+    /// authority is `session ⊓ clamp` — never above the session ceiling, and as
+    /// tight as the operator configures. `None` (and the default clamp) is
+    /// `Caveats::top()`, i.e. the meet is the identity and behavior is unchanged.
+    /// This is the structural tightening point the per-subtask `team_clamp`
+    /// (#749 step 8) plugs into. See [`CrewPolicyConfig`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub crew: Option<CrewPolicyConfig>,
 }
 
 /// One named mode (`[modes.<name>]`, issue #307): the atomic binding the
@@ -1903,6 +1913,34 @@ pub struct Crew {
     pub budgets: Option<CrewBudgets>,
 }
 
+/// `[crew]` dispatch policy (#749 step 2): the operator's structural tightening
+/// point for crews/teams the overseer fields.
+///
+/// A model that fields a crew is the recursion / Confused-Deputy case. Dispatch
+/// hands each crew `session ⊓ clamp` (the [`crate::Caveats`] meet), so the crew's
+/// authority is **always `≤ session`** (the overseer cannot escalate by
+/// dispatching) and **`≤ clamp`** (the operator's bound). With the default
+/// `clamp = Caveats::top()` the meet is the identity — today's behavior is
+/// unchanged — while the seam exists for tighter clamps (and the per-subtask
+/// `team_clamp`, #749 step 8) to plug into.
+///
+/// ```toml
+/// [crew]
+/// # crews may reach only this host, even if the session's net grant is wider
+/// [crew.clamp]
+/// net = { only = ["registry.internal"] }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct CrewPolicyConfig {
+    /// The authority **clamp** dispatched crews are met against
+    /// (`child = session ⊓ clamp`). Defaults to `Caveats::top()` (identity meet —
+    /// behavior unchanged). Tighten an axis here to bound every crew below the
+    /// session ceiling; later steps (#749 step 8) compose a per-subtask clamp on
+    /// top of this at the same `dispatch` seam.
+    #[serde(default)]
+    pub clamp: crate::caveats::Caveats,
+}
+
 /// Budgets + review gates for a crew's control loop (`crew-loadout.md` §budgets).
 /// Consumed by the front door; an honest cap-exit at `max_attempts` returns
 /// `NeedsHumanReview`, never a false success.
@@ -2607,6 +2645,7 @@ impl Default for Config {
             bundles: std::collections::BTreeMap::new(),
             loadouts: std::collections::BTreeMap::new(),
             crews: std::collections::BTreeMap::new(),
+            crew: None,
         }
     }
 }

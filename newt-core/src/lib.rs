@@ -79,10 +79,10 @@ pub use caveats::{CaveatsExt, CountBoundExt, ScopeExt};
 pub use config::{
     AgentsConfig, BackendConfig, BackendKind, BundleConfig, ChatStyle, ColorMode, Config,
     ContextConfig, ContextFeature, ContextFeatureSet, ContextFeatures, ContextManager,
-    ConversationsConfig, EditMode, FooterMode, Loadout, LoadoutSettings, LogConfig, MarkdownMode,
-    MemoryConfig, MemoryDisclosure, MemoryProviderKind, OnEmbedFailure, OpenAiApi,
-    PermissionPreset, PickVia, ProfilePick, ProviderConfig, SemanticConfig, SkillsConfig,
-    SummarizerConfig, ThinkingMode, ToolPermissions, TuiConfig,
+    ConversationsConfig, CrewPolicyConfig, EditMode, FooterMode, Loadout, LoadoutSettings,
+    LogConfig, MarkdownMode, MemoryConfig, MemoryDisclosure, MemoryProviderKind, OnEmbedFailure,
+    OpenAiApi, PermissionPreset, PickVia, ProfilePick, ProviderConfig, SemanticConfig,
+    SkillsConfig, SummarizerConfig, ThinkingMode, ToolPermissions, TuiConfig,
 };
 pub use conversation::{
     new_conversation_id, session_plan_dir, session_plan_path, ConversationRecord,
