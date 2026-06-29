@@ -11,6 +11,9 @@
 
 // pub(crate) since Step 18.5 (#247): the `Summarizing` memory provider
 // delegates to this same pipeline instead of keeping a duplicate one.
+// #727: read-only context-budget introspection (the `get_context_remaining`
+// tool) — a pure renderer the agentic loop feeds per-turn budget state into.
+mod budget;
 pub(crate) mod compress;
 mod crew_attest;
 mod crew_tool;
@@ -189,6 +192,7 @@ mod tidy_tables_tests {
         }
     }
 }
+pub use budget::get_context_remaining_tool_definition;
 pub use memory_fetch::{
     memory_fetch_tool_definition, MemAddr, MemPayload, MemorySource, StoreMemorySource,
 };
@@ -1995,39 +1999,57 @@ pub async fn chat_complete(
             // write tool runs, so the post-turn gate can revert exactly newt's writes.
             ledger_note_write(write_ledger, name, &args, workspace);
             let tool_t0 = std::time::Instant::now();
-            let result = execute_tool(
-                name,
-                &args,
-                workspace,
-                color,
-                tool_output_lines,
-                caveats,
-                mcp,
-                build_check_cmd.as_deref(),
-                // Reborrow + re-coerce: shortens the trait-object lifetime to
-                // this call (Option<&mut dyn _> is invariant, so the longer
-                // ChatCtx lifetime can't unify directly).
-                note_sink
-                    .as_deref_mut()
-                    .map(|s| &mut *s as &mut dyn NoteSink),
-                recall_source,
-                memory_source,
-                // #263 prompted grants — same reborrow pattern as note_sink.
-                permission_gate
-                    .as_deref_mut()
-                    .map(|g| &mut *g as &mut dyn PermissionGate),
-                // #307: the active preset's exec floor (the bypass ceiling).
-                exec_floor,
-                // PR4: the injected embedded-git capability (None for headless).
-                git_tool,
-                // #479: the injected crew/team orchestration (None for headless).
-                crew_runner,
-                scratchpad_store,
-                code_search,
-                experience_store,
-                step_ledger,
-            )
-            .await;
+            // #727: intercept the read-only budget self-read here. Its answer is
+            // dynamic per-turn loop state — the num_ctx input ceiling and the
+            // conversation's token estimate — which are in scope in the loop, not
+            // inside execute_tool. `prompt_tracker.current` is real-token currency,
+            // the same the ceiling is in. The rendered string then flows through
+            // all the normal bookkeeping below (ok, tool_events, phantom_reaches,
+            // spill), so aliases recorded as Rewrites stay correct.
+            let result = if tools::is_context_remaining_call(name) {
+                let report = budget::render_context_budget(
+                    prompt_tracker.current(&messages, Some(&tools), cal, estimation),
+                    num_ctx_input_ceiling(num_ctx),
+                    num_ctx,
+                );
+                display::print_tool_call("get_context_remaining", "", color);
+                display::print_tool_output(&report, tool_output_lines, color);
+                report
+            } else {
+                execute_tool(
+                    name,
+                    &args,
+                    workspace,
+                    color,
+                    tool_output_lines,
+                    caveats,
+                    mcp,
+                    build_check_cmd.as_deref(),
+                    // Reborrow + re-coerce: shortens the trait-object lifetime to
+                    // this call (Option<&mut dyn _> is invariant, so the longer
+                    // ChatCtx lifetime can't unify directly).
+                    note_sink
+                        .as_deref_mut()
+                        .map(|s| &mut *s as &mut dyn NoteSink),
+                    recall_source,
+                    memory_source,
+                    // #263 prompted grants — same reborrow pattern as note_sink.
+                    permission_gate
+                        .as_deref_mut()
+                        .map(|g| &mut *g as &mut dyn PermissionGate),
+                    // #307: the active preset's exec floor (the bypass ceiling).
+                    exec_floor,
+                    // PR4: the injected embedded-git capability (None for headless).
+                    git_tool,
+                    // #479: the injected crew/team orchestration (None for headless).
+                    crew_runner,
+                    scratchpad_store,
+                    code_search,
+                    experience_store,
+                    step_ledger,
+                )
+                .await
+            };
             // 17.6: record the call for the turn's events column — args are
             // digested (never stored raw), duration is a display claim.
             // Step 27.3: classify once; remember failures so an exact repeat is
@@ -3144,39 +3166,54 @@ pub async fn openai_chat_complete(
             // write tool runs, so the post-turn gate can revert exactly newt's writes.
             ledger_note_write(write_ledger, name, &args, workspace);
             let tool_t0 = std::time::Instant::now();
-            let result = execute_tool(
-                name,
-                &args,
-                workspace,
-                color,
-                tool_output_lines,
-                caveats,
-                mcp,
-                build_check_cmd.as_deref(),
-                // Reborrow + re-coerce: shortens the trait-object lifetime to
-                // this call (Option<&mut dyn _> is invariant, so the longer
-                // ChatCtx lifetime can't unify directly).
-                note_sink
-                    .as_deref_mut()
-                    .map(|s| &mut *s as &mut dyn NoteSink),
-                recall_source,
-                memory_source,
-                // #263 prompted grants — same reborrow pattern as note_sink.
-                permission_gate
-                    .as_deref_mut()
-                    .map(|g| &mut *g as &mut dyn PermissionGate),
-                // #307: the active preset's exec floor (the bypass ceiling).
-                exec_floor,
-                // PR4: the injected embedded-git capability (None for headless).
-                git_tool,
-                // #479: the injected crew/team orchestration (None for headless).
-                crew_runner,
-                scratchpad_store,
-                code_search,
-                experience_store,
-                step_ledger,
-            )
-            .await;
+            // #727: intercept the read-only budget self-read (see the Ollama path).
+            // num_ctx is not applicable on OpenAI-compatible endpoints (so the
+            // ceiling is usually None → an honest "no ceiling configured"), but the
+            // used-token figure is still reported.
+            let result = if tools::is_context_remaining_call(name) {
+                let report = budget::render_context_budget(
+                    prompt_tracker.current(&messages, Some(&tools), cal, estimation),
+                    num_ctx_input_ceiling(num_ctx),
+                    num_ctx,
+                );
+                display::print_tool_call("get_context_remaining", "", color);
+                display::print_tool_output(&report, tool_output_lines, color);
+                report
+            } else {
+                execute_tool(
+                    name,
+                    &args,
+                    workspace,
+                    color,
+                    tool_output_lines,
+                    caveats,
+                    mcp,
+                    build_check_cmd.as_deref(),
+                    // Reborrow + re-coerce: shortens the trait-object lifetime to
+                    // this call (Option<&mut dyn _> is invariant, so the longer
+                    // ChatCtx lifetime can't unify directly).
+                    note_sink
+                        .as_deref_mut()
+                        .map(|s| &mut *s as &mut dyn NoteSink),
+                    recall_source,
+                    memory_source,
+                    // #263 prompted grants — same reborrow pattern as note_sink.
+                    permission_gate
+                        .as_deref_mut()
+                        .map(|g| &mut *g as &mut dyn PermissionGate),
+                    // #307: the active preset's exec floor (the bypass ceiling).
+                    exec_floor,
+                    // PR4: the injected embedded-git capability (None for headless).
+                    git_tool,
+                    // #479: the injected crew/team orchestration (None for headless).
+                    crew_runner,
+                    scratchpad_store,
+                    code_search,
+                    experience_store,
+                    step_ledger,
+                )
+                .await
+            };
             if debug {
                 let excerpt: String = result.chars().take(120).collect();
                 print_debug(&format!("tool result: {excerpt:?}"), color);
@@ -3391,7 +3428,10 @@ pub async fn openai_responses_complete(
         tool_output_lines,
         debug,
         trace,
-        num_ctx: _,
+        // #727: bound (not `_`) so get_context_remaining can report the budget;
+        // on the Responses wire num_ctx is normally unset (cloud), so the report
+        // is honestly ceiling-less.
+        num_ctx,
         connect_timeout_secs,
         inference_timeout_secs,
         mid_loop_trim_threshold: _,
@@ -3411,7 +3451,8 @@ pub async fn openai_responses_complete(
         mut permission_gate,
         on_round_usage: _,
         estimate_ratio: _,
-        estimation: _,
+        // #727: bound for the get_context_remaining used-token estimate.
+        estimation,
         summary_input_cap_floor_chars: _,
         exec_floor,
         write_ledger,
@@ -3605,32 +3646,47 @@ pub async fn openai_responses_complete(
             }
             ledger_note_write(write_ledger, name, &args, workspace);
             let tool_t0 = std::time::Instant::now();
-            let result = execute_tool(
-                name,
-                &args,
-                workspace,
-                color,
-                tool_output_lines,
-                caveats,
-                mcp,
-                build_check_cmd.as_deref(),
-                note_sink
-                    .as_deref_mut()
-                    .map(|s| &mut *s as &mut dyn NoteSink),
-                recall_source,
-                memory_source,
-                permission_gate
-                    .as_deref_mut()
-                    .map(|g| &mut *g as &mut dyn PermissionGate),
-                exec_floor,
-                git_tool,
-                crew_runner,
-                scratchpad_store,
-                code_search,
-                experience_store,
-                step_ledger,
-            )
-            .await;
+            // #727: intercept the read-only budget self-read (see the Ollama path).
+            // The Responses loop has no PromptTracker, so `used` is the chars/4
+            // estimate of the running `input` plus tool schemas; num_ctx is normally
+            // unset here, so the report is honestly ceiling-less.
+            let result = if tools::is_context_remaining_call(name) {
+                let report = budget::render_context_budget(
+                    estimate_request_tokens(&input, Some(&tools_chat), estimation),
+                    num_ctx_input_ceiling(num_ctx),
+                    num_ctx,
+                );
+                display::print_tool_call("get_context_remaining", "", color);
+                display::print_tool_output(&report, tool_output_lines, color);
+                report
+            } else {
+                execute_tool(
+                    name,
+                    &args,
+                    workspace,
+                    color,
+                    tool_output_lines,
+                    caveats,
+                    mcp,
+                    build_check_cmd.as_deref(),
+                    note_sink
+                        .as_deref_mut()
+                        .map(|s| &mut *s as &mut dyn NoteSink),
+                    recall_source,
+                    memory_source,
+                    permission_gate
+                        .as_deref_mut()
+                        .map(|g| &mut *g as &mut dyn PermissionGate),
+                    exec_floor,
+                    git_tool,
+                    crew_runner,
+                    scratchpad_store,
+                    code_search,
+                    experience_store,
+                    step_ledger,
+                )
+                .await
+            };
             if debug {
                 let excerpt: String = result.chars().take(120).collect();
                 print_debug(&format!("tool result: {excerpt:?}"), color);
