@@ -21,7 +21,7 @@
 //! ↔ a future panel/tournament) the same way it swaps the `Dispatcher` transport.
 
 use crate::{BackendPool, ChatRequest, Dispatcher};
-use newt_core::caveats::{Caveats, CaveatsExt};
+use newt_core::caveats::{Caveats, CaveatsExt, CountBoundExt};
 use newt_core::lazy_emission::lazy_emission_reason;
 use newt_core::Tier;
 use serde::Deserialize;
@@ -248,6 +248,34 @@ pub async fn run_crew(
     caveats: &Caveats,
     task: &str,
 ) -> CrewOutcome {
+    // --- max_calls budget (#753): complete mediation for the call-count axis ---
+    //
+    // The crew's unit of "a call" is a MODEL/ROLE dispatch — every navigate,
+    // plan, and triage round issues exactly one `run_role_with_timeout`. That is
+    // the same "inference call" unit `newt-coder` already bounds (`coder.rs`'s
+    // `calls_used` / `check_call_budget`), and it is the resource `max_calls` is
+    // meant to cap (model invocations / cost), so we count and gate THAT — not the
+    // planning-round count. `cfg.max_attempts` still bounds the planning rounds;
+    // this is an INDEPENDENT ceiling so a clamped `max_calls` caveat actually has
+    // teeth. Before EACH dispatch we ask `max_calls.permits_one_more(calls_used)`,
+    // and when the budget denies we stop with an honest `NeedsHumanReview`
+    // cap-exit (never reported as success). `CountBound::Unlimited` (the default /
+    // `Caveats::top`) permits every call, so an unclamped crew is unchanged.
+    //
+    // NET AXIS — deliberately NOT gated in this loop. The crew has no DIRECT
+    // network effect that a `caveats.permits_net(host)` check could mediate:
+    //   (a) model inference goes to the backend INFRASTRUCTURE endpoint (the
+    //       agent's own substrate, not a task-chosen host), and
+    //   (b) any network a verification command performs happens INSIDE
+    //       `workspace.run_test()` — that is the EXEC axis's concern (which
+    //       command may run) and requires an OS sandbox for true containment,
+    //       not a predicate at this layer.
+    // So `permits_net` is correctly NOT a crew-loop call-site; net at the crew
+    // layer is governed transitively via the exec axis + the OS sandbox, by
+    // design (complete mediation per axis: this axis needs a sandbox, not a
+    // crew-loop predicate).
+    let mut calls_used: u64 = 0;
+
     // 1. NAVIGATE — pick the relevant files (then the harness reads them).
     let nav_req = ChatRequest::new()
         .system(
@@ -263,6 +291,16 @@ pub async fn run_crew(
     let role_bound = cfg
         .role_timeout
         .unwrap_or_else(crate::dispatch::role_dispatch_timeout);
+    // max_calls (#753): a zero budget can't even afford the navigator — honest
+    // cap-exit before any model is touched.
+    if !caveats.max_calls.permits_one_more(calls_used) {
+        return CrewOutcome {
+            status: CrewStatus::NeedsHumanReview,
+            attempts: 0,
+            touched: Vec::new(),
+        };
+    }
+    calls_used += 1;
     let nav: NavOut = match pool
         .run_role_with_timeout(
             dispatcher,
@@ -283,13 +321,34 @@ pub async fn run_crew(
         }
     };
 
-    // 2. CURATE — the harness reads only the navigator-selected, existing files.
-    let curated: String = nav
+    // 2. CURATE — the harness reads only the navigator-selected, existing files,
+    //    AND only those the `fs_read` leash permits (ROADMAP 23.1 / #752): complete
+    //    mediation for the READ axis, mirroring the `fs_write` partition at apply
+    //    below. A clamped `fs_read` caveat must have teeth — a denied file is NEVER
+    //    read, and the denied set is surfaced to the crew honestly, so the algebra's
+    //    read narrowing fails VISIBLY (a note in the context) rather than silently.
+    let (readable, denied_read): (Vec<&str>, Vec<&str>) = nav
         .relevant_files
+        .iter()
+        .map(String::as_str)
+        .partition(|f| caveats.permits_fs_read(f));
+    let mut curated: String = readable
         .iter()
         .filter_map(|f| workspace.read(f).map(|c| format!("=== {f} ===\n{c}")))
         .collect::<Vec<_>>()
         .join("\n\n");
+    if !denied_read.is_empty() {
+        let note = format!(
+            "{} file(s) not readable under your fs_read caveat: {}",
+            denied_read.len(),
+            denied_read.join(", ")
+        );
+        curated = if curated.is_empty() {
+            note
+        } else {
+            format!("{curated}\n\n{note}")
+        };
+    }
 
     let mut failures: Vec<String> = Vec::new();
     let mut touched: Vec<String> = Vec::new();
@@ -318,6 +377,17 @@ pub async fn run_crew(
             .user(format!(
                 "TASK:\n{task}\n\nRELEVANT FILES:\n{curated}{prior}"
             ));
+        // max_calls (#753): gate the planner dispatch. If the budget is spent the
+        // crew stops here — `attempt - 1` planning rounds completed before this one
+        // (this round never started), an honest cap-exit, not a vacuous pass.
+        if !caveats.max_calls.permits_one_more(calls_used) {
+            return CrewOutcome {
+                status: CrewStatus::NeedsHumanReview,
+                attempts: attempt - 1,
+                touched,
+            };
+        }
+        calls_used += 1;
         let edits: Vec<Edit> = match pool
             .run_role_with_timeout(
                 dispatcher,
@@ -418,6 +488,17 @@ pub async fn run_crew(
                  {\"summary\":\"what failed\",\"next_action\":\"what to change\"}.",
             )
             .user(format!("TASK:\n{task}\n\nVERIFICATION OUTPUT:\n{output}"));
+        // max_calls (#753): gate the triage dispatch. With the budget spent the
+        // next planning round could not dispatch either, so stop now — this round's
+        // plan/apply/verify already completed, so `attempt` rounds were spent.
+        if !caveats.max_calls.permits_one_more(calls_used) {
+            return CrewOutcome {
+                status: CrewStatus::NeedsHumanReview,
+                attempts: attempt,
+                touched,
+            };
+        }
+        calls_used += 1;
         let tri: TriageOut = match pool
             .run_role_with_timeout(
                 dispatcher,
@@ -707,6 +788,105 @@ mod tests {
         assert_eq!(ws.read("target.rs").as_deref(), Some("BAD"), "untouched");
     }
 
+    /// Workspace that RECORDS every `read()` call, so a test can assert exactly
+    /// which navigator-selected files the harness actually opened. `target.rs`
+    /// drives the verify (passes once it contains "GOOD"), as in [`MemWs`].
+    struct RecordingWs {
+        files: BTreeMap<String, String>,
+        reads: std::cell::RefCell<Vec<String>>,
+    }
+    impl Workspace for RecordingWs {
+        fn files(&self) -> Vec<String> {
+            self.files.keys().cloned().collect()
+        }
+        fn read(&self, path: &str) -> Option<String> {
+            self.reads.borrow_mut().push(path.to_string());
+            self.files.get(path).cloned()
+        }
+        fn apply(&mut self, edits: &[Edit]) -> Vec<String> {
+            edits
+                .iter()
+                .map(|e| {
+                    self.files.insert(e.path.clone(), e.new_content.clone());
+                    e.path.clone()
+                })
+                .collect()
+        }
+        fn run_test(&self) -> (bool, String) {
+            match self.files.get("target.rs") {
+                Some(c) if c.contains("GOOD") => (true, "ok".into()),
+                _ => (false, "FAILED".into()),
+            }
+        }
+    }
+
+    /// Navigator selects one in-scope and one out-of-scope file; the planner makes
+    /// `target.rs` GOOD on its first reply so the loop converges in one attempt (the
+    /// curate read happens once, before the attempt loop).
+    struct ReadGateMock;
+    #[async_trait]
+    impl Dispatcher for ReadGateMock {
+        async fn dispatch(
+            &self,
+            _backend: &PoolBackend,
+            model: &str,
+            _req: ChatRequest,
+        ) -> anyhow::Result<ChatReply> {
+            let content = match model {
+                "nav" => r#"{"relevant_files":["docs/x.rs","secret.rs"]}"#.to_string(),
+                "planner" => r#"{"edits":[{"path":"target.rs","new_content":"GOOD"}]}"#.to_string(),
+                "triage" => r#"{"summary":"","next_action":""}"#.to_string(),
+                other => panic!("unexpected model {other}"),
+            };
+            Ok(ChatReply {
+                content,
+                model_id: model.to_string(),
+                usage: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn refuses_to_read_outside_the_fs_read_leash() {
+        // #752: complete mediation for the READ axis. fs_read = Only(["docs/x.rs"])
+        // clamps reads to that one file; the navigator selects BOTH it and the
+        // out-of-scope `secret.rs`. The harness must read the in-scope file and must
+        // NOT read the denied one — otherwise the clamped caveat is silently ignored.
+        // RED on the pre-#752 code, which read every navigator pick unconditionally.
+        let p = pool();
+        let mut ws = RecordingWs {
+            files: BTreeMap::from([
+                ("target.rs".to_string(), "BAD".to_string()),
+                ("docs/x.rs".to_string(), "DOC".to_string()),
+                ("secret.rs".to_string(), "TOPSECRET".to_string()),
+            ]),
+            reads: std::cell::RefCell::new(Vec::new()),
+        };
+        let read_clamped = newt_core::caveats::Caveats {
+            fs_read: newt_core::caveats::Scope::only(["docs/x.rs".to_string()]),
+            ..newt_core::caveats::Caveats::top()
+        };
+        let out = run_crew(
+            &p,
+            &ReadGateMock,
+            &mut ws,
+            &cfg(3),
+            &read_clamped,
+            "make target.rs GOOD",
+        )
+        .await;
+        assert_eq!(out.status, CrewStatus::Passed, "{out:?}");
+        let reads = ws.reads.borrow();
+        assert!(
+            reads.iter().any(|r| r == "docs/x.rs"),
+            "the in-scope file must be read: {reads:?}"
+        );
+        assert!(
+            !reads.iter().any(|r| r == "secret.rs"),
+            "the out-of-scope file must NOT be read under the fs_read leash: {reads:?}"
+        );
+    }
+
     /// Planner that always emits a lazy/elided placeholder for the target file.
     struct LazyMock;
     #[async_trait]
@@ -937,5 +1117,96 @@ mod tests {
         assert!(!task_requires_change(
             "Verify the rollup behavior via manual check"
         ));
+    }
+
+    /// Counts EVERY model dispatch (across all roles) so a test can assert the
+    /// crew honored a `max_calls` budget. The planner always emits a BAD edit, so
+    /// the crew never converges — absent the budget it would burn every attempt.
+    struct CountingMock {
+        dispatches: AtomicUsize,
+    }
+    #[async_trait]
+    impl Dispatcher for CountingMock {
+        async fn dispatch(
+            &self,
+            _backend: &PoolBackend,
+            model: &str,
+            _req: ChatRequest,
+        ) -> anyhow::Result<ChatReply> {
+            self.dispatches.fetch_add(1, Ordering::SeqCst);
+            let content = match model {
+                "nav" => r#"{"relevant_files":["target.rs"]}"#.to_string(),
+                "triage" => {
+                    r#"{"summary":"still BAD","next_action":"set content to GOOD"}"#.to_string()
+                }
+                // Never converges: always re-emits BAD, so verify always fails.
+                "planner" => r#"{"edits":[{"path":"target.rs","new_content":"BAD"}]}"#.to_string(),
+                other => panic!("unexpected model {other}"),
+            };
+            Ok(ChatReply {
+                content,
+                model_id: model.to_string(),
+                usage: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn max_calls_caveat_bounds_total_model_calls() {
+        // #753: a clamped `max_calls` caveat must bound the crew's model calls even
+        // when `cfg.max_attempts` is far larger. With AtMost(3) and max_attempts=10,
+        // the crew makes navigate + plan + triage = 3 dispatches and then stops at
+        // the next planner gate (the budget is spent). RED on the pre-#753 code,
+        // which bounds the loop ONLY by `cfg.max_attempts` and so burns navigate +
+        // 10*(plan+triage) = 21 dispatches before exiting.
+        let p = pool();
+        let d = CountingMock {
+            dispatches: AtomicUsize::new(0),
+        };
+        let mut ws = MemWs::new();
+        let budget = newt_core::caveats::Caveats {
+            max_calls: newt_core::caveats::CountBound::AtMost(3),
+            ..newt_core::caveats::Caveats::top()
+        };
+        let out = run_crew(
+            &p,
+            &d,
+            &mut ws,
+            &cfg(10),
+            &budget,
+            "modify target.rs to be GOOD",
+        )
+        .await;
+        let calls = d.dispatches.load(Ordering::SeqCst);
+        assert!(
+            calls <= 3,
+            "max_calls=AtMost(3) must bound the crew's model calls regardless of \
+             cfg.max_attempts=10, but it made {calls} dispatches"
+        );
+        // Budget-exhausted is an honest cap-exit — never reported as success.
+        assert_eq!(out.status, CrewStatus::NeedsHumanReview, "{out:?}");
+    }
+
+    #[tokio::test]
+    async fn max_calls_zero_denies_even_the_navigator() {
+        // #753 edge: AtMost(0) can't afford a single model call, so the crew exits
+        // honestly having dispatched NOTHING (attempts:0).
+        let p = pool();
+        let d = CountingMock {
+            dispatches: AtomicUsize::new(0),
+        };
+        let mut ws = MemWs::new();
+        let budget = newt_core::caveats::Caveats {
+            max_calls: newt_core::caveats::CountBound::AtMost(0),
+            ..newt_core::caveats::Caveats::top()
+        };
+        let out = run_crew(&p, &d, &mut ws, &cfg(5), &budget, "modify target.rs").await;
+        assert_eq!(
+            d.dispatches.load(Ordering::SeqCst),
+            0,
+            "no call may be made"
+        );
+        assert_eq!(out.status, CrewStatus::NeedsHumanReview);
+        assert_eq!(out.attempts, 0);
     }
 }
