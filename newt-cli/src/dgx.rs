@@ -36,6 +36,7 @@ use newt_core::router::Classification;
 use newt_core::{Config, Router, Tier};
 use newt_inference::local::LocalVllmBackend;
 
+use crate::dgx_registry::{self, InferenceTool, ModelVariant};
 use crate::dgx_status;
 use crate::dgx_vllm;
 
@@ -86,6 +87,45 @@ pub enum DgxCmd {
         /// — `{ total_gib, used_gib, available_gib, running_workloads[] }`.
         #[arg(long)]
         json: bool,
+    },
+    /// Select, clear for, and launch the strongest fitting model on the node
+    /// (issue #709 §4) — the high-level deploy verb, decoupled from the
+    /// low-level `vllm up` knobs.
+    ///
+    /// With `--strongest`, reads the node's available memory budget over SSH and
+    /// picks the strongest registry model that fits (15% headroom, single node).
+    /// Otherwise deploys the explicit `<model>` slug (e.g. `ornith-35b-fp16`).
+    /// Either way it first evicts competing workloads, then launches — Mode A
+    /// invokes the operator's convention script `~/ornith-{size}-{format}.sh`
+    /// when present on the node, else Mode B falls back to a generated
+    /// `vllm serve`. Finally it polls the endpoint until it is serving.
+    Deploy {
+        /// Deploy the strongest model that fits the node's available budget.
+        #[arg(long, conflicts_with = "model")]
+        strongest: bool,
+        /// Deploy a specific variant by its convention slug, e.g.
+        /// `ornith-35b-fp16` (see `~/ornith-{size}-{format}.sh`). Required
+        /// unless `--strongest` is given.
+        #[arg(required_unless_present = "strongest")]
+        model: Option<String>,
+        /// SSH node name (defaults to the active node).
+        #[arg(long)]
+        node: Option<String>,
+    },
+    /// Evict inference workloads on the node and report the recovered budget
+    /// (issue #709 §3).
+    ///
+    /// Stops any running vLLM server and unloads every resident Ollama model to
+    /// free the shared unified-memory pool. With `--restart-ollama`, also
+    /// restarts the ollama service over SSH to drop CUDA buffers an idle-but-
+    /// loaded runner still pins. Reports the memory freed (budget before/after).
+    Clear {
+        /// SSH node name (defaults to the active node).
+        #[arg(long)]
+        node: Option<String>,
+        /// Also restart the ollama service over SSH to evict CUDA buffers.
+        #[arg(long)]
+        restart_ollama: bool,
     },
     /// List the models available on the active DGX endpoint.
     Models,
@@ -322,6 +362,15 @@ pub async fn run(cmd: DgxCmd, config_path: Option<&Path>) -> anyhow::Result<()> 
         ),
         DgxCmd::Route { task } => route(&task, config_path),
         DgxCmd::Status { node, json } => status(config_path, node.as_deref(), json).await,
+        DgxCmd::Deploy {
+            strongest,
+            model,
+            node,
+        } => deploy(config_path, strongest, model.as_deref(), node.as_deref()).await,
+        DgxCmd::Clear {
+            node,
+            restart_ollama,
+        } => clear(config_path, node.as_deref(), restart_ollama).await,
         DgxCmd::Models => models(config_path).await,
         DgxCmd::Doctor => doctor(config_path).await,
         DgxCmd::Use { model } => use_model(config_path, &model),
@@ -1835,6 +1884,251 @@ async fn evict_vllm_server(ssh: &dyn SshExec, dgx: &DgxConfig) -> anyhow::Result
             Ok(()) => println!("  stopped vLLM server {id}"),
             Err(e) => eprintln!("  WARNING: failed to stop vLLM server {id}: {e}"),
         }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// deploy / clear — hardware-aware inference deployment (issue #709, PR2)
+// ---------------------------------------------------------------------------
+
+/// The OpenAI-compatible serve port a deployed variant listens on, by tool: the
+/// vLLM / llama.cpp convention is 8000, Ollama's is 11434. The convention deploy
+/// scripts follow this (e.g. `vllm serve --port 8000`). The health gate polls
+/// `<host>:<port>/v1/models` — which Ollama also exposes — so one port rule
+/// covers both. Pure.
+fn serve_port(tool: InferenceTool) -> u16 {
+    match tool {
+        InferenceTool::Ollama => 11434,
+        InferenceTool::Vllm | InferenceTool::LlamaCpp => 8000,
+    }
+}
+
+/// Resolve which variant `deploy` should launch (issue #709 §6 / §4). With
+/// `strongest`, the strongest registry model fitting `available_gib` on a single
+/// node; otherwise the explicit `model` slug looked up in the registry.
+/// `available_gib` is ignored in the explicit path (the caller skips the budget
+/// probe then). Pure — the budget is gathered by the caller.
+fn select_deploy_variant(
+    strongest: bool,
+    model: Option<&str>,
+    available_gib: f64,
+) -> anyhow::Result<&'static ModelVariant> {
+    if strongest {
+        return dgx_registry::strongest_model(available_gib, 1).ok_or_else(|| {
+            anyhow::anyhow!(
+                "no registry model fits the available budget ({available_gib:.1} GiB, before \
+                 the 15% headroom) — free memory (`newt dgx clear`) or see `newt dgx status`"
+            )
+        });
+    }
+    let slug = model.ok_or_else(|| {
+        anyhow::anyhow!("specify a model slug (e.g. ornith-35b-fp16) or pass --strongest")
+    })?;
+    dgx_registry::find_variant(slug).ok_or_else(|| {
+        anyhow::anyhow!(
+            "unknown model {slug:?}; expected a registry slug like ornith-35b-fp16 \
+             (the `~/ornith-{{size}}-{{format}}.sh` convention)"
+        )
+    })
+}
+
+/// How `deploy` launches a selected variant (issue #709 §4), decided purely from
+/// whether the variant's convention script is present on the node.
+#[derive(Debug, PartialEq, Eq)]
+enum DeployRoute {
+    /// Mode A — invoke the operator's pre-written convention script.
+    Script {
+        /// The `~/ornith-{size}-{format}.sh` path (tilde expands on the node).
+        path: String,
+        /// The shell-safe convention slug (used for the log/pid file names).
+        slug: String,
+        /// Port the launched server is expected to serve on.
+        port: u16,
+    },
+    /// Mode B — no convention script: serve the model id via generated `vllm`.
+    VllmFallback {
+        /// The model id passed to the generated `vllm serve` (the variant name).
+        model: String,
+        /// Port the generated server serves on.
+        port: u16,
+    },
+}
+
+/// Choose the deploy route for `v` given whether its convention script exists on
+/// the node (issue #709 §4): Mode A invokes the script, Mode B falls back to a
+/// generated `vllm serve`. Pure.
+fn deploy_route(v: &ModelVariant, script_present: bool) -> DeployRoute {
+    let port = serve_port(v.tool);
+    if script_present {
+        DeployRoute::Script {
+            path: dgx_registry::script_name(v),
+            slug: dgx_registry::variant_slug(v),
+            port,
+        }
+    } else {
+        DeployRoute::VllmFallback {
+            model: v.name.to_string(),
+            port,
+        }
+    }
+}
+
+/// Remote command that prints `FOUND`/`MISSING` for the convention script and
+/// always exits 0 (so a *missing* script is distinguishable from an SSH/host
+/// error, which surfaces as a capture failure). Pure. The leading `~` in
+/// `script_path` is left unquoted so the remote shell expands it.
+fn script_probe_command(script_path: &str) -> String {
+    format!("test -f {script_path} && echo FOUND || echo MISSING")
+}
+
+/// True iff the [`script_probe_command`] stdout reports the script present. Pure.
+fn script_is_present(probe_stdout: &str) -> bool {
+    probe_stdout.lines().any(|l| l.trim() == "FOUND")
+}
+
+/// On-node state dir for deploy launch bookkeeping (log + pidfile).
+fn deploy_state_dir() -> &'static str {
+    "$HOME/.newt/dgx/deploy"
+}
+
+/// Remote script that launches the convention deploy script detached with
+/// `nohup`, logging under [`deploy_state_dir`] keyed by the (shell-safe) `slug`,
+/// and recording its PID — mirroring [`dgx_vllm::vllm_remote_script`]. Pure.
+/// `script_path`'s leading `~` is left unquoted so it expands on the node.
+fn deploy_launch_command(script_path: &str, slug: &str) -> String {
+    let dir = deploy_state_dir();
+    format!(
+        "set -eu\n\
+         mkdir -p \"{dir}\"\n\
+         nohup {script_path} > \"{dir}/{slug}.log\" 2>&1 &\n\
+         echo $! > \"{dir}/{slug}.pid\"\n"
+    )
+}
+
+/// The remote command that restarts the ollama service to drop CUDA buffers an
+/// idle-but-loaded runner still pins (the `--restart-ollama` step). Tries the
+/// user-scope unit first, then the system unit, covering both common install
+/// styles; names no host. Pure.
+fn restart_ollama_command() -> &'static str {
+    "systemctl --user restart ollama 2>/dev/null || systemctl restart ollama"
+}
+
+/// Restart the ollama service on the node (best-effort: a warning, not an abort,
+/// on failure). `ssh` is injectable so tests never touch a real node.
+fn restart_ollama_service(ssh: &dyn SshExec, user: &str, host: &str) {
+    match ssh.run(user, host, None, restart_ollama_command()) {
+        Ok(()) => println!("  restarted ollama service"),
+        Err(e) => eprintln!("  WARNING: failed to restart ollama: {e}"),
+    }
+}
+
+/// Memory freed (GiB) between two budget snapshots: how much `available` grew.
+/// Saturating — a workload that started in between can never report negative.
+/// Pure.
+fn freed_gib(before: &dgx_status::MemBudget, after: &dgx_status::MemBudget) -> f64 {
+    let freed = after.available_bytes.saturating_sub(before.available_bytes);
+    dgx_pull::bytes_to_gib(freed)
+}
+
+/// `dgx deploy [--strongest] [<model>]` — select, clear for, launch, health-gate.
+async fn deploy(
+    config_path: Option<&Path>,
+    strongest: bool,
+    model: Option<&str>,
+    node: Option<&str>,
+) -> anyhow::Result<()> {
+    let mut dgx = dgx_config(config_path)?;
+    if let Some(n) = node {
+        dgx.active_node = Some(n.to_string());
+    }
+    let user = dgx.ssh_user();
+    let host = dgx.ssh_host()?;
+
+    // 1. Select the variant (the budget probe is only needed for --strongest).
+    let variant = if strongest {
+        let budget = dgx_status::gather_budget(&RealSshCapture, &user, &host, None)?;
+        let available_gib = dgx_pull::bytes_to_gib(budget.available_bytes);
+        println!("Available budget: {available_gib:.1} GiB");
+        select_deploy_variant(true, None, available_gib)?
+    } else {
+        select_deploy_variant(false, model, 0.0)?
+    };
+    println!(
+        "Selected {} {} (~{:.0} GiB, {})",
+        variant.name,
+        variant.format,
+        variant.gib,
+        variant.tool.as_str()
+    );
+
+    // 2. Evict competing workloads to make room before launching.
+    println!("Clearing competing workloads…");
+    evict_vllm_server(&RealSsh, &dgx).await?;
+    evict_ollama_models(&dgx).await?;
+
+    // 3. Mode A (convention script present) or Mode B (generated vLLM fallback).
+    use crate::dgx_status::SshCapture as _;
+    let script_path = dgx_registry::script_name(variant);
+    let probe = RealSshCapture.capture(&user, &host, None, &script_probe_command(&script_path))?;
+    let route = deploy_route(variant, script_is_present(&probe));
+    let port = match &route {
+        DeployRoute::Script { path, slug, port } => {
+            println!("Mode A: invoking convention script {path}");
+            RealSsh.run(&user, &host, None, &deploy_launch_command(path, slug))?;
+            *port
+        }
+        DeployRoute::VllmFallback { model, port } => {
+            println!(
+                "Mode B: no convention script {script_path} on node — \
+                 generating a vLLM launch for {model}"
+            );
+            let plan = build_plan_from_args(model, &default_vllm_plan_args())?;
+            execute_vllm_plan(&RealSsh, &user, &host, &plan, false)?;
+            *port
+        }
+    };
+
+    // 4. Health gate: poll until the endpoint is serving, then report its URL.
+    let endpoint = format!("http://{host}:{port}");
+    println!("Waiting for {endpoint}/v1/models (cold load can take minutes)…");
+    poll_vllm_ready(&endpoint, &RetryPolicy::for_local_inference()).await?;
+    println!("Serving at {endpoint}");
+    Ok(())
+}
+
+/// `dgx clear [--restart-ollama]` — evict inference workloads, report freed mem.
+async fn clear(
+    config_path: Option<&Path>,
+    node: Option<&str>,
+    restart_ollama: bool,
+) -> anyhow::Result<()> {
+    let mut dgx = dgx_config(config_path)?;
+    if let Some(n) = node {
+        dgx.active_node = Some(n.to_string());
+    }
+    let user = dgx.ssh_user();
+    let host = dgx.ssh_host()?;
+
+    // Budget before (best-effort — never block the eviction on an SSH read).
+    let before = dgx_status::gather_budget(&RealSshCapture, &user, &host, None).ok();
+
+    println!("Clearing inference workloads on {host}…");
+    evict_vllm_server(&RealSsh, &dgx).await?;
+    evict_ollama_models(&dgx).await?;
+    if restart_ollama {
+        restart_ollama_service(&RealSsh, &user, &host);
+    }
+
+    // Budget after + freed report (best-effort).
+    let after = dgx_status::gather_budget(&RealSshCapture, &user, &host, None).ok();
+    match (before, after) {
+        (Some(b), Some(a)) => {
+            print!("{}", dgx_status::render_budget_human(&host, &a));
+            println!("  Freed:      {:.1} GiB", freed_gib(&b, &a));
+        }
+        (None, Some(a)) => print!("{}", dgx_status::render_budget_human(&host, &a)),
+        _ => println!("  (memory budget unavailable over SSH)"),
     }
     Ok(())
 }
@@ -3481,5 +3775,235 @@ tiers = ["FAST", "STANDARD"]
         })
         .is_none());
         assert!(drift_notice_line(&ReconcileVerdict::NoLiveState).is_none());
+    }
+
+    // --- deploy / clear (issue #709, PR2) ---------------------------------
+
+    /// Fetch a registry variant by slug for tests (panics on a typo'd slug).
+    fn variant(slug: &str) -> &'static ModelVariant {
+        dgx_registry::find_variant(slug).unwrap_or_else(|| panic!("no variant {slug}"))
+    }
+
+    #[test]
+    fn serve_port_maps_tool_to_convention_port() {
+        assert_eq!(serve_port(InferenceTool::Vllm), 8000);
+        assert_eq!(serve_port(InferenceTool::LlamaCpp), 8000);
+        assert_eq!(serve_port(InferenceTool::Ollama), 11434);
+    }
+
+    #[test]
+    fn select_strongest_variant_picks_the_best_fit_for_the_budget() {
+        // 96 GiB available, 1 node → 81.6 usable → 21/35/70 fit, 104 does not →
+        // the strongest is the 35B FP16 (70 GiB). This WIRES PR1's selector.
+        let v = select_deploy_variant(true, None, 96.0).expect("a model fits");
+        assert_eq!(v.name, "Ornith-1.0-35B");
+        assert_eq!(v.format, "FP16");
+        // A huge budget reaches the strongest overall (the 397B FP8).
+        let v = select_deploy_variant(true, None, 600.0).expect("everything fits");
+        assert_eq!(v.name, "Ornith-1.0-397B");
+        assert_eq!(v.format, "FP8");
+    }
+
+    #[test]
+    fn select_strongest_variant_errors_when_nothing_fits() {
+        // 10 GiB → below the smallest model's headroom-adjusted need.
+        let err = select_deploy_variant(true, None, 10.0)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no registry model fits"), "{err}");
+        assert!(err.contains("newt dgx clear"), "{err}");
+    }
+
+    #[test]
+    fn select_explicit_variant_looks_up_the_slug() {
+        let v = select_deploy_variant(false, Some("ornith-397b-q2"), 0.0).expect("known slug");
+        assert_eq!(v.name, "Ornith-1.0-397B");
+        assert_eq!(v.format, "Q2_K_GGUF");
+        assert_eq!(v.tool, InferenceTool::LlamaCpp);
+    }
+
+    #[test]
+    fn select_explicit_variant_rejects_unknown_and_missing() {
+        let err = select_deploy_variant(false, Some("ornith-99b-fp4"), 0.0)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown model"), "{err}");
+        // No --strongest and no slug → a clear, actionable error.
+        let err = select_deploy_variant(false, None, 0.0)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--strongest"), "{err}");
+    }
+
+    #[test]
+    fn deploy_route_mode_a_when_script_present() {
+        // The expected Mode-A script path for the selected variant.
+        let v = variant("ornith-35b-fp8");
+        assert_eq!(
+            deploy_route(v, true),
+            DeployRoute::Script {
+                path: "~/ornith-35b-fp8.sh".to_string(),
+                slug: "ornith-35b-fp8".to_string(),
+                port: 8000,
+            }
+        );
+        // An Ollama variant routes Mode A on the Ollama port.
+        let v = variant("ornith-35b-q4");
+        assert_eq!(
+            deploy_route(v, true),
+            DeployRoute::Script {
+                path: "~/ornith-35b-q4.sh".to_string(),
+                slug: "ornith-35b-q4".to_string(),
+                port: 11434,
+            }
+        );
+    }
+
+    #[test]
+    fn deploy_route_mode_b_fallback_when_script_absent() {
+        // No convention script → fall back to a generated vLLM serve of the
+        // variant's model name.
+        let v = variant("ornith-35b-fp8");
+        assert_eq!(
+            deploy_route(v, false),
+            DeployRoute::VllmFallback {
+                model: "Ornith-1.0-35B".to_string(),
+                port: 8000,
+            }
+        );
+    }
+
+    #[test]
+    fn script_probe_command_and_parse() {
+        let v = variant("ornith-35b-fp16");
+        let path = dgx_registry::script_name(v);
+        let cmd = script_probe_command(&path);
+        // Always exits 0 (FOUND/MISSING) so SSH-up is distinguishable from a
+        // missing script; the tilde is left unquoted so the node expands it.
+        assert_eq!(
+            cmd,
+            "test -f ~/ornith-35b-fp16.sh && echo FOUND || echo MISSING"
+        );
+        assert!(script_is_present("FOUND\n"));
+        assert!(script_is_present("  FOUND  "));
+        assert!(!script_is_present("MISSING\n"));
+        assert!(!script_is_present(""));
+    }
+
+    #[test]
+    fn deploy_launch_command_nohups_the_script_detached() {
+        let cmd = deploy_launch_command("~/ornith-35b-fp8.sh", "ornith-35b-fp8");
+        assert!(cmd.starts_with("set -eu\n"));
+        // Tilde left unquoted (expands on the node), detached with nohup.
+        assert!(cmd.contains("nohup ~/ornith-35b-fp8.sh"));
+        assert!(cmd.contains("ornith-35b-fp8.log"));
+        assert!(cmd.contains("ornith-35b-fp8.pid"));
+        assert!(cmd.contains("echo $! >"));
+        // The state dir is $HOME-rooted (no leaked absolute home path).
+        assert!(cmd.contains("$HOME/.newt/dgx/deploy"));
+    }
+
+    #[test]
+    fn restart_ollama_command_is_host_free_and_stable() {
+        let cmd = restart_ollama_command();
+        assert!(cmd.contains("systemctl"));
+        assert!(cmd.contains("restart ollama"));
+        // Tries user scope then system scope — names no host.
+        assert!(cmd.contains("--user"));
+    }
+
+    #[test]
+    fn restart_ollama_service_records_the_command() {
+        let ssh = RecordingSsh::new();
+        restart_ollama_service(&ssh, "bob", "dgx.test");
+        let calls = ssh.calls.borrow();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "bob");
+        assert_eq!(calls[0].1, "dgx.test");
+        assert_eq!(calls[0].3, restart_ollama_command());
+    }
+
+    #[test]
+    fn freed_gib_reports_growth_and_saturates() {
+        let mk = |avail_gib: u64| dgx_status::MemBudget {
+            total_bytes: 128 * 1024 * 1024 * 1024,
+            available_bytes: avail_gib * 1024 * 1024 * 1024,
+            workloads: vec![],
+        };
+        // available grew 10 → 30 GiB → 20 GiB freed.
+        assert!((freed_gib(&mk(10), &mk(30)) - 20.0).abs() < 1e-9);
+        // A shrink (a workload started in between) saturates to 0, never < 0.
+        assert!((freed_gib(&mk(30), &mk(10))).abs() < 1e-9);
+    }
+
+    /// A DgxConfig whose active node serves BOTH engines at `uri` and is
+    /// SSH-reachable — for exercising the `clear` eviction sequence.
+    fn both_engines_config_at(uri: &str) -> DgxConfig {
+        DgxConfig {
+            active_node: Some("home".to_string()),
+            active_endpoint: EndpointKind::Vllm,
+            nodes: vec![DgxNode {
+                name: "home".to_string(),
+                ollama: Some(uri.to_string()),
+                vllm: Some(uri.to_string()),
+                ssh_host: Some("dgx.test".to_string()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn clear_sequence_evicts_both_engines_then_restarts() {
+        // The exact SSH sequence `clear --restart-ollama` issues, over a mocked
+        // SSH seam + wiremock'd engine endpoints (no live node/network).
+        let server = MockServer::start().await;
+        // A running vLLM server (so evict_vllm_server kills it).
+        Mock::given(method("GET"))
+            .and(wm_path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{ "id": "qwen3.6-35b" }]
+            })))
+            .mount(&server)
+            .await;
+        // A resident Ollama model (so evict_ollama_models unloads it).
+        Mock::given(method("GET"))
+            .and(wm_path("/api/ps"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "models": [{ "name": "nemotron3:33b", "size": 100 }]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(wm_path("/api/generate"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&server)
+            .await;
+
+        let cfg = both_engines_config_at(&server.uri());
+        let ssh = RecordingSsh::new();
+        // Mirror clear()'s mutating steps over the injectable seams.
+        evict_vllm_server(&ssh, &cfg).await.unwrap();
+        evict_ollama_models(&cfg).await.unwrap();
+        restart_ollama_service(&ssh, &cfg.ssh_user(), &cfg.ssh_host().unwrap());
+
+        // The Ollama unload went over HTTP (not SSH): one /api/generate POST.
+        // (Done before borrowing `calls` so no RefCell ref is held across await.)
+        let reqs = server.received_requests().await.unwrap();
+        assert_eq!(
+            reqs.iter()
+                .filter(|r| r.url.path() == "/api/generate")
+                .count(),
+            1
+        );
+
+        let calls = ssh.calls.borrow();
+        assert_eq!(calls.len(), 2, "vLLM stop + ollama restart");
+        // 1) vLLM server stopped by pidfile.
+        assert_eq!(calls[0].1, "dgx.test");
+        assert!(calls[0].3.contains("qwen3.6-35b.pid"));
+        assert!(calls[0].3.contains("kill"));
+        // 2) ollama service restarted.
+        assert_eq!(calls[1].3, restart_ollama_command());
     }
 }

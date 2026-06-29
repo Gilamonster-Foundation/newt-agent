@@ -145,6 +145,55 @@ pub fn select_strongest(
         .max_by(|a, b| a.quality_score.cmp(&b.quality_score))
 }
 
+// ---------------------------------------------------------------------------
+// Deploy convention: slug + script name (issue #709 §4, Mode A)
+// ---------------------------------------------------------------------------
+
+/// The size token from a model name: the final `-`-delimited component,
+/// lowercased — `Ornith-1.0-35B` → `35b`, `Ornith-1.0-397B` → `397b`. Pure.
+fn size_token(name: &str) -> String {
+    name.rsplit('-').next().unwrap_or(name).to_ascii_lowercase()
+}
+
+/// The format token from a weight format: the part before the first `_`,
+/// lowercased — `Q4_GGUF` → `q4`, `Q2_K_GGUF` → `q2`, `FP8` → `fp8`. Pure.
+fn format_token(format: &str) -> String {
+    format
+        .split('_')
+        .next()
+        .unwrap_or(format)
+        .to_ascii_lowercase()
+}
+
+/// The convention slug for a variant — `ornith-{size}-{format}`, e.g.
+/// `Ornith-1.0-35B` + `FP8` → `ornith-35b-fp8`. This is the token accepted by
+/// `newt dgx deploy <slug>` and the basename (minus `~/` and `.sh`) of the
+/// convention deploy script. Pure; derived from identity only (no host).
+///
+/// THREE-CS NOTE: this encodes the `ornith-{size}-{format}` script-naming
+/// **Convention** (one of the three Cs). It lives with the identity it derives
+/// from; a future config source would instead carry an explicit `script` field
+/// per variant, dropping this derivation.
+pub fn variant_slug(v: &ModelVariant) -> String {
+    format!("ornith-{}-{}", size_token(v.name), format_token(v.format))
+}
+
+/// The convention deploy-script path for a variant: `~/{slug}.sh`, e.g.
+/// `~/ornith-35b-fp8.sh` (issue #709 §4, Mode A). Pure. The leading `~` is a
+/// shell convention expanded **on the node**, never a resolved home path here
+/// (and so this leaks no host/user).
+pub fn script_name(v: &ModelVariant) -> String {
+    format!("~/{}.sh", variant_slug(v))
+}
+
+/// Find a registry variant by its convention slug (case-insensitive), e.g.
+/// `ornith-35b-fp16`. `None` when no variant matches. Pure — the lookup table
+/// for `newt dgx deploy <slug>`.
+pub fn find_variant(slug: &str) -> Option<&'static ModelVariant> {
+    let want = slug.trim().to_ascii_lowercase();
+    REGISTRY.iter().find(|v| variant_slug(v) == want)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -262,6 +311,89 @@ mod tests {
     #[test]
     fn empty_table_returns_none() {
         assert!(select_strongest(&[], 1000.0, 10).is_none());
+    }
+
+    // --- deploy convention: slug / script_name / find_variant --------
+
+    #[test]
+    fn variant_slug_follows_the_convention() {
+        // The issue's worked example: Ornith-1.0-35B + FP8 → ornith-35b-fp8.
+        let fp8 = REGISTRY
+            .iter()
+            .find(|v| v.name == "Ornith-1.0-35B" && v.format == "FP8")
+            .expect("35B FP8 present");
+        assert_eq!(variant_slug(fp8), "ornith-35b-fp8");
+    }
+
+    #[test]
+    fn variant_slug_normalizes_size_and_format_tokens() {
+        // size token = last `-` component lowercased; format token = part before
+        // the first `_` lowercased (so the GGUF/_K suffixes are dropped).
+        let cases = [
+            ("Ornith-1.0-35B", "Q4_GGUF", "ornith-35b-q4"),
+            ("Ornith-1.0-35B", "FP16", "ornith-35b-fp16"),
+            ("Ornith-1.0-397B", "Q2_K_GGUF", "ornith-397b-q2"),
+            ("Ornith-1.0-397B", "FP8", "ornith-397b-fp8"),
+        ];
+        for (name, format, want) in cases {
+            let v = ModelVariant {
+                name,
+                format,
+                gib: 1.0,
+                tool: InferenceTool::Vllm,
+                quality_score: 1,
+            };
+            assert_eq!(variant_slug(&v), want, "{name} {format}");
+        }
+    }
+
+    #[test]
+    fn every_registry_slug_is_unique() {
+        // The slug is the deploy lookup key — collisions would make
+        // `find_variant` ambiguous.
+        let mut slugs: Vec<String> = REGISTRY.iter().map(variant_slug).collect();
+        let count = slugs.len();
+        slugs.sort();
+        slugs.dedup();
+        assert_eq!(slugs.len(), count, "registry slugs must be unique");
+    }
+
+    #[test]
+    fn script_name_is_the_tilde_convention_path() {
+        let fp8 = REGISTRY
+            .iter()
+            .find(|v| v.name == "Ornith-1.0-35B" && v.format == "FP8")
+            .expect("35B FP8 present");
+        assert_eq!(script_name(fp8), "~/ornith-35b-fp8.sh");
+        // No leaked host/user/home — only the `~` shell convention + the slug.
+        assert!(script_name(fp8).starts_with("~/"));
+        assert!(script_name(fp8).ends_with(".sh"));
+    }
+
+    #[test]
+    fn find_variant_round_trips_every_slug_case_insensitively() {
+        for v in REGISTRY {
+            let slug = variant_slug(v);
+            assert_eq!(find_variant(&slug), Some(v), "lower {slug}");
+            assert_eq!(
+                find_variant(&slug.to_ascii_uppercase()),
+                Some(v),
+                "upper {slug}"
+            );
+            // Surrounding whitespace is tolerated.
+            assert_eq!(
+                find_variant(&format!("  {slug}  ")),
+                Some(v),
+                "padded {slug}"
+            );
+        }
+    }
+
+    #[test]
+    fn find_variant_unknown_is_none() {
+        assert!(find_variant("ornith-99b-fp4").is_none());
+        assert!(find_variant("").is_none());
+        assert!(find_variant("not-a-slug").is_none());
     }
 
     #[test]
