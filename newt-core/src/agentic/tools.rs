@@ -1113,41 +1113,15 @@ fn envelope_denial_reason(envelope: &serde_json::Value) -> String {
     }
 }
 
-fn toml_string_literal(value: &str) -> String {
-    value.replace('\\', "\\\\").replace('"', "\\\"")
-}
-
+/// The allowlist NAME for an exec target — the trailing path component (the
+/// program's basename), so `/usr/bin/env` and `C:\tools\env.exe` resolve to the
+/// command a grant would actually allowlist. Used when lifting a denied exec
+/// into a #263 [`PermissionRequest`].
 fn exec_allowlist_name(target: &str) -> &str {
     target
         .rsplit(['/', '\\'])
         .find(|part| !part.is_empty())
         .unwrap_or(target)
-}
-
-fn extra_exec_hint(envelope: &serde_json::Value) -> Option<String> {
-    let denials = envelope.get("denials")?.as_array()?;
-    let target = denials.iter().find_map(|d| {
-        let kind = d.get("kind")?.as_str()?;
-        if kind != "exec" {
-            return None;
-        }
-        d.get("target")?
-            .as_str()
-            .filter(|target| !target.is_empty())
-    })?;
-
-    Some(format!(
-        "add it via [tui.permissions] extra_exec = [\"{}\"] in your newt config",
-        toml_string_literal(exec_allowlist_name(target))
-    ))
-}
-
-fn envelope_denial_reason_with_guidance(envelope: &serde_json::Value) -> String {
-    let reason = envelope_denial_reason(envelope);
-    match extra_exec_hint(envelope) {
-        Some(hint) => format!("{reason} - {hint}"),
-        None => reason,
-    }
 }
 
 /// #721: the model-actionable recovery appended to every capability denial the
@@ -1195,16 +1169,61 @@ fn denied_fs_result(kind: &str, path: &str) -> String {
     format!("capability denied: {kind} does not permit '{path}'. {DENIAL_RECOVERY_HINT}")
 }
 
-/// The standard `run_command` capability-denial result. The human-facing
-/// transcript line (via [`print_denied`]) keeps the operator config hint
-/// (`extra_exec`); the MODEL-facing return additionally leads to the recoverable
-/// [`DENIAL_RECOVERY_HINT`] (#721) so the denial is no longer a dead-end. The
-/// #263 prompt path still falls back here bit-for-bit on deny (and on a second
-/// denial after a re-execution).
+/// The standard `run_command` capability-denial result, composed EXACTLY ONCE:
+/// a single `capability denied: <bare reason>. <recovery hint>` for the model.
+///
+/// #775 (§2.5): the model-facing message is ONE clean level. Two earlier defects
+/// are removed:
+///
+/// 1. The bare denial `reason` (a full sentence from the leash, e.g.
+///    `exec of "export" is not within the granted authority`) is NO LONGER
+///    stuffed into [`print_denied`]'s bare `'{target}'` slot. Doing so produced
+///    the garbled `capability denied: exec does not permit '<whole reason
+///    sentence> - add it via …>'` — a denial sentence nested inside another.
+///    [`print_denied`] now receives only the BARE command target, matching its
+///    `{axis} does not permit '{target}'` contract (the same shape the fs path
+///    uses via [`denied_fs_result`]).
+/// 2. The stale `extra_exec` config hint is gone from the model-facing message.
+///    #721 superseded "edit your `[tui.permissions]` config" with the
+///    model-actionable [`DENIAL_RECOVERY_HINT`] (`request_permissions`), so the
+///    model now sees the bare reason once plus that hint — never a config edit
+///    it cannot perform mid-turn.
+///
+/// The #263 prompt path still falls back here on deny (and on a second denial
+/// after a re-execution).
 fn denied_run_command_result(envelope: &serde_json::Value, color: bool) -> String {
-    let reason = envelope_denial_reason_with_guidance(envelope);
-    print_denied("exec", &reason, color);
-    format!("capability denied: {reason}. {DENIAL_RECOVERY_HINT}")
+    // Human transcript NOTICE: the bare denied command(s), never the reason
+    // sentence (stuffing a sentence into print_denied's `'{target}'` slot was
+    // the garble — see #775 above).
+    print_denied("exec", &exec_denial_target_label(envelope), color);
+    // Model-facing message: composed exactly once.
+    format!(
+        "capability denied: {}. {DENIAL_RECOVERY_HINT}",
+        envelope_denial_reason(envelope)
+    )
+}
+
+/// The bare target for the human exec-denial NOTICE: the denied command name(s)
+/// the leash refused, NEVER the reason sentence. Joins multiple targets with
+/// `, `; falls back to a generic label so the notice always prints one clean
+/// `{axis} does not permit '{target}'` line. (#775 — restores
+/// [`print_denied`]'s bare-`'{target}'` contract.)
+fn exec_denial_target_label(envelope: &serde_json::Value) -> String {
+    let targets: Vec<&str> = envelope
+        .get("denials")
+        .and_then(serde_json::Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|d| d.get("target").and_then(serde_json::Value::as_str))
+                .filter(|t| !t.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    if targets.is_empty() {
+        "a command".to_string()
+    } else {
+        targets.join(", ")
+    }
 }
 
 /// The standard `run_command` success path: print + return stdout/stderr,
@@ -3033,30 +3052,6 @@ mod tests {
     }
 
     #[test]
-    fn extra_exec_hint_only_for_exec_denials_with_targets() {
-        assert!(extra_exec_hint(&serde_json::json!({})).is_none());
-        assert!(extra_exec_hint(&serde_json::json!({"denials": []})).is_none());
-        // Non-exec kinds never produce the exec escape-hatch hint.
-        let open_only = serde_json::json!({
-            "denials": [{"kind": "open", "target": "/x", "reason": "r"}]
-        });
-        assert!(extra_exec_hint(&open_only).is_none());
-        // Empty target → no hint.
-        let empty_target = serde_json::json!({
-            "denials": [{"kind": "exec", "target": "", "reason": "r"}]
-        });
-        assert!(extra_exec_hint(&empty_target).is_none());
-        // The happy path names the command in the TOML snippet.
-        let exec = serde_json::json!({
-            "denials": [{"kind": "exec", "target": "env", "reason": "r"}]
-        });
-        assert_eq!(
-            extra_exec_hint(&exec).unwrap(),
-            "add it via [tui.permissions] extra_exec = [\"env\"] in your newt config"
-        );
-    }
-
-    #[test]
     fn exec_allowlist_name_takes_basename() {
         assert_eq!(exec_allowlist_name("env"), "env");
         assert_eq!(exec_allowlist_name("/usr/bin/env"), "env");
@@ -3064,61 +3059,39 @@ mod tests {
         assert_eq!(exec_allowlist_name("C:\\tools\\env.exe"), "env.exe");
     }
 
+    /// #775 (§2.5): the human exec-denial NOTICE shows the BARE command
+    /// target(s), never the reason sentence — restoring [`print_denied`]'s
+    /// `'{target}'` contract. Stuffing the full reason there produced the
+    /// field-report garble `capability denied: exec does not permit '<whole
+    /// reason sentence>'`.
     #[test]
-    fn toml_string_literal_escapes_backslash_and_quote() {
-        assert_eq!(toml_string_literal("plain"), "plain");
-        assert_eq!(toml_string_literal(r#"a"b"#), r#"a\"b"#);
-        assert_eq!(toml_string_literal(r"a\b"), r"a\\b");
-    }
-
-    #[test]
-    fn exec_denial_guidance_escapes_toml_literal() {
-        let envelope = serde_json::json!({
+    fn exec_denial_target_label_is_the_bare_command_not_the_reason() {
+        let one = serde_json::json!({
             "denied": true,
+            "denials": [{
+                "kind": "exec",
+                "target": "export",
+                "reason": "exec of \"export\" is not within the granted authority"
+            }]
+        });
+        let label = exec_denial_target_label(&one);
+        assert_eq!(label, "export");
+        // It is the bare command — NEVER the reason sentence (which, in the
+        // `'{target}'` slot, was the nested garble).
+        assert!(!label.contains("is not within the granted authority"));
+        // Multiple targets join cleanly; an envelope with no target falls back
+        // to a generic label so the notice still prints one clean line.
+        let multi = serde_json::json!({
             "denials": [
-                {
-                    "kind": "exec",
-                    "target": "bad\"cmd",
-                    "reason": "exec bad command denied"
-                }
+                {"kind": "exec", "target": "export", "reason": "r"},
+                {"kind": "exec", "target": "set", "reason": "r"}
             ]
         });
-        let reason = envelope_denial_reason_with_guidance(&envelope);
-        assert!(reason.contains("[tui.permissions] extra_exec = [\"bad\\\"cmd\"]"));
-    }
-
-    #[test]
-    fn exec_denial_guidance_uses_command_name_for_absolute_paths() {
-        let envelope = serde_json::json!({
-            "denied": true,
-            "denials": [
-                {
-                    "kind": "exec",
-                    "target": "/usr/bin/env",
-                    "reason": "exec of \"/usr/bin/env\" is not within the granted authority"
-                }
-            ]
-        });
-        let reason = envelope_denial_reason_with_guidance(&envelope);
-        assert!(reason.contains("[tui.permissions] extra_exec = [\"env\"]"));
-        assert!(!reason.contains("extra_exec = [\"/usr/bin/env\"]"));
-    }
-
-    #[test]
-    fn exec_denial_guidance_uses_command_name_for_windows_paths() {
-        let envelope = serde_json::json!({
-            "denied": true,
-            "denials": [
-                {
-                    "kind": "exec",
-                    "target": "C:\\tools\\env.exe",
-                    "reason": "exec of \"C:\\tools\\env.exe\" is not within the granted authority"
-                }
-            ]
-        });
-        let reason = envelope_denial_reason_with_guidance(&envelope);
-        assert!(reason.contains("[tui.permissions] extra_exec = [\"env.exe\"]"));
-        assert!(!reason.contains("extra_exec = [\"C:\\\\tools\\\\env.exe\"]"));
+        assert_eq!(exec_denial_target_label(&multi), "export, set");
+        assert_eq!(
+            exec_denial_target_label(&serde_json::json!({})),
+            "a command"
+        );
     }
 
     #[test]
@@ -4805,10 +4778,11 @@ mod execute_tool_branch_tests {
 
     #[test]
     fn exec_denial_is_recoverable_not_a_dead_end() {
-        // #721: the exec denial the MODEL sees leads to the model-actionable
-        // request_permissions path — not ONLY the human-only config edit (the
-        // dead-end the issue reported). The operator config hint may stay as a
-        // secondary line for the human; both are present.
+        // #721 + #775: the exec denial the MODEL sees is ONE clean level —
+        // `capability denied: <bare reason>. <recovery hint>` — leading to the
+        // model-actionable request_permissions path, NOT the stale `extra_exec`
+        // config edit (which #721 superseded and the model cannot perform
+        // mid-turn).
         let envelope = serde_json::json!({
             "denied": true,
             "denials": [{
@@ -4820,7 +4794,53 @@ mod execute_tool_branch_tests {
         let out = denied_run_command_result(&envelope, false);
         assert!(out.starts_with("capability denied:"), "got: {out}");
         assert!(out.contains("request_permissions"), "got: {out}");
-        assert!(out.contains("[tui.permissions] extra_exec"), "got: {out}");
+        // #775: the stale `extra_exec` config hint is GONE from the model-facing
+        // message (it leaked in before; the human transcript carries the bare
+        // command via print_denied instead).
+        assert!(
+            !out.contains("extra_exec"),
+            "the model message must not carry the stale config hint: {out}"
+        );
+    }
+
+    /// #775 (§2.5) regression: the model-facing `run_command` denial is ONE
+    /// clean level and never a denial sentence NESTED inside another. Before
+    /// the fix, `denied_run_command_result` appended the `extra_exec` config
+    /// hint to the reason (and `print_denied` stuffed that whole sentence into
+    /// its bare `'{target}'` slot), yielding `capability denied: exec does not
+    /// permit '<reason> - add it via …>'`. The model-facing return now carries
+    /// exactly one `capability denied:`, the bare reason, and the recovery hint.
+    #[test]
+    fn run_command_denial_is_single_level_not_nested() {
+        let envelope = serde_json::json!({
+            "denied": true,
+            "denials": [{
+                "kind": "exec",
+                "target": "export",
+                "reason": "exec of \"export\" is not within the granted authority"
+            }]
+        });
+        let out = denied_run_command_result(&envelope, false);
+        // Exactly one denial prefix — never a `capability denied:` inside another.
+        assert_eq!(
+            out.matches("capability denied:").count(),
+            1,
+            "exactly one denial level: {out}"
+        );
+        // RED on today: the stale config hint was glued onto the model message.
+        assert!(!out.contains("add it via"), "stale config hint: {out}");
+        assert!(!out.contains("extra_exec"), "stale config hint: {out}");
+        // No reason sentence nested inside a `does not permit '…'` slot.
+        assert!(
+            !out.contains("does not permit 'exec of"),
+            "nested denial sentence: {out}"
+        );
+        // The bare reason and the #721 recovery hint are both present.
+        assert!(
+            out.contains("exec of \"export\" is not within the granted authority"),
+            "got: {out}"
+        );
+        assert!(out.contains("request_permissions"), "got: {out}");
     }
 
     #[test]
