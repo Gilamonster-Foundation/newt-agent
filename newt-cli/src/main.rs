@@ -2,23 +2,12 @@ use anyhow::Result;
 use clap::Parser;
 
 fn main() -> Result<()> {
-    // Windows' default main-thread stack (~1 MB) overflows on the (large) clap
-    // CLI tree during `Cli::parse()` — STATUS_STACK_OVERFLOW (0xC00000FD); Linux's
-    // 8 MB default hides it. Run parse + the async dispatch on a thread with an
-    // explicit large stack so every platform has room. (#709)
-    std::thread::Builder::new()
-        .name("newt-main".into())
-        .stack_size(16 * 1024 * 1024)
-        .spawn(|| {
-            tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .thread_stack_size(16 * 1024 * 1024)
-                .build()?
-                .block_on(run())
-        })
-        .expect("spawn newt-main thread")
-        .join()
-        .expect("newt-main thread panicked")
+    // Windows' default main-thread stack (~1 MB) overflows on the large clap
+    // command tree during `Cli::parse()` before any diagnostics are printed.
+    // Keep parse + dispatch behind Newt's explicit CLI stack policy. (#747)
+    newt_cli::stack::run_on_cli_stack("newt-main", || {
+        newt_cli::stack::build_cli_runtime()?.block_on(run())
+    })
 }
 
 async fn run() -> Result<()> {
