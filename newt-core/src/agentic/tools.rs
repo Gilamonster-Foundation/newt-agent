@@ -346,6 +346,11 @@ pub(crate) fn merged_tool_definitions(
     // tool names, so gating it on presence would defeat the purpose). Its
     // executor builds the catalog from THIS session's advertised set.
     defs.push(super::tool_search::tool_search_tool_definition());
+    // #727: `get_context_remaining` is advertised ALWAYS — a read-only budget
+    // self-read, broadly useful and degrading honestly (it reports "no ceiling
+    // configured" when num_ctx is unset), so like resume_context it carries no
+    // `with_*` gate and rides in every session, headless included.
+    defs.push(super::budget::get_context_remaining_tool_definition());
     if with_save_note {
         defs.push(save_note_tool_definition());
     }
@@ -447,6 +452,11 @@ const ALL_TOOL_NAMES: &[&str] = &[
     // #725: always-advertised tool-discovery search, so a model that looks up a
     // tool by intent is never treated as a hallucination.
     "tool_search",
+    // #727: always-advertised read-only context-budget introspection. The
+    // agentic loop intercepts it at the dispatch site (where num_ctx + the
+    // conversation estimate are in scope) and renders the budget; it is a real
+    // name so it is never treated as a hallucination.
+    "get_context_remaining",
 ];
 
 /// Returns `true` if a tool call looks like a hallucination:
@@ -597,8 +607,30 @@ pub(crate) fn resolve_tool_alias(name: &str) -> Option<AliasOutcome> {
                  plan with statuses), or delegate subtasks via crew/team (needs /team)."
                 .to_string(),
         )),
+        // #727 BUDGET — "how much context do I have left" reaches. get_context_remaining
+        // takes no args (it is a self-read), so the foreign call's (empty) arg shape
+        // matches: safe to silently Rewrite. The real name `get_context_remaining` is
+        // NOT here — it falls through to `None` and dispatches unchanged (the loop
+        // intercepts it), so it is never an alias of itself.
+        "context_remaining" | "tokens_left" | "remaining_tokens" | "budget"
+        | "how_much_context" | "context_budget" | "token_budget" => {
+            Some(AliasOutcome::Rewrite("get_context_remaining"))
+        }
         _ => None,
     }
+}
+
+/// #727: true when `name` is `get_context_remaining` or one of its rewrite
+/// aliases. The agentic loop computes the per-turn budget at the dispatch site
+/// (where `num_ctx` and the conversation estimate are in scope) and renders it
+/// there, bypassing [`execute_tool`] — so the loop must recognize both the
+/// canonical name and the aliases that resolve to it.
+pub(crate) fn is_context_remaining_call(name: &str) -> bool {
+    name == "get_context_remaining"
+        || matches!(
+            resolve_tool_alias(name),
+            Some(AliasOutcome::Rewrite("get_context_remaining"))
+        )
 }
 
 /// #717: classify a single tool/capability reach for the alias-seam telemetry.
@@ -2716,6 +2748,9 @@ mod tests {
                 // #725: advertised ALWAYS (a discovery tool must always be
                 // present), so it too joins the base set with every flag off.
                 "tool_search",
+                // #727: advertised ALWAYS (read-only budget self-read, no
+                // presence gate), pushed right after resume_context.
+                "get_context_remaining",
             ]
         );
     }
@@ -4756,6 +4791,63 @@ mod execute_tool_branch_tests {
             true,
         )
         .is_none());
+    }
+
+    #[test]
+    fn get_context_remaining_is_a_real_tool_not_a_phantom() {
+        // #727: real, always-advertised, no-arg budget read — never treated as
+        // an alias of itself or a hallucination.
+        assert!(resolve_tool_alias("get_context_remaining").is_none());
+        assert!(ALL_TOOL_NAMES.contains(&"get_context_remaining"));
+        assert!(classify_phantom_reach(
+            "get_context_remaining",
+            &serde_json::json!({}),
+            "Context budget: ~10 tokens used of an input ceiling of ~80 (80% of num_ctx 100).",
+            true,
+        )
+        .is_none());
+        // The always-advertised def rides in every session (empty MCP).
+        let defs = merged_tool_definitions(
+            &NoMcp, false, false, false, false, false, false, false, false, false,
+        );
+        assert!(defs
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["function"]["name"] == "get_context_remaining"));
+    }
+
+    #[test]
+    fn budget_verbs_rewrite_to_get_context_remaining() {
+        // #727: the instinctive "how much context is left" reaches all resolve
+        // to the canonical no-arg read (safe silent Rewrite — matching arg shape).
+        for n in [
+            "context_remaining",
+            "tokens_left",
+            "remaining_tokens",
+            "budget",
+            "how_much_context",
+            "context_budget",
+            "token_budget",
+        ] {
+            assert!(
+                matches!(
+                    resolve_tool_alias(n),
+                    Some(AliasOutcome::Rewrite("get_context_remaining"))
+                ),
+                "{n} must rewrite to get_context_remaining"
+            );
+            // A Rewrite alias is mined by the #717 telemetry as a Rewrite.
+            assert!(
+                is_context_remaining_call(n),
+                "{n} must be recognized as a budget call by the loop"
+            );
+        }
+        // The canonical name is recognized by the loop but is NOT an alias.
+        assert!(is_context_remaining_call("get_context_remaining"));
+        assert!(resolve_tool_alias("get_context_remaining").is_none());
+        // An unrelated name is neither.
+        assert!(!is_context_remaining_call("read_file"));
     }
 
     /// FLAG OFF (no gate): the denial is deterministic and still DENIES every
