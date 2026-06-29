@@ -2790,6 +2790,8 @@ mod permission_prompt_tests {
     fn permissions_command_reflects_the_active_mode() {
         let state = PermissionPromptState::default();
         let preset = newt_core::NamedPermissionPreset {
+            // fs_read: None preserves pre-#755 behavior (reads unrestricted).
+            fs_read: None,
             readonly: true,
             exec_allow: vec!["git".to_string()],
             deny: vec!["*".to_string()],
@@ -13056,6 +13058,8 @@ mod mode_command_tests {
         cfg.permission_presets.insert(
             "readonly-triage".to_string(),
             newt_core::NamedPermissionPreset {
+                // fs_read: None preserves pre-#755 behavior (reads unrestricted).
+                fs_read: None,
                 readonly: true,
                 exec_allow: vec!["git".to_string()],
                 deny: vec!["*".to_string()],
