@@ -143,6 +143,18 @@ pub struct Cli {
     #[arg(long, visible_alias = "yolo", global = true, default_value_t = false)]
     pub disable_ocap: bool,
 
+    /// facade P4 (#780): turn OFF the convenience tool-call ROUTING for THIS
+    /// invocation. By default a model's `run_command("cat X")` / `ls` / `find` /
+    /// read-only `git` is silently rewritten to the governed built-in
+    /// (`read_file`/`list_dir`/`find`/the git read path); `--no-route` runs the
+    /// command on the normal exec path as-is instead. This is the L2
+    /// convenience-OFF switch and is DELIBERATELY DISTINCT from `--disable-ocap`
+    /// /`--yolo`: it NEVER disables the L3 boundary — the confined shell still
+    /// gates exec and the fs fence still governs reads. Equivalent to
+    /// `NEWT_NO_ROUTE=1`; env-only, no config key, so it cannot silently persist.
+    #[arg(long, global = true, default_value_t = false)]
+    pub no_route: bool,
+
     /// Cap the Ollama context window (KV-cache) to this many tokens.
     /// Prevents VRAM exhaustion on large models by limiting how much memory
     /// Ollama allocates for the attention cache. Equivalent to setting
@@ -657,6 +669,13 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             // purpose — no config key, no silent persistence.
             if cli.disable_ocap {
                 unsafe { std::env::set_var("NEWT_DISABLE_OCAP", "1") };
+            }
+            // facade P4 (#780): --no-route turns OFF the convenience tool-call
+            // routing (run_command reads the var per call). A DISTINCT switch
+            // from --disable-ocap (§7-F5): L2-convenience-off, L3-boundary
+            // untouched — the two env vars never alias. Env-only, no config key.
+            if cli.no_route {
+                unsafe { std::env::set_var("NEWT_NO_ROUTE", "1") };
             }
             // --no-agents-file / --agents-file thread to the TUI via env vars.
             if cli.no_agents_file {
@@ -1188,6 +1207,25 @@ mod tests {
         assert!(matches!(cli.command, Some(Command::Code { .. })));
         let cli = Cli::try_parse_from(["newt"]).unwrap();
         assert!(!cli.disable_ocap);
+    }
+
+    /// facade P4 (#780): `--no-route` parses bare and under `code`, is OFF by
+    /// default, and is a DISTINCT flag from `--disable-ocap`/`--yolo` (§7-F5) —
+    /// the two never alias, so the routing escape can never imply an unconfine.
+    #[test]
+    fn parses_no_route_distinct_from_disable_ocap() {
+        let cli = Cli::try_parse_from(["newt"]).unwrap();
+        assert!(!cli.no_route);
+        let cli = Cli::try_parse_from(["newt", "--no-route"]).unwrap();
+        assert!(cli.no_route);
+        let cli = Cli::try_parse_from(["newt", "code", "--no-route"]).unwrap();
+        assert!(cli.no_route);
+        // --no-route does NOT set the L3-off bypass, and --yolo does NOT set
+        // the routing flag: distinct mechanisms, never aliased.
+        let cli = Cli::try_parse_from(["newt", "--no-route"]).unwrap();
+        assert!(cli.no_route && !cli.disable_ocap);
+        let cli = Cli::try_parse_from(["newt", "--yolo"]).unwrap();
+        assert!(cli.disable_ocap && !cli.no_route);
     }
 
     #[test]

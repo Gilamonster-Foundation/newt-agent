@@ -102,6 +102,10 @@ mod recall;
 // #714: the `resume_context` tool — a self-scoped read of THIS conversation's
 // own pre-interrupt work (the affordance `recall` structurally cannot be).
 mod resume;
+// facade P4 (#780): hidden tool-call routing — promote the model's read-only
+// shell reaches (`cat`/`ls`/`find` + read-only `git`) to a silent rewrite onto
+// the governed built-ins, gate the rest. The route/gate split is pure DATA.
+mod routing;
 // #725: the `tool_search` discovery tool — find a real tool by intent instead
 // of fabricating a foreign name (the structural complement to the #716 alias
 // seam + #717 phantom telemetry).
