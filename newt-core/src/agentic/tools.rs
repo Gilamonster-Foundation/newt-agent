@@ -340,6 +340,12 @@ pub(crate) fn merged_tool_definitions(
     // session" when its sources are `None`), so unlike the presence-gated tools
     // it carries no `with_*` flag and rides in every session, headless included.
     defs.push(super::resume::resume_context_tool_definition());
+    // #725: `tool_search` is advertised ALWAYS, like `resume_context` — a
+    // discovery tool that lets the model look up a real tool by intent must be
+    // present in every session (it is the structural antidote to fabricated
+    // tool names, so gating it on presence would defeat the purpose). Its
+    // executor builds the catalog from THIS session's advertised set.
+    defs.push(super::tool_search::tool_search_tool_definition());
     if with_save_note {
         defs.push(save_note_tool_definition());
     }
@@ -438,6 +444,9 @@ const ALL_TOOL_NAMES: &[&str] = &[
     // degrades to "no operator available" when no gate is present), so a model
     // calling it after a denial is never treated as a hallucination.
     "request_permissions",
+    // #725: always-advertised tool-discovery search, so a model that looks up a
+    // tool by intent is never treated as a hallucination.
+    "tool_search",
 ];
 
 /// Returns `true` if a tool call looks like a hallucination:
@@ -574,6 +583,13 @@ pub(crate) fn resolve_tool_alias(name: &str) -> Option<AliasOutcome> {
                  dispatches it."
             )))
         }
+        // #725 TOOL-DISCOVERY — the instinctive "which tool does X?" reach. All
+        // mean exactly tool_search (a `query` arg, or none — execute_tool_search
+        // lists everything on an empty query), so silently Rewrite. `tool_search`
+        // itself is the REAL tool and falls through to `None` below — it is never
+        // an alias of itself.
+        "find_tool" | "search_tools" | "list_tools" | "which_tool" | "available_tools"
+        | "what_tools" | "tools" => Some(AliasOutcome::Rewrite("tool_search")),
         // #716 WORKFLOW — no workflow/pipeline primitive exists; redirect to the
         // plan tools (and crew/team, which needs /team).
         "workflow" | "run_workflow" | "start_workflow" | "pipeline" => Some(AliasOutcome::Correct(
@@ -1676,6 +1692,35 @@ pub async fn execute_tool(
             execute_request_permissions(args, permission_gate, color, tool_output_lines)
         }
 
+        // #725: tool discovery — search THIS session's advertised catalog by
+        // intent so a model that half-remembers a capability finds the real tool
+        // name instead of fabricating one. Advertised always; the catalog is
+        // rebuilt here from the live presence sources (the `with_*` flags derive
+        // from which optional capabilities this call was handed), so the search
+        // reflects exactly what was advertised — built-ins, presence-gated tools,
+        // AND the connected MCP `server__tool` entries. The matcher
+        // ([`super::tool_search::execute_tool_search`]) is pure; the print + the
+        // catalog build live here.
+        "tool_search" => {
+            let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
+            print_tool_call("tool_search", query, color);
+            let catalog = merged_tool_definitions(
+                &*mcp,
+                note_sink.is_some(),
+                recall_source.is_some(),
+                memory_source.is_some(),
+                git_tool.is_some(),
+                crew_runner.is_some(),
+                scratchpad_store.is_some(),
+                code_search.is_some(),
+                experience_store.is_some(),
+                step_ledger.is_some(),
+            );
+            let out = super::tool_search::execute_tool_search(query, &catalog);
+            print_tool_output(&out, tool_output_lines, color);
+            out
+        }
+
         // Embedded git (PR4, #461): dispatch through the injected GitTool
         // (newt-git's LocalGitTool). `GitCaveats::from_session` projects the
         // session's authority onto the git surface (fail-closed: a read-only
@@ -2370,6 +2415,75 @@ mod tests {
         assert_eq!(got, None);
     }
 
+    // ---- #725: tool_search discovery (alias + name registry) ----
+
+    #[test]
+    fn tool_search_is_a_real_tool_name() {
+        // It must be in the canonical registry so a model calling it is never
+        // treated as a hallucination.
+        assert!(ALL_TOOL_NAMES.contains(&"tool_search"));
+    }
+
+    #[test]
+    fn discovery_verbs_alias_to_tool_search() {
+        // The instinctive "which tool does X?" reaches silently Rewrite to the
+        // real tool_search.
+        for verb in [
+            "find_tool",
+            "search_tools",
+            "list_tools",
+            "which_tool",
+            "available_tools",
+            "what_tools",
+            "tools",
+        ] {
+            match resolve_tool_alias(verb) {
+                Some(AliasOutcome::Rewrite(c)) => assert_eq!(c, "tool_search", "verb: {verb}"),
+                other => panic!(
+                    "expected Rewrite(tool_search) for {verb}, got something else: {}",
+                    other.is_some()
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn tool_search_is_not_an_alias_of_itself() {
+        // The real name must fall through unchanged (no recursive rewrite).
+        assert!(resolve_tool_alias("tool_search").is_none());
+    }
+
+    #[test]
+    fn classify_phantom_discovery_reach_is_a_rewrite() {
+        // #725 + #717: a discovery reach resolves through the alias seam to a
+        // Rewrite, so the phantom telemetry captures it for free.
+        let got = classify_phantom_reach("find_tool", &serde_json::json!({}), "ignored", false);
+        assert_eq!(
+            got,
+            Some(crate::PhantomResolution::Rewrite("tool_search".into()))
+        );
+    }
+
+    #[test]
+    fn classify_phantom_tool_search_real_call_is_none() {
+        // A real tool_search call is not phantom telemetry.
+        let got = classify_phantom_reach(
+            "tool_search",
+            &serde_json::json!({"query": "read"}),
+            "Tools matching \"read\":\n- read_file — Read a file",
+            true,
+        );
+        assert_eq!(got, None);
+    }
+
+    #[test]
+    fn tool_search_is_not_a_hallucination() {
+        assert!(!is_hallucination(
+            "tool_search",
+            &serde_json::json!({"query": "x"})
+        ));
+    }
+
     // ---- #719: read_file payload window/cap/pagination (pure, no fs) ----
 
     #[test]
@@ -2599,6 +2713,9 @@ mod tests {
                 // #714: advertised ALWAYS (no presence gate), so it joins the
                 // base set even with every `with_*` flag off.
                 "resume_context",
+                // #725: advertised ALWAYS (a discovery tool must always be
+                // present), so it too joins the base set with every flag off.
+                "tool_search",
             ]
         );
     }
