@@ -14,6 +14,8 @@ pub mod crew;
 pub mod crew_runner;
 mod dgx;
 mod dgx_pull;
+pub mod dgx_registry;
+pub mod dgx_status;
 pub mod dgx_vllm;
 mod doctor;
 mod identity_cmd;

@@ -153,6 +153,19 @@ fn dgx_requires_subcommand() {
 }
 
 #[test]
+fn dgx_status_help_lists_json_flag() {
+    // Issue #709 §1: `newt dgx status` gained a memory-budget view with a
+    // `--json` form and a `--node` override. Clap-surface only (no SSH/network).
+    Command::cargo_bin("newt")
+        .unwrap()
+        .args(["dgx", "status", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--json"))
+        .stdout(predicate::str::contains("--node"));
+}
+
+#[test]
 fn dgx_pull_help_lists_flags() {
     Command::cargo_bin("newt")
         .unwrap()

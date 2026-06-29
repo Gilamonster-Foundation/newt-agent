@@ -36,6 +36,7 @@ use newt_core::router::Classification;
 use newt_core::{Config, Router, Tier};
 use newt_inference::local::LocalVllmBackend;
 
+use crate::dgx_status;
 use crate::dgx_vllm;
 
 /// `newt dgx <cmd>` subcommands.
@@ -73,8 +74,19 @@ pub enum DgxCmd {
         /// Task description to classify (quote multi-word tasks).
         task: String,
     },
-    /// Show active-endpoint health and the models loaded on the DGX.
-    Status,
+    /// Show active-endpoint health, the models loaded on the DGX, and the node
+    /// memory budget (issue #709 §1): total / used / available memory plus the
+    /// running inference workloads (ollama / vllm), read over SSH from
+    /// `/proc/meminfo` + `ps`. This replaces the old `nvidia-smi` placeholder.
+    Status {
+        /// SSH node name (defaults to the active node).
+        #[arg(long)]
+        node: Option<String>,
+        /// Emit ONLY the structured memory budget as JSON (issue #709 §1 shape)
+        /// — `{ total_gib, used_gib, available_gib, running_workloads[] }`.
+        #[arg(long)]
+        json: bool,
+    },
     /// List the models available on the active DGX endpoint.
     Models,
     /// Probe every configured DGX endpoint flavor and report reachability.
@@ -309,7 +321,7 @@ pub async fn run(cmd: DgxCmd, config_path: Option<&Path>) -> anyhow::Result<()> 
             yes,
         ),
         DgxCmd::Route { task } => route(&task, config_path),
-        DgxCmd::Status => status(config_path).await,
+        DgxCmd::Status { node, json } => status(config_path, node.as_deref(), json).await,
         DgxCmd::Models => models(config_path).await,
         DgxCmd::Doctor => doctor(config_path).await,
         DgxCmd::Use { model } => use_model(config_path, &model),
@@ -625,8 +637,28 @@ async fn models(config_path: Option<&Path>) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn status(config_path: Option<&Path>) -> anyhow::Result<()> {
-    let dgx = dgx_config(config_path)?;
+async fn status(config_path: Option<&Path>, node: Option<&str>, json: bool) -> anyhow::Result<()> {
+    let mut dgx = dgx_config(config_path)?;
+    if let Some(n) = node {
+        dgx.active_node = Some(n.to_string());
+    }
+
+    // --json: emit ONLY the structured memory budget (issue #709 §1). The SSH
+    // host is required for this form, so a missing host is a hard error here.
+    if json {
+        let host = dgx.ssh_host()?;
+        let user = dgx.ssh_user();
+        let budget = dgx_status::gather_budget(&RealSshCapture, &user, &host, None)?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&dgx_status::budget_json(&budget))?
+        );
+        return Ok(());
+    }
+
+    // Human form: endpoint health + loaded models (existing), then the SSH
+    // memory budget. The budget is best-effort — never block the health view on
+    // SSH reachability.
     let kind = dgx.active_endpoint;
     let base = dgx.resolve_endpoint()?;
     let client = http_client();
@@ -648,7 +680,20 @@ async fn status(config_path: Option<&Path>) -> anyhow::Result<()> {
             Err(e) => println!("  Running:  (unavailable: {e})"),
         }
     }
-    println!("  GPU mem:  (SSH to the host and run: nvidia-smi)");
+
+    // Node memory budget over SSH (replaces the old nvidia-smi placeholder).
+    match dgx.ssh_host() {
+        Ok(host) => {
+            let user = dgx.ssh_user();
+            match dgx_status::gather_budget(&RealSshCapture, &user, &host, None) {
+                Ok(budget) => print!("{}", dgx_status::render_budget_human(&host, &budget)),
+                Err(e) => println!("  Memory:   (unavailable over SSH: {e})"),
+            }
+        }
+        Err(_) => {
+            println!("  Memory:   (no ssh_host configured — set [dgx].nodes[].ssh_host)");
+        }
+    }
     Ok(())
 }
 
@@ -918,6 +963,33 @@ impl SshExec for RealSsh {
             anyhow::bail!("ssh command failed: {status}");
         }
         Ok(())
+    }
+}
+
+/// Real SSH capture for `dgx status` budget gathering: spawns `ssh` and returns
+/// its captured stdout. The pure parsing/budget logic lives behind the
+/// [`dgx_status::SshCapture`] seam (unit-tested with canned stdout), so this thin
+/// wrapper is the only un-unit-tested edge — it mirrors [`RealSsh`].
+struct RealSshCapture;
+
+impl dgx_status::SshCapture for RealSshCapture {
+    fn capture(
+        &self,
+        user: &str,
+        host: &str,
+        port: Option<u16>,
+        command: &str,
+    ) -> anyhow::Result<String> {
+        let argv = dgx_pull::ssh_argv(user, host, port, command);
+        let (prog, rest) = argv.split_first().expect("ssh argv non-empty");
+        let out = std::process::Command::new(prog)
+            .args(rest)
+            .output()
+            .map_err(|e| anyhow::anyhow!("failed to spawn ssh: {e}"))?;
+        if !out.status.success() {
+            anyhow::bail!("ssh command failed: {}", out.status);
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     }
 }
 
