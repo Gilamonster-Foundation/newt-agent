@@ -2039,9 +2039,15 @@ pub async fn chat_complete(
                 ));
             }
             // #717: record any phantom/capability reach (alias / hallucination
-            // / real-tool empty miss) for the alias-seam telemetry.
+            // / real-tool empty miss) for the alias-seam telemetry. #479 (G4)
+            // composes the gated-off seam here, where `advertise_team` is known:
+            // a `crew`/`compose_roster` reach with the surface OFF is a real name
+            // (so `classify_phantom_reach` never flags it) but exactly the
+            // delegation signal we want to mine for the common OFF default.
             if let Some(pr) = phantom_reaches.as_deref_mut() {
-                if let Some(resolution) = tools::classify_phantom_reach(name, &args, &result, ok) {
+                if let Some(resolution) = tools::classify_phantom_reach(name, &args, &result, ok)
+                    .or_else(|| tools::classify_gated_off_reach(name, advertise_team))
+                {
                     pr.push(crate::PhantomReach {
                         name_as_called: name.to_string(),
                         resolution,
@@ -3185,9 +3191,15 @@ pub async fn openai_chat_complete(
                 ));
             }
             // #717: record any phantom/capability reach (alias / hallucination
-            // / real-tool empty miss) for the alias-seam telemetry.
+            // / real-tool empty miss) for the alias-seam telemetry. #479 (G4)
+            // composes the gated-off seam here, where `advertise_team` is known:
+            // a `crew`/`compose_roster` reach with the surface OFF is a real name
+            // (so `classify_phantom_reach` never flags it) but exactly the
+            // delegation signal we want to mine for the common OFF default.
             if let Some(pr) = phantom_reaches.as_deref_mut() {
-                if let Some(resolution) = tools::classify_phantom_reach(name, &args, &result, ok) {
+                if let Some(resolution) = tools::classify_phantom_reach(name, &args, &result, ok)
+                    .or_else(|| tools::classify_gated_off_reach(name, advertise_team))
+                {
                     pr.push(crate::PhantomReach {
                         name_as_called: name.to_string(),
                         resolution,
@@ -3631,9 +3643,15 @@ pub async fn openai_responses_complete(
                 ));
             }
             // #717: record any phantom/capability reach (alias / hallucination
-            // / real-tool empty miss) for the alias-seam telemetry.
+            // / real-tool empty miss) for the alias-seam telemetry. #479 (G4)
+            // composes the gated-off seam here, where `advertise_team` is known:
+            // a `crew`/`compose_roster` reach with the surface OFF is a real name
+            // (so `classify_phantom_reach` never flags it) but exactly the
+            // delegation signal we want to mine for the common OFF default.
             if let Some(pr) = phantom_reaches.as_deref_mut() {
-                if let Some(resolution) = tools::classify_phantom_reach(name, &args, &result, ok) {
+                if let Some(resolution) = tools::classify_phantom_reach(name, &args, &result, ok)
+                    .or_else(|| tools::classify_gated_off_reach(name, advertise_team))
+                {
                     pr.push(crate::PhantomReach {
                         name_as_called: name.to_string(),
                         resolution,
