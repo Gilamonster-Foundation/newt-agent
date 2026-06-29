@@ -283,13 +283,34 @@ pub async fn run_crew(
         }
     };
 
-    // 2. CURATE — the harness reads only the navigator-selected, existing files.
-    let curated: String = nav
+    // 2. CURATE — the harness reads only the navigator-selected, existing files,
+    //    AND only those the `fs_read` leash permits (ROADMAP 23.1 / #752): complete
+    //    mediation for the READ axis, mirroring the `fs_write` partition at apply
+    //    below. A clamped `fs_read` caveat must have teeth — a denied file is NEVER
+    //    read, and the denied set is surfaced to the crew honestly, so the algebra's
+    //    read narrowing fails VISIBLY (a note in the context) rather than silently.
+    let (readable, denied_read): (Vec<&str>, Vec<&str>) = nav
         .relevant_files
+        .iter()
+        .map(String::as_str)
+        .partition(|f| caveats.permits_fs_read(f));
+    let mut curated: String = readable
         .iter()
         .filter_map(|f| workspace.read(f).map(|c| format!("=== {f} ===\n{c}")))
         .collect::<Vec<_>>()
         .join("\n\n");
+    if !denied_read.is_empty() {
+        let note = format!(
+            "{} file(s) not readable under your fs_read caveat: {}",
+            denied_read.len(),
+            denied_read.join(", ")
+        );
+        curated = if curated.is_empty() {
+            note
+        } else {
+            format!("{curated}\n\n{note}")
+        };
+    }
 
     let mut failures: Vec<String> = Vec::new();
     let mut touched: Vec<String> = Vec::new();
@@ -705,6 +726,105 @@ mod tests {
             "nothing may be written outside the leash"
         );
         assert_eq!(ws.read("target.rs").as_deref(), Some("BAD"), "untouched");
+    }
+
+    /// Workspace that RECORDS every `read()` call, so a test can assert exactly
+    /// which navigator-selected files the harness actually opened. `target.rs`
+    /// drives the verify (passes once it contains "GOOD"), as in [`MemWs`].
+    struct RecordingWs {
+        files: BTreeMap<String, String>,
+        reads: std::cell::RefCell<Vec<String>>,
+    }
+    impl Workspace for RecordingWs {
+        fn files(&self) -> Vec<String> {
+            self.files.keys().cloned().collect()
+        }
+        fn read(&self, path: &str) -> Option<String> {
+            self.reads.borrow_mut().push(path.to_string());
+            self.files.get(path).cloned()
+        }
+        fn apply(&mut self, edits: &[Edit]) -> Vec<String> {
+            edits
+                .iter()
+                .map(|e| {
+                    self.files.insert(e.path.clone(), e.new_content.clone());
+                    e.path.clone()
+                })
+                .collect()
+        }
+        fn run_test(&self) -> (bool, String) {
+            match self.files.get("target.rs") {
+                Some(c) if c.contains("GOOD") => (true, "ok".into()),
+                _ => (false, "FAILED".into()),
+            }
+        }
+    }
+
+    /// Navigator selects one in-scope and one out-of-scope file; the planner makes
+    /// `target.rs` GOOD on its first reply so the loop converges in one attempt (the
+    /// curate read happens once, before the attempt loop).
+    struct ReadGateMock;
+    #[async_trait]
+    impl Dispatcher for ReadGateMock {
+        async fn dispatch(
+            &self,
+            _backend: &PoolBackend,
+            model: &str,
+            _req: ChatRequest,
+        ) -> anyhow::Result<ChatReply> {
+            let content = match model {
+                "nav" => r#"{"relevant_files":["docs/x.rs","secret.rs"]}"#.to_string(),
+                "planner" => r#"{"edits":[{"path":"target.rs","new_content":"GOOD"}]}"#.to_string(),
+                "triage" => r#"{"summary":"","next_action":""}"#.to_string(),
+                other => panic!("unexpected model {other}"),
+            };
+            Ok(ChatReply {
+                content,
+                model_id: model.to_string(),
+                usage: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn refuses_to_read_outside_the_fs_read_leash() {
+        // #752: complete mediation for the READ axis. fs_read = Only(["docs/x.rs"])
+        // clamps reads to that one file; the navigator selects BOTH it and the
+        // out-of-scope `secret.rs`. The harness must read the in-scope file and must
+        // NOT read the denied one — otherwise the clamped caveat is silently ignored.
+        // RED on the pre-#752 code, which read every navigator pick unconditionally.
+        let p = pool();
+        let mut ws = RecordingWs {
+            files: BTreeMap::from([
+                ("target.rs".to_string(), "BAD".to_string()),
+                ("docs/x.rs".to_string(), "DOC".to_string()),
+                ("secret.rs".to_string(), "TOPSECRET".to_string()),
+            ]),
+            reads: std::cell::RefCell::new(Vec::new()),
+        };
+        let read_clamped = newt_core::caveats::Caveats {
+            fs_read: newt_core::caveats::Scope::only(["docs/x.rs".to_string()]),
+            ..newt_core::caveats::Caveats::top()
+        };
+        let out = run_crew(
+            &p,
+            &ReadGateMock,
+            &mut ws,
+            &cfg(3),
+            &read_clamped,
+            "make target.rs GOOD",
+        )
+        .await;
+        assert_eq!(out.status, CrewStatus::Passed, "{out:?}");
+        let reads = ws.reads.borrow();
+        assert!(
+            reads.iter().any(|r| r == "docs/x.rs"),
+            "the in-scope file must be read: {reads:?}"
+        );
+        assert!(
+            !reads.iter().any(|r| r == "secret.rs"),
+            "the out-of-scope file must NOT be read under the fs_read leash: {reads:?}"
+        );
     }
 
     /// Planner that always emits a lazy/elided placeholder for the target file.
