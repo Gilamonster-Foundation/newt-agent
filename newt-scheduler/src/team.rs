@@ -15,7 +15,7 @@
 //! orchestration over the existing seams — unit-testable with mocks, no network.
 
 use crate::{run_crew, BackendPool, ChatRequest, CrewConfig, CrewStatus, Dispatcher, Workspace};
-use newt_core::caveats::Caveats;
+use newt_core::caveats::{Caveats, CaveatsExt};
 use newt_core::Tier;
 use serde::{Deserialize, Serialize};
 
@@ -163,8 +163,26 @@ pub async fn run_team(
             });
             continue;
         }
+        // #754 — gate the per-subtask `verify` through the exec axis (the T2
+        // "verify-as-payload" vector). The `verify` is LEAD-authored, and the
+        // lead is an LLM: untrusted plan input. Installed as the workspace test
+        // command, the crew later runs it as a shell command (`sh -c`), so its
+        // authority follows its PROVENANCE — it must be authorized by the exec
+        // caveat, fail-closed, exactly as `crew_runner` gates the caller-supplied
+        // top-level verify and `plan_exec` gates the plan-leaf verify.
+        // `permits_exec` is exact-match, so a narrow exec scope cannot be escaped
+        // by chaining ("cargo; curl" never equals "cargo"). REFUSE, not run: a
+        // denied verify is NOT installed — the subtask proceeds under the
+        // workspace's DEFAULT check rather than executing an un-permitted command.
         if let Some(verify) = &st.verify {
-            workspace.set_test_command(verify);
+            if caveats.permits_exec(verify) {
+                workspace.set_test_command(verify);
+            } else {
+                eprintln!(
+                    "per-subtask verify refused: {verify:?} is outside the exec caveat \
+                     — falling back to the workspace default check"
+                );
+            }
         }
         let outcome = run_crew(pool, dispatcher, workspace, &cfg.crew, caveats, &st.task).await;
         let status = match outcome.status {
@@ -447,6 +465,40 @@ mod tests {
             ws.verifies,
             vec!["check-a".to_string(), "check-b".to_string()]
         );
+    }
+
+    #[tokio::test]
+    async fn denied_per_subtask_verify_is_refused_not_installed() {
+        // #754 (T2 "verify-as-payload"): the per-subtask `verify` is LEAD-authored
+        // — the lead is an LLM, so it is untrusted plan input. The exec caveat here
+        // permits "check-a" but NOT "check-b". The permitted verify IS installed;
+        // the denied one is REFUSED, not run — it is absent from the recorded
+        // commands, so that subtask falls back to the workspace's default check
+        // instead of executing an un-permitted shell command.
+        //
+        // RED on pre-#754 code: `set_test_command` was called unconditionally, so
+        // BOTH "check-a" and "check-b" were recorded. GREEN after: only "check-a".
+        let p = pool();
+        let d = TeamMock {
+            plan_json: r#"{"subtasks":[
+                {"task":"do A","verify":"check-a"},
+                {"task":"do B","verify":"check-b"}
+            ]}"#
+            .into(),
+            block: false,
+            planner_calls: AtomicUsize::new(0),
+        };
+        let mut ws = MemWs::new();
+        // Exec authority covers ONLY "check-a"; "check-b" is outside the caveat.
+        let mut caveats = newt_core::caveats::Caveats::top();
+        caveats.exec = newt_core::caveats::Scope::only(["check-a".to_string()]);
+        let out = run_team(&p, &d, &mut ws, &cfg(), &caveats, "goal").await;
+        // The plan still ran (refuse-not-run: the denied subtask proceeds under the
+        // default check, which the converging crew passes).
+        assert_eq!(out.status, TeamStatus::AllPassed);
+        assert_eq!(out.plan, vec!["do A".to_string(), "do B".to_string()]);
+        // Only the permitted verify was installed; the denied one was refused.
+        assert_eq!(ws.verifies, vec!["check-a".to_string()]);
     }
 
     #[tokio::test]
