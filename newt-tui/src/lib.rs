@@ -1594,12 +1594,60 @@ impl SessionCapability {
 // Prompted ocap grants — issue #263 (`--prompt-for-permissions`)
 // ---------------------------------------------------------------------------
 
-/// Is prompted-permission mode configured for this session? Pure in its
-/// inputs so it's unit-testable; the caller additionally requires stdin to
-/// be a real terminal — a piped/headless invocation must never block on a
-/// prompt even when the flag is set.
+/// Is prompted-permission mode explicitly configured for this session? Pure in
+/// its inputs so it's unit-testable. This is the EXPLICIT-ON signal only
+/// (`--prompt-for-permissions` / `[tui.permissions] prompt`); whether the
+/// session actually prompts is decided by [`should_prompt_permissions`], which
+/// adds the #721 interactive default and the headless / explicit-off guards.
 fn permission_prompting_configured(env_flag: bool, tui: Option<&newt_core::TuiConfig>) -> bool {
     env_flag || tui.is_some_and(|t| t.permissions.prompt)
+}
+
+/// #721: the named default for whether an INTERACTIVE session prompts on a
+/// capability denial. Flipped ON — a human at a real terminal now gets the
+/// allow/deny prompt by default, because a denial that ASKS the operator beats a
+/// dead-end denial the model can't recover from. Convention-as-data: flip this
+/// one knob to change the default without touching the predicate.
+const INTERACTIVE_PROMPT_DEFAULT: bool = true;
+
+/// #721: should this session prompt the human on a capability denial?
+///
+/// Pure predicate (unit-tested; the caller supplies the resolved TTY / tier
+/// signals — never a real TTY in a test). The default flipped for INTERACTIVE
+/// sessions (see [`INTERACTIVE_PROMPT_DEFAULT`]); HEADLESS / piped / eval / ACP
+/// stay DEFAULT-DENY — they must NEVER block on a prompt no one can answer.
+///
+/// - `configured_on` — prompting explicitly enabled (`--prompt-for-permissions`
+///   / `NEWT_PROMPT_FOR_PERMISSIONS` / `[tui.permissions] prompt = true`).
+///   Honored, but with the new default no longer REQUIRED for interactive.
+/// - `explicit_off`  — explicitly disabled (`--no-prompt-for-permissions` /
+///   `NEWT_NO_PROMPT_FOR_PERMISSIONS`). Wins over both the default AND
+///   `configured_on` — fail-closed honors the human's stated choice.
+/// - `interactive`   — stdin AND stdout are real terminals.
+/// - `headless`      — a non-interactive tier (worker / eval / ACP) that must
+///   never block on a TTY prompt regardless of any ON signal.
+///
+/// Precedence: headless / non-TTY → never (the default-deny invariant the issue
+/// requires); else explicit OFF → never; else ON (explicitly configured, or the
+/// interactive default).
+fn should_prompt_permissions(
+    configured_on: bool,
+    explicit_off: bool,
+    interactive: bool,
+    headless: bool,
+) -> bool {
+    // Default-deny invariant: a session that cannot answer a TTY prompt never
+    // prompts, no matter what was configured. Load-bearing for headless safety.
+    if headless || !interactive {
+        return false;
+    }
+    // An explicit OFF beats the interactive default and an explicit ON.
+    if explicit_off {
+        return false;
+    }
+    // Interactive and not disabled: prompt — either explicitly on, or the #721
+    // default. Both land here as ON.
+    configured_on || INTERACTIVE_PROMPT_DEFAULT
 }
 
 /// One human choice at the permission prompt.
@@ -2559,10 +2607,12 @@ mod permission_prompt_tests {
             None, // step_ledger
         )
         .await;
-        assert_eq!(
-            out,
-            "capability denied: fs_read does not permit 'outside.txt'"
+        assert!(
+            out.starts_with("capability denied: fs_read does not permit 'outside.txt'"),
+            "got: {out}"
         );
+        // #721: the denial now also carries the model-actionable recovery path.
+        assert!(out.contains("request_permissions"), "got: {out}");
         assert_eq!(prompts.get(), 2, "allow-once does not stick");
         drop(gate);
         assert_eq!(state.decisions.len(), 2);
@@ -2631,6 +2681,26 @@ mod permission_prompt_tests {
         tui.permissions.prompt = true;
         assert!(permission_prompting_configured(false, Some(&tui)));
         assert!(permission_prompting_configured(true, Some(&tui)));
+    }
+
+    #[test]
+    fn should_prompt_permissions_defaults_on_interactive_and_off_headless() {
+        // #721: the new default — an interactive human prompts even with NOTHING
+        // configured (the dead-end denial used to be the only outcome).
+        assert!(should_prompt_permissions(false, false, true, false));
+        // Explicitly configured ON, interactive: still ON.
+        assert!(should_prompt_permissions(true, false, true, false));
+
+        // Headless / eval / ACP NEVER prompt — the default-deny invariant —
+        // even when explicitly configured on. (A prompt no one can answer hangs.)
+        assert!(!should_prompt_permissions(true, false, true, true));
+        // Non-TTY (piped / captured) is likewise default-deny.
+        assert!(!should_prompt_permissions(true, false, false, false));
+        assert!(!should_prompt_permissions(false, false, false, false));
+
+        // Explicit OFF beats the interactive default AND an explicit ON.
+        assert!(!should_prompt_permissions(false, true, true, false));
+        assert!(!should_prompt_permissions(true, true, true, false));
     }
 
     #[test]
@@ -4001,14 +4071,27 @@ fn run_chat(
     // after each turn from the turn's input tokens + the resolved send budget,
     // and shown in the rich header for the NEXT prompt. `None` until known.
     let mut token_gauge: Option<(u32, u32)> = None;
-    // Prompted ocap grants (issue #263), resolved ONCE per session: the flag
-    // (env, set by `--prompt-for-permissions`) or `[tui.permissions] prompt`,
-    // AND a real terminal on stdin — a piped/headless invocation must never
-    // block on a prompt no matter what the config says.
-    let prompt_permissions_enabled = permission_prompting_configured(
-        std::env::var("NEWT_PROMPT_FOR_PERMISSIONS").is_ok(),
-        resolve_tui(&cfg).as_ref(),
-    ) && io::stdin().is_terminal();
+    // Prompted ocap grants (issue #263 + #721), resolved ONCE per session.
+    // #721 flipped the default: an INTERACTIVE human (BOTH stdin and stdout are
+    // real terminals) now prompts on a denial BY DEFAULT — a denial that asks
+    // beats a dead-end denial the model can't recover from. A piped / captured /
+    // headless stream stays DEFAULT-DENY (never blocks on a prompt no one can
+    // answer). `--no-prompt-for-permissions` (env NEWT_NO_PROMPT_FOR_PERMISSIONS)
+    // opts back out; `--prompt-for-permissions` / config still turns it on (now
+    // redundant with the default for interactive, but honored).
+    let interactive = io::stdin().is_terminal() && io::stdout().is_terminal();
+    let prompt_permissions_enabled = should_prompt_permissions(
+        permission_prompting_configured(
+            std::env::var("NEWT_PROMPT_FOR_PERMISSIONS").is_ok(),
+            resolve_tui(&cfg).as_ref(),
+        ),
+        std::env::var("NEWT_NO_PROMPT_FOR_PERMISSIONS").is_ok(),
+        interactive,
+        // run_chat is the INTERACTIVE entry point; headless / eval / ACP build
+        // their own loop with `permission_gate: None` and never reach here, so
+        // the dual-TTY `interactive` check above is the operative guard.
+        false,
+    );
     let mut permission_state = PermissionPromptState::default();
     // `[tui] allow_bang_escape` (default true): the human's `!` host shell-out.
     // The model can never reach it regardless; this only governs the keyboard.
@@ -10516,10 +10599,14 @@ mod disable_ocap_session_tests {
             None, // step_ledger
         )
         .await;
-        assert_eq!(
-            out,
-            format!("capability denied: fs_write does not permit '{escape}'")
+        assert!(
+            out.starts_with(&format!(
+                "capability denied: fs_write does not permit '{escape}'"
+            )),
+            "got: {out}"
         );
+        // #721: the denial now also carries the model-actionable recovery path.
+        assert!(out.contains("request_permissions"), "got: {out}");
         assert!(!std::path::Path::new(escape).exists());
     }
 
