@@ -10,10 +10,14 @@
 //! impl is injected — the `/team` toggle (presence gate).
 //!
 //! **OCAP:** a model fielding a crew is the recursion / Confused-Deputy case. The
-//! [`CrewRunner`] impl runs every spawned crew under `meet`-**attenuated** caveats
-//! (never the session's full grant), so the overseer cannot escalate by dispatching
-//! a crew. The toggle is the operator's on/off; the attenuation is the structural
-//! bound. See `docs/design/crew-swarm-overseer.md`.
+//! [`CrewRunner`] impl runs every spawned crew under `caveats.meet(crew_clamp)`,
+//! so a crew's authority can never **exceed** the session ceiling — it is `≤` the
+//! session on every axis (the overseer cannot escalate by dispatching a crew) and
+//! is further bounded by `crew_clamp`. The clamp is the operator's / per-subtask
+//! tightening point (`[crew] clamp`; it **defaults to `Caveats::top()`**, so the
+//! meet is the identity today and the bound is exactly "`≤ session`" until an
+//! operator narrows it — #749 step 8). The `/team` toggle is the operator's on/off;
+//! the `meet` is the structural bound. See `docs/design/crew-swarm-overseer.md`.
 
 use crate::caveats::Caveats;
 use async_trait::async_trait;
@@ -24,17 +28,21 @@ use serde_json::Value;
 /// exactly like [`GitTool`](super::git_tool::GitTool)).
 ///
 /// `op` is one of `compose_roster` | `crew` | `team`; `args` is the tool-call
-/// argument object. The implementation **attenuates** `caveats` (fail-closed) and
-/// returns either a rendered, model-readable result string (`Ok`) — a roster
-/// proposal, or a crew's diff + verify status for the overseer to review — or an
-/// error string the tool layer surfaces verbatim (`Err`).
+/// argument object. The implementation **bounds** `caveats` by the meet with a
+/// crew clamp (`session ⊓ clamp`, so the crew runs at `≤ session`) and fails
+/// closed on the write / exec / attest gates, then returns either a rendered,
+/// model-readable result string (`Ok`) — a roster proposal, or a crew's diff +
+/// verify status for the overseer to review — or an error string the tool layer
+/// surfaces verbatim (`Err`).
 ///
 /// This is the **universal crew primitive**: `LocalCrewRunner` (newt-cli) runs the
 /// crew here; a future `MeshCrewRunner` ships the task over agent-mesh; and a
 /// **wyvern resident** implements it server-side to receive crew/plan tasks
 /// (wyvern-agent#42). Same contract — `(op, args, caveats) → rendered result` —
-/// with `caveats` travelling (attenuated per hop) so authority crosses the wire
-/// with the work. `async` because dispatch runs inference, not just local I/O.
+/// with `caveats` travelling (met with each hop's clamp, so authority is
+/// monotone-non-increasing across the wire — never amplified) so authority
+/// crosses the wire with the work. `async` because dispatch runs inference, not
+/// just local I/O.
 #[async_trait]
 pub trait CrewRunner: Send + Sync {
     async fn dispatch(&self, op: &str, args: &Value, caveats: &Caveats) -> Result<String, String>;
@@ -84,7 +92,8 @@ pub fn crew_tool_definition() -> Value {
                             isolated workspace, runs the verification, and returns the diff \
                             + status for you to review and accept or re-dispatch. Compose a \
                             roster first (compose_roster) or name a saved crew. Crews run \
-                            under attenuated permissions — they cannot exceed your authority.",
+                            under your authority met with the crew clamp — they can never \
+                            exceed your authority (their permissions are <= yours).",
             "parameters": {
                 "type": "object",
                 "properties": {

@@ -81,6 +81,20 @@ impl LocalCrewRunner {
         BackendPool::from_source(&StaticSource::from_configs(self.cfg.backends.iter()))
     }
 
+    /// The crew authority **clamp** (#749 step 2 tightening point): dispatched
+    /// crews are met against this, so a crew's effective authority is
+    /// `session ⊓ clamp`. Sourced from `[crew] clamp` in config; **defaults to
+    /// `Caveats::top()`**, which makes the meet the identity (behavior unchanged)
+    /// until an operator — or the per-subtask `team_clamp` (#749 step 8) at this
+    /// same seam — tightens it. Three Cs: the clamp is *configured* data, not a
+    /// hardcoded policy.
+    fn crew_clamp(&self) -> Caveats {
+        self.cfg
+            .crew
+            .as_ref()
+            .map_or_else(Caveats::top, |c| c.clamp.clone())
+    }
+
     /// Resolve the crew to field: a named saved `[crews.<name>]` if `args.crew`
     /// is given, else compose one from the live environment. Returns the crew
     /// config, an optional lead (team mode), and the rationale lines.
@@ -201,6 +215,20 @@ fn choose_test_cmd(
         .or_else(|| infer_test_command(dir))
 }
 
+/// Compute the caveats a dispatched crew actually runs under: the **meet** of
+/// the session's grant and the crew clamp (`session ⊓ clamp`).
+///
+/// This is the structural Confused-Deputy bound (#749 step 2). `meet` is the
+/// authority lattice's greatest-lower-bound, so the result is **always `≤ session`
+/// on every axis** — the overseer can never escalate by fielding a crew — and
+/// **`≤ clamp`** (the operator's / per-subtask tightening). With the default
+/// `clamp = Caveats::top()` the meet is the identity, so the child equals the
+/// session and today's behavior is unchanged while the seam exists. Pure, so the
+/// `≤ session` guarantee is unit-testable without a live dispatch.
+fn dispatch_caveats(session: &Caveats, clamp: &Caveats) -> Caveats {
+    session.meet(clamp)
+}
+
 /// Decide a crew leaf's dispatch result by whether it actually LANDED work.
 ///
 /// `plan_exec` marks a leaf `Done` on `Ok` and `Failed` on `Err`. A crew that ran
@@ -305,6 +333,16 @@ impl CrewRunner for LocalCrewRunner {
                     "no verification command — pass 'verify' / --locked-verify or add a justfile / Cargo.toml / pyproject.toml"
                         .to_string()
                 })?;
+                // OCAP seam (#749 step 2): a dispatched crew runs under
+                // `session ⊓ crew_clamp`, NEVER the session's full grant — the
+                // structural bound on the recursion / Confused-Deputy case. `meet`
+                // keeps the child `≤ session` on every axis (the overseer cannot
+                // escalate by fielding a crew); the clamp (default `top()`, so the
+                // meet is the identity today) is the operator / per-subtask
+                // (`team_clamp`, #749 step 8) tightening point. Computed once here
+                // and handed to both `run_team` and `run_crew`.
+                let crew_clamp = self.crew_clamp();
+                let child_caveats = dispatch_caveats(caveats, &crew_clamp);
                 let id = worktree_id();
                 // Leaf composition (#646): fork the worktree off the cumulative
                 // chain tip (the last landed leaf), not bare HEAD, so each leaf
@@ -320,13 +358,27 @@ impl CrewRunner for LocalCrewRunner {
                         crew: crew_cfg,
                         max_subtasks: MAX_SUBTASKS,
                     };
-                    let out =
-                        run_team(&pool, &LocalDispatcher, &mut ws, &team_cfg, caveats, task).await;
+                    let out = run_team(
+                        &pool,
+                        &LocalDispatcher,
+                        &mut ws,
+                        &team_cfg,
+                        &child_caveats,
+                        task,
+                    )
+                    .await;
                     let passed = out.status == TeamStatus::AllPassed;
                     (render_team(&out), passed)
                 } else {
-                    let out =
-                        run_crew(&pool, &LocalDispatcher, &mut ws, &crew_cfg, caveats, task).await;
+                    let out = run_crew(
+                        &pool,
+                        &LocalDispatcher,
+                        &mut ws,
+                        &crew_cfg,
+                        &child_caveats,
+                        task,
+                    )
+                    .await;
                     let passed = out.status == CrewStatus::Passed;
                     (render_crew(&out), passed)
                 };
@@ -394,6 +446,16 @@ mod tests {
         LocalCrewRunner::new(Config::default(), std::env::temp_dir(), Presence::Prompt)
     }
 
+    /// A runner whose `[crew] clamp` is sourced from config (three Cs) — the
+    /// per-deployment tightening point the `.meet()` seam reads.
+    fn runner_with_clamp(clamp: Caveats) -> LocalCrewRunner {
+        let cfg = Config {
+            crew: Some(newt_core::CrewPolicyConfig { clamp }),
+            ..Config::default()
+        };
+        LocalCrewRunner::new(cfg, std::env::temp_dir(), Presence::Prompt)
+    }
+
     #[test]
     fn locked_verify_outranks_caller_and_is_set_by_builder() {
         use std::path::Path;
@@ -433,6 +495,87 @@ mod tests {
         let r = crew_dispatch_result("✗ verification did NOT pass — discarded".into(), false);
         assert!(r.is_err(), "a non-landing crew leaf must be an Err, not Ok");
         assert!(r.unwrap_err().contains("did NOT pass"));
+    }
+
+    /// #749 step 2 — the `.meet()` seam: a dispatched crew runs under
+    /// `session ⊓ crew_clamp`, so its authority can never EXCEED the session.
+    ///
+    /// RED on today's code: before this step `dispatch` passed the session
+    /// `caveats` UNMODIFIED to `run_team`/`run_crew` (no `.meet()`), so the crew's
+    /// caveats == the session's — with a net-allowing session a crew would
+    /// `permits_net` despite a clamp that denies it (the false "never the session's
+    /// full grant" claim). The two assertions below contrast the buggy value (the
+    /// session itself permits net) with the fixed value (`dispatch_caveats` denies
+    /// net and stays `≤ session`). This is the machine-checked OCAP claim.
+    #[test]
+    fn dispatch_caveats_meets_the_clamp_and_stays_le_session() {
+        // Session allows the net axis (and everything else).
+        let session = Caveats::top();
+        // Operator clamp denies net (Only(∅)); the other axes stay open.
+        let clamp = Caveats {
+            net: Scope::none(),
+            ..Caveats::top()
+        };
+        // The bug this step fixes: today's unmodified child == session, which
+        // PERMITS net — so a crew would inherit the session's full net grant.
+        assert!(
+            session.permits_net("evil.example.com"),
+            "the session (today's unmodified child) allows net — the false claim"
+        );
+        // The fix: the child handed to the crew is `session ⊓ clamp`.
+        let child = dispatch_caveats(&session, &clamp);
+        assert!(
+            !child.permits_net("evil.example.com"),
+            "after the meet the crew's caveats DENY the clamp-denied axis"
+        );
+        // …and the meet is always `≤` the session (the Confused-Deputy bound).
+        assert!(
+            child.leq(&session),
+            "a dispatched crew can never exceed the session ceiling"
+        );
+    }
+
+    /// The default clamp is `Caveats::top()`, so the meet is the IDENTITY —
+    /// today's behavior is unchanged (the seam exists but does not narrow).
+    #[test]
+    fn default_crew_clamp_is_top_so_the_meet_is_identity() {
+        let r = runner(); // Config::default() → no [crew] section
+        assert_eq!(r.crew_clamp(), Caveats::top(), "default clamp is top()");
+        let session = Caveats {
+            net: Scope::only(["api.internal".to_string()]),
+            ..Caveats::top()
+        };
+        // meet with top() leaves the session exactly as-is.
+        assert_eq!(
+            dispatch_caveats(&session, &r.crew_clamp()),
+            session,
+            "the default seam is the identity — behavior unchanged"
+        );
+    }
+
+    /// Config sources the clamp (three Cs): a `[crew] clamp` that denies net is
+    /// honored by `crew_clamp()`, and the runner's dispatch composition
+    /// (`session ⊓ crew_clamp`) denies net while staying `≤ session`. This is the
+    /// wiring assertion binding the seam to the configured clamp.
+    #[test]
+    fn configured_crew_clamp_is_sourced_and_composed() {
+        let clamp = Caveats {
+            net: Scope::none(),
+            ..Caveats::top()
+        };
+        let r = runner_with_clamp(clamp.clone());
+        assert_eq!(
+            r.crew_clamp(),
+            clamp,
+            "the [crew] clamp is sourced from config"
+        );
+        let session = Caveats::top(); // session allows net
+        let child = dispatch_caveats(&session, &r.crew_clamp());
+        assert!(
+            !child.permits_net("evil.example.com"),
+            "the configured clamp denies net at the dispatch seam"
+        );
+        assert!(child.leq(&session), "still ≤ session");
     }
 
     #[tokio::test]
