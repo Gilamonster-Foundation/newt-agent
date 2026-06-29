@@ -2022,6 +2022,42 @@ fn effective_caveats(base: &newt_core::Caveats, mode: Option<&ActiveMode>) -> ne
     }
 }
 
+/// #774 (P0): the always-on exec FLOOR threaded to `execute_tool` as
+/// `exec_floor`. The operator's `[tui.permissions]` exec clamp is a
+/// NON-OPTIONAL floor — enforced even with NO active `/mode`.
+///
+/// `effective_exec` is the base `[tui.permissions]` exec scope already met with
+/// any active `/mode` clamp (i.e. `effective_caveats(base, mode).exec`), so the
+/// floor is meet-only: `/mode` can only TIGHTEN it, never widen it past either
+/// the base or the preset.
+///
+/// Returns `Some(effective_exec)` whenever the operator configured a restrictive
+/// exec clamp (`Scope::Only`) OR a `/mode` is active, so an out-of-floor command
+/// can never take the `--disable-ocap` / `--yolo` unconfined bypass — it falls
+/// through to the confined shell, which enforces the (already-clamped) caveats
+/// and denies it. Returns `None` ONLY when exec is unrestricted (`Scope::All`)
+/// AND no `/mode` is active, leaving the unrestricted `--disable-ocap` bypass
+/// exactly as it was pre-#307 (whether `--yolo` should unconfine at all by
+/// default is a separate question — design-review §7-F5 / P4, out of scope here).
+///
+/// Before #774 the floor was sourced from the active `/mode` ALONE
+/// (`active_mode.map(|m| m.clamp.exec.clone())`), so a configured
+/// `[tui.permissions]` clamp imposed NO floor without a `/mode` — the
+/// design-review F1 finding: the operator's exec clamp was not enforced by
+/// default on the bypass path.
+fn exec_floor_from(
+    effective_exec: &newt_core::caveats::Scope<String>,
+    mode_active: bool,
+) -> Option<newt_core::caveats::Scope<String>> {
+    use newt_core::caveats::Scope;
+    match effective_exec {
+        // Unrestricted base, no mode ⇒ no floor (pre-#307 bypass, bit-for-bit).
+        Scope::All if !mode_active => None,
+        // A configured restriction, or any active mode, is an always-on floor.
+        scope => Some(scope.clone()),
+    }
+}
+
 /// Render the `/permissions` listing: this session's prompted decisions (in
 /// prompt order) plus where the durable record lives. Promotion to a lasting
 /// grant is deliberately NOT offered here — that is a human editing
@@ -5435,10 +5471,17 @@ fn run_chat(
                     // unchanged. Computed once so all three consult one value.
                     let turn_caveats = effective_caveats(cap.caveats(), active_mode.as_ref());
                     // The active preset clamp threaded to the gate (re-clamps
-                    // any session grant) and the exec floor threaded to the
-                    // bypass. Both `None` when no mode is active.
+                    // any session grant); `None` when no mode is active.
                     let preset_clamp = active_mode.as_ref().map(|m| m.clamp.clone());
-                    let exec_floor = active_mode.as_ref().map(|m| m.clamp.exec.clone());
+                    // #774 (P0): the exec FLOOR threaded to the bypass is the
+                    // operator's `[tui.permissions]` exec clamp — a NON-OPTIONAL
+                    // floor enforced even with no active `/mode`. `turn_caveats.exec`
+                    // is the base clamp already met with the mode (meet-only), so
+                    // `/mode` only tightens it. `None` only when exec is
+                    // unrestricted AND no mode is active. Before #774 this was
+                    // sourced from the mode alone, so a configured clamp imposed
+                    // no floor without a `/mode` (design-review F1).
+                    let exec_floor = exec_floor_from(&turn_caveats.exec, active_mode.is_some());
                     // Prompted ocap grants (issue #263): only an interactive
                     // session constructs a gate — headless paths (ACP worker,
                     // newt-eval) never reach this code, so a denial there can
@@ -10511,6 +10554,48 @@ mod disable_ocap_session_tests {
     use newt_core::agentic::execute_tool;
     #[cfg(unix)]
     use newt_core::caveats::{Caveats, CountBound, Scope};
+
+    /// #774 (P0) — PURE: the operator's `[tui.permissions]` exec clamp is a
+    /// NON-OPTIONAL floor, sourced into `exec_floor` even with NO active
+    /// `/mode`. This is the red→green regression for design-review F1: before
+    /// #774 the floor was sourced from the active `/mode` alone, so a configured
+    /// clamp yielded `exec_floor == None` without a `/mode`, and an out-of-clamp
+    /// command took the `--disable-ocap` bypass UNCONFINED.
+    #[test]
+    fn tui_permissions_exec_clamp_is_an_always_on_floor_without_mode() {
+        use newt_core::caveats::{Scope, ScopeExt as _};
+        // `[tui.permissions]` configures a restrictive exec clamp; NO mode active.
+        let configured_exec: Scope<String> = Scope::only(["cargo".to_string(), "git".to_string()]);
+        let floor = exec_floor_from(&configured_exec, /* mode_active = */ false).expect(
+            "a configured [tui.permissions] exec clamp must be an always-on floor \
+             even without a /mode — on the pre-#774 code this was None, so an \
+             out-of-clamp command ran unconfined under --disable-ocap",
+        );
+        // An out-of-clamp command is NOT authorized by the floor → it can never
+        // take the unconfined bypass; it falls through to the confined shell.
+        assert!(
+            !floor.permits(&"rm".to_string()),
+            "an out-of-clamp command must be denied by the always-on floor"
+        );
+        // The configured commands stay authorized.
+        assert!(floor.permits(&"cargo".to_string()));
+        assert!(floor.permits(&"git".to_string()));
+    }
+
+    /// #774 (P0) — PURE: the floor only NARROWS (OCAP meet-only). `None` is
+    /// returned ONLY when exec is unrestricted (`Scope::All`) AND no `/mode` is
+    /// active, leaving the unrestricted `--disable-ocap` bypass exactly as it
+    /// was pre-#307; any restriction OR any active mode yields a floor.
+    #[test]
+    fn exec_floor_none_only_when_unrestricted_and_no_mode() {
+        use newt_core::caveats::Scope;
+        // Unrestricted base + no mode ⇒ no floor (pre-#307 bypass preserved).
+        assert!(exec_floor_from(&Scope::<String>::All, false).is_none());
+        // Unrestricted base + active mode ⇒ floor present (#307 preserved).
+        assert!(exec_floor_from(&Scope::<String>::All, true).is_some());
+        // Restrictive base + active mode ⇒ floor present.
+        assert!(exec_floor_from(&Scope::only(["git".to_string()]), true).is_some());
+    }
 
     /// RAII env override (the run_command bypass and `ocap_disabled` read
     /// the process env): restore the previous value on drop, including on a
