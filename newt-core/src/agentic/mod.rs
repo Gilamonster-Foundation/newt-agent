@@ -583,8 +583,8 @@ pub struct ChatCtx<'a> {
     /// Experiential store for the record/recall tools (Step 26.6a). `None` = the
     /// tools are not advertised (experiential off). Shared `&dyn` (interior mut).
     pub experience_store: Option<&'a dyn crate::agentic::experiential::ExperienceStore>,
-    /// Plan ledger for the plan_set/plan_advance tools (Step 26.6b). `None` = the
-    /// tools are not advertised (scheduled off). Shared `&dyn` (interior mut).
+    /// Plan ledger for the update_plan tool (Step 26.6b). `None` = the tool is
+    /// not advertised (scheduled off). Shared `&dyn` (interior mut).
     pub step_ledger: Option<&'a dyn crate::agentic::scheduled::StepLedger>,
     pub caveats: &'a crate::caveats::Caveats,
     /// Maximum tool-call rounds before forcing a final tools-disabled
