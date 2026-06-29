@@ -6,6 +6,11 @@
 //! the downstream `gilamonster-agent`, which inherits these crates.
 
 mod crew_form;
+// Danger-tiering for permission grants (facade P1b, §7-F3/F4): pure-data
+// classification of a `(capability, target)` grant into a `DangerTier`, read by
+// the permission prompt to show a system-computed blast-radius line and refuse a
+// plain `[s]ession allow` for high-danger targets.
+mod danger;
 pub mod dgx_probe;
 mod mcp;
 mod mcp_token;
@@ -1671,8 +1676,32 @@ fn parse_permission_choice(input: &str) -> PromptChoice {
     }
 }
 
-/// Build the prompt shown for one denied capability (the #263 sketch shape).
-fn permission_prompt_text(req: &newt_core::PermissionRequest) -> String {
+/// #721 / facade P1b: is this request's `reason` MODEL-authored? Only the
+/// proactive `request_permissions` tool lets the model write the `reason`
+/// (`tools.rs` `execute_request_permissions`); a denial-driven request carries
+/// harness denial text instead. Named so the untrusted-text policy (§7-F4) is
+/// decided in one place.
+fn reason_is_model_authored(req: &newt_core::PermissionRequest) -> bool {
+    req.tool == "request_permissions"
+}
+
+/// Build the prompt shown for one denied capability (the #263 sketch shape),
+/// hardened by facade **P1b** (§7-F3/F4):
+///
+/// 1. A high-danger grant (interpreter exec / broad fs root) carries a
+///    **system-computed blast-radius line** ([`danger::DangerTable::blast_radius`])
+///    that the model cannot author — a fact the lay operator can't be expected to
+///    derive unaided (§1.1).
+/// 2. A **model-authored** `reason` (from `request_permissions`) is labelled as
+///    untrusted model text, never rendered as a harness fact (§7-F4). Harness
+///    denial text (denial-driven requests) is shown plainly as context.
+/// 3. A high-danger grant's menu **omits `[s]ession allow`** — it is not
+///    session-allowable (the refusal is enforced in [`PermissionGate::ask`]);
+///    `[k]ey allow` (step-up, P3, unbuilt) is noted as the future standing path.
+fn permission_prompt_text(
+    req: &newt_core::PermissionRequest,
+    danger: &danger::DangerTable,
+) -> String {
     use newt_core::DenialKind;
     let (verb, axis) = match req.kind {
         DenialKind::Exec => ("run", "outside the granted exec allowlist"),
@@ -1680,16 +1709,63 @@ fn permission_prompt_text(req: &newt_core::PermissionRequest) -> String {
         DenialKind::FsWrite => ("write", "outside the granted fs_write scope"),
         DenialKind::Net => ("reach", "outside the granted net allowlist"),
     };
+    let tier = danger.classify(req.kind, &req.target);
+
+    // (1) §7-F4: a system-computed blast-radius line for high-danger grants — a
+    // fact derived from (capability, target), NOT from any model-supplied text.
+    let blast = match danger.blast_radius(req.kind, &req.target) {
+        Some(line) => format!("{line}\n"),
+        None => String::new(),
+    };
+
+    // (2) §7-F4: the model's `reason` is UNTRUSTED. When it is model-authored
+    // (`request_permissions`), label it as such so the operator never reads it
+    // as a harness fact; a denial-driven request's reason is harness text and is
+    // shown plainly as context.
     let reason = if req.reason.is_empty() {
         String::new()
+    } else if reason_is_model_authored(req) {
+        format!(
+            "  model says (model-authored, unverified): \"{}\"\n",
+            req.reason
+        )
     } else {
         format!("  ({})\n", req.reason)
     };
+
+    // (3) §7-F3/F4: a high-danger target is NOT session-allowable — omit `[s]`
+    // and point at the future step-up path. Low-danger keeps the full menu.
+    let menu = match tier {
+        danger::DangerTier::High => {
+            "[a]llow once   [d]eny (default)   [D]eny always   \
+             (high-danger: [s]ession allow refused — [k]ey allow / step-up is the future path, P3) > "
+        }
+        danger::DangerTier::Low => {
+            "[a]llow once   [s]ession allow   [d]eny (default)   [D]eny always > "
+        }
+    };
+
     format!(
-        "⊘ {} wants to {verb} `{}` — {axis}.\n{reason}  \
-         [a]llow once   [s]ession allow   [d]eny (default)   [D]eny always > ",
+        "⊘ {} wants to {verb} `{}` — {axis}.\n{blast}{reason}  {menu}",
         req.tool, req.target
     )
+}
+
+/// Facade P1b: the production [`danger::DangerTable`] — the built-in
+/// interpreter set plus this environment's broad fs roots (`$HOME` and the
+/// current workspace dir), which a plain `[s]ession allow` must never grant
+/// wholesale (§7-F3/F4). The env read happens once, here, at gate construction;
+/// unit tests build a table by hand (`DangerTable::builtin().with_fs_root(...)`)
+/// and never touch the real env (the no-real-fs-in-unit-tests rule).
+fn production_danger_table() -> danger::DangerTable {
+    let mut table = danger::DangerTable::builtin();
+    if let Some(home) = std::env::var_os("HOME") {
+        table = table.with_fs_root(std::path::PathBuf::from(home));
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        table = table.with_fs_root(cwd);
+    }
+    table
 }
 
 /// Production prompt: print the question, read one line from stdin — the
@@ -1776,6 +1852,11 @@ struct PromptPermissionGate<'a, F: FnMut(&str) -> PromptChoice> {
     /// load-bearing point that keeps the floor honest against grants. `None`
     /// (no active preset) leaves the #263 mint bit-for-bit.
     preset_clamp: Option<newt_core::Caveats>,
+    /// Facade P1b (§7-F3/F4): the pure-DATA danger-tier table. Used to render
+    /// the prompt's system-computed blast-radius line and to refuse a plain
+    /// `[s]ession allow` of a high-danger target (interpreter exec / broad fs
+    /// root). See [`danger`].
+    danger: danger::DangerTable,
     color: bool,
     verbose: bool,
     ask_human: F,
@@ -1864,12 +1945,36 @@ impl<F: FnMut(&str) -> PromptChoice> newt_core::PermissionGate for PromptPermiss
             {
                 continue;
             }
-            match (self.ask_human)(&permission_prompt_text(req)) {
+            match (self.ask_human)(&permission_prompt_text(req, &self.danger)) {
                 PromptChoice::AllowOnce => {
                     self.record(req, "allow", "once");
                     once_grants.push((req.kind, req.target.clone()));
                 }
                 PromptChoice::AllowSession => {
+                    // Facade P1b (§7-F3/F4): a high-danger target (interpreter
+                    // exec / broad fs root) is NOT session-allowable. A standing
+                    // grant of arbitrary execution or the whole tree is exactly
+                    // the catastrophic over-grant P1b closes — the interpreter's
+                    // children fork outside the per-spawn interceptor, and a
+                    // prefix grant of `/` is a whole-tree permit. Refuse:
+                    // fail-closed to a deny so the operator must `[a]llow once`
+                    // per op. `[k]ey allow` (step-up, P3, unbuilt) is the
+                    // intended standing path for these. The prompt menu already
+                    // omits `[s]` for high-danger; this is the enforcement that
+                    // makes a muscle-memory `s` safe.
+                    if self.danger.classify(req.kind, &req.target) == danger::DangerTier::High {
+                        self.record(req, "deny", "session-allow-refused-high-danger");
+                        print_newt(
+                            &format!(
+                                "session allow refused for high-danger `{}` — \
+                                 allow once per op or deny (step-up is the future path)",
+                                req.target
+                            ),
+                            self.color,
+                            self.verbose,
+                        );
+                        return Deny;
+                    }
                     self.record(req, "allow", "session");
                     self.state
                         .session_grants
@@ -2193,6 +2298,7 @@ mod permission_prompt_tests {
             conversation_id: "conv-test".to_string(),
             log_path,
             preset_clamp: None,
+            danger: danger::DangerTable::builtin(),
             color: false,
             verbose: false,
             ask_human: move |_prompt: &str| {
@@ -2222,6 +2328,7 @@ mod permission_prompt_tests {
             conversation_id: "conv-test".to_string(),
             log_path,
             preset_clamp: Some(preset_clamp),
+            danger: danger::DangerTable::builtin(),
             color: false,
             verbose: false,
             ask_human: move |_prompt: &str| {
@@ -2263,7 +2370,8 @@ mod permission_prompt_tests {
 
     #[test]
     fn prompt_text_names_tool_target_axis_and_choices() {
-        let text = permission_prompt_text(&exec_request("npm"));
+        let danger = danger::DangerTable::builtin();
+        let text = permission_prompt_text(&exec_request("npm"), &danger);
         assert!(
             text.contains("run_command wants to run `npm`"),
             "got: {text}"
@@ -2276,34 +2384,180 @@ mod permission_prompt_tests {
             text.contains("not within the granted authority"),
             "reason shown: {text}"
         );
+        // `npm` is a narrow command → low-danger → the full menu (incl. session).
         assert!(
             text.contains("[a]llow once   [s]ession allow   [d]eny (default)   [D]eny always"),
             "got: {text}"
         );
         // Axis wording follows the kind; an empty reason adds no parens.
-        let read = permission_prompt_text(&PermissionRequest {
-            tool: "read_file".to_string(),
-            kind: DenialKind::FsRead,
-            target: "/etc/hosts".to_string(),
-            reason: String::new(),
-        });
+        let read = permission_prompt_text(
+            &PermissionRequest {
+                tool: "read_file".to_string(),
+                kind: DenialKind::FsRead,
+                target: "/etc/hosts".to_string(),
+                reason: String::new(),
+            },
+            &danger,
+        );
         assert!(read.contains("wants to read `/etc/hosts`"), "got: {read}");
         assert!(read.contains("fs_read scope"), "got: {read}");
         assert!(!read.contains("()"), "no empty reason parens: {read}");
-        let net = permission_prompt_text(&PermissionRequest {
-            tool: "web_fetch".to_string(),
-            kind: DenialKind::Net,
-            target: "docs.rs".to_string(),
-            reason: String::new(),
-        });
+        let net = permission_prompt_text(
+            &PermissionRequest {
+                tool: "web_fetch".to_string(),
+                kind: DenialKind::Net,
+                target: "docs.rs".to_string(),
+                reason: String::new(),
+            },
+            &danger,
+        );
         assert!(net.contains("wants to reach `docs.rs`"), "got: {net}");
-        let write = permission_prompt_text(&PermissionRequest {
-            tool: "edit_file".to_string(),
-            kind: DenialKind::FsWrite,
-            target: "/ws/f".to_string(),
-            reason: String::new(),
-        });
+        let write = permission_prompt_text(
+            &PermissionRequest {
+                tool: "edit_file".to_string(),
+                kind: DenialKind::FsWrite,
+                target: "/ws/f".to_string(),
+                reason: String::new(),
+            },
+            &danger,
+        );
         assert!(write.contains("wants to write `/ws/f`"), "got: {write}");
+    }
+
+    /// Facade P1b (§7-F4) — the confused-deputy-through-the-operator fix. A
+    /// `request_permissions{capability:"exec", target:"bash", reason:"…benign…"}`
+    /// must show a SYSTEM-computed blast-radius line the model cannot forge, and
+    /// the benign model `reason` must NOT suppress it (it is labelled untrusted,
+    /// not rendered as harness fact). RED on today's code: the pre-P1b prompt
+    /// shows only the verbatim `reason` and no danger annotation.
+    #[test]
+    fn high_danger_prompt_shows_blast_radius_and_labels_reason_untrusted() {
+        let danger = danger::DangerTable::builtin();
+        // The exact attack from §7-F4: a catastrophic grant under a benign cover.
+        let req = PermissionRequest {
+            tool: "request_permissions".to_string(),
+            kind: DenialKind::Exec,
+            target: "bash".to_string(),
+            reason: "list the files in this directory".to_string(),
+        };
+        let text = permission_prompt_text(&req, &danger);
+
+        // (1) the system blast-radius line is present — a fact, not model text.
+        assert!(
+            text.contains("⚠") && text.contains("interpreter"),
+            "expected a blast-radius warning, got: {text}"
+        );
+        assert!(
+            text.contains("arbitrary command execution"),
+            "expected the exec blast radius, got: {text}"
+        );
+        // The benign reason did NOT suppress the warning — both are present.
+        assert!(
+            text.contains("list the files in this directory"),
+            "the model reason is still shown (as context), got: {text}"
+        );
+        // (2) the model `reason` is labelled UNTRUSTED, never as harness fact.
+        assert!(
+            text.contains("model-authored, unverified"),
+            "the reason must be labelled untrusted model text, got: {text}"
+        );
+        // (3) the menu OMITS a plain `[s]ession allow` and notes the refusal.
+        assert!(
+            !text.contains("[a]llow once   [s]ession allow   [d]eny"),
+            "a high-danger grant must NOT offer the plain session-allow menu, got: {text}"
+        );
+        assert!(
+            text.contains("[s]ession allow refused"),
+            "the prompt must explain the session-allow refusal, got: {text}"
+        );
+
+        // A broad fs root gets the same treatment (root `/`, FsWrite).
+        let fs_req = PermissionRequest {
+            tool: "request_permissions".to_string(),
+            kind: DenialKind::FsWrite,
+            target: "/".to_string(),
+            reason: "just save one small file".to_string(),
+        };
+        let fs_text = permission_prompt_text(&fs_req, &danger);
+        assert!(
+            fs_text.contains("filesystem root") && fs_text.contains("write access to everything"),
+            "expected the fs-root blast radius, got: {fs_text}"
+        );
+        assert!(
+            !fs_text.contains("[s]ession allow   [d]eny"),
+            "fs-root grant must not offer plain session-allow, got: {fs_text}"
+        );
+    }
+
+    /// Facade P1b (§7-F3/F4) — a high-danger target is NOT session-allowable.
+    /// Choosing `[s]ession allow` for an interpreter is refused (fail-closed to a
+    /// deny, no session grant remembered); `[a]llow once` still works. RED on
+    /// today's code: the pre-P1b `AllowSession` arm inserts ANY target into
+    /// `session_grants` unconditionally — a standing arbitrary-code permit.
+    #[test]
+    fn high_danger_target_is_not_session_allowable_but_allow_once_works() {
+        let base = base_caveats("/ws");
+
+        // `[s]ession allow` of `bash` (an interpreter) is REFUSED.
+        let mut state = PermissionPromptState::default();
+        let prompts = Rc::new(Cell::new(0));
+        {
+            let mut gate = scripted_gate(
+                &mut state,
+                base.clone(),
+                None,
+                None,
+                vec![PromptChoice::AllowSession],
+                prompts.clone(),
+            );
+            assert!(
+                matches!(
+                    gate.ask(&[exec_request("bash")]),
+                    newt_core::PermissionDecision::Deny
+                ),
+                "session-allow of an interpreter must be refused (deny)"
+            );
+        }
+        assert!(
+            !state
+                .session_grants
+                .contains(&(DenialKind::Exec, "bash".to_string())),
+            "a refused session-allow must leave NO standing grant"
+        );
+        // The refusal is recorded as a deny, not an allow.
+        assert_eq!(state.decisions.len(), 1);
+        assert_eq!(state.decisions[0].decision, "deny");
+        assert!(
+            state.decisions[0].scope.contains("refused"),
+            "the record must mark the high-danger refusal, got: {}",
+            state.decisions[0].scope
+        );
+
+        // `[a]llow once` of the SAME high-danger target still works (per-op).
+        let mut once_state = PermissionPromptState::default();
+        let once_prompts = Rc::new(Cell::new(0));
+        let mut once_gate = scripted_gate(
+            &mut once_state,
+            base,
+            None,
+            None,
+            vec![PromptChoice::AllowOnce],
+            once_prompts,
+        );
+        match once_gate.ask(&[exec_request("bash")]) {
+            newt_core::PermissionDecision::Allow(c) => {
+                assert!(
+                    c.permits_exec("bash"),
+                    "allow-once grants the target for this op"
+                );
+            }
+            newt_core::PermissionDecision::Deny => {
+                panic!("allow-once of a high-danger target must still be permitted")
+            }
+        }
+        drop(once_gate);
+        // Allow-once leaves no standing grant — the per-op nature is preserved.
+        assert!(once_state.session_grants.is_empty());
     }
 
     /// Allow-once: the minted caveats cover the target for THIS consult, but
@@ -5499,6 +5753,7 @@ fn run_chat(
                             conversation_id: active_conversation_id.clone(),
                             log_path: permission_log_path.clone(),
                             preset_clamp: preset_clamp.clone(),
+                            danger: production_danger_table(),
                             color,
                             verbose,
                             ask_human: prompt_permission_choice as fn(&str) -> PromptChoice,
@@ -10776,6 +11031,7 @@ mod disable_ocap_session_tests {
             conversation_id: "conv-297".to_string(),
             log_path: None,
             preset_clamp: None,
+            danger: danger::DangerTable::builtin(),
             color: false,
             verbose: false,
             ask_human: |_prompt: &str| PromptChoice::AllowOnce,
@@ -10819,6 +11075,7 @@ mod disable_ocap_session_tests {
             conversation_id: "conv-297".to_string(),
             log_path: None,
             preset_clamp: None,
+            danger: danger::DangerTable::builtin(),
             color: false,
             verbose: false,
             ask_human: |_prompt: &str| PromptChoice::AllowOnce,
