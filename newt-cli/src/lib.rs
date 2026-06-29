@@ -114,8 +114,20 @@ pub struct Cli {
     /// `~/.newt/permission-log.jsonl` for later review (`/permissions` lists
     /// them). Equivalent to `[tui.permissions] prompt = true`. Interactive
     /// TUI only: headless runs (worker / eval) always keep the plain denial.
+    /// As of #721 this is now the DEFAULT for interactive sessions, so the
+    /// flag is usually redundant; use `--no-prompt-for-permissions` to opt out.
     #[arg(long, global = true, default_value_t = false)]
     pub prompt_for_permissions: bool,
+
+    /// Opt OUT of interactive permission prompting (#721). By default an
+    /// interactive session now asks the operator on a capability denial; pass
+    /// this to keep the plain, fail-closed denial instead (the model still gets
+    /// the recoverable `request_permissions` guidance). Wins over
+    /// `--prompt-for-permissions` / `[tui.permissions] prompt`. Equivalent to
+    /// `NEWT_NO_PROMPT_FOR_PERMISSIONS=1`. Headless runs are unaffected (they
+    /// never prompt regardless).
+    #[arg(long, global = true, default_value_t = false)]
+    pub no_prompt_for_permissions: bool,
 
     /// INTERIM (#297): disable the ocap confined shell for THIS invocation —
     /// run_command executes unconfined on the plain host shell (same venv/PATH
@@ -624,6 +636,11 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             // only the interactive TUI reads it — worker/eval never prompt.
             if cli.prompt_for_permissions {
                 unsafe { std::env::set_var("NEWT_PROMPT_FOR_PERMISSIONS", "1") };
+            }
+            // #721: --no-prompt-for-permissions opts back out of the new
+            // interactive default; it wins over --prompt-for-permissions/config.
+            if cli.no_prompt_for_permissions {
+                unsafe { std::env::set_var("NEWT_NO_PROMPT_FOR_PERMISSIONS", "1") };
             }
             // --plain (alias --no-footer) forces the footer off; the TUI reads
             // NEWT_FOOTER once. CLI > env > [tui] footer > default (auto).
@@ -1141,6 +1158,17 @@ mod tests {
         assert!(cli.prompt_for_permissions);
         let cli = Cli::try_parse_from(["newt"]).unwrap();
         assert!(!cli.prompt_for_permissions);
+    }
+
+    #[test]
+    fn parses_no_prompt_for_permissions_global() {
+        // #721: the opt-out flag — off by default, parses bare and under `code`.
+        let cli = Cli::try_parse_from(["newt"]).unwrap();
+        assert!(!cli.no_prompt_for_permissions);
+        let cli = Cli::try_parse_from(["newt", "--no-prompt-for-permissions"]).unwrap();
+        assert!(cli.no_prompt_for_permissions);
+        let cli = Cli::try_parse_from(["newt", "code", "--no-prompt-for-permissions"]).unwrap();
+        assert!(cli.no_prompt_for_permissions);
     }
 
     #[test]

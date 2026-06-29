@@ -279,6 +279,29 @@ pub fn tool_definitions() -> serde_json::Value {
                     "required": ["url"]
                 }
             }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "request_permissions",
+                "description": "Ask the operator to GRANT a capability you were denied — the \
+                                capability-grant path (#721). Call this AFTER a `capability denied` \
+                                result to request authority you don't currently have. If an operator \
+                                is present they may allow it; then retry the original operation. In a \
+                                headless session (no operator) you'll be told the capability must be \
+                                configured by the owner — change approach. This requests AUTHORITY \
+                                (it mints a capability grant); it is NOT a way to ask the user a \
+                                free-text question.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "capability": { "type": "string", "enum": ["exec", "fs_read", "fs_write", "net"], "description": "Which capability axis to request" },
+                        "target": { "type": "string", "description": "What to grant: a command name (exec), a path (fs_read/fs_write), or a host (net)" },
+                        "reason": { "type": "string", "description": "Why you need it — shown to the operator deciding" }
+                    },
+                    "required": ["capability", "target", "reason"]
+                }
+            }
         }
     ])
 }
@@ -411,6 +434,10 @@ const ALL_TOOL_NAMES: &[&str] = &[
     // #714: always-advertised self-recovery read (degrades gracefully when its
     // sources are absent), so it is never treated as a hallucination.
     "resume_context",
+    // #721: always-advertised capability-grant request (rides the #263 gate;
+    // degrades to "no operator available" when no gate is present), so a model
+    // calling it after a denial is never treated as a hallucination.
+    "request_permissions",
 ];
 
 /// Returns `true` if a tool call looks like a hallucination:
@@ -469,6 +496,22 @@ pub(crate) fn resolve_tool_alias(name: &str) -> Option<AliasOutcome> {
                  existing file, call edit_file with \
                  {{\"path\", \"old_string\", \"new_string\"}}."
             )))
+        }
+        // #721 mkdir coach — newt has no directory-creation tool, and the model
+        // does not need one: write_file creates parent directories automatically
+        // (create_dir_all), and an empty file for empty content. A model reaching
+        // for `mkdir` (the issue's live `mkdir -p …/src` dead-end) is coached to
+        // the tool that already covers it, turning an exec denial into a
+        // self-correcting tool call. `touch` is intentionally NOT here — it is
+        // already a create-file alias above (→ write_file), and a second arm
+        // would be a duplicate match.
+        "mkdir" | "make_dir" | "makedirs" | "mkdirs" | "create_dir" | "create_directory" => {
+            Some(AliasOutcome::Correct(
+                "newt has no mkdir/touch tool — call write_file; it creates parent \
+                 directories automatically (create_dir_all). For an empty file, call \
+                 write_file with empty content."
+                    .to_string(),
+            ))
         }
         // Read / list aliases — point at read_file / list_dir.
         "cat" | "open_file" | "view_file" | "view" | "open" => {
@@ -981,13 +1024,39 @@ fn envelope_denial_reason_with_guidance(envelope: &serde_json::Value) -> String 
     }
 }
 
-/// The standard `run_command` capability-denial result — the exact text the
-/// model has always received. Factored so the #263 prompt path can fall back
-/// to it bit-for-bit on deny (and on a second denial after a re-execution).
+/// #721: the model-actionable recovery appended to every capability denial the
+/// MODEL sees. A denial used to be a DEAD-END: it told the *human* to edit
+/// `[tui.permissions]`, which the model cannot do mid-turn, so the loop stalled
+/// (the issue's `mkdir` reproduction). This sentence tells the *model* what IT
+/// can do — ask the operator to grant the capability via the
+/// `request_permissions` tool, or change approach. The gate is unchanged: the
+/// call is STILL denied; only the coaching is added. In a headless flow with no
+/// operator, `request_permissions` answers "no operator available", which is
+/// itself a recoverable signal (switch strategy) rather than a config edit.
+const DENIAL_RECOVERY_HINT: &str =
+    "This is outside your granted authority — call request_permissions with the \
+     capability, a target, and a reason to ask the operator to grant it, or take \
+     a different approach that stays within your current authority.";
+
+/// #721: the model-facing capability-denial message for an fs tool — the base
+/// "{kind} does not permit '{path}'" line plus the recoverable, model-actionable
+/// [`DENIAL_RECOVERY_HINT`]. One factored message + regression point shared by
+/// every fs denial (read_file / write_file / edit_file / list_dir / find), so
+/// the recoverable wording can never drift between them.
+fn denied_fs_result(kind: &str, path: &str) -> String {
+    format!("capability denied: {kind} does not permit '{path}'. {DENIAL_RECOVERY_HINT}")
+}
+
+/// The standard `run_command` capability-denial result. The human-facing
+/// transcript line (via [`print_denied`]) keeps the operator config hint
+/// (`extra_exec`); the MODEL-facing return additionally leads to the recoverable
+/// [`DENIAL_RECOVERY_HINT`] (#721) so the denial is no longer a dead-end. The
+/// #263 prompt path still falls back here bit-for-bit on deny (and on a second
+/// denial after a re-execution).
 fn denied_run_command_result(envelope: &serde_json::Value, color: bool) -> String {
     let reason = envelope_denial_reason_with_guidance(envelope);
     print_denied("exec", &reason, color);
-    format!("capability denied: {reason}")
+    format!("capability denied: {reason}. {DENIAL_RECOVERY_HINT}")
 }
 
 /// The standard `run_command` success path: print + return stdout/stderr,
@@ -1075,6 +1144,101 @@ fn fs_gate_allows(
         PermissionDecision::Allow(widened) => tui_permits_path(axis(&widened), full_path),
         PermissionDecision::Deny => false,
     }
+}
+
+/// #721: map the model-supplied `capability` string for `request_permissions`
+/// onto a [`DenialKind`] axis. A small synonym set absorbs the names a weak
+/// local model tends to emit; an unrecognized value returns `None` so the tool
+/// coaches instead of guessing an axis (guessing would request the WRONG
+/// authority). Pure — unit-tested directly.
+fn parse_capability(s: &str) -> Option<DenialKind> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "exec" | "run" | "run_command" | "command" | "shell" => Some(DenialKind::Exec),
+        "fs_read" | "fs-read" | "read" | "read_file" => Some(DenialKind::FsRead),
+        "fs_write" | "fs-write" | "write" | "write_file" => Some(DenialKind::FsWrite),
+        "net" | "network" | "web" | "web_fetch" => Some(DenialKind::Net),
+        _ => None,
+    }
+}
+
+/// #721: the model-facing `request_permissions` tool — the capability-GRANT
+/// path. It builds a [`PermissionRequest`] from `{capability, target, reason}`
+/// and consults the SAME #263 [`PermissionGate`] a denial would: `Allow` reports
+/// granted (and the gate has remembered any session grant, so the model's retry
+/// of the original op rides the existing #263 re-exec machinery), `Deny` reports
+/// declined, and **no gate** (headless / eval / ACP) reports that no operator is
+/// available to grant — a recoverable signal (switch strategy), never a hang.
+///
+/// Reconciliation with #728: `request_permissions` is the capability-GRANT path
+/// — it mints caveats via the gate (real authority change). #728's future
+/// `request_user_input` will be a GENERIC free-text Q&A to the human. Both
+/// "surface to the human", but they are deliberately DISTINCT and must not be
+/// merged: one widens authority through the ocap gate, the other gathers text.
+fn execute_request_permissions(
+    args: &serde_json::Value,
+    gate: Option<&mut dyn PermissionGate>,
+    color: bool,
+    tool_output_lines: usize,
+) -> String {
+    let capability = args["capability"].as_str().unwrap_or("").trim();
+    let target = args["target"].as_str().unwrap_or("").trim();
+    let reason = args["reason"].as_str().unwrap_or("").trim();
+    print_tool_call("request_permissions", capability, color);
+
+    let Some(kind) = parse_capability(capability) else {
+        let out = format!(
+            "request_permissions: unknown capability '{capability}'. Use one of: \
+             exec, fs_read, fs_write, net."
+        );
+        print_tool_output(&out, tool_output_lines, color);
+        return out;
+    };
+    if target.is_empty() {
+        let out = "request_permissions: 'target' is required — the command name (exec), \
+                   the path (fs_read/fs_write), or the host (net)."
+            .to_string();
+        print_tool_output(&out, tool_output_lines, color);
+        return out;
+    }
+
+    let request = PermissionRequest {
+        tool: "request_permissions".to_string(),
+        kind,
+        target: target.to_string(),
+        reason: if reason.is_empty() {
+            format!("model requested {capability} for '{target}'")
+        } else {
+            reason.to_string()
+        },
+    };
+
+    let out = match gate {
+        // The gate consults the operator and (for a session grant) remembers it,
+        // exactly as a denial-driven prompt does. We do not re-execute anything
+        // here — the model retries its original tool call, which rides the #263
+        // re-exec path under the now-granted caveats.
+        Some(g) => match g.ask(std::slice::from_ref(&request)) {
+            PermissionDecision::Allow(_widened) => format!(
+                "granted: the operator allowed {capability} for '{target}'. \
+                 Retry the original operation now."
+            ),
+            PermissionDecision::Deny => format!(
+                "denied: the operator declined {capability} for '{target}'. \
+                 Do not retry it — take a different approach."
+            ),
+        },
+        // Headless / eval / ACP: no interactive gate exists to grant authority.
+        // This is recoverable (change strategy), not a config edit the model
+        // can perform mid-turn.
+        None => format!(
+            "no operator available to grant {capability} for '{target}' — this session \
+             has no interactive permission gate (headless / eval / piped). The capability \
+             must be configured by the owner (e.g. [tui.permissions] in newt config); \
+             take a different approach for now."
+        ),
+    };
+    print_tool_output(&out, tool_output_lines, color);
+    out
 }
 
 /// Best-effort host extraction for the #263 net pre-check. This only gates
@@ -1285,7 +1449,10 @@ fn find_walk(
 /// capability denial consults the human (allow once / session allow / deny)
 /// before failing; an allow re-executes the denied call under the gate's
 /// freshly minted caveats. `None` (the default, and every headless caller)
-/// keeps every denial exactly as it was — bit-for-bit.
+/// keeps every denial exactly as it was — bit-for-bit. #721's
+/// `request_permissions` tool also rides this gate: it lets the MODEL proactively
+/// request a grant (vs. only reacting to a denial), and reports "no operator
+/// available" when the gate is `None`.
 ///
 /// INTERIM (#297): when [`ocap_disabled`] is asserted (`--disable-ocap` /
 /// `--yolo` / `NEWT_DISABLE_OCAP=1`), `run_command` skips the confined shell
@@ -1451,6 +1618,15 @@ pub async fn execute_tool(
             tool_output_lines,
         ),
 
+        // #721: the capability-GRANT request — rides the SAME #263 gate a denial
+        // would consult. Advertised always; `permission_gate` is `None` for
+        // headless / eval / ACP, where it answers "no operator available" rather
+        // than blocking. Consumes the gate (mutually exclusive with the
+        // run_command / fs arms that also use it — only one arm runs per call).
+        "request_permissions" => {
+            execute_request_permissions(args, permission_gate, color, tool_output_lines)
+        }
+
         // Embedded git (PR4, #461): dispatch through the injected GitTool
         // (newt-git's LocalGitTool). `GitCaveats::from_session` projects the
         // session's authority onto the git surface (fail-closed: a read-only
@@ -1610,7 +1786,7 @@ pub async fn execute_tool(
                     })
                 });
                 if !allowed {
-                    let msg = format!("capability denied: fs_read does not permit '{path}'");
+                    let msg = denied_fs_result("fs_read", path);
                     print_denied("fs_read", path, color);
                     return msg;
                 }
@@ -1649,7 +1825,7 @@ pub async fn execute_tool(
                     })
                 });
                 if !allowed {
-                    let msg = format!("capability denied: fs_write does not permit '{path}'");
+                    let msg = denied_fs_result("fs_write", path);
                     print_denied("fs_write", path, color);
                     return msg;
                 }
@@ -1742,7 +1918,7 @@ pub async fn execute_tool(
                     })
                 });
                 if !allowed {
-                    let msg = format!("capability denied: fs_write does not permit '{path}'");
+                    let msg = denied_fs_result("fs_write", path);
                     print_denied("fs_write", path, color);
                     return msg;
                 }
@@ -1824,7 +2000,7 @@ pub async fn execute_tool(
                     })
                 });
                 if !allowed {
-                    let msg = format!("capability denied: fs_read does not permit '{path}'");
+                    let msg = denied_fs_result("fs_read", path);
                     print_denied("fs_read", path, color);
                     return msg;
                 }
@@ -1858,7 +2034,7 @@ pub async fn execute_tool(
                     fs_gate_allows(gate, "find", DenialKind::FsRead, &full_str, |c| &c.fs_read)
                 });
                 if !allowed {
-                    let msg = format!("capability denied: fs_read does not permit '{path}'");
+                    let msg = denied_fs_result("fs_read", path);
                     print_denied("fs_read", path, color);
                     return msg;
                 }
@@ -1892,7 +2068,7 @@ pub async fn execute_tool(
                 full.canonicalize(),
             ) {
                 if !root_canon.starts_with(&ws_canon) {
-                    let msg = format!("capability denied: fs_read does not permit '{path}'");
+                    let msg = denied_fs_result("fs_read", path);
                     print_denied("fs_read", path, color);
                     return msg;
                 }
@@ -2366,6 +2542,9 @@ mod tests {
                 "find",
                 "use_skill",
                 "web_fetch",
+                // #721: advertised ALWAYS (core capability-grant request, no
+                // presence gate) — part of the base tool_definitions() set.
+                "request_permissions",
                 // #714: advertised ALWAYS (no presence gate), so it joins the
                 // base set even with every `with_*` flag off.
                 "resume_context",
@@ -3934,6 +4113,33 @@ mod execute_tool_branch_tests {
     }
 
     #[test]
+    fn alias_coaches_mkdir_to_write_file() {
+        // #721: newt has no directory-creation tool — coach to write_file, which
+        // does create_dir_all on the parent. Turns the issue's `mkdir -p …/src`
+        // dead-end into a self-correcting tool call.
+        for n in [
+            "mkdir",
+            "make_dir",
+            "makedirs",
+            "mkdirs",
+            "create_dir",
+            "create_directory",
+        ] {
+            let Some(AliasOutcome::Correct(msg)) = resolve_tool_alias(n) else {
+                panic!("{n} should produce a Correct outcome");
+            };
+            assert!(msg.contains("write_file"), "{n}: {msg}");
+            assert!(msg.contains("create_dir_all"), "{n}: {msg}");
+        }
+        // `touch` is intentionally NOT in the mkdir arm — it stays a create-file
+        // alias (→ write_file), so there is no duplicate match arm / collision.
+        let Some(AliasOutcome::Correct(msg)) = resolve_tool_alias("touch") else {
+            panic!("touch should still be a create-file Correct outcome");
+        };
+        assert!(msg.contains("write_file"), "touch: {msg}");
+    }
+
+    #[test]
     fn alias_passes_through_real_and_mcp_names() {
         for n in [
             "run_command",
@@ -4210,8 +4416,121 @@ mod execute_tool_branch_tests {
         .await
     }
 
-    /// FLAG OFF (no gate): the denial text is the exact string the model has
-    /// always received — regression-pinned bit-for-bit (#263 acceptance).
+    // -- #721 recoverable denials + request_permissions ---------------------
+
+    #[test]
+    fn exec_denial_is_recoverable_not_a_dead_end() {
+        // #721: the exec denial the MODEL sees leads to the model-actionable
+        // request_permissions path — not ONLY the human-only config edit (the
+        // dead-end the issue reported). The operator config hint may stay as a
+        // secondary line for the human; both are present.
+        let envelope = serde_json::json!({
+            "denied": true,
+            "denials": [{
+                "kind": "exec",
+                "target": "mkdir",
+                "reason": "exec of \"mkdir\" is not within the granted authority"
+            }]
+        });
+        let out = denied_run_command_result(&envelope, false);
+        assert!(out.starts_with("capability denied:"), "got: {out}");
+        assert!(out.contains("request_permissions"), "got: {out}");
+        assert!(out.contains("[tui.permissions] extra_exec"), "got: {out}");
+    }
+
+    #[test]
+    fn parse_capability_maps_synonyms_and_rejects_unknown() {
+        assert_eq!(parse_capability("exec"), Some(DenialKind::Exec));
+        assert_eq!(parse_capability("shell"), Some(DenialKind::Exec));
+        assert_eq!(parse_capability("FS_READ"), Some(DenialKind::FsRead));
+        assert_eq!(parse_capability("write"), Some(DenialKind::FsWrite));
+        assert_eq!(parse_capability("network"), Some(DenialKind::Net));
+        assert_eq!(parse_capability("gpu"), None);
+        assert_eq!(parse_capability(""), None);
+    }
+
+    #[test]
+    fn request_permissions_grant_deny_and_no_gate() {
+        let base = Caveats::top();
+
+        // Mock gate ALLOWS → "granted" + the retry coaching; the gate was asked
+        // with the parsed axis + target.
+        let mut gate = MockGate::new(true, &base);
+        let out = execute_request_permissions(
+            &serde_json::json!({"capability": "exec", "target": "mkdir", "reason": "make a dir"}),
+            Some(&mut gate),
+            false,
+            20,
+        );
+        assert!(out.starts_with("granted:"), "got: {out}");
+        assert!(out.contains("Retry the original operation"), "got: {out}");
+        assert_eq!(gate.asks.len(), 1);
+        assert_eq!(
+            gate.asks[0],
+            ("request_permissions".to_string(), "exec:mkdir".to_string())
+        );
+
+        // Mock gate DENIES → "denied" + don't-retry coaching.
+        let mut gate = MockGate::new(false, &base);
+        let out = execute_request_permissions(
+            &serde_json::json!({"capability": "fs_write", "target": "/tmp/x", "reason": "w"}),
+            Some(&mut gate),
+            false,
+            20,
+        );
+        assert!(out.starts_with("denied:"), "got: {out}");
+        assert!(out.contains("different approach"), "got: {out}");
+
+        // NO gate (headless / eval) → "no operator available" — recoverable,
+        // never a hang or a config-only dead end.
+        let out = execute_request_permissions(
+            &serde_json::json!({"capability": "net", "target": "docs.rs", "reason": "fetch"}),
+            None,
+            false,
+            20,
+        );
+        assert!(out.contains("no operator available"), "got: {out}");
+    }
+
+    #[test]
+    fn request_permissions_coaches_bad_inputs() {
+        // Unknown capability → coach listing the valid axes (no gate consulted).
+        let out = execute_request_permissions(
+            &serde_json::json!({"capability": "gpu", "target": "x", "reason": "y"}),
+            None,
+            false,
+            20,
+        );
+        assert!(out.contains("unknown capability"), "got: {out}");
+        assert!(out.contains("fs_read"), "got: {out}");
+        // Missing target → coach.
+        let out = execute_request_permissions(
+            &serde_json::json!({"capability": "exec", "reason": "y"}),
+            None,
+            false,
+            20,
+        );
+        assert!(out.contains("'target' is required"), "got: {out}");
+    }
+
+    #[test]
+    fn request_permissions_is_a_real_tool_not_a_phantom() {
+        // #721: a real, always-advertised tool — never an alias / hallucination.
+        assert!(resolve_tool_alias("request_permissions").is_none());
+        assert!(ALL_TOOL_NAMES.contains(&"request_permissions"));
+        assert!(classify_phantom_reach(
+            "request_permissions",
+            &serde_json::json!({"capability": "exec", "target": "mkdir", "reason": "r"}),
+            "granted: the operator allowed exec for 'mkdir'.",
+            true,
+        )
+        .is_none());
+    }
+
+    /// FLAG OFF (no gate): the denial is deterministic and still DENIES every
+    /// fs op (the #263 default-deny posture is intact) — now in the #721
+    /// recoverable form (`denied_fs_result`, carrying the request_permissions
+    /// path), pinned via the shared helper so the wording can't drift.
     #[tokio::test]
     async fn no_gate_denials_are_bit_for_bit_unchanged() {
         let ws = tempfile::TempDir::new().unwrap();
@@ -4229,10 +4548,7 @@ mod execute_tool_branch_tests {
             None,
         )
         .await;
-        assert_eq!(
-            out,
-            "capability denied: fs_read does not permit 'secret.txt'"
-        );
+        assert_eq!(out, denied_fs_result("fs_read", "secret.txt"));
         let out = run_tool(
             "list_dir",
             serde_json::json!({"path": "."}),
@@ -4241,7 +4557,7 @@ mod execute_tool_branch_tests {
             None,
         )
         .await;
-        assert_eq!(out, "capability denied: fs_read does not permit '.'");
+        assert_eq!(out, denied_fs_result("fs_read", "."));
         let out = run_tool(
             "write_file",
             serde_json::json!({"path": "a.txt", "content": "c"}),
@@ -4250,7 +4566,7 @@ mod execute_tool_branch_tests {
             None,
         )
         .await;
-        assert_eq!(out, "capability denied: fs_write does not permit 'a.txt'");
+        assert_eq!(out, denied_fs_result("fs_write", "a.txt"));
         let out = run_tool(
             "edit_file",
             serde_json::json!({"path": "a.txt", "old_string": "a", "new_string": "b"}),
@@ -4259,7 +4575,9 @@ mod execute_tool_branch_tests {
             None,
         )
         .await;
-        assert_eq!(out, "capability denied: fs_write does not permit 'a.txt'");
+        assert_eq!(out, denied_fs_result("fs_write", "a.txt"));
+        // #721: every fs denial now carries the model-actionable recovery path.
+        assert!(out.contains("request_permissions"), "got: {out}");
     }
 
     /// Gate allows an fs_read denial → the read proceeds and returns the
@@ -4318,10 +4636,7 @@ mod execute_tool_branch_tests {
         )
         .await;
         assert_eq!(gated, ungated);
-        assert_eq!(
-            gated,
-            "capability denied: fs_read does not permit 'secret.txt'"
-        );
+        assert_eq!(gated, denied_fs_result("fs_read", "secret.txt"));
         assert_eq!(gate.asks.len(), 1, "the human was asked exactly once");
     }
 
@@ -4435,10 +4750,7 @@ mod execute_tool_branch_tests {
             None, // step_ledger
         )
         .await;
-        assert_eq!(
-            out,
-            "capability denied: fs_read does not permit 'secret.txt'"
-        );
+        assert_eq!(out, denied_fs_result("fs_read", "secret.txt"));
     }
 
     /// web_fetch with a gate: an out-of-allowlist host consults the gate
@@ -5173,10 +5485,7 @@ mod disable_ocap_tests {
             &caveats,
         )
         .await;
-        assert_eq!(
-            out,
-            format!("capability denied: fs_write does not permit '{escape}'")
-        );
+        assert_eq!(out, denied_fs_result("fs_write", escape));
         assert!(!std::path::Path::new(escape).exists());
 
         let out = run_tool(
@@ -5186,10 +5495,7 @@ mod disable_ocap_tests {
             &caveats,
         )
         .await;
-        assert_eq!(
-            out,
-            "capability denied: fs_read does not permit '/etc/hostname'"
-        );
+        assert_eq!(out, denied_fs_result("fs_read", "/etc/hostname"));
     }
 
     /// Precedence (#297): with both `--disable-ocap` and a #263 gate present,
