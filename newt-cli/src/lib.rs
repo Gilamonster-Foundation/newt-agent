@@ -20,6 +20,7 @@ pub mod dgx_vllm;
 mod doctor;
 mod identity_cmd;
 mod skills;
+pub mod stack;
 pub mod stdio_guard;
 mod tuning_cmd;
 

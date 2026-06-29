@@ -5,6 +5,26 @@ use predicates::prelude::*;
 use std::io::Write;
 
 #[test]
+fn binary_help_surfaces_start_on_the_guarded_cli_stack() {
+    // Regression for PR #746 / issue #747: on Windows, the expanded clap tree
+    // overflowed the default ~1 MiB process main-thread stack before any
+    // stdout/stderr. Exercise the real binary entrypoint, not `Cli::try_parse`,
+    // so removing the 16 MiB wrapper fails as a process startup regression.
+    for args in [
+        &["--help"][..],
+        &["dgx", "--help"][..],
+        &["plan", "--help"][..],
+    ] {
+        Command::cargo_bin("newt")
+            .unwrap()
+            .args(args)
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("newt"));
+    }
+}
+
+#[test]
 fn doctor_runs_without_crash() {
     Command::cargo_bin("newt")
         .unwrap()
