@@ -354,11 +354,11 @@ pub(crate) fn merged_tool_definitions(
         defs.push(super::experiential::experience_record_tool_definition());
         defs.push(super::experiential::experience_recall_tool_definition());
     }
-    // Step 26.6b (#586): the scheduled plan_set/plan_advance tools, only with the gate.
-    // #716: the read-only plan_get joins them under the same scheduled gate.
+    // Step 26.6b (#586): the scheduled plan tools, only with the gate. #715 PR2
+    // collapsed the plan_set + plan_advance write tools into a single update_plan;
+    // #716's read-only plan_get joins it under the same scheduled gate.
     if with_scheduled {
-        defs.push(super::scheduled::plan_set_tool_definition());
-        defs.push(super::scheduled::plan_advance_tool_definition());
+        defs.push(super::scheduled::update_plan_tool_definition());
         defs.push(super::scheduled::plan_get_tool_definition());
     }
     defs.extend(mcp.tool_defs());
@@ -406,8 +406,7 @@ const ALL_TOOL_NAMES: &[&str] = &[
     "code_search",
     "experience_record",
     "experience_recall",
-    "plan_set",
-    "plan_advance",
+    "update_plan",
     "plan_get",
     // #714: always-advertised self-recovery read (degrades gracefully when its
     // sources are absent), so it is never treated as a hallucination.
@@ -478,18 +477,32 @@ pub(crate) fn resolve_tool_alias(name: &str) -> Option<AliasOutcome> {
                  {{\"path\"}}. To list a directory, call list_dir with {{\"path\"}}."
             )))
         }
-        // #716 PLAN — start/revise a plan. The arg shape is free prose, not the
-        // ordered `{"steps":[…]}` array plan_set wants, so Correct (coach), never
-        // a silent Rewrite. When `scheduled` is off the dispatch arm for plan_set
-        // returns "scheduled planning is off" — the model still gets a coherent
-        // answer rather than a dead end.
+        // #716 + #715 PR2 PLAN — start/revise a plan. The arg shape is free prose,
+        // not the ordered `{"plan":[{"step","status"}]}` array update_plan wants, so
+        // Correct (coach), never a silent Rewrite. When `scheduled` is off the
+        // dispatch arm for update_plan returns "scheduled planning is off" — the
+        // model still gets a coherent answer rather than a dead end. `update_plan`
+        // itself is the REAL tool now (falls through to `None`), so it is never an
+        // alias of itself; `set_plan`/`plan_advance` no longer exist.
         "enter_plan" | "enter_plan_mode" | "plan_mode" | "start_plan" | "begin_plan"
-        | "make_plan" | "create_plan" | "plan" | "planning" | "update_plan" | "set_plan"
-        | "todo" | "todos" | "todo_write" => Some(AliasOutcome::Correct(format!(
-            "'{name}' is not a newt tool. To start or revise your plan, call plan_set with \
-             {{\"steps\":[...]}} (ordered short imperative phrases); the active step shows in \
-             the <plan> checklist each turn, and call plan_advance when a step is done."
-        ))),
+        | "make_plan" | "create_plan" | "plan" | "planning" | "todo" | "todos" | "todo_write" => {
+            Some(AliasOutcome::Correct(format!(
+                "'{name}' is not a newt tool. To start or revise your plan, call update_plan with \
+                 {{\"plan\":[{{\"step\",\"status\"}}]}} — send the full ordered list each time, \
+                 each step's status one of pending/in_progress/completed (exactly one \
+                 in_progress)."
+            )))
+        }
+        // #715 PR2 ADVANCE-ish verbs — there is no longer a separate "advance" tool;
+        // progress is recorded by re-sending the whole plan with the finished step
+        // marked completed. Coach the model back to update_plan.
+        "next_step" | "complete_step" | "finish_step" | "mark_done" | "step_done" => {
+            Some(AliasOutcome::Correct(format!(
+                "'{name}' is not a newt tool. To advance your plan, call update_plan with the \
+                 full plan and mark the finished step \"completed\" (and the next one \
+                 \"in_progress\")."
+            )))
+        }
         // #716 PLAN-READ — read the current plan. plan_get takes no args, so the
         // foreign call's (empty) arg shape matches: safe to silently Rewrite.
         // `what_was_i_doing` stays here (→ plan_get) — it asks specifically for
@@ -521,8 +534,8 @@ pub(crate) fn resolve_tool_alias(name: &str) -> Option<AliasOutcome> {
         // #716 WORKFLOW — no workflow/pipeline primitive exists; redirect to the
         // plan tools (and crew/team, which needs /team).
         "workflow" | "run_workflow" | "start_workflow" | "pipeline" => Some(AliasOutcome::Correct(
-            "newt has no workflow tool; sequence the work with plan_set + plan_advance, or \
-                 delegate subtasks via crew/team (needs /team)."
+            "newt has no workflow tool; sequence the work with update_plan (the full ordered \
+                 plan with statuses), or delegate subtasks via crew/team (needs /team)."
                 .to_string(),
         )),
         _ => None,
@@ -1411,18 +1424,15 @@ pub async fn execute_tool(
             None => "unknown tool: experience_recall (experiential memory is off)".to_string(),
         },
 
-        // Step 26.6b (#586): scheduled plan_set/plan_advance — presence-gated on
-        // the ledger (advertised only when the `scheduled` feature is on).
-        "plan_set" => match step_ledger {
-            Some(l) => super::scheduled::execute_plan_set(args, l, color, tool_output_lines),
-            None => "unknown tool: plan_set (scheduled planning is off)".to_string(),
-        },
-        "plan_advance" => match step_ledger {
-            Some(l) => super::scheduled::execute_plan_advance(l, color, tool_output_lines),
-            None => "unknown tool: plan_advance (scheduled planning is off)".to_string(),
+        // Step 26.6b (#586) / #715 PR2: scheduled update_plan — the single plan
+        // WRITE tool, presence-gated on the ledger (advertised only when the
+        // `scheduled` feature is on). Replaces plan_set + plan_advance.
+        "update_plan" => match step_ledger {
+            Some(l) => super::scheduled::execute_update_plan(args, l, color, tool_output_lines),
+            None => "unknown tool: update_plan (scheduled planning is off)".to_string(),
         },
         // #716: read-only plan view (the alias target for "what was I doing?"
-        // probes) — same presence gate as plan_set/plan_advance.
+        // probes) — same presence gate as update_plan.
         "plan_get" => match step_ledger {
             Some(l) => super::scheduled::execute_plan_get(l, color, tool_output_lines),
             None => "unknown tool: plan_get (scheduled planning is off)".to_string(),
@@ -2067,7 +2077,10 @@ mod tests {
         let got = classify_phantom_reach("make_plan", &serde_json::json!({}), "ignored", false);
         match got {
             Some(crate::PhantomResolution::Correct(msg)) => {
-                assert!(msg.contains("plan_set"), "guidance names the tool: {msg}");
+                assert!(
+                    msg.contains("update_plan"),
+                    "guidance names the tool: {msg}"
+                );
             }
             other => panic!("expected Correct, got {other:?}"),
         }
@@ -2815,11 +2828,12 @@ mod tests {
                 "{t} is a real tool"
             );
         }
-        // Step 26.6b (#586): the scheduled plan_set/plan_advance tools, only with the gate.
+        // Step 26.6b (#586) / #715 PR2: the scheduled update_plan + plan_get tools,
+        // only with the gate (plan_set/plan_advance collapsed into update_plan).
         let sched = merged_tool_definitions(
             &NoMcp, false, false, false, false, false, false, false, false, true,
         );
-        for t in ["plan_set", "plan_advance", "plan_get"] {
+        for t in ["update_plan", "plan_get"] {
             assert!(names(&sched).contains(&t), "{t} advertised with_scheduled");
             assert!(!names(&without).contains(&t), "{t} hidden without the gate");
             assert!(
@@ -3002,10 +3016,13 @@ mod tests {
     async fn scheduled_dispatch_only_with_a_ledger() {
         use crate::agentic::scheduled::{SessionStepLedger, StepLedger};
         let caveats = crate::caveats::Caveats::top();
-        let args = serde_json::json!({ "steps": ["a", "b"] });
-        // Step 26.6b / #716: no ledger → unknown tool for ALL plan arms (presence
-        // -gate parity, including the read-only plan_get).
-        for name in ["plan_set", "plan_advance", "plan_get"] {
+        let args = serde_json::json!({ "plan": [
+            { "step": "a", "status": "in_progress" },
+            { "step": "b", "status": "pending" },
+        ] });
+        // Step 26.6b / #716 / #715 PR2: no ledger → unknown tool for ALL plan arms
+        // (presence-gate parity, including the read-only plan_get).
+        for name in ["update_plan", "plan_get"] {
             let out = execute_tool(
                 name, &args, ".", false, 20, &caveats, &mut NoMcp, None, None, None, None, None,
                 None, None, None, None, None, None, None,
@@ -3013,10 +3030,10 @@ mod tests {
             .await;
             assert!(out.starts_with(&format!("unknown tool: {name}")), "{out}");
         }
-        // with a ledger → plan_set routes to the executor and mutates it.
+        // with a ledger → update_plan routes to the executor and mutates it.
         let ledger = SessionStepLedger::default();
         let out = execute_tool(
-            "plan_set",
+            "update_plan",
             &args,
             ".",
             false,
@@ -3037,7 +3054,7 @@ mod tests {
             Some(&ledger as &dyn StepLedger),
         )
         .await;
-        assert_eq!(out, "plan set: 2 steps");
+        assert!(out.starts_with("<plan>\n"), "{out}");
         assert_eq!(ledger.count(), 2);
         // #716: plan_get with a ledger renders the <plan> block, read-only.
         let got = execute_tool(
@@ -3924,8 +3941,7 @@ mod execute_tool_branch_tests {
             "write_file",
             "edit_file",
             "git",
-            "plan_set",
-            "plan_advance",
+            "update_plan",
             "plan_get",
             "server__do_thing",
         ] {
@@ -3939,7 +3955,7 @@ mod execute_tool_branch_tests {
     // -- #716: plan / plan-read / crew / workflow alias families --------------
 
     #[test]
-    fn alias_corrects_plan_names_to_plan_set() {
+    fn alias_corrects_plan_names_to_update_plan() {
         for n in [
             "enter_plan",
             "enter_plan_mode",
@@ -3950,8 +3966,6 @@ mod execute_tool_branch_tests {
             "create_plan",
             "plan",
             "planning",
-            "update_plan",
-            "set_plan",
             "todo",
             "todos",
             "todo_write",
@@ -3959,9 +3973,28 @@ mod execute_tool_branch_tests {
             let Some(AliasOutcome::Correct(msg)) = resolve_tool_alias(n) else {
                 panic!("{n} should produce a Correct outcome");
             };
-            assert!(msg.contains("plan_set"), "{n}: {msg}");
-            assert!(msg.contains("plan_advance"), "{n}: {msg}");
+            assert!(msg.contains("update_plan"), "{n}: {msg}");
         }
+        // #715 PR2: the advance-ish verbs coach update_plan + "completed" too.
+        for n in [
+            "next_step",
+            "complete_step",
+            "finish_step",
+            "mark_done",
+            "step_done",
+        ] {
+            let Some(AliasOutcome::Correct(msg)) = resolve_tool_alias(n) else {
+                panic!("{n} should produce a Correct outcome");
+            };
+            assert!(msg.contains("update_plan"), "{n}: {msg}");
+            assert!(msg.contains("completed"), "{n}: {msg}");
+        }
+        // #715 PR2: update_plan is the REAL tool now → not an alias (returns None),
+        // exactly like the resume_context fix; the old set_plan name is gone too.
+        assert!(
+            resolve_tool_alias("update_plan").is_none(),
+            "update_plan must dispatch as the real tool, not a self-alias"
+        );
     }
 
     #[test]
@@ -4055,8 +4088,7 @@ mod execute_tool_branch_tests {
                 panic!("{n} should produce a Correct outcome");
             };
             assert!(msg.contains("no workflow tool"), "{n}: {msg}");
-            assert!(msg.contains("plan_set"), "{n}: {msg}");
-            assert!(msg.contains("plan_advance"), "{n}: {msg}");
+            assert!(msg.contains("update_plan"), "{n}: {msg}");
         }
     }
 

@@ -3,10 +3,9 @@
 //! A "compiled per-step view": instead of leaning on an ever-growing chat
 //! buffer, the model keeps an ORDERED plan of steps (each Todo / Active / Done)
 //! and a compiled `<plan>` checklist is injected at the head of every turn. The
-//! model maintains it with `plan_set` (compile/replace the plan) and
-//! `plan_advance` (finish the active step, activate the next), so it stays
-//! oriented around its plan's progress rather than re-deriving it from a long
-//! transcript.
+//! model maintains it with `update_plan` (send the full ordered list each time,
+//! each step tagged pending/in_progress/completed), so it stays oriented around
+//! its plan's progress rather than re-deriving it from a long transcript.
 //!
 //! Pure in-memory + deterministic (a `Vec`, no clock/uuid), so the whole feature
 //! unit-tests with zero network/fs. Mirrors `scratchpad.rs`: a `&self`
@@ -82,8 +81,7 @@ pub(crate) const PLAN_TOTAL_CAP: usize = 3_000;
 
 /// A session store for the ordered plan (Step 26.6b). `&self` methods (interior
 /// mutability) so one shared `&dyn StepLedger` serves both the per-turn `<plan>`
-/// injection and the plan_set/plan_advance tools. Task-specific → cleared on
-/// `/new`.
+/// injection and the update_plan tool. Task-specific → cleared on `/new`.
 pub trait StepLedger: Send + Sync {
     /// Replace the plan with a fresh ordered list — the first step becomes
     /// Active, the rest Todo. Blank descriptions are dropped; capped at
@@ -259,40 +257,44 @@ pub fn plan_reseat_pointer(ledger: &dyn StepLedger) -> Option<String> {
 // Tool schemas (advertised only when the feature is on + a ledger is present)
 // ---------------------------------------------------------------------------
 
-/// `plan_set` tool definition.
-pub fn plan_set_tool_definition() -> serde_json::Value {
+/// `update_plan` tool definition (#715 PR2) — the single WRITE surface that
+/// replaces `plan_set` + `plan_advance`. The Codex shape: send the full ordered
+/// list each turn, each step tagged with its status (exactly one `in_progress`).
+pub fn update_plan_tool_definition() -> serde_json::Value {
     serde_json::json!({
         "type": "function",
         "function": {
-            "name": "plan_set",
-            "description": "Compile (or recompile) your plan as an ORDERED list of steps. The \
-                            first becomes the active step and a <plan> checklist is shown at \
-                            the head of every turn — work the active step, then call \
-                            plan_advance. Re-call plan_set to revise the whole plan.",
+            "name": "update_plan",
+            "description": "Create or update your plan — send the full ordered list each time \
+                            with each step's status. A <plan> checklist is shown at the head of \
+                            every turn; mark the step you are on \"in_progress\" and finished \
+                            steps \"completed\". Replaces plan_set/plan_advance.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "steps": {
+                    "plan": {
                         "type": "array",
-                        "items": { "type": "string" },
-                        "description": "The steps in order, each a short imperative phrase."
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "step": {
+                                    "type": "string",
+                                    "description": "A short imperative phrase for the step."
+                                },
+                                "status": {
+                                    "type": "string",
+                                    "enum": ["pending", "in_progress", "completed"],
+                                    "description": "The step's progress; exactly one step \
+                                                    should be in_progress."
+                                }
+                            },
+                            "required": ["step", "status"]
+                        },
+                        "description": "The ordered steps, each with its status."
                     }
                 },
-                "required": ["steps"]
+                "required": ["plan"]
             }
-        }
-    })
-}
-
-/// `plan_advance` tool definition.
-pub fn plan_advance_tool_definition() -> serde_json::Value {
-    serde_json::json!({
-        "type": "function",
-        "function": {
-            "name": "plan_advance",
-            "description": "Mark the active step DONE and activate the next one. Call it when \
-                            you finish a step; the <plan> checklist updates next turn.",
-            "parameters": { "type": "object", "properties": {}, "required": [] }
         }
     })
 }
@@ -315,41 +317,82 @@ pub fn plan_get_tool_definition() -> serde_json::Value {
 // Executors (every branch returns a tool-result String, never a loop abort)
 // ---------------------------------------------------------------------------
 
-/// Execute a `plan_set` call (Step 26.6b).
-pub(crate) fn execute_plan_set(
+/// Map a tool-supplied `status` string onto a [`StepStatus`]. Lenient: the
+/// schema's canonical `pending`/`in_progress`/`completed` plus their obvious
+/// synonyms; anything unrecognized (or missing) falls back to `Todo` so a noisy
+/// status never aborts the call.
+fn parse_step_status(raw: &str) -> StepStatus {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "completed" | "complete" | "done" => StepStatus::Done,
+        "in_progress" | "in-progress" | "active" | "current" => StepStatus::Active,
+        _ => StepStatus::Todo, // "pending" / "todo" / unknown
+    }
+}
+
+/// Enforce the Codex invariant of EXACTLY ONE active step — leniently. If the
+/// model sent no `in_progress` (or several), the first non-completed step is
+/// made active and any other actives demoted to Todo. An all-completed plan is
+/// left with no active step (the plan is done).
+fn normalize_active(steps: &mut [Step]) {
+    let active = steps
+        .iter()
+        .filter(|s| s.status == StepStatus::Active)
+        .count();
+    if active == 1 {
+        return; // the well-formed case — respect the model's choice
+    }
+    for s in steps.iter_mut() {
+        if s.status == StepStatus::Active {
+            s.status = StepStatus::Todo;
+        }
+    }
+    if let Some(first) = steps.iter_mut().find(|s| s.status != StepStatus::Done) {
+        first.status = StepStatus::Active;
+    }
+}
+
+/// Execute an `update_plan` call (#715 PR2) — the single WRITE surface. Parses
+/// the `{plan:[{step,status}]}` array into a [`PlanSnapshot`] and reinstates the
+/// ledger via [`StepLedger::restore`] (the same full-state path persistence uses,
+/// so statuses land verbatim). Returns the rendered `<plan>` block so the model
+/// sees the result; read it back later with `plan_get`.
+pub(crate) fn execute_update_plan(
     args: &serde_json::Value,
     ledger: &dyn StepLedger,
     color: bool,
     tool_output_lines: usize,
 ) -> String {
-    print_tool_call("plan_set", "", color);
-    let steps: Vec<String> = args["steps"]
-        .as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default();
-    let out = if steps.iter().all(|s| s.trim().is_empty()) {
-        "error: plan_set requires a non-empty `steps` array".to_string()
-    } else {
-        format!("plan set: {} steps", ledger.set_plan(&steps))
-    };
-    print_tool_output(&out, tool_output_lines, color);
-    out
-}
-
-/// Execute a `plan_advance` call (Step 26.6b).
-pub(crate) fn execute_plan_advance(
-    ledger: &dyn StepLedger,
-    color: bool,
-    tool_output_lines: usize,
-) -> String {
-    print_tool_call("plan_advance", "", color);
-    let out = match ledger.advance() {
-        Some(next) => format!("advanced — now active: {next}"),
-        None => "advanced — plan complete (no steps remaining)".to_string(),
+    print_tool_call("update_plan", "", color);
+    let out = match args["plan"].as_array() {
+        None => "error: update_plan requires a `plan` array of {\"step\",\"status\"} objects"
+            .to_string(),
+        Some(items) => {
+            let mut steps: Vec<Step> = items
+                .iter()
+                .filter_map(|it| {
+                    let desc = it.get("step").and_then(|v| v.as_str())?.trim();
+                    if desc.is_empty() {
+                        return None;
+                    }
+                    let status = it
+                        .get("status")
+                        .and_then(|v| v.as_str())
+                        .map_or(StepStatus::Todo, parse_step_status);
+                    Some(Step {
+                        description: desc.to_string(),
+                        status,
+                    })
+                })
+                .take(MAX_STEPS)
+                .collect();
+            if steps.is_empty() {
+                "error: update_plan requires a non-empty `plan` array".to_string()
+            } else {
+                normalize_active(&mut steps);
+                ledger.restore(&PlanSnapshot { steps });
+                plan_block(ledger).unwrap_or_else(|| "plan updated".to_string())
+            }
+        }
     };
     print_tool_output(&out, tool_output_lines, color);
     out
@@ -357,7 +400,7 @@ pub(crate) fn execute_plan_advance(
 
 /// Execute a `plan_get` call (#716) — render the current `<plan>` checklist
 /// read-only (no ledger mutation), so a resumed turn can recover "what was I
-/// working on". Empty plan → a hint to start one with `plan_set`.
+/// working on". Empty plan → a hint to start one with `update_plan`.
 pub(crate) fn execute_plan_get(
     ledger: &dyn StepLedger,
     color: bool,
@@ -365,7 +408,8 @@ pub(crate) fn execute_plan_get(
 ) -> String {
     print_tool_call("plan_get", "", color);
     let out = plan_block(ledger).unwrap_or_else(|| {
-        "no active plan — call plan_set with {\"steps\":[...]} to start one".to_string()
+        "no active plan — call update_plan with {\"plan\":[{\"step\",\"status\"}]} to start one"
+            .to_string()
     });
     print_tool_output(&out, tool_output_lines, color);
     out
@@ -524,46 +568,106 @@ mod tests {
     }
 
     #[test]
-    fn executors_set_advance_and_coach() {
+    fn update_plan_sets_statuses_renders_block_and_is_lenient() {
+        // #715 PR2: update_plan is the single WRITE surface ({plan:[{step,status}]}).
         let l = SessionStepLedger::default();
-        // set: empty array → coaching, plan untouched
+        // missing `plan` → coaching error, ledger untouched
+        assert!(execute_update_plan(&serde_json::json!({}), &l, false, 20).starts_with("error:"));
+        assert_eq!(l.count(), 0);
+        // empty array → error, still untouched
         assert!(
-            execute_plan_set(&serde_json::json!({"steps": []}), &l, false, 20)
+            execute_update_plan(&serde_json::json!({"plan": []}), &l, false, 20)
                 .starts_with("error:")
         );
         assert_eq!(l.count(), 0);
-        // set: real steps → count reported
-        assert_eq!(
-            execute_plan_set(
-                &serde_json::json!({"steps": ["scope it", "build it", "test it"]}),
-                &l,
-                false,
-                20
-            ),
-            "plan set: 3 steps"
+        // a full plan with one in_progress → statuses land in the ledger AND the
+        // rendered <plan> block comes back.
+        let out = execute_update_plan(
+            &serde_json::json!({"plan": [
+                {"step": "scope it", "status": "completed"},
+                {"step": "build it", "status": "in_progress"},
+                {"step": "test it",  "status": "pending"},
+            ]}),
+            &l,
+            false,
+            20,
         );
-        // advance: reports the new active step, then completion
-        assert_eq!(
-            execute_plan_advance(&l, false, 20),
-            "advanced — now active: build it"
+        assert!(
+            out.starts_with("<plan>\n") && out.ends_with("</plan>"),
+            "{out}"
         );
+        assert!(out.contains("✓ 1. scope it"), "{out}");
+        assert!(out.contains("→ 2. build it"), "{out}");
+        assert!(out.contains("☐ 3. test it"), "{out}");
+        let steps = l.steps();
+        assert_eq!(steps[0].status, StepStatus::Done);
+        assert_eq!(steps[1].status, StepStatus::Active);
+        assert_eq!(steps[2].status, StepStatus::Todo);
         assert_eq!(
-            execute_plan_advance(&l, false, 20),
-            "advanced — now active: test it"
+            steps
+                .iter()
+                .filter(|s| s.status == StepStatus::Active)
+                .count(),
+            1,
+            "exactly one in_progress"
         );
-        assert!(execute_plan_advance(&l, false, 20).contains("plan complete"));
+        // lenient: NO in_progress → the first non-completed becomes active.
+        let none_active = execute_update_plan(
+            &serde_json::json!({"plan": [
+                {"step": "a", "status": "completed"},
+                {"step": "b", "status": "pending"},
+                {"step": "c", "status": "pending"},
+            ]}),
+            &l,
+            false,
+            20,
+        );
+        assert!(
+            none_active.contains("→ 2. b"),
+            "first non-completed becomes active: {none_active}"
+        );
+        // lenient: MULTIPLE in_progress → only the first non-completed stays active.
+        execute_update_plan(
+            &serde_json::json!({"plan": [
+                {"step": "x", "status": "in_progress"},
+                {"step": "y", "status": "in_progress"},
+            ]}),
+            &l,
+            false,
+            20,
+        );
+        let s = l.steps();
+        assert_eq!(
+            s.iter().filter(|x| x.status == StepStatus::Active).count(),
+            1,
+            "multiple in_progress collapse to one"
+        );
+        assert_eq!(s[0].status, StepStatus::Active, "the first becomes active");
+        // blank step descriptions are dropped (the set_plan filtering parity).
+        let dropped = execute_update_plan(
+            &serde_json::json!({"plan": [
+                {"step": "  ", "status": "pending"},
+                {"step": "real", "status": "in_progress"},
+            ]}),
+            &l,
+            false,
+            20,
+        );
+        assert!(dropped.contains("→ 1. real"), "{dropped}");
+        assert_eq!(l.count(), 1, "blank step dropped");
     }
 
     #[test]
     fn tool_definitions_shape() {
-        assert_eq!(plan_set_tool_definition()["function"]["name"], "plan_set");
         assert_eq!(
-            plan_advance_tool_definition()["function"]["name"],
-            "plan_advance"
+            update_plan_tool_definition()["function"]["name"],
+            "update_plan"
         );
         assert_eq!(plan_get_tool_definition()["function"]["name"], "plan_get");
+        // update_plan takes the `plan` array of {step,status} objects.
         assert!(
-            plan_set_tool_definition()["function"]["parameters"]["properties"]["steps"].is_object()
+            update_plan_tool_definition()["function"]["parameters"]["properties"]["plan"]
+                .is_object()
         );
         // #716: plan_get is read-only — no args.
         assert_eq!(

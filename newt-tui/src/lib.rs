@@ -5094,8 +5094,9 @@ fn run_chat(
                         let mut hints: Vec<&str> = Vec::new();
                         if turn_features.scheduled {
                             hints.push(
-                                "For multi-step work, FIRST call plan_set([...]) with the steps, \
-                                 then plan_advance() as you finish each one.",
+                                "For multi-step work, call update_plan with the full ordered plan \
+                                 (each step's status pending/in_progress/completed); re-send it \
+                                 with the finished step marked completed as you go.",
                             );
                         }
                         if scratchpad_on {
@@ -5415,7 +5416,7 @@ fn run_chat(
                                             &experience_store as &dyn newt_core::ExperienceStore,
                                         ),
                                         // Step 26.6b (#586): the plan ledger for
-                                        // plan_set/plan_advance — Some only when on.
+                                        // update_plan — Some only when on.
                                         step_ledger: scheduled_on
                                             .then_some(&step_ledger as &dyn newt_core::StepLedger),
                                         // #307: the clamped effective caveats (base ∩
