@@ -631,6 +631,33 @@ pub(crate) fn classify_phantom_reach(
     None
 }
 
+/// #479 (G4): classify a `crew`/`compose_roster` reach made while the crew/team
+/// surface is gated OFF (`advertise_team == false`, the default — the runner is
+/// only built when the operator sets `NEWT_TEAM`).
+///
+/// Pure: given the name the model called and whether the team surface is
+/// advertised this session, decide whether this is a gated-off delegation reach
+/// worth mining. Returns `None` for everything else (non-crew names, or crew
+/// names when the surface is ON — those dispatch normally).
+///
+/// This is a SEPARATE seam from [`classify_phantom_reach`] on purpose: `crew`
+/// and `compose_roster` stay real names in [`ALL_TOOL_NAMES`] (so the ON path is
+/// a normal dispatch and [`is_hallucination`] is unchanged), which means
+/// `classify_phantom_reach` never flags them. The gated-off detection needs the
+/// one fact that function does not have — `advertise_team` — which is known in
+/// the agent loop, so the loop composes the two seams there.
+pub(crate) fn classify_gated_off_reach(
+    name: &str,
+    advertise_team: bool,
+) -> Option<crate::PhantomResolution> {
+    if !advertise_team && (name == "crew" || name == "compose_roster") {
+        return Some(crate::PhantomResolution::GatedOff(
+            "crew/team surface off (NEWT_TEAM)".into(),
+        ));
+    }
+    None
+}
+
 /// Classic Levenshtein edit distance (pure two-row DP). Inputs are tool names
 /// (short), so the simple version is plenty — for fuzzy suggestions only.
 fn levenshtein(a: &str, b: &str) -> usize {
@@ -1037,6 +1064,28 @@ const DENIAL_RECOVERY_HINT: &str =
     "This is outside your granted authority — call request_permissions with the \
      capability, a target, and a reason to ask the operator to grant it, or take \
      a different approach that stays within your current authority.";
+
+/// #479 (G4): the model-facing recovery coach when `crew`/`compose_roster` is
+/// reached while the crew/team surface is OFF — the DEFAULT, since the runner is
+/// only built when the operator sets `NEWT_TEAM`. Replaces the flat
+/// `unknown tool: … (no crew surface …)` dead-end (which left the model nowhere
+/// to go) with a model-actionable message in the #721 [`DENIAL_RECOVERY_HINT`]
+/// style: it names the operator gesture that enables the surface (`NEWT_TEAM`)
+/// AND a real solo alternative (the always-available file/exec tools), so the
+/// reach is recoverable instead of a wall. The OCAP presence-gate is unchanged —
+/// crew stays `NEWT_TEAM`-gated; only the coaching is added.
+const CREW_OFF_RECOVERY_HINT: &str =
+    "the crew/team surface is not enabled this session (the operator launches it \
+     with NEWT_TEAM). Accomplish this yourself with the available tools \
+     (read_file/write_file/edit_file/run_command/...), or ask the operator to \
+     enable a crew.";
+
+/// The model-facing result for a `crew`/`compose_roster` dispatch when no
+/// `CrewRunner` was injected. One factored message + regression point carrying
+/// [`CREW_OFF_RECOVERY_HINT`], so the recoverable wording can never drift.
+fn crew_off_recovery_result(name: &str) -> String {
+    format!("'{name}' is unavailable: {CREW_OFF_RECOVERY_HINT}")
+}
 
 /// #721: the model-facing capability-denial message for an fs tool — the base
 /// "{kind} does not permit '{path}'" line plus the recoverable, model-actionable
@@ -1665,7 +1714,9 @@ pub async fn execute_tool(
                 print_tool_output(&out, tool_output_lines, color);
                 out
             }
-            None => format!("unknown tool: {name} (no crew surface in this session)"),
+            // #479 (G4): replace the flat dead-end with a recoverable coach —
+            // name the operator gesture (NEWT_TEAM) + a real solo alternative.
+            None => crew_off_recovery_result(name),
         },
 
         "run_command" => {
@@ -3501,10 +3552,73 @@ mod execute_tool_branch_tests {
         assert!(out.contains("proposed roster"), "got: {out}");
     }
 
+    /// #479 (G4): with no `CrewRunner` injected (the OFF default), the dispatch
+    /// arm coaches recovery instead of the old flat `unknown tool` dead-end — it
+    /// names the operator gesture (`NEWT_TEAM`) and a real solo alternative, and
+    /// must NOT read as "unknown tool".
     #[tokio::test]
-    async fn crew_arm_without_injection_is_unknown_tool() {
-        let out = run_crew_tool("crew", serde_json::json!({ "task": "x" }), None).await;
-        assert!(out.contains("unknown tool: crew"), "got: {out}");
+    async fn crew_arm_without_injection_coaches_recovery() {
+        for name in ["crew", "compose_roster"] {
+            let out = run_crew_tool(name, serde_json::json!({ "task": "x" }), None).await;
+            assert!(out.contains("NEWT_TEAM"), "{name}: {out}");
+            assert!(out.contains("read_file"), "{name}: {out}");
+            assert!(!out.contains("unknown tool"), "{name}: {out}");
+        }
+    }
+
+    /// #479 (G4): the factored coach helper names the gate + a real alternative
+    /// and never reads as "unknown tool" — the regression point for the wording.
+    #[test]
+    fn crew_off_recovery_result_names_gate_and_alternative() {
+        let out = crew_off_recovery_result("crew");
+        assert!(out.contains("'crew'"), "{out}");
+        assert!(out.contains("NEWT_TEAM"), "{out}");
+        // A real, always-available solo alternative is offered.
+        assert!(out.contains("write_file"), "{out}");
+        assert!(!out.contains("unknown tool"), "{out}");
+    }
+
+    /// #479 (G4): the gated-off telemetry seam. A `crew`/`compose_roster` reach
+    /// with the surface OFF records a `GatedOff` phantom; the same names with the
+    /// surface ON record nothing (they dispatch normally), and a non-crew name is
+    /// never gated-off.
+    #[test]
+    fn classify_gated_off_reach_only_fires_for_off_crew_names() {
+        for name in ["crew", "compose_roster"] {
+            assert_eq!(
+                classify_gated_off_reach(name, false),
+                Some(crate::PhantomResolution::GatedOff(
+                    "crew/team surface off (NEWT_TEAM)".into()
+                )),
+                "{name} OFF should record GatedOff"
+            );
+            assert_eq!(
+                classify_gated_off_reach(name, true),
+                None,
+                "{name} ON dispatches normally — no phantom"
+            );
+        }
+        // A non-crew tool is never a gated-off reach, OFF or ON.
+        assert_eq!(classify_gated_off_reach("read_file", false), None);
+        assert_eq!(classify_gated_off_reach("read_file", true), None);
+    }
+
+    /// #479 (G4) guard: the OFF-state changes do not touch `is_hallucination`
+    /// (crew/compose_roster stay real names) or `classify_phantom_reach` for the
+    /// crew names — both kept exactly so the ON path stays a normal dispatch.
+    #[test]
+    fn crew_names_stay_real_and_unflagged_by_existing_seams() {
+        for name in ["crew", "compose_roster"] {
+            assert!(
+                !is_hallucination(name, &serde_json::json!({ "task": "x" })),
+                "{name} must stay a real tool name"
+            );
+            assert_eq!(
+                classify_phantom_reach(name, &serde_json::json!({ "task": "x" }), "ok", true),
+                None,
+                "{name} must not be flagged by classify_phantom_reach"
+            );
+        }
     }
 
     // --- #496: the embedded `find` tool -----------------------------------

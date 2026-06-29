@@ -114,6 +114,14 @@ pub enum PhantomResolution {
     Unknown,
     /// A real tool that misfired / returned empty-by-design (the reason).
     RealToolMiss(String),
+    /// #479 (G4): a real tool reached while its surface is presence-gated OFF —
+    /// `crew`/`compose_roster` with the crew/team surface absent (the default,
+    /// since the runner is only built when the operator sets `NEWT_TEAM`). The
+    /// name stays real (in `ALL_TOOL_NAMES`, so `is_hallucination` is unchanged
+    /// and the ON path dispatches normally), so `classify_phantom_reach` never
+    /// flags it — yet a gated-off reach is exactly the delegation signal we want
+    /// to mine for the common OFF default. The string names the gated surface.
+    GatedOff(String),
     /// A reach narrated in prose that never became a tool call (reserved; NOT
     /// emitted in v1 — the narration scanner is a deferred follow-up).
     NarratedNoCall,
