@@ -197,6 +197,11 @@ impl CaveatProfile {
                 Some(n) => CountBound::AtMost(n),
                 None => CountBound::Unlimited,
             },
+            // DEFERRED (issue #755 / epic #749): `valid_for_generation` is a
+            // causal-generation-window axis, not a filesystem/exec/net
+            // capability a preset or role profile clamps — it is minted at
+            // dispatch time. Narrowing it here is out of scope for the M6
+            // grammar-gap fix; left at `Scope::All` as a follow-up.
             valid_for_generation: Scope::All,
         }
     }
@@ -234,6 +239,7 @@ impl CaveatProfile {
 /// exec_allow = ["git", "gh"]   # a small exec allowlist
 /// deny       = ["*"]           # everything else (net) denied
 /// max_calls  = 40              # optional tool-call ceiling
+/// # fs_read  = ["src/"]        # optional: confine reads (omit ⇒ read all)
 /// ```
 ///
 /// ## Semantics — a clamp, never a grant
@@ -247,6 +253,12 @@ impl CaveatProfile {
 /// enforcement site consults (and re-`meet`-ed over any re-minted grant).
 ///
 /// Each field maps onto a [`CaveatProfile`] axis:
+/// - `fs_read = [..]` / `"none"` ⇒ clamp `fs_read = Only({..})` / `none`.
+///   **Optional** — omitted (`None`) leaves `fs_read` unrestricted (`all`),
+///   the back-compat default. Before this field a preset structurally could
+///   *not* narrow reads (the M6 grammar gap, issue #755) even though
+///   [`CaveatProfile`] / [`Caveats`] can express a read clamp. A read-only
+///   triage mode still reads everything unless it sets this deliberately.
 /// - `readonly = true` ⇒ `fs_write = none`, `exec = none` (the floor a triage
 ///   mode wants). `false`/omitted leaves those axes unconstrained (`all`).
 /// - `exec_allow = [..]` ⇒ `exec = Only({..})`. Overrides `readonly`'s
@@ -268,6 +280,14 @@ impl CaveatProfile {
 /// add `exec_allow` only for the few programs the mode genuinely needs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct NamedPermissionPreset {
+    /// Optional `fs_read` clamp (issue #755 — the M6 grammar-gap fix).
+    /// `None`/omitted ⇒ the `fs_read` axis stays at the top of its axis
+    /// (`all`), exactly the pre-#755 behavior where a preset structurally
+    /// could not narrow reads. `Some(spec)` narrows reads (e.g.
+    /// `Only({..})` to confine a triage mode to a subtree). Serde-defaults
+    /// to `None`, so every existing preset is byte-for-byte unchanged.
+    #[serde(default)]
+    pub fs_read: Option<ScopeSpec>,
     /// `true` ⇒ deny all writes and (unless `exec_allow` overrides) all exec.
     #[serde(default)]
     pub readonly: bool,
@@ -319,10 +339,25 @@ impl NamedPermissionPreset {
         } else {
             ScopeSpec::default()
         };
+        // fs_read: an explicit clamp narrows reads (issue #755 — the M6
+        // grammar-gap fix). `None`/omitted ⇒ the top of the axis (`all`), the
+        // historical behavior: before #755 this was hardcoded to
+        // `ScopeSpec::default()`, so a preset structurally could not clamp
+        // reads even though `CaveatProfile`/`Caveats` can. A read-only triage
+        // mode still reads everything unless a preset deliberately narrows it.
+        let fs_read = self.fs_read.clone().unwrap_or_default();
+        // DEFERRED (default-deny is step 8's job, not here): the "empty/absent
+        // preset ⇒ identity clamp (`Caveats::top()`)" default — each unset axis
+        // staying at the top of its axis — is the CORRECT meet-identity
+        // semantics for a *clamp*: an empty clamp adds no restriction and is
+        // applied via `meet`, so an absent axis must be the top. The
+        // "default-deny for un-annotated subtasks" (an absent subtask `kind` ⇒
+        // the most-restrictive preset) belongs in step 8's subtask-clamp
+        // derivation, NOT in this general lowering. Flipping the general default
+        // to deny here would break back-compat for every preset consumer
+        // (steps 2-7), so step 8 owns that default-deny.
         CaveatProfile {
-            // fs_read is never clamped by a preset (a read-only triage mode
-            // still reads); it stays at the top of its axis.
-            fs_read: ScopeSpec::default(),
+            fs_read,
             fs_write,
             exec,
             net,
@@ -709,6 +744,7 @@ body
     #[test]
     fn deny_star_clamps_net_to_none() {
         let p = NamedPermissionPreset {
+            fs_read: None,
             readonly: true,
             exec_allow: vec!["git".to_string()],
             deny: vec!["*".to_string()],
@@ -754,6 +790,7 @@ max_calls = 40
     #[test]
     fn preset_summary_renders_each_clamp() {
         let p = NamedPermissionPreset {
+            fs_read: None,
             readonly: true,
             exec_allow: vec!["git".to_string(), "gh".to_string()],
             deny: vec!["*".to_string()],
@@ -761,5 +798,73 @@ max_calls = 40
         };
         assert_eq!(p.summary(), "readonly exec=[git, gh] deny=* max_calls=40");
         assert_eq!(NamedPermissionPreset::default().summary(), "unconstrained");
+    }
+
+    // --- #755 M6 grammar gap: a preset can clamp fs_read -----------------
+
+    #[test]
+    fn fs_read_clamp_narrows_reads() {
+        // M6 grammar-gap fix (issue #755): a preset CAN now clamp `fs_read`.
+        //
+        // RED on pre-#755 code: `to_caveat_profile` hardcoded
+        // `fs_read: ScopeSpec::default()` (= `Scope::All`), so the `fs_read`
+        // axis was *always* unrestricted regardless of the preset — this
+        // assertion would have read `Scope::All`. GREEN once the optional
+        // `fs_read` clamp is honored.
+        let p = NamedPermissionPreset {
+            fs_read: Some(ScopeSpec::Items(vec!["src/".to_string()])),
+            ..NamedPermissionPreset::default()
+        };
+        let c = p.clamp();
+        assert_eq!(
+            c.fs_read,
+            Scope::only(["src/".to_string()]),
+            "an fs_read clamp must narrow the read axis"
+        );
+        // The other axes are untouched by an fs_read-only clamp.
+        assert_eq!(c.fs_write, Scope::All);
+        assert_eq!(c.exec, Scope::All);
+        assert_eq!(c.net, Scope::All);
+    }
+
+    #[test]
+    fn omitted_fs_read_clamp_reads_all() {
+        // Back-compat: a preset that does not set `fs_read` leaves the read
+        // axis at the top (`all`), exactly the pre-#755 behavior. A `None`
+        // serde-default lowers to `ScopeSpec::default()` ⇒ `Scope::All`.
+        let p = NamedPermissionPreset {
+            readonly: true,
+            ..NamedPermissionPreset::default()
+        };
+        assert_eq!(
+            p.clamp().fs_read,
+            Scope::All,
+            "an unspecified fs_read clamp must leave reads unrestricted"
+        );
+        // The default preset declares no fs_read clamp.
+        assert_eq!(NamedPermissionPreset::default().fs_read, None);
+    }
+
+    #[test]
+    fn fs_read_clamp_parses_from_config_toml() {
+        // The `[permission_presets.<name>]` config shape accepts an optional
+        // `fs_read` clamp as a keyword or an allow-list, like the other axes.
+        let toml = "\
+readonly = true
+fs_read = [\"src/\", \"docs/\"]
+";
+        let p: NamedPermissionPreset = toml::from_str(toml).unwrap();
+        assert!(p.readonly);
+        assert_eq!(
+            p.fs_read,
+            Some(ScopeSpec::Items(vec![
+                "src/".to_string(),
+                "docs/".to_string()
+            ]))
+        );
+        assert_eq!(
+            p.clamp().fs_read,
+            Scope::only(["src/".to_string(), "docs/".to_string()])
+        );
     }
 }
