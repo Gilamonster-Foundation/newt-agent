@@ -21,7 +21,7 @@
 //! ↔ a future panel/tournament) the same way it swaps the `Dispatcher` transport.
 
 use crate::{BackendPool, ChatRequest, Dispatcher};
-use newt_core::caveats::{Caveats, CaveatsExt};
+use newt_core::caveats::{Caveats, CaveatsExt, CountBoundExt};
 use newt_core::lazy_emission::lazy_emission_reason;
 use newt_core::Tier;
 use serde::Deserialize;
@@ -248,6 +248,34 @@ pub async fn run_crew(
     caveats: &Caveats,
     task: &str,
 ) -> CrewOutcome {
+    // --- max_calls budget (#753): complete mediation for the call-count axis ---
+    //
+    // The crew's unit of "a call" is a MODEL/ROLE dispatch — every navigate,
+    // plan, and triage round issues exactly one `run_role_with_timeout`. That is
+    // the same "inference call" unit `newt-coder` already bounds (`coder.rs`'s
+    // `calls_used` / `check_call_budget`), and it is the resource `max_calls` is
+    // meant to cap (model invocations / cost), so we count and gate THAT — not the
+    // planning-round count. `cfg.max_attempts` still bounds the planning rounds;
+    // this is an INDEPENDENT ceiling so a clamped `max_calls` caveat actually has
+    // teeth. Before EACH dispatch we ask `max_calls.permits_one_more(calls_used)`,
+    // and when the budget denies we stop with an honest `NeedsHumanReview`
+    // cap-exit (never reported as success). `CountBound::Unlimited` (the default /
+    // `Caveats::top`) permits every call, so an unclamped crew is unchanged.
+    //
+    // NET AXIS — deliberately NOT gated in this loop. The crew has no DIRECT
+    // network effect that a `caveats.permits_net(host)` check could mediate:
+    //   (a) model inference goes to the backend INFRASTRUCTURE endpoint (the
+    //       agent's own substrate, not a task-chosen host), and
+    //   (b) any network a verification command performs happens INSIDE
+    //       `workspace.run_test()` — that is the EXEC axis's concern (which
+    //       command may run) and requires an OS sandbox for true containment,
+    //       not a predicate at this layer.
+    // So `permits_net` is correctly NOT a crew-loop call-site; net at the crew
+    // layer is governed transitively via the exec axis + the OS sandbox, by
+    // design (complete mediation per axis: this axis needs a sandbox, not a
+    // crew-loop predicate).
+    let mut calls_used: u64 = 0;
+
     // 1. NAVIGATE — pick the relevant files (then the harness reads them).
     let nav_req = ChatRequest::new()
         .system(
@@ -263,6 +291,16 @@ pub async fn run_crew(
     let role_bound = cfg
         .role_timeout
         .unwrap_or_else(crate::dispatch::role_dispatch_timeout);
+    // max_calls (#753): a zero budget can't even afford the navigator — honest
+    // cap-exit before any model is touched.
+    if !caveats.max_calls.permits_one_more(calls_used) {
+        return CrewOutcome {
+            status: CrewStatus::NeedsHumanReview,
+            attempts: 0,
+            touched: Vec::new(),
+        };
+    }
+    calls_used += 1;
     let nav: NavOut = match pool
         .run_role_with_timeout(
             dispatcher,
@@ -339,6 +377,17 @@ pub async fn run_crew(
             .user(format!(
                 "TASK:\n{task}\n\nRELEVANT FILES:\n{curated}{prior}"
             ));
+        // max_calls (#753): gate the planner dispatch. If the budget is spent the
+        // crew stops here — `attempt - 1` planning rounds completed before this one
+        // (this round never started), an honest cap-exit, not a vacuous pass.
+        if !caveats.max_calls.permits_one_more(calls_used) {
+            return CrewOutcome {
+                status: CrewStatus::NeedsHumanReview,
+                attempts: attempt - 1,
+                touched,
+            };
+        }
+        calls_used += 1;
         let edits: Vec<Edit> = match pool
             .run_role_with_timeout(
                 dispatcher,
@@ -439,6 +488,17 @@ pub async fn run_crew(
                  {\"summary\":\"what failed\",\"next_action\":\"what to change\"}.",
             )
             .user(format!("TASK:\n{task}\n\nVERIFICATION OUTPUT:\n{output}"));
+        // max_calls (#753): gate the triage dispatch. With the budget spent the
+        // next planning round could not dispatch either, so stop now — this round's
+        // plan/apply/verify already completed, so `attempt` rounds were spent.
+        if !caveats.max_calls.permits_one_more(calls_used) {
+            return CrewOutcome {
+                status: CrewStatus::NeedsHumanReview,
+                attempts: attempt,
+                touched,
+            };
+        }
+        calls_used += 1;
         let tri: TriageOut = match pool
             .run_role_with_timeout(
                 dispatcher,
@@ -1057,5 +1117,96 @@ mod tests {
         assert!(!task_requires_change(
             "Verify the rollup behavior via manual check"
         ));
+    }
+
+    /// Counts EVERY model dispatch (across all roles) so a test can assert the
+    /// crew honored a `max_calls` budget. The planner always emits a BAD edit, so
+    /// the crew never converges — absent the budget it would burn every attempt.
+    struct CountingMock {
+        dispatches: AtomicUsize,
+    }
+    #[async_trait]
+    impl Dispatcher for CountingMock {
+        async fn dispatch(
+            &self,
+            _backend: &PoolBackend,
+            model: &str,
+            _req: ChatRequest,
+        ) -> anyhow::Result<ChatReply> {
+            self.dispatches.fetch_add(1, Ordering::SeqCst);
+            let content = match model {
+                "nav" => r#"{"relevant_files":["target.rs"]}"#.to_string(),
+                "triage" => {
+                    r#"{"summary":"still BAD","next_action":"set content to GOOD"}"#.to_string()
+                }
+                // Never converges: always re-emits BAD, so verify always fails.
+                "planner" => r#"{"edits":[{"path":"target.rs","new_content":"BAD"}]}"#.to_string(),
+                other => panic!("unexpected model {other}"),
+            };
+            Ok(ChatReply {
+                content,
+                model_id: model.to_string(),
+                usage: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn max_calls_caveat_bounds_total_model_calls() {
+        // #753: a clamped `max_calls` caveat must bound the crew's model calls even
+        // when `cfg.max_attempts` is far larger. With AtMost(3) and max_attempts=10,
+        // the crew makes navigate + plan + triage = 3 dispatches and then stops at
+        // the next planner gate (the budget is spent). RED on the pre-#753 code,
+        // which bounds the loop ONLY by `cfg.max_attempts` and so burns navigate +
+        // 10*(plan+triage) = 21 dispatches before exiting.
+        let p = pool();
+        let d = CountingMock {
+            dispatches: AtomicUsize::new(0),
+        };
+        let mut ws = MemWs::new();
+        let budget = newt_core::caveats::Caveats {
+            max_calls: newt_core::caveats::CountBound::AtMost(3),
+            ..newt_core::caveats::Caveats::top()
+        };
+        let out = run_crew(
+            &p,
+            &d,
+            &mut ws,
+            &cfg(10),
+            &budget,
+            "modify target.rs to be GOOD",
+        )
+        .await;
+        let calls = d.dispatches.load(Ordering::SeqCst);
+        assert!(
+            calls <= 3,
+            "max_calls=AtMost(3) must bound the crew's model calls regardless of \
+             cfg.max_attempts=10, but it made {calls} dispatches"
+        );
+        // Budget-exhausted is an honest cap-exit — never reported as success.
+        assert_eq!(out.status, CrewStatus::NeedsHumanReview, "{out:?}");
+    }
+
+    #[tokio::test]
+    async fn max_calls_zero_denies_even_the_navigator() {
+        // #753 edge: AtMost(0) can't afford a single model call, so the crew exits
+        // honestly having dispatched NOTHING (attempts:0).
+        let p = pool();
+        let d = CountingMock {
+            dispatches: AtomicUsize::new(0),
+        };
+        let mut ws = MemWs::new();
+        let budget = newt_core::caveats::Caveats {
+            max_calls: newt_core::caveats::CountBound::AtMost(0),
+            ..newt_core::caveats::Caveats::top()
+        };
+        let out = run_crew(&p, &d, &mut ws, &cfg(5), &budget, "modify target.rs").await;
+        assert_eq!(
+            d.dispatches.load(Ordering::SeqCst),
+            0,
+            "no call may be made"
+        );
+        assert_eq!(out.status, CrewStatus::NeedsHumanReview);
+        assert_eq!(out.attempts, 0);
     }
 }
