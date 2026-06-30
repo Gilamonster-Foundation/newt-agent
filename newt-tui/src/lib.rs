@@ -1782,24 +1782,20 @@ fn prompt_permission_choice(prompt_text: &str) -> PromptChoice {
 }
 
 /// #728/#783 (Bug C): pure interpreter for one line of free-text human input
-/// (the `request_user_input` tool's answer). A genuine read error → `None` (no
-/// human to answer). EOF (`Ok(0)`) now maps to `Some("")` — the empty trimmed
-/// line — consistent with the permission path: [`prompt_permission_choice`]
-/// treats `read_line`'s `Ok(_)` (which includes `Ok(0)`) as a real answer, not
-/// as "no human". The old `Ok(0) | Err(_) => None` produced a false "running
-/// headless" message whenever stdin merely reached EOF, even with a TTY
-/// present. Any non-error read returns the trimmed line (an empty answer is
-/// still the human's deliberate answer). Pure — unit-tested like
+/// (the `request_user_input` tool's answer). EOF (`Ok(0)`, e.g. the operator
+/// pressing Ctrl-D) is treated exactly like the permission path
+/// ([`prompt_permission_choice`] maps the same EOF to a valid response): it is
+/// an empty, *deliberate* answer → `Some("")`, NOT "no human available". Only a
+/// genuine read error → `None`, so the tool reports "no human available" only
+/// when stdin truly cannot be read. Pure — unit-tested like
 /// [`parse_permission_choice`].
-///
-/// NOTE: when a TTY *is* present, the deeper cause of the spurious EOF is stdin
-/// contention with the chat loop's own reader (two readers racing on one fd).
-/// That is a separate follow-up; this is the consistency fix that stops the
-/// false-headless message, not the full cure.
 fn interpret_user_line(read: io::Result<usize>, buf: &str) -> Option<String> {
     match read {
+        // NOTE: when a TTY *is* present, a spontaneous EOF here implies stdin
+        // contention with the chat loop's own reader; the deeper cure (a
+        // separate stdin owner) is a follow-up — this is the consistency fix.
         Err(_) => None,                        // genuine read error → no human
-        Ok(_) => Some(buf.trim().to_string()), // EOF (Ok(0)) → Some("") — like the permission path
+        Ok(_) => Some(buf.trim().to_string()), // EOF (Ok(0)) → Some("")
     }
 }
 
@@ -2363,21 +2359,17 @@ mod permission_prompt_tests {
 
     #[test]
     fn interpret_user_line_maps_eof_to_empty_and_errors_to_none() {
-        // #728: a normal line → the trimmed answer.
-        assert_eq!(
-            interpret_user_line(Ok(8), "postgres\n"),
-            Some("postgres".to_string())
-        );
-        // An empty line (just Enter) is still the human's deliberate answer.
-        assert_eq!(interpret_user_line(Ok(1), "\n"), Some(String::new()));
-        // #783 (Bug C), red→green: EOF (Ok(0)) now maps to Some("") — the empty
-        // trimmed line — consistent with the permission path, NOT None. The old
-        // `Ok(0) | Err(_) => None` returned None here, producing a false
-        // "running headless" message even when a human was at a TTY.
+        // #783 (Bug C): EOF (Ok(0)) is now mapped to Some("") — an empty,
+        // deliberate answer — consistent with prompt_permission_choice, which
+        // treats the same EOF as a valid response. Only a genuine read error →
+        // None ("no human available"). The Ok(0) == Some("") assertion is RED on
+        // the old `Ok(0) | Err(_) => None`.
         assert_eq!(interpret_user_line(Ok(0), ""), Some(String::new()));
-        // Guard (true-headless unaffected): a genuine read error → None, which
-        // the executor renders as the recoverable "no human available" message.
-        assert_eq!(interpret_user_line(Err(io::Error::other("boom")), ""), None);
+        assert_eq!(
+            interpret_user_line(Err(io::Error::from(io::ErrorKind::Other)), ""),
+            None
+        );
+        assert_eq!(interpret_user_line(Ok(5), "hi\n"), Some("hi".to_string()));
     }
 
     #[test]
