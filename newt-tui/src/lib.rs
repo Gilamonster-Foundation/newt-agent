@@ -1781,16 +1781,25 @@ fn prompt_permission_choice(prompt_text: &str) -> PromptChoice {
     }
 }
 
-/// #728: pure interpreter for one line of free-text human input (the
-/// `request_user_input` tool's answer). A closed stdin (`Ok(0)` = EOF, e.g. a
-/// piped / headless run) or a read error → `None`, so the tool reports "no human
-/// available" rather than hanging; otherwise the trimmed line (an empty answer
-/// is still the human's deliberate answer). Pure — unit-tested like
+/// #728/#783 (Bug C): pure interpreter for one line of free-text human input
+/// (the `request_user_input` tool's answer). A genuine read error → `None` (no
+/// human to answer). EOF (`Ok(0)`) now maps to `Some("")` — the empty trimmed
+/// line — consistent with the permission path: [`prompt_permission_choice`]
+/// treats `read_line`'s `Ok(_)` (which includes `Ok(0)`) as a real answer, not
+/// as "no human". The old `Ok(0) | Err(_) => None` produced a false "running
+/// headless" message whenever stdin merely reached EOF, even with a TTY
+/// present. Any non-error read returns the trimmed line (an empty answer is
+/// still the human's deliberate answer). Pure — unit-tested like
 /// [`parse_permission_choice`].
+///
+/// NOTE: when a TTY *is* present, the deeper cause of the spurious EOF is stdin
+/// contention with the chat loop's own reader (two readers racing on one fd).
+/// That is a separate follow-up; this is the consistency fix that stops the
+/// false-headless message, not the full cure.
 fn interpret_user_line(read: io::Result<usize>, buf: &str) -> Option<String> {
     match read {
-        Ok(0) | Err(_) => None,
-        Ok(_) => Some(buf.trim().to_string()),
+        Err(_) => None,                        // genuine read error → no human
+        Ok(_) => Some(buf.trim().to_string()), // EOF (Ok(0)) → Some("") — like the permission path
     }
 }
 
@@ -2353,18 +2362,21 @@ mod permission_prompt_tests {
     }
 
     #[test]
-    fn interpret_user_line_maps_eof_and_errors_to_none() {
-        // #728: a normal line → the trimmed answer; EOF/closed stdin (Ok(0)) and
-        // a read error → None (the tool reports "no human available", no hang).
+    fn interpret_user_line_maps_eof_to_empty_and_errors_to_none() {
+        // #728: a normal line → the trimmed answer.
         assert_eq!(
             interpret_user_line(Ok(8), "postgres\n"),
             Some("postgres".to_string())
         );
         // An empty line (just Enter) is still the human's deliberate answer.
         assert_eq!(interpret_user_line(Ok(1), "\n"), Some(String::new()));
-        // Closed stdin / piped-empty → no human.
-        assert_eq!(interpret_user_line(Ok(0), ""), None);
-        // A read error → no human (never an accidental answer).
+        // #783 (Bug C), red→green: EOF (Ok(0)) now maps to Some("") — the empty
+        // trimmed line — consistent with the permission path, NOT None. The old
+        // `Ok(0) | Err(_) => None` returned None here, producing a false
+        // "running headless" message even when a human was at a TTY.
+        assert_eq!(interpret_user_line(Ok(0), ""), Some(String::new()));
+        // Guard (true-headless unaffected): a genuine read error → None, which
+        // the executor renders as the recoverable "no human available" message.
         assert_eq!(interpret_user_line(Err(io::Error::other("boom")), ""), None);
     }
 
@@ -10530,10 +10542,10 @@ mod run_command_confinement_tests {
         }
     }
 
-    /// Stub: shell tool is temporarily unavailable (pending reubeno/brush#1184).
-    /// Both in-scope and out-of-scope commands return the unavailable error.
-    /// Restore the original two tests from git history once brush support lands.
-    /// See: https://github.com/Gilamonster-Foundation/agent-bridle/issues/20
+    /// An allow-listed external command runs under the confined shell. Built
+    /// against the agent-bridle env-seam branch (#783), the bridle ships the
+    /// REAL safe-subset shell (no stub): with `exec` granting `env` and fs
+    /// unrestricted (no Landlock), `env` runs and prints the environment.
     #[cfg(unix)]
     #[serial_test::serial(real_fs)]
     #[tokio::test]
@@ -10565,15 +10577,18 @@ mod run_command_confinement_tests {
         )
         .await;
         assert!(
-            out.contains("unavailable in this build"),
-            "stub error must link to tracking PR, got: {out}"
+            !out.contains("capability denied") && !out.contains("unavailable in this build"),
+            "an allow-listed external command must run, not be denied, got: {out}"
+        );
+        assert!(
+            out.contains('='),
+            "`env` must print KEY=VALUE environment lines, got: {out}"
         );
     }
 
-    /// Stub: shell tool is temporarily unavailable (pending reubeno/brush#1184).
-    /// Out-of-scope commands return the unavailable error, not a caveats denial.
-    /// Restore from git history once brush support lands.
-    /// See: https://github.com/Gilamonster-Foundation/agent-bridle/issues/20
+    /// An out-of-scope command is DENIED by the real safe-subset shell (env-seam
+    /// branch, #783): `env` is not in the `echo`-only exec grant, so the confined
+    /// shell refuses it with a capability denial (not the old stub error).
     #[cfg(unix)]
     #[serial_test::serial(real_fs)]
     #[tokio::test]
@@ -10605,8 +10620,8 @@ mod run_command_confinement_tests {
         )
         .await;
         assert!(
-            out.contains("unavailable in this build"),
-            "stub error must link to tracking PR, got: {out}"
+            out.contains("capability denied"),
+            "an out-of-scope command must be denied by the confined shell, got: {out}"
         );
     }
 
@@ -11111,7 +11126,7 @@ mod disable_ocap_session_tests {
     /// readonly preset clamp STOPS the unconfined bypass for a denied exec. The
     /// preset's exec floor is threaded as `exec_floor`; `echo` is outside it, so
     /// the command does NOT run unconfined — it falls to the confined dispatch
-    /// (stub-shell ⇒ error). A triage mode is NOT un-clamped by `--yolo`.
+    /// (env-seam real shell ⇒ denied). A triage mode is NOT un-clamped by `--yolo`.
     #[cfg(unix)]
     #[serial_test::serial(real_fs)]
     #[tokio::test]
@@ -11153,8 +11168,8 @@ mod disable_ocap_session_tests {
         .await;
         assert_ne!(out, "should-not-run\n", "the floor must block --yolo");
         assert!(
-            out.starts_with("error:"),
-            "fell to confined dispatch: {out}"
+            out.contains("capability denied"),
+            "fell to the confined dispatch and was denied: {out}"
         );
     }
 }
