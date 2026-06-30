@@ -245,30 +245,34 @@ lto = "thin"
 codegen-units = 1
 strip = true
 
-# ── Temporary patch: agent-bridle → crates.io transition ──────────────────
+# ── TRANSITIONAL patch: agent-bridle env seam (newt #783) ─────────────────
 #
-# newt-tui and newt-mcp-server declare `agent-bridle = "0.1"` (registry dep)
-# but agent-bridle 0.1.0 is not yet indexed on crates.io. Until then this patch
-# satisfies the dependency from git.
+# *** NOT THE FINAL STATE. *** Pins agent-bridle to the public
+# `fix/shell-env-seam` branch, which carries the per-dispatch `"env"` seam the
+# #783 Bug A fix depends on: `ShellArgs` accepts an `"env": {KEY:VALUE}` object
+# and sets it on the spawned child, so the venv vars no longer have to be
+# smuggled in as `export …;` text — which the confined safe-subset engine
+# refuses on a compound command (the #783 root cause).
 #
-# Pinned to `feat/step-up-decision-mvp` (advanced from `feat/stub-shell` on
-# 2026-06-19, newt#497): this is the agent-bridle branch that **actually carries**
-# the human-presence `step_up` Gate (agent-bridle#24) ROADMAP 23.2 builds on, AND
-# is brush-free (crates.io-safe — a stub shell). `feat/stub-shell` and
-# `brush-stub/publish-unblock` both LACK `step_up`; `main` has it but carries the
-# real brush shell (dev-only, forbidden by the CI stub guard). The `just shell-stub`
-# toggle targets this branch.
-# INTERIM (Path B) — this is a feature branch; revisit before cutting 0.6.9. The
-# canonical fix is folding `step_up` into the durable stub branch `feat/stub-shell`.
+# This seam is UNRELEASED — not on crates.io and not yet merged into the
+# publishable agent-bridle branch — so it can only be referenced by git branch
+# for now. The branch is brush-free (no active brush git dep — see its
+# Cargo.toml), so it stays crates.io-publishable and passes the `just
+# shell-check` guard (which rejects only `branch = "main"`).
 #
-# After agent-bridle 0.1.0 is indexed on crates.io:
-#   1. Remove this entire [patch.crates-io] block.
-#   2. cargo update -p agent-bridle          (pulls the registry version)
-#   3. Commit the resulting Cargo.lock update.
+# BLOCKER — this PR cannot merge to newt main until:
+#   1. the env seam lands in agent-bridle's publishable branch
+#      (`feat/step-up-decision-mvp`) + a release;
+#   2. this block is replaced by a published-dep version bump (or the patch is
+#      moved onto `feat/step-up-decision-mvp` once the seam is folded in);
+#   3. `cargo update -p agent-bridle` + commit the resulting Cargo.lock.
 # See: https://github.com/Gilamonster-Foundation/agent-bridle/issues/20
+#
+# NOTE: the env-seam branch is main-lineage, so it still carries the `step_up`
+# Gate (agent-bridle#24) the previous `feat/step-up-decision-mvp` patch had.
 
 [patch.crates-io]
-agent-bridle           = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", branch = "feat/step-up-decision-mvp" }
-agent-bridle-core      = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", branch = "feat/step-up-decision-mvp" }
-agent-bridle-tool-shell = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", branch = "feat/step-up-decision-mvp" }
-agent-bridle-tool-web  = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", branch = "feat/step-up-decision-mvp" }
+agent-bridle            = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", branch = "fix/shell-env-seam" }
+agent-bridle-core       = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", branch = "fix/shell-env-seam" }
+agent-bridle-tool-shell = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", branch = "fix/shell-env-seam" }
+agent-bridle-tool-web   = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", branch = "fix/shell-env-seam" }
