@@ -11,7 +11,7 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 [[package]]
 name = "agent-bridle"
 version = "0.1.0"
-source = "git+https://github.com/Gilamonster-Foundation/agent-bridle?branch=fix%2Fshell-env-seam#ed5bb133fabc934479e076a11f78b7537fe07d79"
+source = "git+https://github.com/Gilamonster-Foundation/agent-bridle?rev=ed5bb133fabc934479e076a11f78b7537fe07d79#ed5bb133fabc934479e076a11f78b7537fe07d79"
 dependencies = [
  "agent-bridle-core",
  "agent-bridle-tool-shell",
@@ -21,7 +21,7 @@ dependencies = [
 [[package]]
 name = "agent-bridle-core"
 version = "0.1.0"
-source = "git+https://github.com/Gilamonster-Foundation/agent-bridle?branch=fix%2Fshell-env-seam#ed5bb133fabc934479e076a11f78b7537fe07d79"
+source = "git+https://github.com/Gilamonster-Foundation/agent-bridle?rev=ed5bb133fabc934479e076a11f78b7537fe07d79#ed5bb133fabc934479e076a11f78b7537fe07d79"
 dependencies = [
  "agent-mesh-protocol",
  "anyhow",
@@ -33,7 +33,7 @@ dependencies = [
 [[package]]
 name = "agent-bridle-tool-shell"
 version = "0.1.0"
-source = "git+https://github.com/Gilamonster-Foundation/agent-bridle?branch=fix%2Fshell-env-seam#ed5bb133fabc934479e076a11f78b7537fe07d79"
+source = "git+https://github.com/Gilamonster-Foundation/agent-bridle?rev=ed5bb133fabc934479e076a11f78b7537fe07d79#ed5bb133fabc934479e076a11f78b7537fe07d79"
 dependencies = [
  "agent-bridle-core",
  "anyhow",
@@ -46,7 +46,7 @@ dependencies = [
 [[package]]
 name = "agent-bridle-tool-web"
 version = "0.1.0"
-source = "git+https://github.com/Gilamonster-Foundation/agent-bridle?branch=fix%2Fshell-env-seam#ed5bb133fabc934479e076a11f78b7537fe07d79"
+source = "git+https://github.com/Gilamonster-Foundation/agent-bridle?rev=ed5bb133fabc934479e076a11f78b7537fe07d79#ed5bb133fabc934479e076a11f78b7537fe07d79"
 dependencies = [
  "agent-bridle-core",
  "anyhow",
