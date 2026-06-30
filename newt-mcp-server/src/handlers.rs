@@ -986,11 +986,11 @@ mod tests {
     // against PR #125's unconfined `sh -c` implementation, which ran any `cmd`
     // with full ambient authority and never consulted a Caveats grant.
 
-    /// REGRESSION (P1): with a restrictive grant (`exec` only `echo`), an
-    /// Stub: shell tool is temporarily unavailable (pending reubeno/brush#1184).
-    /// Even in-scope `echo` returns the unavailable error.
-    /// Restore the original assertions from git history once brush support lands.
-    /// See: https://github.com/Gilamonster-Foundation/agent-bridle/issues/20
+    /// REGRESSION (P1): with a grant that includes `echo`, an in-scope `echo`
+    /// RUNS under the confined shell and returns its output. Built against the
+    /// agent-bridle env-seam branch (#783) the bridle ships the REAL safe-subset
+    /// shell (no stub), so the in-scope command succeeds (isError unset) — the
+    /// "unavailable in this build" stub error is retired.
     #[tokio::test]
     async fn shell_run_in_scope_echo_succeeds() {
         let resp = rpc_with_caveats(
@@ -1007,24 +1007,24 @@ mod tests {
 
         assert!(
             resp["error"].is_null(),
-            "stub result must be in-band, not a transport error: {resp}"
+            "result must be in-band, not a transport error: {resp}"
         );
         let result = &resp["result"];
-        assert_eq!(
-            result["isError"], true,
-            "stub must surface as MCP tool error: {result}"
+        assert!(
+            result["isError"].as_bool() != Some(true),
+            "an in-scope echo must succeed, not error: {result}"
         );
         let text = result["content"][0]["text"].as_str().unwrap();
         assert!(
-            text.contains("unavailable in this build"),
-            "stub error must link to tracking PR: {text}"
+            text.contains("bridled"),
+            "the in-scope echo output must be returned: {text}"
         );
     }
 
-    /// Stub: shell tool is temporarily unavailable (pending reubeno/brush#1184).
-    /// Out-of-scope `rm` returns the unavailable error rather than a caveats denial.
-    /// Restore the original assertions from git history once brush support lands.
-    /// See: https://github.com/Gilamonster-Foundation/agent-bridle/issues/20
+    /// Out-of-scope `rm` is DENIED by the real safe-subset shell (env-seam
+    /// branch, #783): it is not in the `echo`-only exec grant, so the confined
+    /// shell refuses it with a capability denial lifted to an MCP `isError`
+    /// (not the old stub "unavailable" error).
     #[cfg(unix)]
     #[tokio::test]
     async fn shell_run_out_of_scope_rm_is_denied() {
@@ -1047,12 +1047,12 @@ mod tests {
         let result = &resp["result"];
         assert_eq!(
             result["isError"], true,
-            "stub must surface as MCP tool error: {result}"
+            "out-of-scope rm must surface as an MCP tool error: {result}"
         );
         let text = result["content"][0]["text"].as_str().unwrap();
         assert!(
-            text.contains("unavailable in this build"),
-            "stub error must link to tracking PR: {text}"
+            text.contains("not within the granted authority"),
+            "out-of-scope rm must surface a capability denial: {text}"
         );
     }
 
@@ -1180,10 +1180,10 @@ mod tests {
         );
     }
 
-    /// Stub: shell tool is temporarily unavailable (pending reubeno/brush#1184).
-    /// Path-separator commands also return the unavailable error rather than a denial.
-    /// Restore the original assertions from git history once brush support lands.
-    /// See: https://github.com/Gilamonster-Foundation/agent-bridle/issues/20
+    /// A path-separator command (`/bin/rm`) is DENIED by the real safe-subset
+    /// shell (env-seam branch, #783): the program is not in the `echo`-only exec
+    /// grant, so the confined shell refuses it with a capability denial lifted to
+    /// an MCP `isError` (not the old stub "unavailable" error).
     #[cfg(unix)]
     #[tokio::test]
     async fn shell_run_bin_rm_path_separator_is_denied() {
@@ -1202,12 +1202,12 @@ mod tests {
         let result = &resp["result"];
         assert_eq!(
             result["isError"], true,
-            "stub must surface as MCP tool error: {result}"
+            "path-separator rm must surface as an MCP tool error: {result}"
         );
         let text = result["content"][0]["text"].as_str().unwrap();
         assert!(
-            text.contains("unavailable in this build"),
-            "stub error must link to tracking PR: {text}"
+            text.contains("not within the granted authority"),
+            "path-separator rm must surface a capability denial: {text}"
         );
     }
 
