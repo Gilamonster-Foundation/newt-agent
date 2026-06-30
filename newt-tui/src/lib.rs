@@ -1781,16 +1781,21 @@ fn prompt_permission_choice(prompt_text: &str) -> PromptChoice {
     }
 }
 
-/// #728: pure interpreter for one line of free-text human input (the
-/// `request_user_input` tool's answer). A closed stdin (`Ok(0)` = EOF, e.g. a
-/// piped / headless run) or a read error → `None`, so the tool reports "no human
-/// available" rather than hanging; otherwise the trimmed line (an empty answer
-/// is still the human's deliberate answer). Pure — unit-tested like
+/// #728/#783 (Bug C): pure interpreter for one line of free-text human input
+/// (the `request_user_input` tool's answer). EOF (`Ok(0)`, e.g. the operator
+/// pressing Ctrl-D) is treated exactly like the permission path
+/// ([`prompt_permission_choice`] maps the same EOF to a valid response): it is
+/// an empty, *deliberate* answer → `Some("")`, NOT "no human available". Only a
+/// genuine read error → `None`, so the tool reports "no human available" only
+/// when stdin truly cannot be read. Pure — unit-tested like
 /// [`parse_permission_choice`].
 fn interpret_user_line(read: io::Result<usize>, buf: &str) -> Option<String> {
     match read {
-        Ok(0) | Err(_) => None,
-        Ok(_) => Some(buf.trim().to_string()),
+        // NOTE: when a TTY *is* present, a spontaneous EOF here implies stdin
+        // contention with the chat loop's own reader; the deeper cure (a
+        // separate stdin owner) is a follow-up — this is the consistency fix.
+        Err(_) => None,                        // genuine read error → no human
+        Ok(_) => Some(buf.trim().to_string()), // EOF (Ok(0)) → Some("")
     }
 }
 
@@ -2353,19 +2358,18 @@ mod permission_prompt_tests {
     }
 
     #[test]
-    fn interpret_user_line_maps_eof_and_errors_to_none() {
-        // #728: a normal line → the trimmed answer; EOF/closed stdin (Ok(0)) and
-        // a read error → None (the tool reports "no human available", no hang).
+    fn interpret_user_line_maps_eof_to_empty_and_errors_to_none() {
+        // #783 (Bug C): EOF (Ok(0)) is now mapped to Some("") — an empty,
+        // deliberate answer — consistent with prompt_permission_choice, which
+        // treats the same EOF as a valid response. Only a genuine read error →
+        // None ("no human available"). The Ok(0) == Some("") assertion is RED on
+        // the old `Ok(0) | Err(_) => None`.
+        assert_eq!(interpret_user_line(Ok(0), ""), Some(String::new()));
         assert_eq!(
-            interpret_user_line(Ok(8), "postgres\n"),
-            Some("postgres".to_string())
+            interpret_user_line(Err(io::Error::from(io::ErrorKind::Other)), ""),
+            None
         );
-        // An empty line (just Enter) is still the human's deliberate answer.
-        assert_eq!(interpret_user_line(Ok(1), "\n"), Some(String::new()));
-        // Closed stdin / piped-empty → no human.
-        assert_eq!(interpret_user_line(Ok(0), ""), None);
-        // A read error → no human (never an accidental answer).
-        assert_eq!(interpret_user_line(Err(io::Error::other("boom")), ""), None);
+        assert_eq!(interpret_user_line(Ok(5), "hi\n"), Some("hi".to_string()));
     }
 
     #[test]
