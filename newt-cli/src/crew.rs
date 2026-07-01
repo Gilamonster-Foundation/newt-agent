@@ -727,6 +727,114 @@ fn parse_authored_plan(raw: &str) -> Option<newt_core::plan::Plan> {
     })
 }
 
+/// The kind of non-actionable subtask [`ACTION_MARKERS`] identifies.
+#[derive(Clone, Copy)]
+enum MarkerKind {
+    /// A read-only "understand the code" verb. The harness already reads the repo
+    /// for the planner, so an inspect leaf produces no diff — prune it wherever it
+    /// sits in the plan.
+    Inspect,
+    /// A verification verb. The harness auto-verifies EVERY subtask, so a *terminal*
+    /// gate leaf (no subtask depends on it) lands no diff — prune it ONLY when
+    /// terminal; a mid-plan gate a real leaf depends on is kept.
+    Gate,
+}
+
+/// The anti-pattern lexicon for the decompose prune (#801): `(leading verb, kind)`
+/// pairs that mark a subtask as non-actionable — it produces no diff and so feeds
+/// the crew executor's "nothing-to-land" fail-stop. Pure DATA (the three Cs): a new
+/// anti-pattern is a one-line edit here (the flat sibling of
+/// `agentic::routing::READ_ROUTES`). Polysemous verbs (build / run / check) are
+/// deliberately EXCLUDED — "Build the parser", "run the migration", "check the
+/// bounds" are real diff-producing work.
+const ACTION_MARKERS: &[(&str, MarkerKind)] = &[
+    ("inspect", MarkerKind::Inspect),
+    ("examine", MarkerKind::Inspect),
+    ("explore", MarkerKind::Inspect),
+    ("investigate", MarkerKind::Inspect),
+    ("understand", MarkerKind::Inspect),
+    ("locate", MarkerKind::Inspect),
+    ("identify", MarkerKind::Inspect),
+    ("review", MarkerKind::Inspect),
+    ("analyze", MarkerKind::Inspect),
+    ("verify", MarkerKind::Gate),
+    ("validate", MarkerKind::Gate),
+    ("test", MarkerKind::Gate),
+    ("confirm", MarkerKind::Gate),
+    ("ensure", MarkerKind::Gate),
+];
+
+/// Classify a subtask by the LEADING verb of its instruction. Returns `None` for a
+/// real (diff-producing) subtask — "Extract helper", "Add validation", "Rename fn"
+/// survive because their leading verb is not a marker. Only the leading token is
+/// consulted, so a marker word later in the sentence never trips a prune.
+fn marker_kind(instruction: &str) -> Option<MarkerKind> {
+    let head = instruction
+        .split(|c: char| !c.is_alphanumeric())
+        .find(|w| !w.is_empty())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    ACTION_MARKERS
+        .iter()
+        .find(|(verb, _)| *verb == head)
+        .map(|(_, kind)| *kind)
+}
+
+/// Deterministically prune non-actionable subtasks from a freshly-authored plan
+/// (#801). A read-only `inspect` leaf and a *terminal* `gate` leaf both produce no
+/// diff, so under the crew executor they trip the "nothing-to-land" fail-stop
+/// (`newt-core/src/agentic/plan_exec.rs`) — the #1 observed crew-mode failure in the
+/// DGX planner-strength sweep. This is the deterministic backstop to
+/// [`PLAN_AUTHOR_SYSTEM`]'s prose, which a weaker planner ignores. Pure and
+/// in-memory: it runs BEFORE any authority grant, only removes subtasks and rewires
+/// their `deps`, and never touches `caveat_policy` — so it cannot widen authority
+/// nor make a gate easier to pass (a surviving leaf still faces the full per-leaf
+/// verify). It removes only a false-NEGATIVE (no-diff) failure source.
+fn prune_non_actionable_subtasks(plan: &mut newt_core::plan::Plan) {
+    use std::collections::HashSet;
+    // Empty-guard: if NOTHING in the plan is actionable — every subtask is a marker
+    // — leave it entirely untouched. Pruning would empty (or half-prune) it; let
+    // `plan_sanity` / re-author handle a degenerate plan rather than fabricate one.
+    if !plan
+        .subtasks
+        .iter()
+        .any(|s| marker_kind(&s.instruction).is_none())
+    {
+        return;
+    }
+    // Fixpoint: remove one prunable subtask at a time (Inspect anywhere; Gate only
+    // when terminal), splicing the removed subtask's own deps into every survivor
+    // that named it — a dangling dep would STALL the survivor, since
+    // `Plan::next_ready_leaf` treats an absent dep as never-`Done`.
+    loop {
+        let depended: HashSet<String> = plan
+            .subtasks
+            .iter()
+            .flat_map(|s| s.deps.iter().cloned())
+            .collect();
+        let victim = plan
+            .subtasks
+            .iter()
+            .position(|s| match marker_kind(&s.instruction) {
+                Some(MarkerKind::Inspect) => true,
+                Some(MarkerKind::Gate) => !depended.contains(&s.id),
+                None => false,
+            });
+        let Some(idx) = victim else { return };
+        let removed = plan.subtasks.remove(idx);
+        for s in &mut plan.subtasks {
+            if let Some(pos) = s.deps.iter().position(|d| *d == removed.id) {
+                s.deps.remove(pos);
+                for vd in &removed.deps {
+                    if !s.deps.contains(vd) {
+                        s.deps.push(vd.clone());
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Decompose `goal` into a `plan::Plan` by asking `model` (the overseer seat).
 /// The model proposes the work; caveats stay default-deny.
 pub async fn author_plan(
@@ -745,12 +853,20 @@ pub async fn author_plan(
         .ok_or_else(|| {
             anyhow::anyhow!("no live model reachable to author the plan (model {model})")
         })?;
-    parse_authored_plan(&reply.result.content).ok_or_else(|| {
-        anyhow::anyhow!(
-            "the model did not return a parseable JSON plan. Raw reply:\n{}",
-            reply.result.content
-        )
-    })
+    parse_authored_plan(&reply.result.content)
+        .map(|mut plan| {
+            // #801: deterministically drop the non-actionable (inspect /
+            // terminal-gate) leaves a weaker planner pads the plan with, before any
+            // authority is granted or the plan is dispatched.
+            prune_non_actionable_subtasks(&mut plan);
+            plan
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "the model did not return a parseable JSON plan. Raw reply:\n{}",
+                reply.result.content
+            )
+        })
 }
 
 /// `newt plan --goal "<g>"` — author a plan from a goal, write it (or print it),
@@ -1608,6 +1724,108 @@ mod tests {
             plan.subtasks[0].caveat_policy,
             newt_core::plan::CaveatPolicy::default()
         );
+    }
+
+    // ── #801: prune non-actionable (inspect / terminal-gate) subtasks ──────────
+    fn marker_sub(id: &str, instruction: &str, deps: &[&str]) -> newt_core::plan::Subtask {
+        newt_core::plan::Subtask {
+            id: id.into(),
+            instruction: instruction.into(),
+            deps: deps.iter().map(|s| (*s).to_string()).collect(),
+            parallel_ok: false,
+            context: vec![],
+            verify: None,
+            status: newt_core::plan::SubtaskStatus::Pending,
+            result: None,
+            parent: None,
+            caveat_policy: newt_core::plan::CaveatPolicy::default(),
+        }
+    }
+    fn marker_plan(subs: Vec<newt_core::plan::Subtask>) -> newt_core::plan::Plan {
+        newt_core::plan::Plan {
+            goal: None,
+            aggregation: newt_core::plan::Aggregation::default(),
+            subtasks: subs,
+        }
+    }
+
+    #[test]
+    fn prune_drops_inspect_and_terminal_gate_rewiring_deps() {
+        // The over-decomposed plan the DGX sweep caught (30b × T2): a read-only
+        // inspect leaf, the real fix, and a trailing validate gate. WOULD FAIL before
+        // #801 — all three subtasks survived and the inspect/gate tripped
+        // nothing-to-land.
+        let mut plan = marker_plan(vec![
+            marker_sub(
+                "inspect-test",
+                "Inspect the existing test to understand the failure",
+                &[],
+            ),
+            marker_sub(
+                "fix",
+                "Modify humanize_duration to return \"1m 30s\"",
+                &["inspect-test"],
+            ),
+            marker_sub(
+                "validate",
+                "Verify the tests pass with cargo test",
+                &["fix"],
+            ),
+        ]);
+        prune_non_actionable_subtasks(&mut plan);
+        let ids: Vec<&str> = plan.subtasks.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["fix"],
+            "inspect + terminal gate pruned, fix survives"
+        );
+        // the fix's dep on the removed inspect (which had no deps) is rewired away,
+        // so it is immediately dispatchable instead of stalled on an absent dep.
+        assert!(plan.subtasks[0].deps.is_empty(), "dangling dep removed");
+    }
+
+    #[test]
+    fn prune_keeps_a_gate_a_real_leaf_depends_on() {
+        // A NON-terminal gate (a survivor still depends on it) is kept — the prune
+        // bites only terminal gates.
+        let mut plan = marker_plan(vec![
+            marker_sub("extract", "Extract the sum into a helper", &[]),
+            marker_sub("check", "Validate the helper compiles", &["extract"]),
+            marker_sub("use", "Rewrite summarize to call the helper", &["check"]),
+        ]);
+        prune_non_actionable_subtasks(&mut plan);
+        let ids: Vec<&str> = plan.subtasks.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["extract", "check", "use"],
+            "mid-plan gate retained"
+        );
+    }
+
+    #[test]
+    fn prune_leaves_an_all_marker_plan_untouched() {
+        // Every subtask is a marker → zero actionable work → the empty-guard leaves
+        // the plan intact for plan_sanity / re-author, never half-pruned.
+        let mut plan = marker_plan(vec![
+            marker_sub("a", "Inspect the module", &[]),
+            marker_sub("b", "Verify the build", &["a"]),
+        ]);
+        prune_non_actionable_subtasks(&mut plan);
+        assert_eq!(plan.subtasks.len(), 2, "all-marker plan untouched");
+    }
+
+    #[test]
+    fn prune_is_a_noop_on_a_plan_of_real_work() {
+        // Non-marker leading verbs ("Add", "Rename") survive unchanged — the existing
+        // behaviour for a well-formed multi-leaf plan, deps intact.
+        let mut plan = marker_plan(vec![
+            marker_sub("a", "Add error handling to parse_port", &[]),
+            marker_sub("b", "Rename the helper", &["a"]),
+        ]);
+        prune_non_actionable_subtasks(&mut plan);
+        let ids: Vec<&str> = plan.subtasks.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, vec!["a", "b"]);
+        assert_eq!(plan.subtasks[1].deps, vec!["a"]);
     }
 
     /// A throwaway git repo with one committed file at `name` containing `body`.
