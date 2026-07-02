@@ -149,12 +149,16 @@ Results land in `$OUT/sweep.tsv` (ratchet's 6 columns + completion timestamp
 + duration + per-row run parameters — `file-regressions.sh`-compatible), with
 `sweep.grid` / `sweep.meta.json` / `errors.log` / `DONE` alongside.
 **Honest trials:** behavioral FAILs count toward n, but rows whose FAIL is
-really an infrastructure failure (crew `no_crew_branch`, single-mode empty
-`tests_pass=`) are logged to `errors.log` and retried on resume, never
+really an infrastructure failure (crew `no_crew_branch_infra`, single-mode
+empty `tests_pass=`) are logged to `errors.log` and retried on resume, never
 counted — and a model group whose *first* contact is an infra failure is
 skipped for the whole invocation (dead-endpoint canary), so an unattended
-sweep cannot fill with connection noise and report `DONE`. Exit code: 0 =
-grid complete, 2 = incomplete (a resume is needed). Throwaway repos go
+sweep cannot fill with connection noise and report `DONE`. A crew run where
+real inference happened but no branch landed is emitted as
+`no_crew_branch_exercised` and **counts as a legitimate FAIL trial** (it
+carries `dir=` so autopsy can read the kept throwaway) — `ratchet.sh`
+discriminates the two from the plan log (#820). Exit code: 0 = grid
+complete, 2 = incomplete (a resume is needed). Throwaway repos go
 under `/var/tmp/newt-sweeps/<name>/`; `--keep fail` (default) reaps PASS
 throwaways immediately and keeps FAILs for autopsy — run
 `sweep.sh --out <dir> --reap` after analysis, and sweep anything older than
