@@ -108,7 +108,12 @@ strip         = true
 # ── Temporary patch: agent-bridle → crates.io transition ──────────────────
 #
 # Mirrors the root workspace's [patch.crates-io] block (see ../Cargo.toml) —
-# kept on the SAME branch (feat/step-up-decision-mvp, carries step_up, newt#497).
+# pinned to the SAME immutable commit (formerly the tip of
+# feat/step-up-decision-mvp, carries step_up + is brush-free, newt#497). NOT
+# `main`: main carries the real brush shell (CI-stub-guard-forbidden) plus
+# 60+ unrelated commits landed since this branch was cut. `rev` (a commit
+# SHA), not `branch` or `tag` pointed at a moving ref — a branch pin died
+# once already when the merged branch was deleted (newt#824).
 # Since Step 9.7 moved the agentic loop into newt-core, newt-core itself
 # declares `agent-bridle = "0.1"` — and newt-mesh, being excluded from the
 # parent workspace, is its own workspace root, so the parent's patch does
@@ -117,7 +122,7 @@ strip         = true
 # See: https://github.com/Gilamonster-Foundation/agent-bridle/issues/20
 
 [patch.crates-io]
-agent-bridle            = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", branch = "feat/step-up-decision-mvp" }
-agent-bridle-core       = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", branch = "feat/step-up-decision-mvp" }
-agent-bridle-tool-shell = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", branch = "feat/step-up-decision-mvp" }
-agent-bridle-tool-web   = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", branch = "feat/step-up-decision-mvp" }
+agent-bridle            = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", rev = "cb7e1ea3192ca125c1756d3e9f24e3064f258118" }
+agent-bridle-core       = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", rev = "cb7e1ea3192ca125c1756d3e9f24e3064f258118" }
+agent-bridle-tool-shell = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", rev = "cb7e1ea3192ca125c1756d3e9f24e3064f258118" }
+agent-bridle-tool-web   = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", rev = "cb7e1ea3192ca125c1756d3e9f24e3064f258118" }
