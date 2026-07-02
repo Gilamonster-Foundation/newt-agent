@@ -356,7 +356,11 @@ run_sweep() {
   printf '%s\n' "$sweep_tmp" > "$OUT/.tmproot"
   export TMPDIR="$sweep_tmp"   # ratchet's mktemp -d lands here
 
-  local cfg_dir git_sha
+  local git_sha
+  # cfg_dir is deliberately GLOBAL: the EXIT trap fires at top-level scope
+  # after run_sweep returns, where a `local` would be out of scope (set -u
+  # would see it unset and the generated endpoint-bearing configs would leak
+  # into the sweep tmp tree until --reap).
   cfg_dir="$(mktemp -d)"
   trap 'rm -rf "${cfg_dir:-}"' EXIT
   git_sha="$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo unknown)"
