@@ -12,6 +12,8 @@ mod crew_form;
 // plain `[s]ession allow` for high-danger targets.
 mod danger;
 pub mod dgx_probe;
+// OSC 8 terminal hyperlinks — clickable URLs in modern terminals (issue #771).
+pub mod terminal_hyperlink;
 mod mcp;
 mod mcp_token;
 pub mod probe;
