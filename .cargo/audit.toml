@@ -16,6 +16,13 @@ ignore = [
     "RUSTSEC-2026-0176", # pyo3: OOB read in PyList/PyTuple iterators (wheel only)
     "RUSTSEC-2026-0177", # pyo3: missing Sync bound on new_closure (wheel only)
     "RUSTSEC-2026-0185", # quinn-proto: remote memory exhaustion (QUIC transitive)
+    "RUSTSEC-2026-0195", # quick-xml: NsReader ns-alloc DoS — transitive via
+                         # syntect 5.3.0 -> plist (a macOS-target-gated dep; not
+                         # in the Linux/Windows build graph). No fixed parent
+                         # release exists yet (syntect 5.3.0 is newest); trim
+                         # when syntect/plist bump to quick-xml >=0.41.
+    "RUSTSEC-2026-0194", # quick-xml: quadratic duplicate-attribute check —
+                         # same crate/chain/condition as -0195 above.
     # unmaintained / unsound — deep transitive, no drop-in fix
     "RUSTSEC-2025-0141", # bincode unmaintained
     "RUSTSEC-2024-0436", # paste unmaintained
