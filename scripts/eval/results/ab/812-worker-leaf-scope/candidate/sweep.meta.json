@@ -1,0 +1,14 @@
+{
+  "name": "candidate",
+  "created": "2026-07-02T16:57:47Z",
+  "git_sha": "4fb6814",
+  "git_sha_note": "corrected post-hoc: sweep.sh's own git_sha field always records $REPO (the harness checkout, eval-continuum) regardless of NEWT_BIN, so it read the harness's HEAD (30b2120) rather than the graded binary's actual source. This arm's binary was built via an explicit NEWT_BIN=.../newt-812-worker-scope/target/release/newt override (feat/812-worker-leaf-scope @ 4fb6814d732cf5907a9c8eb384bcbf28bb6ba8ac, verified equivalent to PR #824's then-current head 4d708aa3 for the tested code paths — only unrelated main-merge noise differs), verified via live process inspection (pgrep -af) during every resume, not the default $REPO binary the baseline arm used. See PR #824 comments for the full resume/contamination investigation.",
+  "tasks": "T2-humanize-duration,010-decompose-god-function",
+  "modes": "crew",
+  "models": "qwen2.5-coder:14b,devstral-small-2:24b,qwen3-coder:30b,qwen2.5-coder:32b,deepseek-r1:70b",
+  "trials": 5,
+  "max_leaves": 6,
+  "timeout": 1200,
+  "keep": "fail",
+  "config_template": "~/.newt/eval-sweeps/template.toml"
+}

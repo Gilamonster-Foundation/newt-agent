@@ -53,6 +53,10 @@ pub struct CrewOutcome {
     pub attempts: u32,
     /// Paths the workspace reports as written, from the last applied plan.
     pub touched: Vec<String>,
+    /// Paths whose edits were REFUSED on the last attempt — by the `fs_write`
+    /// leash or the #812 leaf-scope fence — surfaced so a refusal is
+    /// diagnosable in the terminal report instead of a bare "touched: (none)".
+    pub refused: Vec<String>,
 }
 
 /// The effects side of the loop, injected so the orchestration stays pure.
@@ -233,6 +237,52 @@ fn task_requires_change(task: &str) -> bool {
     has_change || !has_verify
 }
 
+/// #812 leaf-scope fence — pure data + pure predicate.
+///
+/// The one-step directive tells a per-leaf worker it is executing ONE step of
+/// a larger plan and to stay in its lane. It deliberately does NOT promise
+/// "no edits is success": until the landing gate tolerates a verified no-op
+/// leaf (#800, sequenced after this), a no-edit reply still fails the leaf
+/// as nothing-to-land — the directive must not promise what the harness
+/// doesn't deliver. Re-add the already-present clause with #800. Three-Cs
+/// note: prompt knowledge as a `const` (working code first); promotion into
+/// a droppable data pack alongside the `api_surface.rs` lexicons is the
+/// flagged follow-up.
+const ONE_STEP_DIRECTIVE: &str = "\n\nYou are implementing ONE STEP of a larger plan. \
+Confine your edits to these files: {scope}. \
+Do NOT implement other steps of the plan.";
+
+fn one_step_directive(scope: &[String]) -> String {
+    ONE_STEP_DIRECTIVE.replace("{scope}", &scope.join(", "))
+}
+
+/// Does the leaf scope permit editing `path`? PURE and meet-only: an empty
+/// scope permits everything (no fence — byte-identical to pre-#812); a
+/// non-empty scope permits an exact file match or anything under a listed
+/// directory. The scope is a CONVENIENCE attenuation above the OCAP
+/// boundary — it is intersected with (never unioned into) the `fs_write`
+/// leash at apply, so it can only narrow the effective writable set.
+///
+/// Degenerate entries FAIL OPEN: an empty/whitespace entry, `"."`, or `"./"`
+/// names the whole tree, so it permits everything rather than (absurdly)
+/// denying every relative path. The fence is a convenience — bad fence DATA
+/// must never be able to brick a leaf.
+fn scope_permits(scope: &[String], path: &str) -> bool {
+    if scope.is_empty() {
+        return true;
+    }
+    let norm = path.strip_prefix("./").unwrap_or(path);
+    scope.iter().any(|entry| {
+        let e = entry.trim();
+        let e = e.strip_prefix("./").unwrap_or(e);
+        let dir = e.strip_suffix('/').unwrap_or(e);
+        if dir.is_empty() || dir == "." {
+            return true; // degenerate entry = the whole tree = no fence
+        }
+        norm == e || norm == dir || norm.starts_with(&format!("{dir}/"))
+    })
+}
+
 /// The PLAN-step system prompt: turns a leaf's `task` text into whole-file
 /// edits. Pinned as a `const` (not inlined) so the extraction convention below
 /// is unit-testable without a live model.
@@ -278,6 +328,11 @@ const CREW_PLAN_SYSTEM: &str =
 /// `NeedsHumanReview` with `attempts: 0`; planner-unavailable mid-loop ⇒
 /// `NeedsHumanReview` at the current attempt. Triage-unavailable is non-fatal — the
 /// next round simply plans without a fresh diagnosis.
+///
+/// `scope` (#812) fences the worker to its leaf's declared files: the
+/// navigator is seeded to prefer them, the planner prompt carries the
+/// one-step directive, and out-of-scope edits are refused into the same
+/// feedback channel as leash refusals. Empty scope ⇒ no fence.
 pub async fn run_crew(
     pool: &BackendPool,
     dispatcher: &dyn Dispatcher,
@@ -285,6 +340,7 @@ pub async fn run_crew(
     cfg: &CrewConfig,
     caveats: &Caveats,
     task: &str,
+    scope: &[String],
 ) -> CrewOutcome {
     // --- max_calls budget (#753): complete mediation for the call-count axis ---
     //
@@ -315,13 +371,25 @@ pub async fn run_crew(
     let mut calls_used: u64 = 0;
 
     // 1. NAVIGATE — pick the relevant files (then the harness reads them).
+    //    #812: a scoped leaf seeds the navigator with its declared files — a
+    //    soft preference (the navigator may still surface context files; only
+    //    APPLY is fenced).
+    let scope_seed = if scope.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n\nPLAN SCOPE: this step is expected to need only these files — \
+             prefer them: {}",
+            scope.join(", ")
+        )
+    };
     let nav_req = ChatRequest::new()
         .system(
             "You are a repository navigator. Reply with ONLY JSON \
              {\"relevant_files\":[\"path\", ...]} listing the files needed to do the task.",
         )
         .user(format!(
-            "TASK:\n{task}\n\nAVAILABLE FILES:\n{:?}",
+            "TASK:\n{task}\n\nAVAILABLE FILES:\n{:?}{scope_seed}",
             workspace.files()
         ));
     // #698: per-role dispatch bound — the crew config's `role_timeout` if set,
@@ -336,6 +404,7 @@ pub async fn run_crew(
             status: CrewStatus::NeedsHumanReview,
             attempts: 0,
             touched: Vec::new(),
+            refused: Vec::new(),
         };
     }
     calls_used += 1;
@@ -355,6 +424,7 @@ pub async fn run_crew(
                 status: CrewStatus::NeedsHumanReview,
                 attempts: 0,
                 touched: Vec::new(),
+                refused: Vec::new(),
             }
         }
     };
@@ -390,6 +460,7 @@ pub async fn run_crew(
 
     let mut failures: Vec<String> = Vec::new();
     let mut touched: Vec<String> = Vec::new();
+    let mut last_refused: Vec<String> = Vec::new();
     let mut reprompted_zero_edit = false;
 
     for attempt in 1..=cfg.max_attempts {
@@ -399,7 +470,12 @@ pub async fn run_crew(
             None => String::new(),
         };
         let plan_req = ChatRequest::new().system(CREW_PLAN_SYSTEM).user(format!(
-            "TASK:\n{task}\n\nRELEVANT FILES:\n{curated}{prior}"
+            "TASK:\n{task}{directive}\n\nRELEVANT FILES:\n{curated}{prior}",
+            directive = if scope.is_empty() {
+                String::new()
+            } else {
+                one_step_directive(scope)
+            },
         ));
         // max_calls (#753): gate the planner dispatch. If the budget is spent the
         // crew stops here — `attempt - 1` planning rounds completed before this one
@@ -409,6 +485,7 @@ pub async fn run_crew(
                 status: CrewStatus::NeedsHumanReview,
                 attempts: attempt - 1,
                 touched,
+                refused: last_refused,
             };
         }
         calls_used += 1;
@@ -428,6 +505,7 @@ pub async fn run_crew(
                     status: CrewStatus::NeedsHumanReview,
                     attempts: attempt,
                     touched,
+                    refused: last_refused,
                 }
             }
         };
@@ -440,6 +518,19 @@ pub async fn run_crew(
         let (allowed, refused): (Vec<Edit>, Vec<Edit>) = edits
             .into_iter()
             .partition(|e| caveats.permits_fs_write(&e.path));
+        // #812: the leaf-scope fence — a SECOND, meet-only partition. Effective
+        // writable set = worktree ∩ fs_write ∩ scope; the fence can only narrow.
+        // Out-of-scope edits ride the same refusal/feedback channel as leash
+        // refusals (with their own message) so the next round re-aims instead
+        // of silently landing over-reach. Empty scope ⇒ this is a no-op.
+        let (allowed, scope_refused): (Vec<Edit>, Vec<Edit>) = allowed
+            .into_iter()
+            .partition(|e| scope_permits(scope, &e.path));
+        last_refused = refused
+            .iter()
+            .chain(scope_refused.iter())
+            .map(|e| e.path.clone())
+            .collect();
         // Refuse lazy / elided emissions BEFORE apply (#688): applying a
         // `<the full file content remains unchanged>` placeholder silently
         // overwrites real code and only surfaces downstream as a compile error.
@@ -473,6 +564,7 @@ pub async fn run_crew(
         // verify-only leaf so the re-prompt can't goad it into a spurious edit.
         if touched.is_empty()
             && refused.is_empty()
+            && scope_refused.is_empty()
             && !reprompted_zero_edit
             && attempt < cfg.max_attempts
             && task_requires_change(task)
@@ -487,22 +579,48 @@ pub async fn run_crew(
             );
             continue;
         }
+        let mut refusal_notes: Vec<String> = Vec::new();
+        if !refused.is_empty() {
+            let names: Vec<&str> = refused.iter().map(|e| e.path.as_str()).collect();
+            refusal_notes.push(format!(
+                "REFUSED (outside the fs_write leash — attenuate the task or widen the grant): {}",
+                names.join(", ")
+            ));
+        }
+        if !scope_refused.is_empty() {
+            let names: Vec<&str> = scope_refused.iter().map(|e| e.path.as_str()).collect();
+            refusal_notes.push(format!(
+                "REFUSED (outside this leaf's scope — implement ONLY this step; \
+                 the scoped files are: {}): {}",
+                scope.join(", "),
+                names.join(", ")
+            ));
+        }
         let (ok, output) = workspace.run_test();
         if ok {
+            // #812 adversarial-review finding: a green check on the UNCHANGED
+            // tree while edits were REFUSED is NOT success — nothing landed
+            // and the model aimed outside its lane/leash. Accepting it would
+            // return a vacuous first-attempt Passed that dies downstream as
+            // "nothing to land" with ZERO re-aim rounds (the fallback repo
+            // verify is green at HEAD in the common one-shot case). Feed the
+            // refusal back and retry instead — attempts exhausting ends in an
+            // honest NeedsHumanReview, the design doc's predicted arm.
+            if touched.is_empty() && !refusal_notes.is_empty() {
+                failures.push(refusal_notes.join("\n"));
+                continue;
+            }
             return CrewOutcome {
                 status: CrewStatus::Passed,
                 attempts: attempt,
                 touched,
+                refused: last_refused,
             };
         }
-        let output = if refused.is_empty() {
+        let output = if refusal_notes.is_empty() {
             output
         } else {
-            let names: Vec<&str> = refused.iter().map(|e| e.path.as_str()).collect();
-            format!(
-                "REFUSED (outside the fs_write leash — attenuate the task or widen the grant): {}\n{output}",
-                names.join(", ")
-            )
+            format!("{}\n{output}", refusal_notes.join("\n"))
         };
 
         // 6. TRIAGE — diagnose the failure; fed into the next planning round.
@@ -520,6 +638,7 @@ pub async fn run_crew(
                 status: CrewStatus::NeedsHumanReview,
                 attempts: attempt,
                 touched,
+                refused: last_refused,
             };
         }
         calls_used += 1;
@@ -544,6 +663,7 @@ pub async fn run_crew(
         status: CrewStatus::NeedsHumanReview,
         attempts: cfg.max_attempts,
         touched,
+        refused: last_refused,
     }
 }
 
@@ -753,6 +873,7 @@ mod tests {
             &cc,
             &newt_core::caveats::Caveats::top(),
             "modify target.rs to be GOOD",
+            &[],
         )
         .await;
         assert_eq!(out.status, CrewStatus::NeedsHumanReview, "{out:?}");
@@ -783,6 +904,7 @@ mod tests {
             &cfg(3),
             &newt_core::caveats::Caveats::top(),
             "make target.rs GOOD",
+            &[],
         )
         .await;
         assert_eq!(out.status, CrewStatus::Passed);
@@ -804,10 +926,273 @@ mod tests {
             &cfg(1),
             &newt_core::caveats::Caveats::top(),
             "make target.rs GOOD",
+            &[],
         )
         .await;
         assert_eq!(out.status, CrewStatus::NeedsHumanReview);
         assert_eq!(out.attempts, 1);
+    }
+
+    #[test]
+    fn scope_permits_is_meet_only_and_prefix_aware() {
+        let scope = vec!["src/util.rs".to_string(), "tests/".to_string()];
+        // empty scope = no fence
+        assert!(scope_permits(&[], "anything/at/all.rs"));
+        // exact file match, with ./ normalization on either side
+        assert!(scope_permits(&scope, "src/util.rs"));
+        assert!(scope_permits(&scope, "./src/util.rs"));
+        assert!(scope_permits(&["./src/util.rs".to_string()], "src/util.rs"));
+        // directory entries permit anything beneath them
+        assert!(scope_permits(&scope, "tests/grade_spec.rs"));
+        assert!(scope_permits(&["src".to_string()], "src/lib.rs"));
+        // out-of-scope stays out — including sneaky prefixes of a scoped name
+        assert!(!scope_permits(&scope, "src/lib.rs"));
+        assert!(!scope_permits(&scope, "src/util.rs.bak"));
+        assert!(!scope_permits(&scope, "Cargo.toml"));
+    }
+
+    /// Planner that always emits edits to BOTH `target.rs` (the fix) and
+    /// `README.md` (over-reach) — the #812 fence must let the fix land and
+    /// refuse the over-reach, in the same attempt.
+    struct OverreachMock;
+    #[async_trait]
+    impl Dispatcher for OverreachMock {
+        async fn dispatch(
+            &self,
+            _backend: &PoolBackend,
+            model: &str,
+            _req: ChatRequest,
+        ) -> anyhow::Result<ChatReply> {
+            let content = match model {
+                "nav" => r#"{"relevant_files":["target.rs","README.md"]}"#.to_string(),
+                "triage" => r#"{"summary":"s","next_action":"n"}"#.to_string(),
+                "planner" => {
+                    "FILE: target.rs\nGOOD\nEND-FILE\nFILE: README.md\nhacked\nEND-FILE".to_string()
+                }
+                other => panic!("unexpected model {other}"),
+            };
+            Ok(ChatReply {
+                content,
+                model_id: model.to_string(),
+                usage: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn scope_fence_refuses_over_reach_but_lands_the_in_scope_fix() {
+        // #812: scope = the leaf's lane. The in-scope edit lands (verify goes
+        // green), the out-of-scope edit is REFUSED — the accidental-whole-fix /
+        // orphan-file mechanism cannot land work outside the lane.
+        let p = pool();
+        let d = OverreachMock;
+        let mut ws = MemWs::new();
+        let scope = vec!["target.rs".to_string()];
+        let out = run_crew(
+            &p,
+            &d,
+            &mut ws,
+            &cfg(3),
+            &newt_core::caveats::Caveats::top(),
+            "make target.rs GOOD",
+            &scope,
+        )
+        .await;
+        assert_eq!(out.status, CrewStatus::Passed);
+        assert_eq!(out.touched, vec!["target.rs".to_string()]);
+        assert_eq!(
+            ws.read("README.md").as_deref(),
+            Some("docs"),
+            "out-of-scope edit must be refused, not landed"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_scope_lands_the_same_edits_as_before() {
+        // #812 control: with NO scope the same over-reaching planner lands
+        // both edits — proving the fence (not the mock) makes the difference
+        // and that unscoped dispatch stays byte-identical to pre-#812.
+        let p = pool();
+        let d = OverreachMock;
+        let mut ws = MemWs::new();
+        let out = run_crew(
+            &p,
+            &d,
+            &mut ws,
+            &cfg(3),
+            &newt_core::caveats::Caveats::top(),
+            "make target.rs GOOD",
+            &[],
+        )
+        .await;
+        assert_eq!(out.status, CrewStatus::Passed);
+        assert_eq!(
+            ws.read("README.md").as_deref(),
+            Some("hacked"),
+            "no scope → no fence → the over-reach lands (today's behavior)"
+        );
+    }
+
+    /// Planner that ONLY ever emits an out-of-scope edit — models a worker
+    /// aimed at the wrong lane (a wrongly-derived scope, the doc's
+    /// medium-risk vector).
+    struct OffTargetMock;
+    #[async_trait]
+    impl Dispatcher for OffTargetMock {
+        async fn dispatch(
+            &self,
+            _backend: &PoolBackend,
+            model: &str,
+            _req: ChatRequest,
+        ) -> anyhow::Result<ChatReply> {
+            let content = match model {
+                "nav" => r#"{"relevant_files":["README.md"]}"#.to_string(),
+                "triage" => r#"{"summary":"s","next_action":"n"}"#.to_string(),
+                "planner" => "FILE: README.md\nhacked\nEND-FILE".to_string(),
+                other => panic!("unexpected model {other}"),
+            };
+            Ok(ChatReply {
+                content,
+                model_id: model.to_string(),
+                usage: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn refused_only_green_baseline_is_not_a_vacuous_pass() {
+        // #812 adversarial-review regression: green tree (verify passes on
+        // the UNCHANGED workspace) + every edit scope-refused. Accepting the
+        // green check as Passed would return a first-attempt vacuous
+        // Passed-with-nothing that dies downstream as "nothing to land" with
+        // ZERO re-aim rounds. The loop must instead feed the refusal back,
+        // retry, and end in an honest NeedsHumanReview with the refusal
+        // SURFACED in the outcome.
+        let p = pool();
+        let d = OffTargetMock;
+        let mut ws = MemWs::good(); // target.rs already GOOD → run_test green
+        let scope = vec!["target.rs".to_string()];
+        let out = run_crew(
+            &p,
+            &d,
+            &mut ws,
+            &cfg(3),
+            &newt_core::caveats::Caveats::top(),
+            "make target.rs GOOD",
+            &scope,
+        )
+        .await;
+        assert_eq!(
+            out.status,
+            CrewStatus::NeedsHumanReview,
+            "refused-only + green baseline must NOT be a vacuous pass"
+        );
+        assert_eq!(out.attempts, 3, "all re-aim rounds were offered");
+        assert!(out.touched.is_empty());
+        assert_eq!(
+            out.refused,
+            vec!["README.md".to_string()],
+            "the refusal is diagnosable from the outcome"
+        );
+        assert_eq!(ws.read("README.md").as_deref(), Some("docs"), "untouched");
+    }
+
+    /// Dispatcher that RECORDS every prompt (model, full user content) while
+    /// delegating behavior to canned replies — lets a test pin the #812
+    /// prompt mechanisms (nav seed + one-step directive), which are otherwise
+    /// mutation-invisible.
+    struct RecordingDispatcher {
+        prompts: std::sync::Mutex<Vec<(String, String)>>,
+    }
+    #[async_trait]
+    impl Dispatcher for RecordingDispatcher {
+        async fn dispatch(
+            &self,
+            _backend: &PoolBackend,
+            model: &str,
+            req: ChatRequest,
+        ) -> anyhow::Result<ChatReply> {
+            let user = req
+                .messages
+                .iter()
+                .filter(|m| m.role == "user")
+                .map(|m| m.content.clone())
+                .collect::<Vec<_>>()
+                .join("\n");
+            self.prompts.lock().unwrap().push((model.to_string(), user));
+            let content = match model {
+                "nav" => r#"{"relevant_files":["target.rs"]}"#.to_string(),
+                "triage" => r#"{"summary":"s","next_action":"n"}"#.to_string(),
+                "planner" => "FILE: target.rs\nGOOD\nEND-FILE".to_string(),
+                other => panic!("unexpected model {other}"),
+            };
+            Ok(ChatReply {
+                content,
+                model_id: model.to_string(),
+                usage: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn scoped_dispatch_carries_nav_seed_and_one_step_directive() {
+        // #812: the two PROMPT mechanisms are load-bearing (they aim the
+        // worker before the hard fence ever bites) — pin their presence when
+        // scoped and absence when not, so deleting them cannot pass silently.
+        let p = pool();
+        let d = RecordingDispatcher {
+            prompts: std::sync::Mutex::new(Vec::new()),
+        };
+        let mut ws = MemWs::new();
+        let scope = vec!["target.rs".to_string()];
+        run_crew(
+            &p,
+            &d,
+            &mut ws,
+            &cfg(1),
+            &newt_core::caveats::Caveats::top(),
+            "make target.rs GOOD",
+            &scope,
+        )
+        .await;
+        {
+            let prompts = d.prompts.lock().unwrap();
+            let nav = &prompts.iter().find(|(m, _)| m == "nav").unwrap().1;
+            assert!(nav.contains("PLAN SCOPE"), "navigator seeded: {nav}");
+            assert!(nav.contains("target.rs"));
+            let plan = &prompts.iter().find(|(m, _)| m == "planner").unwrap().1;
+            assert!(
+                plan.contains("ONE STEP of a larger plan"),
+                "one-step directive present: {plan}"
+            );
+            assert!(plan.contains("target.rs"));
+            prompts.iter().for_each(|(_, p)| {
+                assert!(
+                    !p.contains("emit NO edits"),
+                    "the no-edits-is-success promise is #800's to make, not ours yet"
+                );
+            });
+        }
+        // Unscoped control: neither mechanism appears.
+        let d2 = RecordingDispatcher {
+            prompts: std::sync::Mutex::new(Vec::new()),
+        };
+        let mut ws2 = MemWs::new();
+        run_crew(
+            &p,
+            &d2,
+            &mut ws2,
+            &cfg(1),
+            &newt_core::caveats::Caveats::top(),
+            "make target.rs GOOD",
+            &[],
+        )
+        .await;
+        let prompts = d2.prompts.lock().unwrap();
+        for (_, prompt) in prompts.iter() {
+            assert!(!prompt.contains("PLAN SCOPE"));
+            assert!(!prompt.contains("ONE STEP of a larger plan"));
+        }
     }
 
     #[tokio::test]
@@ -823,7 +1208,16 @@ mod tests {
             fs_write: newt_core::caveats::Scope::none(),
             ..newt_core::caveats::Caveats::top()
         };
-        let out = run_crew(&p, &d, &mut ws, &cfg(3), &read_only, "make target.rs GOOD").await;
+        let out = run_crew(
+            &p,
+            &d,
+            &mut ws,
+            &cfg(3),
+            &read_only,
+            "make target.rs GOOD",
+            &[],
+        )
+        .await;
         assert_eq!(out.status, CrewStatus::NeedsHumanReview);
         assert!(
             out.touched.is_empty(),
@@ -917,6 +1311,7 @@ mod tests {
             &cfg(3),
             &read_clamped,
             "make target.rs GOOD",
+            &[],
         )
         .await;
         assert_eq!(out.status, CrewStatus::Passed, "{out:?}");
@@ -972,6 +1367,7 @@ mod tests {
             &cfg(2),
             &newt_core::caveats::Caveats::top(),
             "make target.rs GOOD",
+            &[],
         )
         .await;
         assert_eq!(
@@ -1000,6 +1396,7 @@ mod tests {
             &cfg(3),
             &newt_core::caveats::Caveats::top(),
             "task",
+            &[],
         )
         .await;
         assert_eq!(out.status, CrewStatus::NeedsHumanReview);
@@ -1061,6 +1458,7 @@ mod tests {
             &cfg(3),
             &newt_core::caveats::Caveats::top(),
             "modify target.rs to be GOOD",
+            &[],
         )
         .await;
         assert_eq!(out.status, CrewStatus::Passed, "{out:?}");
@@ -1116,6 +1514,7 @@ mod tests {
             &cfg(3),
             &newt_core::caveats::Caveats::top(),
             "modify target.rs to be GOOD",
+            &[],
         )
         .await;
         assert_eq!(out.status, CrewStatus::NeedsHumanReview, "{out:?}");
@@ -1136,6 +1535,7 @@ mod tests {
             &cfg(3),
             &newt_core::caveats::Caveats::top(),
             "ensure target.rs still validates",
+            &[],
         )
         .await;
         assert_eq!(out.status, CrewStatus::Passed, "{out:?}");
@@ -1219,6 +1619,7 @@ mod tests {
             &cfg(10),
             &budget,
             "modify target.rs to be GOOD",
+            &[],
         )
         .await;
         let calls = d.dispatches.load(Ordering::SeqCst);
@@ -1244,7 +1645,7 @@ mod tests {
             max_calls: newt_core::caveats::CountBound::AtMost(0),
             ..newt_core::caveats::Caveats::top()
         };
-        let out = run_crew(&p, &d, &mut ws, &cfg(5), &budget, "modify target.rs").await;
+        let out = run_crew(&p, &d, &mut ws, &cfg(5), &budget, "modify target.rs", &[]).await;
         assert_eq!(
             d.dispatches.load(Ordering::SeqCst),
             0,

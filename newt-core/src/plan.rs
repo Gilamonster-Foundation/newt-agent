@@ -174,6 +174,16 @@ impl Plan {
         }
     }
 
+    /// Drop a subtask's file scope by id (#812). Used by re-grounding: a
+    /// reground means the leaf's grounding was demonstrably wrong, so a
+    /// derived-from-the-same-grounding fence is stale — the retry runs
+    /// unfenced rather than deterministically re-refusing the corrected edit.
+    pub fn clear_context(&mut self, id: &str) {
+        if let Some(s) = self.subtasks.iter_mut().find(|s| s.id == id) {
+            s.context.clear();
+        }
+    }
+
     /// Every leaf is `Done` — the plan finished successfully (branches are
     /// grouping nodes, so only leaf completion is load-bearing). An empty plan is
     /// trivially complete.
@@ -200,9 +210,14 @@ pub struct Subtask {
     /// May this subtask run concurrently with its ready siblings?
     #[serde(default)]
     pub parallel_ok: bool,
-    /// Files the model **nominates** as this subtask's curated context. The
-    /// harness stamps the verbatim bytes at dispatch — the model names the
-    /// paths, it does not assert their contents (the disclosure discipline).
+    /// The leaf's FILE SCOPE — its write lane (#812), not reading material.
+    /// At dispatch this is forwarded as `args["scope"]` and intersected into
+    /// the effective writable set (worktree ∩ fs_write ∩ scope): a meet-only
+    /// convenience fence that can only narrow, never widen. Empty = unfenced
+    /// (pre-#812 behavior). Matching is exact-file or directory-prefix, with
+    /// `./` and trailing-`/` normalized; degenerate entries (`""`, `"."`)
+    /// fail open. Populated by the harness's own def-site grounding, with
+    /// model-declared `files` appended as untrusted augmentation.
     #[serde(default)]
     pub context: Vec<String>,
     /// Optional verify command whose **enforced** result gates the subtask
@@ -250,8 +265,9 @@ pub struct CrewTask {
     /// only *narrow* the parent (attenuation, never amplify): a model-proposed
     /// plan can never widen the grant it was handed.
     pub caveats: Caveats,
-    /// Files the subtask nominated as curated context (stamped verbatim by the
-    /// runner at dispatch).
+    /// The leaf's file scope — its write lane (#812; see
+    /// [`Subtask::context`]). Forwarded as `args["scope"]` and intersected
+    /// into the effective writable set at apply; empty = unfenced.
     pub context: Vec<String>,
     /// The optional verify command that gates this task — forwarded to the crew
     /// op so the child's work is checked before it is accepted (the #332

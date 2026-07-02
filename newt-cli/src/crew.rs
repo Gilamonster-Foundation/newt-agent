@@ -439,6 +439,71 @@ fn plan_grounding_contradictions(
     out
 }
 
+/// #812: a term whose definitions are spread over more than this many files
+/// carries no aiming signal (`main` defines in dozens) — it is skipped rather
+/// than allowed to flood/evict the real target under the scope cap.
+const AMBIGUOUS_DEF_FILES: usize = 3;
+
+/// #812: derive one subtask's file scope from the harness's OWN grounding —
+/// `grep_terms(instruction)` → def-site grep → the defining files. PURE over
+/// the injected `def_sites` (`path:line:content` grep lines), so it is
+/// unit-testable with no fs. Order-preserving dedup; ambiguous terms (defs in
+/// more than [`AMBIGUOUS_DEF_FILES`] files) are skipped entirely — no signal,
+/// not weak signal; git-quoted (`"`-prefixed, core.quotePath) and empty
+/// paths are dropped as unusable fence entries.
+fn derive_subtask_scope(
+    instruction: &str,
+    def_sites: &impl Fn(&str) -> Vec<String>,
+) -> Vec<String> {
+    let mut paths: Vec<String> = Vec::new();
+    for term in grep_terms(instruction) {
+        let mut term_files: Vec<String> = Vec::new();
+        for hit in def_sites(&term) {
+            if let Some(p) = hit.split(':').next() {
+                if !p.is_empty() && !p.starts_with('"') && !term_files.iter().any(|q| q == p) {
+                    term_files.push(p.to_string());
+                }
+            }
+        }
+        if term_files.is_empty() || term_files.len() > AMBIGUOUS_DEF_FILES {
+            continue;
+        }
+        for p in term_files {
+            if !paths.iter().any(|q| q == &p) {
+                paths.push(p);
+            }
+        }
+    }
+    paths
+}
+
+/// #812: stamp every subtask's `context` as ground truth ∪ declaration. The
+/// def-site derivation leads (an under- or mis-declaring model cannot mis-aim
+/// the fence away from the real seam), and the model's self-declared `files`
+/// are APPENDED — augmentation per the design doc §4b, never replacement — so
+/// companion edit targets grounding cannot see (a new test file, docs, a
+/// brand-new module) stay in the lane. Bounded so the lane stays a lane.
+/// Declared entries widen only the FENCE, never authority: the fs_write leash
+/// and the worktree still bound everything, and downstream the scope is
+/// meet-only (it can only NARROW the writable set). Empty fences nothing.
+fn ground_subtask_scopes(
+    plan: &mut newt_core::plan::Plan,
+    def_sites: &impl Fn(&str) -> Vec<String>,
+) {
+    const SCOPE_CAP: usize = 6;
+    for s in &mut plan.subtasks {
+        let mut scope = derive_subtask_scope(&s.instruction, def_sites);
+        for declared in &s.context {
+            let d = declared.trim();
+            if !d.is_empty() && !scope.iter().any(|q| q == d) {
+                scope.push(d.to_string());
+            }
+        }
+        scope.truncate(SCOPE_CAP);
+        s.context = scope;
+    }
+}
+
 /// `newt plan <file>` — PREVIEW an overseer-authored plan, or (`--execute`)
 /// dispatch it leaf-by-leaf via a crew (each leaf in its own worktree, through the
 /// same `LocalCrewRunner` the in-session `crew` tool uses).
@@ -637,6 +702,7 @@ const PLAN_AUTHOR_SYSTEM: &str = "You are a planning lead. Decompose the GOAL in
     {\"goal\":\"<the goal>\",\"subtasks\":[{\"id\":\"<short-kebab-id>\",\
     \"instruction\":\"<imperative code-changing step>\",\
     \"deps\":[\"<id of a step that must finish first>\"],\
+    \"files\":[\"<relative path of a REAL existing file this step edits; omit if unknown>\"],\
     \"verify\":\"<shell command that exits 0 once THIS step is done; omit if none>\"}]}. \
     A small, single-file change is ONE subtask. Do NOT create separate \
     inspect/understand/explore/locate/verify/test/run-tests subtasks — the harness reads \
@@ -719,12 +785,26 @@ fn parse_authored_plan(raw: &str) -> Option<newt_core::plan::Plan> {
                     .collect()
             })
             .unwrap_or_default();
+        // #812: the model's self-declared files are read into `context` as a
+        // FALLBACK only — author_plan_to_plan overrides them with the
+        // harness's own def-site derivation wherever grounding finds the real
+        // seam (the model is untrusted to widen, and unreliable at declaring).
+        let context = s
+            .get("files")
+            .and_then(|f| f.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(str::trim).map(str::to_string))
+                    .filter(|p| !p.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
         subtasks.push(Subtask {
             id,
             instruction,
             deps,
             parallel_ok: false,
-            context: Vec::new(),
+            context,
             verify: s.get("verify").and_then(|x| x.as_str()).map(str::to_string),
             status: SubtaskStatus::Pending,
             result: None,
@@ -975,7 +1055,7 @@ pub async fn author_plan_to_plan(
     // Phase 2: decompose the (doc + repo-augmented) goal into a plan.
     println!("authoring a plan for: {goal}  (model {model})…");
     let prune_cfg = cfg.plan.as_ref().map(|p| p.prune.clone());
-    let plan = author_plan(
+    let mut plan = author_plan(
         &pool,
         &LocalDispatcher,
         &model,
@@ -989,11 +1069,19 @@ pub async fn author_plan_to_plan(
     // mis-ground — re-author ONCE with the citation. A backstop to the #687
     // grounding helper; refutes only on positive contradiction, so a clean plan
     // is never re-authored.
+    // `--full-name` prints paths relative to the repo TOPLEVEL regardless of
+    // `repo_dir` — the same basis as worktree edit paths, so a scope derived
+    // here matches what the fence partitions on even when planning from a
+    // subdir. `core.quotepath=false` keeps non-ASCII paths raw instead of
+    // C-quoted (a quoted path would be an unusable fence entry). (#812)
     let def_sites = |sym: &str| -> Vec<String> {
         git(
             repo_dir,
             &[
+                "-c",
+                "core.quotepath=false",
                 "grep",
+                "--full-name",
                 "-nE",
                 "-e",
                 &definition_grep_pattern(sym),
@@ -1006,6 +1094,9 @@ pub async fn author_plan_to_plan(
     };
     let contradictions = plan_grounding_contradictions(&plan, def_sites);
     if contradictions.is_empty() {
+        // #812: stamp each leaf's file scope from the SAME ground truth the
+        // claim-check uses, so the worker fence bites deterministically.
+        ground_subtask_scopes(&mut plan, &def_sites);
         return Ok(plan);
     }
     println!(
@@ -1017,7 +1108,7 @@ pub async fn author_plan_to_plan(
          fix these and do NOT invent paths:\n{}",
         contradictions.join("\n")
     ));
-    author_plan(
+    let mut plan = author_plan(
         &pool,
         &LocalDispatcher,
         &model,
@@ -1025,7 +1116,9 @@ pub async fn author_plan_to_plan(
         max_subtasks,
         prune_cfg.as_ref(),
     )
-    .await
+    .await?;
+    ground_subtask_scopes(&mut plan, &def_sites);
+    Ok(plan)
 }
 
 /// Bounded structural context about the target repo at `dir` — its language /
@@ -1470,7 +1563,18 @@ async fn run_with(
     // worktree. Reconciling the scheduler's path-enforcement with the lock is a
     // follow-up.
     let caveats = newt_acp_worker::worker_session_caveats(None);
-    let outcome = run_crew(&pool, dispatcher, &mut ws, &crew_cfg, &caveats, &args.task).await;
+    // Direct `newt crew` runs are a single whole-task crew (no plan, no leaf
+    // lanes) — there is no leaf scope to fence (#812), so pass none.
+    let outcome = run_crew(
+        &pool,
+        dispatcher,
+        &mut ws,
+        &crew_cfg,
+        &caveats,
+        &args.task,
+        &[],
+    )
+    .await;
     // Drop ws (removes the worktree) BEFORE we may process::exit upstream.
     let touched_in = ws.path().to_path_buf();
     drop(ws);
@@ -2003,6 +2107,87 @@ mod tests {
         let ids: Vec<&str> = plan.subtasks.iter().map(|s| s.id.as_str()).collect();
         assert_eq!(ids, vec!["a", "b"]);
         assert_eq!(plan.subtasks[1].deps, vec!["a"]);
+    }
+
+    #[test]
+    fn derive_subtask_scope_extracts_def_files_and_skips_ambiguous_terms() {
+        // #812: def_sites returns `path:line:content` grep lines; the scope is
+        // the DEFINING files, order-preserving, deduped. A term defined in
+        // more than AMBIGUOUS_DEF_FILES files carries no aiming signal (e.g.
+        // `main`) and is skipped so it cannot evict the real target; a
+        // git-quoted path (core.quotePath escaping) is dropped as unusable.
+        let def_sites = |sym: &str| -> Vec<String> {
+            match sym {
+                "humanize_duration" => vec![
+                    "src/util.rs:2:pub fn humanize_duration(...)".to_string(),
+                    "src/util.rs:9:fn humanize_duration_impl(...)".to_string(),
+                    "src/lib.rs:11:fn humanizes()".to_string(),
+                    "\"src/gr\\303\\266\\303\\237e.rs\":1:fn humanize_x()".to_string(),
+                ],
+                "main" => (0..14).map(|i| format!("file{i}.rs:1:fn main()")).collect(),
+                _ => Vec::new(),
+            }
+        };
+        let scope = derive_subtask_scope(
+            "fix `humanize_duration` in `main` so 90s renders as 1m 30s",
+            &def_sites,
+        );
+        assert_eq!(
+            scope,
+            vec!["src/util.rs".to_string(), "src/lib.rs".to_string()],
+            "defining files kept; ambiguous `main` skipped; quoted path dropped"
+        );
+        // No grounded symbols → empty scope (fence stays off; never invented).
+        assert!(derive_subtask_scope("tidy the docs", &def_sites).is_empty());
+    }
+
+    #[test]
+    fn ground_subtask_scopes_unions_def_sites_with_declared_files() {
+        // #812 (§4b: augmentation, not replacement): the derived def-site
+        // LEADS the scope, and the model's declared files are APPENDED — a
+        // companion target grounding cannot see (a new test file) must stay
+        // in the lane, and a mis-declaring model still cannot aim the fence
+        // away from the real seam. Where derivation finds nothing, the
+        // declaration alone survives.
+        let mut plan = marker_plan(vec![
+            marker_sub("fix", "Fix `humanize_duration` in the util module", &[]),
+            marker_sub("new", "Create the brand-new reporting module", &[]),
+        ]);
+        plan.subtasks[0].context =
+            vec!["tests/util_test.rs".to_string(), "src/util.rs".to_string()];
+        plan.subtasks[1].context = vec!["src/report.rs".to_string()];
+        let def_sites = |sym: &str| -> Vec<String> {
+            if sym == "humanize_duration" {
+                vec!["src/util.rs:2:pub fn humanize_duration".to_string()]
+            } else {
+                Vec::new()
+            }
+        };
+        ground_subtask_scopes(&mut plan, &def_sites);
+        assert_eq!(
+            plan.subtasks[0].context,
+            vec!["src/util.rs".to_string(), "tests/util_test.rs".to_string()],
+            "derived seam leads; declared companion appended; dup deduped"
+        );
+        assert_eq!(
+            plan.subtasks[1].context,
+            vec!["src/report.rs".to_string()],
+            "no def-site found → the declared file survives alone"
+        );
+    }
+
+    #[test]
+    fn parse_authored_plan_reads_declared_files_into_context() {
+        // #812: the authored JSON's `files` array lands in Subtask.context
+        // (as the untrusted fallback the def-site derivation may override);
+        // absent/empty `files` still parses with an empty context.
+        let raw = r#"{"goal":"g","subtasks":[
+            {"id":"a","instruction":"Fix util","files":["src/util.rs","  "],"deps":[]},
+            {"id":"b","instruction":"Add docs","deps":["a"]}
+        ]}"#;
+        let plan = parse_authored_plan(raw).expect("parses");
+        assert_eq!(plan.subtasks[0].context, vec!["src/util.rs".to_string()]);
+        assert!(plan.subtasks[1].context.is_empty());
     }
 
     /// A throwaway git repo with one committed file at `name` containing `body`.
