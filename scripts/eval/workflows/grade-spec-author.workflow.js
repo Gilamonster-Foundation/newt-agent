@@ -19,8 +19,13 @@ const CASE = argv.case
 const GAMERS = argv.gamers || 3
 const ROUNDS = argv.rounds || 3
 const INSTALL = argv.install !== false
+// argv.repo: newt-agent checkout to operate on; without it, agents must be
+// running with a cwd inside the repo.
+const REPO = argv.repo
+  ? `Repo root: ${argv.repo} (given — use it verbatim, do not guess).`
+  : 'Repo root: resolve via git rev-parse --show-toplevel (requires your cwd to be inside the newt-agent repo).'
 
-const COMMON = `Repo root: resolve via git rev-parse --show-toplevel (you are inside the newt-agent repo). Case dir: <repo>/newt-eval/cases/${CASE}/ (case.toml has the task prompt; workspace/ is the seed the agent starts from). House style for hidden specs: <repo>/newt-eval/cases/T2-humanize-duration/grade_spec.rs — a tests/grade_spec.rs integration test dropped into the produced tree at grading time and run via 'cargo test --test grade_spec'; the agent under eval NEVER sees it. Scratch: use mktemp -d for every seed copy; set CARGO_TARGET_DIR to a dir inside your scratch so builds never pollute the repo; clean up your scratch at the end. NEVER modify the repo itself unless a step explicitly says to.`
+const COMMON = `${REPO} Case dir: <repo>/newt-eval/cases/${CASE}/ (case.toml has the task prompt; workspace/ is the seed the agent starts from). House style for hidden specs: <repo>/newt-eval/cases/T2-humanize-duration/grade_spec.rs — a tests/grade_spec.rs integration test dropped into the produced tree at grading time and run via 'cargo test --test grade_spec'; the agent under eval NEVER sees it. Scratch: use mktemp -d for every seed copy; set CARGO_TARGET_DIR to a dir inside your scratch so builds never pollute the repo; clean up your scratch at the end. NEVER modify the repo itself unless a step explicitly says to.`
 
 phase('Analyze')
 const analysis = await agent(`Analyze eval case ${CASE} to prepare authoring its hidden grade_spec.rs. ${COMMON}

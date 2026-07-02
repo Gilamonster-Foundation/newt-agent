@@ -16,6 +16,10 @@ export const meta = {
 const argv = typeof args === 'string' ? JSON.parse(args) : (args || {})
 if (!argv.findings || !argv.out) throw new Error('missing required args: findings, out')
 const MAXF = argv.max_facets || 7
+// argv.repo: newt-agent checkout; without it, agents resolve from their cwd.
+const REPO = argv.repo
+  ? `The repo root is ${argv.repo} (given — use it verbatim).`
+  : 'Resolve the repo root via git rev-parse --show-toplevel (requires a cwd inside the newt-agent repo).'
 
 // ---- institutional memory as DATA (three-Cs): what killed five plausible
 // fixes in #802 §4a, embedded so every verifier starts calibrated.
