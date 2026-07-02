@@ -764,17 +764,44 @@ const ACTION_MARKERS: &[(&str, MarkerKind)] = &[
     ("ensure", MarkerKind::Gate),
 ];
 
-/// Classify a subtask by the LEADING verb of its instruction. Returns `None` for a
-/// real (diff-producing) subtask — "Extract helper", "Add validation", "Rename fn"
-/// survive because their leading verb is not a marker. Only the leading token is
-/// consulted, so a marker word later in the sentence never trips a prune.
-fn marker_kind(instruction: &str) -> Option<MarkerKind> {
+/// The EFFECTIVE prune lexicon: the compiled [`ACTION_MARKERS`] composed with
+/// the operator's droppable `[plan.prune]` override (#819) — removals first,
+/// then additions (lowercased, deduped, empties dropped). Pure; `None` config
+/// yields exactly the compiled defaults.
+fn effective_markers(cfg: Option<&newt_core::PlanPruneConfig>) -> Vec<(String, MarkerKind)> {
+    let mut out: Vec<(String, MarkerKind)> = ACTION_MARKERS
+        .iter()
+        .map(|(v, k)| ((*v).to_string(), *k))
+        .collect();
+    if let Some(c) = cfg {
+        let removed: Vec<String> = c.remove.iter().map(|w| w.to_ascii_lowercase()).collect();
+        out.retain(|(v, _)| !removed.contains(v));
+        let mut add = |words: &[String], kind: MarkerKind| {
+            for w in words {
+                let w = w.trim().to_ascii_lowercase();
+                if !w.is_empty() && !removed.contains(&w) && !out.iter().any(|(v, _)| *v == w) {
+                    out.push((w, kind));
+                }
+            }
+        };
+        add(&c.add_inspect, MarkerKind::Inspect);
+        add(&c.add_gate, MarkerKind::Gate);
+    }
+    out
+}
+
+/// Classify a subtask by the LEADING verb of its instruction against a
+/// lexicon. Returns `None` for a real (diff-producing) subtask — "Extract
+/// helper", "Add validation", "Rename fn" survive because their leading verb
+/// is not a marker. Only the leading token is consulted, so a marker word
+/// later in the sentence never trips a prune.
+fn marker_kind_in(markers: &[(String, MarkerKind)], instruction: &str) -> Option<MarkerKind> {
     let head = instruction
         .split(|c: char| !c.is_alphanumeric())
         .find(|w| !w.is_empty())
         .unwrap_or("")
         .to_ascii_lowercase();
-    ACTION_MARKERS
+    markers
         .iter()
         .find(|(verb, _)| *verb == head)
         .map(|(_, kind)| *kind)
@@ -790,7 +817,10 @@ fn marker_kind(instruction: &str) -> Option<MarkerKind> {
 /// their `deps`, and never touches `caveat_policy` — so it cannot widen authority
 /// nor make a gate easier to pass (a surviving leaf still faces the full per-leaf
 /// verify). It removes only a false-NEGATIVE (no-diff) failure source.
-fn prune_non_actionable_subtasks(plan: &mut newt_core::plan::Plan) {
+fn prune_non_actionable_subtasks_in(
+    plan: &mut newt_core::plan::Plan,
+    markers: &[(String, MarkerKind)],
+) {
     use std::collections::HashSet;
     // Empty-guard: if NOTHING in the plan is actionable — every subtask is a marker
     // — leave it entirely untouched. Pruning would empty (or half-prune) it; let
@@ -798,7 +828,7 @@ fn prune_non_actionable_subtasks(plan: &mut newt_core::plan::Plan) {
     if !plan
         .subtasks
         .iter()
-        .any(|s| marker_kind(&s.instruction).is_none())
+        .any(|s| marker_kind_in(markers, &s.instruction).is_none())
     {
         return;
     }
@@ -812,14 +842,14 @@ fn prune_non_actionable_subtasks(plan: &mut newt_core::plan::Plan) {
             .iter()
             .flat_map(|s| s.deps.iter().cloned())
             .collect();
-        let victim = plan
-            .subtasks
-            .iter()
-            .position(|s| match marker_kind(&s.instruction) {
-                Some(MarkerKind::Inspect) => true,
-                Some(MarkerKind::Gate) => !depended.contains(&s.id),
-                None => false,
-            });
+        let victim =
+            plan.subtasks
+                .iter()
+                .position(|s| match marker_kind_in(markers, &s.instruction) {
+                    Some(MarkerKind::Inspect) => true,
+                    Some(MarkerKind::Gate) => !depended.contains(&s.id),
+                    None => false,
+                });
         let Some(idx) = victim else { return };
         let removed = plan.subtasks.remove(idx);
         for s in &mut plan.subtasks {
@@ -843,6 +873,7 @@ pub async fn author_plan(
     model: &str,
     goal: &str,
     max_subtasks: usize,
+    prune: Option<&newt_core::PlanPruneConfig>,
 ) -> anyhow::Result<newt_core::plan::Plan> {
     let req = newt_scheduler::ChatRequest::new()
         .system(PLAN_AUTHOR_SYSTEM)
@@ -857,8 +888,12 @@ pub async fn author_plan(
         .map(|mut plan| {
             // #801: deterministically drop the non-actionable (inspect /
             // terminal-gate) leaves a weaker planner pads the plan with, before any
-            // authority is granted or the plan is dispatched.
-            prune_non_actionable_subtasks(&mut plan);
+            // authority is granted or the plan is dispatched. The lexicon composes
+            // with the operator's droppable [plan.prune] override (#819), which can
+            // also disable the prune entirely.
+            if !prune.map(|c| c.disabled).unwrap_or(false) {
+                prune_non_actionable_subtasks_in(&mut plan, &effective_markers(prune));
+            }
             plan
         })
         .ok_or_else(|| {
@@ -927,12 +962,14 @@ pub async fn author_plan_to_plan(
     }
     // Phase 2: decompose the (doc + repo-augmented) goal into a plan.
     println!("authoring a plan for: {goal}  (model {model})…");
+    let prune_cfg = cfg.plan.as_ref().map(|p| p.prune.clone());
     let plan = author_plan(
         &pool,
         &LocalDispatcher,
         &model,
         &effective_goal,
         max_subtasks,
+        prune_cfg.as_ref(),
     )
     .await?;
     // Phase 2b (#691): claim-check the plan against ground truth. A subtask that
@@ -974,6 +1011,7 @@ pub async fn author_plan_to_plan(
         &model,
         &effective_goal,
         max_subtasks,
+        prune_cfg.as_ref(),
     )
     .await
 }
@@ -1714,7 +1752,7 @@ mod tests {
         )
         .unwrap();
         let pool = BackendPool::from_source(&StaticSource::from_configs(cfg.backends.iter()));
-        let plan = author_plan(&pool, &PlanMock, "m", "ship the thing", 8)
+        let plan = author_plan(&pool, &PlanMock, "m", "ship the thing", 8, None)
             .await
             .expect("authored a plan");
         assert_eq!(plan.goal.as_deref(), Some("ship"));
@@ -1724,6 +1762,114 @@ mod tests {
             plan.subtasks[0].caveat_policy,
             newt_core::plan::CaveatPolicy::default()
         );
+    }
+
+    #[test]
+    fn effective_markers_composes_remove_then_add() {
+        // #819: the [plan.prune] override composes with the compiled lexicon —
+        // removals first (and removals beat additions), then case-normalized
+        // deduped additions.
+        let cfg = newt_core::PlanPruneConfig {
+            disabled: false,
+            add_inspect: vec!["Scrutinize".into(), "  ".into(), "verify".into()],
+            add_gate: vec!["smoke".into()],
+            remove: vec!["REVIEW".into(), "verify".into()],
+        };
+        let m = effective_markers(Some(&cfg));
+        assert!(
+            marker_kind_in(&m, "Review the code for style").is_none(),
+            "removed builtin no longer marks"
+        );
+        assert!(
+            marker_kind_in(&m, "verify the output").is_none(),
+            "a removed verb cannot be re-added"
+        );
+        assert!(matches!(
+            marker_kind_in(&m, "Scrutinize the module"),
+            Some(MarkerKind::Inspect)
+        ));
+        assert!(matches!(
+            marker_kind_in(&m, "smoke the build"),
+            Some(MarkerKind::Gate)
+        ));
+        // Untouched builtins survive.
+        assert!(matches!(
+            marker_kind_in(&m, "inspect the parser"),
+            Some(MarkerKind::Inspect)
+        ));
+        // None = exactly the compiled defaults.
+        let d = effective_markers(None);
+        assert_eq!(d.len(), ACTION_MARKERS.len());
+    }
+
+    #[test]
+    fn prune_respects_the_config_lexicon() {
+        // #819: a custom Inspect verb prunes under the composed lexicon and
+        // survives under the defaults — the override is config, not code.
+        let cfg = newt_core::PlanPruneConfig {
+            add_inspect: vec!["scrutinize".into()],
+            ..Default::default()
+        };
+        let mut plan = marker_plan(vec![
+            marker_sub("pad", "Scrutinize the module layout", &[]),
+            marker_sub("work", "Add the parser", &["pad"]),
+        ]);
+        prune_non_actionable_subtasks_in(&mut plan, &effective_markers(Some(&cfg)));
+        let ids: Vec<&str> = plan.subtasks.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, vec!["work"], "custom inspect verb pruned, dep rewired");
+        assert!(plan.subtasks[0].deps.is_empty());
+
+        let mut plan2 = marker_plan(vec![
+            marker_sub("pad", "Scrutinize the module layout", &[]),
+            marker_sub("work", "Add the parser", &["pad"]),
+        ]);
+        prune_non_actionable_subtasks_in(&mut plan2, &effective_markers(None));
+        assert_eq!(plan2.subtasks.len(), 2, "defaults do not know the verb");
+    }
+
+    #[tokio::test]
+    async fn author_plan_with_disabled_prune_keeps_padding_leaves() {
+        // #819: [plan.prune] disabled = true restores the pre-#803 behavior —
+        // the padded inspect leaf survives authoring; with the default config
+        // it is pruned. Same mock, only the config differs.
+        struct PaddedPlanMock;
+        #[async_trait::async_trait]
+        impl Dispatcher for PaddedPlanMock {
+            async fn dispatch(
+                &self,
+                _b: &newt_scheduler::PoolBackend,
+                _m: &str,
+                _r: newt_scheduler::ChatRequest,
+            ) -> anyhow::Result<newt_scheduler::ChatReply> {
+                Ok(newt_scheduler::ChatReply {
+                    content: "{\"goal\":\"g\",\"subtasks\":[\
+                        {\"id\":\"look\",\"instruction\":\"Inspect the module\"},\
+                        {\"id\":\"work\",\"instruction\":\"Add the fix\",\"deps\":[\"look\"]}]}"
+                        .to_string(),
+                    model_id: "m".into(),
+                    usage: None,
+                })
+            }
+        }
+        let cfg: Config = toml::from_str(
+            "[[backends]]\nname=\"x\"\nendpoint=\"http://x:11434\"\nmodel=\"m\"\ntiers=[]\n",
+        )
+        .unwrap();
+        let pool = BackendPool::from_source(&StaticSource::from_configs(cfg.backends.iter()));
+        let disabled = newt_core::PlanPruneConfig {
+            disabled: true,
+            ..Default::default()
+        };
+        let kept = author_plan(&pool, &PaddedPlanMock, "m", "g", 8, Some(&disabled))
+            .await
+            .expect("authored");
+        assert_eq!(kept.subtasks.len(), 2, "disabled ⇒ padding survives");
+        let pruned = author_plan(&pool, &PaddedPlanMock, "m", "g", 8, None)
+            .await
+            .expect("authored");
+        assert_eq!(pruned.subtasks.len(), 1, "default ⇒ padding pruned");
+        assert_eq!(pruned.subtasks[0].id, "work");
+        assert!(pruned.subtasks[0].deps.is_empty(), "dep rewired");
     }
 
     // ── #801: prune non-actionable (inspect / terminal-gate) subtasks ──────────
@@ -1772,7 +1918,7 @@ mod tests {
                 &["fix"],
             ),
         ]);
-        prune_non_actionable_subtasks(&mut plan);
+        prune_non_actionable_subtasks_in(&mut plan, &effective_markers(None));
         let ids: Vec<&str> = plan.subtasks.iter().map(|s| s.id.as_str()).collect();
         assert_eq!(
             ids,
@@ -1793,7 +1939,7 @@ mod tests {
             marker_sub("check", "Validate the helper compiles", &["extract"]),
             marker_sub("use", "Rewrite summarize to call the helper", &["check"]),
         ]);
-        prune_non_actionable_subtasks(&mut plan);
+        prune_non_actionable_subtasks_in(&mut plan, &effective_markers(None));
         let ids: Vec<&str> = plan.subtasks.iter().map(|s| s.id.as_str()).collect();
         assert_eq!(
             ids,
@@ -1810,7 +1956,7 @@ mod tests {
             marker_sub("a", "Inspect the module", &[]),
             marker_sub("b", "Verify the build", &["a"]),
         ]);
-        prune_non_actionable_subtasks(&mut plan);
+        prune_non_actionable_subtasks_in(&mut plan, &effective_markers(None));
         assert_eq!(plan.subtasks.len(), 2, "all-marker plan untouched");
     }
 
@@ -1822,7 +1968,7 @@ mod tests {
             marker_sub("a", "Add error handling to parse_port", &[]),
             marker_sub("b", "Rename the helper", &["a"]),
         ]);
-        prune_non_actionable_subtasks(&mut plan);
+        prune_non_actionable_subtasks_in(&mut plan, &effective_markers(None));
         let ids: Vec<&str> = plan.subtasks.iter().map(|s| s.id.as_str()).collect();
         assert_eq!(ids, vec!["a", "b"]);
         assert_eq!(plan.subtasks[1].deps, vec!["a"]);
