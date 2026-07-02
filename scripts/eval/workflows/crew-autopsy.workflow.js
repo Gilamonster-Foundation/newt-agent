@@ -13,10 +13,12 @@ export const meta = {
 //         id: 'output name (required, e.g. 2026-07-02-baseline)',
 //         include?: 'failures'|'failures+gameable'|'all' (default failures+gameable),
 //         limit?: 24, floor?: 0.7, out_dir?: '<repo>/scripts/eval/results/autopsy' }
-if (!args || !args.source || !args.id) throw new Error('args.source and args.id are required')
-const INCLUDE = args.include || 'failures+gameable'
-const LIMIT = args.limit || 24
-const FLOOR = args.floor ?? 0.7
+// args may arrive as a JSON string depending on the invoker — normalize.
+const argv = typeof args === 'string' ? JSON.parse(args) : (args || {})
+if (!argv.source || !argv.id) throw new Error('missing required args: source, id')
+const INCLUDE = argv.include || 'failures+gameable'
+const LIMIT = argv.limit || 24
+const FLOOR = argv.floor ?? 0.7
 
 // The taxonomy is DATA (three-Cs): keys, definitions, and the evidence
 // signature a classification must quote. Mirrors #802 §3.
@@ -57,13 +59,13 @@ const INVENTORY_SCHEMA = {
     properties: { task: { type: 'string' }, mode: { type: 'string' }, model: { type: 'string' },
       behavioral: { type: 'string' }, run_dir: { type: 'string' }, details: { type: 'string' } } } } },
 }
-const inv = await agent(`Build the autopsy inventory from this source: ${args.source}
+const inv = await agent(`Build the autopsy inventory from this source: ${argv.source}
 - If it is a directory containing sweep.tsv: parse the RATCHET rows (tab-separated; cols 2-6 = task,mode,model,behavioral,details; dir=<path> inside details is the run dir).
 - If it is a .tsv file: same parsing.
 - If it is a comma-separated list of directories: each is a run dir; infer task/mode/model from any .plan.log or leave "unknown".
 Include ONLY rows/dirs matching include='${INCLUDE}' (failures = behavioral FAIL; +gameable adds PASS?gameable; all = everything). Drop items whose run dir no longer exists on disk (they were reaped) — note how many you dropped in a final check by listing them, but only return existing ones.`,
   { label: 'inventory', phase: 'Inventory', schema: INVENTORY_SCHEMA, effort: 'low' })
-if (!inv || !inv.items.length) return { id: args.id, top_mechanism: null, note: 'no autopsy items (nothing failed, or run dirs were reaped)' }
+if (!inv || !inv.items.length) return { id: argv.id, top_mechanism: null, note: 'no autopsy items (nothing failed, or run dirs were reaped)' }
 const items = inv.items.slice(0, LIMIT)
 if (inv.items.length > LIMIT) log(`capped at ${LIMIT} of ${inv.items.length} items — oldest dropped`)
 
@@ -120,19 +122,19 @@ const freqTable = ['| mechanism | count | models affected | tasks affected |', '
   ...ranked.map(([m, n]) => `| ${m} | ${n} | ${[...xModel[m]].join(', ')} | ${[...xTask[m]].join(', ')} |`),
   `| (ops-noise, excluded) | ${classified.length - graded.length} | | |`]
 
-const OUTD = args.out_dir || null
-const synth = await agent(`Write the autopsy for '${args.id}'. Resolve the repo root (git rev-parse --show-toplevel; the source path ${args.source} is inside or near it) and write TWO files under ${OUTD || '<repo>/scripts/eval/results/autopsy'}/:
-1. ${args.id}.json — EXACTLY this JSON, verbatim: ${JSON.stringify({ id: args.id, source: args.source, top_mechanism: top, frequency: freq, items: graded.map((c) => ({ ...c.item, mechanism: c.mechanism, secondary: c.secondary || [], confidence: c.confidence, evidence: c.evidence })) })}
-2. ${args.id}.md — the narrative. RULES: embed this table VERBATIM (never recount):
+const OUTD = argv.out_dir || null
+const synth = await agent(`Write the autopsy for '${argv.id}'. Resolve the repo root (git rev-parse --show-toplevel; the source path ${argv.source} is inside or near it) and write TWO files under ${OUTD || '<repo>/scripts/eval/results/autopsy'}/:
+1. ${argv.id}.json — EXACTLY this JSON, verbatim: ${JSON.stringify({ id: argv.id, source: argv.source, top_mechanism: top, frequency: freq, items: graded.map((c) => ({ ...c.item, mechanism: c.mechanism, secondary: c.secondary || [], confidence: c.confidence, evidence: c.evidence })) })}
+2. ${argv.id}.md — the narrative. RULES: embed this table VERBATIM (never recount):
 ${freqTable.join('\n')}
 Lead with the biggest mover (${top || 'none'}) and why it wins (count x cross-model spread). Quote ONE exemplar evidence snippet per mechanism from the JSON above. End with a '## Next lever' section arguing what to fix first, and a pointer to run /propose-verify with the JSON as findings.
 Then return a 4-sentence summary.`,
   { label: 'synthesize', phase: 'Synthesize', effort: 'high' })
 
 return {
-  id: args.id, top_mechanism: top, frequency: freq,
+  id: argv.id, top_mechanism: top, frequency: freq,
   classified: graded.length, ops_noise: classified.length - graded.length,
-  json_path: `${OUTD || '<repo>/scripts/eval/results/autopsy'}/${args.id}.json`,
-  md_path: `${OUTD || '<repo>/scripts/eval/results/autopsy'}/${args.id}.md`,
+  json_path: `${OUTD || '<repo>/scripts/eval/results/autopsy'}/${argv.id}.json`,
+  md_path: `${OUTD || '<repo>/scripts/eval/results/autopsy'}/${argv.id}.md`,
   summary: synth,
 }

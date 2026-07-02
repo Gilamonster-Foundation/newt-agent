@@ -12,17 +12,19 @@ export const meta = {
 // args: { case: 'e.g. 010-decompose-god-function (required)',
 //         gamers?: 3, rounds?: 3, install?: true,
 //         goal_criteria?: 'override the derived criteria' }
-if (!args || !args.case) throw new Error('args.case is required (a newt-eval/cases/<case> id)')
-const CASE = args.case
-const GAMERS = args.gamers || 3
-const ROUNDS = args.rounds || 3
-const INSTALL = args.install !== false
+// args may arrive as a JSON string depending on the invoker — normalize.
+const argv = typeof args === 'string' ? JSON.parse(args) : (args || {})
+if (!argv.case) throw new Error('missing required arg: case (a newt-eval/cases/<case> id)')
+const CASE = argv.case
+const GAMERS = argv.gamers || 3
+const ROUNDS = argv.rounds || 3
+const INSTALL = argv.install !== false
 
 const COMMON = `Repo root: resolve via git rev-parse --show-toplevel (you are inside the newt-agent repo). Case dir: <repo>/newt-eval/cases/${CASE}/ (case.toml has the task prompt; workspace/ is the seed the agent starts from). House style for hidden specs: <repo>/newt-eval/cases/T2-humanize-duration/grade_spec.rs — a tests/grade_spec.rs integration test dropped into the produced tree at grading time and run via 'cargo test --test grade_spec'; the agent under eval NEVER sees it. Scratch: use mktemp -d for every seed copy; set CARGO_TARGET_DIR to a dir inside your scratch so builds never pollute the repo; clean up your scratch at the end. NEVER modify the repo itself unless a step explicitly says to.`
 
 phase('Analyze')
 const analysis = await agent(`Analyze eval case ${CASE} to prepare authoring its hidden grade_spec.rs. ${COMMON}
-Derive: (1) goal_criteria — what MUST be true for the task's goal to be genuinely met${args.goal_criteria ? ` (operator override to honor: ${args.goal_criteria})` : ''}; (2) observable_behaviors the spec can assert; (3) gaming_surfaces — ways an agent could make naive checks pass without meeting the goal (editing its own tests, no-op wrappers, satisfying behavior without the required structure, etc.); (4) spec_strategy: 'behavioral' if input/output assertions discriminate alone, 'structural' if the goal is a refactor that behavior alone cannot discriminate (e.g. ${CASE.includes('decompose') ? 'this decompose case: helpers extracted AND the god function rewritten to call them AND behavior unchanged' : 'a pure-shape goal'}, where source introspection via include_str! may be needed), 'hybrid' for both. Read case.toml and the whole seed workspace first.`,
+Derive: (1) goal_criteria — what MUST be true for the task's goal to be genuinely met${argv.goal_criteria ? ` (operator override to honor: ${argv.goal_criteria})` : ''}; (2) observable_behaviors the spec can assert; (3) gaming_surfaces — ways an agent could make naive checks pass without meeting the goal (editing its own tests, no-op wrappers, satisfying behavior without the required structure, etc.); (4) spec_strategy: 'behavioral' if input/output assertions discriminate alone, 'structural' if the goal is a refactor that behavior alone cannot discriminate (e.g. ${CASE.includes('decompose') ? 'this decompose case: helpers extracted AND the god function rewritten to call them AND behavior unchanged' : 'a pure-shape goal'}, where source introspection via include_str! may be needed), 'hybrid' for both. Read case.toml and the whole seed workspace first.`,
   { label: 'analyze', phase: 'Analyze', effort: 'high',
     schema: { type: 'object', additionalProperties: false,
       required: ['goal_criteria', 'observable_behaviors', 'gaming_surfaces', 'spec_strategy'],

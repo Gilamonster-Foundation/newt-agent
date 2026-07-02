@@ -12,8 +12,10 @@ export const meta = {
 //                    design doc (required)',
 //         out: 'output doc path, repo-relative or absolute (required)',
 //         facets?: [{key, focus, read:[paths]}], max_facets?: 7 }
-if (!args || !args.findings || !args.out) throw new Error('args.findings and args.out are required')
-const MAXF = args.max_facets || 7
+// args may arrive as a JSON string depending on the invoker — normalize.
+const argv = typeof args === 'string' ? JSON.parse(args) : (args || {})
+if (!argv.findings || !argv.out) throw new Error('missing required args: findings, out')
+const MAXF = argv.max_facets || 7
 
 // ---- institutional memory as DATA (three-Cs): what killed five plausible
 // fixes in #802 §4a, embedded so every verifier starts calibrated.
@@ -83,9 +85,9 @@ const VERDICT_SCHEMA = {
 }
 
 phase('Ground')
-let facets = args.facets
+let facets = argv.facets
 if (!facets || !facets.length) {
-  const g = await agent(`Derive improvement facets from this evidence base: read ${args.findings} in full (if it is an autopsy .json, the 'items' carry mechanisms + evidence quotes; the frequency table ranks mechanisms). Resolve the repo root (git rev-parse --show-toplevel) and skim the code regions the evidence points at. Produce at most ${MAXF} facets, ranked by (frequency x cross-model spread) of the mechanism they target. Each facet: key (kebab slug), focus (2-5 sentences: the observed failure + the direction of a fix, naming real files/functions), read (2-4 repo-relative paths a proposer must read).`,
+  const g = await agent(`Derive improvement facets from this evidence base: read ${argv.findings} in full (if it is an autopsy .json, the 'items' carry mechanisms + evidence quotes; the frequency table ranks mechanisms). Resolve the repo root (git rev-parse --show-toplevel) and skim the code regions the evidence points at. Produce at most ${MAXF} facets, ranked by (frequency x cross-model spread) of the mechanism they target. Each facet: key (kebab slug), focus (2-5 sentences: the observed failure + the direction of a fix, naming real files/functions), read (2-4 repo-relative paths a proposer must read).`,
     { label: 'ground', phase: 'Ground', effort: 'high',
       schema: { type: 'object', additionalProperties: false, required: ['facets'], properties: {
         facets: { type: 'array', maxItems: MAXF, items: { type: 'object', additionalProperties: false,
@@ -97,7 +99,7 @@ if (!facets || !facets.length) {
 log(`${facets.length} facets: ${facets.map((f) => f.key).join(', ')}`)
 
 phase('Propose+Verify')
-const proposePrompt = (f) => `You are improving newt-agent's autonomous crew/plan-execution. Evidence base: read ${args.findings} first.
+const proposePrompt = (f) => `You are improving newt-agent's autonomous crew/plan-execution. Evidence base: read ${argv.findings} first.
 ${GRADING_TRUTH}
 ${CONSTRAINTS}
 YOUR FACET: ${f.key} — ${f.focus}
@@ -128,9 +130,9 @@ const rejected = judged.filter((r) => !r.verdict.keep)
 log(`${kept.length} kept, ${rejected.length} rejected of ${facets.length} facets`)
 
 phase('Synthesize')
-const synth = await agent(`Write the design doc to ${args.out} (resolve relative to the repo root via git rev-parse --show-toplevel; create parent dirs). House style = docs/design/improving-crew-results.md (read it): separate what is SHOWN (the findings) from what is PROPOSED; keep the REJECTED analysis visible in its own section (never hide it — it is the doc's immune system); every per-cell expectation is a hypothesis requiring n>=5 /ab-gate confirmation, not a claim.
+const synth = await agent(`Write the design doc to ${argv.out} (resolve relative to the repo root via git rev-parse --show-toplevel; create parent dirs). House style = docs/design/improving-crew-results.md (read it): separate what is SHOWN (the findings) from what is PROPOSED; keep the REJECTED analysis visible in its own section (never hide it — it is the doc's immune system); every per-cell expectation is a hypothesis requiring n>=5 /ab-gate confirmation, not a claim.
 
-Evidence base: ${args.findings}
+Evidence base: ${argv.findings}
 KEPT proposals (sharpen each with its verdict.improvement; order the roadmap by grade-lift ÷ risk):
 ${JSON.stringify(kept, null, 2)}
 REJECTED (state each verdict's reason, especially inert_on_grade):
@@ -142,6 +144,6 @@ End with '## What to run next': for each kept proposal, the literal /ab-gate inv
 return {
   kept: kept.map((r) => ({ facet: r.facet, title: r.proposal.title, risk: r.verdict.revised_risk, expected_lift_cells: r.proposal.expected_lift_cells })),
   rejected: rejected.map((r) => ({ facet: r.facet, title: r.proposal.title, inert: !!r.verdict.inert_on_grade })),
-  doc_path: args.out,
+  doc_path: argv.out,
   summary: synth,
 }

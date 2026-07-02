@@ -12,10 +12,12 @@ export const meta = {
 //         baseline_dir, candidate_dir: 'completed sweep dirs (required)',
 //         alpha?: 0.05, expected_flip_cells?: ['<model> x <task>', ...],
 //         out?: 'verdict dir (default: <candidate_dir>/ab-<lever>)' }
-if (!args || !args.lever || !args.baseline_dir || !args.candidate_dir)
-  throw new Error('args.lever, args.baseline_dir, args.candidate_dir are required')
-const ALPHA = args.alpha || 0.05
-const OUT = args.out || `${args.candidate_dir}/ab-${args.lever}`
+// args may arrive as a JSON string depending on the invoker — normalize.
+const argv = typeof args === 'string' ? JSON.parse(args) : (args || {})
+if (!argv.lever || !argv.baseline_dir || !argv.candidate_dir)
+  throw new Error('missing required args: lever, baseline_dir, candidate_dir')
+const ALPHA = argv.alpha || 0.05
+const OUT = argv.out || `${argv.candidate_dir}/ab-${argv.lever}`
 
 // ---------- deterministic stats (self-checked; method in README.md)
 const logFact = (n) => { let s = 0; for (let i = 2; i <= n; i++) s += Math.log(i); return s }
@@ -62,8 +64,8 @@ const ingestPrompt = (d) => `Transcribe the sweep at ${d}: read ${d}/sweep.tsv (
 
 phase('Ingest')
 const [base, cand] = await parallel([
-  () => agent(ingestPrompt(args.baseline_dir), { label: 'ingest:baseline', phase: 'Ingest', schema: ROWS_SCHEMA, effort: 'low' }),
-  () => agent(ingestPrompt(args.candidate_dir), { label: 'ingest:candidate', phase: 'Ingest', schema: ROWS_SCHEMA, effort: 'low' }),
+  () => agent(ingestPrompt(argv.baseline_dir), { label: 'ingest:baseline', phase: 'Ingest', schema: ROWS_SCHEMA, effort: 'low' }),
+  () => agent(ingestPrompt(argv.candidate_dir), { label: 'ingest:candidate', phase: 'Ingest', schema: ROWS_SCHEMA, effort: 'low' }),
 ])
 if (!base || !cand) throw new Error('ingest failed')
 if (!base.done || !cand.done) throw new Error(`both arms must be DONE (baseline=${base.done}, candidate=${cand.done}) — a half-run arm biases the comparison`)
@@ -121,7 +123,7 @@ const vTable = ['| cell | verdict | candidate | baseline | p (one-sided) | min n
   ...cellVerdicts.map((v) => `| ${v.cell} | **${v.verdict}** | ${v.candidate || '-'} | ${v.baseline || '-'} | ${v.p_one_sided ?? '-'} | ${v.min_n_for_power ?? '-'} |`)]
 
 // expected-flip scorecard (accountability for the proposal that motivated the lever)
-const scorecard = (args.expected_flip_cells || []).map((exp) => {
+const scorecard = (argv.expected_flip_cells || []).map((exp) => {
   // tokens split on whitespace; a bare 'x' separator token is dropped —
   // never split inside a token (models like 'mixtral' contain x)
   const toks = exp.split(/\s+/).filter((t) => t && t.toLowerCase() !== 'x')
@@ -132,9 +134,9 @@ const scorecard = (args.expected_flip_cells || []).map((exp) => {
 phase('Report')
 const summary = await agent(`Write the A/B verdict to ${OUT}/verdict.md (create the dir). RULES: every number comes from the tables below, embedded VERBATIM — never recompute. State the overall verdict in the first line. If UNGRADEABLE cells exist, say the rung needs a hidden grade_spec.rs (/grade-spec-author) before any lift claim. If UNDERPOWERED, state the min n/arm the observed rates would need. Note the caveat that arms were run sequentially, not interleaved (endpoint drift is uncontrolled). At n=5/arm, significance at alpha=${ALPHA} requires roughly 5/5 vs <=1/5 — say so if relevant.
 
-Lever: ${args.lever}
+Lever: ${argv.lever}
 Overall verdict: ${overall}
-Baseline arm: ${args.baseline_dir} (sha ${base.meta_git_sha}) | Candidate arm: ${args.candidate_dir} (sha ${cand.meta_git_sha})
+Baseline arm: ${argv.baseline_dir} (sha ${base.meta_git_sha}) | Candidate arm: ${argv.candidate_dir} (sha ${cand.meta_git_sha})
 
 ## Per-cell verdicts (embed verbatim)
 ${vTable.join('\n')}
@@ -143,4 +145,4 @@ ${scorecard.length ? `\n## Expected-flip scorecard (embed verbatim)\n| expected 
 Structure: ## Verdict, ## Per-cell table, ${scorecard.length ? '## Expected-flip scorecard, ' : ''}## Method (Fisher one-sided exact, alpha=${ALPHA}, PASS-only on ungameable rungs), ## Caveats. Write the file, then return a 3-sentence summary.`,
   { label: 'report', phase: 'Report', effort: 'high' })
 
-return { lever: args.lever, overall, cells: cellVerdicts, verdict_path: `${OUT}/verdict.md`, summary }
+return { lever: argv.lever, overall, cells: cellVerdicts, verdict_path: `${OUT}/verdict.md`, summary }

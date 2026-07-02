@@ -10,8 +10,10 @@ export const meta = {
 
 // args: { dir: 'path to a sweep dir (required)', baseline?: 'path to a prior
 //         sweep dir', partial?: bool (analyze a still-growing sweep), }
-if (!args || !args.dir) throw new Error('args.dir (sweep directory) is required')
-const DIR = args.dir
+// args may arrive as a JSON string depending on the invoker — normalize.
+const argv = typeof args === 'string' ? JSON.parse(args) : (args || {})
+if (!argv.dir) throw new Error('missing required arg: dir (sweep directory)')
+const DIR = argv.dir
 
 // ---------- deterministic stats (self-checked; tool-neutral method in README.md)
 const wilson = (pass, n, z = 1.96) => {
@@ -53,12 +55,12 @@ const ingestPrompt = (d) => `Transcribe the sweep at ${d} into structured data. 
 phase('Ingest')
 const ingests = await parallel([
   () => agent(ingestPrompt(DIR), { label: 'ingest:current', phase: 'Ingest', schema: ROWS_SCHEMA, effort: 'low' }),
-  ...(args.baseline ? [() => agent(ingestPrompt(args.baseline), { label: 'ingest:baseline', phase: 'Ingest', schema: ROWS_SCHEMA, effort: 'low' })] : []),
+  ...(argv.baseline ? [() => agent(ingestPrompt(argv.baseline), { label: 'ingest:baseline', phase: 'Ingest', schema: ROWS_SCHEMA, effort: 'low' })] : []),
 ])
 const cur = ingests[0]
-const base = args.baseline ? ingests[1] : null
+const base = argv.baseline ? ingests[1] : null
 if (!cur) throw new Error('ingest failed')
-if (!cur.done && !args.partial) throw new Error(`${DIR} has no DONE marker — the sweep is still growing. Pass partial:true to analyze anyway (results will be stamped PARTIAL).`)
+if (!cur.done && !argv.partial) throw new Error(`${DIR} has no DONE marker — the sweep is still growing. Pass partial:true to analyze anyway (results will be stamped PARTIAL).`)
 
 phase('Stats')
 // per-cell aggregation — all numbers computed here, in code
@@ -123,7 +125,7 @@ const stamp = cur.done ? '' : ' **PARTIAL — sweep not DONE; do not cite these 
 const report = await agent(`Write the sweep analysis report to ${DIR}/REPORT.md. RULES: every number in the report must come from the tables below, embedded VERBATIM — do not recount, recompute, or invent any statistic. Per-cell claims with the UNDERPOWERED flag must carry that stamp in prose. PASS?gameable must never be described as a pass; GAMEABLE-RUNG cells need a hidden grade_spec.rs before any claim about them is trustworthy (say so, pointing at /grade-spec-author).${stamp}
 
 Sweep: ${DIR} (git sha ${cur.meta_git_sha}; graded rows ${cur.rows.length}; DONE=${cur.done})
-${args.baseline ? `Baseline: ${args.baseline}` : ''}
+${argv.baseline ? `Baseline: ${argv.baseline}` : ''}
 
 ## Per-cell table (embed verbatim)
 ${cellTable.join('\n')}
