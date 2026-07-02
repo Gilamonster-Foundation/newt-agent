@@ -22,6 +22,13 @@ fn binary_help_surfaces_start_on_the_guarded_cli_stack() {
             .success()
             .stdout(predicate::str::contains("newt"));
     }
+
+    Command::cargo_bin("newt")
+        .unwrap()
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--config-dir"));
 }
 
 #[test]
@@ -77,6 +84,111 @@ default_tier_order = ["FAST"]
         .success()
         .stdout(predicate::str::contains("test-ollama"))
         .stdout(predicate::str::contains("test:7b"));
+}
+
+#[test]
+fn config_dir_flag_reads_config_from_isolated_root() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("config.toml"),
+        r#"
+[[backends]]
+name = "config-dir-backend"
+endpoint = "http://localhost:99997"
+model = "config-dir:1b"
+tiers = ["FAST"]
+
+default_tier_order = ["FAST"]
+"#,
+    )
+    .unwrap();
+
+    Command::cargo_bin("newt")
+        .unwrap()
+        .env_remove("NEWT_CONFIG")
+        .env_remove("NEWT_CONFIG_DIR")
+        .arg("--config-dir")
+        .arg(dir.path())
+        .arg("config")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("config-dir-backend"))
+        .stdout(predicate::str::contains("config-dir:1b"));
+}
+
+#[test]
+fn config_file_flag_overrides_config_dir_for_main_config() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("config.toml"),
+        r#"
+[[backends]]
+name = "config-dir-backend"
+endpoint = "http://localhost:99997"
+model = "config-dir:1b"
+tiers = ["FAST"]
+
+default_tier_order = ["FAST"]
+"#,
+    )
+    .unwrap();
+
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    f.write_all(
+        br#"
+[[backends]]
+name = "explicit-config-backend"
+endpoint = "http://localhost:99996"
+model = "explicit:1b"
+tiers = ["FAST"]
+
+default_tier_order = ["FAST"]
+"#,
+    )
+    .unwrap();
+    f.flush().unwrap();
+
+    Command::cargo_bin("newt")
+        .unwrap()
+        .env_remove("NEWT_CONFIG")
+        .env_remove("NEWT_CONFIG_DIR")
+        .arg("--config-dir")
+        .arg(dir.path())
+        .arg("--config")
+        .arg(f.path())
+        .arg("config")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("explicit-config-backend"))
+        .stdout(predicate::str::contains("explicit:1b"))
+        .stdout(predicate::str::contains("config-dir-backend").not());
+}
+
+#[test]
+fn config_dir_flag_reads_user_dropins_from_isolated_root() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("backends")).unwrap();
+    std::fs::write(
+        dir.path().join("backends").join("dropin.toml"),
+        r#"
+endpoint = "http://localhost:99995"
+model = "dropin:1b"
+tiers = ["FAST"]
+"#,
+    )
+    .unwrap();
+
+    Command::cargo_bin("newt")
+        .unwrap()
+        .env_remove("NEWT_CONFIG")
+        .env_remove("NEWT_CONFIG_DIR")
+        .arg("--config-dir")
+        .arg(dir.path())
+        .arg("config")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("dropin"))
+        .stdout(predicate::str::contains("dropin:1b"));
 }
 
 #[test]

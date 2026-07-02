@@ -53,21 +53,21 @@ pub struct GrantedCaveats {
 }
 
 impl GrantedCaveats {
-    /// Resolve the granted leash from `~/.newt/config.toml`, using the real
-    /// `$HOME`. A missing file (or missing `[caveats]` table) falls through to
-    /// the UNCONFINED default rather than erroring.
+    /// Resolve the granted leash from the user config root. A missing file (or
+    /// missing `[caveats]` table) falls through to the UNCONFINED default rather
+    /// than erroring.
     ///
     /// On any failure to *parse* a present config, this logs a warning and
     /// falls back to the unconfined default — `shell_run` must remain usable
     /// even if the host config is malformed, but the operator is told.
     #[must_use]
     pub fn load() -> Self {
-        let home = home_dir();
-        match Self::resolve(home.as_deref()) {
+        let path = newt_core::Config::user_config_path();
+        match Self::resolve_path(path.as_deref()) {
             Ok(g) => g,
             Err(e) => {
                 eprintln!(
-                    "WARNING: newt-mcp-server could not parse ~/.newt/config.toml [caveats]: {e}; \
+                    "WARNING: newt-mcp-server could not parse the user config [caveats]: {e}; \
                      shell_run is running UNCONFINED (full ambient authority)."
                 );
                 Self {
@@ -86,13 +86,17 @@ impl GrantedCaveats {
     /// unparsable `[caveats]` table) — a missing file is not an error, it
     /// falls through to the unconfined default.
     pub fn resolve(home: Option<&Path>) -> anyhow::Result<Self> {
-        if let Some(home) = home {
-            let path = home.join(".newt").join("config.toml");
+        let path = home.map(|home| home.join(".newt").join("config.toml"));
+        Self::resolve_path(path.as_deref())
+    }
+
+    fn resolve_path(path: Option<&Path>) -> anyhow::Result<Self> {
+        if let Some(path) = path {
             if path.is_file() {
-                let caveats = load_from_config(&path)?;
+                let caveats = load_from_config(path)?;
                 return Ok(Self {
                     caveats,
-                    source: CaveatsSource::ConfigFile(path),
+                    source: CaveatsSource::ConfigFile(path.to_path_buf()),
                 });
             }
         }
@@ -116,9 +120,9 @@ impl GrantedCaveats {
             }
             CaveatsSource::UnconfinedDefault => {
                 "WARNING: newt-mcp-server shell_run is running UNCONFINED \
-                 (no ~/.newt/config.toml [caveats]); shell_run can run any \
+                 (no user config [caveats]); shell_run can run any \
                  command with full ambient authority. Add a [caveats] table to \
-                 ~/.newt/config.toml (e.g. exec = { only = [\"git\", \"cargo\"] }) \
+                 the user config.toml (e.g. exec = { only = [\"git\", \"cargo\"] }) \
                  to confine it."
                     .to_string()
             }
@@ -149,11 +153,6 @@ fn load_from_config(path: &Path) -> anyhow::Result<Caveats> {
     let cfg: Config = toml::from_str(&text)
         .map_err(|e| anyhow::anyhow!("cannot parse {} [caveats]: {e}", path.display()))?;
     Ok(cfg.caveats.unwrap_or_else(Caveats::top))
-}
-
-/// Resolve `$HOME` without pulling in a dirs crate (lean dep budget).
-fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
 }
 
 #[cfg(test)]

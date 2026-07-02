@@ -119,6 +119,19 @@ newt doctor                   # health-check local backends + provider plugins
 newt config                   # print resolved config
 ```
 
+Global config flags:
+
+```bash
+newt --config path/to/config.toml config
+newt --config-dir path/to/newt-root config
+```
+
+`--config-dir` points Newt at an alternate user config root instead of
+`~/.newt`; implicit config reads use `<DIR>/config.toml`, and sibling files
+such as settings, personas, tunings, and model capability caches live next to
+it. This is mainly useful for hermetic tests and smoke runs. If both flags are
+present, `--config` remains the explicit main config file override.
+
 ### Coder mode
 
 `newt worker --coder` (or `NEWT_CODER=1 newt worker`) activates the
