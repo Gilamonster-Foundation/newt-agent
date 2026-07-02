@@ -1220,13 +1220,7 @@ pub async fn chat_complete(
             let remaining = max_tool_rounds.saturating_sub(round + 1);
             messages.push(serde_json::json!({
                 "role": "user",
-                "content": format!(
-                    "[{read_only_rounds} read-only rounds so far. Stop AIMLESS exploring and \
-                     start making the change. This is a nudge, not a limit — you may still \
-                     read. In particular, before an edit_file, read the ONE file you are about \
-                     to change so your old_string matches its exact text; never guess old_string \
-                     or repeat a failed edit. ~{remaining} round(s) left.]"
-                )
+                "content": read_only_action_nudge(read_only_rounds, remaining, step_ledger)
             }));
             read_only_rounds = 0;
         }
@@ -2263,6 +2257,29 @@ fn is_read_only_tool(name: &str) -> bool {
             | "use_skill"
             | "save_note"
             | "recall"
+    )
+}
+
+fn read_only_action_nudge(
+    read_only_rounds: usize,
+    remaining_rounds: usize,
+    step_ledger: Option<&dyn scheduled::StepLedger>,
+) -> String {
+    let plan_clause = if step_ledger.and_then(plan_reseat_pointer).is_some() {
+        " You have an active multi-step plan; keep working the ACTIVE step instead of \
+         restarting or re-planning."
+    } else {
+        ""
+    };
+    format!(
+        "[{read_only_rounds} read-only rounds so far. Stop AIMLESS exploring and start \
+         making the change. This is a nudge, not a limit — you may still read, but if \
+         you have enough context, call edit_file or write_file now. If a capability \
+         denial blocks you, call request_permissions with the exact capability and \
+         target, or take a different approach. If you truly cannot edit yet, state the \
+         exact blocker. Before edit_file, read the ONE file you are about to change so \
+         old_string matches exact text; never guess old_string or repeat a failed edit.\
+         {plan_clause} ~{remaining_rounds} round(s) left.]"
     )
 }
 
@@ -4291,6 +4308,38 @@ mod cap_exit_unit_tests {
         for name in &["edit_file", "write_file", "run_command"] {
             assert!(!is_read_only_tool(name), "{name} should NOT be read-only");
         }
+    }
+
+    #[test]
+    fn read_only_action_nudge_names_edit_permission_and_blocker_paths() {
+        let nudge = read_only_action_nudge(3, 4, None);
+        assert!(nudge.contains("read-only rounds so far"), "{nudge}");
+        assert!(nudge.contains("edit_file"), "{nudge}");
+        assert!(nudge.contains("write_file"), "{nudge}");
+        assert!(nudge.contains("request_permissions"), "{nudge}");
+        assert!(nudge.contains("exact blocker"), "{nudge}");
+    }
+
+    #[test]
+    fn read_only_action_nudge_mentions_active_plan_when_present() {
+        use crate::agentic::scheduled::{SessionStepLedger, StepLedger};
+
+        let ledger = SessionStepLedger::default();
+        ledger.restore(&PlanSnapshot {
+            steps: vec![
+                Step {
+                    description: "inspect".to_string(),
+                    status: StepStatus::Done,
+                },
+                Step {
+                    description: "edit".to_string(),
+                    status: StepStatus::Active,
+                },
+            ],
+        });
+        let nudge = read_only_action_nudge(3, 2, Some(&ledger as &dyn StepLedger));
+        assert!(nudge.contains("active multi-step plan"), "{nudge}");
+        assert!(nudge.contains("ACTIVE step"), "{nudge}");
     }
 }
 
