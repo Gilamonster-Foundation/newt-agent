@@ -8,6 +8,17 @@
 > five tempting fixes were rejected as inert against the actual grade — that
 > analysis is kept in §4 rather than hidden.
 
+> **ADDENDUM (2026-07-01, post-#803): §6's multi-trial caveat is not
+> hypothetical — it bit.** The planner-decomposition prune (#801) landed as
+> #803 and was A/B'd exactly as §5 prescribed (30b × T2 crew, n=5 per arm,
+> same-binary swap): **no measurable lift** (baseline 4/5, fixed 4/5). The
+> material finding: the sweep's n=1 "30b × T2 FAIL" was **noise** — at n=5
+> the cell is ~80% PASS, not a reliable failure. Read every per-cell claim
+> in §2 — including the non-monotonicity headline and single-mode "8/8" —
+> as an **n=1 observation, not a result**, pending the n≥5 baseline
+> re-sweep (#813). §7 records the correction; Epic #811 tracks the
+> follow-through.
+
 ## 1. TL;DR
 
 Sweeping the planner==navigator==triage model from 14b up to r1:70b across two
@@ -408,3 +419,31 @@ model sweep (no more devstral-PASS / 32b-FAIL / r1-PASS coin-flip), and single-m
 - **Multi-trial confirmation.** Every sweep cell is n=1; the flips claimed above
   need >=3 trials per cell to separate signal from LLM non-determinism before any
   cross-model monotonicity claim is stated as a result rather than an observation.
+
+## 7. Addendum: what the n=5 A/B actually showed (post-#803)
+
+§5 predicted "30b × T2 flips FAIL → PASS" from the prune. The A/B (#803;
+n=5/arm, same-binary swap) returned 4/5 vs 4/5. Three corrections follow:
+
+1. **The §2 table is n=1 per cell.** Its values — including the
+   devstral-PASS / 32b-FAIL / r1-PASS non-monotonicity headline and
+   single-mode "8/8" — are observations pending #813's n≥5 re-sweep.
+   Do not cite them as results.
+2. **The prune stays landed on its real merits** — a sound, low-risk,
+   deterministic removal of no-diff padding leaves (a smaller
+   nothing-to-land trap surface) — but it is not a measured grade-mover.
+   Its droppable config seam is #819.
+3. **The next lever is worker leaf-scoping (§4b, now #812)** — the
+   orphan-file failures point at it, most recently a live baseline run
+   where a worker authored an orphan `tests/util.rs` with a broken
+   `use super::util` import and landed nothing (#820).
+
+Tooling landed so this class of error is structural rather than
+disciplinary: `scripts/eval/sweep.sh` (#806/#808 — n≥5 default, crash
+resume, infra noise excluded from trials with a dead-endpoint canary,
+exercised-but-nothing-landed counted honestly per #820) and the
+reconstitutable analysis workflows (#807 — Wilson CIs and Fisher exact
+computed in code; UNDERPOWERED and PASS?gameable stamped as data; A/B
+verdicts refuse to certify lift on gameable rungs). 010's rung is
+ungameable since #810 (nine refereed gaming attacks defeated). The n≥5
+baseline (#813) will be cited here when it lands.
