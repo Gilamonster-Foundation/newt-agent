@@ -445,5 +445,55 @@ exercised-but-nothing-landed counted honestly per #820) and the
 reconstitutable analysis workflows (#807 — Wilson CIs and Fisher exact
 computed in code; UNDERPOWERED and PASS?gameable stamped as data; A/B
 verdicts refuse to certify lift on gameable rungs). 010's rung is
-ungameable since #810 (nine refereed gaming attacks defeated). The n≥5
-baseline (#813) will be cited here when it lands.
+ungameable since #810 (nine refereed gaming attacks defeated).
+
+## 8. Addendum: the n≥5 baseline (#813), and what it actually shows
+
+The re-sweep landed 2026-07-02: 100 rows, all five models (14b, devstral24,
+30b, 32b, r1:70b), both tasks, both modes, n=5 per cell, zero gameable
+passes anywhere in the grid. Full data:
+`scripts/eval/results/sweeps/2026-07-01-pr802-baseline/` (`sweep.tsv` +
+`REPORT.md`, Wilson 95% CIs computed in code per #807, never by a model).
+
+**What is statistically supported at n=5:**
+
+- **Single mode is at ceiling on both tasks** — every one of 20 single
+  cells is 5/5; both single rungs pool to 25/25, Wilson 95% `[87%, 100%]`.
+  The §2 "single 8/8" observation holds up, now at 5× the sample.
+- **Crew lags on `010-decompose-god-function`, and this is the one
+  finding that clears the n=5 bar**: crew pools to 14/25 `[37%, 73%]`,
+  which does **not overlap** single's `[87%, 100%]` — a real,
+  statistically-supported deficit, not noise.
+- **Crew on `T2-humanize-duration` is only suggestive**: 19/25
+  `[57%, 89%]` overlaps single's interval. Do not cite a T2 crew deficit
+  as established.
+- **The §2 non-monotonicity headline does not replicate as stated.**
+  Per-cell crew results at n=5 (pass/5): 010 — 14b 5/5, devstral24 1/5,
+  30b 5/5, 32b 3/5, r1:70b 0/5; T2 — 14b 5/5, devstral24 5/5, 30b 3/5,
+  32b 1/5, r1:70b 5/5. The specific §2 claim "devstral24 PASS, 32b FAIL,
+  r1:70b PASS" on T2 does not hold at n=5: devstral24 is 5/5 (matches),
+  r1:70b is 5/5 (matches), but 32b — not the cell §2 flagged as
+  non-monotonic — is now the weak one at 1/5. The general shape (crew
+  success is **not monotonic in model strength**) still holds; the
+  *specific* per-model story from the n=1 sweep does not — see the full
+  table in `REPORT.md` for every cell.
+
+**Root-cause confirmation (#814 autopsy,
+`scripts/eval/results/autopsy/2026-07-02-pr802-baseline.{json,md}`):**
+17 FAIL runs classified against the §3 taxonomy with evidence quotes,
+each independently re-checked. **`worker-ignores-scope` is the single
+largest mechanism (9/17), spanning three of the four models with
+failures and both tasks** — confirming §4b's worker leaf-scoping as the
+correctly-prioritized next lever, not a guess. A recurring concrete
+instance: a leaf instructed to inspect/validate one fix instead rewrote
+a passing change into a failing one, touching files outside its stated
+purpose. The runner-up bucket (8/17, "other") is plausible-but-noncon­
+forming decomposition — nested/`pub`/panicky helpers that violate the
+010 hidden spec's structural fences — itself downstream of the same
+ungrounded-worker mechanism in several cases.
+
+**Status:** §4b (worker leaf-scoping) is implemented (#812, PR #824) and
+under adversarial review; it does not yet have its own n≥5 A/B verdict
+(§5's confirmation protocol) — that is the next step before merge,
+comparing a candidate-branch sweep against this baseline via `/ab-gate`
+(#807).
