@@ -184,7 +184,18 @@ pub async fn run_team(
                 );
             }
         }
-        let outcome = run_crew(pool, dispatcher, workspace, &cfg.crew, caveats, &st.task).await;
+        // Team-mode dispatch stays UNFENCED (`&[]`): SubtaskSpec has no files
+        // field yet — leaf-scoping the team path is #816.
+        let outcome = run_crew(
+            pool,
+            dispatcher,
+            workspace,
+            &cfg.crew,
+            caveats,
+            &st.task,
+            &[],
+        )
+        .await;
         let status = match outcome.status {
             CrewStatus::Passed => SubtaskStatus::Passed,
             CrewStatus::NeedsHumanReview => {
