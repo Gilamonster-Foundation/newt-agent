@@ -80,7 +80,24 @@ case "$MODE" in
     plan_rc=$?
     final="$(cd "$throw" && git branch --list 'crew/*' --format='%(refname:short)' | tail -1)"
     if [ -z "$final" ]; then
-      emit FAIL "plan_rc=$plan_rc no_crew_branch (see $throw/.plan.log)"; exit 0
+      # No branch landed. Discriminate WHY (#820) — a dead endpoint and a
+      # model that ran but landed nothing are different results:
+      #   no_crew_branch_infra      — the model was never exercised
+      #                               (connection/availability errors, or an
+      #                               empty log). Drivers exclude from n.
+      #   no_crew_branch_exercised  — real inference happened but the crew
+      #                               landed no work: a LEGITIMATE behavioral
+      #                               FAIL (root causes #1/#2/#4 of the
+      #                               improving-crew-results doc). Counts as
+      #                               a trial; dir= kept for autopsy.
+      if [ ! -s "$throw/.plan.log" ] || grep -qiE \
+          'connection refused|error sending request|tcp connect|connection reset|no such host|dns error|not found, try pulling|timed out waiting for' \
+          "$throw/.plan.log"; then
+        emit FAIL "plan_rc=$plan_rc no_crew_branch_infra (see $throw/.plan.log)"
+      else
+        emit FAIL "plan_rc=$plan_rc no_crew_branch_exercised dir=$throw"
+      fi
+      exit 0
     fi
     ( cd "$throw" && git checkout -q "$final" )
     leaves="$(cd "$throw" && git branch --list 'crew/*' | wc -l | tr -d ' ')"
