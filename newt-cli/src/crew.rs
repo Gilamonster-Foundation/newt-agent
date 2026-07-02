@@ -641,9 +641,21 @@ const PLAN_AUTHOR_SYSTEM: &str = "You are a planning lead. Decompose the GOAL in
     A small, single-file change is ONE subtask. Do NOT create separate \
     inspect/understand/explore/locate/verify/test/run-tests subtasks — the harness reads \
     the repo for you and automatically verifies EVERY subtask after it runs (put a step's \
-    own check in its `verify` FIELD, never as a standalone subtask). Use `deps` for \
-    ordering (a step lists the ids it waits on). Ids: short, stable, unique. Do NOT grant \
-    permissions or describe authority — only the work.";
+    own check in its `verify` FIELD, never as a standalone subtask). That prohibition covers \
+    REPHRASINGS of the same non-actionable pattern too — \"add edge-case tests\", \"clean up \
+    the code\", \"update the comments\", \"validate the fix\" are inspect/verify/test steps \
+    wearing different words; fold any such follow-up into the ONE subtask that changes the \
+    behavior, or drop it. Example: the goal \"Fix `humanize_duration` so 90 seconds returns \
+    '1m 30s' and the test passes\" is ONE subtask, not six — \
+    {\"goal\":\"Fix humanize_duration so 90 seconds returns '1m 30s'\",\
+    \"subtasks\":[{\"id\":\"fix-duration-format\",\"instruction\":\"Fix the minutes/seconds \
+    formatting in humanize_duration so it is correct for every input: zero, under a minute, \
+    and a mixed minutes+seconds value\",\"deps\":[],\
+    \"verify\":\"cargo test humanize_duration\"}]} — NOT \
+    fix-then-adjust-then-format-then-test-edge-cases-then-clean-up-then-update-comments; a \
+    failed later subtask strands the earlier ones half-fixed. Use `deps` for ordering (a \
+    step lists the ids it waits on). Ids: short, stable, unique. Do NOT grant permissions or \
+    describe authority — only the work.";
 
 /// The first balanced `{…}` span in `s` (string-aware), so a model reply wrapped
 /// in ```json fences or prose still parses. `None` if there is no balanced object.
@@ -1561,6 +1573,25 @@ mod tests {
         assert!(PLAN_AUTHOR_SYSTEM.contains("MUST change code"));
         assert!(PLAN_AUTHOR_SYSTEM.contains("Do NOT create separate"));
         assert!(PLAN_AUTHOR_SYSTEM.contains("verifies EVERY subtask"));
+    }
+
+    #[test]
+    fn plan_author_prompt_forbids_rephrased_verify_subtasks_and_gives_a_worked_example() {
+        // Regression (autopsy 2026-07-02-pr802-baseline, T2-humanize-duration x
+        // qwen3-coder:30b / qwen2.5-coder:32b x2 / deepseek-r1:70b, secondary tag
+        // planner-over-decomposition): the literal-verb prohibition above was not
+        // enough — planners kept the anti-pattern alive by REPHRASING the forbidden
+        // verbs. tmp.zfbIvGkXKX emitted 6 dependent leaves for a one-line bug fix
+        // (fix-seconds-component, handle-minutes-and-seconds,
+        // format-minutes-and-seconds, test-edge-cases, clean-up-code,
+        // update-comments) — "Add ... tests", "Refactor ... readability", "Update
+        // comments" never say the literal word "test"/"verify" — then stalled with
+        // 4 leaves unreached after leaf 2 broke scope (.plan.log:79-80, "plan
+        // incomplete"). A worked one-shot example is a stronger anti-pattern signal
+        // than a word blocklist alone.
+        assert!(PLAN_AUTHOR_SYSTEM.contains("REPHRASINGS"));
+        assert!(PLAN_AUTHOR_SYSTEM.contains("is ONE subtask, not six"));
+        assert!(PLAN_AUTHOR_SYSTEM.contains("fix-duration-format"));
     }
 
     #[test]
