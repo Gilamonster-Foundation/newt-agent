@@ -267,15 +267,22 @@ strip = true
 # but agent-bridle 0.1.0 is not yet indexed on crates.io. Until then this patch
 # satisfies the dependency from git.
 #
-# Pinned to `feat/step-up-decision-mvp` (advanced from `feat/stub-shell` on
-# 2026-06-19, newt#497): this is the agent-bridle branch that **actually carries**
-# the human-presence `step_up` Gate (agent-bridle#24) ROADMAP 23.2 builds on, AND
-# is brush-free (crates.io-safe — a stub shell). `feat/stub-shell` and
-# `brush-stub/publish-unblock` both LACK `step_up`; `main` has it but carries the
-# real brush shell (dev-only, forbidden by the CI stub guard). The `just shell-stub`
-# toggle targets this branch.
-# INTERIM (Path B) — this is a feature branch; revisit before cutting 0.6.9. The
-# canonical fix is folding `step_up` into the durable stub branch `feat/stub-shell`.
+# Pinned to a specific COMMIT (not a branch, not `main`), formerly the tip of
+# `feat/step-up-decision-mvp` (advanced from `feat/stub-shell` on 2026-06-19,
+# newt#497): the one point in agent-bridle's history that is BOTH brush-free
+# (crates.io-safe — a stub shell) AND carries the human-presence `step_up`
+# Gate (agent-bridle#24) ROADMAP 23.2 builds on. `feat/stub-shell` and
+# `brush-stub/publish-unblock` both LACK `step_up`; agent-bridle `main` HAS
+# `step_up` but also carries the real brush shell (dev-only, forbidden by the
+# CI stub guard) PLUS 60+ unrelated commits since this branch was cut (the
+# ADR-0018 "unbridle" mechanism-off refactor and more) — do NOT point this at
+# `main` or at any moving ref. `rev` (an immutable commit SHA) is deliberate:
+# a `branch =` pin died when `feat/step-up-decision-mvp` was deleted after
+# merge (newt#824); `rev` cannot be deleted the same way. If you need a
+# NEWER agent-bridle commit, that is its own reviewed upgrade — bump this SHA
+# explicitly and re-run the full suite, don't let it drift in silently.
+# INTERIM (Path B); revisit before cutting 0.6.9. The canonical fix is
+# folding `step_up` into the durable stub branch `feat/stub-shell`.
 #
 # After agent-bridle 0.1.0 is indexed on crates.io:
 #   1. Remove this entire [patch.crates-io] block.
@@ -284,7 +291,7 @@ strip = true
 # See: https://github.com/Gilamonster-Foundation/agent-bridle/issues/20
 
 [patch.crates-io]
-agent-bridle           = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", tag = "v0.1.0" }
-agent-bridle-core      = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", tag = "v0.1.0" }
-agent-bridle-tool-shell = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", tag = "v0.1.0" }
-agent-bridle-tool-web  = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", tag = "v0.1.0" }
+agent-bridle           = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", rev = "cb7e1ea3192ca125c1756d3e9f24e3064f258118" }
+agent-bridle-core      = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", rev = "cb7e1ea3192ca125c1756d3e9f24e3064f258118" }
+agent-bridle-tool-shell = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", rev = "cb7e1ea3192ca125c1756d3e9f24e3064f258118" }
+agent-bridle-tool-web  = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", rev = "cb7e1ea3192ca125c1756d3e9f24e3064f258118" }
