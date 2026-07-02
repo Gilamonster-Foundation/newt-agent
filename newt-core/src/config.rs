@@ -176,6 +176,13 @@ pub struct Config {
     /// (#749 step 8) plugs into. See [`CrewPolicyConfig`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub crew: Option<CrewPolicyConfig>,
+
+    /// `[plan]` — plan-authoring policy. Today: the `[plan.prune]` droppable
+    /// override for the decompose prune's anti-pattern lexicon (#801/#803 →
+    /// #819). `None` = compiled defaults, behavior unchanged. See
+    /// [`PlanPruneConfig`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<PlanConfig>,
 }
 
 /// One named mode (`[modes.<name>]`, issue #307): the atomic binding the
@@ -1930,6 +1937,45 @@ pub struct Crew {
 /// [crew.clamp]
 /// net = { only = ["registry.internal"] }
 /// ```
+/// `[plan]` — plan-authoring policy (#819).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct PlanConfig {
+    /// `[plan.prune]` — the decompose-prune lexicon override.
+    #[serde(default)]
+    pub prune: PlanPruneConfig,
+}
+
+/// `[plan.prune]` — droppable, three-Cs override for the #801/#803 planner-
+/// decomposition prune. The compiled `ACTION_MARKERS` lexicon is the default;
+/// this table composes with it (remove first, then additions), so a new
+/// anti-pattern — or un-marking a verb your domain uses for real work — is
+/// CONFIG, not code. The prune itself stays grade-neutral either way: it only
+/// removes no-diff leaves before any authority grant (#803's n=5 A/B measured
+/// no grade lift; it removes a failure *mechanism*).
+///
+/// ```toml
+/// [plan.prune]
+/// disabled = false
+/// add_inspect = ["scrutinize"]   # pruned wherever they lead an instruction
+/// add_gate = ["smoke"]           # pruned only when terminal
+/// remove = ["review"]            # e.g. a repo where "Review X" edits docs
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct PlanPruneConfig {
+    /// Turn the prune off entirely (the pre-#803 behavior).
+    #[serde(default)]
+    pub disabled: bool,
+    /// Extra leading verbs classified Inspect (case-insensitive).
+    #[serde(default)]
+    pub add_inspect: Vec<String>,
+    /// Extra leading verbs classified Gate (case-insensitive).
+    #[serde(default)]
+    pub add_gate: Vec<String>,
+    /// Verbs to REMOVE from the effective lexicon (builtin or added).
+    #[serde(default)]
+    pub remove: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct CrewPolicyConfig {
     /// The authority **clamp** dispatched crews are met against
@@ -2646,6 +2692,7 @@ impl Default for Config {
             loadouts: std::collections::BTreeMap::new(),
             crews: std::collections::BTreeMap::new(),
             crew: None,
+            plan: None,
         }
     }
 }
