@@ -16,6 +16,15 @@ export const meta = {
 const argv = typeof args === 'string' ? JSON.parse(args) : (args || {})
 if (!argv.findings || !argv.out) throw new Error('missing required args: findings, out')
 const MAXF = argv.max_facets || 7
+// argv.repo: newt-agent checkout to GROUND every agent in — critical when
+// multiple worktrees of this repo exist on disk, since an agent's own
+// `git rev-parse --show-toplevel` resolves from ITS process cwd, which may
+// not be inside the intended checkout at all (this is how a propose-verify
+// run once left real edits in an unrelated worktree — see
+// feedback_workflow_propose_agents_need_explicit_no_edit).
+const REPO = argv.repo
+  ? `The repo root is ${argv.repo} (given — use it verbatim, do not run git rev-parse or guess another path).`
+  : 'Resolve the repo root via git rev-parse --show-toplevel (requires a cwd inside the newt-agent repo).'
 // argv.repo: newt-agent checkout; without it, agents resolve from their cwd.
 const REPO = argv.repo
   ? `The repo root is ${argv.repo} (given — use it verbatim).`
@@ -91,7 +100,7 @@ const VERDICT_SCHEMA = {
 phase('Ground')
 let facets = argv.facets
 if (!facets || !facets.length) {
-  const g = await agent(`Derive improvement facets from this evidence base: read ${argv.findings} in full (if it is an autopsy .json, the 'items' carry mechanisms + evidence quotes; the frequency table ranks mechanisms). Resolve the repo root (git rev-parse --show-toplevel) and skim the code regions the evidence points at. Produce at most ${MAXF} facets, ranked by (frequency x cross-model spread) of the mechanism they target. Each facet: key (kebab slug), focus (2-5 sentences: the observed failure + the direction of a fix, naming real files/functions), read (2-4 repo-relative paths a proposer must read).`,
+  const g = await agent(`Derive improvement facets from this evidence base: read ${argv.findings} in full (if it is an autopsy .json, the 'items' carry mechanisms + evidence quotes; the frequency table ranks mechanisms). ${REPO} Skim the code regions the evidence points at (READ ONLY — this phase never edits anything). Produce at most ${MAXF} facets, ranked by (frequency x cross-model spread) of the mechanism they target. Each facet: key (kebab slug), focus (2-5 sentences: the observed failure + the direction of a fix, naming real files/functions), read (2-4 repo-relative paths a proposer must read).`,
     { label: 'ground', phase: 'Ground', effort: 'high',
       schema: { type: 'object', additionalProperties: false, required: ['facets'], properties: {
         facets: { type: 'array', maxItems: MAXF, items: { type: 'object', additionalProperties: false,
@@ -103,16 +112,26 @@ if (!facets || !facets.length) {
 log(`${facets.length} facets: ${facets.map((f) => f.key).join(', ')}`)
 
 phase('Propose+Verify')
+// NO-EDIT is load-bearing, not boilerplate: a propose/verify agent reasoning
+// about a code change can be tempted to actually apply it "to check it
+// works." With multiple worktrees of this repo on disk, an agent that
+// doesn't trust REPO and re-derives its own repo root can land that edit in
+// a completely different, unrelated checkout — discovered only later via an
+// unexpected `git status`. Both prompts below repeat the instruction because
+// the failure was observed at the propose stage, not (only) verify.
+const NO_EDIT = 'Do NOT edit, create, or delete any file in the repository — you are producing a PROPOSAL/VERDICT, not a patch. If you need to check feasibility empirically, do it in a scratch copy under /tmp, never in the repo itself.'
 const proposePrompt = (f) => `You are improving newt-agent's autonomous crew/plan-execution. Evidence base: read ${argv.findings} first.
 ${GRADING_TRUTH}
 ${CONSTRAINTS}
+${REPO} ${NO_EDIT}
 YOUR FACET: ${f.key} — ${f.focus}
-Read the real code (resolve the repo root via git rev-parse --show-toplevel): ${(f.read || []).join(', ')}. Ground every claim in actual functions/lines you saw. Produce ONE concrete, minimal, shippable proposal — the smallest change that moves the observed failures. State expected_lift_cells as testable /ab-gate hypotheses.`
+Read the real code: ${(f.read || []).join(', ')}. Ground every claim in actual functions/lines you saw. Produce ONE concrete, minimal, shippable proposal — the smallest change that moves the observed failures. State expected_lift_cells as testable /ab-gate hypotheses.`
 const verifyPrompt = (prop, f) => `Adversarially verify this proposal for newt-agent's crew executor. Default to SKEPTICAL — your job is to refute it.
 ${GRADING_TRUTH}
 ${CONSTRAINTS}
+${REPO} ${NO_EDIT}
 PROPOSAL (facet ${f.key}): ${JSON.stringify(prop, null, 2)}
-Read the cited code yourself (repo root via git rev-parse --show-toplevel). Check:
+Read the cited code yourself. Check:
 1. SOUND? right files/functions, mechanism as described?
 2. FIXES OBSERVED? would the named cells actually move, or is it plausible-but-inert? Compare against the five calibration rejections above.
 3. INERT ON GRADE? does it change only reporting/diagnostics rather than what lands on the crew/* tip?
@@ -134,7 +153,7 @@ const rejected = judged.filter((r) => !r.verdict.keep)
 log(`${kept.length} kept, ${rejected.length} rejected of ${facets.length} facets`)
 
 phase('Synthesize')
-const synth = await agent(`Write the design doc to ${argv.out} (resolve relative to the repo root via git rev-parse --show-toplevel; create parent dirs). House style = docs/design/improving-crew-results.md (read it): separate what is SHOWN (the findings) from what is PROPOSED; keep the REJECTED analysis visible in its own section (never hide it — it is the doc's immune system); every per-cell expectation is a hypothesis requiring n>=5 /ab-gate confirmation, not a claim.
+const synth = await agent(`Write the design doc to ${argv.out} (resolve relative to the repo root: ${REPO} create parent dirs). This is the ONE file this workflow writes — do not edit anything else. House style = docs/design/improving-crew-results.md (read it): separate what is SHOWN (the findings) from what is PROPOSED; keep the REJECTED analysis visible in its own section (never hide it — it is the doc's immune system); every per-cell expectation is a hypothesis requiring n>=5 /ab-gate confirmation, not a claim.
 
 Evidence base: ${argv.findings}
 KEPT proposals (sharpen each with its verdict.improvement; order the roadmap by grade-lift ÷ risk):

@@ -283,6 +283,44 @@ fn scope_permits(scope: &[String], path: &str) -> bool {
     })
 }
 
+/// The PLAN-step system prompt: turns a leaf's `task` text into whole-file
+/// edits. Pinned as a `const` (not inlined) so the extraction convention below
+/// is unit-testable without a live model.
+///
+/// The trailing sentence is the fix for the autopsy's "other" bucket
+/// (`2026-07-02-pr802-baseline.json`, task `010-decompose-god-function`): a
+/// worker asked to extract a helper "at the definition site of `summarize`"
+/// nested the new `fn` *inside* `summarize`'s body instead of beside it
+/// (`git show b670783`), or emitted it `pub`, or added a `panic!`/bare
+/// `.unwrap()` the hidden grade_spec's structural fence rejects
+/// (`helpers_are_private_with_exact_signatures` /
+/// `summarize_delegates_to_all_three_helpers` /
+/// `helper_bodies_are_straightline` in `tests/grade_spec.rs`). The prior
+/// prompt said nothing about *where* or *how* a new function should be
+/// defined, so an ambiguous instruction resolved to the wrong shape more
+/// often than not. This is a convention, not a grader change: it does not
+/// touch `verify`, cannot make a leaf self-pass, and a violating body still
+/// fails the same real gate it did before — it only shapes what the worker
+/// is more likely to emit on the attempt that lands.
+const CREW_PLAN_SYSTEM: &str =
+    "You are a senior engineer implementing a change. For EACH file you \
+     modify, emit the COMPLETE updated file in EXACTLY this block format \
+     — no diffs, no JSON, no code fences, no prose, no explanation:\n\
+     FILE: <relative/path>\n\
+     <the full, updated file content, verbatim>\n\
+     END-FILE\n\
+     Repeat the block for every changed file. Write the file content \
+     RAW between the markers — do NOT escape it. Emit the COMPLETE \
+     file — NEVER a diff, an ellipsis, or a placeholder such as \
+     '<the full file content remains unchanged>' or '… rest of the \
+     file unchanged …'. If a file is unchanged, omit its block. \
+     When a task asks you to extract, add, or define a new helper or \
+     function, define it as a top-level sibling function next to the \
+     caller — never nested inside another function's body. Give it \
+     exactly the requested name and signature, and keep it private \
+     unless the task explicitly says `pub`. Do not introduce a new \
+     panic, unwrap, or other failure path the task did not ask for.";
+
 /// Run the crew's two-pass control loop on `task`, returning the outcome.
 ///
 /// `None` from [`run_role`](BackendPool::run_role) (nothing live serves a pinned
@@ -431,28 +469,14 @@ pub async fn run_crew(
             Some(f) => format!("\n\nThe previous attempt FAILED verification:\n{f}\nFix it."),
             None => String::new(),
         };
-        let plan_req = ChatRequest::new()
-            .system(
-                "You are a senior engineer implementing a change. For EACH file you \
-                 modify, emit the COMPLETE updated file in EXACTLY this block format \
-                 — no diffs, no JSON, no code fences, no prose, no explanation:\n\
-                 FILE: <relative/path>\n\
-                 <the full, updated file content, verbatim>\n\
-                 END-FILE\n\
-                 Repeat the block for every changed file. Write the file content \
-                 RAW between the markers — do NOT escape it. Emit the COMPLETE \
-                 file — NEVER a diff, an ellipsis, or a placeholder such as \
-                 '<the full file content remains unchanged>' or '… rest of the \
-                 file unchanged …'. If a file is unchanged, omit its block.",
-            )
-            .user(format!(
-                "TASK:\n{task}{directive}\n\nRELEVANT FILES:\n{curated}{prior}",
-                directive = if scope.is_empty() {
-                    String::new()
-                } else {
-                    one_step_directive(scope)
-                },
-            ));
+        let plan_req = ChatRequest::new().system(CREW_PLAN_SYSTEM).user(format!(
+            "TASK:\n{task}{directive}\n\nRELEVANT FILES:\n{curated}{prior}",
+            directive = if scope.is_empty() {
+                String::new()
+            } else {
+                one_step_directive(scope)
+            },
+        ));
         // max_calls (#753): gate the planner dispatch. If the budget is spent the
         // crew stops here — `attempt - 1` planning rounds completed before this one
         // (this round never started), an honest cap-exit, not a vacuous pass.
@@ -666,6 +690,26 @@ mod tests {
             0,
             "unescaped multiline content must fail strict JSON → zero edits (the bug)"
         );
+    }
+
+    #[test]
+    fn crew_plan_system_states_the_extraction_convention() {
+        // Regression for the autopsy's "other" bucket
+        // (2026-07-02-pr802-baseline.json, task 010-decompose-god-function):
+        // before this fix CREW_PLAN_SYSTEM said nothing about *where* a new
+        // helper goes, and devstral-small-2:24b nested the extracted `fn`
+        // inside `summarize`'s body 4/4 runs (`git show b670783`) while other
+        // models emitted it `pub` or with a bare `panic!`/`.unwrap()` — all
+        // rejected by tests/grade_spec.rs's structural fence. Pin the prose so
+        // a future edit can't silently drop the convention.
+        assert!(CREW_PLAN_SYSTEM.contains("top-level sibling function"));
+        assert!(CREW_PLAN_SYSTEM.contains("never nested inside another function's body"));
+        assert!(CREW_PLAN_SYSTEM.contains("keep it private unless the task explicitly says"));
+        assert!(CREW_PLAN_SYSTEM.contains("Do not introduce a new panic, unwrap"));
+        // The bake-off-pinned FILE:/END-FILE directive must survive untouched —
+        // this is an APPEND, not a rewrite of the emission-format contract.
+        assert!(CREW_PLAN_SYSTEM.contains("FILE: <relative/path>"));
+        assert!(CREW_PLAN_SYSTEM.contains("END-FILE"));
     }
 
     #[test]
