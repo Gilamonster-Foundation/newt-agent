@@ -1111,7 +1111,7 @@ pub async fn chat_complete(
 
     let mut accumulated_usage: Option<crate::TokenUsage> = None;
     let mut hallucination_count: u32 = 0;
-    // Step 27.3: guard against looping on a call that already failed this run.
+    // Step 27.3/#771: guard against exact-repeat tool loops this run.
     let mut failed_calls = FailedCallGuard::default();
     let mut overflow_retries: u32 = 0;
     let mut suspicious_empty_retries: u32 = 0;
@@ -1973,9 +1973,9 @@ pub async fn chat_complete(
             if is_hallucination(name, &args) {
                 hallucination_count += 1;
             }
-            // Step 27.3: short-circuit an exact repeat of a call that already
-            // failed this run — steer instead of re-executing the dead call. The
-            // bogus emission is still counted above; we just don't run it again.
+            // Step 27.3/#771: short-circuit selected exact repeats — steer
+            // instead of re-executing a dead or already-useful call. The bogus
+            // emission is still counted above; we just don't run it again.
             if let Some(steer) = failed_calls.repeat_steer(name, &args) {
                 if let Some(rec) = tool_events.as_deref_mut() {
                     rec.push(crate::ToolEvent::from_call(name, &args, false, Some(0)));
@@ -2050,8 +2050,8 @@ pub async fn chat_complete(
             };
             // 17.6: record the call for the turn's events column — args are
             // digested (never stored raw), duration is a display claim.
-            // Step 27.3: classify once; remember failures so an exact repeat is
-            // short-circuited next round and the steer can escalate.
+            // Step 27.3/#771: classify once; remember outcomes that should make
+            // an exact repeat self-correct next round.
             let ok = tools::tool_result_ok(&result);
             failed_calls.record(name, &args, ok, &result);
             if let Some(rec) = tool_events.as_deref_mut() {
@@ -2127,11 +2127,15 @@ fn first_line(s: &str) -> String {
     s.lines().next().unwrap_or("").chars().take(200).collect()
 }
 
-/// Per-run guard against a weak model looping on a tool call that already failed
-/// (Step 27.3). The forensic session showed the model re-issuing the *identical*
-/// failed `run_command` three times and re-reading the same file ~8×, burning
-/// rounds. Keyed by `(name, canonical args)`, it short-circuits an exact repeat
-/// with steering instead of re-executing it, and counts failures per tool name
+/// Per-run guard against a weak model looping on a tool call whose result should
+/// already be actionable. Step 27.3 covered failures: the forensic session showed
+/// the model re-issuing the *identical* failed `run_command` three times and
+/// re-reading the same file ~8×, burning rounds. Later field reports added two
+/// success-shaped loops: no-result probes (`recall`, `state_get`) and successful
+/// `web_fetch` calls with real content.
+///
+/// Keyed by `(name, canonical args)`, it short-circuits selected exact repeats
+/// with steering instead of re-executing them, and counts failures per tool name
 /// so the steer can escalate ("stop using `run_command` — it keeps failing this
 /// session; use the embedded tools"). This handles ANY persistently-failing tool
 /// — a dead shell, a denied command, an unimplemented op — without needing to
@@ -2148,6 +2152,9 @@ struct FailedCallGuard {
     /// model loops the identical call (observed recall x3). Steered on the 2nd
     /// issuance, separate from hard failures (no escalation).
     last_empty: std::collections::HashMap<String, String>,
+    /// #771 field report: successful `web_fetch` with content is enough context;
+    /// an exact repeat should not spend another network/tool round.
+    successful_fetches: std::collections::HashMap<String, String>,
 }
 
 impl FailedCallGuard {
@@ -2161,9 +2168,10 @@ impl FailedCallGuard {
         format!("{name}\u{1}{args}")
     }
 
-    /// Steering message if this exact `(name, args)` already failed OR returned a
-    /// no-result this run, else `None` (let it execute). Hard failures
-    /// (`last_error`) take priority over success-shaped no-results (`last_empty`).
+    /// Steering message if this exact `(name, args)` already produced an outcome
+    /// that should not be repeated this run, else `None` (let it execute). Hard
+    /// failures (`last_error`) take priority over success-shaped no-results
+    /// (`last_empty`), then successful `web_fetch` content.
     fn repeat_steer(&self, name: &str, args: &serde_json::Value) -> Option<String> {
         let key = Self::key(name, args);
         // A genuine prior failure: steer hard, and escalate if this tool keeps
@@ -2190,7 +2198,28 @@ impl FailedCallGuard {
                  tool (read_file / find)."
             ));
         }
+        // #771: a successful fetch already put the page content in context. Local
+        // models can loop by fetching the same URL forever; steer the second exact
+        // call so the model uses the observed page content or changes approach.
+        if name == "web_fetch" {
+            if let Some(url) = self.successful_fetches.get(&key) {
+                return Some(format!(
+                    "You already fetched `{url}` with these exact arguments this turn and received \
+                     a response. Do NOT repeat the identical web_fetch — use the fetched content \
+                     above, fetch a different URL, inspect local files, or answer the user."
+                ));
+            }
+        }
         None
+    }
+
+    fn successful_fetch_url(args: &serde_json::Value, result: &str) -> Option<String> {
+        let url = args.get("url")?.as_str()?.trim();
+        if url.is_empty() || result.trim().is_empty() {
+            None
+        } else {
+            Some(url.chars().take(200).collect())
+        }
     }
 
     /// #718: classify a SUCCESS-shaped result that is empty *by design* — it
@@ -2213,8 +2242,9 @@ impl FailedCallGuard {
     }
 
     /// Record a just-executed call's outcome. Hard failures are remembered (and
-    /// counted, so the steer can escalate); #718 success-shaped no-results are
-    /// remembered separately in `last_empty` (no count — no escalation).
+    /// counted, so the steer can escalate); #718 success-shaped no-results and
+    /// #771 successful web fetches are remembered separately (no count — no
+    /// escalation).
     fn record(&mut self, name: &str, args: &serde_json::Value, ok: bool, result: &str) {
         if !ok {
             self.last_error
@@ -2223,6 +2253,10 @@ impl FailedCallGuard {
         } else if let Some(reason) = Self::no_result_reason(name, result) {
             self.last_empty
                 .insert(Self::key(name, args), reason.to_string());
+        } else if name == "web_fetch" {
+            if let Some(url) = Self::successful_fetch_url(args, result) {
+                self.successful_fetches.insert(Self::key(name, args), url);
+            }
         }
     }
 
@@ -2698,7 +2732,7 @@ pub async fn openai_chat_complete(
 
     let mut accumulated_usage: Option<crate::TokenUsage> = None;
     let mut hallucination_count: u32 = 0;
-    // Step 27.3: guard against looping on a call that already failed this run.
+    // Step 27.3/#771: guard against exact-repeat tool loops this run.
     let mut failed_calls = FailedCallGuard::default();
     // Hard context-window 400s recovered (parse limit → trim → retry). See #223.
     let mut cw_retries: u32 = 0;
@@ -3162,8 +3196,8 @@ pub async fn openai_chat_complete(
             if is_hallucination(name, &args) {
                 hallucination_count += 1;
             }
-            // Step 27.3: short-circuit an exact repeat of a failed call (mirrors
-            // the Ollama path; Responses uses function_call_output). Counted as a
+            // Step 27.3/#771: short-circuit selected exact repeats (mirrors the
+            // Ollama path; Responses uses function_call_output). Counted as a
             // hallucination above first when applicable.
             if let Some(steer) = failed_calls.repeat_steer(name, &args) {
                 if let Some(rec) = tool_events.as_deref_mut() {
@@ -3241,7 +3275,8 @@ pub async fn openai_chat_complete(
             }
             // 17.6: record the call for the turn's events column (mirrors
             // the Ollama path) — digested args, duration as a display claim.
-            // Step 27.3: classify once; remember failures (mirrors Ollama path).
+            // Step 27.3/#771: classify once; remember repeat-steered outcomes
+            // (mirrors Ollama path).
             let ok = tools::tool_result_ok(&result);
             failed_calls.record(name, &args, ok, &result);
             if let Some(rec) = tool_events.as_deref_mut() {
@@ -3526,7 +3561,7 @@ pub async fn openai_responses_complete(
 
     let mut accumulated_usage: Option<crate::TokenUsage> = None;
     let mut hallucination_count: u32 = 0;
-    // Step 27.3: guard against looping on a call that already failed this run.
+    // Step 27.3/#771: guard against exact-repeat tool loops this run.
     let mut failed_calls = FailedCallGuard::default();
     let mut tools_supported = true;
     let mut tools_unsupported_notified = false;
@@ -3646,8 +3681,8 @@ pub async fn openai_responses_complete(
             if is_hallucination(name, &args) {
                 hallucination_count += 1;
             }
-            // Step 27.3: short-circuit an exact repeat of a failed call
-            // (Responses shape: echo a function_call_output with the steer).
+            // Step 27.3/#771: short-circuit selected exact repeats (Responses
+            // shape: echo a function_call_output with the steer).
             // Counted as a hallucination above first when applicable.
             if let Some(steer) = failed_calls.repeat_steer(name, &args) {
                 if let Some(rec) = tool_events.as_deref_mut() {
@@ -3712,7 +3747,8 @@ pub async fn openai_responses_complete(
                 let excerpt: String = result.chars().take(120).collect();
                 print_debug(&format!("tool result: {excerpt:?}"), color);
             }
-            // Step 27.3: classify once; remember failures (mirrors Ollama path).
+            // Step 27.3/#771: classify once; remember repeat-steered outcomes
+            // (mirrors Ollama path).
             let ok = tools::tool_result_ok(&result);
             failed_calls.record(name, &args, ok, &result);
             if let Some(rec) = tool_events.as_deref_mut() {
@@ -4146,6 +4182,43 @@ mod failed_call_guard_tests {
         assert!(
             g.repeat_steer("recall", &q2).is_none(),
             "distinct recall args still run"
+        );
+    }
+
+    #[test]
+    fn steers_duplicate_successful_web_fetch() {
+        let mut g = FailedCallGuard::default();
+        let issue = serde_json::json!({
+            "url": "https://github.com/Gilamonster-Foundation/newt-agent/issues/771"
+        });
+
+        assert!(
+            g.repeat_steer("web_fetch", &issue).is_none(),
+            "first fetch must run"
+        );
+        g.record("web_fetch", &issue, true, "# Issue\n\nbody");
+        let steer = g
+            .repeat_steer("web_fetch", &issue)
+            .expect("2nd identical successful fetch steers");
+        assert!(steer.contains("already fetched"), "{steer}");
+        assert!(
+            steer.contains("https://github.com/Gilamonster-Foundation/newt-agent/issues/771"),
+            "{steer}"
+        );
+        assert!(
+            g.repeat_steer(
+                "web_fetch",
+                &serde_json::json!({"url": "https://github.com/hartsock/scrybe"})
+            )
+            .is_none(),
+            "distinct URLs still run"
+        );
+
+        let file = serde_json::json!({"path": "src/lib.rs"});
+        g.record("read_file", &file, true, "file contents");
+        assert!(
+            g.repeat_steer("read_file", &file).is_none(),
+            "ordinary successful reads are still not steered"
         );
     }
 
