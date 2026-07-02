@@ -4,11 +4,12 @@ name: Nightly eval (capability ratchet)
 #
 # It WRAPS the existing scripts/eval/ratchet.sh (RATCHET.md) — it does NOT
 # reimplement grading. Each night it runs a small v1 tier
-# (task subset x {single,crew} modes x a cheap local coder model, N trials),
-# captures ratchet.sh's RATCHET tsv into scripts/eval/results/, uploads it as an
-# artifact, then hands off to scripts/eval/file-regressions.sh (#790) which files
-# ONE deduplicated issue per rung that behaviorally regressed vs the last green
-# baseline.
+# (task subset x {single,crew} modes x a cheap local coder model, N trials)
+# via scripts/eval/sweep.sh (#804/#818: model-major, crash-resumable, honest
+# infra classification), captures the RATCHET tsv into scripts/eval/results/,
+# uploads it as an artifact, then hands off to
+# scripts/eval/file-regressions.sh (#790) which files ONE deduplicated issue
+# per rung that behaviorally regressed vs the last green baseline.
 #
 # Sibling live tier: .github/workflows/eval-live.yml (weekly BAT/UAT). This one
 # is the *nightly* tier and lives inside the 00:00-05:00 UTC low-cost window.
@@ -93,39 +94,47 @@ jobs:
           cargo build --release --bin newt
           cargo build --release --bin newt-eval
 
-      # Run the v1 tier through the REAL ratchet.sh interface
-      # (--task / --mode single|crew / --model [/ --coder]). ratchet.sh has no
-      # --trials flag, so we loop trials here and append every RATCHET tsv line
-      # to one results file. A rung failing does not abort the tier.
-      - name: Run v1 ratchet tier
+      # Run the v1 tier through scripts/eval/sweep.sh (#804/#818) — the
+      # multi-trial driver over ratchet.sh: model-major grouping, crash resume
+      # (re-dispatching this workflow the SAME DAY tops up the same sweep dir
+      # instead of restarting from zero), and HONEST trials (infra failures —
+      # dead endpoint, model not pulled, exercised-but-nothing-landed
+      # discrimination per #820 — are classified, not counted as behavioral
+      # rows; see RATCHET.md "Honest trials").
+      #
+      # Requires the runner's LOCAL ~/.newt/eval-sweeps/template.toml (the
+      # {{MODEL}} placeholder config — shape in RATCHET.local.example);
+      # sweep.sh refuses to start without it, which is the honest failure for
+      # an unconfigured runner (no host/key ever lives in this file).
+      #
+      # Exit 2 = incomplete (some cells short after infra retries): the STEP
+      # FAILS so a wedged night is visible, but artifact upload and the
+      # regression filer still run on whatever rows landed (if: always()).
+      - name: Run v1 ratchet tier (sweep.sh)
         env:
           NEWT_BIN: ${{ github.workspace }}/target/release/newt
           NEWT_EVAL_BIN: ${{ github.workspace }}/target/release/newt-eval
           CARGO_TARGET_DIR: ${{ github.workspace }}/target
         run: |
           set -uo pipefail
-          results="scripts/eval/results/nightly-$(date -u +%F).tsv"
-          : > "$results"
+          day="$(date -u +%F)"
+          out="scripts/eval/results/sweeps/nightly-$day"
+          rc=0
+          scripts/eval/sweep.sh --out "$out" \
+            --tasks "${EVAL_TASKS// /,}" \
+            --modes "${EVAL_MODES// /,}" \
+            --models "$EVAL_MODEL" \
+            --trials "$EVAL_TRIALS" \
+            --coder --keep none || rc=$?
+          # Preserve the flat-file contract: the artifact glob and
+          # file-regressions.sh's default-baseline discovery (newest other
+          # nightly-*.tsv in results/) predate the sweep-dir layout.
+          results="scripts/eval/results/nightly-$day.tsv"
+          cp "$out/sweep.tsv" "$results" 2>/dev/null || : > "$results"
           echo "RESULTS_FILE=$results" >> "$GITHUB_ENV"
-          for task in $EVAL_TASKS; do
-            for mode in $EVAL_MODES; do
-              for trial in $(seq 1 "$EVAL_TRIALS"); do
-                echo "::group::ratchet $task $mode (trial $trial/$EVAL_TRIALS)"
-                if [ "$mode" = "single" ]; then
-                  scripts/eval/ratchet.sh --task "$task" --mode single \
-                    --model "$EVAL_MODEL" --coder >> "$results" \
-                    || echo "ratchet rc=$? on $task/single trial $trial (non-fatal)"
-                else
-                  scripts/eval/ratchet.sh --task "$task" --mode crew \
-                    --model "$EVAL_MODEL" >> "$results" \
-                    || echo "ratchet rc=$? on $task/crew trial $trial (non-fatal)"
-                fi
-                echo "::endgroup::"
-              done
-            done
-          done
-          echo "=== $results ==="
+          echo "=== $results (sweep rc=$rc; 2 = incomplete — re-run this workflow to top up) ==="
           cat "$results"
+          exit "$rc"
 
       - name: Upload results
         if: always()
