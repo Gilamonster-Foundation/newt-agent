@@ -1,0 +1,26 @@
+# RATCHET.local.example — placeholder templates for the operator's LOCAL
+# eval configs. Copy these OUT of the repo (they are examples, not config):
+# real endpoints/hosts live ONLY in the operator's ~/.newt and are never
+# committed (RATCHET.md security invariant).
+#
+# ── sweep.sh model template ─────────────────────────────────────────────
+# sweep.sh generates one ephemeral $NEWT_CONFIG per swept model by replacing
+# {{MODEL}} in a template. Install as ~/.newt/eval-sweeps/template.toml
+# (or point --config-template at it). This closes the crew-mode label
+# hazard: ratchet.sh's --model is label-only in crew mode — the model that
+# actually runs comes from $NEWT_CONFIG — so sweep.sh derives BOTH from the
+# same variable.
+#
+# providers = []
+# default_tier_order = ["FAST", "STANDARD", "COMPLEX", "REVIEW"]
+#
+# [[backends]]
+# name = "eval"
+# endpoint = "http://YOUR-INFERENCE-HOST:11434"   # never commit a real host
+# model = "{{MODEL}}"                             # substituted per swept model
+# tiers = ["FAST", "STANDARD", "COMPLEX", "REVIEW"]
+# kind = "ollama"
+#
+# ── single fixed-model config (one ratchet.sh cell by hand) ─────────────
+# Same shape with a literal model name instead of {{MODEL}}, e.g.
+# model = "qwen2.5-coder:7b".

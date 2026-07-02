@@ -38,7 +38,9 @@ while [ $# -gt 0 ]; do
     *) echo "ratchet: unknown arg '$1'" >&2; exit 2;;
   esac
 done
-[ -n "$TASK" ] && [ -n "$MODE" ] || { echo "usage: ratchet.sh --task <T> --mode single|crew [...]" >&2; exit 2; }
+if [ -z "$TASK" ] || [ -z "$MODE" ]; then
+  echo "usage: ratchet.sh --task <T> --mode single|crew [...]" >&2; exit 2
+fi
 CASE_DIR="$CASES_DIR/$TASK"
 [ -f "$CASE_DIR/case.toml" ] || { echo "ratchet: no case at $CASE_DIR" >&2; exit 2; }
 
@@ -70,7 +72,9 @@ case "$MODE" in
     base="$(cd "$throw" && git rev-parse HEAD)"
     echo "ratchet: crew run on $TASK in $throw (max-leaves $MAX_LEAVES, timeout ${TIMEOUT}s)" >&2
     # The autonomous loop. --one-shot is the headless approval. Crew roster from ~/.newt.
-    CARGO_TARGET_DIR="$TARGET" timeout "$TIMEOUT" \
+    # -k 60: timeout setpgid()s newt into its own process group, which escapes an
+    # outer group-kill — escalate to SIGKILL so a TERM-immune run can't orphan.
+    CARGO_TARGET_DIR="$TARGET" timeout -k 60 "$TIMEOUT" \
       "$NEWT" plan --goal "$prompt" --one-shot --dir "$throw" --max-leaves "$MAX_LEAVES" \
       >"$throw/.plan.log" 2>&1
     plan_rc=$?
