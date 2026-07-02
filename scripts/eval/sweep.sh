@@ -13,12 +13,15 @@
 #
 # HONEST TRIALS: a row counts toward n only if the model was actually
 # exercised. Rows that are really infrastructure failures wearing a FAIL
-# label — crew "no_crew_branch" (newt plan never produced work, e.g. dead
-# endpoint / model not pulled) or single-mode output with an EMPTY tests_pass
-# (the evaluator never ran) — are logged to errors.log and retried on resume,
-# never appended. If a model group's FIRST contact is an infra failure the
-# whole group is skipped this invocation (dead-endpoint canary): a 20-hour
-# sweep must not fill with well-formed connection noise and report DONE.
+# label — crew "no_crew_branch_infra" (dead endpoint / model not pulled;
+# ratchet.sh discriminates from the plan log, #820) or single-mode output
+# with an EMPTY tests_pass (the evaluator never ran) — are logged to
+# errors.log and retried on resume, never appended. A crew run where real
+# inference happened but nothing landed ("no_crew_branch_exercised") is a
+# LEGITIMATE behavioral FAIL and counts. If a model group's FIRST contact
+# is an infra failure the whole group is skipped this invocation
+# (dead-endpoint canary): a 20-hour sweep must not fill with well-formed
+# connection noise and report DONE.
 #
 # MODEL/ENDPOINT PAIRING: in crew mode ratchet.sh's --model is label-only —
 # what actually runs comes from $NEWT_CONFIG (newt plan honors it). In single
@@ -129,14 +132,21 @@ validate_row() { # row model
 }
 
 # Infra classification: a row whose FAIL is really "the model was never
-# exercised". crew: newt plan produced no crew/* branch. single: the
-# evaluator emitted no tests_pass value at all.
+# exercised". crew: ratchet's no_crew_branch_infra marker (or the legacy
+# bare no_crew_branch, kept conservative); no_crew_branch_exercised means
+# real inference happened and the crew landed nothing — a LEGITIMATE
+# behavioral FAIL that counts toward n (#820). single: the evaluator
+# emitted no tests_pass value at all.
 row_is_infra() { # row
   local mode details tp
   mode="$(printf '%s' "$1" | awk -F'\t' '{print $3}')"
   details="$(printf '%s' "$1" | awk -F'\t' '{print $6}')"
   case "$mode" in
-    crew) case "$details" in *no_crew_branch*) return 0;; esac;;
+    crew)
+      case "$details" in
+        *no_crew_branch_exercised*) return 1;;
+        *no_crew_branch*) return 0;;
+      esac;;
     single)
       tp="$(printf '%s' "$details" | sed -n 's/.*tests_pass=\([^ ]*\).*/\1/p')"
       [ -z "$tp" ] && return 0;;
@@ -254,12 +264,16 @@ self_test() {
   t "validate_row rejects a mislabeled row"  '! validate_row "$bad" m1'
   t "validate_row rejects a non-row"         '! validate_row "timed out" m1'
 
-  local infra_crew infra_single beh_single beh_crew
+  local infra_crew infra_single beh_single beh_crew infra_marked exercised
   infra_crew="$(printf 'RATCHET\tT2\tcrew\tm1\tFAIL\tplan_rc=1 no_crew_branch (see x)')"
+  infra_marked="$(printf 'RATCHET\tT2\tcrew\tm1\tFAIL\tplan_rc=1 no_crew_branch_infra (see x)')"
+  exercised="$(printf 'RATCHET\tT2\tcrew\tm1\tFAIL\tplan_rc=1 no_crew_branch_exercised dir=/x')"
   infra_single="$(printf 'RATCHET\tT2\tsingle\tm1\tFAIL\ttests_pass= all_evaluators_ok=no')"
   beh_single="$(printf 'RATCHET\tT2\tsingle\tm1\tFAIL\ttests_pass=fail all_evaluators_ok=no')"
   beh_crew="$(printf 'RATCHET\tT2\tcrew\tm1\tFAIL\tleaves=3 plan_rc=1 dir=/x')"
-  t "row_is_infra: crew no_crew_branch"      'row_is_infra "$infra_crew"'
+  t "row_is_infra: legacy bare no_crew_branch"        'row_is_infra "$infra_crew"'
+  t "row_is_infra: marked no_crew_branch_infra"       'row_is_infra "$infra_marked"'
+  t "row_is_infra: EXERCISED no-land counts as trial" '! row_is_infra "$exercised"'
   t "row_is_infra: single empty tests_pass"  'row_is_infra "$infra_single"'
   t "row_is_infra: real single FAIL counts"  '! row_is_infra "$beh_single"'
   t "row_is_infra: real crew FAIL counts"    '! row_is_infra "$beh_crew"'
