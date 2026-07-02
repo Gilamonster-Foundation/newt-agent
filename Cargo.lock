@@ -11,7 +11,7 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 [[package]]
 name = "agent-bridle"
 version = "0.1.0"
-source = "git+https://github.com/Gilamonster-Foundation/agent-bridle?branch=feat%2Fstep-up-decision-mvp#cb7e1ea3192ca125c1756d3e9f24e3064f258118"
+source = "git+https://github.com/Gilamonster-Foundation/agent-bridle?rev=cb7e1ea3192ca125c1756d3e9f24e3064f258118#cb7e1ea3192ca125c1756d3e9f24e3064f258118"
 dependencies = [
  "agent-bridle-core",
  "agent-bridle-tool-shell",
@@ -21,7 +21,7 @@ dependencies = [
 [[package]]
 name = "agent-bridle-core"
 version = "0.1.0"
-source = "git+https://github.com/Gilamonster-Foundation/agent-bridle?branch=feat%2Fstep-up-decision-mvp#cb7e1ea3192ca125c1756d3e9f24e3064f258118"
+source = "git+https://github.com/Gilamonster-Foundation/agent-bridle?rev=cb7e1ea3192ca125c1756d3e9f24e3064f258118#cb7e1ea3192ca125c1756d3e9f24e3064f258118"
 dependencies = [
  "agent-mesh-protocol",
  "anyhow",
@@ -33,7 +33,7 @@ dependencies = [
 [[package]]
 name = "agent-bridle-tool-shell"
 version = "0.1.0"
-source = "git+https://github.com/Gilamonster-Foundation/agent-bridle?branch=feat%2Fstep-up-decision-mvp#cb7e1ea3192ca125c1756d3e9f24e3064f258118"
+source = "git+https://github.com/Gilamonster-Foundation/agent-bridle?rev=cb7e1ea3192ca125c1756d3e9f24e3064f258118#cb7e1ea3192ca125c1756d3e9f24e3064f258118"
 dependencies = [
  "agent-bridle-core",
  "anyhow",
@@ -46,7 +46,7 @@ dependencies = [
 [[package]]
 name = "agent-bridle-tool-web"
 version = "0.1.0"
-source = "git+https://github.com/Gilamonster-Foundation/agent-bridle?branch=feat%2Fstep-up-decision-mvp#cb7e1ea3192ca125c1756d3e9f24e3064f258118"
+source = "git+https://github.com/Gilamonster-Foundation/agent-bridle?rev=cb7e1ea3192ca125c1756d3e9f24e3064f258118#cb7e1ea3192ca125c1756d3e9f24e3064f258118"
 dependencies = [
  "agent-bridle-core",
  "anyhow",
@@ -3626,19 +3626,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 
 [[package]]
-name = "plist"
-version = "1.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "092791278e026273c1b65bbdcfbba3a300f2994c896bd01ab01da613c29c46f1"
-dependencies = [
- "base64 0.22.1",
- "indexmap",
- "quick-xml",
- "serde",
- "time",
-]
-
-[[package]]
 name = "plugins-protocol"
 version = "0.6.8"
 dependencies = [
@@ -3874,15 +3861,6 @@ dependencies = [
  "pyo3-build-config",
  "quote",
  "syn 2.0.117",
-]
-
-[[package]]
-name = "quick-xml"
-version = "0.39.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cdcc8dd4e2f670d309a5f0e83fe36dfdc05af317008fea29144da1a2ac858e5e"
-dependencies = [
- "memchr",
 ]
 
 [[package]]
@@ -4929,11 +4907,9 @@ dependencies = [
  "flate2",
  "fnv",
  "once_cell",
- "plist",
  "regex-syntax",
  "serde",
  "serde_derive",
- "serde_json",
  "thiserror 2.0.18",
  "walkdir",
  "yaml-rust",
