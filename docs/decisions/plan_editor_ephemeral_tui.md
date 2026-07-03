@@ -16,7 +16,7 @@ the teardown bug this surface must not repeat), `docs/decisions/mesh_integration
 ## TL;DR
 
 The `/plan` collaborative planner stores its plan as a **plain-text TOML
-front-matter document** (`.newt/sessions/<id>/plan.md`) whose `[[subtask]]`
+front-matter document** (`.scratch/sessions/<id>/plan.md`) whose `[[subtask]]`
 table is the swarm `Plan`/`Subtask` struct (see #332, "Option C"). That format
 is the most powerful and the only one that lifts single-agent → swarm without a
 rewrite — but it is **hostile to hand-edit**. To let a human edit it without
@@ -71,7 +71,7 @@ in tiers of escalating interactivity, all **default to the plain scroller**:
    instruction / context files / verify command. `E` drops the whole `plan.md`
    into `$EDITOR` (vi) for a long free-text edit. On save it serializes back to
    the canonical TOML.
-4. **Approve** — the plan is written to `.newt/sessions/<id>/plan.md`.
+4. **Approve** — the plan is written to `.scratch/sessions/<id>/plan.md`.
 5. **Execute** — one subtask per turn, each in a fresh narrow context (#332 S3).
 
 Steps 1, 2, 4, 5 never touch the alt screen. Step 3 is the only new surface, and
@@ -86,7 +86,7 @@ it is **opt-in and human-initiated**.
    opens it implicitly. The propose/discuss/approve/execute path is plain
    scroller.
 3. **The plain-text plan document is the source of truth.** The editor mutates
-   an in-memory `Plan` and serializes to `.newt/sessions/<id>/plan.md`. The file
+   an in-memory `Plan` and serializes to `.scratch/sessions/<id>/plan.md`. The file
    is fully usable without the editor — editable by hand in vi, over a dumb
    terminal, or generated headlessly. The editor adds zero capability that the
    file does not already express.

@@ -60,8 +60,8 @@ fn git(dir: &Path, args: &[&str]) -> anyhow::Result<String> {
 }
 
 /// A [`Workspace`] backed by an **isolated git worktree** under
-/// `<base>/.newt/worktrees/<id>/` (gitignored, inside cwd so writes stay within
-/// the fs confinement). Edits land in the worktree, never the live tree;
+/// `<base>/.scratch/worktrees/<id>/` (self-ignored, inside cwd so writes stay
+/// within the fs confinement). Edits land in the worktree, never the live tree;
 /// `run_test` shells the verification command there. `Drop` removes the worktree.
 pub struct WorktreeWorkspace {
     /// The original repo (where `git worktree` commands run).
@@ -73,11 +73,16 @@ pub struct WorktreeWorkspace {
 }
 
 impl WorktreeWorkspace {
-    /// Create a detached worktree at `<base>/.newt/worktrees/<id>` off
+    /// Create a detached worktree at `<base>/.scratch/worktrees/<id>` off
     /// `base_ref` (any git commit-ish — a sha, branch, or `HEAD`). `base` must be
     /// a git repo with at least one commit.
     pub fn create(base: &Path, id: &str, base_ref: &str, test_cmd: String) -> anyhow::Result<Self> {
-        let worktree = base.join(".newt").join("worktrees").join(id);
+        // #844: crew scratch (worktrees + the shared cargo target) lives under
+        // `.scratch/`, which `ensure_scratch` self-ignores (`.scratch/.gitignore`
+        // = `*`) so it is never committable — no more `.newt/crew-target` swept
+        // into a commit by `git add -A`.
+        newt_core::scratch::ensure_scratch(base)?;
+        let worktree = base.join(".scratch").join("worktrees").join(id);
         if let Some(parent) = worktree.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -258,7 +263,7 @@ impl Workspace for WorktreeWorkspace {
 /// incrementally instead of each cold. `base` is absolute (the `--dir`/cwd root),
 /// so the path stays absolute and a leaf's own cwd never relativizes it.
 fn crew_shared_target_dir(base: &Path) -> PathBuf {
-    base.join(".newt/crew-target")
+    base.join(".scratch/crew-target")
 }
 
 // ---------------------------------------------------------------------------
@@ -2242,7 +2247,7 @@ mod tests {
         #[cfg(not(windows))]
         let root = Path::new("/tmp/throw");
         let a = crew_shared_target_dir(root);
-        assert!(a.ends_with(".newt/crew-target"), "{a:?}");
+        assert!(a.ends_with(".scratch/crew-target"), "{a:?}");
         assert!(a.is_absolute(), "must be absolute: {a:?}");
         assert_eq!(crew_shared_target_dir(root), a);
     }
@@ -2660,7 +2665,7 @@ mod tests {
         // dry-run never builds a worktree or dispatches.
         let code = run_with(&cfg, args, &RoleMock).await.unwrap();
         assert_eq!(code, 0);
-        assert!(!repo.path().join(".newt/worktrees").exists());
+        assert!(!repo.path().join(".scratch/worktrees").exists());
     }
 
     // -- #687: grounding surfaces the real definition, not an earlier-sorting decoy --

@@ -4482,7 +4482,7 @@ fn run_chat(
         Some(conversation_store_for(workspace, &cfg)?)
     };
     // A session always has a conversation id, assigned up front so the
-    // per-session plan path (`.newt/sessions/<id>/plan.md`, issue #220) is
+    // per-session plan path (`.scratch/sessions/<id>/plan.md`, issue #220) is
     // stable from the first turn. The durable conversation record adopts this
     // id when the first turn is saved.
     let mut active_conversation_id: String = newt_core::new_conversation_id();
@@ -7194,7 +7194,7 @@ fn handle_new_conversation(
     session_opted_fresh: &mut bool,
 ) -> String {
     // A new conversation gets a fresh id, which rotates the per-session plan
-    // path to a new `.newt/sessions/<id>/` dir (issue #220).
+    // path to a new `.scratch/sessions/<id>/` dir (issue #220).
     *conversation_id = newt_core::new_conversation_id();
     // Re-arm compression anti-thrash (F4): the disable notice promises
     // "start a new conversation to reset" — this is what makes that true.
@@ -11985,10 +11985,10 @@ mod skills_integration_tests {
         let prompt = build_system_prompt_with_soul(
             tmp.path().to_str().unwrap(),
             Some("You are a custom agent."),
-            ".newt/sessions/xyz/plan.md",
+            ".scratch/sessions/xyz/plan.md",
         );
         assert!(prompt.contains("You are a custom agent."));
-        assert!(prompt.contains(".newt/sessions/xyz/plan.md"));
+        assert!(prompt.contains(".scratch/sessions/xyz/plan.md"));
     }
 
     #[serial_test::serial(real_fs)]
