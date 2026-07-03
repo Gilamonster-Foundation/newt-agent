@@ -40,6 +40,7 @@ pub mod ssh_caveats;
 pub mod store;
 pub mod symbols;
 pub mod tokens;
+pub mod tooling;
 pub mod tuning;
 pub mod verify_gate;
 pub mod workspace_key;

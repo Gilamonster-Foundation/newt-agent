@@ -1,0 +1,31 @@
+# Tooling pack template (#880). Drop a copy into `~/.newt/tooling/<name>.toml` to
+# teach the crew a new toolchain — or reuse a built-in `name` (rust/python/go) to
+# OVERRIDE it — with no recompile. A repo may match SEVERAL packs (each matching
+# toolchain's phase command runs) or NONE.
+#
+# A pack maps a toolchain to its lifecycle-phase commands. A repo can also
+# override any phase directly in its own `.newt/config.toml`:
+#
+#   [lifecycle]
+#   format = "cargo fmt"
+#   check  = "just check"
+#   clean  = "just clean"
+#
+# and override per-run with the `NEWT_CREW_NORMALIZE` env var (a command, or
+# `none`/empty to disable the format phase).
+
+# The merge / drop-in key. Matching a built-in name replaces it; a new name adds
+# a toolchain.
+name = "zig"
+
+# Marker files whose presence at the repo root selects this toolchain. ANY match.
+detect = ["build.zig", "build.zig.zon"]
+
+# The command per lifecycle phase. All optional — set only what applies.
+# Vocabulary: setup, format, lint, test, check, clean.
+[phases]
+setup  = "zig build --fetch"
+format = "zig fmt ."
+test   = "zig build test"
+check  = "zig build test"
+clean  = "rm -rf zig-cache zig-out"

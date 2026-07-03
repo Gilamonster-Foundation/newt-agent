@@ -30,32 +30,22 @@ pub fn infer_test_command(dir: &Path) -> Option<String> {
     }
 }
 
-/// The repo-convention **normalize/format** command (#880), inferred like
-/// [`infer_test_command`] — de-hard-coded per ecosystem, NOT a fixed `cargo fmt`.
-/// Run before the crew commits so a model quirk (e.g. a dropped trailing newline)
-/// does not bounce off the gate's `fmt --check`. `None` = nothing to normalize.
-pub fn infer_normalize_command(dir: &Path) -> Option<String> {
-    let has = |name: &str| dir.join(name).exists();
-    if has("Cargo.toml") {
-        Some("cargo fmt".to_string())
-    } else if has("pyproject.toml") {
-        Some("ruff format .".to_string())
-    } else if has("go.mod") {
-        Some("gofmt -w .".to_string())
-    } else {
-        None
-    }
-}
-
-/// The normalize command the crew finalize runs: the `NEWT_CREW_NORMALIZE` env
-/// override (a command, or `none`/empty to DISABLE) wins over the repo-inferred
-/// default — configuration over convention. A per-crew config-file key is a
-/// follow-up (mirrors the `[scratch] dir` bridge).
-pub fn normalize_command(dir: &Path) -> Option<String> {
+/// The normalize/format commands the crew finalize runs (in the worktree) before
+/// it commits, so a model quirk (e.g. a dropped trailing newline) doesn't bounce
+/// off the gate's `fmt --check` (#880).
+///
+/// De-hard-coded: the toolchain → formatter mapping is DATA — composable
+/// [`newt_core::tooling`] packs (built-in + `~/.newt/tooling/*.toml` drop-ins),
+/// so a polyglot repo runs SEVERAL formatters and an unknown repo runs NONE. The
+/// `NEWT_CREW_NORMALIZE` env override wins (a single command, or `none`/empty to
+/// DISABLE) — configuration over convention.
+pub fn crew_normalize_commands(dir: &Path) -> Vec<String> {
     match std::env::var("NEWT_CREW_NORMALIZE") {
-        Ok(v) if v.trim().is_empty() || v.trim().eq_ignore_ascii_case("none") => None,
-        Ok(v) => Some(v),
-        Err(_) => infer_normalize_command(dir),
+        Ok(v) if v.trim().is_empty() || v.trim().eq_ignore_ascii_case("none") => Vec::new(),
+        Ok(v) => vec![v],
+        Err(_) => {
+            newt_core::tooling::resolved_phase_commands(dir, newt_core::tooling::Phase::Format)
+        }
     }
 }
 
@@ -152,32 +142,32 @@ impl WorktreeWorkspace {
     /// dropped trailing newline) doesn't bounce off the gate's `fmt --check`.
     /// Best-effort: a missing/failing formatter warns and the commit still lands.
     fn normalize(&self) {
-        let Some(cmd) = normalize_command(&self.worktree) else {
-            return;
-        };
-        #[cfg(unix)]
-        let mut c = {
-            let mut c = Command::new("sh");
-            c.arg("-c").arg(&cmd);
-            c
-        };
-        #[cfg(windows)]
-        let mut c = {
-            let mut c = Command::new("cmd");
-            c.arg("/C").arg(&cmd);
-            c
-        };
-        c.env("CARGO_TARGET_DIR", crew_shared_target_dir(&self.base));
-        match c.current_dir(&self.worktree).output() {
-            Ok(o) if !o.status.success() => {
-                eprintln!("  crew normalize (`{cmd}`) failed — committing unformatted; the gate may flag it");
+        // A polyglot repo can match several tooling packs → run every formatter.
+        for cmd in crew_normalize_commands(&self.worktree) {
+            #[cfg(unix)]
+            let mut c = {
+                let mut c = Command::new("sh");
+                c.arg("-c").arg(&cmd);
+                c
+            };
+            #[cfg(windows)]
+            let mut c = {
+                let mut c = Command::new("cmd");
+                c.arg("/C").arg(&cmd);
+                c
+            };
+            c.env("CARGO_TARGET_DIR", crew_shared_target_dir(&self.base));
+            match c.current_dir(&self.worktree).output() {
+                Ok(o) if !o.status.success() => {
+                    eprintln!("  crew normalize (`{cmd}`) failed — committing unformatted; the gate may flag it");
+                }
+                Err(e) => {
+                    eprintln!(
+                        "  crew normalize (`{cmd}`) could not run ({e}) — committing unformatted"
+                    );
+                }
+                _ => {}
             }
-            Err(e) => {
-                eprintln!(
-                    "  crew normalize (`{cmd}`) could not run ({e}) — committing unformatted"
-                );
-            }
-            _ => {}
         }
     }
 
@@ -2480,29 +2470,15 @@ mod tests {
     }
 
     #[test]
-    fn infer_normalize_command_is_per_ecosystem_not_hardcoded_cargo_fmt() {
-        // #880: de-hard-coded — the formatter follows the repo's ecosystem.
+    fn crew_normalize_commands_come_from_tooling_packs() {
+        // #880: the toolchain→formatter mapping is DATA (newt_core::tooling), so
+        // a Cargo repo resolves `cargo fmt` and an unmarked dir resolves nothing.
+        // (The pack detection/merge/multiple-toolchain logic is tested in
+        // newt_core::tooling; here we confirm the crew wires through to it.)
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(
-            infer_normalize_command(dir.path()),
-            None,
-            "no markers → None"
-        );
-        std::fs::write(dir.path().join("go.mod"), "").unwrap();
-        assert_eq!(
-            infer_normalize_command(dir.path()).as_deref(),
-            Some("gofmt -w .")
-        );
-        std::fs::write(dir.path().join("pyproject.toml"), "").unwrap();
-        assert_eq!(
-            infer_normalize_command(dir.path()).as_deref(),
-            Some("ruff format .")
-        );
+        assert!(crew_normalize_commands(dir.path()).is_empty());
         std::fs::write(dir.path().join("Cargo.toml"), "").unwrap();
-        assert_eq!(
-            infer_normalize_command(dir.path()).as_deref(),
-            Some("cargo fmt")
-        );
+        assert!(crew_normalize_commands(dir.path()).contains(&"cargo fmt".to_string()));
     }
 
     #[test]

@@ -46,6 +46,13 @@ pub struct Config {
     /// override is specified.
     pub default_tier_order: Vec<Tier>,
 
+    /// `[lifecycle]` — the repo's build/dev commands per lifecycle phase
+    /// (`format`, `check`, `clean`, …), #880. Overrides the per-ecosystem tooling
+    /// packs. Applied in [`Config::resolve`] via
+    /// [`crate::tooling::set_lifecycle_override`].
+    #[serde(default)]
+    pub lifecycle: Option<crate::tooling::PhaseCommands>,
+
     /// Optional NVIDIA DGX endpoint-management config powering the
     /// `newt dgx` command suite. `None` when unconfigured — newt never
     /// dials a DGX endpoint unless this (or a `NEWT_DGX_*` env var) is set.
@@ -2676,6 +2683,7 @@ impl Default for Config {
             backends: vec![fallback_localhost_backend()],
             providers: Vec::new(),
             default_tier_order: vec![Tier::Fast, Tier::Standard, Tier::Complex, Tier::Review],
+            lifecycle: None,
             dgx: None,
             tui: None,
             context: None,
@@ -2798,6 +2806,12 @@ impl Config {
         // cowork driver, eval) gets the override here without threading a new
         // `usize` through `ChatCtx` + `execute_tool` + every call site. Idempotent.
         crate::agentic::set_max_output_tokens(cfg.max_output_tokens());
+        // #880: publish the repo `[lifecycle]` overrides the same way — the single
+        // canonical config-application entry — so the crew's normalize (and future
+        // phase consumers) honor `.newt/config.toml`.
+        if let Some(lc) = &cfg.lifecycle {
+            crate::tooling::set_lifecycle_override(lc.clone());
+        }
         Ok(cfg)
     }
 
