@@ -858,6 +858,75 @@ pub fn venv_cmd_prefix() -> Option<String> {
     }
 }
 
+/// Build the venv/exec-path environment as a `{KEY:VALUE}` map for the confined
+/// shell's structured `env` seam (agent-bridle, newt #783).
+///
+/// Same inputs as [`venv_cmd_prefix`] — `NEWT_VENV` (preferred) or
+/// `$VIRTUAL_ENV`, plus `NEWT_EXEC_PATHS` — but delivered as host-supplied env
+/// vars set directly on the spawned child instead of `export …;` text prepended
+/// to the command. The `export` form is the #783 root cause: `export` is a
+/// shell builtin, not a program, so the confined safe-subset engine refuses it
+/// on a compound command (`a; b | c`). Passing the vars through the env seam
+/// sidesteps that entirely and never touches the command text.
+///
+/// `PATH` is the venv `bin` (then any `NEWT_EXEC_PATHS` dirs) *prepended* to the
+/// inherited host `PATH`: the env seam sets the value additively over the
+/// child's ambient environment, so we read the host `PATH` here and build the
+/// full string rather than relying on a `$PATH` expansion inside the value.
+/// Returns an empty map when neither input is set (no env key is sent).
+fn venv_env_map() -> std::collections::BTreeMap<String, String> {
+    let mut map = std::collections::BTreeMap::new();
+    let venv = std::env::var("NEWT_VENV")
+        .or_else(|_| std::env::var("VIRTUAL_ENV"))
+        .ok();
+    let exec_paths = std::env::var("NEWT_EXEC_PATHS").ok();
+
+    if venv.is_none() && exec_paths.is_none() {
+        return map;
+    }
+
+    // Dirs to prepend to PATH (venv/bin first, then any exec-paths), mirroring
+    // venv_cmd_prefix's ordering.
+    let mut path_dirs: Vec<String> = Vec::new();
+    if let Some(ref venv) = venv {
+        map.insert("VIRTUAL_ENV".to_string(), venv.clone());
+        path_dirs.push(format!("{venv}/bin"));
+    }
+    if let Some(ref paths) = exec_paths {
+        for dir in paths.split(':') {
+            if !dir.is_empty() {
+                path_dirs.push(dir.to_string());
+            }
+        }
+    }
+
+    if !path_dirs.is_empty() {
+        let prepend = path_dirs.join(":");
+        let path = match std::env::var("PATH") {
+            Ok(inherited) if !inherited.is_empty() => format!("{prepend}:{inherited}"),
+            _ => prepend,
+        };
+        map.insert("PATH".to_string(), path);
+    }
+
+    map
+}
+
+/// Build the dispatch args for agent-bridle's confined `shell` tool (#783): the
+/// RAW user command (free-form `cmd` mode) plus the venv carried through the
+/// structured `env` seam ([`venv_env_map`]). Deliberately NO `export …;` prefix
+/// on `cmd` — that is what the confined safe-subset engine refuses on a
+/// compound command (the #783 root cause); the env seam sets `VIRTUAL_ENV` /
+/// `PATH` on the spawned child instead. The host-bypass (`--yolo`) path keeps
+/// the prefix form because it runs on a real `/bin/sh` where `export` works.
+fn confined_dispatch_args(cmd: &str, workspace: &str) -> serde_json::Value {
+    serde_json::json!({
+        "cmd": cmd,
+        "cwd": workspace,
+        "env": venv_env_map(),
+    })
+}
+
 // ---------------------------------------------------------------------------
 // INTERIM (#297): the --disable-ocap / --yolo exec escape hatch
 // ---------------------------------------------------------------------------
@@ -2005,8 +2074,15 @@ pub async fn execute_tool(
             // a re-export of `agent_mesh_protocol::caveats::Caveats` — the exact
             // type `Registry::dispatch` expects, so no conversion is needed.
             //
-            // Inject venv env vars if active: the confined shell does not inherit
-            // the host environment, so we prepend export statements to the cmd.
+            // Venv injection (#783): the confined shell carries the venv via
+            // agent-bridle's structured `env` seam (see `confined_dispatch_args`
+            // / `venv_env_map`), NOT by prepending `export …;` to the command —
+            // an `export` builtin is not a program, so the safe-subset engine
+            // refuses it on a compound command (the #783 root cause).
+            //
+            // `cmd_with_venv` (the `export …;`-prefixed form) is built ONLY for
+            // the host-bypass path below: that runs on a real `/bin/sh` where
+            // `export` is a genuine builtin and the prefix works correctly.
             let cmd_with_venv = match venv_cmd_prefix() {
                 Some(prefix) => format!("{prefix}{cmd}"),
                 None => cmd.to_string(),
@@ -2036,10 +2112,9 @@ pub async fn execute_tool(
                 };
             }
 
-            let dispatch_args = serde_json::json!({
-                "cmd": cmd_with_venv,
-                "cwd": workspace,
-            });
+            // #783: RAW cmd + venv via the env seam — never the `export …;`
+            // prefix, which the confined safe-subset engine refuses.
+            let dispatch_args = confined_dispatch_args(cmd, workspace);
             match agent_bridle::registry()
                 .dispatch("shell", dispatch_args.clone(), caveats)
                 .await
@@ -5830,12 +5905,12 @@ mod disable_ocap_tests {
         }
     }
 
-    /// FLAG OFF = bit-for-bit current behavior, pinned. On this stub-shell
-    /// build (the publishable configuration, see the [patch.crates-io] note)
-    /// the bridle dispatch fails closed with the tracking-issue error for
-    /// EVERY command — exactly the operator-reported breakage #297 hatches
-    /// around. Restore-from-history note: like the newt-tui confinement
-    /// tests, this assertion changes when the real brush shell returns.
+    /// FLAG OFF ⇒ the command goes to the confined dispatch, which governs it.
+    /// Built against the agent-bridle env-seam branch (#783), the bridle ships
+    /// the REAL safe-subset shell (not the old fail-closed stub), so an
+    /// ungranted `echo` under `exec = none` is DENIED by the L3 boundary. This
+    /// is the "when the real shell returns" case the prior stub-build note
+    /// anticipated; the "unavailable in this build" stub error is retired.
     #[tokio::test]
     async fn flag_off_run_command_keeps_the_confined_dispatch_verbatim() {
         let _l = env_lock().await;
@@ -5849,10 +5924,9 @@ mod disable_ocap_tests {
             &caveats,
         )
         .await;
-        assert!(out.starts_with("error:"), "got: {out}");
         assert!(
-            out.contains("unavailable in this build"),
-            "the stub dispatch error must surface unchanged, got: {out}"
+            out.contains("capability denied"),
+            "flag off ⇒ the confined dispatch must govern (deny) the command, got: {out}"
         );
     }
 
@@ -6014,7 +6088,7 @@ mod disable_ocap_tests {
     /// an exec FLOOR that denies the command must STOP the unconfined bypass.
     /// `echo` is outside a readonly floor (`exec = none`), so even with yolo on
     /// it does NOT run on the host shell — it falls through to the confined
-    /// dispatch, which on this stub-shell build fails closed. A deliberately
+    /// dispatch, which (env-seam real shell) DENIES it. A deliberately
     /// restricted triage mode is NOT un-clamped by `--yolo`.
     #[tokio::test]
     async fn floor_blocks_disable_ocap_for_a_denied_exec() {
@@ -6037,15 +6111,11 @@ mod disable_ocap_tests {
         )
         .await;
         // The bypass did NOT fire: the command never reached the host shell, so
-        // we see the confined-dispatch error, not `should-not-run\n`.
+        // it fell to the confined dispatch and was denied, not `should-not-run\n`.
         assert_ne!(out, "should-not-run\n", "the floor must block the bypass");
         assert!(
-            out.starts_with("error:"),
-            "fell to confined dispatch: {out}"
-        );
-        assert!(
-            out.contains("unavailable in this build"),
-            "confined stub error surfaces, got: {out}"
+            out.contains("capability denied"),
+            "fell to confined dispatch and was denied, got: {out}"
         );
     }
 
@@ -6080,7 +6150,7 @@ mod disable_ocap_tests {
     /// FLOOR conservatism — a COMPOUND command never bypasses under an active
     /// floor, even if its leading token is allow-listed: `echo ok && rm -rf /`
     /// must not smuggle `rm` past an `echo` grant. It falls to the confined
-    /// shell (stub ⇒ error), which gates each spawn.
+    /// shell (env-seam real shell ⇒ denied), which gates each spawn.
     #[tokio::test]
     async fn floor_refuses_bypass_for_a_compound_command() {
         let _l = env_lock().await;
@@ -6103,9 +6173,11 @@ mod disable_ocap_tests {
         )
         .await;
         assert_ne!(out, "ok\n", "a compound command must not bypass the floor");
+        // Compound ⇒ never bypasses; it falls to the confined shell, which
+        // (env-seam real shell) denies the ungranted command under `exec = none`.
         assert!(
-            out.starts_with("error:"),
-            "fell to confined dispatch: {out}"
+            out.contains("capability denied"),
+            "fell to confined dispatch and was denied, got: {out}"
         );
     }
 
@@ -6157,9 +6229,11 @@ mod disable_ocap_tests {
         assert_eq!(shell_envelope_output(&envelope, 20, false), "out\nerr\n");
     }
 
-    /// The venv/PATH prefix logic rides the host shell unchanged: the same
-    /// `export VIRTUAL_ENV=…; export PATH=…;` prefix the confined shell got
-    /// is prepended to the bypassed command.
+    /// The venv/PATH prefix logic rides the HOST-BYPASS path unchanged: the
+    /// `export VIRTUAL_ENV=…; export PATH=…;` prefix is prepended to the
+    /// `--yolo` command, which runs on a real `/bin/sh` where `export` works.
+    /// (The confined path no longer gets the prefix — it uses the env seam;
+    /// see `confined_dispatch_uses_env_seam_not_export_prefix_783`.)
     #[cfg(unix)]
     #[tokio::test]
     async fn yolo_keeps_the_venv_prefix_logic() {
@@ -6178,6 +6252,61 @@ mod disable_ocap_tests {
         )
         .await;
         assert_eq!(out, "/opt/fake-venv\n");
+    }
+
+    /// #783 regression (Bug A): the confined-shell dispatch carries the RAW
+    /// user command and the venv via agent-bridle's structured `env` seam — NOT
+    /// an `export …;` prefix on `cmd`. The old code built
+    /// `{ "cmd": cmd_with_venv, "cwd": … }` (the prefixed form), and the
+    /// confined safe-subset engine refuses an `export` builtin on a compound
+    /// command, which is the bug. Pure: builds the dispatch args only, no spawn.
+    #[tokio::test]
+    async fn confined_dispatch_uses_env_seam_not_export_prefix_783() {
+        let _l = env_lock().await;
+        let _venv = EnvVar::set("NEWT_VENV", "/opt/fake-venv");
+        let _virtual = EnvVar::unset("VIRTUAL_ENV");
+        let _paths = EnvVar::unset("NEWT_EXEC_PATHS");
+
+        // The literal failing case from #783.
+        let cmd = "hostname; sw_vers 2>/dev/null | head -1; uname -s";
+        let args = confined_dispatch_args(cmd, "/work/dir");
+
+        // The command is passed RAW — no `export …;` prefix smuggled in.
+        assert_eq!(args["cmd"], cmd);
+        assert!(
+            !args["cmd"]
+                .as_str()
+                .expect("cmd is a string")
+                .contains("export "),
+            "confined cmd must not carry an export prefix: {args}"
+        );
+        assert_eq!(args["cwd"], "/work/dir");
+
+        // The venv rides the env seam: VIRTUAL_ENV + venv bin prepended to PATH.
+        assert_eq!(args["env"]["VIRTUAL_ENV"], "/opt/fake-venv");
+        let path = args["env"]["PATH"].as_str().expect("PATH in the env seam");
+        assert!(
+            path.starts_with("/opt/fake-venv/bin"),
+            "venv bin must be prepended to PATH: {path}"
+        );
+    }
+
+    /// #783: with neither venv input set, the env seam is empty (no spurious
+    /// VIRTUAL_ENV / PATH keys) — the no-venv invocation is unaffected.
+    #[tokio::test]
+    async fn confined_dispatch_env_seam_empty_without_venv_783() {
+        let _l = env_lock().await;
+        let _venv = EnvVar::unset("NEWT_VENV");
+        let _virtual = EnvVar::unset("VIRTUAL_ENV");
+        let _paths = EnvVar::unset("NEWT_EXEC_PATHS");
+
+        let args = confined_dispatch_args("ls -la", "/work/dir");
+        assert_eq!(args["cmd"], "ls -la");
+        assert_eq!(
+            args["env"],
+            serde_json::json!({}),
+            "no venv inputs ⇒ empty env map: {args}"
+        );
     }
 
     /// fs fence under yolo (#297): the newt-native workspace fence is NOT
@@ -6417,7 +6546,7 @@ mod disable_ocap_tests {
     /// F5 (§7-F5): `--no-route` bypasses routing but NEVER disables L3. With
     /// `NEWT_NO_ROUTE=1`, the same out-of-bounds `cat` is no longer routed to
     /// `read_file` (no `fs_read` denial), yet it does NOT run unconfined — it
-    /// falls to the confined shell (fail-closed on this stub build), and
+    /// falls to the confined shell (env-seam real shell ⇒ denied), and
     /// `ocap_disabled()` stays false. The boundary holds.
     #[tokio::test]
     async fn no_route_bypasses_routing_but_keeps_l3() {
@@ -6440,9 +6569,9 @@ mod disable_ocap_tests {
             "--no-route must not route to read_file; got: {out}"
         );
         // …and the command did NOT run unconfined: it took the confined shell
-        // (fail-closed on this stub build — the L3 boundary held).
+        // (env-seam real shell ⇒ denied — the L3 boundary held).
         assert!(
-            out.starts_with("error:") && out.contains("unavailable in this build"),
+            out.contains("capability denied"),
             "the L3 confined dispatch must still gate the command; got: {out}"
         );
     }

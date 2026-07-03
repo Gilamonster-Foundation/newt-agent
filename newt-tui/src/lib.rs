@@ -10638,10 +10638,10 @@ mod run_command_confinement_tests {
         }
     }
 
-    /// Stub: shell tool is temporarily unavailable (pending reubeno/brush#1184).
-    /// Both in-scope and out-of-scope commands return the unavailable error.
-    /// Restore the original two tests from git history once brush support lands.
-    /// See: https://github.com/Gilamonster-Foundation/agent-bridle/issues/20
+    /// An allow-listed external command runs under the confined shell. Built
+    /// against the agent-bridle env-seam branch (#783), the bridle ships the
+    /// REAL safe-subset shell (no stub): with `exec` granting `env` and fs
+    /// unrestricted (no Landlock), `env` runs and prints the environment.
     #[cfg(unix)]
     #[serial_test::serial(real_fs)]
     #[tokio::test]
@@ -10673,15 +10673,18 @@ mod run_command_confinement_tests {
         )
         .await;
         assert!(
-            out.contains("unavailable in this build"),
-            "stub error must link to tracking PR, got: {out}"
+            !out.contains("capability denied") && !out.contains("unavailable in this build"),
+            "an allow-listed external command must run, not be denied, got: {out}"
+        );
+        assert!(
+            out.contains('='),
+            "`env` must print KEY=VALUE environment lines, got: {out}"
         );
     }
 
-    /// Stub: shell tool is temporarily unavailable (pending reubeno/brush#1184).
-    /// Out-of-scope commands return the unavailable error, not a caveats denial.
-    /// Restore from git history once brush support lands.
-    /// See: https://github.com/Gilamonster-Foundation/agent-bridle/issues/20
+    /// An out-of-scope command is DENIED by the real safe-subset shell (env-seam
+    /// branch, #783): `env` is not in the `echo`-only exec grant, so the confined
+    /// shell refuses it with a capability denial (not the old stub error).
     #[cfg(unix)]
     #[serial_test::serial(real_fs)]
     #[tokio::test]
@@ -10713,8 +10716,8 @@ mod run_command_confinement_tests {
         )
         .await;
         assert!(
-            out.contains("unavailable in this build"),
-            "stub error must link to tracking PR, got: {out}"
+            out.contains("capability denied"),
+            "an out-of-scope command must be denied by the confined shell, got: {out}"
         );
     }
 
@@ -11219,7 +11222,7 @@ mod disable_ocap_session_tests {
     /// readonly preset clamp STOPS the unconfined bypass for a denied exec. The
     /// preset's exec floor is threaded as `exec_floor`; `echo` is outside it, so
     /// the command does NOT run unconfined — it falls to the confined dispatch
-    /// (stub-shell ⇒ error). A triage mode is NOT un-clamped by `--yolo`.
+    /// (env-seam real shell ⇒ denied). A triage mode is NOT un-clamped by `--yolo`.
     #[cfg(unix)]
     #[serial_test::serial(real_fs)]
     #[tokio::test]
@@ -11261,8 +11264,8 @@ mod disable_ocap_session_tests {
         .await;
         assert_ne!(out, "should-not-run\n", "the floor must block --yolo");
         assert!(
-            out.starts_with("error:"),
-            "fell to confined dispatch: {out}"
+            out.contains("capability denied"),
+            "fell to the confined dispatch and was denied: {out}"
         );
     }
 }
