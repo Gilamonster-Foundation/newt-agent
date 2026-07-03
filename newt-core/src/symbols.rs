@@ -702,4 +702,39 @@ mod tests {
         let json = serde_json::to_string(&v).unwrap();
         assert!(json.contains("\"verdict\":\"fabricated\""));
     }
+
+    /// Exact single-component match against the known set.
+    #[test]
+    fn module_is_known_exact_single_component() {
+        let known: BTreeSet<String> = ["os".to_string()].into_iter().collect();
+        assert!(module_is_known("os", &known));
+    }
+
+    /// A declared root covers a dotted submodule via prefix matching.
+    #[test]
+    fn module_is_known_prefix_covers_submodule() {
+        let known: BTreeSet<String> = ["newt_agent".to_string()].into_iter().collect();
+        assert!(module_is_known("newt_agent.core", &known));
+    }
+
+    /// A completely unrelated module is not considered known.
+    #[test]
+    fn module_is_known_no_match() {
+        let known: BTreeSet<String> = ["os".to_string()].into_iter().collect();
+        assert!(!module_is_known("sys", &known));
+    }
+
+    /// An empty string yields no matching prefix and is not considered known.
+    #[test]
+    fn module_is_known_empty_module() {
+        let known: BTreeSet<String> = ["os".to_string()].into_iter().collect();
+        assert!(!module_is_known("", &known));
+    }
+
+    /// An unrelated set entry must NOT match a dotted prefix (guards false positives).
+    #[test]
+    fn module_is_known_substring_is_not_prefix() {
+        let known: BTreeSet<String> = ["pathlib".to_string()].into_iter().collect();
+        assert!(!module_is_known("os.path", &known));
+    }
 }
