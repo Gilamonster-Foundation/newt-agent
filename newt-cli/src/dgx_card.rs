@@ -19,10 +19,11 @@
 use std::path::{Path, PathBuf};
 
 use newt_core::model_card::{
-    builtin_cards, load_card_file, load_dropin_dir, no_hardware_leak, resolve, ModelCard,
+    builtin_cards, load_card_file, load_dropin_dir, no_hardware_leak, resolve, Backend, ModelCard,
+    VllmProfile,
 };
 
-use crate::dgx::CardCmd;
+use crate::dgx::{CardCmd, VllmPlanArgs};
 
 /// A card paired with where it came from — drives the `list` SOURCE column.
 pub struct CardEntry {
@@ -183,14 +184,44 @@ fn resolve_from(
     Ok(resolve(base, &dropins, None))
 }
 
+/// Map a card's vLLM profile onto the `vllm up` plan args, folding the structured
+/// parser flags (reasoning / tool-call / auto-tool-choice) into the verbatim
+/// `extra` argv so they ride the `vllm serve` command line ahead of the card's
+/// own raw `extra`. Pure — the seam `card setup` shares with `vllm up`.
+#[must_use]
+pub fn card_to_vllm_plan_args(vllm: &VllmProfile) -> VllmPlanArgs {
+    let mut extra: Vec<String> = Vec::new();
+    if let Some(p) = &vllm.reasoning_parser {
+        extra.push("--reasoning-parser".to_string());
+        extra.push(p.clone());
+    }
+    if let Some(p) = &vllm.tool_call_parser {
+        extra.push("--tool-call-parser".to_string());
+        extra.push(p.clone());
+    }
+    if vllm.enable_auto_tool_choice == Some(true) {
+        extra.push("--enable-auto-tool-choice".to_string());
+    }
+    extra.extend(vllm.extra.iter().cloned());
+    VllmPlanArgs {
+        served_name: vllm.served_name.clone(),
+        dtype: None,
+        tensor_parallel: vllm.tensor_parallel.unwrap_or(1),
+        max_model_len: vllm.max_model_len,
+        gpu_mem_util: vllm.gpu_mem.unwrap_or(0.90),
+        port: 8000,
+        docker: false,
+        extra,
+    }
+}
+
 /// Execute a `card` subcommand — the thin IO shell over the pure renderers.
-/// Gathers built-ins (compiled in) + drop-ins (`~/.newt/models`, best-effort)
-/// and prints. Read-only: nothing here mutates config or touches the network.
+/// `list` / `show` / `validate` are read-only; `setup` stands a backend up.
 ///
 /// # Errors
-/// Surfaces a bad `--card`/name (unknown card, unreadable/invalid file) as an
-/// `anyhow` error for the CLI to print.
-pub fn run(cmd: CardCmd, config_path: Option<&Path>) -> anyhow::Result<()> {
+/// Surfaces a bad name/card (unknown, unreadable, invalid, or leaky) or a
+/// stand-up failure as an `anyhow` error for the CLI to print.
+pub async fn run(cmd: CardCmd, config_path: Option<&Path>) -> anyhow::Result<()> {
     let dropins = || {
         dropin_dir(config_path)
             .map(|d| load_dropin_dir(&d))
@@ -217,7 +248,102 @@ pub fn run(cmd: CardCmd, config_path: Option<&Path>) -> anyhow::Result<()> {
             println!("{report}");
             Ok(())
         }
+        CardCmd::Setup {
+            name,
+            model,
+            node,
+            backend,
+            dry_run,
+            force,
+        } => {
+            let card =
+                resolve_from(&name, builtin_cards(), dropins()).map_err(|e| anyhow::anyhow!(e))?;
+            // Validate (schema + host/LAN-IP leak) BEFORE standing anything up.
+            validate_report(&card).map_err(|e| anyhow::anyhow!(e))?;
+            let backend = match backend.as_deref() {
+                Some(b) => b.parse::<Backend>().map_err(|e| anyhow::anyhow!(e))?,
+                None => card.backend.ok_or_else(|| {
+                    anyhow::anyhow!("card `{}` has no backend; pass --backend", card.name)
+                })?,
+            };
+            match backend {
+                Backend::Vllm => setup_vllm(config_path, &card, model, node, force, dry_run).await,
+                Backend::Ollama => {
+                    setup_ollama_stub(&card);
+                    Ok(())
+                }
+                Backend::LlamaCpp => {
+                    anyhow::bail!("card setup: the llama_cpp backend is not supported yet")
+                }
+            }
+        }
     }
+}
+
+/// vLLM `card setup`: map the card onto the `vllm up` plan args and reuse the
+/// stand-up (fit pre-flight → `vllm serve` over SSH → poll → activate endpoint).
+/// The card's sampling tuning (temperature/top_p/top_k) is recorded on the card
+/// but newt has no per-model sampling override yet, so it is reported, not wired.
+async fn setup_vllm(
+    config_path: Option<&Path>,
+    card: &ModelCard,
+    model: Option<String>,
+    node: Option<String>,
+    force: bool,
+    dry_run: bool,
+) -> anyhow::Result<()> {
+    let vllm = card
+        .vllm
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("card `{}`: backend=vllm but no [vllm] block", card.name))?;
+    let plan_args = card_to_vllm_plan_args(vllm);
+    let served = vllm
+        .served_name
+        .clone()
+        .unwrap_or_else(|| card.name.clone());
+    let checkpoint = model.unwrap_or_else(|| served.clone());
+    println!(
+        "card setup `{}`: vLLM, serving `{checkpoint}` as `{served}`{}",
+        card.name,
+        if dry_run { " (dry run)" } else { "" }
+    );
+    crate::dgx::vllm_up(
+        config_path,
+        &checkpoint,
+        node.as_deref(),
+        &plan_args,
+        force,
+        false,
+        dry_run,
+    )
+    .await?;
+    if let Some(t) = &card.tuning {
+        if t.temperature.is_some() || t.top_p.is_some() || t.top_k.is_some() {
+            println!(
+                "note: the card's sampling tuning (temperature/top_p/top_k) is recorded on the \
+                 card but newt does not yet auto-apply per-model sampling — a follow-up."
+            );
+        }
+    }
+    Ok(())
+}
+
+/// ollama `card setup`: intentionally NOT implemented (vLLM is the first
+/// fully-supported backend). The card still resolves + validates; this prints
+/// how to point newt at the tag today and writes nothing.
+fn setup_ollama_stub(card: &ModelCard) {
+    println!(
+        "card setup `{}`: the ollama backend is not yet implemented — vLLM is the first \
+         fully-supported backend.",
+        card.name
+    );
+    let tag = card
+        .ollama
+        .as_ref()
+        .and_then(|o| o.tag.clone())
+        .unwrap_or_else(|| "<tag>".to_string());
+    println!("  The card resolves + validates fine. To point newt at the tag today:");
+    println!("    newt dgx switch ollama {tag}");
 }
 
 #[cfg(test)]
@@ -349,5 +475,46 @@ mod tests {
         let resolved =
             resolve_from("custom", vec![], vec![vllm_card("custom", 0.3)]).expect("drop-in only");
         assert_eq!(resolved.name, "custom");
+    }
+
+    #[test]
+    fn card_to_plan_args_folds_parser_flags_into_extra() {
+        // The Ornith built-in exercises the full mapping.
+        let vllm = newt_core::model_card::builtin_card("Ornith-1.0-35B")
+            .unwrap()
+            .vllm
+            .unwrap();
+        let args = card_to_vllm_plan_args(&vllm);
+        assert_eq!(args.served_name.as_deref(), Some("Ornith-1.0-35B"));
+        assert_eq!(args.max_model_len, Some(262144));
+        assert_eq!(args.tensor_parallel, 1);
+        // The structured parser flags are folded into the serve argv...
+        let e = args.extra.join(" ");
+        assert!(e.contains("--reasoning-parser qwen3"), "got: {e}");
+        assert!(e.contains("--tool-call-parser qwen3_xml"), "got: {e}");
+        assert!(e.contains("--enable-auto-tool-choice"), "got: {e}");
+        // ...ahead of the card's own raw extra (the escape hatch).
+        assert!(e.contains("--enable-prefix-caching"), "got: {e}");
+        let (rp, pc) = (
+            e.find("--reasoning-parser").unwrap(),
+            e.find("--enable-prefix-caching").unwrap(),
+        );
+        assert!(rp < pc, "structured flags precede raw extra: {e}");
+    }
+
+    #[test]
+    fn card_to_plan_args_omits_absent_flags_and_defaults() {
+        // A minimal vLLM profile: no parsers, no extra.
+        let c = card("name = \"m\"\nbackend = \"vllm\"\n\n[vllm]\nserved_name = \"m\"\n");
+        let args = card_to_vllm_plan_args(c.vllm.as_ref().unwrap());
+        assert!(
+            args.extra.is_empty(),
+            "no flags -> empty extra: {:?}",
+            args.extra
+        );
+        assert_eq!(args.tensor_parallel, 1);
+        assert_eq!((args.gpu_mem_util * 100.0).round(), 90.0); // default 0.90
+        assert_eq!(args.port, 8000);
+        assert!(!args.docker);
     }
 }
