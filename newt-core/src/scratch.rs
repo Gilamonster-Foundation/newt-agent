@@ -1,39 +1,90 @@
-//! `.scratch/` — the project-local **ephemeral** state root (#844).
+//! `.scratch/` — the project-local **ephemeral** state root (#844), and its
+//! configurable relocation.
 //!
-//! Crew worktrees, the crew's shared cargo target, and per-session plans live
-//! under `<repo>/.scratch/`, NOT under `.newt/`. That keeps `.newt/` for
-//! *tracked* project config (`config.toml`, `agent-identity.toml`, `plan.md`,
-//! `language-packs/`) and puts everything generated/ephemeral in one clearly
-//! throwaway place — no more mixed tracked/untracked noise in `git status`
-//! (the failure mode that let a 201 MB `crew-target` and a leftover worktree get
-//! swept into a commit by `git add -A`).
+//! Three Cs:
+//! - **Convention:** `.newt/` holds *tracked* per-repo newt config
+//!   (`config.toml`, `agent-identity.toml`, `plan.md`, `language-packs/`);
+//!   generated/ephemeral state (crew worktrees, the crew cargo target,
+//!   per-session plans) defaults to a sibling **`.scratch/`**.
+//! - **Configuration:** that location is NOT hard-coded. The scratch dir is
+//!   resolved from `NEWT_SCRATCH_DIR` (env), else the `.scratch` default, and may
+//!   be **absolute** — so an environment where the checkout is read-only can
+//!   point scratch at `/tmp`/`/var/tmp`, and a k8s deploy can point it at a PVC
+//!   mount, exactly as git worktrees conventionally live outside the repo tree.
+//!   (A `[scratch] dir` config-file key bridging to the same resolution is a
+//!   planned follow-up.)
+//! - **Composition:** every scratch consumer goes through [`scratch_root`] /
+//!   [`ensure_scratch`], so the location is decided in one place.
 //!
 //! **The ignore is baked into the harness, not the model.** [`ensure_scratch`]
-//! writes `.scratch/.gitignore` containing `*` (exactly the pattern cargo uses
-//! for `target/.gitignore`), so git ignores every scratch file *independent of*
-//! the repo's root `.gitignore`. Every code path that creates scratch calls it,
-//! so the ignore can never be forgotten — a crew or session can't accidentally
-//! make its scratch committable.
+//! writes `<root>/.gitignore` containing `*` (like cargo's `target/.gitignore`),
+//! so scratch is ignored independent of the repo's root `.gitignore`. (Moot when
+//! scratch is relocated outside the repo, but harmless + correct in-tree.)
 
 use std::io;
 use std::path::{Path, PathBuf};
 
-/// The ephemeral scratch root under `base`: `<base>/.scratch`. Pure.
+/// The default ephemeral dir, relative to the repo root. A convention, not a
+/// lock-in — override it via `NEWT_SCRATCH_DIR` (a `[scratch] dir` config-file
+/// bridge to the same resolution is a planned follow-up).
+pub const DEFAULT_SCRATCH_DIR: &str = ".scratch";
+
+/// The configured scratch dir: `NEWT_SCRATCH_DIR` env → `.scratch` default. The
+/// result may be relative (joined under the repo) or **absolute** (used as-is),
+/// so a read-only checkout or a k8s deploy can point scratch at `/tmp`, a PVC
+/// mount, or anywhere writable.
 #[must_use]
-pub fn scratch_root(base: &Path) -> PathBuf {
-    base.join(".scratch")
+pub fn scratch_dir() -> String {
+    match std::env::var("NEWT_SCRATCH_DIR") {
+        Ok(v) if !v.trim().is_empty() => v,
+        _ => DEFAULT_SCRATCH_DIR.to_string(),
+    }
 }
 
-/// Contents of the self-ignoring `.scratch/.gitignore`. `*` ignores every file
-/// under `.scratch/` regardless of the repo's root `.gitignore`, so the harness
-/// owns the ignore and the model cannot forget it.
+/// Resolve a scratch dir setting against a repo `base`: an **absolute** setting
+/// is used verbatim (relocated outside the repo — `/tmp`, a PVC, …); a
+/// **relative** one is joined under `base`. Pure.
+#[must_use]
+pub fn resolve_scratch_root(base: &Path, dir: &str) -> PathBuf {
+    let p = Path::new(dir);
+    if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        base.join(p)
+    }
+}
+
+/// The ephemeral scratch root for repo `base`, honoring the configured location.
+#[must_use]
+pub fn scratch_root(base: &Path) -> PathBuf {
+    resolve_scratch_root(base, &scratch_dir())
+}
+
+/// The workspace-RELATIVE scratch subdir for state that must stay inside the
+/// file-write fence (per-session plans). Uses the configured dir when it is
+/// relative; falls back to the default when scratch is relocated to an absolute
+/// path (a fenced write can't escape the workspace — moving session plans out to
+/// an absolute scratch is a follow-up that needs the fs fence to admit it).
+#[must_use]
+pub fn scratch_workspace_subdir() -> String {
+    let dir = scratch_dir();
+    if Path::new(&dir).is_absolute() {
+        DEFAULT_SCRATCH_DIR.to_string()
+    } else {
+        dir
+    }
+}
+
+/// Contents of the self-ignoring `<root>/.gitignore`. `*` ignores every file
+/// under the scratch root regardless of the repo's root `.gitignore`, so the
+/// harness owns the ignore and the model cannot forget it.
 pub const SCRATCH_GITIGNORE: &str =
     "# Auto-generated by newt: ephemeral scratch (#844). Never commit this dir.\n*\n";
 
-/// Create `<base>/.scratch/` and ensure its self-ignoring `.gitignore` exists.
-/// Idempotent — call it from every scratch-write path (crew worktrees, the crew
-/// target, per-session plans) so scratch is *never* committable, even if the
-/// root `.gitignore` is missing the entry. Returns the scratch root.
+/// Create the scratch root for `base` and ensure its self-ignoring `.gitignore`
+/// exists. Idempotent — call from every scratch-write path so scratch is *never*
+/// committable, even if the root `.gitignore` is missing the entry. Returns the
+/// resolved root.
 ///
 /// # Errors
 /// Propagates a directory-create or `.gitignore` write failure.
@@ -52,16 +103,37 @@ mod tests {
     use super::*;
 
     #[test]
-    fn scratch_root_is_dot_scratch_under_base() {
+    fn resolve_relative_setting_is_joined_under_base() {
         assert_eq!(
-            scratch_root(Path::new("/repo")),
+            resolve_scratch_root(Path::new("/repo"), ".scratch"),
             PathBuf::from("/repo/.scratch")
+        );
+        assert_eq!(
+            resolve_scratch_root(Path::new("/repo"), ".myscratch"),
+            PathBuf::from("/repo/.myscratch")
         );
     }
 
     #[test]
+    fn resolve_absolute_setting_relocates_outside_the_repo() {
+        // The read-only-checkout / k8s-PVC case: an absolute setting is used
+        // verbatim, NOT joined under the repo.
+        assert_eq!(
+            resolve_scratch_root(Path::new("/repo"), "/tmp/newt-scratch"),
+            PathBuf::from("/tmp/newt-scratch")
+        );
+    }
+
+    #[test]
+    fn workspace_subdir_falls_back_to_default_when_scratch_is_absolute() {
+        // A fenced write can't escape the workspace, so an absolute scratch dir
+        // keeps session plans on the relative default.
+        // (scratch_dir() with no env/config set → the default, which is relative.)
+        assert_eq!(scratch_workspace_subdir(), DEFAULT_SCRATCH_DIR);
+    }
+
+    #[test]
     fn gitignore_body_ignores_everything() {
-        // `*` on its own line is the whole point — git ignores all scratch.
         assert!(SCRATCH_GITIGNORE.lines().any(|l| l.trim() == "*"));
     }
 
@@ -69,17 +141,16 @@ mod tests {
     fn ensure_scratch_creates_dir_and_self_ignore() {
         let tmp = tempfile::tempdir().unwrap();
         let root = ensure_scratch(tmp.path()).unwrap();
-        assert!(root.is_dir(), "scratch root created");
+        assert!(root.is_dir());
         let ignore = root.join(".gitignore");
-        assert!(ignore.is_file(), ".scratch/.gitignore written");
+        assert!(ignore.is_file());
         assert_eq!(std::fs::read_to_string(&ignore).unwrap(), SCRATCH_GITIGNORE);
     }
 
     #[test]
-    fn ensure_scratch_is_idempotent_and_preserves_existing_ignore() {
+    fn ensure_scratch_is_idempotent_and_preserves_a_customized_ignore() {
         let tmp = tempfile::tempdir().unwrap();
         ensure_scratch(tmp.path()).unwrap();
-        // A user (or a prior run) customized the ignore — do not clobber it.
         let ignore = scratch_root(tmp.path()).join(".gitignore");
         std::fs::write(&ignore, "*\n!keep.txt\n").unwrap();
         ensure_scratch(tmp.path()).unwrap();
