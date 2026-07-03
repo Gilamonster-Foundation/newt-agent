@@ -65,3 +65,6 @@ docs/research/*.pdf
 .env.local
 *.token
 ~/.newt/
+
+# Newt local session state
+/.newt/sessions/

@@ -12,9 +12,11 @@ mod crew_form;
 // plain `[s]ession allow` for high-danger targets.
 mod danger;
 pub mod dgx_probe;
+// OSC 8 terminal hyperlinks — clickable URLs in modern terminals (issue #771).
 mod mcp;
 mod mcp_token;
 pub mod probe;
+pub mod terminal_hyperlink;
 // The TTY rich inline input surface (issue #416). Feature-gated so the default
 // and headless/wyvern builds never compile it in — newt stays amphibious.
 #[cfg(feature = "rich-tui")]
@@ -1676,6 +1678,69 @@ fn parse_permission_choice(input: &str) -> PromptChoice {
     }
 }
 
+static PROMPT_STDIN_DEPTH: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Whether a prompt currently owns stdin. Its only non-test reader is the
+/// `#[cfg(unix)]` interrupt watcher (`watch_for_interrupt`), so gate the reader the
+/// same way — otherwise Windows (which has no watcher) trips `-D warnings` on dead
+/// code. The depth counter itself stays cross-platform: `PromptStdinGuard` maintains
+/// it everywhere (its callers `prompt_permission_choice` / `prompt_user_input` are
+/// not `cfg`-gated), so the static is never dead.
+#[cfg(any(unix, test))]
+fn prompt_stdin_active() -> bool {
+    PROMPT_STDIN_DEPTH.load(std::sync::atomic::Ordering::Acquire) > 0
+}
+
+/// While a permission or free-text prompt is active, stdin belongs to the
+/// prompt reader. On Unix the surrounding turn may have put the terminal in
+/// cbreak mode for Esc/Ctrl-C watching; temporarily restore line-oriented input
+/// so `read_line` actually waits for an answer, then restore the previous mode.
+struct PromptStdinGuard {
+    #[cfg(unix)]
+    restore: Option<libc::termios>,
+}
+
+impl PromptStdinGuard {
+    fn enter() -> Self {
+        PROMPT_STDIN_DEPTH.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Self {
+            #[cfg(unix)]
+            restore: enter_prompt_line_mode().ok(),
+        }
+    }
+}
+
+impl Drop for PromptStdinGuard {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Some(prev) = self.restore.take() {
+            unsafe {
+                libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &prev);
+            }
+        }
+        PROMPT_STDIN_DEPTH.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+#[cfg(unix)]
+fn enter_prompt_line_mode() -> io::Result<libc::termios> {
+    unsafe {
+        let fd = libc::STDIN_FILENO;
+        let mut prev: libc::termios = std::mem::zeroed();
+        if libc::tcgetattr(fd, &mut prev) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut line = prev;
+        line.c_lflag |= libc::ICANON | libc::ECHO;
+        line.c_cc[libc::VMIN] = 1;
+        line.c_cc[libc::VTIME] = 0;
+        if libc::tcsetattr(fd, libc::TCSANOW, &line) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(prev)
+    }
+}
+
 /// #721 / facade P1b: is this request's `reason` MODEL-authored? Only the
 /// proactive `request_permissions` tool lets the model write the `reason`
 /// (`tools.rs` `execute_request_permissions`); a denial-driven request carries
@@ -1772,6 +1837,7 @@ fn production_danger_table() -> danger::DangerTable {
 /// same blocking-confirm shape as `write_file`'s y/N. Any read error is a
 /// deny (never a hang, never an allow).
 fn prompt_permission_choice(prompt_text: &str) -> PromptChoice {
+    let _stdin = PromptStdinGuard::enter();
     print!("{prompt_text}");
     io::stdout().flush().ok();
     let mut answer = String::new();
@@ -1804,6 +1870,7 @@ fn interpret_user_line(read: io::Result<usize>, buf: &str) -> Option<String> {
 /// interpret it via [`interpret_user_line`]. Closed stdin / read error → `None`
 /// (no human to answer), never a hang.
 fn prompt_user_input(question: &str) -> Option<String> {
+    let _stdin = PromptStdinGuard::enter();
     print!("? {question}\n> ");
     io::stdout().flush().ok();
     let mut answer = String::new();
@@ -2370,6 +2437,34 @@ mod permission_prompt_tests {
             None
         );
         assert_eq!(interpret_user_line(Ok(5), "hi\n"), Some("hi".to_string()));
+    }
+
+    #[serial_test::serial(prompt_stdin)]
+    #[test]
+    fn prompt_stdin_guard_marks_prompt_ownership_and_clears_on_drop() {
+        assert!(
+            !prompt_stdin_active(),
+            "test starts with no active prompt stdin owner"
+        );
+        {
+            let _guard = PromptStdinGuard::enter();
+            assert!(
+                prompt_stdin_active(),
+                "active prompts must tell the interrupt watcher not to read stdin"
+            );
+            {
+                let _nested = PromptStdinGuard::enter();
+                assert!(prompt_stdin_active(), "nested prompts keep ownership");
+            }
+            assert!(
+                prompt_stdin_active(),
+                "dropping one nested guard must not release stdin early"
+            );
+        }
+        assert!(
+            !prompt_stdin_active(),
+            "prompt stdin ownership must clear when the guard drops"
+        );
     }
 
     #[test]
@@ -8515,10 +8610,15 @@ fn watch_for_interrupt(
     stop: &std::sync::atomic::AtomicBool,
 ) {
     use std::sync::atomic::Ordering;
+    use std::time::Duration;
     let fd = libc::STDIN_FILENO;
     let mut buf = [0u8; 64];
     let mut presses = 0u32;
     while !stop.load(Ordering::Relaxed) {
+        if prompt_stdin_active() {
+            std::thread::sleep(Duration::from_millis(10));
+            continue;
+        }
         let mut pfd = libc::pollfd {
             fd,
             events: libc::POLLIN,
@@ -8527,6 +8627,10 @@ fn watch_for_interrupt(
         let n = unsafe { libc::poll(&mut pfd, 1, 100) };
         if n <= 0 || pfd.revents & libc::POLLIN == 0 {
             continue; // timeout or spurious — re-check `stop`
+        }
+        if prompt_stdin_active() {
+            std::thread::sleep(Duration::from_millis(10));
+            continue;
         }
         let r = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
         if r <= 0 {
