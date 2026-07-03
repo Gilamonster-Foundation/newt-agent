@@ -1,0 +1,88 @@
+# The #867 validation prompt, miniaturized. The real incident: asked to
+# "alter the /end command so that it also exits the program" against newt
+# itself, ornith:35b burned 24 rounds searching for a dedicated /end handler
+# that doesn't exist (/end is an alias arm inside a match), hit the round
+# cap, and confabulated `newt-tui/src/commands.rs`. This fixture reproduces
+# that exact geometry — the "command" is one alias arm sharing a close path
+# with /new and /restart — so the task is un-gameable by grepping for a
+# handler: the model must read the dispatch flow and split the alias while
+# preserving the shared close bookkeeping.
+name = "015-end-command-exits"
+description = "Split /end out of the /new alias set: still closes out, then exits (#867 validation prompt)"
+language = "rust"
+difficulty = "L2"
+prompt = """
+This crate is a tiny line-command REPL: `Session::dispatch` in src/lib.rs
+handles one input line, and the slash commands `/new`, `/end`, and
+`/restart` are currently aliases — all three close out the current
+conversation (shared bookkeeping in `close_conversation`) and keep the
+loop running.
+
+Alter the `/end` command so that it also exits the program: it must still
+close out the conversation exactly like `/new` does (the close bookkeeping
+runs and `last_reason` records "end"), but dispatch must then return
+`Outcome::Exit` instead of `Outcome::Continue`. `/new` and `/restart` keep
+their current behavior, and `/quit` stays an abandon (no close). Add a unit
+test `end_closes_and_exits` covering the new behavior: `/end` returns
+`Outcome::Exit`, increments `closed_count`, and records the "end" reason.
+"""
+
+evaluators = [
+    "diff_nonempty",
+    "diff_applies",
+    "rust_compiles",
+    "tests_pass",
+    "pattern_match",
+]
+
+expected_patterns = [
+    "fn end_closes_and_exits",
+    "Outcome::Exit",
+]
+
+[mock_response]
+content = """
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -45,9 +45,10 @@ impl Session {
+     pub fn dispatch(&mut self, line: &str) -> Outcome {
+         let trimmed = line.trim();
+         if let Some(name) = trimmed.strip_prefix('/') {
+-            // `/new` · `/end` · `/restart` all close out the current
+-            // conversation and start a fresh one (the three are aliases).
+-            // The only difference is the reason recorded.
++            // `/new` · `/restart` close out the current conversation and
++            // start a fresh one (aliases). `/end` is NOT an alias: it closes
++            // out the same way, then exits the program — the session's
++            // "I'm done for now" signal.
+             let close_word = match name {
+                 "new" => Some("new"),
+                 "end" => Some("end"),
+@@ -56,6 +57,9 @@ impl Session {
+             };
+             if let Some(reason) = close_word {
+                 self.close_conversation(reason);
++                if reason == "end" {
++                    return Outcome::Exit;
++                }
+                 return Outcome::Continue;
+             }
+             if name == "quit" || name == "exit" {
+@@ -98,6 +102,16 @@ mod tests {
+         assert_eq!(s.last_reason.as_deref(), Some("restart"));
+     }
+ 
++    #[test]
++    fn end_closes_and_exits() {
++        let mut s = Session::new();
++        s.dispatch("hello");
++        assert_eq!(s.dispatch("/end"), Outcome::Exit);
++        assert_eq!(s.closed_count, 1, "/end still closes out like /new");
++        assert_eq!(s.last_reason.as_deref(), Some("end"));
++        assert!(s.at_end_of_input());
++    }
++
+     #[test]
+     fn quit_exits_without_closing() {
+         let mut s = Session::new();
+"""
