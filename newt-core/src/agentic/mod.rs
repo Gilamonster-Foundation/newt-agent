@@ -209,7 +209,8 @@ pub use permissions::{
 pub use recall::{recall_tool_definition, RecallSource, StoreRecallSource};
 pub use resume::resume_context_tool_definition;
 pub use tools::{
-    execute_tool, ocap_disabled, set_max_output_tokens, tool_definitions, venv_cmd_prefix,
+    execute_tool, full_access_requested, ocap_disabled, set_max_output_tokens, tool_definitions,
+    venv_cmd_prefix,
 };
 pub use transcript::{
     transcript_lines, transcript_lines_styled, TranscriptLine, TranscriptRole, TranscriptStyle,

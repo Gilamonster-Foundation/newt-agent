@@ -149,6 +149,19 @@ pub struct Cli {
     #[arg(long, visible_alias = "yolo", global = true, default_value_t = false)]
     pub disable_ocap: bool,
 
+    /// Override the configured `[tui.permissions]` preset with `full_access`
+    /// for THIS invocation — session authority becomes unrestricted (fs fence,
+    /// net leash, and exec allowlist all lifted; `write_file` behaves exactly
+    /// as it does under the `full_access` preset). A DISTINCT switch from
+    /// `--disable-ocap`/`--yolo`: this widens *authority*, while `--yolo`
+    /// changes the exec *mechanism* (host shell vs confined shell) and still
+    /// honors the active exec floor. Combine them (`--yolo --full-access`)
+    /// for a fully unrestricted host shell. Equivalent to `NEWT_FULL_ACCESS=1`;
+    /// deliberately NO config-file key beyond the existing preset, so the
+    /// per-run override can never silently persist.
+    #[arg(long, global = true, default_value_t = false)]
+    pub full_access: bool,
+
     /// facade P4 (#780): turn OFF the convenience tool-call ROUTING for THIS
     /// invocation. By default a model's `run_command("cat X")` / `ls` / `find` /
     /// read-only `git` is silently rewritten to the governed built-in
@@ -681,6 +694,13 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             // purpose — no config key, no silent persistence.
             if cli.disable_ocap {
                 unsafe { std::env::set_var("NEWT_DISABLE_OCAP", "1") };
+            }
+            // --full-access threads the same way: the TUI's policy_for reads
+            // NEWT_FULL_ACCESS when building the session capability, and the
+            // session banner surfaces it loudly. Env-only on purpose — the
+            // per-run override never persists to config.
+            if cli.full_access {
+                unsafe { std::env::set_var("NEWT_FULL_ACCESS", "1") };
             }
             // facade P4 (#780): --no-route turns OFF the convenience tool-call
             // routing (run_command reads the var per call). A DISTINCT switch
@@ -1238,6 +1258,25 @@ mod tests {
         assert!(cli.no_route && !cli.disable_ocap);
         let cli = Cli::try_parse_from(["newt", "--yolo"]).unwrap();
         assert!(cli.disable_ocap && !cli.no_route);
+    }
+
+    /// `--full-access` parses bare and under `code`, is OFF by default, and is
+    /// a DISTINCT flag from `--disable-ocap`/`--yolo`: authority-widening and
+    /// the exec-mechanism bypass never alias — asking for one never implies
+    /// the other.
+    #[test]
+    fn parses_full_access_distinct_from_disable_ocap() {
+        let cli = Cli::try_parse_from(["newt"]).unwrap();
+        assert!(!cli.full_access);
+        let cli = Cli::try_parse_from(["newt", "--full-access"]).unwrap();
+        assert!(cli.full_access && !cli.disable_ocap);
+        let cli = Cli::try_parse_from(["newt", "code", "--full-access"]).unwrap();
+        assert!(cli.full_access);
+        assert!(matches!(cli.command, Some(Command::Code { .. })));
+        let cli = Cli::try_parse_from(["newt", "--yolo"]).unwrap();
+        assert!(cli.disable_ocap && !cli.full_access);
+        let cli = Cli::try_parse_from(["newt", "--yolo", "--full-access"]).unwrap();
+        assert!(cli.disable_ocap && cli.full_access);
     }
 
     #[test]
