@@ -508,9 +508,43 @@ const DIRECT_TOOL_NAMES: &[&str] = &[
     // #496: `find …` typed at run_command redirects to the embedded `find`
     // tool — which works even when the shell is unavailable in this build.
     "find",
-    // PR4: `git …` typed at run_command redirects to the embedded `git` tool.
+    // PR4: `git …` typed at run_command redirects to the embedded `git` tool —
+    // but ONLY its LOCAL ops; the network ops fall through (see
+    // [`GIT_NETWORK_SUBCOMMANDS`] / [`run_command_redirect`], #898).
     "git",
 ];
+
+/// #898: git subcommands that reach the network. The embedded `git` tool
+/// (newt-git) is LOCAL-ONLY — `clone`/`fetch`/`push` are deferred — so if
+/// run_command bounced *every* `git …` back to that pushless tool, a model
+/// could never push a branch (and then never see the "Create a pull request …
+/// by visiting: <URL>" line git prints, and never open a PR — issue #898).
+/// These ops are therefore allowed to fall through to the confined shell, where
+/// the `net` caveat still gates whether the remote is reachable. Local ops
+/// (`status`/`log`/`diff`/`add`/`commit`/…) keep redirecting to the embedded
+/// tool, which does them better and works even when the shell is unavailable.
+const GIT_NETWORK_SUBCOMMANDS: &[&str] = &["push", "fetch", "pull", "clone"];
+
+/// Decide whether a `run_command` invocation is really a misdirected call to a
+/// direct tool (`list_dir`/`read_file`/…/`git`), and if so which one — so the
+/// executor can bounce it with a correction and [`is_hallucination`] can count
+/// it. Returns `None` when the command should run in the shell as-is.
+///
+/// `git` is special (#898): only its LOCAL ops redirect to the embedded git
+/// tool; its network ops ([`GIT_NETWORK_SUBCOMMANDS`]) fall through so the model
+/// can actually push a branch and read the PR-creation URL git prints.
+fn run_command_redirect(command: &str) -> Option<&'static str> {
+    let mut tokens = command.split_ascii_whitespace();
+    let first = tokens.next().unwrap_or("");
+    if first == "git" {
+        let sub = tokens.next().unwrap_or("");
+        if GIT_NETWORK_SUBCOMMANDS.contains(&sub) {
+            return None;
+        }
+        return Some("git");
+    }
+    DIRECT_TOOL_NAMES.iter().copied().find(|&t| t == first)
+}
 
 /// Every tool newt can dispatch by name — the base tools plus all
 /// presence-gated ones. Single source of truth for [`is_hallucination`] (which
@@ -567,8 +601,9 @@ const ALL_TOOL_NAMES: &[&str] = &[
 pub(crate) fn is_hallucination(tool_name: &str, args: &serde_json::Value) -> bool {
     if tool_name == "run_command" {
         let cmd = args["command"].as_str().unwrap_or("");
-        let first = cmd.split_ascii_whitespace().next().unwrap_or("");
-        return DIRECT_TOOL_NAMES.contains(&first);
+        // A misdirected direct-tool call is a hallucination; a real shell
+        // command (including the git NETWORK ops #898 lets through) is not.
+        return run_command_redirect(cmd).is_some();
     }
     // MCP tools are namespaced with `__` — never treat them as hallucinations.
     if tool_name.contains("__") {
@@ -1513,8 +1548,44 @@ fn shell_envelope_output(
         // #726: the MODEL-facing payload is capped by the shared TOKEN budget so
         // a verbose command can't flood the context window (the #719 failure
         // mode, previously uncapped for run_command). Small output is unchanged.
-        cap_model_output(&out, max_output_tokens())
+        let capped = cap_model_output(&out, max_output_tokens());
+        // #898: if this command's output carries a forge "open a pull/merge
+        // request" URL (git prints it on push of a new branch), append an
+        // explicit next-step hint so the model opens the PR instead of stalling.
+        // Detected from the UNcapped output so a long push log can't truncate the
+        // URL away, and appended AFTER the cap so the hint always survives.
+        match pr_creation_url(&out) {
+            Some(url) => format!("{capped}{}", pr_next_step_hint(url)),
+            None => capped,
+        }
     }
+}
+
+/// #898: the forge "open a pull/merge request" URL that git prints on `push` of
+/// a new branch — GitHub `…/pull/new/<branch>` (or a `…/compare/…` link) and
+/// GitLab `…/merge_requests/new…`. Returned so [`shell_envelope_output`] can
+/// append a next-step hint: models routinely push and then stall instead of
+/// opening the PR (issue #898). Scans whitespace-split tokens because git emits
+/// the URL on its own `remote:`-prefixed line.
+fn pr_creation_url(output: &str) -> Option<&str> {
+    output.split_whitespace().find(|tok| {
+        tok.starts_with("https://")
+            && (tok.contains("/pull/new/")
+                || tok.contains("/merge_requests/new")
+                || tok.contains("/compare/"))
+    })
+}
+
+/// The next-step hint appended after a push whose output carries a PR-creation
+/// URL (#898). Names the concrete `gh` command AND the tool boundary — the
+/// embedded `git` tool cannot push or open PRs — so the model proceeds through
+/// run_command + `gh` instead of looping back to the pushless git tool.
+fn pr_next_step_hint(url: &str) -> String {
+    format!(
+        "\n\n[newt] A branch was pushed. To open a pull request now, call \
+         run_command with `gh pr create --fill` (the `gh` CLI is available; the \
+         `git` tool cannot push or open PRs). Or open this URL: {url}"
+    )
 }
 
 /// Lift a confined-shell denial envelope into promptable #263 requests.
@@ -2224,11 +2295,10 @@ pub async fn execute_tool(
 
             // Corrective guard: the model tried to call a tool as a shell binary.
             // Return a correction so the model can retry with the right tool call.
-            if let Some(tool) = DIRECT_TOOL_NAMES
-                .iter()
-                .copied()
-                .find(|t| cmd.split_ascii_whitespace().next() == Some(*t))
-            {
+            // #898: git NETWORK ops (push/fetch/pull/clone) are NOT bounced — the
+            // embedded git tool can't do them, so they fall through to the shell
+            // (net-gated), letting the model push a branch and open a PR.
+            if let Some(tool) = run_command_redirect(cmd) {
                 return format!(
                     "error: '{tool}' is a tool, not a shell command. \
                      Call it as a separate tool invocation — \
@@ -3368,6 +3438,110 @@ mod tests {
         ] {
             assert!(!is_hallucination(t, &serde_json::json!({"path": "."})));
         }
+    }
+
+    /// #898: `run_command_redirect` bounces LOCAL git ops (and other direct
+    /// tools) to their embedded tool, but lets git NETWORK ops fall through to
+    /// the shell — otherwise a model can never `git push` (the pushless embedded
+    /// git tool + the blanket bounce were a hard dead-end).
+    #[test]
+    fn run_command_redirect_lets_git_network_ops_through() {
+        // Network ops the embedded git tool cannot do → fall through (None).
+        for cmd in [
+            "git push origin fix/foo",
+            "git push",
+            "git fetch origin",
+            "git pull",
+            "git clone https://example.com/r.git",
+        ] {
+            assert_eq!(run_command_redirect(cmd), None, "{cmd} must fall through");
+        }
+        // Local ops the embedded git tool handles → still redirect.
+        for cmd in [
+            "git status",
+            "git log --oneline",
+            "git add .",
+            "git commit -m x",
+        ] {
+            assert_eq!(
+                run_command_redirect(cmd),
+                Some("git"),
+                "{cmd} must redirect"
+            );
+        }
+        // Other direct tools still redirect; plain shell commands run as-is.
+        assert_eq!(run_command_redirect("read_file foo.txt"), Some("read_file"));
+        assert_eq!(run_command_redirect("list_dir ."), Some("list_dir"));
+        assert_eq!(run_command_redirect("cargo test"), None);
+        assert_eq!(run_command_redirect("gh pr create --fill"), None);
+        assert_eq!(run_command_redirect(""), None);
+    }
+
+    /// #898 regression: a real `git push` at run_command must NOT be counted as
+    /// a hallucination (it now runs), while a local `git status` still is.
+    #[test]
+    fn is_hallucination_allows_git_network_ops() {
+        assert!(!is_hallucination(
+            "run_command",
+            &serde_json::json!({"command": "git push origin fix/foo"})
+        ));
+        assert!(!is_hallucination(
+            "run_command",
+            &serde_json::json!({"command": "git fetch"})
+        ));
+        assert!(is_hallucination(
+            "run_command",
+            &serde_json::json!({"command": "git status"})
+        ));
+    }
+
+    /// #898: the forge PR/MR-creation URL is extracted from git's push output
+    /// (GitHub and GitLab), and ordinary URLs do not false-positive.
+    #[test]
+    fn pr_creation_url_extracts_github_and_gitlab() {
+        let github = "remote: Create a pull request for 'fix/foo' on GitHub by visiting:\n\
+                      remote:      https://github.com/OWNER/REPO/pull/new/fix/foo\n";
+        assert_eq!(
+            pr_creation_url(github),
+            Some("https://github.com/OWNER/REPO/pull/new/fix/foo")
+        );
+        let gitlab = "remote: To create a merge request for topic, visit:\n\
+                      remote:   https://gitlab.com/g/p/-/merge_requests/new?x=topic\n";
+        assert_eq!(
+            pr_creation_url(gitlab),
+            Some("https://gitlab.com/g/p/-/merge_requests/new?x=topic")
+        );
+        // No PR URL present → None (ordinary fetch/clone output, plain links).
+        assert_eq!(pr_creation_url("Already up to date.\n"), None);
+        assert_eq!(
+            pr_creation_url("see https://github.com/OWNER/REPO/issues/1"),
+            None
+        );
+    }
+
+    /// #898: after a push whose output carries a PR-creation URL,
+    /// `shell_envelope_output` appends the `gh pr create` next-step hint (and the
+    /// URL survives), while ordinary command output is left untouched.
+    #[test]
+    fn shell_envelope_output_appends_pr_hint_on_push() {
+        let push = serde_json::json!({
+            "exit_code": 0,
+            "stdout": "",
+            "stderr": "remote: Create a pull request for 'fix/foo' on GitHub by visiting:\n\
+                       remote:      https://github.com/OWNER/REPO/pull/new/fix/foo\n",
+        });
+        let out = shell_envelope_output(&push, 50, false);
+        assert!(out.contains("gh pr create --fill"), "hint missing: {out}");
+        assert!(
+            out.contains("https://github.com/OWNER/REPO/pull/new/fix/foo"),
+            "url dropped: {out}"
+        );
+
+        // Ordinary output: no hint, payload unchanged.
+        let plain = serde_json::json!({ "exit_code": 0, "stdout": "hello\n", "stderr": "" });
+        let out = shell_envelope_output(&plain, 50, false);
+        assert!(!out.contains("gh pr create"), "spurious hint: {out}");
+        assert_eq!(out, "hello\n");
     }
 
     #[test]
