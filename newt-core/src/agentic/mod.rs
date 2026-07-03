@@ -14,6 +14,9 @@
 // #727: read-only context-budget introspection (the `get_context_remaining`
 // tool) — a pure renderer the agentic loop feeds per-turn budget state into.
 mod budget;
+// #867: path-claim verification for the cap-exit summary (the file-name
+// sibling of the #717 phantom-tool-reach telemetry).
+mod claim_check;
 pub(crate) mod compress;
 mod crew_attest;
 mod crew_tool;
@@ -2113,6 +2116,11 @@ pub async fn chat_complete(
         },
     )
     .await?;
+    // #867: the evidence for this summary was just trimmed away, which is
+    // exactly when a model fabricates plausible file paths — verify every
+    // cited path against the workspace and append a visible refutation for
+    // any that don't exist. Appends only; the model's prose is never edited.
+    let text = claim_check::annotate_against_workspace(text, workspace);
     Ok((text, streamed, usage, hallucination_count))
 }
 
@@ -2391,10 +2399,18 @@ fn suspicious_empty_ollama_diagnostic(json: &serde_json::Value) -> String {
 /// `progress` (the `<plan>`/`<state>` working memory, Step 27.5) is folded in so
 /// the model summarizes against what it actually accomplished.
 fn cap_exit_nudge(max_tool_rounds: usize, progress: Option<&str>) -> String {
+    // #867: the message list was just trimmed (`trim_for_summary`), so most
+    // of the evidence this summary should cite is GONE — the forensic session
+    // showed a model reconstructing plausible-but-nonexistent file paths from
+    // its priors at exactly this point. Constrain the summary to what is
+    // still verbatim in context; absence must be stated, not papered over.
     let base = format!(
         "You have reached the tool-call limit ({max_tool_rounds} rounds). \
          Do NOT call any more tools. Summarize what you found across the tool \
-         calls above and give your best final answer now."
+         calls above and give your best final answer now. Cite only file paths \
+         that appear verbatim in the messages above — if the evidence you need \
+         was in the omitted messages, say so plainly instead of reconstructing \
+         file names or line numbers from memory."
     );
     match progress {
         Some(p) => format!("{base}\n\nYour progress so far:\n{p}"),
@@ -3332,6 +3348,8 @@ pub async fn openai_chat_complete(
         },
     )
     .await?;
+    // #867: same path-claim refutation as the Ollama cap exit.
+    let text = claim_check::annotate_against_workspace(text, workspace);
     Ok((text, streamed, usage, hallucination_count))
 }
 
@@ -4272,6 +4290,13 @@ mod cap_exit_unit_tests {
         let nudge = cap_exit_nudge(5, None);
         assert!(nudge.contains("5 rounds"), "got: {nudge}");
         assert!(nudge.contains("Do NOT call any more tools"));
+        // #867: the grounding constraint — the trim just deleted the evidence,
+        // so the nudge must forbid reconstructing paths from memory.
+        assert!(
+            nudge.contains("Cite only file paths that appear verbatim"),
+            "got: {nudge}"
+        );
+        assert!(nudge.contains("say so plainly"), "got: {nudge}");
         assert!(
             !nudge.contains("progress so far"),
             "no block when None: {nudge}"
@@ -6259,6 +6284,61 @@ mod http_loop_tests {
 
         assert!(reply.contains("tool-call limit of 2"), "got: {reply}");
         assert!(reply.contains("max_tool_rounds"), "names the knob");
+    }
+
+    /// #867 regression: the cap-exit summary cites a file that does not
+    /// exist (the forensic transcript's exact shape — evidence trimmed, the
+    /// model reconstructs a plausible path). The claim check must append a
+    /// visible refutation naming the path, while leaving the model's prose
+    /// intact as a prefix.
+    struct HallucinatingFinalSummary;
+    impl Respond for HallucinatingFinalSummary {
+        fn respond(&self, req: &Request) -> ResponseTemplate {
+            if body_json(req).get("tools").is_some() {
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "message": {"content": "", "tool_calls": [{
+                        "function": {"name": "definitely_not_a_real_tool", "arguments": {}}
+                    }]}
+                }))
+            } else {
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "message": {"content":
+                        "The /end command is defined in newt-tui/src/commands.rs \
+                         (lines 38-40) as enum variants."}
+                }))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn cap_exit_hallucinated_path_gets_claim_check_refutation() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(HallucinatingFinalSummary)
+            .mount(&server)
+            .await;
+
+        let messages = msgs();
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut c = ctx(&uri, &messages, &caveats);
+        c.max_tool_rounds = 2;
+        // `ctx` sets workspace = "." (this crate's dir under cargo test), so
+        // the cited `newt-tui/src/commands.rs` provably does not exist there.
+        let (reply, _, _, _) = chat_complete(c, &mut NoMcp)
+            .await
+            .expect("chat_complete should succeed");
+
+        assert!(
+            reply.contains("newt-tui/src/commands.rs (lines 38-40)"),
+            "the model's prose is preserved verbatim: {reply}"
+        );
+        assert!(reply.contains("⚠ claim check (#867)"), "got: {reply}");
+        assert!(
+            reply.contains("`newt-tui/src/commands.rs`"),
+            "the fabricated path is named in the refutation: {reply}"
+        );
     }
 
     // -----------------------------------------------------------------------
