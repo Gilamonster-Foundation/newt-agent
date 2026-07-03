@@ -277,23 +277,19 @@ fn crew_dispatch_result(report: String, did_land: bool) -> Result<String, String
     }
 }
 
-/// The `Co-Authored-By` trailer crediting the MODEL that authored a crew's edits
-/// (its planner/editor role) on the landed commit (#879) — so a delegated crew's
-/// work is attributed to the model that actually did it. Models aren't git
-/// accounts, so the email is a stable, non-routable `.invalid` placeholder
-/// (RFC 2606) derived from the model name; git/GitHub display the NAME. Pure.
-fn crew_coauthor_trailer(model: &str) -> String {
-    let slug: String = model
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() {
-                c.to_ascii_lowercase()
-            } else {
-                '-'
-            }
-        })
-        .collect();
-    format!("Co-Authored-By: {model} <{slug}@crew.invalid>")
+/// The `Co-authored-by` trailer crediting the **`newt-agent[bot]`** GitHub App on
+/// a crew's landed commit (#879) — the recognized identity for newt-authored
+/// work, which GitHub links to https://github.com/apps/newt-agent. Resolved from
+/// the compiled-in agent identity (`newt_core::DEFAULT_AGENT_{NAME,EMAIL}`), NOT
+/// a hard-coded string, so it always matches the app (and a fork's configured
+/// identity). The specific model is noted in the commit body, not as a
+/// fake-email co-author. Pure.
+fn crew_coauthor_trailer() -> String {
+    format!(
+        "Co-authored-by: {} <{}>",
+        newt_core::DEFAULT_AGENT_NAME,
+        newt_core::DEFAULT_AGENT_EMAIL
+    )
 }
 
 #[async_trait]
@@ -455,10 +451,13 @@ impl CrewRunner for LocalCrewRunner {
                     let (name, email) = newt_core::AgentIdentity::resolve()
                         .unwrap_or_default()
                         .git_author();
-                    // #879: credit the model that authored the edits (the crew's
-                    // planner/editor role) with a Co-Authored-By trailer, so the
-                    // landed commit attributes the delegated work to the model.
-                    let message = format!("{task}\n\n{}", crew_coauthor_trailer(&editor_model));
+                    // #879: attribute the landed commit to the recognized
+                    // newt-agent[bot] app (Co-authored-by), and note which model
+                    // the crew actually ran in the body.
+                    let message = format!(
+                        "{task}\n\nAuthored by the newt-agent crew (model: {editor_model}).\n\n{}",
+                        crew_coauthor_trailer()
+                    );
                     match ws.commit_to_branch(&format!("crew/{id}"), &name, &email, &message) {
                         Ok((branch, sha)) => {
                             // Advance the chain cursor to this landed tip so the
@@ -599,16 +598,20 @@ mod tests {
     }
 
     #[test]
-    fn crew_coauthor_trailer_credits_the_editing_model() {
-        // #879: the landed commit credits the model that authored the edits.
-        let t = crew_coauthor_trailer("Ornith-1.0-35B");
-        assert!(t.starts_with("Co-Authored-By: Ornith-1.0-35B <"), "{t}");
-        // Non-alnum chars in a model tag (`:`, `.`) sanitize to a valid,
-        // non-routable `.invalid` email local-part; the NAME keeps the tag.
+    fn crew_coauthor_trailer_credits_the_newt_agent_bot() {
+        // #879 (review): the landed commit is co-authored by the recognized
+        // newt-agent[bot] app — resolved from the compiled-in agent identity,
+        // NOT a hard-coded string — so it always matches the GitHub App.
+        let t = crew_coauthor_trailer();
         assert_eq!(
-            crew_coauthor_trailer("ornith:35b"),
-            "Co-Authored-By: ornith:35b <ornith-35b@crew.invalid>"
+            t,
+            format!(
+                "Co-authored-by: {} <{}>",
+                newt_core::DEFAULT_AGENT_NAME,
+                newt_core::DEFAULT_AGENT_EMAIL
+            )
         );
+        assert!(t.contains("newt-agent[bot]"), "{t}");
     }
 
     /// #749 step 2 — the `.meet()` seam: a dispatched crew runs under
