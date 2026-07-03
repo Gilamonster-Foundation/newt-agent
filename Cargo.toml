@@ -64,6 +64,7 @@ thiserror = "2.0"
 libc = "0.2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+serde_yaml = "0.9" # model cards (#853) accept YAML as well as TOML (already in the lock)
 base64 = "0.22"
 sha2 = "0.10"
 getrandom = "0.2"
