@@ -30,6 +30,25 @@ pub fn infer_test_command(dir: &Path) -> Option<String> {
     }
 }
 
+/// The normalize/format commands the crew finalize runs (in the worktree) before
+/// it commits, so a model quirk (e.g. a dropped trailing newline) doesn't bounce
+/// off the gate's `fmt --check` (#880).
+///
+/// De-hard-coded: the toolchain → formatter mapping is DATA — composable
+/// [`newt_core::tooling`] packs (built-in + `~/.newt/tooling/*.toml` drop-ins),
+/// so a polyglot repo runs SEVERAL formatters and an unknown repo runs NONE. The
+/// `NEWT_CREW_NORMALIZE` env override wins (a single command, or `none`/empty to
+/// DISABLE) — configuration over convention.
+pub fn crew_normalize_commands(dir: &Path) -> Vec<String> {
+    match std::env::var("NEWT_CREW_NORMALIZE") {
+        Ok(v) if v.trim().is_empty() || v.trim().eq_ignore_ascii_case("none") => Vec::new(),
+        Ok(v) => vec![v],
+        Err(_) => {
+            newt_core::tooling::resolved_phase_commands(dir, newt_core::tooling::Phase::Format)
+        }
+    }
+}
+
 /// Is `path` a safe in-worktree edit target — built only from `Normal` (and `.`)
 /// components, so no root/drive prefix and no `..` escape? `Path::join` discards
 /// the base for an absolute path, so this guard (not the `fs_write` caveat, which
@@ -118,6 +137,40 @@ impl WorktreeWorkspace {
         git(&self.worktree, &["diff", "--cached", "HEAD"]).unwrap_or_default()
     }
 
+    /// #880: run the repo-convention formatter (or the `NEWT_CREW_NORMALIZE`
+    /// override) in the worktree before committing, so a model quirk (e.g. a
+    /// dropped trailing newline) doesn't bounce off the gate's `fmt --check`.
+    /// Best-effort: a missing/failing formatter warns and the commit still lands.
+    fn normalize(&self) {
+        // A polyglot repo can match several tooling packs → run every formatter.
+        for cmd in crew_normalize_commands(&self.worktree) {
+            #[cfg(unix)]
+            let mut c = {
+                let mut c = Command::new("sh");
+                c.arg("-c").arg(&cmd);
+                c
+            };
+            #[cfg(windows)]
+            let mut c = {
+                let mut c = Command::new("cmd");
+                c.arg("/C").arg(&cmd);
+                c
+            };
+            c.env("CARGO_TARGET_DIR", crew_shared_target_dir(&self.base));
+            match c.current_dir(&self.worktree).output() {
+                Ok(o) if !o.status.success() => {
+                    eprintln!("  crew normalize (`{cmd}`) failed — committing unformatted; the gate may flag it");
+                }
+                Err(e) => {
+                    eprintln!(
+                        "  crew normalize (`{cmd}`) could not run ({e}) — committing unformatted"
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+
     /// **Land** the crew's work as a commit on a new `branch` in the SHARED object
     /// store, so verified work persists (a reviewable, mergeable branch the base
     /// repo sees) instead of being thrown away with the worktree. The worktree is a
@@ -132,6 +185,9 @@ impl WorktreeWorkspace {
         author_email: &str,
         message: &str,
     ) -> anyhow::Result<(String, String)> {
+        // #880: normalize (format) the model's edits before staging, so a quirk
+        // like a dropped trailing newline doesn't bounce off the gate.
+        self.normalize();
         git(&self.worktree, &["checkout", "-q", "-b", branch])?;
         git(&self.worktree, &["add", "-A"])?;
         // `diff --cached --quiet` exits 0 when the index matches HEAD (nothing to
@@ -2411,6 +2467,18 @@ mod tests {
             infer_test_command(dir.path()).as_deref(),
             Some("just check")
         );
+    }
+
+    #[test]
+    fn crew_normalize_commands_come_from_tooling_packs() {
+        // #880: the toolchain→formatter mapping is DATA (newt_core::tooling), so
+        // a Cargo repo resolves `cargo fmt` and an unmarked dir resolves nothing.
+        // (The pack detection/merge/multiple-toolchain logic is tested in
+        // newt_core::tooling; here we confirm the crew wires through to it.)
+        let dir = tempfile::tempdir().unwrap();
+        assert!(crew_normalize_commands(dir.path()).is_empty());
+        std::fs::write(dir.path().join("Cargo.toml"), "").unwrap();
+        assert!(crew_normalize_commands(dir.path()).contains(&"cargo fmt".to_string()));
     }
 
     #[test]
