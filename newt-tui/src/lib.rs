@@ -5420,7 +5420,12 @@ fn run_chat(
                         print_newt(&msg, color, verbose);
                         surface.save_history();
                         println!();
-                        continue;
+                        if reason == "end" {
+                            clean_exit = true;
+                            break;
+                        } else {
+                            continue;
+                        }
                     }
                     let slash_body = task.trim_start_matches('/');
                     if slash_body == "conversation" || slash_body.starts_with("conversation ") {
