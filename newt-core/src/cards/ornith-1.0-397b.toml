@@ -1,0 +1,27 @@
+# Built-in model card: Ornith-1.0-397B — GATED. Almost certainly exceeds a single
+# node (FP8 ~400 GiB; needs multi-node tensor-parallel), so `newt dgx card setup`
+# refuses it without --force via the fit pre-flight. Shipped as DATA so the profile
+# exists the moment the hardware does. IDENTITIES + serving profile ONLY.
+name = "Ornith-1.0-397B"
+backend = "vllm"
+footprint_gib = 400.0 # FP8 (the dgx_registry FP8 row).
+gated = true
+
+[vllm]
+served_name = "Ornith-1.0-397B"
+max_model_len = 262144
+reasoning_parser = "qwen3"
+tool_call_parser = "qwen3_xml"
+enable_auto_tool_choice = true
+extra = ["--enable-prefix-caching", "--trust-remote-code"]
+
+[tuning]
+temperature = 0.6
+top_p = 0.95
+top_k = 20
+context_tokens = 262144
+
+[capability]
+emits_leading_reasoning = true
+thinking_default = true
+reasoning_content_field = "reasoning_content"

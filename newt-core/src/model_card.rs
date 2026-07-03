@@ -355,6 +355,31 @@ pub fn resolve(builtin: ModelCard, dropins: &[ModelCard], one_off: Option<ModelC
     card
 }
 
+/// The built-in model cards shipped with newt (embedded DATA) — the base layer of
+/// the precedence chain. A drop-in `~/.newt/models/<name>.toml` overrides one by
+/// name; `--card <path>` overlays a one-off. Ornith-1.0-35B is the reference card;
+/// the 397B ships `gated` (it almost certainly exceeds a single node).
+#[must_use]
+pub fn builtin_cards() -> Vec<ModelCard> {
+    const EMBEDDED: &[&str] = &[
+        include_str!("cards/ornith-1.0-35b.toml"),
+        include_str!("cards/ornith-1.0-397b.toml"),
+    ];
+    EMBEDDED
+        .iter()
+        .map(|s| parse_card(s, "toml").expect("built-in card is valid TOML"))
+        .collect()
+}
+
+/// The built-in card whose `name` matches (case-insensitive), if any.
+#[must_use]
+pub fn builtin_card(name: &str) -> Option<ModelCard> {
+    let want = name.trim().to_ascii_lowercase();
+    builtin_cards()
+        .into_iter()
+        .find(|c| c.name.to_ascii_lowercase() == want)
+}
+
 /// Scan a card for a leaked machine identity — an RFC1918 / CGNAT IPv4 literal in
 /// any string field. Built-in cards MUST pass (identities only; the endpoint lives
 /// in local `[dgx]` config). Returns the offending values (empty = clean).
@@ -602,5 +627,87 @@ capability:
         ] {
             assert!(!is_private_ipv4(ip), "{ip} is NOT flagged");
         }
+    }
+
+    // ── #854: built-in Ornith cards ───────────────────────────────────────
+    #[test]
+    fn builtin_cards_parse_validate_and_are_leak_free() {
+        let cards = builtin_cards();
+        assert!(!cards.is_empty(), "built-in cards present");
+        for c in &cards {
+            c.validate()
+                .unwrap_or_else(|e| panic!("built-in `{}` invalid: {e}", c.name));
+            assert!(
+                no_hardware_leak(c).is_empty(),
+                "built-in `{}` leaks a private IP",
+                c.name
+            );
+            // Identities only: a built-in card pins NO node-specific knob.
+            if let Some(v) = c.vllm.as_ref() {
+                assert!(v.gpu_mem.is_none(), "{}: gpu_mem is node-specific", c.name);
+                assert!(
+                    v.tensor_parallel.is_none(),
+                    "{}: tensor_parallel is node-specific",
+                    c.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ornith_35b_card_has_the_expected_settings() {
+        let c = builtin_card("Ornith-1.0-35B").expect("Ornith-1.0-35B present");
+        assert_eq!(c.backend, Some(Backend::Vllm));
+        assert_eq!(c.gated, None, "the 35B is runnable, not gated");
+        let v = c.vllm.unwrap();
+        assert_eq!(v.max_model_len, Some(262_144));
+        assert_eq!(v.reasoning_parser.as_deref(), Some("qwen3"));
+        assert_eq!(v.tool_call_parser.as_deref(), Some("qwen3_xml"));
+        assert_eq!(v.enable_auto_tool_choice, Some(true));
+        assert!(v.extra.iter().any(|a| a == "--enable-prefix-caching"));
+        assert!(v.extra.iter().any(|a| a == "--trust-remote-code"));
+        let t = c.tuning.unwrap();
+        assert_eq!(t.temperature, Some(0.6));
+        assert_eq!(t.top_p, Some(0.95));
+        assert_eq!(t.top_k, Some(20));
+        assert_eq!(t.context_tokens, Some(262_144));
+        let cap = c.capability.unwrap();
+        assert_eq!(cap.emits_leading_reasoning, Some(true));
+        assert_eq!(cap.thinking_default, Some(true));
+        assert_eq!(
+            cap.reasoning_content_field.as_deref(),
+            Some("reasoning_content")
+        );
+        let o = c.ollama.unwrap();
+        assert_eq!(o.tag.as_deref(), Some("ornith:35b"));
+        assert!(
+            o.num_ctx.unwrap() < 262_144,
+            "ollama num_ctx is capped below the native window (OOM guard)"
+        );
+    }
+
+    #[test]
+    fn ornith_397b_is_gated() {
+        let c = builtin_card("Ornith-1.0-397B").expect("397B present as a gated card");
+        assert_eq!(c.gated, Some(true), "the 397B must be hardware-gated");
+    }
+
+    #[test]
+    fn builtin_card_is_overridable_by_name() {
+        // A drop-in overrides only what it sets; the rest inherits from the built-in.
+        let base = builtin_card("Ornith-1.0-35B").unwrap();
+        let dropin: ModelCard =
+            toml::from_str("name = \"Ornith-1.0-35B\"\n[ollama]\nnum_ctx = 65536").unwrap();
+        let resolved = resolve(base, std::slice::from_ref(&dropin), None);
+        assert_eq!(
+            resolved.ollama.unwrap().num_ctx,
+            Some(65536),
+            "drop-in wins"
+        );
+        assert_eq!(
+            resolved.vllm.unwrap().reasoning_parser.as_deref(),
+            Some("qwen3"),
+            "un-set fields inherit from the built-in"
+        );
     }
 }
