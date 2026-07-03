@@ -13,10 +13,10 @@ mod crew_form;
 mod danger;
 pub mod dgx_probe;
 // OSC 8 terminal hyperlinks — clickable URLs in modern terminals (issue #771).
-pub mod terminal_hyperlink;
 mod mcp;
 mod mcp_token;
 pub mod probe;
+pub mod terminal_hyperlink;
 // The TTY rich inline input surface (issue #416). Feature-gated so the default
 // and headless/wyvern builds never compile it in — newt stays amphibious.
 #[cfg(feature = "rich-tui")]

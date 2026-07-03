@@ -10,15 +10,15 @@ Modern terminals (iTerm2, WezTerm, GNOME Terminal, Alacritty, Kitty, VS Code) su
 \x1b]8;;https://example.com\x1b\\clickable text\x1b]8;;\x1b\\
 ```
 
-This module provides `format_hyperlink(text, url)` which wraps terminal output in OSC 8 sequences when the user is running Newt against an actual terminal (not a pipe or CI).
+This module provides `render_link(text, url)` which wraps terminal output in OSC 8 sequences when the user is running Newt against an actual terminal (not a pipe or CI).
 
 ## Usage
 
 ```rust
-use newt_tui::terminal_hyperlink::{supports_osc8, format_hyperlink};
+use newt_tui::terminal_hyperlink::{supports_osc8, render_link};
 
 if supports_osc8() {
-    println!("{}", format_hyperlink("View issue", "https://github.com/org/repo/issues/771"));
+    println!("{}", render_link("View issue", "https://github.com/org/repo/issues/771"));
 } else {
     println!("View issue: https://github.com/org/repo/issues/771");
 }

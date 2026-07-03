@@ -4,7 +4,7 @@
 // These verify the OSC 8 escape sequences render correctly in a real terminal.
 // They print raw bytes so you can visually confirm clickable links appear.
 
-use newt_tui::terminal_hyperlink::{render_link, render_url, supports_osc8};
+use newt_tui::terminal_hyperlink::{render_link, render_link_osc8, render_url, supports_osc8};
 
 #[test]
 fn test_os8_visible_in_terminal() {
@@ -42,16 +42,16 @@ fn test_os8_visible_in_terminal() {
     println!("\nTest 4 (query params):");
     println!("{search}");
 
-    // Test 5: Fallback format (simulated by checking raw structure).
-    let fallback = render_link("plain text", "https://example.com/path");
+    // Test 5: OSC 8 format structure.
+    let osc8 = render_link_osc8("plain text", "https://example.com/path");
     println!("\nTest 5 (structure check):");
-    assert!(fallback.starts_with("\x1b]8;;"));
-    assert!(fallback.ends_with('\x07'));
+    assert!(osc8.starts_with("\x1b]8;;"));
+    assert!(osc8.ends_with('\x07'));
     println!("Structure OK: starts with OSC 8 open, ends with ST.");
 
     // Test 6: Verify the reset sequence.
-    let link = render_link("before", "https://a.com");
-    let link2 = render_link("after", "https://b.com");
+    let link = render_link_osc8("before", "https://a.com");
+    let link2 = render_link_osc8("after", "https://b.com");
     let combined = format!("{link} then {link2}");
     println!("\nTest 6 (reset between links):");
     println!("{combined}");
