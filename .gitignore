@@ -66,5 +66,13 @@ docs/research/*.pdf
 *.token
 ~/.newt/
 
-# Newt local session state
+# Newt ephemeral scratch (#844): crew worktrees, the crew cargo target, and
+# per-session plans all live under `.scratch/`, which `.newt/` no longer holds.
+# The harness ALSO writes a self-ignoring `.scratch/.gitignore` (`*`) whenever it
+# creates scratch (newt_core::scratch::ensure_scratch), so scratch is ignored
+# even if this root entry is removed — the model can't forget it.
+/.scratch/
+
+# Retired: session state moved from `.newt/sessions/` to `.scratch/sessions/`
+# (#844). Kept briefly so any lingering old dir stays ignored during migration.
 /.newt/sessions/

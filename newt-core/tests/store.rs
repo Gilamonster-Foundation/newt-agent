@@ -39,11 +39,11 @@ fn raw(root: &std::path::Path) -> rusqlite::Connection {
 fn session_plan_path_is_workspace_relative_under_sessions() {
     assert_eq!(
         session_plan_path("abc-123"),
-        std::path::Path::new(".newt/sessions/abc-123/plan.md"),
+        std::path::Path::new(".scratch/sessions/abc-123/plan.md"),
     );
     assert_eq!(
         session_plan_dir("abc-123"),
-        std::path::Path::new(".newt/sessions/abc-123"),
+        std::path::Path::new(".scratch/sessions/abc-123"),
     );
 }
 

@@ -277,6 +277,18 @@ fn crew_dispatch_result(report: String, did_land: bool) -> Result<String, String
     }
 }
 
+/// The `Co-authored-by` trailer for a crew's landed commit (#879): the crew's
+/// editing **model** as the display NAME, with the recognized **`newt-agent[bot]`**
+/// app EMAIL (`newt_core::DEFAULT_AGENT_EMAIL`, not a hard-coded string). So
+/// GitHub attributes the commit to https://github.com/apps/newt-agent (via the
+/// shared bot email) while the name records which model actually ran. Pure.
+fn crew_coauthor_trailer(model: &str) -> String {
+    format!(
+        "Co-authored-by: {model} <{}>",
+        newt_core::DEFAULT_AGENT_EMAIL
+    )
+}
+
 #[async_trait]
 impl CrewRunner for LocalCrewRunner {
     async fn dispatch(&self, op: &str, args: &Value, caveats: &Caveats) -> Result<String, String> {
@@ -350,6 +362,9 @@ impl CrewRunner for LocalCrewRunner {
                 };
                 let pool = self.pool();
                 let (crew_cfg, lead, rationale) = self.resolve_roster(&pool, args, mode)?;
+                // #879: the editing model, captured before crew_cfg may move into
+                // a TeamConfig — the landed commit credits it (Co-Authored-By).
+                let editor_model = crew_cfg.planner_model.clone();
                 // Pick the gate by PROVENANCE priority: an operator-supplied
                 // `--locked-verify` (trusted, overrides all) > the model-authored
                 // `caller_verify` (already exec-gated above) > the repo-inferred
@@ -433,7 +448,10 @@ impl CrewRunner for LocalCrewRunner {
                     let (name, email) = newt_core::AgentIdentity::resolve()
                         .unwrap_or_default()
                         .git_author();
-                    match ws.commit_to_branch(&format!("crew/{id}"), &name, &email, task) {
+                    // #879: attribute the landed commit — the editing model as the
+                    // co-author NAME, under the newt-agent[bot] app EMAIL.
+                    let message = format!("{task}\n\n{}", crew_coauthor_trailer(&editor_model));
+                    match ws.commit_to_branch(&format!("crew/{id}"), &name, &email, &message) {
                         Ok((branch, sha)) => {
                             // Advance the chain cursor to this landed tip so the
                             // NEXT leaf forks off it. ONLY on a real land — a
@@ -570,6 +588,25 @@ mod tests {
         let r = crew_dispatch_result("✗ verification did NOT pass — discarded".into(), false);
         assert!(r.is_err(), "a non-landing crew leaf must be an Err, not Ok");
         assert!(r.unwrap_err().contains("did NOT pass"));
+    }
+
+    #[test]
+    fn crew_coauthor_trailer_names_the_model_under_the_bot_email() {
+        // #879: the editing MODEL is the co-author NAME; the newt-agent[bot] app
+        // EMAIL (from the compiled-in identity, not a hard-coded string) makes
+        // GitHub attribute the commit to https://github.com/apps/newt-agent.
+        let t = crew_coauthor_trailer("ornith:35b");
+        assert_eq!(
+            t,
+            format!(
+                "Co-authored-by: ornith:35b <{}>",
+                newt_core::DEFAULT_AGENT_EMAIL
+            )
+        );
+        assert!(
+            t.contains("newt-agent[bot]@users.noreply.github.com"),
+            "{t}"
+        );
     }
 
     /// #749 step 2 — the `.meet()` seam: a dispatched crew runs under

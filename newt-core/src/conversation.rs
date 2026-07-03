@@ -227,16 +227,21 @@ pub fn new_conversation_id() -> String {
 }
 
 /// Workspace-relative directory holding a conversation's per-session plan:
-/// `.newt/sessions/<conversation-id>`. Workspace-relative so the file tools'
-/// workspace fence permits writing it and it travels with the repo. See #220.
+/// `<scratch>/sessions/<conversation-id>` (default `.scratch/sessions/...`). Under
+/// the ephemeral scratch root (#844) so it stays out of `.newt/` tracked config;
+/// kept workspace-RELATIVE (via [`crate::scratch::scratch_workspace_subdir`]) so
+/// the file tools' workspace fence permits writing it — an absolute scratch
+/// relocation applies to crew scratch, not fenced session plans. See #220, #844.
 pub fn session_plan_dir(conversation_id: &str) -> PathBuf {
-    Path::new(".newt").join("sessions").join(conversation_id)
+    Path::new(&crate::scratch::scratch_workspace_subdir())
+        .join("sessions")
+        .join(conversation_id)
 }
 
 /// Workspace-relative per-session plan document path:
-/// `.newt/sessions/<conversation-id>/plan.md`. This is the path the system
+/// `.scratch/sessions/<conversation-id>/plan.md`. This is the path the system
 /// prompt tells the model to use; it replaces the old fixed `.newt/plan.md`
-/// that collided when several newt instances ran in one repo. See issue #220.
+/// that collided when several newt instances ran in one repo. See #220, #844.
 pub fn session_plan_path(conversation_id: &str) -> PathBuf {
     session_plan_dir(conversation_id).join("plan.md")
 }

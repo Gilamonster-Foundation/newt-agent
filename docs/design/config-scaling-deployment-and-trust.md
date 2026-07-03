@@ -35,7 +35,7 @@ must serve both, which makes these first-class, not afterthoughts:
   override so `~/.newt` can be relocated when `$HOME` is read-only/ephemeral in a
   container (the loader uses one `newt_home()` helper instead of `home_dir()`
   directly).
-- **PV / PVC for writable state.** Crew worktrees (`./.newt/worktrees/`), caches
+- **PV / PVC for writable state.** Crew worktrees (`./.scratch/worktrees/`), caches
   (`~/.newt/{cache,tmp}/`), and history land on persistent volumes — the
   container's ephemeral fs won't do. Keeping all writable state under two
   relocatable roots (`NEWT_HOME` and the workdir) is what makes that mountable.
@@ -99,7 +99,7 @@ paths with ambient authority. So:
 
 ### Gitignore convention
 
-Commit `./.newt/*.toml`. Gitignore `./.newt/{cache,worktrees,local}/`. Per-dev
+Commit `./.newt/*.toml`. Gitignore `./.scratch/ (crew worktrees, caches, session plans)`. Per-dev
 overrides via `./.newt/local/*.toml` (gitignored, merged last). Deletable caches
 in `$NEWT_HOME/.newt/{cache,tmp}/`. `newt init` writes a `./.newt/.gitignore`
 with these rules.

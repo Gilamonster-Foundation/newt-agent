@@ -260,5 +260,5 @@ across the triad; a **cycle-safe reference resolver** (built now, `extends`/
 `include` cross-links enabled later); and a **trust gate** for committed project
 configs (`newt trust`, direnv-style) — because config is read *unconfined at
 bootstrap*, so a committed `./.newt/` in a cloned repo is a trust boundary.
-Convention: commit `./.newt/*.toml`, gitignore `./.newt/{cache,worktrees,local}/`,
+Convention: commit `./.newt/*.toml`, gitignore `./.scratch/ (crew worktrees, caches, session plans)`,
 deletable caches in `~/.newt/{cache,tmp}/`.
