@@ -108,12 +108,35 @@ pub struct ToolingPack {
     /// Pack name — the merge / drop-in key (`rust`, `python`, …). A drop-in with
     /// an existing name overrides the built-in; a new name adds a toolchain.
     pub name: String,
-    /// Marker files whose presence at the repo root selects this toolchain. ANY.
+    /// Marker files whose presence at the repo root selects this toolchain.
+    /// By default ANY match selects it; with `require_all` **every** marker must
+    /// exist (e.g. PyO3 = `Cargo.toml` AND `pyproject.toml`).
     #[serde(default)]
     pub detect: Vec<String>,
+    /// Require ALL `detect` markers (a compound toolchain like Rust+PyO3), and
+    /// SUPERSEDE the component packs it subsumes (so a PyO3 repo uses the `pyo3`
+    /// pack, not `rust` + `python` on top of it).
+    #[serde(default)]
+    pub require_all: bool,
     /// The toolchain's default command per lifecycle phase (`[phases]`).
     #[serde(default)]
     pub phases: PhaseCommands,
+}
+
+impl ToolingPack {
+    /// Does this pack's detection match a repo at `repo_dir`?
+    #[must_use]
+    fn matches(&self, repo_dir: &Path) -> bool {
+        if self.detect.is_empty() {
+            return false;
+        }
+        let exists = |m: &String| repo_dir.join(m).exists();
+        if self.require_all {
+            self.detect.iter().all(exists)
+        } else {
+            self.detect.iter().any(exists)
+        }
+    }
 }
 
 /// The built-in tooling packs — worked examples a contributor copies into a
@@ -123,10 +146,30 @@ pub fn builtin_tooling_packs() -> Vec<ToolingPack> {
     let pack = |name: &str, marker: &str, phases: PhaseCommands| ToolingPack {
         name: name.into(),
         detect: vec![marker.into()],
+        require_all: false,
         phases,
     };
     let some = |s: &str| Some(s.to_string());
     vec![
+        // Rust + PyO3 (maturin) — a compound toolchain: BOTH Cargo.toml AND
+        // pyproject.toml. `require_all` supersedes the plain `rust` + `python`
+        // packs so a PyO3 repo gets one coherent lifecycle, not three stacked.
+        ToolingPack {
+            name: "pyo3".into(),
+            detect: vec!["Cargo.toml".into(), "pyproject.toml".into()],
+            require_all: true,
+            phases: PhaseCommands {
+                setup: some("maturin develop"),
+                format: some("cargo fmt && ruff format ."),
+                lint: some("cargo clippy --all-targets -- -D warnings && ruff check ."),
+                test: some("maturin develop && pytest -x"),
+                check: some(
+                    "cargo fmt -- --check && cargo clippy --all-targets -- -D warnings \
+                     && maturin develop && cargo test && pytest -x",
+                ),
+                clean: some("cargo clean"),
+            },
+        },
         pack(
             "rust",
             "Cargo.toml",
@@ -221,10 +264,31 @@ pub fn phase_commands_from_packs(
     phase: Phase,
     packs: &[ToolingPack],
 ) -> Vec<String> {
-    packs
-        .iter()
-        .filter(|p| p.detect.iter().any(|m| repo_dir.join(m).exists()))
+    matching_packs(repo_dir, packs)
+        .into_iter()
         .filter_map(|p| p.phases.get(phase).map(str::to_string))
+        .collect()
+}
+
+/// The packs that select `repo_dir`, after **supersession**: a matching
+/// `require_all` pack drops the matching packs whose `detect` markers are a
+/// strict subset of its own — so a Rust+PyO3 repo runs the `pyo3` pack, not
+/// `rust` + `python` stacked underneath it.
+fn matching_packs<'a>(repo_dir: &Path, packs: &'a [ToolingPack]) -> Vec<&'a ToolingPack> {
+    let matched: Vec<&ToolingPack> = packs.iter().filter(|p| p.matches(repo_dir)).collect();
+    let supersets: Vec<&[String]> = matched
+        .iter()
+        .filter(|p| p.require_all)
+        .map(|p| p.detect.as_slice())
+        .collect();
+    matched
+        .iter()
+        .filter(|p| {
+            !supersets
+                .iter()
+                .any(|sup| sup.len() > p.detect.len() && p.detect.iter().all(|m| sup.contains(m)))
+        })
+        .copied()
         .collect()
 }
 
@@ -298,11 +362,35 @@ mod tests {
     }
 
     #[test]
+    fn pyo3_require_all_supersedes_rust_and_python() {
+        // Rust + PyO3 (BOTH markers) → the `pyo3` pack ONLY, not rust + python
+        // stacked. One coherent format + one check (with `maturin develop`).
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "").unwrap();
+        std::fs::write(dir.path().join("pyproject.toml"), "").unwrap();
+        assert_eq!(
+            phase_commands_from_packs(dir.path(), Phase::Format, &builtin_tooling_packs()),
+            vec!["cargo fmt && ruff format .".to_string()]
+        );
+        let check = phase_commands_from_packs(dir.path(), Phase::Check, &builtin_tooling_packs());
+        assert_eq!(check.len(), 1, "one coherent check, not three: {check:?}");
+        assert!(check[0].contains("maturin develop"), "{check:?}");
+        // A pure-Rust repo still resolves just `rust`.
+        let d2 = tempfile::tempdir().unwrap();
+        std::fs::write(d2.path().join("Cargo.toml"), "").unwrap();
+        assert_eq!(
+            phase_commands_from_packs(d2.path(), Phase::Format, &builtin_tooling_packs()),
+            vec!["cargo fmt".to_string()]
+        );
+    }
+
+    #[test]
     fn a_dropin_overrides_by_name_and_adds_new_toolchains() {
         let dropins = vec![
             ToolingPack {
                 name: "rust".into(),
                 detect: vec!["Cargo.toml".into()],
+                require_all: false,
                 phases: PhaseCommands {
                     format: Some("cargo +nightly fmt".into()),
                     ..PhaseCommands::default()
@@ -311,6 +399,7 @@ mod tests {
             ToolingPack {
                 name: "zig".into(),
                 detect: vec!["build.zig".into()],
+                require_all: false,
                 phases: PhaseCommands {
                     format: Some("zig fmt .".into()),
                     ..PhaseCommands::default()
