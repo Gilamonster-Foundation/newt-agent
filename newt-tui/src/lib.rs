@@ -1468,9 +1468,19 @@ fn read_only_caveats(workspace: &str) -> newt_core::caveats::Caveats {
 /// (write implies read) and is also widened into the already-fenced `fs_write`.
 fn policy_for(tui: Option<newt_core::TuiConfig>, workspace: &str) -> newt_core::caveats::Caveats {
     use newt_core::caveats::Scope;
-    let mut caveats = tui
-        .map(|t| t.permissions.to_caveats(workspace))
-        .unwrap_or_else(|| read_only_caveats(workspace));
+    // --full-access / NEWT_FULL_ACCESS=1: per-invocation preset override —
+    // build the policy from `full_access` (`Caveats::top()`, the exact value
+    // `ToolPermissions::to_caveats` yields for that preset) regardless of the
+    // configured preset. This also empties the #774 exec floor (`Scope::All`
+    // + no mode ⇒ `exec_floor_from` → None), so combined with --yolo the
+    // host-shell bypass covers every command. Surfaced loudly at session
+    // start by `full_access_banner`.
+    let mut caveats = if newt_core::agentic::full_access_requested() {
+        newt_core::caveats::Caveats::top()
+    } else {
+        tui.map(|t| t.permissions.to_caveats(workspace))
+            .unwrap_or_else(|| read_only_caveats(workspace))
+    };
     let extra = scan_cli_exec_grants();
     if !extra.is_empty() {
         if let Scope::Only(ref mut set) = caveats.exec {
@@ -1524,7 +1534,9 @@ fn mint_operating_key(
 /// own leash but never loosen it.
 ///
 /// Safe by default: an absent config, or any identity error, yields read-only —
-/// never `Caveats::top()`.
+/// never `Caveats::top()`. The one exception is the explicit per-invocation
+/// `--full-access` / `NEWT_FULL_ACCESS=1` preset override (see `policy_for`),
+/// which is operator-asserted per run and loudly surfaced at session start.
 struct SessionCapability {
     /// The live operating key. `None` if the per-user key is unavailable; the
     /// capability then degrades to a plain caveats floor (still narrowing-only).
@@ -2335,6 +2347,34 @@ fn ocap_disabled_record(conversation_id: &str) -> newt_core::PermissionRecord {
         newt_core::DenialKind::Exec,
         "*",
         "ocap-disabled",
+        "session",
+    )
+}
+
+/// The unmissable session-start banner shown when the `--full-access` preset
+/// override is asserted (`NEWT_FULL_ACCESS=1`). The override itself lives in
+/// `policy_for`; this is the loud surfacing half of the contract, mirroring
+/// `ocap_disabled_banner`.
+fn full_access_banner() -> String {
+    "⚠ FULL ACCESS (--full-access): session authority is unrestricted — fs fence, \
+     net leash, and exec allowlist are all lifted for this run; drop the flag to \
+     restore the configured preset"
+        .to_string()
+}
+
+/// The ONE `full-access` line written to the #263 permission log at session
+/// start, so the audit trail shows this session ran with the unrestricted
+/// preset override. The override widens every capability axis; the log schema
+/// records one line keyed on the exec axis (the sharpest one), `target: "*"`,
+/// `scope: "session"` — the override is per-session, never per-command. A
+/// record, not authority: nothing reads it back.
+fn full_access_record(conversation_id: &str) -> newt_core::PermissionRecord {
+    newt_core::PermissionRecord::new(
+        conversation_id,
+        "session",
+        newt_core::DenialKind::Exec,
+        "*",
+        "full-access",
         "session",
     )
 }
@@ -4593,6 +4633,21 @@ fn run_chat(
         print_newt(&ocap_disabled_banner(), color, verbose);
         if let Some(path) = permission_log_path.as_deref() {
             if let Err(e) = ocap_disabled_record(&active_conversation_id).append_jsonl(path) {
+                print_newt(
+                    &format!("warning: permission log write failed: {e}"),
+                    color,
+                    verbose,
+                );
+            }
+        }
+    }
+    // --full-access / NEWT_FULL_ACCESS=1 — same loud-surfacing contract as the
+    // ocap bypass: an unmissable banner plus ONE `full-access` line in the
+    // #263 permission log. The override itself lives in `policy_for`.
+    if newt_core::agentic::full_access_requested() {
+        print_newt(&full_access_banner(), color, verbose);
+        if let Some(path) = permission_log_path.as_deref() {
+            if let Err(e) = full_access_record(&active_conversation_id).append_jsonl(path) {
                 print_newt(
                     &format!("warning: permission log write failed: {e}"),
                     color,
@@ -10977,26 +11032,30 @@ mod disable_ocap_session_tests {
         assert!(exec_floor_from(&Scope::only(["git".to_string()]), true).is_some());
     }
 
-    /// RAII env override (the run_command bypass and `ocap_disabled` read
-    /// the process env): restore the previous value on drop, including on a
-    /// failed assertion, so yolo never leaks into a neighboring test. Used
-    /// only under the exclusive `env_write_guard_async`.
-    #[cfg(unix)]
+    /// RAII env override (the run_command bypass, `ocap_disabled`, and
+    /// `full_access_requested` read the process env): restore the previous
+    /// value on drop, including on a failed assertion, so yolo/full-access
+    /// never leaks into a neighboring test. Used only under the exclusive
+    /// env write guard (`env_write_guard` / `env_write_guard_async`).
     struct EnvVar {
         key: &'static str,
         saved: Option<String>,
     }
 
-    #[cfg(unix)]
     impl EnvVar {
         fn set(key: &'static str, value: &str) -> Self {
             let saved = std::env::var(key).ok();
             std::env::set_var(key, value);
             Self { key, saved }
         }
+
+        fn unset(key: &'static str) -> Self {
+            let saved = std::env::var(key).ok();
+            std::env::remove_var(key);
+            Self { key, saved }
+        }
     }
 
-    #[cfg(unix)]
     impl Drop for EnvVar {
         fn drop(&mut self) {
             match self.saved.take() {
@@ -11041,6 +11100,83 @@ mod disable_ocap_session_tests {
         assert_eq!(lines.len(), 1);
         let parsed: newt_core::PermissionRecord = serde_json::from_str(lines[0]).unwrap();
         assert_eq!(parsed, rec);
+    }
+
+    /// `--full-access`: the banner is unmissable and names the mechanism —
+    /// the flag, the consequence, and how to get the configured preset back.
+    #[test]
+    fn full_access_banner_names_the_flag_and_the_consequence() {
+        let banner = full_access_banner();
+        assert!(banner.contains("⚠ FULL ACCESS"), "got: {banner}");
+        assert!(banner.contains("--full-access"), "got: {banner}");
+        assert!(
+            banner.contains("session authority is unrestricted"),
+            "got: {banner}"
+        );
+        assert!(
+            banner.contains("restore the configured preset"),
+            "got: {banner}"
+        );
+    }
+
+    /// The `full-access` session record mirrors the ocap-disabled one —
+    /// `decision: "full-access"`, `scope: "session"` — and lands in the same
+    /// #263 jsonl log as prompted decisions, one line, lossless round-trip.
+    #[serial_test::serial(real_fs)]
+    #[test]
+    fn full_access_record_is_the_session_shape_and_appends() {
+        let rec = full_access_record("conv-full-access");
+        assert_eq!(rec.conversation_id, "conv-full-access");
+        assert_eq!(rec.tool, "session");
+        assert_eq!(rec.kind, "exec");
+        assert_eq!(rec.target, "*");
+        assert_eq!(rec.decision, "full-access");
+        assert_eq!(rec.scope, "session");
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("permission-log.jsonl");
+        rec.append_jsonl(&path).unwrap();
+        let body = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = body.lines().collect();
+        assert_eq!(lines.len(), 1);
+        let parsed: newt_core::PermissionRecord = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(parsed, rec);
+    }
+
+    /// `--full-access` / NEWT_FULL_ACCESS=1: `policy_for` builds the session
+    /// policy from the `full_access` preset (`Caveats::top()`) regardless of
+    /// the configured preset — and with the override absent, the configured
+    /// preset rules exactly as before. `top()`'s `exec == Scope::All` is also
+    /// what empties the #774 floor (`exec_floor_none_only_when_unrestricted_
+    /// and_no_mode` above), so `--yolo --full-access` covers every command.
+    #[test]
+    fn full_access_env_overrides_configured_preset_in_policy_for() {
+        use newt_core::caveats::{Caveats as Cav, Scope};
+        // Exclusive guard: this test mutates NEWT_FULL_ACCESS, which
+        // policy_for reads (alongside the NEWT_*_PATHS grant scans).
+        let _g = crate::test_env_guard::env_write_guard();
+        let tui = newt_core::TuiConfig::default(); // preset: workspace_dev
+
+        {
+            let _off = EnvVar::unset("NEWT_FULL_ACCESS");
+            let base = policy_for(Some(tui.clone()), "/ws");
+            assert!(
+                matches!(base.exec, Scope::Only(_)),
+                "override absent ⇒ the configured workspace_dev allowlist rules"
+            );
+        }
+
+        let _on = EnvVar::set("NEWT_FULL_ACCESS", "1");
+        assert_eq!(
+            policy_for(Some(tui), "/ws"),
+            Cav::top(),
+            "override asserted ⇒ the full_access preset, bit-for-bit"
+        );
+        assert_eq!(
+            policy_for(None, "/ws"),
+            Cav::top(),
+            "the explicit flag overrides even the absent-config read-only default"
+        );
     }
 
     /// Exec-none caveats, workspace-fenced fs — the shape under which the

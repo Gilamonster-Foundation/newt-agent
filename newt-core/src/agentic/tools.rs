@@ -958,6 +958,26 @@ pub fn ocap_disabled() -> bool {
     std::env::var("NEWT_DISABLE_OCAP").is_ok_and(|v| v == "1")
 }
 
+/// Is the per-invocation `full_access` preset override asserted?
+///
+/// True only when `NEWT_FULL_ACCESS=1` — set by the CLI's `--full-access`
+/// flag. The session policy is then built from the `full_access` preset
+/// (`Caveats::top()`) regardless of the configured `[tui.permissions]`
+/// preset, exactly as if the config said `preset = "full_access"` for this
+/// one run. Like [`ocap_disabled`], the value must be exactly `"1"` — a
+/// widening switch reads fail-closed — and it is deliberately env-only, so
+/// the override can never silently persist.
+///
+/// This is a DISTINCT switch from [`ocap_disabled`] (`--yolo`): the two
+/// compose but never alias. `--full-access` widens the session *authority*
+/// (fs fence, net leash, exec allowlist → unrestricted, which also empties
+/// the #774 exec floor); `--yolo` changes the exec *mechanism* (host shell
+/// instead of the confined shell) and still honors whatever floor is in
+/// force. `--yolo --full-access` together yield an unrestricted host shell.
+pub fn full_access_requested() -> bool {
+    std::env::var("NEWT_FULL_ACCESS").is_ok_and(|v| v == "1")
+}
+
 /// facade P4 (#780): is the convenience **routing** turned OFF for this call?
 ///
 /// True only when `NEWT_NO_ROUTE=1` — set by the CLI's `--no-route` flag. It
@@ -5901,6 +5921,33 @@ mod disable_ocap_tests {
                 ocap_disabled(),
                 expected,
                 "NEWT_DISABLE_OCAP={value:?} must read as {expected}"
+            );
+        }
+    }
+
+    /// Same fail-closed contract for the `--full-access` preset override:
+    /// ONLY the exact value `1` asserts it (the flag and the env var are one
+    /// mechanism — `--full-access` just exports the var).
+    #[test]
+    fn full_access_requested_requires_exactly_1() {
+        let _l = ENV_LOCK.blocking_lock();
+        {
+            let _unset = EnvVar::unset("NEWT_FULL_ACCESS");
+            assert!(!full_access_requested(), "absent ⇒ configured preset rules");
+        }
+        for (value, expected) in [
+            ("1", true),
+            ("0", false),
+            ("", false),
+            ("true", false),
+            ("yes", false),
+            ("FULL", false),
+        ] {
+            let _set = EnvVar::set("NEWT_FULL_ACCESS", value);
+            assert_eq!(
+                full_access_requested(),
+                expected,
+                "NEWT_FULL_ACCESS={value:?} must read as {expected}"
             );
         }
     }
