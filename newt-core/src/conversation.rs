@@ -227,11 +227,15 @@ pub fn new_conversation_id() -> String {
 }
 
 /// Workspace-relative directory holding a conversation's per-session plan:
-/// `.scratch/sessions/<conversation-id>`. Under `.scratch/` (the ephemeral root,
-/// #844) so it stays out of `.newt/` tracked config; workspace-relative so the
-/// file tools' workspace fence permits writing it. See #220, #844.
+/// `<scratch>/sessions/<conversation-id>` (default `.scratch/sessions/...`). Under
+/// the ephemeral scratch root (#844) so it stays out of `.newt/` tracked config;
+/// kept workspace-RELATIVE (via [`crate::scratch::scratch_workspace_subdir`]) so
+/// the file tools' workspace fence permits writing it — an absolute scratch
+/// relocation applies to crew scratch, not fenced session plans. See #220, #844.
 pub fn session_plan_dir(conversation_id: &str) -> PathBuf {
-    Path::new(".scratch").join("sessions").join(conversation_id)
+    Path::new(&crate::scratch::scratch_workspace_subdir())
+        .join("sessions")
+        .join(conversation_id)
 }
 
 /// Workspace-relative per-session plan document path:

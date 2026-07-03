@@ -81,8 +81,8 @@ impl WorktreeWorkspace {
         // `.scratch/`, which `ensure_scratch` self-ignores (`.scratch/.gitignore`
         // = `*`) so it is never committable — no more `.newt/crew-target` swept
         // into a commit by `git add -A`.
-        newt_core::scratch::ensure_scratch(base)?;
-        let worktree = base.join(".scratch").join("worktrees").join(id);
+        let scratch = newt_core::scratch::ensure_scratch(base)?;
+        let worktree = scratch.join("worktrees").join(id);
         if let Some(parent) = worktree.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -263,7 +263,7 @@ impl Workspace for WorktreeWorkspace {
 /// incrementally instead of each cold. `base` is absolute (the `--dir`/cwd root),
 /// so the path stays absolute and a leaf's own cwd never relativizes it.
 fn crew_shared_target_dir(base: &Path) -> PathBuf {
-    base.join(".scratch/crew-target")
+    newt_core::scratch::scratch_root(base).join("crew-target")
 }
 
 // ---------------------------------------------------------------------------
