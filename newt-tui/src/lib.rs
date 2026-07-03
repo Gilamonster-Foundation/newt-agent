@@ -1316,6 +1316,16 @@ fn coauthor_trailer(model: &str) -> String {
     )
 }
 
+fn yolo_runtime_authority_note() -> Option<&'static str> {
+    newt_core::agentic::ocap_disabled().then_some(
+        "Runtime authority: --disable-ocap/--yolo is active. run_command uses the \
+         unconfined host shell when the active exec floor permits it, not the \
+         brush/agent-bridle confined shell. Do not claim run_command is unavailable \
+         due to brush in this mode. Native fs tools remain workspace-fenced; \
+         web_fetch remains net-leashed.",
+    )
+}
+
 fn runtime_context_block(model: &str, endpoint: &str, kind: newt_core::BackendKind) -> String {
     let now = chrono::Local::now()
         .format("%Y-%m-%d %H:%M:%S %Z")
@@ -1325,6 +1335,9 @@ fn runtime_context_block(model: &str, endpoint: &str, kind: newt_core::BackendKi
         _ => "ollama",
     };
     let bot_email = newt_core::DEFAULT_AGENT_EMAIL;
+    let runtime_authority = yolo_runtime_authority_note()
+        .map(|note| format!("# Runtime authority\n{note}\n"))
+        .unwrap_or_default();
     format!(
         "# Environment (refreshed every turn)\n\
          Harness: newt-agent v{VERSION}\n\
@@ -1335,6 +1348,7 @@ fn runtime_context_block(model: &str, endpoint: &str, kind: newt_core::BackendKi
          When asked who or what you are — and when attributing work (commit \
          trailers, git notes, PR text) — use this real model name and harness; \
          never invent or guess an identity.\n\
+         {runtime_authority}\
          # Git commit identity\n\
          Prefer the `git` tool: it commits as `newt-agent[bot] <{bot_email}>` and \
          auto-signs `Co-authored-by: {model} <{bot_email}>` — do NOT add that \
@@ -15597,6 +15611,56 @@ mod env_resolution_tests {
             oa.contains("openai-compatible @ https://api.openai.com"),
             "{oa}"
         );
+    }
+
+    #[test]
+    fn yolo_runtime_authority_note_tracks_disable_ocap_env() {
+        with_env_vars(&[], &["NEWT_DISABLE_OCAP"], || {
+            assert!(yolo_runtime_authority_note().is_none());
+        });
+
+        with_env_vars(&[("NEWT_DISABLE_OCAP", "1")], &[], || {
+            let note = yolo_runtime_authority_note().expect("yolo note");
+            assert!(note.contains("--disable-ocap/--yolo is active"), "{note}");
+            assert!(
+                note.contains("run_command uses the unconfined host shell"),
+                "{note}"
+            );
+            assert!(
+                note.contains("not the brush/agent-bridle confined shell"),
+                "{note}"
+            );
+            assert!(note.contains("web_fetch remains net-leashed"), "{note}");
+            assert!(!note.contains("web_fetch uses the unconfined"), "{note}");
+        });
+    }
+
+    #[test]
+    fn runtime_context_block_includes_yolo_authority_note_only_when_active() {
+        with_env_vars(&[], &["NEWT_DISABLE_OCAP"], || {
+            let block =
+                runtime_context_block("qwen3:30b", "http://h", newt_core::BackendKind::Ollama);
+            assert!(
+                !block.contains("--disable-ocap/--yolo is active"),
+                "{block}"
+            );
+        });
+
+        with_env_vars(&[("NEWT_DISABLE_OCAP", "1")], &[], || {
+            let block =
+                runtime_context_block("qwen3:30b", "http://h", newt_core::BackendKind::Ollama);
+            assert!(block.contains("# Runtime authority"), "{block}");
+            assert!(
+                block.contains("Do not claim run_command is unavailable due to brush in this mode"),
+                "{block}"
+            );
+            assert!(
+                block.contains(
+                    "Native fs tools remain workspace-fenced; web_fetch remains net-leashed"
+                ),
+                "{block}"
+            );
+        });
     }
 
     #[test]
