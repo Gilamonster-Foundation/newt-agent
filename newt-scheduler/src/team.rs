@@ -209,6 +209,12 @@ pub async fn run_team(
                 blocked = true;
                 SubtaskStatus::NeedsHumanReview
             }
+            // #883: a vacuous verify (baseline already green) is not a pass; it
+            // blocks the team like a needs-review leaf.
+            CrewStatus::VacuousVerify => {
+                blocked = true;
+                SubtaskStatus::NeedsHumanReview
+            }
         };
         results.push(SubtaskResult {
             subtask: st.task.clone(),
@@ -386,6 +392,9 @@ mod tests {
                 triage_model: "triage".into(),
                 max_attempts: 2,
                 role_timeout: None,
+                // Team subtasks share a workspace sequentially — a green baseline
+                // is expected once a prior subtask landed, so no calibration here.
+                calibrate_baseline: false,
             },
             max_subtasks: 5,
         }

@@ -43,6 +43,11 @@ pub enum CrewStatus {
     /// Attempts were exhausted without a green check — escalate to a human (or a
     /// stronger loadout). Never reported as success: an honest cap-exit.
     NeedsHumanReview,
+    /// #883: the verify was already green on the PRE-EDIT baseline yet the crew
+    /// LANDED edits — the check cannot prove the change (a vacuous verify, e.g. a
+    /// filtered `cargo test <not-yet-existing-test>` that runs 0 tests and exits
+    /// 0). Never reported as success.
+    VacuousVerify,
 }
 
 /// The result of running the crew on a task.
@@ -93,6 +98,13 @@ pub struct CrewConfig {
     /// (`role_dispatch_timeout`). Settable from the crew config so a slow
     /// loadout can widen it without an env var (review on #698).
     pub role_timeout: Option<std::time::Duration>,
+    /// #883: apply verify-baseline calibration — flag a verify that is already
+    /// green on the PRE-EDIT tree (yet the crew landed edits) as `VacuousVerify`
+    /// instead of a false `Passed`. ON for a standalone crew leaf. OFF for
+    /// team/plan sequential subtasks, whose SHARED workspace makes a green
+    /// baseline expected once a prior leaf landed (per-leaf-verify-aware
+    /// calibration there is a follow-up).
+    pub calibrate_baseline: bool,
 }
 
 // --- role output contracts (parsed from each role's JSON reply) ---------------
@@ -458,6 +470,13 @@ pub async fn run_crew(
         };
     }
 
+    // #883 verify calibration: capture the verify verdict on the PRE-EDIT tree
+    // once, before any apply() (apply only runs inside the loop). A verify that
+    // is already green here cannot discriminate the crew's edits — a later green
+    // with edits landed is vacuous. Gated: OFF for team/plan sequential subtasks
+    // whose shared workspace is expectedly green once a prior leaf landed.
+    let baseline_ok = cfg.calibrate_baseline && workspace.run_test().0;
+
     let mut failures: Vec<String> = Vec::new();
     let mut touched: Vec<String> = Vec::new();
     let mut last_refused: Vec<String> = Vec::new();
@@ -598,6 +617,20 @@ pub async fn run_crew(
         }
         let (ok, output) = workspace.run_test();
         if ok {
+            // #883 verify calibration: a check that was ALREADY green on the
+            // pre-edit baseline cannot prove the crew's edits. Baseline-green +
+            // edits-landed = Vacuous — never a success. A keep-green verify-only
+            // leaf (baseline green, ZERO edits) classifies KeepGreen and falls
+            // through to the honest pass below (preserving #701).
+            if classify_verify(baseline_ok, true, !touched.is_empty()) == VerifyCalibration::Vacuous
+            {
+                return CrewOutcome {
+                    status: CrewStatus::VacuousVerify,
+                    attempts: attempt,
+                    touched,
+                    refused: last_refused,
+                };
+            }
             // #812 adversarial-review finding: a green check on the UNCHANGED
             // tree while edits were REFUSED is NOT success — nothing landed
             // and the model aimed outside its lane/leash. Accepting it would
@@ -837,6 +870,8 @@ mod tests {
             triage_model: "triage".into(),
             max_attempts,
             role_timeout: None,
+            // Single-crew tests exercise the #883 calibration by default.
+            calibrate_baseline: true,
         }
     }
 
@@ -877,6 +912,54 @@ mod tests {
         )
         .await;
         assert_eq!(out.status, CrewStatus::NeedsHumanReview, "{out:?}");
+    }
+
+    /// A dispatcher whose planner ALWAYS emits a (non-empty) edit writing
+    /// `target.rs=GOOD` — a landed edit even though the baseline is already green.
+    struct AlwaysEditGoodMock;
+    #[async_trait]
+    impl Dispatcher for AlwaysEditGoodMock {
+        async fn dispatch(
+            &self,
+            _backend: &PoolBackend,
+            model: &str,
+            _req: ChatRequest,
+        ) -> anyhow::Result<ChatReply> {
+            let content = match model {
+                "nav" => r#"{"relevant_files":["target.rs"]}"#.to_string(),
+                "triage" => r#"{"summary":"ok","next_action":"none"}"#.to_string(),
+                "planner" => r#"{"edits":[{"path":"target.rs","new_content":"GOOD"}]}"#.to_string(),
+                other => panic!("unexpected model {other}"),
+            };
+            Ok(ChatReply {
+                content,
+                model_id: model.to_string(),
+                usage: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn vacuous_verify_flags_green_baseline_change() {
+        // #883 regression: the verify is GREEN on the pre-edit baseline
+        // (`MemWs::good` → target.rs=GOOD) yet the crew LANDS an edit. The check
+        // cannot prove the change, so the crew must report VacuousVerify — NOT a
+        // false Passed. This test FAILS on pre-#883 code (which returns Passed).
+        let p = pool();
+        let mut ws = MemWs::good();
+        let out = run_crew(
+            &p,
+            &AlwaysEditGoodMock,
+            &mut ws,
+            &cfg(3),
+            &newt_core::caveats::Caveats::top(),
+            "make target.rs GOOD",
+            &[],
+        )
+        .await;
+        assert_eq!(out.status, CrewStatus::VacuousVerify, "{out:?}");
+        assert!(!out.touched.is_empty(), "the crew landed an edit: {out:?}");
+        assert_eq!(out.attempts, 1);
     }
 
     /// One backend serving all three role models at every tier.
@@ -1653,5 +1736,78 @@ mod tests {
         );
         assert_eq!(out.status, CrewStatus::NeedsHumanReview);
         assert_eq!(out.attempts, 0);
+    }
+}
+
+/// #883 verify calibration: classify a verify verdict against its PRE-EDIT baseline.
+/// A verify that already passes on the unedited tree cannot prove the crew's edits —
+/// a later green is VACUOUS. A real pass = baseline failed and the edited tree passed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerifyCalibration {
+    /// Baseline FAILED, edited PASSED — a genuine, discriminating pass.
+    Discriminating,
+    /// Baseline PASSED and the crew made NO edits — a legitimate verify-only keep-green leaf.
+    KeepGreen,
+    /// Baseline PASSED yet the crew LANDED edits — the check cannot prove the change.
+    Vacuous,
+    /// The edited tree does not pass yet — retry / triage.
+    StillFailing,
+}
+
+/// Pure classifier: no I/O. `made_edits` is whether the crew wrote any file.
+pub fn classify_verify(baseline_ok: bool, edited_ok: bool, made_edits: bool) -> VerifyCalibration {
+    match (baseline_ok, edited_ok) {
+        (_, false) => VerifyCalibration::StillFailing,
+        (false, true) => VerifyCalibration::Discriminating,
+        (true, true) if made_edits => VerifyCalibration::Vacuous,
+        (true, true) => VerifyCalibration::KeepGreen,
+    }
+}
+
+#[cfg(test)]
+mod calibration_tests {
+    use super::{classify_verify, VerifyCalibration};
+
+    #[test]
+    fn classify_verify_real_fix_is_discriminating() {
+        assert_eq!(
+            classify_verify(false, true, true),
+            VerifyCalibration::Discriminating
+        );
+    }
+
+    #[test]
+    fn classify_verify_green_baseline_with_edits_is_vacuous() {
+        // The #883 core case: verify was already green on the unedited tree, yet the
+        // crew landed edits -> the check cannot prove the change. Also covers a
+        // filtered `cargo test <missing>` that runs 0 tests and exits 0 (baseline_ok=true).
+        assert_eq!(
+            classify_verify(true, true, true),
+            VerifyCalibration::Vacuous
+        );
+    }
+
+    #[test]
+    fn classify_verify_green_baseline_no_edits_is_keep_green() {
+        assert_eq!(
+            classify_verify(true, true, false),
+            VerifyCalibration::KeepGreen
+        );
+    }
+
+    #[test]
+    fn classify_verify_not_passing_yet_is_still_failing() {
+        assert_eq!(
+            classify_verify(false, false, true),
+            VerifyCalibration::StillFailing
+        );
+        assert_eq!(
+            classify_verify(true, false, true),
+            VerifyCalibration::StillFailing
+        );
+        assert_eq!(
+            classify_verify(false, false, false),
+            VerifyCalibration::StillFailing
+        );
     }
 }

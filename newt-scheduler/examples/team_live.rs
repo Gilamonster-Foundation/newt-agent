@@ -90,6 +90,7 @@ async fn main() {
             triage_model: small.clone(),
             max_attempts: 2,
             role_timeout: None,
+            calibrate_baseline: false,
         },
         max_subtasks: 2,
     };

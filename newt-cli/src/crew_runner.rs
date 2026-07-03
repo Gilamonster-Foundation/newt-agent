@@ -125,6 +125,10 @@ impl LocalCrewRunner {
                 triage_model: triage,
                 max_attempts: MAX_ATTEMPTS,
                 role_timeout: crew.role_timeout_secs.map(std::time::Duration::from_secs),
+                // #883: the in-process runner backs the crew tool + plan leaves
+                // (sequential, shared cumulative worktree); calibration for those
+                // is a follow-up, so it is off here.
+                calibrate_baseline: false,
             };
             return Ok((
                 cc,
@@ -165,6 +169,9 @@ fn render_crew(o: &newt_scheduler::CrewOutcome) -> String {
     let status = match o.status {
         CrewStatus::Passed => "PASS",
         CrewStatus::NeedsHumanReview => "NEEDS HUMAN REVIEW",
+        CrewStatus::VacuousVerify => {
+            "VACUOUS VERIFY (baseline already green — cannot prove the change; not landed)"
+        }
     };
     let mut line = format!(
         "crew: {status} after {} attempt(s); touched: {}",
