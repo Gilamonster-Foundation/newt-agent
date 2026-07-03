@@ -357,8 +357,7 @@ pub enum VllmCmd {
 /// `newt dgx card <cmd>` — model cards (all settings to serve one model).
 ///
 /// The pure render / validate / resolve logic lives in [`crate::dgx_card`]; this
-/// is just the clap surface. `setup` (stand a backend up + write the `~/.newt`
-/// config; vLLM first, ollama stubbed) is the #855 follow-on.
+/// is just the clap surface.
 #[derive(Subcommand, Debug)]
 pub enum CardCmd {
     /// List the built-in cards plus any drop-ins under `~/.newt/models`.
@@ -380,6 +379,33 @@ pub enum CardCmd {
     Validate {
         /// Path to a `.toml` / `.yaml` card.
         path: std::path::PathBuf,
+    },
+    /// Stand a model's backend up from its card + point newt at it.
+    ///
+    /// vLLM: renders `vllm serve` with the card's parsers / context window /
+    /// prefix-caching over SSH to the active DGX node, polls readiness, and
+    /// activates the endpoint (reuses the `vllm up` machinery). ollama: NOT yet
+    /// implemented — vLLM is the first fully-supported backend.
+    Setup {
+        /// Card name to set up (e.g. `Ornith-1.0-35B`; see `card list`).
+        name: String,
+        /// The checkpoint to serve (HF `<org>/<repo>` or an on-node path). The
+        /// card carries the serving KNOBS, not WHICH checkpoint; defaults to the
+        /// card's `served_name` when omitted.
+        #[arg(long)]
+        model: Option<String>,
+        /// SSH node name (defaults to the active node).
+        #[arg(long)]
+        node: Option<String>,
+        /// Override the card's backend (`vllm` | `ollama`).
+        #[arg(long)]
+        backend: Option<String>,
+        /// Render the plan + remote script without SSHing or writing config.
+        #[arg(long)]
+        dry_run: bool,
+        /// Proceed even when the model exceeds the node memory budget.
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -489,7 +515,7 @@ pub async fn run(cmd: DgxCmd, config_path: Option<&Path>) -> anyhow::Result<()> 
                 .await
             }
         },
-        DgxCmd::Card { cmd } => crate::dgx_card::run(cmd, config_path),
+        DgxCmd::Card { cmd } => crate::dgx_card::run(cmd, config_path).await,
         DgxCmd::Gpu => gpu(config_path).await,
         DgxCmd::Switch {
             engine,
@@ -1586,7 +1612,10 @@ fn resolve_served_name(dgx: &DgxConfig, served_name: Option<&str>) -> anyhow::Re
 }
 
 /// `dgx vllm up <model>` — fit pre-flight, launch, wait for readiness, persist.
-async fn vllm_up(
+///
+/// `pub(crate)` so `card setup` (dgx_card.rs) reuses the same stand-up after
+/// mapping a card onto [`VllmPlanArgs`].
+pub(crate) async fn vllm_up(
     config_path: Option<&Path>,
     model: &str,
     node: Option<&str>,
