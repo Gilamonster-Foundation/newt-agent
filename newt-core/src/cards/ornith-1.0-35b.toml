@@ -1,0 +1,36 @@
+# Built-in model card: Ornith-1.0-35B (deepreinforce-ai) — the reference card.
+# IDENTITIES + serving profile ONLY: no host / IP / GPU / port. The endpoint and
+# any node-specific knob (tensor_parallel, gpu_mem) live in the operator's local
+# [dgx] config or a `~/.newt/models/ornith-1.0-35b.toml` override.
+name = "Ornith-1.0-35B"
+backend = "vllm"
+footprint_gib = 35.0 # FP8 resident footprint (the dgx_registry FP8 row).
+
+[vllm]
+served_name = "Ornith-1.0-35B"
+max_model_len = 262144
+reasoning_parser = "qwen3"     # CoT -> a separate `reasoning_content` field.
+tool_call_parser = "qwen3_xml" # native XML tool calls -> OpenAI `tool_calls`.
+enable_auto_tool_choice = true
+# Prefix caching + trust-remote-code (FP8 loads the model's own code) as raw argv
+# until/unless they become typed VllmProfile fields.
+extra = ["--enable-prefix-caching", "--trust-remote-code"]
+
+[ollama]
+tag = "ornith:35b"
+# Capped WELL below the 262144 native window on purpose: ollama's auto num_ctx
+# takes ~80% of the declared window, which for a Q4 35B (~21 GiB of weights) sizes
+# a ~209K-token KV cache and OOMs a modest node. 32768 is a safe, generous default;
+# override it for a bigger box.
+num_ctx = 32768
+
+[tuning]
+temperature = 0.6 # the card's agentic default (1.0 reproduces the benchmarks).
+top_p = 0.95
+top_k = 20
+context_tokens = 262144
+
+[capability]
+emits_leading_reasoning = true # qwen3.5 family: opens the turn with a <think> block.
+thinking_default = true        # thinking on by default (the per-turn toggle's fail-safe).
+reasoning_content_field = "reasoning_content"
