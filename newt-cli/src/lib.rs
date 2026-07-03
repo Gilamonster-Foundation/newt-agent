@@ -38,6 +38,12 @@ pub struct Cli {
     #[arg(short, long, global = true)]
     pub config: Option<PathBuf>,
 
+    /// Use a different user config root instead of ~/.newt.
+    /// Reads config.toml and sibling state files from this directory. An
+    /// explicit --config file still wins for the main config document.
+    #[arg(long, global = true, value_name = "DIR")]
+    pub config_dir: Option<PathBuf>,
+
     /// Skip the full-screen splash: print a compact inline header instead.
     /// Applies to the `code` subcommand (the default). Also configurable
     /// via `[tui] no_splash = true` in newt.toml. Overrides `--splash`.
@@ -451,6 +457,12 @@ fn abs_grant_paths(paths: &[PathBuf]) -> Result<std::ffi::OsString, std::env::Jo
 }
 
 pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
+    if let Some(dir) = cli.config_dir.as_deref() {
+        let dir = abs_grant_path(dir);
+        // SAFETY: single-threaded before any async work or config resolution.
+        unsafe { std::env::set_var(newt_core::config::NEWT_CONFIG_DIR_ENV, dir) };
+    }
+
     // Resolve the venv: --venv flag wins, then fall back to an already-activated $VIRTUAL_ENV.
     // Set NEWT_VENV so the TUI can inject it into the agent-bridle confined shell (which does
     // not inherit the host environment, so a process-level PATH change has no effect there).

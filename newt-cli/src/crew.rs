@@ -439,6 +439,71 @@ fn plan_grounding_contradictions(
     out
 }
 
+/// #812: a term whose definitions are spread over more than this many files
+/// carries no aiming signal (`main` defines in dozens) — it is skipped rather
+/// than allowed to flood/evict the real target under the scope cap.
+const AMBIGUOUS_DEF_FILES: usize = 3;
+
+/// #812: derive one subtask's file scope from the harness's OWN grounding —
+/// `grep_terms(instruction)` → def-site grep → the defining files. PURE over
+/// the injected `def_sites` (`path:line:content` grep lines), so it is
+/// unit-testable with no fs. Order-preserving dedup; ambiguous terms (defs in
+/// more than [`AMBIGUOUS_DEF_FILES`] files) are skipped entirely — no signal,
+/// not weak signal; git-quoted (`"`-prefixed, core.quotePath) and empty
+/// paths are dropped as unusable fence entries.
+fn derive_subtask_scope(
+    instruction: &str,
+    def_sites: &impl Fn(&str) -> Vec<String>,
+) -> Vec<String> {
+    let mut paths: Vec<String> = Vec::new();
+    for term in grep_terms(instruction) {
+        let mut term_files: Vec<String> = Vec::new();
+        for hit in def_sites(&term) {
+            if let Some(p) = hit.split(':').next() {
+                if !p.is_empty() && !p.starts_with('"') && !term_files.iter().any(|q| q == p) {
+                    term_files.push(p.to_string());
+                }
+            }
+        }
+        if term_files.is_empty() || term_files.len() > AMBIGUOUS_DEF_FILES {
+            continue;
+        }
+        for p in term_files {
+            if !paths.iter().any(|q| q == &p) {
+                paths.push(p);
+            }
+        }
+    }
+    paths
+}
+
+/// #812: stamp every subtask's `context` as ground truth ∪ declaration. The
+/// def-site derivation leads (an under- or mis-declaring model cannot mis-aim
+/// the fence away from the real seam), and the model's self-declared `files`
+/// are APPENDED — augmentation per the design doc §4b, never replacement — so
+/// companion edit targets grounding cannot see (a new test file, docs, a
+/// brand-new module) stay in the lane. Bounded so the lane stays a lane.
+/// Declared entries widen only the FENCE, never authority: the fs_write leash
+/// and the worktree still bound everything, and downstream the scope is
+/// meet-only (it can only NARROW the writable set). Empty fences nothing.
+fn ground_subtask_scopes(
+    plan: &mut newt_core::plan::Plan,
+    def_sites: &impl Fn(&str) -> Vec<String>,
+) {
+    const SCOPE_CAP: usize = 6;
+    for s in &mut plan.subtasks {
+        let mut scope = derive_subtask_scope(&s.instruction, def_sites);
+        for declared in &s.context {
+            let d = declared.trim();
+            if !d.is_empty() && !scope.iter().any(|q| q == d) {
+                scope.push(d.to_string());
+            }
+        }
+        scope.truncate(SCOPE_CAP);
+        s.context = scope;
+    }
+}
+
 /// `newt plan <file>` — PREVIEW an overseer-authored plan, or (`--execute`)
 /// dispatch it leaf-by-leaf via a crew (each leaf in its own worktree, through the
 /// same `LocalCrewRunner` the in-session `crew` tool uses).
@@ -637,13 +702,26 @@ const PLAN_AUTHOR_SYSTEM: &str = "You are a planning lead. Decompose the GOAL in
     {\"goal\":\"<the goal>\",\"subtasks\":[{\"id\":\"<short-kebab-id>\",\
     \"instruction\":\"<imperative code-changing step>\",\
     \"deps\":[\"<id of a step that must finish first>\"],\
+    \"files\":[\"<relative path of a REAL existing file this step edits; omit if unknown>\"],\
     \"verify\":\"<shell command that exits 0 once THIS step is done; omit if none>\"}]}. \
     A small, single-file change is ONE subtask. Do NOT create separate \
     inspect/understand/explore/locate/verify/test/run-tests subtasks — the harness reads \
     the repo for you and automatically verifies EVERY subtask after it runs (put a step's \
-    own check in its `verify` FIELD, never as a standalone subtask). Use `deps` for \
-    ordering (a step lists the ids it waits on). Ids: short, stable, unique. Do NOT grant \
-    permissions or describe authority — only the work.";
+    own check in its `verify` FIELD, never as a standalone subtask). That prohibition covers \
+    REPHRASINGS of the same non-actionable pattern too — \"add edge-case tests\", \"clean up \
+    the code\", \"update the comments\", \"validate the fix\" are inspect/verify/test steps \
+    wearing different words; fold any such follow-up into the ONE subtask that changes the \
+    behavior, or drop it. Example: the goal \"Fix `humanize_duration` so 90 seconds returns \
+    '1m 30s' and the test passes\" is ONE subtask, not six — \
+    {\"goal\":\"Fix humanize_duration so 90 seconds returns '1m 30s'\",\
+    \"subtasks\":[{\"id\":\"fix-duration-format\",\"instruction\":\"Fix the minutes/seconds \
+    formatting in humanize_duration so it is correct for every input: zero, under a minute, \
+    and a mixed minutes+seconds value\",\"deps\":[],\
+    \"verify\":\"cargo test humanize_duration\"}]} — NOT \
+    fix-then-adjust-then-format-then-test-edge-cases-then-clean-up-then-update-comments; a \
+    failed later subtask strands the earlier ones half-fixed. Use `deps` for ordering (a \
+    step lists the ids it waits on). Ids: short, stable, unique. Do NOT grant permissions or \
+    describe authority — only the work.";
 
 /// The first balanced `{…}` span in `s` (string-aware), so a model reply wrapped
 /// in ```json fences or prose still parses. `None` if there is no balanced object.
@@ -707,12 +785,26 @@ fn parse_authored_plan(raw: &str) -> Option<newt_core::plan::Plan> {
                     .collect()
             })
             .unwrap_or_default();
+        // #812: the model's self-declared files are read into `context` as a
+        // FALLBACK only — author_plan_to_plan overrides them with the
+        // harness's own def-site derivation wherever grounding finds the real
+        // seam (the model is untrusted to widen, and unreliable at declaring).
+        let context = s
+            .get("files")
+            .and_then(|f| f.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(str::trim).map(str::to_string))
+                    .filter(|p| !p.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
         subtasks.push(Subtask {
             id,
             instruction,
             deps,
             parallel_ok: false,
-            context: Vec::new(),
+            context,
             verify: s.get("verify").and_then(|x| x.as_str()).map(str::to_string),
             status: SubtaskStatus::Pending,
             result: None,
@@ -727,6 +819,144 @@ fn parse_authored_plan(raw: &str) -> Option<newt_core::plan::Plan> {
     })
 }
 
+/// The kind of non-actionable subtask [`ACTION_MARKERS`] identifies.
+#[derive(Clone, Copy)]
+enum MarkerKind {
+    /// A read-only "understand the code" verb. The harness already reads the repo
+    /// for the planner, so an inspect leaf produces no diff — prune it wherever it
+    /// sits in the plan.
+    Inspect,
+    /// A verification verb. The harness auto-verifies EVERY subtask, so a *terminal*
+    /// gate leaf (no subtask depends on it) lands no diff — prune it ONLY when
+    /// terminal; a mid-plan gate a real leaf depends on is kept.
+    Gate,
+}
+
+/// The anti-pattern lexicon for the decompose prune (#801): `(leading verb, kind)`
+/// pairs that mark a subtask as non-actionable — it produces no diff and so feeds
+/// the crew executor's "nothing-to-land" fail-stop. Pure DATA (the three Cs): a new
+/// anti-pattern is a one-line edit here (the flat sibling of
+/// `agentic::routing::READ_ROUTES`). Polysemous verbs (build / run / check) are
+/// deliberately EXCLUDED — "Build the parser", "run the migration", "check the
+/// bounds" are real diff-producing work.
+const ACTION_MARKERS: &[(&str, MarkerKind)] = &[
+    ("inspect", MarkerKind::Inspect),
+    ("examine", MarkerKind::Inspect),
+    ("explore", MarkerKind::Inspect),
+    ("investigate", MarkerKind::Inspect),
+    ("understand", MarkerKind::Inspect),
+    ("locate", MarkerKind::Inspect),
+    ("identify", MarkerKind::Inspect),
+    ("review", MarkerKind::Inspect),
+    ("analyze", MarkerKind::Inspect),
+    ("verify", MarkerKind::Gate),
+    ("validate", MarkerKind::Gate),
+    ("test", MarkerKind::Gate),
+    ("confirm", MarkerKind::Gate),
+    ("ensure", MarkerKind::Gate),
+];
+
+/// The EFFECTIVE prune lexicon: the compiled [`ACTION_MARKERS`] composed with
+/// the operator's droppable `[plan.prune]` override (#819) — removals first,
+/// then additions (lowercased, deduped, empties dropped). Pure; `None` config
+/// yields exactly the compiled defaults.
+fn effective_markers(cfg: Option<&newt_core::PlanPruneConfig>) -> Vec<(String, MarkerKind)> {
+    let mut out: Vec<(String, MarkerKind)> = ACTION_MARKERS
+        .iter()
+        .map(|(v, k)| ((*v).to_string(), *k))
+        .collect();
+    if let Some(c) = cfg {
+        let removed: Vec<String> = c.remove.iter().map(|w| w.to_ascii_lowercase()).collect();
+        out.retain(|(v, _)| !removed.contains(v));
+        let mut add = |words: &[String], kind: MarkerKind| {
+            for w in words {
+                let w = w.trim().to_ascii_lowercase();
+                if !w.is_empty() && !removed.contains(&w) && !out.iter().any(|(v, _)| *v == w) {
+                    out.push((w, kind));
+                }
+            }
+        };
+        add(&c.add_inspect, MarkerKind::Inspect);
+        add(&c.add_gate, MarkerKind::Gate);
+    }
+    out
+}
+
+/// Classify a subtask by the LEADING verb of its instruction against a
+/// lexicon. Returns `None` for a real (diff-producing) subtask — "Extract
+/// helper", "Add validation", "Rename fn" survive because their leading verb
+/// is not a marker. Only the leading token is consulted, so a marker word
+/// later in the sentence never trips a prune.
+fn marker_kind_in(markers: &[(String, MarkerKind)], instruction: &str) -> Option<MarkerKind> {
+    let head = instruction
+        .split(|c: char| !c.is_alphanumeric())
+        .find(|w| !w.is_empty())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    markers
+        .iter()
+        .find(|(verb, _)| *verb == head)
+        .map(|(_, kind)| *kind)
+}
+
+/// Deterministically prune non-actionable subtasks from a freshly-authored plan
+/// (#801). A read-only `inspect` leaf and a *terminal* `gate` leaf both produce no
+/// diff, so under the crew executor they trip the "nothing-to-land" fail-stop
+/// (`newt-core/src/agentic/plan_exec.rs`) — the #1 observed crew-mode failure in the
+/// DGX planner-strength sweep. This is the deterministic backstop to
+/// [`PLAN_AUTHOR_SYSTEM`]'s prose, which a weaker planner ignores. Pure and
+/// in-memory: it runs BEFORE any authority grant, only removes subtasks and rewires
+/// their `deps`, and never touches `caveat_policy` — so it cannot widen authority
+/// nor make a gate easier to pass (a surviving leaf still faces the full per-leaf
+/// verify). It removes only a false-NEGATIVE (no-diff) failure source.
+fn prune_non_actionable_subtasks_in(
+    plan: &mut newt_core::plan::Plan,
+    markers: &[(String, MarkerKind)],
+) {
+    use std::collections::HashSet;
+    // Empty-guard: if NOTHING in the plan is actionable — every subtask is a marker
+    // — leave it entirely untouched. Pruning would empty (or half-prune) it; let
+    // `plan_sanity` / re-author handle a degenerate plan rather than fabricate one.
+    if !plan
+        .subtasks
+        .iter()
+        .any(|s| marker_kind_in(markers, &s.instruction).is_none())
+    {
+        return;
+    }
+    // Fixpoint: remove one prunable subtask at a time (Inspect anywhere; Gate only
+    // when terminal), splicing the removed subtask's own deps into every survivor
+    // that named it — a dangling dep would STALL the survivor, since
+    // `Plan::next_ready_leaf` treats an absent dep as never-`Done`.
+    loop {
+        let depended: HashSet<String> = plan
+            .subtasks
+            .iter()
+            .flat_map(|s| s.deps.iter().cloned())
+            .collect();
+        let victim =
+            plan.subtasks
+                .iter()
+                .position(|s| match marker_kind_in(markers, &s.instruction) {
+                    Some(MarkerKind::Inspect) => true,
+                    Some(MarkerKind::Gate) => !depended.contains(&s.id),
+                    None => false,
+                });
+        let Some(idx) = victim else { return };
+        let removed = plan.subtasks.remove(idx);
+        for s in &mut plan.subtasks {
+            if let Some(pos) = s.deps.iter().position(|d| *d == removed.id) {
+                s.deps.remove(pos);
+                for vd in &removed.deps {
+                    if !s.deps.contains(vd) {
+                        s.deps.push(vd.clone());
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Decompose `goal` into a `plan::Plan` by asking `model` (the overseer seat).
 /// The model proposes the work; caveats stay default-deny.
 pub async fn author_plan(
@@ -735,6 +965,7 @@ pub async fn author_plan(
     model: &str,
     goal: &str,
     max_subtasks: usize,
+    prune: Option<&newt_core::PlanPruneConfig>,
 ) -> anyhow::Result<newt_core::plan::Plan> {
     let req = newt_scheduler::ChatRequest::new()
         .system(PLAN_AUTHOR_SYSTEM)
@@ -745,12 +976,24 @@ pub async fn author_plan(
         .ok_or_else(|| {
             anyhow::anyhow!("no live model reachable to author the plan (model {model})")
         })?;
-    parse_authored_plan(&reply.result.content).ok_or_else(|| {
-        anyhow::anyhow!(
-            "the model did not return a parseable JSON plan. Raw reply:\n{}",
-            reply.result.content
-        )
-    })
+    parse_authored_plan(&reply.result.content)
+        .map(|mut plan| {
+            // #801: deterministically drop the non-actionable (inspect /
+            // terminal-gate) leaves a weaker planner pads the plan with, before any
+            // authority is granted or the plan is dispatched. The lexicon composes
+            // with the operator's droppable [plan.prune] override (#819), which can
+            // also disable the prune entirely.
+            if !prune.map(|c| c.disabled).unwrap_or(false) {
+                prune_non_actionable_subtasks_in(&mut plan, &effective_markers(prune));
+            }
+            plan
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "the model did not return a parseable JSON plan. Raw reply:\n{}",
+                reply.result.content
+            )
+        })
 }
 
 /// `newt plan --goal "<g>"` — author a plan from a goal, write it (or print it),
@@ -811,12 +1054,14 @@ pub async fn author_plan_to_plan(
     }
     // Phase 2: decompose the (doc + repo-augmented) goal into a plan.
     println!("authoring a plan for: {goal}  (model {model})…");
-    let plan = author_plan(
+    let prune_cfg = cfg.plan.as_ref().map(|p| p.prune.clone());
+    let mut plan = author_plan(
         &pool,
         &LocalDispatcher,
         &model,
         &effective_goal,
         max_subtasks,
+        prune_cfg.as_ref(),
     )
     .await?;
     // Phase 2b (#691): claim-check the plan against ground truth. A subtask that
@@ -824,11 +1069,19 @@ pub async fn author_plan_to_plan(
     // mis-ground — re-author ONCE with the citation. A backstop to the #687
     // grounding helper; refutes only on positive contradiction, so a clean plan
     // is never re-authored.
+    // `--full-name` prints paths relative to the repo TOPLEVEL regardless of
+    // `repo_dir` — the same basis as worktree edit paths, so a scope derived
+    // here matches what the fence partitions on even when planning from a
+    // subdir. `core.quotepath=false` keeps non-ASCII paths raw instead of
+    // C-quoted (a quoted path would be an unusable fence entry). (#812)
     let def_sites = |sym: &str| -> Vec<String> {
         git(
             repo_dir,
             &[
+                "-c",
+                "core.quotepath=false",
                 "grep",
+                "--full-name",
                 "-nE",
                 "-e",
                 &definition_grep_pattern(sym),
@@ -841,6 +1094,9 @@ pub async fn author_plan_to_plan(
     };
     let contradictions = plan_grounding_contradictions(&plan, def_sites);
     if contradictions.is_empty() {
+        // #812: stamp each leaf's file scope from the SAME ground truth the
+        // claim-check uses, so the worker fence bites deterministically.
+        ground_subtask_scopes(&mut plan, &def_sites);
         return Ok(plan);
     }
     println!(
@@ -852,14 +1108,17 @@ pub async fn author_plan_to_plan(
          fix these and do NOT invent paths:\n{}",
         contradictions.join("\n")
     ));
-    author_plan(
+    let mut plan = author_plan(
         &pool,
         &LocalDispatcher,
         &model,
         &effective_goal,
         max_subtasks,
+        prune_cfg.as_ref(),
     )
-    .await
+    .await?;
+    ground_subtask_scopes(&mut plan, &def_sites);
+    Ok(plan)
 }
 
 /// Bounded structural context about the target repo at `dir` — its language /
@@ -1304,7 +1563,18 @@ async fn run_with(
     // worktree. Reconciling the scheduler's path-enforcement with the lock is a
     // follow-up.
     let caveats = newt_acp_worker::worker_session_caveats(None);
-    let outcome = run_crew(&pool, dispatcher, &mut ws, &crew_cfg, &caveats, &args.task).await;
+    // Direct `newt crew` runs are a single whole-task crew (no plan, no leaf
+    // lanes) — there is no leaf scope to fence (#812), so pass none.
+    let outcome = run_crew(
+        &pool,
+        dispatcher,
+        &mut ws,
+        &crew_cfg,
+        &caveats,
+        &args.task,
+        &[],
+    )
+    .await;
     // Drop ws (removes the worktree) BEFORE we may process::exit upstream.
     let touched_in = ws.path().to_path_buf();
     drop(ws);
@@ -1407,6 +1677,25 @@ mod tests {
         assert!(PLAN_AUTHOR_SYSTEM.contains("MUST change code"));
         assert!(PLAN_AUTHOR_SYSTEM.contains("Do NOT create separate"));
         assert!(PLAN_AUTHOR_SYSTEM.contains("verifies EVERY subtask"));
+    }
+
+    #[test]
+    fn plan_author_prompt_forbids_rephrased_verify_subtasks_and_gives_a_worked_example() {
+        // Regression (autopsy 2026-07-02-pr802-baseline, T2-humanize-duration x
+        // qwen3-coder:30b / qwen2.5-coder:32b x2 / deepseek-r1:70b, secondary tag
+        // planner-over-decomposition): the literal-verb prohibition above was not
+        // enough — planners kept the anti-pattern alive by REPHRASING the forbidden
+        // verbs. tmp.zfbIvGkXKX emitted 6 dependent leaves for a one-line bug fix
+        // (fix-seconds-component, handle-minutes-and-seconds,
+        // format-minutes-and-seconds, test-edge-cases, clean-up-code,
+        // update-comments) — "Add ... tests", "Refactor ... readability", "Update
+        // comments" never say the literal word "test"/"verify" — then stalled with
+        // 4 leaves unreached after leaf 2 broke scope (.plan.log:79-80, "plan
+        // incomplete"). A worked one-shot example is a stronger anti-pattern signal
+        // than a word blocklist alone.
+        assert!(PLAN_AUTHOR_SYSTEM.contains("REPHRASINGS"));
+        assert!(PLAN_AUTHOR_SYSTEM.contains("is ONE subtask, not six"));
+        assert!(PLAN_AUTHOR_SYSTEM.contains("fix-duration-format"));
     }
 
     #[test]
@@ -1598,7 +1887,7 @@ mod tests {
         )
         .unwrap();
         let pool = BackendPool::from_source(&StaticSource::from_configs(cfg.backends.iter()));
-        let plan = author_plan(&pool, &PlanMock, "m", "ship the thing", 8)
+        let plan = author_plan(&pool, &PlanMock, "m", "ship the thing", 8, None)
             .await
             .expect("authored a plan");
         assert_eq!(plan.goal.as_deref(), Some("ship"));
@@ -1608,6 +1897,297 @@ mod tests {
             plan.subtasks[0].caveat_policy,
             newt_core::plan::CaveatPolicy::default()
         );
+    }
+
+    #[test]
+    fn effective_markers_composes_remove_then_add() {
+        // #819: the [plan.prune] override composes with the compiled lexicon —
+        // removals first (and removals beat additions), then case-normalized
+        // deduped additions.
+        let cfg = newt_core::PlanPruneConfig {
+            disabled: false,
+            add_inspect: vec!["Scrutinize".into(), "  ".into(), "verify".into()],
+            add_gate: vec!["smoke".into()],
+            remove: vec!["REVIEW".into(), "verify".into()],
+        };
+        let m = effective_markers(Some(&cfg));
+        assert!(
+            marker_kind_in(&m, "Review the code for style").is_none(),
+            "removed builtin no longer marks"
+        );
+        assert!(
+            marker_kind_in(&m, "verify the output").is_none(),
+            "a removed verb cannot be re-added"
+        );
+        assert!(matches!(
+            marker_kind_in(&m, "Scrutinize the module"),
+            Some(MarkerKind::Inspect)
+        ));
+        assert!(matches!(
+            marker_kind_in(&m, "smoke the build"),
+            Some(MarkerKind::Gate)
+        ));
+        // Untouched builtins survive.
+        assert!(matches!(
+            marker_kind_in(&m, "inspect the parser"),
+            Some(MarkerKind::Inspect)
+        ));
+        // None = exactly the compiled defaults.
+        let d = effective_markers(None);
+        assert_eq!(d.len(), ACTION_MARKERS.len());
+    }
+
+    #[test]
+    fn prune_respects_the_config_lexicon() {
+        // #819: a custom Inspect verb prunes under the composed lexicon and
+        // survives under the defaults — the override is config, not code.
+        let cfg = newt_core::PlanPruneConfig {
+            add_inspect: vec!["scrutinize".into()],
+            ..Default::default()
+        };
+        let mut plan = marker_plan(vec![
+            marker_sub("pad", "Scrutinize the module layout", &[]),
+            marker_sub("work", "Add the parser", &["pad"]),
+        ]);
+        prune_non_actionable_subtasks_in(&mut plan, &effective_markers(Some(&cfg)));
+        let ids: Vec<&str> = plan.subtasks.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, vec!["work"], "custom inspect verb pruned, dep rewired");
+        assert!(plan.subtasks[0].deps.is_empty());
+
+        let mut plan2 = marker_plan(vec![
+            marker_sub("pad", "Scrutinize the module layout", &[]),
+            marker_sub("work", "Add the parser", &["pad"]),
+        ]);
+        prune_non_actionable_subtasks_in(&mut plan2, &effective_markers(None));
+        assert_eq!(plan2.subtasks.len(), 2, "defaults do not know the verb");
+    }
+
+    #[tokio::test]
+    async fn author_plan_with_disabled_prune_keeps_padding_leaves() {
+        // #819: [plan.prune] disabled = true restores the pre-#803 behavior —
+        // the padded inspect leaf survives authoring; with the default config
+        // it is pruned. Same mock, only the config differs.
+        struct PaddedPlanMock;
+        #[async_trait::async_trait]
+        impl Dispatcher for PaddedPlanMock {
+            async fn dispatch(
+                &self,
+                _b: &newt_scheduler::PoolBackend,
+                _m: &str,
+                _r: newt_scheduler::ChatRequest,
+            ) -> anyhow::Result<newt_scheduler::ChatReply> {
+                Ok(newt_scheduler::ChatReply {
+                    content: "{\"goal\":\"g\",\"subtasks\":[\
+                        {\"id\":\"look\",\"instruction\":\"Inspect the module\"},\
+                        {\"id\":\"work\",\"instruction\":\"Add the fix\",\"deps\":[\"look\"]}]}"
+                        .to_string(),
+                    model_id: "m".into(),
+                    usage: None,
+                })
+            }
+        }
+        let cfg: Config = toml::from_str(
+            "[[backends]]\nname=\"x\"\nendpoint=\"http://x:11434\"\nmodel=\"m\"\ntiers=[]\n",
+        )
+        .unwrap();
+        let pool = BackendPool::from_source(&StaticSource::from_configs(cfg.backends.iter()));
+        let disabled = newt_core::PlanPruneConfig {
+            disabled: true,
+            ..Default::default()
+        };
+        let kept = author_plan(&pool, &PaddedPlanMock, "m", "g", 8, Some(&disabled))
+            .await
+            .expect("authored");
+        assert_eq!(kept.subtasks.len(), 2, "disabled ⇒ padding survives");
+        let pruned = author_plan(&pool, &PaddedPlanMock, "m", "g", 8, None)
+            .await
+            .expect("authored");
+        assert_eq!(pruned.subtasks.len(), 1, "default ⇒ padding pruned");
+        assert_eq!(pruned.subtasks[0].id, "work");
+        assert!(pruned.subtasks[0].deps.is_empty(), "dep rewired");
+    }
+
+    // ── #801: prune non-actionable (inspect / terminal-gate) subtasks ──────────
+    fn marker_sub(id: &str, instruction: &str, deps: &[&str]) -> newt_core::plan::Subtask {
+        newt_core::plan::Subtask {
+            id: id.into(),
+            instruction: instruction.into(),
+            deps: deps.iter().map(|s| (*s).to_string()).collect(),
+            parallel_ok: false,
+            context: vec![],
+            verify: None,
+            status: newt_core::plan::SubtaskStatus::Pending,
+            result: None,
+            parent: None,
+            caveat_policy: newt_core::plan::CaveatPolicy::default(),
+        }
+    }
+    fn marker_plan(subs: Vec<newt_core::plan::Subtask>) -> newt_core::plan::Plan {
+        newt_core::plan::Plan {
+            goal: None,
+            aggregation: newt_core::plan::Aggregation::default(),
+            subtasks: subs,
+        }
+    }
+
+    #[test]
+    fn prune_drops_inspect_and_terminal_gate_rewiring_deps() {
+        // The over-decomposed plan the DGX sweep caught (30b × T2): a read-only
+        // inspect leaf, the real fix, and a trailing validate gate. WOULD FAIL before
+        // #801 — all three subtasks survived and the inspect/gate tripped
+        // nothing-to-land.
+        let mut plan = marker_plan(vec![
+            marker_sub(
+                "inspect-test",
+                "Inspect the existing test to understand the failure",
+                &[],
+            ),
+            marker_sub(
+                "fix",
+                "Modify humanize_duration to return \"1m 30s\"",
+                &["inspect-test"],
+            ),
+            marker_sub(
+                "validate",
+                "Verify the tests pass with cargo test",
+                &["fix"],
+            ),
+        ]);
+        prune_non_actionable_subtasks_in(&mut plan, &effective_markers(None));
+        let ids: Vec<&str> = plan.subtasks.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["fix"],
+            "inspect + terminal gate pruned, fix survives"
+        );
+        // the fix's dep on the removed inspect (which had no deps) is rewired away,
+        // so it is immediately dispatchable instead of stalled on an absent dep.
+        assert!(plan.subtasks[0].deps.is_empty(), "dangling dep removed");
+    }
+
+    #[test]
+    fn prune_keeps_a_gate_a_real_leaf_depends_on() {
+        // A NON-terminal gate (a survivor still depends on it) is kept — the prune
+        // bites only terminal gates.
+        let mut plan = marker_plan(vec![
+            marker_sub("extract", "Extract the sum into a helper", &[]),
+            marker_sub("check", "Validate the helper compiles", &["extract"]),
+            marker_sub("use", "Rewrite summarize to call the helper", &["check"]),
+        ]);
+        prune_non_actionable_subtasks_in(&mut plan, &effective_markers(None));
+        let ids: Vec<&str> = plan.subtasks.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["extract", "check", "use"],
+            "mid-plan gate retained"
+        );
+    }
+
+    #[test]
+    fn prune_leaves_an_all_marker_plan_untouched() {
+        // Every subtask is a marker → zero actionable work → the empty-guard leaves
+        // the plan intact for plan_sanity / re-author, never half-pruned.
+        let mut plan = marker_plan(vec![
+            marker_sub("a", "Inspect the module", &[]),
+            marker_sub("b", "Verify the build", &["a"]),
+        ]);
+        prune_non_actionable_subtasks_in(&mut plan, &effective_markers(None));
+        assert_eq!(plan.subtasks.len(), 2, "all-marker plan untouched");
+    }
+
+    #[test]
+    fn prune_is_a_noop_on_a_plan_of_real_work() {
+        // Non-marker leading verbs ("Add", "Rename") survive unchanged — the existing
+        // behaviour for a well-formed multi-leaf plan, deps intact.
+        let mut plan = marker_plan(vec![
+            marker_sub("a", "Add error handling to parse_port", &[]),
+            marker_sub("b", "Rename the helper", &["a"]),
+        ]);
+        prune_non_actionable_subtasks_in(&mut plan, &effective_markers(None));
+        let ids: Vec<&str> = plan.subtasks.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, vec!["a", "b"]);
+        assert_eq!(plan.subtasks[1].deps, vec!["a"]);
+    }
+
+    #[test]
+    fn derive_subtask_scope_extracts_def_files_and_skips_ambiguous_terms() {
+        // #812: def_sites returns `path:line:content` grep lines; the scope is
+        // the DEFINING files, order-preserving, deduped. A term defined in
+        // more than AMBIGUOUS_DEF_FILES files carries no aiming signal (e.g.
+        // `main`) and is skipped so it cannot evict the real target; a
+        // git-quoted path (core.quotePath escaping) is dropped as unusable.
+        let def_sites = |sym: &str| -> Vec<String> {
+            match sym {
+                "humanize_duration" => vec![
+                    "src/util.rs:2:pub fn humanize_duration(...)".to_string(),
+                    "src/util.rs:9:fn humanize_duration_impl(...)".to_string(),
+                    "src/lib.rs:11:fn humanizes()".to_string(),
+                    "\"src/gr\\303\\266\\303\\237e.rs\":1:fn humanize_x()".to_string(),
+                ],
+                "main" => (0..14).map(|i| format!("file{i}.rs:1:fn main()")).collect(),
+                _ => Vec::new(),
+            }
+        };
+        let scope = derive_subtask_scope(
+            "fix `humanize_duration` in `main` so 90s renders as 1m 30s",
+            &def_sites,
+        );
+        assert_eq!(
+            scope,
+            vec!["src/util.rs".to_string(), "src/lib.rs".to_string()],
+            "defining files kept; ambiguous `main` skipped; quoted path dropped"
+        );
+        // No grounded symbols → empty scope (fence stays off; never invented).
+        assert!(derive_subtask_scope("tidy the docs", &def_sites).is_empty());
+    }
+
+    #[test]
+    fn ground_subtask_scopes_unions_def_sites_with_declared_files() {
+        // #812 (§4b: augmentation, not replacement): the derived def-site
+        // LEADS the scope, and the model's declared files are APPENDED — a
+        // companion target grounding cannot see (a new test file) must stay
+        // in the lane, and a mis-declaring model still cannot aim the fence
+        // away from the real seam. Where derivation finds nothing, the
+        // declaration alone survives.
+        let mut plan = marker_plan(vec![
+            marker_sub("fix", "Fix `humanize_duration` in the util module", &[]),
+            marker_sub("new", "Create the brand-new reporting module", &[]),
+        ]);
+        plan.subtasks[0].context =
+            vec!["tests/util_test.rs".to_string(), "src/util.rs".to_string()];
+        plan.subtasks[1].context = vec!["src/report.rs".to_string()];
+        let def_sites = |sym: &str| -> Vec<String> {
+            if sym == "humanize_duration" {
+                vec!["src/util.rs:2:pub fn humanize_duration".to_string()]
+            } else {
+                Vec::new()
+            }
+        };
+        ground_subtask_scopes(&mut plan, &def_sites);
+        assert_eq!(
+            plan.subtasks[0].context,
+            vec!["src/util.rs".to_string(), "tests/util_test.rs".to_string()],
+            "derived seam leads; declared companion appended; dup deduped"
+        );
+        assert_eq!(
+            plan.subtasks[1].context,
+            vec!["src/report.rs".to_string()],
+            "no def-site found → the declared file survives alone"
+        );
+    }
+
+    #[test]
+    fn parse_authored_plan_reads_declared_files_into_context() {
+        // #812: the authored JSON's `files` array lands in Subtask.context
+        // (as the untrusted fallback the def-site derivation may override);
+        // absent/empty `files` still parses with an empty context.
+        let raw = r#"{"goal":"g","subtasks":[
+            {"id":"a","instruction":"Fix util","files":["src/util.rs","  "],"deps":[]},
+            {"id":"b","instruction":"Add docs","deps":["a"]}
+        ]}"#;
+        let plan = parse_authored_plan(raw).expect("parses");
+        assert_eq!(plan.subtasks[0].context, vec!["src/util.rs".to_string()]);
+        assert!(plan.subtasks[1].context.is_empty());
     }
 
     /// A throwaway git repo with one committed file at `name` containing `body`.

@@ -115,16 +115,69 @@ the operator's local pieces. Placeholder templates (no real hosts) live in
 `T0–T4` lean on behavioral **workspace tests** so the generic `tests_pass` carries the "it
 works" signal; `T5` reuses #672's exact instrument.
 
-## Running (spec for `ratchet.sh`)
+## Running
+
+Two layers: `ratchet.sh` runs exactly **one** (task × mode × model) cell;
+`sweep.sh` (#804) drives the **matrix** with n trials per cell and crash
+resume. The n=1 lesson from the #802 sweep (its headline cell was noise —
+~80% PASS at n=5) is baked in: per-cell claims need **n ≥ 5**, so multi-trial
+is the default, not an option.
 
 ```bash
-# one cell
-scripts/eval/ratchet.sh --task T0 --mode single --backend gnuc-3b --trials 3
-# a mode sweep on one model (the ratchet, live)
-scripts/eval/ratchet.sh --task T4 --modes single,plan,plan+crew --backend gnuc-7b --crew mixed
-# the v1 gnuc matrix
-scripts/eval/ratchet.sh --all --tier gnuc            # → results/ratchet-<date>.md + charts
+# one cell (the primitive — unchanged contract; nightly + file-regressions.sh rely on it)
+scripts/eval/ratchet.sh --task T0-fix-add --mode single --model qwen2.5-coder:7b --coder
+scripts/eval/ratchet.sh --task T2-humanize-duration --mode crew --max-leaves 6
+
+# the matrix, n>=5 per cell, resumable (kill/reboot → re-run the same command to top up)
+scripts/eval/sweep.sh --out scripts/eval/results/sweeps/<date>-<experiment> \
+  --tasks T2-humanize-duration,010-decompose-god-function \
+  --modes single,crew --models <name1>,<name2> --trials 5
+
+scripts/eval/sweep.sh --out <dir> --status   # completion grid, ETA, DONE state
+scripts/eval/sweep.sh --self-test            # offline logic checks (no binaries)
 ```
+
+`sweep.sh` groups cells **model-major** (the shared inference endpoint evicts
+models on load — never interleave), generates an ephemeral `$NEWT_CONFIG` per
+model from the operator's local `{{MODEL}}` template
+(`~/.newt/eval-sweeps/template.toml`, shape in `RATCHET.local.example`), and
+asserts each emitted row's model column matches the label — in crew mode
+`ratchet.sh --model` is label-only, the config decides what actually runs, so
+config and label must come from one variable.
+
+Results land in `$OUT/sweep.tsv` (ratchet's 6 columns + completion timestamp
++ duration + per-row run parameters — `file-regressions.sh`-compatible), with
+`sweep.grid` / `sweep.meta.json` / `errors.log` / `DONE` alongside.
+**Honest trials:** behavioral FAILs count toward n, but rows whose FAIL is
+really an infrastructure failure (crew `no_crew_branch_infra`, single-mode
+empty `tests_pass=`) are logged to `errors.log` and retried on resume, never
+counted — and a model group whose *first* contact is an infra failure is
+skipped for the whole invocation (dead-endpoint canary), so an unattended
+sweep cannot fill with connection noise and report `DONE`. A crew run where
+real inference happened but no branch landed is emitted as
+`no_crew_branch_exercised` and **counts as a legitimate FAIL trial** (it
+carries `dir=` so autopsy can read the kept throwaway) — `ratchet.sh`
+discriminates the two from the plan log (#820). Exit code: 0 = grid
+complete, 2 = incomplete (a resume is needed). Throwaway repos go
+under `/var/tmp/newt-sweeps/<name>/`; `--keep fail` (default) reaps PASS
+throwaways immediately and keeps FAILs for autopsy — run
+`sweep.sh --out <dir> --reap` after analysis, and sweep anything older than
+~14 days out of `/var/tmp/newt-sweeps/`.
+
+For a multi-hour grid, detach it from the session (survives logout with
+`loginctl enable-linger`):
+
+```bash
+systemd-run --user --unit newt-sweep-<name> --working-directory "$PWD" \
+  --setenv NEWT_BIN="$PWD/target/release/newt" \
+  --setenv NEWT_EVAL_BIN="$PWD/target/release/newt-eval" \
+  scripts/eval/sweep.sh --out ... --tasks ... --modes ... --models ... --trials 5
+journalctl --user -fu newt-sweep-<name>     # follow
+systemctl --user stop newt-sweep-<name>     # stop (resume later by relaunching)
+```
+
+Build the release binaries **before** launching; sweep.sh refuses to start
+without them and never rebuilds mid-sweep.
 
 ## Status & build order
 

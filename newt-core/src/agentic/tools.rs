@@ -5544,6 +5544,29 @@ mod execute_tool_branch_tests {
         );
     }
 
+    /// Regression for the field report: github.com is outside the default net
+    /// scope, so a TUI-provided gate must be consulted before the bridle leash
+    /// returns the denial to the model.
+    #[tokio::test]
+    async fn web_fetch_github_denial_consults_permission_gate() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let caveats = caveats_rw(ws.path()); // net: Scope::none()
+        let mut gate = MockGate::new(false, &caveats);
+        let out = run_tool_gated(
+            "web_fetch",
+            serde_json::json!({"url": "https://github.com/openai/codex"}),
+            ws.path(),
+            &caveats,
+            &mut gate,
+        )
+        .await;
+        assert!(out.starts_with("error:"), "leash denial surfaces: {out}");
+        assert_eq!(
+            gate.asks,
+            vec![("web_fetch".to_string(), "net:github.com".to_string())]
+        );
+    }
+
     /// An unparseable URL skips the net pre-check entirely — the gate is
     /// never consulted and the dispatch (with the original caveats) answers.
     #[tokio::test]

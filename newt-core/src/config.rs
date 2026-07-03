@@ -1,8 +1,9 @@
 //! Configuration loading for Newt-Agent.
 //!
 //! Base resolution order: `$NEWT_CONFIG` env var, then `./newt.toml`,
-//! `~/.newt/config.toml`, `/etc/newt/config.toml`. If none exist the
-//! built-in defaults are used (a single Ollama backend on localhost).
+//! `$NEWT_CONFIG_DIR/config.toml` (or `~/.newt/config.toml`), then
+//! `/etc/newt/config.toml`. If none exist the built-in defaults are used
+//! (a single Ollama backend on localhost).
 //!
 //! A project-local `.newt/config.toml` (found by walking up from the current
 //! directory) is then deep-merged **over** that base, so a git repo can pin its
@@ -15,6 +16,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{NewtError, Result};
 use crate::router::Tier;
+
+/// Process-scoped user config root override, set by the CLI's `--config-dir`.
+pub const NEWT_CONFIG_DIR_ENV: &str = "NEWT_CONFIG_DIR";
 
 // ---------------------------------------------------------------------------
 // Config types
@@ -176,6 +180,13 @@ pub struct Config {
     /// (#749 step 8) plugs into. See [`CrewPolicyConfig`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub crew: Option<CrewPolicyConfig>,
+
+    /// `[plan]` — plan-authoring policy. Today: the `[plan.prune]` droppable
+    /// override for the decompose prune's anti-pattern lexicon (#801/#803 →
+    /// #819). `None` = compiled defaults, behavior unchanged. See
+    /// [`PlanPruneConfig`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<PlanConfig>,
 }
 
 /// One named mode (`[modes.<name>]`, issue #307): the atomic binding the
@@ -1930,6 +1941,45 @@ pub struct Crew {
 /// [crew.clamp]
 /// net = { only = ["registry.internal"] }
 /// ```
+/// `[plan]` — plan-authoring policy (#819).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct PlanConfig {
+    /// `[plan.prune]` — the decompose-prune lexicon override.
+    #[serde(default)]
+    pub prune: PlanPruneConfig,
+}
+
+/// `[plan.prune]` — droppable, three-Cs override for the #801/#803 planner-
+/// decomposition prune. The compiled `ACTION_MARKERS` lexicon is the default;
+/// this table composes with it (remove first, then additions), so a new
+/// anti-pattern — or un-marking a verb your domain uses for real work — is
+/// CONFIG, not code. The prune itself stays grade-neutral either way: it only
+/// removes no-diff leaves before any authority grant (#803's n=5 A/B measured
+/// no grade lift; it removes a failure *mechanism*).
+///
+/// ```toml
+/// [plan.prune]
+/// disabled = false
+/// add_inspect = ["scrutinize"]   # pruned wherever they lead an instruction
+/// add_gate = ["smoke"]           # pruned only when terminal
+/// remove = ["review"]            # e.g. a repo where "Review X" edits docs
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct PlanPruneConfig {
+    /// Turn the prune off entirely (the pre-#803 behavior).
+    #[serde(default)]
+    pub disabled: bool,
+    /// Extra leading verbs classified Inspect (case-insensitive).
+    #[serde(default)]
+    pub add_inspect: Vec<String>,
+    /// Extra leading verbs classified Gate (case-insensitive).
+    #[serde(default)]
+    pub add_gate: Vec<String>,
+    /// Verbs to REMOVE from the effective lexicon (builtin or added).
+    #[serde(default)]
+    pub remove: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct CrewPolicyConfig {
     /// The authority **clamp** dispatched crews are met against
@@ -2557,8 +2607,8 @@ impl SummarizerConfig {
         if let Ok(p) = std::env::var("NEWT_SUMMARIZER_CONFIG") {
             paths.push(PathBuf::from(p));
         }
-        if let Some(home) = home_dir() {
-            paths.push(home.join(".newt").join("summarizer.toml"));
+        if let Some(dir) = Config::user_config_dir() {
+            paths.push(dir.join("summarizer.toml"));
         }
         paths
     }
@@ -2646,6 +2696,7 @@ impl Default for Config {
             loadouts: std::collections::BTreeMap::new(),
             crews: std::collections::BTreeMap::new(),
             crew: None,
+            plan: None,
         }
     }
 }
@@ -2667,7 +2718,7 @@ impl Config {
     /// Base search order (first match wins):
     /// 1. `$NEWT_CONFIG` environment variable
     /// 2. `./newt.toml`
-    /// 3. `~/.newt/config.toml`
+    /// 3. `$NEWT_CONFIG_DIR/config.toml` or `~/.newt/config.toml`
     /// 4. `/etc/newt/config.toml`
     ///
     /// Then, if a project-local `.newt/config.toml` is found by walking up from
@@ -2766,8 +2817,8 @@ impl Config {
     /// backend name. A malformed drop-in is skipped with a warning; it must not
     /// break startup.
     fn merge_disk_backends(&mut self) {
-        if let Some(h) = home_dir() {
-            self.merge_backends_from_dir(&h.join(".newt").join("backends"));
+        if let Some(dir) = Self::user_config_dir() {
+            self.merge_backends_from_dir(&dir.join("backends"));
         }
         if let Some(proj) = Self::project_config_path() {
             if let Some(parent) = proj.parent() {
@@ -2830,8 +2881,8 @@ impl Config {
     /// name. A malformed drop-in is skipped with a warning; it must not break
     /// startup.
     fn merge_disk_dgx_nodes(&mut self) {
-        if let Some(h) = home_dir() {
-            self.merge_dgx_nodes_from_dir(&h.join(".newt").join("dgx"));
+        if let Some(dir) = Self::user_config_dir() {
+            self.merge_dgx_nodes_from_dir(&dir.join("dgx"));
         }
         if let Some(proj) = Self::project_config_path() {
             if let Some(parent) = proj.parent() {
@@ -2886,8 +2937,8 @@ impl Config {
     /// validated when it is selected (`newt crew --crew <name>`), mirroring the
     /// inline `[crews.*]` and disk-loadout paths.
     fn merge_disk_crews(&mut self) {
-        if let Some(h) = home_dir() {
-            self.merge_crews_from_dir(&h.join(".newt").join("crews"));
+        if let Some(dir) = Self::user_config_dir() {
+            self.merge_crews_from_dir(&dir.join("crews"));
         }
         if let Some(proj) = Self::project_config_path() {
             if let Some(parent) = proj.parent() {
@@ -2930,8 +2981,8 @@ impl Config {
     /// stem is the bundle name. A malformed drop-in is skipped with a warning — it
     /// must not break startup.
     fn merge_disk_bundles(&mut self) {
-        if let Some(h) = home_dir() {
-            self.merge_bundles_from_dir(&h.join(".newt").join("bundles"));
+        if let Some(dir) = Self::user_config_dir() {
+            self.merge_bundles_from_dir(&dir.join("bundles"));
         }
         if let Some(proj) = Self::project_config_path() {
             if let Some(parent) = proj.parent() {
@@ -2976,8 +3027,8 @@ impl Config {
     /// is selected (`--loadout`), not at load, mirroring the inline `[loadouts.*]`
     /// path.
     fn merge_disk_loadouts(&mut self) {
-        if let Some(h) = home_dir() {
-            self.merge_loadouts_from_dir(&h.join(".newt").join("loadouts"));
+        if let Some(dir) = Self::user_config_dir() {
+            self.merge_loadouts_from_dir(&dir.join("loadouts"));
         }
         if let Some(proj) = Self::project_config_path() {
             if let Some(parent) = proj.parent() {
@@ -3029,10 +3080,22 @@ impl Config {
         find_project_config_from(&cwd, home_dir().as_deref())
     }
 
-    /// The user-writable config path: `~/.newt/config.toml`.
+    /// The user-writable config root: `$NEWT_CONFIG_DIR` or `~/.newt`.
+    pub fn user_config_dir() -> Option<PathBuf> {
+        if let Some(path) = std::env::var_os(NEWT_CONFIG_DIR_ENV)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+        {
+            return Some(path);
+        }
+        home_dir().map(|h| h.join(".newt"))
+    }
+
+    /// The user-writable config path: `$NEWT_CONFIG_DIR/config.toml` or
+    /// `~/.newt/config.toml`.
     /// This is the first path `resolve()` reads and the target for `save()`.
     pub fn user_config_path() -> Option<PathBuf> {
-        home_dir().map(|h| h.join(".newt").join("config.toml"))
+        Self::user_config_dir().map(|dir| dir.join("config.toml"))
     }
 
     /// Serialize the config to pretty TOML for **audit**, with inline secret
@@ -3077,8 +3140,8 @@ impl Config {
             .map(|s| s.search.as_slice())
             .unwrap_or(&[]);
         if configured.is_empty() {
-            let default = home_dir()
-                .map(|h| h.join(".newt").join("skills"))
+            let default = Self::user_config_dir()
+                .map(|dir| dir.join("skills"))
                 .unwrap_or_else(|| PathBuf::from(".newt/skills"));
             return vec![default];
         }
@@ -3104,8 +3167,8 @@ impl Config {
 
         paths.push(PathBuf::from("./newt.toml"));
 
-        if let Some(home) = home_dir() {
-            paths.push(home.join(".newt").join("config.toml"));
+        if let Some(path) = Self::user_config_path() {
+            paths.push(path);
         }
 
         paths.push(PathBuf::from("/etc/newt/config.toml"));

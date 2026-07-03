@@ -76,16 +76,23 @@ pub struct TeamOutcome {
 }
 
 /// A planned subtask: the work, plus an optional **per-subtask** verification
-/// command (so independent subtasks each get their own check, not one shared one).
+/// command (so independent subtasks each get their own check, not one shared one),
+/// plus an optional leaf-scope fence (#816, mirroring crew mode's `Subtask.context`
+/// from #812: model-declared, meet-only, empty = unconstrained — never touches
+/// `verify`, never widens authority above the worktree/fs_write boundary it sits
+/// inside). Unlike crew mode's def-site-grounded scope (#812 §"Sharpen it"), this
+/// is the model's self-report ALONE — `run_team` has no repo-grep seam to ground
+/// it against, and porting that hardening is tracked separately (see #816's PR).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Subtask {
     task: String,
     verify: Option<String>,
+    files: Vec<String>,
 }
 
-/// The lead's entry — accepts a plain string OR a `{task, verify}` object, so a
-/// weaker lead that emits bare strings still works (verify falls back to the
-/// workspace's default check).
+/// The lead's entry — accepts a plain string OR a `{task, verify, files}` object,
+/// so a weaker lead that emits bare strings still works (verify/files fall back to
+/// the workspace's default check / an unfenced dispatch).
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum SubtaskSpec {
@@ -94,6 +101,8 @@ enum SubtaskSpec {
         task: String,
         #[serde(default)]
         verify: Option<String>,
+        #[serde(default)]
+        files: Vec<String>,
     },
 }
 
@@ -119,8 +128,9 @@ pub async fn run_team(
             "You are a tech lead. Break the GOAL into an ordered list of small, \
              independently-verifiable engineering subtasks. Reply with ONLY JSON \
              {\"subtasks\":[{\"task\":\"<imperative step>\",\"verify\":\"<a shell command \
-             that exits 0 once THIS step is done; omit if there is no per-step check>\"}]} \
-             — concrete, smallest-first.",
+             that exits 0 once THIS step is done; omit if there is no per-step check>\",\
+             \"files\":[\"<relative path of a REAL existing file this step edits; omit \
+             if unknown>\"]}]} — concrete, smallest-first.",
         )
         .user(format!(
             "GOAL:\n{goal}\n\nAt most {} subtasks.",
@@ -184,7 +194,15 @@ pub async fn run_team(
                 );
             }
         }
-        let outcome = run_crew(pool, dispatcher, workspace, &cfg.crew, caveats, &st.task).await;
+        // #816: the lead-declared files list is the leaf-scope fence, threaded
+        // into run_crew's meet-only `scope_permits` gate exactly as #812 threads
+        // crew mode's `Subtask.context`. Empty files (a Plain entry, or a
+        // Detailed entry that omitted files) ⇒ unfenced, byte-identical to
+        // pre-#816 dispatch.
+        let outcome = run_crew(
+            pool, dispatcher, workspace, &cfg.crew, caveats, &st.task, &st.files,
+        )
+        .await;
         let status = match outcome.status {
             CrewStatus::Passed => SubtaskStatus::Passed,
             CrewStatus::NeedsHumanReview => {
@@ -227,15 +245,29 @@ fn parse_plan(content: &str, max: usize) -> Vec<Subtask> {
         .subtasks
         .into_iter()
         .map(|s| match s {
-            SubtaskSpec::Plain(task) => Subtask { task, verify: None },
-            SubtaskSpec::Detailed { task, verify } => Subtask {
+            SubtaskSpec::Plain(task) => Subtask {
+                task,
+                verify: None,
+                files: Vec::new(),
+            },
+            SubtaskSpec::Detailed {
+                task,
+                verify,
+                files,
+            } => Subtask {
                 task,
                 verify: verify.filter(|v| !v.trim().is_empty()),
+                files: files
+                    .into_iter()
+                    .map(|f| f.trim().to_string())
+                    .filter(|f| !f.is_empty())
+                    .collect(),
             },
         })
         .map(|s| Subtask {
             task: s.task.trim().to_string(),
             verify: s.verify,
+            files: s.files,
         })
         .filter(|s| !s.task.is_empty())
         .take(max)
@@ -261,6 +293,7 @@ mod tests {
         fn new() -> Self {
             let mut files = BTreeMap::new();
             files.insert("target.rs".to_string(), "BAD".to_string());
+            files.insert("README.md".to_string(), "docs".to_string());
             Self {
                 files,
                 verifies: Vec::new(),
@@ -499,6 +532,98 @@ mod tests {
         assert_eq!(out.plan, vec!["do A".to_string(), "do B".to_string()]);
         // Only the permitted verify was installed; the denied one was refused.
         assert_eq!(ws.verifies, vec!["check-a".to_string()]);
+    }
+
+    /// Lead emits one subtask; the planner always emits edits to BOTH
+    /// `target.rs` (the intended fix) and `README.md` (over-reach), regardless
+    /// of scope. `scoped` toggles whether the lead's entry declares
+    /// `files:["target.rs"]` — the #816 fence must let the fix land and
+    /// refuse the over-reach when scoped, and land both (unfenced,
+    /// byte-identical to pre-#816) when not.
+    struct OverreachTeamMock {
+        scoped: bool,
+    }
+    #[async_trait]
+    impl Dispatcher for OverreachTeamMock {
+        async fn dispatch(
+            &self,
+            _b: &PoolBackend,
+            model: &str,
+            _req: ChatRequest,
+        ) -> anyhow::Result<ChatReply> {
+            let content = match model {
+                "lead" if self.scoped => {
+                    r#"{"subtasks":[{"task":"fix target.rs","files":["target.rs"]}]}"#.to_string()
+                }
+                "lead" => r#"{"subtasks":[{"task":"fix target.rs"}]}"#.to_string(),
+                "nav" => r#"{"relevant_files":["target.rs","README.md"]}"#.to_string(),
+                "triage" => r#"{"summary":"s","next_action":"n"}"#.to_string(),
+                "planner" => r#"{"edits":[
+                    {"path":"target.rs","new_content":"GOOD"},
+                    {"path":"README.md","new_content":"hacked"}
+                ]}"#
+                .to_string(),
+                other => panic!("unexpected model {other}"),
+            };
+            Ok(ChatReply {
+                content,
+                model_id: model.to_string(),
+                usage: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn scoped_subtask_fences_out_of_scope_edits() {
+        // #816: a lead-declared `files` list fences the team-dispatched crew
+        // exactly like #812 fences a plan leaf. The in-scope edit lands
+        // (verify goes green); the out-of-scope edit is refused.
+        let p = pool();
+        let d = OverreachTeamMock { scoped: true };
+        let mut ws = MemWs::new();
+        let out = run_team(
+            &p,
+            &d,
+            &mut ws,
+            &cfg(),
+            &newt_core::caveats::Caveats::top(),
+            "goal",
+        )
+        .await;
+        assert_eq!(out.status, TeamStatus::AllPassed);
+        assert_eq!(ws.read("target.rs").as_deref(), Some("GOOD"));
+        assert_eq!(
+            ws.read("README.md").as_deref(),
+            Some("docs"),
+            "out-of-scope edit must be refused, not landed"
+        );
+    }
+
+    #[tokio::test]
+    async fn unscoped_subtask_is_unfenced_same_as_before_816() {
+        // Same OverreachTeamMock, but the lead omits `files` -> Subtask.files
+        // is empty -> no fence -> the over-reach edit lands too, proving the
+        // fence (not the mock) makes the difference, and that omitted-files
+        // dispatch is byte-identical to pre-#816 team dispatch.
+        let p = pool();
+        let d = OverreachTeamMock { scoped: false };
+        let mut ws = MemWs::new();
+        let out = run_team(
+            &p,
+            &d,
+            &mut ws,
+            &cfg(),
+            &newt_core::caveats::Caveats::top(),
+            "goal",
+        )
+        .await;
+        assert_eq!(out.status, TeamStatus::AllPassed);
+        assert_eq!(ws.read("target.rs").as_deref(), Some("GOOD"));
+        assert_eq!(
+            ws.read("README.md").as_deref(),
+            Some("hacked"),
+            "unscoped dispatch must remain unfenced"
+        );
     }
 
     #[tokio::test]

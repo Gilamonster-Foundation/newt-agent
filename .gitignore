@@ -48,6 +48,14 @@ tsconfig.json
 package.json
 package-lock.json
 
+# Eval analysis workflow TEMPLATES are canonical, committed sources (#805) —
+# carve them out of the blanket *.js ignore above.
+!scripts/eval/workflows/*.workflow.js
+
+# ...but the reconstituted Claude Code commands are GENERATED artifacts:
+# scripts/eval/workflows/install.sh recreates them on any fresh machine.
+/.claude/workflows/
+
 # Research source PDFs — large binaries; we commit the synthesis notes, not the
 # papers themselves (cite the arXiv id instead). See docs/research/*.md.
 docs/research/*.pdf
@@ -57,3 +65,6 @@ docs/research/*.pdf
 .env.local
 *.token
 ~/.newt/
+
+# Newt local session state
+/.newt/sessions/

@@ -166,7 +166,7 @@ fn render_crew(o: &newt_scheduler::CrewOutcome) -> String {
         CrewStatus::Passed => "PASS",
         CrewStatus::NeedsHumanReview => "NEEDS HUMAN REVIEW",
     };
-    format!(
+    let mut line = format!(
         "crew: {status} after {} attempt(s); touched: {}",
         o.attempts,
         if o.touched.is_empty() {
@@ -174,7 +174,32 @@ fn render_crew(o: &newt_scheduler::CrewOutcome) -> String {
         } else {
             o.touched.join(", ")
         }
-    )
+    );
+    // #812: a refusal must be diagnosable from the terminal report — a bare
+    // "touched: (none)" over a refused last attempt reads as the model doing
+    // nothing when the harness in fact fenced its edits.
+    if !o.refused.is_empty() {
+        line.push_str(&format!(
+            "; refused (leash/scope): {}",
+            o.refused.join(", ")
+        ));
+    }
+    line
+}
+
+/// Parse the #812 leaf-scope argument (`args["scope"]`, forwarded by
+/// plan_exec from `Subtask.context`). Missing/empty/mis-typed ⇒ empty scope ⇒
+/// no fence — the dispatch is byte-identical to pre-#812. Pure, so the parse
+/// contract is unit-testable without a dispatch.
+fn parse_scope_arg(args: &serde_json::Value) -> Vec<String> {
+    args.get("scope")
+        .and_then(|s| s.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn render_team(o: &newt_scheduler::TeamOutcome) -> String {
@@ -370,6 +395,11 @@ impl CrewRunner for LocalCrewRunner {
                     let passed = out.status == TeamStatus::AllPassed;
                     (render_team(&out), passed)
                 } else {
+                    // #812: the leaf's file scope, forwarded by plan_exec from
+                    // Subtask.context. A missing/empty scope fences nothing —
+                    // byte-identical to the pre-#812 dispatch. Team mode stays
+                    // unfenced until SubtaskSpec grows a files field (#816).
+                    let scope = parse_scope_arg(args);
                     let out = run_crew(
                         &pool,
                         &LocalDispatcher,
@@ -377,6 +407,7 @@ impl CrewRunner for LocalCrewRunner {
                         &crew_cfg,
                         &child_caveats,
                         task,
+                        &scope,
                     )
                     .await;
                     let passed = out.status == CrewStatus::Passed;
@@ -481,6 +512,43 @@ mod tests {
                 .as_deref(),
             Some("restore && test")
         );
+    }
+
+    #[test]
+    fn parse_scope_arg_reads_strings_and_defaults_empty() {
+        // #812: the receiving side of the plan_exec scope forward. Missing,
+        // mis-typed, or non-string entries all degrade to "no fence" — never
+        // an error, never an invented fence.
+        use serde_json::json;
+        assert_eq!(
+            parse_scope_arg(&json!({"scope": ["src/util.rs", "tests/"]})),
+            vec!["src/util.rs".to_string(), "tests/".to_string()]
+        );
+        assert!(parse_scope_arg(&json!({"task": "x"})).is_empty());
+        assert!(parse_scope_arg(&json!({"scope": "not-an-array"})).is_empty());
+        assert!(parse_scope_arg(&json!({"scope": [1, 2]})).is_empty());
+    }
+
+    #[test]
+    fn render_crew_surfaces_refusals() {
+        // #812: a refused last attempt must be diagnosable from the report —
+        // "touched: (none)" alone reads as the model doing nothing when the
+        // harness in fact fenced its edits.
+        let refused = newt_scheduler::CrewOutcome {
+            status: CrewStatus::NeedsHumanReview,
+            attempts: 3,
+            touched: Vec::new(),
+            refused: vec!["README.md".to_string()],
+        };
+        let line = render_crew(&refused);
+        assert!(line.contains("refused (leash/scope): README.md"), "{line}");
+        let clean = newt_scheduler::CrewOutcome {
+            status: CrewStatus::Passed,
+            attempts: 1,
+            touched: vec!["src/util.rs".to_string()],
+            refused: Vec::new(),
+        };
+        assert!(!render_crew(&clean).contains("refused"));
     }
 
     #[test]

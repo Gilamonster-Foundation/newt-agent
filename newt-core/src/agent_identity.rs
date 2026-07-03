@@ -38,7 +38,7 @@ use std::process::Command;
 use serde::{Deserialize, Serialize};
 
 use crate::config::{
-    expand_tilde, find_project_config_from, home_dir, merge_toml, ArrayMergeStrategy,
+    expand_tilde, find_project_config_from, home_dir, merge_toml, ArrayMergeStrategy, Config,
 };
 use crate::error::{NewtError, Result};
 
@@ -340,14 +340,25 @@ impl AgentIdentity {
     pub fn resolve_with_source() -> Result<(Self, IdentitySource)> {
         let cwd = std::env::current_dir().ok();
         let home = home_dir();
-        Self::resolve_from(cwd.as_deref(), home.as_deref())
+        let user_config_dir = Config::user_config_dir();
+        Self::resolve_from_dirs(cwd.as_deref(), home.as_deref(), user_config_dir.as_deref())
     }
 
     /// The resolution core, parameterized on cwd + home so it is unit-testable
     /// against temp dirs without mutating the process environment.
+    #[cfg(test)]
     pub(crate) fn resolve_from(
         cwd: Option<&Path>,
         home: Option<&Path>,
+    ) -> Result<(Self, IdentitySource)> {
+        let user_config_dir = home.map(|h| h.join(".newt"));
+        Self::resolve_from_dirs(cwd, home, user_config_dir.as_deref())
+    }
+
+    fn resolve_from_dirs(
+        cwd: Option<&Path>,
+        home: Option<&Path>,
+        user_config_dir: Option<&Path>,
     ) -> Result<(Self, IdentitySource)> {
         // 1. Workspace walk-up — reuse the exact config.toml walk-up logic.
         if let Some(start) = cwd {
@@ -371,8 +382,8 @@ impl AgentIdentity {
         }
 
         // 2. Home.
-        if let Some(h) = home {
-            let candidate = h.join(".newt").join("agent-identity.toml");
+        if let Some(dir) = user_config_dir {
+            let candidate = dir.join("agent-identity.toml");
             if candidate.is_file() {
                 return Ok((Self::load(&candidate)?, IdentitySource::Home(candidate)));
             }

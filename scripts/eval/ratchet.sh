@@ -38,7 +38,9 @@ while [ $# -gt 0 ]; do
     *) echo "ratchet: unknown arg '$1'" >&2; exit 2;;
   esac
 done
-[ -n "$TASK" ] && [ -n "$MODE" ] || { echo "usage: ratchet.sh --task <T> --mode single|crew [...]" >&2; exit 2; }
+if [ -z "$TASK" ] || [ -z "$MODE" ]; then
+  echo "usage: ratchet.sh --task <T> --mode single|crew [...]" >&2; exit 2
+fi
 CASE_DIR="$CASES_DIR/$TASK"
 [ -f "$CASE_DIR/case.toml" ] || { echo "ratchet: no case at $CASE_DIR" >&2; exit 2; }
 
@@ -70,13 +72,32 @@ case "$MODE" in
     base="$(cd "$throw" && git rev-parse HEAD)"
     echo "ratchet: crew run on $TASK in $throw (max-leaves $MAX_LEAVES, timeout ${TIMEOUT}s)" >&2
     # The autonomous loop. --one-shot is the headless approval. Crew roster from ~/.newt.
-    CARGO_TARGET_DIR="$TARGET" timeout "$TIMEOUT" \
+    # -k 60: timeout setpgid()s newt into its own process group, which escapes an
+    # outer group-kill — escalate to SIGKILL so a TERM-immune run can't orphan.
+    CARGO_TARGET_DIR="$TARGET" timeout -k 60 "$TIMEOUT" \
       "$NEWT" plan --goal "$prompt" --one-shot --dir "$throw" --max-leaves "$MAX_LEAVES" \
       >"$throw/.plan.log" 2>&1
     plan_rc=$?
     final="$(cd "$throw" && git branch --list 'crew/*' --format='%(refname:short)' | tail -1)"
     if [ -z "$final" ]; then
-      emit FAIL "plan_rc=$plan_rc no_crew_branch (see $throw/.plan.log)"; exit 0
+      # No branch landed. Discriminate WHY (#820) — a dead endpoint and a
+      # model that ran but landed nothing are different results:
+      #   no_crew_branch_infra      — the model was never exercised
+      #                               (connection/availability errors, or an
+      #                               empty log). Drivers exclude from n.
+      #   no_crew_branch_exercised  — real inference happened but the crew
+      #                               landed no work: a LEGITIMATE behavioral
+      #                               FAIL (root causes #1/#2/#4 of the
+      #                               improving-crew-results doc). Counts as
+      #                               a trial; dir= kept for autopsy.
+      if [ ! -s "$throw/.plan.log" ] || grep -qiE \
+          'connection refused|error sending request|tcp connect|connection reset|no such host|dns error|not found, try pulling|timed out waiting for' \
+          "$throw/.plan.log"; then
+        emit FAIL "plan_rc=$plan_rc no_crew_branch_infra (see $throw/.plan.log)"
+      else
+        emit FAIL "plan_rc=$plan_rc no_crew_branch_exercised dir=$throw"
+      fi
+      exit 0
     fi
     ( cd "$throw" && git checkout -q "$final" )
     leaves="$(cd "$throw" && git branch --list 'crew/*' | wc -l | tr -d ' ')"

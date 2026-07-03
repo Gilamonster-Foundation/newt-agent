@@ -166,10 +166,26 @@ unicode-width = "0.2"
 markdown-table-formatter = "0.3"
 
 # Syntax highlighting for fenced code blocks (newt-core, behind the optional
-# `markdown-syntect` feature — Step 25.6). `default-fancy` uses fancy-regex
-# (pure Rust) instead of the onig C dependency, so even when enabled there is no
-# C toolchain requirement. Off by default — heavy (syntax + theme assets).
-syntect = { version = "5", default-features = false, features = ["default-fancy"] }
+# `markdown-syntect` feature — Step 25.6). fancy-regex (pure Rust) instead of the
+# onig C dependency, so even when enabled there is no C toolchain requirement. Off
+# by default — heavy (syntax + theme assets).
+#
+# This is `default-fancy` MINUS `plist-load`: newt only calls
+# `SyntaxSet::load_defaults_newlines()` / `ThemeSet::load_defaults()` (the embedded
+# dumps, via `dump-load`), never `load_from_folder` (`.tmTheme` plist parsing). So
+# dropping `plist-load` removes the `plist` → `quick-xml` subtree entirely — closing
+# RUSTSEC-2026-0194 / RUSTSEC-2026-0195 (no fixed `plist`/`quick-xml` is reachable
+# through syntect yet: latest `plist` 1.9.0 still requires `quick-xml ^0.39.2`).
+syntect = { version = "5", default-features = false, features = [
+    "parsing",
+    "default-syntaxes",
+    "default-themes",
+    "html",
+    "yaml-load",
+    "dump-load",
+    "dump-create",
+    "regex-fancy",
+] }
 
 # Test utilities (dev-only)
 tempfile = "3"
@@ -260,7 +276,10 @@ strip = true
 # history) rather than a branch that no longer resolves on a cold CI checkout.
 # The commit is brush-free (no active brush git dep), so it stays
 # crates.io-publishable, and a `rev =` pin passes the `just shell-check` guard
-# (which rejects only `branch = "main"`).
+# (which rejects only `branch = "main"`). This supersedes the older
+# `cb7e1ea3` (`feat/step-up-decision-mvp`) pin that newt `main` carried: that
+# rev predates the env seam, and `ed5bb13` is main-lineage so it retains the
+# same `step_up` Gate (agent-bridle#24) — the full suite below proves both.
 #
 # BLOCKER — this PR cannot merge to newt main until:
 #   1. agent-bridle ships a release (or publishable branch) carrying the env seam;
