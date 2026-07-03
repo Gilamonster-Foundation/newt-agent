@@ -94,14 +94,15 @@ pub(crate) fn annotate_missing_claims(text: String, exists: impl Fn(&str) -> boo
     )
 }
 
-/// Cap-exit wiring: annotate `text` against the REAL workspace tree. A claim
-/// resolves when its lexically-normalized absolute form stays inside the
-/// workspace AND exists on disk. Claims that normalize outside the root
-/// (absolute paths elsewhere, `..` escapes) are refuted without ever being
-/// stat'd — the checker honors the same workspace fence as the fs tools.
-pub(crate) fn annotate_against_workspace(text: String, workspace: &str) -> String {
+/// The REAL-filesystem claim resolver for `workspace`: a claim resolves when
+/// its lexically-normalized absolute form stays inside the workspace AND
+/// exists on disk. Claims that normalize outside the root (absolute paths
+/// elsewhere, `..` escapes) are refuted without ever being stat'd — the
+/// checker honors the same workspace fence as the fs tools. Shared by the
+/// cap-exit annotation and the [`ObservedPaths`] ledger.
+pub(crate) fn workspace_resolver(workspace: &str) -> impl Fn(&str) -> bool {
     let root = super::lexical_normalize(std::path::Path::new(workspace));
-    annotate_missing_claims(text, |claim| {
+    move |claim: &str| {
         let p = std::path::Path::new(claim);
         let abs = if p.is_absolute() {
             p.to_path_buf()
@@ -110,7 +111,53 @@ pub(crate) fn annotate_against_workspace(text: String, workspace: &str) -> Strin
         };
         let norm = super::lexical_normalize(&abs);
         norm.starts_with(&root) && norm.exists()
-    })
+    }
+}
+
+/// Cap-exit wiring: annotate `text` against the REAL workspace tree via
+/// [`workspace_resolver`].
+pub(crate) fn annotate_against_workspace(text: String, workspace: &str) -> String {
+    annotate_missing_claims(text, workspace_resolver(workspace))
+}
+
+/// Ledger cap: enough to name every file a real investigation touches while
+/// keeping the cap-exit prompt bounded — collection stops once full.
+const OBSERVED_CAP: usize = 40;
+
+/// #867 Part A: the observed-paths ledger. Every tool-result round records
+/// the path-like tokens that VERIFY against the workspace (grep's
+/// `path:line:` hits, `find`/`list_dir` listings, …), deduplicated in
+/// first-seen order and capped at [`OBSERVED_CAP`]. Collected as the rounds
+/// happen, the ledger is immune to `trim_for_summary` — so the cap-exit
+/// nudge can hand the model a manifest of REAL paths to cite even though the
+/// evidence messages themselves were just trimmed away.
+///
+/// Only paths that verify are recorded: the ledger is a whitelist of ground
+/// truth, never a channel for a tool error message (or the model's own
+/// echoed hallucination) to smuggle a fake path into the prompt.
+#[derive(Default)]
+pub(crate) struct ObservedPaths {
+    ordered: Vec<String>,
+}
+
+impl ObservedPaths {
+    /// Record every claim in `text` that `exists` verifies, skipping
+    /// duplicates; a no-op once the cap is reached.
+    pub(crate) fn record(&mut self, text: &str, exists: impl Fn(&str) -> bool) {
+        for claim in path_claims(text) {
+            if self.ordered.len() >= OBSERVED_CAP {
+                return;
+            }
+            if exists(&claim) && !self.ordered.contains(&claim) {
+                self.ordered.push(claim);
+            }
+        }
+    }
+
+    /// The recorded paths, first-seen order.
+    pub(crate) fn into_vec(self) -> Vec<String> {
+        self.ordered
+    }
 }
 
 #[cfg(test)]
@@ -167,6 +214,25 @@ mod tests {
         assert!(out.contains("`dir7/f7.rs`"));
         assert!(!out.contains("`dir8/f8.rs`"), "capped at {LISTED_CLAIMS}");
         assert!(out.contains("(+4 more)"), "got: {out}");
+    }
+
+    /// #867 Part A: the ledger records only verified paths, dedupes in
+    /// first-seen order, and stops at the cap — an error message citing a
+    /// fake path can never enter the manifest.
+    #[test]
+    fn observed_paths_records_verified_dedupes_and_caps() {
+        let mut led = ObservedPaths::default();
+        led.record("src/a.rs:12: hit and src/b.rs:9: hit", |c| c != "src/b.rs");
+        led.record("src/a.rs:44: again, plus docs/x.md", |_| true);
+        assert_eq!(led.into_vec(), vec!["src/a.rs", "docs/x.md"]);
+
+        let mut full = ObservedPaths::default();
+        let many: String = (0..50).map(|i| format!("d/f{i}.rs ")).collect();
+        full.record(&many, |_| true);
+        let v = full.into_vec();
+        assert_eq!(v.len(), 40, "capped at OBSERVED_CAP");
+        assert_eq!(v[0], "d/f0.rs");
+        assert_eq!(v[39], "d/f39.rs");
     }
 
     /// The workspace wiring honors the fence: a `..` escape and an absolute

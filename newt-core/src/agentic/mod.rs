@@ -1179,6 +1179,10 @@ pub async fn chat_complete(
     // Phase 20 §2.2: the thinking-only quirk is reported at most once per
     // turn — re-detection adds no information and would thrash the cache.
     let mut thinking_only_reported = false;
+    // #867 Part A: ledger of REAL workspace paths surfaced by tool results,
+    // collected as the rounds happen so it survives the cap-exit trim.
+    let mut observed_paths = claim_check::ObservedPaths::default();
+    let observed_resolver = claim_check::workspace_resolver(workspace);
 
     // Agentic loop — up to `max_tool_rounds` tool-call rounds.
     'round_loop: for round in 0..max_tool_rounds {
@@ -2083,6 +2087,9 @@ pub async fn chat_complete(
                     });
                 }
             }
+            // #867 Part A: ledger the verified paths this result surfaced
+            // BEFORE the offload may spill the text out of the transcript.
+            observed_paths.record(&result, &observed_resolver);
             messages.push(serde_json::json!({
                 "role": "tool",
                 // Step 26.3 (#584): offload an oversized result (redact → spill →
@@ -2114,6 +2121,7 @@ pub async fn chat_complete(
             accumulated: accumulated_usage,
             wasted_calls: failed_calls.total_failures(),
             progress,
+            observed: observed_paths.into_vec(),
         },
     )
     .await?;
@@ -2398,14 +2406,15 @@ fn suspicious_empty_ollama_diagnostic(json: &serde_json::Value) -> String {
 
 /// Build the nudge appended to the message list when the tool-round cap is hit.
 /// `progress` (the `<plan>`/`<state>` working memory, Step 27.5) is folded in so
-/// the model summarizes against what it actually accomplished.
-fn cap_exit_nudge(max_tool_rounds: usize, progress: Option<&str>) -> String {
+/// the model summarizes against what it actually accomplished; `observed`
+/// (#867 Part A) is the verified-paths manifest collected across the rounds.
+fn cap_exit_nudge(max_tool_rounds: usize, progress: Option<&str>, observed: &[String]) -> String {
     // #867: the message list was just trimmed (`trim_for_summary`), so most
     // of the evidence this summary should cite is GONE — the forensic session
     // showed a model reconstructing plausible-but-nonexistent file paths from
     // its priors at exactly this point. Constrain the summary to what is
     // still verbatim in context; absence must be stated, not papered over.
-    let base = format!(
+    let mut nudge = format!(
         "You have reached the tool-call limit ({max_tool_rounds} rounds). \
          Do NOT call any more tools. Summarize what you found across the tool \
          calls above and give your best final answer now. Cite only file paths \
@@ -2413,10 +2422,22 @@ fn cap_exit_nudge(max_tool_rounds: usize, progress: Option<&str>) -> String {
          was in the omitted messages, say so plainly instead of reconstructing \
          file names or line numbers from memory."
     );
-    match progress {
-        Some(p) => format!("{base}\n\nYour progress so far:\n{p}"),
-        None => base,
+    // #867 Part A: the ledger survived the trim — hand the model the REAL
+    // manifest so grounded citation is possible, not just demanded.
+    if !observed.is_empty() {
+        nudge.push_str(
+            "\n\nFile paths actually observed in tool results this run \
+             (these exist — cite from this list):",
+        );
+        for p in observed {
+            nudge.push_str("\n- ");
+            nudge.push_str(p);
+        }
     }
+    if let Some(p) = progress {
+        nudge.push_str(&format!("\n\nYour progress so far:\n{p}"));
+    }
+    nudge
 }
 
 /// Fallback message returned when even the final tools-disabled completion
@@ -2458,12 +2479,15 @@ fn cap_exit_fallback(
 
 /// The cap-exit context threaded into a final tools-disabled summary (Step
 /// 27.5): the round limit, accumulated usage, the count of failed tool calls
-/// (drives honest advice), and the salvaged `<plan>`/`<state>` progress.
+/// (drives honest advice), the salvaged `<plan>`/`<state>` progress, and the
+/// #867 observed-paths manifest (verified paths from tool results, collected
+/// before the trim could delete them).
 struct CapExit {
     max_tool_rounds: usize,
     accumulated: Option<crate::TokenUsage>,
     wasted_calls: usize,
     progress: Option<String>,
+    observed: Vec<String>,
 }
 
 /// Final tools-disabled completion for the Ollama (`/api/chat`) path.
@@ -2483,10 +2507,11 @@ async fn final_summary_ollama(
         accumulated,
         wasted_calls,
         progress,
+        observed,
     } = cap;
     messages.push(serde_json::json!({
         "role": "user",
-        "content": cap_exit_nudge(max_tool_rounds, progress.as_deref()),
+        "content": cap_exit_nudge(max_tool_rounds, progress.as_deref(), &observed),
     }));
     // No `tools` key => the model cannot emit tool calls.
     let body = serde_json::json!({
@@ -2572,10 +2597,11 @@ async fn final_summary_openai(
         accumulated,
         wasted_calls,
         progress,
+        observed,
     } = cap;
     messages.push(serde_json::json!({
         "role": "user",
-        "content": cap_exit_nudge(max_tool_rounds, progress.as_deref()),
+        "content": cap_exit_nudge(max_tool_rounds, progress.as_deref(), &observed),
     }));
     // Omit `tools` / `tool_choice` => the model cannot emit tool calls.
     let body = serde_json::json!({
@@ -2789,6 +2815,10 @@ pub async fn openai_chat_complete(
     // Truthful context-size tracker (prompt-tokens-preferred, Step 18.1).
     let mut prompt_tracker = PromptTracker::new();
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+
+    // #867 Part A: observed-paths ledger (matches the Ollama path).
+    let mut observed_paths = claim_check::ObservedPaths::default();
+    let observed_resolver = claim_check::workspace_resolver(workspace);
 
     // Agentic loop — up to `max_tool_rounds` tool-call rounds (matches the Ollama path).
     'round_loop: for round in 0..max_tool_rounds {
@@ -3348,6 +3378,8 @@ pub async fn openai_chat_complete(
                     });
                 }
             }
+            // #867 Part A: ledger verified paths (see the Ollama path).
+            observed_paths.record(&result, &observed_resolver);
             messages.push(serde_json::json!({
                 "role": "tool",
                 "tool_call_id": id,
@@ -3373,6 +3405,7 @@ pub async fn openai_chat_complete(
             accumulated: accumulated_usage,
             wasted_calls: failed_calls.total_failures(),
             progress,
+            observed: observed_paths.into_vec(),
         },
     )
     .await?;
@@ -4315,7 +4348,7 @@ mod cap_exit_unit_tests {
 
     #[test]
     fn cap_exit_nudge_names_the_limit_and_folds_in_progress() {
-        let nudge = cap_exit_nudge(5, None);
+        let nudge = cap_exit_nudge(5, None, &[]);
         assert!(nudge.contains("5 rounds"), "got: {nudge}");
         assert!(nudge.contains("Do NOT call any more tools"));
         // #867: the grounding constraint — the trim just deleted the evidence,
@@ -4329,10 +4362,38 @@ mod cap_exit_unit_tests {
             !nudge.contains("progress so far"),
             "no block when None: {nudge}"
         );
+        assert!(
+            !nudge.contains("actually observed"),
+            "no manifest block when the ledger is empty: {nudge}"
+        );
         // Step 27.5: the <plan>/<state> progress is folded into the nudge.
-        let with = cap_exit_nudge(5, Some("<plan>1. [x] foo</plan>"));
+        let with = cap_exit_nudge(5, Some("<plan>1. [x] foo</plan>"), &[]);
         assert!(with.contains("Your progress so far"), "got: {with}");
         assert!(with.contains("<plan>1. [x] foo</plan>"), "got: {with}");
+    }
+
+    /// #867 Part A: the observed-paths manifest survives the trim and is
+    /// handed to the model as the citable ground truth.
+    #[test]
+    fn cap_exit_nudge_folds_in_the_observed_paths_manifest() {
+        let observed = vec![
+            "newt-tui/src/lib.rs".to_string(),
+            "newt-core/src/agentic/mod.rs".to_string(),
+        ];
+        let nudge = cap_exit_nudge(5, Some("<state>k=v</state>"), &observed);
+        assert!(
+            nudge.contains("File paths actually observed in tool results"),
+            "got: {nudge}"
+        );
+        assert!(nudge.contains("- newt-tui/src/lib.rs"), "got: {nudge}");
+        assert!(
+            nudge.contains("- newt-core/src/agentic/mod.rs"),
+            "got: {nudge}"
+        );
+        // Manifest precedes the progress block; both survive together.
+        let manifest_at = nudge.find("actually observed").unwrap();
+        let progress_at = nudge.find("Your progress so far").unwrap();
+        assert!(manifest_at < progress_at, "got: {nudge}");
     }
 
     #[test]
