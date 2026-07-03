@@ -1547,6 +1547,9 @@ async fn run_with(
         triage_model,
         max_attempts,
         role_timeout: None,
+        // #883: the standalone `newt crew` leaf calibrates — a verify already
+        // green on the pre-edit tree cannot prove the crew's edits.
+        calibrate_baseline: true,
     };
     // Honest, non-top session caveats (the #94 guardrail forbids `Caveats::top()`
     // in dispatch code): exec/net are locked down. The REAL fs boundary here is
@@ -1656,6 +1659,14 @@ fn render(o: &CrewOutcome, worktree: &Path) -> i32 {
         CrewStatus::NeedsHumanReview => {
             println!(
                 "⚠ crew needs human review — {} attempt(s) without a green check",
+                o.attempts
+            );
+            2
+        }
+        CrewStatus::VacuousVerify => {
+            println!(
+                "⚠ vacuous verify — the check passed on the unedited baseline, so a green \
+                 cannot prove the change ({} attempt(s)); not landed",
                 o.attempts
             );
             2

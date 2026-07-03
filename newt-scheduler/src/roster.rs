@@ -64,6 +64,10 @@ impl RosterSpec {
             triage_model: self.triage.clone(),
             max_attempts,
             role_timeout: None,
+            // #883: composed rosters back the LocalCrewRunner (crew tool + plan
+            // leaves); calibration for those sequential/shared paths is a
+            // follow-up, so a composed crew does not calibrate by default.
+            calibrate_baseline: false,
         }
     }
 
