@@ -84,7 +84,8 @@ pub use config::{
     ConversationsConfig, CrewPolicyConfig, EditMode, FooterMode, Loadout, LoadoutSettings,
     LogConfig, MarkdownMode, MemoryConfig, MemoryDisclosure, MemoryProviderKind, OnEmbedFailure,
     OpenAiApi, PermissionPreset, PickVia, PlanConfig, PlanPruneConfig, ProfilePick, ProviderConfig,
-    SemanticConfig, SkillsConfig, SummarizerConfig, ThinkingMode, ToolPermissions, TuiConfig,
+    ScratchConfig, SemanticConfig, SkillsConfig, SummarizerConfig, ThinkingMode, ToolPermissions,
+    TuiConfig,
 };
 pub use conversation::{
     new_conversation_id, session_plan_dir, session_plan_path, ConversationRecord,
