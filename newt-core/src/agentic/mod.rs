@@ -3069,7 +3069,27 @@ pub async fn openai_chat_complete(
 
         let message = &json["choices"][0]["message"];
 
-        let oa_content = message["content"].as_str().unwrap_or("").to_string();
+        // #857: split the reasoning OFF the answer. A `<think>` block (reasoning
+        // parser off) must never be returned or fed to the content-scrape recovery,
+        // and the separate `reasoning_content` channel (reasoning parser on) is read
+        // but never concatenated into the reply. Normal replies (no reasoning) are
+        // unchanged: `split_reasoning` returns the content verbatim.
+        let (oa_content, inline_reasoning) =
+            crate::reasoning::split_reasoning(message["content"].as_str().unwrap_or(""));
+        let separate_reasoning = message["reasoning_content"]
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        if debug && (separate_reasoning.is_some() || inline_reasoning.is_some()) {
+            let n = separate_reasoning
+                .map(str::len)
+                .or_else(|| inline_reasoning.as_deref().map(str::len))
+                .unwrap_or(0);
+            print_debug(
+                &format!("reasoning ({n} chars) surfaced to the trace, not the answer"),
+                color,
+            );
+        }
         let native_calls = message["tool_calls"].as_array();
         // Recover tool calls emitted as content instead of the native field —
         // the #1 weak-model failure (see `tool_recovery`). Mirror of the Ollama
@@ -3098,8 +3118,7 @@ pub async fn openai_chat_complete(
         }
 
         if debug {
-            let content = message["content"].as_str().unwrap_or("");
-            let excerpt: String = content.chars().take(80).collect();
+            let excerpt: String = oa_content.chars().take(80).collect();
             let tc_count = tool_calls.map(|tc| tc.len()).unwrap_or(0);
             let usage_str = match round_usage {
                 Some(u) => format!("{} in / {} out", u.input_tokens, u.output_tokens),
@@ -3125,7 +3144,7 @@ pub async fn openai_chat_complete(
                     );
                 }
             }
-            let content = message["content"].as_str().unwrap_or("").to_string();
+            let content = oa_content.clone();
             if content.is_empty() && debug {
                 print_debug(
                     "empty content with no tool calls — model produced nothing",
@@ -3150,8 +3169,8 @@ pub async fn openai_chat_complete(
             return Ok((out, false, accumulated_usage, hallucination_count));
         }
 
-        // Record the assistant turn verbatim (it carries the tool_calls), then
-        // run each call and feed the result back keyed by its tool_call_id.
+        // Record the assistant turn (it carries the tool_calls), then run each call
+        // and feed the result back keyed by its tool_call_id.
         // Phase 20 §2.2: tool calls are usable output (mirrors the Ollama path).
         emit_accepted(
             &mut on_round_usage,
@@ -3159,7 +3178,15 @@ pub async fn openai_chat_complete(
             truncation_suspect,
             round_est_raw,
         );
-        messages.push(message.clone());
+        // #857: re-send a CLEAN assistant turn — stripped content (no inline
+        // <think>) and no prior-turn `reasoning_content` (the model must not be fed
+        // its own CoT back). The `tool_calls` are preserved.
+        let mut assistant_turn = message.clone();
+        assistant_turn["content"] = serde_json::Value::String(oa_content.clone());
+        if let Some(obj) = assistant_turn.as_object_mut() {
+            obj.remove("reasoning_content");
+        }
+        messages.push(assistant_turn);
         for tc in tool_calls.unwrap() {
             let id = tc["id"].as_str().unwrap_or("");
             // Some API proxies (e.g. NVIDIA inference → Anthropic backend) wrap
@@ -6375,6 +6402,45 @@ mod http_loop_tests {
         let u = usage.unwrap();
         assert_eq!((u.input_tokens, u.output_tokens), (10, 4));
         assert_eq!(hallu, 0);
+    }
+
+    #[tokio::test]
+    async fn openai_strips_inline_think_and_never_returns_reasoning_content() {
+        // #857: a reasoning model served with the parser OFF puts its CoT inline as
+        // <think>…</think> in content; served with the parser ON it lands in a
+        // separate reasoning_content field. Either way the returned answer must be
+        // ONLY the clean content — no <think> markers, no CoT, no reasoning_content.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {
+                    "content": "<think>secret chain of thought</think>The final answer.",
+                    "reasoning_content": "separate-channel reasoning"
+                }}]
+            })))
+            .mount(&server)
+            .await;
+
+        let messages = msgs();
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut c = ctx(&uri, &messages, &caveats);
+        c.kind = BackendKind::Openai;
+        let (reply, _streamed, _usage, _hallu) = chat_complete(c, &mut NoMcp)
+            .await
+            .expect("openai dispatch should succeed");
+
+        assert_eq!(reply, "The final answer.", "answer is the stripped content");
+        assert!(!reply.contains("<think>"), "no think markers: {reply}");
+        assert!(
+            !reply.contains("secret chain of thought"),
+            "inline CoT must not leak: {reply}"
+        );
+        assert!(
+            !reply.contains("separate-channel reasoning"),
+            "reasoning_content must not leak into the reply: {reply}"
+        );
     }
 
     #[tokio::test]
