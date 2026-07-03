@@ -200,6 +200,17 @@ pub enum DgxCmd {
         #[command(subcommand)]
         cmd: VllmCmd,
     },
+    /// Model cards — every setting to serve one model, as data (#855).
+    ///
+    /// A card bundles the vLLM / ollama serving profile + tuning + capability
+    /// flags for one model. Built-ins ship compiled in (Ornith); a user drops
+    /// `~/.newt/models/<name>.toml|.yaml` to override a built-in or teach newt a
+    /// new model. `list` / `show` / `validate` are the discover-and-inspect
+    /// surface; standing a backend up (`setup`) is the #855 follow-on.
+    Card {
+        #[command(subcommand)]
+        cmd: CardCmd,
+    },
     /// Cross-engine GPU residency snapshot: what Ollama and vLLM each hold on
     /// the node right now, plus available memory.
     ///
@@ -343,6 +354,35 @@ pub enum VllmCmd {
     },
 }
 
+/// `newt dgx card <cmd>` — model cards (all settings to serve one model).
+///
+/// The pure render / validate / resolve logic lives in [`crate::dgx_card`]; this
+/// is just the clap surface. `setup` (stand a backend up + write the `~/.newt`
+/// config; vLLM first, ollama stubbed) is the #855 follow-on.
+#[derive(Subcommand, Debug)]
+pub enum CardCmd {
+    /// List the built-in cards plus any drop-ins under `~/.newt/models`.
+    List {
+        /// Emit a JSON array instead of a table.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print one resolved card as canonical TOML (built-in < drop-in override).
+    Show {
+        /// Card name, e.g. `Ornith-1.0-35B` (see `card list`).
+        name: String,
+        /// Emit JSON instead of TOML.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Validate a card file (`.toml` / `.yaml`) without installing it — checks
+    /// the schema and refuses a card that leaks a host / LAN IP.
+    Validate {
+        /// Path to a `.toml` / `.yaml` card.
+        path: std::path::PathBuf,
+    },
+}
+
 /// Dispatch a `newt dgx` subcommand.
 pub async fn run(cmd: DgxCmd, config_path: Option<&Path>) -> anyhow::Result<()> {
     match cmd {
@@ -449,6 +489,7 @@ pub async fn run(cmd: DgxCmd, config_path: Option<&Path>) -> anyhow::Result<()> 
                 .await
             }
         },
+        DgxCmd::Card { cmd } => crate::dgx_card::run(cmd, config_path),
         DgxCmd::Gpu => gpu(config_path).await,
         DgxCmd::Switch {
             engine,
