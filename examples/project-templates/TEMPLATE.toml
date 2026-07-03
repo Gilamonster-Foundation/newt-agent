@@ -1,0 +1,48 @@
+# Project-template drop-in (#892). Copy into `~/.newt/templates/<name>.toml` to
+# teach `newt new` a new ecosystem — or reuse a built-in name (`pyo3` / `python`
+# / `rust`) to OVERRIDE it — with no recompile. Same merge model as tooling packs
+# (`examples/tooling-packs/`): match a built-in `name` to replace it; a new name
+# adds an ecosystem.
+#
+# `newt new <name> <project>` renders every file below into the target directory.
+# In BOTH `path` and `body`, two placeholders are substituted:
+#   {{name}}        the project name, verbatim (e.g. "my-demo")
+#   {{name_snake}}  a legal snake_case module identifier (e.g. "my_demo")
+#
+# A template that lays down the marker files a tooling pack detects (e.g.
+# Cargo.toml + pyproject.toml for the `pyo3` pack) round-trips: the scaffolded
+# project's lifecycle phases (`newt lifecycle check`, the crew, …) resolve out of
+# the box.
+
+# The merge / drop-in key.
+name = "zig"
+
+# One entry per file, laid down in order. `path` is repo-relative (forward
+# slashes); parent directories are created automatically.
+[[files]]
+path = "build.zig"
+body = """
+const std = @import("std");
+
+pub fn build(b: *std.Build) void {
+    _ = b;
+}
+"""
+
+[[files]]
+path = "src/main.zig"
+body = """
+const std = @import("std");
+
+pub fn main() void {
+    std.debug.print("{{name}}\\n", .{});
+}
+"""
+
+[[files]]
+path = ".gitignore"
+body = """
+zig-cache/
+zig-out/
+.scratch/
+"""

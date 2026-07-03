@@ -20,6 +20,7 @@ pub mod dgx_status;
 pub mod dgx_vllm;
 mod doctor;
 mod identity_cmd;
+mod new_project;
 mod skills;
 pub mod stack;
 pub mod stdio_guard;
@@ -379,6 +380,24 @@ pub enum Command {
     /// endpoint, preview, and write ~/.newt/config.toml. Unlike `init` (which
     /// silently auto-probes Ollama), this prompts the human through each choice.
     Setup,
+    /// Scaffold a NEW project for an ecosystem, already wired for its lifecycle
+    /// phases. `newt new pyo3 mypkg` lays down a minimal, buildable Rust+PyO3
+    /// (maturin) project; `python` and `rust` too. Templates are DATA (built-in
+    /// or `~/.newt/templates/<name>.toml` drop-ins). With no ecosystem, lists the
+    /// available templates.
+    New {
+        /// Ecosystem template: `pyo3` | `python` | `rust` (or a drop-in name).
+        /// Omit to list available templates.
+        ecosystem: Option<String>,
+        /// Project name (default: the target directory's final component).
+        name: Option<String>,
+        /// Target directory (default: `./<name>`).
+        #[arg(long)]
+        dir: Option<PathBuf>,
+        /// Write into a non-empty target directory (overwriting colliding files).
+        #[arg(long, default_value_t = false)]
+        force: bool,
+    },
     /// Manage skills across a configurable search path (newt + Claude Code +
     /// Codex + …). `list` / `install <path>` / `share`.
     Skills {
@@ -850,6 +869,12 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         Command::Init => newt_tui::run_init(newt_tui::color_supported()),
         Command::Setup => newt_tui::run_setup(newt_tui::color_supported()),
         Command::Auth { server } => auth_cmd::run(server),
+        Command::New {
+            ecosystem,
+            name,
+            dir,
+            force,
+        } => new_project::run(ecosystem, name, dir, force),
         Command::Skills { cmd } => skills::run(cmd, cli.config.as_deref()),
         Command::Dgx { cmd } => dgx::run(cmd, cli.config.as_deref()).await,
         Command::Tunings { cmd } => tuning_cmd::run(cmd, cli.config.as_deref()),

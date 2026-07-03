@@ -39,6 +39,7 @@ pub mod settings;
 pub mod ssh_caveats;
 pub mod store;
 pub mod symbols;
+pub mod templates;
 pub mod tokens;
 pub mod tooling;
 pub mod tuning;
