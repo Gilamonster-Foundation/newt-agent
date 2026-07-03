@@ -7,12 +7,11 @@
 //!   generated/ephemeral state (crew worktrees, the crew cargo target,
 //!   per-session plans) defaults to a sibling **`.scratch/`**.
 //! - **Configuration:** that location is NOT hard-coded. The scratch dir is
-//!   resolved from `NEWT_SCRATCH_DIR` (env), else the `.scratch` default, and may
-//!   be **absolute** — so an environment where the checkout is read-only can
-//!   point scratch at `/tmp`/`/var/tmp`, and a k8s deploy can point it at a PVC
-//!   mount, exactly as git worktrees conventionally live outside the repo tree.
-//!   (A `[scratch] dir` config-file key bridging to the same resolution is a
-//!   planned follow-up.)
+//!   resolved `NEWT_SCRATCH_DIR` (env) → `[scratch] dir` (config file) → the
+//!   `.scratch` default, and may be **absolute** — so an environment where the
+//!   checkout is read-only can point scratch at `/tmp`/`/var/tmp`, and a k8s
+//!   deploy can point it at a PVC mount, exactly as git worktrees conventionally
+//!   live outside the repo tree.
 //! - **Composition:** every scratch consumer goes through [`scratch_root`] /
 //!   [`ensure_scratch`], so the location is decided in one place.
 //!
@@ -23,22 +22,42 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 /// The default ephemeral dir, relative to the repo root. A convention, not a
-/// lock-in — override it via `NEWT_SCRATCH_DIR` (a `[scratch] dir` config-file
-/// bridge to the same resolution is a planned follow-up).
+/// lock-in — override it via the `[scratch] dir` config key or `NEWT_SCRATCH_DIR`.
 pub const DEFAULT_SCRATCH_DIR: &str = ".scratch";
 
-/// The configured scratch dir: `NEWT_SCRATCH_DIR` env → `.scratch` default. The
+/// The `[scratch] dir` config value, published once when config resolves
+/// ([`set_scratch_dir`]). The env var still wins over it at read time.
+static CONFIGURED_SCRATCH_DIR: OnceLock<String> = OnceLock::new();
+
+/// Publish the config-file scratch dir (`[scratch] dir`), once. First non-empty
+/// value wins; a no-op for `None`/empty. Called from `Config::resolve` so every
+/// config-loading entry point picks it up. `NEWT_SCRATCH_DIR` still overrides.
+pub fn set_scratch_dir(dir: impl Into<String>) {
+    let dir = dir.into();
+    if !dir.trim().is_empty() {
+        let _ = CONFIGURED_SCRATCH_DIR.set(dir);
+    }
+}
+
+/// The configured scratch dir, by precedence:
+/// `NEWT_SCRATCH_DIR` env → `[scratch] dir` config → `.scratch` default. The
 /// result may be relative (joined under the repo) or **absolute** (used as-is),
 /// so a read-only checkout or a k8s deploy can point scratch at `/tmp`, a PVC
 /// mount, or anywhere writable.
 #[must_use]
 pub fn scratch_dir() -> String {
-    match std::env::var("NEWT_SCRATCH_DIR") {
-        Ok(v) if !v.trim().is_empty() => v,
-        _ => DEFAULT_SCRATCH_DIR.to_string(),
+    if let Ok(v) = std::env::var("NEWT_SCRATCH_DIR") {
+        if !v.trim().is_empty() {
+            return v;
+        }
     }
+    CONFIGURED_SCRATCH_DIR
+        .get()
+        .cloned()
+        .unwrap_or_else(|| DEFAULT_SCRATCH_DIR.to_string())
 }
 
 /// Resolve a scratch dir setting against a repo `base`: an **absolute** setting

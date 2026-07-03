@@ -24,6 +24,16 @@ pub const NEWT_CONFIG_DIR_ENV: &str = "NEWT_CONFIG_DIR";
 // Config types
 // ---------------------------------------------------------------------------
 
+/// `[scratch]` — the ephemeral-state location (#844). See [`Config::scratch`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScratchConfig {
+    /// The scratch dir: relative (under the repo, default `.scratch`) or absolute
+    /// (`/tmp`, a PVC mount) for a read-only checkout. `NEWT_SCRATCH_DIR` wins.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dir: Option<String>,
+}
+
 /// Top-level Newt-Agent configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -41,6 +51,14 @@ pub struct Config {
 
     /// External provider-plugin definitions.
     pub providers: Vec<ProviderConfig>,
+
+    /// `[scratch]` — where ephemeral state (crew worktrees, the crew cargo
+    /// target, per-session plans) lives (#844). `dir` may be relative (under the
+    /// repo, default `.scratch`) or absolute (`/tmp`, a k8s PVC mount) for
+    /// read-only checkouts. `NEWT_SCRATCH_DIR` overrides it. Applied in
+    /// [`Config::resolve`] via [`crate::scratch::set_scratch_dir`].
+    #[serde(default)]
+    pub scratch: Option<ScratchConfig>,
 
     /// Default tier ordering used by the router when no per-backend
     /// override is specified.
@@ -2682,6 +2700,7 @@ impl Default for Config {
         Self {
             backends: vec![fallback_localhost_backend()],
             providers: Vec::new(),
+            scratch: None,
             default_tier_order: vec![Tier::Fast, Tier::Standard, Tier::Complex, Tier::Review],
             lifecycle: None,
             dgx: None,
@@ -2811,6 +2830,11 @@ impl Config {
         // phase consumers) honor `.newt/config.toml`.
         if let Some(lc) = &cfg.lifecycle {
             crate::tooling::set_lifecycle_override(lc.clone());
+        }
+        // #844: publish `[scratch] dir` the same way — so crew worktrees / the crew
+        // target / session plans honor it. `NEWT_SCRATCH_DIR` still overrides.
+        if let Some(dir) = cfg.scratch.as_ref().and_then(|s| s.dir.as_deref()) {
+            crate::scratch::set_scratch_dir(dir);
         }
         Ok(cfg)
     }
@@ -3494,6 +3518,20 @@ mod tests {
         let c: ContextConfig = toml::from_str("manager = \"progressive\"").unwrap();
         assert_eq!(c.manager, ContextManager::Progressive);
         assert_eq!(ContextConfig::default().manager, ContextManager::Standard);
+    }
+
+    #[test]
+    fn scratch_section_defaults_and_parses() {
+        // #844: `[scratch] dir` parses onto Config; absent → None (the `.scratch`
+        // default applies at resolution). Uses `from_str` (not `resolve`) so this
+        // does NOT publish a process-global scratch dir.
+        let bare: Config = toml::from_str("").unwrap();
+        assert!(bare.scratch.is_none());
+        let cfg: Config = toml::from_str("[scratch]\ndir = \"/tmp/newt-scratch\"\n").unwrap();
+        assert_eq!(
+            cfg.scratch.and_then(|s| s.dir).as_deref(),
+            Some("/tmp/newt-scratch")
+        );
     }
 
     #[test]
