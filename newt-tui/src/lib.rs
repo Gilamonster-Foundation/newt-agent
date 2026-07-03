@@ -1680,6 +1680,13 @@ fn parse_permission_choice(input: &str) -> PromptChoice {
 
 static PROMPT_STDIN_DEPTH: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// Whether a prompt currently owns stdin. Its only non-test reader is the
+/// `#[cfg(unix)]` interrupt watcher (`watch_for_interrupt`), so gate the reader the
+/// same way — otherwise Windows (which has no watcher) trips `-D warnings` on dead
+/// code. The depth counter itself stays cross-platform: `PromptStdinGuard` maintains
+/// it everywhere (its callers `prompt_permission_choice` / `prompt_user_input` are
+/// not `cfg`-gated), so the static is never dead.
+#[cfg(any(unix, test))]
 fn prompt_stdin_active() -> bool {
     PROMPT_STDIN_DEPTH.load(std::sync::atomic::Ordering::Acquire) > 0
 }
