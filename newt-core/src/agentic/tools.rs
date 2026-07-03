@@ -338,6 +338,58 @@ fn request_user_input_tool_definition() -> serde_json::Value {
     })
 }
 
+/// The `lifecycle` tool (#891) — the model-facing surface over the data-driven
+/// lifecycle system (#880). Instead of guessing a raw shell command, the model
+/// names a phase and newt runs THIS repo's resolved command for it
+/// ([`crate::tooling::resolved_phase_commands`]): the `.newt/config.toml`
+/// `[lifecycle]` override, else the matching tooling packs (Rust / Python /
+/// PyO3 / Go / drop-in / custom). Advertised ALWAYS — like `resume_context`,
+/// it degrades honestly (a phase with no configured command returns a clear
+/// "no command configured", not an error), so it needs no presence gate. The
+/// phase-name enum is built from [`crate::tooling::Phase::ALL`] so the schema
+/// can never drift from the vocabulary.
+pub fn lifecycle_tool_definition() -> serde_json::Value {
+    let phases: Vec<&str> = crate::tooling::Phase::ALL
+        .iter()
+        .map(|p| p.as_str())
+        .collect();
+    serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": "lifecycle",
+            "description": "Run a named project lifecycle phase using THIS repo's \
+                configured command instead of guessing a raw shell command. \
+                Phases: setup (resolve deps / prepare a checkout), format \
+                (auto-format the tree), lint (static analysis), test (run the \
+                tests), check (the full gate a change must pass), clean (remove \
+                build artifacts). The command is resolved from \
+                .newt/config.toml [lifecycle] and the repo's tooling packs \
+                (Rust / Python / PyO3 / Go / custom), so `check` runs the RIGHT \
+                gate for this project. Prefer this over run_command for build / \
+                test / format / lint / check work so the project's own \
+                conventions are honored uniformly across build systems. Use \
+                action=list to see the resolved command without running it.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "phase": {
+                        "type": "string",
+                        "enum": phases,
+                        "description": "The lifecycle phase to run."
+                    },
+                    "action": {
+                        "type": "string",
+                        "enum": ["run", "list"],
+                        "description": "run (default) executes the phase's resolved command; \
+                                        list returns the command without running it."
+                    }
+                },
+                "required": ["phase"]
+            }
+        }
+    })
+}
+
 /// The built-in tool definitions plus every connected MCP server's tools
 /// (namespaced `server__tool`). This is what the agent loop advertises to the
 /// model so it can call remote MCP tools alongside the built-ins.
@@ -389,6 +441,13 @@ pub(crate) fn merged_tool_definitions(
     // gate is present), so like resume_context it carries no `with_*` gate and
     // rides in every session.
     defs.push(request_user_input_tool_definition());
+    // #891: the `lifecycle` tool is advertised ALWAYS — the model-facing surface
+    // over the #880 lifecycle system. It degrades honestly (a phase with no
+    // configured command returns a clear "no command configured"), so like
+    // resume_context it carries no `with_*` gate and rides in every session,
+    // headless included. The executor resolves the command from THIS repo's
+    // `[lifecycle]` + tooling packs at call time.
+    defs.push(lifecycle_tool_definition());
     if with_save_note {
         defs.push(save_note_tool_definition());
     }
@@ -542,6 +601,10 @@ pub(crate) fn resolve_tool_alias(name: &str) -> Option<AliasOutcome> {
         // run_command arm reports that — Step 27.3 presence-gates it.)
         "execute" | "exec" | "bash" | "shell" | "sh" | "zsh" | "terminal" | "run_shell_command"
         | "shell_command" | "system" => Some(AliasOutcome::Rewrite("run_command")),
+        // #891 lifecycle aliases — same `{phase, action}` arg shape as
+        // `lifecycle`, so we rewrite and dispatch. Common phrasings a model
+        // reaches for when it wants to run a named phase.
+        "run_phase" | "run_lifecycle" | "lifecycle_run" => Some(AliasOutcome::Rewrite("lifecycle")),
         // Edit aliases — different arg shape; point at edit_file's signature.
         "str_replace_editor" | "str_replace" | "str-replace-editor" | "apply_patch" | "edit"
         | "editor" | "replace_in_file" | "search_replace" => Some(AliasOutcome::Correct(format!(
@@ -1048,6 +1111,93 @@ fn exec_floor_permits(floor: Option<&crate::caveats::Scope<String>>, cmd: &str) 
 ///
 /// A spawn failure surfaces as `Err`, which the caller formats as the same
 /// `error: …` string a bridle dispatch failure produces.
+/// Run `cmd` through the SAME confined-shell path the `run_command` tool uses —
+/// the venv env seam, the `--disable-ocap` host bypass under the #307 exec
+/// floor, the agent-bridle confined shell, and the #263 permission-gate re-ask —
+/// and render the envelope. Shared by the `run_command` and `lifecycle` (#891)
+/// arms so both honor **identical** exec caveats; the caller prints the
+/// tool-call line first.
+async fn exec_confined_command(
+    cmd: &str,
+    workspace: &str,
+    color: bool,
+    tool_output_lines: usize,
+    caveats: &crate::caveats::Caveats,
+    exec_floor: Option<&crate::caveats::Scope<String>>,
+    permission_gate: Option<&mut dyn PermissionGate>,
+) -> String {
+    // Venv injection (#783): the confined shell carries the venv via
+    // agent-bridle's structured `env` seam (see `confined_dispatch_args` /
+    // `venv_env_map`), NOT by prepending `export …;` to the command — an
+    // `export` builtin is not a program, so the safe-subset engine refuses it on
+    // a compound command (the #783 root cause). `cmd_with_venv` (the
+    // `export …;`-prefixed form) is built ONLY for the host-bypass path below:
+    // that runs on a real `/bin/sh` where `export` is a genuine builtin.
+    let cmd_with_venv = match venv_cmd_prefix() {
+        Some(prefix) => format!("{prefix}{cmd}"),
+        None => cmd.to_string(),
+    };
+
+    // INTERIM (#297): --disable-ocap / --yolo / NEWT_DISABLE_OCAP=1 — run the
+    // command UNCONFINED on the host shell instead of the bridle's confined
+    // shell. Nothing is denied here, so the #263 permission gate below is never
+    // consulted. #307 FLOOR: a named-permission-preset clamp WINS over the
+    // bypass — the unconfined host path is taken ONLY if the floor permits this
+    // command's leading token; else it falls through to the confined shell,
+    // which enforces the already-clamped `caveats`. `None` keeps the bypass
+    // bit-for-bit.
+    if ocap_disabled() && exec_floor_permits(exec_floor, cmd) {
+        return match host_shell_dispatch(&cmd_with_venv, workspace).await {
+            Ok(envelope) => shell_envelope_output(&envelope, tool_output_lines, color),
+            Err(e) => format!("error: {e}"),
+        };
+    }
+
+    // #783: RAW cmd + venv via the env seam — never the `export …;` prefix,
+    // which the confined safe-subset engine refuses.
+    let dispatch_args = confined_dispatch_args(cmd, workspace);
+    match agent_bridle::registry()
+        .dispatch("shell", dispatch_args.clone(), caveats)
+        .await
+    {
+        // The confined shell ran. Its envelope carries
+        // `{ exit_code, stdout, stderr, timed_out, ... }` plus — when the leash
+        // refused a capability — the STRUCTURED denial fields
+        // `{ denied: true, denials: [{ kind, target, reason }] }`. In free-form
+        // mode an out-of-scope command is denied *inside* the shell by the brush
+        // interceptor (the command genuinely does not run); we lift that to the
+        // capability-denied UX by reading the structured `denied` field — NEVER
+        // a stderr grep.
+        Ok(envelope) if envelope_denied(&envelope) => {
+            // #263: an interactive gate may turn this denial into a human grant.
+            // ONE consult + ONE re-execution per call: a second denial (a
+            // different target reached on the re-run) surfaces as the standard
+            // envelope — the model can retry, which prompts afresh.
+            if let Some(gate) = permission_gate {
+                if let Some(requests) = exec_denial_requests(&envelope) {
+                    if let PermissionDecision::Allow(widened) = gate.ask(&requests) {
+                        return match agent_bridle::registry()
+                            .dispatch("shell", dispatch_args, &widened)
+                            .await
+                        {
+                            Ok(env2) if envelope_denied(&env2) => {
+                                denied_run_command_result(&env2, color)
+                            }
+                            Ok(env2) => shell_envelope_output(&env2, tool_output_lines, color),
+                            Err(e) => format!("error: {e}"),
+                        };
+                    }
+                }
+            }
+            denied_run_command_result(&envelope, color)
+        }
+        Ok(envelope) => shell_envelope_output(&envelope, tool_output_lines, color),
+        // An argv-mode leash denial, or an error from inside the tool — surface
+        // the reason; the dispatch error Display is safe to show.
+        Err(e) => format!("error: {e}"),
+    }
+}
+
 async fn host_shell_dispatch(cmd: &str, cwd: &str) -> std::io::Result<serde_json::Value> {
     let output = host_shell_output(cmd, cwd).await?;
     Ok(serde_json::json!({
@@ -2089,94 +2239,76 @@ pub async fn execute_tool(
             print_tool_call("run_command", cmd, color);
 
             // Route the WHOLE command through agent-bridle's confined shell
-            // (free-form `cmd` mode) under the SAME Caveats the TUI resolved
-            // from `[tui].permissions`. `caveats` is `crate::caveats::Caveats`,
-            // a re-export of `agent_mesh_protocol::caveats::Caveats` — the exact
-            // type `Registry::dispatch` expects, so no conversion is needed.
-            //
-            // Venv injection (#783): the confined shell carries the venv via
-            // agent-bridle's structured `env` seam (see `confined_dispatch_args`
-            // / `venv_env_map`), NOT by prepending `export …;` to the command —
-            // an `export` builtin is not a program, so the safe-subset engine
-            // refuses it on a compound command (the #783 root cause).
-            //
-            // `cmd_with_venv` (the `export …;`-prefixed form) is built ONLY for
-            // the host-bypass path below: that runs on a real `/bin/sh` where
-            // `export` is a genuine builtin and the prefix works correctly.
-            let cmd_with_venv = match venv_cmd_prefix() {
-                Some(prefix) => format!("{prefix}{cmd}"),
-                None => cmd.to_string(),
+            // (free-form `cmd` mode) under the SAME Caveats the TUI resolved from
+            // `[tui].permissions`. The confined-exec core is shared with the
+            // `lifecycle` arm (#891) so both honor identical exec caveats.
+            exec_confined_command(
+                cmd,
+                workspace,
+                color,
+                tool_output_lines,
+                caveats,
+                exec_floor,
+                permission_gate,
+            )
+            .await
+        }
+
+        // #891: the model-facing lifecycle surface over the #880 system. Resolve
+        // THIS repo's command for the named phase (`.newt/config.toml
+        // [lifecycle]` → matching tooling packs) and run it through the SAME
+        // confined exec path as run_command. `action=list` returns the resolved
+        // command WITHOUT running it — a pure discovery read.
+        "lifecycle" => {
+            let phase_key = args.get("phase").and_then(|v| v.as_str()).unwrap_or("");
+            let Some(phase) = crate::tooling::Phase::from_key(phase_key) else {
+                let valid = crate::tooling::Phase::ALL
+                    .iter()
+                    .map(|p| p.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return format!(
+                    "error: unknown lifecycle phase '{phase_key}'. Valid phases: {valid}."
+                );
             };
-
-            // INTERIM (#297): --disable-ocap / --yolo / NEWT_DISABLE_OCAP=1 —
-            // run the command UNCONFINED on the host shell instead of the
-            // bridle's confined shell. Same venv/PATH prefix, same envelope
-            // shape, same output formatting. Nothing is denied here, so the
-            // #263 permission gate below is never consulted — the issue's
-            // precedence rule (`--disable-ocap` > `--prompt-for-permissions`
-            // for exec) falls out structurally. The fs tools below are NOT
-            // bypassed: yolo is unconfined exec, fenced fs.
-            //
-            // #307 FLOOR: a named-permission-preset clamp WINS over the bypass.
-            // When `exec_floor` is `Some`, the unconfined host path is taken
-            // ONLY if the floor permits this command's leading token. An
-            // out-of-floor command (e.g. `rm` under a readonly triage preset)
-            // falls through to the confined shell below, which enforces the
-            // already-clamped `caveats` and denies it — so `--yolo` can never
-            // raise authority above the active preset. `None` (no preset) keeps
-            // the bypass bit-for-bit.
-            if ocap_disabled() && exec_floor_permits(exec_floor, cmd) {
-                return match host_shell_dispatch(&cmd_with_venv, workspace).await {
-                    Ok(envelope) => shell_envelope_output(&envelope, tool_output_lines, color),
-                    Err(e) => format!("error: {e}"),
-                };
+            let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("run");
+            // Resolve from the `[lifecycle]` override → matching tooling packs.
+            // Several toolchains may each contribute a command; join with `&&`
+            // so the confined shell runs them in sequence and short-circuits on
+            // the first failure (the safe-subset engine supports `&&`).
+            let cmds =
+                crate::tooling::resolved_phase_commands(std::path::Path::new(workspace), phase);
+            if cmds.is_empty() {
+                return format!(
+                    "no command configured for lifecycle phase '{}'. Set it in \
+                     .newt/config.toml [lifecycle] or a tooling pack; `lifecycle` \
+                     only runs commands the project declares.",
+                    phase.as_str()
+                );
             }
-
-            // #783: RAW cmd + venv via the env seam — never the `export …;`
-            // prefix, which the confined safe-subset engine refuses.
-            let dispatch_args = confined_dispatch_args(cmd, workspace);
-            match agent_bridle::registry()
-                .dispatch("shell", dispatch_args.clone(), caveats)
-                .await
-            {
-                // The confined shell ran. Its envelope carries
-                // `{ exit_code, stdout, stderr, timed_out, ... }` plus — when the
-                // leash refused a capability — the STRUCTURED denial fields
-                // `{ denied: true, denials: [{ kind, target, reason }] }`. In
-                // free-form mode an out-of-scope command is denied *inside* the
-                // shell by the brush interceptor (the command genuinely does not
-                // run); we lift that to the existing capability-denied UX by
-                // reading the structured `denied` field — NEVER a stderr grep.
-                Ok(envelope) if envelope_denied(&envelope) => {
-                    // #263: an interactive gate may turn this denial into a
-                    // human grant. ONE consult + ONE re-execution per call: a
-                    // second denial (a different target reached on the re-run)
-                    // surfaces as the standard envelope — the model can retry,
-                    // which prompts afresh for the new target.
-                    if let Some(gate) = permission_gate {
-                        if let Some(requests) = exec_denial_requests(&envelope) {
-                            if let PermissionDecision::Allow(widened) = gate.ask(&requests) {
-                                return match agent_bridle::registry()
-                                    .dispatch("shell", dispatch_args, &widened)
-                                    .await
-                                {
-                                    Ok(env2) if envelope_denied(&env2) => {
-                                        denied_run_command_result(&env2, color)
-                                    }
-                                    Ok(env2) => {
-                                        shell_envelope_output(&env2, tool_output_lines, color)
-                                    }
-                                    Err(e) => format!("error: {e}"),
-                                };
-                            }
-                        }
-                    }
-                    denied_run_command_result(&envelope, color)
+            let joined = cmds.join(" && ");
+            match action {
+                "list" => format!("lifecycle {} → {joined}", phase.as_str()),
+                "run" => {
+                    print_tool_call(
+                        "lifecycle",
+                        &format!("{} → {joined}", phase.as_str()),
+                        color,
+                    );
+                    exec_confined_command(
+                        &joined,
+                        workspace,
+                        color,
+                        tool_output_lines,
+                        caveats,
+                        exec_floor,
+                        permission_gate,
+                    )
+                    .await
                 }
-                Ok(envelope) => shell_envelope_output(&envelope, tool_output_lines, color),
-                // An argv-mode leash denial, or an error from inside the tool —
-                // surface the reason; the dispatch error Display is safe to show.
-                Err(e) => format!("error: {e}"),
+                other => format!(
+                    "error: unknown lifecycle action '{other}'. Use 'run' (default) or 'list'."
+                ),
             }
         }
 
@@ -3033,8 +3165,81 @@ mod tests {
                 // #728: advertised ALWAYS (a model must always be able to ask the
                 // human; degrades honestly headless), pushed last.
                 "request_user_input",
+                // #891: advertised ALWAYS (the model-facing lifecycle surface;
+                // degrades honestly with "no command configured"), pushed after
+                // request_user_input.
+                "lifecycle",
             ]
         );
+    }
+
+    #[test]
+    fn lifecycle_definition_enum_matches_phase_vocabulary() {
+        // The schema's phase enum is built from `Phase::ALL`, so it can never
+        // drift from the vocabulary the executor parses with `Phase::from_key`.
+        let def = lifecycle_tool_definition();
+        assert_eq!(def["function"]["name"], "lifecycle");
+        let enum_vals: Vec<&str> = def["function"]["parameters"]["properties"]["phase"]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        let vocab: Vec<&str> = crate::tooling::Phase::ALL
+            .iter()
+            .map(|p| p.as_str())
+            .collect();
+        assert_eq!(enum_vals, vocab);
+    }
+
+    #[test]
+    fn run_phase_aliases_route_to_lifecycle() {
+        for a in ["run_phase", "run_lifecycle", "lifecycle_run"] {
+            assert!(
+                matches!(
+                    resolve_tool_alias(a),
+                    Some(AliasOutcome::Rewrite("lifecycle"))
+                ),
+                "{a} should rewrite to lifecycle"
+            );
+        }
+        // The canonical name is NOT an alias — it dispatches directly.
+        assert!(resolve_tool_alias("lifecycle").is_none());
+    }
+
+    #[tokio::test]
+    async fn lifecycle_unknown_phase_lists_valid_phases() {
+        // An unknown phase returns before any fs/subprocess touch, so this is a
+        // fully-mocked unit test.
+        let caveats = crate::caveats::Caveats::top();
+        let args = serde_json::json!({ "phase": "deploy" });
+        let out = execute_tool(
+            "lifecycle",
+            &args,
+            ".",
+            false,
+            20,
+            &caveats,
+            &mut NoMcp,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(
+            out.starts_with("error: unknown lifecycle phase 'deploy'"),
+            "{out}"
+        );
+        assert!(out.contains("check"), "should name valid phases: {out}");
     }
 
     /// `save_note` is sink-gated: absent from the base `tool_definitions`

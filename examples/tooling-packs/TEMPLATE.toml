@@ -13,6 +13,12 @@
 #
 # and override per-run with the `NEWT_CREW_NORMALIZE` env var (a command, or
 # `none`/empty to disable the format phase).
+#
+# The MODEL reaches these phases directly in its tool loop via the `lifecycle`
+# tool (#891): `lifecycle {phase:"check"}` runs THIS repo's resolved check
+# command; `lifecycle {phase:"check", action:"list"}` shows it without running.
+# So a pack you define here is what the model runs when it asks to check/test/
+# format/lint/clean — uniformly across Rust / Python / PyO3 / Go / custom.
 
 # The merge / drop-in key. Matching a built-in name replaces it; a new name adds
 # a toolchain.
