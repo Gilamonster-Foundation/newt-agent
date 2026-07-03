@@ -30,6 +30,35 @@ pub fn infer_test_command(dir: &Path) -> Option<String> {
     }
 }
 
+/// The repo-convention **normalize/format** command (#880), inferred like
+/// [`infer_test_command`] — de-hard-coded per ecosystem, NOT a fixed `cargo fmt`.
+/// Run before the crew commits so a model quirk (e.g. a dropped trailing newline)
+/// does not bounce off the gate's `fmt --check`. `None` = nothing to normalize.
+pub fn infer_normalize_command(dir: &Path) -> Option<String> {
+    let has = |name: &str| dir.join(name).exists();
+    if has("Cargo.toml") {
+        Some("cargo fmt".to_string())
+    } else if has("pyproject.toml") {
+        Some("ruff format .".to_string())
+    } else if has("go.mod") {
+        Some("gofmt -w .".to_string())
+    } else {
+        None
+    }
+}
+
+/// The normalize command the crew finalize runs: the `NEWT_CREW_NORMALIZE` env
+/// override (a command, or `none`/empty to DISABLE) wins over the repo-inferred
+/// default — configuration over convention. A per-crew config-file key is a
+/// follow-up (mirrors the `[scratch] dir` bridge).
+pub fn normalize_command(dir: &Path) -> Option<String> {
+    match std::env::var("NEWT_CREW_NORMALIZE") {
+        Ok(v) if v.trim().is_empty() || v.trim().eq_ignore_ascii_case("none") => None,
+        Ok(v) => Some(v),
+        Err(_) => infer_normalize_command(dir),
+    }
+}
+
 /// Is `path` a safe in-worktree edit target — built only from `Normal` (and `.`)
 /// components, so no root/drive prefix and no `..` escape? `Path::join` discards
 /// the base for an absolute path, so this guard (not the `fs_write` caveat, which
@@ -118,6 +147,40 @@ impl WorktreeWorkspace {
         git(&self.worktree, &["diff", "--cached", "HEAD"]).unwrap_or_default()
     }
 
+    /// #880: run the repo-convention formatter (or the `NEWT_CREW_NORMALIZE`
+    /// override) in the worktree before committing, so a model quirk (e.g. a
+    /// dropped trailing newline) doesn't bounce off the gate's `fmt --check`.
+    /// Best-effort: a missing/failing formatter warns and the commit still lands.
+    fn normalize(&self) {
+        let Some(cmd) = normalize_command(&self.worktree) else {
+            return;
+        };
+        #[cfg(unix)]
+        let mut c = {
+            let mut c = Command::new("sh");
+            c.arg("-c").arg(&cmd);
+            c
+        };
+        #[cfg(windows)]
+        let mut c = {
+            let mut c = Command::new("cmd");
+            c.arg("/C").arg(&cmd);
+            c
+        };
+        c.env("CARGO_TARGET_DIR", crew_shared_target_dir(&self.base));
+        match c.current_dir(&self.worktree).output() {
+            Ok(o) if !o.status.success() => {
+                eprintln!("  crew normalize (`{cmd}`) failed — committing unformatted; the gate may flag it");
+            }
+            Err(e) => {
+                eprintln!(
+                    "  crew normalize (`{cmd}`) could not run ({e}) — committing unformatted"
+                );
+            }
+            _ => {}
+        }
+    }
+
     /// **Land** the crew's work as a commit on a new `branch` in the SHARED object
     /// store, so verified work persists (a reviewable, mergeable branch the base
     /// repo sees) instead of being thrown away with the worktree. The worktree is a
@@ -132,6 +195,9 @@ impl WorktreeWorkspace {
         author_email: &str,
         message: &str,
     ) -> anyhow::Result<(String, String)> {
+        // #880: normalize (format) the model's edits before staging, so a quirk
+        // like a dropped trailing newline doesn't bounce off the gate.
+        self.normalize();
         git(&self.worktree, &["checkout", "-q", "-b", branch])?;
         git(&self.worktree, &["add", "-A"])?;
         // `diff --cached --quiet` exits 0 when the index matches HEAD (nothing to
@@ -2410,6 +2476,32 @@ mod tests {
         assert_eq!(
             infer_test_command(dir.path()).as_deref(),
             Some("just check")
+        );
+    }
+
+    #[test]
+    fn infer_normalize_command_is_per_ecosystem_not_hardcoded_cargo_fmt() {
+        // #880: de-hard-coded — the formatter follows the repo's ecosystem.
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            infer_normalize_command(dir.path()),
+            None,
+            "no markers → None"
+        );
+        std::fs::write(dir.path().join("go.mod"), "").unwrap();
+        assert_eq!(
+            infer_normalize_command(dir.path()).as_deref(),
+            Some("gofmt -w .")
+        );
+        std::fs::write(dir.path().join("pyproject.toml"), "").unwrap();
+        assert_eq!(
+            infer_normalize_command(dir.path()).as_deref(),
+            Some("ruff format .")
+        );
+        std::fs::write(dir.path().join("Cargo.toml"), "").unwrap();
+        assert_eq!(
+            infer_normalize_command(dir.path()).as_deref(),
+            Some("cargo fmt")
         );
     }
 
