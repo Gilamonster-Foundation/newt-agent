@@ -63,6 +63,14 @@ impl Phase {
             Self::Clean => "clean",
         }
     }
+
+    /// Parse a phase key — the inverse of [`as_str`](Self::as_str). Unknown → `None`.
+    /// (Named `from_key`, not `from_str`, to avoid the `FromStr` trait's error
+    /// contract and the `should_implement_trait` clippy lint.)
+    #[must_use]
+    pub fn from_key(key: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|p| p.as_str() == key)
+    }
 }
 
 /// A per-phase command map — used both as a pack's default commands (`[phases]`)
@@ -325,6 +333,15 @@ mod tests {
         assert_eq!(Phase::Format.as_str(), "format");
         assert_eq!(Phase::Check.as_str(), "check");
         assert_eq!(Phase::ALL.len(), 6);
+    }
+
+    #[test]
+    fn from_key_round_trips_every_phase_and_rejects_unknown() {
+        for p in Phase::ALL {
+            assert_eq!(Phase::from_key(p.as_str()), Some(p));
+        }
+        assert_eq!(Phase::from_key("deploy"), None);
+        assert_eq!(Phase::from_key(""), None);
     }
 
     #[test]
