@@ -1318,7 +1318,12 @@ async fn exec_confined_command(
             // different target reached on the re-run) surfaces as the standard
             // envelope — the model can retry, which prompts afresh.
             if let Some(gate) = permission_gate {
-                if let Some(requests) = exec_denial_requests(&envelope) {
+                // #905: promptable exec denials OR net-host denials (agent-bridle
+                // #196). On Allow, the re-mint widens the matching axis (net adds
+                // the host to the allow-list), so the proxy admits it on re-run.
+                if let Some(requests) =
+                    exec_denial_requests(&envelope).or_else(|| net_denial_requests(&envelope))
+                {
                     if let PermissionDecision::Allow(widened) = gate.ask(&requests) {
                         return match agent_bridle::registry()
                             .dispatch("shell", dispatch_args, &widened)
@@ -1597,7 +1602,11 @@ fn denied_run_command_result(envelope: &serde_json::Value, color: bool) -> Strin
     // Human transcript NOTICE: the bare denied command(s), never the reason
     // sentence (stuffing a sentence into print_denied's `'{target}'` slot was
     // the garble — see #775 above).
-    print_denied("exec", &exec_denial_target_label(envelope), color);
+    print_denied(
+        denial_axis_label(envelope),
+        &exec_denial_target_label(envelope),
+        color,
+    );
     // Model-facing message: composed exactly once.
     format!(
         "capability denied: {}. {DENIAL_RECOVERY_HINT}",
@@ -1727,6 +1736,60 @@ fn exec_denial_requests(envelope: &serde_json::Value) -> Option<Vec<PermissionRe
         });
     }
     Some(requests)
+}
+
+/// #905: lift a confined-shell NET denial envelope into promptable #263 requests
+/// — the `net`-axis sibling of [`exec_denial_requests`]. agent-bridle #196
+/// surfaces a refused CONNECT host as `Denial { kind: "net", target: <host> }`
+/// (with `denied: true`), so when the operator's `net` allow-list refuses a host
+/// the shell reached (e.g. `git push` to `github.com`), this turns each into a
+/// `PermissionRequest { kind: Net, target: host }` the gate can prompt per-host.
+///
+/// Returns `Some` only when EVERY denial is a `net` kind with a non-empty host
+/// target — the case a grant is meaningful (add the host to the net allow-list).
+/// A mixed or non-net batch returns `None` and keeps the standard denial.
+fn net_denial_requests(envelope: &serde_json::Value) -> Option<Vec<PermissionRequest>> {
+    let denials = envelope.get("denials")?.as_array()?;
+    if denials.is_empty() {
+        return None;
+    }
+    let mut requests = Vec::with_capacity(denials.len());
+    for d in denials {
+        if d.get("kind")?.as_str()? != "net" {
+            return None;
+        }
+        let host = d.get("target")?.as_str().filter(|t| !t.is_empty())?;
+        requests.push(PermissionRequest {
+            tool: "run_command".to_string(),
+            kind: DenialKind::Net,
+            target: host.to_string(),
+            reason: d
+                .get("reason")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        });
+    }
+    Some(requests)
+}
+
+/// #905: the axis label for the human denial NOTICE — `net` when EVERY denial is
+/// a net (host) refusal, else `exec` (exec / mixed / empty default). Keeps a net
+/// denial from being mislabeled `exec does not permit '<host>'`.
+fn denial_axis_label(envelope: &serde_json::Value) -> &'static str {
+    let all_net = envelope
+        .get("denials")
+        .and_then(serde_json::Value::as_array)
+        .filter(|arr| !arr.is_empty())
+        .is_some_and(|arr| {
+            arr.iter()
+                .all(|d| d.get("kind").and_then(serde_json::Value::as_str) == Some("net"))
+        });
+    if all_net {
+        "net"
+    } else {
+        "exec"
+    }
 }
 
 /// Consult the #263 gate for one denied fs path. Returns `true` only when
@@ -3879,6 +3942,60 @@ mod tests {
             "denials": [{"kind": "exec", "reason": "r"}]
         });
         assert!(exec_denial_requests(&no_target).is_none());
+    }
+
+    /// #905: a NET denial envelope (agent-bridle #196 shape) lifts to a per-host
+    /// net PermissionRequest; the target is the CONNECT host verbatim (no
+    /// basename mangling). Non-net / mixed / empty batches stay flat.
+    #[test]
+    fn net_denial_requests_lifts_only_pure_net_envelopes() {
+        let net_only = serde_json::json!({
+            "denied": true,
+            "denials": [
+                {"kind": "net", "target": "github.com", "reason": "net does not permit 'github.com'"},
+                {"kind": "net", "target": "api.github.com", "reason": "net does not permit 'api.github.com'"}
+            ]
+        });
+        let reqs = net_denial_requests(&net_only).expect("promptable");
+        assert_eq!(reqs.len(), 2);
+        assert_eq!(reqs[0].tool, "run_command");
+        assert_eq!(reqs[0].kind, DenialKind::Net);
+        assert_eq!(
+            reqs[0].target, "github.com",
+            "host verbatim, not a basename"
+        );
+        assert_eq!(reqs[0].reason, "net does not permit 'github.com'");
+        assert_eq!(reqs[1].target, "api.github.com");
+
+        // A non-net entry anywhere → not net-promptable (exec lifter handles exec).
+        let mixed = serde_json::json!({
+            "denials": [
+                {"kind": "net", "target": "github.com", "reason": "r"},
+                {"kind": "exec", "target": "npm", "reason": "r"}
+            ]
+        });
+        assert!(net_denial_requests(&mixed).is_none());
+        // Exec-only is not net-promptable; empty/missing targets never are.
+        let exec_only = serde_json::json!({"denials": [{"kind": "exec", "target": "npm"}]});
+        assert!(net_denial_requests(&exec_only).is_none());
+        assert!(net_denial_requests(&serde_json::json!({"denials": []})).is_none());
+        let empty_target = serde_json::json!({"denials": [{"kind": "net", "target": ""}]});
+        assert!(net_denial_requests(&empty_target).is_none());
+    }
+
+    /// #905: the human denial NOTICE labels a pure-net refusal `net` (not `exec`),
+    /// so it never reads "exec does not permit '<host>'". Exec / mixed stay `exec`.
+    #[test]
+    fn denial_axis_label_is_net_only_for_pure_net() {
+        let net = serde_json::json!({"denials": [{"kind": "net", "target": "github.com"}]});
+        assert_eq!(denial_axis_label(&net), "net");
+        let exec = serde_json::json!({"denials": [{"kind": "exec", "target": "rm"}]});
+        assert_eq!(denial_axis_label(&exec), "exec");
+        let mixed = serde_json::json!({
+            "denials": [{"kind": "net", "target": "h"}, {"kind": "exec", "target": "rm"}]
+        });
+        assert_eq!(denial_axis_label(&mixed), "exec", "mixed defaults to exec");
+        assert_eq!(denial_axis_label(&serde_json::json!({})), "exec");
     }
 
     #[test]
