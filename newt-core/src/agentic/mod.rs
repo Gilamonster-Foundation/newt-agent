@@ -887,10 +887,20 @@ mod retry_ledger_tests {
 /// True when a backend 400 says the model can't accept a `tools` field.
 /// Ollama phrases it `"<model> does not support tools"`; OpenAI-compatible
 /// servers vary, so we also accept the looser `"not support tools"`. Used to
-/// drop tools and retry once, then keep them off for the session (deepseek-r1).
+/// drop tools and retry once, then keep them off for the turn (deepseek-r1).
 fn is_tools_unsupported_error(e: &anyhow::Error) -> bool {
     let s = e.to_string().to_lowercase();
     s.contains("does not support tools") || s.contains("not support tools")
+}
+
+/// True when Ollama accepted the `tools` field but its internal XML tool-call
+/// parser rejected the model's generated `<function>/<parameter>` markup before
+/// returning an assistant message. There is no content for Newt's text-mode
+/// tool recovery to parse, so the usable recovery is the same shape as a
+/// tools-unsupported model: retry the turn without advertising tools.
+fn is_ollama_tool_xml_error(e: &anyhow::Error) -> bool {
+    let s = e.to_string().to_lowercase();
+    s.contains("xml syntax error") && s.contains("parameter") && s.contains("function")
 }
 
 /// Main agentic loop: call model → execute tool calls → feed results back → repeat.
@@ -1439,19 +1449,23 @@ pub async fn chat_complete(
             Err(e) => {
                 // No-tools recovery: a model that rejects the `tools` field
                 // (deepseek-r1) 400s even on "hello". Drop tools, notice once,
-                // and re-dispatch the same round — self-limiting (the rebuilt
-                // body omits tools) and session-persistent.
-                if tools_supported && is_tools_unsupported_error(&e) {
+                // and re-dispatch the same turn — self-limiting because the
+                // rebuilt body omits tools.
+                let tools_unsupported = is_tools_unsupported_error(&e);
+                let malformed_xml_tool_call = is_ollama_tool_xml_error(&e);
+                if tools_supported && (tools_unsupported || malformed_xml_tool_call) {
                     tools_supported = false;
                     if !tools_unsupported_notified {
                         tools_unsupported_notified = true;
-                        print_newt(
-                            &format!(
-                                "{model} does not support tools — tools disabled for this session"
-                            ),
-                            color,
-                            false,
-                        );
+                        let notice = if tools_unsupported {
+                            format!("{model} does not support tools — tools disabled for this turn")
+                        } else {
+                            format!(
+                                "{model} produced malformed Ollama XML tool-call syntax — \
+                                 retrying without tools for this turn"
+                            )
+                        };
+                        print_newt(&notice, color, false);
                     }
                     continue 'round_loop;
                 }
@@ -5894,6 +5908,21 @@ mod http_loop_tests {
         )));
     }
 
+    #[test]
+    fn detects_ollama_tool_xml_parser_errors() {
+        assert!(is_ollama_tool_xml_error(&anyhow::anyhow!(
+            "{}",
+            r#"Ollama 500 Internal Server Error: {"error":"XML syntax error on line 7: element \u003cparameter\u003e closed by \u003c/function\u003e"}"#
+        )));
+        assert!(is_ollama_tool_xml_error(&anyhow::anyhow!(
+            "{}",
+            r#"Ollama 500 Internal Server Error: {"error":"XML syntax error on line 2: element <parameter> closed by </function>"}"#
+        )));
+        assert!(!is_ollama_tool_xml_error(&anyhow::anyhow!(
+            "Ollama 500 Internal Server Error: model runner crashed"
+        )));
+    }
+
     /// A model that rejects the `tools` field (deepseek-r1) 400s on the first
     /// dispatch; newt must drop tools and re-dispatch, answering normally. The
     /// tools-absent retry is the one that succeeds — no tools-400 loop.
@@ -5956,6 +5985,70 @@ mod http_loop_tests {
             rejections.load(Ordering::SeqCst),
             1,
             "exactly one tools-bearing request 400s — the drop is self-limiting"
+        );
+    }
+
+    /// Ollama can 500 before returning assistant content when its XML parser
+    /// sees malformed Qwen-style tool-call tags. Newt cannot recover a tool call
+    /// it never receives, so it should retry without advertising tools.
+    struct MalformedToolXmlResponder {
+        rejections: Arc<AtomicUsize>,
+        served_without_tools: Arc<AtomicBool>,
+    }
+    impl Respond for MalformedToolXmlResponder {
+        fn respond(&self, req: &Request) -> ResponseTemplate {
+            if body_json(req).get("tools").is_some() {
+                self.rejections.fetch_add(1, Ordering::SeqCst);
+                return ResponseTemplate::new(500).set_body_json(serde_json::json!({
+                    "error": "XML syntax error on line 7: element <parameter> closed by </function>"
+                }));
+            }
+            self.served_without_tools.store(true, Ordering::SeqCst);
+            if is_stream(req) {
+                ndjson(&[serde_json::json!({
+                    "message": {"content": "recovered without tools"}, "done": true,
+                    "prompt_eval_count": 4, "eval_count": 3
+                })])
+            } else {
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "message": {"content": "probe answer without tools"},
+                    "prompt_eval_count": 4, "eval_count": 3,
+                }))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn ollama_tool_xml_error_recovers_by_dropping_tools() {
+        let server = MockServer::start().await;
+        let rejections = Arc::new(AtomicUsize::new(0));
+        let served_without_tools = Arc::new(AtomicBool::new(false));
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(MalformedToolXmlResponder {
+                rejections: rejections.clone(),
+                served_without_tools: served_without_tools.clone(),
+            })
+            .mount(&server)
+            .await;
+
+        let messages = msgs();
+        let caveats = Caveats::top();
+        let (reply, streamed, _usage, _) =
+            chat_complete(ctx(&server.uri(), &messages, &caveats), &mut NoMcp)
+                .await
+                .expect("malformed XML tool-call parser errors should fall back to no-tools");
+
+        assert_eq!(reply, "recovered without tools");
+        assert!(streamed);
+        assert!(
+            served_without_tools.load(Ordering::SeqCst),
+            "a request without the tools field was eventually served"
+        );
+        assert_eq!(
+            rejections.load(Ordering::SeqCst),
+            1,
+            "the deterministic XML parser failure is not retried with tools"
         );
     }
 
