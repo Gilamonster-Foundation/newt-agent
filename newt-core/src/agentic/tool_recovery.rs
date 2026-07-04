@@ -247,6 +247,33 @@ mod tests {
     }
 
     #[test]
+    fn narrated_intent_to_act_is_not_a_dropped_call() {
+        // Real weak-model (ornith:35b) narrations that ended a turn with no tool
+        // call: a plan announcement, not a mis-formatted call. Recovery finds
+        // nothing AND does not flag tool_shaped, so the loop's format-
+        // hallucination path stays quiet — proving the "narrate-then-stop" stall
+        // is a turn-termination gap, not a parse drop. The fix belongs in the
+        // loop's `!has_tools` branch (see `narration_action_nudge`), not here.
+        for prose in [
+            "Now I have everything I need. Let me make the two edits: \
+             1. newt-cli/src/lib.rs ... 2. newt-core/src/config.rs ... \
+             Let me make both edits now.",
+            "Now I'll add the --home flag to the Cli struct. \
+             I'll place it near the other directory-related options:",
+        ] {
+            let r = recover_tool_calls(prose);
+            assert!(
+                r.calls.is_empty(),
+                "narration must yield no call: {prose:?}"
+            );
+            assert!(
+                !r.tool_shaped,
+                "narration must not look tool-shaped: {prose:?}"
+            );
+        }
+    }
+
+    #[test]
     fn json_without_name_arguments_is_not_a_call() {
         // A JSON blob that isn't a tool call (e.g. a config snippet) is ignored.
         let r = recover_tool_calls("Here is config: {\"debug\": true, \"level\": 3}");

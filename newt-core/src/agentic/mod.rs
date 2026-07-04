@@ -1176,6 +1176,14 @@ pub async fn chat_complete(
     // When this hits READ_ONLY_NUDGE_AFTER, a brief injected message tells the
     // model to stop exploring and start writing.
     let mut read_only_rounds: usize = 0;
+    // "Narrate-then-stop" rescue: a weak model often ANNOUNCES its next action
+    // in prose ("Let me edit …") and emits no tool call. The loop would treat
+    // that zero-tool round as a final answer and end the turn, forcing a human
+    // "continue". `narration_nudges` bounds the auto-continue that instead
+    // nudges the model to actually call the tool (≤ NARRATION_NUDGE_CAP per
+    // turn); the trigger is `looks_like_intent_to_act`, so a genuine conclusion
+    // (with or without prior tool calls this turn) is never nudged.
+    let mut narration_nudges: usize = 0;
     // Phase 20 §2.2: the thinking-only quirk is reported at most once per
     // turn — re-detection adds no information and would thrash the cache.
     let mut thinking_only_reported = false;
@@ -1935,6 +1943,35 @@ pub async fn chat_complete(
                 ));
             }
 
+            // Narrate-then-stop rescue: the model produced prose and no tool
+            // call. If it has already acted this turn (mid-task) or the prose
+            // reads as intent-to-act, nudge it to actually call the tool and run
+            // another round instead of ending the turn — what a human "continue"
+            // does. Bounded by NARRATION_NUDGE_CAP and the round budget so a
+            // chronic narrator can't loop; after the cap the prose is accepted
+            // as the final answer (the return below). A genuine from-the-start
+            // final answer (no prior call, no intent cue) is never nudged.
+            if narration_nudges < NARRATION_NUDGE_CAP
+                && round + 1 < max_tool_rounds
+                && looks_like_intent_to_act(&streamed)
+            {
+                if debug {
+                    print_debug(
+                        "narrated intent with no tool call — nudging to act and continuing",
+                        color,
+                    );
+                }
+                // Record the model's own narration, then the corrective, so the
+                // next round sees both (mirrors the has-tools assistant turn).
+                messages.push(serde_json::json!({ "role": "assistant", "content": streamed }));
+                messages.push(serde_json::json!({
+                    "role": "user",
+                    "content": narration_action_nudge(),
+                }));
+                narration_nudges += 1;
+                accumulated_usage = merge_round_usage(accumulated_usage, stream_usage);
+                continue 'round_loop;
+            }
             // Phase 20 §2.2: a non-empty streamed answer is usable output.
             emit_accepted(
                 &mut on_round_usage,
@@ -2309,6 +2346,92 @@ fn is_read_only_tool(name: &str) -> bool {
             | "save_note"
             | "recall"
     )
+}
+
+/// Max "you narrated intent but called no tool" auto-continue nudges per turn.
+/// Bounded so a chronically-narrating weak model can't loop or drain the round
+/// budget; after the cap its narration is accepted as the final answer.
+/// (Candidate for a `[tui] narration_nudge_cap` knob in a follow-up.)
+const NARRATION_NUDGE_CAP: usize = 1;
+
+/// Heuristic: does this assistant prose read as "I am ABOUT to act" rather than
+/// a finished answer? The sole trigger for the narrate-then-stop rescue — a
+/// zero-tool-call round is nudged (once) only when its prose announces an
+/// action it then failed to emit as a tool call. Requires an intent cue AND an
+/// action verb, and excludes borrowed-cue sign-offs ("let me know …"), so a
+/// genuine conclusion is never nudged — whether or not the model already called
+/// tools this turn (a normal "act, then conclude" turn must not be nudged). A
+/// residual false positive costs at most one extra round (NARRATION_NUDGE_CAP),
+/// never a loop. Cue/verb/exclusion lists are pure data — extend without
+/// touching the control flow (three Cs).
+fn looks_like_intent_to_act(content: &str) -> bool {
+    const INTENT_CUES: &[&str] = &[
+        "let me ",
+        "let's ",
+        "i'll ",
+        "i will ",
+        "i'm going to ",
+        "i am going to ",
+        "now i",
+        "next, i",
+        "next i",
+        "going to ",
+        "i'm now",
+        "i am now",
+    ];
+    const ACT_VERBS: &[&str] = &[
+        "edit",
+        "creat",
+        "add",
+        "modif",
+        "updat",
+        "writ",
+        "implement",
+        "chang",
+        "appl",
+        "run ",
+        "make ",
+        "fix",
+        "replac",
+        "insert",
+        "delet",
+        "remov",
+    ];
+    // Borrowed-cue sign-offs that are NOT "about to act" — checked first so a
+    // conversational close is never mistaken for pending work.
+    const NON_ACTIONS: &[&str] = &[
+        "let me know",
+        "let me explain",
+        "let me clarify",
+        "let me summarize",
+        "let me recap",
+        "let me walk you",
+    ];
+    let lc = content.to_lowercase();
+    // The intent lives at the tail ("… Let me make both edits now."), so only
+    // scan the last stretch — the body may recount findings that mention verbs.
+    // Snap the cut to a char boundary so a multibyte glyph (em dash, …) at the
+    // 400-byte mark can't panic the slice.
+    let cut = lc.len().saturating_sub(400);
+    let start = (cut..=lc.len())
+        .find(|&i| lc.is_char_boundary(i))
+        .unwrap_or(0);
+    let tail = &lc[start..];
+    if NON_ACTIONS.iter().any(|n| tail.contains(n)) {
+        return false;
+    }
+    INTENT_CUES.iter().any(|c| tail.contains(c)) && ACT_VERBS.iter().any(|v| tail.contains(v))
+}
+
+/// The corrective injected when the model narrated its next action but emitted
+/// no tool call (the narrate-then-stop stall). Sibling of [`read_only_action_nudge`].
+fn narration_action_nudge() -> String {
+    "You described what you were about to do but did not call any tool, so \
+     nothing actually happened. If you intended to act, emit the tool call now \
+     (for example edit_file or write_file with the real arguments) — do not just \
+     describe it. If you are genuinely finished, say so explicitly in one \
+     sentence."
+        .to_string()
 }
 
 fn read_only_action_nudge(
@@ -2820,6 +2943,9 @@ pub async fn openai_chat_complete(
     let mut observed_paths = claim_check::ObservedPaths::default();
     let observed_resolver = claim_check::workspace_resolver(workspace);
 
+    // Narrate-then-stop rescue counter (mirror of the Ollama path).
+    let mut narration_nudges: usize = 0;
+
     // Agentic loop — up to `max_tool_rounds` tool-call rounds (matches the Ollama path).
     'round_loop: for round in 0..max_tool_rounds {
         // Interrupt checkpoint (Esc / Ctrl-C), same contract as the Ollama path:
@@ -3180,6 +3306,28 @@ pub async fn openai_chat_complete(
                     "empty content with no tool calls — model produced nothing",
                     color,
                 );
+            }
+            // Narrate-then-stop rescue (mirror of the Ollama loop): non-empty
+            // prose with no tool call. Nudge once and continue instead of ending
+            // the turn — bounded by NARRATION_NUDGE_CAP + the round budget.
+            if !content.is_empty()
+                && narration_nudges < NARRATION_NUDGE_CAP
+                && round + 1 < max_tool_rounds
+                && looks_like_intent_to_act(&content)
+            {
+                if debug {
+                    print_debug(
+                        "narrated intent with no tool call — nudging to act and continuing",
+                        color,
+                    );
+                }
+                messages.push(serde_json::json!({ "role": "assistant", "content": content }));
+                messages.push(serde_json::json!({
+                    "role": "user",
+                    "content": narration_action_nudge(),
+                }));
+                narration_nudges += 1;
+                continue 'round_loop;
             }
             // Phase 20 §2.2: non-empty final content is usable output —
             // report the accepted prompt before returning.
@@ -6707,6 +6855,162 @@ mod http_loop_tests {
             .expect("must succeed even when the summary errors");
         assert!(reply.contains("tool-call limit of 2"), "got: {reply}");
         assert!(reply.contains("max_tool_rounds"));
+    }
+
+    // -- Narrate-then-stop rescue: bounded no-tool-call auto-continue ---------
+
+    /// OpenAI responder that serves a scripted `choices[0].message` per request
+    /// (by order); out-of-range requests repeat the last scripted entry.
+    struct ScriptedOpenAi {
+        round: Arc<AtomicUsize>,
+        script: Vec<serde_json::Value>,
+    }
+    impl Respond for ScriptedOpenAi {
+        fn respond(&self, _req: &Request) -> ResponseTemplate {
+            let i = self.round.fetch_add(1, Ordering::SeqCst);
+            let msg = self
+                .script
+                .get(i)
+                .or_else(|| self.script.last())
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({ "content": "final." }));
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({ "choices": [{ "message": msg }] }))
+        }
+    }
+
+    /// Drive the OpenAI loop over a per-round script; return `(reply, requests)`.
+    async fn run_openai_script(script: Vec<serde_json::Value>) -> (String, usize) {
+        let server = MockServer::start().await;
+        let round = Arc::new(AtomicUsize::new(0));
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ScriptedOpenAi {
+                round: round.clone(),
+                script,
+            })
+            .mount(&server)
+            .await;
+        let messages = msgs();
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut c = ctx(&uri, &messages, &caveats);
+        c.kind = BackendKind::Openai;
+        let (reply, _s, _u, _h) = chat_complete(c, &mut NoMcp).await.expect("dispatch");
+        (reply, round.load(Ordering::SeqCst))
+    }
+
+    #[tokio::test]
+    async fn narrated_intent_with_no_tool_call_nudges_and_continues() {
+        // The model narrates intent to act but calls no tool. Instead of ending
+        // the turn (the bug), the loop nudges and runs another round, returning
+        // the post-nudge answer.
+        let (reply, rounds) = run_openai_script(vec![
+            serde_json::json!({ "content": "Let me edit the file now." }),
+            serde_json::json!({ "content": "All done — the edit is complete." }),
+        ])
+        .await;
+        assert_eq!(rounds, 2, "must run a second round after the nudge");
+        assert!(
+            reply.contains("complete"),
+            "returns the post-nudge answer: {reply}"
+        );
+        assert!(
+            !reply.contains("Let me edit"),
+            "must not return the narration: {reply}"
+        );
+    }
+
+    #[tokio::test]
+    async fn narration_auto_continue_is_bounded_by_the_cap() {
+        // The model narrates intent EVERY round. The cap (1) allows exactly one
+        // nudge, then the narration is accepted as the final answer — no loop.
+        let (reply, rounds) = run_openai_script(vec![
+            serde_json::json!({ "content": "Let me keep editing now." }),
+            serde_json::json!({ "content": "Let me keep editing now." }),
+            serde_json::json!({ "content": "Let me keep editing now." }),
+        ])
+        .await;
+        assert_eq!(
+            rounds, 2,
+            "exactly one nudge (cap=1), then accept, got {rounds}"
+        );
+        assert!(
+            reply.contains("editing"),
+            "narration accepted as final: {reply}"
+        );
+    }
+
+    #[tokio::test]
+    async fn genuine_final_answer_is_not_nudged() {
+        // No prior tool call and no intent-to-act cue → a real answer returns
+        // immediately, un-nudged (no wasted round).
+        let (reply, rounds) = run_openai_script(vec![
+            serde_json::json!({ "content": "The capital of France is Paris." }),
+        ])
+        .await;
+        assert_eq!(
+            rounds, 1,
+            "a plain final answer is not nudged, got {rounds}"
+        );
+        assert!(reply.contains("Paris"), "returns the answer: {reply}");
+    }
+
+    #[tokio::test]
+    async fn final_answer_after_a_tool_call_is_not_nudged() {
+        // The normal "act, then conclude" turn: a tool call, then a cue-less
+        // final answer. The rescue must NOT fire (no intent cue) — else every
+        // ordinary tool-using turn would waste a round.
+        let (reply, rounds) = run_openai_script(vec![
+            serde_json::json!({
+                "content": null,
+                "tool_calls": [{
+                    "id": "c1", "type": "function",
+                    "function": { "name": "definitely_not_a_real_tool", "arguments": "{}" }
+                }]
+            }),
+            serde_json::json!({ "content": "The files were examined; everything checks out." }),
+        ])
+        .await;
+        assert_eq!(
+            rounds, 2,
+            "tool call (r0) then final answer (r1) — no extra round, got {rounds}"
+        );
+        assert!(
+            reply.contains("checks out"),
+            "returns the final answer as-is: {reply}"
+        );
+    }
+
+    #[test]
+    fn looks_like_intent_to_act_separates_narration_from_final_answers() {
+        // Real repro narrations that ended a turn — must read as intent-to-act.
+        assert!(looks_like_intent_to_act(
+            "Now I have everything I need. Let me make both edits now."
+        ));
+        assert!(looks_like_intent_to_act(
+            "Now I'll add the --home flag to the Cli struct."
+        ));
+        assert!(looks_like_intent_to_act(
+            "I'm going to edit the config file."
+        ));
+        // Genuine sign-offs / answers — must NOT be nudged.
+        assert!(!looks_like_intent_to_act("The capital of France is Paris."));
+        assert!(!looks_like_intent_to_act(
+            "I have finished editing the file and the tests pass."
+        ));
+        assert!(!looks_like_intent_to_act(
+            "Here is a summary of what I found across the tool calls."
+        ));
+        // Borrowed-cue sign-off ("let me know" + a verb) — must NOT be nudged.
+        assert!(!looks_like_intent_to_act(
+            "Done. Let me know if you want any further changes."
+        ));
+        // A long narration whose 400-byte tail cut lands mid-multibyte-glyph
+        // (each `…` is 3 bytes; 200 of them puts the cut at byte 211, not a char
+        // boundary) must not panic the slice — and still classify as intent.
+        let multibyte = format!("{}let me edit", "…".repeat(200));
+        assert!(looks_like_intent_to_act(&multibyte));
     }
 }
 
