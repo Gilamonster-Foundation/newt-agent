@@ -12,6 +12,7 @@ use super::permissions::{DenialKind, PermissionDecision, PermissionGate, Permiss
 use super::recall::{execute_recall, recall_tool_definition, RecallSource};
 use crate::caveats::CaveatsExt as _;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::LazyLock;
 
 /// #719: default line window for `read_file`'s **model-facing** payload. The
 /// on-screen display is capped separately; this bounds what enters the model's
@@ -419,78 +420,30 @@ pub(crate) fn merged_tool_definitions(
         serde_json::Value::Array(a) => a,
         other => vec![other],
     };
-    // #714: `resume_context` is advertised ALWAYS — it is broadly useful and
-    // degrades gracefully (the executor returns a clear "no history this
-    // session" when its sources are `None`), so unlike the presence-gated tools
-    // it carries no `with_*` flag and rides in every session, headless included.
-    defs.push(super::resume::resume_context_tool_definition());
-    // #725: `tool_search` is advertised ALWAYS, like `resume_context` — a
-    // discovery tool that lets the model look up a real tool by intent must be
-    // present in every session (it is the structural antidote to fabricated
-    // tool names, so gating it on presence would defeat the purpose). Its
-    // executor builds the catalog from THIS session's advertised set.
-    defs.push(super::tool_search::tool_search_tool_definition());
-    // #727: `get_context_remaining` is advertised ALWAYS — a read-only budget
-    // self-read, broadly useful and degrading honestly (it reports "no ceiling
-    // configured" when num_ctx is unset), so like resume_context it carries no
-    // `with_*` gate and rides in every session, headless included.
-    defs.push(super::budget::get_context_remaining_tool_definition());
-    // #728: `request_user_input` is advertised ALWAYS — a model must always be
-    // able to ask the human a question, and it degrades honestly headless (the
-    // executor returns "no human available this session" when no interactive
-    // gate is present), so like resume_context it carries no `with_*` gate and
-    // rides in every session.
-    defs.push(request_user_input_tool_definition());
-    // #891: the `lifecycle` tool is advertised ALWAYS — the model-facing surface
-    // over the #880 lifecycle system. It degrades honestly (a phase with no
-    // configured command returns a clear "no command configured"), so like
-    // resume_context it carries no `with_*` gate and rides in every session,
-    // headless included. The executor resolves the command from THIS repo's
-    // `[lifecycle]` + tooling packs at call time.
-    defs.push(lifecycle_tool_definition());
-    if with_save_note {
-        defs.push(save_note_tool_definition());
-    }
-    if with_recall {
-        defs.push(recall_tool_definition());
-    }
-    if with_memory_fetch {
-        defs.push(memory_fetch_tool_definition());
-    }
-    // PR4: the `git` tool is advertised only when a GitTool is injected (the
-    // binary is in a git repo and supplied LocalGitTool) — presence gate.
-    if with_git {
-        defs.push(super::git_tool::git_tool_definition());
-    }
-    // #479: the `compose_roster` + `crew` tools are advertised only when a
-    // CrewRunner is injected (the `/team` toggle) — presence gate.
-    if with_team {
-        defs.push(super::crew_tool::compose_roster_tool_definition());
-        defs.push(super::crew_tool::crew_tool_definition());
-    }
-    // Step 26.4 (#583): the scratchpad state tools — advertised only when the
-    // `scratchpad` feature is on AND a store is present (presence gate).
-    if with_scratchpad {
-        defs.push(super::scratchpad::state_set_tool_definition());
-        defs.push(super::scratchpad::state_get_tool_definition());
-        defs.push(super::scratchpad::state_clear_tool_definition());
-    }
-    // Step 26.5.5 (#582): the code_search tool — advertised only when the
-    // `semantic` feature is on AND an index is present (presence gate).
-    if with_code_search {
-        defs.push(super::semantic::code_search_tool_definition());
-    }
-    // Step 26.6a (#585): the experiential record/recall tools, only with the gate.
-    if with_experiential {
-        defs.push(super::experiential::experience_record_tool_definition());
-        defs.push(super::experiential::experience_recall_tool_definition());
-    }
-    // Step 26.6b (#586): the scheduled plan tools, only with the gate. #715 PR2
-    // collapsed the plan_set + plan_advance write tools into a single update_plan;
-    // #716's read-only plan_get joins it under the same scheduled gate.
-    if with_scheduled {
-        defs.push(super::scheduled::update_plan_tool_definition());
-        defs.push(super::scheduled::plan_get_tool_definition());
+    // #894: everything after the base array is [`EXTENDED_TOOL_REGISTRY`],
+    // advertised in declaration order when its gate is satisfied. The always-on
+    // tools (resume_context #714 / tool_search #725 / get_context_remaining #727
+    // / request_user_input #728 / lifecycle #891) carry `Gate::Always` and ride
+    // every session, degrading honestly when their backing source is `None`; the
+    // rest are gated on the matching injected `with_*` capability (git PR4,
+    // compose_roster+crew #479, scratchpad #583, code_search #582, experiential
+    // #585, scheduled #586/#715/#716). Adding a tool is one `ToolSpec`, which
+    // updates this listing AND `ALL_TOOL_NAMES` together — no more drift.
+    for spec in EXTENDED_TOOL_REGISTRY {
+        if gate_satisfied(
+            spec.gate,
+            with_save_note,
+            with_recall,
+            with_memory_fetch,
+            with_git,
+            with_team,
+            with_scratchpad,
+            with_code_search,
+            with_experiential,
+            with_scheduled,
+        ) {
+            defs.push((spec.definition)());
+        }
     }
     defs.extend(mcp.tool_defs());
     serde_json::Value::Array(defs)
@@ -546,11 +499,155 @@ fn run_command_redirect(command: &str) -> Option<&'static str> {
     DIRECT_TOOL_NAMES.iter().copied().find(|&t| t == first)
 }
 
-/// Every tool newt can dispatch by name — the base tools plus all
-/// presence-gated ones. Single source of truth for [`is_hallucination`] (which
-/// names are real) and [`nearest_tool_name`] (suggestion candidates). MCP
-/// `server__tool` names contain `__` and are matched separately.
-const ALL_TOOL_NAMES: &[&str] = &[
+/// #894: the built-in tool registry — ONE self-describing entry per non-base
+/// tool (name + JSON schema builder + presence gate), replacing the parallel
+/// hand-kept lists that used to drift (the `lifecycle` tool, #891, was
+/// advertised + dispatched yet missing from the old `ALL_TOOL_NAMES`, so every
+/// legitimate `lifecycle` call was miscounted as a hallucination). Adding a
+/// tool here now updates BOTH the advertised set ([`merged_tool_definitions`])
+/// AND the real-name set ([`ALL_TOOL_NAMES`]) atomically — you cannot half-wire
+/// one without the other. The base tools stay inlined in [`tool_definitions`]
+/// (their names mirrored in [`BASE_TOOL_NAMES`], guarded by a test); the
+/// executor dispatch match is intentionally left as a separate pass.
+///
+/// Presence condition for a registered tool. `Always` tools ride every session
+/// (they degrade honestly when their backing source is absent); the rest are
+/// advertised only when the matching `with_*` capability is injected.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Gate {
+    Always,
+    SaveNote,
+    Recall,
+    MemoryFetch,
+    Git,
+    Team,
+    Scratchpad,
+    CodeSearch,
+    Experiential,
+    Scheduled,
+}
+
+/// One built-in (non-base) tool, declared in exactly one place.
+struct ToolSpec {
+    /// The tool name the model calls — must equal `(definition)()`'s function name.
+    name: &'static str,
+    /// Builds the tool's JSON schema (the same `*_tool_definition()` fns used
+    /// before; the registry just references them).
+    definition: fn() -> serde_json::Value,
+    /// When this tool is advertised + treated as a real (non-hallucinated) name.
+    gate: Gate,
+}
+
+/// The registered non-base tools, in advertised order. This IS the order
+/// [`merged_tool_definitions`] pushes them (after the base array), preserved
+/// byte-for-byte from the previous hand-written push ladder.
+const EXTENDED_TOOL_REGISTRY: &[ToolSpec] = &[
+    // Always-on (degrade gracefully when their source is None) —
+    // #714 / #725 / #727 / #728 / #891.
+    ToolSpec {
+        name: "resume_context",
+        definition: super::resume::resume_context_tool_definition,
+        gate: Gate::Always,
+    },
+    ToolSpec {
+        name: "tool_search",
+        definition: super::tool_search::tool_search_tool_definition,
+        gate: Gate::Always,
+    },
+    ToolSpec {
+        name: "get_context_remaining",
+        definition: super::budget::get_context_remaining_tool_definition,
+        gate: Gate::Always,
+    },
+    ToolSpec {
+        name: "request_user_input",
+        definition: request_user_input_tool_definition,
+        gate: Gate::Always,
+    },
+    ToolSpec {
+        name: "lifecycle",
+        definition: lifecycle_tool_definition,
+        gate: Gate::Always,
+    },
+    // Presence-gated on an injected capability (one `with_*` flag each).
+    ToolSpec {
+        name: "save_note",
+        definition: save_note_tool_definition,
+        gate: Gate::SaveNote,
+    },
+    ToolSpec {
+        name: "recall",
+        definition: recall_tool_definition,
+        gate: Gate::Recall,
+    },
+    ToolSpec {
+        name: "memory_fetch",
+        definition: memory_fetch_tool_definition,
+        gate: Gate::MemoryFetch,
+    },
+    ToolSpec {
+        name: "git",
+        definition: super::git_tool::git_tool_definition,
+        gate: Gate::Git,
+    },
+    ToolSpec {
+        name: "compose_roster",
+        definition: super::crew_tool::compose_roster_tool_definition,
+        gate: Gate::Team,
+    },
+    ToolSpec {
+        name: "crew",
+        definition: super::crew_tool::crew_tool_definition,
+        gate: Gate::Team,
+    },
+    ToolSpec {
+        name: "state_set",
+        definition: super::scratchpad::state_set_tool_definition,
+        gate: Gate::Scratchpad,
+    },
+    ToolSpec {
+        name: "state_get",
+        definition: super::scratchpad::state_get_tool_definition,
+        gate: Gate::Scratchpad,
+    },
+    ToolSpec {
+        name: "state_clear",
+        definition: super::scratchpad::state_clear_tool_definition,
+        gate: Gate::Scratchpad,
+    },
+    ToolSpec {
+        name: "code_search",
+        definition: super::semantic::code_search_tool_definition,
+        gate: Gate::CodeSearch,
+    },
+    ToolSpec {
+        name: "experience_record",
+        definition: super::experiential::experience_record_tool_definition,
+        gate: Gate::Experiential,
+    },
+    ToolSpec {
+        name: "experience_recall",
+        definition: super::experiential::experience_recall_tool_definition,
+        gate: Gate::Experiential,
+    },
+    ToolSpec {
+        name: "update_plan",
+        definition: super::scheduled::update_plan_tool_definition,
+        gate: Gate::Scheduled,
+    },
+    ToolSpec {
+        name: "plan_get",
+        definition: super::scheduled::plan_get_tool_definition,
+        gate: Gate::Scheduled,
+    },
+];
+
+/// The base tools inlined in [`tool_definitions`], by name. The base array is
+/// the one place these tools are declared; this mirror exists only so
+/// [`ALL_TOOL_NAMES`] can be assembled without re-parsing JSON, and it is kept
+/// in lockstep by `base_tool_names_match_tool_definitions`. The EXTENDED tools'
+/// names are NOT duplicated here — they live on their [`ToolSpec`].
+const BASE_TOOL_NAMES: &[&str] = &[
     "run_command",
     "read_file",
     "write_file",
@@ -559,41 +656,51 @@ const ALL_TOOL_NAMES: &[&str] = &[
     "find",
     "use_skill",
     "web_fetch",
-    "save_note",
-    "recall",
-    "memory_fetch",
-    "git",
-    "compose_roster",
-    "crew",
-    "state_set",
-    "state_get",
-    "state_clear",
-    "code_search",
-    "experience_record",
-    "experience_recall",
-    "update_plan",
-    "plan_get",
-    // #714: always-advertised self-recovery read (degrades gracefully when its
-    // sources are absent), so it is never treated as a hallucination.
-    "resume_context",
-    // #721: always-advertised capability-grant request (rides the #263 gate;
-    // degrades to "no operator available" when no gate is present), so a model
-    // calling it after a denial is never treated as a hallucination.
     "request_permissions",
-    // #725: always-advertised tool-discovery search, so a model that looks up a
-    // tool by intent is never treated as a hallucination.
-    "tool_search",
-    // #727: always-advertised read-only context-budget introspection. The
-    // agentic loop intercepts it at the dispatch site (where num_ctx + the
-    // conversation estimate are in scope) and renders the budget; it is a real
-    // name so it is never treated as a hallucination.
-    "get_context_remaining",
-    // #728: always-advertised generic ask-the-human tool (rides the #263
-    // human-interface gate via `ask_question`; degrades to "no human available"
-    // when no gate is present), so a model asking a question is never treated as
-    // a hallucination.
-    "request_user_input",
 ];
+
+/// Every tool newt can dispatch by name — the base tools plus every registered
+/// one — DERIVED from [`BASE_TOOL_NAMES`] + [`EXTENDED_TOOL_REGISTRY`] so it can
+/// never drift from the advertised set. Single source of truth for
+/// [`is_hallucination`] (which names are real) and [`nearest_tool_name`]
+/// (suggestion candidates). MCP `server__tool` names contain `__` and are
+/// matched separately.
+static ALL_TOOL_NAMES: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
+    BASE_TOOL_NAMES
+        .iter()
+        .copied()
+        .chain(EXTENDED_TOOL_REGISTRY.iter().map(|s| s.name))
+        .collect()
+});
+
+/// Whether a [`Gate`] is satisfied given this session's injected capabilities.
+/// Extracted so [`merged_tool_definitions`] reads as one loop over the registry.
+#[allow(clippy::too_many_arguments)] // mirrors merged_tool_definitions' with_* flags
+fn gate_satisfied(
+    gate: Gate,
+    with_save_note: bool,
+    with_recall: bool,
+    with_memory_fetch: bool,
+    with_git: bool,
+    with_team: bool,
+    with_scratchpad: bool,
+    with_code_search: bool,
+    with_experiential: bool,
+    with_scheduled: bool,
+) -> bool {
+    match gate {
+        Gate::Always => true,
+        Gate::SaveNote => with_save_note,
+        Gate::Recall => with_recall,
+        Gate::MemoryFetch => with_memory_fetch,
+        Gate::Git => with_git,
+        Gate::Team => with_team,
+        Gate::Scratchpad => with_scratchpad,
+        Gate::CodeSearch => with_code_search,
+        Gate::Experiential => with_experiential,
+        Gate::Scheduled => with_scheduled,
+    }
+}
 
 /// Returns `true` if a tool call looks like a hallucination:
 /// - `run_command` called with a tool name as the shell command, or
@@ -609,6 +716,8 @@ pub(crate) fn is_hallucination(tool_name: &str, args: &serde_json::Value) -> boo
     if tool_name.contains("__") {
         return false;
     }
+    // #894: derived from BASE_TOOL_NAMES + EXTENDED_TOOL_REGISTRY, so it can
+    // never drift from the advertised set.
     !ALL_TOOL_NAMES.contains(&tool_name)
 }
 
@@ -3240,6 +3349,95 @@ mod tests {
                 // request_user_input.
                 "lifecycle",
             ]
+        );
+    }
+
+    /// #894: each registry entry's schema-builder produces the SAME name the
+    /// entry declares — catches a copy-paste where the `ToolSpec.name` and the
+    /// `*_tool_definition()` disagree.
+    #[test]
+    fn registry_specs_match_their_definition_names() {
+        for spec in EXTENDED_TOOL_REGISTRY {
+            let def = (spec.definition)();
+            assert_eq!(
+                def["function"]["name"].as_str(),
+                Some(spec.name),
+                "ToolSpec name {:?} != definition name",
+                spec.name
+            );
+        }
+    }
+
+    /// #894: no built-in tool name is declared twice across the base array and
+    /// the registry (a dup would double-advertise and confuse dispatch).
+    #[test]
+    fn builtin_tool_names_are_unique() {
+        let mut seen = std::collections::HashSet::new();
+        for name in ALL_TOOL_NAMES.iter() {
+            assert!(seen.insert(*name), "duplicate built-in tool name: {name}");
+        }
+    }
+
+    /// #894 anti-drift (the payoff): with EVERY gate on, the advertised set from
+    /// `merged_tool_definitions` equals `ALL_TOOL_NAMES` in BOTH directions. This
+    /// is the test that would have caught the `lifecycle` drift — a tool
+    /// advertised/dispatched but missing from the real-name set (or vice versa)
+    /// fails here.
+    #[test]
+    fn advertised_set_matches_all_tool_names_both_directions() {
+        let all =
+            merged_tool_definitions(&NoMcp, true, true, true, true, true, true, true, true, true);
+        let advertised: std::collections::HashSet<&str> = all
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|d| d["function"]["name"].as_str())
+            .collect();
+        let names: std::collections::HashSet<&str> = ALL_TOOL_NAMES.iter().copied().collect();
+        // Every advertised tool is a real (non-hallucinated) name...
+        for a in &advertised {
+            assert!(
+                names.contains(a),
+                "advertised but not in ALL_TOOL_NAMES: {a}"
+            );
+        }
+        // ...and every real name is actually advertised when its gate is on.
+        for n in &names {
+            assert!(
+                advertised.contains(n),
+                "in ALL_TOOL_NAMES but never advertised: {n}"
+            );
+        }
+    }
+
+    /// #894: `BASE_TOOL_NAMES` mirrors the names inlined in `tool_definitions()`
+    /// exactly and in order — the one hand-kept mirror, guarded here.
+    #[test]
+    fn base_tool_names_match_tool_definitions() {
+        let defs = tool_definitions();
+        let base: Vec<&str> = defs
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|d| d["function"]["name"].as_str())
+            .collect();
+        assert_eq!(base, BASE_TOOL_NAMES);
+    }
+
+    /// #894 regression for the concrete drift that motivated the registry: the
+    /// `lifecycle` tool (#891) is advertised + dispatched, so it MUST be a real
+    /// name — otherwise every legitimate `lifecycle` call is miscounted as a
+    /// hallucination (inflating the anti-loop counter). Before the registry it
+    /// was missing from `ALL_TOOL_NAMES`; the derivation makes that impossible.
+    #[test]
+    fn lifecycle_is_a_real_tool_name_not_a_hallucination() {
+        assert!(
+            ALL_TOOL_NAMES.contains(&"lifecycle"),
+            "lifecycle must be a real tool name"
+        );
+        assert!(
+            !is_hallucination("lifecycle", &serde_json::json!({"phase": "test"})),
+            "a real lifecycle call must not be flagged as a hallucination"
         );
     }
 
