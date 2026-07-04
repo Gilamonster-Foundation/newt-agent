@@ -4885,6 +4885,9 @@ fn run_chat(
     // Step 25.4 (#568): per-session Markdown override set by `/markdown on|off`.
     // `None` defers to `[tui].markdown`; `Some(b)` forces it for the session.
     let mut markdown_override: Option<bool> = None;
+    // Human-only per-session override for the agentic loop's tool-call round
+    // safety valve. `None` preserves config/model-tuning behavior exactly.
+    let mut max_tool_rounds_override: Option<usize> = None;
     // Step 24.8 (#559): per-session context-manager override from
     // `/context manager <name>`. `None` defers to `[context].manager`.
     let mut context_manager_override: Option<newt_core::ContextManager> = None;
@@ -5571,6 +5574,70 @@ fn run_chat(
                         println!();
                         continue;
                     }
+                    if tool_round_limit_command_arg(&task).is_some() {
+                        let configured = cfg
+                            .find_model_tuning(&inf_model)
+                            .and_then(|t| t.max_tool_rounds)
+                            .unwrap_or_else(|| max_tool_rounds(&cfg));
+                        match parse_tool_round_limit_command(&task) {
+                            Ok(ToolRoundLimitCommand::Show) => {
+                                print_newt(
+                                    &tool_round_limit_status(configured, max_tool_rounds_override),
+                                    color,
+                                    verbose,
+                                );
+                            }
+                            Ok(ToolRoundLimitCommand::Set(n)) => {
+                                max_tool_rounds_override = Some(n);
+                                print_newt(
+                                    &tool_round_limit_status(configured, max_tool_rounds_override),
+                                    color,
+                                    verbose,
+                                );
+                            }
+                            Ok(ToolRoundLimitCommand::Double) => {
+                                let current = effective_tool_round_limit(
+                                    configured,
+                                    max_tool_rounds_override,
+                                );
+                                max_tool_rounds_override = Some(double_tool_round_limit(current));
+                                print_newt(
+                                    &tool_round_limit_status(configured, max_tool_rounds_override),
+                                    color,
+                                    verbose,
+                                );
+                            }
+                            Ok(ToolRoundLimitCommand::Reset) => {
+                                max_tool_rounds_override = None;
+                                print_newt(
+                                    &format!(
+                                        "tool-call round limit reset to {}",
+                                        describe_tool_round_limit(configured)
+                                    ),
+                                    color,
+                                    verbose,
+                                );
+                            }
+                            Ok(ToolRoundLimitCommand::Unlimited) => {
+                                max_tool_rounds_override = Some(EFFECTIVELY_UNLIMITED_TOOL_ROUNDS);
+                                print_newt(
+                                    &tool_round_limit_status(configured, max_tool_rounds_override),
+                                    color,
+                                    verbose,
+                                );
+                            }
+                            Err(e) => print_newt(
+                                &format!(
+                                    "error: {e} — use /rounds [show|<n>|double|reset|unlimited]"
+                                ),
+                                color,
+                                verbose,
+                            ),
+                        }
+                        surface.save_history();
+                        println!();
+                        continue;
+                    }
                     if slash_md == "context" || slash_md.starts_with("context ") {
                         // Step 24.8 (#559) / Step 26.1 (#588): the context-manager
                         // preset selector + composable feature toggles. Only
@@ -5939,9 +6006,13 @@ fn run_chat(
 
                     // Per-model tuning: explicit config overrides global defaults.
                     let model_tune = cfg.find_model_tuning(&inf_model);
-                    let eff_max_tool_rounds = model_tune
+                    let configured_max_tool_rounds = model_tune
                         .and_then(|t| t.max_tool_rounds)
                         .unwrap_or_else(|| max_tool_rounds(&cfg));
+                    let eff_max_tool_rounds = effective_tool_round_limit(
+                        configured_max_tool_rounds,
+                        max_tool_rounds_override,
+                    );
                     let eff_mid_loop_trim = model_tune
                         .and_then(|t| t.mid_loop_trim_threshold)
                         .unwrap_or_else(|| mid_loop_trim_threshold(&cfg))
@@ -8436,6 +8507,101 @@ fn max_tool_rounds(cfg: &newt_core::Config) -> usize {
     cfg.tui.as_ref().map(|t| t.max_tool_rounds).unwrap_or(25)
 }
 
+const EFFECTIVELY_UNLIMITED_TOOL_ROUNDS: usize = 10_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolRoundLimitCommand {
+    Show,
+    Set(usize),
+    Double,
+    Reset,
+    Unlimited,
+}
+
+fn tool_round_limit_command_arg(input: &str) -> Option<&str> {
+    let body = input.trim().trim_start_matches('/').trim();
+    ["rounds", "tool-rounds", "max-rounds"]
+        .iter()
+        .find_map(|cmd| {
+            let rest = body.strip_prefix(*cmd)?;
+            let boundary = rest.is_empty()
+                || rest
+                    .chars()
+                    .next()
+                    .map(char::is_whitespace)
+                    .unwrap_or(false);
+            boundary.then(|| rest.trim())
+        })
+}
+
+/// Parse `/rounds [show|<n>|double|reset|unlimited]`, the human-controlled
+/// session override for the agentic loop's tool-call round safety valve.
+fn parse_tool_round_limit_command(input: &str) -> anyhow::Result<ToolRoundLimitCommand> {
+    let Some(arg) = tool_round_limit_command_arg(input) else {
+        anyhow::bail!("not a tool-round limit command");
+    };
+    if arg.is_empty() {
+        return Ok(ToolRoundLimitCommand::Show);
+    }
+
+    let normalized = arg.to_ascii_lowercase();
+    match normalized.as_str() {
+        "show" | "status" => Ok(ToolRoundLimitCommand::Show),
+        "double" | "x2" | "2x" => Ok(ToolRoundLimitCommand::Double),
+        "reset" | "default" | "config" | "auto" => Ok(ToolRoundLimitCommand::Reset),
+        "unlimited" | "infinite" | "finish" | "until-finished" | "run-until-finished"
+        | "until finished" | "run until finished" => Ok(ToolRoundLimitCommand::Unlimited),
+        _ => {
+            let n = arg.parse::<usize>().map_err(|_| {
+                anyhow::anyhow!(
+                    "unknown /rounds argument '{arg}' (use show, <n>, double, reset, unlimited)"
+                )
+            })?;
+            if n == 0 {
+                anyhow::bail!("tool-call round limit must be at least 1");
+            }
+            if n > EFFECTIVELY_UNLIMITED_TOOL_ROUNDS {
+                anyhow::bail!(
+                    "tool-call round limit must be <= {EFFECTIVELY_UNLIMITED_TOOL_ROUNDS}"
+                );
+            }
+            Ok(ToolRoundLimitCommand::Set(n))
+        }
+    }
+}
+
+fn effective_tool_round_limit(configured: usize, session_override: Option<usize>) -> usize {
+    session_override.unwrap_or(configured)
+}
+
+fn double_tool_round_limit(current: usize) -> usize {
+    current
+        .saturating_mul(2)
+        .clamp(1, EFFECTIVELY_UNLIMITED_TOOL_ROUNDS)
+}
+
+fn describe_tool_round_limit(rounds: usize) -> String {
+    if rounds >= EFFECTIVELY_UNLIMITED_TOOL_ROUNDS {
+        format!("{rounds} (effectively unlimited)")
+    } else {
+        rounds.to_string()
+    }
+}
+
+fn tool_round_limit_status(configured: usize, session_override: Option<usize>) -> String {
+    match session_override {
+        Some(rounds) => format!(
+            "tool-call round limit: {} this session (config/model default {})",
+            describe_tool_round_limit(rounds),
+            describe_tool_round_limit(configured)
+        ),
+        None => format!(
+            "tool-call round limit: {} (config/model default)",
+            describe_tool_round_limit(configured)
+        ),
+    }
+}
+
 /// Ollama context-window cap. Resolution order:
 ///   1. `NEWT_NUM_CTX` env var (set by `--num-ctx` CLI flag or manually)
 ///   2. `[tui] num_ctx` in config
@@ -9140,6 +9306,7 @@ fn canonical_help_topic(cmd: &str) -> &str {
         "quit" => "exit",
         "end" | "restart" => "new",
         "vi" | "vim" | "emacs" | "nano" | "edit-mode" => "editor",
+        "tool-rounds" | "max-rounds" => "rounds",
         _ => cmd,
     }
 }
@@ -9241,6 +9408,20 @@ Summarize-and-prune the in-flight context to reclaim window, optionally biased
 toward a topic. Runs automatically when the window fills; this forces it early.
   /compress
   /compress the auth refactor"
+        }
+        "rounds" => {
+            "\
+/rounds [show|<n>|double|reset|unlimited] — session tool-call round limit
+
+Human-only override for how many tool-call rounds the agent may run in a
+single turn. It does not edit config and lasts only for this session.
+  /rounds             show the effective limit
+  /rounds 50          allow 50 tool-call rounds per turn
+  /rounds double      double the current effective limit
+  /rounds reset       return to config/model tuning
+  /rounds unlimited   set 10000 rounds, effectively run-until-finished
+
+Aliases: /tool-rounds, /max-rounds."
         }
         "remember" => {
             "\
@@ -9451,6 +9632,7 @@ fn help_lines() -> &'static [&'static str] {
         "  /probe reset             - wipe all learned probe values (conformance, windows, calibration)",
         "  /memory                  - show context window / notes usage",
         "  /compress [focus]        - compress context now, optionally focused on a topic",
+        "  /rounds [n|double|reset|unlimited] - set this session's tool-call round limit",
         "  /context                 - show the active context manager + features",
         "  /context manager [preset] - show or set the strategy preset (standard; progressive/distributed pending #546)",
         "  /context feature <name> [on|off] - toggle a composable context feature (all pending #582-#586)",
@@ -10866,6 +11048,74 @@ mod tests {
     }
 
     #[test]
+    fn tool_round_limit_commands_parse_expected_forms() {
+        assert_eq!(
+            parse_tool_round_limit_command("/rounds").unwrap(),
+            ToolRoundLimitCommand::Show
+        );
+        assert_eq!(
+            parse_tool_round_limit_command("/rounds status").unwrap(),
+            ToolRoundLimitCommand::Show
+        );
+        assert_eq!(
+            parse_tool_round_limit_command("/tool-rounds 50").unwrap(),
+            ToolRoundLimitCommand::Set(50)
+        );
+        assert_eq!(
+            parse_tool_round_limit_command("/max-rounds double").unwrap(),
+            ToolRoundLimitCommand::Double
+        );
+        assert_eq!(
+            parse_tool_round_limit_command("/rounds x2").unwrap(),
+            ToolRoundLimitCommand::Double
+        );
+        assert_eq!(
+            parse_tool_round_limit_command("/rounds reset").unwrap(),
+            ToolRoundLimitCommand::Reset
+        );
+        assert_eq!(
+            parse_tool_round_limit_command("/rounds default").unwrap(),
+            ToolRoundLimitCommand::Reset
+        );
+        assert_eq!(
+            parse_tool_round_limit_command("/rounds unlimited").unwrap(),
+            ToolRoundLimitCommand::Unlimited
+        );
+        assert_eq!(
+            parse_tool_round_limit_command("/rounds run until finished").unwrap(),
+            ToolRoundLimitCommand::Unlimited
+        );
+
+        assert!(parse_tool_round_limit_command("/roundsx 10").is_err());
+        assert!(parse_tool_round_limit_command("/rounds 0").is_err());
+        assert!(parse_tool_round_limit_command("/rounds 10001").is_err());
+        assert!(parse_tool_round_limit_command("/rounds many").is_err());
+    }
+
+    #[test]
+    fn tool_round_limit_override_resolves_and_reports() {
+        assert_eq!(effective_tool_round_limit(25, None), 25);
+        assert_eq!(effective_tool_round_limit(25, Some(50)), 50);
+        assert_eq!(double_tool_round_limit(25), 50);
+        assert_eq!(
+            double_tool_round_limit(EFFECTIVELY_UNLIMITED_TOOL_ROUNDS),
+            EFFECTIVELY_UNLIMITED_TOOL_ROUNDS
+        );
+        assert_eq!(
+            tool_round_limit_status(25, None),
+            "tool-call round limit: 25 (config/model default)"
+        );
+        assert_eq!(
+            tool_round_limit_status(25, Some(50)),
+            "tool-call round limit: 50 this session (config/model default 25)"
+        );
+        assert!(
+            tool_round_limit_status(25, Some(EFFECTIVELY_UNLIMITED_TOOL_ROUNDS))
+                .contains("effectively unlimited")
+        );
+    }
+
+    #[test]
     fn slash_help_returns_true() {
         assert!(dispatch_slash("/help", "/ws", false, false).unwrap());
     }
@@ -10894,6 +11144,9 @@ mod tests {
             "probe",
             "memory",
             "compress",
+            "rounds",
+            "tool-rounds",
+            "max-rounds",
             "remember",
             "new",
             "end",
