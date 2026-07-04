@@ -1,0 +1,14 @@
+{
+  "name": "candidate",
+  "created": "2026-07-04T00:18:20Z",
+  "git_sha": "255dbb3486601320c59f72cec90ae3aa0b43b8c2",
+  "git_sha_note": "corrected post-hoc, same known issue as #812's candidate arm: sweep.sh's own git_sha field always records $REPO (the harness checkout), not the graded binary's actual source. This arm's binary was built via an explicit NEWT_BIN=.../newt-812-worker-scope override, from current main @ 255dbb3 (has both #812's def-site scoping AND #836's sibling-not-nested convention, verified present via grep before the sweep launched), not eval-continuum's own default binary.",
+  "tasks": "010-decompose-god-function",
+  "modes": "crew",
+  "models": "qwen2.5-coder:14b,devstral-small-2:24b,qwen3-coder:30b,qwen2.5-coder:32b,deepseek-r1:70b",
+  "trials": 5,
+  "max_leaves": 6,
+  "timeout": 1200,
+  "keep": "fail",
+  "config_template": "~/.newt/eval-sweeps/template.toml"
+}
