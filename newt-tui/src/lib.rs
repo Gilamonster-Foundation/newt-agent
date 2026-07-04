@@ -6031,9 +6031,12 @@ fn run_chat(
                         let mut hints: Vec<&str> = Vec::new();
                         if turn_features.scheduled {
                             hints.push(
-                                "For multi-step work, call update_plan with the full ordered plan \
-                                 (each step's status pending/in_progress/completed); re-send it \
-                                 with the finished step marked completed as you go.",
+                                "For multi-step, ambiguous, resumed, or context-compacted work, \
+                                 prefer calling update_plan first with a short 2-6 step ordered \
+                                 plan (each step's status pending/in_progress/completed) before \
+                                 more investigation. Re-send it with the finished step marked \
+                                 completed as you go. If plan_get says no active plan, create one \
+                                 with update_plan instead of polling plan_get again.",
                             );
                         }
                         if scratchpad_on {
