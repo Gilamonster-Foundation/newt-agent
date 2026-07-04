@@ -25,7 +25,8 @@ const REPO = argv.repo
   ? `Repo root: ${argv.repo} (given — use it verbatim, do not guess).`
   : 'Repo root: resolve via git rev-parse --show-toplevel (requires your cwd to be inside the newt-agent repo).'
 
-const COMMON = `${REPO} Case dir: <repo>/newt-eval/cases/${CASE}/ (case.toml has the task prompt; workspace/ is the seed the agent starts from). House style for hidden specs: <repo>/newt-eval/cases/T2-humanize-duration/grade_spec.rs — a tests/grade_spec.rs integration test dropped into the produced tree at grading time and run via 'cargo test --test grade_spec'; the agent under eval NEVER sees it. Scratch: use mktemp -d for every seed copy; set CARGO_TARGET_DIR to a dir inside your scratch so builds never pollute the repo; clean up your scratch at the end. NEVER modify the repo itself unless a step explicitly says to.`
+const CASE_SPEC_PATH = `<repo>/newt-eval/cases/${CASE}/grade_spec.rs`
+const COMMON = `${REPO} Case dir: <repo>/newt-eval/cases/${CASE}/ (case.toml has the task prompt; workspace/ is the seed the agent starts from) — READ-ONLY reference for you; do not write into it. House style for hidden specs: <repo>/newt-eval/cases/T2-humanize-duration/grade_spec.rs — a tests/grade_spec.rs integration test dropped into the produced tree at grading time and run via 'cargo test --test grade_spec'; the agent under eval NEVER sees it. Scratch: use mktemp -d for every seed copy; set CARGO_TARGET_DIR to a dir inside your scratch so builds never pollute the repo; clean up your scratch at the end. NEVER write to ${CASE_SPEC_PATH} yourself, at any step, for any reason (not to "save a draft", not to "double-check it compiles in place", not for any purpose) — that exact path is written EXACTLY ONCE, by the install step alone, which is identified by its own explicit instruction to do so. If your task doesn't literally say "install the certified spec", every file you touch must live under a scratch dir (mktemp -d) and nowhere inside <repo>.`
 
 phase('Analyze')
 const analysis = await agent(`Analyze eval case ${CASE} to prepare authoring its hidden grade_spec.rs. ${COMMON}
@@ -141,6 +142,22 @@ Spec source:\n${draft.spec_source}`,
   installed = true
 }
 
+// #851: a prior run left an uncertified spec on disk despite the install
+// gate above correctly never firing — some earlier step (draft/harden/
+// certify) wrote to the repo anyway, contrary to its own instructions. This
+// self-check catches that class of bug automatically instead of relying on
+// whoever runs the workflow to `git status` before committing: an
+// independent agent re-checks the REAL repo state against what this script
+// believes happened, regardless of certified/installed outcome.
+const selfCheck = await agent(`${COMMON} Run \`git status --short\` in the repo. Report EVERY line whose path starts with \`newt-eval/cases/${CASE}/\` or \`scripts/eval/results/gaming-corpus/${CASE}/\` verbatim. Do not interpret, do not fix, do not delete anything — read-only. If there are none, report an empty list.`,
+  { label: 'self-check', phase: 'Certify', effort: 'low',
+    schema: { type: 'object', additionalProperties: false, required: ['case_paths'],
+      properties: { case_paths: { type: 'array', items: { type: 'string' } } } } })
+const strayFiles = selfCheck && selfCheck.case_paths.length > 0 && !installed
+  ? selfCheck.case_paths
+  : []
+if (strayFiles.length) log(`WARNING: stray files found for uninstalled case ${CASE} — ${strayFiles.join('; ')} (see #851)`)
+
 return {
   case: CASE,
   status: certified ? (installed ? 'installed' : 'certified-not-installed') : 'uncertified',
@@ -149,4 +166,5 @@ return {
   certification: cert,
   spec_path: installed ? `newt-eval/cases/${CASE}/grade_spec.rs` : null,
   corpus_path: corpus.length && installed ? `scripts/eval/results/gaming-corpus/${CASE}/` : null,
+  stray_files_warning: strayFiles.length ? strayFiles : undefined,
 }
