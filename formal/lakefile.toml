@@ -1,0 +1,9 @@
+name = "caveat-lattice"
+defaultTargets = ["CaveatLattice"]
+
+# The OCAP caveat-lattice formal spec (#902). Self-contained: no Mathlib, so it
+# builds from a bare Lean toolchain (see lean-toolchain). `lake build` checks
+# every theorem; a Rust change that breaks a proven invariant fails this build.
+
+[[lean_lib]]
+name = "CaveatLattice"

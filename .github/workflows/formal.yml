@@ -1,0 +1,33 @@
+name: formal (Lean proofs)
+
+# Machine-checked OCAP caveat-lattice spec (#902 / `formal/`). A change that
+# breaks a proven invariant fails this build — the "formal specifications engine"
+# in its first form.
+#
+# HOOK PARITY: intentionally NONE. This is a Lean toolchain gate, orthogonal to
+# the Rust `.githooks/pre-push` (`just check`), and requiring a full Lean
+# install in every developer's pre-push would be disproportionate. The gate is
+# CI-only by design; `formal/README.md` documents `lake build` for local checks.
+# Runs only when the formal tree changes (paths filter below).
+
+on:
+  push:
+    paths: ['formal/**', '.github/workflows/formal.yml']
+  pull_request:
+    paths: ['formal/**', '.github/workflows/formal.yml']
+
+jobs:
+  lean:
+    name: Lean caveat-lattice proofs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install elan (Lean toolchain manager)
+        run: |
+          set -euo pipefail
+          curl -sSfL https://elan.lean-lang.org/elan-init.sh -o elan-init.sh
+          sh elan-init.sh -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+      - name: lake build (checks every theorem; toolchain pinned in lean-toolchain)
+        working-directory: formal
+        run: lake build
