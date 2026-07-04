@@ -3195,6 +3195,59 @@ impl Config {
         std::fs::write(path, text).map_err(NewtError::Io)
     }
 
+    /// #904: append `host` to `[tui.permissions] net` in the TOML `text`,
+    /// **preserving comments and formatting** — unlike [`Config::save`], which
+    /// re-serializes the whole typed struct and drops the user's comments,
+    /// ordering, and any keys newt does not model. Creates the
+    /// `[tui.permissions]` table and its `net` array if absent; a no-op if the
+    /// host is already listed. PURE (no I/O), so it unit-tests without a
+    /// filesystem. This is the durable "allow permanently" grant path — it is
+    /// only ever driven by an explicit human keypress at the permission prompt.
+    pub fn with_net_host(text: &str, host: &str) -> Result<String> {
+        let mut doc = text
+            .parse::<toml_edit::DocumentMut>()
+            .map_err(|e| NewtError::Config(format!("config is not valid TOML: {e}")))?;
+        let tui = doc
+            .as_table_mut()
+            .entry("tui")
+            .or_insert(toml_edit::Item::Table(toml_edit::Table::new()));
+        let tui_tbl = tui
+            .as_table_mut()
+            .ok_or_else(|| NewtError::Config("[tui] is not a table".to_string()))?;
+        let perms = tui_tbl
+            .entry("permissions")
+            .or_insert(toml_edit::Item::Table(toml_edit::Table::new()));
+        let perms_tbl = perms
+            .as_table_mut()
+            .ok_or_else(|| NewtError::Config("[tui.permissions] is not a table".to_string()))?;
+        let net =
+            perms_tbl
+                .entry("net")
+                .or_insert(toml_edit::Item::Value(toml_edit::Value::Array(
+                    toml_edit::Array::new(),
+                )));
+        let arr = net.as_array_mut().ok_or_else(|| {
+            NewtError::Config("[tui.permissions] net is not an array".to_string())
+        })?;
+        if !arr.iter().any(|v| v.as_str() == Some(host)) {
+            arr.push(host);
+        }
+        Ok(doc.to_string())
+    }
+
+    /// Durably grant a net host by appending it to `[tui.permissions] net` in the
+    /// config file at `path`, comment-preserving (see [`Config::with_net_host`]).
+    /// A missing file is treated as empty (the table is created). Creates parent
+    /// dirs as needed. Used by the interactive gate's "allow permanently" choice.
+    pub fn append_permission_net_host(path: &Path, host: &str) -> Result<()> {
+        let text = std::fs::read_to_string(path).unwrap_or_default();
+        let updated = Self::with_net_host(&text, host)?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(NewtError::Io)?;
+        }
+        std::fs::write(path, updated).map_err(NewtError::Io)
+    }
+
     /// Build the ordered list of candidate config file paths.
     fn candidate_paths() -> Vec<PathBuf> {
         let mut paths = Vec::new();
@@ -5010,6 +5063,62 @@ max_tool_rounds = 25
         assert!(toml.contains("bacon"));
         let back: ToolPermissions = toml::from_str(&toml).unwrap();
         assert_eq!(back, perms);
+    }
+
+    // ---- #904: comment-preserving "allow permanently" net writer ----
+
+    #[test]
+    fn with_net_host_creates_table_from_empty_and_scope_includes_host() {
+        let out = Config::with_net_host("", "github.com").unwrap();
+        // The written TOML parses back and its net scope now permits the host.
+        let cfg: Config = toml::from_str(&out).unwrap();
+        let perms = cfg.tui.unwrap().permissions;
+        assert!(perms.net.contains(&"github.com".to_string()));
+        assert!(
+            matches!(perms.net_scope(), crate::caveats::Scope::Only(ref s) if s.contains("github.com")),
+            "net_scope must permit the granted host"
+        );
+    }
+
+    #[test]
+    fn with_net_host_preserves_comments_and_other_keys() {
+        let original = "\
+# my hand-authored config — keep this comment
+[tui.permissions]
+preset = \"workspace_dev\"  # inline comment
+net = [\"already.example.com\"]
+";
+        let out = Config::with_net_host(original, "github.com").unwrap();
+        // Comments survive (the whole point vs Config::save).
+        assert!(
+            out.contains("# my hand-authored config"),
+            "top comment lost: {out}"
+        );
+        assert!(
+            out.contains("# inline comment"),
+            "inline comment lost: {out}"
+        );
+        // The pre-existing host is kept and the new one appended.
+        assert!(out.contains("already.example.com"));
+        assert!(out.contains("github.com"));
+        // preset key untouched.
+        assert!(out.contains("workspace_dev"));
+    }
+
+    #[test]
+    fn with_net_host_is_idempotent_no_duplicate() {
+        let once = Config::with_net_host("", "github.com").unwrap();
+        let twice = Config::with_net_host(&once, "github.com").unwrap();
+        assert_eq!(
+            twice.matches("github.com").count(),
+            1,
+            "duplicated host: {twice}"
+        );
+    }
+
+    #[test]
+    fn with_net_host_rejects_invalid_toml() {
+        assert!(Config::with_net_host("this = = not toml", "github.com").is_err());
     }
 
     fn openai_backend(api_key_file: Option<String>, api_key_env: Option<String>) -> BackendConfig {

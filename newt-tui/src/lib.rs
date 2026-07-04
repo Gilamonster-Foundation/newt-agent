@@ -1694,16 +1694,24 @@ enum PromptChoice {
     /// so the gate refuses this `(kind, target)` without re-prompting, across
     /// restarts. `[D]eny always` is the session-scoped sibling.
     DenyPermanent,
+    /// #904: allow PERMANENTLY — for a NET host, durably grant it by appending
+    /// it to `[tui.permissions] net` in the config (comment-preserving), so the
+    /// next session reads it as an ambient allow and never prompts. Only offered
+    /// for net denials; a durable widen of any axis is an explicit human keypress
+    /// and is still re-minted `⊑` the user root (attenuation-only).
+    AllowPermanent,
 }
 
 /// Map a typed answer to a choice. Case-significant on purpose — `[d]eny`
-/// is the default, `[D]eny always` the session escalation, and `[P]ermanently
-/// deny` the durable one (#904). Anything unrecognized (including empty / EOF)
-/// is the safe default: deny.
+/// is the default, `[D]eny always` the session escalation, `[P]ermanently
+/// deny` the durable deny (#904), and `[A]llow permanently` the durable net
+/// grant (#904). Anything unrecognized (including empty / EOF) is the safe
+/// default: deny.
 fn parse_permission_choice(input: &str) -> PromptChoice {
     match input.trim() {
         "a" => PromptChoice::AllowOnce,
         "s" => PromptChoice::AllowSession,
+        "A" => PromptChoice::AllowPermanent,
         "D" => PromptChoice::DenyAlways,
         "P" => PromptChoice::DenyPermanent,
         _ => PromptChoice::Deny,
@@ -1832,13 +1840,23 @@ fn permission_prompt_text(
 
     // (3) §7-F3/F4: a high-danger target is NOT session-allowable — omit `[s]`
     // and point at the future step-up path. Low-danger keeps the full menu.
+    // #904: a low-danger NET host also gets `[A]llow permanently` — a durable
+    // grant written to `[tui.permissions] net`. Not offered for other axes (no
+    // per-target config allowlist) nor for high-danger (never durably widened).
     let menu = match tier {
         danger::DangerTier::High => {
             "[a]llow once   [d]eny (default)   [D]eny always   [P]ermanently deny   \
              (high-danger: [s]ession allow refused — [k]ey allow / step-up is the future path, P3) > "
+                .to_string()
+        }
+        danger::DangerTier::Low if req.kind == DenialKind::Net => {
+            "[a]llow once   [s]ession allow   [A]llow permanently (adds host to config)   \
+             [d]eny (default)   [D]eny always   [P]ermanently deny > "
+                .to_string()
         }
         danger::DangerTier::Low => {
             "[a]llow once   [s]ession allow   [d]eny (default)   [D]eny always   [P]ermanently deny > "
+                .to_string()
         }
     };
 
@@ -1972,6 +1990,10 @@ struct PromptPermissionGate<'a, F: FnMut(&str) -> PromptChoice> {
     /// `[P]ermanently deny`. `None` degrades that choice to session-scoped (like
     /// `[D]eny always`) — the deny still holds, it just won't survive a restart.
     denials_path: Option<std::path::PathBuf>,
+    /// #904: user config path (`~/.newt/config.toml`) that `[A]llow permanently`
+    /// appends a net host to (`[tui.permissions] net`, comment-preserving).
+    /// `None` degrades that choice to a session grant (durable widen unavailable).
+    config_path: Option<std::path::PathBuf>,
     /// #307 FLOOR: the active named-permission-preset clamp, if any. The minted
     /// authority is re-`meet`-ed with this ceiling so a session-grant can NEVER
     /// re-add a target the preset denied — `widen_caveats` adds to `Only` sets,
@@ -2105,6 +2127,70 @@ impl<F: FnMut(&str) -> PromptChoice> newt_core::PermissionGate for PromptPermiss
                         return Deny;
                     }
                     self.record(req, "allow", "session");
+                    self.state
+                        .session_grants
+                        .insert((req.kind, req.target.clone()));
+                }
+                PromptChoice::AllowPermanent => {
+                    // #904: durably grant a NET host by appending it to
+                    // `[tui.permissions] net` (comment-preserving). It is ALSO
+                    // added to session_grants so it holds immediately this
+                    // session — the durable grant only takes effect on the next
+                    // config load. The grant still flows through `mint()`
+                    // (re-minted ⊑ root), so the attenuation-only invariant holds.
+                    //
+                    // Only net is durably grantable (the only per-target config
+                    // allowlist). A non-net `[A]` (not offered in the menu, but a
+                    // muscle-memory keypress) degrades to a session grant, and a
+                    // high-danger net host is refused like `[s]ession allow`.
+                    if req.kind != newt_core::DenialKind::Net {
+                        self.record(req, "allow", "session");
+                        self.state
+                            .session_grants
+                            .insert((req.kind, req.target.clone()));
+                        continue;
+                    }
+                    if self.danger.classify(req.kind, &req.target) == danger::DangerTier::High {
+                        self.record(req, "deny", "permanent-allow-refused-high-danger");
+                        print_newt(
+                            &format!("permanent allow refused for high-danger `{}`", req.target),
+                            self.color,
+                            self.verbose,
+                        );
+                        return Deny;
+                    }
+                    self.record(req, "allow", "permanent");
+                    match self.config_path.as_deref() {
+                        Some(path) => {
+                            if let Err(e) =
+                                newt_core::Config::append_permission_net_host(path, &req.target)
+                            {
+                                print_newt(
+                                    &format!(
+                                        "warning: could not persist net grant to config: {e} \
+                                         (granted for this session only)"
+                                    ),
+                                    self.color,
+                                    self.verbose,
+                                );
+                            } else {
+                                print_newt(
+                                    &format!(
+                                        "added `{}` to [tui.permissions] net — future sessions \
+                                         will not prompt for it",
+                                        req.target
+                                    ),
+                                    self.color,
+                                    self.verbose,
+                                );
+                            }
+                        }
+                        None => print_newt(
+                            "no config path this session — net grant is session-only",
+                            self.color,
+                            self.verbose,
+                        ),
+                    }
                     self.state
                         .session_grants
                         .insert((req.kind, req.target.clone()));
@@ -2476,6 +2562,7 @@ mod permission_prompt_tests {
             conversation_id: "conv-test".to_string(),
             log_path,
             denials_path: None,
+            config_path: None,
             preset_clamp: None,
             danger: danger::DangerTable::builtin(),
             color: false,
@@ -2507,6 +2594,7 @@ mod permission_prompt_tests {
             conversation_id: "conv-test".to_string(),
             log_path,
             denials_path: None,
+            config_path: None,
             preset_clamp: Some(preset_clamp),
             danger: danger::DangerTable::builtin(),
             color: false,
@@ -2525,10 +2613,13 @@ mod permission_prompt_tests {
         assert_eq!(parse_permission_choice("s"), PromptChoice::AllowSession);
         assert_eq!(parse_permission_choice("d"), PromptChoice::Deny);
         assert_eq!(parse_permission_choice("D"), PromptChoice::DenyAlways);
+        // #904: the durable tiers.
+        assert_eq!(parse_permission_choice("P"), PromptChoice::DenyPermanent);
+        assert_eq!(parse_permission_choice("A"), PromptChoice::AllowPermanent);
         // Default = deny: empty (just Enter / EOF), garbage, near-misses.
         assert_eq!(parse_permission_choice(""), PromptChoice::Deny);
         assert_eq!(parse_permission_choice("yes"), PromptChoice::Deny);
-        assert_eq!(parse_permission_choice("A"), PromptChoice::Deny);
+        // Case-significant: capital `S` is not a choice (session is lowercase `s`).
         assert_eq!(parse_permission_choice("S"), PromptChoice::Deny);
     }
 
@@ -2794,6 +2885,7 @@ mod permission_prompt_tests {
                 conversation_id: "conv-904".to_string(),
                 log_path: None,
                 denials_path: Some(denials.clone()),
+                config_path: None,
                 preset_clamp: None,
                 danger: danger::DangerTable::builtin(),
                 color: false,
@@ -2825,6 +2917,7 @@ mod permission_prompt_tests {
                 conversation_id: "conv-904b".to_string(),
                 log_path: None,
                 denials_path: Some(denials.clone()),
+                config_path: None,
                 preset_clamp: None,
                 danger: danger::DangerTable::builtin(),
                 color: false,
@@ -2851,6 +2944,102 @@ mod permission_prompt_tests {
         // Case-significant + safe default: lowercase p / unknown / empty → deny.
         assert_eq!(parse_permission_choice("p"), PromptChoice::Deny);
         assert_eq!(parse_permission_choice(""), PromptChoice::Deny);
+    }
+
+    /// #904: the `[A]llow permanently` option is offered ONLY for net denials
+    /// (the only axis with a per-target config allowlist); every axis still
+    /// offers `[P]ermanently deny`.
+    #[test]
+    fn permanent_allow_offered_for_net_only() {
+        let danger = danger::DangerTable::builtin();
+        let net = permission_prompt_text(
+            &PermissionRequest {
+                tool: "web_fetch".to_string(),
+                kind: DenialKind::Net,
+                target: "github.com".to_string(),
+                reason: String::new(),
+            },
+            &danger,
+        );
+        let exec = permission_prompt_text(&exec_request("npm"), &danger);
+        assert!(
+            net.contains("[A]llow permanently"),
+            "net must offer it: {net}"
+        );
+        assert!(
+            !exec.contains("[A]llow permanently"),
+            "exec must NOT: {exec}"
+        );
+        assert!(net.contains("[P]ermanently deny") && exec.contains("[P]ermanently deny"));
+    }
+
+    /// #904: `[A]llow permanently` for a net host grants it this session AND
+    /// durably appends it to `[tui.permissions] net` in the config, so a fresh
+    /// session reads it as an ambient allow (net scope permits it → no denial →
+    /// no prompt). The written config is valid TOML that round-trips.
+    #[test]
+    fn allow_permanently_grants_now_and_persists_host_to_config() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config = dir.path().join("config.toml");
+        // Start from a hand-authored config with a comment (proves preservation).
+        std::fs::write(&config, "# my config\n[tui.permissions]\nnet = []\n").unwrap();
+        let base = base_caveats("/ws");
+        let net_req = newt_core::PermissionRequest {
+            tool: "web_fetch".to_string(),
+            kind: DenialKind::Net,
+            target: "github.com".to_string(),
+            reason: "net does not permit 'github.com'".to_string(),
+        };
+
+        let mut state = PermissionPromptState::default();
+        {
+            let mut script = vec![PromptChoice::AllowPermanent].into_iter();
+            let mut gate = PromptPermissionGate {
+                state: &mut state,
+                base,
+                key_path: None,
+                conversation_id: "conv-904a".to_string(),
+                log_path: None,
+                denials_path: None,
+                config_path: Some(config.clone()),
+                preset_clamp: None,
+                danger: danger::DangerTable::builtin(),
+                color: false,
+                verbose: false,
+                ask_human: move |_p: &str| script.next().expect("script exhausted"),
+            };
+            match gate.ask(std::slice::from_ref(&net_req)) {
+                newt_core::PermissionDecision::Allow(c) => {
+                    assert!(c.permits_net("github.com"), "granted this session");
+                }
+                newt_core::PermissionDecision::Deny => {
+                    panic!("permanent-allow of a net host must be granted")
+                }
+            }
+        }
+        // Holds this session.
+        assert!(state
+            .session_grants
+            .contains(&(DenialKind::Net, "github.com".to_string())));
+        assert_eq!(state.decisions[0].scope, "permanent");
+        // Durably written: the config parses back and its net scope permits it,
+        // and the hand-authored comment survived (comment-preserving write).
+        let written = std::fs::read_to_string(&config).unwrap();
+        assert!(written.contains("# my config"), "comment lost: {written}");
+        assert!(
+            written.contains("github.com"),
+            "host not persisted: {written}"
+        );
+        let reloaded = newt_core::Config::load(&config).unwrap();
+        assert!(
+            reloaded
+                .tui
+                .unwrap()
+                .permissions
+                .net
+                .contains(&"github.com".to_string()),
+            "a fresh session reads the durable net grant"
+        );
     }
 
     /// Allow-once: the minted caveats cover the target for THIS consult, but
@@ -4739,6 +4928,8 @@ fn run_chat(
     // state so `[P]ermanently deny` decisions from prior runs still hold.
     let permission_denials_path =
         newt_core::Config::user_config_path().map(|p| p.with_file_name("permission-denials.jsonl"));
+    // #904: the user config file that `[A]llow permanently` appends a net host to.
+    let permission_config_path = newt_core::Config::user_config_path();
     let mut permission_state =
         PermissionPromptState::with_persistent_denials(permission_denials_path.as_deref());
     print_newt(
@@ -4762,8 +4953,9 @@ fn run_chat(
     if prompt_permissions_enabled {
         print_newt(
             "prompted permissions ON — capability denials will ask: allow once / session / deny / \
-             permanently deny (decisions recorded; /permissions lists them; permanent denials \
-             persist in ~/.newt/permission-denials.jsonl)",
+             permanently deny (a net host also offers allow-permanently, which adds it to \
+             [tui.permissions] net). Decisions recorded; /permissions lists them; permanent \
+             denials persist in ~/.newt/permission-denials.jsonl",
             color,
             verbose,
         );
@@ -6072,6 +6264,7 @@ fn run_chat(
                             conversation_id: active_conversation_id.clone(),
                             log_path: permission_log_path.clone(),
                             denials_path: permission_denials_path.clone(),
+                            config_path: permission_config_path.clone(),
                             preset_clamp: preset_clamp.clone(),
                             danger: production_danger_table(),
                             color,
@@ -11444,6 +11637,7 @@ mod disable_ocap_session_tests {
             conversation_id: "conv-297".to_string(),
             log_path: None,
             denials_path: None,
+            config_path: None,
             preset_clamp: None,
             danger: danger::DangerTable::builtin(),
             color: false,
@@ -11489,6 +11683,7 @@ mod disable_ocap_session_tests {
             conversation_id: "conv-297".to_string(),
             log_path: None,
             denials_path: None,
+            config_path: None,
             preset_clamp: None,
             danger: danger::DangerTable::builtin(),
             color: false,
