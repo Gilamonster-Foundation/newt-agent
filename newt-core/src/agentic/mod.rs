@@ -206,8 +206,8 @@ pub use memory_fetch::{
 pub use note_sink::{save_note_tool_definition, NoteNudge, NoteSink};
 pub use observation::{ShellObservation, SHELL_OBSERVATION_PREFIX};
 pub use permissions::{
-    widen_caveats, DenialKind, PermissionDecision, PermissionGate, PermissionRecord,
-    PermissionRequest,
+    append_denial, load_denials, widen_caveats, DenialKind, PermissionDecision, PermissionGate,
+    PermissionRecord, PermissionRequest, PersistentDenial,
 };
 pub use recall::{recall_tool_definition, RecallSource, StoreRecallSource};
 pub use resume::resume_context_tool_definition;

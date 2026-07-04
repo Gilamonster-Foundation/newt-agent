@@ -53,6 +53,89 @@ impl DenialKind {
     }
 }
 
+/// Inverse of [`DenialKind::as_str`] — parse a persisted `kind`. `Err(())` for
+/// an unknown string so a corrupt/forward-incompatible denylist line is skipped
+/// rather than trusted (#904). A trait impl (not an inherent `from_str`) so
+/// `"net".parse::<DenialKind>()` works and clippy's `should_implement_trait` is
+/// satisfied.
+impl std::str::FromStr for DenialKind {
+    type Err = ();
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "exec" => Ok(Self::Exec),
+            "fs_read" => Ok(Self::FsRead),
+            "fs_write" => Ok(Self::FsWrite),
+            "net" => Ok(Self::Net),
+            _ => Err(()),
+        }
+    }
+}
+
+/// #904: one durable "permanently deny" entry — a `(kind, target)` the human
+/// chose to deny across restarts, so the gate refuses it WITHOUT re-prompting.
+/// Stored one JSON line per entry in `~/.newt/permission-denials.jsonl` (a
+/// sibling of `permission-log.jsonl`).
+///
+/// Unlike the permission LOG (a review artifact that is never read back into
+/// authority), this file IS read back — at gate construction — and consulted
+/// before prompting. That is sound precisely because it is **deny-only**: a
+/// denylist can never widen authority, so reading it back cannot break the
+/// attenuation-only invariant. A permanent *allow* has no analogue here; a
+/// durable grant stays a deliberate `[tui.permissions]` edit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistentDenial {
+    /// Capability axis: `exec` / `fs_read` / `fs_write` / `net`.
+    pub kind: String,
+    /// What is denied — a command name (exec), a path (fs_*), or a host (net).
+    pub target: String,
+    /// Wall-clock at decision time (RFC 3339, UTC) — a display claim, never
+    /// an ordering key.
+    pub ts_claim: String,
+}
+
+/// Parse a denials file body into `(kind, target)` pairs — PURE (no I/O), so it
+/// unit-tests without a filesystem. Malformed lines and unknown `kind`s are
+/// skipped (a corrupt entry must never crash the gate or, worse, be trusted).
+pub fn parse_denials(contents: &str) -> Vec<(DenialKind, String)> {
+    contents
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|line| {
+            let d: PersistentDenial = serde_json::from_str(line).ok()?;
+            let kind: DenialKind = d.kind.parse().ok()?;
+            (!d.target.is_empty()).then_some((kind, d.target))
+        })
+        .collect()
+}
+
+/// Load the persistent denylist from `path`. A missing file is an empty list
+/// (not an error) — the common first-run case.
+pub fn load_denials(path: &Path) -> Vec<(DenialKind, String)> {
+    match std::fs::read_to_string(path) {
+        Ok(body) => parse_denials(&body),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Append one permanent-deny entry as a JSON line, creating parent dirs as
+/// needed. Mirrors [`PermissionRecord::append_jsonl`].
+pub fn append_denial(path: &Path, kind: DenialKind, target: &str) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let entry = PersistentDenial {
+        kind: kind.as_str().to_string(),
+        target: target.to_string(),
+        ts_claim: chrono::Utc::now().to_rfc3339(),
+    };
+    let line = serde_json::to_string(&entry).map_err(std::io::Error::other)?;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    writeln!(file, "{line}")
+}
+
 /// One denied capability surfaced for a human decision.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PermissionRequest {
@@ -316,5 +399,65 @@ mod tests {
         assert_eq!(parsed, a, "round-trips losslessly");
         let parsed: PermissionRecord = serde_json::from_str(lines[1]).unwrap();
         assert_eq!(parsed.kind, "net");
+    }
+
+    // ---- #904: persistent "permanently deny" store ----
+
+    #[test]
+    fn denial_kind_from_str_round_trips_and_rejects_unknown() {
+        for k in [
+            DenialKind::Exec,
+            DenialKind::FsRead,
+            DenialKind::FsWrite,
+            DenialKind::Net,
+        ] {
+            assert_eq!(k.as_str().parse::<DenialKind>(), Ok(k));
+        }
+        assert!("nope".parse::<DenialKind>().is_err());
+        assert!("".parse::<DenialKind>().is_err());
+    }
+
+    #[test]
+    fn parse_denials_is_pure_and_skips_bad_lines() {
+        let body = "\
+{\"kind\":\"net\",\"target\":\"github.com\",\"ts_claim\":\"2026-07-04T00:00:00Z\"}
+{\"kind\":\"exec\",\"target\":\"rm\",\"ts_claim\":\"2026-07-04T00:00:00Z\"}
+
+not json at all
+{\"kind\":\"bogus\",\"target\":\"x\",\"ts_claim\":\"2026-07-04T00:00:00Z\"}
+{\"kind\":\"net\",\"target\":\"\",\"ts_claim\":\"2026-07-04T00:00:00Z\"}
+";
+        let got = parse_denials(body);
+        // Only the two well-formed, known-kind, non-empty-target lines survive.
+        assert_eq!(
+            got,
+            vec![
+                (DenialKind::Net, "github.com".to_string()),
+                (DenialKind::Exec, "rm".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn load_denials_missing_file_is_empty_not_error() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let missing = dir.path().join("nope").join("permission-denials.jsonl");
+        assert!(load_denials(&missing).is_empty());
+    }
+
+    #[test]
+    fn append_denial_then_load_round_trips_and_creates_dirs() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("nested").join("permission-denials.jsonl");
+        append_denial(&path, DenialKind::Net, "github.com").unwrap();
+        append_denial(&path, DenialKind::Exec, "curl").unwrap();
+        let loaded = load_denials(&path);
+        assert_eq!(
+            loaded,
+            vec![
+                (DenialKind::Net, "github.com".to_string()),
+                (DenialKind::Exec, "curl".to_string()),
+            ]
+        );
     }
 }
