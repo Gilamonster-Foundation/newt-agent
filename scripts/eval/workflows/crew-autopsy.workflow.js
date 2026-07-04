@@ -9,7 +9,9 @@ export const meta = {
   ],
 }
 
-// args: { source: 'sweep dir | path to RATCHET tsv | comma-separated run dirs (required)',
+// args: { source: 'sweep dir | path to RATCHET tsv | comma-separated run dirs, optionally
+//         "dir|BEHAVIORAL" pairs e.g. "/tmp/a|FAIL,/tmp/b|PASS" when the caller already
+//         knows each dir's ground-truth outcome from its own sweep.tsv (required)',
 //         id: 'output name (required, e.g. 2026-07-02-baseline)',
 //         include?: 'failures'|'failures+gameable'|'all' (default failures+gameable),
 //         limit?: 24, floor?: 0.7, out_dir?: '<repo>/scripts/eval/results/autopsy' }
@@ -62,7 +64,8 @@ const INVENTORY_SCHEMA = {
 const inv = await agent(`Build the autopsy inventory from this source: ${argv.source}
 - If it is a directory containing sweep.tsv: parse the RATCHET rows (tab-separated; cols 2-6 = task,mode,model,behavioral,details; dir=<path> inside details is the run dir).
 - If it is a .tsv file: same parsing.
-- If it is a comma-separated list of directories: each is a run dir; infer task/mode/model from any .plan.log or leave "unknown".
+- If it is a comma-separated list of "dir|BEHAVIORAL" pairs (e.g. "/tmp/a|FAIL,/tmp/b|PASS?gameable"): the caller already knows each dir's ground-truth outcome from its own sweep.tsv. Use that BEHAVIORAL value VERBATIM — it is authoritative. Do NOT re-derive, re-run, or second-guess it by reading the run dir; that is the Classify phase's job, not Inventory's. infer task/mode/model from any .plan.log or leave "unknown".
+- If it is a bare comma-separated list of directories with no "|BEHAVIORAL" suffix: there is no ground truth available here — you must infer behavioral from the directory contents (this is inherently unreliable; prefer the "dir|BEHAVIORAL" form whenever the caller can supply it).
 Include ONLY rows/dirs matching include='${INCLUDE}' (failures = behavioral FAIL; +gameable adds PASS?gameable; all = everything). Drop items whose run dir no longer exists on disk (they were reaped) — note how many you dropped in a final check by listing them, but only return existing ones.`,
   { label: 'inventory', phase: 'Inventory', schema: INVENTORY_SCHEMA, effort: 'low' })
 if (!inv || !inv.items.length) return { id: argv.id, top_mechanism: null, note: 'no autopsy items (nothing failed, or run dirs were reaped)' }
@@ -75,7 +78,8 @@ const classifyPrompt = (it) => `Autopsy ONE crew-eval run. Item: ${JSON.stringif
 Investigate the run dir: read ${it.run_dir}/.plan.log; run (read-only) git -C ${it.run_dir} branch --list 'crew/*', git -C ${it.run_dir} log --oneline --all, and git diffs between the baseline commit and the crew/* tips. Do NOT modify anything in the dir.
 Classify the PRIMARY mechanism from this taxonomy (secondary mechanisms allowed):
 ${taxText}
-RULES: every classification needs at least one VERBATIM quote from the run artifacts (schema requires it). If the evidence genuinely fits none, use 'other'. If the log shows the model was never exercised (connection/pull errors), use 'ops-noise'. Report confidence honestly — a verifier re-reads anything below ${FLOOR}.`
+RULES: every classification needs at least one VERBATIM quote from the run artifacts (schema requires it). If the evidence genuinely fits none, use 'other'. If the log shows the model was never exercised (connection/pull errors), use 'ops-noise'. Report confidence honestly — a verifier re-reads anything below ${FLOOR}.
+GROUND TRUTH CHECK (this item's own \`behavioral\` field above is authoritative — it is what the sweep actually recorded, not something to re-derive): 'grading-integrity' means the sweep recorded a PASS or PASS?gameable that should NOT have been one. If \`item.behavioral\` is FAIL, this item was NOT graded PASS — do not classify it as 'grading-integrity' on the theory that "the sweep should have recorded PASS but I think it's really broken" or similar; a FAIL item with genuinely bad code is a worker-quality mechanism (worker-ignores-scope, worker-spurious-edits, fail-stop, etc.), never grading-integrity. If you believe the recorded behavioral is itself wrong for some OTHER reason, that claim requires literally reproducing the grade yourself (checkout the final crew/* branch, drop the real grade_spec.rs into tests/, run \`cargo test --test grade_spec\`, and quote the actual exit result) — a diff read alone is not sufficient evidence for a grading-integrity claim, because a plausible-looking diff can still be one that correctly fails the real spec.`
 const chunk = (arr, n) => arr.reduce((a, x, i) => ((i % n ? a[a.length - 1].push(x) : a.push([x])), a), [])
 let classified = []
 for (const batch of chunk(items, 8)) {
