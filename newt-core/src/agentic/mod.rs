@@ -1126,7 +1126,7 @@ pub async fn chat_complete(
     let mut accumulated_usage: Option<crate::TokenUsage> = None;
     let mut hallucination_count: u32 = 0;
     // Step 27.3/#771: guard against exact-repeat tool loops this run.
-    let mut failed_calls = FailedCallGuard::default();
+    let mut repeat_calls = RepeatCallGuard::default();
     let mut overflow_retries: u32 = 0;
     let mut suspicious_empty_retries: u32 = 0;
     // Hard context-window 400s recovered (parse limit → trim → retry). See #223.
@@ -2035,14 +2035,14 @@ pub async fn chat_complete(
             // Step 27.3/#771: short-circuit selected exact repeats — steer
             // instead of re-executing a dead or already-useful call. The bogus
             // emission is still counted above; we just don't run it again.
-            if let Some(steer) = failed_calls.repeat_steer(name, &args) {
+            if let Some(steer) = repeat_calls.repeat_steer(name, &args) {
                 if let Some(rec) = tool_events.as_deref_mut() {
                     rec.push(crate::ToolEvent::from_call(name, &args, false, Some(0)));
                 }
                 messages.push(serde_json::json!({ "role": "tool", "content": steer }));
                 continue;
             }
-            if !is_read_only_tool(name) {
+            if !is_read_only_call(name, &args) {
                 round_wrote = true;
             }
             // Organic save_note use resets the memory-nudge counter (the
@@ -2112,7 +2112,7 @@ pub async fn chat_complete(
             // Step 27.3/#771: classify once; remember outcomes that should make
             // an exact repeat self-correct next round.
             let ok = tools::tool_result_ok(&result);
-            failed_calls.record(name, &args, ok, &result);
+            repeat_calls.record(name, &args, ok, &result);
             if let Some(rec) = tool_events.as_deref_mut() {
                 rec.push(crate::ToolEvent::from_call(
                     name,
@@ -2170,7 +2170,7 @@ pub async fn chat_complete(
         CapExit {
             max_tool_rounds,
             accumulated: accumulated_usage,
-            wasted_calls: failed_calls.total_failures(),
+            wasted_calls: repeat_calls.total_failures(),
             progress,
             observed: observed_paths.into_vec(),
         },
@@ -2190,7 +2190,7 @@ pub async fn chat_complete(
 /// a note must not suppress the stop-exploring-start-writing nudge; `recall`
 /// (17.5) reads past conversations and is likewise pure exploration.
 /// First line of a tool result, capped — used as the remembered error reason in
-/// [`FailedCallGuard`] so the steering message is short.
+/// [`RepeatCallGuard`] so the steering message is short.
 fn first_line(s: &str) -> String {
     s.lines().next().unwrap_or("").chars().take(200).collect()
 }
@@ -2198,34 +2198,43 @@ fn first_line(s: &str) -> String {
 /// Per-run guard against a weak model looping on a tool call whose result should
 /// already be actionable. Step 27.3 covered failures: the forensic session showed
 /// the model re-issuing the *identical* failed `run_command` three times and
-/// re-reading the same file ~8×, burning rounds. Later field reports added two
-/// success-shaped loops: no-result probes (`recall`, `state_get`) and successful
-/// `web_fetch` calls with real content.
+/// re-reading the same file ~8×, burning rounds. Later field reports added
+/// success-shaped loops: no-result probes (`recall`, `state_get`), successful
+/// `web_fetch` calls with real content, and successful read-only shell probes.
 ///
 /// Keyed by `(name, canonical args)`, it short-circuits selected exact repeats
-/// with steering instead of re-executing them, and counts failures per tool name
-/// so the steer can escalate ("stop using `run_command` — it keeps failing this
-/// session; use the embedded tools"). This handles ANY persistently-failing tool
-/// — a dead shell, a denied command, an unimplemented op — without needing to
-/// know *why* it fails (shell availability is a build/config property with no
-/// clean runtime signal; see `tools::ocap_disabled` docs).
-#[derive(Default)]
-struct FailedCallGuard {
-    /// `(name + canonical args)` → first line of the error it last returned.
-    last_error: std::collections::HashMap<String, String>,
-    /// `name` → how many times it has failed this run (any args).
-    fails_by_tool: std::collections::HashMap<String, usize>,
-    /// #718: (name+args) -> reason a SUCCESS result was empty-by-design. These
-    /// pass tool_result_ok (ok=true) so the failure guard misses them, yet the
-    /// model loops the identical call (observed recall x3). Steered on the 2nd
-    /// issuance, separate from hard failures (no escalation).
-    last_empty: std::collections::HashMap<String, String>,
-    /// #771 field report: successful `web_fetch` with content is enough context;
-    /// an exact repeat should not spend another network/tool round.
-    successful_fetches: std::collections::HashMap<String, String>,
+/// with steering instead of re-executing them. The classifier sees every call
+/// outcome, but most successes deliberately stay repeatable; only failures,
+/// success-shaped no-results, successful `web_fetch`, and successful read-only
+/// shell probes are memoized. It also counts failures per tool name so the steer
+/// can escalate ("stop using `run_command` — it keeps failing this session; use
+/// the embedded tools"). This handles ANY persistently-failing tool — a dead
+/// shell, a denied command, an unimplemented op — without needing to know *why*
+/// it fails (shell availability is a build/config property with no clean runtime
+/// signal; see `tools::ocap_disabled` docs).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RepeatMemo {
+    Failure {
+        first_line: String,
+    },
+    NoResult {
+        reason: String,
+    },
+    EvidenceObserved {
+        subject: String,
+        advice: &'static str,
+    },
 }
 
-impl FailedCallGuard {
+#[derive(Default)]
+struct RepeatCallGuard {
+    /// `(name + canonical args)` → the prior outcome that should steer an exact repeat.
+    repeat_memos: std::collections::HashMap<String, RepeatMemo>,
+    /// `name` → how many times it has failed this run (any args).
+    fails_by_tool: std::collections::HashMap<String, usize>,
+}
+
+impl RepeatCallGuard {
     /// How many consecutive failures of one tool before the steer escalates to
     /// "stop using it".
     const ESCALATE_AFTER: usize = 2;
@@ -2236,57 +2245,61 @@ impl FailedCallGuard {
         format!("{name}\u{1}{args}")
     }
 
-    /// Steering message if this exact `(name, args)` already produced an outcome
-    /// that should not be repeated this run, else `None` (let it execute). Hard
-    /// failures (`last_error`) take priority over success-shaped no-results
-    /// (`last_empty`), then successful `web_fetch` content.
+    /// Steering message if this exact `(name, args)` already produced a memoized
+    /// outcome that should not be repeated this run, else `None` (let it execute).
     fn repeat_steer(&self, name: &str, args: &serde_json::Value) -> Option<String> {
         let key = Self::key(name, args);
-        // A genuine prior failure: steer hard, and escalate if this tool keeps
-        // failing this session.
-        if let Some(prev) = self.last_error.get(&key) {
-            let mut msg = format!(
-                "You already called `{name}` with these exact arguments and it failed: {prev}. \
-                 Do NOT repeat the same call — use a different tool or different arguments."
-            );
-            if self.fails_by_tool.get(name).copied().unwrap_or(0) >= Self::ESCALATE_AFTER {
-                msg.push_str(&format!(
-                    " `{name}` has failed repeatedly this session; stop using it and prefer the \
-                     embedded tools (read_file, edit_file, write_file, find, git)."
-                ));
+        match self.repeat_memos.get(&key)? {
+            RepeatMemo::Failure { first_line: prev } => {
+                let mut msg = format!(
+                    "You already called `{name}` with these exact arguments and it failed: {prev}. \
+                     Do NOT repeat the same call — use a different tool or different arguments."
+                );
+                if self.fails_by_tool.get(name).copied().unwrap_or(0) >= Self::ESCALATE_AFTER {
+                    msg.push_str(&format!(
+                        " `{name}` has failed repeatedly this session; stop using it and prefer \
+                         the embedded tools (read_file, edit_file, write_file, find, git)."
+                    ));
+                }
+                Some(msg)
             }
-            return Some(msg);
-        }
-        // #718: a success-shaped no-result the model is re-issuing identically.
-        // Steer on the 2nd call — but no escalation (it is not a hard failure).
-        if let Some(reason) = self.last_empty.get(&key) {
-            return Some(format!(
+            RepeatMemo::NoResult { reason } => Some(format!(
                 "You already ran `{name}` with these exact arguments this turn and {reason}. \
                  Don't repeat the identical call — change the arguments, or use a different \
                  tool (read_file / find)."
-            ));
+            )),
+            RepeatMemo::EvidenceObserved { subject, advice } => Some(format!(
+                "You already observed {subject} with `{name}` and received output. Do NOT repeat \
+                 the identical call — {advice}"
+            )),
         }
-        // #771: a successful fetch already put the page content in context. Local
-        // models can loop by fetching the same URL forever; steer the second exact
-        // call so the model uses the observed page content or changes approach.
-        if name == "web_fetch" {
-            if let Some(url) = self.successful_fetches.get(&key) {
-                return Some(format!(
-                    "You already fetched `{url}` with these exact arguments this turn and received \
-                     a response. Do NOT repeat the identical web_fetch — use the fetched content \
-                     above, fetch a different URL, inspect local files, or answer the user."
-                ));
-            }
-        }
-        None
     }
 
-    fn successful_fetch_url(args: &serde_json::Value, result: &str) -> Option<String> {
+    fn successful_fetch_url(name: &str, args: &serde_json::Value, result: &str) -> Option<String> {
+        if name != "web_fetch" {
+            return None;
+        }
         let url = args.get("url")?.as_str()?.trim();
         if url.is_empty() || result.trim().is_empty() {
             None
         } else {
             Some(url.chars().take(200).collect())
+        }
+    }
+
+    fn successful_read_only_shell_command(
+        name: &str,
+        args: &serde_json::Value,
+        result: &str,
+    ) -> Option<String> {
+        if name != "run_command" || result.trim().is_empty() {
+            return None;
+        }
+        let command = args.get("command")?.as_str()?.trim();
+        if is_read_only_shell_probe(command) {
+            Some(command.chars().take(200).collect())
+        } else {
+            None
         }
     }
 
@@ -2309,22 +2322,52 @@ impl FailedCallGuard {
         }
     }
 
-    /// Record a just-executed call's outcome. Hard failures are remembered (and
-    /// counted, so the steer can escalate); #718 success-shaped no-results and
-    /// #771 successful web fetches are remembered separately (no count — no
-    /// escalation).
+    /// Classify a just-executed call into the subset of outcomes that should
+    /// steer an exact repeat. This function sees all calls, but deliberately
+    /// returns `None` for ordinary successes so valid repeated work (builds,
+    /// tests, rereads after edits, write-capable commands) can keep running.
+    fn classify_repeat_memo(
+        name: &str,
+        args: &serde_json::Value,
+        ok: bool,
+        result: &str,
+    ) -> Option<RepeatMemo> {
+        if !ok {
+            return Some(RepeatMemo::Failure {
+                first_line: first_line(result),
+            });
+        }
+        if let Some(reason) = Self::no_result_reason(name, result) {
+            return Some(RepeatMemo::NoResult {
+                reason: reason.to_string(),
+            });
+        }
+        if let Some(url) = Self::successful_fetch_url(name, args, result) {
+            return Some(RepeatMemo::EvidenceObserved {
+                subject: format!("`{url}`"),
+                advice: "use the fetched content above, fetch a different URL, inspect local \
+                         files, or answer the user.",
+            });
+        }
+        if let Some(command) = Self::successful_read_only_shell_command(name, args, result) {
+            return Some(RepeatMemo::EvidenceObserved {
+                subject: format!("read-only shell probe `{command}`"),
+                advice: "use the observed output above, change the query, inspect a different \
+                         file, or make the next edit/test decision.",
+            });
+        }
+        None
+    }
+
+    /// Record a just-executed call's outcome. Failures are also counted so the
+    /// steer can escalate; success-shaped memos are not counted because they are
+    /// not hard failures.
     fn record(&mut self, name: &str, args: &serde_json::Value, ok: bool, result: &str) {
         if !ok {
-            self.last_error
-                .insert(Self::key(name, args), first_line(result));
             *self.fails_by_tool.entry(name.to_string()).or_default() += 1;
-        } else if let Some(reason) = Self::no_result_reason(name, result) {
-            self.last_empty
-                .insert(Self::key(name, args), reason.to_string());
-        } else if name == "web_fetch" {
-            if let Some(url) = Self::successful_fetch_url(args, result) {
-                self.successful_fetches.insert(Self::key(name, args), url);
-            }
+        }
+        if let Some(memo) = Self::classify_repeat_memo(name, args, ok, result) {
+            self.repeat_memos.insert(Self::key(name, args), memo);
         }
     }
 
@@ -2360,6 +2403,35 @@ fn is_read_only_tool(name: &str) -> bool {
             | "save_note"
             | "recall"
     )
+}
+
+fn is_read_only_call(name: &str, args: &serde_json::Value) -> bool {
+    is_read_only_tool(name)
+        || (name == "run_command"
+            && args
+                .get("command")
+                .and_then(|v| v.as_str())
+                .is_some_and(is_read_only_shell_probe))
+}
+
+fn is_read_only_shell_probe(command: &str) -> bool {
+    let command = command.trim();
+    if command.is_empty() {
+        return false;
+    }
+    const SHELL_META: &[char] = &['&', '|', ';', '`', '$', '\n', '>', '<', '(', ')'];
+    if command.contains(SHELL_META) {
+        return false;
+    }
+    let mut tokens = command.split_ascii_whitespace();
+    let Some(program) = tokens.next() else {
+        return false;
+    };
+    match program {
+        "grep" | "rg" | "head" | "tail" | "wc" | "pwd" => true,
+        "sed" => !tokens.any(|t| t == "-i" || t.starts_with("-i")),
+        _ => false,
+    }
 }
 
 /// Max "you narrated intent but called no tool" auto-continue nudges per turn.
@@ -2913,7 +2985,7 @@ pub async fn openai_chat_complete(
     let mut accumulated_usage: Option<crate::TokenUsage> = None;
     let mut hallucination_count: u32 = 0;
     // Step 27.3/#771: guard against exact-repeat tool loops this run.
-    let mut failed_calls = FailedCallGuard::default();
+    let mut repeat_calls = RepeatCallGuard::default();
     // Hard context-window 400s recovered (parse limit → trim → retry). See #223.
     let mut cw_retries: u32 = 0;
     // No-tools recovery (mirrors the Ollama path): a model that rejects the
@@ -3435,7 +3507,7 @@ pub async fn openai_chat_complete(
             // Step 27.3/#771: short-circuit selected exact repeats (mirrors the
             // Ollama path; Responses uses function_call_output). Counted as a
             // hallucination above first when applicable.
-            if let Some(steer) = failed_calls.repeat_steer(name, &args) {
+            if let Some(steer) = repeat_calls.repeat_steer(name, &args) {
                 if let Some(rec) = tool_events.as_deref_mut() {
                     rec.push(crate::ToolEvent::from_call(name, &args, false, Some(0)));
                 }
@@ -3514,7 +3586,7 @@ pub async fn openai_chat_complete(
             // Step 27.3/#771: classify once; remember repeat-steered outcomes
             // (mirrors Ollama path).
             let ok = tools::tool_result_ok(&result);
-            failed_calls.record(name, &args, ok, &result);
+            repeat_calls.record(name, &args, ok, &result);
             if let Some(rec) = tool_events.as_deref_mut() {
                 rec.push(crate::ToolEvent::from_call(
                     name,
@@ -3565,7 +3637,7 @@ pub async fn openai_chat_complete(
         CapExit {
             max_tool_rounds,
             accumulated: accumulated_usage,
-            wasted_calls: failed_calls.total_failures(),
+            wasted_calls: repeat_calls.total_failures(),
             progress,
             observed: observed_paths.into_vec(),
         },
@@ -3803,7 +3875,7 @@ pub async fn openai_responses_complete(
     let mut accumulated_usage: Option<crate::TokenUsage> = None;
     let mut hallucination_count: u32 = 0;
     // Step 27.3/#771: guard against exact-repeat tool loops this run.
-    let mut failed_calls = FailedCallGuard::default();
+    let mut repeat_calls = RepeatCallGuard::default();
     let mut tools_supported = true;
     let mut tools_unsupported_notified = false;
 
@@ -3925,7 +3997,7 @@ pub async fn openai_responses_complete(
             // Step 27.3/#771: short-circuit selected exact repeats (Responses
             // shape: echo a function_call_output with the steer).
             // Counted as a hallucination above first when applicable.
-            if let Some(steer) = failed_calls.repeat_steer(name, &args) {
+            if let Some(steer) = repeat_calls.repeat_steer(name, &args) {
                 if let Some(rec) = tool_events.as_deref_mut() {
                     rec.push(crate::ToolEvent::from_call(name, &args, false, Some(0)));
                 }
@@ -3991,7 +4063,7 @@ pub async fn openai_responses_complete(
             // Step 27.3/#771: classify once; remember repeat-steered outcomes
             // (mirrors Ollama path).
             let ok = tools::tool_result_ok(&result);
-            failed_calls.record(name, &args, ok, &result);
+            repeat_calls.record(name, &args, ok, &result);
             if let Some(rec) = tool_events.as_deref_mut() {
                 rec.push(crate::ToolEvent::from_call(
                     name,
@@ -4326,12 +4398,12 @@ async fn stream_response(
 }
 
 #[cfg(test)]
-mod failed_call_guard_tests {
+mod repeat_call_guard_tests {
     use super::*;
 
     #[test]
     fn short_circuits_exact_repeat_and_escalates() {
-        let mut g = FailedCallGuard::default();
+        let mut g = RepeatCallGuard::default();
         let args = serde_json::json!({"command": "mkdir x"});
         // First sight of the call → let it run (no steer).
         assert!(g.repeat_steer("run_command", &args).is_none());
@@ -4357,7 +4429,7 @@ mod failed_call_guard_tests {
 
     #[test]
     fn ignores_successes_and_distinct_calls() {
-        let mut g = FailedCallGuard::default();
+        let mut g = RepeatCallGuard::default();
         let a = serde_json::json!({"path": "f.rs"});
         g.record("read_file", &a, true, "file contents"); // success → not remembered
         assert!(g.repeat_steer("read_file", &a).is_none());
@@ -4376,7 +4448,7 @@ mod failed_call_guard_tests {
         // #718: a success-shaped no-result that the model re-issues byte-for-byte
         // is steered on its 2nd call — distinct from a hard failure (no escalation),
         // distinct from a genuine success (which is never steered).
-        let mut g = FailedCallGuard::default();
+        let mut g = RepeatCallGuard::default();
 
         // recall "no matches" — first sight runs; record it; the identical 2nd
         // issuance is steered before re-execution.
@@ -4428,7 +4500,7 @@ mod failed_call_guard_tests {
 
     #[test]
     fn steers_duplicate_successful_web_fetch() {
-        let mut g = FailedCallGuard::default();
+        let mut g = RepeatCallGuard::default();
         let issue = serde_json::json!({
             "url": "https://github.com/Gilamonster-Foundation/newt-agent/issues/771"
         });
@@ -4441,7 +4513,8 @@ mod failed_call_guard_tests {
         let steer = g
             .repeat_steer("web_fetch", &issue)
             .expect("2nd identical successful fetch steers");
-        assert!(steer.contains("already fetched"), "{steer}");
+        assert!(steer.contains("already observed"), "{steer}");
+        assert!(steer.contains("`web_fetch`"), "{steer}");
         assert!(
             steer.contains("https://github.com/Gilamonster-Foundation/newt-agent/issues/771"),
             "{steer}"
@@ -4464,36 +4537,97 @@ mod failed_call_guard_tests {
     }
 
     #[test]
+    fn steers_duplicate_successful_read_only_run_command() {
+        let mut g = RepeatCallGuard::default();
+        let args = serde_json::json!({
+            "command": "grep -n 'help_lines' /Users/shawnhartsock/workspaces/newt-agent/newt-tui/src/lib.rs"
+        });
+
+        assert!(
+            g.repeat_steer("run_command", &args).is_none(),
+            "first grep should run"
+        );
+        g.record(
+            "run_command",
+            &args,
+            true,
+            "9439:fn help_lines() -> &'static [&'static str] {",
+        );
+
+        let steer = g
+            .repeat_steer("run_command", &args)
+            .expect("second identical grep should steer");
+        assert!(steer.contains("already observed"), "{steer}");
+        assert!(steer.contains("read-only shell probe"), "{steer}");
+        assert!(steer.contains("`run_command`"), "{steer}");
+        assert!(steer.contains("grep -n"), "{steer}");
+        assert!(steer.contains("Do NOT repeat"), "{steer}");
+    }
+
+    #[test]
+    fn does_not_steer_successful_write_capable_run_command() {
+        let mut g = RepeatCallGuard::default();
+        let args = serde_json::json!({"command": "cargo test -p newt-tui"});
+
+        g.record("run_command", &args, true, "test result: ok");
+
+        assert!(
+            g.repeat_steer("run_command", &args).is_none(),
+            "successful build/test commands are still repeatable"
+        );
+    }
+
+    #[test]
+    fn classifier_leaves_ordinary_successes_repeatable() {
+        let file = serde_json::json!({"path": "src/lib.rs"});
+        assert_eq!(
+            RepeatCallGuard::classify_repeat_memo("read_file", &file, true, "file contents"),
+            None
+        );
+
+        let tests = serde_json::json!({"command": "cargo test -p newt-core"});
+        assert_eq!(
+            RepeatCallGuard::classify_repeat_memo("run_command", &tests, true, "test result: ok"),
+            None
+        );
+
+        let mut g = RepeatCallGuard::default();
+        g.record("read_file", &file, true, "file contents");
+        g.record("run_command", &tests, true, "test result: ok");
+        assert!(
+            g.repeat_memos.is_empty(),
+            "ordinary successful calls must stay repeatable"
+        );
+    }
+
+    #[test]
     fn no_result_reason_classifies_and_routes() {
         // recall / state_get no-result prefixes classify…
-        assert!(FailedCallGuard::no_result_reason(
+        assert!(RepeatCallGuard::no_result_reason(
             "recall",
             "no matches in past conversations for \"x\" — try different keywords."
         )
         .is_some_and(|r| r.contains("no matches") && r.contains("resume_context")));
         assert!(
-            FailedCallGuard::no_result_reason("state_get", "no such key: current_task")
+            RepeatCallGuard::no_result_reason("state_get", "no such key: current_task")
                 .is_some_and(|r| r.contains("not set"))
         );
         // …a real success with content does not.
         assert!(
-            FailedCallGuard::no_result_reason("recall", "3 match(es) in past conversations")
+            RepeatCallGuard::no_result_reason("recall", "3 match(es) in past conversations")
                 .is_none()
         );
-        assert!(FailedCallGuard::no_result_reason("read_file", "file contents").is_none());
+        assert!(RepeatCallGuard::no_result_reason("read_file", "file contents").is_none());
 
-        // A recall ERROR (ok=false) goes through the FAILURE path, not last_empty:
-        // it lands in last_error (escalation-eligible), never in last_empty.
-        let mut g = FailedCallGuard::default();
+        // A recall ERROR (ok=false) goes through the FAILURE path, not no-result
+        // classification: it lands in repeat_memos as escalation-eligible.
+        let mut g = RepeatCallGuard::default();
         let q = serde_json::json!({"query": "x"});
         g.record("recall", &q, false, "error: index unavailable");
-        assert!(g
-            .last_error
-            .contains_key(&FailedCallGuard::key("recall", &q)));
-        assert!(
-            g.last_empty.is_empty(),
-            "an ok=false recall is a hard failure, never a no-result"
-        );
+        assert!(matches!(
+            g.repeat_memos.get(&RepeatCallGuard::key("recall", &q)),
+            Some(RepeatMemo::Failure { first_line }) if first_line == "error: index unavailable"
+        ));
     }
 
     #[test]
@@ -4657,6 +4791,35 @@ mod cap_exit_unit_tests {
         for name in &["edit_file", "write_file", "run_command"] {
             assert!(!is_read_only_tool(name), "{name} should NOT be read-only");
         }
+    }
+
+    #[test]
+    fn read_only_call_classifies_simple_shell_probes() {
+        assert!(is_read_only_call(
+            "run_command",
+            &serde_json::json!({"command": "grep -n 'help_lines' newt-tui/src/lib.rs"})
+        ));
+        assert!(is_read_only_call(
+            "run_command",
+            &serde_json::json!({"command": "rg -n format_help newt-tui/src"})
+        ));
+        assert!(is_read_only_call(
+            "run_command",
+            &serde_json::json!({"command": "sed -n '1,20p' newt-tui/src/lib.rs"})
+        ));
+
+        assert!(!is_read_only_call(
+            "run_command",
+            &serde_json::json!({"command": "cargo test -p newt-tui"})
+        ));
+        assert!(!is_read_only_call(
+            "run_command",
+            &serde_json::json!({"command": "sed -i 's/a/b/' file.txt"})
+        ));
+        assert!(!is_read_only_call(
+            "run_command",
+            &serde_json::json!({"command": "grep x file > out.txt"})
+        ));
     }
 
     #[test]
