@@ -268,7 +268,9 @@ pub fn update_plan_tool_definition() -> serde_json::Value {
             "description": "Create or update your plan — send the full ordered list each time \
                             with each step's status. A <plan> checklist is shown at the head of \
                             every turn; mark the step you are on \"in_progress\" and finished \
-                            steps \"completed\". Replaces plan_set/plan_advance.",
+                            steps \"completed\". Prefer this before more investigation for \
+                            multi-step, ambiguous, resumed, or context-compacted work. Replaces \
+                            plan_set/plan_advance.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -306,8 +308,9 @@ pub fn plan_get_tool_definition() -> serde_json::Value {
         "function": {
             "name": "plan_get",
             "description": "Read the current <plan> checklist — the ordered steps and which is \
-                            active. No args. Use it to recover what you were working on, e.g. \
-                            after a resume.",
+                            active. No args. Use it to recover what you were working on after a \
+                            resume; if it reports no active plan, create one with update_plan \
+                            instead of calling plan_get again.",
             "parameters": { "type": "object", "properties": {}, "required": [] }
         }
     })
@@ -408,7 +411,10 @@ pub(crate) fn execute_plan_get(
 ) -> String {
     print_tool_call("plan_get", "", color);
     let out = plan_block(ledger).unwrap_or_else(|| {
-        "no active plan — call update_plan with {\"plan\":[{\"step\",\"status\"}]} to start one"
+        "no active plan — if this is multi-step, ambiguous, resumed, or context-compacted work, \
+         call update_plan next with a short 2-6 step ordered plan using statuses \
+         pending/in_progress/completed; do not call plan_get again until you have created or \
+         updated a plan"
             .to_string()
     });
     print_tool_output(&out, tool_output_lines, color);
@@ -682,6 +688,11 @@ mod tests {
         let l = SessionStepLedger::default();
         let empty = execute_plan_get(&l, false, 20);
         assert!(empty.starts_with("no active plan"), "{empty}");
+        assert!(empty.contains("update_plan next"), "{empty}");
+        assert!(
+            empty.contains("do not call plan_get again"),
+            "empty plan_get must steer away from polling: {empty}"
+        );
         assert_eq!(l.count(), 0, "plan_get does not mutate the ledger");
         // a ledger with steps → the compiled <plan> block, read-only.
         l.set_plan(&["scope it".to_string(), "build it".to_string()]);

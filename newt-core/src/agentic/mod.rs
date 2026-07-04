@@ -2265,8 +2265,8 @@ impl RepeatCallGuard {
             }
             RepeatMemo::NoResult { reason } => Some(format!(
                 "You already ran `{name}` with these exact arguments this turn and {reason}. \
-                 Don't repeat the identical call — change the arguments, or use a different \
-                 tool (read_file / find)."
+                 Don't repeat the identical call — create or update the missing state, change \
+                 the arguments when the tool accepts them, or use a different tool."
             )),
             RepeatMemo::EvidenceObserved { subject, advice } => Some(format!(
                 "You already observed {subject} with `{name}` and received output. Do NOT repeat \
@@ -2318,6 +2318,10 @@ impl RepeatCallGuard {
             "state_get" if result.starts_with("no such key") => {
                 Some("the key is not set (state_get returned \"no such key\")")
             }
+            "plan_get" if result.starts_with("no active plan") => Some(
+                "it found no active plan; call update_plan now with a short ordered plan if the \
+                 work has more than one step",
+            ),
             _ => None,
         }
     }
@@ -2482,6 +2486,17 @@ fn looks_like_intent_to_act(content: &str) -> bool {
         "insert",
         "delet",
         "remov",
+        "understand",
+        "check",
+        "compar",
+        "inspect",
+        "examin",
+        "review",
+        "look ",
+        "read ",
+        "verify",
+        "determin",
+        "figure out",
     ];
     // Borrowed-cue sign-offs that are NOT "about to act" — checked first so a
     // conversational close is never mistaken for pending work.
@@ -4485,6 +4500,21 @@ mod repeat_call_guard_tests {
             "2nd identical state_get steers"
         );
 
+        // plan_get empty ledger — same: the second identical read is steered
+        // toward creating the missing plan instead of polling the empty ledger.
+        let empty_plan_args = serde_json::json!({});
+        assert!(g.repeat_steer("plan_get", &empty_plan_args).is_none());
+        g.record(
+            "plan_get",
+            &empty_plan_args,
+            true,
+            "no active plan — if this is multi-step work, call update_plan next",
+        );
+        let plan_steer = g
+            .repeat_steer("plan_get", &empty_plan_args)
+            .expect("2nd identical empty plan_get steers");
+        assert!(plan_steer.contains("update_plan"), "{plan_steer}");
+
         // A genuine success with content is still NEVER steered on repeat.
         let f = serde_json::json!({"path": "f.rs"});
         g.record("read_file", &f, true, "file contents");
@@ -4611,6 +4641,10 @@ mod repeat_call_guard_tests {
         assert!(
             RepeatCallGuard::no_result_reason("state_get", "no such key: current_task")
                 .is_some_and(|r| r.contains("not set"))
+        );
+        assert!(
+            RepeatCallGuard::no_result_reason("plan_get", "no active plan — call update_plan")
+                .is_some_and(|r| r.contains("update_plan"))
         );
         // …a real success with content does not.
         assert!(
@@ -7249,6 +7283,12 @@ mod http_loop_tests {
         ));
         assert!(looks_like_intent_to_act(
             "I'm going to edit the config file."
+        ));
+        assert!(looks_like_intent_to_act(
+            "Let me understand what was already done on this branch and compare it with the issue requirements."
+        ));
+        assert!(looks_like_intent_to_act(
+            "Let me check the current implementation and identify any gaps."
         ));
         // Genuine sign-offs / answers — must NOT be nudged.
         assert!(!looks_like_intent_to_act("The capital of France is Paris."));
