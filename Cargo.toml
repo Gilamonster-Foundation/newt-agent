@@ -279,8 +279,14 @@ strip = true
 # crates.io-publishable, and a `rev =` pin passes the `just shell-check` guard
 # (which rejects only `branch = "main"`). This supersedes the older
 # `cb7e1ea3` (`feat/step-up-decision-mvp`) pin that newt `main` carried: that
-# rev predates the env seam, and `ed5bb13` is main-lineage so it retains the
-# same `step_up` Gate (agent-bridle#24) — the full suite below proves both.
+# rev predates the env seam. `195e1c7` is agent-bridle `main` HEAD and a clean
+# forward move from the prior `ed5bb13` pin (75 commits, ed5bb13 is an
+# ancestor); it retains the `step_up` Gate (agent-bridle#24) and additionally
+# carries **agent-bridle #196** — the egress proxy now surfaces a refused
+# CONNECT host as a structured `net` denial, which newt #905's
+# `net_denial_requests` lifts into a per-host permission prompt. The delta also
+# brings ADR-0018 unbridle (StepUpPolicy in dispatch #179) and the `Disclosure`
+# block on `ToolEnvelope` (#171) — accommodated in this bump.
 #
 # BLOCKER — this PR cannot merge to newt main until:
 #   1. agent-bridle ships a release (or publishable branch) carrying the env seam;
@@ -292,7 +298,7 @@ strip = true
 # (agent-bridle#24) the previous `feat/step-up-decision-mvp` patch had.
 
 [patch.crates-io]
-agent-bridle            = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", rev = "ed5bb133fabc934479e076a11f78b7537fe07d79" }
-agent-bridle-core       = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", rev = "ed5bb133fabc934479e076a11f78b7537fe07d79" }
-agent-bridle-tool-shell = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", rev = "ed5bb133fabc934479e076a11f78b7537fe07d79" }
-agent-bridle-tool-web   = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", rev = "ed5bb133fabc934479e076a11f78b7537fe07d79" }
+agent-bridle            = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", rev = "195e1c7e48d885df98d44fbb5facaf9adc392058" }
+agent-bridle-core       = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", rev = "195e1c7e48d885df98d44fbb5facaf9adc392058" }
+agent-bridle-tool-shell = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", rev = "195e1c7e48d885df98d44fbb5facaf9adc392058" }
+agent-bridle-tool-web   = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", rev = "195e1c7e48d885df98d44fbb5facaf9adc392058" }
