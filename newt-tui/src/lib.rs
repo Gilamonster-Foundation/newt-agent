@@ -23,10 +23,10 @@ pub mod terminal_hyperlink;
 mod rich_input;
 // The lean input surface (issue #527): a dead-simple word-wrapped text box, the
 // flight/wyvern morphology. Always built — it is the footer-off / lean tier.
+mod help_sections;
 mod lean_input;
 mod setup;
 mod wizard;
-mod help_sections;
 
 use mcp::Mcp;
 // Step 9.7: the agentic loop (ChatCtx / chat_complete / execute_tool and their

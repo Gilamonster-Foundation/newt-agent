@@ -109,22 +109,178 @@ pub static SECTION_HELP: &[&str] = &[
     "/docs [topic] - Open documentation in browser",
 ];
 
+// ── Per-command detail pages (for `/cmd help`) ───────────────────
+
+/// Detailed help for the `/dgx` command family.
+pub static HELP_DGX: &[&str] = &[
+    "/dgx pull <model> - Pull a model from DGX hub",
+    "/dgx list [query]  - List available models on DGX hub",
+    "/dgx inspect <id>  - Show full metadata for a model",
+    "/dgx verify <path> - Verify integrity of a downloaded model",
+];
+
+/// Detailed help for the `/conversation` command family.
+pub static HELP_CONVERSATION: &[&str] = &[
+    "/conversation history - Show conversation history",
+    "/conversation save [name] - Save current conversation with optional name",
+    "/conversation restore <id> - Restore a saved conversation",
+    "/conversation export <format> - Export conversation (json, md, txt)",
+    "/conversation truncate [n] - Keep last n messages",
+];
+
+/// Detailed help for the `/persona` command family.
+pub static HELP_PERSONA: &[&str] = &[
+    "/persona list - List available personas",
+    "/persona show <name> - Show persona details",
+    "/persona use <name> - Switch to a different persona",
+    "/persona create [file] - Create a new persona from template or file",
+    "/persona delete <name> - Remove a persona",
+];
+
+/// Detailed help for the `/model` command family.
+pub static HELP_MODEL: &[&str] = &[
+    "/model set <name> - Set active model (alias: /backend)",
+    "/model list - List available models",
+    "/model info [name] - Show model details and capabilities",
+    "/model probe <model> - Quick quality test with latency",
+];
+
+/// Detailed help for the `/config` command family.
+pub static HELP_CONFIG: &[&str] = &[
+    "/config show [key] - Show config value(s)",
+    "/config set <key> <value> - Set a config value",
+    "/config reset - Reset all settings to defaults",
+    "/config path - Show config file location",
+];
+
+/// Detailed help for the `/permissions` command family.
+pub static HELP_PERMISSIONS: &[&str] = &[
+    "/permissions list - List current permissions",
+    "/permissions grant <cap> <target> - Grant a permission",
+    "/permissions revoke <cap> - Revoke a permission",
+];
+
+/// Detailed help for the `/tools` command family.
+pub static HELP_TOOLS: &[&str] = &[
+    "/tools list - List available tools",
+    "/tools enable <name> - Enable a tool",
+    "/tools disable <name> - Disable a tool",
+    "/tools info <name> - Show tool details and usage",
+];
+
+/// Detailed help for the `/agent` command family.
+pub static HELP_AGENT: &[&str] = &[
+    "/agent list - List available agents",
+    "/agent use <name> - Switch to a different agent",
+    "/agent info [name] - Show agent details and capabilities",
+];
+
+/// Detailed help for the `/memory` command family.
+pub static HELP_MEMORY: &[&str] = &[
+    "/memory show - List all saved notes (alias: /notes)",
+    "/memory add <text> - Add a note (alias: /remember)",
+    "/memory remove <keyword> - Remove a note by keyword",
+    "/memory search <query> - Search notes for matching text",
+];
+
+/// Detailed help for the `/eval` command family.
+pub static HELP_EVAL: &[&str] = &[
+    "/eval list [suite] - List available eval suites or tests",
+    "/eval run <suite|test> - Run an evaluation suite or test",
+    "/eval report [id] - Show results for a past evaluation",
+];
+
+/// Detailed help for the `/plan` command family.
+pub static HELP_PLAN: &[&str] = &[
+    "/plan show - Show current task plan (alias: /todo)",
+    "/plan add <step> - Add a step to the plan",
+    "/plan done <n> - Mark step n as completed",
+    "/plan clear - Clear the current plan",
+];
+
+// ── Map of command → detail page for `/cmd help` progressive disclosure ──
+
+/// Returns the detailed help lines for a given slash command, if one exists.
+pub fn command_detail(cmd: &str) -> Option<&'static [&'static str]> {
+    match cmd {
+        "dgx" => Some(HELP_DGX),
+        "conversation" => Some(HELP_CONVERSATION),
+        "persona" | "pers" => Some(HELP_PERSONA),
+        "model" | "backend" => Some(HELP_MODEL),
+        "config" | "set" => Some(HELP_CONFIG),
+        "permissions" | "perm" => Some(HELP_PERMISSIONS),
+        "tools" => Some(HELP_TOOLS),
+        "agent" => Some(HELP_AGENT),
+        "memory" | "remember" | "notes" => Some(HELP_MEMORY),
+        "eval" | "e" => Some(HELP_EVAL),
+        "plan" | "todo" => Some(HELP_PLAN),
+        _ => None,
+    }
+}
+
+/// Render a single command's detail page.
+pub fn format_command_help(cmd: &str) -> Option<String> {
+    let lines = command_detail(cmd)?;
+    if lines.is_empty() {
+        return None;
+    }
+    let mut out = String::new();
+    let _ = writeln!(out, "## /{cmd} help");
+    for line in lines {
+        let _ = writeln!(out, "  {line}");
+    }
+    Some(out)
+}
+
 // ── Builder ──────────────────────────────────────────────────────
 
 /// Build all sections in display order.
 pub fn build_sections() -> Vec<HelpSection> {
     vec![
-        HelpSection { title: "Main Commands", lines: SECTION_MAIN },
-        HelpSection { title: "Model & Backend", lines: SECTION_MODEL },
-        HelpSection { title: "Context Management", lines: SECTION_CONTEXT },
-        HelpSection { title: "Tools & Integration", lines: SECTION_TOOLS },
-        HelpSection { title: "Permissions", lines: SECTION_PERMISSIONS },
-        HelpSection { title: "Settings", lines: SECTION_SETTINGS },
-        HelpSection { title: "Agent", lines: SECTION_AGENT },
-        HelpSection { title: "Prompt & Tokens", lines: SECTION_PROMPT },
-        HelpSection { title: "Evaluation", lines: SECTION_EVAL },
-        HelpSection { title: "System", lines: SECTION_SYSTEM },
-        HelpSection { title: "Help", lines: SECTION_HELP },
+        HelpSection {
+            title: "Main Commands",
+            lines: SECTION_MAIN,
+        },
+        HelpSection {
+            title: "Model & Backend",
+            lines: SECTION_MODEL,
+        },
+        HelpSection {
+            title: "Context Management",
+            lines: SECTION_CONTEXT,
+        },
+        HelpSection {
+            title: "Tools & Integration",
+            lines: SECTION_TOOLS,
+        },
+        HelpSection {
+            title: "Permissions",
+            lines: SECTION_PERMISSIONS,
+        },
+        HelpSection {
+            title: "Settings",
+            lines: SECTION_SETTINGS,
+        },
+        HelpSection {
+            title: "Agent",
+            lines: SECTION_AGENT,
+        },
+        HelpSection {
+            title: "Prompt & Tokens",
+            lines: SECTION_PROMPT,
+        },
+        HelpSection {
+            title: "Evaluation",
+            lines: SECTION_EVAL,
+        },
+        HelpSection {
+            title: "System",
+            lines: SECTION_SYSTEM,
+        },
+        HelpSection {
+            title: "Help",
+            lines: SECTION_HELP,
+        },
     ]
 }
 
@@ -217,7 +373,11 @@ mod tests {
     fn test_format_help_no_empty_sections() {
         let sections = build_sections();
         for section in &sections {
-            assert!(!section.lines.is_empty(), "Section '{}' has no lines", section.title);
+            assert!(
+                !section.lines.is_empty(),
+                "Section '{}' has no lines",
+                section.title
+            );
         }
     }
 
@@ -232,7 +392,10 @@ mod tests {
     #[test]
     fn test_format_help_no_leading_blank_line() {
         let help = format_help();
-        assert!(!help.starts_with('\n'), "Help output should not start with a blank line");
+        assert!(
+            !help.starts_with('\n'),
+            "Help output should not start with a blank line"
+        );
     }
 
     #[test]
