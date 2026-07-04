@@ -2042,7 +2042,7 @@ pub async fn chat_complete(
                 messages.push(serde_json::json!({ "role": "tool", "content": steer }));
                 continue;
             }
-            if !is_read_only_tool(name) {
+            if !is_read_only_call(name, &args) {
                 round_wrote = true;
             }
             // Organic save_note use resets the memory-nudge counter (the
@@ -2223,6 +2223,10 @@ struct FailedCallGuard {
     /// #771 field report: successful `web_fetch` with content is enough context;
     /// an exact repeat should not spend another network/tool round.
     successful_fetches: std::collections::HashMap<String, String>,
+    /// Successful shell probes such as `grep`/`rg` are read-only observations.
+    /// Re-running the byte-identical command is usually local-model thrash, not
+    /// progress, but real build/test/edit-capable commands must keep running.
+    successful_read_only_shell: std::collections::HashMap<String, String>,
 }
 
 impl FailedCallGuard {
@@ -2278,6 +2282,16 @@ impl FailedCallGuard {
                 ));
             }
         }
+        if name == "run_command" {
+            if let Some(command) = self.successful_read_only_shell.get(&key) {
+                return Some(format!(
+                    "You already ran the read-only shell probe `{command}` with these exact \
+                     arguments this turn and received output. Do NOT repeat the identical \
+                     run_command — use the observed output above, change the query, inspect a \
+                     different file, or make the next edit/test decision."
+                ));
+            }
+        }
         None
     }
 
@@ -2287,6 +2301,22 @@ impl FailedCallGuard {
             None
         } else {
             Some(url.chars().take(200).collect())
+        }
+    }
+
+    fn successful_read_only_shell_command(
+        name: &str,
+        args: &serde_json::Value,
+        result: &str,
+    ) -> Option<String> {
+        if name != "run_command" || result.trim().is_empty() {
+            return None;
+        }
+        let command = args.get("command")?.as_str()?.trim();
+        if is_read_only_shell_probe(command) {
+            Some(command.chars().take(200).collect())
+        } else {
+            None
         }
     }
 
@@ -2325,6 +2355,9 @@ impl FailedCallGuard {
             if let Some(url) = Self::successful_fetch_url(args, result) {
                 self.successful_fetches.insert(Self::key(name, args), url);
             }
+        } else if let Some(command) = Self::successful_read_only_shell_command(name, args, result) {
+            self.successful_read_only_shell
+                .insert(Self::key(name, args), command);
         }
     }
 
@@ -2360,6 +2393,35 @@ fn is_read_only_tool(name: &str) -> bool {
             | "save_note"
             | "recall"
     )
+}
+
+fn is_read_only_call(name: &str, args: &serde_json::Value) -> bool {
+    is_read_only_tool(name)
+        || (name == "run_command"
+            && args
+                .get("command")
+                .and_then(|v| v.as_str())
+                .is_some_and(is_read_only_shell_probe))
+}
+
+fn is_read_only_shell_probe(command: &str) -> bool {
+    let command = command.trim();
+    if command.is_empty() {
+        return false;
+    }
+    const SHELL_META: &[char] = &['&', '|', ';', '`', '$', '\n', '>', '<', '(', ')'];
+    if command.contains(SHELL_META) {
+        return false;
+    }
+    let mut tokens = command.split_ascii_whitespace();
+    let Some(program) = tokens.next() else {
+        return false;
+    };
+    match program {
+        "grep" | "rg" | "head" | "tail" | "wc" | "pwd" => true,
+        "sed" => !tokens.any(|t| t == "-i" || t.starts_with("-i")),
+        _ => false,
+    }
 }
 
 /// Max "you narrated intent but called no tool" auto-continue nudges per turn.
@@ -4464,6 +4526,45 @@ mod failed_call_guard_tests {
     }
 
     #[test]
+    fn steers_duplicate_successful_read_only_run_command() {
+        let mut g = FailedCallGuard::default();
+        let args = serde_json::json!({
+            "command": "grep -n 'help_lines' /Users/shawnhartsock/workspaces/newt-agent/newt-tui/src/lib.rs"
+        });
+
+        assert!(
+            g.repeat_steer("run_command", &args).is_none(),
+            "first grep should run"
+        );
+        g.record(
+            "run_command",
+            &args,
+            true,
+            "9439:fn help_lines() -> &'static [&'static str] {",
+        );
+
+        let steer = g
+            .repeat_steer("run_command", &args)
+            .expect("second identical grep should steer");
+        assert!(steer.contains("already ran"), "{steer}");
+        assert!(steer.contains("grep -n"), "{steer}");
+        assert!(steer.contains("Do NOT repeat"), "{steer}");
+    }
+
+    #[test]
+    fn does_not_steer_successful_write_capable_run_command() {
+        let mut g = FailedCallGuard::default();
+        let args = serde_json::json!({"command": "cargo test -p newt-tui"});
+
+        g.record("run_command", &args, true, "test result: ok");
+
+        assert!(
+            g.repeat_steer("run_command", &args).is_none(),
+            "successful build/test commands are still repeatable"
+        );
+    }
+
+    #[test]
     fn no_result_reason_classifies_and_routes() {
         // recall / state_get no-result prefixes classify…
         assert!(FailedCallGuard::no_result_reason(
@@ -4657,6 +4758,35 @@ mod cap_exit_unit_tests {
         for name in &["edit_file", "write_file", "run_command"] {
             assert!(!is_read_only_tool(name), "{name} should NOT be read-only");
         }
+    }
+
+    #[test]
+    fn read_only_call_classifies_simple_shell_probes() {
+        assert!(is_read_only_call(
+            "run_command",
+            &serde_json::json!({"command": "grep -n 'help_lines' newt-tui/src/lib.rs"})
+        ));
+        assert!(is_read_only_call(
+            "run_command",
+            &serde_json::json!({"command": "rg -n format_help newt-tui/src"})
+        ));
+        assert!(is_read_only_call(
+            "run_command",
+            &serde_json::json!({"command": "sed -n '1,20p' newt-tui/src/lib.rs"})
+        ));
+
+        assert!(!is_read_only_call(
+            "run_command",
+            &serde_json::json!({"command": "cargo test -p newt-tui"})
+        ));
+        assert!(!is_read_only_call(
+            "run_command",
+            &serde_json::json!({"command": "sed -i 's/a/b/' file.txt"})
+        ));
+        assert!(!is_read_only_call(
+            "run_command",
+            &serde_json::json!({"command": "grep x file > out.txt"})
+        ));
     }
 
     #[test]
