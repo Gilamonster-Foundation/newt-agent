@@ -26,6 +26,7 @@ mod rich_input;
 mod lean_input;
 mod setup;
 mod wizard;
+mod help_sections;
 
 use mcp::Mcp;
 // Step 9.7: the agentic loop (ChatCtx / chat_complete / execute_tool and their
@@ -9814,10 +9815,7 @@ fn dispatch_slash(
         "exit" | "quit" => return Ok(false),
 
         "help" => {
-            print_newt("Available commands:", color, verbose);
-            for line in help_lines() {
-                println!("{line}");
-            }
+            print_newt(&help_sections::format_help(), color, verbose);
         }
 
         "version" => print_newt(&format!("v{VERSION}"), color, verbose),
