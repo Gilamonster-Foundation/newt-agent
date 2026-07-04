@@ -1,0 +1,13 @@
+{
+  "name": "2026-07-01-pr802-baseline",
+  "created": "2026-07-02T02:57:18Z",
+  "git_sha": "30b2120",
+  "tasks": "T2-humanize-duration,010-decompose-god-function",
+  "modes": "single,crew",
+  "models": "qwen2.5-coder:14b,devstral-small-2:24b,qwen3-coder:30b,qwen2.5-coder:32b,deepseek-r1:70b",
+  "trials": 5,
+  "max_leaves": 6,
+  "timeout": 1200,
+  "keep": "fail",
+  "config_template": "~/.newt/eval-sweeps/template.toml"
+}
