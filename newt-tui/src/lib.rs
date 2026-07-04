@@ -1690,16 +1690,22 @@ enum PromptChoice {
     AllowSession,
     Deny,
     DenyAlways,
+    /// #904: deny PERMANENTLY — persisted to `~/.newt/permission-denials.jsonl`
+    /// so the gate refuses this `(kind, target)` without re-prompting, across
+    /// restarts. `[D]eny always` is the session-scoped sibling.
+    DenyPermanent,
 }
 
 /// Map a typed answer to a choice. Case-significant on purpose — `[d]eny`
-/// is the default and `[D]eny always` the escalation, per the #263 sketch.
-/// Anything unrecognized (including empty / EOF) is the safe default: deny.
+/// is the default, `[D]eny always` the session escalation, and `[P]ermanently
+/// deny` the durable one (#904). Anything unrecognized (including empty / EOF)
+/// is the safe default: deny.
 fn parse_permission_choice(input: &str) -> PromptChoice {
     match input.trim() {
         "a" => PromptChoice::AllowOnce,
         "s" => PromptChoice::AllowSession,
         "D" => PromptChoice::DenyAlways,
+        "P" => PromptChoice::DenyPermanent,
         _ => PromptChoice::Deny,
     }
 }
@@ -1828,11 +1834,11 @@ fn permission_prompt_text(
     // and point at the future step-up path. Low-danger keeps the full menu.
     let menu = match tier {
         danger::DangerTier::High => {
-            "[a]llow once   [d]eny (default)   [D]eny always   \
+            "[a]llow once   [d]eny (default)   [D]eny always   [P]ermanently deny   \
              (high-danger: [s]ession allow refused — [k]ey allow / step-up is the future path, P3) > "
         }
         danger::DangerTier::Low => {
-            "[a]llow once   [s]ession allow   [d]eny (default)   [D]eny always > "
+            "[a]llow once   [s]ession allow   [d]eny (default)   [D]eny always   [P]ermanently deny > "
         }
     };
 
@@ -1915,9 +1921,28 @@ struct PermissionPromptState {
     /// `(kind, target)` pairs the human denied for the rest of the session
     /// (`[D]eny always`) — auto-denied without re-prompting.
     session_denials: std::collections::BTreeSet<(newt_core::DenialKind, String)>,
+    /// #904: `(kind, target)` pairs the human denied PERMANENTLY
+    /// (`[P]ermanently deny`) — loaded from `~/.newt/permission-denials.jsonl`
+    /// at session start and auto-denied without re-prompting, across restarts.
+    /// Deny-only, so reading it back can never widen authority.
+    persistent_denials: std::collections::BTreeSet<(newt_core::DenialKind, String)>,
     /// Every prompted decision this session, in prompt order — what
     /// `/permissions` lists. Also appended to the durable log as made.
     decisions: Vec<newt_core::PermissionRecord>,
+}
+
+impl PermissionPromptState {
+    /// Load the persistent denylist from `path` into a fresh state (#904). A
+    /// missing file yields an empty denylist. Called once at session start.
+    fn with_persistent_denials(path: Option<&std::path::Path>) -> Self {
+        let persistent_denials = path
+            .map(|p| newt_core::load_denials(p).into_iter().collect())
+            .unwrap_or_default();
+        Self {
+            persistent_denials,
+            ..Self::default()
+        }
+    }
 }
 
 /// The TUI's [`newt_core::PermissionGate`]: prompts the human on a denial,
@@ -1943,6 +1968,10 @@ struct PromptPermissionGate<'a, F: FnMut(&str) -> PromptChoice> {
     /// Durable decision log (`~/.newt/permission-log.jsonl`); `None` keeps
     /// the in-session list only.
     log_path: Option<std::path::PathBuf>,
+    /// #904: durable denylist (`~/.newt/permission-denials.jsonl`) appended on
+    /// `[P]ermanently deny`. `None` degrades that choice to session-scoped (like
+    /// `[D]eny always`) — the deny still holds, it just won't survive a restart.
+    denials_path: Option<std::path::PathBuf>,
     /// #307 FLOOR: the active named-permission-preset clamp, if any. The minted
     /// authority is re-`meet`-ed with this ceiling so a session-grant can NEVER
     /// re-add a target the preset denied — `widen_caveats` adds to `Only` sets,
@@ -2023,12 +2052,14 @@ impl<F: FnMut(&str) -> PromptChoice> newt_core::PermissionGate for PromptPermiss
         if requests.is_empty() {
             return Deny;
         }
-        // `[D]eny always` short-circuits without re-prompting (and without
-        // re-recording — the session-scoped deny was recorded when chosen).
+        // `[D]eny always` (session) and `[P]ermanently deny` (#904, durable)
+        // both short-circuit without re-prompting and without re-recording —
+        // the deny was recorded when chosen. The persistent set was loaded from
+        // disk at session start, so a permanent deny survives restarts.
         if requests.iter().any(|r| {
-            self.state
-                .session_denials
-                .contains(&(r.kind, r.target.clone()))
+            let key = (r.kind, r.target.clone());
+            self.state.session_denials.contains(&key)
+                || self.state.persistent_denials.contains(&key)
         }) {
             return Deny;
         }
@@ -2086,6 +2117,27 @@ impl<F: FnMut(&str) -> PromptChoice> newt_core::PermissionGate for PromptPermiss
                     self.record(req, "deny", "session");
                     self.state
                         .session_denials
+                        .insert((req.kind, req.target.clone()));
+                    return Deny;
+                }
+                PromptChoice::DenyPermanent => {
+                    // #904: record + persist so this (kind, target) is denied
+                    // across restarts. A persist-write failure is reported but
+                    // never blocks the decision, and the in-memory set is still
+                    // updated so it holds for the rest of THIS session even if
+                    // the disk write failed.
+                    self.record(req, "deny", "permanent");
+                    if let Some(path) = self.denials_path.as_deref() {
+                        if let Err(e) = newt_core::append_denial(path, req.kind, &req.target) {
+                            print_newt(
+                                &format!("warning: permission denylist write failed: {e}"),
+                                self.color,
+                                self.verbose,
+                            );
+                        }
+                    }
+                    self.state
+                        .persistent_denials
                         .insert((req.kind, req.target.clone()));
                     return Deny;
                 }
@@ -2423,6 +2475,7 @@ mod permission_prompt_tests {
             key_path,
             conversation_id: "conv-test".to_string(),
             log_path,
+            denials_path: None,
             preset_clamp: None,
             danger: danger::DangerTable::builtin(),
             color: false,
@@ -2453,6 +2506,7 @@ mod permission_prompt_tests {
             key_path,
             conversation_id: "conv-test".to_string(),
             log_path,
+            denials_path: None,
             preset_clamp: Some(preset_clamp),
             danger: danger::DangerTable::builtin(),
             color: false,
@@ -2711,6 +2765,92 @@ mod permission_prompt_tests {
         drop(once_gate);
         // Allow-once leaves no standing grant — the per-op nature is preserved.
         assert!(once_state.session_grants.is_empty());
+    }
+
+    /// #904: `[P]ermanently deny` persists the `(kind, target)` to disk and, in a
+    /// FRESH session that reloads it, auto-denies the same target WITHOUT ever
+    /// prompting — the durable sibling of `[D]eny always`. Exercised on a net
+    /// host (the motivating axis), but the mechanism is axis-agnostic.
+    #[test]
+    fn permanently_deny_persists_and_reloads_without_reprompting() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let denials = dir.path().join("permission-denials.jsonl");
+        let base = base_caveats("/ws");
+        let net_req = newt_core::PermissionRequest {
+            tool: "web_fetch".to_string(),
+            kind: DenialKind::Net,
+            target: "evil.example.com".to_string(),
+            reason: "net does not permit 'evil.example.com'".to_string(),
+        };
+
+        // Session 1 — the human picks [P]ermanently deny.
+        let mut state = PermissionPromptState::default();
+        {
+            let mut script = vec![PromptChoice::DenyPermanent].into_iter();
+            let mut gate = PromptPermissionGate {
+                state: &mut state,
+                base: base.clone(),
+                key_path: None,
+                conversation_id: "conv-904".to_string(),
+                log_path: None,
+                denials_path: Some(denials.clone()),
+                preset_clamp: None,
+                danger: danger::DangerTable::builtin(),
+                color: false,
+                verbose: false,
+                ask_human: move |_p: &str| script.next().expect("script exhausted"),
+            };
+            assert!(matches!(
+                gate.ask(std::slice::from_ref(&net_req)),
+                newt_core::PermissionDecision::Deny
+            ));
+        }
+        assert_eq!(state.decisions.len(), 1);
+        assert_eq!(state.decisions[0].decision, "deny");
+        assert_eq!(state.decisions[0].scope, "permanent");
+        assert_eq!(
+            newt_core::load_denials(&denials),
+            vec![(DenialKind::Net, "evil.example.com".to_string())],
+            "the permanent deny was written to disk"
+        );
+
+        // Session 2 (fresh) — the denylist is loaded, so the SAME target is
+        // denied WITHOUT prompting (the scripted human panics if consulted).
+        let mut fresh = PermissionPromptState::with_persistent_denials(Some(&denials));
+        {
+            let mut gate = PromptPermissionGate {
+                state: &mut fresh,
+                base,
+                key_path: None,
+                conversation_id: "conv-904b".to_string(),
+                log_path: None,
+                denials_path: Some(denials.clone()),
+                preset_clamp: None,
+                danger: danger::DangerTable::builtin(),
+                color: false,
+                verbose: false,
+                ask_human: |_p: &str| panic!("must NOT prompt: target was permanently denied"),
+            };
+            assert!(matches!(
+                gate.ask(std::slice::from_ref(&net_req)),
+                newt_core::PermissionDecision::Deny
+            ));
+        }
+        // No prompt ⇒ no new decision recorded in the fresh session.
+        assert!(fresh.decisions.is_empty());
+    }
+
+    /// #904: the choice parser maps `P` to the permanent deny and leaves the
+    /// existing keys (incl. the session `D`) intact; unknown/empty stays deny.
+    #[test]
+    fn parse_permission_choice_maps_permanent_deny() {
+        assert_eq!(parse_permission_choice("P"), PromptChoice::DenyPermanent);
+        assert_eq!(parse_permission_choice("D"), PromptChoice::DenyAlways);
+        assert_eq!(parse_permission_choice("a"), PromptChoice::AllowOnce);
+        assert_eq!(parse_permission_choice("s"), PromptChoice::AllowSession);
+        // Case-significant + safe default: lowercase p / unknown / empty → deny.
+        assert_eq!(parse_permission_choice("p"), PromptChoice::Deny);
+        assert_eq!(parse_permission_choice(""), PromptChoice::Deny);
     }
 
     /// Allow-once: the minted caveats cover the target for THIS consult, but
@@ -4588,7 +4728,6 @@ fn run_chat(
         // the dual-TTY `interactive` check above is the operative guard.
         false,
     );
-    let mut permission_state = PermissionPromptState::default();
     // `[tui] allow_bang_escape` (default true): the human's `!` host shell-out.
     // The model can never reach it regardless; this only governs the keyboard.
     let bang_escape_enabled = resolve_tui(&cfg)
@@ -4596,6 +4735,12 @@ fn run_chat(
         .unwrap_or(true);
     let permission_log_path =
         newt_core::Config::user_config_path().map(|p| p.with_file_name("permission-log.jsonl"));
+    // #904: the durable denylist lives next to the log; load it into the session
+    // state so `[P]ermanently deny` decisions from prior runs still hold.
+    let permission_denials_path =
+        newt_core::Config::user_config_path().map(|p| p.with_file_name("permission-denials.jsonl"));
+    let mut permission_state =
+        PermissionPromptState::with_persistent_denials(permission_denials_path.as_deref());
     print_newt(
         &ready_line(VERSION, &inf_model, &inf_url, inf_kind),
         color,
@@ -4616,8 +4761,9 @@ fn run_chat(
     }
     if prompt_permissions_enabled {
         print_newt(
-            "prompted permissions ON — capability denials will ask: allow once / session / deny \
-             (decisions recorded; /permissions lists them)",
+            "prompted permissions ON — capability denials will ask: allow once / session / deny / \
+             permanently deny (decisions recorded; /permissions lists them; permanent denials \
+             persist in ~/.newt/permission-denials.jsonl)",
             color,
             verbose,
         );
@@ -5925,6 +6071,7 @@ fn run_chat(
                             key_path: key_path.clone(),
                             conversation_id: active_conversation_id.clone(),
                             log_path: permission_log_path.clone(),
+                            denials_path: permission_denials_path.clone(),
                             preset_clamp: preset_clamp.clone(),
                             danger: production_danger_table(),
                             color,
@@ -11296,6 +11443,7 @@ mod disable_ocap_session_tests {
             key_path: None,
             conversation_id: "conv-297".to_string(),
             log_path: None,
+            denials_path: None,
             preset_clamp: None,
             danger: danger::DangerTable::builtin(),
             color: false,
@@ -11340,6 +11488,7 @@ mod disable_ocap_session_tests {
             key_path: None,
             conversation_id: "conv-297".to_string(),
             log_path: None,
+            denials_path: None,
             preset_clamp: None,
             danger: danger::DangerTable::builtin(),
             color: false,
