@@ -115,6 +115,8 @@ async fn main() {
     println!("  scratch {}", root.display());
     println!("  goal: {goal}\n");
 
+    // Throwaway scratch dir, not a git repo — nothing to grep against.
+    let no_grounding = |_: &str| Vec::<String>::new();
     let out = run_team(
         &pool,
         &LocalDispatcher,
@@ -122,6 +124,7 @@ async fn main() {
         &cfg,
         &newt_core::caveats::Caveats::top(),
         goal,
+        &no_grounding,
     )
     .await;
 

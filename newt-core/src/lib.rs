@@ -33,6 +33,7 @@ pub mod reasoning;
 pub mod retry;
 pub mod role_profile;
 pub mod router;
+pub mod scope_grounding;
 pub mod scratch;
 pub mod session;
 pub mod settings;

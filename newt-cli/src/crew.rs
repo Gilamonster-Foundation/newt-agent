@@ -10,6 +10,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use newt_core::scope_grounding::{definition_grep_pattern, grep_terms, ground_scope};
 use newt_scheduler::{Edit, Workspace};
 
 /// Infer the verification command for a repo at `dir`, in priority order:
@@ -66,7 +67,7 @@ fn is_safe_worktree_path(path: &str) -> bool {
 }
 
 /// Run `git <args>` in `dir`, returning trimmed stdout on success.
-fn git(dir: &Path, args: &[&str]) -> anyhow::Result<String> {
+pub(crate) fn git(dir: &Path, args: &[&str]) -> anyhow::Result<String> {
     let out = Command::new("git").args(args).current_dir(dir).output()?;
     if !out.status.success() {
         anyhow::bail!(
@@ -76,6 +77,36 @@ fn git(dir: &Path, args: &[&str]) -> anyhow::Result<String> {
         );
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// Build a `def_sites` closure backed by `git grep` in `repo_dir` — the SAME
+/// grounding crew mode's [`author_plan_to_plan`] and team mode's dispatch
+/// (`newt-cli/src/crew_runner.rs`) both call, so the two modes ground
+/// identically and cannot drift. `--full-name` prints paths relative to the
+/// repo TOPLEVEL regardless of `repo_dir` — the same basis as worktree edit
+/// paths, so a scope derived here matches what the fence partitions on even
+/// when planning from a subdir. `core.quotepath=false` keeps non-ASCII paths
+/// raw instead of C-quoted (a quoted path would be an unusable fence entry).
+/// (#812, #840)
+pub(crate) fn def_sites_grep(repo_dir: &Path) -> impl Fn(&str) -> Vec<String> + '_ {
+    move |sym: &str| -> Vec<String> {
+        git(
+            repo_dir,
+            &[
+                "-c",
+                "core.quotepath=false",
+                "grep",
+                "--full-name",
+                "-nE",
+                "-e",
+                &definition_grep_pattern(sym),
+                "--",
+                "*.rs",
+            ],
+        )
+        .map(|s| s.lines().map(str::to_string).collect())
+        .unwrap_or_default()
+    }
 }
 
 /// A [`Workspace`] backed by an **isolated git worktree** under
@@ -500,68 +531,15 @@ fn plan_grounding_contradictions(
     out
 }
 
-/// #812: a term whose definitions are spread over more than this many files
-/// carries no aiming signal (`main` defines in dozens) — it is skipped rather
-/// than allowed to flood/evict the real target under the scope cap.
-const AMBIGUOUS_DEF_FILES: usize = 3;
-
-/// #812: derive one subtask's file scope from the harness's OWN grounding —
-/// `grep_terms(instruction)` → def-site grep → the defining files. PURE over
-/// the injected `def_sites` (`path:line:content` grep lines), so it is
-/// unit-testable with no fs. Order-preserving dedup; ambiguous terms (defs in
-/// more than [`AMBIGUOUS_DEF_FILES`] files) are skipped entirely — no signal,
-/// not weak signal; git-quoted (`"`-prefixed, core.quotePath) and empty
-/// paths are dropped as unusable fence entries.
-fn derive_subtask_scope(
-    instruction: &str,
-    def_sites: &impl Fn(&str) -> Vec<String>,
-) -> Vec<String> {
-    let mut paths: Vec<String> = Vec::new();
-    for term in grep_terms(instruction) {
-        let mut term_files: Vec<String> = Vec::new();
-        for hit in def_sites(&term) {
-            if let Some(p) = hit.split(':').next() {
-                if !p.is_empty() && !p.starts_with('"') && !term_files.iter().any(|q| q == p) {
-                    term_files.push(p.to_string());
-                }
-            }
-        }
-        if term_files.is_empty() || term_files.len() > AMBIGUOUS_DEF_FILES {
-            continue;
-        }
-        for p in term_files {
-            if !paths.iter().any(|q| q == &p) {
-                paths.push(p);
-            }
-        }
-    }
-    paths
-}
-
-/// #812: stamp every subtask's `context` as ground truth ∪ declaration. The
-/// def-site derivation leads (an under- or mis-declaring model cannot mis-aim
-/// the fence away from the real seam), and the model's self-declared `files`
-/// are APPENDED — augmentation per the design doc §4b, never replacement — so
-/// companion edit targets grounding cannot see (a new test file, docs, a
-/// brand-new module) stay in the lane. Bounded so the lane stays a lane.
-/// Declared entries widen only the FENCE, never authority: the fs_write leash
-/// and the worktree still bound everything, and downstream the scope is
-/// meet-only (it can only NARROW the writable set). Empty fences nothing.
+/// #812/#840: stamp every subtask's `context` as ground truth ∪ declaration,
+/// via the shared [`newt_core::scope_grounding::ground_scope`] — the same
+/// implementation team mode's `run_team` calls, so the two paths cannot drift.
 fn ground_subtask_scopes(
     plan: &mut newt_core::plan::Plan,
     def_sites: &impl Fn(&str) -> Vec<String>,
 ) {
-    const SCOPE_CAP: usize = 6;
     for s in &mut plan.subtasks {
-        let mut scope = derive_subtask_scope(&s.instruction, def_sites);
-        for declared in &s.context {
-            let d = declared.trim();
-            if !d.is_empty() && !scope.iter().any(|q| q == d) {
-                scope.push(d.to_string());
-            }
-        }
-        scope.truncate(SCOPE_CAP);
-        s.context = scope;
+        s.context = ground_scope(&s.instruction, &s.context, def_sites);
     }
 }
 
@@ -1130,30 +1108,8 @@ pub async fn author_plan_to_plan(
     // mis-ground — re-author ONCE with the citation. A backstop to the #687
     // grounding helper; refutes only on positive contradiction, so a clean plan
     // is never re-authored.
-    // `--full-name` prints paths relative to the repo TOPLEVEL regardless of
-    // `repo_dir` — the same basis as worktree edit paths, so a scope derived
-    // here matches what the fence partitions on even when planning from a
-    // subdir. `core.quotepath=false` keeps non-ASCII paths raw instead of
-    // C-quoted (a quoted path would be an unusable fence entry). (#812)
-    let def_sites = |sym: &str| -> Vec<String> {
-        git(
-            repo_dir,
-            &[
-                "-c",
-                "core.quotepath=false",
-                "grep",
-                "--full-name",
-                "-nE",
-                "-e",
-                &definition_grep_pattern(sym),
-                "--",
-                "*.rs",
-            ],
-        )
-        .map(|s| s.lines().map(str::to_string).collect())
-        .unwrap_or_default()
-    };
-    let contradictions = plan_grounding_contradictions(&plan, def_sites);
+    let def_sites = def_sites_grep(repo_dir);
+    let contradictions = plan_grounding_contradictions(&plan, &def_sites);
     if contradictions.is_empty() {
         // #812: stamp each leaf's file scope from the SAME ground truth the
         // claim-check uses, so the worker fence bites deterministically.
@@ -1247,85 +1203,6 @@ fn github_refs(goal: &str) -> Vec<(String, String, String, String)> {
     refs
 }
 
-/// Words that, adjacent to a code-like identifier, mark it as a symbol the
-/// instruction names — so the claim-check (#691) sees "the help_lines function"
-/// the same as a backticked `help_lines`. (#696)
-const DEF_KEYWORDS: &[&str] = &[
-    "function", "fn", "struct", "trait", "enum", "method", "type", "module", "mod", "macro",
-];
-
-/// A code-like identifier: snake_case (`_`), CamelCase (mixed case), or contains a
-/// digit — so plain prose ("the", "parser") isn't mistaken for a symbol. (#696)
-fn looks_like_identifier(t: &str) -> bool {
-    let t = t.trim_matches('`');
-    !t.is_empty()
-        && t.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-        && t.chars()
-            .next()
-            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-        && (t.contains('_')
-            || t.contains(|c: char| c.is_ascii_digit())
-            || (t.chars().any(|c| c.is_ascii_uppercase())
-                && t.chars().any(|c| c.is_ascii_lowercase())))
-}
-
-/// High-signal code-ish terms in `text` to grep for: slash-commands (`/dgx`),
-/// backtick-quoted single tokens (`help_lines`), and — for the claim-check's
-/// recall (#696) — code-like identifiers adjacent to a def keyword ("the
-/// help_lines function", "struct Foo"). Distinctive enough to locate real code
-/// without the noise a bare word like "help" would drown it in.
-fn grep_terms(text: &str) -> Vec<String> {
-    let mut terms: Vec<String> = Vec::new();
-    // Backtick-quoted single tokens.
-    let mut rest = text;
-    while let Some(open) = rest.find('`') {
-        rest = &rest[open + 1..];
-        let Some(close) = rest.find('`') else { break };
-        let span = rest[..close].trim();
-        if (3..=40).contains(&span.chars().count())
-            && span.split_whitespace().count() == 1
-            && span.chars().any(|c| c.is_ascii_alphanumeric())
-        {
-            terms.push(span.to_string());
-        }
-        rest = &rest[close + 1..];
-    }
-    // Slash-commands: `/word`.
-    for tok in text.split(|c: char| c.is_whitespace() || "()[]{}<>,;:\"'".contains(c)) {
-        if let Some(after) = tok.strip_prefix('/') {
-            let cmd: String = after
-                .chars()
-                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
-                .collect();
-            if cmd.len() >= 2 {
-                terms.push(format!("/{cmd}"));
-            }
-        }
-    }
-    // Code-like identifiers adjacent to a def keyword (#696): "the help_lines
-    // function", "struct Foo", "refactor parse_config" — so the claim-check sees
-    // an unquoted symbol the model named. Guarded to code-like tokens so plain
-    // prose isn't grepped.
-    let words: Vec<&str> = text
-        .split(|c: char| c.is_whitespace() || "()[]{}<>,;:\"'`".contains(c))
-        .collect();
-    for (i, w) in words.iter().enumerate() {
-        if DEF_KEYWORDS.contains(&w.to_ascii_lowercase().as_str()) {
-            let prev = i.checked_sub(1).and_then(|j| words.get(j));
-            let next = words.get(i + 1);
-            for cand in [prev, next].into_iter().flatten() {
-                if looks_like_identifier(cand) {
-                    terms.push((*cand).to_string());
-                }
-            }
-        }
-    }
-    terms.sort();
-    terms.dedup();
-    terms.truncate(12);
-    terms
-}
-
 /// One grep block for a single task term: the DEFINITION sites (the real seam)
 /// and the other mention sites, kept apart so [`format_grounding_hits`] can rank
 /// definitions FIRST and never truncate them. The #687 bug was `git grep |
@@ -1337,31 +1214,6 @@ struct GroundingBlock {
     term: String,
     defs: Vec<String>,
     mentions: Vec<String>,
-}
-
-/// Escape ERE metacharacters so a task term matches literally inside the
-/// definition pattern (grep terms are usually bare symbols, but be safe).
-fn ere_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        if "\\.^$*+?()[]{}|".contains(c) {
-            out.push('\\');
-        }
-        out.push(c);
-    }
-    out
-}
-
-/// A POSIX-ERE pattern (for `git grep -E`) matching a Rust DEFINITION of `term`
-/// — `fn`/`struct`/`trait`/`enum`/`type`/`const`/`static`/`union`/`mod`, with an
-/// optional `pub`/`async`/`unsafe`, at line start, the symbol word-bounded — and
-/// NOT a bare mention.
-fn definition_grep_pattern(term: &str) -> String {
-    format!(
-        "^[[:space:]]*(pub[[:space:]]+)?(async[[:space:]]+)?(unsafe[[:space:]]+)?\
-         (fn|struct|trait|enum|type|const|static|union|mod)[[:space:]]+{}([^A-Za-z0-9_]|$)",
-        ere_escape(term)
-    )
 }
 
 fn truncate_grep_line(line: &str) -> String {
@@ -2182,38 +2034,6 @@ mod tests {
     }
 
     #[test]
-    fn derive_subtask_scope_extracts_def_files_and_skips_ambiguous_terms() {
-        // #812: def_sites returns `path:line:content` grep lines; the scope is
-        // the DEFINING files, order-preserving, deduped. A term defined in
-        // more than AMBIGUOUS_DEF_FILES files carries no aiming signal (e.g.
-        // `main`) and is skipped so it cannot evict the real target; a
-        // git-quoted path (core.quotePath escaping) is dropped as unusable.
-        let def_sites = |sym: &str| -> Vec<String> {
-            match sym {
-                "humanize_duration" => vec![
-                    "src/util.rs:2:pub fn humanize_duration(...)".to_string(),
-                    "src/util.rs:9:fn humanize_duration_impl(...)".to_string(),
-                    "src/lib.rs:11:fn humanizes()".to_string(),
-                    "\"src/gr\\303\\266\\303\\237e.rs\":1:fn humanize_x()".to_string(),
-                ],
-                "main" => (0..14).map(|i| format!("file{i}.rs:1:fn main()")).collect(),
-                _ => Vec::new(),
-            }
-        };
-        let scope = derive_subtask_scope(
-            "fix `humanize_duration` in `main` so 90s renders as 1m 30s",
-            &def_sites,
-        );
-        assert_eq!(
-            scope,
-            vec!["src/util.rs".to_string(), "src/lib.rs".to_string()],
-            "defining files kept; ambiguous `main` skipped; quoted path dropped"
-        );
-        // No grounded symbols → empty scope (fence stays off; never invented).
-        assert!(derive_subtask_scope("tidy the docs", &def_sites).is_empty());
-    }
-
-    #[test]
     fn ground_subtask_scopes_unions_def_sites_with_declared_files() {
         // #812 (§4b: augmentation, not replacement): the derived def-site
         // LEADS the scope, and the model's declared files are APPENDED — a
@@ -2260,35 +2080,6 @@ mod tests {
         let plan = parse_authored_plan(raw).expect("parses");
         assert_eq!(plan.subtasks[0].context, vec!["src/util.rs".to_string()]);
         assert!(plan.subtasks[1].context.is_empty());
-    }
-
-    /// A throwaway git repo with one committed file at `name` containing `body`.
-    #[test]
-    fn grep_terms_extracts_slash_commands_and_backtick_tokens_only() {
-        let terms =
-            grep_terms("roll up `/dgx` help; refactor `help_lines` and /models — but not help");
-        assert!(terms.contains(&"/dgx".to_string()), "{terms:?}");
-        assert!(terms.contains(&"/models".to_string()), "{terms:?}");
-        assert!(terms.contains(&"help_lines".to_string()), "{terms:?}");
-        // Bare common words (like "help") are NOT extracted — too noisy to grep.
-        assert!(!terms.iter().any(|t| t == "help"), "{terms:?}");
-    }
-
-    #[test]
-    fn grep_terms_extracts_unquoted_identifiers_next_to_def_keywords() {
-        // #696: the model often names a symbol unquoted — "the help_lines function".
-        // C (#691) missed exactly this in the #548 retest.
-        let t1 = grep_terms("Refactor the help_lines function in newt-cli/src/crew.rs");
-        assert!(t1.contains(&"help_lines".to_string()), "{t1:?}");
-        let t2 = grep_terms("add a new struct ConfigLoader to hold settings");
-        assert!(t2.contains(&"ConfigLoader".to_string()), "{t2:?}");
-        // Plain prose adjacent to a keyword is NOT a symbol (precision guard).
-        let t3 = grep_terms("this function works well and the parser is fine");
-        assert!(
-            !t3.iter()
-                .any(|x| x == "works" || x == "parser" || x == "the"),
-            "{t3:?}"
-        );
     }
 
     #[test]
@@ -2791,17 +2582,6 @@ mod tests {
     #[test]
     fn empty_blocks_yield_empty_grounding() {
         assert!(format_grounding_hits(&[]).is_empty());
-    }
-
-    #[test]
-    fn definition_grep_pattern_matches_defs_not_mentions() {
-        let re = regex::Regex::new(&definition_grep_pattern("help_lines")).unwrap();
-        assert!(re.is_match("fn help_lines() -> &'static [&'static str] {"));
-        assert!(re.is_match("    pub async fn help_lines() {"));
-        assert!(re.is_match("pub fn help_lines<T>(x: T) {"));
-        assert!(!re.is_match("    // help_lines is the seam"));
-        assert!(!re.is_match("    let v = self.help_lines();"));
-        assert!(!re.is_match("fn help_lines_other() {")); // word-bounded, not a prefix
     }
 
     #[test]
