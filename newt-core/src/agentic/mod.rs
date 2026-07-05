@@ -900,7 +900,7 @@ fn is_tools_unsupported_error(e: &anyhow::Error) -> bool {
 /// tools-unsupported model: retry the turn without advertising tools.
 fn is_ollama_tool_xml_error(e: &anyhow::Error) -> bool {
     let s = e.to_string().to_lowercase();
-    s.contains("xml syntax error") && s.contains("parameter") && s.contains("function")
+    s.contains("ollama") && s.contains("xml syntax error")
 }
 
 /// Main agentic loop: call model → execute tool calls → feed results back → repeat.
@@ -6517,8 +6517,15 @@ mod http_loop_tests {
             "{}",
             r#"Ollama 500 Internal Server Error: {"error":"XML syntax error on line 2: element <parameter> closed by </function>"}"#
         )));
+        assert!(is_ollama_tool_xml_error(&anyhow::anyhow!(
+            "{}",
+            r#"Ollama 500 Internal Server Error: {"error":"XML syntax error on line 3: unexpected end element \u003c/parameter\u003e"}"#
+        )));
         assert!(!is_ollama_tool_xml_error(&anyhow::anyhow!(
             "Ollama 500 Internal Server Error: model runner crashed"
+        )));
+        assert!(!is_ollama_tool_xml_error(&anyhow::anyhow!(
+            "OpenAI 400 Bad Request: XML syntax error in user supplied file"
         )));
     }
 
