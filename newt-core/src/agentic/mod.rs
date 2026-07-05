@@ -1976,8 +1976,12 @@ pub async fn chat_complete(
             // chronic narrator can't loop; after the cap the prose is accepted
             // as the final answer (the return below). A genuine from-the-start
             // final answer (no prior call, no intent cue) is never nudged.
+            let nudge_classification = nudge_classifier.classify(&streamed);
             if pending_plan_nudges < PENDING_PLAN_NUDGE_CAP && round + 1 < max_tool_rounds {
-                if let Some(nudge) = pending_plan_completion_nudge(step_ledger) {
+                if let Some(nudge) = pending_plan_completion_nudge(
+                    step_ledger,
+                    nudge_classification.is_plan_update(),
+                ) {
                     if debug {
                         print_debug(
                             "active plan has unfinished steps — nudging before final answer",
@@ -2012,7 +2016,7 @@ pub async fn chat_complete(
             }
             if narration_nudges < NARRATION_NUDGE_CAP
                 && round + 1 < max_tool_rounds
-                && nudge_classifier.is_pending_action(&streamed)
+                && nudge_classification.is_pending_action()
             {
                 if debug {
                     print_debug(
@@ -2592,6 +2596,7 @@ fn stale_file_ground_truth_nudge() -> String {
 
 fn pending_plan_completion_nudge(
     step_ledger: Option<&dyn scheduled::StepLedger>,
+    needs_plan_update: bool,
 ) -> Option<String> {
     let snapshot = step_ledger?.snapshot();
     let total = snapshot.steps.len();
@@ -2615,12 +2620,24 @@ fn pending_plan_completion_nudge(
         .map(|s| format!(" Active step: '{}'.", s.description))
         .unwrap_or_default();
     let step_word = if unfinished == 1 { "step" } else { "steps" };
-    Some(format!(
-        "You ended the turn while the active plan still has {unfinished}/{total} unfinished \
-         {step_word}.{active_clause} Either call update_plan with completed steps marked \
-         completed, call the next tool for the active step, or state the concrete blocker. \
-         Do not hand off by only describing remaining work."
-    ))
+    if needs_plan_update {
+        Some(format!(
+            "You ended with a findings/next-steps summary while the active plan still has \
+             {unfinished}/{total} unfinished {step_word}.{active_clause} Your summary says \
+             immediate prerequisite repair work now blocks the active step. Call update_plan now \
+             with the full ordered plan: mark completed steps completed, make the immediate \
+             blocker repair the active step, and keep later feature work pending. Then call the \
+             next concrete tool for that active repair. Do not repeat the findings summary or \
+             claim a tool-call limit while this nudge is giving you another round."
+        ))
+    } else {
+        Some(format!(
+            "You ended the turn while the active plan still has {unfinished}/{total} unfinished \
+             {step_word}.{active_clause} Either call update_plan with completed steps marked \
+             completed, call the next tool for the active step, or state the concrete blocker. \
+             Do not hand off by only describing remaining work."
+        ))
+    }
 }
 
 fn read_only_action_nudge(
@@ -3524,11 +3541,16 @@ pub async fn openai_chat_complete(
             // Narrate-then-stop rescue (mirror of the Ollama loop): non-empty
             // prose with no tool call. Nudge once and continue instead of ending
             // the turn — bounded by NARRATION_NUDGE_CAP + the round budget.
+            let nudge_classification =
+                (!content.is_empty()).then(|| nudge_classifier.classify(&content));
             if !content.is_empty()
                 && pending_plan_nudges < PENDING_PLAN_NUDGE_CAP
                 && round + 1 < max_tool_rounds
             {
-                if let Some(nudge) = pending_plan_completion_nudge(step_ledger) {
+                let needs_plan_update = nudge_classification
+                    .as_ref()
+                    .is_some_and(|c| c.is_plan_update());
+                if let Some(nudge) = pending_plan_completion_nudge(step_ledger, needs_plan_update) {
                     if debug {
                         print_debug(
                             "active plan has unfinished steps — nudging before final answer",
@@ -3563,7 +3585,9 @@ pub async fn openai_chat_complete(
             if !content.is_empty()
                 && narration_nudges < NARRATION_NUDGE_CAP
                 && round + 1 < max_tool_rounds
-                && nudge_classifier.is_pending_action(&content)
+                && nudge_classification
+                    .as_ref()
+                    .is_some_and(|c| c.is_pending_action())
             {
                 if debug {
                     print_debug(
@@ -5041,7 +5065,7 @@ mod cap_exit_unit_tests {
     fn pending_plan_completion_nudge_is_state_driven() {
         use crate::agentic::scheduled::{SessionStepLedger, StepLedger};
 
-        assert!(pending_plan_completion_nudge(None).is_none());
+        assert!(pending_plan_completion_nudge(None, false).is_none());
 
         let ledger = SessionStepLedger::default();
         ledger.restore(&PlanSnapshot {
@@ -5056,7 +5080,7 @@ mod cap_exit_unit_tests {
                 },
             ],
         });
-        let nudge = pending_plan_completion_nudge(Some(&ledger as &dyn StepLedger))
+        let nudge = pending_plan_completion_nudge(Some(&ledger as &dyn StepLedger), false)
             .expect("open plan produces a nudge");
         assert!(nudge.contains("1/2 unfinished step"), "{nudge}");
         assert!(nudge.contains("Active step: 'keep working'"), "{nudge}");
@@ -5064,13 +5088,33 @@ mod cap_exit_unit_tests {
         assert!(nudge.contains("call the next tool"), "{nudge}");
         assert!(nudge.contains("concrete blocker"), "{nudge}");
 
+        let plan_update_nudge =
+            pending_plan_completion_nudge(Some(&ledger as &dyn StepLedger), true)
+                .expect("open plan produces a plan-update nudge");
+        assert!(
+            plan_update_nudge.contains("findings/next-steps summary"),
+            "{plan_update_nudge}"
+        );
+        assert!(
+            plan_update_nudge.contains("Call update_plan now"),
+            "{plan_update_nudge}"
+        );
+        assert!(
+            plan_update_nudge.contains("make the immediate blocker repair the active step"),
+            "{plan_update_nudge}"
+        );
+        assert!(
+            plan_update_nudge.contains("Do not repeat the findings summary"),
+            "{plan_update_nudge}"
+        );
+
         ledger.restore(&PlanSnapshot {
             steps: vec![Step {
                 description: "complete".to_string(),
                 status: StepStatus::Done,
             }],
         });
-        assert!(pending_plan_completion_nudge(Some(&ledger as &dyn StepLedger)).is_none());
+        assert!(pending_plan_completion_nudge(Some(&ledger as &dyn StepLedger), false).is_none());
     }
 }
 
@@ -7627,6 +7671,94 @@ mod http_loop_tests {
             !reply.contains("I need to finish"),
             "must not accept a plain handoff while plan is open: {reply}"
         );
+    }
+
+    #[tokio::test]
+    async fn findings_summary_with_stale_plan_nudges_update_plan_then_continues() {
+        let ledger = SessionStepLedger::default();
+        ledger.restore(&PlanSnapshot {
+            steps: vec![
+                Step {
+                    description: "convert help sections".to_string(),
+                    status: StepStatus::Done,
+                },
+                Step {
+                    description: "wire progressive dispatch in lib.rs".to_string(),
+                    status: StepStatus::Active,
+                },
+                Step {
+                    description: "add tests".to_string(),
+                    status: StepStatus::Todo,
+                },
+            ],
+        });
+        let findings = "\
+Summary of Findings
+
+Across the tool calls, I observed two issues in newt-tui/src/help_sections.rs:
+1. Duplicate function definitions
+2. Stray closing brace
+
+Current Status
+
+The build is broken due to these syntax errors. The plan was at step 2, but we need to fix the immediate compilation issues first before proceeding with feature work.
+
+Next Steps Required
+
+To continue, I would need to remove the duplicate function using edit_file, locate and remove the stray brace, verify cargo check, then proceed with step 2 of the plan.
+
+However, I've reached the tool-call limit and cannot make these edits now.";
+        let (reply, rounds) = run_openai_script_with_ledger(
+            vec![
+                serde_json::json!({ "content": findings }),
+                serde_json::json!({
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "plan_1",
+                        "type": "function",
+                        "function": {
+                            "name": "update_plan",
+                            "arguments": serde_json::json!({
+                                "plan": [
+                                    {"step": "fix duplicate help rollup functions and stray brace", "status": "in_progress"},
+                                    {"step": "wire progressive dispatch in lib.rs", "status": "pending"},
+                                    {"step": "add rollup tests", "status": "pending"}
+                                ]
+                            }).to_string()
+                        }
+                    }]
+                }),
+                serde_json::json!({
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "edit_1",
+                        "type": "function",
+                        "function": {
+                            "name": "definitely_not_a_real_tool",
+                            "arguments": "{}"
+                        }
+                    }]
+                }),
+                serde_json::json!({ "content": "Done." }),
+            ],
+            Some(&ledger as &dyn StepLedger),
+        )
+        .await;
+        assert_eq!(
+            rounds, 4,
+            "findings summary should be nudged into update_plan, then a concrete tool"
+        );
+        assert_eq!(reply, "Done.");
+        assert!(
+            !reply.contains("tool-call limit"),
+            "must not accept the handoff summary: {reply}"
+        );
+        let snap = ledger.snapshot();
+        assert_eq!(
+            snap.steps[0].description,
+            "fix duplicate help rollup functions and stray brace"
+        );
+        assert_eq!(snap.steps[0].status, StepStatus::Active);
     }
 
     #[tokio::test]

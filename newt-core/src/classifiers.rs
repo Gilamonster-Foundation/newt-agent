@@ -3,7 +3,8 @@
 //! Classifier drop-ins live under `~/.newt/classifiers/` (or
 //! `$NEWT_CONFIG_DIR/classifiers/`). The first shipped classifier is the
 //! `NudgeClassifier`, used by the agentic loop to distinguish final answers
-//! from "I am about to continue" narrations when the model emitted no tool call.
+//! from no-tool-call stall shapes such as "I am about to continue" narrations
+//! and stale-plan findings summaries.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -19,6 +20,8 @@ const NUDGE_CLASSIFIER_FILE: &str = "nudge.toml";
 pub enum NudgeClass {
     /// The assistant is announcing an action it has not actually performed.
     PendingAction,
+    /// The assistant discovered prerequisite work that should revise the plan.
+    PlanUpdate,
     /// The assistant appears to be giving a real final answer.
     FinalAnswer,
     /// No configured class was close enough to trust.
@@ -34,7 +37,14 @@ pub struct NudgeClassification {
 
 impl NudgeClassification {
     pub fn is_pending_action(&self) -> bool {
-        self.class == NudgeClass::PendingAction
+        matches!(
+            self.class,
+            NudgeClass::PendingAction | NudgeClass::PlanUpdate
+        )
+    }
+
+    pub fn is_plan_update(&self) -> bool {
+        self.class == NudgeClass::PlanUpdate
     }
 }
 
@@ -51,7 +61,7 @@ pub struct NudgeClassifierConfig {
     #[serde(default = "default_min_margin")]
     pub min_margin: f32,
     /// Prototype phrases by class. Keys are canonical class names:
-    /// `pending_action`, `final_answer`.
+    /// `pending_action`, `plan_update`, `final_answer`.
     #[serde(default)]
     pub classes: BTreeMap<String, Vec<String>>,
 }
@@ -97,6 +107,16 @@ fn builtin_nudge_classes() -> BTreeMap<String, Vec<String>> {
                 "Next I will add the tests.".to_string(),
                 "Current blocker: the for loop needs a one line fix. Next steps needed: fix the iteration type error in lib.rs.".to_string(),
                 "What remains: fix the compile error, add tests, and run the check.".to_string(),
+            ],
+        ),
+        (
+            "plan_update".to_string(),
+            vec![
+                "Summary of Findings. Current Status: the build is broken due to syntax errors. Next Steps Required: remove the duplicate function, remove the stray brace, verify cargo check, then proceed with the active plan step.".to_string(),
+                "The active plan says to continue feature work, but I found immediate compilation blockers that must be inserted into the plan first before proceeding.".to_string(),
+                "To continue, I need to update the plan with prerequisite repair work, then use edit_file and run the build check.".to_string(),
+                "However, I have reached the tool-call limit and cannot make these edits now. The plan needs to be updated before continuing.".to_string(),
+                "Recommended next action if session resumes: fix duplicate functions, clean up broken tests, read lib.rs, then wire the progressive dispatch. The build is currently broken and that is the blocker for further progress.".to_string(),
             ],
         ),
         (
@@ -259,6 +279,7 @@ pub fn classifier_config_dir() -> Option<PathBuf> {
 fn parse_nudge_class(s: &str) -> Option<NudgeClass> {
     match s.trim().to_ascii_lowercase().replace('-', "_").as_str() {
         "pending_action" | "continue" | "continuation" => Some(NudgeClass::PendingAction),
+        "plan_update" | "update_plan" | "stale_plan" | "replan" => Some(NudgeClass::PlanUpdate),
         "final_answer" | "final" | "done" => Some(NudgeClass::FinalAnswer),
         _ => None,
     }
@@ -325,6 +346,53 @@ Next steps needed:
         ));
         assert!(!classifier.is_pending_action("The capital of France is Paris."));
         assert!(!classifier.is_pending_action("Done. Let me know if you want any further changes."));
+    }
+
+    #[test]
+    fn nudge_classifier_separates_plan_update_summaries_from_final_summaries() {
+        let classifier = NudgeClassifier::builtin();
+        let findings = "\
+Summary of Findings
+
+Across the tool calls, I observed two issues in newt-tui/src/help_sections.rs:
+1. Duplicate function
+2. Stray closing brace
+
+Current Status
+
+The build is broken due to these syntax errors. The plan was at step 2, but we need to fix the immediate compilation issues first.
+
+Next Steps Required
+
+To continue, I would need to remove the duplicate function using edit_file, remove the stray brace using edit_file, verify cargo check, then proceed with step 2 of the plan.
+
+However, I've reached the tool-call limit and cannot make these edits now.";
+
+        let classified = classifier.classify(findings);
+        assert_eq!(classified.class, NudgeClass::PlanUpdate);
+        assert!(classified.is_pending_action());
+        assert!(classified.is_plan_update());
+
+        let resume_handoff = "\
+Summary
+
+I reached the tool-call limit. Current state of newt-tui/src/help_sections.rs:
+duplicate topic_has_rollups and rollup_page_for_topic definitions need to be removed.
+
+Recommended next action if session resumes:
+1. Fix the duplicate functions.
+2. Clean up the broken test block.
+3. Read lib.rs and wire the progressive dispatch.
+
+The build is currently broken due to the duplicate definitions — that's the blocker for any further progress.";
+        assert_eq!(
+            classifier.classify(resume_handoff).class,
+            NudgeClass::PlanUpdate
+        );
+
+        let final_summary =
+            classifier.classify("Here is a summary of what I found across the tool calls.");
+        assert_eq!(final_summary.class, NudgeClass::FinalAnswer);
     }
 
     #[test]
