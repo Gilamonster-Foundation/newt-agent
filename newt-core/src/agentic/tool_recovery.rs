@@ -3,9 +3,10 @@
 //!
 //! The #1 weak-model failure observed in the dgx1 A/B (see
 //! `docs/research/weak-model-plan-mode-findings.md`) is *tool-call format*:
-//! small models emit the call as text — a fenced/bare JSON object, or a
-//! `<function=NAME><parameter=K>V</parameter></function>` block — while the
-//! native `tool_calls` array is empty, so the harness never executes it
+//! small models emit the call as text — a fenced/bare JSON object,
+//! `<function=NAME><parameter=K>V</parameter></function>`, or
+//! `<read_file><path>…</path></read_file>`-style root tags — while the native
+//! `tool_calls` array is empty, so the harness never executes it
 //! (`tool_calls=0` → nothing runs). Even `qwen3-coder:30b` did this on 2/6 runs.
 //!
 //! This module recovers those calls into the **native Ollama shape**
@@ -13,11 +14,12 @@
 //! executor and the `is_hallucination` / dup-guard / caveat path unchanged.
 //!
 //! Authority note (see `docs/decisions/structural_parsing_over_regex.md`): the
-//! JSON form is parsed with `serde_json` (structural); the `<function=>` form is
-//! parsed by a bounded tag scan (no regex → no ReDoS) with a charset-validated
-//! name. Recovery only EXTRACTS `(name, args)`; the authority decision is made
-//! downstream by `resolve_tool_alias` + `is_hallucination` + the caveat check, so
-//! a spoofed name cannot gain authority here.
+//! JSON form is parsed with `serde_json` (structural); XML-ish forms are parsed
+//! by bounded tag scans (no regex → no ReDoS) with charset-validated names. Root
+//! tag recovery only accepts known built-in newt tool names, and recovery only
+//! EXTRACTS `(name, args)`; the authority decision is still made downstream by
+//! `resolve_tool_alias` + `is_hallucination` + the caveat check, so a spoofed
+//! name cannot gain authority here.
 
 use serde_json::{json, Value};
 
@@ -27,9 +29,10 @@ pub struct Recovery {
     /// Recovered calls in native shape (`{"function":{"name","arguments"}}`).
     /// Empty when nothing parseable was found.
     pub calls: Vec<Value>,
-    /// The content *looked* like a tool-call attempt (a `<function=` or a
-    /// `"name"`+`"arguments"` JSON object) even if it did not fully parse — a
-    /// format-hallucination signal the caller counts and steers on.
+    /// The content *looked* like a tool-call attempt (a `<function=`, a known
+    /// tool root tag, or a `"name"`+`"arguments"` JSON object) even if it did
+    /// not fully parse — a format-hallucination signal the caller counts and
+    /// steers on.
     pub tool_shaped: bool,
 }
 
@@ -55,6 +58,10 @@ fn param_value(raw: &str) -> Value {
 
 fn native(name: &str, args: Value) -> Value {
     json!({ "function": { "name": name, "arguments": args } })
+}
+
+fn close_tag(name: &str) -> String {
+    format!("</{name}>")
 }
 
 /// Recover the `<function=NAME> <parameter=K>V</parameter> … </function>` form.
@@ -104,6 +111,61 @@ fn recover_function_tag(content: &str, out: &mut Vec<Value>) -> bool {
         }
     }
     shaped
+}
+
+/// Recover `<TOOL><arg>value</arg>…</TOOL>` where `TOOL` is a known built-in
+/// newt tool name. This is the XML-ish root-tag dialect local models sometimes
+/// learn from other harnesses. Unknown root tags are ignored so prose snippets,
+/// HTML/XML examples, and arbitrary `<note>…</note>` blocks do not become tool
+/// calls.
+fn recover_root_tool_tag(content: &str, out: &mut Vec<Value>) -> bool {
+    let mut shaped = false;
+    let mut rest = content;
+    while let Some(open) = rest.find('<') {
+        let after = &rest[open + 1..];
+        let Some(gt) = after.find('>') else { break };
+        let tag = after[..gt].trim();
+        let name = tag.split_ascii_whitespace().next().unwrap_or("");
+        let body_start = open + 1 + gt + 1;
+
+        if valid_name(name) && super::tools::known_builtin_tool_name(name) {
+            shaped = true;
+            let close = close_tag(name);
+            let Some(body_len) = rest[body_start..].find(&close) else {
+                break;
+            };
+            let body = &rest[body_start..body_start + body_len];
+            out.push(native(name, Value::Object(xml_child_args(body))));
+            rest = &rest[body_start + body_len + close.len()..];
+        } else {
+            rest = &after[gt + 1..];
+        }
+    }
+    shaped
+}
+
+fn xml_child_args(body: &str) -> serde_json::Map<String, Value> {
+    let mut args = serde_json::Map::new();
+    let mut rest = body;
+    while let Some(open) = rest.find('<') {
+        let after = &rest[open + 1..];
+        let Some(gt) = after.find('>') else { break };
+        let tag = after[..gt].trim();
+        let key = tag.split_ascii_whitespace().next().unwrap_or("");
+        let val_start = open + 1 + gt + 1;
+        if valid_name(key) {
+            let close = close_tag(key);
+            let Some(val_len) = rest[val_start..].find(&close) else {
+                break;
+            };
+            let val = &rest[val_start..val_start + val_len];
+            args.insert(key.to_string(), param_value(val));
+            rest = &rest[val_start + val_len + close.len()..];
+        } else {
+            rest = &after[gt + 1..];
+        }
+    }
+    args
 }
 
 /// Recover the JSON-object form: `{"name": "…", "arguments": {…}}`, whether bare
@@ -177,6 +239,9 @@ pub fn recover_tool_calls(content: &str) -> Recovery {
     let mut calls = Vec::new();
     let mut shaped = recover_function_tag(content, &mut calls);
     if calls.is_empty() {
+        shaped |= recover_root_tool_tag(content, &mut calls);
+    }
+    if calls.is_empty() {
         shaped |= recover_json(content, &mut calls);
     }
     Recovery {
@@ -237,6 +302,38 @@ mod tests {
         assert_eq!(r.calls[0]["function"]["name"], "plan_advance");
         assert_eq!(r.calls[1]["function"]["name"], "read_file");
         assert_eq!(r.calls[1]["function"]["arguments"]["path"], "x.rs");
+    }
+
+    #[test]
+    fn recovers_known_tool_root_tag_form_ornith_observed() {
+        let content = "Let me read that now.\n\n<read_file> <path>/Users/shawnhartsock/workspaces/newt-agent/newt-tui/src/help_sections.rs</path> </read_file>";
+        let r = recover_tool_calls(content);
+        assert!(r.tool_shaped);
+        assert_eq!(r.calls.len(), 1);
+        assert_eq!(r.calls[0]["function"]["name"], "read_file");
+        assert_eq!(
+            r.calls[0]["function"]["arguments"]["path"],
+            "/Users/shawnhartsock/workspaces/newt-agent/newt-tui/src/help_sections.rs"
+        );
+    }
+
+    #[test]
+    fn recovers_multiple_known_tool_root_tags_in_order() {
+        let content = "<plan_get></plan_get>\n<read_file><path>x.rs</path></read_file>";
+        let r = recover_tool_calls(content);
+        assert!(r.tool_shaped);
+        assert_eq!(r.calls.len(), 2);
+        assert_eq!(r.calls[0]["function"]["name"], "plan_get");
+        assert_eq!(r.calls[0]["function"]["arguments"], json!({}));
+        assert_eq!(r.calls[1]["function"]["name"], "read_file");
+        assert_eq!(r.calls[1]["function"]["arguments"]["path"], "x.rs");
+    }
+
+    #[test]
+    fn arbitrary_xml_root_tags_are_not_tool_calls() {
+        let r = recover_tool_calls("<note><path>x.rs</path></note>");
+        assert!(r.calls.is_empty());
+        assert!(!r.tool_shaped);
     }
 
     #[test]
