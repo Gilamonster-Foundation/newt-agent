@@ -895,12 +895,18 @@ fn is_tools_unsupported_error(e: &anyhow::Error) -> bool {
 
 /// True when Ollama accepted the `tools` field but its internal XML tool-call
 /// parser rejected the model's generated `<function>/<parameter>` markup before
-/// returning an assistant message. There is no content for Newt's text-mode
-/// tool recovery to parse, so the usable recovery is the same shape as a
-/// tools-unsupported model: retry the turn without advertising tools.
+/// returning an assistant message. This is a malformed generation, not proof
+/// that the model lacks tool support, so retry with tools still advertised and
+/// a corrective nudge instead of disabling tools for the whole turn.
 fn is_ollama_tool_xml_error(e: &anyhow::Error) -> bool {
     let s = e.to_string().to_lowercase();
     s.contains("ollama") && s.contains("xml syntax error")
+}
+
+fn ollama_tool_xml_retry_nudge() -> &'static str {
+    "The previous assistant turn failed inside Ollama's XML tool-call parser. \
+     Keep using tools, but emit exactly one valid native tool call with well-formed \
+     arguments now. Do not answer in prose or wrap the call in explanatory XML."
 }
 
 /// Main agentic loop: call model → execute tool calls → feed results back → repeat.
@@ -1203,6 +1209,8 @@ pub async fn chat_complete(
     let mut stale_file_nudges: usize = 0;
     let nudge_classifier = crate::NudgeClassifier::load_default();
     let workflow_steerer = crate::WorkflowSteerer::load_default();
+    let mut workflow_runtime = WorkflowRuntimeState::default();
+    let mut ollama_xml_retry_nudges: usize = 0;
     // Phase 20 §2.2: the thinking-only quirk is reported at most once per
     // turn — re-detection adds no information and would thrash the cache.
     let mut thinking_only_reported = false;
@@ -1241,6 +1249,9 @@ pub async fn chat_complete(
         if round > 0 {
             if let Some(ptr) = step_ledger.and_then(plan_reseat_pointer) {
                 messages.push(serde_json::json!({ "role": "user", "content": ptr }));
+            }
+            if let Some(nudge) = workflow_runtime.round_start_nudge(step_ledger) {
+                messages.push(serde_json::json!({ "role": "user", "content": nudge }));
             }
         }
 
@@ -1467,23 +1478,37 @@ pub async fn chat_complete(
                 // No-tools recovery: a model that rejects the `tools` field
                 // (deepseek-r1) 400s even on "hello". Drop tools, notice once,
                 // and re-dispatch the same turn — self-limiting because the
-                // rebuilt body omits tools.
+                // rebuilt body omits tools. A malformed XML tool-call error is
+                // different: Ollama accepted tools but choked on the model's
+                // generated markup, so keep tools available and retry with a
+                // bounded corrective nudge.
                 let tools_unsupported = is_tools_unsupported_error(&e);
                 let malformed_xml_tool_call = is_ollama_tool_xml_error(&e);
-                if tools_supported && (tools_unsupported || malformed_xml_tool_call) {
+                if tools_supported && tools_unsupported {
                     tools_supported = false;
                     if !tools_unsupported_notified {
                         tools_unsupported_notified = true;
-                        let notice = if tools_unsupported {
-                            format!("{model} does not support tools — tools disabled for this turn")
-                        } else {
-                            format!(
-                                "{model} produced malformed Ollama XML tool-call syntax — \
-                                 retrying without tools for this turn"
-                            )
-                        };
+                        let notice = format!(
+                            "{model} does not support tools — tools disabled for this turn"
+                        );
                         print_newt(&notice, color, false);
                     }
+                    continue 'round_loop;
+                }
+                if tools_supported && malformed_xml_tool_call && ollama_xml_retry_nudges < 2 {
+                    ollama_xml_retry_nudges += 1;
+                    print_newt(
+                        &format!(
+                            "{model} produced malformed Ollama XML tool-call syntax — \
+                             retrying with a stricter tool-call nudge"
+                        ),
+                        color,
+                        false,
+                    );
+                    messages.push(serde_json::json!({
+                        "role": "user",
+                        "content": ollama_tool_xml_retry_nudge()
+                    }));
                     continue 'round_loop;
                 }
                 // Graceful context-window 400 recovery: parse the model's real
@@ -1983,6 +2008,24 @@ pub async fn chat_complete(
                 .is_plan_update()
                 .then(|| workflow_steerer.plan_update_hint(&workflow_classifier_text))
                 .flatten();
+            if round + 1 < max_tool_rounds {
+                if let Some(nudge) = workflow_runtime.rediscovery_nudge(
+                    Some(&nudge_classification),
+                    &streamed,
+                    step_ledger,
+                ) {
+                    if debug {
+                        print_debug(
+                            "workflow evidence rediscovery — nudging toward active repair",
+                            color,
+                        );
+                    }
+                    messages.push(serde_json::json!({ "role": "assistant", "content": streamed }));
+                    messages.push(serde_json::json!({ "role": "user", "content": nudge }));
+                    accumulated_usage = merge_round_usage(accumulated_usage, stream_usage);
+                    continue 'round_loop;
+                }
+            }
             if pending_plan_nudges < PENDING_PLAN_NUDGE_CAP && round + 1 < max_tool_rounds {
                 if let Some(nudge) = pending_plan_completion_nudge(
                     step_ledger,
@@ -2169,6 +2212,7 @@ pub async fn chat_complete(
             // an exact repeat self-correct next round.
             let ok = tools::tool_result_ok(&result);
             repeat_calls.record(name, &args, ok, &result);
+            workflow_runtime.record_tool_result(&result);
             if let Some(rec) = tool_events.as_deref_mut() {
                 rec.push(crate::ToolEvent::from_call(
                     name,
@@ -2209,6 +2253,7 @@ pub async fn chat_complete(
         } else {
             read_only_rounds = read_only_rounds.saturating_add(1);
         }
+        workflow_runtime.record_round_outcome(round_wrote);
     }
 
     // Reached the round cap. Trim the bloated message list so the final
@@ -2436,6 +2481,207 @@ impl RepeatCallGuard {
     fn total_failures(&self) -> usize {
         self.fails_by_tool.values().sum()
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WorkflowErrorEvidence {
+    fingerprint: String,
+    observations: usize,
+}
+
+#[derive(Debug, Default)]
+struct WorkflowRuntimeState {
+    error_evidence: Option<WorkflowErrorEvidence>,
+    read_only_rounds_after_evidence: usize,
+    writes_after_evidence: usize,
+    step_lock_nudges: usize,
+    rediscovery_nudges: usize,
+}
+
+impl WorkflowRuntimeState {
+    const STEP_LOCK_NUDGE_CAP: usize = 3;
+    const REDISCOVERY_NUDGE_CAP: usize = 2;
+
+    fn record_tool_result(&mut self, result: &str) {
+        let Some(fingerprint) = build_error_fingerprint(result) else {
+            return;
+        };
+        match self.error_evidence.as_mut() {
+            Some(evidence) if evidence.fingerprint == fingerprint => {
+                evidence.observations = evidence.observations.saturating_add(1);
+            }
+            _ => {
+                self.error_evidence = Some(WorkflowErrorEvidence {
+                    fingerprint,
+                    observations: 1,
+                });
+                self.read_only_rounds_after_evidence = 0;
+                self.writes_after_evidence = 0;
+                self.step_lock_nudges = 0;
+                self.rediscovery_nudges = 0;
+            }
+        }
+    }
+
+    fn record_round_outcome(&mut self, round_wrote: bool) {
+        if self.error_evidence.is_none() {
+            return;
+        }
+        if round_wrote {
+            self.writes_after_evidence = self.writes_after_evidence.saturating_add(1);
+            self.read_only_rounds_after_evidence = 0;
+        } else {
+            self.read_only_rounds_after_evidence =
+                self.read_only_rounds_after_evidence.saturating_add(1);
+        }
+    }
+
+    fn round_start_nudge(
+        &mut self,
+        step_ledger: Option<&dyn scheduled::StepLedger>,
+    ) -> Option<String> {
+        let evidence = self.error_evidence.as_ref()?;
+        if self.writes_after_evidence > 0 || self.read_only_rounds_after_evidence == 0 {
+            return None;
+        }
+        if self.step_lock_nudges >= Self::STEP_LOCK_NUDGE_CAP {
+            return None;
+        }
+        self.step_lock_nudges += 1;
+        Some(workflow_step_lock_nudge(
+            &evidence.fingerprint,
+            evidence.observations,
+            active_step_description(step_ledger).as_deref(),
+        ))
+    }
+
+    fn rediscovery_nudge(
+        &mut self,
+        classification: Option<&crate::NudgeClassification>,
+        content: &str,
+        step_ledger: Option<&dyn scheduled::StepLedger>,
+    ) -> Option<String> {
+        let evidence = self.error_evidence.as_ref()?;
+        if self.writes_after_evidence > 0 {
+            return None;
+        }
+        if self.rediscovery_nudges >= Self::REDISCOVERY_NUDGE_CAP {
+            return None;
+        }
+        let classified_stall = classification.is_some_and(|c| {
+            matches!(
+                c.class,
+                crate::NudgeClass::PendingAction | crate::NudgeClass::PlanUpdate
+            )
+        });
+        if !classified_stall && !looks_like_error_rediscovery(content) {
+            return None;
+        }
+        self.rediscovery_nudges += 1;
+        Some(workflow_rediscovery_nudge(
+            &evidence.fingerprint,
+            active_step_description(step_ledger).as_deref(),
+        ))
+    }
+}
+
+fn build_error_fingerprint(result: &str) -> Option<String> {
+    let mut pending_error: Option<String> = None;
+    let mut fingerprints = Vec::new();
+    for line in result.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("error[") || trimmed.starts_with("error:") {
+            pending_error = Some(normalize_error_line(trimmed));
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("-->") {
+            if let Some(error) = pending_error.take() {
+                let location = rest
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .trim_start_matches("./");
+                if location.is_empty() {
+                    fingerprints.push(error);
+                } else {
+                    fingerprints.push(format!("{location} {error}"));
+                }
+                if fingerprints.len() >= 3 {
+                    break;
+                }
+            }
+        }
+    }
+    if fingerprints.is_empty() {
+        pending_error.map(|e| e.chars().take(240).collect())
+    } else {
+        Some(fingerprints.join(" | ").chars().take(500).collect())
+    }
+}
+
+fn normalize_error_line(line: &str) -> String {
+    let mut out = String::new();
+    let mut in_ws = false;
+    for c in line.chars() {
+        if c.is_whitespace() {
+            if !in_ws {
+                out.push(' ');
+                in_ws = true;
+            }
+        } else if c != '`' {
+            out.push(c);
+            in_ws = false;
+        }
+    }
+    out.chars().take(240).collect()
+}
+
+fn active_step_description(step_ledger: Option<&dyn scheduled::StepLedger>) -> Option<String> {
+    let snapshot = step_ledger?.snapshot();
+    snapshot
+        .steps
+        .iter()
+        .find(|step| step.status == StepStatus::Active)
+        .or_else(|| {
+            snapshot
+                .steps
+                .iter()
+                .find(|step| step.status != StepStatus::Done)
+        })
+        .map(|step| step.description.clone())
+}
+
+fn workflow_step_lock_nudge(
+    fingerprint: &str,
+    observations: usize,
+    active_step: Option<&str>,
+) -> String {
+    let active = active_step
+        .map(|step| format!(" Active step: '{step}'."))
+        .unwrap_or_default();
+    format!(
+        "<workflow_state>\nactive_step = \"repair the current compiler/test error\"\nlast_error_fingerprint = \"{fingerprint}\"\nobservations = {observations}\nnext_allowed_actions = \"edit_file/write_file for the active repair, then run the focused verification\"\ndisallowed_actions = \"re-reading the same evidence, re-deriving the same plan, or restating findings without editing\"\n</workflow_state>\n{active} You already have the error evidence above. Do not re-read or summarize it again. Make the smallest edit that addresses this exact fingerprint, then run the focused check."
+    )
+}
+
+fn workflow_rediscovery_nudge(fingerprint: &str, active_step: Option<&str>) -> String {
+    let active = active_step
+        .map(|step| format!(" Active step: '{step}'."))
+        .unwrap_or_default();
+    format!(
+        "You are rediscovering an error that is already recorded: {fingerprint}.{active} Do not restate findings, update the same plan, or claim handoff. Call the concrete edit tool for this repair now. After the edit, run one focused verification command and use its new output as ground truth."
+    )
+}
+
+fn looks_like_error_rediscovery(content: &str) -> bool {
+    let lc = content.to_ascii_lowercase();
+    (lc.contains("summary of findings")
+        || lc.contains("root cause")
+        || lc.contains("current state")
+        || lc.contains("remaining work")
+        || lc.contains("build failure"))
+        && (lc.contains("error") || lc.contains("build") || lc.contains("compile"))
 }
 
 /// Render the agent's working-memory progress (`<plan>` checklist + `<state>`)
@@ -3265,6 +3511,7 @@ pub async fn openai_chat_complete(
     let mut stale_file_nudges: usize = 0;
     let nudge_classifier = crate::NudgeClassifier::load_default();
     let workflow_steerer = crate::WorkflowSteerer::load_default();
+    let mut workflow_runtime = WorkflowRuntimeState::default();
 
     // Agentic loop — up to `max_tool_rounds` tool-call rounds (matches the Ollama path).
     'round_loop: for round in 0..max_tool_rounds {
@@ -3291,6 +3538,9 @@ pub async fn openai_chat_complete(
         if round > 0 {
             if let Some(ptr) = step_ledger.and_then(plan_reseat_pointer) {
                 messages.push(serde_json::json!({ "role": "user", "content": ptr }));
+            }
+            if let Some(nudge) = workflow_runtime.round_start_nudge(step_ledger) {
+                messages.push(serde_json::json!({ "role": "user", "content": nudge }));
             }
         }
 
@@ -3637,6 +3887,23 @@ pub async fn openai_chat_complete(
                 .as_ref()
                 .filter(|classification| classification.is_plan_update())
                 .and_then(|_| workflow_steerer.plan_update_hint(&workflow_classifier_text));
+            if !content.is_empty() && round + 1 < max_tool_rounds {
+                if let Some(nudge) = workflow_runtime.rediscovery_nudge(
+                    nudge_classification.as_ref(),
+                    &content,
+                    step_ledger,
+                ) {
+                    if debug {
+                        print_debug(
+                            "workflow evidence rediscovery — nudging toward active repair",
+                            color,
+                        );
+                    }
+                    messages.push(serde_json::json!({ "role": "assistant", "content": content }));
+                    messages.push(serde_json::json!({ "role": "user", "content": nudge }));
+                    continue 'round_loop;
+                }
+            }
             if !content.is_empty()
                 && pending_plan_nudges < PENDING_PLAN_NUDGE_CAP
                 && round + 1 < max_tool_rounds
@@ -3737,6 +4004,7 @@ pub async fn openai_chat_complete(
             obj.remove("reasoning_content");
         }
         messages.push(assistant_turn);
+        let mut round_wrote = false;
         for tc in tool_calls.unwrap() {
             let id = tc["id"].as_str().unwrap_or("");
             // Some API proxies (e.g. NVIDIA inference → Anthropic backend) wrap
@@ -3803,6 +4071,9 @@ pub async fn openai_chat_complete(
                     "content": steer,
                 }));
                 continue;
+            }
+            if !is_read_only_call(name, &args) {
+                round_wrote = true;
             }
             // Organic save_note use resets the memory-nudge counter (mirrors
             // the Ollama path).
@@ -3873,6 +4144,7 @@ pub async fn openai_chat_complete(
             // (mirrors Ollama path).
             let ok = tools::tool_result_ok(&result);
             repeat_calls.record(name, &args, ok, &result);
+            workflow_runtime.record_tool_result(&result);
             if let Some(rec) = tool_events.as_deref_mut() {
                 rec.push(crate::ToolEvent::from_call(
                     name,
@@ -3907,6 +4179,7 @@ pub async fn openai_chat_complete(
                 "content": spill::maybe_offload(result, tool_offload, spill_store),
             }));
         }
+        workflow_runtime.record_round_outcome(round_wrote);
     }
 
     // Reached the round cap. Trim the message list and make ONE final
@@ -4898,6 +5171,66 @@ mod repeat_call_guard_tests {
         assert!(
             g.repeat_memos.is_empty(),
             "ordinary successful calls must stay repeatable"
+        );
+    }
+
+    #[test]
+    fn workflow_error_fingerprint_captures_cargo_location() {
+        let output = r#"
+error[E0425]: cannot find value `SECTION_PROMPT_TOKENS` in this scope
+   --> newt-tui/src/help_sections.rs:523:22
+    |
+523 |         lines: SECTION_PROMPT_TOKENS,
+    |                ^^^^^^^^^^^^^^^^^^^^^ help: a static with a similar name exists: `SECTION_PROMPT`
+"#;
+
+        let fp = build_error_fingerprint(output).expect("cargo error should fingerprint");
+
+        assert!(fp.contains("newt-tui/src/help_sections.rs:523:22"), "{fp}");
+        assert!(fp.contains("error[E0425]"), "{fp}");
+        assert!(fp.contains("SECTION_PROMPT_TOKENS"), "{fp}");
+    }
+
+    #[test]
+    fn workflow_runtime_nudges_after_error_without_writes() {
+        let output = r#"
+error[E0425]: cannot find value `SECTION_PROMPT_TOKENS` in this scope
+   --> newt-tui/src/help_sections.rs:523:22
+"#;
+        let mut state = WorkflowRuntimeState::default();
+
+        state.record_tool_result(output);
+        state.record_round_outcome(false);
+
+        let nudge = state
+            .round_start_nudge(None)
+            .expect("read-only round after evidence should lock the active repair");
+        assert!(nudge.contains("<workflow_state>"), "{nudge}");
+        assert!(
+            nudge.contains("newt-tui/src/help_sections.rs:523:22"),
+            "{nudge}"
+        );
+        assert!(nudge.contains("next_allowed_actions"), "{nudge}");
+        assert!(nudge.contains("disallowed_actions"), "{nudge}");
+
+        let classification = crate::NudgeClassification {
+            class: crate::NudgeClass::PlanUpdate,
+            score: 1.0,
+        };
+        let rediscovery = state
+            .rediscovery_nudge(
+                Some(&classification),
+                "Summary of Findings\nRoot Cause: the build failure is still present.",
+                None,
+            )
+            .expect("classified summary should be steered toward action");
+        assert!(
+            rediscovery.contains("Do not restate findings"),
+            "{rediscovery}"
+        );
+        assert!(
+            rediscovery.contains("newt-tui/src/help_sections.rs:523:22"),
+            "{rediscovery}"
         );
     }
 
@@ -6773,29 +7106,48 @@ mod http_loop_tests {
     }
 
     /// Ollama can 500 before returning assistant content when its XML parser
-    /// sees malformed Qwen-style tool-call tags. Newt cannot recover a tool call
-    /// it never receives, so it should retry without advertising tools.
+    /// sees malformed Qwen-style tool-call tags. That is not the same as
+    /// "model does not support tools": Newt should retry with tools still
+    /// advertised so the model can make forward progress on the next round.
     struct MalformedToolXmlResponder {
         rejections: Arc<AtomicUsize>,
+        served_with_tools_after_error: Arc<AtomicBool>,
         served_without_tools: Arc<AtomicBool>,
     }
     impl Respond for MalformedToolXmlResponder {
         fn respond(&self, req: &Request) -> ResponseTemplate {
             if body_json(req).get("tools").is_some() {
-                self.rejections.fetch_add(1, Ordering::SeqCst);
-                return ResponseTemplate::new(500).set_body_json(serde_json::json!({
-                    "error": "XML syntax error on line 7: element <parameter> closed by </function>"
+                if self.rejections.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return ResponseTemplate::new(500).set_body_json(serde_json::json!({
+                        "error": "XML syntax error on line 7: element <parameter> closed by </function>"
+                    }));
+                }
+                self.served_with_tools_after_error
+                    .store(true, Ordering::SeqCst);
+                if is_stream(req) {
+                    return ndjson(&[serde_json::json!({
+                        "message": {"content": "recovered with tools still available"},
+                        "done": true,
+                        "prompt_eval_count": 4,
+                        "eval_count": 3
+                    })]);
+                }
+                return ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "message": {"content": "probe answer with tools still available"},
+                    "prompt_eval_count": 4,
+                    "eval_count": 3,
                 }));
             }
             self.served_without_tools.store(true, Ordering::SeqCst);
             if is_stream(req) {
                 ndjson(&[serde_json::json!({
-                    "message": {"content": "recovered without tools"}, "done": true,
+                    "message": {"content": "unexpected no-tools stream"},
+                    "done": true,
                     "prompt_eval_count": 4, "eval_count": 3
                 })])
             } else {
                 ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "message": {"content": "probe answer without tools"},
+                    "message": {"content": "unexpected no-tools probe"},
                     "prompt_eval_count": 4, "eval_count": 3,
                 }))
             }
@@ -6803,14 +7155,16 @@ mod http_loop_tests {
     }
 
     #[tokio::test]
-    async fn ollama_tool_xml_error_recovers_by_dropping_tools() {
+    async fn ollama_tool_xml_error_recovers_with_tools_still_available() {
         let server = MockServer::start().await;
         let rejections = Arc::new(AtomicUsize::new(0));
+        let served_with_tools_after_error = Arc::new(AtomicBool::new(false));
         let served_without_tools = Arc::new(AtomicBool::new(false));
         Mock::given(method("POST"))
             .and(path("/api/chat"))
             .respond_with(MalformedToolXmlResponder {
                 rejections: rejections.clone(),
+                served_with_tools_after_error: served_with_tools_after_error.clone(),
                 served_without_tools: served_without_tools.clone(),
             })
             .mount(&server)
@@ -6821,18 +7175,22 @@ mod http_loop_tests {
         let (reply, streamed, _usage, _) =
             chat_complete(ctx(&server.uri(), &messages, &caveats), &mut NoMcp)
                 .await
-                .expect("malformed XML tool-call parser errors should fall back to no-tools");
+                .expect("malformed XML tool-call parser errors should retry with tools");
 
-        assert_eq!(reply, "recovered without tools");
+        assert_eq!(reply, "recovered with tools still available");
         assert!(streamed);
         assert!(
-            served_without_tools.load(Ordering::SeqCst),
-            "a request without the tools field was eventually served"
+            served_with_tools_after_error.load(Ordering::SeqCst),
+            "a tools-bearing request was served after the XML parser failure"
+        );
+        assert!(
+            !served_without_tools.load(Ordering::SeqCst),
+            "malformed XML must not disable tools for the turn"
         );
         assert_eq!(
             rejections.load(Ordering::SeqCst),
-            1,
-            "the deterministic XML parser failure is not retried with tools"
+            3,
+            "the XML error probe, retry probe, and streaming re-issue all keep tools advertised"
         );
     }
 
