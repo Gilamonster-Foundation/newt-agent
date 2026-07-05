@@ -1358,12 +1358,100 @@ async fn host_shell_dispatch(cmd: &str, cwd: &str) -> std::io::Result<serde_json
     let output = host_shell_output(cmd, cwd).await?;
     Ok(serde_json::json!({
         "exit_code": output.status.code().unwrap_or(-1),
-        "stdout": String::from_utf8_lossy(&output.stdout),
-        "stderr": String::from_utf8_lossy(&output.stderr),
+        "stdout": decode_shell_stream(&output.stdout),
+        "stderr": decode_shell_stream(&output.stderr),
         // Honest provenance, same field the bridle envelope always carries:
         // nothing sandboxed this run.
         "sandbox_kind": "none",
     }))
+}
+
+fn decode_shell_stream(bytes: &[u8]) -> String {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => text.to_string(),
+        Err(_) => repair_bsd_cat_v_utf8(bytes)
+            .unwrap_or_else(|| String::from_utf8_lossy(bytes).into_owned()),
+    }
+}
+
+/// macOS/BSD `cat -v` is not Unicode-aware: for a UTF-8 glyph such as `─`
+/// (`e2 94 80`) it emits the lead byte raw (`e2`) and renders only the
+/// continuation bytes as ASCII meta-control notation (`M-^TM-^@`). That byte
+/// stream is invalid UTF-8, so a plain lossy decode becomes `�M-^TM-^@`.
+///
+/// Repair only that precise shape. This keeps ordinary valid UTF-8 untouched and
+/// leaves unrelated binary output on the existing lossy fallback.
+fn repair_bsd_cat_v_utf8(bytes: &[u8]) -> Option<String> {
+    let mut repaired = Vec::with_capacity(bytes.len());
+    let mut changed = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        let lead = bytes[i];
+        let Some(cont_count) = utf8_continuation_count(lead) else {
+            repaired.push(lead);
+            i += 1;
+            continue;
+        };
+
+        let mut seq = Vec::with_capacity(cont_count + 1);
+        seq.push(lead);
+        let mut j = i + 1;
+        let mut ok = true;
+        for _ in 0..cont_count {
+            match parse_cat_v_meta_byte(bytes, j) {
+                Some((cont, next)) if (0x80..=0xbf).contains(&cont) => {
+                    seq.push(cont);
+                    j = next;
+                }
+                _ => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+
+        if ok && std::str::from_utf8(&seq).is_ok() {
+            repaired.extend_from_slice(&seq);
+            changed = true;
+            i = j;
+        } else {
+            repaired.push(lead);
+            i += 1;
+        }
+    }
+
+    changed.then(|| String::from_utf8(repaired).ok()).flatten()
+}
+
+fn utf8_continuation_count(lead: u8) -> Option<usize> {
+    match lead {
+        0xc2..=0xdf => Some(1),
+        0xe0..=0xef => Some(2),
+        0xf0..=0xf4 => Some(3),
+        _ => None,
+    }
+}
+
+fn parse_cat_v_meta_byte(bytes: &[u8], start: usize) -> Option<(u8, usize)> {
+    if start + 2 > bytes.len() || &bytes[start..start + 2] != b"M-" {
+        return None;
+    }
+    let pos = start + 2;
+    match bytes.get(pos).copied()? {
+        b'^' => {
+            let c = bytes.get(pos + 1).copied()?;
+            let low = if c == b'?' {
+                0x7f
+            } else if (b'@'..=b'_').contains(&c) {
+                c - b'@'
+            } else {
+                return None;
+            };
+            Some((low | 0x80, pos + 2))
+        }
+        c if (0x20..=0x7e).contains(&c) => Some((c | 0x80, pos + 1)),
+        _ => None,
+    }
 }
 
 /// INTERIM (#297) host shell selection: `bash -c` with an `sh -c` fallback
@@ -6975,6 +7063,29 @@ mod disable_ocap_tests {
         assert!(!envelope_denied(&envelope));
         // And the shared formatter renders it like any confined result.
         assert_eq!(shell_envelope_output(&envelope, 20, false), "out\nerr\n");
+    }
+
+    #[test]
+    fn decode_shell_stream_preserves_valid_utf8() {
+        let text = "// ── Model — test ──\n";
+        assert_eq!(decode_shell_stream(text.as_bytes()), text);
+    }
+
+    #[test]
+    fn decode_shell_stream_repairs_bsd_cat_v_utf8_notation() {
+        // This is what macOS/BSD `cat -v` emits for "─ —\n" in a UTF-8
+        // locale: the leading e2 byte is raw, while continuation bytes are
+        // rendered as M-^T/M-^@ etc. A lossy decode would display
+        // "�M-^TM-^@ �M-^@M-^T".
+        let cat_v = b"\xe2M-^TM-^@ \xe2M-^@M-^T\n";
+        assert_eq!(decode_shell_stream(cat_v), "─ —\n");
+    }
+
+    #[test]
+    fn decode_shell_stream_repairs_two_byte_bsd_cat_v_notation() {
+        // "é" is c3 a9; BSD `cat -v` leaves c3 raw and renders a9 as M-).
+        let cat_v = b"caf\xc3M-)\n";
+        assert_eq!(decode_shell_stream(cat_v), "café\n");
     }
 
     /// The venv/PATH prefix logic rides the HOST-BYPASS path unchanged: the
