@@ -1194,6 +1194,10 @@ pub async fn chat_complete(
     // turn); the trigger is `looks_like_intent_to_act`, so a genuine conclusion
     // (with or without prior tool calls this turn) is never nudged.
     let mut narration_nudges: usize = 0;
+    // A stricter sibling: when a model concludes "the file changed under me"
+    // without proving it, force one read-only ground-truth check round instead
+    // of letting it hand the stale-context claim back to the human.
+    let mut stale_file_nudges: usize = 0;
     // Phase 20 §2.2: the thinking-only quirk is reported at most once per
     // turn — re-detection adds no information and would thrash the cache.
     let mut thinking_only_reported = false;
@@ -1965,6 +1969,25 @@ pub async fn chat_complete(
             // chronic narrator can't loop; after the cap the prose is accepted
             // as the final answer (the return below). A genuine from-the-start
             // final answer (no prior call, no intent cue) is never nudged.
+            if stale_file_nudges < STALE_FILE_NUDGE_CAP
+                && round + 1 < max_tool_rounds
+                && looks_like_unverified_stale_file_blocker(&streamed)
+            {
+                if debug {
+                    print_debug(
+                        "unverified stale-file blocker — nudging to check ground truth",
+                        color,
+                    );
+                }
+                messages.push(serde_json::json!({ "role": "assistant", "content": streamed }));
+                messages.push(serde_json::json!({
+                    "role": "user",
+                    "content": stale_file_ground_truth_nudge(),
+                }));
+                stale_file_nudges += 1;
+                accumulated_usage = merge_round_usage(accumulated_usage, stream_usage);
+                continue 'round_loop;
+            }
             if narration_nudges < NARRATION_NUDGE_CAP
                 && round + 1 < max_tool_rounds
                 && looks_like_intent_to_act(&streamed)
@@ -2443,6 +2466,18 @@ fn is_read_only_shell_probe(command: &str) -> bool {
 /// budget; after the cap its narration is accepted as the final answer.
 /// (Candidate for a `[tui] narration_nudge_cap` knob in a follow-up.)
 const NARRATION_NUDGE_CAP: usize = 1;
+/// Max "you claimed file context changed under you without verifying" nudges
+/// per turn. Kept separate from narration nudges: this is a blocker-specific
+/// ground-truth check, not generic intent-to-act recovery.
+const STALE_FILE_NUDGE_CAP: usize = 1;
+
+fn tail_on_char_boundary(s: &str, max_bytes: usize) -> &str {
+    let cut = s.len().saturating_sub(max_bytes);
+    let start = (cut..=s.len())
+        .find(|&i| s.is_char_boundary(i))
+        .unwrap_or(0);
+    &s[start..]
+}
 
 /// Heuristic: does this assistant prose read as "I am ABOUT to act" rather than
 /// a finished answer? The sole trigger for the narrate-then-stop rescue — a
@@ -2513,15 +2548,62 @@ fn looks_like_intent_to_act(content: &str) -> bool {
     // scan the last stretch — the body may recount findings that mention verbs.
     // Snap the cut to a char boundary so a multibyte glyph (em dash, …) at the
     // 400-byte mark can't panic the slice.
-    let cut = lc.len().saturating_sub(400);
-    let start = (cut..=lc.len())
-        .find(|&i| lc.is_char_boundary(i))
-        .unwrap_or(0);
-    let tail = &lc[start..];
+    let tail = tail_on_char_boundary(&lc, 400);
     if NON_ACTIONS.iter().any(|n| tail.contains(n)) {
         return false;
     }
     INTENT_CUES.iter().any(|c| tail.contains(c)) && ACT_VERBS.iter().any(|v| tail.contains(v))
+}
+
+/// Heuristic: did the model stop because it *believes* a file changed under it,
+/// without first proving that via git/filesystem ground truth? This catches the
+/// "stale line numbers ⇒ operator should restore the file" stall: a context
+/// summary or partial read gets mistaken for a concurrent edit, and the model
+/// stops instead of running read-only checks.
+fn looks_like_unverified_stale_file_blocker(content: &str) -> bool {
+    const FILE_CUES: &[&str] = &[
+        "file",
+        "line reference",
+        "line references",
+        "old_string",
+        "edit_file",
+        ".rs",
+        ".toml",
+        ".md",
+    ];
+    const STALE_CUES: &[&str] = &[
+        "modified out from under",
+        "changed out from under",
+        "edited out from under",
+        "modified concurrently",
+        "changed concurrently",
+        "stale context",
+        "contexts are stale",
+        "context is stale",
+        "old line references",
+        "line references are invalid",
+        "file grew from",
+        "grew from",
+    ];
+    const BLOCKER_CUES: &[&str] = &[
+        "blocked",
+        "cannot safely",
+        "can't safely",
+        "could land in the wrong place",
+        "corrupt the code",
+        "restore",
+        "git checkout",
+        "revert",
+        "operator should",
+        "human should",
+        "recommendation",
+    ];
+
+    let lc = content.to_lowercase();
+    let tail = tail_on_char_boundary(&lc, 1_200);
+    FILE_CUES.iter().any(|c| tail.contains(c))
+        && STALE_CUES.iter().any(|c| tail.contains(c))
+        && BLOCKER_CUES.iter().any(|c| tail.contains(c))
 }
 
 /// The corrective injected when the model narrated its next action but emitted
@@ -2532,6 +2614,17 @@ fn narration_action_nudge() -> String {
      (for example edit_file or write_file with the real arguments) — do not just \
      describe it. If you are genuinely finished, say so explicitly in one \
      sentence."
+        .to_string()
+}
+
+fn stale_file_ground_truth_nudge() -> String {
+    "You claimed the file changed under you or that your edit context is stale, \
+     but you did not prove that with ground truth. Before stopping or asking the \
+     operator to restore/revert anything, run read-only verification: git status \
+     --short, git diff -- <file>, wc -l <file>, and re-read the exact target \
+     range. If those checks do not prove an actual concurrent change, continue \
+     from the verified file contents. Never recommend git checkout/revert unless \
+     git diff proves unwanted changes and the operator approves."
         .to_string()
 }
 
@@ -3046,6 +3139,8 @@ pub async fn openai_chat_complete(
 
     // Narrate-then-stop rescue counter (mirror of the Ollama path).
     let mut narration_nudges: usize = 0;
+    // Unverified stale-file blocker rescue counter (mirror of the Ollama path).
+    let mut stale_file_nudges: usize = 0;
 
     // Agentic loop — up to `max_tool_rounds` tool-call rounds (matches the Ollama path).
     'round_loop: for round in 0..max_tool_rounds {
@@ -3411,6 +3506,25 @@ pub async fn openai_chat_complete(
             // Narrate-then-stop rescue (mirror of the Ollama loop): non-empty
             // prose with no tool call. Nudge once and continue instead of ending
             // the turn — bounded by NARRATION_NUDGE_CAP + the round budget.
+            if !content.is_empty()
+                && stale_file_nudges < STALE_FILE_NUDGE_CAP
+                && round + 1 < max_tool_rounds
+                && looks_like_unverified_stale_file_blocker(&content)
+            {
+                if debug {
+                    print_debug(
+                        "unverified stale-file blocker — nudging to check ground truth",
+                        color,
+                    );
+                }
+                messages.push(serde_json::json!({ "role": "assistant", "content": content }));
+                messages.push(serde_json::json!({
+                    "role": "user",
+                    "content": stale_file_ground_truth_nudge(),
+                }));
+                stale_file_nudges += 1;
+                continue 'round_loop;
+            }
             if !content.is_empty()
                 && narration_nudges < NARRATION_NUDGE_CAP
                 && round + 1 < max_tool_rounds
@@ -7272,6 +7386,42 @@ mod http_loop_tests {
         );
     }
 
+    #[tokio::test]
+    async fn stale_file_blocker_nudges_ground_truth_check_and_continues() {
+        let blocker = "\
+Summary
+
+What happened: The lib.rs file I was editing grew from ~9400 to ~16808 lines \
+between reads — likely modified concurrently by another agent or tool. This \
+means my old edit contexts are stale.
+
+Why I'm blocked: I cannot safely use edit_file on lib.rs because the file has \
+been modified out from under me. My old line references and context are invalid \
+for an 8400-line larger file.
+
+Final Answer / Recommendation
+
+The operator should restore lib.rs to a known-good state (e.g., git checkout \
+newt-tui/src/lib.rs).";
+        let (reply, rounds) = run_openai_script(vec![
+            serde_json::json!({ "content": blocker }),
+            serde_json::json!({ "content": "Ground truth checked; lib.rs is clean, so I am continuing." }),
+        ])
+        .await;
+        assert_eq!(
+            rounds, 2,
+            "stale-file blocker should get one verification nudge"
+        );
+        assert!(
+            reply.contains("lib.rs is clean"),
+            "returns the post-nudge answer: {reply}"
+        );
+        assert!(
+            !reply.contains("git checkout"),
+            "must not accept the unverified revert recommendation: {reply}"
+        );
+    }
+
     #[test]
     fn looks_like_intent_to_act_separates_narration_from_final_answers() {
         // Real repro narrations that ended a turn — must read as intent-to-act.
@@ -7307,6 +7457,38 @@ mod http_loop_tests {
         // boundary) must not panic the slice — and still classify as intent.
         let multibyte = format!("{}let me edit", "…".repeat(200));
         assert!(looks_like_intent_to_act(&multibyte));
+    }
+
+    #[test]
+    fn looks_like_unverified_stale_file_blocker_requires_file_stale_and_blocker_cues() {
+        assert!(looks_like_unverified_stale_file_blocker(
+            "The lib.rs file I was editing grew from ~9400 to ~16808 lines between reads. \
+             Why I'm blocked: I cannot safely use edit_file because the file has been \
+             modified out from under me. The operator should restore lib.rs."
+        ));
+        assert!(looks_like_unverified_stale_file_blocker(
+            "My old line references are invalid and the context is stale. Any edit could \
+             land in the wrong place and corrupt the code; recommendation: restore the file."
+        ));
+        assert!(!looks_like_unverified_stale_file_blocker(
+            "The cache entry is stale, so I refreshed it and continued."
+        ));
+        assert!(!looks_like_unverified_stale_file_blocker(
+            "I checked git diff and the file is clean, so I can continue from the verified contents."
+        ));
+    }
+
+    #[test]
+    fn stale_file_ground_truth_nudge_names_read_only_checks_and_revert_guard() {
+        let nudge = stale_file_ground_truth_nudge();
+        assert!(nudge.contains("git status --short"), "{nudge}");
+        assert!(nudge.contains("git diff -- <file>"), "{nudge}");
+        assert!(nudge.contains("wc -l <file>"), "{nudge}");
+        assert!(nudge.contains("re-read the exact target range"), "{nudge}");
+        assert!(
+            nudge.contains("Never recommend git checkout/revert"),
+            "{nudge}"
+        );
     }
 }
 
