@@ -45,6 +45,7 @@ pub mod tokens;
 pub mod tooling;
 pub mod tuning;
 pub mod verify_gate;
+pub mod workflows;
 pub mod workspace_key;
 
 #[cfg(feature = "pyo3")]
@@ -124,4 +125,8 @@ pub use router::{Router, Tier};
 pub use session::SessionId;
 pub use store::{sanitize_fts5_query, ConversationStore, SearchHit};
 pub use tokens::TokenEstimation;
+pub use workflows::{
+    builtin_workflows, load_workflows_from_dir, merge_workflows, workflow_config_dir,
+    WorkflowClassifierConfig, WorkflowConfig, WorkflowSteerer, WorkflowStep,
+};
 pub use workspace_key::workspace_key_v2;

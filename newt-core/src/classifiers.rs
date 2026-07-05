@@ -96,6 +96,7 @@ fn builtin_nudge_classes() -> BTreeMap<String, Vec<String>> {
             vec![
                 "Now I have everything I need. Let me make both edits now.".to_string(),
                 "Let me edit the file.".to_string(),
+                "Let me keep editing now.".to_string(),
                 "Now I'll add the --home flag to the Cli struct.".to_string(),
                 "I'm going to edit the config file.".to_string(),
                 "Let me understand what was already done on this branch and compare it with the issue requirements.".to_string(),
@@ -341,6 +342,7 @@ Next steps needed:
 3. Run just check."
         ));
         assert!(classifier.is_pending_action("Now I'll add the --home flag to the Cli struct."));
+        assert!(classifier.is_pending_action("Let me keep editing now."));
         assert!(classifier.is_pending_action(
             "I found the issue - there's an extra closing brace } on line 809 of help_sections.rs that's causing a syntax error. I need to remove this stray brace."
         ));

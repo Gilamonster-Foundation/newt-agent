@@ -1202,6 +1202,7 @@ pub async fn chat_complete(
     // of letting it hand the stale-context claim back to the human.
     let mut stale_file_nudges: usize = 0;
     let nudge_classifier = crate::NudgeClassifier::load_default();
+    let workflow_steerer = crate::WorkflowSteerer::load_default();
     // Phase 20 §2.2: the thinking-only quirk is reported at most once per
     // turn — re-detection adds no information and would thrash the cache.
     let mut thinking_only_reported = false;
@@ -1977,10 +1978,16 @@ pub async fn chat_complete(
             // as the final answer (the return below). A genuine from-the-start
             // final answer (no prior call, no intent cue) is never nudged.
             let nudge_classification = nudge_classifier.classify(&streamed);
+            let workflow_classifier_text = workflow_classifier_text(&messages, &streamed);
+            let workflow_hint = nudge_classification
+                .is_plan_update()
+                .then(|| workflow_steerer.plan_update_hint(&workflow_classifier_text))
+                .flatten();
             if pending_plan_nudges < PENDING_PLAN_NUDGE_CAP && round + 1 < max_tool_rounds {
                 if let Some(nudge) = pending_plan_completion_nudge(
                     step_ledger,
                     nudge_classification.is_plan_update(),
+                    workflow_hint.as_deref(),
                 ) {
                     if debug {
                         print_debug(
@@ -2594,9 +2601,41 @@ fn stale_file_ground_truth_nudge() -> String {
         .to_string()
 }
 
+fn workflow_classifier_text(messages: &[serde_json::Value], current_content: &str) -> String {
+    let mut parts = Vec::new();
+    let start = messages.len().saturating_sub(12);
+    for message in &messages[start..] {
+        if let Some(text) = message_text(message) {
+            if !text.trim().is_empty() {
+                parts.push(text);
+            }
+        }
+    }
+    if !current_content.trim().is_empty() {
+        parts.push(current_content.to_string());
+    }
+    parts.join("\n")
+}
+
+fn message_text(message: &serde_json::Value) -> Option<String> {
+    match message.get("content")? {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Array(parts) => {
+            let text = parts
+                .iter()
+                .filter_map(|part| part.get("text").and_then(|text| text.as_str()))
+                .collect::<Vec<_>>()
+                .join("\n");
+            (!text.is_empty()).then_some(text)
+        }
+        _ => None,
+    }
+}
+
 fn pending_plan_completion_nudge(
     step_ledger: Option<&dyn scheduled::StepLedger>,
     needs_plan_update: bool,
+    workflow_hint: Option<&str>,
 ) -> Option<String> {
     let snapshot = step_ledger?.snapshot();
     let total = snapshot.steps.len();
@@ -2620,6 +2659,11 @@ fn pending_plan_completion_nudge(
         .map(|s| format!(" Active step: '{}'.", s.description))
         .unwrap_or_default();
     let step_word = if unfinished == 1 { "step" } else { "steps" };
+    let workflow_clause = workflow_hint
+        .map(str::trim)
+        .filter(|hint| !hint.is_empty())
+        .map(|hint| format!("\n\n{hint}"))
+        .unwrap_or_default();
     if needs_plan_update {
         Some(format!(
             "You ended with a findings/next-steps summary while the active plan still has \
@@ -2628,7 +2672,7 @@ fn pending_plan_completion_nudge(
              with the full ordered plan: mark completed steps completed, make the immediate \
              blocker repair the active step, and keep later feature work pending. Then call the \
              next concrete tool for that active repair. Do not repeat the findings summary or \
-             claim a tool-call limit while this nudge is giving you another round."
+             claim a tool-call limit while this nudge is giving you another round.{workflow_clause}"
         ))
     } else {
         Some(format!(
@@ -3176,6 +3220,7 @@ pub async fn openai_chat_complete(
     // Unverified stale-file blocker rescue counter (mirror of the Ollama path).
     let mut stale_file_nudges: usize = 0;
     let nudge_classifier = crate::NudgeClassifier::load_default();
+    let workflow_steerer = crate::WorkflowSteerer::load_default();
 
     // Agentic loop — up to `max_tool_rounds` tool-call rounds (matches the Ollama path).
     'round_loop: for round in 0..max_tool_rounds {
@@ -3543,6 +3588,11 @@ pub async fn openai_chat_complete(
             // the turn — bounded by NARRATION_NUDGE_CAP + the round budget.
             let nudge_classification =
                 (!content.is_empty()).then(|| nudge_classifier.classify(&content));
+            let workflow_classifier_text = workflow_classifier_text(&messages, &content);
+            let workflow_hint = nudge_classification
+                .as_ref()
+                .filter(|classification| classification.is_plan_update())
+                .and_then(|_| workflow_steerer.plan_update_hint(&workflow_classifier_text));
             if !content.is_empty()
                 && pending_plan_nudges < PENDING_PLAN_NUDGE_CAP
                 && round + 1 < max_tool_rounds
@@ -3550,7 +3600,11 @@ pub async fn openai_chat_complete(
                 let needs_plan_update = nudge_classification
                     .as_ref()
                     .is_some_and(|c| c.is_plan_update());
-                if let Some(nudge) = pending_plan_completion_nudge(step_ledger, needs_plan_update) {
+                if let Some(nudge) = pending_plan_completion_nudge(
+                    step_ledger,
+                    needs_plan_update,
+                    workflow_hint.as_deref(),
+                ) {
                     if debug {
                         print_debug(
                             "active plan has unfinished steps — nudging before final answer",
@@ -5065,7 +5119,7 @@ mod cap_exit_unit_tests {
     fn pending_plan_completion_nudge_is_state_driven() {
         use crate::agentic::scheduled::{SessionStepLedger, StepLedger};
 
-        assert!(pending_plan_completion_nudge(None, false).is_none());
+        assert!(pending_plan_completion_nudge(None, false, None).is_none());
 
         let ledger = SessionStepLedger::default();
         ledger.restore(&PlanSnapshot {
@@ -5080,7 +5134,7 @@ mod cap_exit_unit_tests {
                 },
             ],
         });
-        let nudge = pending_plan_completion_nudge(Some(&ledger as &dyn StepLedger), false)
+        let nudge = pending_plan_completion_nudge(Some(&ledger as &dyn StepLedger), false, None)
             .expect("open plan produces a nudge");
         assert!(nudge.contains("1/2 unfinished step"), "{nudge}");
         assert!(nudge.contains("Active step: 'keep working'"), "{nudge}");
@@ -5088,9 +5142,14 @@ mod cap_exit_unit_tests {
         assert!(nudge.contains("call the next tool"), "{nudge}");
         assert!(nudge.contains("concrete blocker"), "{nudge}");
 
-        let plan_update_nudge =
-            pending_plan_completion_nudge(Some(&ledger as &dyn StepLedger), true)
-                .expect("open plan produces a plan-update nudge");
+        let plan_update_nudge = pending_plan_completion_nudge(
+            Some(&ledger as &dyn StepLedger),
+            true,
+            Some(
+                "Configured workflow 'github_pr' is active. Workflow steps:\n- commit_step: Commit the verified step",
+            ),
+        )
+        .expect("open plan produces a plan-update nudge");
         assert!(
             plan_update_nudge.contains("findings/next-steps summary"),
             "{plan_update_nudge}"
@@ -5107,6 +5166,14 @@ mod cap_exit_unit_tests {
             plan_update_nudge.contains("Do not repeat the findings summary"),
             "{plan_update_nudge}"
         );
+        assert!(
+            plan_update_nudge.contains("github_pr"),
+            "{plan_update_nudge}"
+        );
+        assert!(
+            plan_update_nudge.contains("commit_step"),
+            "{plan_update_nudge}"
+        );
 
         ledger.restore(&PlanSnapshot {
             steps: vec![Step {
@@ -5114,7 +5181,33 @@ mod cap_exit_unit_tests {
                 status: StepStatus::Done,
             }],
         });
-        assert!(pending_plan_completion_nudge(Some(&ledger as &dyn StepLedger), false).is_none());
+        assert!(
+            pending_plan_completion_nudge(Some(&ledger as &dyn StepLedger), false, None).is_none()
+        );
+    }
+
+    #[test]
+    fn workflow_classifier_text_keeps_recent_user_issue_context() {
+        let messages = vec![
+            serde_json::json!({
+                "role": "user",
+                "content": "Take a look at https://github.com/Gilamonster-Foundation/newt-agent/issues/548 and get me a PR."
+            }),
+            serde_json::json!({
+                "role": "assistant",
+                "content": "I will inspect the issue and repo state."
+            }),
+        ];
+        let text = workflow_classifier_text(
+            &messages,
+            "Summary of Findings\n\nCurrent Status: the build is broken. Next Steps Required: update the plan.",
+        );
+        let hint = crate::WorkflowSteerer::builtin()
+            .plan_update_hint(&text)
+            .expect("GitHub issue context should select the PR workflow");
+        assert!(hint.contains("github_pr"), "{hint}");
+        assert!(hint.contains("read_issue"), "{hint}");
+        assert!(hint.contains("open_pr"), "{hint}");
     }
 }
 
@@ -7655,16 +7748,19 @@ mod http_loop_tests {
                 serde_json::json!({
                     "content": "Plan updated; continuing with the active step."
                 }),
+                serde_json::json!({
+                    "content": "The active step is now complete."
+                }),
             ],
             Some(&ledger as &dyn StepLedger),
         )
         .await;
         assert_eq!(
-            rounds, 2,
-            "open plan should force one completion-gate round"
+            rounds, 3,
+            "open plan should force a completion-gate round and action-nudge follow-on narration"
         );
         assert!(
-            reply.contains("Plan updated"),
+            reply.contains("complete"),
             "returns the post-nudge answer: {reply}"
         );
         assert!(
@@ -7874,6 +7970,7 @@ newt-tui/src/lib.rs).";
         assert!(looks_like_intent_to_act(
             "Now I'll add the --home flag to the Cli struct."
         ));
+        assert!(looks_like_intent_to_act("Let me keep editing now."));
         assert!(looks_like_intent_to_act(
             "I'm going to edit the config file."
         ));
