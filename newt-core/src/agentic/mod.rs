@@ -2532,6 +2532,12 @@ fn looks_like_intent_to_act(content: &str) -> bool {
         "going to ",
         "i'm now",
         "i am now",
+        "continuing with ",
+        "continuing to ",
+        "continuing by ",
+        "continue with ",
+        "continue to ",
+        "continue by ",
     ];
     const ACT_VERBS: &[&str] = &[
         "edit",
@@ -7687,6 +7693,54 @@ mod http_loop_tests {
     }
 
     #[tokio::test]
+    async fn continuing_with_active_step_after_plan_nudge_gets_action_nudge() {
+        let ledger = SessionStepLedger::default();
+        ledger.restore(&PlanSnapshot {
+            steps: vec![
+                Step {
+                    description: "convert help sections".to_string(),
+                    status: StepStatus::Done,
+                },
+                Step {
+                    description: "insert progressive dispatch".to_string(),
+                    status: StepStatus::Active,
+                },
+                Step {
+                    description: "add tests".to_string(),
+                    status: StepStatus::Todo,
+                },
+            ],
+        });
+        let (reply, rounds) = run_openai_script_with_ledger(
+            vec![
+                serde_json::json!({
+                    "content": "I need to finish Step 2, then Steps 3-5."
+                }),
+                serde_json::json!({
+                    "content": "Plan is current — no update needed. Continuing with step 2: inserting the progressive dispatch into lib.rs."
+                }),
+                serde_json::json!({
+                    "content": "The edit is now complete."
+                }),
+            ],
+            Some(&ledger as &dyn StepLedger),
+        )
+        .await;
+        assert_eq!(
+            rounds, 3,
+            "plan nudge should be followed by an action nudge for continuing-with narration"
+        );
+        assert!(
+            reply.contains("complete"),
+            "returns the post-action-nudge answer: {reply}"
+        );
+        assert!(
+            !reply.contains("Continuing with step 2"),
+            "must not stop on the continuing-with narration: {reply}"
+        );
+    }
+
+    #[tokio::test]
     async fn stale_file_blocker_nudges_ground_truth_check_and_continues() {
         let blocker = "\
 Summary
@@ -7742,6 +7796,9 @@ newt-tui/src/lib.rs).";
         ));
         assert!(looks_like_intent_to_act(
             "The help section logic itself has no tests yet.\n\nLet me commit this first step, then move on:"
+        ));
+        assert!(looks_like_intent_to_act(
+            "Plan is current — no update needed. Continuing with step 2: inserting the progressive dispatch into lib.rs."
         ));
         // Genuine sign-offs / answers — must NOT be nudged.
         assert!(!looks_like_intent_to_act("The capital of France is Paris."));
