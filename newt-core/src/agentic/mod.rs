@@ -1194,6 +1194,9 @@ pub async fn chat_complete(
     // turn); the trigger is `looks_like_intent_to_act`, so a genuine conclusion
     // (with or without prior tool calls this turn) is never nudged.
     let mut narration_nudges: usize = 0;
+    // State-driven final-answer gate: a no-tool reply is suspicious when the
+    // active plan still has open steps. Nudge once to update_plan / act / block.
+    let mut pending_plan_nudges: usize = 0;
     // A stricter sibling: when a model concludes "the file changed under me"
     // without proving it, force one read-only ground-truth check round instead
     // of letting it hand the stale-context claim back to the human.
@@ -1969,6 +1972,21 @@ pub async fn chat_complete(
             // chronic narrator can't loop; after the cap the prose is accepted
             // as the final answer (the return below). A genuine from-the-start
             // final answer (no prior call, no intent cue) is never nudged.
+            if pending_plan_nudges < PENDING_PLAN_NUDGE_CAP && round + 1 < max_tool_rounds {
+                if let Some(nudge) = pending_plan_completion_nudge(step_ledger) {
+                    if debug {
+                        print_debug(
+                            "active plan has unfinished steps — nudging before final answer",
+                            color,
+                        );
+                    }
+                    messages.push(serde_json::json!({ "role": "assistant", "content": streamed }));
+                    messages.push(serde_json::json!({ "role": "user", "content": nudge }));
+                    pending_plan_nudges += 1;
+                    accumulated_usage = merge_round_usage(accumulated_usage, stream_usage);
+                    continue 'round_loop;
+                }
+            }
             if stale_file_nudges < STALE_FILE_NUDGE_CAP
                 && round + 1 < max_tool_rounds
                 && looks_like_unverified_stale_file_blocker(&streamed)
@@ -2466,6 +2484,9 @@ fn is_read_only_shell_probe(command: &str) -> bool {
 /// budget; after the cap its narration is accepted as the final answer.
 /// (Candidate for a `[tui] narration_nudge_cap` knob in a follow-up.)
 const NARRATION_NUDGE_CAP: usize = 1;
+/// Max "you ended while a plan still has open steps" nudges per turn. This is
+/// state-driven from the plan ledger, not prose-matched.
+const PENDING_PLAN_NUDGE_CAP: usize = 1;
 /// Max "you claimed file context changed under you without verifying" nudges
 /// per turn. Kept separate from narration nudges: this is a blocker-specific
 /// ground-truth check, not generic intent-to-act recovery.
@@ -2629,6 +2650,39 @@ fn stale_file_ground_truth_nudge() -> String {
      from the verified file contents. Never recommend git checkout/revert unless \
      git diff proves unwanted changes and the operator approves."
         .to_string()
+}
+
+fn pending_plan_completion_nudge(
+    step_ledger: Option<&dyn scheduled::StepLedger>,
+) -> Option<String> {
+    let snapshot = step_ledger?.snapshot();
+    let total = snapshot.steps.len();
+    if total == 0 {
+        return None;
+    }
+    let unfinished = snapshot
+        .steps
+        .iter()
+        .filter(|s| s.status != StepStatus::Done)
+        .count();
+    if unfinished == 0 {
+        return None;
+    }
+    let active = snapshot
+        .steps
+        .iter()
+        .find(|s| s.status == StepStatus::Active)
+        .or_else(|| snapshot.steps.iter().find(|s| s.status != StepStatus::Done));
+    let active_clause = active
+        .map(|s| format!(" Active step: '{}'.", s.description))
+        .unwrap_or_default();
+    let step_word = if unfinished == 1 { "step" } else { "steps" };
+    Some(format!(
+        "You ended the turn while the active plan still has {unfinished}/{total} unfinished \
+         {step_word}.{active_clause} Either call update_plan with completed steps marked \
+         completed, call the next tool for the active step, or state the concrete blocker. \
+         Do not hand off by only describing remaining work."
+    ))
 }
 
 fn read_only_action_nudge(
@@ -3142,6 +3196,8 @@ pub async fn openai_chat_complete(
 
     // Narrate-then-stop rescue counter (mirror of the Ollama path).
     let mut narration_nudges: usize = 0;
+    // Pending-plan final-answer gate counter (mirror of the Ollama path).
+    let mut pending_plan_nudges: usize = 0;
     // Unverified stale-file blocker rescue counter (mirror of the Ollama path).
     let mut stale_file_nudges: usize = 0;
 
@@ -3509,6 +3565,23 @@ pub async fn openai_chat_complete(
             // Narrate-then-stop rescue (mirror of the Ollama loop): non-empty
             // prose with no tool call. Nudge once and continue instead of ending
             // the turn — bounded by NARRATION_NUDGE_CAP + the round budget.
+            if !content.is_empty()
+                && pending_plan_nudges < PENDING_PLAN_NUDGE_CAP
+                && round + 1 < max_tool_rounds
+            {
+                if let Some(nudge) = pending_plan_completion_nudge(step_ledger) {
+                    if debug {
+                        print_debug(
+                            "active plan has unfinished steps — nudging before final answer",
+                            color,
+                        );
+                    }
+                    messages.push(serde_json::json!({ "role": "assistant", "content": content }));
+                    messages.push(serde_json::json!({ "role": "user", "content": nudge }));
+                    pending_plan_nudges += 1;
+                    continue 'round_loop;
+                }
+            }
             if !content.is_empty()
                 && stale_file_nudges < STALE_FILE_NUDGE_CAP
                 && round + 1 < max_tool_rounds
@@ -5003,6 +5076,42 @@ mod cap_exit_unit_tests {
         let nudge = read_only_action_nudge(3, 2, Some(&ledger as &dyn StepLedger));
         assert!(nudge.contains("active multi-step plan"), "{nudge}");
         assert!(nudge.contains("ACTIVE step"), "{nudge}");
+    }
+
+    #[test]
+    fn pending_plan_completion_nudge_is_state_driven() {
+        use crate::agentic::scheduled::{SessionStepLedger, StepLedger};
+
+        assert!(pending_plan_completion_nudge(None).is_none());
+
+        let ledger = SessionStepLedger::default();
+        ledger.restore(&PlanSnapshot {
+            steps: vec![
+                Step {
+                    description: "already done".to_string(),
+                    status: StepStatus::Done,
+                },
+                Step {
+                    description: "keep working".to_string(),
+                    status: StepStatus::Active,
+                },
+            ],
+        });
+        let nudge = pending_plan_completion_nudge(Some(&ledger as &dyn StepLedger))
+            .expect("open plan produces a nudge");
+        assert!(nudge.contains("1/2 unfinished step"), "{nudge}");
+        assert!(nudge.contains("Active step: 'keep working'"), "{nudge}");
+        assert!(nudge.contains("update_plan"), "{nudge}");
+        assert!(nudge.contains("call the next tool"), "{nudge}");
+        assert!(nudge.contains("concrete blocker"), "{nudge}");
+
+        ledger.restore(&PlanSnapshot {
+            steps: vec![Step {
+                description: "complete".to_string(),
+                status: StepStatus::Done,
+            }],
+        });
+        assert!(pending_plan_completion_nudge(Some(&ledger as &dyn StepLedger)).is_none());
     }
 }
 
@@ -7287,7 +7396,10 @@ mod http_loop_tests {
     }
 
     /// Drive the OpenAI loop over a per-round script; return `(reply, requests)`.
-    async fn run_openai_script(script: Vec<serde_json::Value>) -> (String, usize) {
+    async fn run_openai_script_with_ledger(
+        script: Vec<serde_json::Value>,
+        step_ledger: Option<&dyn StepLedger>,
+    ) -> (String, usize) {
         let server = MockServer::start().await;
         let round = Arc::new(AtomicUsize::new(0));
         Mock::given(method("POST"))
@@ -7303,8 +7415,13 @@ mod http_loop_tests {
         let uri = server.uri();
         let mut c = ctx(&uri, &messages, &caveats);
         c.kind = BackendKind::Openai;
+        c.step_ledger = step_ledger;
         let (reply, _s, _u, _h) = chat_complete(c, &mut NoMcp).await.expect("dispatch");
         (reply, round.load(Ordering::SeqCst))
+    }
+
+    async fn run_openai_script(script: Vec<serde_json::Value>) -> (String, usize) {
+        run_openai_script_with_ledger(script, None).await
     }
 
     #[tokio::test]
@@ -7387,6 +7504,71 @@ mod http_loop_tests {
             reply.contains("checks out"),
             "returns the final answer as-is: {reply}"
         );
+    }
+
+    #[tokio::test]
+    async fn pending_plan_final_answer_nudges_before_handoff() {
+        let ledger = SessionStepLedger::default();
+        ledger.restore(&PlanSnapshot {
+            steps: vec![
+                Step {
+                    description: "convert help sections".to_string(),
+                    status: StepStatus::Done,
+                },
+                Step {
+                    description: "fix format_command_list and update lib.rs".to_string(),
+                    status: StepStatus::Active,
+                },
+                Step {
+                    description: "add tests".to_string(),
+                    status: StepStatus::Todo,
+                },
+            ],
+        });
+        let (reply, rounds) = run_openai_script_with_ledger(
+            vec![
+                serde_json::json!({
+                    "content": "I need to finish Step 2, then Steps 3-5."
+                }),
+                serde_json::json!({
+                    "content": "Plan updated; continuing with the active step."
+                }),
+            ],
+            Some(&ledger as &dyn StepLedger),
+        )
+        .await;
+        assert_eq!(
+            rounds, 2,
+            "open plan should force one completion-gate round"
+        );
+        assert!(
+            reply.contains("Plan updated"),
+            "returns the post-nudge answer: {reply}"
+        );
+        assert!(
+            !reply.contains("I need to finish"),
+            "must not accept a plain handoff while plan is open: {reply}"
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_plan_final_answer_is_accepted() {
+        let ledger = SessionStepLedger::default();
+        ledger.restore(&PlanSnapshot {
+            steps: vec![Step {
+                description: "done".to_string(),
+                status: StepStatus::Done,
+            }],
+        });
+        let (reply, rounds) = run_openai_script_with_ledger(
+            vec![serde_json::json!({
+                "content": "All plan steps are complete."
+            })],
+            Some(&ledger as &dyn StepLedger),
+        )
+        .await;
+        assert_eq!(rounds, 1, "completed plan must not be nudged");
+        assert!(reply.contains("complete"), "returns final answer: {reply}");
     }
 
     #[tokio::test]
