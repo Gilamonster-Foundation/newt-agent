@@ -1219,8 +1219,29 @@ pub async fn chat_complete(
     let mut observed_paths = claim_check::ObservedPaths::default();
     let observed_resolver = claim_check::workspace_resolver(workspace);
 
-    // Agentic loop — up to `max_tool_rounds` tool-call rounds.
-    'round_loop: for round in 0..max_tool_rounds {
+    // Agentic loop — up to `max_tool_rounds` tool-call rounds, with a tiny
+    // evidence-backed grace window when the normal cap lands immediately after
+    // read-only repair context.
+    let hard_tool_rounds = max_tool_rounds.saturating_add(WORKFLOW_GRACE_ROUND_CAP);
+    let mut workflow_grace_rounds = 0usize;
+    'round_loop: for round in 0..hard_tool_rounds {
+        if round >= max_tool_rounds {
+            let Some(nudge) = workflow_runtime.cap_grace_nudge(
+                step_ledger,
+                max_tool_rounds,
+                workflow_grace_rounds,
+            ) else {
+                break;
+            };
+            workflow_grace_rounds += 1;
+            if debug {
+                print_debug(
+                    "workflow evidence at round cap — granting bounded action round",
+                    color,
+                );
+            }
+            messages.push(serde_json::json!({ "role": "user", "content": nudge }));
+        }
         // Interrupt checkpoint (Esc / Ctrl-C): bail before spending another
         // round on the model or a tool. The reply is empty — the caller sees
         // `cancel` set and treats the turn as abandoned regardless.
@@ -2111,6 +2132,7 @@ pub async fn chat_complete(
         );
         messages.push(message.clone());
         let mut round_wrote = false;
+        let mut round_modified_workspace = false;
         for tc in tool_calls.unwrap() {
             let anthropic_native = tc["function"].is_null();
             let name = if anthropic_native {
@@ -2211,6 +2233,9 @@ pub async fn chat_complete(
             // Step 27.3/#771: classify once; remember outcomes that should make
             // an exact repeat self-correct next round.
             let ok = tools::tool_result_ok(&result);
+            if ok && is_workspace_write_call(name) {
+                round_modified_workspace = true;
+            }
             repeat_calls.record(name, &args, ok, &result);
             workflow_runtime.record_tool_result(&result);
             if let Some(rec) = tool_events.as_deref_mut() {
@@ -2253,7 +2278,7 @@ pub async fn chat_complete(
         } else {
             read_only_rounds = read_only_rounds.saturating_add(1);
         }
-        workflow_runtime.record_round_outcome(round_wrote);
+        workflow_runtime.record_round_outcome(round_modified_workspace);
     }
 
     // Reached the round cap. Trim the bloated message list so the final
@@ -2503,7 +2528,7 @@ impl WorkflowRuntimeState {
     const REDISCOVERY_NUDGE_CAP: usize = 2;
 
     fn record_tool_result(&mut self, result: &str) {
-        let Some(fingerprint) = build_error_fingerprint(result) else {
+        let Some(fingerprint) = workflow_error_fingerprint(result) else {
             return;
         };
         match self.error_evidence.as_mut() {
@@ -2583,6 +2608,41 @@ impl WorkflowRuntimeState {
             active_step_description(step_ledger).as_deref(),
         ))
     }
+
+    fn cap_grace_nudge(
+        &mut self,
+        step_ledger: Option<&dyn scheduled::StepLedger>,
+        max_tool_rounds: usize,
+        grace_rounds_used: usize,
+    ) -> Option<String> {
+        let evidence = self.error_evidence.as_ref()?;
+        if self.writes_after_evidence > 0 {
+            if grace_rounds_used > 0 {
+                return None;
+            }
+            return Some(workflow_post_write_grace_nudge(
+                &evidence.fingerprint,
+                active_step_description(step_ledger).as_deref(),
+                max_tool_rounds,
+            ));
+        }
+        if self.read_only_rounds_after_evidence == 0 {
+            return None;
+        }
+        if grace_rounds_used >= WORKFLOW_GRACE_ROUND_CAP {
+            return None;
+        }
+        Some(workflow_cap_grace_nudge(
+            &evidence.fingerprint,
+            active_step_description(step_ledger).as_deref(),
+            max_tool_rounds,
+            grace_rounds_used + 1,
+        ))
+    }
+}
+
+fn workflow_error_fingerprint(result: &str) -> Option<String> {
+    build_error_fingerprint(result).or_else(|| edit_miss_fingerprint(result))
 }
 
 fn build_error_fingerprint(result: &str) -> Option<String> {
@@ -2618,6 +2678,27 @@ fn build_error_fingerprint(result: &str) -> Option<String> {
     } else {
         Some(fingerprints.join(" | ").chars().take(500).collect())
     }
+}
+
+fn edit_miss_fingerprint(result: &str) -> Option<String> {
+    let lc = result.to_ascii_lowercase();
+    if !(lc.contains("old_string")
+        && (lc.contains("not found")
+            || lc.contains("old string not found")
+            || lc.contains("matches 0")
+            || lc.contains("no match")))
+    {
+        return None;
+    }
+    let line = result
+        .lines()
+        .find(|line| {
+            let l = line.to_ascii_lowercase();
+            l.contains("old_string")
+                && (l.contains("not found") || l.contains("matches 0") || l.contains("no match"))
+        })
+        .unwrap_or("edit_file old_string not found");
+    Some(format!("edit_file {}", normalize_error_line(line)))
 }
 
 fn normalize_error_line(line: &str) -> String {
@@ -2661,7 +2742,7 @@ fn workflow_step_lock_nudge(
         .map(|step| format!(" Active step: '{step}'."))
         .unwrap_or_default();
     format!(
-        "<workflow_state>\nactive_step = \"repair the current compiler/test error\"\nlast_error_fingerprint = \"{fingerprint}\"\nobservations = {observations}\nnext_allowed_actions = \"edit_file/write_file for the active repair, then run the focused verification\"\ndisallowed_actions = \"re-reading the same evidence, re-deriving the same plan, or restating findings without editing\"\n</workflow_state>\n{active} You already have the error evidence above. Do not re-read or summarize it again. Make the smallest edit that addresses this exact fingerprint, then run the focused check."
+        "<workflow_state>\nactive_step = \"repair the current tool/build error\"\nlast_error_fingerprint = \"{fingerprint}\"\nobservations = {observations}\nnext_allowed_actions = \"use the latest file evidence, then edit_file/write_file for the active repair, then run the focused verification\"\ndisallowed_actions = \"re-reading the same evidence, re-deriving the same plan, or restating findings without editing\"\n</workflow_state>\n{active} You already have the error evidence above. Do not re-read or summarize it again unless you need one exact replacement span. Make the smallest edit that addresses this exact fingerprint, then run the focused check."
     )
 }
 
@@ -2671,6 +2752,33 @@ fn workflow_rediscovery_nudge(fingerprint: &str, active_step: Option<&str>) -> S
         .unwrap_or_default();
     format!(
         "You are rediscovering an error that is already recorded: {fingerprint}.{active} Do not restate findings, update the same plan, or claim handoff. Call the concrete edit tool for this repair now. After the edit, run one focused verification command and use its new output as ground truth."
+    )
+}
+
+fn workflow_cap_grace_nudge(
+    fingerprint: &str,
+    active_step: Option<&str>,
+    max_tool_rounds: usize,
+    grace_round: usize,
+) -> String {
+    let active = active_step
+        .map(|step| format!(" Active step: '{step}'."))
+        .unwrap_or_default();
+    format!(
+        "<workflow_state>\nnormal_tool_round_cap = {max_tool_rounds}\nworkflow_grace_round = {grace_round}/{WORKFLOW_GRACE_ROUND_CAP}\nlast_error_fingerprint = \"{fingerprint}\"\nnext_allowed_actions = \"call edit_file or write_file now using the latest observed file contents; then run the focused verification\"\ndisallowed_actions = \"summary of findings, handoff, plan rediscovery, or another broad read-only pass\"\n</workflow_state>\nThe normal tool-call cap was reached immediately after repair evidence without a successful workspace edit.{active} This is a bounded extra action round, not a final-answer round. Use the latest observed contents and call the concrete edit tool now. If one exact replacement span is still missing, read only that minimal span, then edit on the next grace round."
+    )
+}
+
+fn workflow_post_write_grace_nudge(
+    fingerprint: &str,
+    active_step: Option<&str>,
+    max_tool_rounds: usize,
+) -> String {
+    let active = active_step
+        .map(|step| format!(" Active step: '{step}'."))
+        .unwrap_or_default();
+    format!(
+        "<workflow_state>\nnormal_tool_round_cap = {max_tool_rounds}\nworkflow_grace_round = 1/{WORKFLOW_GRACE_ROUND_CAP}\nlast_error_fingerprint = \"{fingerprint}\"\nnext_allowed_actions = \"run the focused verification for the edit you just made, or continue the active implementation step with one concrete tool call\"\ndisallowed_actions = \"summary of findings, handoff, or broad rediscovery\"\n</workflow_state>\nThe normal tool-call cap was reached immediately after a workspace edit related to recorded repair evidence.{active} This is a bounded verification round. Do not summarize or stop because of the normal cap; run the focused check or the next concrete implementation tool now."
     )
 }
 
@@ -2720,6 +2828,10 @@ fn is_read_only_call(name: &str, args: &serde_json::Value) -> bool {
                 .is_some_and(is_read_only_shell_probe))
 }
 
+fn is_workspace_write_call(name: &str) -> bool {
+    matches!(name, "write_file" | "edit_file")
+}
+
 fn is_read_only_shell_probe(command: &str) -> bool {
     let command = command.trim();
     if command.is_empty() {
@@ -2757,6 +2869,11 @@ const SUSPICIOUS_EMPTY_RETRY_CAP: u32 = 2;
 /// per turn. Kept separate from narration nudges: this is a blocker-specific
 /// ground-truth check, not generic intent-to-act recovery.
 const STALE_FILE_NUDGE_CAP: usize = 1;
+/// Extra rounds granted only when workflow evidence says the normal cap would
+/// otherwise stop immediately after read-only repair context. This is not a
+/// general cap raise; a successful workspace write or exhausted evidence stops
+/// the grace path.
+const WORKFLOW_GRACE_ROUND_CAP: usize = 2;
 
 fn tail_on_char_boundary(s: &str, max_bytes: usize) -> &str {
     let cut = s.len().saturating_sub(max_bytes);
@@ -3513,8 +3630,29 @@ pub async fn openai_chat_complete(
     let workflow_steerer = crate::WorkflowSteerer::load_default();
     let mut workflow_runtime = WorkflowRuntimeState::default();
 
-    // Agentic loop — up to `max_tool_rounds` tool-call rounds (matches the Ollama path).
-    'round_loop: for round in 0..max_tool_rounds {
+    // Agentic loop — up to `max_tool_rounds` tool-call rounds (matches the
+    // Ollama path), plus bounded workflow grace rounds when the normal cap
+    // would stop after read-only repair context.
+    let hard_tool_rounds = max_tool_rounds.saturating_add(WORKFLOW_GRACE_ROUND_CAP);
+    let mut workflow_grace_rounds = 0usize;
+    'round_loop: for round in 0..hard_tool_rounds {
+        if round >= max_tool_rounds {
+            let Some(nudge) = workflow_runtime.cap_grace_nudge(
+                step_ledger,
+                max_tool_rounds,
+                workflow_grace_rounds,
+            ) else {
+                break;
+            };
+            workflow_grace_rounds += 1;
+            if debug {
+                print_debug(
+                    "workflow evidence at round cap — granting bounded action round",
+                    color,
+                );
+            }
+            messages.push(serde_json::json!({ "role": "user", "content": nudge }));
+        }
         // Interrupt checkpoint (Esc / Ctrl-C), same contract as the Ollama path:
         // bail at the round boundary with an empty reply; the caller treats the
         // turn as abandoned. (The OpenAI path's per-request awaits are not yet
@@ -4004,7 +4142,7 @@ pub async fn openai_chat_complete(
             obj.remove("reasoning_content");
         }
         messages.push(assistant_turn);
-        let mut round_wrote = false;
+        let mut round_modified_workspace = false;
         for tc in tool_calls.unwrap() {
             let id = tc["id"].as_str().unwrap_or("");
             // Some API proxies (e.g. NVIDIA inference → Anthropic backend) wrap
@@ -4071,9 +4209,6 @@ pub async fn openai_chat_complete(
                     "content": steer,
                 }));
                 continue;
-            }
-            if !is_read_only_call(name, &args) {
-                round_wrote = true;
             }
             // Organic save_note use resets the memory-nudge counter (mirrors
             // the Ollama path).
@@ -4143,6 +4278,9 @@ pub async fn openai_chat_complete(
             // Step 27.3/#771: classify once; remember repeat-steered outcomes
             // (mirrors Ollama path).
             let ok = tools::tool_result_ok(&result);
+            if ok && is_workspace_write_call(name) {
+                round_modified_workspace = true;
+            }
             repeat_calls.record(name, &args, ok, &result);
             workflow_runtime.record_tool_result(&result);
             if let Some(rec) = tool_events.as_deref_mut() {
@@ -4179,7 +4317,7 @@ pub async fn openai_chat_complete(
                 "content": spill::maybe_offload(result, tool_offload, spill_store),
             }));
         }
-        workflow_runtime.record_round_outcome(round_wrote);
+        workflow_runtime.record_round_outcome(round_modified_workspace);
     }
 
     // Reached the round cap. Trim the message list and make ONE final
@@ -5232,6 +5370,47 @@ error[E0425]: cannot find value `SECTION_PROMPT_TOKENS` in this scope
             rediscovery.contains("newt-tui/src/help_sections.rs:523:22"),
             "{rediscovery}"
         );
+    }
+
+    #[test]
+    fn workflow_runtime_tracks_failed_edit_as_unresolved_evidence() {
+        let output = "error: old_string not found in newt-tui/src/help_sections.rs";
+        let mut state = WorkflowRuntimeState::default();
+
+        state.record_tool_result(output);
+        state.record_round_outcome(false);
+
+        let nudge = state
+            .round_start_nudge(None)
+            .expect("failed edit should remain unresolved repair evidence");
+        assert!(nudge.contains("old_string not found"), "{nudge}");
+
+        let grace = state
+            .cap_grace_nudge(None, 25, 0)
+            .expect("cap after failed edit/read-only recovery should grant an action round");
+        assert!(grace.contains("workflow_grace_round = 1/2"), "{grace}");
+        assert!(
+            grace.contains("call edit_file or write_file now"),
+            "{grace}"
+        );
+
+        state.record_round_outcome(true);
+        let verify = state
+            .cap_grace_nudge(None, 25, 0)
+            .expect("a successful edit at the cap should get one verification round");
+        assert!(verify.contains("focused verification"), "{verify}");
+        assert!(
+            state.cap_grace_nudge(None, 25, 1).is_none(),
+            "post-edit verification grace is granted only once"
+        );
+    }
+
+    #[test]
+    fn workspace_write_classifier_is_narrow() {
+        assert!(is_workspace_write_call("edit_file"));
+        assert!(is_workspace_write_call("write_file"));
+        assert!(!is_workspace_write_call("run_command"));
+        assert!(!is_workspace_write_call("read_file"));
     }
 
     #[test]
