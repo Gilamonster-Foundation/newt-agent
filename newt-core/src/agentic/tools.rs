@@ -673,6 +673,13 @@ static ALL_TOOL_NAMES: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
         .collect()
 });
 
+/// Whether `tool_name` is a built-in newt tool name. Dynamic MCP tool names are
+/// intentionally excluded; callers that need MCP should check their live MCP
+/// registry separately.
+pub(crate) fn known_builtin_tool_name(tool_name: &str) -> bool {
+    ALL_TOOL_NAMES.contains(&tool_name)
+}
+
 /// Whether a [`Gate`] is satisfied given this session's injected capabilities.
 /// Extracted so [`merged_tool_definitions`] reads as one loop over the registry.
 #[allow(clippy::too_many_arguments)] // mirrors merged_tool_definitions' with_* flags
