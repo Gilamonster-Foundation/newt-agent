@@ -1,5 +1,9 @@
 //! Categorized help data for slash commands.
 //! Used by `help_display()` in lib.rs to render grouped output.
+//!
+//! Rollups let the user drill down: a top-level command shows its group's
+//! overview (which sub-commands exist), and `/cmd help <name>` resolves to
+//! one of three levels — rollup page, detail page, or one-shot `command_help_page`.
 
 use std::fmt::Write as FmtWrite;
 
@@ -9,6 +13,153 @@ pub struct HelpSection {
     pub title: &'static str,
     /// Lines for this section (no leading slash prefix).
     pub lines: &'static [&'static str],
+}
+
+// ── Rollup infrastructure ────────────────────────────────────────
+
+/// A page shown when the user drills into a command group. Contains the
+/// group's sub-commands plus optional nested detail pages for each one.
+#[derive(Clone, Debug)]
+pub struct RollupPage {
+    /// Display title (e.g. "Conversation", "Models").
+    pub title: &'static str,
+    /// One-line summary of what this group does.
+    pub summary: &'static str,
+    /// Sub-commands with their one-line descriptions and optional detail key.
+    /// `detail_key` is the command name to look up in `command_detail()`.
+    pub entries: &'static [RollupEntry],
+}
+
+/// A single entry inside a rollup page.
+#[derive(Clone, Debug)]
+pub struct RollupEntry {
+    /// The slash command (without leading `/`).
+    pub cmd: &'static str,
+    /// Short description shown inline.
+    pub desc: &'static str,
+    /// Optional detail key — if set, this entry has a drill-down page.
+    pub detail_key: Option<&'static str>,
+}
+
+// ── Rollup data ────────────────────────────────────────────────
+
+/// Conversation commands rollup (main + context).
+pub static ROLLUP_CONVERSATION: RollupPage = RollupPage {
+    title: "Conversation",
+    summary: "Start, end, and manage your chat session.",
+    entries: &[
+        RollupEntry { cmd: "help", desc: "Show all available commands", detail_key: None },
+        RollupEntry { cmd: "new", desc: "Start a new conversation (alias: /reset, /restart)", detail_key: None },
+        RollupEntry { cmd: "end", desc: "End the current conversation (alias: /done)", detail_key: None },
+        RollupEntry { cmd: "remember", desc: "Save a note to persistent memory", detail_key: Some("memory") },
+        RollupEntry { cmd: "forget", desc: "Remove a saved note", detail_key: None },
+        RollupEntry { cmd: "notes", desc: "List all saved notes", detail_key: None },
+        RollupEntry { cmd: "context", desc: "Show current conversation state", detail_key: None },
+        RollupEntry { cmd: "compress", desc: "Compress the conversation to reduce token usage", detail_key: Some("compress") },
+        RollupEntry { cmd: "restore", desc: "Restore a previous conversation from session history", detail_key: None },
+        RollupEntry { cmd: "save", desc: "Save the current conversation to disk", detail_key: None },
+    ],
+};
+
+/// Model and backend commands rollup.
+pub static ROLLUP_MODELS: RollupPage = RollupPage {
+    title: "Models & Backends",
+    summary: "Inspect, switch, and classify models.",
+    entries: &[
+        RollupEntry { cmd: "models", desc: "List models on the active endpoint", detail_key: Some("models") },
+        RollupEntry { cmd: "model", desc: "Switch the model on the active backend", detail_key: Some("model") },
+        RollupEntry { cmd: "backend", desc: "Switch the backend wire protocol", detail_key: Some("backend") },
+        RollupEntry { cmd: "backends", desc: "List configured backends, or switch to one by name", detail_key: Some("backends") },
+        RollupEntry { cmd: "probe", desc: "Test a model with a simple prompt and show latency/quality", detail_key: Some("probe") },
+    ],
+};
+
+/// Tools and integration rollup.
+pub static ROLLUP_TOOLS: RollupPage = RollupPage {
+    title: "Tools & Integration",
+    summary: "External tool integration and agent communication.",
+    entries: &[
+        RollupEntry { cmd: "mcp", desc: "Run an MCP server tool (alias: /mcptool)", detail_key: None },
+        RollupEntry { cmd: "acp", desc: "Start the ACP worker for cross-agent communication", detail_key: None },
+        RollupEntry { cmd: "tools", desc: "Manage available tools", detail_key: Some("tools") },
+    ],
+};
+
+/// Settings and configuration rollup.
+pub static ROLLUP_SETTINGS: RollupPage = RollupPage {
+    title: "Settings & Configuration",
+    summary: "Configuration, permissions, and system settings.",
+    entries: &[
+        RollupEntry { cmd: "config", desc: "Show or set configuration (alias: /set)", detail_key: Some("config") },
+        RollupEntry { cmd: "reset-config", desc: "Reset all configuration to defaults", detail_key: None },
+        RollupEntry { cmd: "log-level", desc: "Set logging level (debug, info, warn, error)", detail_key: None },
+        RollupEntry { cmd: "permissions", desc: "Manage permissions (alias: /perm)", detail_key: Some("permissions") },
+        RollupEntry { cmd: "allow", desc: "Allow a specific command permanently", detail_key: None },
+    ],
+};
+
+/// Agent and evaluation rollup.
+pub static ROLLUP_AGENT: RollupPage = RollupPage {
+    title: "Agent & Evaluation",
+    summary: "Agent behavior, personas, testing, and system info.",
+    entries: &[
+        RollupEntry { cmd: "agent", desc: "Switch to a specific agent persona or list available agents", detail_key: Some("agent") },
+        RollupEntry { cmd: "plan", desc: "Show the current task plan (alias: /todo)", detail_key: Some("plan") },
+        RollupEntry { cmd: "stop", desc: "Stop the current operation/execution", detail_key: None },
+        RollupEntry { cmd: "persona", desc: "Manage personas", detail_key: Some("persona") },
+        RollupEntry { cmd: "eval", desc: "Run an evaluation suite or specific test (alias: /e)", detail_key: Some("eval") },
+        RollupEntry { cmd: "benchmark", desc: "Run a benchmark suite", detail_key: None },
+        RollupEntry { cmd: "status", desc: "Show system status (version, backends, uptime)", detail_key: None },
+        RollupEntry { cmd: "debug", desc: "Enable debug mode for a specific feature", detail_key: None },
+        RollupEntry { cmd: "info", desc: "Show detailed system information", detail_key: None },
+    ],
+};
+
+/// DGX hub commands rollup.
+pub static ROLLUP_DGX: RollupPage = RollupPage {
+    title: "DGX Hub",
+    summary: "Pull, list, and inspect models from the DGX hub.",
+    entries: &[
+        RollupEntry { cmd: "dgx", desc: "Manage DGX hub models", detail_key: Some("dgx") },
+    ],
+};
+
+/// Conversation management rollup (separate from main conversation).
+pub static ROLLUP_CONVERSATION_MGMT: RollupPage = RollupPage {
+    title: "Conversation Management",
+    summary: "Advanced conversation lifecycle operations.",
+    entries: &[
+        RollupEntry { cmd: "conversation", desc: "Manage conversation history and export", detail_key: Some("conversation") },
+    ],
+};
+
+/// All rollup pages, keyed by the top-level command name.
+pub static SECTION_MAIN_ROLLUPS: &[(&str, &RollupPage)] = &[
+    ("conversation", &ROLLUP_CONVERSATION),
+    ("models", &ROLLUP_MODELS),
+    ("tools", &ROLLUP_TOOLS),
+    ("settings", &ROLLUP_SETTINGS),
+    ("agent", &ROLLUP_AGENT),
+    ("dgx", &ROLLUP_DGX),
+    ("conversation-mgmt", &ROLLUP_CONVERSATION_MGMT),
+];
+
+// Helper: check if a command has rollup pages.
+pub fn topic_has_rollups(topic: &str) -> bool {
+    SECTION_MAIN_ROLLUPS.iter().any(|(name, _)| *name == topic)
+}
+
+/// Get the rollup page for a topic (if any).
+pub fn rollup_page_for_topic(topic: &str) -> Option<&'static RollupPage> {
+    SECTION_MAIN_ROLLUPS
+        .iter()
+        .find(|(name, _)| *name == topic)
+        .map(|(_, page)| *page)
+}
+
+/// Get the detail lines for a command (if any).
+pub fn rollup_detail_for(cmd: &str) -> Option<&'static [&'static str]> {
+    command_detail(cmd)
 }
 
 // ── Main command sections ────────────────────────────────────────

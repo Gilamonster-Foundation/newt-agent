@@ -35,6 +35,7 @@ use mcp::Mcp;
 use newt_core::agentic::{
     chat_complete, print_harness_notice, print_newt, warmup_if_cold, ChatCtx, NEWT_ORANGE_CT,
 };
+use help_sections::{rollup_page_for_topic, topic_has_rollups};
 use std::borrow::Cow;
 
 /// Run the (non-interactive) setup wizard unconditionally — used by `newt init`.
@@ -9695,11 +9696,23 @@ Add --help (or -h) to any command for its page."
 
 /// Print one command's `--help` page; `true` when a page exists. Unknown topics
 /// get a one-line miss so a typo doesn't fall through to the wrong handler.
+/// Supports progressive disclosure: if the topic has rollups, show the grouped
+/// overview first; otherwise render the flat detail page.
 fn print_command_help(cmd: &str, color: bool, verbose: bool) -> bool {
+    let canonical = canonical_help_topic(cmd);
+
+    // Rollup support: some topics (e.g. /model-config) group many related
+    // sub-commands under one name — show a rollup page listing them instead of
+    // the single canonical help page. Sub-command --help still resolves via
+    // `command_help_page` below, so individual detail pages are untouched.
+    if topic_has_rollups(canonical) {
+        return print_rollup_page(canonical, color, verbose);
+    }
+
     match command_help_page(cmd) {
         Some(page) => {
             print_newt(
-                &format!("/{} help", canonical_help_topic(cmd)),
+                &format!("/{} help", canonical),
                 color,
                 verbose,
             );
@@ -9716,6 +9729,40 @@ fn print_command_help(cmd: &str, color: bool, verbose: bool) -> bool {
             );
             false
         }
+    }
+}
+
+/// Render a rollup page: group header + sub-command list with descriptions.
+/// This is the "progressive disclosure" layer — shows what's available in a
+/// category before drilling into individual commands.
+fn print_rollup_page(topic: &str, color: bool, verbose: bool) -> bool {
+    if let Some(page) = rollup_page_for_topic(topic) {
+        // Header
+        print_newt(&format!("/{} help — {}", topic, page.title), color, verbose);
+        println!("{}", page.summary);
+        println!();
+
+        // Sub-commands with descriptions and optional drill-down indicators.
+        for entry in page.entries.iter() {
+            let cmd_prefix = format!("  /{}", entry.cmd);
+            let desc = if entry.detail_key.is_some() {
+                format!("{} — click for details", entry.desc)
+            } else {
+                entry.desc.to_string()
+            };
+            print_newt(&cmd_prefix, color, verbose);
+            println!("{}", desc);
+        }
+
+        // Footer hint: suggest drilling into a sub-command.
+        if !page.entries.is_empty() {
+            println!();
+            println!("  Run /<command> --help for the full detail page.");
+        }
+
+        true
+    } else {
+        false
     }
 }
 
