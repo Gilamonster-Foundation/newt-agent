@@ -93,6 +93,7 @@ fn builtin_nudge_classes() -> BTreeMap<String, Vec<String>> {
                 "The help section logic itself has no tests yet. Let me commit this first step, then move on.".to_string(),
                 "Plan is current — no update needed. Continuing with step 2: inserting the progressive dispatch into lib.rs.".to_string(),
                 "Continuing with the active step: updating the file now.".to_string(),
+                "I found the issue: there is an extra closing brace causing a syntax error. I need to remove this stray brace.".to_string(),
                 "Next I will add the tests.".to_string(),
                 "Current blocker: the for loop needs a one line fix. Next steps needed: fix the iteration type error in lib.rs.".to_string(),
                 "What remains: fix the compile error, add tests, and run the check.".to_string(),
@@ -319,6 +320,9 @@ Next steps needed:
 3. Run just check."
         ));
         assert!(classifier.is_pending_action("Now I'll add the --home flag to the Cli struct."));
+        assert!(classifier.is_pending_action(
+            "I found the issue - there's an extra closing brace } on line 809 of help_sections.rs that's causing a syntax error. I need to remove this stray brace."
+        ));
         assert!(!classifier.is_pending_action("The capital of France is Paris."));
         assert!(!classifier.is_pending_action("Done. Let me know if you want any further changes."));
     }

@@ -7553,6 +7553,38 @@ mod http_loop_tests {
     }
 
     #[tokio::test]
+    async fn observed_fix_intent_after_a_tool_call_nudges_and_continues() {
+        // Live repro: after a read-only observation, the model identified the
+        // exact edit but stopped on prose instead of calling the edit tool.
+        let (reply, rounds) = run_openai_script(vec![
+            serde_json::json!({
+                "content": null,
+                "tool_calls": [{
+                    "id": "c1", "type": "function",
+                    "function": { "name": "definitely_not_a_real_tool", "arguments": "{}" }
+                }]
+            }),
+            serde_json::json!({
+                "content": "I found the issue - there's an extra closing brace } on line 809 of help_sections.rs that's causing a syntax error. I need to remove this stray brace."
+            }),
+            serde_json::json!({ "content": "The stray brace is removed and the compile error is fixed." }),
+        ])
+        .await;
+        assert_eq!(
+            rounds, 3,
+            "tool call, narrated edit intent, then post-nudge answer; got {rounds}"
+        );
+        assert!(
+            reply.contains("compile error is fixed"),
+            "returns the post-nudge answer: {reply}"
+        );
+        assert!(
+            !reply.contains("I need to remove"),
+            "must not stop on the narrated edit intent: {reply}"
+        );
+    }
+
+    #[tokio::test]
     async fn pending_plan_final_answer_nudges_before_handoff() {
         let ledger = SessionStepLedger::default();
         ledger.restore(&PlanSnapshot {
@@ -7724,6 +7756,9 @@ newt-tui/src/lib.rs).";
         ));
         assert!(looks_like_intent_to_act(
             "Plan is current — no update needed. Continuing with step 2: inserting the progressive dispatch into lib.rs."
+        ));
+        assert!(looks_like_intent_to_act(
+            "I found the issue - there's an extra closing brace } on line 809 of help_sections.rs that's causing a syntax error. I need to remove this stray brace."
         ));
         // Genuine sign-offs / answers — must NOT be nudged.
         assert!(!looks_like_intent_to_act("The capital of France is Paris."));
