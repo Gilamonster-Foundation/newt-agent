@@ -4425,6 +4425,51 @@ fn build_semantic_embedder(
     ))
 }
 
+/// Preflight semantic embedder availability before walking the workspace. This
+/// keeps default-on semantic context cheap in binaries that were not built with
+/// the embedded feature, or where the local model path is not configured yet.
+fn semantic_embedder_unavailable_reason(cfg: &newt_core::SemanticConfig) -> Option<String> {
+    if !embeddings_backend_is_embedded(cfg) {
+        return None;
+    }
+    #[cfg(not(feature = "embedded"))]
+    {
+        Some(
+            "embedded semantic retrieval is selected, but this binary lacks the `embedded` \
+             feature; rebuild with --features embedded or configure an explicit \
+             [context.semantic].embeddings_endpoint"
+                .to_string(),
+        )
+    }
+    #[cfg(feature = "embedded")]
+    {
+        let Some(path) = cfg.embedding_model_path.as_deref() else {
+            return Some(
+                "embedded semantic retrieval needs [context.semantic].embedding_model_path \
+                 pointing at a local candle-clean standard-BERT model dir"
+                    .to_string(),
+            );
+        };
+        let dir = std::path::Path::new(path);
+        if !dir.is_dir() {
+            return Some(format!(
+                "embedded semantic retrieval model dir not found: {}",
+                dir.display()
+            ));
+        }
+        for required in ["config.json", "tokenizer.json", "model.safetensors"] {
+            let file = dir.join(required);
+            if !file.exists() {
+                return Some(format!(
+                    "embedded semantic retrieval model file not found: {}",
+                    file.display()
+                ));
+            }
+        }
+        None
+    }
+}
+
 /// Build the in-process candle embedder (#720). The `CandleEmbedder` loads a
 /// candle-clean standard-BERT model from `model_path` (a local dir) once and
 /// embeds on a non-contending device (CPU by default). Falls back to a failing
@@ -6278,15 +6323,20 @@ fn run_chat(
                     // embedder (when `embeddings_api = "embedded"`) — the latter
                     // computes embeddings locally so retrieval never touches the
                     // DGX chat model's VRAM. The selection is a pure helper.
-                    let semantic_embedder: Option<Box<dyn newt_core::Embedder>> =
-                        semantic_on.then(|| {
-                            build_semantic_embedder(
+                    let semantic_embedder: Option<Box<dyn newt_core::Embedder>> = if semantic_on {
+                        if semantic_embedder_unavailable_reason(&semantic_cfg).is_some() {
+                            None
+                        } else {
+                            Some(build_semantic_embedder(
                                 &semantic_cfg,
                                 &inf_url,
                                 inf_kind,
                                 inf_key.as_deref(),
-                            )
-                        });
+                            ))
+                        }
+                    } else {
+                        None
+                    };
                     if let Some(embedder) = semantic_embedder.as_deref() {
                         if !semantic_indexed {
                             // Attempt indexing ONCE per session (reset on /new),
@@ -15531,6 +15581,29 @@ mod helper_fn_tests {
             ..Default::default()
         };
         assert!(semantic_zero_index_hint(&http).contains("Ollama/OpenAI"));
+    }
+
+    #[test]
+    fn semantic_embedder_preflight_skips_unavailable_embedded_path() {
+        let embedded = newt_core::SemanticConfig::default();
+        let reason = semantic_embedder_unavailable_reason(&embedded)
+            .expect("default semantic embeddings select the embedded path");
+        #[cfg(not(feature = "embedded"))]
+        assert!(
+            reason.contains("lacks the `embedded` feature"),
+            "got: {reason}"
+        );
+        #[cfg(feature = "embedded")]
+        assert!(reason.contains("embedding_model_path"), "got: {reason}");
+    }
+
+    #[test]
+    fn semantic_embedder_preflight_allows_explicit_http_embeddings() {
+        let http = newt_core::SemanticConfig {
+            embeddings_api: Some(newt_core::BackendKind::Ollama),
+            ..Default::default()
+        };
+        assert!(semantic_embedder_unavailable_reason(&http).is_none());
     }
 
     #[tokio::test]
