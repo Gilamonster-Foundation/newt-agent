@@ -1371,6 +1371,122 @@ fn runtime_context_block(model: &str, endpoint: &str, kind: newt_core::BackendKi
     )
 }
 
+const WORKSPACE_STATE_DIRTY_FILE_LIMIT: usize = 12;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WorkspaceStateSnapshot {
+    timestamp: String,
+    branch: Option<String>,
+    dirty_files: Vec<String>,
+    git_status_available: bool,
+}
+
+fn workspace_state_block(workspace: &str) -> String {
+    format_workspace_state_block(&collect_workspace_state(workspace))
+}
+
+fn collect_workspace_state(workspace: &str) -> WorkspaceStateSnapshot {
+    let timestamp = chrono::Local::now().to_rfc3339();
+    let branch = git_stdout(workspace, &["branch", "--show-current"])
+        .filter(|b| !b.trim().is_empty())
+        .or_else(|| {
+            git_stdout(workspace, &["rev-parse", "--short", "HEAD"])
+                .filter(|h| !h.trim().is_empty())
+                .map(|h| format!("detached HEAD ({h})"))
+        });
+    let status = git_stdout(workspace, &["status", "--porcelain=v1"]);
+    let dirty_files = status
+        .as_deref()
+        .map(parse_git_porcelain_dirty_files)
+        .unwrap_or_default();
+    WorkspaceStateSnapshot {
+        timestamp,
+        branch,
+        dirty_files,
+        git_status_available: status.is_some(),
+    }
+}
+
+fn git_stdout(workspace: &str, args: &[&str]) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(workspace)
+        .args(args)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn parse_git_porcelain_dirty_files(status: &str) -> Vec<String> {
+    let mut files = Vec::new();
+    for raw in status.lines() {
+        if raw.starts_with("##") || raw.len() < 4 {
+            continue;
+        }
+        let path = raw.get(3..).unwrap_or_default().trim();
+        let path = path
+            .rsplit_once(" -> ")
+            .map(|(_, new_path)| new_path)
+            .unwrap_or(path);
+        if !path.is_empty() && !files.iter().any(|seen| seen == path) {
+            files.push(path.to_string());
+        }
+    }
+    files
+}
+
+fn format_workspace_state_block(state: &WorkspaceStateSnapshot) -> String {
+    let mut lines = vec![
+        "<workspace_state>".to_string(),
+        format!("timestamp: {}", state.timestamp),
+    ];
+    if let Some(branch) = &state.branch {
+        lines.push(format!("branch: {branch}"));
+    } else if state.git_status_available {
+        lines.push("branch: detached or unknown".to_string());
+    } else {
+        lines.push("git: unavailable (not a git worktree or git command failed)".to_string());
+    }
+
+    if state.git_status_available {
+        if state.dirty_files.is_empty() {
+            lines.push("dirty files: none".to_string());
+            lines.push("local changes: clean".to_string());
+        } else {
+            lines.push(format!("dirty files ({}):", state.dirty_files.len()));
+            for path in state
+                .dirty_files
+                .iter()
+                .take(WORKSPACE_STATE_DIRTY_FILE_LIMIT)
+            {
+                lines.push(format!("- {path}"));
+            }
+            let overflow = state
+                .dirty_files
+                .len()
+                .saturating_sub(WORKSPACE_STATE_DIRTY_FILE_LIMIT);
+            if overflow > 0 {
+                lines.push(format!("- ... {overflow} more"));
+            }
+            lines.push(
+                "unlanded local changes exist; do not treat them as upstream-complete work"
+                    .to_string(),
+            );
+            lines.push(
+                "next completion step: verify, commit, push/open PR, or state blocker".to_string(),
+            );
+        }
+    } else {
+        lines.push("dirty files: unknown".to_string());
+    }
+
+    lines.push("</workspace_state>".to_string());
+    lines.join("\n")
+}
+
 fn prompt_str(workspace: &str, is_vi: bool, model: &str, rich: bool) -> String {
     let template = std::env::var("NEWT_PROMPT").ok().or_else(|| {
         newt_core::Config::resolve()
@@ -6081,7 +6197,8 @@ fn run_chat(
                     let scratchpad_on = turn_features.scratchpad;
                     let semantic_on = turn_features.semantic;
                     let mut turn_system = format!(
-                        "{}\n{system}",
+                        "{}\n\n{}\n{system}",
+                        workspace_state_block(workspace),
                         runtime_context_block(&inf_model, &inf_url, inf_kind)
                     );
                     // Step 26.4 (#583): inject the <state> block at the HEAD of the
@@ -10540,6 +10657,73 @@ mod tests {
         // must carry the canonical bot email.
         assert!(blk.contains("user.email='293447090+newt-agent[bot]@users.noreply.github.com'"));
         assert!(blk.contains("git -c user.name="));
+    }
+
+    #[test]
+    fn workspace_state_block_formats_dirty_snapshot_with_timestamp() {
+        let block = format_workspace_state_block(&WorkspaceStateSnapshot {
+            timestamp: "2026-07-04T21:23:45-04:00".to_string(),
+            branch: Some("feat/help-rollups".to_string()),
+            dirty_files: vec![
+                "newt-tui/src/help_sections.rs".to_string(),
+                "newt-tui/src/lib.rs".to_string(),
+            ],
+            git_status_available: true,
+        });
+
+        assert!(block.starts_with("<workspace_state>\ntimestamp: 2026-07-04T21:23:45-04:00"));
+        assert!(block.contains("branch: feat/help-rollups"), "{block}");
+        assert!(block.contains("dirty files (2):"), "{block}");
+        assert!(
+            block.contains("- newt-tui/src/help_sections.rs")
+                && block.contains("- newt-tui/src/lib.rs"),
+            "{block}"
+        );
+        assert!(
+            block.contains(
+                "unlanded local changes exist; do not treat them as upstream-complete work"
+            ),
+            "{block}"
+        );
+        assert!(
+            block.contains("next completion step: verify, commit, push/open PR, or state blocker"),
+            "{block}"
+        );
+    }
+
+    #[test]
+    fn workspace_state_block_formats_clean_snapshot_without_dirty_nudge() {
+        let block = format_workspace_state_block(&WorkspaceStateSnapshot {
+            timestamp: "2026-07-04T21:23:45-04:00".to_string(),
+            branch: Some("main".to_string()),
+            dirty_files: Vec::new(),
+            git_status_available: true,
+        });
+
+        assert!(block.contains("timestamp: 2026-07-04T21:23:45-04:00"));
+        assert!(block.contains("branch: main"), "{block}");
+        assert!(block.contains("dirty files: none"), "{block}");
+        assert!(block.contains("local changes: clean"), "{block}");
+        assert!(!block.contains("unlanded local changes exist"), "{block}");
+    }
+
+    #[test]
+    fn parse_git_porcelain_dirty_files_dedupes_and_tracks_rename_target() {
+        let files = parse_git_porcelain_dirty_files(
+            " M newt-tui/src/lib.rs\n\
+             ?? docs/new file.md\n\
+             R  old.rs -> src/new.rs\n\
+             M  newt-tui/src/lib.rs\n",
+        );
+
+        assert_eq!(
+            files,
+            vec![
+                "newt-tui/src/lib.rs".to_string(),
+                "docs/new file.md".to_string(),
+                "src/new.rs".to_string(),
+            ]
+        );
     }
 
     #[test]
