@@ -1417,6 +1417,13 @@ pub struct TuiConfig {
     #[serde(default = "default_max_tool_rounds")]
     pub max_tool_rounds: usize,
 
+    /// Additional progress-aware rounds available after `max_tool_rounds` when
+    /// an active workflow still has incomplete steps and the recent rounds show
+    /// repair progress or actionable evidence. Default: 5. Set to 0 to make the
+    /// normal round cap hard again.
+    #[serde(default = "default_workflow_grace_rounds")]
+    pub workflow_grace_rounds: usize,
+
     /// Tool-call permission policy for the interactive TUI: which tools the
     /// model may invoke and over which targets. This is a *preset that selects
     /// an attenuation* — the host (`newt-identity`) lowers it into a signed,
@@ -1569,6 +1576,10 @@ fn default_max_tool_rounds() -> usize {
     25
 }
 
+fn default_workflow_grace_rounds() -> usize {
+    5
+}
+
 fn default_connect_timeout_secs() -> u64 {
     5
 }
@@ -1643,6 +1654,10 @@ pub struct ModelTuning {
     /// Per-model `max_tool_rounds` override.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tool_rounds: Option<usize>,
+
+    /// Per-model `[tui].workflow_grace_rounds` override.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_grace_rounds: Option<usize>,
 }
 
 impl Config {
@@ -2365,6 +2380,7 @@ impl Default for TuiConfig {
             thinking: ThinkingMode::Stream,
             tool_output_lines: default_tool_output_lines(),
             max_tool_rounds: default_max_tool_rounds(),
+            workflow_grace_rounds: default_workflow_grace_rounds(),
             permissions: ToolPermissions::default(),
             debug: None,
             trace: None,
@@ -5238,6 +5254,8 @@ net = [\"already.example.com\"]
         // The function default and the struct default agree on 25.
         assert_eq!(default_max_tool_rounds(), 25);
         assert_eq!(TuiConfig::default().max_tool_rounds, 25);
+        assert_eq!(default_workflow_grace_rounds(), 5);
+        assert_eq!(TuiConfig::default().workflow_grace_rounds, 5);
     }
 
     #[test]
@@ -5261,6 +5279,27 @@ net = [\"already.example.com\"]
     }
 
     #[test]
+    fn tui_workflow_grace_rounds_can_be_overridden_or_disabled() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [tui]
+            workflow_grace_rounds = 9
+        "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.tui.unwrap().workflow_grace_rounds, 9);
+
+        let disabled: Config = toml::from_str(
+            r#"
+            [tui]
+            workflow_grace_rounds = 0
+        "#,
+        )
+        .unwrap();
+        assert_eq!(disabled.tui.unwrap().workflow_grace_rounds, 0);
+    }
+
+    #[test]
     fn model_tuning_parses_from_toml() {
         let toml = r#"
             [[model_tuning]]
@@ -5268,6 +5307,7 @@ net = [\"already.example.com\"]
             num_ctx = 24576
             mid_loop_trim_threshold = 12
             max_tool_rounds = 20
+            workflow_grace_rounds = 8
 
             [[model_tuning]]
             model = "qwen3-coder:30b"
@@ -5280,10 +5320,12 @@ net = [\"already.example.com\"]
         assert_eq!(nemo.num_ctx, Some(24576));
         assert_eq!(nemo.mid_loop_trim_threshold, Some(12));
         assert_eq!(nemo.max_tool_rounds, Some(20));
+        assert_eq!(nemo.workflow_grace_rounds, Some(8));
 
         let qwen = cfg.find_model_tuning("qwen3-coder:30b").unwrap();
         assert_eq!(qwen.num_ctx, Some(65536));
         assert_eq!(qwen.mid_loop_trim_threshold, None);
+        assert_eq!(qwen.workflow_grace_rounds, None);
     }
 
     #[test]
@@ -5303,6 +5345,7 @@ net = [\"already.example.com\"]
         assert_eq!(entry.num_ctx, None);
         assert_eq!(entry.mid_loop_trim_threshold, None);
         assert_eq!(entry.max_tool_rounds, None);
+        assert_eq!(entry.workflow_grace_rounds, None);
     }
 
     // ---- #726: [tools] max_output_tokens ----

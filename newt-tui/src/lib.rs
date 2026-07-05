@@ -6124,6 +6124,9 @@ fn run_chat(
                         configured_max_tool_rounds,
                         max_tool_rounds_override,
                     );
+                    let eff_workflow_grace_rounds = model_tune
+                        .and_then(|t| t.workflow_grace_rounds)
+                        .unwrap_or_else(|| workflow_grace_rounds(&cfg));
                     let eff_mid_loop_trim = model_tune
                         .and_then(|t| t.mid_loop_trim_threshold)
                         .unwrap_or_else(|| mid_loop_trim_threshold(&cfg))
@@ -6558,6 +6561,7 @@ fn run_chat(
                                         // mode is active.
                                         caveats: &turn_caveats,
                                         max_tool_rounds: eff_max_tool_rounds,
+                                        workflow_grace_rounds: eff_workflow_grace_rounds,
                                         tool_output_lines: tool_output_lines(&cfg),
                                         debug: debug_mode(&cfg),
                                         trace: trace_mode(&cfg),
@@ -8622,6 +8626,15 @@ fn tool_output_lines(cfg: &newt_core::Config) -> usize {
 /// Defaults to 25 when there's no `[tui]` table or no config file.
 fn max_tool_rounds(cfg: &newt_core::Config) -> usize {
     cfg.tui.as_ref().map(|t| t.max_tool_rounds).unwrap_or(25)
+}
+
+/// Additional progress-aware tool-call rounds after `[tui].max_tool_rounds`.
+/// Defaults to 5; set to 0 to keep the normal round cap hard.
+fn workflow_grace_rounds(cfg: &newt_core::Config) -> usize {
+    cfg.tui
+        .as_ref()
+        .map(|t| t.workflow_grace_rounds)
+        .unwrap_or(5)
 }
 
 const EFFECTIVELY_UNLIMITED_TOOL_ROUNDS: usize = 10_000;
@@ -11234,18 +11247,22 @@ mod tests {
         let cfg = newt_core::Config {
             tui: Some(newt_core::TuiConfig {
                 max_tool_rounds: 7,
+                workflow_grace_rounds: 4,
                 tool_output_lines: 3,
                 ..Default::default()
             }),
             ..Default::default()
         };
         assert_eq!(max_tool_rounds(&cfg), 7);
+        assert_eq!(workflow_grace_rounds(&cfg), 4);
         assert_eq!(tool_output_lines(&cfg), 3);
         assert_eq!(resolve_tui(&cfg).map(|t| t.max_tool_rounds), Some(7));
+        assert_eq!(resolve_tui(&cfg).map(|t| t.workflow_grace_rounds), Some(4));
 
         // An empty config yields the documented defaults.
         let empty = newt_core::Config::default();
         assert_eq!(max_tool_rounds(&empty), 25);
+        assert_eq!(workflow_grace_rounds(&empty), 5);
         assert_eq!(tool_output_lines(&empty), 20);
         assert_eq!(resolve_tui(&empty), None);
     }
@@ -14705,6 +14722,7 @@ mod tool_round_cap_tests {
                     step_ledger: None,
                     caveats: &caveats,
                     max_tool_rounds: 5,
+                    workflow_grace_rounds: 0,
                     tool_output_lines: 20,
                     debug: false,
                     trace: false,
@@ -16498,6 +16516,7 @@ mod env_resolution_tests {
                 mid_loop_trim_threshold: None,
                 mid_loop_trim_tokens: None,
                 max_tool_rounds: None,
+                workflow_grace_rounds: None,
             }],
             ..Default::default()
         };
