@@ -2497,6 +2497,9 @@ fn looks_like_intent_to_act(content: &str) -> bool {
         "verify",
         "determin",
         "figure out",
+        "commit",
+        "stage",
+        "push",
     ];
     // Borrowed-cue sign-offs that are NOT "about to act" — checked first so a
     // conversational close is never mistaken for pending work.
@@ -7289,6 +7292,9 @@ mod http_loop_tests {
         ));
         assert!(looks_like_intent_to_act(
             "Let me check the current implementation and identify any gaps."
+        ));
+        assert!(looks_like_intent_to_act(
+            "The help section logic itself has no tests yet.\n\nLet me commit this first step, then move on:"
         ));
         // Genuine sign-offs / answers — must NOT be nudged.
         assert!(!looks_like_intent_to_act("The capital of France is Paris."));
