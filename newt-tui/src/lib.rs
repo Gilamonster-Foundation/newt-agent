@@ -32,10 +32,10 @@ use mcp::Mcp;
 // Step 9.7: the agentic loop (ChatCtx / chat_complete / execute_tool and their
 // dependency closure) lives in `newt_core::agentic` now — the TUI is a thin
 // wrapper that resolves config + caveats per turn and threads them in.
+use help_sections::{rollup_page_for_topic, topic_has_rollups};
 use newt_core::agentic::{
     chat_complete, print_harness_notice, print_newt, warmup_if_cold, ChatCtx, NEWT_ORANGE_CT,
 };
-use help_sections::{rollup_page_for_topic, topic_has_rollups};
 use std::borrow::Cow;
 
 /// Run the (non-interactive) setup wizard unconditionally — used by `newt init`.
@@ -9711,11 +9711,7 @@ fn print_command_help(cmd: &str, color: bool, verbose: bool) -> bool {
 
     match command_help_page(cmd) {
         Some(page) => {
-            print_newt(
-                &format!("/{} help", canonical),
-                color,
-                verbose,
-            );
+            print_newt(&format!("/{canonical} help"), color, verbose);
             for line in page.lines() {
                 println!("{line}");
             }
@@ -9743,7 +9739,7 @@ fn print_rollup_page(topic: &str, color: bool, verbose: bool) -> bool {
         println!();
 
         // Sub-commands with descriptions and optional drill-down indicators.
-        for entry in page.entries.iter() {
+        for entry in page.entries {
             let cmd_prefix = format!("  /{}", entry.cmd);
             let desc = if entry.detail_key.is_some() {
                 format!("{} — click for details", entry.desc)
@@ -9751,7 +9747,7 @@ fn print_rollup_page(topic: &str, color: bool, verbose: bool) -> bool {
                 entry.desc.to_string()
             };
             print_newt(&cmd_prefix, color, verbose);
-            println!("{}", desc);
+            println!("{desc}");
         }
 
         // Footer hint: suggest drilling into a sub-command.
@@ -9784,6 +9780,7 @@ fn help_request(task: &str) -> Option<String> {
     None
 }
 
+#[allow(dead_code)]
 fn help_lines() -> &'static [&'static str] {
     &[
         "  /models                  - list models on the active endpoint",
@@ -9862,7 +9859,23 @@ fn dispatch_slash(
         "exit" | "quit" => return Ok(false),
 
         "help" => {
-            print_newt(&help_sections::format_help(), color, verbose);
+            if arg1.is_empty() {
+                print_newt(&help_sections::format_help(), color, verbose);
+            } else {
+                let topic = arg1.to_lowercase().replace(' ', "_").replace('&', "and");
+                if help_sections::topic_has_rollups(&topic) {
+                    if let Some(page) = help_sections::rollup_page_for_topic(&topic) {
+                        print_newt(
+                            &help_sections::format_rollup_detail(page).join("\n"),
+                            color,
+                            verbose,
+                        );
+                    } else {
+                        // No rollup page — fall back to full detail rendering.
+                        print_newt(&help_sections::format_help_for_topic(arg1), color, verbose);
+                    }
+                }
+            }
         }
 
         "version" => print_newt(&format!("v{VERSION}"), color, verbose),

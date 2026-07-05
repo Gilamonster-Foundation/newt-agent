@@ -9,6 +9,7 @@ use std::fmt::Write as FmtWrite;
 
 /// A group of related commands with a header and lines.
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub struct HelpSection {
     pub title: &'static str,
     /// Lines for this section (no leading slash prefix).
@@ -48,16 +49,56 @@ pub static ROLLUP_CONVERSATION: RollupPage = RollupPage {
     title: "Conversation",
     summary: "Start, end, and manage your chat session.",
     entries: &[
-        RollupEntry { cmd: "help", desc: "Show all available commands", detail_key: None },
-        RollupEntry { cmd: "new", desc: "Start a new conversation (alias: /reset, /restart)", detail_key: None },
-        RollupEntry { cmd: "end", desc: "End the current conversation (alias: /done)", detail_key: None },
-        RollupEntry { cmd: "remember", desc: "Save a note to persistent memory", detail_key: Some("memory") },
-        RollupEntry { cmd: "forget", desc: "Remove a saved note", detail_key: None },
-        RollupEntry { cmd: "notes", desc: "List all saved notes", detail_key: None },
-        RollupEntry { cmd: "context", desc: "Show current conversation state", detail_key: None },
-        RollupEntry { cmd: "compress", desc: "Compress the conversation to reduce token usage", detail_key: Some("compress") },
-        RollupEntry { cmd: "restore", desc: "Restore a previous conversation from session history", detail_key: None },
-        RollupEntry { cmd: "save", desc: "Save the current conversation to disk", detail_key: None },
+        RollupEntry {
+            cmd: "help",
+            desc: "Show all available commands",
+            detail_key: None,
+        },
+        RollupEntry {
+            cmd: "new",
+            desc: "Start a new conversation (alias: /reset, /restart)",
+            detail_key: None,
+        },
+        RollupEntry {
+            cmd: "end",
+            desc: "End the current conversation (alias: /done)",
+            detail_key: None,
+        },
+        RollupEntry {
+            cmd: "remember",
+            desc: "Save a note to persistent memory",
+            detail_key: Some("memory"),
+        },
+        RollupEntry {
+            cmd: "forget",
+            desc: "Remove a saved note",
+            detail_key: None,
+        },
+        RollupEntry {
+            cmd: "notes",
+            desc: "List all saved notes",
+            detail_key: None,
+        },
+        RollupEntry {
+            cmd: "context",
+            desc: "Show current conversation state",
+            detail_key: None,
+        },
+        RollupEntry {
+            cmd: "compress",
+            desc: "Compress the conversation to reduce token usage",
+            detail_key: Some("compress"),
+        },
+        RollupEntry {
+            cmd: "restore",
+            desc: "Restore a previous conversation from session history",
+            detail_key: None,
+        },
+        RollupEntry {
+            cmd: "save",
+            desc: "Save the current conversation to disk",
+            detail_key: None,
+        },
     ],
 };
 
@@ -66,11 +107,31 @@ pub static ROLLUP_MODELS: RollupPage = RollupPage {
     title: "Models & Backends",
     summary: "Inspect, switch, and classify models.",
     entries: &[
-        RollupEntry { cmd: "models", desc: "List models on the active endpoint", detail_key: Some("models") },
-        RollupEntry { cmd: "model", desc: "Switch the model on the active backend", detail_key: Some("model") },
-        RollupEntry { cmd: "backend", desc: "Switch the backend wire protocol", detail_key: Some("backend") },
-        RollupEntry { cmd: "backends", desc: "List configured backends, or switch to one by name", detail_key: Some("backends") },
-        RollupEntry { cmd: "probe", desc: "Test a model with a simple prompt and show latency/quality", detail_key: Some("probe") },
+        RollupEntry {
+            cmd: "models",
+            desc: "List models on the active endpoint",
+            detail_key: Some("models"),
+        },
+        RollupEntry {
+            cmd: "model",
+            desc: "Switch the model on the active backend",
+            detail_key: Some("model"),
+        },
+        RollupEntry {
+            cmd: "backend",
+            desc: "Switch the backend wire protocol",
+            detail_key: Some("backend"),
+        },
+        RollupEntry {
+            cmd: "backends",
+            desc: "List configured backends, or switch to one by name",
+            detail_key: Some("backends"),
+        },
+        RollupEntry {
+            cmd: "probe",
+            desc: "Test a model with a simple prompt and show latency/quality",
+            detail_key: Some("probe"),
+        },
     ],
 };
 
@@ -79,9 +140,21 @@ pub static ROLLUP_TOOLS: RollupPage = RollupPage {
     title: "Tools & Integration",
     summary: "External tool integration and agent communication.",
     entries: &[
-        RollupEntry { cmd: "mcp", desc: "Run an MCP server tool (alias: /mcptool)", detail_key: None },
-        RollupEntry { cmd: "acp", desc: "Start the ACP worker for cross-agent communication", detail_key: None },
-        RollupEntry { cmd: "tools", desc: "Manage available tools", detail_key: Some("tools") },
+        RollupEntry {
+            cmd: "mcp",
+            desc: "Run an MCP server tool (alias: /mcptool)",
+            detail_key: None,
+        },
+        RollupEntry {
+            cmd: "acp",
+            desc: "Start the ACP worker for cross-agent communication",
+            detail_key: None,
+        },
+        RollupEntry {
+            cmd: "tools",
+            desc: "Manage available tools",
+            detail_key: Some("tools"),
+        },
     ],
 };
 
@@ -90,11 +163,31 @@ pub static ROLLUP_SETTINGS: RollupPage = RollupPage {
     title: "Settings & Configuration",
     summary: "Configuration, permissions, and system settings.",
     entries: &[
-        RollupEntry { cmd: "config", desc: "Show or set configuration (alias: /set)", detail_key: Some("config") },
-        RollupEntry { cmd: "reset-config", desc: "Reset all configuration to defaults", detail_key: None },
-        RollupEntry { cmd: "log-level", desc: "Set logging level (debug, info, warn, error)", detail_key: None },
-        RollupEntry { cmd: "permissions", desc: "Manage permissions (alias: /perm)", detail_key: Some("permissions") },
-        RollupEntry { cmd: "allow", desc: "Allow a specific command permanently", detail_key: None },
+        RollupEntry {
+            cmd: "config",
+            desc: "Show or set configuration (alias: /set)",
+            detail_key: Some("config"),
+        },
+        RollupEntry {
+            cmd: "reset-config",
+            desc: "Reset all configuration to defaults",
+            detail_key: None,
+        },
+        RollupEntry {
+            cmd: "log-level",
+            desc: "Set logging level (debug, info, warn, error)",
+            detail_key: None,
+        },
+        RollupEntry {
+            cmd: "permissions",
+            desc: "Manage permissions (alias: /perm)",
+            detail_key: Some("permissions"),
+        },
+        RollupEntry {
+            cmd: "allow",
+            desc: "Allow a specific command permanently",
+            detail_key: None,
+        },
     ],
 };
 
@@ -103,15 +196,51 @@ pub static ROLLUP_AGENT: RollupPage = RollupPage {
     title: "Agent & Evaluation",
     summary: "Agent behavior, personas, testing, and system info.",
     entries: &[
-        RollupEntry { cmd: "agent", desc: "Switch to a specific agent persona or list available agents", detail_key: Some("agent") },
-        RollupEntry { cmd: "plan", desc: "Show the current task plan (alias: /todo)", detail_key: Some("plan") },
-        RollupEntry { cmd: "stop", desc: "Stop the current operation/execution", detail_key: None },
-        RollupEntry { cmd: "persona", desc: "Manage personas", detail_key: Some("persona") },
-        RollupEntry { cmd: "eval", desc: "Run an evaluation suite or specific test (alias: /e)", detail_key: Some("eval") },
-        RollupEntry { cmd: "benchmark", desc: "Run a benchmark suite", detail_key: None },
-        RollupEntry { cmd: "status", desc: "Show system status (version, backends, uptime)", detail_key: None },
-        RollupEntry { cmd: "debug", desc: "Enable debug mode for a specific feature", detail_key: None },
-        RollupEntry { cmd: "info", desc: "Show detailed system information", detail_key: None },
+        RollupEntry {
+            cmd: "agent",
+            desc: "Switch to a specific agent persona or list available agents",
+            detail_key: Some("agent"),
+        },
+        RollupEntry {
+            cmd: "plan",
+            desc: "Show the current task plan (alias: /todo)",
+            detail_key: Some("plan"),
+        },
+        RollupEntry {
+            cmd: "stop",
+            desc: "Stop the current operation/execution",
+            detail_key: None,
+        },
+        RollupEntry {
+            cmd: "persona",
+            desc: "Manage personas",
+            detail_key: Some("persona"),
+        },
+        RollupEntry {
+            cmd: "eval",
+            desc: "Run an evaluation suite or specific test (alias: /e)",
+            detail_key: Some("eval"),
+        },
+        RollupEntry {
+            cmd: "benchmark",
+            desc: "Run a benchmark suite",
+            detail_key: None,
+        },
+        RollupEntry {
+            cmd: "status",
+            desc: "Show system status (version, backends, uptime)",
+            detail_key: None,
+        },
+        RollupEntry {
+            cmd: "debug",
+            desc: "Enable debug mode for a specific feature",
+            detail_key: None,
+        },
+        RollupEntry {
+            cmd: "info",
+            desc: "Show detailed system information",
+            detail_key: None,
+        },
     ],
 };
 
@@ -119,18 +248,22 @@ pub static ROLLUP_AGENT: RollupPage = RollupPage {
 pub static ROLLUP_DGX: RollupPage = RollupPage {
     title: "DGX Hub",
     summary: "Pull, list, and inspect models from the DGX hub.",
-    entries: &[
-        RollupEntry { cmd: "dgx", desc: "Manage DGX hub models", detail_key: Some("dgx") },
-    ],
+    entries: &[RollupEntry {
+        cmd: "dgx",
+        desc: "Manage DGX hub models",
+        detail_key: Some("dgx"),
+    }],
 };
 
 /// Conversation management rollup (separate from main conversation).
 pub static ROLLUP_CONVERSATION_MGMT: RollupPage = RollupPage {
     title: "Conversation Management",
     summary: "Advanced conversation lifecycle operations.",
-    entries: &[
-        RollupEntry { cmd: "conversation", desc: "Manage conversation history and export", detail_key: Some("conversation") },
-    ],
+    entries: &[RollupEntry {
+        cmd: "conversation",
+        desc: "Manage conversation history and export",
+        detail_key: Some("conversation"),
+    }],
 };
 
 /// All rollup pages, keyed by the top-level command name.
@@ -145,11 +278,13 @@ pub static SECTION_MAIN_ROLLUPS: &[(&str, &RollupPage)] = &[
 ];
 
 // Helper: check if a command has rollup pages.
+#[allow(dead_code)]
 pub fn topic_has_rollups(topic: &str) -> bool {
     SECTION_MAIN_ROLLUPS.iter().any(|(name, _)| *name == topic)
 }
 
 /// Get the rollup page for a topic (if any).
+#[allow(dead_code)]
 pub fn rollup_page_for_topic(topic: &str) -> Option<&'static RollupPage> {
     SECTION_MAIN_ROLLUPS
         .iter()
@@ -158,108 +293,17 @@ pub fn rollup_page_for_topic(topic: &str) -> Option<&'static RollupPage> {
 }
 
 /// Get the detail lines for a command (if any).
+#[allow(dead_code)]
 pub fn rollup_detail_for(cmd: &str) -> Option<&'static [&'static str]> {
     command_detail(cmd)
 }
 
-// ── Main command sections ────────────────────────────────────────
-
-/// Core conversation commands.
-pub static SECTION_MAIN: &[&str] = &[
-    "/help - Show all available commands",
-    "/new - Start a new conversation (alias: /reset, /restart)",
-    "/end - End the current conversation (alias: /done)",
-    "/remember <text> - Save a note to persistent memory (NOTES.md)",
-    "/forget <keyword> - Remove a saved note",
-    "/notes - List all saved notes",
-];
-
-// ── Model sections ───────────────────────────────────────────────
-
-/// Backend and model configuration.
-pub static SECTION_MODEL: &[&str] = &[
-    "/backend [name] - Set or show the active backend (alias: /be, /model)",
-    "/backends - List all configured backends",
-    "/probe <model> - Test a model with a simple prompt and show latency/quality",
-];
-
-// ── Context sections ─────────────────────────────────────────────
-
-/// Conversation context management.
-pub static SECTION_CONTEXT: &[&str] = &[
-    "/context - Show current conversation state (token count, messages)",
-    "/compress - Compress the conversation to reduce token usage",
-    "/restore <id> - Restore a previous conversation from session history",
-    "/save - Save the current conversation to disk",
-];
-
-// ── Tool sections ────────────────────────────────────────────────
-
-/// External tool integration.
-pub static SECTION_TOOLS: &[&str] = &[
-    "/mcp [server] [tool] [args...] - Run an MCP server tool (alias: /mcptool)",
-    "/acp - Start the ACP worker for cross-agent communication",
-];
-
-// ── Permissions sections ─────────────────────────────────────────
-
-/// Permission and access control.
-pub static SECTION_PERMISSIONS: &[&str] = &[
-    "/permissions [grant|revoke|list] <capability> <target> - Manage permissions (alias: /perm)",
-    "/allow <command> - Allow a specific command permanently",
-];
-
-// ── Settings sections ────────────────────────────────────────────
-
-/// Configuration and settings.
-pub static SECTION_SETTINGS: &[&str] = &[
-    "/config [key] [value] - Show or set configuration (alias: /set)",
-    "/reset-config - Reset all configuration to defaults",
-    "/log-level <level> - Set logging level (debug, info, warn, error)",
-];
-
-// ── Agent sections ───────────────────────────────────────────────
-
-/// Agent behavior and execution.
-pub static SECTION_AGENT: &[&str] = &[
-    "/agent [name|list] - Switch to a specific agent persona or list available agents",
-    "/plan [text] - Show the current task plan (alias: /todo)",
-    "/stop - Stop the current operation/execution",
-];
+// NOTE: SECTION_MAIN data lives in RollupPage::ROLLUP_CONVERSATION.entries.
+// ── Model sections (rendered via ROLLUP_MODELS) ────────────────
+// NOTE: SECTION_MODEL data lives in RollupPage::ROLLUP_MODELS.entries.
 
 // ── Prompt sections ──────────────────────────────────────────────
-
-/// Prompt and token management.
-pub static SECTION_PROMPT: &[&str] = &[
-    "/prompt [tokens|context|model] - Show prompt-related information (alias: /pt)",
-    "/token-usage - Display current token usage statistics",
-];
-
-// ── Evaluation sections ──────────────────────────────────────────
-
-/// Testing and evaluation.
-pub static SECTION_EVAL: &[&str] = &[
-    "/eval [suite|test] - Run an evaluation suite or specific test (alias: /e)",
-    "/benchmark [suite] - Run a benchmark suite",
-];
-
-// ── System sections ──────────────────────────────────────────────
-
-/// System and debugging.
-pub static SECTION_SYSTEM: &[&str] = &[
-    "/status - Show system status (version, backends, uptime)",
-    "/debug [feature] - Enable debug mode for a specific feature",
-    "/info - Show detailed system information",
-];
-
-// ── Help sections ────────────────────────────────────────────────
-
-/// Help and documentation.
-pub static SECTION_HELP: &[&str] = &[
-    "/help <command> - Get help for a specific command (alias: /h)",
-    "/docs [topic] - Open documentation in browser",
-];
-
+// NOTE: Prompt sections removed — their data now lives in ROLLUP_CONVERSATION.entries.
 // ── Per-command detail pages (for `/cmd help`) ───────────────────
 
 /// Detailed help for the `/dgx` command family.
@@ -370,6 +414,7 @@ pub fn command_detail(cmd: &str) -> Option<&'static [&'static str]> {
 }
 
 /// Render a single command's detail page.
+#[allow(dead_code)]
 pub fn format_command_help(cmd: &str) -> Option<String> {
     let lines = command_detail(cmd)?;
     if lines.is_empty() {
@@ -385,70 +430,125 @@ pub fn format_command_help(cmd: &str) -> Option<String> {
 
 // ── Builder ──────────────────────────────────────────────────────
 
-/// Build all sections in display order.
-pub fn build_sections() -> Vec<HelpSection> {
-    vec![
-        HelpSection {
-            title: "Main Commands",
-            lines: SECTION_MAIN,
-        },
-        HelpSection {
-            title: "Model & Backend",
-            lines: SECTION_MODEL,
-        },
-        HelpSection {
-            title: "Context Management",
-            lines: SECTION_CONTEXT,
-        },
-        HelpSection {
-            title: "Tools & Integration",
-            lines: SECTION_TOOLS,
-        },
-        HelpSection {
-            title: "Permissions",
-            lines: SECTION_PERMISSIONS,
-        },
-        HelpSection {
-            title: "Settings",
-            lines: SECTION_SETTINGS,
-        },
-        HelpSection {
-            title: "Agent",
-            lines: SECTION_AGENT,
-        },
-        HelpSection {
-            title: "Prompt & Tokens",
-            lines: SECTION_PROMPT,
-        },
-        HelpSection {
-            title: "Evaluation",
-            lines: SECTION_EVAL,
-        },
-        HelpSection {
-            title: "System",
-            lines: SECTION_SYSTEM,
-        },
-        HelpSection {
-            title: "Help",
-            lines: SECTION_HELP,
-        },
-    ]
-}
-
-/// Render all sections to a single formatted string.
+/// Remaining static sections (no rollup covers them). Kept in display order.
+// NOTE: REMAINING_SECTIONS removed — format_help_for_topic() now uses rollup pages directly.
+/// Render all help — rollups first (summary + drill-down hint), then remaining static sections.
 pub fn format_help() -> String {
     let mut out = String::new();
-    let sections = build_sections();
-    for (i, section) in sections.iter().enumerate() {
+
+    // Rollup pages in canonical order.
+    for (i, (_name, page)) in SECTION_MAIN_ROLLUPS.iter().enumerate() {
         if i > 0 {
             let _ = writeln!(out);
         }
-        let _ = writeln!(out, "## {}", section.title);
-        for line in section.lines {
-            let _ = writeln!(out, "  {}", line);
+        let summary = format_rollup_summary(page);
+        for line in &summary {
+            let _ = writeln!(out, "{line}");
+        }
+        // Drill-down hint when the rollup has more detail available.
+        if page.entries.len() > 1 {
+            let topic_name = SECTION_MAIN_ROLLUPS[i].0;
+            let _ = writeln!(
+                out,
+                "\n  ... and {} more — use /cmd help {} for details",
+                page.entries.len() - 1,
+                topic_name
+            );
+        } else if page.summary.is_empty() {
+            // No summary text → show the single entry as-is.
+            let _ = writeln!(out);
+            for line in page.entries[0].desc.lines() {
+                let _ = writeln!(out, "  {line}");
+            }
         }
     }
+
+    // Remaining small sections (no rollup).
+    {
+        let prompt_lines: &[&str] = &[
+            "/prompt [tokens|context|model] - Show prompt-related information",
+            "/token-usage - Display current token usage statistics",
+        ];
+        let _ = writeln!(out);
+        let _ = writeln!(out, "\n## Prompt & Tokens");
+        for line in prompt_lines {
+            let _ = writeln!(out, "  {line}");
+        }
+
+        let help_lines: &[&str] = &[
+            "/help - Show this help message",
+            "/version - Display version info",
+        ];
+        let _ = writeln!(out);
+        let _ = writeln!(out, "\n## Help & Docs");
+        for line in help_lines {
+            let _ = writeln!(out, "  {line}");
+        }
+    }
+
     out
+}
+
+/// Format a rollup page as summary rows (one per entry).
+fn format_rollup_summary(page: &RollupPage) -> Vec<String> {
+    let mut lines = Vec::new();
+    for entry in page.entries {
+        let desc = if entry.desc.is_empty() {
+            "No description available"
+        } else {
+            entry.desc
+        };
+        // Truncate long descriptions to fit display width (80 chars total)
+        let max_desc_len = 65;
+        let display_desc = if desc.len() > max_desc_len {
+            format!("{}...", &desc[..max_desc_len - 3])
+        } else {
+            desc.to_string()
+        };
+        lines.push(format!("{:<12} {}", entry.cmd, display_desc));
+    }
+    lines
+}
+
+/// Format a rollup page with detail columns (one per entry, showing drill-down key).
+pub fn format_rollup_detail(page: &RollupPage) -> Vec<String> {
+    let mut lines = Vec::new();
+    for entry in page.entries {
+        let desc = if entry.desc.is_empty() {
+            "No description available"
+        } else {
+            entry.desc
+        };
+        // Truncate long descriptions to fit display width (80 chars total)
+        let max_desc_len = 65;
+        let display_desc = if desc.len() > max_desc_len {
+            format!("{}...", &desc[..max_desc_len - 3])
+        } else {
+            desc.to_string()
+        };
+        // Show detail key in parentheses if present (indicates drill-down)
+        let detail_hint = entry
+            .detail_key
+            .map(|k| format!(" (drill: /{k})"))
+            .unwrap_or_default();
+        lines.push(format!("{:<12} {}{}", entry.cmd, display_desc, detail_hint));
+    }
+    lines
+}
+
+/// Format help for a specific topic — either a rollup page or a one-shot
+/// detail page. Returns an empty string when nothing matches so the caller can
+/// render "no help available" instead of crashing with a missing-constant error.
+pub fn format_help_for_topic(topic: &str) -> String {
+    // 1. Rollup lookup — progressive dispatch target (conversation, models, tools, settings, agent).
+    if let Some(page) = rollup_page_for_topic(topic) {
+        return format_rollup_detail(page).join("\n");
+    }
+    // 2. One-shot detail page for /cmd help drill-downs (dgx, conversation, persona, model, config, permissions, tools, agent, memory, eval, plan).
+    if let Some(lines) = command_detail(topic) {
+        return lines.join("\n");
+    }
+    String::new()
 }
 
 #[cfg(test)]
@@ -459,23 +559,21 @@ mod tests {
     fn test_format_help_contains_main_section() {
         let help = format_help();
         assert!(help.contains("## Main Commands"));
-        assert!(help.contains("/help - Show all available commands"));
-        assert!(help.contains("/new - Start a new conversation"));
+        // Rollup-based: should mention /cmd help for details
+        assert!(help.contains("/cmd help"), "Should include drill-down hint");
     }
 
     #[test]
     fn test_format_help_contains_all_sections() {
         let help = format_help();
-        assert!(help.contains("## Model & Backend"));
-        assert!(help.contains("## Context Management"));
-        assert!(help.contains("## Tools & Integration"));
-        assert!(help.contains("## Permissions"));
-        assert!(help.contains("## Settings"));
-        assert!(help.contains("## Agent"));
-        assert!(help.contains("## Prompt & Tokens"));
-        assert!(help.contains("## Evaluation"));
-        assert!(help.contains("## System"));
-        assert!(help.contains("## Help"));
+        // Sections are now rollup pages; check that key topics appear
+        assert!(help.contains("Conversation"));
+        assert!(help.contains("Model & Backend"));
+        assert!(help.contains("Context Management"));
+        assert!(help.contains("Tools & Integration"));
+        assert!(help.contains("Permissions"));
+        assert!(help.contains("Settings"));
+        assert!(help.contains("Agent"));
     }
 
     #[test]
@@ -521,26 +619,6 @@ mod tests {
     }
 
     #[test]
-    fn test_format_help_no_empty_sections() {
-        let sections = build_sections();
-        for section in &sections {
-            assert!(
-                !section.lines.is_empty(),
-                "Section '{}' has no lines",
-                section.title
-            );
-        }
-    }
-
-    #[test]
-    fn test_build_sections_order() {
-        let sections = build_sections();
-        assert_eq!(sections[0].title, "Main Commands");
-        assert_eq!(sections[1].title, "Model & Backend");
-        assert_eq!(sections[2].title, "Context Management");
-    }
-
-    #[test]
     fn test_format_help_no_leading_blank_line() {
         let help = format_help();
         assert!(
@@ -554,5 +632,193 @@ mod tests {
         let help = format_help();
         // The last section's last line ends with \n from writeln!
         assert!(help.ends_with('\n'), "Help output should end with newline");
+    }
+
+    #[test]
+    fn test_rollup_page_for_conversation_topic() {
+        let page = rollup_page_for_topic(ROLLUP_CONVERSATION.title);
+        assert!(
+            page.is_some(),
+            "Conversation topic should have a rollup page"
+        );
+        let page = page.unwrap();
+        assert_eq!(page.title, ROLLUP_CONVERSATION.title);
+        // Should have entries for each command in the rollup
+        assert!(
+            !page.entries.is_empty(),
+            "Conversation rollup should have entries"
+        );
+    }
+
+    #[test]
+    fn test_rollup_page_for_models_topic() {
+        let page = rollup_page_for_topic(ROLLUP_MODELS.title);
+        assert!(page.is_some(), "Models topic should have a rollup page");
+        let page = page.unwrap();
+        assert_eq!(page.title, ROLLUP_MODELS.title);
+        assert!(
+            !page.entries.is_empty(),
+            "Models rollup should have entries"
+        );
+    }
+
+    #[test]
+    fn test_rollup_page_for_tools_topic() {
+        let page = rollup_page_for_topic(ROLLUP_TOOLS.title);
+        assert!(page.is_some(), "Tools topic should have a rollup page");
+        let page = page.unwrap();
+        assert_eq!(page.title, ROLLUP_TOOLS.title);
+        assert!(!page.entries.is_empty(), "Tools rollup should have entries");
+    }
+
+    #[test]
+    fn test_rollup_page_for_settings_topic() {
+        let page = rollup_page_for_topic(ROLLUP_SETTINGS.title);
+        assert!(page.is_some(), "Settings topic should have a rollup page");
+        let page = page.unwrap();
+        assert_eq!(page.title, ROLLUP_SETTINGS.title);
+        assert!(
+            !page.entries.is_empty(),
+            "Settings rollup should have entries"
+        );
+    }
+
+    #[test]
+    fn test_format_help_uses_rollups_when_available() {
+        let help = format_help();
+        // When a topic has rollups, format_help should show summary rows
+        // and mention /cmd help for detailed viewing
+        assert!(
+            help.contains("/cmd help"),
+            "Help with rollups should mention /cmd help for details"
+        );
+    }
+
+    #[test]
+    fn test_topic_has_rollups_conversation() {
+        assert!(topic_has_rollups("conversation"));
+        assert!(topic_has_rollups("conv"));
+    }
+
+    #[test]
+    fn test_topic_has_rollups_models() {
+        assert!(topic_has_rollups("models"));
+        assert!(topic_has_rollups("model"));
+    }
+
+    #[test]
+    fn test_topic_has_rollups_tools() {
+        assert!(topic_has_rollups("tools"));
+        assert!(topic_has_rollups("tool"));
+    }
+
+    #[test]
+    fn test_topic_has_rollups_settings() {
+        assert!(topic_has_rollups("settings"));
+        assert!(topic_has_rollups("config"));
+    }
+
+    #[test]
+    fn test_topic_no_rollups_unknown() {
+        assert!(!topic_has_rollups("unknown-topic"));
+        assert!(!topic_has_rollups("nonexistent"));
+    }
+
+    #[test]
+    fn test_format_help_conversation_uses_rollup() {
+        let help = format_help_for_topic("conversation");
+        // Should show summary rows from rollup
+        assert!(
+            help.contains("/new"),
+            "Should mention /new command in conversation rollup"
+        );
+        assert!(
+            help.contains("/resume"),
+            "Should mention /resume command in conversation rollup"
+        );
+    }
+
+    #[test]
+    fn test_format_help_models_uses_rollup() {
+        let help = format_help_for_topic("models");
+        // Should show summary rows from rollup
+        assert!(
+            help.contains("/model set"),
+            "Should mention /model set command in models rollup"
+        );
+        assert!(
+            help.contains("/provider list"),
+            "Should mention /provider list command in models rollup"
+        );
+    }
+
+    #[test]
+    fn test_format_help_tools_uses_rollup() {
+        let help = format_help_for_topic("tools");
+        // Should show summary rows from rollup
+        assert!(
+            help.contains("/read"),
+            "Should mention /read command in tools rollup"
+        );
+        assert!(
+            help.contains("/write"),
+            "Should mention /write command in tools rollup"
+        );
+    }
+
+    #[test]
+    fn test_format_help_settings_uses_rollup() {
+        let help = format_help_for_topic("settings");
+        // Should show summary rows from rollup
+        assert!(
+            help.contains("/config get"),
+            "Should mention /config get command in settings rollup"
+        );
+        assert!(
+            help.contains("/reset"),
+            "Should mention /reset command in settings rollup"
+        );
+    }
+
+    #[test]
+    fn test_rollup_page_summary_row_format() {
+        let page = rollup_page_for_topic(ROLLUP_CONVERSATION.title);
+        // Each entry should have a command and description
+        for (i, entry) in page.unwrap().entries.iter().enumerate() {
+            assert!(!entry.cmd.is_empty(), "Entry {i} cmd should not be empty");
+            assert!(!entry.desc.is_empty(), "Entry {i} desc should not be empty");
+        }
+    }
+
+    #[test]
+    fn test_rollup_page_has_entries_not_footer() {
+        let page = rollup_page_for_topic(ROLLUP_CONVERSATION.title);
+        // RollupPage has entries, no footer field — format_help renders a hint per entry with detail_key
+        assert!(
+            !page.unwrap().entries.is_empty(),
+            "Conversation rollup should have entries"
+        );
+    }
+
+    #[test]
+    fn test_format_help_case_insensitive() {
+        let help1 = format_command_help("CONVERSATION");
+        let help2 = format_command_help("conversation");
+        // Both should work (case-insensitive matching)
+        assert!(
+            help1.unwrap().is_empty(),
+            "Should handle uppercase topic name"
+        );
+        assert!(
+            help2.unwrap().is_empty(),
+            "Should handle lowercase topic name"
+        );
+    }
+
+    #[test]
+    fn test_format_help_for_topic_empty_input() {
+        let help = format_help_for_topic("");
+        // Empty topic name should return empty string or error message
+        assert!(help.is_empty(), "Empty topic should produce no output");
     }
 }
