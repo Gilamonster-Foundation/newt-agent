@@ -12,6 +12,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
 
+const BUNDLED_GITHUB_PR_WORKFLOW: &str = include_str!("workflows/github_pr.toml");
+
 /// Front matter that lets the workflow classifier find this workflow.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorkflowClassifierConfig {
@@ -169,69 +171,8 @@ impl WorkflowConfig {
 /// Built-in GitHub PR workflow: issue/request -> branch -> commits -> PR.
 #[must_use]
 pub fn builtin_workflows() -> Vec<WorkflowConfig> {
-    vec![WorkflowConfig {
-        name: "github_pr".to_string(),
-        enabled: true,
-        description: "read an issue/request, implement in tracked steps, commit to a branch, push, and open a GitHub PR".to_string(),
-        classifier: WorkflowClassifierConfig {
-            min_score: default_classifier_min_score(),
-            keywords: vec![
-                "github issue".to_string(),
-                "github.com".to_string(),
-                "pull request".to_string(),
-                "open a pr".to_string(),
-                "create a pr".to_string(),
-            ],
-            examples: vec![
-                "Read this GitHub issue, plan the implementation, create a branch, commit the work, push, and open a PR.".to_string(),
-                "Take a look at this issue, implement the fix in steps, commit each step, and create a pull request.".to_string(),
-                "Build the requested change from an issue URL and get me a GitHub PR.".to_string(),
-            ],
-        },
-        trigger_terms: Vec::new(),
-        steps: vec![
-            WorkflowStep {
-                id: "read_issue".to_string(),
-                title: "Read the issue/request and current repo state".to_string(),
-                steer: "Gather ground truth from the issue, git status, branch, log, and relevant files before editing".to_string(),
-            },
-            WorkflowStep {
-                id: "plan_implementation".to_string(),
-                title: "Break the implementation into ordered steps".to_string(),
-                steer: "Call update_plan with concrete implementation, verification, commit, push, and PR steps".to_string(),
-            },
-            WorkflowStep {
-                id: "create_branch".to_string(),
-                title: "Create or switch to a feature branch".to_string(),
-                steer: "Use git status/branch ground truth before creating or switching branches".to_string(),
-            },
-            WorkflowStep {
-                id: "implement_step".to_string(),
-                title: "Implement the active step".to_string(),
-                steer: "Make the smallest coherent edit for the active plan step".to_string(),
-            },
-            WorkflowStep {
-                id: "verify_step".to_string(),
-                title: "Verify the active step".to_string(),
-                steer: "Run focused tests/checks that prove the step works".to_string(),
-            },
-            WorkflowStep {
-                id: "commit_step".to_string(),
-                title: "Commit the verified step to the branch".to_string(),
-                steer: "Stage only relevant files and commit with the required LLM attribution trailer".to_string(),
-            },
-            WorkflowStep {
-                id: "push_branch".to_string(),
-                title: "Push the branch".to_string(),
-                steer: "Push the feature branch after the intended commits are present".to_string(),
-            },
-            WorkflowStep {
-                id: "open_pr".to_string(),
-                title: "Open or update the GitHub PR".to_string(),
-                steer: "Create/update the PR with what changed, test plan, and out-of-scope notes".to_string(),
-            },
-        ],
-    }]
+    vec![toml::from_str(BUNDLED_GITHUB_PR_WORKFLOW)
+        .expect("bundled GitHub PR workflow template is valid")]
 }
 
 /// Load workflow drop-ins from a directory. Missing/malformed files are skipped.

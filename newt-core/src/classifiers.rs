@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use crate::config::Config;
 
 const NUDGE_CLASSIFIER_FILE: &str = "nudge.toml";
+const BUNDLED_NUDGE_CLASSIFIER: &str = include_str!("classifiers/nudge.toml");
 
 /// A nudge class the agentic loop knows how to act on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,12 +69,7 @@ pub struct NudgeClassifierConfig {
 
 impl Default for NudgeClassifierConfig {
     fn default() -> Self {
-        Self {
-            version: default_classifier_version(),
-            min_score: default_min_score(),
-            min_margin: default_min_margin(),
-            classes: builtin_nudge_classes(),
-        }
+        bundled_nudge_config()
     }
 }
 
@@ -89,51 +85,12 @@ fn default_min_margin() -> f32 {
     0.03
 }
 
-fn builtin_nudge_classes() -> BTreeMap<String, Vec<String>> {
-    BTreeMap::from([
-        (
-            "pending_action".to_string(),
-            vec![
-                "Now I have everything I need. Let me make both edits now.".to_string(),
-                "Let me edit the file.".to_string(),
-                "Let me keep editing now.".to_string(),
-                "Now I'll add the --home flag to the Cli struct.".to_string(),
-                "I'm going to edit the config file.".to_string(),
-                "Let me understand what was already done on this branch and compare it with the issue requirements.".to_string(),
-                "Let me check the current implementation and identify any gaps.".to_string(),
-                "The help section logic itself has no tests yet. Let me commit this first step, then move on.".to_string(),
-                "Plan is current — no update needed. Continuing with step 2: inserting the progressive dispatch into lib.rs.".to_string(),
-                "Continuing with the active step: updating the file now.".to_string(),
-                "I found the issue: there is an extra closing brace causing a syntax error. I need to remove this stray brace.".to_string(),
-                "I have two issues: duplicate definitions and a stray brace. Let me fix both, read around the duplicate, then verify with a build check.".to_string(),
-                "Next I will add the tests.".to_string(),
-                "Current blocker: the for loop needs a one line fix. Next steps needed: fix the iteration type error in lib.rs.".to_string(),
-                "What remains: fix the compile error, add tests, and run the check.".to_string(),
-            ],
-        ),
-        (
-            "plan_update".to_string(),
-            vec![
-                "Summary of Findings. Current Status: the build is broken due to syntax errors. Next Steps Required: remove the duplicate function, remove the stray brace, verify cargo check, then proceed with the active plan step.".to_string(),
-                "The active plan says to continue feature work, but I found immediate compilation blockers that must be inserted into the plan first before proceeding.".to_string(),
-                "To continue, I need to update the plan with prerequisite repair work, then use edit_file and run the build check.".to_string(),
-                "However, I have reached the tool-call limit and cannot make these edits now. The plan needs to be updated before continuing.".to_string(),
-                "Recommended next action if session resumes: fix duplicate functions, clean up broken tests, read lib.rs, then wire the progressive dispatch. The build is currently broken and that is the blocker for further progress.".to_string(),
-            ],
-        ),
-        (
-            "final_answer".to_string(),
-            vec![
-                "The capital of France is Paris.".to_string(),
-                "I have finished editing the file and the tests pass.".to_string(),
-                "Here is a summary of what I found across the tool calls.".to_string(),
-                "Done. Let me know if you want any further changes.".to_string(),
-                "The files were examined; everything checks out.".to_string(),
-                "All plan steps are complete.".to_string(),
-                "The duplicate helper definitions and stray brace were removed, and the build check passed.".to_string(),
-            ],
-        ),
-    ])
+fn bundled_nudge_config() -> NudgeClassifierConfig {
+    toml::from_str(BUNDLED_NUDGE_CLASSIFIER).expect("bundled nudge classifier template is valid")
+}
+
+fn bundled_nudge_classes() -> BTreeMap<String, Vec<String>> {
+    bundled_nudge_config().classes
 }
 
 impl NudgeClassifierConfig {
@@ -156,7 +113,7 @@ impl NudgeClassifierConfig {
     }
 
     fn with_builtin_fallbacks(mut self) -> Self {
-        let builtins = builtin_nudge_classes();
+        let builtins = bundled_nudge_classes();
         for (class, examples) in builtins {
             self.classes.entry(class).or_insert(examples);
         }

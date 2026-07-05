@@ -1,0 +1,40 @@
+version = 1
+min_score = 0.28
+min_margin = 0.03
+
+[classes]
+pending_action = [
+  "Now I have everything I need. Let me make both edits now.",
+  "Let me edit the file.",
+  "Let me keep editing now.",
+  "Now I'll add the --home flag to the Cli struct.",
+  "I'm going to edit the config file.",
+  "Let me understand what was already done on this branch and compare it with the issue requirements.",
+  "Let me check the current implementation and identify any gaps.",
+  "The help section logic itself has no tests yet. Let me commit this first step, then move on.",
+  "Plan is current - no update needed. Continuing with step 2: inserting the progressive dispatch into lib.rs.",
+  "Continuing with the active step: updating the file now.",
+  "I found the issue: there is an extra closing brace causing a syntax error. I need to remove this stray brace.",
+  "I have two issues: duplicate definitions and a stray brace. Let me fix both, read around the duplicate, then verify with a build check.",
+  "Next I will add the tests.",
+  "Current blocker: the for loop needs a one line fix. Next steps needed: fix the iteration type error in lib.rs.",
+  "What remains: fix the compile error, add tests, and run the check.",
+]
+
+plan_update = [
+  "Summary of Findings. Current Status: the build is broken due to syntax errors. Next Steps Required: remove the duplicate function, remove the stray brace, verify cargo check, then proceed with the active plan step.",
+  "The active plan says to continue feature work, but I found immediate compilation blockers that must be inserted into the plan first before proceeding.",
+  "To continue, I need to update the plan with prerequisite repair work, then use edit_file and run the build check.",
+  "However, I have reached the tool-call limit and cannot make these edits now. The plan needs to be updated before continuing.",
+  "Recommended next action if session resumes: fix duplicate functions, clean up broken tests, read lib.rs, then wire the progressive dispatch. The build is currently broken and that is the blocker for further progress.",
+]
+
+final_answer = [
+  "The capital of France is Paris.",
+  "I have finished editing the file and the tests pass.",
+  "Here is a summary of what I found across the tool calls.",
+  "Done. Let me know if you want any further changes.",
+  "The files were examined; everything checks out.",
+  "All plan steps are complete.",
+  "The duplicate helper definitions and stray brace were removed, and the build check passed.",
+]
