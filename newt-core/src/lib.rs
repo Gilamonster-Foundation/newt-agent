@@ -9,6 +9,7 @@ pub mod agentic;
 pub mod agents;
 pub mod api_surface;
 pub mod caveats;
+pub mod classifiers;
 pub mod config;
 pub mod conversation;
 pub mod dgx;
@@ -81,6 +82,9 @@ pub use agentic::{
 pub use agents::AgentsProvider;
 pub use api_surface::ApiSurfaceProvider;
 pub use caveats::{CaveatsExt, CountBoundExt, ScopeExt};
+pub use classifiers::{
+    classifier_config_dir, NudgeClass, NudgeClassification, NudgeClassifier, NudgeClassifierConfig,
+};
 pub use config::{
     AgentsConfig, BackendConfig, BackendKind, BundleConfig, ChatStyle, ColorMode, Config,
     ContextConfig, ContextFeature, ContextFeatureSet, ContextFeatures, ContextManager,

@@ -1191,8 +1191,8 @@ pub async fn chat_complete(
     // that zero-tool round as a final answer and end the turn, forcing a human
     // "continue". `narration_nudges` bounds the auto-continue that instead
     // nudges the model to actually call the tool (≤ NARRATION_NUDGE_CAP per
-    // turn); the trigger is `looks_like_intent_to_act`, so a genuine conclusion
-    // (with or without prior tool calls this turn) is never nudged.
+    // turn); the trigger is the configurable NudgeClassifier, so a genuine
+    // conclusion (with or without prior tool calls this turn) is never nudged.
     let mut narration_nudges: usize = 0;
     // State-driven final-answer gate: a no-tool reply is suspicious when the
     // active plan still has open steps. Nudge once to update_plan / act / block.
@@ -1201,6 +1201,7 @@ pub async fn chat_complete(
     // without proving it, force one read-only ground-truth check round instead
     // of letting it hand the stale-context claim back to the human.
     let mut stale_file_nudges: usize = 0;
+    let nudge_classifier = crate::NudgeClassifier::load_default();
     // Phase 20 §2.2: the thinking-only quirk is reported at most once per
     // turn — re-detection adds no information and would thrash the cache.
     let mut thinking_only_reported = false;
@@ -2011,7 +2012,7 @@ pub async fn chat_complete(
             }
             if narration_nudges < NARRATION_NUDGE_CAP
                 && round + 1 < max_tool_rounds
-                && looks_like_intent_to_act(&streamed)
+                && nudge_classifier.is_pending_action(&streamed)
             {
                 if debug {
                     print_debug(
@@ -2508,89 +2509,12 @@ fn tail_on_char_boundary(s: &str, max_bytes: usize) -> &str {
     &s[start..]
 }
 
-/// Heuristic: does this assistant prose read as "I am ABOUT to act" rather than
-/// a finished answer? The sole trigger for the narrate-then-stop rescue — a
-/// zero-tool-call round is nudged (once) only when its prose announces an
-/// action it then failed to emit as a tool call. Requires an intent cue AND an
-/// action verb, and excludes borrowed-cue sign-offs ("let me know …"), so a
-/// genuine conclusion is never nudged — whether or not the model already called
-/// tools this turn (a normal "act, then conclude" turn must not be nudged). A
-/// residual false positive costs at most one extra round (NARRATION_NUDGE_CAP),
-/// never a loop. Cue/verb/exclusion lists are pure data — extend without
-/// touching the control flow (three Cs).
+/// Compatibility wrapper for the narrate-then-stop classifier. Production turns
+/// use [`crate::NudgeClassifier::load_default`] so `~/.newt/classifiers/nudge.toml`
+/// can tune the examples; pure tests use the built-in prototypes here.
+#[cfg(test)]
 fn looks_like_intent_to_act(content: &str) -> bool {
-    const INTENT_CUES: &[&str] = &[
-        "let me ",
-        "let's ",
-        "i'll ",
-        "i will ",
-        "i'm going to ",
-        "i am going to ",
-        "now i",
-        "next, i",
-        "next i",
-        "going to ",
-        "i'm now",
-        "i am now",
-        "continuing with ",
-        "continuing to ",
-        "continuing by ",
-        "continue with ",
-        "continue to ",
-        "continue by ",
-    ];
-    const ACT_VERBS: &[&str] = &[
-        "edit",
-        "creat",
-        "add",
-        "modif",
-        "updat",
-        "writ",
-        "implement",
-        "chang",
-        "appl",
-        "run ",
-        "make ",
-        "fix",
-        "replac",
-        "insert",
-        "delet",
-        "remov",
-        "understand",
-        "check",
-        "compar",
-        "inspect",
-        "examin",
-        "review",
-        "look ",
-        "read ",
-        "verify",
-        "determin",
-        "figure out",
-        "commit",
-        "stage",
-        "push",
-    ];
-    // Borrowed-cue sign-offs that are NOT "about to act" — checked first so a
-    // conversational close is never mistaken for pending work.
-    const NON_ACTIONS: &[&str] = &[
-        "let me know",
-        "let me explain",
-        "let me clarify",
-        "let me summarize",
-        "let me recap",
-        "let me walk you",
-    ];
-    let lc = content.to_lowercase();
-    // The intent lives at the tail ("… Let me make both edits now."), so only
-    // scan the last stretch — the body may recount findings that mention verbs.
-    // Snap the cut to a char boundary so a multibyte glyph (em dash, …) at the
-    // 400-byte mark can't panic the slice.
-    let tail = tail_on_char_boundary(&lc, 400);
-    if NON_ACTIONS.iter().any(|n| tail.contains(n)) {
-        return false;
-    }
-    INTENT_CUES.iter().any(|c| tail.contains(c)) && ACT_VERBS.iter().any(|v| tail.contains(v))
+    crate::NudgeClassifier::builtin().is_pending_action(content)
 }
 
 /// Heuristic: did the model stop because it *believes* a file changed under it,
@@ -3234,6 +3158,7 @@ pub async fn openai_chat_complete(
     let mut pending_plan_nudges: usize = 0;
     // Unverified stale-file blocker rescue counter (mirror of the Ollama path).
     let mut stale_file_nudges: usize = 0;
+    let nudge_classifier = crate::NudgeClassifier::load_default();
 
     // Agentic loop — up to `max_tool_rounds` tool-call rounds (matches the Ollama path).
     'round_loop: for round in 0..max_tool_rounds {
@@ -3638,7 +3563,7 @@ pub async fn openai_chat_complete(
             if !content.is_empty()
                 && narration_nudges < NARRATION_NUDGE_CAP
                 && round + 1 < max_tool_rounds
-                && looks_like_intent_to_act(&content)
+                && nudge_classifier.is_pending_action(&content)
             {
                 if debug {
                     print_debug(
