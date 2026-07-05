@@ -4386,15 +4386,19 @@ impl newt_core::Embedder for FailingEmbedder {
 }
 
 /// Whether the semantic feature should embed on the **in-process** backend
-/// (`embeddings_api = "embedded"`, #720) rather than over HTTP. Pure for testing.
+/// rather than over HTTP. Embedded is the default when the semantic config does
+/// not name an HTTP endpoint/protocol; Ollama/OpenAI embeddings are an explicit
+/// performance-tuning choice. Pure for testing.
 fn embeddings_backend_is_embedded(cfg: &newt_core::SemanticConfig) -> bool {
     cfg.embeddings_api == Some(newt_core::BackendKind::Embedded)
+        || (cfg.embeddings_api.is_none() && cfg.embeddings_endpoint.is_none())
 }
 
-/// Build the semantic embedder (#720). When `embeddings_api = "embedded"`, the
-/// in-process candle embedder runs on the laptop so retrieval never touches the
-/// DGX chat model's VRAM; otherwise the HTTP [`EmbeddingsClient`](newt_core::EmbeddingsClient)
-/// (Ollama / OpenAI) over the resolved target. Always returns a usable
+/// Build the semantic embedder (#720). By default, or when
+/// `embeddings_api = "embedded"`, the in-process candle embedder runs on the
+/// laptop so retrieval never touches the DGX chat model's VRAM. HTTP
+/// [`EmbeddingsClient`](newt_core::EmbeddingsClient) embeddings are selected
+/// only by explicit Ollama/OpenAI semantic config. Always returns a usable
 /// `Box<dyn Embedder>` — a mis-configured embedded path yields a failing embedder
 /// (→ indexing no-op) rather than panicking. Pure for testing.
 fn build_semantic_embedder(
@@ -4455,6 +4459,27 @@ fn make_embedded_embedder(
                 .to_string(),
         })
     }
+}
+
+fn semantic_zero_index_hint(cfg: &newt_core::SemanticConfig) -> String {
+    if embeddings_backend_is_embedded(cfg) {
+        return "semantic: indexed 0 chunks — embedded embeddings are unavailable; check \
+                [context.semantic].embedding_model_path points at a local candle-clean \
+                standard-BERT model dir and this binary was built with the embedded feature \
+                (retrieval is a no-op until embeddings work)"
+            .to_string();
+    }
+    let target = cfg
+        .embeddings_endpoint
+        .as_deref()
+        .unwrap_or("the active chat backend");
+    format!(
+        "semantic: indexed 0 chunks — embeddings from {target} produced no vectors for '{}'; \
+         configure [context.semantic].embeddings_endpoint/embeddings_api for an Ollama/OpenAI \
+         embeddings service, or set embedding_model_path to use embedded embeddings \
+         (retrieval is a no-op until embeddings work)",
+        cfg.embedding_model
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -6288,11 +6313,7 @@ fn run_chat(
                                 });
                                 if n == 0 {
                                     print_harness_notice(
-                                        &format!(
-                                            "semantic: indexed 0 chunks — is the embedding model \
-                                             '{}' pulled in Ollama? (retrieval is a no-op until it is)",
-                                            semantic_cfg.embedding_model
-                                        ),
+                                        &semantic_zero_index_hint(&semantic_cfg),
                                         color,
                                     );
                                 } else {
@@ -6978,7 +6999,11 @@ fn resolve_embeddings_target(
             cfg.embeddings_api.unwrap_or(newt_core::BackendKind::Ollama),
             None,
         ),
-        None => (inf_url.to_string(), inf_kind, inf_key.map(str::to_string)),
+        None => (
+            inf_url.to_string(),
+            cfg.embeddings_api.unwrap_or(inf_kind),
+            inf_key.map(str::to_string),
+        ),
     }
 }
 
@@ -8896,9 +8921,9 @@ fn context_features(
     kind: newt_core::BackendKind,
 ) -> newt_core::ContextFeatureSet {
     // Step 27.4: the base depends on the backend — local (Ollama) sessions
-    // default the cross-round working-memory features (scratchpad + scheduled)
-    // ON; cloud keeps the all-off preset baseline. `[context.features]` config
-    // then session overrides still layer on top and win.
+    // default the local-assist features (scratchpad + semantic + scheduled) ON;
+    // cloud keeps the all-off preset baseline. `[context.features]` config then
+    // session overrides still layer on top and win.
     let base = newt_core::ContextFeatureSet::base_for(manager, kind);
     let with_config = cfg
         .context
@@ -8919,6 +8944,60 @@ struct ContextCommandResult {
     set_feature: Option<(newt_core::ContextFeature, bool)>,
 }
 
+fn handle_context_feature_arg(
+    arg: &str,
+    features: newt_core::ContextFeatureSet,
+    out: &mut ContextCommandResult,
+) {
+    use newt_core::ContextFeature;
+    let mut parts = arg.split_whitespace();
+    let name = parts.next().unwrap_or("");
+    let toggle = parts.next();
+    match ContextFeature::from_keyword(name) {
+        Some(f) => match toggle {
+            None => {
+                let state = if features.get(f) { "on" } else { "off" };
+                let tail = if f.available() {
+                    String::new()
+                } else {
+                    format!(" (not yet available — #{})", f.issue())
+                };
+                out.lines
+                    .push(format!("context feature {}: {state}{tail}", f.keyword()));
+            }
+            Some(t @ ("on" | "off")) => {
+                let want = t == "on";
+                if f.available() {
+                    out.set_feature = Some((f, want));
+                    out.lines
+                        .push(format!("context feature {} → {t}", f.keyword()));
+                } else {
+                    // Report the ACTUAL resolved state, not a hardcoded "off" —
+                    // config can force an unimplemented feature on, and the
+                    // toggle (which we refuse) doesn't change it.
+                    let state = if features.get(f) { "on" } else { "off" };
+                    out.lines.push(format!(
+                        "context feature '{}' is not yet available (see #{}) — staying {state}",
+                        f.keyword(),
+                        f.issue()
+                    ));
+                }
+            }
+            Some(other) => out.lines.push(format!(
+                "unknown toggle '{other}' for /context feature — use on|off"
+            )),
+        },
+        None => out.lines.push(format!(
+            "unknown context feature '{name}' — use {}",
+            ContextFeature::ALL
+                .iter()
+                .map(|f| f.keyword())
+                .collect::<Vec<_>>()
+                .join("|")
+        )),
+    }
+}
+
 /// Dispatch `/context [manager <preset> | feature <name> [on|off]]` against the
 /// current config + session overrides (Step 26.1, #588). `rest` is the text
 /// after `context`. Unavailable presets/features report "not yet available" and
@@ -8931,6 +9010,7 @@ fn handle_context_command(
     kind: newt_core::BackendKind,
 ) -> ContextCommandResult {
     use newt_core::{ContextFeature, ContextManager};
+    let rest = rest.trim();
     let manager = context_manager(cfg, manager_override);
     let features = context_features(cfg, manager, feature_override, kind);
     let mgr_src = if manager_override.is_some() {
@@ -9003,51 +9083,15 @@ fn handle_context_command(
             out.lines.push(format!("  [{state}] {}{tail}", f.keyword()));
         }
     } else if let Some(arg) = rest.strip_prefix("feature ") {
-        let mut parts = arg.split_whitespace();
-        let name = parts.next().unwrap_or("");
-        let toggle = parts.next();
-        match ContextFeature::from_keyword(name) {
-            Some(f) => match toggle {
-                None => {
-                    let state = if features.get(f) { "on" } else { "off" };
-                    let tail = if f.available() {
-                        String::new()
-                    } else {
-                        format!(" (not yet available — #{})", f.issue())
-                    };
-                    out.lines
-                        .push(format!("context feature {}: {state}{tail}", f.keyword()));
-                }
-                Some(t @ ("on" | "off")) => {
-                    let want = t == "on";
-                    if f.available() {
-                        out.set_feature = Some((f, want));
-                        out.lines
-                            .push(format!("context feature {} → {t}", f.keyword()));
-                    } else {
-                        // Report the ACTUAL resolved state, not a hardcoded
-                        // "off" — config can force an unimplemented feature on,
-                        // and the toggle (which we refuse) doesn't change it.
-                        let state = if features.get(f) { "on" } else { "off" };
-                        out.lines.push(format!(
-                            "context feature '{}' is not yet available (see #{}) — staying {state}",
-                            f.keyword(),
-                            f.issue()
-                        ));
-                    }
-                }
-                Some(other) => out.lines.push(format!(
-                    "unknown toggle '{other}' for /context feature — use on|off"
-                )),
-            },
-            None => out.lines.push(format!(
-                "unknown context feature '{name}' — use {}",
-                ContextFeature::ALL
-                    .iter()
-                    .map(|f| f.keyword())
-                    .collect::<Vec<_>>()
-                    .join("|")
-            )),
+        handle_context_feature_arg(arg, features, &mut out);
+    } else if let Some(head) = rest.split_whitespace().next() {
+        if ContextFeature::from_keyword(head).is_some() {
+            handle_context_feature_arg(rest, features, &mut out);
+        } else {
+            out.lines.push(format!(
+                "unknown /context subcommand '{rest}' — \
+                 use /context [manager <preset> | feature <name> [on|off] | stats]"
+            ));
         }
     } else {
         out.lines.push(format!(
@@ -15039,12 +15083,12 @@ mod helper_fn_tests {
     }
 
     #[test]
-    fn context_features_local_backend_defaults_plan_ledger_on() {
+    fn context_features_local_backend_defaults_plan_semantic_ledger_on() {
         use newt_core::{
             BackendKind, ContextConfig, ContextFeature as F, ContextFeatures, ContextManager,
         };
-        // Step 27.4: a local (Ollama) session defaults scratchpad + scheduled ON
-        // with no config at all.
+        // Step 27.4: a local (Ollama) session defaults scratchpad + semantic +
+        // scheduled ON with no config at all.
         let local = context_features(
             &newt_core::Config::default(),
             ContextManager::Standard,
@@ -15052,6 +15096,7 @@ mod helper_fn_tests {
             BackendKind::Ollama,
         );
         assert!(local.get(F::Scratchpad));
+        assert!(local.get(F::Semantic));
         assert!(local.get(F::Scheduled));
         // An explicit [context.features] scheduled = false still wins.
         let mut off = ContextFeatures::default();
@@ -15135,6 +15180,7 @@ mod helper_fn_tests {
 
         // feature query (no toggle) shows state + availability
         assert!(run("feature semantic").lines[0].contains("context feature semantic: off"));
+        assert!(run("semantic").lines[0].contains("context feature semantic: off"));
 
         // A feature FORCED on via [context.features] (allowed even before it's
         // implemented): toggling it off is still refused, and the message +
@@ -15191,6 +15237,10 @@ mod helper_fn_tests {
         // semantic shipped in 26.5 → toggles ON (alias "retrieval" too).
         assert_eq!(
             run("feature retrieval on").set_feature,
+            Some((newt_core::ContextFeature::Semantic, true))
+        );
+        assert_eq!(
+            run("semantic on").set_feature,
             Some((newt_core::ContextFeature::Semantic, true))
         );
 
@@ -15418,36 +15468,49 @@ mod helper_fn_tests {
     }
 
     #[test]
-    fn resolve_embeddings_target_decouples_or_falls_back() {
+    fn resolve_embeddings_target_decouples_or_uses_explicit_protocol() {
         use newt_core::BackendKind;
-        // Unset endpoint → fall back to the active backend (url, protocol, key)
-        // — back-compat, and protocol-aware (carries inf_kind).
-        let mut cfg = newt_core::SemanticConfig::default();
+        // The HTTP helper still falls back to the active backend URL when the
+        // caller explicitly selects an HTTP embeddings protocol without a
+        // separate endpoint.
+        let cfg = newt_core::SemanticConfig {
+            embeddings_api: Some(BackendKind::Ollama),
+            ..Default::default()
+        };
         let (url, kind, key) =
             resolve_embeddings_target(&cfg, "http://dgx1:8000", BackendKind::Openai, Some("sk-x"));
         assert_eq!(url, "http://dgx1:8000");
-        assert_eq!(kind, BackendKind::Openai);
+        assert_eq!(kind, BackendKind::Ollama);
         assert_eq!(key.as_deref(), Some("sk-x"));
         // Explicit endpoint → used as-is, no inherited key; protocol defaults to
         // Ollama when embeddings_api is unset.
-        cfg.embeddings_endpoint = Some("http://REDACTED-HOST:11434".to_string());
+        let cfg = newt_core::SemanticConfig {
+            embeddings_endpoint: Some("http://REDACTED-HOST:11434".to_string()),
+            ..Default::default()
+        };
         let (url, kind, key) =
             resolve_embeddings_target(&cfg, "http://dgx1:8000", BackendKind::Openai, Some("sk-x"));
         assert_eq!(url, "http://REDACTED-HOST:11434");
         assert_eq!(kind, BackendKind::Ollama);
         assert_eq!(key, None);
         // ...and honors an explicit embeddings_api.
-        cfg.embeddings_api = Some(BackendKind::Openai);
+        let cfg = newt_core::SemanticConfig {
+            embeddings_api: Some(BackendKind::Openai),
+            ..cfg
+        };
         let (_, kind, _) = resolve_embeddings_target(&cfg, "http://x", BackendKind::Ollama, None);
         assert_eq!(kind, BackendKind::Openai);
     }
 
     #[test]
-    fn embeddings_backend_is_embedded_only_for_embedded_api() {
-        // #720: the in-process candle embedder is selected ONLY by
-        // `embeddings_api = "embedded"`; every other (including unset) is HTTP.
+    fn embeddings_backend_is_embedded_by_default_or_embedded_api() {
+        // #720: the in-process candle embedder is the default. HTTP embeddings
+        // require explicit Ollama/OpenAI semantic config.
         let mut cfg = newt_core::SemanticConfig::default();
-        assert!(!embeddings_backend_is_embedded(&cfg)); // None (default)
+        assert!(embeddings_backend_is_embedded(&cfg)); // None (default)
+        cfg.embeddings_endpoint = Some("http://REDACTED-HOST:11434".to_string());
+        assert!(!embeddings_backend_is_embedded(&cfg));
+        cfg.embeddings_endpoint = None;
         cfg.embeddings_api = Some(newt_core::BackendKind::Ollama);
         assert!(!embeddings_backend_is_embedded(&cfg));
         cfg.embeddings_api = Some(newt_core::BackendKind::Openai);
@@ -15456,20 +15519,29 @@ mod helper_fn_tests {
         assert!(embeddings_backend_is_embedded(&cfg));
     }
 
-    #[tokio::test]
-    async fn build_semantic_embedder_selects_embedded_path() {
-        // #720: with `embeddings_api = "embedded"` the builder takes the embedded
-        // branch. In a build WITHOUT the `embedded` feature that yields a failing
-        // embedder whose error names the missing feature — proving the embedded
-        // path was selected (an HTTP client would attempt a network call, not
-        // return this message). With the feature but no model dir it likewise
-        // fails closed (no model dir / no `embedding_model_path`). Either way the
-        // distinctive "embedded" wording shows the HTTP branch was NOT taken.
-        let cfg = newt_core::SemanticConfig {
-            embeddings_api: Some(newt_core::BackendKind::Embedded),
-            embedding_model_path: Some("/nonexistent/newt-bge-dir".to_string()),
+    #[test]
+    fn semantic_zero_index_hint_matches_embedder_path() {
+        let embedded = newt_core::SemanticConfig::default();
+        let hint = semantic_zero_index_hint(&embedded);
+        assert!(hint.contains("embedded embeddings"), "got: {hint}");
+        assert!(hint.contains("embedding_model_path"), "got: {hint}");
+
+        let http = newt_core::SemanticConfig {
+            embeddings_endpoint: Some("http://REDACTED-HOST:11434".to_string()),
             ..Default::default()
         };
+        assert!(semantic_zero_index_hint(&http).contains("Ollama/OpenAI"));
+    }
+
+    #[tokio::test]
+    async fn build_semantic_embedder_selects_embedded_path() {
+        // #720: with no explicit HTTP embeddings target, the builder takes the
+        // embedded branch. In a build WITHOUT the `embedded` feature that yields
+        // a failing embedder whose error names the missing feature — proving the
+        // embedded path was selected (an HTTP client would attempt a network
+        // call, not return this message). With the feature but no model dir it
+        // likewise fails closed.
+        let cfg = newt_core::SemanticConfig::default();
         let embedder = build_semantic_embedder(&cfg, "http://unused", inf_kind_ollama(), None);
         let err = embedder.embed("x").await.unwrap_err().to_string();
         assert!(
@@ -15494,7 +15566,10 @@ mod helper_fn_tests {
     async fn build_semantic_embedder_http_branch_constructs() {
         // The non-embedded branch builds an HTTP EmbeddingsClient (construction is
         // pure — no network). Exercising it keeps the HTTP path covered.
-        let cfg = newt_core::SemanticConfig::default(); // embeddings_api = None
+        let cfg = newt_core::SemanticConfig {
+            embeddings_api: Some(newt_core::BackendKind::Ollama),
+            ..Default::default()
+        };
         let _embedder =
             build_semantic_embedder(&cfg, "http://localhost:11434", inf_kind_ollama(), None);
         // Constructed without panic; embed() is intentionally NOT called (network).

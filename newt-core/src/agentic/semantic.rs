@@ -401,10 +401,12 @@ pub async fn index_files(
                         tracing::error!(
                             error = %e,
                             file = file.as_str(),
-                            "semantic indexing disabled: embeddings failed. Point \
-                             [context.semantic].embeddings_endpoint at an endpoint that serves \
-                             the embedding model (e.g. an Ollama host with the model pulled), or \
-                             set on_embed_failure = \"warn\" to keep trying per-chunk. Indexed \
+                            "semantic indexing disabled: embeddings failed. Configure \
+                             [context.semantic] for a working embedder: use \
+                             embeddings_endpoint/embeddings_api for an Ollama or OpenAI \
+                             embeddings service, or embeddings_api = \"embedded\" with \
+                             embedding_model_path for local in-process embeddings. Set \
+                             on_embed_failure = \"warn\" to keep trying per-chunk. Indexed \
                              {indexed} chunk(s) before stopping."
                         );
                         return indexed;
