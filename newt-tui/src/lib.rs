@@ -4025,11 +4025,9 @@ struct SummarizerOpts {
     timeout_secs: u64,
     /// Retry attempts before falling back to the static marker (Step 24.2).
     retries: u32,
-    /// Optional fallback model (Step 24.3; `summarizer.toml` `fallback_model`). When the
-    /// primary model's attempts all fail, the summary is retried once on this
-    /// model — a rung above the static marker. `None` = no explicit fallback;
-    /// for an Ollama backend the first installed [`FALLBACK_MODEL_PREFERENCES`]
-    /// model is auto-picked instead (Step 24.9), probed lazily on first failure.
+    /// Optional fallback model (Step 24.3; `summarizer.toml` `fallback_model`).
+    /// When the primary model's attempts all fail, the summary is retried once
+    /// on this model — a rung above the static marker. `None` = no fallback.
     fallback_model: Option<String>,
     /// Whether to surface live retry/fallback notices (Step 24.7). On only in
     /// interactive color sessions — off (default) for headless/captured streams.
@@ -4058,6 +4056,9 @@ fn retry_progress_msg(attempt: u32, total: u32) -> String {
 }
 fn fallback_progress_msg(model: &str) -> String {
     format!("⚠ summarizer falling back to {model}…")
+}
+fn failure_progress_msg(err: &anyhow::Error) -> String {
+    format!("⚠ summarizer failed ({err}); using static compression marker…")
 }
 fn summarizer_progress(msg: &str, color: bool) {
     use std::io::Write as _;
@@ -4182,81 +4183,6 @@ async fn summarize_one_model(
     Err(last_err.unwrap_or_else(|| anyhow::anyhow!("summarizer failed")))
 }
 
-/// Built-in small/fast models tried, in order, as the summarizer fallback when
-/// no `summarizer_model` is configured (Step 24.9, #559). The first one
-/// installed on the Ollama summarizer backend is used. All are small enough to
-/// land a summary well under `summarizer_timeout_secs` on a box where the slow
-/// primary model blew it — the #548 189s-to-static-marker shape. Order is
-/// smallest-capable-first; coding-tuned models lead since the summarized middle
-/// is a coding-agent conversation.
-const FALLBACK_MODEL_PREFERENCES: &[&str] = &[
-    "qwen2.5-coder:3b",
-    "nemotron-mini:4b",
-    "qwen2.5:3b",
-    "gemma:2b",
-    "phi3:mini",
-];
-
-/// Probe an Ollama backend's installed models (`GET /api/tags`) and return the
-/// first [`FALLBACK_MODEL_PREFERENCES`] entry present by exact tag, or `None`.
-/// Best-effort: any transport/non-2xx/parse error yields `None` (the caller
-/// degrades to the static marker — a probe failure never aborts compression).
-async fn probe_fallback_model(
-    client: &reqwest::Client,
-    url: &str,
-    api_key: &Option<String>,
-) -> Option<String> {
-    let tags_url = format!("{}/api/tags", url.trim_end_matches('/'));
-    let mut req = client.get(&tags_url);
-    if let Some(key) = api_key {
-        req = req.bearer_auth(key);
-    }
-    let resp = req.send().await.ok()?;
-    if !resp.status().is_success() {
-        return None;
-    }
-    let json: serde_json::Value = resp.json().await.ok()?;
-    let installed = json["models"].as_array()?;
-    let has = |name: &str| installed.iter().any(|m| m["name"].as_str() == Some(name));
-    FALLBACK_MODEL_PREFERENCES
-        .iter()
-        .find(|pref| has(pref))
-        .map(|pref| pref.to_string())
-}
-
-/// Resolve the fallback summarizer model: an explicit `summarizer_model` wins;
-/// otherwise, for an Ollama backend, the first installed preference-list model,
-/// probed at most once per session via `cache` (Step 24.9). OpenAI-compatible
-/// backends skip the probe (no safe `/api/tags` enumeration) and return `None`.
-async fn resolve_fallback_model(
-    cache: &tokio::sync::OnceCell<Option<String>>,
-    opts: &SummarizerOpts,
-    openai: bool,
-    url: &str,
-    api_key: &Option<String>,
-) -> Option<String> {
-    if let Some(fb) = &opts.fallback_model {
-        return Some(fb.clone());
-    }
-    if openai {
-        return None;
-    }
-    cache
-        .get_or_init(|| async {
-            // A short, bounded probe — the fallback's value is speed, so don't
-            // spend the full summary timeout discovering it.
-            match reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(opts.timeout_secs.min(10)))
-                .build()
-            {
-                Ok(client) => probe_fallback_model(&client, url, api_key).await,
-                Err(_) => None,
-            }
-        })
-        .await
-        .clone()
-}
-
 fn make_loop_summarizer(
     url: String,
     model: String,
@@ -4270,31 +4196,21 @@ fn make_loop_summarizer(
     if kind == newt_core::BackendKind::Embedded {
         return make_embedded_summarizer(model, model_path);
     }
-    // Session-scoped, probe-once cache for the auto-picked fallback model
-    // (Step 24.9). Resolved lazily on the FIRST primary failure — a session
-    // whose primary summarizer never fails never probes `/api/tags`.
-    let fallback_cache: std::sync::Arc<tokio::sync::OnceCell<Option<String>>> =
-        std::sync::Arc::new(tokio::sync::OnceCell::new());
     Box::new(move |prompt: String| {
         let url = url.clone();
         let model = model.clone();
         let api_key = api_key.clone();
         let opts = opts.clone();
-        let fallback_cache = fallback_cache.clone();
         let openai = kind == newt_core::BackendKind::Openai;
         Box::pin(async move {
             match summarize_one_model(&url, &model, openai, &prompt, &opts, &api_key).await {
                 Ok(s) => Ok(s),
                 // Step 24.3 (#559): the primary model's attempts all failed — try
-                // the fallback model once (a rung above the static marker). The
-                // fallback is the explicit `summarizer_model` or, when unset, the
-                // first installed preference-list model (Step 24.9). Surface the
-                // primary error if the fallback is absent or also fails.
+                // an explicitly configured fallback model once (a rung above the
+                // static marker). Without explicit configuration, surface the
+                // primary error so the compressor degrades immediately.
                 Err(primary_err) => {
-                    let fallback =
-                        resolve_fallback_model(&fallback_cache, &opts, openai, &url, &api_key)
-                            .await;
-                    match fallback {
+                    match opts.fallback_model.clone() {
                         Some(fb) if fb != model => {
                             // Step 24.7 (#559): announce the fallback live.
                             if opts.color {
@@ -4302,9 +4218,18 @@ fn make_loop_summarizer(
                             }
                             summarize_one_model(&url, &fb, openai, &prompt, &opts, &api_key)
                                 .await
-                                .map_err(|_| primary_err)
+                                .map_err(|fallback_err| {
+                                    anyhow::anyhow!(
+                                        "primary summarizer failed: {primary_err}; fallback summarizer '{fb}' failed: {fallback_err}"
+                                    )
+                                })
                         }
-                        _ => Err(primary_err),
+                        _ => {
+                            if opts.color {
+                                summarizer_progress(&failure_progress_msg(&primary_err), true);
+                            }
+                            Err(primary_err)
+                        }
                     }
                 }
             }
@@ -4386,15 +4311,19 @@ impl newt_core::Embedder for FailingEmbedder {
 }
 
 /// Whether the semantic feature should embed on the **in-process** backend
-/// (`embeddings_api = "embedded"`, #720) rather than over HTTP. Pure for testing.
+/// rather than over HTTP. Embedded is the default when the semantic config does
+/// not name an HTTP endpoint/protocol; Ollama/OpenAI embeddings are an explicit
+/// performance-tuning choice. Pure for testing.
 fn embeddings_backend_is_embedded(cfg: &newt_core::SemanticConfig) -> bool {
     cfg.embeddings_api == Some(newt_core::BackendKind::Embedded)
+        || (cfg.embeddings_api.is_none() && cfg.embeddings_endpoint.is_none())
 }
 
-/// Build the semantic embedder (#720). When `embeddings_api = "embedded"`, the
-/// in-process candle embedder runs on the laptop so retrieval never touches the
-/// DGX chat model's VRAM; otherwise the HTTP [`EmbeddingsClient`](newt_core::EmbeddingsClient)
-/// (Ollama / OpenAI) over the resolved target. Always returns a usable
+/// Build the semantic embedder (#720). By default, or when
+/// `embeddings_api = "embedded"`, the in-process candle embedder runs on the
+/// laptop so retrieval never touches the DGX chat model's VRAM. HTTP
+/// [`EmbeddingsClient`](newt_core::EmbeddingsClient) embeddings are selected
+/// only by explicit Ollama/OpenAI semantic config. Always returns a usable
 /// `Box<dyn Embedder>` — a mis-configured embedded path yields a failing embedder
 /// (→ indexing no-op) rather than panicking. Pure for testing.
 fn build_semantic_embedder(
@@ -4419,6 +4348,51 @@ fn build_semantic_embedder(
         60,
         2,
     ))
+}
+
+/// Preflight semantic embedder availability before walking the workspace. This
+/// keeps default-on semantic context cheap in binaries that were not built with
+/// the embedded feature, or where the local model path is not configured yet.
+fn semantic_embedder_unavailable_reason(cfg: &newt_core::SemanticConfig) -> Option<String> {
+    if !embeddings_backend_is_embedded(cfg) {
+        return None;
+    }
+    #[cfg(not(feature = "embedded"))]
+    {
+        Some(
+            "embedded semantic retrieval is selected, but this binary lacks the `embedded` \
+             feature; rebuild with --features embedded or configure an explicit \
+             [context.semantic].embeddings_endpoint"
+                .to_string(),
+        )
+    }
+    #[cfg(feature = "embedded")]
+    {
+        let Some(path) = cfg.embedding_model_path.as_deref() else {
+            return Some(
+                "embedded semantic retrieval needs [context.semantic].embedding_model_path \
+                 pointing at a local candle-clean standard-BERT model dir"
+                    .to_string(),
+            );
+        };
+        let dir = std::path::Path::new(path);
+        if !dir.is_dir() {
+            return Some(format!(
+                "embedded semantic retrieval model dir not found: {}",
+                dir.display()
+            ));
+        }
+        for required in ["config.json", "tokenizer.json", "model.safetensors"] {
+            let file = dir.join(required);
+            if !file.exists() {
+                return Some(format!(
+                    "embedded semantic retrieval model file not found: {}",
+                    file.display()
+                ));
+            }
+        }
+        None
+    }
 }
 
 /// Build the in-process candle embedder (#720). The `CandleEmbedder` loads a
@@ -4455,6 +4429,27 @@ fn make_embedded_embedder(
                 .to_string(),
         })
     }
+}
+
+fn semantic_zero_index_hint(cfg: &newt_core::SemanticConfig) -> String {
+    if embeddings_backend_is_embedded(cfg) {
+        return "semantic: indexed 0 chunks — embedded embeddings are unavailable; check \
+                [context.semantic].embedding_model_path points at a local candle-clean \
+                standard-BERT model dir and this binary was built with the embedded feature \
+                (retrieval is a no-op until embeddings work)"
+            .to_string();
+    }
+    let target = cfg
+        .embeddings_endpoint
+        .as_deref()
+        .unwrap_or("the active chat backend");
+    format!(
+        "semantic: indexed 0 chunks — embeddings from {target} produced no vectors for '{}'; \
+         configure [context.semantic].embeddings_endpoint/embeddings_api for an Ollama/OpenAI \
+         embeddings service, or set embedding_model_path to use embedded embeddings \
+         (retrieval is a no-op until embeddings work)",
+        cfg.embedding_model
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -6253,15 +6248,20 @@ fn run_chat(
                     // embedder (when `embeddings_api = "embedded"`) — the latter
                     // computes embeddings locally so retrieval never touches the
                     // DGX chat model's VRAM. The selection is a pure helper.
-                    let semantic_embedder: Option<Box<dyn newt_core::Embedder>> =
-                        semantic_on.then(|| {
-                            build_semantic_embedder(
+                    let semantic_embedder: Option<Box<dyn newt_core::Embedder>> = if semantic_on {
+                        if semantic_embedder_unavailable_reason(&semantic_cfg).is_some() {
+                            None
+                        } else {
+                            Some(build_semantic_embedder(
                                 &semantic_cfg,
                                 &inf_url,
                                 inf_kind,
                                 inf_key.as_deref(),
-                            )
-                        });
+                            ))
+                        }
+                    } else {
+                        None
+                    };
                     if let Some(embedder) = semantic_embedder.as_deref() {
                         if !semantic_indexed {
                             // Attempt indexing ONCE per session (reset on /new),
@@ -6288,11 +6288,7 @@ fn run_chat(
                                 });
                                 if n == 0 {
                                     print_harness_notice(
-                                        &format!(
-                                            "semantic: indexed 0 chunks — is the embedding model \
-                                             '{}' pulled in Ollama? (retrieval is a no-op until it is)",
-                                            semantic_cfg.embedding_model
-                                        ),
+                                        &semantic_zero_index_hint(&semantic_cfg),
                                         color,
                                     );
                                 } else {
@@ -6978,7 +6974,11 @@ fn resolve_embeddings_target(
             cfg.embeddings_api.unwrap_or(newt_core::BackendKind::Ollama),
             None,
         ),
-        None => (inf_url.to_string(), inf_kind, inf_key.map(str::to_string)),
+        None => (
+            inf_url.to_string(),
+            cfg.embeddings_api.unwrap_or(inf_kind),
+            inf_key.map(str::to_string),
+        ),
     }
 }
 
@@ -8896,9 +8896,9 @@ fn context_features(
     kind: newt_core::BackendKind,
 ) -> newt_core::ContextFeatureSet {
     // Step 27.4: the base depends on the backend — local (Ollama) sessions
-    // default the cross-round working-memory features (scratchpad + scheduled)
-    // ON; cloud keeps the all-off preset baseline. `[context.features]` config
-    // then session overrides still layer on top and win.
+    // default the local-assist features (scratchpad + semantic + scheduled) ON;
+    // cloud keeps the all-off preset baseline. `[context.features]` config then
+    // session overrides still layer on top and win.
     let base = newt_core::ContextFeatureSet::base_for(manager, kind);
     let with_config = cfg
         .context
@@ -8919,6 +8919,60 @@ struct ContextCommandResult {
     set_feature: Option<(newt_core::ContextFeature, bool)>,
 }
 
+fn handle_context_feature_arg(
+    arg: &str,
+    features: newt_core::ContextFeatureSet,
+    out: &mut ContextCommandResult,
+) {
+    use newt_core::ContextFeature;
+    let mut parts = arg.split_whitespace();
+    let name = parts.next().unwrap_or("");
+    let toggle = parts.next();
+    match ContextFeature::from_keyword(name) {
+        Some(f) => match toggle {
+            None => {
+                let state = if features.get(f) { "on" } else { "off" };
+                let tail = if f.available() {
+                    String::new()
+                } else {
+                    format!(" (not yet available — #{})", f.issue())
+                };
+                out.lines
+                    .push(format!("context feature {}: {state}{tail}", f.keyword()));
+            }
+            Some(t @ ("on" | "off")) => {
+                let want = t == "on";
+                if f.available() {
+                    out.set_feature = Some((f, want));
+                    out.lines
+                        .push(format!("context feature {} → {t}", f.keyword()));
+                } else {
+                    // Report the ACTUAL resolved state, not a hardcoded "off" —
+                    // config can force an unimplemented feature on, and the
+                    // toggle (which we refuse) doesn't change it.
+                    let state = if features.get(f) { "on" } else { "off" };
+                    out.lines.push(format!(
+                        "context feature '{}' is not yet available (see #{}) — staying {state}",
+                        f.keyword(),
+                        f.issue()
+                    ));
+                }
+            }
+            Some(other) => out.lines.push(format!(
+                "unknown toggle '{other}' for /context feature — use on|off"
+            )),
+        },
+        None => out.lines.push(format!(
+            "unknown context feature '{name}' — use {}",
+            ContextFeature::ALL
+                .iter()
+                .map(|f| f.keyword())
+                .collect::<Vec<_>>()
+                .join("|")
+        )),
+    }
+}
+
 /// Dispatch `/context [manager <preset> | feature <name> [on|off]]` against the
 /// current config + session overrides (Step 26.1, #588). `rest` is the text
 /// after `context`. Unavailable presets/features report "not yet available" and
@@ -8931,6 +8985,7 @@ fn handle_context_command(
     kind: newt_core::BackendKind,
 ) -> ContextCommandResult {
     use newt_core::{ContextFeature, ContextManager};
+    let rest = rest.trim();
     let manager = context_manager(cfg, manager_override);
     let features = context_features(cfg, manager, feature_override, kind);
     let mgr_src = if manager_override.is_some() {
@@ -9003,51 +9058,15 @@ fn handle_context_command(
             out.lines.push(format!("  [{state}] {}{tail}", f.keyword()));
         }
     } else if let Some(arg) = rest.strip_prefix("feature ") {
-        let mut parts = arg.split_whitespace();
-        let name = parts.next().unwrap_or("");
-        let toggle = parts.next();
-        match ContextFeature::from_keyword(name) {
-            Some(f) => match toggle {
-                None => {
-                    let state = if features.get(f) { "on" } else { "off" };
-                    let tail = if f.available() {
-                        String::new()
-                    } else {
-                        format!(" (not yet available — #{})", f.issue())
-                    };
-                    out.lines
-                        .push(format!("context feature {}: {state}{tail}", f.keyword()));
-                }
-                Some(t @ ("on" | "off")) => {
-                    let want = t == "on";
-                    if f.available() {
-                        out.set_feature = Some((f, want));
-                        out.lines
-                            .push(format!("context feature {} → {t}", f.keyword()));
-                    } else {
-                        // Report the ACTUAL resolved state, not a hardcoded
-                        // "off" — config can force an unimplemented feature on,
-                        // and the toggle (which we refuse) doesn't change it.
-                        let state = if features.get(f) { "on" } else { "off" };
-                        out.lines.push(format!(
-                            "context feature '{}' is not yet available (see #{}) — staying {state}",
-                            f.keyword(),
-                            f.issue()
-                        ));
-                    }
-                }
-                Some(other) => out.lines.push(format!(
-                    "unknown toggle '{other}' for /context feature — use on|off"
-                )),
-            },
-            None => out.lines.push(format!(
-                "unknown context feature '{name}' — use {}",
-                ContextFeature::ALL
-                    .iter()
-                    .map(|f| f.keyword())
-                    .collect::<Vec<_>>()
-                    .join("|")
-            )),
+        handle_context_feature_arg(arg, features, &mut out);
+    } else if let Some(head) = rest.split_whitespace().next() {
+        if ContextFeature::from_keyword(head).is_some() {
+            handle_context_feature_arg(rest, features, &mut out);
+        } else {
+            out.lines.push(format!(
+                "unknown /context subcommand '{rest}' — \
+                 use /context [manager <preset> | feature <name> [on|off] | stats]"
+            ));
         }
     } else {
         out.lines.push(format!(
@@ -15039,12 +15058,12 @@ mod helper_fn_tests {
     }
 
     #[test]
-    fn context_features_local_backend_defaults_plan_ledger_on() {
+    fn context_features_local_backend_defaults_plan_semantic_ledger_on() {
         use newt_core::{
             BackendKind, ContextConfig, ContextFeature as F, ContextFeatures, ContextManager,
         };
-        // Step 27.4: a local (Ollama) session defaults scratchpad + scheduled ON
-        // with no config at all.
+        // Step 27.4: a local (Ollama) session defaults scratchpad + semantic +
+        // scheduled ON with no config at all.
         let local = context_features(
             &newt_core::Config::default(),
             ContextManager::Standard,
@@ -15052,6 +15071,7 @@ mod helper_fn_tests {
             BackendKind::Ollama,
         );
         assert!(local.get(F::Scratchpad));
+        assert!(local.get(F::Semantic));
         assert!(local.get(F::Scheduled));
         // An explicit [context.features] scheduled = false still wins.
         let mut off = ContextFeatures::default();
@@ -15135,6 +15155,7 @@ mod helper_fn_tests {
 
         // feature query (no toggle) shows state + availability
         assert!(run("feature semantic").lines[0].contains("context feature semantic: off"));
+        assert!(run("semantic").lines[0].contains("context feature semantic: off"));
 
         // A feature FORCED on via [context.features] (allowed even before it's
         // implemented): toggling it off is still refused, and the message +
@@ -15191,6 +15212,10 @@ mod helper_fn_tests {
         // semantic shipped in 26.5 → toggles ON (alias "retrieval" too).
         assert_eq!(
             run("feature retrieval on").set_feature,
+            Some((newt_core::ContextFeature::Semantic, true))
+        );
+        assert_eq!(
+            run("semantic on").set_feature,
             Some((newt_core::ContextFeature::Semantic, true))
         );
 
@@ -15418,36 +15443,49 @@ mod helper_fn_tests {
     }
 
     #[test]
-    fn resolve_embeddings_target_decouples_or_falls_back() {
+    fn resolve_embeddings_target_decouples_or_uses_explicit_protocol() {
         use newt_core::BackendKind;
-        // Unset endpoint → fall back to the active backend (url, protocol, key)
-        // — back-compat, and protocol-aware (carries inf_kind).
-        let mut cfg = newt_core::SemanticConfig::default();
+        // The HTTP helper still falls back to the active backend URL when the
+        // caller explicitly selects an HTTP embeddings protocol without a
+        // separate endpoint.
+        let cfg = newt_core::SemanticConfig {
+            embeddings_api: Some(BackendKind::Ollama),
+            ..Default::default()
+        };
         let (url, kind, key) =
             resolve_embeddings_target(&cfg, "http://dgx1:8000", BackendKind::Openai, Some("sk-x"));
         assert_eq!(url, "http://dgx1:8000");
-        assert_eq!(kind, BackendKind::Openai);
+        assert_eq!(kind, BackendKind::Ollama);
         assert_eq!(key.as_deref(), Some("sk-x"));
         // Explicit endpoint → used as-is, no inherited key; protocol defaults to
         // Ollama when embeddings_api is unset.
-        cfg.embeddings_endpoint = Some("http://REDACTED-HOST:11434".to_string());
+        let cfg = newt_core::SemanticConfig {
+            embeddings_endpoint: Some("http://REDACTED-HOST:11434".to_string()),
+            ..Default::default()
+        };
         let (url, kind, key) =
             resolve_embeddings_target(&cfg, "http://dgx1:8000", BackendKind::Openai, Some("sk-x"));
         assert_eq!(url, "http://REDACTED-HOST:11434");
         assert_eq!(kind, BackendKind::Ollama);
         assert_eq!(key, None);
         // ...and honors an explicit embeddings_api.
-        cfg.embeddings_api = Some(BackendKind::Openai);
+        let cfg = newt_core::SemanticConfig {
+            embeddings_api: Some(BackendKind::Openai),
+            ..cfg
+        };
         let (_, kind, _) = resolve_embeddings_target(&cfg, "http://x", BackendKind::Ollama, None);
         assert_eq!(kind, BackendKind::Openai);
     }
 
     #[test]
-    fn embeddings_backend_is_embedded_only_for_embedded_api() {
-        // #720: the in-process candle embedder is selected ONLY by
-        // `embeddings_api = "embedded"`; every other (including unset) is HTTP.
+    fn embeddings_backend_is_embedded_by_default_or_embedded_api() {
+        // #720: the in-process candle embedder is the default. HTTP embeddings
+        // require explicit Ollama/OpenAI semantic config.
         let mut cfg = newt_core::SemanticConfig::default();
-        assert!(!embeddings_backend_is_embedded(&cfg)); // None (default)
+        assert!(embeddings_backend_is_embedded(&cfg)); // None (default)
+        cfg.embeddings_endpoint = Some("http://REDACTED-HOST:11434".to_string());
+        assert!(!embeddings_backend_is_embedded(&cfg));
+        cfg.embeddings_endpoint = None;
         cfg.embeddings_api = Some(newt_core::BackendKind::Ollama);
         assert!(!embeddings_backend_is_embedded(&cfg));
         cfg.embeddings_api = Some(newt_core::BackendKind::Openai);
@@ -15456,20 +15494,52 @@ mod helper_fn_tests {
         assert!(embeddings_backend_is_embedded(&cfg));
     }
 
-    #[tokio::test]
-    async fn build_semantic_embedder_selects_embedded_path() {
-        // #720: with `embeddings_api = "embedded"` the builder takes the embedded
-        // branch. In a build WITHOUT the `embedded` feature that yields a failing
-        // embedder whose error names the missing feature — proving the embedded
-        // path was selected (an HTTP client would attempt a network call, not
-        // return this message). With the feature but no model dir it likewise
-        // fails closed (no model dir / no `embedding_model_path`). Either way the
-        // distinctive "embedded" wording shows the HTTP branch was NOT taken.
-        let cfg = newt_core::SemanticConfig {
-            embeddings_api: Some(newt_core::BackendKind::Embedded),
-            embedding_model_path: Some("/nonexistent/newt-bge-dir".to_string()),
+    #[test]
+    fn semantic_zero_index_hint_matches_embedder_path() {
+        let embedded = newt_core::SemanticConfig::default();
+        let hint = semantic_zero_index_hint(&embedded);
+        assert!(hint.contains("embedded embeddings"), "got: {hint}");
+        assert!(hint.contains("embedding_model_path"), "got: {hint}");
+
+        let http = newt_core::SemanticConfig {
+            embeddings_endpoint: Some("http://REDACTED-HOST:11434".to_string()),
             ..Default::default()
         };
+        assert!(semantic_zero_index_hint(&http).contains("Ollama/OpenAI"));
+    }
+
+    #[test]
+    fn semantic_embedder_preflight_skips_unavailable_embedded_path() {
+        let embedded = newt_core::SemanticConfig::default();
+        let reason = semantic_embedder_unavailable_reason(&embedded)
+            .expect("default semantic embeddings select the embedded path");
+        #[cfg(not(feature = "embedded"))]
+        assert!(
+            reason.contains("lacks the `embedded` feature"),
+            "got: {reason}"
+        );
+        #[cfg(feature = "embedded")]
+        assert!(reason.contains("embedding_model_path"), "got: {reason}");
+    }
+
+    #[test]
+    fn semantic_embedder_preflight_allows_explicit_http_embeddings() {
+        let http = newt_core::SemanticConfig {
+            embeddings_api: Some(newt_core::BackendKind::Ollama),
+            ..Default::default()
+        };
+        assert!(semantic_embedder_unavailable_reason(&http).is_none());
+    }
+
+    #[tokio::test]
+    async fn build_semantic_embedder_selects_embedded_path() {
+        // #720: with no explicit HTTP embeddings target, the builder takes the
+        // embedded branch. In a build WITHOUT the `embedded` feature that yields
+        // a failing embedder whose error names the missing feature — proving the
+        // embedded path was selected (an HTTP client would attempt a network
+        // call, not return this message). With the feature but no model dir it
+        // likewise fails closed.
+        let cfg = newt_core::SemanticConfig::default();
         let embedder = build_semantic_embedder(&cfg, "http://unused", inf_kind_ollama(), None);
         let err = embedder.embed("x").await.unwrap_err().to_string();
         assert!(
@@ -15494,7 +15564,10 @@ mod helper_fn_tests {
     async fn build_semantic_embedder_http_branch_constructs() {
         // The non-embedded branch builds an HTTP EmbeddingsClient (construction is
         // pure — no network). Exercising it keeps the HTTP path covered.
-        let cfg = newt_core::SemanticConfig::default(); // embeddings_api = None
+        let cfg = newt_core::SemanticConfig {
+            embeddings_api: Some(newt_core::BackendKind::Ollama),
+            ..Default::default()
+        };
         let _embedder =
             build_semantic_embedder(&cfg, "http://localhost:11434", inf_kind_ollama(), None);
         // Constructed without panic; embed() is intentionally NOT called (network).
@@ -16911,21 +16984,23 @@ mod http_loop_tests {
         assert_eq!(out, "FB SUM", "fell back to the secondary model");
     }
 
-    /// Step 24.9 (#559): with no `summarizer_model` configured, an Ollama
-    /// summarizer backend auto-picks the first installed preference-list model
-    /// (probed via `/api/tags`) as the fallback when the primary model fails.
+    /// With no explicit fallback configured, the summarizer must not spend
+    /// another live turn auto-picking an installed Ollama model. The compression
+    /// pipeline turns the surfaced primary error into the static marker.
     #[tokio::test(flavor = "multi_thread")]
-    async fn summarizer_auto_picks_preference_fallback_when_unset() {
+    async fn loop_summarizer_does_not_auto_pick_fallback_when_unset() {
         use wiremock::{Request, Respond};
 
         struct ByModel;
         impl Respond for ByModel {
             fn respond(&self, req: &Request) -> ResponseTemplate {
                 let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
-                // "nemotron-mini:4b" is the only installed preference model below.
+                // The installed small model would succeed, but it was not
+                // explicitly configured as the summarizer fallback.
                 if body["model"] == "nemotron-mini:4b" {
-                    ResponseTemplate::new(200)
-                        .set_body_json(serde_json::json!({"message": {"content": "AUTO FB"}}))
+                    ResponseTemplate::new(200).set_body_json(
+                        serde_json::json!({"message": {"content": "UNCONFIGURED FB"}}),
+                    )
                 } else {
                     ResponseTemplate::new(500) // the primary model always fails
                 }
@@ -16943,6 +17018,7 @@ mod http_loop_tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "models": [{"name": "session-model:27b"}, {"name": "nemotron-mini:4b"}]
             })))
+            .expect(0)
             .mount(&server)
             .await;
 
@@ -16954,68 +17030,15 @@ mod http_loop_tests {
             None,
             SummarizerOpts {
                 retries: 0,
-                fallback_model: None, // <- unset: auto-pick path
+                fallback_model: None,
                 ..Default::default()
             },
         );
-        let out = s("summarize".into()).await.unwrap();
-        assert_eq!(out, "AUTO FB", "auto-picked the installed preference model");
-    }
-
-    /// Step 24.9: the probe honors preference ORDER, not the order `/api/tags`
-    /// lists models in — `nemotron-mini:4b` outranks `gemma:2b` even when listed
-    /// after it.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn probe_fallback_model_respects_preference_order() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/api/tags"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "models": [{"name": "gemma:2b"}, {"name": "nemotron-mini:4b"}]
-            })))
-            .mount(&server)
-            .await;
-        let client = reqwest::Client::new();
-        let picked = super::probe_fallback_model(&client, &server.uri(), &None).await;
-        assert_eq!(picked.as_deref(), Some("nemotron-mini:4b"));
-    }
-
-    /// Step 24.9: no installed model matches the preference list ⇒ `None` (the
-    /// caller then surfaces the primary error → static marker).
-    #[tokio::test(flavor = "multi_thread")]
-    async fn probe_fallback_model_none_when_no_preference_installed() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/api/tags"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "models": [{"name": "llama3.1:8b"}, {"name": "custom:99b"}]
-            })))
-            .mount(&server)
-            .await;
-        let client = reqwest::Client::new();
-        let picked = super::probe_fallback_model(&client, &server.uri(), &None).await;
-        assert_eq!(picked, None);
-    }
-
-    /// Step 24.9: OpenAI-compatible backends have no `/api/tags` to enumerate —
-    /// `resolve_fallback_model` short-circuits to `None` without any probe (the
-    /// unroutable URL would error if it were hit).
-    #[tokio::test(flavor = "multi_thread")]
-    async fn resolve_fallback_model_skips_probe_for_openai() {
-        let cache = tokio::sync::OnceCell::new();
-        let opts = SummarizerOpts {
-            fallback_model: None,
-            ..Default::default()
-        };
-        let picked = super::resolve_fallback_model(
-            &cache,
-            &opts,
-            true, // openai
-            "http://127.0.0.1:1",
-            &None,
-        )
-        .await;
-        assert_eq!(picked, None);
+        let err = s("summarize".into()).await.unwrap_err();
+        assert!(
+            err.to_string().contains("summarizer endpoint 500"),
+            "the primary error should surface for static-marker compression: {err}"
+        );
     }
 
     /// Step 24.10 (#559): a `summarizer.toml` with its own backend overrides

@@ -1,0 +1,58 @@
+name = "github_pr"
+enabled = true
+description = "read an issue/request, implement in tracked steps, commit to a branch, push, and open a GitHub PR"
+
+[classifier]
+min_score = 0.24
+keywords = [
+  "github issue",
+  "github.com",
+  "pull request",
+  "open a pr",
+  "create a pr",
+]
+examples = [
+  "Read this GitHub issue, plan the implementation, create a branch, commit the work, push, and open a PR.",
+  "Take a look at this issue, implement the fix in steps, commit each step, and create a pull request.",
+  "Build the requested change from an issue URL and get me a GitHub PR.",
+]
+
+[[steps]]
+id = "read_issue"
+title = "Read the issue/request and current repo state"
+steer = "Gather ground truth from the issue, git status, branch, log, and relevant files before editing"
+
+[[steps]]
+id = "plan_implementation"
+title = "Break the implementation into ordered steps"
+steer = "Call update_plan with concrete implementation, verification, commit, push, and PR steps"
+
+[[steps]]
+id = "create_branch"
+title = "Create or switch to a feature branch"
+steer = "Use git status/branch ground truth before creating or switching branches"
+
+[[steps]]
+id = "implement_step"
+title = "Implement the active step"
+steer = "Make the smallest coherent edit for the active plan step"
+
+[[steps]]
+id = "verify_step"
+title = "Verify the active step"
+steer = "Run focused tests/checks that prove the step works"
+
+[[steps]]
+id = "commit_step"
+title = "Commit the verified step to the branch"
+steer = "Stage only relevant files and commit with the required LLM attribution trailer"
+
+[[steps]]
+id = "push_branch"
+title = "Push the feature branch"
+steer = "Push the feature branch after the intended commits are present"
+
+[[steps]]
+id = "open_pr"
+title = "Open or update the GitHub PR"
+steer = "Create/update the PR with what changed, test plan, and out-of-scope notes"

@@ -9,6 +9,7 @@ pub mod agentic;
 pub mod agents;
 pub mod api_surface;
 pub mod caveats;
+pub mod classifiers;
 pub mod config;
 pub mod conversation;
 pub mod dgx;
@@ -44,6 +45,7 @@ pub mod tokens;
 pub mod tooling;
 pub mod tuning;
 pub mod verify_gate;
+pub mod workflows;
 pub mod workspace_key;
 
 #[cfg(feature = "pyo3")]
@@ -81,6 +83,9 @@ pub use agentic::{
 pub use agents::AgentsProvider;
 pub use api_surface::ApiSurfaceProvider;
 pub use caveats::{CaveatsExt, CountBoundExt, ScopeExt};
+pub use classifiers::{
+    classifier_config_dir, NudgeClass, NudgeClassification, NudgeClassifier, NudgeClassifierConfig,
+};
 pub use config::{
     AgentsConfig, BackendConfig, BackendKind, BundleConfig, ChatStyle, ColorMode, Config,
     ContextConfig, ContextFeature, ContextFeatureSet, ContextFeatures, ContextManager,
@@ -120,4 +125,8 @@ pub use router::{Router, Tier};
 pub use session::SessionId;
 pub use store::{sanitize_fts5_query, ConversationStore, SearchHit};
 pub use tokens::TokenEstimation;
+pub use workflows::{
+    builtin_workflows, load_workflows_from_dir, merge_workflows, workflow_config_dir,
+    WorkflowClassifierConfig, WorkflowConfig, WorkflowSteerer, WorkflowStep,
+};
 pub use workspace_key::workspace_key_v2;

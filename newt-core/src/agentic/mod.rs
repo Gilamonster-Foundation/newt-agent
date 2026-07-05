@@ -895,12 +895,18 @@ fn is_tools_unsupported_error(e: &anyhow::Error) -> bool {
 
 /// True when Ollama accepted the `tools` field but its internal XML tool-call
 /// parser rejected the model's generated `<function>/<parameter>` markup before
-/// returning an assistant message. There is no content for Newt's text-mode
-/// tool recovery to parse, so the usable recovery is the same shape as a
-/// tools-unsupported model: retry the turn without advertising tools.
+/// returning an assistant message. This is a malformed generation, not proof
+/// that the model lacks tool support, so retry with tools still advertised and
+/// a corrective nudge instead of disabling tools for the whole turn.
 fn is_ollama_tool_xml_error(e: &anyhow::Error) -> bool {
     let s = e.to_string().to_lowercase();
-    s.contains("xml syntax error") && s.contains("parameter") && s.contains("function")
+    s.contains("ollama") && s.contains("xml syntax error")
+}
+
+fn ollama_tool_xml_retry_nudge() -> &'static str {
+    "The previous assistant turn failed inside Ollama's XML tool-call parser. \
+     Keep using tools, but emit exactly one valid native tool call with well-formed \
+     arguments now. Do not answer in prose or wrap the call in explanatory XML."
 }
 
 /// Main agentic loop: call model → execute tool calls → feed results back → repeat.
@@ -1191,8 +1197,8 @@ pub async fn chat_complete(
     // that zero-tool round as a final answer and end the turn, forcing a human
     // "continue". `narration_nudges` bounds the auto-continue that instead
     // nudges the model to actually call the tool (≤ NARRATION_NUDGE_CAP per
-    // turn); the trigger is `looks_like_intent_to_act`, so a genuine conclusion
-    // (with or without prior tool calls this turn) is never nudged.
+    // turn); the trigger is the configurable NudgeClassifier, so a genuine
+    // conclusion (with or without prior tool calls this turn) is never nudged.
     let mut narration_nudges: usize = 0;
     // State-driven final-answer gate: a no-tool reply is suspicious when the
     // active plan still has open steps. Nudge once to update_plan / act / block.
@@ -1201,6 +1207,10 @@ pub async fn chat_complete(
     // without proving it, force one read-only ground-truth check round instead
     // of letting it hand the stale-context claim back to the human.
     let mut stale_file_nudges: usize = 0;
+    let nudge_classifier = crate::NudgeClassifier::load_default();
+    let workflow_steerer = crate::WorkflowSteerer::load_default();
+    let mut workflow_runtime = WorkflowRuntimeState::default();
+    let mut ollama_xml_retry_nudges: usize = 0;
     // Phase 20 §2.2: the thinking-only quirk is reported at most once per
     // turn — re-detection adds no information and would thrash the cache.
     let mut thinking_only_reported = false;
@@ -1209,8 +1219,29 @@ pub async fn chat_complete(
     let mut observed_paths = claim_check::ObservedPaths::default();
     let observed_resolver = claim_check::workspace_resolver(workspace);
 
-    // Agentic loop — up to `max_tool_rounds` tool-call rounds.
-    'round_loop: for round in 0..max_tool_rounds {
+    // Agentic loop — up to `max_tool_rounds` tool-call rounds, with a tiny
+    // evidence-backed grace window when the normal cap lands immediately after
+    // read-only repair context.
+    let hard_tool_rounds = max_tool_rounds.saturating_add(WORKFLOW_GRACE_ROUND_CAP);
+    let mut workflow_grace_rounds = 0usize;
+    'round_loop: for round in 0..hard_tool_rounds {
+        if round >= max_tool_rounds {
+            let Some(nudge) = workflow_runtime.cap_grace_nudge(
+                step_ledger,
+                max_tool_rounds,
+                workflow_grace_rounds,
+            ) else {
+                break;
+            };
+            workflow_grace_rounds += 1;
+            if debug {
+                print_debug(
+                    "workflow evidence at round cap — granting bounded action round",
+                    color,
+                );
+            }
+            messages.push(serde_json::json!({ "role": "user", "content": nudge }));
+        }
         // Interrupt checkpoint (Esc / Ctrl-C): bail before spending another
         // round on the model or a tool. The reply is empty — the caller sees
         // `cancel` set and treats the turn as abandoned regardless.
@@ -1239,6 +1270,9 @@ pub async fn chat_complete(
         if round > 0 {
             if let Some(ptr) = step_ledger.and_then(plan_reseat_pointer) {
                 messages.push(serde_json::json!({ "role": "user", "content": ptr }));
+            }
+            if let Some(nudge) = workflow_runtime.round_start_nudge(step_ledger) {
+                messages.push(serde_json::json!({ "role": "user", "content": nudge }));
             }
         }
 
@@ -1465,23 +1499,37 @@ pub async fn chat_complete(
                 // No-tools recovery: a model that rejects the `tools` field
                 // (deepseek-r1) 400s even on "hello". Drop tools, notice once,
                 // and re-dispatch the same turn — self-limiting because the
-                // rebuilt body omits tools.
+                // rebuilt body omits tools. A malformed XML tool-call error is
+                // different: Ollama accepted tools but choked on the model's
+                // generated markup, so keep tools available and retry with a
+                // bounded corrective nudge.
                 let tools_unsupported = is_tools_unsupported_error(&e);
                 let malformed_xml_tool_call = is_ollama_tool_xml_error(&e);
-                if tools_supported && (tools_unsupported || malformed_xml_tool_call) {
+                if tools_supported && tools_unsupported {
                     tools_supported = false;
                     if !tools_unsupported_notified {
                         tools_unsupported_notified = true;
-                        let notice = if tools_unsupported {
-                            format!("{model} does not support tools — tools disabled for this turn")
-                        } else {
-                            format!(
-                                "{model} produced malformed Ollama XML tool-call syntax — \
-                                 retrying without tools for this turn"
-                            )
-                        };
+                        let notice = format!(
+                            "{model} does not support tools — tools disabled for this turn"
+                        );
                         print_newt(&notice, color, false);
                     }
+                    continue 'round_loop;
+                }
+                if tools_supported && malformed_xml_tool_call && ollama_xml_retry_nudges < 2 {
+                    ollama_xml_retry_nudges += 1;
+                    print_newt(
+                        &format!(
+                            "{model} produced malformed Ollama XML tool-call syntax — \
+                             retrying with a stricter tool-call nudge"
+                        ),
+                        color,
+                        false,
+                    );
+                    messages.push(serde_json::json!({
+                        "role": "user",
+                        "content": ollama_tool_xml_retry_nudge()
+                    }));
                     continue 'round_loop;
                 }
                 // Graceful context-window 400 recovery: parse the model's real
@@ -1975,8 +2023,42 @@ pub async fn chat_complete(
             // chronic narrator can't loop; after the cap the prose is accepted
             // as the final answer (the return below). A genuine from-the-start
             // final answer (no prior call, no intent cue) is never nudged.
+            let nudge_classification = nudge_classifier.classify(&streamed);
+            let workflow_classifier_text = workflow_classifier_text(&messages, &streamed);
+            let workflow_hint = nudge_classification
+                .is_plan_update()
+                .then(|| workflow_steerer.plan_update_hint(&workflow_classifier_text))
+                .flatten();
+            let classifier_plan_direction = nudge_classification
+                .is_plan_update()
+                .then(|| nudge_classifier.direction_for(crate::NudgeClass::PlanUpdate))
+                .flatten();
+            let plan_nudge_hint =
+                combine_nudge_hints(classifier_plan_direction, workflow_hint.as_deref());
+            if round + 1 < max_tool_rounds {
+                if let Some(nudge) = workflow_runtime.rediscovery_nudge(
+                    Some(&nudge_classification),
+                    &streamed,
+                    step_ledger,
+                ) {
+                    if debug {
+                        print_debug(
+                            "workflow evidence rediscovery — nudging toward active repair",
+                            color,
+                        );
+                    }
+                    messages.push(serde_json::json!({ "role": "assistant", "content": streamed }));
+                    messages.push(serde_json::json!({ "role": "user", "content": nudge }));
+                    accumulated_usage = merge_round_usage(accumulated_usage, stream_usage);
+                    continue 'round_loop;
+                }
+            }
             if pending_plan_nudges < PENDING_PLAN_NUDGE_CAP && round + 1 < max_tool_rounds {
-                if let Some(nudge) = pending_plan_completion_nudge(step_ledger) {
+                if let Some(nudge) = pending_plan_completion_nudge(
+                    step_ledger,
+                    nudge_classification.is_plan_update(),
+                    plan_nudge_hint.as_deref(),
+                ) {
                     if debug {
                         print_debug(
                             "active plan has unfinished steps — nudging before final answer",
@@ -2011,7 +2093,7 @@ pub async fn chat_complete(
             }
             if narration_nudges < NARRATION_NUDGE_CAP
                 && round + 1 < max_tool_rounds
-                && looks_like_intent_to_act(&streamed)
+                && nudge_classification.is_pending_action()
             {
                 if debug {
                     print_debug(
@@ -2022,9 +2104,13 @@ pub async fn chat_complete(
                 // Record the model's own narration, then the corrective, so the
                 // next round sees both (mirrors the has-tools assistant turn).
                 messages.push(serde_json::json!({ "role": "assistant", "content": streamed }));
+                let direction = nudge_classifier
+                    .direction_for(nudge_classification.class)
+                    .map(str::to_string)
+                    .unwrap_or_else(narration_action_nudge);
                 messages.push(serde_json::json!({
                     "role": "user",
-                    "content": narration_action_nudge(),
+                    "content": direction,
                 }));
                 narration_nudges += 1;
                 accumulated_usage = merge_round_usage(accumulated_usage, stream_usage);
@@ -2056,6 +2142,7 @@ pub async fn chat_complete(
         );
         messages.push(message.clone());
         let mut round_wrote = false;
+        let mut round_modified_workspace = false;
         for tc in tool_calls.unwrap() {
             let anthropic_native = tc["function"].is_null();
             let name = if anthropic_native {
@@ -2156,7 +2243,11 @@ pub async fn chat_complete(
             // Step 27.3/#771: classify once; remember outcomes that should make
             // an exact repeat self-correct next round.
             let ok = tools::tool_result_ok(&result);
+            if ok && is_workspace_write_call(name) {
+                round_modified_workspace = true;
+            }
             repeat_calls.record(name, &args, ok, &result);
+            workflow_runtime.record_tool_result(&result);
             if let Some(rec) = tool_events.as_deref_mut() {
                 rec.push(crate::ToolEvent::from_call(
                     name,
@@ -2197,6 +2288,7 @@ pub async fn chat_complete(
         } else {
             read_only_rounds = read_only_rounds.saturating_add(1);
         }
+        workflow_runtime.record_round_outcome(round_modified_workspace);
     }
 
     // Reached the round cap. Trim the bloated message list so the final
@@ -2426,6 +2518,290 @@ impl RepeatCallGuard {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WorkflowErrorEvidence {
+    fingerprint: String,
+    observations: usize,
+}
+
+#[derive(Debug, Default)]
+struct WorkflowRuntimeState {
+    error_evidence: Option<WorkflowErrorEvidence>,
+    read_only_rounds_after_evidence: usize,
+    writes_after_evidence: usize,
+    step_lock_nudges: usize,
+    rediscovery_nudges: usize,
+}
+
+impl WorkflowRuntimeState {
+    const STEP_LOCK_NUDGE_CAP: usize = 3;
+    const REDISCOVERY_NUDGE_CAP: usize = 2;
+
+    fn record_tool_result(&mut self, result: &str) {
+        let Some(fingerprint) = workflow_error_fingerprint(result) else {
+            return;
+        };
+        match self.error_evidence.as_mut() {
+            Some(evidence) if evidence.fingerprint == fingerprint => {
+                evidence.observations = evidence.observations.saturating_add(1);
+            }
+            _ => {
+                self.error_evidence = Some(WorkflowErrorEvidence {
+                    fingerprint,
+                    observations: 1,
+                });
+                self.read_only_rounds_after_evidence = 0;
+                self.writes_after_evidence = 0;
+                self.step_lock_nudges = 0;
+                self.rediscovery_nudges = 0;
+            }
+        }
+    }
+
+    fn record_round_outcome(&mut self, round_wrote: bool) {
+        if self.error_evidence.is_none() {
+            return;
+        }
+        if round_wrote {
+            self.writes_after_evidence = self.writes_after_evidence.saturating_add(1);
+            self.read_only_rounds_after_evidence = 0;
+        } else {
+            self.read_only_rounds_after_evidence =
+                self.read_only_rounds_after_evidence.saturating_add(1);
+        }
+    }
+
+    fn round_start_nudge(
+        &mut self,
+        step_ledger: Option<&dyn scheduled::StepLedger>,
+    ) -> Option<String> {
+        let evidence = self.error_evidence.as_ref()?;
+        if self.writes_after_evidence > 0 || self.read_only_rounds_after_evidence == 0 {
+            return None;
+        }
+        if self.step_lock_nudges >= Self::STEP_LOCK_NUDGE_CAP {
+            return None;
+        }
+        self.step_lock_nudges += 1;
+        Some(workflow_step_lock_nudge(
+            &evidence.fingerprint,
+            evidence.observations,
+            active_step_description(step_ledger).as_deref(),
+        ))
+    }
+
+    fn rediscovery_nudge(
+        &mut self,
+        classification: Option<&crate::NudgeClassification>,
+        content: &str,
+        step_ledger: Option<&dyn scheduled::StepLedger>,
+    ) -> Option<String> {
+        let evidence = self.error_evidence.as_ref()?;
+        if self.writes_after_evidence > 0 {
+            return None;
+        }
+        if self.rediscovery_nudges >= Self::REDISCOVERY_NUDGE_CAP {
+            return None;
+        }
+        let classified_stall = classification.is_some_and(|c| {
+            matches!(
+                c.class,
+                crate::NudgeClass::PendingAction | crate::NudgeClass::PlanUpdate
+            )
+        });
+        if !classified_stall && !looks_like_error_rediscovery(content) {
+            return None;
+        }
+        self.rediscovery_nudges += 1;
+        Some(workflow_rediscovery_nudge(
+            &evidence.fingerprint,
+            active_step_description(step_ledger).as_deref(),
+        ))
+    }
+
+    fn cap_grace_nudge(
+        &mut self,
+        step_ledger: Option<&dyn scheduled::StepLedger>,
+        max_tool_rounds: usize,
+        grace_rounds_used: usize,
+    ) -> Option<String> {
+        let evidence = self.error_evidence.as_ref()?;
+        if self.writes_after_evidence > 0 {
+            if grace_rounds_used > 0 {
+                return None;
+            }
+            return Some(workflow_post_write_grace_nudge(
+                &evidence.fingerprint,
+                active_step_description(step_ledger).as_deref(),
+                max_tool_rounds,
+            ));
+        }
+        if self.read_only_rounds_after_evidence == 0 {
+            return None;
+        }
+        if grace_rounds_used >= WORKFLOW_GRACE_ROUND_CAP {
+            return None;
+        }
+        Some(workflow_cap_grace_nudge(
+            &evidence.fingerprint,
+            active_step_description(step_ledger).as_deref(),
+            max_tool_rounds,
+            grace_rounds_used + 1,
+        ))
+    }
+}
+
+fn workflow_error_fingerprint(result: &str) -> Option<String> {
+    build_error_fingerprint(result).or_else(|| edit_miss_fingerprint(result))
+}
+
+fn build_error_fingerprint(result: &str) -> Option<String> {
+    let mut pending_error: Option<String> = None;
+    let mut fingerprints = Vec::new();
+    for line in result.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("error[") || trimmed.starts_with("error:") {
+            pending_error = Some(normalize_error_line(trimmed));
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("-->") {
+            if let Some(error) = pending_error.take() {
+                let location = rest
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .trim_start_matches("./");
+                if location.is_empty() {
+                    fingerprints.push(error);
+                } else {
+                    fingerprints.push(format!("{location} {error}"));
+                }
+                if fingerprints.len() >= 3 {
+                    break;
+                }
+            }
+        }
+    }
+    if fingerprints.is_empty() {
+        pending_error.map(|e| e.chars().take(240).collect())
+    } else {
+        Some(fingerprints.join(" | ").chars().take(500).collect())
+    }
+}
+
+fn edit_miss_fingerprint(result: &str) -> Option<String> {
+    let lc = result.to_ascii_lowercase();
+    if !(lc.contains("old_string")
+        && (lc.contains("not found")
+            || lc.contains("old string not found")
+            || lc.contains("matches 0")
+            || lc.contains("no match")))
+    {
+        return None;
+    }
+    let line = result
+        .lines()
+        .find(|line| {
+            let l = line.to_ascii_lowercase();
+            l.contains("old_string")
+                && (l.contains("not found") || l.contains("matches 0") || l.contains("no match"))
+        })
+        .unwrap_or("edit_file old_string not found");
+    Some(format!("edit_file {}", normalize_error_line(line)))
+}
+
+fn normalize_error_line(line: &str) -> String {
+    let mut out = String::new();
+    let mut in_ws = false;
+    for c in line.chars() {
+        if c.is_whitespace() {
+            if !in_ws {
+                out.push(' ');
+                in_ws = true;
+            }
+        } else if c != '`' {
+            out.push(c);
+            in_ws = false;
+        }
+    }
+    out.chars().take(240).collect()
+}
+
+fn active_step_description(step_ledger: Option<&dyn scheduled::StepLedger>) -> Option<String> {
+    let snapshot = step_ledger?.snapshot();
+    snapshot
+        .steps
+        .iter()
+        .find(|step| step.status == StepStatus::Active)
+        .or_else(|| {
+            snapshot
+                .steps
+                .iter()
+                .find(|step| step.status != StepStatus::Done)
+        })
+        .map(|step| step.description.clone())
+}
+
+fn workflow_step_lock_nudge(
+    fingerprint: &str,
+    observations: usize,
+    active_step: Option<&str>,
+) -> String {
+    let active = active_step
+        .map(|step| format!(" Active step: '{step}'."))
+        .unwrap_or_default();
+    format!(
+        "<workflow_state>\nactive_step = \"repair the current tool/build error\"\nlast_error_fingerprint = \"{fingerprint}\"\nobservations = {observations}\nnext_allowed_actions = \"use the latest file evidence, then edit_file/write_file for the active repair, then run the focused verification\"\ndisallowed_actions = \"re-reading the same evidence, re-deriving the same plan, or restating findings without editing\"\n</workflow_state>\n{active} You already have the error evidence above. Do not re-read or summarize it again unless you need one exact replacement span. Make the smallest edit that addresses this exact fingerprint, then run the focused check."
+    )
+}
+
+fn workflow_rediscovery_nudge(fingerprint: &str, active_step: Option<&str>) -> String {
+    let active = active_step
+        .map(|step| format!(" Active step: '{step}'."))
+        .unwrap_or_default();
+    format!(
+        "You are rediscovering an error that is already recorded: {fingerprint}.{active} Do not restate findings, update the same plan, or claim handoff. Call the concrete edit tool for this repair now. After the edit, run one focused verification command and use its new output as ground truth."
+    )
+}
+
+fn workflow_cap_grace_nudge(
+    fingerprint: &str,
+    active_step: Option<&str>,
+    max_tool_rounds: usize,
+    grace_round: usize,
+) -> String {
+    let active = active_step
+        .map(|step| format!(" Active step: '{step}'."))
+        .unwrap_or_default();
+    format!(
+        "<workflow_state>\nnormal_tool_round_cap = {max_tool_rounds}\nworkflow_grace_round = {grace_round}/{WORKFLOW_GRACE_ROUND_CAP}\nlast_error_fingerprint = \"{fingerprint}\"\nnext_allowed_actions = \"call edit_file or write_file now using the latest observed file contents; then run the focused verification\"\ndisallowed_actions = \"summary of findings, handoff, plan rediscovery, or another broad read-only pass\"\n</workflow_state>\nThe normal tool-call cap was reached immediately after repair evidence without a successful workspace edit.{active} This is a bounded extra action round, not a final-answer round. Use the latest observed contents and call the concrete edit tool now. If one exact replacement span is still missing, read only that minimal span, then edit on the next grace round."
+    )
+}
+
+fn workflow_post_write_grace_nudge(
+    fingerprint: &str,
+    active_step: Option<&str>,
+    max_tool_rounds: usize,
+) -> String {
+    let active = active_step
+        .map(|step| format!(" Active step: '{step}'."))
+        .unwrap_or_default();
+    format!(
+        "<workflow_state>\nnormal_tool_round_cap = {max_tool_rounds}\nworkflow_grace_round = 1/{WORKFLOW_GRACE_ROUND_CAP}\nlast_error_fingerprint = \"{fingerprint}\"\nnext_allowed_actions = \"run the focused verification for the edit you just made, or continue the active implementation step with one concrete tool call\"\ndisallowed_actions = \"summary of findings, handoff, or broad rediscovery\"\n</workflow_state>\nThe normal tool-call cap was reached immediately after a workspace edit related to recorded repair evidence.{active} This is a bounded verification round. Do not summarize or stop because of the normal cap; run the focused check or the next concrete implementation tool now."
+    )
+}
+
+fn looks_like_error_rediscovery(content: &str) -> bool {
+    let lc = content.to_ascii_lowercase();
+    (lc.contains("summary of findings")
+        || lc.contains("root cause")
+        || lc.contains("current state")
+        || lc.contains("remaining work")
+        || lc.contains("build failure"))
+        && (lc.contains("error") || lc.contains("build") || lc.contains("compile"))
+}
+
 /// Render the agent's working-memory progress (`<plan>` checklist + `<state>`)
 /// at a cap exit, so partial work is salvaged into the final summary / fallback
 /// instead of being lost (Step 27.5). `None` when both are empty.
@@ -2460,6 +2836,10 @@ fn is_read_only_call(name: &str, args: &serde_json::Value) -> bool {
                 .get("command")
                 .and_then(|v| v.as_str())
                 .is_some_and(is_read_only_shell_probe))
+}
+
+fn is_workspace_write_call(name: &str) -> bool {
+    matches!(name, "write_file" | "edit_file")
 }
 
 fn is_read_only_shell_probe(command: &str) -> bool {
@@ -2499,6 +2879,11 @@ const SUSPICIOUS_EMPTY_RETRY_CAP: u32 = 2;
 /// per turn. Kept separate from narration nudges: this is a blocker-specific
 /// ground-truth check, not generic intent-to-act recovery.
 const STALE_FILE_NUDGE_CAP: usize = 1;
+/// Extra rounds granted only when workflow evidence says the normal cap would
+/// otherwise stop immediately after read-only repair context. This is not a
+/// general cap raise; a successful workspace write or exhausted evidence stops
+/// the grace path.
+const WORKFLOW_GRACE_ROUND_CAP: usize = 2;
 
 fn tail_on_char_boundary(s: &str, max_bytes: usize) -> &str {
     let cut = s.len().saturating_sub(max_bytes);
@@ -2508,83 +2893,12 @@ fn tail_on_char_boundary(s: &str, max_bytes: usize) -> &str {
     &s[start..]
 }
 
-/// Heuristic: does this assistant prose read as "I am ABOUT to act" rather than
-/// a finished answer? The sole trigger for the narrate-then-stop rescue — a
-/// zero-tool-call round is nudged (once) only when its prose announces an
-/// action it then failed to emit as a tool call. Requires an intent cue AND an
-/// action verb, and excludes borrowed-cue sign-offs ("let me know …"), so a
-/// genuine conclusion is never nudged — whether or not the model already called
-/// tools this turn (a normal "act, then conclude" turn must not be nudged). A
-/// residual false positive costs at most one extra round (NARRATION_NUDGE_CAP),
-/// never a loop. Cue/verb/exclusion lists are pure data — extend without
-/// touching the control flow (three Cs).
+/// Compatibility wrapper for the narrate-then-stop classifier. Production turns
+/// use [`crate::NudgeClassifier::load_default`] so `~/.newt/classifiers/nudge.toml`
+/// can tune the examples; pure tests use the built-in prototypes here.
+#[cfg(test)]
 fn looks_like_intent_to_act(content: &str) -> bool {
-    const INTENT_CUES: &[&str] = &[
-        "let me ",
-        "let's ",
-        "i'll ",
-        "i will ",
-        "i'm going to ",
-        "i am going to ",
-        "now i",
-        "next, i",
-        "next i",
-        "going to ",
-        "i'm now",
-        "i am now",
-    ];
-    const ACT_VERBS: &[&str] = &[
-        "edit",
-        "creat",
-        "add",
-        "modif",
-        "updat",
-        "writ",
-        "implement",
-        "chang",
-        "appl",
-        "run ",
-        "make ",
-        "fix",
-        "replac",
-        "insert",
-        "delet",
-        "remov",
-        "understand",
-        "check",
-        "compar",
-        "inspect",
-        "examin",
-        "review",
-        "look ",
-        "read ",
-        "verify",
-        "determin",
-        "figure out",
-        "commit",
-        "stage",
-        "push",
-    ];
-    // Borrowed-cue sign-offs that are NOT "about to act" — checked first so a
-    // conversational close is never mistaken for pending work.
-    const NON_ACTIONS: &[&str] = &[
-        "let me know",
-        "let me explain",
-        "let me clarify",
-        "let me summarize",
-        "let me recap",
-        "let me walk you",
-    ];
-    let lc = content.to_lowercase();
-    // The intent lives at the tail ("… Let me make both edits now."), so only
-    // scan the last stretch — the body may recount findings that mention verbs.
-    // Snap the cut to a char boundary so a multibyte glyph (em dash, …) at the
-    // 400-byte mark can't panic the slice.
-    let tail = tail_on_char_boundary(&lc, 400);
-    if NON_ACTIONS.iter().any(|n| tail.contains(n)) {
-        return false;
-    }
-    INTENT_CUES.iter().any(|c| tail.contains(c)) && ACT_VERBS.iter().any(|v| tail.contains(v))
+    crate::NudgeClassifier::builtin().is_pending_action(content)
 }
 
 /// Heuristic: did the model stop because it *believes* a file changed under it,
@@ -2660,8 +2974,52 @@ fn stale_file_ground_truth_nudge() -> String {
         .to_string()
 }
 
+fn workflow_classifier_text(messages: &[serde_json::Value], current_content: &str) -> String {
+    let mut parts = Vec::new();
+    let start = messages.len().saturating_sub(12);
+    for message in &messages[start..] {
+        if let Some(text) = message_text(message) {
+            if !text.trim().is_empty() {
+                parts.push(text);
+            }
+        }
+    }
+    if !current_content.trim().is_empty() {
+        parts.push(current_content.to_string());
+    }
+    parts.join("\n")
+}
+
+fn combine_nudge_hints(first: Option<&str>, second: Option<&str>) -> Option<String> {
+    let text = [first, second]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .filter(|hint| !hint.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    (!text.is_empty()).then_some(text)
+}
+
+fn message_text(message: &serde_json::Value) -> Option<String> {
+    match message.get("content")? {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Array(parts) => {
+            let text = parts
+                .iter()
+                .filter_map(|part| part.get("text").and_then(|text| text.as_str()))
+                .collect::<Vec<_>>()
+                .join("\n");
+            (!text.is_empty()).then_some(text)
+        }
+        _ => None,
+    }
+}
+
 fn pending_plan_completion_nudge(
     step_ledger: Option<&dyn scheduled::StepLedger>,
+    needs_plan_update: bool,
+    workflow_hint: Option<&str>,
 ) -> Option<String> {
     let snapshot = step_ledger?.snapshot();
     let total = snapshot.steps.len();
@@ -2685,12 +3043,29 @@ fn pending_plan_completion_nudge(
         .map(|s| format!(" Active step: '{}'.", s.description))
         .unwrap_or_default();
     let step_word = if unfinished == 1 { "step" } else { "steps" };
-    Some(format!(
-        "You ended the turn while the active plan still has {unfinished}/{total} unfinished \
-         {step_word}.{active_clause} Either call update_plan with completed steps marked \
-         completed, call the next tool for the active step, or state the concrete blocker. \
-         Do not hand off by only describing remaining work."
-    ))
+    let workflow_clause = workflow_hint
+        .map(str::trim)
+        .filter(|hint| !hint.is_empty())
+        .map(|hint| format!("\n\n{hint}"))
+        .unwrap_or_default();
+    if needs_plan_update {
+        Some(format!(
+            "You ended with a findings/next-steps summary while the active plan still has \
+             {unfinished}/{total} unfinished {step_word}.{active_clause} Your summary says \
+             immediate prerequisite repair work now blocks the active step. Call update_plan now \
+             with the full ordered plan: mark completed steps completed, make the immediate \
+             blocker repair the active step, and keep later feature work pending. Then call the \
+             next concrete tool for that active repair. Do not repeat the findings summary or \
+             claim a tool-call limit while this nudge is giving you another round.{workflow_clause}"
+        ))
+    } else {
+        Some(format!(
+            "You ended the turn while the active plan still has {unfinished}/{total} unfinished \
+             {step_word}.{active_clause} Either call update_plan with completed steps marked \
+             completed, call the next tool for the active step, or state the concrete blocker. \
+             Do not hand off by only describing remaining work."
+        ))
+    }
 }
 
 fn read_only_action_nudge(
@@ -2822,7 +3197,9 @@ fn cap_exit_nudge(max_tool_rounds: usize, progress: Option<&str>, observed: &[St
          calls above and give your best final answer now. Cite only file paths \
          that appear verbatim in the messages above — if the evidence you need \
          was in the omitted messages, say so plainly instead of reconstructing \
-         file names or line numbers from memory."
+         file names or line numbers from memory. Do not answer with an intention \
+         to keep working (for example, \"let me read/edit/verify\"); if work remains, \
+         list it as remaining work and state that the round cap stopped further tool calls."
     );
     // #867 Part A: the ledger survived the trim — hand the model the REAL
     // manifest so grounded citation is possible, not just demanded.
@@ -2847,36 +3224,73 @@ fn cap_exit_nudge(max_tool_rounds: usize, progress: Option<&str>, observed: &[St
 /// progress so partial work survives (Step 27.5), and gives HONEST advice: a run
 /// dominated by failed tool calls is a tooling/permissions problem, not too few
 /// rounds, so we don't blindly tell the user to raise the cap.
+fn cap_exit_tokens_hint(max_tool_rounds: usize, accumulated: Option<crate::TokenUsage>) -> String {
+    match accumulated {
+        Some(u) => format!(
+            " ({} in / {} out tokens consumed across {max_tool_rounds} rounds)",
+            u.input_tokens, u.output_tokens,
+        ),
+        None => String::new(),
+    }
+}
+
+fn cap_exit_advice(max_tool_rounds: usize, wasted_calls: usize) -> &'static str {
+    // If at least one failed tool call per round, the cap was thrash, not a
+    // genuine need for more rounds.
+    if wasted_calls >= max_tool_rounds.max(1) {
+        "most of those rounds were spent on tool calls that failed — the model \
+         could not find a working edit/shell path, which is usually a tooling or \
+         permissions issue rather than too few rounds; check `newt doctor`"
+    } else {
+        "raise [tui].max_tool_rounds in your config, or ask a more focused question"
+    }
+}
+
+fn cap_exit_progress_block(label: &str, progress: Option<&str>) -> String {
+    match progress {
+        Some(p) => format!("\n\n{label}:\n{p}"),
+        None => String::new(),
+    }
+}
+
 fn cap_exit_fallback(
     max_tool_rounds: usize,
     accumulated: Option<crate::TokenUsage>,
     wasted_calls: usize,
     progress: Option<&str>,
 ) -> String {
-    let tokens_hint = match accumulated {
-        Some(u) => format!(
-            " ({} in / {} out tokens consumed across {max_tool_rounds} rounds)",
-            u.input_tokens, u.output_tokens,
-        ),
-        None => String::new(),
-    };
-    // If at least one failed tool call per round, the cap was thrash, not a
-    // genuine need for more rounds.
-    let advice = if wasted_calls >= max_tool_rounds.max(1) {
-        "most of those rounds were spent on tool calls that failed — the model \
-         could not find a working edit/shell path, which is usually a tooling or \
-         permissions issue rather than too few rounds; check `newt doctor`"
-    } else {
-        "raise [tui].max_tool_rounds in your config, or ask a more focused question"
-    };
-    let salvaged = match progress {
-        Some(p) => format!("\n\nProgress captured before the summary failed:\n{p}"),
-        None => String::new(),
-    };
+    let tokens_hint = cap_exit_tokens_hint(max_tool_rounds, accumulated);
+    let advice = cap_exit_advice(max_tool_rounds, wasted_calls);
+    let salvaged = cap_exit_progress_block("Progress captured before the summary failed", progress);
     format!(
         "(reached the tool-call limit of {max_tool_rounds} rounds{tokens_hint}, \
          and the final summarization request also failed — {advice}){salvaged}"
     )
+}
+
+fn cap_exit_action_handoff_fallback(
+    max_tool_rounds: usize,
+    accumulated: Option<crate::TokenUsage>,
+    wasted_calls: usize,
+    progress: Option<&str>,
+) -> String {
+    let tokens_hint = cap_exit_tokens_hint(max_tool_rounds, accumulated);
+    let advice = cap_exit_advice(max_tool_rounds, wasted_calls);
+    let salvaged = cap_exit_progress_block("Progress captured at the tool-call limit", progress);
+    format!(
+        "(reached the tool-call limit of {max_tool_rounds} rounds{tokens_hint}; \
+         the final tools-disabled summary described future tool actions instead \
+         of final state, so Newt preserved the verified progress instead of \
+         accepting that handoff — {advice}){salvaged}"
+    )
+}
+
+fn cap_exit_summary_is_action_handoff(content: &str) -> bool {
+    crate::NudgeClassifier::load_default()
+        .classify(content)
+        .class
+        == crate::NudgeClass::PendingAction
+        || looks_like_unverified_stale_file_blocker(content)
 }
 
 /// The cap-exit context threaded into a final tools-disabled summary (Step
@@ -2962,6 +3376,17 @@ async fn final_summary_ollama(
                     ),
                     false,
                     accumulated,
+                ))
+            } else if cap_exit_summary_is_action_handoff(&content) {
+                Ok((
+                    cap_exit_action_handoff_fallback(
+                        max_tool_rounds,
+                        accumulated,
+                        wasted_calls,
+                        progress.as_deref(),
+                    ),
+                    false,
+                    total,
                 ))
             } else {
                 Ok((content, false, total))
@@ -3054,6 +3479,17 @@ async fn final_summary_openai(
                     ),
                     false,
                     accumulated,
+                ))
+            } else if cap_exit_summary_is_action_handoff(&content) {
+                Ok((
+                    cap_exit_action_handoff_fallback(
+                        max_tool_rounds,
+                        accumulated,
+                        wasted_calls,
+                        progress.as_deref(),
+                    ),
+                    false,
+                    total,
                 ))
             } else {
                 Ok((content, false, total))
@@ -3228,9 +3664,33 @@ pub async fn openai_chat_complete(
     let mut pending_plan_nudges: usize = 0;
     // Unverified stale-file blocker rescue counter (mirror of the Ollama path).
     let mut stale_file_nudges: usize = 0;
+    let nudge_classifier = crate::NudgeClassifier::load_default();
+    let workflow_steerer = crate::WorkflowSteerer::load_default();
+    let mut workflow_runtime = WorkflowRuntimeState::default();
 
-    // Agentic loop — up to `max_tool_rounds` tool-call rounds (matches the Ollama path).
-    'round_loop: for round in 0..max_tool_rounds {
+    // Agentic loop — up to `max_tool_rounds` tool-call rounds (matches the
+    // Ollama path), plus bounded workflow grace rounds when the normal cap
+    // would stop after read-only repair context.
+    let hard_tool_rounds = max_tool_rounds.saturating_add(WORKFLOW_GRACE_ROUND_CAP);
+    let mut workflow_grace_rounds = 0usize;
+    'round_loop: for round in 0..hard_tool_rounds {
+        if round >= max_tool_rounds {
+            let Some(nudge) = workflow_runtime.cap_grace_nudge(
+                step_ledger,
+                max_tool_rounds,
+                workflow_grace_rounds,
+            ) else {
+                break;
+            };
+            workflow_grace_rounds += 1;
+            if debug {
+                print_debug(
+                    "workflow evidence at round cap — granting bounded action round",
+                    color,
+                );
+            }
+            messages.push(serde_json::json!({ "role": "user", "content": nudge }));
+        }
         // Interrupt checkpoint (Esc / Ctrl-C), same contract as the Ollama path:
         // bail at the round boundary with an empty reply; the caller treats the
         // turn as abandoned. (The OpenAI path's per-request awaits are not yet
@@ -3254,6 +3714,9 @@ pub async fn openai_chat_complete(
         if round > 0 {
             if let Some(ptr) = step_ledger.and_then(plan_reseat_pointer) {
                 messages.push(serde_json::json!({ "role": "user", "content": ptr }));
+            }
+            if let Some(nudge) = workflow_runtime.round_start_nudge(step_ledger) {
+                messages.push(serde_json::json!({ "role": "user", "content": nudge }));
             }
         }
 
@@ -3593,11 +4056,48 @@ pub async fn openai_chat_complete(
             // Narrate-then-stop rescue (mirror of the Ollama loop): non-empty
             // prose with no tool call. Nudge once and continue instead of ending
             // the turn — bounded by NARRATION_NUDGE_CAP + the round budget.
+            let nudge_classification =
+                (!content.is_empty()).then(|| nudge_classifier.classify(&content));
+            let workflow_classifier_text = workflow_classifier_text(&messages, &content);
+            let workflow_hint = nudge_classification
+                .as_ref()
+                .filter(|classification| classification.is_plan_update())
+                .and_then(|_| workflow_steerer.plan_update_hint(&workflow_classifier_text));
+            let classifier_plan_direction = nudge_classification
+                .as_ref()
+                .filter(|classification| classification.is_plan_update())
+                .and_then(|_| nudge_classifier.direction_for(crate::NudgeClass::PlanUpdate));
+            let plan_nudge_hint =
+                combine_nudge_hints(classifier_plan_direction, workflow_hint.as_deref());
+            if !content.is_empty() && round + 1 < max_tool_rounds {
+                if let Some(nudge) = workflow_runtime.rediscovery_nudge(
+                    nudge_classification.as_ref(),
+                    &content,
+                    step_ledger,
+                ) {
+                    if debug {
+                        print_debug(
+                            "workflow evidence rediscovery — nudging toward active repair",
+                            color,
+                        );
+                    }
+                    messages.push(serde_json::json!({ "role": "assistant", "content": content }));
+                    messages.push(serde_json::json!({ "role": "user", "content": nudge }));
+                    continue 'round_loop;
+                }
+            }
             if !content.is_empty()
                 && pending_plan_nudges < PENDING_PLAN_NUDGE_CAP
                 && round + 1 < max_tool_rounds
             {
-                if let Some(nudge) = pending_plan_completion_nudge(step_ledger) {
+                let needs_plan_update = nudge_classification
+                    .as_ref()
+                    .is_some_and(|c| c.is_plan_update());
+                if let Some(nudge) = pending_plan_completion_nudge(
+                    step_ledger,
+                    needs_plan_update,
+                    plan_nudge_hint.as_deref(),
+                ) {
                     if debug {
                         print_debug(
                             "active plan has unfinished steps — nudging before final answer",
@@ -3632,7 +4132,9 @@ pub async fn openai_chat_complete(
             if !content.is_empty()
                 && narration_nudges < NARRATION_NUDGE_CAP
                 && round + 1 < max_tool_rounds
-                && looks_like_intent_to_act(&content)
+                && nudge_classification
+                    .as_ref()
+                    .is_some_and(|c| c.is_pending_action())
             {
                 if debug {
                     print_debug(
@@ -3641,9 +4143,14 @@ pub async fn openai_chat_complete(
                     );
                 }
                 messages.push(serde_json::json!({ "role": "assistant", "content": content }));
+                let direction = nudge_classification
+                    .as_ref()
+                    .and_then(|classification| nudge_classifier.direction_for(classification.class))
+                    .map(str::to_string)
+                    .unwrap_or_else(narration_action_nudge);
                 messages.push(serde_json::json!({
                     "role": "user",
-                    "content": narration_action_nudge(),
+                    "content": direction,
                 }));
                 narration_nudges += 1;
                 continue 'round_loop;
@@ -3684,6 +4191,7 @@ pub async fn openai_chat_complete(
             obj.remove("reasoning_content");
         }
         messages.push(assistant_turn);
+        let mut round_modified_workspace = false;
         for tc in tool_calls.unwrap() {
             let id = tc["id"].as_str().unwrap_or("");
             // Some API proxies (e.g. NVIDIA inference → Anthropic backend) wrap
@@ -3819,7 +4327,11 @@ pub async fn openai_chat_complete(
             // Step 27.3/#771: classify once; remember repeat-steered outcomes
             // (mirrors Ollama path).
             let ok = tools::tool_result_ok(&result);
+            if ok && is_workspace_write_call(name) {
+                round_modified_workspace = true;
+            }
             repeat_calls.record(name, &args, ok, &result);
+            workflow_runtime.record_tool_result(&result);
             if let Some(rec) = tool_events.as_deref_mut() {
                 rec.push(crate::ToolEvent::from_call(
                     name,
@@ -3854,6 +4366,7 @@ pub async fn openai_chat_complete(
                 "content": spill::maybe_offload(result, tool_offload, spill_store),
             }));
         }
+        workflow_runtime.record_round_outcome(round_modified_workspace);
     }
 
     // Reached the round cap. Trim the message list and make ONE final
@@ -4849,6 +5362,107 @@ mod repeat_call_guard_tests {
     }
 
     #[test]
+    fn workflow_error_fingerprint_captures_cargo_location() {
+        let output = r#"
+error[E0425]: cannot find value `SECTION_PROMPT_TOKENS` in this scope
+   --> newt-tui/src/help_sections.rs:523:22
+    |
+523 |         lines: SECTION_PROMPT_TOKENS,
+    |                ^^^^^^^^^^^^^^^^^^^^^ help: a static with a similar name exists: `SECTION_PROMPT`
+"#;
+
+        let fp = build_error_fingerprint(output).expect("cargo error should fingerprint");
+
+        assert!(fp.contains("newt-tui/src/help_sections.rs:523:22"), "{fp}");
+        assert!(fp.contains("error[E0425]"), "{fp}");
+        assert!(fp.contains("SECTION_PROMPT_TOKENS"), "{fp}");
+    }
+
+    #[test]
+    fn workflow_runtime_nudges_after_error_without_writes() {
+        let output = r#"
+error[E0425]: cannot find value `SECTION_PROMPT_TOKENS` in this scope
+   --> newt-tui/src/help_sections.rs:523:22
+"#;
+        let mut state = WorkflowRuntimeState::default();
+
+        state.record_tool_result(output);
+        state.record_round_outcome(false);
+
+        let nudge = state
+            .round_start_nudge(None)
+            .expect("read-only round after evidence should lock the active repair");
+        assert!(nudge.contains("<workflow_state>"), "{nudge}");
+        assert!(
+            nudge.contains("newt-tui/src/help_sections.rs:523:22"),
+            "{nudge}"
+        );
+        assert!(nudge.contains("next_allowed_actions"), "{nudge}");
+        assert!(nudge.contains("disallowed_actions"), "{nudge}");
+
+        let classification = crate::NudgeClassification {
+            class: crate::NudgeClass::PlanUpdate,
+            score: 1.0,
+        };
+        let rediscovery = state
+            .rediscovery_nudge(
+                Some(&classification),
+                "Summary of Findings\nRoot Cause: the build failure is still present.",
+                None,
+            )
+            .expect("classified summary should be steered toward action");
+        assert!(
+            rediscovery.contains("Do not restate findings"),
+            "{rediscovery}"
+        );
+        assert!(
+            rediscovery.contains("newt-tui/src/help_sections.rs:523:22"),
+            "{rediscovery}"
+        );
+    }
+
+    #[test]
+    fn workflow_runtime_tracks_failed_edit_as_unresolved_evidence() {
+        let output = "error: old_string not found in newt-tui/src/help_sections.rs";
+        let mut state = WorkflowRuntimeState::default();
+
+        state.record_tool_result(output);
+        state.record_round_outcome(false);
+
+        let nudge = state
+            .round_start_nudge(None)
+            .expect("failed edit should remain unresolved repair evidence");
+        assert!(nudge.contains("old_string not found"), "{nudge}");
+
+        let grace = state
+            .cap_grace_nudge(None, 25, 0)
+            .expect("cap after failed edit/read-only recovery should grant an action round");
+        assert!(grace.contains("workflow_grace_round = 1/2"), "{grace}");
+        assert!(
+            grace.contains("call edit_file or write_file now"),
+            "{grace}"
+        );
+
+        state.record_round_outcome(true);
+        let verify = state
+            .cap_grace_nudge(None, 25, 0)
+            .expect("a successful edit at the cap should get one verification round");
+        assert!(verify.contains("focused verification"), "{verify}");
+        assert!(
+            state.cap_grace_nudge(None, 25, 1).is_none(),
+            "post-edit verification grace is granted only once"
+        );
+    }
+
+    #[test]
+    fn workspace_write_classifier_is_narrow() {
+        assert!(is_workspace_write_call("edit_file"));
+        assert!(is_workspace_write_call("write_file"));
+        assert!(!is_workspace_write_call("run_command"));
+        assert!(!is_workspace_write_call("read_file"));
+    }
+
+    #[test]
     fn no_result_reason_classifies_and_routes() {
         // recall / state_get no-result prefixes classify…
         assert!(RepeatCallGuard::no_result_reason(
@@ -5022,6 +5636,39 @@ mod cap_exit_unit_tests {
     }
 
     #[test]
+    fn cap_exit_summary_action_handoff_is_rejected() {
+        let handoff = "I have two issues: duplicate topic_has_rollups and a stray brace. Let me fix both — read around 490 to see what needs removing, then verify with a build check.";
+        assert!(cap_exit_summary_is_action_handoff(handoff));
+        assert!(!cap_exit_summary_is_action_handoff(
+            "The duplicate helper definitions and stray brace were removed, and the build check passed."
+        ));
+
+        let fallback = cap_exit_action_handoff_fallback(
+            25,
+            None,
+            2,
+            Some("<plan>1. [ ] fix duplicate helper definitions</plan>"),
+        );
+        assert!(fallback.contains("tool-call limit of 25"), "{fallback}");
+        assert!(
+            fallback.contains("described future tool actions"),
+            "{fallback}"
+        );
+        assert!(
+            fallback.contains("preserved the verified progress"),
+            "{fallback}"
+        );
+        assert!(
+            !fallback.contains("final summarization request also failed"),
+            "{fallback}"
+        );
+        assert!(
+            fallback.contains("Progress captured at the tool-call limit"),
+            "{fallback}"
+        );
+    }
+
+    #[test]
     fn read_only_tools_classified_correctly() {
         // save_note writes memory, not the workspace: a round that only
         // saved a note must still count toward the read-only write-nudge.
@@ -5110,7 +5757,7 @@ mod cap_exit_unit_tests {
     fn pending_plan_completion_nudge_is_state_driven() {
         use crate::agentic::scheduled::{SessionStepLedger, StepLedger};
 
-        assert!(pending_plan_completion_nudge(None).is_none());
+        assert!(pending_plan_completion_nudge(None, false, None).is_none());
 
         let ledger = SessionStepLedger::default();
         ledger.restore(&PlanSnapshot {
@@ -5125,7 +5772,7 @@ mod cap_exit_unit_tests {
                 },
             ],
         });
-        let nudge = pending_plan_completion_nudge(Some(&ledger as &dyn StepLedger))
+        let nudge = pending_plan_completion_nudge(Some(&ledger as &dyn StepLedger), false, None)
             .expect("open plan produces a nudge");
         assert!(nudge.contains("1/2 unfinished step"), "{nudge}");
         assert!(nudge.contains("Active step: 'keep working'"), "{nudge}");
@@ -5133,13 +5780,72 @@ mod cap_exit_unit_tests {
         assert!(nudge.contains("call the next tool"), "{nudge}");
         assert!(nudge.contains("concrete blocker"), "{nudge}");
 
+        let plan_update_nudge = pending_plan_completion_nudge(
+            Some(&ledger as &dyn StepLedger),
+            true,
+            Some(
+                "Configured workflow 'github_pr' is active. Workflow steps:\n- commit_step: Commit the verified step",
+            ),
+        )
+        .expect("open plan produces a plan-update nudge");
+        assert!(
+            plan_update_nudge.contains("findings/next-steps summary"),
+            "{plan_update_nudge}"
+        );
+        assert!(
+            plan_update_nudge.contains("Call update_plan now"),
+            "{plan_update_nudge}"
+        );
+        assert!(
+            plan_update_nudge.contains("make the immediate blocker repair the active step"),
+            "{plan_update_nudge}"
+        );
+        assert!(
+            plan_update_nudge.contains("Do not repeat the findings summary"),
+            "{plan_update_nudge}"
+        );
+        assert!(
+            plan_update_nudge.contains("github_pr"),
+            "{plan_update_nudge}"
+        );
+        assert!(
+            plan_update_nudge.contains("commit_step"),
+            "{plan_update_nudge}"
+        );
+
         ledger.restore(&PlanSnapshot {
             steps: vec![Step {
                 description: "complete".to_string(),
                 status: StepStatus::Done,
             }],
         });
-        assert!(pending_plan_completion_nudge(Some(&ledger as &dyn StepLedger)).is_none());
+        assert!(
+            pending_plan_completion_nudge(Some(&ledger as &dyn StepLedger), false, None).is_none()
+        );
+    }
+
+    #[test]
+    fn workflow_classifier_text_keeps_recent_user_issue_context() {
+        let messages = vec![
+            serde_json::json!({
+                "role": "user",
+                "content": "Take a look at https://github.com/Gilamonster-Foundation/newt-agent/issues/548 and get me a PR."
+            }),
+            serde_json::json!({
+                "role": "assistant",
+                "content": "I will inspect the issue and repo state."
+            }),
+        ];
+        let text = workflow_classifier_text(
+            &messages,
+            "Summary of Findings\n\nCurrent Status: the build is broken. Next Steps Required: update the plan.",
+        );
+        let hint = crate::WorkflowSteerer::builtin()
+            .plan_update_hint(&text)
+            .expect("GitHub issue context should select the PR workflow");
+        assert!(hint.contains("github_pr"), "{hint}");
+        assert!(hint.contains("read_issue"), "{hint}");
+        assert!(hint.contains("open_pr"), "{hint}");
     }
 }
 
@@ -5319,6 +6025,55 @@ mod tool_round_cap_tests {
         assert_eq!(reply, "here is my partial summary");
         assert_ne!(reply, "(reached tool-call limit)");
         assert!(!streamed);
+    }
+
+    #[tokio::test]
+    async fn ollama_cap_exit_rejects_action_intent_summary() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "message": {
+                    "content": "I have two issues: duplicate topic_has_rollups and a stray brace. Let me fix both — read around 490 to see what needs removing, then verify with a build check."
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let chat_url = format!("{}/api/chat", server.uri());
+        let (reply, streamed, _usage) = final_summary_ollama(
+            &client,
+            &chat_url,
+            "test-model",
+            Vec::new(),
+            CapExit {
+                max_tool_rounds: 25,
+                accumulated: None,
+                wasted_calls: 0,
+                progress: Some("<plan>1. [ ] fix duplicate helper definitions</plan>".to_string()),
+                observed: Vec::new(),
+            },
+        )
+        .await
+        .expect("final summary helper should return a fallback");
+
+        assert!(!streamed);
+        assert!(reply.contains("tool-call limit of 25"), "{reply}");
+        assert!(reply.contains("described future tool actions"), "{reply}");
+        assert!(reply.contains("preserved the verified progress"), "{reply}");
+        assert!(
+            !reply.contains("Let me fix both"),
+            "must not accept action-intent cap summary: {reply}"
+        );
+        assert!(
+            !reply.contains("final summarization request also failed"),
+            "{reply}"
+        );
+        assert!(
+            reply.contains("Progress captured at the tool-call limit"),
+            "{reply}"
+        );
     }
 
     /// UAT (Step 27.3 + 27.5, simulated integration): a thrash run — a DISTINCT
@@ -6517,8 +7272,15 @@ mod http_loop_tests {
             "{}",
             r#"Ollama 500 Internal Server Error: {"error":"XML syntax error on line 2: element <parameter> closed by </function>"}"#
         )));
+        assert!(is_ollama_tool_xml_error(&anyhow::anyhow!(
+            "{}",
+            r#"Ollama 500 Internal Server Error: {"error":"XML syntax error on line 3: unexpected end element \u003c/parameter\u003e"}"#
+        )));
         assert!(!is_ollama_tool_xml_error(&anyhow::anyhow!(
             "Ollama 500 Internal Server Error: model runner crashed"
+        )));
+        assert!(!is_ollama_tool_xml_error(&anyhow::anyhow!(
+            "OpenAI 400 Bad Request: XML syntax error in user supplied file"
         )));
     }
 
@@ -6588,29 +7350,48 @@ mod http_loop_tests {
     }
 
     /// Ollama can 500 before returning assistant content when its XML parser
-    /// sees malformed Qwen-style tool-call tags. Newt cannot recover a tool call
-    /// it never receives, so it should retry without advertising tools.
+    /// sees malformed Qwen-style tool-call tags. That is not the same as
+    /// "model does not support tools": Newt should retry with tools still
+    /// advertised so the model can make forward progress on the next round.
     struct MalformedToolXmlResponder {
         rejections: Arc<AtomicUsize>,
+        served_with_tools_after_error: Arc<AtomicBool>,
         served_without_tools: Arc<AtomicBool>,
     }
     impl Respond for MalformedToolXmlResponder {
         fn respond(&self, req: &Request) -> ResponseTemplate {
             if body_json(req).get("tools").is_some() {
-                self.rejections.fetch_add(1, Ordering::SeqCst);
-                return ResponseTemplate::new(500).set_body_json(serde_json::json!({
-                    "error": "XML syntax error on line 7: element <parameter> closed by </function>"
+                if self.rejections.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return ResponseTemplate::new(500).set_body_json(serde_json::json!({
+                        "error": "XML syntax error on line 7: element <parameter> closed by </function>"
+                    }));
+                }
+                self.served_with_tools_after_error
+                    .store(true, Ordering::SeqCst);
+                if is_stream(req) {
+                    return ndjson(&[serde_json::json!({
+                        "message": {"content": "recovered with tools still available"},
+                        "done": true,
+                        "prompt_eval_count": 4,
+                        "eval_count": 3
+                    })]);
+                }
+                return ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "message": {"content": "probe answer with tools still available"},
+                    "prompt_eval_count": 4,
+                    "eval_count": 3,
                 }));
             }
             self.served_without_tools.store(true, Ordering::SeqCst);
             if is_stream(req) {
                 ndjson(&[serde_json::json!({
-                    "message": {"content": "recovered without tools"}, "done": true,
+                    "message": {"content": "unexpected no-tools stream"},
+                    "done": true,
                     "prompt_eval_count": 4, "eval_count": 3
                 })])
             } else {
                 ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "message": {"content": "probe answer without tools"},
+                    "message": {"content": "unexpected no-tools probe"},
                     "prompt_eval_count": 4, "eval_count": 3,
                 }))
             }
@@ -6618,14 +7399,16 @@ mod http_loop_tests {
     }
 
     #[tokio::test]
-    async fn ollama_tool_xml_error_recovers_by_dropping_tools() {
+    async fn ollama_tool_xml_error_recovers_with_tools_still_available() {
         let server = MockServer::start().await;
         let rejections = Arc::new(AtomicUsize::new(0));
+        let served_with_tools_after_error = Arc::new(AtomicBool::new(false));
         let served_without_tools = Arc::new(AtomicBool::new(false));
         Mock::given(method("POST"))
             .and(path("/api/chat"))
             .respond_with(MalformedToolXmlResponder {
                 rejections: rejections.clone(),
+                served_with_tools_after_error: served_with_tools_after_error.clone(),
                 served_without_tools: served_without_tools.clone(),
             })
             .mount(&server)
@@ -6636,18 +7419,22 @@ mod http_loop_tests {
         let (reply, streamed, _usage, _) =
             chat_complete(ctx(&server.uri(), &messages, &caveats), &mut NoMcp)
                 .await
-                .expect("malformed XML tool-call parser errors should fall back to no-tools");
+                .expect("malformed XML tool-call parser errors should retry with tools");
 
-        assert_eq!(reply, "recovered without tools");
+        assert_eq!(reply, "recovered with tools still available");
         assert!(streamed);
         assert!(
-            served_without_tools.load(Ordering::SeqCst),
-            "a request without the tools field was eventually served"
+            served_with_tools_after_error.load(Ordering::SeqCst),
+            "a tools-bearing request was served after the XML parser failure"
+        );
+        assert!(
+            !served_without_tools.load(Ordering::SeqCst),
+            "malformed XML must not disable tools for the turn"
         );
         assert_eq!(
             rejections.load(Ordering::SeqCst),
-            1,
-            "the deterministic XML parser failure is not retried with tools"
+            3,
+            "the XML error probe, retry probe, and streaming re-issue all keep tools advertised"
         );
     }
 
@@ -7615,6 +8402,38 @@ mod http_loop_tests {
     }
 
     #[tokio::test]
+    async fn observed_fix_intent_after_a_tool_call_nudges_and_continues() {
+        // Live repro: after a read-only observation, the model identified the
+        // exact edit but stopped on prose instead of calling the edit tool.
+        let (reply, rounds) = run_openai_script(vec![
+            serde_json::json!({
+                "content": null,
+                "tool_calls": [{
+                    "id": "c1", "type": "function",
+                    "function": { "name": "definitely_not_a_real_tool", "arguments": "{}" }
+                }]
+            }),
+            serde_json::json!({
+                "content": "I found the issue - there's an extra closing brace } on line 809 of help_sections.rs that's causing a syntax error. I need to remove this stray brace."
+            }),
+            serde_json::json!({ "content": "The stray brace is removed and the compile error is fixed." }),
+        ])
+        .await;
+        assert_eq!(
+            rounds, 3,
+            "tool call, narrated edit intent, then post-nudge answer; got {rounds}"
+        );
+        assert!(
+            reply.contains("compile error is fixed"),
+            "returns the post-nudge answer: {reply}"
+        );
+        assert!(
+            !reply.contains("I need to remove"),
+            "must not stop on the narrated edit intent: {reply}"
+        );
+    }
+
+    #[tokio::test]
     async fn pending_plan_final_answer_nudges_before_handoff() {
         let ledger = SessionStepLedger::default();
         ledger.restore(&PlanSnapshot {
@@ -7641,22 +8460,113 @@ mod http_loop_tests {
                 serde_json::json!({
                     "content": "Plan updated; continuing with the active step."
                 }),
+                serde_json::json!({
+                    "content": "The active step is now complete."
+                }),
             ],
             Some(&ledger as &dyn StepLedger),
         )
         .await;
         assert_eq!(
-            rounds, 2,
-            "open plan should force one completion-gate round"
+            rounds, 3,
+            "open plan should force a completion-gate round and action-nudge follow-on narration"
         );
         assert!(
-            reply.contains("Plan updated"),
+            reply.contains("complete"),
             "returns the post-nudge answer: {reply}"
         );
         assert!(
             !reply.contains("I need to finish"),
             "must not accept a plain handoff while plan is open: {reply}"
         );
+    }
+
+    #[tokio::test]
+    async fn findings_summary_with_stale_plan_nudges_update_plan_then_continues() {
+        let ledger = SessionStepLedger::default();
+        ledger.restore(&PlanSnapshot {
+            steps: vec![
+                Step {
+                    description: "convert help sections".to_string(),
+                    status: StepStatus::Done,
+                },
+                Step {
+                    description: "wire progressive dispatch in lib.rs".to_string(),
+                    status: StepStatus::Active,
+                },
+                Step {
+                    description: "add tests".to_string(),
+                    status: StepStatus::Todo,
+                },
+            ],
+        });
+        let findings = "\
+Summary of Findings
+
+Across the tool calls, I observed two issues in newt-tui/src/help_sections.rs:
+1. Duplicate function definitions
+2. Stray closing brace
+
+Current Status
+
+The build is broken due to these syntax errors. The plan was at step 2, but we need to fix the immediate compilation issues first before proceeding with feature work.
+
+Next Steps Required
+
+To continue, I would need to remove the duplicate function using edit_file, locate and remove the stray brace, verify cargo check, then proceed with step 2 of the plan.
+
+However, I've reached the tool-call limit and cannot make these edits now.";
+        let (reply, rounds) = run_openai_script_with_ledger(
+            vec![
+                serde_json::json!({ "content": findings }),
+                serde_json::json!({
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "plan_1",
+                        "type": "function",
+                        "function": {
+                            "name": "update_plan",
+                            "arguments": serde_json::json!({
+                                "plan": [
+                                    {"step": "fix duplicate help rollup functions and stray brace", "status": "in_progress"},
+                                    {"step": "wire progressive dispatch in lib.rs", "status": "pending"},
+                                    {"step": "add rollup tests", "status": "pending"}
+                                ]
+                            }).to_string()
+                        }
+                    }]
+                }),
+                serde_json::json!({
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "edit_1",
+                        "type": "function",
+                        "function": {
+                            "name": "definitely_not_a_real_tool",
+                            "arguments": "{}"
+                        }
+                    }]
+                }),
+                serde_json::json!({ "content": "Done." }),
+            ],
+            Some(&ledger as &dyn StepLedger),
+        )
+        .await;
+        assert_eq!(
+            rounds, 4,
+            "findings summary should be nudged into update_plan, then a concrete tool"
+        );
+        assert_eq!(reply, "Done.");
+        assert!(
+            !reply.contains("tool-call limit"),
+            "must not accept the handoff summary: {reply}"
+        );
+        let snap = ledger.snapshot();
+        assert_eq!(
+            snap.steps[0].description,
+            "fix duplicate help rollup functions and stray brace"
+        );
+        assert_eq!(snap.steps[0].status, StepStatus::Active);
     }
 
     #[tokio::test]
@@ -7677,6 +8587,54 @@ mod http_loop_tests {
         .await;
         assert_eq!(rounds, 1, "completed plan must not be nudged");
         assert!(reply.contains("complete"), "returns final answer: {reply}");
+    }
+
+    #[tokio::test]
+    async fn continuing_with_active_step_after_plan_nudge_gets_action_nudge() {
+        let ledger = SessionStepLedger::default();
+        ledger.restore(&PlanSnapshot {
+            steps: vec![
+                Step {
+                    description: "convert help sections".to_string(),
+                    status: StepStatus::Done,
+                },
+                Step {
+                    description: "insert progressive dispatch".to_string(),
+                    status: StepStatus::Active,
+                },
+                Step {
+                    description: "add tests".to_string(),
+                    status: StepStatus::Todo,
+                },
+            ],
+        });
+        let (reply, rounds) = run_openai_script_with_ledger(
+            vec![
+                serde_json::json!({
+                    "content": "I need to finish Step 2, then Steps 3-5."
+                }),
+                serde_json::json!({
+                    "content": "Plan is current — no update needed. Continuing with step 2: inserting the progressive dispatch into lib.rs."
+                }),
+                serde_json::json!({
+                    "content": "The edit is now complete."
+                }),
+            ],
+            Some(&ledger as &dyn StepLedger),
+        )
+        .await;
+        assert_eq!(
+            rounds, 3,
+            "plan nudge should be followed by an action nudge for continuing-with narration"
+        );
+        assert!(
+            reply.contains("complete"),
+            "returns the post-action-nudge answer: {reply}"
+        );
+        assert!(
+            !reply.contains("Continuing with step 2"),
+            "must not stop on the continuing-with narration: {reply}"
+        );
     }
 
     #[tokio::test]
@@ -7724,6 +8682,7 @@ newt-tui/src/lib.rs).";
         assert!(looks_like_intent_to_act(
             "Now I'll add the --home flag to the Cli struct."
         ));
+        assert!(looks_like_intent_to_act("Let me keep editing now."));
         assert!(looks_like_intent_to_act(
             "I'm going to edit the config file."
         ));
@@ -7735,6 +8694,12 @@ newt-tui/src/lib.rs).";
         ));
         assert!(looks_like_intent_to_act(
             "The help section logic itself has no tests yet.\n\nLet me commit this first step, then move on:"
+        ));
+        assert!(looks_like_intent_to_act(
+            "Plan is current — no update needed. Continuing with step 2: inserting the progressive dispatch into lib.rs."
+        ));
+        assert!(looks_like_intent_to_act(
+            "I found the issue - there's an extra closing brace } on line 809 of help_sections.rs that's causing a syntax error. I need to remove this stray brace."
         ));
         // Genuine sign-offs / answers — must NOT be nudged.
         assert!(!looks_like_intent_to_act("The capital of France is Paris."));

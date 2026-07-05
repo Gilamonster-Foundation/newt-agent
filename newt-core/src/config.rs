@@ -950,13 +950,14 @@ impl ContextFeatureSet {
     }
 
     /// The base feature set *before* `[context.features]` / session overrides:
-    /// the `manager` preset's bundle, with the cross-round working-memory
-    /// features (`scratchpad` + `scheduled`) defaulted ON for local
-    /// (`BackendKind::Ollama`) backends. A weak local model needs the
-    /// `<plan>` / `<state>` ledger to carry a checklist across tool-call rounds
-    /// instead of re-deriving state each round (Step 27.4). Cloud
-    /// (OpenAI-compatible) backends keep the all-off preset baseline; explicit
-    /// overrides still win — they layer on top via [`ContextFeatures::apply_to`].
+    /// the `manager` preset's bundle, with local-assist features (`scratchpad`,
+    /// `semantic`, and `scheduled`) defaulted ON for local (`BackendKind::Ollama`)
+    /// backends. A weak local model needs the `<plan>` / `<state>` ledger to
+    /// carry a checklist across tool-call rounds instead of re-deriving state
+    /// each round (Step 27.4), and semantic retrieval should be ready without a
+    /// live toggle once an embedder is configured. Cloud (OpenAI-compatible)
+    /// backends keep the all-off preset baseline; explicit overrides still win —
+    /// they layer on top via [`ContextFeatures::apply_to`].
     ///
     /// Note: a *local* vLLM / llama.cpp server reports as `Openai` (that's the
     /// wire protocol, not the host), so those users opt in via
@@ -965,6 +966,7 @@ impl ContextFeatureSet {
         let mut base = manager.base_features();
         if matches!(kind, BackendKind::Ollama) {
             base.scratchpad = true;
+            base.semantic = true;
             base.scheduled = true;
         }
         base
@@ -1163,27 +1165,30 @@ pub struct SemanticConfig {
     /// `bge-small-en-v1.5`), NOT `nomic-embed-text`, which candle 0.8 cannot load.
     #[serde(default = "default_embedding_model")]
     pub embedding_model: String,
-    /// Local model **directory** for the embedded embedder (`embeddings_api =
-    /// "embedded"`, #720): a candle-clean standard-BERT model dir holding
+    /// Local model **directory** for the embedded embedder (#720): a
+    /// candle-clean standard-BERT model dir holding
     /// `config.json` + `tokenizer.json` + `model.safetensors` (e.g. a fetched
-    /// `BAAI/bge-small-en-v1.5`). `None` (default) ⇒ the embedded path can't load
-    /// and reports a clear error. Ignored by the HTTP embeddings path. Mirrors the
-    /// summarizer's `model_path`.
+    /// `BAAI/bge-small-en-v1.5`). `None` (default) ⇒ the embedded path can't
+    /// load and reports a clear error. When `embeddings_api` and
+    /// `embeddings_endpoint` are unset, a configured path selects embedded
+    /// embeddings automatically. Ignored by explicit HTTP embeddings targets.
+    /// Mirrors the summarizer's `model_path`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding_model_path: Option<String>,
     /// How many code chunks to retrieve per turn. Default 5.
     #[serde(default = "default_semantic_top_k")]
     pub top_k: usize,
     /// Dedicated endpoint that serves embeddings (e.g. an Ollama
-    /// `http://host:11434`). `None` (default) reuses the active inference
-    /// backend — which only works if that backend actually serves embeddings,
-    /// so set this to a real embeddings host when chat runs on a backend that
-    /// doesn't (e.g. a vLLM coder server). Decouples embeddings from chat.
+    /// `http://host:11434`). `None` (default) leaves semantic retrieval on the
+    /// embedded path unless `embeddings_api` explicitly selects an HTTP protocol.
+    /// Set this to a real embeddings host when remote/vector-server embeddings
+    /// are a deliberate performance choice.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embeddings_endpoint: Option<String>,
     /// Wire protocol of `embeddings_endpoint` — `ollama` (`/api/embeddings`) or
-    /// `openai` (`/v1/embeddings`). `None` (default) means: infer from the
-    /// active backend when `embeddings_endpoint` is unset, else assume `ollama`.
+    /// `openai` (`/v1/embeddings`). `embedded` selects the in-process embedder.
+    /// `None` (default) selects embedded embeddings when `embeddings_endpoint`
+    /// is also unset; with an explicit endpoint, `None` assumes `ollama`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embeddings_api: Option<BackendKind>,
     /// What to do when embedding fails structurally (wrong endpoint / model
@@ -3699,14 +3704,16 @@ mod tests {
     }
 
     #[test]
-    fn base_for_local_defaults_plan_and_state_on_cloud_stays_off() {
+    fn base_for_local_defaults_plan_state_and_semantic_on_cloud_stays_off() {
         use ContextFeature as F;
-        // Step 27.4: local (Ollama) backends default scratchpad + scheduled ON.
+        // Step 27.4: local (Ollama) backends default scratchpad + scheduled ON;
+        // semantic is also enabled by default but degrades to a one-shot no-op
+        // until an embedder is configured.
         let local = ContextFeatureSet::base_for(ContextManager::Standard, BackendKind::Ollama);
         assert!(local.get(F::Scratchpad));
+        assert!(local.get(F::Semantic));
         assert!(local.get(F::Scheduled));
-        assert!(!local.get(F::Semantic)); // only the working-memory pair flips
-                                          // Cloud (OpenAI-compatible) keeps the all-off preset baseline.
+        // Cloud (OpenAI-compatible) keeps the all-off preset baseline.
         let cloud = ContextFeatureSet::base_for(ContextManager::Standard, BackendKind::Openai);
         assert!(cloud.enabled().is_empty());
         // An explicit override still wins over the local default (force off).
