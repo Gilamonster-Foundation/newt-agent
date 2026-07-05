@@ -10,6 +10,7 @@ use super::memory_fetch::{execute_memory_fetch, memory_fetch_tool_definition, Me
 use super::note_sink::{execute_save_note, save_note_tool_definition, NoteSink};
 use super::permissions::{DenialKind, PermissionDecision, PermissionGate, PermissionRequest};
 use super::recall::{execute_recall, recall_tool_definition, RecallSource};
+use super::spill::{self, SpillStore};
 use crate::caveats::CaveatsExt as _;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::LazyLock;
@@ -28,6 +29,7 @@ const DEFAULT_READ_LIMIT: usize = 2_000;
 /// closed for `read_file`. Overridable by `[tools] max_output_tokens` in config;
 /// see [`set_max_output_tokens`].
 const DEFAULT_MAX_OUTPUT_TOKENS: usize = 10_000;
+const DEFAULT_OUTPUT_HEAD_TOKENS: usize = 1_500;
 
 /// Process-wide model-facing output budget, in tokens. Defaults to
 /// [`DEFAULT_MAX_OUTPUT_TOKENS`]; the resolved `[tools] max_output_tokens`
@@ -38,6 +40,7 @@ const DEFAULT_MAX_OUTPUT_TOKENS: usize = 10_000;
 /// `ChatCtx` + `execute_tool` + every call site (≈60, mostly tests). Follow-up:
 /// thread it per-session like `tool_output_lines` once warranted.
 static MAX_OUTPUT_TOKENS: AtomicUsize = AtomicUsize::new(DEFAULT_MAX_OUTPUT_TOKENS);
+static OUTPUT_HEAD_TOKENS: AtomicUsize = AtomicUsize::new(DEFAULT_OUTPUT_HEAD_TOKENS);
 
 /// Set the process-wide model-facing output budget (tokens). Called once from
 /// `Config::resolve` with the resolved `[tools] max_output_tokens`. `0` means
@@ -46,21 +49,40 @@ pub fn set_max_output_tokens(max_tokens: usize) {
     MAX_OUTPUT_TOKENS.store(max_tokens, Ordering::Relaxed);
 }
 
+/// Set the head allocation for oversized `run_command` output. The tail gets
+/// the remaining budget. `0` means pure-tail; values greater than the max output
+/// budget are clamped by [`cap_model_output`].
+pub fn set_output_head_tokens(head_tokens: usize) {
+    OUTPUT_HEAD_TOKENS.store(head_tokens, Ordering::Relaxed);
+}
+
 /// The active model-facing output budget (tokens). [`DEFAULT_MAX_OUTPUT_TOKENS`]
 /// until [`set_max_output_tokens`] overrides it.
 fn max_output_tokens() -> usize {
     MAX_OUTPUT_TOKENS.load(Ordering::Relaxed)
 }
 
-/// #726: cap a tool's **model-facing** output to `max_tokens`' worth of chars,
-/// estimated with the default chars/token heuristic
+fn output_head_tokens() -> usize {
+    OUTPUT_HEAD_TOKENS.load(Ordering::Relaxed)
+}
+
+/// #726/#945: cap a tool's **model-facing** output to `max_tokens`' worth of
+/// chars, estimated with the default chars/token heuristic
 /// ([`crate::tokens::TokenEstimation`], 4 chars/token — the same constant the
-/// context estimator uses). When the text's estimated tokens exceed the budget
-/// it is truncated at a char boundary and a marker is appended pointing the
-/// model at a narrower command / a paginated read. A small output (or
-/// `max_tokens == 0`, meaning no cap) passes through verbatim. Pure (no fs / no
-/// global) — unit-tested directly.
+/// context estimator uses). Oversized output is rendered as head+tail rather
+/// than head-only so command summaries and failures at the end survive. A small
+/// output (or `max_tokens == 0`, meaning no cap) passes through verbatim. Pure
+/// (no fs / no global) — unit-tested directly.
 fn cap_model_output(text: &str, max_tokens: usize) -> String {
+    cap_model_output_with_handle(text, max_tokens, output_head_tokens(), None)
+}
+
+fn cap_model_output_with_handle(
+    text: &str,
+    max_tokens: usize,
+    head_tokens: usize,
+    spill_id: Option<&str>,
+) -> String {
     if max_tokens == 0 {
         return text.to_string();
     }
@@ -69,15 +91,36 @@ fn cap_model_output(text: &str, max_tokens: usize) -> String {
         return text.to_string();
     }
     let max_chars = est.chars_for_tokens(max_tokens);
-    let mut cut = max_chars.min(text.len());
-    while cut > 0 && !text.is_char_boundary(cut) {
-        cut -= 1;
-    }
-    format!(
-        "{}\n\n[output truncated to ~{max_tokens} tokens — narrow the command \
-         / use read_file with offset+limit]",
-        &text[..cut]
-    )
+    let head_tokens = head_tokens.min(max_tokens);
+    let head_chars = est.chars_for_tokens(head_tokens).min(max_chars);
+    let tail_chars = max_chars.saturating_sub(head_chars);
+    let total_chars = text.chars().count();
+    let shown_chars = head_chars.saturating_add(tail_chars).min(total_chars);
+    let elided = total_chars.saturating_sub(shown_chars);
+    let head = take_chars(text, head_chars);
+    let tail = take_tail_chars(text, tail_chars);
+    let marker = match spill_id {
+        Some(id) => format!(
+            "[… {elided} chars elided (head+tail shown). Full output: \
+             memory_fetch(\"spill:{id}\"); search it with \
+             memory_fetch(\"spill:{id}\", grep=\"<pattern>\") …]"
+        ),
+        None => format!(
+            "[… {elided} chars elided (head+tail shown; ~{max_tokens} token budget). \
+             Narrow the command or use a more specific grep/filter if needed …]"
+        ),
+    };
+    format!("{head}\n\n{marker}\n\n{tail}")
+}
+
+fn take_chars(text: &str, max_chars: usize) -> String {
+    text.chars().take(max_chars).collect()
+}
+
+fn take_tail_chars(text: &str, max_chars: usize) -> String {
+    let mut chars: Vec<char> = text.chars().rev().take(max_chars).collect();
+    chars.reverse();
+    chars.into_iter().collect()
 }
 
 /// Window + cap a file's contents for `read_file`'s model-facing payload (#719,
@@ -1268,6 +1311,7 @@ fn exec_floor_permits(floor: Option<&crate::caveats::Scope<String>>, cmd: &str) 
 /// and render the envelope. Shared by the `run_command` and `lifecycle` (#891)
 /// arms so both honor **identical** exec caveats; the caller prints the
 /// tool-call line first.
+#[allow(clippy::too_many_arguments)]
 async fn exec_confined_command(
     cmd: &str,
     workspace: &str,
@@ -1276,6 +1320,8 @@ async fn exec_confined_command(
     caveats: &crate::caveats::Caveats,
     exec_floor: Option<&crate::caveats::Scope<String>>,
     permission_gate: Option<&mut dyn PermissionGate>,
+    tool_offload: bool,
+    spill_store: Option<&dyn SpillStore>,
 ) -> String {
     // Venv injection (#783): the confined shell carries the venv via
     // agent-bridle's structured `env` seam (see `confined_dispatch_args` /
@@ -1299,7 +1345,13 @@ async fn exec_confined_command(
     // bit-for-bit.
     if ocap_disabled() && exec_floor_permits(exec_floor, cmd) {
         return match host_shell_dispatch(&cmd_with_venv, workspace).await {
-            Ok(envelope) => shell_envelope_output(&envelope, tool_output_lines, color),
+            Ok(envelope) => shell_envelope_output(
+                &envelope,
+                tool_output_lines,
+                color,
+                tool_offload,
+                spill_store,
+            ),
             Err(e) => format!("error: {e}"),
         };
     }
@@ -1339,7 +1391,13 @@ async fn exec_confined_command(
                             Ok(env2) if envelope_denied(&env2) => {
                                 denied_run_command_result(&env2, color)
                             }
-                            Ok(env2) => shell_envelope_output(&env2, tool_output_lines, color),
+                            Ok(env2) => shell_envelope_output(
+                                &env2,
+                                tool_output_lines,
+                                color,
+                                tool_offload,
+                                spill_store,
+                            ),
                             Err(e) => format!("error: {e}"),
                         };
                     }
@@ -1347,7 +1405,13 @@ async fn exec_confined_command(
             }
             denied_run_command_result(&envelope, color)
         }
-        Ok(envelope) => shell_envelope_output(&envelope, tool_output_lines, color),
+        Ok(envelope) => shell_envelope_output(
+            &envelope,
+            tool_output_lines,
+            color,
+            tool_offload,
+            spill_store,
+        ),
         // An argv-mode leash denial, or an error from inside the tool — surface
         // the reason; the dispatch error Display is safe to show.
         Err(e) => format!("error: {e}"),
@@ -1739,6 +1803,8 @@ fn shell_envelope_output(
     envelope: &serde_json::Value,
     tool_output_lines: usize,
     color: bool,
+    tool_offload: bool,
+    spill_store: Option<&dyn SpillStore>,
 ) -> String {
     let stdout = envelope
         .get("stdout")
@@ -1758,10 +1824,34 @@ fn shell_envelope_output(
             .unwrap_or(-1);
         format!("(exit {code})")
     } else {
-        // #726: the MODEL-facing payload is capped by the shared TOKEN budget so
-        // a verbose command can't flood the context window (the #719 failure
-        // mode, previously uncapped for run_command). Small output is unchanged.
-        let capped = cap_model_output(&out, max_output_tokens());
+        // #726/#945: the MODEL-facing payload is capped by the shared TOKEN
+        // budget using head+tail. When tool_offload is on, spill the FULL
+        // redacted output before capping so the true tail and elided middle stay
+        // recoverable via memory_fetch("spill:<id>") and grep.
+        let max_tokens = max_output_tokens();
+        let est = crate::tokens::TokenEstimation::default();
+        let over_model_budget = max_tokens != 0 && est.tokens_for_chars(out.len()) > max_tokens;
+        let over_spill_budget = out.chars().count() > spill::TOOL_RESULT_SPILL_CAP;
+        let should_spill =
+            max_tokens != 0 && tool_offload && (over_model_budget || over_spill_budget);
+        let capped = if should_spill {
+            match spill_store {
+                Some(store) => {
+                    let (id, redacted) = spill::store_redacted_full(&out, store);
+                    let teaser_tokens =
+                        est.tokens_for_chars(spill::TOOL_RESULT_SPILL_CAP.saturating_sub(512));
+                    cap_model_output_with_handle(
+                        &redacted,
+                        max_tokens.min(teaser_tokens),
+                        output_head_tokens(),
+                        Some(&id),
+                    )
+                }
+                None => cap_model_output(&out, max_tokens),
+            }
+        } else {
+            cap_model_output(&out, max_tokens)
+        };
         // #898: if this command's output carries a forge "open a pull/merge
         // request" URL (git prints it on push of a new branch), append an
         // explicit next-step hint so the model opens the PR instead of stalling.
@@ -2305,6 +2395,56 @@ pub async fn execute_tool(
     experience_store: Option<&dyn super::experiential::ExperienceStore>,
     step_ledger: Option<&dyn super::scheduled::StepLedger>,
 ) -> String {
+    execute_tool_with_offload(
+        name,
+        args,
+        workspace,
+        color,
+        tool_output_lines,
+        caveats,
+        mcp,
+        build_check_cmd,
+        note_sink,
+        recall_source,
+        memory_source,
+        permission_gate,
+        exec_floor,
+        git_tool,
+        crew_runner,
+        scratchpad_store,
+        code_search,
+        experience_store,
+        step_ledger,
+        false,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn execute_tool_with_offload(
+    name: &str,
+    args: &serde_json::Value,
+    workspace: &str,
+    color: bool,
+    tool_output_lines: usize,
+    caveats: &crate::caveats::Caveats,
+    mcp: &mut dyn McpTools,
+    build_check_cmd: Option<&str>,
+    note_sink: Option<&mut dyn NoteSink>,
+    recall_source: Option<&dyn RecallSource>,
+    memory_source: Option<&dyn MemorySource>,
+    permission_gate: Option<&mut dyn PermissionGate>,
+    exec_floor: Option<&crate::caveats::Scope<String>>,
+    git_tool: Option<&dyn GitTool>,
+    crew_runner: Option<&dyn CrewRunner>,
+    scratchpad_store: Option<&dyn super::scratchpad::ScratchpadStore>,
+    code_search: Option<super::semantic::CodeSearch<'_>>,
+    experience_store: Option<&dyn super::experiential::ExperienceStore>,
+    step_ledger: Option<&dyn super::scheduled::StepLedger>,
+    tool_offload: bool,
+    spill_store: Option<&dyn SpillStore>,
+) -> String {
     // Remote MCP tools (namespaced `server__tool`) route to their server before
     // the built-in match. They carry no Caveats leash in this build.
     if mcp.handles(name) {
@@ -2587,6 +2727,8 @@ pub async fn execute_tool(
                 caveats,
                 exec_floor,
                 permission_gate,
+                tool_offload,
+                spill_store,
             )
             .await
         }
@@ -2640,6 +2782,8 @@ pub async fn execute_tool(
                         caveats,
                         exec_floor,
                         permission_gate,
+                        tool_offload,
+                        spill_store,
                     )
                     .await
                 }
@@ -3367,22 +3511,17 @@ mod tests {
     }
 
     #[test]
-    fn cap_model_output_truncates_over_budget_with_a_marker() {
-        // ~25k tokens of 'a' against a 1000-token budget → truncated near
-        // budget × chars/token, at a char boundary, with the marker appended.
-        let est = crate::tokens::TokenEstimation::default();
-        let budget = 1_000;
-        let max_chars = est.chars_for_tokens(budget);
-        let big = "a".repeat(100_000);
-        let out = cap_model_output(&big, budget);
+    fn cap_model_output_truncates_over_budget_as_head_tail() {
+        let big = format!("HEAD_MARKER\n{}\nTAIL_MARKER", "middle\n".repeat(20_000));
+        let out = cap_model_output_with_handle(&big, 1_000, 100, None);
         assert!(out.len() < big.len(), "must shrink: {} bytes", out.len());
+        assert!(out.contains("HEAD_MARKER"), "head dropped: {out:?}");
+        assert!(out.contains("TAIL_MARKER"), "tail dropped: {out:?}");
+        assert!(out.contains("head+tail shown"), "marker present: {out:?}");
         assert!(
-            out.contains("output truncated to ~1000 tokens"),
-            "marker present: {out:?}"
+            !out.contains(&"middle\n".repeat(1_000)),
+            "middle should be elided"
         );
-        // The kept body is exactly the char budget (all ASCII → clean boundary).
-        let body = out.split("\n\n[output truncated").next().unwrap();
-        assert_eq!(body.len(), max_chars, "kept ~budget chars");
     }
 
     #[test]
@@ -3392,9 +3531,12 @@ mod tests {
         let budget = 10; // ~40 chars
         let body = "é".repeat(1_000); // 2 bytes each
         let out = cap_model_output(&body, budget);
-        let kept = out.split("\n\n[output truncated").next().unwrap();
-        assert!(kept.is_char_boundary(kept.len()), "valid boundary");
-        assert!(kept.chars().all(|c| c == 'é'), "no split char: {kept:?}");
+        assert!(out.is_char_boundary(out.len()), "valid boundary");
+        assert!(
+            out.chars()
+                .all(|c| c == 'é' || !c.is_control() || c == '\n'),
+            "no split char: {out:?}"
+        );
     }
 
     #[test]
@@ -3886,7 +4028,7 @@ mod tests {
             "stderr": "remote: Create a pull request for 'fix/foo' on GitHub by visiting:\n\
                        remote:      https://github.com/OWNER/REPO/pull/new/fix/foo\n",
         });
-        let out = shell_envelope_output(&push, 50, false);
+        let out = shell_envelope_output(&push, 50, false, false, None);
         assert!(out.contains("gh pr create --fill"), "hint missing: {out}");
         assert!(
             out.contains("https://github.com/OWNER/REPO/pull/new/fix/foo"),
@@ -3895,9 +4037,42 @@ mod tests {
 
         // Ordinary output: no hint, payload unchanged.
         let plain = serde_json::json!({ "exit_code": 0, "stdout": "hello\n", "stderr": "" });
-        let out = shell_envelope_output(&plain, 50, false);
+        let out = shell_envelope_output(&plain, 50, false, false, None);
         assert!(!out.contains("gh pr create"), "spurious hint: {out}");
         assert_eq!(out, "hello\n");
+    }
+
+    #[test]
+    fn shell_envelope_output_spills_full_output_before_head_tail_cap() {
+        let full = format!(
+            "HEAD_ONLY_MARKER\n{}\nMIDDLE_ONLY_MARKER\n{}\nTAIL_ONLY_MARKER\n",
+            "alpha\n".repeat(10_000),
+            "omega\n".repeat(10_000)
+        );
+        let envelope = serde_json::json!({
+            "exit_code": 0,
+            "stdout": full,
+            "stderr": "",
+        });
+        let store = spill::SessionSpillStore::default();
+        let out = shell_envelope_output(&envelope, 50, false, true, Some(&store));
+
+        assert!(out.contains("HEAD_ONLY_MARKER"), "head dropped: {out}");
+        assert!(out.contains("TAIL_ONLY_MARKER"), "tail dropped: {out}");
+        assert!(
+            out.contains("memory_fetch(\"spill:s0\")"),
+            "spill handle missing: {out}"
+        );
+        assert!(
+            out.contains("grep=\"<pattern>\""),
+            "search affordance missing: {out}"
+        );
+        let stored = store.fetch("s0").expect("full output stored");
+        assert!(
+            stored.contains("MIDDLE_ONLY_MARKER"),
+            "spilled payload was capped before storage"
+        );
+        assert!(stored.ends_with("TAIL_ONLY_MARKER\n"));
     }
 
     #[test]
@@ -7062,7 +7237,10 @@ mod disable_ocap_tests {
         assert!(envelope.get("denials").is_none(), "got: {envelope}");
         assert!(!envelope_denied(&envelope));
         // And the shared formatter renders it like any confined result.
-        assert_eq!(shell_envelope_output(&envelope, 20, false), "out\nerr\n");
+        assert_eq!(
+            shell_envelope_output(&envelope, 20, false, false, None),
+            "out\nerr\n"
+        );
     }
 
     #[test]

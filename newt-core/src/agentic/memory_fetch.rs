@@ -267,7 +267,8 @@ const MEMORY_FETCH_DESCRIPTION: &str =
      `turn:<conversation-id>#<seq>` (one past turn, e.g. \
      `turn:174856320012#7` — copy the id and `seq N` from a recall hit), \
      or `spill:<id>` (the full secret-redacted body of a tool output that was \
-     truncated for length — the `[… truncated …]` marker carries the id), \
+     truncated for length — the `[… truncated …]` marker carries the id; add \
+     `grep` to return matching lines instead of the whole payload), \
      or `compaction:<id>` (the full secret-redacted text of an earlier \
      conversation span the compressor summarized away — the compaction summary \
      names the id; use it to recover an exact detail the summary dropped). \
@@ -296,6 +297,13 @@ pub fn memory_fetch_tool_definition() -> serde_json::Value {
                                         or 'compaction:s1' — copy it exactly as the \
                                         index, a recall hit, a truncation marker, or \
                                         a compaction summary showed it"
+                    },
+                    "grep": {
+                        "type": "string",
+                        "description": "Optional substring to search inside the fetched body. \
+                                        Useful for spill:<id> command output; returns matching \
+                                        lines with a small amount of context instead of the full \
+                                        payload."
                     }
                 },
                 "required": ["address"]
@@ -327,6 +335,11 @@ pub(crate) fn execute_memory_fetch(
     tool_output_lines: usize,
 ) -> String {
     let address = args["address"].as_str().unwrap_or("").trim();
+    let grep = args
+        .get("grep")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
 
     print_tool_call("memory_fetch", address, color);
 
@@ -352,10 +365,53 @@ pub(crate) fn execute_memory_fetch(
     };
 
     let out = match payload {
-        MemPayload::Found(body) => body,
+        MemPayload::Found(body) => match grep {
+            Some(pattern) => grep_payload(&body, pattern),
+            None => body,
+        },
         MemPayload::NotFound { reason } => format!("no such memory item: {reason}"),
     };
     print_tool_output(&out, tool_output_lines, color);
+    out
+}
+
+fn grep_payload(body: &str, pattern: &str) -> String {
+    const CONTEXT: usize = 2;
+    const MAX_MATCHES: usize = 40;
+    let lines: Vec<&str> = body.lines().collect();
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    for (idx, line) in lines.iter().enumerate() {
+        if line.contains(pattern) {
+            if ranges.len() >= MAX_MATCHES {
+                break;
+            }
+            let start = idx.saturating_sub(CONTEXT);
+            let end = (idx + CONTEXT + 1).min(lines.len());
+            if let Some((_, prev_end)) = ranges.last_mut() {
+                if start <= *prev_end {
+                    *prev_end = end.max(*prev_end);
+                    continue;
+                }
+            }
+            ranges.push((start, end));
+        }
+    }
+    if ranges.is_empty() {
+        return format!("no matches for {pattern:?} in fetched payload");
+    }
+    let mut out = format!("matches for {pattern:?} in fetched payload:");
+    for (range_idx, (start, end)) in ranges.iter().enumerate() {
+        if range_idx > 0 {
+            out.push_str("\n--");
+        }
+        for (line_idx, line) in lines.iter().enumerate().take(*end).skip(*start) {
+            use std::fmt::Write as _;
+            let _ = write!(out, "\n{:>6}: {}", line_idx + 1, line);
+        }
+    }
+    if lines.iter().filter(|line| line.contains(pattern)).count() > MAX_MATCHES {
+        out.push_str("\n[additional matches omitted; use a narrower grep pattern]");
+    }
     out
 }
 
@@ -505,6 +561,44 @@ pub(crate) mod tests {
             *source.calls.lock().unwrap(),
             vec![MemAddr::Note { id: "2".into() }]
         );
+    }
+
+    #[test]
+    fn grep_returns_matching_lines_with_context() {
+        let source = MockSource {
+            body: Some("first\nbefore\nneedle here\nafter\nlast\n".to_string()),
+            ..Default::default()
+        };
+        let out = execute_memory_fetch(
+            &serde_json::json!({"address": "spill:s0", "grep": "needle"}),
+            &source,
+            false,
+            20,
+        );
+        assert!(out.contains("matches for \"needle\""), "{out}");
+        assert!(out.contains("     2: before"), "{out}");
+        assert!(out.contains("     3: needle here"), "{out}");
+        assert!(out.contains("     4: after"), "{out}");
+        assert!(
+            !out.contains("first\nbefore"),
+            "should render numbered lines"
+        );
+    }
+
+    #[test]
+    fn grep_reports_no_matches_without_returning_full_payload() {
+        let source = MockSource {
+            body: Some("alpha\nbeta\ngamma\n".to_string()),
+            ..Default::default()
+        };
+        let out = execute_memory_fetch(
+            &serde_json::json!({"address": "spill:s0", "grep": "delta"}),
+            &source,
+            false,
+            20,
+        );
+        assert!(out.contains("no matches for \"delta\""), "{out}");
+        assert!(!out.contains("alpha\nbeta"), "{out}");
     }
 
     #[test]

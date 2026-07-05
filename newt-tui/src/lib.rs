@@ -15039,15 +15039,18 @@ mod helper_fn_tests {
         use newt_core::{
             BackendKind, ContextConfig, ContextFeature as F, ContextFeatures, ContextManager,
         };
-        // Cloud (Openai) base: no [context] → the preset base bundle (all off).
-        assert!(context_features(
+        // Cloud (Openai) base: local spill offload is on by default, while
+        // embedding/plan/state features stay opt-in.
+        let cloud = context_features(
             &newt_core::Config::default(),
             ContextManager::Standard,
             &ContextFeatures::default(),
             BackendKind::Openai,
-        )
-        .enabled()
-        .is_empty());
+        );
+        assert!(cloud.get(F::ToolOffload));
+        assert!(!cloud.get(F::Semantic));
+        assert!(!cloud.get(F::Scratchpad));
+        assert!(!cloud.get(F::Scheduled));
         // [context.features] override layers over the preset base.
         let mut cfg_feats = ContextFeatures::default();
         cfg_feats.set(F::Semantic, Some(true));
@@ -15080,20 +15083,22 @@ mod helper_fn_tests {
         use newt_core::{
             BackendKind, ContextConfig, ContextFeature as F, ContextFeatures, ContextManager,
         };
-        // Step 27.4: a local (Ollama) session defaults scratchpad + semantic +
-        // scheduled ON with no config at all.
+        // #945 + Step 27.4: a local (Ollama) session defaults tool_offload,
+        // scratchpad, semantic, and scheduled ON with no config at all.
         let local = context_features(
             &newt_core::Config::default(),
             ContextManager::Standard,
             &ContextFeatures::default(),
             BackendKind::Ollama,
         );
+        assert!(local.get(F::ToolOffload));
         assert!(local.get(F::Scratchpad));
         assert!(local.get(F::Semantic));
         assert!(local.get(F::Scheduled));
-        // An explicit [context.features] scheduled = false still wins.
+        // Explicit [context.features] off values still win.
         let mut off = ContextFeatures::default();
         off.set(F::Scheduled, Some(false));
+        off.set(F::ToolOffload, Some(false));
         let cfg = newt_core::Config {
             context: Some(ContextConfig {
                 manager: ContextManager::Standard,
@@ -15111,6 +15116,10 @@ mod helper_fn_tests {
         assert!(
             !resolved.get(F::Scheduled),
             "explicit off overrides the local default"
+        );
+        assert!(
+            !resolved.get(F::ToolOffload),
+            "explicit off overrides default-on offload"
         );
         assert!(resolved.get(F::Scratchpad), "untouched feature stays on");
     }

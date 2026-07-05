@@ -109,6 +109,16 @@ pub fn maybe_offload(result: String, tool_offload: bool, spill: Option<&dyn Spil
     head_tail_excerpt(&redacted, &id)
 }
 
+/// Redact and store a full payload, returning `(id, redacted_payload)` so a
+/// caller can build its own model-facing teaser from the exact bytes that were
+/// stored. Used by `run_command` before its model-facing cap, so the spill store
+/// sees the true tail instead of an already-truncated result.
+pub fn store_redacted_full(result: &str, spill: &dyn SpillStore) -> (String, String) {
+    let redacted = redact_secrets(result);
+    let id = spill.store(redacted.clone());
+    (id, redacted)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

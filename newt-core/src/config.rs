@@ -950,20 +950,22 @@ impl ContextFeatureSet {
     }
 
     /// The base feature set *before* `[context.features]` / session overrides:
-    /// the `manager` preset's bundle, with local-assist features (`scratchpad`,
-    /// `semantic`, and `scheduled`) defaulted ON for local (`BackendKind::Ollama`)
-    /// backends. A weak local model needs the `<plan>` / `<state>` ledger to
-    /// carry a checklist across tool-call rounds instead of re-deriving state
-    /// each round (Step 27.4), and semantic retrieval should be ready without a
-    /// live toggle once an embedder is configured. Cloud (OpenAI-compatible)
-    /// backends keep the all-off preset baseline; explicit overrides still win —
-    /// they layer on top via [`ContextFeatures::apply_to`].
+    /// the `manager` preset's bundle, with `tool_offload` defaulted ON because
+    /// it is local, deterministic spill storage and should not depend on
+    /// semantic embedding availability. Local-assist features (`scratchpad`,
+    /// `semantic`, and `scheduled`) additionally default ON for local
+    /// (`BackendKind::Ollama`) backends. A weak local model needs the `<plan>` /
+    /// `<state>` ledger to carry a checklist across tool-call rounds instead of
+    /// re-deriving state each round (Step 27.4), and semantic retrieval should
+    /// be ready without a live toggle once an embedder is configured. Explicit
+    /// overrides still win — they layer on top via [`ContextFeatures::apply_to`].
     ///
     /// Note: a *local* vLLM / llama.cpp server reports as `Openai` (that's the
     /// wire protocol, not the host), so those users opt in via
     /// `[context.features]` rather than getting it by default.
     pub fn base_for(manager: ContextManager, kind: BackendKind) -> Self {
         let mut base = manager.base_features();
+        base.tool_offload = true;
         if matches!(kind, BackendKind::Ollama) {
             base.scratchpad = true;
             base.semantic = true;
@@ -1314,13 +1316,14 @@ impl Default for AgentsConfig {
 
 /// Tool-execution behaviour stored under `[tools]` in `newt.toml` (#726).
 ///
-/// Currently a single knob: the **token budget** that caps every tool's
-/// model-facing output. This bounds what a single tool result can add to the
-/// context window — applied to both `read_file` (its char backstop) and
-/// `run_command` (its shell envelope) — so a verbose command or a huge file
-/// can't saturate a small local model's window and abandon the task. Mirrors
-/// Codex's `exec_command.max_output_tokens`. Distinct from `[tui]
-/// tool_output_lines`, which caps the on-screen DISPLAY by lines.
+/// Tool-output knobs: the **token budget** that caps every tool's model-facing
+/// output, plus the head/tail split for oversized shell output. This bounds
+/// what a single tool result can add to the context window — applied to both
+/// `read_file` (its char backstop) and `run_command` (its shell envelope) — so a
+/// verbose command or a huge file can't saturate a small local model's window
+/// and abandon the task. Mirrors Codex's `exec_command.max_output_tokens`.
+/// Distinct from `[tui] tool_output_lines`, which caps the on-screen DISPLAY by
+/// lines.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ToolsConfig {
@@ -1330,18 +1333,30 @@ pub struct ToolsConfig {
     /// estimated with the shared chars/token heuristic (see [`crate::tokens`]).
     #[serde(default = "default_max_output_tokens")]
     pub max_output_tokens: usize,
+
+    /// Tokens reserved for the head of an oversized `run_command` result. The
+    /// remaining budget is spent on the tail, so failures and summaries at the
+    /// end survive by default. `0` is pure-tail; values greater than
+    /// `max_output_tokens` are clamped to pure-head.
+    #[serde(default = "default_output_head_tokens")]
+    pub output_head_tokens: usize,
 }
 
 impl Default for ToolsConfig {
     fn default() -> Self {
         Self {
             max_output_tokens: default_max_output_tokens(),
+            output_head_tokens: default_output_head_tokens(),
         }
     }
 }
 
 fn default_max_output_tokens() -> usize {
     10_000
+}
+
+fn default_output_head_tokens() -> usize {
+    1_500
 }
 
 // ---------------------------------------------------------------------------
@@ -2846,6 +2861,7 @@ impl Config {
         // cowork driver, eval) gets the override here without threading a new
         // `usize` through `ChatCtx` + `execute_tool` + every call site. Idempotent.
         crate::agentic::set_max_output_tokens(cfg.max_output_tokens());
+        crate::agentic::set_output_head_tokens(cfg.output_head_tokens());
         // #880: publish the repo `[lifecycle]` overrides the same way — the single
         // canonical config-application entry — so the crew's normalize (and future
         // phase consumers) honor `.newt/config.toml`.
@@ -2868,6 +2884,15 @@ impl Config {
             .as_ref()
             .map(|t| t.max_output_tokens)
             .unwrap_or_else(default_max_output_tokens)
+    }
+
+    /// The configured head allocation for oversized `run_command` output
+    /// (`[tools] output_head_tokens`), or the built-in tail-biased default.
+    pub fn output_head_tokens(&self) -> usize {
+        self.tools
+            .as_ref()
+            .map(|t| t.output_head_tokens)
+            .unwrap_or_else(default_output_head_tokens)
     }
 
     /// Merge per-file backends from the `backends/` dirs next to the config:
@@ -3720,22 +3745,29 @@ mod tests {
     }
 
     #[test]
-    fn base_for_local_defaults_plan_state_and_semantic_on_cloud_stays_off() {
+    fn base_for_defaults_tool_offload_on_and_local_assist_on_for_ollama() {
         use ContextFeature as F;
-        // Step 27.4: local (Ollama) backends default scratchpad + scheduled ON;
-        // semantic is also enabled by default but degrades to a one-shot no-op
-        // until an embedder is configured.
+        // #945: tool offload is local spill storage and defaults ON for every
+        // backend. Step 27.4: local (Ollama) backends additionally default
+        // scratchpad + scheduled ON; semantic also defaults ON but degrades to a
+        // one-shot no-op until an embedder is configured.
         let local = ContextFeatureSet::base_for(ContextManager::Standard, BackendKind::Ollama);
+        assert!(local.get(F::ToolOffload));
         assert!(local.get(F::Scratchpad));
         assert!(local.get(F::Semantic));
         assert!(local.get(F::Scheduled));
-        // Cloud (OpenAI-compatible) keeps the all-off preset baseline.
+        // Cloud (OpenAI-compatible) gets offload, but not local-assist features.
         let cloud = ContextFeatureSet::base_for(ContextManager::Standard, BackendKind::Openai);
-        assert!(cloud.enabled().is_empty());
+        assert!(cloud.get(F::ToolOffload));
+        assert!(!cloud.get(F::Scratchpad));
+        assert!(!cloud.get(F::Semantic));
+        assert!(!cloud.get(F::Scheduled));
         // An explicit override still wins over the local default (force off).
         let mut ov = ContextFeatures::default();
         ov.set(F::Scheduled, Some(false));
+        ov.set(F::ToolOffload, Some(false));
         assert!(!ov.apply_to(local).get(F::Scheduled));
+        assert!(!ov.apply_to(local).get(F::ToolOffload));
         assert!(ov.apply_to(local).get(F::Scratchpad)); // untouched feature stays on
     }
 
@@ -5356,7 +5388,9 @@ net = [\"already.example.com\"]
         let cfg: Config = toml::from_str("").unwrap();
         assert!(cfg.tools.is_none());
         assert_eq!(cfg.max_output_tokens(), 10_000);
+        assert_eq!(cfg.output_head_tokens(), 1_500);
         assert_eq!(Config::default().max_output_tokens(), 10_000);
+        assert_eq!(Config::default().output_head_tokens(), 1_500);
     }
 
     #[test]
@@ -5365,11 +5399,14 @@ net = [\"already.example.com\"]
             r#"
             [tools]
             max_output_tokens = 4096
+            output_head_tokens = 512
         "#,
         )
         .unwrap();
         assert_eq!(cfg.tools.as_ref().unwrap().max_output_tokens, 4096);
+        assert_eq!(cfg.tools.as_ref().unwrap().output_head_tokens, 512);
         assert_eq!(cfg.max_output_tokens(), 4096);
+        assert_eq!(cfg.output_head_tokens(), 512);
     }
 
     #[test]
@@ -5377,6 +5414,7 @@ net = [\"already.example.com\"]
         // A `[tools]` table that omits the key falls back to the default fn.
         let cfg: Config = toml::from_str("[tools]\n").unwrap();
         assert_eq!(cfg.max_output_tokens(), 10_000);
+        assert_eq!(cfg.output_head_tokens(), 1_500);
     }
 
     #[test]

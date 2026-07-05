@@ -212,8 +212,8 @@ pub use permissions::{
 pub use recall::{recall_tool_definition, RecallSource, StoreRecallSource};
 pub use resume::resume_context_tool_definition;
 pub use tools::{
-    execute_tool, full_access_requested, ocap_disabled, set_max_output_tokens, tool_definitions,
-    venv_cmd_prefix,
+    execute_tool, execute_tool_with_offload, full_access_requested, ocap_disabled,
+    set_max_output_tokens, set_output_head_tokens, tool_definitions, venv_cmd_prefix,
 };
 pub use transcript::{
     transcript_lines, transcript_lines_styled, TranscriptLine, TranscriptRole, TranscriptStyle,
@@ -2216,7 +2216,7 @@ pub async fn chat_complete(
                 display::print_tool_output(&report, tool_output_lines, color);
                 report
             } else {
-                execute_tool(
+                execute_tool_with_offload(
                     name,
                     &args,
                     workspace,
@@ -2247,6 +2247,8 @@ pub async fn chat_complete(
                     code_search,
                     experience_store,
                     step_ledger,
+                    tool_offload,
+                    spill_store,
                 )
                 .await
             };
@@ -2297,7 +2299,7 @@ pub async fn chat_complete(
                 "role": "tool",
                 // Step 26.3 (#584): offload an oversized result (redact → spill →
                 // teaser+handle) when tool_offload is on; unchanged otherwise.
-                "content": spill::maybe_offload(result, tool_offload, spill_store)
+                "content": maybe_offload_tool_result(name, result, tool_offload, spill_store)
             }));
         }
         if round_wrote {
@@ -2889,6 +2891,19 @@ fn is_read_only_call(name: &str, args: &serde_json::Value) -> bool {
 
 fn is_workspace_write_call(name: &str) -> bool {
     matches!(name, "write_file" | "edit_file")
+}
+
+fn maybe_offload_tool_result(
+    name: &str,
+    result: String,
+    tool_offload: bool,
+    spill_store: Option<&dyn spill::SpillStore>,
+) -> String {
+    if matches!(name, "run_command" | "lifecycle") {
+        result
+    } else {
+        spill::maybe_offload(result, tool_offload, spill_store)
+    }
 }
 
 fn meaningful_workflow_progress(name: &str, result: &str) -> bool {
@@ -4351,7 +4366,7 @@ pub async fn openai_chat_complete(
                 display::print_tool_output(&report, tool_output_lines, color);
                 report
             } else {
-                execute_tool(
+                execute_tool_with_offload(
                     name,
                     &args,
                     workspace,
@@ -4382,6 +4397,8 @@ pub async fn openai_chat_complete(
                     code_search,
                     experience_store,
                     step_ledger,
+                    tool_offload,
+                    spill_store,
                 )
                 .await
             };
@@ -4435,7 +4452,7 @@ pub async fn openai_chat_complete(
                 "role": "tool",
                 "tool_call_id": id,
                 // Step 26.3 (#584): see the Ollama path.
-                "content": spill::maybe_offload(result, tool_offload, spill_store),
+                "content": maybe_offload_tool_result(name, result, tool_offload, spill_store),
             }));
         }
         workflow_runtime.record_round_outcome(round_modified_workspace, round_progress);
@@ -4848,7 +4865,7 @@ pub async fn openai_responses_complete(
                 display::print_tool_output(&report, tool_output_lines, color);
                 report
             } else {
-                execute_tool(
+                execute_tool_with_offload(
                     name,
                     &args,
                     workspace,
@@ -4872,6 +4889,8 @@ pub async fn openai_responses_complete(
                     code_search,
                     experience_store,
                     step_ledger,
+                    tool_offload,
+                    spill_store,
                 )
                 .await
             };
@@ -4912,7 +4931,7 @@ pub async fn openai_responses_complete(
                 "type": "function_call_output",
                 "call_id": call_id,
                 // Step 26.3 (#584): see the Ollama path (Responses output shape).
-                "output": spill::maybe_offload(result, tool_offload, spill_store),
+                "output": maybe_offload_tool_result(name, result, tool_offload, spill_store),
             }));
         }
     }
