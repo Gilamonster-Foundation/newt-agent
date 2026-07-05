@@ -1795,7 +1795,9 @@ pub async fn chat_complete(
                         .map(|u| u.output_tokens > 0)
                         .unwrap_or(false);
 
-                    if generated_unusable_output && suspicious_empty_retries < 1 {
+                    if generated_unusable_output
+                        && suspicious_empty_retries < SUSPICIOUS_EMPTY_RETRY_CAP
+                    {
                         if trace {
                             print_trace(&ollama_response_shape(&json), color);
                         }
@@ -1808,7 +1810,8 @@ pub async fn chat_complete(
                             };
                             print_debug(
                                 &format!(
-                                    "empty assistant content with generated tokens — retrying once ({field_note})"
+                                    "empty assistant content with generated tokens — retrying ({}/{SUSPICIOUS_EMPTY_RETRY_CAP}; {field_note})",
+                                    suspicious_empty_retries + 1
                                 ),
                                 color,
                             );
@@ -1826,7 +1829,7 @@ pub async fn chat_complete(
                         }
                         messages.push(serde_json::json!({
                             "role": "user",
-                            "content": "Your previous response produced generated tokens but no assistant-visible content and no tool call. Reply with either a tool call or final assistant content."
+                            "content": suspicious_empty_retry_nudge(suspicious_empty_retries, &json)
                         }));
                         accumulated_usage = merged;
                         suspicious_empty_retries += 1;
@@ -2487,6 +2490,11 @@ const NARRATION_NUDGE_CAP: usize = 1;
 /// Max "you ended while a plan still has open steps" nudges per turn. This is
 /// state-driven from the plan ledger, not prose-matched.
 const PENDING_PLAN_NUDGE_CAP: usize = 1;
+/// Max "generated hidden thinking but no visible content/tool call" retries per
+/// turn. The first retry is generic; the second is explicit that hidden
+/// thinking is not an action. Bounded so a broken backend still exits with the
+/// diagnostic.
+const SUSPICIOUS_EMPTY_RETRY_CAP: u32 = 2;
 /// Max "you claimed file context changed under you without verifying" nudges
 /// per turn. Kept separate from narration nudges: this is a blocker-specific
 /// ground-truth check, not generic intent-to-act recovery.
@@ -2763,6 +2771,26 @@ fn ollama_response_shape(json: &serde_json::Value) -> String {
         json["eval_count"]
             .as_u64()
             .map_or("missing".to_string(), |n| n.to_string())
+    )
+}
+
+fn suspicious_empty_retry_nudge(retry_index: u32, json: &serde_json::Value) -> String {
+    if retry_index == 0 {
+        return "Your previous response produced generated tokens but no assistant-visible content \
+                and no tool call. Reply with either a tool call or final assistant content."
+            .to_string();
+    }
+    let fields = ollama_non_content_fields(json);
+    let field_note = if fields.is_empty() {
+        "hidden/non-content fields".to_string()
+    } else {
+        format!("hidden/non-content field(s): {}", fields.join(", "))
+    };
+    format!(
+        "Your previous response again produced generated tokens only in {field_note}, \
+         with no assistant-visible content and no tool call. Hidden thinking is not an \
+         action. If you intend to act, emit the exact tool call now; otherwise reply \
+         with final assistant-visible content. Do not continue with hidden-only reasoning."
     )
 }
 
@@ -6786,6 +6814,86 @@ mod http_loop_tests {
                 >= 2566,
             "usage from the suspicious empty round must be preserved"
         );
+    }
+
+    struct SuspiciousEmptyTwiceThenRecover {
+        probes: Arc<AtomicUsize>,
+        saw_strong_nudge: Arc<AtomicBool>,
+    }
+    impl Respond for SuspiciousEmptyTwiceThenRecover {
+        fn respond(&self, req: &Request) -> ResponseTemplate {
+            if is_stream(req) {
+                if self.probes.load(Ordering::SeqCst) <= 2 {
+                    ndjson(&[serde_json::json!({
+                        "message": {"content": ""},
+                        "done": true,
+                        "prompt_eval_count": 9,
+                        "eval_count": 4
+                    })])
+                } else {
+                    ndjson(&[serde_json::json!({
+                        "message": {"content": "recovered after strong hidden-only nudge"},
+                        "done": true,
+                        "prompt_eval_count": 5,
+                        "eval_count": 3
+                    })])
+                }
+            } else {
+                let body = body_json(req);
+                if body["messages"].as_array().into_iter().flatten().any(|m| {
+                    m["content"]
+                        .as_str()
+                        .unwrap_or("")
+                        .contains("Hidden thinking is not an action")
+                }) {
+                    self.saw_strong_nudge.store(true, Ordering::SeqCst);
+                }
+                let n = self.probes.fetch_add(1, Ordering::SeqCst) + 1;
+                if n <= 2 {
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "message": {
+                            "content": "",
+                            "thinking": "I know the next action but did not emit it."
+                        },
+                        "prompt_eval_count": 10,
+                        "eval_count": 2559,
+                    }))
+                } else {
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "message": {"content": "recovered after strong hidden-only nudge"},
+                        "prompt_eval_count": 5,
+                        "eval_count": 3,
+                    }))
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn repeated_thinking_only_gets_stronger_second_nudge() {
+        let server = MockServer::start().await;
+        let probes = Arc::new(AtomicUsize::new(0));
+        let saw_strong_nudge = Arc::new(AtomicBool::new(false));
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(SuspiciousEmptyTwiceThenRecover {
+                probes: probes.clone(),
+                saw_strong_nudge: saw_strong_nudge.clone(),
+            })
+            .mount(&server)
+            .await;
+
+        let messages = msgs();
+        let caveats = Caveats::top();
+        let (reply, streamed, _, _) =
+            chat_complete(ctx(&server.uri(), &messages, &caveats), &mut NoMcp)
+                .await
+                .expect("second hidden-only nudge should recover the turn");
+
+        assert_eq!(reply, "recovered after strong hidden-only nudge");
+        assert!(streamed);
+        assert_eq!(probes.load(Ordering::SeqCst), 3);
+        assert!(saw_strong_nudge.load(Ordering::SeqCst));
     }
 
     struct SuspiciousEmptyStaysEmpty;
