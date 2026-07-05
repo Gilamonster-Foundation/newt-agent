@@ -2029,6 +2029,12 @@ pub async fn chat_complete(
                 .is_plan_update()
                 .then(|| workflow_steerer.plan_update_hint(&workflow_classifier_text))
                 .flatten();
+            let classifier_plan_direction = nudge_classification
+                .is_plan_update()
+                .then(|| nudge_classifier.direction_for(crate::NudgeClass::PlanUpdate))
+                .flatten();
+            let plan_nudge_hint =
+                combine_nudge_hints(classifier_plan_direction, workflow_hint.as_deref());
             if round + 1 < max_tool_rounds {
                 if let Some(nudge) = workflow_runtime.rediscovery_nudge(
                     Some(&nudge_classification),
@@ -2051,7 +2057,7 @@ pub async fn chat_complete(
                 if let Some(nudge) = pending_plan_completion_nudge(
                     step_ledger,
                     nudge_classification.is_plan_update(),
-                    workflow_hint.as_deref(),
+                    plan_nudge_hint.as_deref(),
                 ) {
                     if debug {
                         print_debug(
@@ -2098,9 +2104,13 @@ pub async fn chat_complete(
                 // Record the model's own narration, then the corrective, so the
                 // next round sees both (mirrors the has-tools assistant turn).
                 messages.push(serde_json::json!({ "role": "assistant", "content": streamed }));
+                let direction = nudge_classifier
+                    .direction_for(nudge_classification.class)
+                    .map(str::to_string)
+                    .unwrap_or_else(narration_action_nudge);
                 messages.push(serde_json::json!({
                     "role": "user",
-                    "content": narration_action_nudge(),
+                    "content": direction,
                 }));
                 narration_nudges += 1;
                 accumulated_usage = merge_round_usage(accumulated_usage, stream_usage);
@@ -2980,6 +2990,17 @@ fn workflow_classifier_text(messages: &[serde_json::Value], current_content: &st
     parts.join("\n")
 }
 
+fn combine_nudge_hints(first: Option<&str>, second: Option<&str>) -> Option<String> {
+    let text = [first, second]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .filter(|hint| !hint.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    (!text.is_empty()).then_some(text)
+}
+
 fn message_text(message: &serde_json::Value) -> Option<String> {
     match message.get("content")? {
         serde_json::Value::String(s) => Some(s.clone()),
@@ -3203,47 +3224,64 @@ fn cap_exit_nudge(max_tool_rounds: usize, progress: Option<&str>, observed: &[St
 /// progress so partial work survives (Step 27.5), and gives HONEST advice: a run
 /// dominated by failed tool calls is a tooling/permissions problem, not too few
 /// rounds, so we don't blindly tell the user to raise the cap.
+fn cap_exit_tokens_hint(max_tool_rounds: usize, accumulated: Option<crate::TokenUsage>) -> String {
+    match accumulated {
+        Some(u) => format!(
+            " ({} in / {} out tokens consumed across {max_tool_rounds} rounds)",
+            u.input_tokens, u.output_tokens,
+        ),
+        None => String::new(),
+    }
+}
+
+fn cap_exit_advice(max_tool_rounds: usize, wasted_calls: usize) -> &'static str {
+    // If at least one failed tool call per round, the cap was thrash, not a
+    // genuine need for more rounds.
+    if wasted_calls >= max_tool_rounds.max(1) {
+        "most of those rounds were spent on tool calls that failed — the model \
+         could not find a working edit/shell path, which is usually a tooling or \
+         permissions issue rather than too few rounds; check `newt doctor`"
+    } else {
+        "raise [tui].max_tool_rounds in your config, or ask a more focused question"
+    }
+}
+
+fn cap_exit_progress_block(label: &str, progress: Option<&str>) -> String {
+    match progress {
+        Some(p) => format!("\n\n{label}:\n{p}"),
+        None => String::new(),
+    }
+}
+
 fn cap_exit_fallback(
     max_tool_rounds: usize,
     accumulated: Option<crate::TokenUsage>,
     wasted_calls: usize,
     progress: Option<&str>,
 ) -> String {
-    let tokens_hint = match accumulated {
-        Some(u) => format!(
-            " ({} in / {} out tokens consumed across {max_tool_rounds} rounds)",
-            u.input_tokens, u.output_tokens,
-        ),
-        None => String::new(),
-    };
-    // If at least one failed tool call per round, the cap was thrash, not a
-    // genuine need for more rounds.
-    let advice = if wasted_calls >= max_tool_rounds.max(1) {
-        "most of those rounds were spent on tool calls that failed — the model \
-         could not find a working edit/shell path, which is usually a tooling or \
-         permissions issue rather than too few rounds; check `newt doctor`"
-    } else {
-        "raise [tui].max_tool_rounds in your config, or ask a more focused question"
-    };
-    let salvaged = match progress {
-        Some(p) => format!("\n\nProgress captured before the summary failed:\n{p}"),
-        None => String::new(),
-    };
+    let tokens_hint = cap_exit_tokens_hint(max_tool_rounds, accumulated);
+    let advice = cap_exit_advice(max_tool_rounds, wasted_calls);
+    let salvaged = cap_exit_progress_block("Progress captured before the summary failed", progress);
     format!(
         "(reached the tool-call limit of {max_tool_rounds} rounds{tokens_hint}, \
          and the final summarization request also failed — {advice}){salvaged}"
     )
 }
 
-fn cap_exit_incomplete_summary_fallback(
+fn cap_exit_action_handoff_fallback(
     max_tool_rounds: usize,
     accumulated: Option<crate::TokenUsage>,
     wasted_calls: usize,
     progress: Option<&str>,
 ) -> String {
+    let tokens_hint = cap_exit_tokens_hint(max_tool_rounds, accumulated);
+    let advice = cap_exit_advice(max_tool_rounds, wasted_calls);
+    let salvaged = cap_exit_progress_block("Progress captured at the tool-call limit", progress);
     format!(
-        "{}\n\nThe final tools-disabled summary was rejected because it described future tool actions instead of giving a final answer.",
-        cap_exit_fallback(max_tool_rounds, accumulated, wasted_calls, progress)
+        "(reached the tool-call limit of {max_tool_rounds} rounds{tokens_hint}; \
+         the final tools-disabled summary described future tool actions instead \
+         of final state, so Newt preserved the verified progress instead of \
+         accepting that handoff — {advice}){salvaged}"
     )
 }
 
@@ -3341,7 +3379,7 @@ async fn final_summary_ollama(
                 ))
             } else if cap_exit_summary_is_action_handoff(&content) {
                 Ok((
-                    cap_exit_incomplete_summary_fallback(
+                    cap_exit_action_handoff_fallback(
                         max_tool_rounds,
                         accumulated,
                         wasted_calls,
@@ -3444,7 +3482,7 @@ async fn final_summary_openai(
                 ))
             } else if cap_exit_summary_is_action_handoff(&content) {
                 Ok((
-                    cap_exit_incomplete_summary_fallback(
+                    cap_exit_action_handoff_fallback(
                         max_tool_rounds,
                         accumulated,
                         wasted_calls,
@@ -4025,6 +4063,12 @@ pub async fn openai_chat_complete(
                 .as_ref()
                 .filter(|classification| classification.is_plan_update())
                 .and_then(|_| workflow_steerer.plan_update_hint(&workflow_classifier_text));
+            let classifier_plan_direction = nudge_classification
+                .as_ref()
+                .filter(|classification| classification.is_plan_update())
+                .and_then(|_| nudge_classifier.direction_for(crate::NudgeClass::PlanUpdate));
+            let plan_nudge_hint =
+                combine_nudge_hints(classifier_plan_direction, workflow_hint.as_deref());
             if !content.is_empty() && round + 1 < max_tool_rounds {
                 if let Some(nudge) = workflow_runtime.rediscovery_nudge(
                     nudge_classification.as_ref(),
@@ -4052,7 +4096,7 @@ pub async fn openai_chat_complete(
                 if let Some(nudge) = pending_plan_completion_nudge(
                     step_ledger,
                     needs_plan_update,
-                    workflow_hint.as_deref(),
+                    plan_nudge_hint.as_deref(),
                 ) {
                     if debug {
                         print_debug(
@@ -4099,9 +4143,14 @@ pub async fn openai_chat_complete(
                     );
                 }
                 messages.push(serde_json::json!({ "role": "assistant", "content": content }));
+                let direction = nudge_classification
+                    .as_ref()
+                    .and_then(|classification| nudge_classifier.direction_for(classification.class))
+                    .map(str::to_string)
+                    .unwrap_or_else(narration_action_nudge);
                 messages.push(serde_json::json!({
                     "role": "user",
-                    "content": narration_action_nudge(),
+                    "content": direction,
                 }));
                 narration_nudges += 1;
                 continue 'round_loop;
@@ -5594,7 +5643,7 @@ mod cap_exit_unit_tests {
             "The duplicate helper definitions and stray brace were removed, and the build check passed."
         ));
 
-        let fallback = cap_exit_incomplete_summary_fallback(
+        let fallback = cap_exit_action_handoff_fallback(
             25,
             None,
             2,
@@ -5602,10 +5651,21 @@ mod cap_exit_unit_tests {
         );
         assert!(fallback.contains("tool-call limit of 25"), "{fallback}");
         assert!(
-            fallback.contains("rejected because it described future tool actions"),
+            fallback.contains("described future tool actions"),
             "{fallback}"
         );
-        assert!(fallback.contains("Progress captured"), "{fallback}");
+        assert!(
+            fallback.contains("preserved the verified progress"),
+            "{fallback}"
+        );
+        assert!(
+            !fallback.contains("final summarization request also failed"),
+            "{fallback}"
+        );
+        assert!(
+            fallback.contains("Progress captured at the tool-call limit"),
+            "{fallback}"
+        );
     }
 
     #[test]
@@ -6000,15 +6060,20 @@ mod tool_round_cap_tests {
 
         assert!(!streamed);
         assert!(reply.contains("tool-call limit of 25"), "{reply}");
-        assert!(
-            reply.contains("rejected because it described future tool actions"),
-            "{reply}"
-        );
+        assert!(reply.contains("described future tool actions"), "{reply}");
+        assert!(reply.contains("preserved the verified progress"), "{reply}");
         assert!(
             !reply.contains("Let me fix both"),
             "must not accept action-intent cap summary: {reply}"
         );
-        assert!(reply.contains("Progress captured"), "{reply}");
+        assert!(
+            !reply.contains("final summarization request also failed"),
+            "{reply}"
+        );
+        assert!(
+            reply.contains("Progress captured at the tool-call limit"),
+            "{reply}"
+        );
     }
 
     /// UAT (Step 27.3 + 27.5, simulated integration): a thrash run — a DISTINCT

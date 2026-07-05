@@ -61,10 +61,22 @@ pub struct NudgeClassifierConfig {
     /// Minimum gap between the winning class and runner-up.
     #[serde(default = "default_min_margin")]
     pub min_margin: f32,
-    /// Prototype phrases by class. Keys are canonical class names:
+    /// Class definitions keyed by canonical class names:
     /// `pending_action`, `plan_update`, `final_answer`.
     #[serde(default)]
-    pub classes: BTreeMap<String, Vec<String>>,
+    pub classes: BTreeMap<String, NudgeClassConfig>,
+}
+
+/// One nudge class: many input matchers share one output nudge.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct NudgeClassConfig {
+    /// Prototype phrases that classify model output into this class.
+    #[serde(default)]
+    pub matchers: Vec<String>,
+    /// Model-facing corrective direction sent when this class triggers an
+    /// auto-continue path. Empty means "do not send a class-specific nudge".
+    #[serde(default)]
+    pub nudge: String,
 }
 
 impl Default for NudgeClassifierConfig {
@@ -89,7 +101,7 @@ fn bundled_nudge_config() -> NudgeClassifierConfig {
     toml::from_str(BUNDLED_NUDGE_CLASSIFIER).expect("bundled nudge classifier template is valid")
 }
 
-fn bundled_nudge_classes() -> BTreeMap<String, Vec<String>> {
+fn bundled_nudge_classes() -> BTreeMap<String, NudgeClassConfig> {
     bundled_nudge_config().classes
 }
 
@@ -114,8 +126,18 @@ impl NudgeClassifierConfig {
 
     fn with_builtin_fallbacks(mut self) -> Self {
         let builtins = bundled_nudge_classes();
-        for (class, examples) in builtins {
-            self.classes.entry(class).or_insert(examples);
+        for (class, bundled) in builtins {
+            self.classes
+                .entry(class)
+                .and_modify(|configured| {
+                    if configured.matchers.is_empty() {
+                        configured.matchers = bundled.matchers.clone();
+                    }
+                    if configured.nudge.trim().is_empty() {
+                        configured.nudge = bundled.nudge.clone();
+                    }
+                })
+                .or_insert(bundled);
         }
         if self.min_score <= 0.0 {
             self.min_score = default_min_score();
@@ -199,9 +221,10 @@ impl NudgeClassifier {
             .cfg
             .classes
             .iter()
-            .filter_map(|(class, examples)| {
+            .filter_map(|(class, class_cfg)| {
                 let class = parse_nudge_class(class)?;
-                let best = examples
+                let best = class_cfg
+                    .matchers
                     .iter()
                     .map(|example| prototype_similarity(&query, &tokens(example)))
                     .fold(0.0_f32, f32::max);
@@ -228,6 +251,15 @@ impl NudgeClassifier {
     pub fn is_pending_action(&self, text: &str) -> bool {
         self.classify(text).is_pending_action()
     }
+
+    pub fn direction_for(&self, class: NudgeClass) -> Option<&str> {
+        self.cfg
+            .classes
+            .get(nudge_class_key(class))
+            .map(|class_cfg| class_cfg.nudge.as_str())
+            .map(str::trim)
+            .filter(|direction| !direction.is_empty())
+    }
 }
 
 /// The classifier config root: `$NEWT_CONFIG_DIR/classifiers` or
@@ -242,6 +274,15 @@ fn parse_nudge_class(s: &str) -> Option<NudgeClass> {
         "plan_update" | "update_plan" | "stale_plan" | "replan" => Some(NudgeClass::PlanUpdate),
         "final_answer" | "final" | "done" => Some(NudgeClass::FinalAnswer),
         _ => None,
+    }
+}
+
+fn nudge_class_key(class: NudgeClass) -> &'static str {
+    match class {
+        NudgeClass::PendingAction => "pending_action",
+        NudgeClass::PlanUpdate => "plan_update",
+        NudgeClass::FinalAnswer => "final_answer",
+        NudgeClass::Unknown => "unknown",
     }
 }
 
@@ -313,6 +354,12 @@ Next steps needed:
         assert!(!classifier.is_pending_action(
             "The duplicate helper definitions and stray brace were removed, and the build check passed."
         ));
+        assert!(
+            classifier
+                .direction_for(NudgeClass::PendingAction)
+                .is_some_and(|d| d.contains("emit the tool call now")),
+            "bundled classifier should carry output direction text"
+        );
     }
 
     #[test]
@@ -374,9 +421,12 @@ version = 1
 min_score = 0.20
 min_margin = 0.01
 
-[classes]
-pending_action = ["Proceeding with the patch by editing the target file."]
-final_answer = ["No changes are needed."]
+[classes.pending_action]
+matchers = ["Proceeding with the patch by editing the target file."]
+nudge = "Call the edit tool now."
+
+[classes.final_answer]
+matchers = ["No changes are needed."]
 "#,
         )
         .unwrap();
@@ -386,6 +436,16 @@ final_answer = ["No changes are needed."]
             classifier.is_pending_action("Proceeding with the patch by editing the target file.")
         );
         assert!(!classifier.is_pending_action("No changes are needed."));
+        assert_eq!(
+            classifier.direction_for(NudgeClass::PendingAction),
+            Some("Call the edit tool now.")
+        );
+        assert!(
+            classifier
+                .direction_for(NudgeClass::PlanUpdate)
+                .is_some_and(|d| d.contains("Update the plan first")),
+            "partial user configs still inherit bundled nudges"
+        );
     }
 
     #[test]

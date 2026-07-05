@@ -2,8 +2,9 @@ version = 1
 min_score = 0.28
 min_margin = 0.03
 
-[classes]
-pending_action = [
+[classes.pending_action]
+nudge = "You described what you were about to do but did not call any tool, so nothing actually happened. If you intended to act, emit the tool call now (for example edit_file or write_file with the real arguments) - do not just describe it. If you are genuinely finished, say so explicitly in one sentence."
+matchers = [
   "Now I have everything I need. Let me make both edits now.",
   "Let me edit the file.",
   "Let me keep editing now.",
@@ -21,7 +22,9 @@ pending_action = [
   "What remains: fix the compile error, add tests, and run the check.",
 ]
 
-plan_update = [
+[classes.plan_update]
+nudge = "Your findings changed the shape of the active work. Update the plan first, then call the next concrete tool for the new active repair step. Do not repeat the findings summary or hand off while this nudge is giving you another round."
+matchers = [
   "Summary of Findings. Current Status: the build is broken due to syntax errors. Next Steps Required: remove the duplicate function, remove the stray brace, verify cargo check, then proceed with the active plan step.",
   "The active plan says to continue feature work, but I found immediate compilation blockers that must be inserted into the plan first before proceeding.",
   "To continue, I need to update the plan with prerequisite repair work, then use edit_file and run the build check.",
@@ -29,7 +32,9 @@ plan_update = [
   "Recommended next action if session resumes: fix duplicate functions, clean up broken tests, read lib.rs, then wire the progressive dispatch. The build is currently broken and that is the blocker for further progress.",
 ]
 
-final_answer = [
+[classes.final_answer]
+nudge = ""
+matchers = [
   "The capital of France is Paris.",
   "I have finished editing the file and the tests pass.",
   "Here is a summary of what I found across the tool calls.",
