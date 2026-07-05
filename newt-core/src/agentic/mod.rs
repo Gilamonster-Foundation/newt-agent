@@ -2813,7 +2813,9 @@ fn cap_exit_nudge(max_tool_rounds: usize, progress: Option<&str>, observed: &[St
          calls above and give your best final answer now. Cite only file paths \
          that appear verbatim in the messages above — if the evidence you need \
          was in the omitted messages, say so plainly instead of reconstructing \
-         file names or line numbers from memory."
+         file names or line numbers from memory. Do not answer with an intention \
+         to keep working (for example, \"let me read/edit/verify\"); if work remains, \
+         list it as remaining work and state that the round cap stopped further tool calls."
     );
     // #867 Part A: the ledger survived the trim — hand the model the REAL
     // manifest so grounded citation is possible, not just demanded.
@@ -2868,6 +2870,26 @@ fn cap_exit_fallback(
         "(reached the tool-call limit of {max_tool_rounds} rounds{tokens_hint}, \
          and the final summarization request also failed — {advice}){salvaged}"
     )
+}
+
+fn cap_exit_incomplete_summary_fallback(
+    max_tool_rounds: usize,
+    accumulated: Option<crate::TokenUsage>,
+    wasted_calls: usize,
+    progress: Option<&str>,
+) -> String {
+    format!(
+        "{}\n\nThe final tools-disabled summary was rejected because it described future tool actions instead of giving a final answer.",
+        cap_exit_fallback(max_tool_rounds, accumulated, wasted_calls, progress)
+    )
+}
+
+fn cap_exit_summary_is_action_handoff(content: &str) -> bool {
+    crate::NudgeClassifier::load_default()
+        .classify(content)
+        .class
+        == crate::NudgeClass::PendingAction
+        || looks_like_unverified_stale_file_blocker(content)
 }
 
 /// The cap-exit context threaded into a final tools-disabled summary (Step
@@ -2953,6 +2975,17 @@ async fn final_summary_ollama(
                     ),
                     false,
                     accumulated,
+                ))
+            } else if cap_exit_summary_is_action_handoff(&content) {
+                Ok((
+                    cap_exit_incomplete_summary_fallback(
+                        max_tool_rounds,
+                        accumulated,
+                        wasted_calls,
+                        progress.as_deref(),
+                    ),
+                    false,
+                    total,
                 ))
             } else {
                 Ok((content, false, total))
@@ -3045,6 +3078,17 @@ async fn final_summary_openai(
                     ),
                     false,
                     accumulated,
+                ))
+            } else if cap_exit_summary_is_action_handoff(&content) {
+                Ok((
+                    cap_exit_incomplete_summary_fallback(
+                        max_tool_rounds,
+                        accumulated,
+                        wasted_calls,
+                        progress.as_deref(),
+                    ),
+                    false,
+                    total,
                 ))
             } else {
                 Ok((content, false, total))
@@ -5031,6 +5075,28 @@ mod cap_exit_unit_tests {
     }
 
     #[test]
+    fn cap_exit_summary_action_handoff_is_rejected() {
+        let handoff = "I have two issues: duplicate topic_has_rollups and a stray brace. Let me fix both — read around 490 to see what needs removing, then verify with a build check.";
+        assert!(cap_exit_summary_is_action_handoff(handoff));
+        assert!(!cap_exit_summary_is_action_handoff(
+            "The duplicate helper definitions and stray brace were removed, and the build check passed."
+        ));
+
+        let fallback = cap_exit_incomplete_summary_fallback(
+            25,
+            None,
+            2,
+            Some("<plan>1. [ ] fix duplicate helper definitions</plan>"),
+        );
+        assert!(fallback.contains("tool-call limit of 25"), "{fallback}");
+        assert!(
+            fallback.contains("rejected because it described future tool actions"),
+            "{fallback}"
+        );
+        assert!(fallback.contains("Progress captured"), "{fallback}");
+    }
+
+    #[test]
     fn read_only_tools_classified_correctly() {
         // save_note writes memory, not the workspace: a round that only
         // saved a note must still count toward the read-only write-nudge.
@@ -5387,6 +5453,50 @@ mod tool_round_cap_tests {
         assert_eq!(reply, "here is my partial summary");
         assert_ne!(reply, "(reached tool-call limit)");
         assert!(!streamed);
+    }
+
+    #[tokio::test]
+    async fn ollama_cap_exit_rejects_action_intent_summary() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "message": {
+                    "content": "I have two issues: duplicate topic_has_rollups and a stray brace. Let me fix both — read around 490 to see what needs removing, then verify with a build check."
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let chat_url = format!("{}/api/chat", server.uri());
+        let (reply, streamed, _usage) = final_summary_ollama(
+            &client,
+            &chat_url,
+            "test-model",
+            Vec::new(),
+            CapExit {
+                max_tool_rounds: 25,
+                accumulated: None,
+                wasted_calls: 0,
+                progress: Some("<plan>1. [ ] fix duplicate helper definitions</plan>".to_string()),
+                observed: Vec::new(),
+            },
+        )
+        .await
+        .expect("final summary helper should return a fallback");
+
+        assert!(!streamed);
+        assert!(reply.contains("tool-call limit of 25"), "{reply}");
+        assert!(
+            reply.contains("rejected because it described future tool actions"),
+            "{reply}"
+        );
+        assert!(
+            !reply.contains("Let me fix both"),
+            "must not accept action-intent cap summary: {reply}"
+        );
+        assert!(reply.contains("Progress captured"), "{reply}");
     }
 
     /// UAT (Step 27.3 + 27.5, simulated integration): a thrash run — a DISTINCT

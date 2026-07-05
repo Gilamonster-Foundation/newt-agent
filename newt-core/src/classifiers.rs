@@ -105,6 +105,7 @@ fn builtin_nudge_classes() -> BTreeMap<String, Vec<String>> {
                 "Plan is current — no update needed. Continuing with step 2: inserting the progressive dispatch into lib.rs.".to_string(),
                 "Continuing with the active step: updating the file now.".to_string(),
                 "I found the issue: there is an extra closing brace causing a syntax error. I need to remove this stray brace.".to_string(),
+                "I have two issues: duplicate definitions and a stray brace. Let me fix both, read around the duplicate, then verify with a build check.".to_string(),
                 "Next I will add the tests.".to_string(),
                 "Current blocker: the for loop needs a one line fix. Next steps needed: fix the iteration type error in lib.rs.".to_string(),
                 "What remains: fix the compile error, add tests, and run the check.".to_string(),
@@ -129,6 +130,7 @@ fn builtin_nudge_classes() -> BTreeMap<String, Vec<String>> {
                 "Done. Let me know if you want any further changes.".to_string(),
                 "The files were examined; everything checks out.".to_string(),
                 "All plan steps are complete.".to_string(),
+                "The duplicate helper definitions and stray brace were removed, and the build check passed.".to_string(),
             ],
         ),
     ])
@@ -346,8 +348,14 @@ Next steps needed:
         assert!(classifier.is_pending_action(
             "I found the issue - there's an extra closing brace } on line 809 of help_sections.rs that's causing a syntax error. I need to remove this stray brace."
         ));
+        assert!(classifier.is_pending_action(
+            "I have two issues: duplicate topic_has_rollups and a stray brace. Let me fix both — read around 490 to see what needs removing, then verify with a build check."
+        ));
         assert!(!classifier.is_pending_action("The capital of France is Paris."));
         assert!(!classifier.is_pending_action("Done. Let me know if you want any further changes."));
+        assert!(!classifier.is_pending_action(
+            "The duplicate helper definitions and stray brace were removed, and the build check passed."
+        ));
     }
 
     #[test]
