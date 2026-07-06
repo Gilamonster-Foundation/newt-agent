@@ -586,10 +586,10 @@ impl CommandRunner for PendingRunner {
 }
 
 /// The result oracle: run the graded program via the injected [`CommandRunner`]
-/// and assert its stdout equals the case's `expected_output`. Step 1 is an
-/// **exact** string compare (normalization strategies arrive in step 2). Opt-in
-/// per case via `evaluators = ["output_matches"]`; passes with a skip note when
-/// the case declares no `expected_output` / `[output_match]`.
+/// and assert its stdout equals the case's `expected_output`, compared through
+/// the case's [`normalize`](crate::normalize) pipeline (empty list = exact
+/// compare). Opt-in per case via `evaluators = ["output_matches"]`; passes with
+/// a skip note when the case declares no `expected_output` / `[output_match]`.
 pub struct OutputMatchesEvaluator<R: CommandRunner> {
     runner: R,
 }
@@ -637,14 +637,24 @@ impl<R: CommandRunner> Evaluator for OutputMatchesEvaluator<R> {
                 ),
             );
         }
-        // Step 1: exact-string compare; normalization strategies arrive in step 2.
-        if outcome.stdout == *expected {
-            EvalResult::pass(self.name(), "stdout matched expected_output")
+        // Compare through the case's normalization pipeline (#959). An empty
+        // `normalize` list is an exact byte compare (the step-1 default).
+        let cmp = crate::normalize::compare(&outcome.stdout, expected, om);
+        let warn_note = if cmp.warnings.is_empty() {
+            String::new()
+        } else {
+            format!(" (normalize warnings: {})", cmp.warnings.join("; "))
+        };
+        if cmp.equal {
+            EvalResult::pass(
+                self.name(),
+                format!("stdout matched expected_output{warn_note}"),
+            )
         } else {
             EvalResult::fail(
                 self.name(),
                 format!(
-                    "stdout != expected_output ({} vs {} bytes)",
+                    "stdout != expected_output ({} vs {} bytes){warn_note}",
                     outcome.stdout.len(),
                     expected.len()
                 ),
@@ -808,6 +818,7 @@ mod tests {
         ctx.case.output_match = Some(crate::cases::OutputMatch {
             run: run.iter().map(|s| (*s).to_string()).collect(),
             timeout_ms: Some(1000),
+            ..Default::default()
         });
         ctx
     }
@@ -849,6 +860,30 @@ mod tests {
             r.passed && r.details.contains("no expected_output"),
             "{r:?}"
         );
+    }
+
+    #[test]
+    fn output_matches_applies_normalize_pipeline_before_compare() {
+        // stdout has a trailing newline + extra whitespace the expected lacks;
+        // trim + collapse_whitespace reconcile them, so the oracle passes (#959).
+        let mut ctx = oracle_ctx(Some("a b"), &["echo", "a b"]);
+        if let Some(om) = ctx.case.output_match.as_mut() {
+            om.normalize = vec!["trim".into(), "collapse_whitespace".into()];
+        }
+        let r = OutputMatchesEvaluator::new(MockRunner(oc("  a   b \n", Some(0), false)))
+            .evaluate(&ctx);
+        assert!(r.passed, "{r:?}");
+    }
+
+    #[test]
+    fn output_matches_surfaces_normalize_warning_for_unknown_strategy() {
+        let mut ctx = oracle_ctx(Some("x"), &["echo", "x"]);
+        if let Some(om) = ctx.case.output_match.as_mut() {
+            om.normalize = vec!["bogus".into()];
+        }
+        let r = OutputMatchesEvaluator::new(MockRunner(oc("x", Some(0), false))).evaluate(&ctx);
+        assert!(r.passed, "unknown strategy is non-fatal: {r:?}");
+        assert!(r.details.contains("bogus"), "warning surfaced: {r:?}");
     }
 
     #[test]
