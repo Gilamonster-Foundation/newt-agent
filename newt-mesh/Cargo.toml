@@ -121,8 +121,13 @@ strip         = true
 # agent-bridle 0.1.0 is indexed on crates.io.
 # See: https://github.com/Gilamonster-Foundation/agent-bridle/issues/20
 
+# Kept in lock-step with the root workspace patch (../Cargo.toml): `4860146` =
+# agent-bridle `main` after PR #203, carrying the `host-shell` engine + the
+# full-access PATH seed. newt-core now enables the `host-shell`/`os-sandbox`
+# features, so this excluded workspace must pin the same rev or feature
+# resolution fails here. Still a `rev` (immutable SHA), never a moving ref.
 [patch.crates-io]
-agent-bridle            = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", rev = "cb7e1ea3192ca125c1756d3e9f24e3064f258118" }
-agent-bridle-core       = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", rev = "cb7e1ea3192ca125c1756d3e9f24e3064f258118" }
-agent-bridle-tool-shell = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", rev = "cb7e1ea3192ca125c1756d3e9f24e3064f258118" }
-agent-bridle-tool-web   = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", rev = "cb7e1ea3192ca125c1756d3e9f24e3064f258118" }
+agent-bridle            = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", rev = "4860146" }
+agent-bridle-core       = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", rev = "4860146" }
+agent-bridle-tool-shell = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", rev = "4860146" }
+agent-bridle-tool-web   = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", rev = "4860146" }
