@@ -2610,9 +2610,16 @@ fn ocap_disabled_record(conversation_id: &str) -> newt_core::PermissionRecord {
 /// `policy_for`; this is the loud surfacing half of the contract, mirroring
 /// `ocap_disabled_banner`.
 fn full_access_banner() -> String {
-    "⚠ FULL ACCESS (--full-access): session authority is unrestricted — fs fence, \
-     net leash, and exec allowlist are all lifted for this run; drop the flag to \
-     restore the configured preset"
+    // #926: frame this as *ambient authority* + OCAP attenuation, not merely
+    // "unrestricted" — the point of the harness is to attenuate the user's full
+    // ambient authority into structural grants; --full-access temporarily hands
+    // that ambient authority back. It also switches run_command to the `host`
+    // shell engine (a real /bin/sh in the platform kernel jail).
+    "⚠ FULL ACCESS (--full-access): the agent is granted your full AMBIENT authority \
+     for this run — the Object-Capability attenuations (fs fence, net leash, exec \
+     allowlist) are lifted and run_command uses the `host` shell engine (a real \
+     /bin/sh inside the platform kernel jail). Writes are still prompted. Drop the \
+     flag to restore Object-Capability authority restrictions."
         .to_string()
 }
 
@@ -11930,12 +11937,10 @@ mod disable_ocap_session_tests {
         let banner = full_access_banner();
         assert!(banner.contains("⚠ FULL ACCESS"), "got: {banner}");
         assert!(banner.contains("--full-access"), "got: {banner}");
+        // #926: the prose frames it as ambient authority + OCAP attenuation.
+        assert!(banner.contains("full AMBIENT authority"), "got: {banner}");
         assert!(
-            banner.contains("session authority is unrestricted"),
-            "got: {banner}"
-        );
-        assert!(
-            banner.contains("restore the configured preset"),
+            banner.contains("Object-Capability authority restrictions"),
             "got: {banner}"
         );
     }

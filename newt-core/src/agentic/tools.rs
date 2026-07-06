@@ -1184,6 +1184,59 @@ fn confined_dispatch_args(cmd: &str, workspace: &str) -> serde_json::Value {
     })
 }
 
+/// The shell engine selected for this process (ADR 0005 D2 seam). Resolved once
+/// at startup by the CLI ([`crate::resolve_shell_engine`] over the `[shell]
+/// engine` config, the `--shell-engine` flag, and the `--full-access`
+/// auto-upgrade) and published via `NEWT_SHELL_ENGINE`, so the deep
+/// `run_command` dispatch reads it without threading it through every signature
+/// — the same env-published pattern as [`ocap_disabled`] /
+/// [`full_access_requested`]. Absent or unparseable falls back to the
+/// `safe-subset` default.
+fn shell_engine() -> crate::ShellEngine {
+    if let Some(engine) = std::env::var("NEWT_SHELL_ENGINE")
+        .ok()
+        .and_then(|s| s.parse::<crate::ShellEngine>().ok())
+    {
+        return engine;
+    }
+    // No engine was published (e.g. a non-CLI entry point that set
+    // NEWT_FULL_ACCESS directly). Honor the same auto-upgrade the CLI applies so
+    // `NEWT_FULL_ACCESS=1` alone still gets the full-grammar `host` engine.
+    if full_access_requested() {
+        crate::ShellEngine::Host
+    } else {
+        crate::ShellEngine::default()
+    }
+}
+
+/// agent-bridle's tool registry with the `"shell"` tool bound to the selected
+/// engine (the ADR 0005 D2 seam: `safe-subset` / `host` / `brush` all honor the
+/// same `Tool` contract under the `"shell"` name). `web_fetch` is added
+/// unchanged. Mirrors `agent_bridle::registry()` but swaps the shell engine so
+/// `[shell] engine = "host"` (or `--full-access`) routes `run_command` to the
+/// full-grammar, kernel-jailed sandbox-host engine instead of the safe subset.
+fn bridle_registry() -> agent_bridle::Registry {
+    use std::sync::Arc;
+    let shell: Arc<dyn agent_bridle::Tool> = match shell_engine() {
+        crate::ShellEngine::SafeSubset => Arc::new(agent_bridle::ShellTool::new()),
+        crate::ShellEngine::Host => Arc::new(agent_bridle::HostShellTool::new()),
+        crate::ShellEngine::Brush => {
+            // Track 2 (agent-bridle#20) not shipped: the carried brush engine is
+            // not compiled into this build. `host` is the closest full-grammar
+            // engine, so fall back to it — loudly, never a silent downgrade.
+            tracing::warn!(
+                "shell engine 'brush' is not available in this build \
+                 (agent-bridle#20 / Track 2); falling back to 'host'"
+            );
+            Arc::new(agent_bridle::HostShellTool::new())
+        }
+    };
+    agent_bridle::Registry::builder()
+        .tool(shell)
+        .tool(Arc::new(agent_bridle::WebFetchTool::new()))
+        .build()
+}
+
 // ---------------------------------------------------------------------------
 // INTERIM (#297): the --disable-ocap / --yolo exec escape hatch
 // ---------------------------------------------------------------------------
@@ -1359,7 +1412,7 @@ async fn exec_confined_command(
     // #783: RAW cmd + venv via the env seam — never the `export …;` prefix,
     // which the confined safe-subset engine refuses.
     let dispatch_args = confined_dispatch_args(cmd, workspace);
-    match agent_bridle::registry()
+    match bridle_registry()
         .dispatch("shell", dispatch_args.clone(), caveats)
         .await
     {
@@ -1384,7 +1437,7 @@ async fn exec_confined_command(
                     exec_denial_requests(&envelope).or_else(|| net_denial_requests(&envelope))
                 {
                     if let PermissionDecision::Allow(widened) = gate.ask(&requests) {
-                        return match agent_bridle::registry()
+                        return match bridle_registry()
                             .dispatch("shell", dispatch_args, &widened)
                             .await
                         {

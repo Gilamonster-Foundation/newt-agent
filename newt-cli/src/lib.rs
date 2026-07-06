@@ -29,6 +29,15 @@ mod tuning_cmd;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
+/// clap value parser for `--shell-engine`. Delegates to [`newt_core::ShellEngine`]'s
+/// `FromStr` (canonical names plus aliases like `landlock`→`host`); a bad value
+/// is rejected at parse time with the list of accepted engines.
+fn parse_shell_engine(
+    s: &str,
+) -> Result<newt_core::ShellEngine, Box<dyn std::error::Error + Send + Sync + 'static>> {
+    Ok(s.parse::<newt_core::ShellEngine>()?)
+}
+
 #[derive(Parser, Debug)]
 #[command(
     name = "newt",
@@ -163,6 +172,17 @@ pub struct Cli {
     /// per-run override can never silently persist.
     #[arg(long, global = true, default_value_t = false)]
     pub full_access: bool,
+
+    /// Select the shell **engine** `run_command` uses for THIS invocation (the
+    /// ADR 0005 D2 seam): `safe-subset` (portable default — refuses
+    /// `$(...)`/dynamic constructs), `host` (real `/bin/sh -c` inside the L3
+    /// kernel jail — full grammar; what `--full-access` auto-selects), or
+    /// `brush` (the carried bash-in-Rust engine + L2 interceptor; falls back to
+    /// `host` until the brush build ships, agent-bridle#20). Overrides the
+    /// `[shell] engine` config key. The L3 backend (Landlock/Seatbelt) is a
+    /// separate, auto-selected axis.
+    #[arg(long, global = true, value_parser = parse_shell_engine)]
+    pub shell_engine: Option<newt_core::ShellEngine>,
 
     /// facade P4 (#780): turn OFF the convenience tool-call ROUTING for THIS
     /// invocation. By default a model's `run_command("cat X")` / `ls` / `find` /
@@ -721,6 +741,19 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             // per-run override never persists to config.
             if cli.full_access {
                 unsafe { std::env::set_var("NEWT_FULL_ACCESS", "1") };
+            }
+            // --shell-engine selects which agent-bridle engine run_command uses
+            // (ADR 0005 D2 seam). Resolved ONCE here — precedence
+            // `--shell-engine` > `[shell] engine` > `--full-access`→`host` >
+            // `safe-subset` — and published via NEWT_SHELL_ENGINE for newt-core's
+            // dispatch to read (same env pattern as NEWT_FULL_ACCESS).
+            {
+                let configured = newt_core::Config::resolve()
+                    .ok()
+                    .and_then(|c| c.shell.and_then(|s| s.engine));
+                let engine =
+                    newt_core::resolve_shell_engine(cli.shell_engine, configured, cli.full_access);
+                unsafe { std::env::set_var("NEWT_SHELL_ENGINE", engine.as_str()) };
             }
             // facade P4 (#780): --no-route turns OFF the convenience tool-call
             // routing (run_command reads the var per call). A DISTINCT switch

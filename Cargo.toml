@@ -297,8 +297,12 @@ strip = true
 # NOTE: `ed5bb13` is main-lineage, so it still carries the `step_up` Gate
 # (agent-bridle#24) the previous `feat/step-up-decision-mvp` patch had.
 
+# BUMP (shell-engine surface): 195e1c7 → 4860146 = agent-bridle `main` after
+# PR #203 (`fix(tool-shell): seed PATH in the sandbox-host engine so full-access
+# resolves bare names`). This carries the `host-shell` engine (ADR 0019, #199)
+# plus the full-access PATH seed, which newt's `[shell] engine = "host"` selects.
 [patch.crates-io]
-agent-bridle            = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", rev = "195e1c7e48d885df98d44fbb5facaf9adc392058" }
-agent-bridle-core       = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", rev = "195e1c7e48d885df98d44fbb5facaf9adc392058" }
-agent-bridle-tool-shell = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", rev = "195e1c7e48d885df98d44fbb5facaf9adc392058" }
-agent-bridle-tool-web   = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", rev = "195e1c7e48d885df98d44fbb5facaf9adc392058" }
+agent-bridle            = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", rev = "4860146" }
+agent-bridle-core       = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", rev = "4860146" }
+agent-bridle-tool-shell = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", rev = "4860146" }
+agent-bridle-tool-web   = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", rev = "4860146" }
