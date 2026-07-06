@@ -2283,7 +2283,7 @@ pub fn ocap_l3_backend() -> (&'static str, bool) {
 
 #[cfg(test)]
 mod shell_engine_tests {
-    use super::{resolve_shell_engine, ShellConfig, ShellEngine};
+    use super::{full_access_default_engine, resolve_shell_engine, ShellConfig, ShellEngine};
 
     #[test]
     fn from_str_canonical_and_aliases() {
@@ -2344,8 +2344,16 @@ mod shell_engine_tests {
     }
 
     #[test]
-    fn resolve_full_access_auto_upgrades_to_host_when_unset() {
+    fn resolve_full_access_auto_upgrades_when_unset() {
+        // `host` on unix, `brush` on Windows (host-shell needs `/bin/sh`).
+        assert_eq!(
+            resolve_shell_engine(None, None, true),
+            full_access_default_engine()
+        );
+        #[cfg(not(windows))]
         assert_eq!(resolve_shell_engine(None, None, true), ShellEngine::Host);
+        #[cfg(windows)]
+        assert_eq!(resolve_shell_engine(None, None, true), ShellEngine::Brush);
     }
 
     #[test]
