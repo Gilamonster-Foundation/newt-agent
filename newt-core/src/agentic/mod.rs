@@ -1729,6 +1729,134 @@ pub async fn chat_complete(
                     );
                 }
             }
+            // A final text candidate can come from either the streaming re-issue
+            // or the non-streamed probe fallback. Run both through the same
+            // no-tool final-answer gates so "Let me inspect..." does not force a
+            // human "continue" just because the stream returned empty.
+            macro_rules! maybe_nudge_no_tool_content {
+                ($content:expr, $usage:expr) => {{
+                    let content = $content;
+                    if !content.is_empty() {
+                        let nudge_classification = nudge_classifier.classify(content);
+                        let workflow_classifier_text =
+                            workflow_classifier_text(&messages, content);
+                        let workflow_hint = nudge_classification
+                            .is_plan_update()
+                            .then(|| workflow_steerer.plan_update_hint(&workflow_classifier_text))
+                            .flatten();
+                        let classifier_plan_direction = nudge_classification
+                            .is_plan_update()
+                            .then(|| {
+                                nudge_classifier.direction_for(crate::NudgeClass::PlanUpdate)
+                            })
+                            .flatten();
+                        let plan_nudge_hint =
+                            combine_nudge_hints(classifier_plan_direction, workflow_hint.as_deref());
+                        if round + 1 < current_tool_round_limit {
+                            if let Some(nudge) = workflow_runtime.rediscovery_nudge(
+                                Some(&nudge_classification),
+                                content,
+                                step_ledger,
+                            ) {
+                                if debug {
+                                    print_debug(
+                                        "workflow evidence rediscovery — nudging toward active repair",
+                                        color,
+                                    );
+                                }
+                                messages.push(serde_json::json!({
+                                    "role": "assistant",
+                                    "content": content
+                                }));
+                                messages.push(serde_json::json!({
+                                    "role": "user",
+                                    "content": nudge
+                                }));
+                                accumulated_usage = merge_round_usage(accumulated_usage, $usage);
+                                continue 'round_loop;
+                            }
+                        }
+                        if pending_plan_nudges < PENDING_PLAN_NUDGE_CAP
+                            && round + 1 < current_tool_round_limit
+                        {
+                            if let Some(nudge) = pending_plan_completion_nudge(
+                                step_ledger,
+                                nudge_classification.is_plan_update(),
+                                plan_nudge_hint.as_deref(),
+                            ) {
+                                if debug {
+                                    print_debug(
+                                        "active plan has unfinished steps — nudging before final answer",
+                                        color,
+                                    );
+                                }
+                                messages.push(serde_json::json!({
+                                    "role": "assistant",
+                                    "content": content
+                                }));
+                                messages.push(serde_json::json!({
+                                    "role": "user",
+                                    "content": nudge
+                                }));
+                                pending_plan_nudges += 1;
+                                accumulated_usage = merge_round_usage(accumulated_usage, $usage);
+                                continue 'round_loop;
+                            }
+                        }
+                        if stale_file_nudges < STALE_FILE_NUDGE_CAP
+                            && round + 1 < current_tool_round_limit
+                            && looks_like_unverified_stale_file_blocker(content)
+                        {
+                            if debug {
+                                print_debug(
+                                    "unverified stale-file blocker — nudging to check ground truth",
+                                    color,
+                                );
+                            }
+                            messages.push(serde_json::json!({
+                                "role": "assistant",
+                                "content": content
+                            }));
+                            messages.push(serde_json::json!({
+                                "role": "user",
+                                "content": stale_file_ground_truth_nudge(),
+                            }));
+                            stale_file_nudges += 1;
+                            accumulated_usage = merge_round_usage(accumulated_usage, $usage);
+                            continue 'round_loop;
+                        }
+                        if narration_nudges < NARRATION_NUDGE_CAP
+                            && round + 1 < current_tool_round_limit
+                            && nudge_classification.is_pending_action()
+                        {
+                            if debug {
+                                print_debug(
+                                    "narrated intent with no tool call — nudging to act and continuing",
+                                    color,
+                                );
+                            }
+                            // Record the model's own narration, then the
+                            // corrective, so the next round sees both (mirrors
+                            // the has-tools assistant turn).
+                            messages.push(serde_json::json!({
+                                "role": "assistant",
+                                "content": content
+                            }));
+                            let direction = nudge_classifier
+                                .direction_for(nudge_classification.class)
+                                .map(str::to_string)
+                                .unwrap_or_else(narration_action_nudge);
+                            messages.push(serde_json::json!({
+                                "role": "user",
+                                "content": direction,
+                            }));
+                            narration_nudges += 1;
+                            accumulated_usage = merge_round_usage(accumulated_usage, $usage);
+                            continue 'round_loop;
+                        }
+                    }
+                }};
+            }
             // No tool calls — re-issue with stream:true so the user sees tokens.
             // `messages` already contains the task; just replay with streaming.
             //
@@ -1788,6 +1916,7 @@ pub async fn chat_complete(
                 if debug {
                     print_debug("stream request non-2xx — using probe content", color);
                 }
+                maybe_nudge_no_tool_content!(probe_content.as_str(), None);
                 // Phase 20 §2.2: the probe round produced usable content —
                 // quality gate met, report it before returning.
                 if !probe_content.is_empty() {
@@ -1841,6 +1970,7 @@ pub async fn chat_complete(
                         color,
                     );
                     if !probe_content.is_empty() {
+                        maybe_nudge_no_tool_content!(probe_content.as_str(), None);
                         emit_accepted(
                             &mut on_round_usage,
                             round_usage,
@@ -2029,6 +2159,7 @@ pub async fn chat_complete(
                     return Ok((msg.to_string(), false, merged, hallucination_count));
                 }
                 // Use probe content; print it since it was never streamed.
+                maybe_nudge_no_tool_content!(probe_content.as_str(), stream_usage);
                 // Phase 20 §2.2: non-empty probe content is usable output.
                 emit_accepted(
                     &mut on_round_usage,
@@ -2052,100 +2183,7 @@ pub async fn chat_complete(
             // chronic narrator can't loop; after the cap the prose is accepted
             // as the final answer (the return below). A genuine from-the-start
             // final answer (no prior call, no intent cue) is never nudged.
-            let nudge_classification = nudge_classifier.classify(&streamed);
-            let workflow_classifier_text = workflow_classifier_text(&messages, &streamed);
-            let workflow_hint = nudge_classification
-                .is_plan_update()
-                .then(|| workflow_steerer.plan_update_hint(&workflow_classifier_text))
-                .flatten();
-            let classifier_plan_direction = nudge_classification
-                .is_plan_update()
-                .then(|| nudge_classifier.direction_for(crate::NudgeClass::PlanUpdate))
-                .flatten();
-            let plan_nudge_hint =
-                combine_nudge_hints(classifier_plan_direction, workflow_hint.as_deref());
-            if round + 1 < current_tool_round_limit {
-                if let Some(nudge) = workflow_runtime.rediscovery_nudge(
-                    Some(&nudge_classification),
-                    &streamed,
-                    step_ledger,
-                ) {
-                    if debug {
-                        print_debug(
-                            "workflow evidence rediscovery — nudging toward active repair",
-                            color,
-                        );
-                    }
-                    messages.push(serde_json::json!({ "role": "assistant", "content": streamed }));
-                    messages.push(serde_json::json!({ "role": "user", "content": nudge }));
-                    accumulated_usage = merge_round_usage(accumulated_usage, stream_usage);
-                    continue 'round_loop;
-                }
-            }
-            if pending_plan_nudges < PENDING_PLAN_NUDGE_CAP && round + 1 < current_tool_round_limit
-            {
-                if let Some(nudge) = pending_plan_completion_nudge(
-                    step_ledger,
-                    nudge_classification.is_plan_update(),
-                    plan_nudge_hint.as_deref(),
-                ) {
-                    if debug {
-                        print_debug(
-                            "active plan has unfinished steps — nudging before final answer",
-                            color,
-                        );
-                    }
-                    messages.push(serde_json::json!({ "role": "assistant", "content": streamed }));
-                    messages.push(serde_json::json!({ "role": "user", "content": nudge }));
-                    pending_plan_nudges += 1;
-                    accumulated_usage = merge_round_usage(accumulated_usage, stream_usage);
-                    continue 'round_loop;
-                }
-            }
-            if stale_file_nudges < STALE_FILE_NUDGE_CAP
-                && round + 1 < current_tool_round_limit
-                && looks_like_unverified_stale_file_blocker(&streamed)
-            {
-                if debug {
-                    print_debug(
-                        "unverified stale-file blocker — nudging to check ground truth",
-                        color,
-                    );
-                }
-                messages.push(serde_json::json!({ "role": "assistant", "content": streamed }));
-                messages.push(serde_json::json!({
-                    "role": "user",
-                    "content": stale_file_ground_truth_nudge(),
-                }));
-                stale_file_nudges += 1;
-                accumulated_usage = merge_round_usage(accumulated_usage, stream_usage);
-                continue 'round_loop;
-            }
-            if narration_nudges < NARRATION_NUDGE_CAP
-                && round + 1 < current_tool_round_limit
-                && nudge_classification.is_pending_action()
-            {
-                if debug {
-                    print_debug(
-                        "narrated intent with no tool call — nudging to act and continuing",
-                        color,
-                    );
-                }
-                // Record the model's own narration, then the corrective, so the
-                // next round sees both (mirrors the has-tools assistant turn).
-                messages.push(serde_json::json!({ "role": "assistant", "content": streamed }));
-                let direction = nudge_classifier
-                    .direction_for(nudge_classification.class)
-                    .map(str::to_string)
-                    .unwrap_or_else(narration_action_nudge);
-                messages.push(serde_json::json!({
-                    "role": "user",
-                    "content": direction,
-                }));
-                narration_nudges += 1;
-                accumulated_usage = merge_round_usage(accumulated_usage, stream_usage);
-                continue 'round_loop;
-            }
+            maybe_nudge_no_tool_content!(streamed.as_str(), stream_usage);
             // Phase 20 §2.2: a non-empty streamed answer is usable output.
             emit_accepted(
                 &mut on_round_usage,
@@ -7707,6 +7745,69 @@ mod http_loop_tests {
         assert_eq!(reply, "probe says hi");
         assert!(!streamed, "fallback content was never streamed");
         assert_eq!(usage.unwrap().input_tokens, 5);
+    }
+
+    /// Regression for the DGX wedge: the non-streamed probe said "Let me verify
+    /// by looking...", then the streaming re-issue returned no tokens. The probe
+    /// fallback must still go through the no-tool nudge gate instead of ending
+    /// the turn and forcing the operator to type "continue".
+    struct EmptyStreamPendingActionResponder {
+        probes: Arc<AtomicUsize>,
+    }
+    impl Respond for EmptyStreamPendingActionResponder {
+        fn respond(&self, req: &Request) -> ResponseTemplate {
+            if is_stream(req) {
+                return ndjson(&[serde_json::json!({
+                    "message": {"content": ""},
+                    "done": true,
+                    "prompt_eval_count": 6,
+                    "eval_count": 0
+                })]);
+            }
+            let probe = self.probes.fetch_add(1, Ordering::SeqCst);
+            let content = if probe == 0 {
+                "Now I understand the issue. Let me verify by looking at format_rollup_detail."
+            } else {
+                "Verified after the automatic continue."
+            };
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "message": {"content": content},
+                "prompt_eval_count": 5 + probe as u32,
+                "eval_count": 2,
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_stream_probe_fallback_pending_action_nudges_and_continues() {
+        let server = MockServer::start().await;
+        let probes = Arc::new(AtomicUsize::new(0));
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(EmptyStreamPendingActionResponder {
+                probes: probes.clone(),
+            })
+            .mount(&server)
+            .await;
+
+        let messages = msgs();
+        let caveats = Caveats::top();
+        let (reply, streamed, _usage, _) =
+            chat_complete(ctx(&server.uri(), &messages, &caveats), &mut NoMcp)
+                .await
+                .expect("chat_complete should auto-continue after pending probe fallback");
+
+        assert_eq!(
+            probes.load(Ordering::SeqCst),
+            2,
+            "the nudge ran a second probe"
+        );
+        assert_eq!(reply, "Verified after the automatic continue.");
+        assert!(!streamed, "the second answer also came from probe fallback");
+        assert!(
+            !reply.contains("Let me verify"),
+            "must not return the pending-action narration"
+        );
     }
 
     /// Probe AND stream both empty, with no safe-context hint → the loop gives
