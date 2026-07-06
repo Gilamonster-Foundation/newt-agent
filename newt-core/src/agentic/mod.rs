@@ -212,8 +212,8 @@ pub use permissions::{
 pub use recall::{recall_tool_definition, RecallSource, StoreRecallSource};
 pub use resume::resume_context_tool_definition;
 pub use tools::{
-    execute_tool, full_access_requested, ocap_disabled, set_max_output_tokens, tool_definitions,
-    venv_cmd_prefix,
+    execute_tool, execute_tool_with_offload, full_access_requested, ocap_disabled,
+    set_max_output_tokens, set_output_head_tokens, tool_definitions, venv_cmd_prefix,
 };
 pub use transcript::{
     transcript_lines, transcript_lines_styled, TranscriptLine, TranscriptRole, TranscriptStyle,
@@ -604,8 +604,12 @@ pub struct ChatCtx<'a> {
     pub step_ledger: Option<&'a dyn crate::agentic::scheduled::StepLedger>,
     pub caveats: &'a crate::caveats::Caveats,
     /// Maximum tool-call rounds before forcing a final tools-disabled
-    /// completion (from `[tui].max_tool_rounds`, default 25).
+    /// completion (from `[tui].max_tool_rounds`, default 40).
     pub max_tool_rounds: usize,
+    /// Additional progress-aware rounds available after `max_tool_rounds` when
+    /// the active workflow still has incomplete work and the recent rounds show
+    /// repair evidence or concrete progress. `0` makes the normal cap hard.
+    pub workflow_grace_rounds: usize,
     /// Max lines of tool output shown inline (from `[tui].tool_output_lines`,
     /// default 20). Resolved once per turn and threaded to `execute_tool` so
     /// the tool loop never re-reads config from disk.
@@ -1037,6 +1041,7 @@ pub async fn chat_complete(
         step_ledger,
         caveats,
         max_tool_rounds,
+        workflow_grace_rounds,
         tool_output_lines,
         debug,
         trace,
@@ -1210,6 +1215,13 @@ pub async fn chat_complete(
     let nudge_classifier = crate::NudgeClassifier::load_default();
     let workflow_steerer = crate::WorkflowSteerer::load_default();
     let mut workflow_runtime = WorkflowRuntimeState::default();
+    // The matching workflow's round-cap grace horizon override, resolved once
+    // from the turn's opening context (diagnostic workflows need more
+    // read-only rounds between checkpoints than routine edits — see
+    // `diagnose_failure.toml`'s `progress_horizon_rounds`).
+    workflow_runtime.set_progress_horizon(
+        workflow_steerer.progress_horizon(&workflow_classifier_text(&messages, "")),
+    );
     let mut ollama_xml_retry_nudges: usize = 0;
     // Phase 20 §2.2: the thinking-only quirk is reported at most once per
     // turn — re-detection adds no information and would thrash the cache.
@@ -1219,13 +1231,17 @@ pub async fn chat_complete(
     let mut observed_paths = claim_check::ObservedPaths::default();
     let observed_resolver = claim_check::workspace_resolver(workspace);
 
-    // Agentic loop — up to `max_tool_rounds` tool-call rounds, with a tiny
-    // evidence-backed grace window when the normal cap lands immediately after
-    // read-only repair context.
-    let hard_tool_rounds = max_tool_rounds.saturating_add(WORKFLOW_GRACE_ROUND_CAP);
-    let mut workflow_grace_rounds = 0usize;
+    // Agentic loop — up to `max_tool_rounds` tool-call rounds, with an optional
+    // evidence-backed grace window when the normal cap lands during active
+    // workflow progress. The hard ceiling remains finite and configurable.
+    let hard_tool_rounds = max_tool_rounds.saturating_add(workflow_grace_rounds);
+    let mut workflow_grace_active = false;
+    let mut current_tool_round_limit = max_tool_rounds;
     'round_loop: for round in 0..hard_tool_rounds {
-        if round >= max_tool_rounds {
+        if round >= current_tool_round_limit {
+            if workflow_grace_active {
+                break;
+            }
             let Some(nudge) = workflow_runtime.cap_grace_nudge(
                 step_ledger,
                 max_tool_rounds,
@@ -1233,10 +1249,11 @@ pub async fn chat_complete(
             ) else {
                 break;
             };
-            workflow_grace_rounds += 1;
+            workflow_grace_active = true;
+            current_tool_round_limit = hard_tool_rounds;
             if debug {
                 print_debug(
-                    "workflow evidence at round cap — granting bounded action round",
+                    "workflow progress at soft round cap — granting configured grace window",
                     color,
                 );
             }
@@ -1284,10 +1301,22 @@ pub async fn chat_complete(
         // local models (e.g. nemotron3:33b).
         const READ_ONLY_NUDGE_AFTER: usize = 3;
         if read_only_rounds >= READ_ONLY_NUDGE_AFTER {
-            let remaining = max_tool_rounds.saturating_sub(round + 1);
+            let remaining = current_tool_round_limit.saturating_sub(round + 1);
+            // Sustained read-only exploration on a task that classifies as a
+            // diagnose/fix workflow is exactly the shape `crew`/`team`
+            // delegation exists for — offer it here (only when sub-agent
+            // dispatch is actually available this session) instead of only
+            // ever telling the model to act inline.
+            let delegate_hint = workflow_steerer
+                .delegate_hint(&workflow_classifier_text(&messages, ""), advertise_team);
             messages.push(serde_json::json!({
                 "role": "user",
-                "content": read_only_action_nudge(read_only_rounds, remaining, step_ledger)
+                "content": read_only_action_nudge(
+                    read_only_rounds,
+                    remaining,
+                    step_ledger,
+                    delegate_hint.as_deref(),
+                )
             }));
             read_only_rounds = 0;
         }
@@ -2035,7 +2064,7 @@ pub async fn chat_complete(
                 .flatten();
             let plan_nudge_hint =
                 combine_nudge_hints(classifier_plan_direction, workflow_hint.as_deref());
-            if round + 1 < max_tool_rounds {
+            if round + 1 < current_tool_round_limit {
                 if let Some(nudge) = workflow_runtime.rediscovery_nudge(
                     Some(&nudge_classification),
                     &streamed,
@@ -2053,7 +2082,8 @@ pub async fn chat_complete(
                     continue 'round_loop;
                 }
             }
-            if pending_plan_nudges < PENDING_PLAN_NUDGE_CAP && round + 1 < max_tool_rounds {
+            if pending_plan_nudges < PENDING_PLAN_NUDGE_CAP && round + 1 < current_tool_round_limit
+            {
                 if let Some(nudge) = pending_plan_completion_nudge(
                     step_ledger,
                     nudge_classification.is_plan_update(),
@@ -2073,7 +2103,7 @@ pub async fn chat_complete(
                 }
             }
             if stale_file_nudges < STALE_FILE_NUDGE_CAP
-                && round + 1 < max_tool_rounds
+                && round + 1 < current_tool_round_limit
                 && looks_like_unverified_stale_file_blocker(&streamed)
             {
                 if debug {
@@ -2092,7 +2122,7 @@ pub async fn chat_complete(
                 continue 'round_loop;
             }
             if narration_nudges < NARRATION_NUDGE_CAP
-                && round + 1 < max_tool_rounds
+                && round + 1 < current_tool_round_limit
                 && nudge_classification.is_pending_action()
             {
                 if debug {
@@ -2143,6 +2173,7 @@ pub async fn chat_complete(
         messages.push(message.clone());
         let mut round_wrote = false;
         let mut round_modified_workspace = false;
+        let mut round_progress = false;
         for tc in tool_calls.unwrap() {
             let anthropic_native = tc["function"].is_null();
             let name = if anthropic_native {
@@ -2204,7 +2235,7 @@ pub async fn chat_complete(
                 display::print_tool_output(&report, tool_output_lines, color);
                 report
             } else {
-                execute_tool(
+                execute_tool_with_offload(
                     name,
                     &args,
                     workspace,
@@ -2235,6 +2266,8 @@ pub async fn chat_complete(
                     code_search,
                     experience_store,
                     step_ledger,
+                    tool_offload,
+                    spill_store,
                 )
                 .await
             };
@@ -2246,8 +2279,13 @@ pub async fn chat_complete(
             if ok && is_workspace_write_call(name) {
                 round_modified_workspace = true;
             }
+            if ok && meaningful_workflow_progress(name, &result) {
+                round_progress = true;
+            }
             repeat_calls.record(name, &args, ok, &result);
-            workflow_runtime.record_tool_result(&result);
+            if workflow_runtime.record_tool_result(&result) {
+                round_progress = true;
+            }
             if let Some(rec) = tool_events.as_deref_mut() {
                 rec.push(crate::ToolEvent::from_call(
                     name,
@@ -2280,7 +2318,7 @@ pub async fn chat_complete(
                 "role": "tool",
                 // Step 26.3 (#584): offload an oversized result (redact → spill →
                 // teaser+handle) when tool_offload is on; unchanged otherwise.
-                "content": spill::maybe_offload(result, tool_offload, spill_store)
+                "content": maybe_offload_tool_result(name, result, tool_offload, spill_store)
             }));
         }
         if round_wrote {
@@ -2288,7 +2326,7 @@ pub async fn chat_complete(
         } else {
             read_only_rounds = read_only_rounds.saturating_add(1);
         }
-        workflow_runtime.record_round_outcome(round_modified_workspace);
+        workflow_runtime.record_round_outcome(round_modified_workspace, round_progress);
     }
 
     // Reached the round cap. Trim the bloated message list so the final
@@ -2529,6 +2567,13 @@ struct WorkflowRuntimeState {
     error_evidence: Option<WorkflowErrorEvidence>,
     read_only_rounds_after_evidence: usize,
     writes_after_evidence: usize,
+    rounds_since_progress: Option<usize>,
+    /// Override for [`WORKFLOW_RECENT_PROGRESS_ROUNDS`], set once per turn from
+    /// the matching [`crate::WorkflowSteerer`] workflow's
+    /// `progress_horizon_rounds` (diagnostic workflows legitimately need more
+    /// read-only rounds between plan/edit checkpoints than routine edits do —
+    /// see `diagnose_failure.toml`). `None` uses the shared default.
+    progress_horizon_rounds: Option<usize>,
     step_lock_nudges: usize,
     rediscovery_nudges: usize,
 }
@@ -2537,13 +2582,25 @@ impl WorkflowRuntimeState {
     const STEP_LOCK_NUDGE_CAP: usize = 3;
     const REDISCOVERY_NUDGE_CAP: usize = 2;
 
-    fn record_tool_result(&mut self, result: &str) {
+    /// Set once per turn from the matching workflow's horizon override, if
+    /// any. A no-op call (`None`) leaves the shared default in effect.
+    fn set_progress_horizon(&mut self, rounds: Option<usize>) {
+        self.progress_horizon_rounds = rounds;
+    }
+
+    fn progress_horizon(&self) -> usize {
+        self.progress_horizon_rounds
+            .unwrap_or(WORKFLOW_RECENT_PROGRESS_ROUNDS)
+    }
+
+    fn record_tool_result(&mut self, result: &str) -> bool {
         let Some(fingerprint) = workflow_error_fingerprint(result) else {
-            return;
+            return false;
         };
         match self.error_evidence.as_mut() {
             Some(evidence) if evidence.fingerprint == fingerprint => {
                 evidence.observations = evidence.observations.saturating_add(1);
+                false
             }
             _ => {
                 self.error_evidence = Some(WorkflowErrorEvidence {
@@ -2554,11 +2611,17 @@ impl WorkflowRuntimeState {
                 self.writes_after_evidence = 0;
                 self.step_lock_nudges = 0;
                 self.rediscovery_nudges = 0;
+                true
             }
         }
     }
 
-    fn record_round_outcome(&mut self, round_wrote: bool) {
+    fn record_round_outcome(&mut self, round_wrote: bool, round_progress: bool) {
+        if round_progress {
+            self.rounds_since_progress = Some(0);
+        } else if let Some(rounds) = self.rounds_since_progress.as_mut() {
+            *rounds = rounds.saturating_add(1);
+        }
         if self.error_evidence.is_none() {
             return;
         }
@@ -2623,31 +2686,41 @@ impl WorkflowRuntimeState {
         &mut self,
         step_ledger: Option<&dyn scheduled::StepLedger>,
         max_tool_rounds: usize,
-        grace_rounds_used: usize,
+        workflow_grace_rounds: usize,
     ) -> Option<String> {
-        let evidence = self.error_evidence.as_ref()?;
-        if self.writes_after_evidence > 0 {
-            if grace_rounds_used > 0 {
-                return None;
+        if workflow_grace_rounds == 0 {
+            return None;
+        }
+        let active_step = active_step_description(step_ledger);
+        let recent_progress = self
+            .rounds_since_progress
+            .is_some_and(|rounds| rounds <= self.progress_horizon());
+        if let Some(evidence) = self.error_evidence.as_ref() {
+            if self.writes_after_evidence > 0 {
+                return Some(workflow_post_write_grace_nudge(
+                    &evidence.fingerprint,
+                    active_step.as_deref(),
+                    max_tool_rounds,
+                    workflow_grace_rounds,
+                ));
             }
-            return Some(workflow_post_write_grace_nudge(
-                &evidence.fingerprint,
-                active_step_description(step_ledger).as_deref(),
+            if self.read_only_rounds_after_evidence > 0 || recent_progress {
+                return Some(workflow_cap_grace_nudge(
+                    &evidence.fingerprint,
+                    active_step.as_deref(),
+                    max_tool_rounds,
+                    workflow_grace_rounds,
+                ));
+            }
+        }
+        if active_step.is_some() && recent_progress {
+            return Some(workflow_progress_grace_nudge(
+                active_step.as_deref(),
                 max_tool_rounds,
+                workflow_grace_rounds,
             ));
         }
-        if self.read_only_rounds_after_evidence == 0 {
-            return None;
-        }
-        if grace_rounds_used >= WORKFLOW_GRACE_ROUND_CAP {
-            return None;
-        }
-        Some(workflow_cap_grace_nudge(
-            &evidence.fingerprint,
-            active_step_description(step_ledger).as_deref(),
-            max_tool_rounds,
-            grace_rounds_used + 1,
-        ))
+        None
     }
 }
 
@@ -2769,13 +2842,13 @@ fn workflow_cap_grace_nudge(
     fingerprint: &str,
     active_step: Option<&str>,
     max_tool_rounds: usize,
-    grace_round: usize,
+    workflow_grace_rounds: usize,
 ) -> String {
     let active = active_step
         .map(|step| format!(" Active step: '{step}'."))
         .unwrap_or_default();
     format!(
-        "<workflow_state>\nnormal_tool_round_cap = {max_tool_rounds}\nworkflow_grace_round = {grace_round}/{WORKFLOW_GRACE_ROUND_CAP}\nlast_error_fingerprint = \"{fingerprint}\"\nnext_allowed_actions = \"call edit_file or write_file now using the latest observed file contents; then run the focused verification\"\ndisallowed_actions = \"summary of findings, handoff, plan rediscovery, or another broad read-only pass\"\n</workflow_state>\nThe normal tool-call cap was reached immediately after repair evidence without a successful workspace edit.{active} This is a bounded extra action round, not a final-answer round. Use the latest observed contents and call the concrete edit tool now. If one exact replacement span is still missing, read only that minimal span, then edit on the next grace round."
+        "<workflow_state>\nnormal_tool_round_cap = {max_tool_rounds}\nconfigured_workflow_grace_rounds = {workflow_grace_rounds}\nlast_error_fingerprint = \"{fingerprint}\"\nnext_allowed_actions = \"call edit_file or write_file now using the latest observed file contents; then run the focused verification\"\ndisallowed_actions = \"summary of findings, handoff, plan rediscovery, or another broad read-only pass\"\n</workflow_state>\nThe normal tool-call cap was reached immediately after repair evidence without a successful workspace edit.{active} This is a bounded grace window, not a final-answer round. Use the latest observed contents and call the concrete edit tool now. If one exact replacement span is still missing, read only that minimal span, then edit in the grace window."
     )
 }
 
@@ -2783,12 +2856,26 @@ fn workflow_post_write_grace_nudge(
     fingerprint: &str,
     active_step: Option<&str>,
     max_tool_rounds: usize,
+    workflow_grace_rounds: usize,
 ) -> String {
     let active = active_step
         .map(|step| format!(" Active step: '{step}'."))
         .unwrap_or_default();
     format!(
-        "<workflow_state>\nnormal_tool_round_cap = {max_tool_rounds}\nworkflow_grace_round = 1/{WORKFLOW_GRACE_ROUND_CAP}\nlast_error_fingerprint = \"{fingerprint}\"\nnext_allowed_actions = \"run the focused verification for the edit you just made, or continue the active implementation step with one concrete tool call\"\ndisallowed_actions = \"summary of findings, handoff, or broad rediscovery\"\n</workflow_state>\nThe normal tool-call cap was reached immediately after a workspace edit related to recorded repair evidence.{active} This is a bounded verification round. Do not summarize or stop because of the normal cap; run the focused check or the next concrete implementation tool now."
+        "<workflow_state>\nnormal_tool_round_cap = {max_tool_rounds}\nconfigured_workflow_grace_rounds = {workflow_grace_rounds}\nlast_error_fingerprint = \"{fingerprint}\"\nnext_allowed_actions = \"run the focused verification for the edit you just made, or continue the active implementation step with one concrete tool call\"\ndisallowed_actions = \"summary of findings, handoff, or broad rediscovery\"\n</workflow_state>\nThe normal tool-call cap was reached immediately after a workspace edit related to recorded repair evidence.{active} This is a bounded verification window. Do not summarize or stop because of the normal cap; run the focused check or the next concrete implementation tool now."
+    )
+}
+
+fn workflow_progress_grace_nudge(
+    active_step: Option<&str>,
+    max_tool_rounds: usize,
+    workflow_grace_rounds: usize,
+) -> String {
+    let active = active_step
+        .map(|step| format!(" Active step: '{step}'."))
+        .unwrap_or_default();
+    format!(
+        "<workflow_state>\nnormal_tool_round_cap = {max_tool_rounds}\nconfigured_workflow_grace_rounds = {workflow_grace_rounds}\nnext_allowed_actions = \"continue the active workflow step with one concrete tool call, then update the plan or verify\"\ndisallowed_actions = \"summary of findings, handoff, or broad rediscovery\"\n</workflow_state>\nThe normal tool-call cap was reached while the active workflow was still making concrete progress.{active} This is a bounded grace window, not a final-answer round. Continue with the next concrete implementation or verification tool now."
     )
 }
 
@@ -2842,6 +2929,32 @@ fn is_workspace_write_call(name: &str) -> bool {
     matches!(name, "write_file" | "edit_file")
 }
 
+fn maybe_offload_tool_result(
+    name: &str,
+    result: String,
+    tool_offload: bool,
+    spill_store: Option<&dyn spill::SpillStore>,
+) -> String {
+    if matches!(name, "run_command" | "lifecycle") {
+        result
+    } else {
+        spill::maybe_offload(result, tool_offload, spill_store)
+    }
+}
+
+fn meaningful_workflow_progress(name: &str, result: &str) -> bool {
+    match name {
+        "update_plan" => true,
+        "write_file" => result.starts_with("wrote ") || result.starts_with("✓ wrote "),
+        "edit_file" => edit_result_changed_file(result),
+        _ => false,
+    }
+}
+
+fn edit_result_changed_file(result: &str) -> bool {
+    result.starts_with("edited ") || result.starts_with("✓ edited ")
+}
+
 fn is_read_only_shell_probe(command: &str) -> bool {
     let command = command.trim();
     if command.is_empty() {
@@ -2879,11 +2992,9 @@ const SUSPICIOUS_EMPTY_RETRY_CAP: u32 = 2;
 /// per turn. Kept separate from narration nudges: this is a blocker-specific
 /// ground-truth check, not generic intent-to-act recovery.
 const STALE_FILE_NUDGE_CAP: usize = 1;
-/// Extra rounds granted only when workflow evidence says the normal cap would
-/// otherwise stop immediately after read-only repair context. This is not a
-/// general cap raise; a successful workspace write or exhausted evidence stops
-/// the grace path.
-const WORKFLOW_GRACE_ROUND_CAP: usize = 2;
+/// Recent-progress horizon used to decide whether a configured workflow grace
+/// window should activate at the normal round cap.
+const WORKFLOW_RECENT_PROGRESS_ROUNDS: usize = 3;
 
 fn tail_on_char_boundary(s: &str, max_bytes: usize) -> &str {
     let cut = s.len().saturating_sub(max_bytes);
@@ -3072,6 +3183,7 @@ fn read_only_action_nudge(
     read_only_rounds: usize,
     remaining_rounds: usize,
     step_ledger: Option<&dyn scheduled::StepLedger>,
+    delegate_hint: Option<&str>,
 ) -> String {
     let plan_clause = if step_ledger.and_then(plan_reseat_pointer).is_some() {
         " You have an active multi-step plan; keep working the ACTIVE step instead of \
@@ -3079,6 +3191,9 @@ fn read_only_action_nudge(
     } else {
         ""
     };
+    let delegate_clause = delegate_hint
+        .map(|hint| format!(" {hint}"))
+        .unwrap_or_default();
     format!(
         "[{read_only_rounds} read-only rounds so far. Stop AIMLESS exploring and start \
          making the change. This is a nudge, not a limit — you may still read, but if \
@@ -3087,7 +3202,7 @@ fn read_only_action_nudge(
          target, or take a different approach. If you truly cannot edit yet, state the \
          exact blocker. Before edit_file, read the ONE file you are about to change so \
          old_string matches exact text; never guess old_string or repeat a failed edit.\
-         {plan_clause} ~{remaining_rounds} round(s) left.]"
+         {plan_clause}{delegate_clause} ~{remaining_rounds} round(s) left.]"
     )
 }
 
@@ -3539,6 +3654,7 @@ pub async fn openai_chat_complete(
         step_ledger,
         caveats,
         max_tool_rounds,
+        workflow_grace_rounds,
         tool_output_lines,
         debug,
         trace,
@@ -3667,14 +3783,22 @@ pub async fn openai_chat_complete(
     let nudge_classifier = crate::NudgeClassifier::load_default();
     let workflow_steerer = crate::WorkflowSteerer::load_default();
     let mut workflow_runtime = WorkflowRuntimeState::default();
+    // See the Ollama path: a matching workflow's grace-horizon override.
+    workflow_runtime.set_progress_horizon(
+        workflow_steerer.progress_horizon(&workflow_classifier_text(&messages, "")),
+    );
 
     // Agentic loop — up to `max_tool_rounds` tool-call rounds (matches the
-    // Ollama path), plus bounded workflow grace rounds when the normal cap
-    // would stop after read-only repair context.
-    let hard_tool_rounds = max_tool_rounds.saturating_add(WORKFLOW_GRACE_ROUND_CAP);
-    let mut workflow_grace_rounds = 0usize;
+    // Ollama path), plus a configurable workflow grace window when the normal
+    // cap would stop during active workflow progress.
+    let hard_tool_rounds = max_tool_rounds.saturating_add(workflow_grace_rounds);
+    let mut workflow_grace_active = false;
+    let mut current_tool_round_limit = max_tool_rounds;
     'round_loop: for round in 0..hard_tool_rounds {
-        if round >= max_tool_rounds {
+        if round >= current_tool_round_limit {
+            if workflow_grace_active {
+                break;
+            }
             let Some(nudge) = workflow_runtime.cap_grace_nudge(
                 step_ledger,
                 max_tool_rounds,
@@ -3682,10 +3806,11 @@ pub async fn openai_chat_complete(
             ) else {
                 break;
             };
-            workflow_grace_rounds += 1;
+            workflow_grace_active = true;
+            current_tool_round_limit = hard_tool_rounds;
             if debug {
                 print_debug(
-                    "workflow evidence at round cap — granting bounded action round",
+                    "workflow progress at soft round cap — granting configured grace window",
                     color,
                 );
             }
@@ -4069,7 +4194,7 @@ pub async fn openai_chat_complete(
                 .and_then(|_| nudge_classifier.direction_for(crate::NudgeClass::PlanUpdate));
             let plan_nudge_hint =
                 combine_nudge_hints(classifier_plan_direction, workflow_hint.as_deref());
-            if !content.is_empty() && round + 1 < max_tool_rounds {
+            if !content.is_empty() && round + 1 < current_tool_round_limit {
                 if let Some(nudge) = workflow_runtime.rediscovery_nudge(
                     nudge_classification.as_ref(),
                     &content,
@@ -4088,7 +4213,7 @@ pub async fn openai_chat_complete(
             }
             if !content.is_empty()
                 && pending_plan_nudges < PENDING_PLAN_NUDGE_CAP
-                && round + 1 < max_tool_rounds
+                && round + 1 < current_tool_round_limit
             {
                 let needs_plan_update = nudge_classification
                     .as_ref()
@@ -4112,7 +4237,7 @@ pub async fn openai_chat_complete(
             }
             if !content.is_empty()
                 && stale_file_nudges < STALE_FILE_NUDGE_CAP
-                && round + 1 < max_tool_rounds
+                && round + 1 < current_tool_round_limit
                 && looks_like_unverified_stale_file_blocker(&content)
             {
                 if debug {
@@ -4131,7 +4256,7 @@ pub async fn openai_chat_complete(
             }
             if !content.is_empty()
                 && narration_nudges < NARRATION_NUDGE_CAP
-                && round + 1 < max_tool_rounds
+                && round + 1 < current_tool_round_limit
                 && nudge_classification
                     .as_ref()
                     .is_some_and(|c| c.is_pending_action())
@@ -4192,6 +4317,7 @@ pub async fn openai_chat_complete(
         }
         messages.push(assistant_turn);
         let mut round_modified_workspace = false;
+        let mut round_progress = false;
         for tc in tool_calls.unwrap() {
             let id = tc["id"].as_str().unwrap_or("");
             // Some API proxies (e.g. NVIDIA inference → Anthropic backend) wrap
@@ -4284,7 +4410,7 @@ pub async fn openai_chat_complete(
                 display::print_tool_output(&report, tool_output_lines, color);
                 report
             } else {
-                execute_tool(
+                execute_tool_with_offload(
                     name,
                     &args,
                     workspace,
@@ -4315,6 +4441,8 @@ pub async fn openai_chat_complete(
                     code_search,
                     experience_store,
                     step_ledger,
+                    tool_offload,
+                    spill_store,
                 )
                 .await
             };
@@ -4330,8 +4458,13 @@ pub async fn openai_chat_complete(
             if ok && is_workspace_write_call(name) {
                 round_modified_workspace = true;
             }
+            if ok && meaningful_workflow_progress(name, &result) {
+                round_progress = true;
+            }
             repeat_calls.record(name, &args, ok, &result);
-            workflow_runtime.record_tool_result(&result);
+            if workflow_runtime.record_tool_result(&result) {
+                round_progress = true;
+            }
             if let Some(rec) = tool_events.as_deref_mut() {
                 rec.push(crate::ToolEvent::from_call(
                     name,
@@ -4363,10 +4496,10 @@ pub async fn openai_chat_complete(
                 "role": "tool",
                 "tool_call_id": id,
                 // Step 26.3 (#584): see the Ollama path.
-                "content": spill::maybe_offload(result, tool_offload, spill_store),
+                "content": maybe_offload_tool_result(name, result, tool_offload, spill_store),
             }));
         }
-        workflow_runtime.record_round_outcome(round_modified_workspace);
+        workflow_runtime.record_round_outcome(round_modified_workspace, round_progress);
     }
 
     // Reached the round cap. Trim the message list and make ONE final
@@ -4540,6 +4673,7 @@ pub async fn openai_responses_complete(
         step_ledger,
         caveats,
         max_tool_rounds,
+        workflow_grace_rounds: _,
         tool_output_lines,
         debug,
         trace,
@@ -4775,7 +4909,7 @@ pub async fn openai_responses_complete(
                 display::print_tool_output(&report, tool_output_lines, color);
                 report
             } else {
-                execute_tool(
+                execute_tool_with_offload(
                     name,
                     &args,
                     workspace,
@@ -4799,6 +4933,8 @@ pub async fn openai_responses_complete(
                     code_search,
                     experience_store,
                     step_ledger,
+                    tool_offload,
+                    spill_store,
                 )
                 .await
             };
@@ -4839,7 +4975,7 @@ pub async fn openai_responses_complete(
                 "type": "function_call_output",
                 "call_id": call_id,
                 // Step 26.3 (#584): see the Ollama path (Responses output shape).
-                "output": spill::maybe_offload(result, tool_offload, spill_store),
+                "output": maybe_offload_tool_result(name, result, tool_offload, spill_store),
             }));
         }
     }
@@ -5387,7 +5523,7 @@ error[E0425]: cannot find value `SECTION_PROMPT_TOKENS` in this scope
         let mut state = WorkflowRuntimeState::default();
 
         state.record_tool_result(output);
-        state.record_round_outcome(false);
+        state.record_round_outcome(false, false);
 
         let nudge = state
             .round_start_nudge(None)
@@ -5427,7 +5563,7 @@ error[E0425]: cannot find value `SECTION_PROMPT_TOKENS` in this scope
         let mut state = WorkflowRuntimeState::default();
 
         state.record_tool_result(output);
-        state.record_round_outcome(false);
+        state.record_round_outcome(false, false);
 
         let nudge = state
             .round_start_nudge(None)
@@ -5435,22 +5571,88 @@ error[E0425]: cannot find value `SECTION_PROMPT_TOKENS` in this scope
         assert!(nudge.contains("old_string not found"), "{nudge}");
 
         let grace = state
-            .cap_grace_nudge(None, 25, 0)
+            .cap_grace_nudge(None, 25, 5)
             .expect("cap after failed edit/read-only recovery should grant an action round");
-        assert!(grace.contains("workflow_grace_round = 1/2"), "{grace}");
+        assert!(
+            grace.contains("configured_workflow_grace_rounds = 5"),
+            "{grace}"
+        );
         assert!(
             grace.contains("call edit_file or write_file now"),
             "{grace}"
         );
+        assert!(
+            state.cap_grace_nudge(None, 25, 0).is_none(),
+            "configured zero grace disables soft cap extension"
+        );
 
-        state.record_round_outcome(true);
+        state.record_round_outcome(true, true);
         let verify = state
-            .cap_grace_nudge(None, 25, 0)
-            .expect("a successful edit at the cap should get one verification round");
+            .cap_grace_nudge(None, 25, 3)
+            .expect("a successful edit at the cap should get a verification window");
         assert!(verify.contains("focused verification"), "{verify}");
         assert!(
-            state.cap_grace_nudge(None, 25, 1).is_none(),
-            "post-edit verification grace is granted only once"
+            verify.contains("configured_workflow_grace_rounds = 3"),
+            "{verify}"
+        );
+    }
+
+    #[test]
+    fn workflow_runtime_grants_configured_grace_for_recent_plan_progress() {
+        let ledger = SessionStepLedger::default();
+        ledger.set_plan(&["finish round-cap grace".to_string(), "verify".to_string()]);
+        let mut state = WorkflowRuntimeState::default();
+
+        state.record_round_outcome(false, true);
+
+        let nudge = state
+            .cap_grace_nudge(Some(&ledger), 2, 4)
+            .expect("recent active-plan progress should activate configured grace");
+        assert!(
+            nudge.contains("configured_workflow_grace_rounds = 4"),
+            "{nudge}"
+        );
+        assert!(nudge.contains("finish round-cap grace"), "{nudge}");
+        assert!(
+            state.cap_grace_nudge(Some(&ledger), 2, 0).is_none(),
+            "zero configured grace keeps the cap hard"
+        );
+    }
+
+    /// #<issue>: a diagnostic workflow (e.g. `diagnose_failure.toml`,
+    /// `progress_horizon_rounds = 6`) legitimately spends more read-only
+    /// rounds between plan checkpoints than a routine edit does. Without a
+    /// horizon override, 4 rounds since the last checkpoint already exceeds
+    /// the shared default (`WORKFLOW_RECENT_PROGRESS_ROUNDS = 3`) and grace
+    /// does NOT activate — RED on the pre-fix behavior. Setting the override
+    /// widens the window so the same 4-rounds-stale state still counts as
+    /// "recent" — GREEN.
+    #[test]
+    fn progress_horizon_override_widens_the_recent_progress_window() {
+        let ledger = SessionStepLedger::default();
+        ledger.set_plan(&["diagnose the failure".to_string(), "fix it".to_string()]);
+
+        let mut default_horizon = WorkflowRuntimeState::default();
+        default_horizon.record_round_outcome(false, true); // a checkpoint...
+        for _ in 0..4 {
+            default_horizon.record_round_outcome(false, false); // ...then 4 idle rounds
+        }
+        assert!(
+            default_horizon
+                .cap_grace_nudge(Some(&ledger), 2, 4)
+                .is_none(),
+            "4 rounds since the last checkpoint exceeds the default 3-round horizon"
+        );
+
+        let mut widened = WorkflowRuntimeState::default();
+        widened.set_progress_horizon(Some(6));
+        widened.record_round_outcome(false, true);
+        for _ in 0..4 {
+            widened.record_round_outcome(false, false);
+        }
+        assert!(
+            widened.cap_grace_nudge(Some(&ledger), 2, 4).is_some(),
+            "a widened 6-round horizon still treats 4-rounds-stale as recent progress"
         );
     }
 
@@ -5723,7 +5925,7 @@ mod cap_exit_unit_tests {
 
     #[test]
     fn read_only_action_nudge_names_edit_permission_and_blocker_paths() {
-        let nudge = read_only_action_nudge(3, 4, None);
+        let nudge = read_only_action_nudge(3, 4, None, None);
         assert!(nudge.contains("read-only rounds so far"), "{nudge}");
         assert!(nudge.contains("edit_file"), "{nudge}");
         assert!(nudge.contains("write_file"), "{nudge}");
@@ -5748,9 +5950,30 @@ mod cap_exit_unit_tests {
                 },
             ],
         });
-        let nudge = read_only_action_nudge(3, 2, Some(&ledger as &dyn StepLedger));
+        let nudge = read_only_action_nudge(3, 2, Some(&ledger as &dyn StepLedger), None);
         assert!(nudge.contains("active multi-step plan"), "{nudge}");
         assert!(nudge.contains("ACTIVE step"), "{nudge}");
+    }
+
+    /// #<issue>: when a `WorkflowSteerer` match offers a delegate hint (e.g.
+    /// the built-in `diagnose_failure` workflow, and `crew`/`team` dispatch is
+    /// available this session), the read-only nudge surfaces it — sustained
+    /// read-only exploration on that task shape is exactly what delegation is
+    /// for, not just "stop reading, edit it yourself".
+    #[test]
+    fn read_only_action_nudge_includes_a_delegate_hint_when_offered() {
+        let nudge = read_only_action_nudge(3, 4, None, Some("consider calling crew or team"));
+        assert!(nudge.contains("consider calling crew or team"), "{nudge}");
+        // Still carries the original inline-action guidance too — delegation
+        // is offered ALONGSIDE continuing directly, never in place of it.
+        assert!(nudge.contains("edit_file"), "{nudge}");
+    }
+
+    #[test]
+    fn read_only_action_nudge_omits_delegate_clause_when_none_offered() {
+        let nudge = read_only_action_nudge(3, 4, None, None);
+        assert!(!nudge.contains("crew"), "{nudge}");
+        assert!(!nudge.contains("team"), "{nudge}");
     }
 
     #[test]
@@ -5982,6 +6205,7 @@ mod tool_round_cap_tests {
                 step_ledger: None,
                 caveats: &caveats,
                 max_tool_rounds: cap,
+                workflow_grace_rounds: 0,
                 tool_output_lines: 20,
                 debug: false,
                 trace: false,
@@ -6142,6 +6366,7 @@ mod tool_round_cap_tests {
                 step_ledger: None,
                 caveats: &caveats,
                 max_tool_rounds: cap,
+                workflow_grace_rounds: 0,
                 tool_output_lines: 20,
                 debug: false,
                 trace: false,
@@ -6221,6 +6446,7 @@ mod tool_round_cap_tests {
                 step_ledger: None,
                 caveats: &caveats,
                 max_tool_rounds: 5,
+                workflow_grace_rounds: 0,
                 tool_output_lines: 20,
                 debug: false,
                 trace: false,
@@ -6361,6 +6587,7 @@ mod tool_round_cap_tests {
                 step_ledger: None,
                 caveats: &caveats,
                 max_tool_rounds: 5,
+                workflow_grace_rounds: 0,
                 tool_output_lines: 20,
                 debug: false,
                 trace: false,
@@ -6438,6 +6665,7 @@ mod tool_round_cap_tests {
                 step_ledger: None,
                 caveats: &caveats,
                 max_tool_rounds: cap,
+                workflow_grace_rounds: 0,
                 tool_output_lines: 20,
                 debug: false,
                 trace: false,
@@ -6538,6 +6766,7 @@ mod tool_round_cap_tests {
                 step_ledger: None,
                 caveats: &caveats,
                 max_tool_rounds: 1,
+                workflow_grace_rounds: 0,
                 tool_output_lines: 20,
                 debug: false,
                 trace: false,
@@ -6650,6 +6879,7 @@ mod tool_round_cap_tests {
                 step_ledger: None,
                 caveats: &caveats,
                 max_tool_rounds: 1,
+                workflow_grace_rounds: 0,
                 tool_output_lines: 20,
                 debug: false,
                 trace: false,
@@ -6754,6 +6984,7 @@ mod tool_round_cap_tests {
                 step_ledger: None,
                 caveats: &caveats,
                 max_tool_rounds: 2,
+                workflow_grace_rounds: 0,
                 tool_output_lines: 20,
                 debug: false,
                 trace: false,
@@ -6899,6 +7130,7 @@ mod tool_round_cap_tests {
                 step_ledger: None,
                 caveats: &caveats,
                 max_tool_rounds: cap,
+                workflow_grace_rounds: 0,
                 tool_output_lines: 20,
                 debug: false,
                 trace: false,
@@ -7054,6 +7286,7 @@ mod tool_round_cap_tests {
                 step_ledger: None,
                 caveats: &caveats,
                 max_tool_rounds: 10,
+                workflow_grace_rounds: 0,
                 tool_output_lines: 5,
                 debug: false,
                 trace: false,
@@ -7148,6 +7381,7 @@ mod http_loop_tests {
             step_ledger: None,
             caveats,
             max_tool_rounds: 8,
+            workflow_grace_rounds: 0,
             tool_output_lines: 20,
             debug: false,
             trace: false,
@@ -8807,6 +9041,7 @@ mod save_note_loop_tests {
             step_ledger: None,
             caveats,
             max_tool_rounds: 6,
+            workflow_grace_rounds: 0,
             tool_output_lines: 20,
             debug: false,
             trace: false,
@@ -9291,6 +9526,7 @@ mod compression_loop_tests {
             step_ledger: None,
             caveats,
             max_tool_rounds: 12,
+            workflow_grace_rounds: 0,
             tool_output_lines: 2,
             debug: false,
             trace: false,
@@ -10440,6 +10676,7 @@ mod observation_hook_tests {
             step_ledger: None,
             caveats,
             max_tool_rounds: 8,
+            workflow_grace_rounds: 0,
             tool_output_lines: 20,
             debug: false,
             trace: false,

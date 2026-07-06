@@ -13,9 +13,17 @@ use serde::{Deserialize, Serialize};
 use crate::config::Config;
 
 const BUNDLED_GITHUB_PR_WORKFLOW: &str = include_str!("workflows/github_pr.toml");
+const BUNDLED_DIAGNOSE_FAILURE_WORKFLOW: &str = include_str!("workflows/diagnose_failure.toml");
 
 /// Front matter that lets the workflow classifier find this workflow.
+///
+/// `deny_unknown_fields`: a misplaced top-level field (e.g. `delegate_hint`
+/// written AFTER `[classifier]` opens) would otherwise be silently parsed as
+/// an unknown key of *this* table and dropped — no error, no warning, just a
+/// field that quietly never takes effect. Denying unknown fields turns that
+/// into a loud parse failure instead.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkflowClassifierConfig {
     /// Minimum prototype similarity required for an example match.
     #[serde(default = "default_classifier_min_score")]
@@ -76,6 +84,20 @@ pub struct WorkflowConfig {
     /// Ordered workflow steps.
     #[serde(default)]
     pub steps: Vec<WorkflowStep>,
+    /// A short model-facing hint recommending `crew`/`team` sub-agent
+    /// delegation instead of continuing to spend this session's own round
+    /// budget, offered only when this workflow matches AND sub-agent dispatch
+    /// is actually available this session. `None` (the default) means this
+    /// workflow never suggests delegation.
+    #[serde(default)]
+    pub delegate_hint: Option<String>,
+    /// Override for how many rounds without a plan/edit checkpoint still
+    /// count as "recent progress" for round-cap grace, when this workflow
+    /// matches. `None` uses the shared default. Diagnostic workflows
+    /// legitimately need more read-only rounds between checkpoints than
+    /// routine edits do.
+    #[serde(default)]
+    pub progress_horizon_rounds: Option<usize>,
 }
 
 fn default_enabled() -> bool {
@@ -168,11 +190,17 @@ impl WorkflowConfig {
     }
 }
 
-/// Built-in GitHub PR workflow: issue/request -> branch -> commits -> PR.
+/// Built-in workflows: GitHub PR (issue/request -> branch -> commits -> PR) and
+/// diagnose-failure (investigate a failing test/pipeline/build/PR conflict,
+/// then land a fix — with a delegate hint pointing at `crew`/`team`).
 #[must_use]
 pub fn builtin_workflows() -> Vec<WorkflowConfig> {
-    vec![toml::from_str(BUNDLED_GITHUB_PR_WORKFLOW)
-        .expect("bundled GitHub PR workflow template is valid")]
+    vec![
+        toml::from_str(BUNDLED_GITHUB_PR_WORKFLOW)
+            .expect("bundled GitHub PR workflow template is valid"),
+        toml::from_str(BUNDLED_DIAGNOSE_FAILURE_WORKFLOW)
+            .expect("bundled diagnose-failure workflow template is valid"),
+    ]
 }
 
 /// Load workflow drop-ins from a directory. Missing/malformed files are skipped.
@@ -277,6 +305,40 @@ impl WorkflowSteerer {
             .find(|workflow| workflow.matches(text))
             .map(WorkflowConfig::render_plan_update_hint)
     }
+
+    /// The FIRST enabled matching workflow, if any (shared by
+    /// [`Self::delegate_hint`] and [`Self::progress_horizon`] so both read the
+    /// same match rather than each re-running the classifier).
+    fn matching(&self, text: &str) -> Option<&WorkflowConfig> {
+        self.workflows
+            .iter()
+            .filter(|workflow| workflow.enabled)
+            .find(|workflow| workflow.matches(text))
+    }
+
+    /// A short hint recommending `crew`/`team` delegation, when the matching
+    /// workflow configures one AND sub-agent dispatch is available this
+    /// session (`crew_available`). Never returned when `crew_available` is
+    /// false, regardless of workflow match — there is nothing to delegate to.
+    #[must_use]
+    pub fn delegate_hint(&self, text: &str, crew_available: bool) -> Option<String> {
+        if !crew_available {
+            return None;
+        }
+        self.matching(text)?
+            .delegate_hint
+            .as_deref()
+            .map(str::trim)
+            .filter(|hint| !hint.is_empty())
+            .map(str::to_string)
+    }
+
+    /// The matching workflow's round-cap grace "recent progress" horizon
+    /// override, if any.
+    #[must_use]
+    pub fn progress_horizon(&self, text: &str) -> Option<usize> {
+        self.matching(text)?.progress_horizon_rounds
+    }
 }
 
 #[cfg(test)]
@@ -338,5 +400,101 @@ steer = "Always commit before pushing"
     fn workflow_dir_is_under_user_config_dir() {
         let dir = workflow_config_dir().unwrap_or_else(|| PathBuf::from(".newt/workflows"));
         assert!(dir.ends_with("workflows"));
+    }
+
+    #[test]
+    fn diagnose_failure_workflow_matches_failure_investigation_text() {
+        let steer = WorkflowSteerer::builtin();
+        let hint = steer
+            .plan_update_hint("I'm showing broken tests here, can you find and fix them?")
+            .expect("built-in diagnose_failure workflow should match");
+        assert!(hint.contains("diagnose_failure"), "{hint}");
+        assert!(hint.contains("reproduce"), "{hint}");
+        assert!(hint.contains("isolate"), "{hint}");
+    }
+
+    #[test]
+    fn delegate_hint_is_none_without_crew_available_even_on_a_match() {
+        let steer = WorkflowSteerer::builtin();
+        assert!(steer
+            .delegate_hint("the pipeline is red, investigate why and fix it", false)
+            .is_none());
+    }
+
+    #[test]
+    fn delegate_hint_recommends_crew_team_when_matched_and_available() {
+        let steer = WorkflowSteerer::builtin();
+        let hint = steer
+            .delegate_hint("the pipeline is red, investigate why and fix it", true)
+            .expect("diagnose_failure workflow should match and offer a delegate hint");
+        assert!(hint.contains("crew"), "{hint}");
+        assert!(hint.contains("team"), "{hint}");
+    }
+
+    #[test]
+    fn delegate_hint_is_none_for_a_workflow_without_one_configured() {
+        // github_pr has no `delegate_hint` configured — a match must not
+        // fabricate a delegation suggestion it didn't ask for.
+        let steer = WorkflowSteerer::builtin();
+        assert!(steer
+            .delegate_hint("I need to plan the implementation and open a PR", true)
+            .is_none());
+    }
+
+    #[test]
+    fn delegate_hint_is_none_for_unmatched_text() {
+        let steer = WorkflowSteerer::builtin();
+        assert!(steer
+            .delegate_hint("Summarize the local cache eviction behavior", true)
+            .is_none());
+    }
+
+    #[test]
+    fn progress_horizon_is_none_for_a_workflow_without_an_override() {
+        let steer = WorkflowSteerer::builtin();
+        assert_eq!(
+            steer.progress_horizon("I need to plan the implementation and open a PR"),
+            None
+        );
+    }
+
+    #[test]
+    fn progress_horizon_returns_the_matching_workflows_override() {
+        let steer = WorkflowSteerer::builtin();
+        assert_eq!(
+            steer.progress_horizon("the pipeline is red, investigate why and fix it"),
+            Some(6)
+        );
+    }
+
+    /// Regression: a `delegate_hint`/`progress_horizon_rounds` field written
+    /// AFTER `[classifier]` opens used to be silently swallowed as an unknown
+    /// key of `WorkflowClassifierConfig` — no error, and the field just never
+    /// took effect (the exact bug this bundled workflow file hit while being
+    /// authored). `deny_unknown_fields` turns that into a loud parse error.
+    #[test]
+    fn misplaced_top_level_field_after_classifier_is_a_parse_error_not_silently_dropped() {
+        let toml = r#"
+name = "bad"
+
+[classifier]
+keywords = ["x"]
+delegate_hint = "this belongs to WorkflowConfig, not WorkflowClassifierConfig"
+"#;
+        let err = toml::from_str::<WorkflowConfig>(toml)
+            .expect_err("a misplaced field must fail to parse, not silently vanish");
+        assert!(
+            err.to_string().to_ascii_lowercase().contains("unknown"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn progress_horizon_is_none_for_unmatched_text() {
+        let steer = WorkflowSteerer::builtin();
+        assert_eq!(
+            steer.progress_horizon("Summarize the local cache eviction behavior"),
+            None
+        );
     }
 }

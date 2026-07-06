@@ -81,6 +81,9 @@ pub struct TurnDriverConfig {
     pub caveats: crate::caveats::Caveats,
     /// Maximum tool-call rounds before a forced final completion.
     pub max_tool_rounds: usize,
+    /// Additional progress-aware rounds after `max_tool_rounds`; `0` makes the
+    /// normal cap hard.
+    pub workflow_grace_rounds: usize,
     /// Max lines of tool output shown inline.
     pub tool_output_lines: usize,
     /// Ollama `options.num_ctx` (ignored on the OpenAI path).
@@ -119,7 +122,8 @@ impl TurnDriverConfig {
             api_key: None,
             workspace: workspace.into(),
             caveats: crate::caveats::Caveats::top(),
-            max_tool_rounds: 25,
+            max_tool_rounds: 40,
+            workflow_grace_rounds: 5,
             tool_output_lines: 20,
             num_ctx: None,
             connect_timeout_secs: 5,
@@ -373,6 +377,7 @@ async fn run_one_turn(
         step_ledger: None,
         caveats: &config.caveats,
         max_tool_rounds: config.max_tool_rounds,
+        workflow_grace_rounds: config.workflow_grace_rounds,
         tool_output_lines: config.tool_output_lines,
         debug: false,
         trace: false,

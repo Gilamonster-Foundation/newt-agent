@@ -950,20 +950,22 @@ impl ContextFeatureSet {
     }
 
     /// The base feature set *before* `[context.features]` / session overrides:
-    /// the `manager` preset's bundle, with local-assist features (`scratchpad`,
-    /// `semantic`, and `scheduled`) defaulted ON for local (`BackendKind::Ollama`)
-    /// backends. A weak local model needs the `<plan>` / `<state>` ledger to
-    /// carry a checklist across tool-call rounds instead of re-deriving state
-    /// each round (Step 27.4), and semantic retrieval should be ready without a
-    /// live toggle once an embedder is configured. Cloud (OpenAI-compatible)
-    /// backends keep the all-off preset baseline; explicit overrides still win —
-    /// they layer on top via [`ContextFeatures::apply_to`].
+    /// the `manager` preset's bundle, with `tool_offload` defaulted ON because
+    /// it is local, deterministic spill storage and should not depend on
+    /// semantic embedding availability. Local-assist features (`scratchpad`,
+    /// `semantic`, and `scheduled`) additionally default ON for local
+    /// (`BackendKind::Ollama`) backends. A weak local model needs the `<plan>` /
+    /// `<state>` ledger to carry a checklist across tool-call rounds instead of
+    /// re-deriving state each round (Step 27.4), and semantic retrieval should
+    /// be ready without a live toggle once an embedder is configured. Explicit
+    /// overrides still win — they layer on top via [`ContextFeatures::apply_to`].
     ///
     /// Note: a *local* vLLM / llama.cpp server reports as `Openai` (that's the
     /// wire protocol, not the host), so those users opt in via
     /// `[context.features]` rather than getting it by default.
     pub fn base_for(manager: ContextManager, kind: BackendKind) -> Self {
         let mut base = manager.base_features();
+        base.tool_offload = true;
         if matches!(kind, BackendKind::Ollama) {
             base.scratchpad = true;
             base.semantic = true;
@@ -1314,13 +1316,14 @@ impl Default for AgentsConfig {
 
 /// Tool-execution behaviour stored under `[tools]` in `newt.toml` (#726).
 ///
-/// Currently a single knob: the **token budget** that caps every tool's
-/// model-facing output. This bounds what a single tool result can add to the
-/// context window — applied to both `read_file` (its char backstop) and
-/// `run_command` (its shell envelope) — so a verbose command or a huge file
-/// can't saturate a small local model's window and abandon the task. Mirrors
-/// Codex's `exec_command.max_output_tokens`. Distinct from `[tui]
-/// tool_output_lines`, which caps the on-screen DISPLAY by lines.
+/// Tool-output knobs: the **token budget** that caps every tool's model-facing
+/// output, plus the head/tail split for oversized shell output. This bounds
+/// what a single tool result can add to the context window — applied to both
+/// `read_file` (its char backstop) and `run_command` (its shell envelope) — so a
+/// verbose command or a huge file can't saturate a small local model's window
+/// and abandon the task. Mirrors Codex's `exec_command.max_output_tokens`.
+/// Distinct from `[tui] tool_output_lines`, which caps the on-screen DISPLAY by
+/// lines.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ToolsConfig {
@@ -1330,18 +1333,30 @@ pub struct ToolsConfig {
     /// estimated with the shared chars/token heuristic (see [`crate::tokens`]).
     #[serde(default = "default_max_output_tokens")]
     pub max_output_tokens: usize,
+
+    /// Tokens reserved for the head of an oversized `run_command` result. The
+    /// remaining budget is spent on the tail, so failures and summaries at the
+    /// end survive by default. `0` is pure-tail; values greater than
+    /// `max_output_tokens` are clamped to pure-head.
+    #[serde(default = "default_output_head_tokens")]
+    pub output_head_tokens: usize,
 }
 
 impl Default for ToolsConfig {
     fn default() -> Self {
         Self {
             max_output_tokens: default_max_output_tokens(),
+            output_head_tokens: default_output_head_tokens(),
         }
     }
 }
 
 fn default_max_output_tokens() -> usize {
     10_000
+}
+
+fn default_output_head_tokens() -> usize {
+    1_500
 }
 
 // ---------------------------------------------------------------------------
@@ -1413,9 +1428,20 @@ pub struct TuiConfig {
     /// round is one model response that may emit tool calls; once this many
     /// rounds have run without a tool-free answer, newt asks the model once
     /// more with tools disabled so the user still gets a real (partial)
-    /// answer instead of a placeholder. Default: 25.
+    /// answer instead of a placeholder. Default: 40 (raised from 25 — a
+    /// modest safety margin alongside `workflow_grace_rounds` and the
+    /// workflow-classifier delegate hint; genuinely open-ended diagnostic work
+    /// should reach for `crew`/`team` delegation rather than depend on an
+    /// unbounded cap here).
     #[serde(default = "default_max_tool_rounds")]
     pub max_tool_rounds: usize,
+
+    /// Additional progress-aware rounds available after `max_tool_rounds` when
+    /// an active workflow still has incomplete steps and the recent rounds show
+    /// repair progress or actionable evidence. Default: 5. Set to 0 to make the
+    /// normal round cap hard again.
+    #[serde(default = "default_workflow_grace_rounds")]
+    pub workflow_grace_rounds: usize,
 
     /// Tool-call permission policy for the interactive TUI: which tools the
     /// model may invoke and over which targets. This is a *preset that selects
@@ -1566,7 +1592,11 @@ fn default_tool_output_lines() -> usize {
 }
 
 fn default_max_tool_rounds() -> usize {
-    25
+    40
+}
+
+fn default_workflow_grace_rounds() -> usize {
+    5
 }
 
 fn default_connect_timeout_secs() -> u64 {
@@ -1643,6 +1673,10 @@ pub struct ModelTuning {
     /// Per-model `max_tool_rounds` override.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tool_rounds: Option<usize>,
+
+    /// Per-model `[tui].workflow_grace_rounds` override.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_grace_rounds: Option<usize>,
 }
 
 impl Config {
@@ -2365,6 +2399,7 @@ impl Default for TuiConfig {
             thinking: ThinkingMode::Stream,
             tool_output_lines: default_tool_output_lines(),
             max_tool_rounds: default_max_tool_rounds(),
+            workflow_grace_rounds: default_workflow_grace_rounds(),
             permissions: ToolPermissions::default(),
             debug: None,
             trace: None,
@@ -2830,6 +2865,7 @@ impl Config {
         // cowork driver, eval) gets the override here without threading a new
         // `usize` through `ChatCtx` + `execute_tool` + every call site. Idempotent.
         crate::agentic::set_max_output_tokens(cfg.max_output_tokens());
+        crate::agentic::set_output_head_tokens(cfg.output_head_tokens());
         // #880: publish the repo `[lifecycle]` overrides the same way — the single
         // canonical config-application entry — so the crew's normalize (and future
         // phase consumers) honor `.newt/config.toml`.
@@ -2852,6 +2888,15 @@ impl Config {
             .as_ref()
             .map(|t| t.max_output_tokens)
             .unwrap_or_else(default_max_output_tokens)
+    }
+
+    /// The configured head allocation for oversized `run_command` output
+    /// (`[tools] output_head_tokens`), or the built-in tail-biased default.
+    pub fn output_head_tokens(&self) -> usize {
+        self.tools
+            .as_ref()
+            .map(|t| t.output_head_tokens)
+            .unwrap_or_else(default_output_head_tokens)
     }
 
     /// Merge per-file backends from the `backends/` dirs next to the config:
@@ -3704,22 +3749,29 @@ mod tests {
     }
 
     #[test]
-    fn base_for_local_defaults_plan_state_and_semantic_on_cloud_stays_off() {
+    fn base_for_defaults_tool_offload_on_and_local_assist_on_for_ollama() {
         use ContextFeature as F;
-        // Step 27.4: local (Ollama) backends default scratchpad + scheduled ON;
-        // semantic is also enabled by default but degrades to a one-shot no-op
-        // until an embedder is configured.
+        // #945: tool offload is local spill storage and defaults ON for every
+        // backend. Step 27.4: local (Ollama) backends additionally default
+        // scratchpad + scheduled ON; semantic also defaults ON but degrades to a
+        // one-shot no-op until an embedder is configured.
         let local = ContextFeatureSet::base_for(ContextManager::Standard, BackendKind::Ollama);
+        assert!(local.get(F::ToolOffload));
         assert!(local.get(F::Scratchpad));
         assert!(local.get(F::Semantic));
         assert!(local.get(F::Scheduled));
-        // Cloud (OpenAI-compatible) keeps the all-off preset baseline.
+        // Cloud (OpenAI-compatible) gets offload, but not local-assist features.
         let cloud = ContextFeatureSet::base_for(ContextManager::Standard, BackendKind::Openai);
-        assert!(cloud.enabled().is_empty());
+        assert!(cloud.get(F::ToolOffload));
+        assert!(!cloud.get(F::Scratchpad));
+        assert!(!cloud.get(F::Semantic));
+        assert!(!cloud.get(F::Scheduled));
         // An explicit override still wins over the local default (force off).
         let mut ov = ContextFeatures::default();
         ov.set(F::Scheduled, Some(false));
+        ov.set(F::ToolOffload, Some(false));
         assert!(!ov.apply_to(local).get(F::Scheduled));
+        assert!(!ov.apply_to(local).get(F::ToolOffload));
         assert!(ov.apply_to(local).get(F::Scratchpad)); // untouched feature stays on
     }
 
@@ -5234,20 +5286,25 @@ net = [\"already.example.com\"]
     }
 
     #[test]
-    fn default_max_tool_rounds_is_25() {
-        // The function default and the struct default agree on 25.
-        assert_eq!(default_max_tool_rounds(), 25);
-        assert_eq!(TuiConfig::default().max_tool_rounds, 25);
+    fn default_max_tool_rounds_is_40() {
+        // #<issue>: raised from 25 — a modest safety margin alongside
+        // workflow_grace_rounds and the diagnose_failure delegate hint, not a
+        // substitute for either. The function default and the struct default
+        // agree on 40.
+        assert_eq!(default_max_tool_rounds(), 40);
+        assert_eq!(TuiConfig::default().max_tool_rounds, 40);
+        assert_eq!(default_workflow_grace_rounds(), 5);
+        assert_eq!(TuiConfig::default().workflow_grace_rounds, 5);
     }
 
     #[test]
     fn tui_max_tool_rounds_defaults_when_field_absent() {
-        // An empty `[tui]` table => serde default kicks in => 25.
+        // An empty `[tui]` table => serde default kicks in => 40.
         let toml = r#"
             [tui]
         "#;
         let cfg: Config = toml::from_str(toml).unwrap();
-        assert_eq!(cfg.tui.unwrap().max_tool_rounds, 25);
+        assert_eq!(cfg.tui.unwrap().max_tool_rounds, 40);
     }
 
     #[test]
@@ -5261,6 +5318,27 @@ net = [\"already.example.com\"]
     }
 
     #[test]
+    fn tui_workflow_grace_rounds_can_be_overridden_or_disabled() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [tui]
+            workflow_grace_rounds = 9
+        "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.tui.unwrap().workflow_grace_rounds, 9);
+
+        let disabled: Config = toml::from_str(
+            r#"
+            [tui]
+            workflow_grace_rounds = 0
+        "#,
+        )
+        .unwrap();
+        assert_eq!(disabled.tui.unwrap().workflow_grace_rounds, 0);
+    }
+
+    #[test]
     fn model_tuning_parses_from_toml() {
         let toml = r#"
             [[model_tuning]]
@@ -5268,6 +5346,7 @@ net = [\"already.example.com\"]
             num_ctx = 24576
             mid_loop_trim_threshold = 12
             max_tool_rounds = 20
+            workflow_grace_rounds = 8
 
             [[model_tuning]]
             model = "qwen3-coder:30b"
@@ -5280,10 +5359,12 @@ net = [\"already.example.com\"]
         assert_eq!(nemo.num_ctx, Some(24576));
         assert_eq!(nemo.mid_loop_trim_threshold, Some(12));
         assert_eq!(nemo.max_tool_rounds, Some(20));
+        assert_eq!(nemo.workflow_grace_rounds, Some(8));
 
         let qwen = cfg.find_model_tuning("qwen3-coder:30b").unwrap();
         assert_eq!(qwen.num_ctx, Some(65536));
         assert_eq!(qwen.mid_loop_trim_threshold, None);
+        assert_eq!(qwen.workflow_grace_rounds, None);
     }
 
     #[test]
@@ -5303,6 +5384,7 @@ net = [\"already.example.com\"]
         assert_eq!(entry.num_ctx, None);
         assert_eq!(entry.mid_loop_trim_threshold, None);
         assert_eq!(entry.max_tool_rounds, None);
+        assert_eq!(entry.workflow_grace_rounds, None);
     }
 
     // ---- #726: [tools] max_output_tokens ----
@@ -5313,7 +5395,9 @@ net = [\"already.example.com\"]
         let cfg: Config = toml::from_str("").unwrap();
         assert!(cfg.tools.is_none());
         assert_eq!(cfg.max_output_tokens(), 10_000);
+        assert_eq!(cfg.output_head_tokens(), 1_500);
         assert_eq!(Config::default().max_output_tokens(), 10_000);
+        assert_eq!(Config::default().output_head_tokens(), 1_500);
     }
 
     #[test]
@@ -5322,11 +5406,14 @@ net = [\"already.example.com\"]
             r#"
             [tools]
             max_output_tokens = 4096
+            output_head_tokens = 512
         "#,
         )
         .unwrap();
         assert_eq!(cfg.tools.as_ref().unwrap().max_output_tokens, 4096);
+        assert_eq!(cfg.tools.as_ref().unwrap().output_head_tokens, 512);
         assert_eq!(cfg.max_output_tokens(), 4096);
+        assert_eq!(cfg.output_head_tokens(), 512);
     }
 
     #[test]
@@ -5334,6 +5421,7 @@ net = [\"already.example.com\"]
         // A `[tools]` table that omits the key falls back to the default fn.
         let cfg: Config = toml::from_str("[tools]\n").unwrap();
         assert_eq!(cfg.max_output_tokens(), 10_000);
+        assert_eq!(cfg.output_head_tokens(), 1_500);
     }
 
     #[test]
