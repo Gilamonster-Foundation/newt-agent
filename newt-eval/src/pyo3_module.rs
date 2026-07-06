@@ -101,6 +101,12 @@ impl PyTestCase {
         &self.inner.name
     }
 
+    /// The `output_matches` expected stdout (#957), if the case declares one.
+    #[getter]
+    fn expected_output(&self) -> Option<&str> {
+        self.inner.expected_output.as_deref()
+    }
+
     #[getter]
     fn description(&self) -> &str {
         &self.inner.description

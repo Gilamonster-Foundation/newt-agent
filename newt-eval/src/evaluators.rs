@@ -9,7 +9,7 @@
 //! [`evaluator_by_name`] and [`default_evaluators`].
 
 use std::collections::BTreeSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 
@@ -537,6 +537,122 @@ fn collect_py_into(root: &Path, dir: &Path, out: &mut Vec<(String, String)>) {
     }
 }
 
+// ── output_matches (result oracle, #957) ────────────────────────────
+
+/// A command to run for the `output_matches` oracle.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RunSpec {
+    /// argv to execute; `argv[0]` is the program.
+    pub argv: Vec<String>,
+    /// Working directory (the graded worktree).
+    pub cwd: PathBuf,
+    /// Optional wall-clock timeout in milliseconds.
+    pub timeout_ms: Option<u64>,
+}
+
+/// What a [`CommandRunner`] captured from one run.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RunOutcome {
+    pub stdout: String,
+    pub stderr: String,
+    /// Process exit code; `None` if it did not exit normally (signal / not run).
+    pub exit_code: Option<i32>,
+    /// True if the runner killed it for exceeding `timeout_ms`.
+    pub timed_out: bool,
+}
+
+/// The injected seam for running the graded program (#957). Mocked in unit
+/// tests; the real subprocess implementation lands in the epic's step 3, so the
+/// evaluator's compare logic is fully exercised without spawning a process.
+pub trait CommandRunner: Send + Sync {
+    fn run(&self, spec: &RunSpec) -> RunOutcome;
+}
+
+/// Placeholder runner registered until the real subprocess runner (epic step 3)
+/// is wired. It runs nothing and says so honestly. `output_matches` is opt-in
+/// (never in [`default_evaluators`]), so no existing case is affected.
+pub struct PendingRunner;
+
+impl CommandRunner for PendingRunner {
+    fn run(&self, _spec: &RunSpec) -> RunOutcome {
+        RunOutcome {
+            stdout: String::new(),
+            stderr: "output_matches: subprocess runner not wired until the epic's step 3 (#957)"
+                .to_string(),
+            exit_code: None,
+            timed_out: false,
+        }
+    }
+}
+
+/// The result oracle: run the graded program via the injected [`CommandRunner`]
+/// and assert its stdout equals the case's `expected_output`. Step 1 is an
+/// **exact** string compare (normalization strategies arrive in step 2). Opt-in
+/// per case via `evaluators = ["output_matches"]`; passes with a skip note when
+/// the case declares no `expected_output` / `[output_match]`.
+pub struct OutputMatchesEvaluator<R: CommandRunner> {
+    runner: R,
+}
+
+impl<R: CommandRunner> OutputMatchesEvaluator<R> {
+    pub fn new(runner: R) -> Self {
+        Self { runner }
+    }
+}
+
+impl<R: CommandRunner> Evaluator for OutputMatchesEvaluator<R> {
+    fn name(&self) -> &str {
+        "output_matches"
+    }
+
+    fn evaluate(&self, ctx: &EvalContext) -> EvalResult {
+        let Some(expected) = ctx.case.expected_output.as_ref() else {
+            return EvalResult::pass(self.name(), "no expected_output configured");
+        };
+        let Some(om) = ctx.case.output_match.as_ref() else {
+            return EvalResult::pass(self.name(), "no [output_match] configured");
+        };
+        if om.run.is_empty() {
+            return EvalResult::fail(self.name(), "[output_match].run is empty");
+        }
+        let spec = RunSpec {
+            argv: om.run.clone(),
+            cwd: ctx.workspace.clone(),
+            timeout_ms: om.timeout_ms,
+        };
+        let outcome = self.runner.run(&spec);
+        if outcome.timed_out {
+            return EvalResult::fail(
+                self.name(),
+                format!("run timed out after {:?} ms: {:?}", om.timeout_ms, om.run),
+            );
+        }
+        if outcome.exit_code != Some(0) {
+            return EvalResult::fail(
+                self.name(),
+                format!(
+                    "run exited with {:?} (stderr: {})",
+                    outcome.exit_code,
+                    outcome.stderr.trim()
+                ),
+            );
+        }
+        // Step 1: exact-string compare; normalization strategies arrive in step 2.
+        if outcome.stdout == *expected {
+            EvalResult::pass(self.name(), "stdout matched expected_output")
+        } else {
+            EvalResult::fail(
+                self.name(),
+                format!(
+                    "stdout != expected_output ({} vs {} bytes)",
+                    outcome.stdout.len(),
+                    expected.len()
+                ),
+            )
+        }
+    }
+}
+
 // ── Registry ────────────────────────────────────────────────────────
 
 /// Lookup an evaluator by `case.toml` name. Returns `None` for unknown
@@ -549,6 +665,9 @@ pub fn evaluator_by_name(name: &str) -> Option<Arc<dyn Evaluator>> {
         "tests_pass" => Some(Arc::new(TestsPassEvaluator)),
         "pattern_match" => Some(Arc::new(PatternMatchEvaluator)),
         "python_imports" => Some(Arc::new(PythonImportsEvaluator)),
+        // Opt-in result oracle (#957); NOT in `default_evaluators`. Uses the
+        // placeholder runner until the real subprocess runner (step 3) lands.
+        "output_matches" => Some(Arc::new(OutputMatchesEvaluator::new(PendingRunner))),
         _ => None,
     }
 }
@@ -641,6 +760,8 @@ mod tests {
             prompt: "".into(),
             evaluators: vec![],
             expected_patterns,
+            expected_output: None,
+            output_match: None,
             mock_response: MockResponse { content: "".into() },
             difficulty: "L1".into(),
             case_dir: PathBuf::new(),
@@ -662,6 +783,112 @@ mod tests {
         std::mem::forget(a);
         std::mem::forget(b);
         (pa, pb)
+    }
+
+    // ── output_matches (#957 step 1) — fully mocked runner ──────────
+
+    struct MockRunner(RunOutcome);
+    impl CommandRunner for MockRunner {
+        fn run(&self, _spec: &RunSpec) -> RunOutcome {
+            self.0.clone()
+        }
+    }
+    fn oc(stdout: &str, exit: Option<i32>, timed_out: bool) -> RunOutcome {
+        RunOutcome {
+            stdout: stdout.into(),
+            stderr: String::new(),
+            exit_code: exit,
+            timed_out,
+        }
+    }
+    fn oracle_ctx(expected: Option<&str>, run: &[&str]) -> EvalContext {
+        let (ws, base) = empty_dirs();
+        let mut ctx = make_ctx("", vec![], "rust", ws, base);
+        ctx.case.expected_output = expected.map(str::to_string);
+        ctx.case.output_match = Some(crate::cases::OutputMatch {
+            run: run.iter().map(|s| (*s).to_string()).collect(),
+            timeout_ms: Some(1000),
+        });
+        ctx
+    }
+
+    #[test]
+    fn output_matches_passes_when_stdout_equals_expected() {
+        let ctx = oracle_ctx(Some("42\n"), &["echo", "42"]);
+        let r = OutputMatchesEvaluator::new(MockRunner(oc("42\n", Some(0), false))).evaluate(&ctx);
+        assert!(r.passed, "{r:?}");
+    }
+
+    #[test]
+    fn output_matches_fails_when_stdout_differs() {
+        let ctx = oracle_ctx(Some("42\n"), &["echo", "43"]);
+        let r = OutputMatchesEvaluator::new(MockRunner(oc("43\n", Some(0), false))).evaluate(&ctx);
+        assert!(!r.passed, "{r:?}");
+    }
+
+    #[test]
+    fn output_matches_fails_on_nonzero_exit() {
+        let ctx = oracle_ctx(Some("42\n"), &["false"]);
+        let r = OutputMatchesEvaluator::new(MockRunner(oc("", Some(1), false))).evaluate(&ctx);
+        assert!(!r.passed && r.details.contains("exited"), "{r:?}");
+    }
+
+    #[test]
+    fn output_matches_fails_on_timeout() {
+        let ctx = oracle_ctx(Some("42\n"), &["sleep", "99"]);
+        let r = OutputMatchesEvaluator::new(MockRunner(oc("", None, true))).evaluate(&ctx);
+        assert!(!r.passed && r.details.contains("timed out"), "{r:?}");
+    }
+
+    #[test]
+    fn output_matches_skips_without_expected_output() {
+        let (ws, base) = empty_dirs();
+        let ctx = make_ctx("", vec![], "rust", ws, base); // expected_output = None
+        let r = OutputMatchesEvaluator::new(MockRunner(oc("x", Some(0), false))).evaluate(&ctx);
+        assert!(
+            r.passed && r.details.contains("no expected_output"),
+            "{r:?}"
+        );
+    }
+
+    #[test]
+    fn output_matches_resolves_by_name_and_is_not_a_default() {
+        assert_eq!(
+            evaluator_by_name("output_matches").unwrap().name(),
+            "output_matches"
+        );
+        assert!(
+            !default_evaluators()
+                .iter()
+                .any(|e| e.name() == "output_matches"),
+            "output_matches must stay opt-in (not in default_evaluators)"
+        );
+    }
+
+    #[test]
+    fn case_toml_deserializes_output_match_fields() {
+        let toml = r#"
+name = "d"
+description = ""
+language = "python"
+prompt = ""
+evaluators = ["output_matches"]
+expected_output = "42\n"
+[output_match]
+run = ["python3", "solution.py"]
+timeout_ms = 5000
+[mock_response]
+content = ""
+"#;
+        let c: crate::cases::TestCase = toml::from_str(toml).unwrap();
+        assert_eq!(c.expected_output.as_deref(), Some("42\n"));
+        let om = c.output_match.expect("output_match parsed");
+        assert_eq!(
+            om.run,
+            vec!["python3".to_string(), "solution.py".to_string()]
+        );
+        assert_eq!(om.timeout_ms, Some(5000));
+        assert!(c.evaluators.contains(&"output_matches".to_string()));
     }
 
     #[test]
@@ -787,6 +1014,8 @@ mod tests {
             prompt: "".into(),
             evaluators: vec![],
             expected_patterns: vec![],
+            expected_output: None,
+            output_match: None,
             mock_response: MockResponse { content: "".into() },
             difficulty: "L1".into(),
             case_dir: PathBuf::new(),

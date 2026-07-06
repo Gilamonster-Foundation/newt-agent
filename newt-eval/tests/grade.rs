@@ -32,6 +32,8 @@ fn seed_case(case_dir: &Path, evaluators: &[&str], patterns: &[&str]) -> TestCas
         },
         difficulty: "L1".to_string(),
         case_dir: case_dir.to_path_buf(),
+        expected_output: None,
+        output_match: None,
     }
 }
 

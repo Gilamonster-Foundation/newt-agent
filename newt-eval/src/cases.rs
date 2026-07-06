@@ -32,6 +32,16 @@ pub struct TestCase {
     /// `pattern_match` evaluator). At least one must match.
     #[serde(default)]
     pub expected_patterns: Vec<String>,
+    /// Expected program stdout for the `output_matches` result oracle (#957):
+    /// the harness runs the graded program and asserts its stdout equals this
+    /// (after normalization — identity in step 1). `None` = the case opts out
+    /// (the evaluator passes with a skip note), mirroring `expected_patterns`.
+    #[serde(default)]
+    pub expected_output: Option<String>,
+    /// `[output_match]` — how to run the graded program for `output_matches`.
+    /// `None` = opt-out (skip). See [`OutputMatch`].
+    #[serde(default)]
+    pub output_match: Option<OutputMatch>,
     /// What the mock Ollama returns in mock mode. Ignored in live mode.
     pub mock_response: MockResponse,
     /// Difficulty tier, used by the `--difficulty` filter:
@@ -47,6 +57,23 @@ pub struct TestCase {
     /// Absolute path to the case directory (the parent of `case.toml`).
     #[serde(skip)]
     pub case_dir: PathBuf,
+}
+
+/// Run configuration for the `output_matches` result oracle (#957): the argv to
+/// execute the graded worktree's entry point, plus an optional wall-clock budget.
+/// Pure data (three-Cs) — new behavior is new case config, not new Rust. The
+/// normalization strategies (trim / collapse-ws / numeric-tolerance / regex) are
+/// added as further pure-data config in the epic's step 2; step 1 is exact match.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct OutputMatch {
+    /// argv to run against the graded worktree, e.g. `["python3", "solution.py"]`
+    /// or `["cargo", "run", "--quiet"]`. Empty is a misconfiguration.
+    #[serde(default)]
+    pub run: Vec<String>,
+    /// Wall-clock timeout in milliseconds. Enforced by the real subprocess
+    /// runner (epic step 3); recorded here as pure data now.
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
 }
 
 /// Canned response body for mock mode.
@@ -298,6 +325,8 @@ content = ""
             prompt: "".into(),
             evaluators: vec![],
             expected_patterns: vec![],
+            expected_output: None,
+            output_match: None,
             mock_response: MockResponse { content: "".into() },
             difficulty: "L1".into(),
             case_dir: PathBuf::new(),
@@ -340,6 +369,8 @@ content = ""
             prompt: "".into(),
             evaluators: vec![],
             expected_patterns: vec![],
+            expected_output: None,
+            output_match: None,
             mock_response: MockResponse { content: "".into() },
             difficulty: diff.into(),
             case_dir: PathBuf::new(),
