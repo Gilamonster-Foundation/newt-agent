@@ -486,7 +486,15 @@ pub async fn retrieve_evidence(
 /// it reads the real filesystem); the pure chunk/embed/index logic it feeds is
 /// the fully-mocked part above. Reuses the `ignore` crate (newt-core's `find`
 /// tool already depends on it).
-pub fn gather_code_files(workspace: &str) -> Vec<(String, String)> {
+/// Gather up to `MAX_FILES` source files whose extension is in `extensions`
+/// (each ≤ `MAX_BYTES`), as `(relative_path, contents)`.
+///
+/// The extension allow-list is a **parameter**, not a hardcoded `rs`/`py` literal
+/// (#956): the API-surface caller derives it from the *resolved language packs*
+/// (so `bash`/`c_cpp`/`go`/`java` and any drop-in pack are actually read), while
+/// the semantic embedding index passes its own narrower set to bound how many
+/// files it embeds (blast radius). An empty `extensions` gathers nothing.
+pub fn gather_code_files(workspace: &str, extensions: &[String]) -> Vec<(String, String)> {
     const MAX_FILES: usize = 400;
     const MAX_BYTES: u64 = 200_000;
     let mut out = Vec::new();
@@ -496,7 +504,7 @@ pub fn gather_code_files(workspace: &str) -> Vec<(String, String)> {
         }
         let path = entry.path();
         let ext = path.extension().and_then(|e| e.to_str());
-        if !matches!(ext, Some("rs") | Some("py")) {
+        if !ext.is_some_and(|e| extensions.iter().any(|x| x == e)) {
             continue;
         }
         if path.metadata().map(|m| m.len()).unwrap_or(u64::MAX) > MAX_BYTES {
@@ -579,6 +587,45 @@ mod tests {
     use std::sync::Arc;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+    #[test]
+    fn gather_code_files_honors_the_extension_allowlist_956() {
+        // #956: the extension allow-list is a PARAMETER, not a hardcoded rs/py.
+        // A bash pack's `.sh` files (and any drop-in pack's) must be gathered when
+        // the pack's extension is requested — they were silently dropped before,
+        // starving the API-surface block for 4 of 6 built-in languages.
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "newt-gcf-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("tool.sh"), "myfunc() { echo hi; }\n").unwrap();
+        std::fs::write(dir.join("main.rs"), "pub fn open() {}\n").unwrap();
+        let ws = dir.to_string_lossy().to_string();
+
+        // Only `sh` requested → the bash file is gathered; the rs file is not.
+        let sh_only = gather_code_files(&ws, &["sh".to_string()]);
+        assert!(
+            sh_only.iter().any(|(p, _)| p.ends_with("tool.sh")),
+            "the .sh file must be gathered when `sh` is requested: {sh_only:?}"
+        );
+        assert!(
+            !sh_only.iter().any(|(p, _)| p.ends_with("main.rs")),
+            "rs was not requested: {sh_only:?}"
+        );
+
+        // Multiple extensions → the multi-language surface reads both.
+        let both = gather_code_files(&ws, &["rs".to_string(), "sh".to_string()]);
+        assert!(both.iter().any(|(p, _)| p.ends_with("tool.sh")));
+        assert!(both.iter().any(|(p, _)| p.ends_with("main.rs")));
+
+        // Empty allow-list gathers nothing.
+        assert!(gather_code_files(&ws, &[]).is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[tokio::test]
     async fn embed_parses_the_vector() {

@@ -349,7 +349,14 @@ impl MemoryProvider for ApiSurfaceProvider {
 
     async fn initialize(&mut self, ctx: &SessionContext) -> anyhow::Result<()> {
         // `gather_code_files` is the only fs touch; rendering is pure (tested).
-        let files: Vec<(String, String)> = crate::gather_code_files(&ctx.workspace)
+        // Read files for EVERY extension the resolved packs declare (#956), not a
+        // hardcoded rs/py — so bash/c_cpp/go/java and drop-in packs are surfaced.
+        let extensions: Vec<String> = self
+            .packs
+            .iter()
+            .flat_map(|p| p.extensions.iter().cloned())
+            .collect();
+        let files: Vec<(String, String)> = crate::gather_code_files(&ctx.workspace, &extensions)
             .into_iter()
             .map(|(path, content)| {
                 let rel = path
