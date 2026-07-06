@@ -76,6 +76,65 @@ Language-specific evaluators auto-skip non-Rust cases with a clear note.
 `tests_pass` also skips Rust cases that have no `#[test]` anywhere so
 trivial cases don't pay the cargo-test bill.
 
+## The `output_matches` result oracle (#957)
+
+Beyond the diff/pattern checks, `output_matches` grades **what the program
+prints** — it runs the graded program and compares its stdout to a declared
+`expected_output`. It is **opt-in** (add `"output_matches"` to a case's
+`evaluators`; it is never in the defaults) and passes with a skip note when a
+case declares no `expected_output` / `[output_match]`.
+
+A case configures it with a top-level `expected_output` and an `[output_match]`
+table:
+
+```toml
+evaluators = ["output_matches"]
+
+# What the program's stdout must equal (after the normalize pipeline below).
+expected_output = "42"
+
+[output_match]
+# argv to run in the graded worktree. argv[0] is the program/interpreter.
+run = ["python3", "solution.py"]
+# Hard wall-clock budget; the process is killed on expiry and reported timed_out.
+timeout_ms = 10000
+# Ordered normalization strategies (#959), applied to BOTH sides before compare.
+# Empty list = exact byte match.
+normalize = ["regex_extract", "numeric_tolerance"]
+# For regex_extract: reduce each side to capture group 1 (pull the answer out of
+# surrounding noise). Program may print "computing...\nResult: 42.0\n".
+extract_pattern = 'Result:\s*([\d.]+)'
+# For numeric_tolerance: compare as numbers within epsilon (default 1e-9).
+epsilon = 0.001
+```
+
+**Normalization strategies** (pure data — new tolerance is config, not code):
+
+| Strategy | Effect |
+|----------|--------|
+| `trim` | strip leading/trailing whitespace |
+| `collapse_whitespace` | runs of whitespace → a single space |
+| `trailing_newline` | drop a trailing CR/LF run |
+| `regex_extract` | reduce each side to capture group 1 of `extract_pattern` |
+| `numeric_tolerance` | compare as `f64` within `epsilon`; falls back to string compare when non-numeric |
+
+Unknown strategy names, and `regex_extract` with a missing/invalid
+`extract_pattern`, are **skipped with a warning** (never fatal) — the same
+tolerant-load rule the language packs use.
+
+**Trust boundary + tiering.** The real runner (`SubprocessRunner`) executes
+untrusted, model-produced code and does **not** sandbox it (no network or
+filesystem confinement beyond `cwd`; see #887). The real-subprocess tests live
+in [`tests/output_matches_real.rs`](tests/output_matches_real.rs), are
+`#[ignore]`d out of the per-PR unit run, and run in the **weekly + release**
+tiers, single-threaded:
+
+```bash
+cargo test -p newt-eval --test output_matches_real -- --ignored --test-threads=1
+```
+
+(CI: `.github/workflows/output-oracle-real.yml`.)
+
 ## Adding a new case
 
 A case is a directory under `newt-eval/cases/NNN-name/` with two parts:

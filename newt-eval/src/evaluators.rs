@@ -585,6 +585,114 @@ impl CommandRunner for PendingRunner {
     }
 }
 
+/// The real `CommandRunner` (#960): actually executes `spec.argv` in the graded
+/// worktree, captures stdout/stderr, and enforces a hard wall-clock timeout.
+///
+/// **Trust boundary.** The graded program is *untrusted* code produced by a
+/// model. This runner does **not** sandbox it — no network isolation, no
+/// filesystem confinement beyond `cwd`. That is deliberately out of scope here
+/// (the confinement story is the OCAP shell engine; see the harness-attack
+/// surface tracked in #887). Only run `output_matches` cases you trust, and only
+/// in the weekly/release tiers. A `NEWT_EVAL_SANDBOX=1` marker is set in the
+/// child env as an advisory signal, not an enforced boundary.
+pub struct SubprocessRunner;
+
+impl CommandRunner for SubprocessRunner {
+    fn run(&self, spec: &RunSpec) -> RunOutcome {
+        use std::io::Read;
+        use std::process::Stdio;
+        use std::time::{Duration, Instant};
+
+        let Some((program, rest)) = spec.argv.split_first() else {
+            return RunOutcome {
+                stdout: String::new(),
+                stderr: "output_matches: [output_match].run is empty".to_string(),
+                exit_code: None,
+                timed_out: false,
+            };
+        };
+
+        let mut child = match Command::new(program)
+            .args(rest)
+            .current_dir(&spec.cwd)
+            // Advisory marker (see the trust-boundary note above); not enforced.
+            .env("NEWT_EVAL_SANDBOX", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        {
+            Ok(c) => c,
+            // Missing interpreter/binary is the common misconfiguration — report
+            // it honestly and never auto-download.
+            Err(e) => {
+                return RunOutcome {
+                    stdout: String::new(),
+                    stderr: format!("runtime not found: {program} ({e})"),
+                    exit_code: None,
+                    timed_out: false,
+                };
+            }
+        };
+
+        // Drain both pipes on threads so the child can't deadlock on a full pipe
+        // while we poll for exit.
+        let read_pipe = |pipe: Option<std::process::ChildStdout>| {
+            std::thread::spawn(move || {
+                let mut buf = Vec::new();
+                if let Some(mut p) = pipe {
+                    let _ = p.read_to_end(&mut buf);
+                }
+                buf
+            })
+        };
+        let read_err = |pipe: Option<std::process::ChildStderr>| {
+            std::thread::spawn(move || {
+                let mut buf = Vec::new();
+                if let Some(mut p) = pipe {
+                    let _ = p.read_to_end(&mut buf);
+                }
+                buf
+            })
+        };
+        let out_handle = read_pipe(child.stdout.take());
+        let err_handle = read_err(child.stderr.take());
+
+        // Poll for exit up to the deadline; kill on expiry. `None` timeout means
+        // "no wall-clock budget" — wait indefinitely.
+        let deadline = spec
+            .timeout_ms
+            .map(|ms| Instant::now() + Duration::from_millis(ms));
+        let mut timed_out = false;
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break Some(status),
+                Ok(None) => {
+                    if let Some(dl) = deadline {
+                        if Instant::now() >= dl {
+                            let _ = child.kill();
+                            let _ = child.wait();
+                            timed_out = true;
+                            break None;
+                        }
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => break None,
+            }
+        };
+
+        let stdout = String::from_utf8_lossy(&out_handle.join().unwrap_or_default()).into_owned();
+        let stderr = String::from_utf8_lossy(&err_handle.join().unwrap_or_default()).into_owned();
+        RunOutcome {
+            stdout,
+            stderr,
+            exit_code: status.and_then(|s| s.code()),
+            timed_out,
+        }
+    }
+}
+
 /// The result oracle: run the graded program via the injected [`CommandRunner`]
 /// and assert its stdout equals the case's `expected_output`, compared through
 /// the case's [`normalize`](crate::normalize) pipeline (empty list = exact
@@ -675,9 +783,10 @@ pub fn evaluator_by_name(name: &str) -> Option<Arc<dyn Evaluator>> {
         "tests_pass" => Some(Arc::new(TestsPassEvaluator)),
         "pattern_match" => Some(Arc::new(PatternMatchEvaluator)),
         "python_imports" => Some(Arc::new(PythonImportsEvaluator)),
-        // Opt-in result oracle (#957); NOT in `default_evaluators`. Uses the
-        // placeholder runner until the real subprocess runner (step 3) lands.
-        "output_matches" => Some(Arc::new(OutputMatchesEvaluator::new(PendingRunner))),
+        // Opt-in result oracle (#957); NOT in `default_evaluators`. Executes the
+        // graded program for real via `SubprocessRunner` (#960) — see its
+        // trust-boundary note; run only trusted cases, weekly/release tier.
+        "output_matches" => Some(Arc::new(OutputMatchesEvaluator::new(SubprocessRunner))),
         _ => None,
     }
 }
@@ -884,6 +993,37 @@ mod tests {
         let r = OutputMatchesEvaluator::new(MockRunner(oc("x", Some(0), false))).evaluate(&ctx);
         assert!(r.passed, "unknown strategy is non-fatal: {r:?}");
         assert!(r.details.contains("bogus"), "warning surfaced: {r:?}");
+    }
+
+    #[test]
+    fn subprocess_runner_reports_runtime_not_found_for_missing_binary() {
+        // Hermetic + instant (no real heavy process): spawning a non-existent
+        // program fails immediately with a clear diagnostic (#960).
+        let spec = RunSpec {
+            argv: vec!["newt-eval-no-such-binary-xyzzy".to_string()],
+            cwd: std::env::temp_dir(),
+            timeout_ms: Some(1000),
+        };
+        let out = SubprocessRunner.run(&spec);
+        assert_eq!(out.exit_code, None);
+        assert!(!out.timed_out);
+        assert!(
+            out.stderr.contains("runtime not found"),
+            "stderr: {}",
+            out.stderr
+        );
+    }
+
+    #[test]
+    fn subprocess_runner_reports_empty_argv() {
+        let spec = RunSpec {
+            argv: vec![],
+            cwd: std::env::temp_dir(),
+            timeout_ms: None,
+        };
+        let out = SubprocessRunner.run(&spec);
+        assert_eq!(out.exit_code, None);
+        assert!(out.stderr.contains("empty"), "stderr: {}", out.stderr);
     }
 
     #[test]

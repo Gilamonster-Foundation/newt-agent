@@ -45,8 +45,9 @@ pub mod pyo3_module;
 
 pub use cases::{default_cases_dir, load_all, MockResponse, TestCase};
 pub use evaluators::{
-    default_evaluators, evaluator_by_name, DiffAppliesEvaluator, DiffNonemptyEvaluator, Evaluator,
-    PatternMatchEvaluator, RustCompilesEvaluator, TestsPassEvaluator,
+    default_evaluators, evaluator_by_name, CommandRunner, DiffAppliesEvaluator,
+    DiffNonemptyEvaluator, Evaluator, OutputMatchesEvaluator, PatternMatchEvaluator, RunSpec,
+    RustCompilesEvaluator, SubprocessRunner, TestsPassEvaluator,
 };
 pub use grade::grade_workspace;
 pub use lint::{lint_case_prompts, lint_prompt, LintError};
