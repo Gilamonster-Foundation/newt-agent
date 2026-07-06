@@ -1,0 +1,67 @@
+name = "tdd_peer_review"
+enabled = true
+description = "test-driven, multi-agent implementation: red, green, refactor, then an independent peer review before it's done"
+
+# Top-level WorkflowConfig fields — MUST stay before [classifier] opens a
+# sub-table, or TOML parses them as unknown (silently ignored) keys of
+# [classifier] instead of top-level fields.
+delegate_hint = "Peer review is only a real check if it comes from a genuinely independent perspective — the same context that wrote the change is the worst judge of it. Delegate the review step to crew (a fresh sub-agent with no stake in the implementation, working from the diff alone) rather than only self-reviewing; for a design with several independent pieces, crew can also implement in parallel with each member owning one piece plus its own test."
+progress_horizon_rounds = 6
+
+[classifier]
+min_score = 0.3
+keywords = [
+  "use tdd",
+  "test-driven",
+  "test driven",
+  "red green refactor",
+  "write a failing test first",
+  "test-first",
+  "build this test-first",
+  "peer review this",
+  "peer-review this",
+  "get a second opinion on this implementation",
+  "review this implementation",
+]
+examples = [
+  "Use TDD for this: write a failing test first, then implement.",
+  "Build this test-first — red, green, refactor — and then peer review it.",
+  "Implement with tests, and get an independent review before calling it done.",
+  "Write the test before the implementation, then have it peer reviewed.",
+]
+
+[[steps]]
+id = "write_failing_test"
+title = "Write (or confirm) a failing test"
+steer = "Write a test that captures the actual requirement before any implementation exists — a test retrofitted after the code tends to just describe what the code already does, not what it should do"
+tools = ["write_file", "edit_file"]
+
+[[steps]]
+id = "confirm_red"
+title = "Confirm it fails for the RIGHT reason"
+steer = "Run it and read the failure — a setup bug or typo failing for the wrong reason isn't red, it's broken; fix the test itself before treating this as a real starting point"
+tools = ["run_command"]
+
+[[steps]]
+id = "implement_green"
+title = "Implement the smallest change that makes it pass"
+steer = "No extra scope beyond what the failing test requires — additional generality can come in the refactor step, once it's justified by a second case"
+tools = ["edit_file", "write_file", "run_command"]
+
+[[steps]]
+id = "refactor"
+title = "Refactor now that it's green"
+steer = "Clean up naming/structure/duplication; re-run the test after every refactor step so it never goes red silently"
+tools = ["edit_file", "run_command"]
+
+[[steps]]
+id = "peer_review"
+title = "Get an independent peer review before calling it done"
+steer = "Delegate to crew for a genuinely independent read of the diff, or if working solo, adversarially critique the change as if it were someone else's PR — the goal is a perspective that didn't write the code and has no reason to be charitable to it"
+tools = ["crew", "git"]
+
+[[steps]]
+id = "address_findings"
+title = "Address review findings, then re-verify"
+steer = "Fix what the review surfaced; if the fix touches behavior, go back through confirm_red/implement_green for that change rather than treating the review pass as a rubber stamp"
+tools = ["edit_file", "run_command"]

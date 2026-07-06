@@ -14,6 +14,10 @@ use crate::config::Config;
 
 const BUNDLED_GITHUB_PR_WORKFLOW: &str = include_str!("workflows/github_pr.toml");
 const BUNDLED_DIAGNOSE_FAILURE_WORKFLOW: &str = include_str!("workflows/diagnose_failure.toml");
+const BUNDLED_FIX_FAILING_TESTS_WORKFLOW: &str = include_str!("workflows/fix_failing_tests.toml");
+const BUNDLED_RESEARCH_WORKFLOW: &str = include_str!("workflows/research.toml");
+const BUNDLED_PLANNING_WORKFLOW: &str = include_str!("workflows/planning.toml");
+const BUNDLED_TDD_PEER_REVIEW_WORKFLOW: &str = include_str!("workflows/tdd_peer_review.toml");
 
 /// Front matter that lets the workflow classifier find this workflow.
 ///
@@ -60,6 +64,15 @@ pub struct WorkflowStep {
     /// Concrete steering text for this step.
     #[serde(default)]
     pub steer: String,
+    /// Suggested tool names for this step (e.g. `["code_search", "read_file"]`,
+    /// or `["crew"]`/`["team"]` when the step itself is naturally a
+    /// delegation point). Advisory only — never a hard requirement, and
+    /// never validated against what's actually available this session (a
+    /// tool named here but not offered is simply not usable; the model
+    /// already knows its real tool list). Empty means no specific
+    /// suggestion for this step.
+    #[serde(default)]
+    pub tools: Vec<String>,
 }
 
 /// A configured workflow steer.
@@ -181,6 +194,11 @@ impl WorkflowConfig {
                     out.push_str(" - ");
                     out.push_str(step.steer.trim());
                 }
+                if !step.tools.is_empty() {
+                    out.push_str(" (tools: ");
+                    out.push_str(&step.tools.join(", "));
+                    out.push(')');
+                }
             }
         }
         out.push_str(
@@ -190,12 +208,28 @@ impl WorkflowConfig {
     }
 }
 
-/// Built-in workflows: GitHub PR (issue/request -> branch -> commits -> PR) and
-/// diagnose-failure (investigate a failing test/pipeline/build/PR conflict,
-/// then land a fix — with a delegate hint pointing at `crew`/`team`).
+/// Built-in workflows, most-specific first (a earlier entry wins ties in
+/// [`WorkflowSteerer::matching`]'s first-match search):
+/// - `fix_failing_tests` — the specific, mechanical run→fix→reverify LOOP.
+/// - `tdd_peer_review` — test-first implementation with an independent review.
+/// - `research` — an open-ended investigative question, not tied to a failure.
+/// - `planning` — produce/critique a plan or design before implementing.
+/// - `github_pr` — issue/request -> branch -> commits -> PR.
+/// - `diagnose_failure` — the broadest: investigate a failing
+///   test/pipeline/build/PR conflict, then land a fix.
+///
+/// All but `github_pr` carry a `delegate_hint` pointing at `crew`.
 #[must_use]
 pub fn builtin_workflows() -> Vec<WorkflowConfig> {
     vec![
+        toml::from_str(BUNDLED_FIX_FAILING_TESTS_WORKFLOW)
+            .expect("bundled fix-failing-tests workflow template is valid"),
+        toml::from_str(BUNDLED_TDD_PEER_REVIEW_WORKFLOW)
+            .expect("bundled TDD-peer-review workflow template is valid"),
+        toml::from_str(BUNDLED_RESEARCH_WORKFLOW)
+            .expect("bundled research workflow template is valid"),
+        toml::from_str(BUNDLED_PLANNING_WORKFLOW)
+            .expect("bundled planning workflow template is valid"),
         toml::from_str(BUNDLED_GITHUB_PR_WORKFLOW)
             .expect("bundled GitHub PR workflow template is valid"),
         toml::from_str(BUNDLED_DIAGNOSE_FAILURE_WORKFLOW)
@@ -389,6 +423,47 @@ steer = "Always commit before pushing"
     }
 
     #[test]
+    fn step_tools_render_when_present_and_are_absent_when_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("synthetic.toml"),
+            r#"
+name = "synthetic"
+
+[classifier]
+keywords = ["do the synthetic thing"]
+
+[[steps]]
+id = "with_tools"
+title = "A step naming tools"
+steer = "do it"
+tools = ["read_file", "crew"]
+
+[[steps]]
+id = "without_tools"
+title = "A step naming no tools"
+steer = "do the other thing"
+"#,
+        )
+        .unwrap();
+
+        let steer = WorkflowSteerer::load_from_dir(dir.path());
+        let hint = steer
+            .plan_update_hint("do the synthetic thing")
+            .expect("synthetic workflow should match");
+        assert!(hint.contains("(tools: read_file, crew)"), "{hint}");
+        // The tool-less step's line must not carry a stray/empty "(tools: )".
+        let without_tools_line = hint
+            .lines()
+            .find(|l| l.contains("without_tools"))
+            .expect("without_tools step should render");
+        assert!(
+            !without_tools_line.contains("(tools:"),
+            "{without_tools_line}"
+        );
+    }
+
+    #[test]
     fn unmatched_text_does_not_select_a_default_workflow() {
         let steer = WorkflowSteerer::builtin();
         assert!(steer
@@ -400,6 +475,105 @@ steer = "Always commit before pushing"
     fn workflow_dir_is_under_user_config_dir() {
         let dir = workflow_config_dir().unwrap_or_else(|| PathBuf::from(".newt/workflows"));
         assert!(dir.ends_with("workflows"));
+    }
+
+    #[test]
+    fn fix_failing_tests_workflow_matches_and_renders_tool_suggestions() {
+        let steer = WorkflowSteerer::builtin();
+        let hint = steer
+            .plan_update_hint("Keep iterating on the tests until the whole suite is green.")
+            .expect("built-in fix_failing_tests workflow should match");
+        assert!(hint.contains("fix_failing_tests"), "{hint}");
+        assert!(hint.contains("run_suite"), "{hint}");
+        assert!(hint.contains("loop_or_stop"), "{hint}");
+        // Per-step tool suggestions render into the hint.
+        assert!(hint.contains("(tools: run_command"), "{hint}");
+        assert!(hint.contains("edit_file"), "{hint}");
+    }
+
+    #[test]
+    fn fix_failing_tests_delegate_hint_offers_crew_for_the_mechanical_loop() {
+        let steer = WorkflowSteerer::builtin();
+        let hint = steer
+            .delegate_hint(
+                "Fix all the failing tests one at a time and re-run until none fail.",
+                true,
+            )
+            .expect("fix_failing_tests should match and offer a delegate hint");
+        assert!(hint.contains("crew"), "{hint}");
+    }
+
+    #[test]
+    fn research_workflow_matches_open_ended_investigation_not_a_failure() {
+        let steer = WorkflowSteerer::builtin();
+        let hint = steer
+            .plan_update_hint(
+                "Investigate how these two subsystems communicate before we change either one.",
+            )
+            .expect("built-in research workflow should match");
+        assert!(hint.contains("'research'"), "{hint}");
+        assert!(hint.contains("gather_evidence"), "{hint}");
+        assert!(hint.contains("(tools: code_search"), "{hint}");
+    }
+
+    #[test]
+    fn research_delegate_hint_frames_crew_as_parallel_breadth() {
+        let steer = WorkflowSteerer::builtin();
+        let hint = steer
+            .delegate_hint(
+                "Explore the codebase to find every place this pattern is used.",
+                true,
+            )
+            .expect("research should match and offer a delegate hint");
+        assert!(hint.contains("crew"), "{hint}");
+        assert!(hint.to_ascii_lowercase().contains("parallel"), "{hint}");
+    }
+
+    #[test]
+    fn planning_workflow_matches_design_first_phrasing() {
+        let steer = WorkflowSteerer::builtin();
+        let hint = steer
+            .plan_update_hint("Write a design doc proposing an approach to this problem.")
+            .expect("built-in planning workflow should match");
+        assert!(hint.contains("'planning'"), "{hint}");
+        assert!(hint.contains("adversarial_check"), "{hint}");
+        assert!(hint.contains("(tools: crew)"), "{hint}");
+    }
+
+    #[test]
+    fn planning_does_not_steal_the_github_pr_workflows_own_match() {
+        // Regression: "plan the implementation" is common enough vocabulary
+        // that `planning`'s classifier (listed before `github_pr`) initially
+        // stole this exact github_pr test phrase via example similarity.
+        let steer = WorkflowSteerer::builtin();
+        let hint = steer
+            .plan_update_hint("I need to plan the implementation and open a PR")
+            .expect("built-in workflow should match");
+        assert!(hint.contains("github_pr"), "{hint}");
+    }
+
+    #[test]
+    fn tdd_peer_review_workflow_matches_test_first_phrasing() {
+        let steer = WorkflowSteerer::builtin();
+        let hint = steer
+            .plan_update_hint("Use TDD for this: write a failing test first, then implement.")
+            .expect("built-in tdd_peer_review workflow should match");
+        assert!(hint.contains("tdd_peer_review"), "{hint}");
+        assert!(hint.contains("confirm_red"), "{hint}");
+        assert!(hint.contains("peer_review"), "{hint}");
+    }
+
+    #[test]
+    fn tdd_peer_review_delegate_hint_frames_crew_as_independent_reviewer() {
+        let steer = WorkflowSteerer::builtin();
+        let hint = steer
+            .delegate_hint(
+                "Build this test-first — red, green, refactor — and then peer review it.",
+                true,
+            )
+            .expect("tdd_peer_review should match and offer a delegate hint");
+        assert!(hint.contains("crew"), "{hint}");
+        assert!(hint.to_ascii_lowercase().contains("independent"), "{hint}");
     }
 
     #[test]
