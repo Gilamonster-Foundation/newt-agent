@@ -114,8 +114,9 @@ loopback access — exactly the shape of the observed "Empty reply from server" 
 a contended CI runner (this M4 is too fast/uncontended to lose the race).
 
 **Suggested fix (one line, matches every sibling):** add
-`let _serial = net_test_lock();` as the test's first statement. Tracked as an
-agent-bridle issue with this evidence; a fix PR is held for review.
+`let _serial = net_test_lock();` as the test's first statement. Filed as
+**agent-bridle #207** (still applicable on `main` as of 2026-07-06); a one-line
+fix PR is a follow-up.
 
 ## 5. Phase B — newt integration test (PLAN, post-approval)
 
@@ -160,7 +161,18 @@ A model actually driving the fence, observed from outside.
 
 | Item | Where | State |
 |---|---|---|
-| Minimal newt enablement PR — bump bridle pin to tested `main` SHA + add `macos-seatbelt`/`linux-landlock` features + Phase B test + a `seatbelt` passthrough feature | newt (#868 item 4, partial) | post-approval |
-| `[shell] engine` config surface + `--shell=<engine>` override + `--yolo`→sandboxed-host re-point | newt #868 (items 1–3) | deferred follow-up |
-| net-proxy `net_test_lock()` one-liner | agent-bridle | issue filed; PR held for review |
+| `[shell] engine` config surface + `--shell-engine` override + `--full-access`→host + `newt doctor` engine readout | newt #951 | ✅ **shipped** (#951) |
+| newt Seatbelt/host-shell enablement (the earlier standalone `macos-seatbelt` pin-bump plan) | newt | **subsumed** by the engine-selection line (#951) + the agent-bridle **0.7.0-rc.1** brush-ocap release (#205); no standalone PR needed |
+| net-proxy `net_test_lock()` one-liner | agent-bridle | filed as **#207**; one-line fix follow-up |
 | Propose a `just uat-seatbelt` recipe so this is one command | newt | optional |
+
+## 8. Update — 2026-07-06 (0.7.0-rc.1 gate)
+
+Phase A's Seatbelt line was re-verified on the owner MacBook as part of the
+agent-bridle **0.7.0-rc.1** pre-publication gate (**agent-bridle #205**): the
+host-shell Seatbelt keystone, the brush engine's in-process confinement, Homebrew
+PATH parity, carried coreutils under a scrubbed env (**#206**), and a live
+**dgx1-inference** newt run (`--shell-engine host` running `$(...)` end-to-end)
+all pass. The newt engine surface (`--shell-engine`, `newt doctor` → "Seatbelt —
+available") landed via #951. Phases B/C here are superseded by that surface; this
+doc stands as the record of the first owner-Mac Seatbelt run.
