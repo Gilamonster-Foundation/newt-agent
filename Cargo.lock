@@ -11,7 +11,7 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 [[package]]
 name = "agent-bridle"
 version = "0.1.0"
-source = "git+https://github.com/Gilamonster-Foundation/agent-bridle?rev=195e1c7e48d885df98d44fbb5facaf9adc392058#195e1c7e48d885df98d44fbb5facaf9adc392058"
+source = "git+https://github.com/Gilamonster-Foundation/agent-bridle?rev=4860146#48601461dd0b2e76ba6f920999827eeb77c7f190"
 dependencies = [
  "agent-bridle-core",
  "agent-bridle-tool-shell",
@@ -21,11 +21,12 @@ dependencies = [
 [[package]]
 name = "agent-bridle-core"
 version = "0.1.0"
-source = "git+https://github.com/Gilamonster-Foundation/agent-bridle?rev=195e1c7e48d885df98d44fbb5facaf9adc392058#195e1c7e48d885df98d44fbb5facaf9adc392058"
+source = "git+https://github.com/Gilamonster-Foundation/agent-bridle?rev=4860146#48601461dd0b2e76ba6f920999827eeb77c7f190"
 dependencies = [
  "agent-mesh-protocol",
  "anyhow",
  "async-trait",
+ "landlock",
  "serde",
  "serde_json",
 ]
@@ -33,7 +34,7 @@ dependencies = [
 [[package]]
 name = "agent-bridle-tool-shell"
 version = "0.1.0"
-source = "git+https://github.com/Gilamonster-Foundation/agent-bridle?rev=195e1c7e48d885df98d44fbb5facaf9adc392058#195e1c7e48d885df98d44fbb5facaf9adc392058"
+source = "git+https://github.com/Gilamonster-Foundation/agent-bridle?rev=4860146#48601461dd0b2e76ba6f920999827eeb77c7f190"
 dependencies = [
  "agent-bridle-core",
  "anyhow",
@@ -46,7 +47,7 @@ dependencies = [
 [[package]]
 name = "agent-bridle-tool-web"
 version = "0.1.0"
-source = "git+https://github.com/Gilamonster-Foundation/agent-bridle?rev=195e1c7e48d885df98d44fbb5facaf9adc392058#195e1c7e48d885df98d44fbb5facaf9adc392058"
+source = "git+https://github.com/Gilamonster-Foundation/agent-bridle?rev=4860146#48601461dd0b2e76ba6f920999827eeb77c7f190"
 dependencies = [
  "agent-bridle-core",
  "anyhow",
@@ -1373,6 +1374,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "enumflags2"
+version = "0.7.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1027f7680c853e056ebcec683615fb6fbbc07dbaa13b4d5d9442b146ded4ecef"
+dependencies = [
+ "enumflags2_derive",
+]
+
+[[package]]
+name = "enumflags2_derive"
+version = "0.7.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "67c78a4d8fdf9953a5c9d458f9efe940fd97a0cab0941c075a813ac594733827"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2548,6 +2569,17 @@ dependencies = [
  "futures-util",
  "once_cell",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "landlock"
+version = "0.4.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "635839550ae8b90d9fd2571460a6645dc0aec070225956ca7a2831ed31d2795d"
+dependencies = [
+ "enumflags2",
+ "libc",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

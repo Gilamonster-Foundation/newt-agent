@@ -82,6 +82,13 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tui: Option<TuiConfig>,
 
+    /// `[shell]` — which engine runs `run_command` (ADR 0005 D2 seam). `None` /
+    /// unset → the `safe-subset` default, except `--full-access` auto-upgrades to
+    /// `host`. Overridable per-session by `--shell-engine`. The L3 backend
+    /// (Landlock/Seatbelt/AppContainer) is a separate, auto-selected axis.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shell: Option<ShellConfig>,
+
     /// `[context]` — context-management strategy selection (Step 24.8, #559).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<ContextConfig>,
@@ -2139,6 +2146,209 @@ pub enum PermissionPreset {
     Custom,
 }
 
+/// Which shell **engine** interprets `run_command` — the ADR 0005 D2 seam. This
+/// is the *engine* axis (what parses/runs the command line); the *L3 backend*
+/// axis (Landlock/Seatbelt/AppContainer, the kernel fence) is auto-selected
+/// per-OS and is **not** chosen here. "Landlock vs brush" is really "the `host`
+/// engine (guarantee rests entirely on the kernel fence) vs the `brush` engine
+/// (L2 interceptor confines in-process, with the fence as an added backstop)."
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum ShellEngine {
+    /// bridle's argv + safe-subset parser: refuses `$(...)`/backticks/dynamic
+    /// constructs by design and spawns argv directly. Portable default.
+    #[default]
+    SafeSubset,
+    /// The sandboxed-host engine (ADR 0019): real `/bin/sh -c` with the whole
+    /// process tree in the L3 jail. Full grammar; the guarantee rests entirely
+    /// on the kernel fence. Refuses a *restricted* `exec`/`net` grant. Needs a
+    /// host `/bin/sh`. `--full-access` auto-selects this.
+    Host,
+    /// The carried brush engine (bash-in-Rust + the L2 `CommandInterceptor`):
+    /// full grammar, in-process, cross-platform, and the only engine that also
+    /// confines a *restricted* `exec`/`net` grant. Requires the `brush` build
+    /// (agent-bridle#20 / Track 2); until that ships, selecting `brush` falls
+    /// back to `host` with a warning.
+    Brush,
+}
+
+impl ShellEngine {
+    /// The canonical config/flag token (`kebab-case`).
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::SafeSubset => "safe-subset",
+            Self::Host => "host",
+            Self::Brush => "brush",
+        }
+    }
+}
+
+impl std::fmt::Display for ShellEngine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for ShellEngine {
+    type Err = String;
+
+    /// Parse a shell-engine token. Accepts the canonical names plus intuitive
+    /// aliases (`subset`/`safe`, `sandbox-host`/`landlock`, `brush-ocap`), so a
+    /// user thinking in "landlock vs brush-ocap" terms still resolves correctly.
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().replace('_', "-").as_str() {
+            "safe-subset" | "subset" | "safe" => Ok(Self::SafeSubset),
+            "host" | "sandbox-host" | "landlock" | "seatbelt" => Ok(Self::Host),
+            "brush" | "brush-ocap" => Ok(Self::Brush),
+            other => Err(format!(
+                "unknown shell engine '{other}' (expected one of: safe-subset, host, brush)"
+            )),
+        }
+    }
+}
+
+/// `[shell]` — engine selection for `run_command`. `engine = None` (the field
+/// unset) is deliberately distinct from an explicit choice: an unset engine lets
+/// `--full-access` auto-upgrade to `host` (see [`resolve_shell_engine`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ShellConfig {
+    /// The selected engine, or `None` to accept the context default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine: Option<ShellEngine>,
+}
+
+/// Resolve the effective shell engine in precedence order: an explicit CLI
+/// `--shell-engine` wins, then the `[shell] engine` config key, then — only when
+/// neither was set — `--full-access` auto-upgrades to `host` (a full,
+/// unrestricted-authority shell is what full-access implies), otherwise the
+/// `safe-subset` default. Keeping the auto-upgrade *last* means an explicit
+/// choice is never silently overridden.
+#[must_use]
+pub fn resolve_shell_engine(
+    cli: Option<ShellEngine>,
+    configured: Option<ShellEngine>,
+    full_access: bool,
+) -> ShellEngine {
+    cli.or(configured).unwrap_or(if full_access {
+        ShellEngine::Host
+    } else {
+        ShellEngine::SafeSubset
+    })
+}
+
+/// The OCAP **L3 backend** (the kernel fence) for this platform, and whether it
+/// is active on this host. This is the axis *separate* from the shell engine
+/// ([`ShellEngine`]): the engine parses/runs the command line (L2), the backend
+/// confines it in the kernel (L3). Surfaced by `newt doctor` (#926) so the
+/// operator can see what actually enforces a restricted grant here. A restricted
+/// `fs` grant is only real when the backend is available; otherwise it is
+/// honestly advisory (agent-bridle reports `sandbox_kind = None`).
+#[must_use]
+pub fn ocap_l3_backend() -> (&'static str, bool) {
+    #[cfg(target_os = "linux")]
+    {
+        ("Landlock", agent_bridle::landlock_is_supported())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        ("Seatbelt", agent_bridle::seatbelt_is_supported())
+    }
+    #[cfg(target_os = "windows")]
+    {
+        ("AppContainer", true)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        ("none", false)
+    }
+}
+
+#[cfg(test)]
+mod shell_engine_tests {
+    use super::{resolve_shell_engine, ShellConfig, ShellEngine};
+
+    #[test]
+    fn from_str_canonical_and_aliases() {
+        assert_eq!(
+            "safe-subset".parse::<ShellEngine>().unwrap(),
+            ShellEngine::SafeSubset
+        );
+        assert_eq!(
+            "subset".parse::<ShellEngine>().unwrap(),
+            ShellEngine::SafeSubset
+        );
+        assert_eq!("host".parse::<ShellEngine>().unwrap(), ShellEngine::Host);
+        // A user thinking "landlock vs brush" resolves `landlock` → the host
+        // engine (whose guarantee rests on the Landlock/Seatbelt fence).
+        assert_eq!(
+            "landlock".parse::<ShellEngine>().unwrap(),
+            ShellEngine::Host
+        );
+        assert_eq!("BRUSH".parse::<ShellEngine>().unwrap(), ShellEngine::Brush);
+        assert_eq!(
+            "brush-ocap".parse::<ShellEngine>().unwrap(),
+            ShellEngine::Brush
+        );
+        assert!("bogus".parse::<ShellEngine>().is_err());
+    }
+
+    #[test]
+    fn as_str_roundtrips() {
+        for e in [
+            ShellEngine::SafeSubset,
+            ShellEngine::Host,
+            ShellEngine::Brush,
+        ] {
+            assert_eq!(e.as_str().parse::<ShellEngine>().unwrap(), e);
+        }
+    }
+
+    #[test]
+    fn resolve_flag_wins_over_everything() {
+        assert_eq!(
+            resolve_shell_engine(
+                Some(ShellEngine::SafeSubset),
+                Some(ShellEngine::Brush),
+                true
+            ),
+            ShellEngine::SafeSubset,
+            "explicit --shell-engine wins even over config and --full-access"
+        );
+    }
+
+    #[test]
+    fn resolve_config_wins_over_full_access_auto_upgrade() {
+        assert_eq!(
+            resolve_shell_engine(None, Some(ShellEngine::SafeSubset), true),
+            ShellEngine::SafeSubset,
+            "an explicit [shell] engine is not overridden by --full-access"
+        );
+    }
+
+    #[test]
+    fn resolve_full_access_auto_upgrades_to_host_when_unset() {
+        assert_eq!(resolve_shell_engine(None, None, true), ShellEngine::Host);
+    }
+
+    #[test]
+    fn resolve_defaults_to_safe_subset() {
+        assert_eq!(
+            resolve_shell_engine(None, None, false),
+            ShellEngine::SafeSubset
+        );
+    }
+
+    #[test]
+    fn shell_config_deserializes_kebab_case() {
+        let cfg: ShellConfig = toml::from_str("engine = \"host\"").unwrap();
+        assert_eq!(cfg.engine, Some(ShellEngine::Host));
+        let cfg: ShellConfig = toml::from_str("engine = \"safe-subset\"").unwrap();
+        assert_eq!(cfg.engine, Some(ShellEngine::SafeSubset));
+    }
+}
+
 impl PermissionPreset {
     pub const ALL: [Self; 4] = [
         Self::ReadOnly,
@@ -2745,6 +2955,7 @@ impl Default for Config {
             lifecycle: None,
             dgx: None,
             tui: None,
+            shell: None,
             context: None,
             tools: None,
             pricing: None,

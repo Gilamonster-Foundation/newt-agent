@@ -48,6 +48,37 @@ pub async fn run(config_path: Option<&Path>) -> anyhow::Result<()> {
     // Discovered MCP servers — newt's own `[[mcp_servers]]` merged with the
     // servers already configured for Claude Code (~/.claude.json + ./.mcp.json),
     // so you can confirm newt sees the same set without re-configuring anything.
+    // Shell engine + OCAP posture (#868 / #926): which engine parses run_command
+    // (L2) and which kernel backend fences it (L3) — separate axes.
+    println!("\nShell engine (OCAP):");
+    let engine = config
+        .shell
+        .as_ref()
+        .and_then(|s| s.engine)
+        .unwrap_or(newt_core::ShellEngine::SafeSubset);
+    println!("  configured engine (L2): {engine}");
+    println!("    · safe-subset — refuses $(...)/dynamic constructs (portable default)");
+    println!(
+        "    · host        — real /bin/sh in the kernel jail (full grammar; --full-access auto-selects)"
+    );
+    println!(
+        "    · brush       — carried bash-in-Rust + L2 interceptor (agent-bridle#20; falls back to host)"
+    );
+    println!("  override per-run: --shell-engine <safe-subset|host|brush>");
+    let (backend, active) = newt_core::ocap_l3_backend();
+    println!(
+        "  L3 kernel jail (this platform): {backend} — {}",
+        if active {
+            "available"
+        } else {
+            "NOT available → a restricted fs grant runs advisory-only (sandbox_kind=None)"
+        }
+    );
+    println!(
+        "  agent-bridle attenuates your full ambient authority into structural OCAP grants; \
+         --full-access temporarily lifts them."
+    );
+
     println!("\nMCP servers (newt config + Claude Code config):");
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
     let workspace = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));

@@ -51,7 +51,10 @@ crossterm.workspace = true
 newt-skills.workspace = true
 reqwest.workspace = true
 tokio.workspace = true
-agent-bridle = { version = "0.1", features = ["shell", "web"] }
+# `host-shell` = the sandboxed-host engine (`/bin/sh -c` in the L3 jail, ADR 0019)
+# selectable via `[shell] engine = "host"`; `os-sandbox` enables every OS L3
+# backend (Landlock/Seatbelt/AppContainer — each inert off its target OS).
+agent-bridle = { version = "0.1", features = ["shell", "web", "host-shell", "os-sandbox"] }
 
 # Step 25.1 (#568 follow-on): Markdown → ANSI rendering for assistant output,
 # behind the default `markdown` feature. Stripped under --no-default-features
