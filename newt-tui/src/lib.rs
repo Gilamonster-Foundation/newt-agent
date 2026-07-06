@@ -6278,7 +6278,13 @@ fn run_chat(
                             // whether or not it yields chunks — so a missing
                             // embedding model doesn't re-walk + re-embed every turn.
                             semantic_indexed = true;
-                            let files = newt_core::gather_code_files(workspace);
+                            // Semantic embedding index keeps the narrow rs/py set
+                            // on purpose (#956 blast-radius note): broadening it
+                            // would embed every language's files each session.
+                            let files = newt_core::gather_code_files(
+                                workspace,
+                                &["rs".to_string(), "py".to_string()],
+                            );
                             if !files.is_empty() {
                                 print_newt(
                                     &format!(
