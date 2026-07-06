@@ -80,9 +80,10 @@ pub struct TeamOutcome {
 /// plus an optional leaf-scope fence (#816, mirroring crew mode's `Subtask.context`
 /// from #812: model-declared, meet-only, empty = unconstrained — never touches
 /// `verify`, never widens authority above the worktree/fs_write boundary it sits
-/// inside). Unlike crew mode's def-site-grounded scope (#812 §"Sharpen it"), this
-/// is the model's self-report ALONE — `run_team` has no repo-grep seam to ground
-/// it against, and porting that hardening is tracked separately (see #816's PR).
+/// inside). #840: the fence is no longer the model's self-report ALONE — `run_team`
+/// now def-site-grounds it via the same [`newt_core::scope_grounding::ground_scope`]
+/// crew mode uses (#812 §"Sharpen it"), so `files` is a fallback/augmentation on
+/// top of the harness's OWN grounding, not the source of truth.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Subtask {
     task: String,
@@ -114,6 +115,13 @@ struct PlanOut {
 
 /// Run the team on `goal`: lead decomposes → a crew runs each subtask over the
 /// shared `workspace`, stopping at the first block.
+///
+/// `def_sites` (#840) is the harness's own grounding — typically a `git grep`
+/// closure built by the caller exactly as crew mode's `author_plan_to_plan`
+/// does — used to derive each subtask's file scope BEFORE the lead's own
+/// `files` declaration augments it. A closure returning `Vec::new()` for every
+/// term (e.g. in tests, or when the caller has no repo to grep) degrades to
+/// the lead's declaration alone, byte-identical to pre-#840 behavior.
 pub async fn run_team(
     pool: &BackendPool,
     dispatcher: &dyn Dispatcher,
@@ -121,6 +129,7 @@ pub async fn run_team(
     cfg: &TeamConfig,
     caveats: &Caveats,
     goal: &str,
+    def_sites: &impl Fn(&str) -> Vec<String>,
 ) -> TeamOutcome {
     // 1. DECOMPOSE — the lead breaks the goal into ordered subtasks.
     let req = ChatRequest::new()
@@ -194,13 +203,17 @@ pub async fn run_team(
                 );
             }
         }
-        // #816: the lead-declared files list is the leaf-scope fence, threaded
-        // into run_crew's meet-only `scope_permits` gate exactly as #812 threads
-        // crew mode's `Subtask.context`. Empty files (a Plain entry, or a
-        // Detailed entry that omitted files) ⇒ unfenced, byte-identical to
-        // pre-#816 dispatch.
+        // #840: the harness's OWN grounding LEADS the leaf-scope fence — the
+        // same `ground_scope` crew mode's `author_plan_to_plan` calls — and the
+        // lead-declared `files` is APPENDED (augmentation, never replacement),
+        // then threaded into run_crew's meet-only `scope_permits` gate exactly
+        // as #812 threads crew mode's `Subtask.context`. A `def_sites` that
+        // finds nothing for every term, together with empty `files` (a Plain
+        // entry, or a Detailed entry that omitted files), degrades to
+        // unfenced — byte-identical to pre-#816 dispatch.
+        let scope = newt_core::scope_grounding::ground_scope(&st.task, &st.files, def_sites);
         let outcome = run_crew(
-            pool, dispatcher, workspace, &cfg.crew, caveats, &st.task, &st.files,
+            pool, dispatcher, workspace, &cfg.crew, caveats, &st.task, &scope,
         )
         .await;
         let status = match outcome.status {
@@ -400,6 +413,15 @@ mod tests {
         }
     }
 
+    /// A `def_sites` closure that finds nothing for every term — the tests
+    /// below aren't exercising #840's grounding itself (see
+    /// `grounds_scope_from_def_sites_even_with_no_declared_files` for that),
+    /// so this degrades `run_team` to the lead's `files` declaration alone,
+    /// exactly like pre-#840 dispatch.
+    fn no_grounding() -> impl Fn(&str) -> Vec<String> {
+        |_: &str| Vec::new()
+    }
+
     #[tokio::test]
     async fn decomposes_and_runs_every_subtask() {
         let p = pool();
@@ -416,6 +438,7 @@ mod tests {
             &cfg(),
             &newt_core::caveats::Caveats::top(),
             "build the thing",
+            &no_grounding(),
         )
         .await;
         assert_eq!(out.status, TeamStatus::AllPassed);
@@ -442,6 +465,7 @@ mod tests {
             &cfg(),
             &newt_core::caveats::Caveats::top(),
             "goal",
+            &no_grounding(),
         )
         .await;
         assert_eq!(out.status, TeamStatus::Blocked);
@@ -471,6 +495,7 @@ mod tests {
             &cfg(),
             &newt_core::caveats::Caveats::top(),
             "goal",
+            &no_grounding(),
         )
         .await;
         assert_eq!(out.status, TeamStatus::NoPlan);
@@ -499,6 +524,7 @@ mod tests {
             &cfg(),
             &newt_core::caveats::Caveats::top(),
             "goal",
+            &no_grounding(),
         )
         .await;
         assert_eq!(out.status, TeamStatus::AllPassed);
@@ -534,7 +560,7 @@ mod tests {
         // Exec authority covers ONLY "check-a"; "check-b" is outside the caveat.
         let mut caveats = newt_core::caveats::Caveats::top();
         caveats.exec = newt_core::caveats::Scope::only(["check-a".to_string()]);
-        let out = run_team(&p, &d, &mut ws, &cfg(), &caveats, "goal").await;
+        let out = run_team(&p, &d, &mut ws, &cfg(), &caveats, "goal", &no_grounding()).await;
         // The plan still ran (refuse-not-run: the denied subtask proceeds under the
         // default check, which the converging crew passes).
         assert_eq!(out.status, TeamStatus::AllPassed);
@@ -597,6 +623,7 @@ mod tests {
             &cfg(),
             &newt_core::caveats::Caveats::top(),
             "goal",
+            &no_grounding(),
         )
         .await;
         assert_eq!(out.status, TeamStatus::AllPassed);
@@ -624,6 +651,7 @@ mod tests {
             &cfg(),
             &newt_core::caveats::Caveats::top(),
             "goal",
+            &no_grounding(),
         )
         .await;
         assert_eq!(out.status, TeamStatus::AllPassed);
@@ -632,6 +660,78 @@ mod tests {
             ws.read("README.md").as_deref(),
             Some("hacked"),
             "unscoped dispatch must remain unfenced"
+        );
+    }
+
+    /// Lead emits one subtask with NO declared `files`, but an instruction
+    /// naming a backtick symbol (`` `target_symbol` ``) a real `def_sites`
+    /// closure can resolve — the harness's OWN grounding, not the model's
+    /// self-report.
+    struct GroundedTeamMock;
+    #[async_trait]
+    impl Dispatcher for GroundedTeamMock {
+        async fn dispatch(
+            &self,
+            _b: &PoolBackend,
+            model: &str,
+            _req: ChatRequest,
+        ) -> anyhow::Result<ChatReply> {
+            let content = match model {
+                "lead" => {
+                    r#"{"subtasks":[{"task":"fix `target_symbol` in the code"}]}"#.to_string()
+                }
+                "nav" => r#"{"relevant_files":["target.rs","README.md"]}"#.to_string(),
+                "triage" => r#"{"summary":"s","next_action":"n"}"#.to_string(),
+                "planner" => r#"{"edits":[
+                    {"path":"target.rs","new_content":"GOOD"},
+                    {"path":"README.md","new_content":"hacked"}
+                ]}"#
+                .to_string(),
+                other => panic!("unexpected model {other}"),
+            };
+            Ok(ChatReply {
+                content,
+                model_id: model.to_string(),
+                usage: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn grounds_scope_from_def_sites_even_with_no_declared_files() {
+        // #840: the lead declares NO files (same shape as
+        // `unscoped_subtask_is_unfenced_same_as_before_816`), but this time a
+        // REAL `def_sites` closure resolves the instruction's backtick symbol
+        // to `target.rs` — the harness's OWN grounding fences the over-reach
+        // even though the model self-reported nothing. RED on pre-#840 code
+        // (which threads only `st.files`, ignoring `def_sites` entirely):
+        // both edits would land, exactly like the sibling test above.
+        let p = pool();
+        let d = GroundedTeamMock;
+        let mut ws = MemWs::new();
+        let def_sites = |sym: &str| -> Vec<String> {
+            if sym == "target_symbol" {
+                vec!["target.rs:1:fn target_symbol()".to_string()]
+            } else {
+                Vec::new()
+            }
+        };
+        let out = run_team(
+            &p,
+            &d,
+            &mut ws,
+            &cfg(),
+            &newt_core::caveats::Caveats::top(),
+            "goal",
+            &def_sites,
+        )
+        .await;
+        assert_eq!(out.status, TeamStatus::AllPassed);
+        assert_eq!(ws.read("target.rs").as_deref(), Some("GOOD"));
+        assert_eq!(
+            ws.read("README.md").as_deref(),
+            Some("docs"),
+            "def-site-derived scope must fence the over-reach even with no declared files"
         );
     }
 
@@ -651,6 +751,7 @@ mod tests {
             &cfg(),
             &newt_core::caveats::Caveats::top(),
             "goal",
+            &no_grounding(),
         )
         .await;
         assert_eq!(out.status, TeamStatus::NoPlan);

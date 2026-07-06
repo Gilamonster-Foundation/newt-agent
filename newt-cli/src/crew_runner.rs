@@ -405,6 +405,11 @@ impl CrewRunner for LocalCrewRunner {
                         crew: crew_cfg,
                         max_subtasks: MAX_SUBTASKS,
                     };
+                    // #840: ground the fence in the harness's OWN grep, not just
+                    // the lead's self-report — the same `def_sites_grep` crew
+                    // mode's `author_plan_to_plan` uses, so both dispatch paths
+                    // ground identically.
+                    let def_sites = crate::crew::def_sites_grep(&self.dir);
                     let out = run_team(
                         &pool,
                         &LocalDispatcher,
@@ -412,6 +417,7 @@ impl CrewRunner for LocalCrewRunner {
                         &team_cfg,
                         &child_caveats,
                         task,
+                        &def_sites,
                     )
                     .await;
                     let passed = out.status == TeamStatus::AllPassed;
