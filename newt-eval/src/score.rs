@@ -35,6 +35,8 @@ pub fn score_python_workspace(workspace: &Path, surface_dir: &Path) -> anyhow::R
         prompt: String::new(),
         evaluators: vec!["python_imports".to_string()],
         expected_patterns: Vec::new(),
+        expected_output: None,
+        output_match: None,
         mock_response: MockResponse {
             content: String::new(),
         },
