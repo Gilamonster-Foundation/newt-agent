@@ -52,6 +52,10 @@ pub mod workspace_key;
 #[cfg(feature = "pyo3")]
 pub mod pyo3_module;
 
+/// Carried-coreutils dispatch (agent-bridle #206): a newt binary calls this at
+/// the top of `main` to become dispatch-capable, so the brush engine's carried
+/// `ls`/`cat` shims re-exec against the newt binary itself.
+pub use agent_bridle::maybe_dispatch;
 pub use agent_identity::{
     AgentIdentity, GithubApp, IdentitySource, Secret, SecretRef, DEFAULT_AGENT_EMAIL,
     DEFAULT_AGENT_NAME,

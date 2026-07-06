@@ -51,7 +51,7 @@ agent-mesh-protocol.workspace = true
 #
 # The workspace [patch.crates-io] satisfies this dep from the stub-shell git
 # branch until agent-bridle 0.1.0 is indexed on crates.io.
-agent-bridle = { version = "0.7", features = ["shell", "web", "host-shell", "os-sandbox", "brush"] }
+agent-bridle = { version = "0.7", features = ["shell", "web", "host-shell", "os-sandbox", "brush", "carried-coreutils"] }
 
 # Optional PyO3 bindings — opt in only via the umbrella `newt-agent-py`
 # crate; default builds stay Python-free.

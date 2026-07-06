@@ -2,6 +2,13 @@ use anyhow::Result;
 use clap::Parser;
 
 fn main() -> Result<()> {
+    // Carried-coreutils dispatch (agent-bridle #206): if this process was invoked
+    // as `newt --invoke-bundled <name> …` (the brush engine's carried-coreutils
+    // shim re-execing us), run the in-process uutils coreutil and exit. MUST be
+    // first — before clap/tracing/stack setup.
+    if let Some(code) = newt_core::maybe_dispatch() {
+        std::process::exit(code);
+    }
     // Windows' default main-thread stack (~1 MB) overflows on the large clap
     // command tree during `Cli::parse()` before any diagnostics are printed.
     // Keep parse + dispatch behind Newt's explicit CLI stack policy. (#747)
