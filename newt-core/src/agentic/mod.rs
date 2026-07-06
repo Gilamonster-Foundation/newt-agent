@@ -604,7 +604,7 @@ pub struct ChatCtx<'a> {
     pub step_ledger: Option<&'a dyn crate::agentic::scheduled::StepLedger>,
     pub caveats: &'a crate::caveats::Caveats,
     /// Maximum tool-call rounds before forcing a final tools-disabled
-    /// completion (from `[tui].max_tool_rounds`, default 25).
+    /// completion (from `[tui].max_tool_rounds`, default 40).
     pub max_tool_rounds: usize,
     /// Additional progress-aware rounds available after `max_tool_rounds` when
     /// the active workflow still has incomplete work and the recent rounds show
@@ -1215,6 +1215,13 @@ pub async fn chat_complete(
     let nudge_classifier = crate::NudgeClassifier::load_default();
     let workflow_steerer = crate::WorkflowSteerer::load_default();
     let mut workflow_runtime = WorkflowRuntimeState::default();
+    // The matching workflow's round-cap grace horizon override, resolved once
+    // from the turn's opening context (diagnostic workflows need more
+    // read-only rounds between checkpoints than routine edits — see
+    // `diagnose_failure.toml`'s `progress_horizon_rounds`).
+    workflow_runtime.set_progress_horizon(
+        workflow_steerer.progress_horizon(&workflow_classifier_text(&messages, "")),
+    );
     let mut ollama_xml_retry_nudges: usize = 0;
     // Phase 20 §2.2: the thinking-only quirk is reported at most once per
     // turn — re-detection adds no information and would thrash the cache.
@@ -1295,9 +1302,21 @@ pub async fn chat_complete(
         const READ_ONLY_NUDGE_AFTER: usize = 3;
         if read_only_rounds >= READ_ONLY_NUDGE_AFTER {
             let remaining = current_tool_round_limit.saturating_sub(round + 1);
+            // Sustained read-only exploration on a task that classifies as a
+            // diagnose/fix workflow is exactly the shape `crew`/`team`
+            // delegation exists for — offer it here (only when sub-agent
+            // dispatch is actually available this session) instead of only
+            // ever telling the model to act inline.
+            let delegate_hint = workflow_steerer
+                .delegate_hint(&workflow_classifier_text(&messages, ""), advertise_team);
             messages.push(serde_json::json!({
                 "role": "user",
-                "content": read_only_action_nudge(read_only_rounds, remaining, step_ledger)
+                "content": read_only_action_nudge(
+                    read_only_rounds,
+                    remaining,
+                    step_ledger,
+                    delegate_hint.as_deref(),
+                )
             }));
             read_only_rounds = 0;
         }
@@ -2549,6 +2568,12 @@ struct WorkflowRuntimeState {
     read_only_rounds_after_evidence: usize,
     writes_after_evidence: usize,
     rounds_since_progress: Option<usize>,
+    /// Override for [`WORKFLOW_RECENT_PROGRESS_ROUNDS`], set once per turn from
+    /// the matching [`crate::WorkflowSteerer`] workflow's
+    /// `progress_horizon_rounds` (diagnostic workflows legitimately need more
+    /// read-only rounds between plan/edit checkpoints than routine edits do —
+    /// see `diagnose_failure.toml`). `None` uses the shared default.
+    progress_horizon_rounds: Option<usize>,
     step_lock_nudges: usize,
     rediscovery_nudges: usize,
 }
@@ -2556,6 +2581,17 @@ struct WorkflowRuntimeState {
 impl WorkflowRuntimeState {
     const STEP_LOCK_NUDGE_CAP: usize = 3;
     const REDISCOVERY_NUDGE_CAP: usize = 2;
+
+    /// Set once per turn from the matching workflow's horizon override, if
+    /// any. A no-op call (`None`) leaves the shared default in effect.
+    fn set_progress_horizon(&mut self, rounds: Option<usize>) {
+        self.progress_horizon_rounds = rounds;
+    }
+
+    fn progress_horizon(&self) -> usize {
+        self.progress_horizon_rounds
+            .unwrap_or(WORKFLOW_RECENT_PROGRESS_ROUNDS)
+    }
 
     fn record_tool_result(&mut self, result: &str) -> bool {
         let Some(fingerprint) = workflow_error_fingerprint(result) else {
@@ -2658,7 +2694,7 @@ impl WorkflowRuntimeState {
         let active_step = active_step_description(step_ledger);
         let recent_progress = self
             .rounds_since_progress
-            .is_some_and(|rounds| rounds <= WORKFLOW_RECENT_PROGRESS_ROUNDS);
+            .is_some_and(|rounds| rounds <= self.progress_horizon());
         if let Some(evidence) = self.error_evidence.as_ref() {
             if self.writes_after_evidence > 0 {
                 return Some(workflow_post_write_grace_nudge(
@@ -3147,6 +3183,7 @@ fn read_only_action_nudge(
     read_only_rounds: usize,
     remaining_rounds: usize,
     step_ledger: Option<&dyn scheduled::StepLedger>,
+    delegate_hint: Option<&str>,
 ) -> String {
     let plan_clause = if step_ledger.and_then(plan_reseat_pointer).is_some() {
         " You have an active multi-step plan; keep working the ACTIVE step instead of \
@@ -3154,6 +3191,9 @@ fn read_only_action_nudge(
     } else {
         ""
     };
+    let delegate_clause = delegate_hint
+        .map(|hint| format!(" {hint}"))
+        .unwrap_or_default();
     format!(
         "[{read_only_rounds} read-only rounds so far. Stop AIMLESS exploring and start \
          making the change. This is a nudge, not a limit — you may still read, but if \
@@ -3162,7 +3202,7 @@ fn read_only_action_nudge(
          target, or take a different approach. If you truly cannot edit yet, state the \
          exact blocker. Before edit_file, read the ONE file you are about to change so \
          old_string matches exact text; never guess old_string or repeat a failed edit.\
-         {plan_clause} ~{remaining_rounds} round(s) left.]"
+         {plan_clause}{delegate_clause} ~{remaining_rounds} round(s) left.]"
     )
 }
 
@@ -3743,6 +3783,10 @@ pub async fn openai_chat_complete(
     let nudge_classifier = crate::NudgeClassifier::load_default();
     let workflow_steerer = crate::WorkflowSteerer::load_default();
     let mut workflow_runtime = WorkflowRuntimeState::default();
+    // See the Ollama path: a matching workflow's grace-horizon override.
+    workflow_runtime.set_progress_horizon(
+        workflow_steerer.progress_horizon(&workflow_classifier_text(&messages, "")),
+    );
 
     // Agentic loop — up to `max_tool_rounds` tool-call rounds (matches the
     // Ollama path), plus a configurable workflow grace window when the normal
@@ -5575,6 +5619,43 @@ error[E0425]: cannot find value `SECTION_PROMPT_TOKENS` in this scope
         );
     }
 
+    /// #<issue>: a diagnostic workflow (e.g. `diagnose_failure.toml`,
+    /// `progress_horizon_rounds = 6`) legitimately spends more read-only
+    /// rounds between plan checkpoints than a routine edit does. Without a
+    /// horizon override, 4 rounds since the last checkpoint already exceeds
+    /// the shared default (`WORKFLOW_RECENT_PROGRESS_ROUNDS = 3`) and grace
+    /// does NOT activate — RED on the pre-fix behavior. Setting the override
+    /// widens the window so the same 4-rounds-stale state still counts as
+    /// "recent" — GREEN.
+    #[test]
+    fn progress_horizon_override_widens_the_recent_progress_window() {
+        let ledger = SessionStepLedger::default();
+        ledger.set_plan(&["diagnose the failure".to_string(), "fix it".to_string()]);
+
+        let mut default_horizon = WorkflowRuntimeState::default();
+        default_horizon.record_round_outcome(false, true); // a checkpoint...
+        for _ in 0..4 {
+            default_horizon.record_round_outcome(false, false); // ...then 4 idle rounds
+        }
+        assert!(
+            default_horizon
+                .cap_grace_nudge(Some(&ledger), 2, 4)
+                .is_none(),
+            "4 rounds since the last checkpoint exceeds the default 3-round horizon"
+        );
+
+        let mut widened = WorkflowRuntimeState::default();
+        widened.set_progress_horizon(Some(6));
+        widened.record_round_outcome(false, true);
+        for _ in 0..4 {
+            widened.record_round_outcome(false, false);
+        }
+        assert!(
+            widened.cap_grace_nudge(Some(&ledger), 2, 4).is_some(),
+            "a widened 6-round horizon still treats 4-rounds-stale as recent progress"
+        );
+    }
+
     #[test]
     fn workspace_write_classifier_is_narrow() {
         assert!(is_workspace_write_call("edit_file"));
@@ -5844,7 +5925,7 @@ mod cap_exit_unit_tests {
 
     #[test]
     fn read_only_action_nudge_names_edit_permission_and_blocker_paths() {
-        let nudge = read_only_action_nudge(3, 4, None);
+        let nudge = read_only_action_nudge(3, 4, None, None);
         assert!(nudge.contains("read-only rounds so far"), "{nudge}");
         assert!(nudge.contains("edit_file"), "{nudge}");
         assert!(nudge.contains("write_file"), "{nudge}");
@@ -5869,9 +5950,30 @@ mod cap_exit_unit_tests {
                 },
             ],
         });
-        let nudge = read_only_action_nudge(3, 2, Some(&ledger as &dyn StepLedger));
+        let nudge = read_only_action_nudge(3, 2, Some(&ledger as &dyn StepLedger), None);
         assert!(nudge.contains("active multi-step plan"), "{nudge}");
         assert!(nudge.contains("ACTIVE step"), "{nudge}");
+    }
+
+    /// #<issue>: when a `WorkflowSteerer` match offers a delegate hint (e.g.
+    /// the built-in `diagnose_failure` workflow, and `crew`/`team` dispatch is
+    /// available this session), the read-only nudge surfaces it — sustained
+    /// read-only exploration on that task shape is exactly what delegation is
+    /// for, not just "stop reading, edit it yourself".
+    #[test]
+    fn read_only_action_nudge_includes_a_delegate_hint_when_offered() {
+        let nudge = read_only_action_nudge(3, 4, None, Some("consider calling crew or team"));
+        assert!(nudge.contains("consider calling crew or team"), "{nudge}");
+        // Still carries the original inline-action guidance too — delegation
+        // is offered ALONGSIDE continuing directly, never in place of it.
+        assert!(nudge.contains("edit_file"), "{nudge}");
+    }
+
+    #[test]
+    fn read_only_action_nudge_omits_delegate_clause_when_none_offered() {
+        let nudge = read_only_action_nudge(3, 4, None, None);
+        assert!(!nudge.contains("crew"), "{nudge}");
+        assert!(!nudge.contains("team"), "{nudge}");
     }
 
     #[test]

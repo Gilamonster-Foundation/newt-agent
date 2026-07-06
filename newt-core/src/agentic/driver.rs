@@ -122,7 +122,7 @@ impl TurnDriverConfig {
             api_key: None,
             workspace: workspace.into(),
             caveats: crate::caveats::Caveats::top(),
-            max_tool_rounds: 25,
+            max_tool_rounds: 40,
             workflow_grace_rounds: 5,
             tool_output_lines: 20,
             num_ctx: None,

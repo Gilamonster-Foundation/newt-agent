@@ -1428,7 +1428,11 @@ pub struct TuiConfig {
     /// round is one model response that may emit tool calls; once this many
     /// rounds have run without a tool-free answer, newt asks the model once
     /// more with tools disabled so the user still gets a real (partial)
-    /// answer instead of a placeholder. Default: 25.
+    /// answer instead of a placeholder. Default: 40 (raised from 25 — a
+    /// modest safety margin alongside `workflow_grace_rounds` and the
+    /// workflow-classifier delegate hint; genuinely open-ended diagnostic work
+    /// should reach for `crew`/`team` delegation rather than depend on an
+    /// unbounded cap here).
     #[serde(default = "default_max_tool_rounds")]
     pub max_tool_rounds: usize,
 
@@ -1588,7 +1592,7 @@ fn default_tool_output_lines() -> usize {
 }
 
 fn default_max_tool_rounds() -> usize {
-    25
+    40
 }
 
 fn default_workflow_grace_rounds() -> usize {
@@ -5282,22 +5286,25 @@ net = [\"already.example.com\"]
     }
 
     #[test]
-    fn default_max_tool_rounds_is_25() {
-        // The function default and the struct default agree on 25.
-        assert_eq!(default_max_tool_rounds(), 25);
-        assert_eq!(TuiConfig::default().max_tool_rounds, 25);
+    fn default_max_tool_rounds_is_40() {
+        // #<issue>: raised from 25 — a modest safety margin alongside
+        // workflow_grace_rounds and the diagnose_failure delegate hint, not a
+        // substitute for either. The function default and the struct default
+        // agree on 40.
+        assert_eq!(default_max_tool_rounds(), 40);
+        assert_eq!(TuiConfig::default().max_tool_rounds, 40);
         assert_eq!(default_workflow_grace_rounds(), 5);
         assert_eq!(TuiConfig::default().workflow_grace_rounds, 5);
     }
 
     #[test]
     fn tui_max_tool_rounds_defaults_when_field_absent() {
-        // An empty `[tui]` table => serde default kicks in => 25.
+        // An empty `[tui]` table => serde default kicks in => 40.
         let toml = r#"
             [tui]
         "#;
         let cfg: Config = toml::from_str(toml).unwrap();
-        assert_eq!(cfg.tui.unwrap().max_tool_rounds, 25);
+        assert_eq!(cfg.tui.unwrap().max_tool_rounds, 40);
     }
 
     #[test]

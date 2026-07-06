@@ -1,0 +1,62 @@
+name = "diagnose_failure"
+enabled = true
+description = "investigate a failing test, pipeline, build, or PR conflict, then land a fix"
+
+# Top-level WorkflowConfig fields — MUST stay before [classifier] opens a
+# sub-table, or TOML parses them as unknown (silently ignored) keys of
+# [classifier] instead of top-level fields.
+delegate_hint = "This looks like a multi-step diagnostic/fix task. If the investigation spans several files or is likely to take many iterations, consider calling crew or team to delegate the remaining work to a sub-agent with its own round budget and an isolated worktree, instead of continuing to spend this session's rounds on it. Continue directly only if you are already close to a concrete fix."
+progress_horizon_rounds = 6
+
+[classifier]
+min_score = 0.24
+keywords = [
+  "failing test",
+  "failing tests",
+  "failing pipeline",
+  "ci failure",
+  "ci is red",
+  "broken build",
+  "broken test",
+  "broken pipeline",
+  "merge conflict",
+  "pr conflict",
+  "why is this failing",
+  "why is it failing",
+  "investigate the failure",
+  "research a failure",
+  "research this failure",
+  "find and fix the broken",
+]
+examples = [
+  "This test is failing in CI, can you find and fix it?",
+  "The pipeline is red, investigate why and fix it.",
+  "There's a merge conflict on this PR, resolve it.",
+  "Something is broken, research the failure and propose a fix.",
+  "I'm showing broken tests here, can you find and fix them?",
+]
+
+[[steps]]
+id = "reproduce"
+title = "Reproduce the failure"
+steer = "Run the failing check directly to see the actual error before theorizing"
+
+[[steps]]
+id = "isolate"
+title = "Isolate the root cause"
+steer = "Narrow to the specific file/line/assertion responsible; avoid broad re-exploration once found"
+
+[[steps]]
+id = "decide_delegate"
+title = "Decide whether to delegate or fix directly"
+steer = "If the fix is small and clear, make it directly; if it spans multiple files or needs iteration, delegate via crew/team"
+
+[[steps]]
+id = "fix"
+title = "Implement the fix"
+steer = "Make the smallest coherent change that addresses the root cause"
+
+[[steps]]
+id = "verify"
+title = "Verify the fix"
+steer = "Re-run the failing check and confirm it now passes; check for regressions"
