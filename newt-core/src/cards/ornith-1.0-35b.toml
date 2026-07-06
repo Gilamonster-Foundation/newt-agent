@@ -5,13 +5,14 @@
 name = "Ornith-1.0-35B"
 backend = "vllm"
 footprint_gib = 35.0 # FP8 resident footprint (the dgx_registry FP8 row).
+# reasoning_parser/tool_call_parser/enable_auto_tool_choice come from the
+# qwen3 family defaults (cards/families/qwen3.toml) — override here only if
+# this specific card needs to diverge from the family.
+family = "qwen3"
 
 [vllm]
 served_name = "Ornith-1.0-35B"
 max_model_len = 262144
-reasoning_parser = "qwen3"     # CoT -> a separate `reasoning_content` field.
-tool_call_parser = "qwen3_xml" # native XML tool calls -> OpenAI `tool_calls`.
-enable_auto_tool_choice = true
 # Prefix caching + trust-remote-code (FP8 loads the model's own code) as raw argv
 # until/unless they become typed VllmProfile fields.
 extra = ["--enable-prefix-caching", "--trust-remote-code"]

@@ -479,11 +479,18 @@ mod tests {
 
     #[test]
     fn card_to_plan_args_folds_parser_flags_into_extra() {
-        // The Ornith built-in exercises the full mapping.
-        let vllm = newt_core::model_card::builtin_card("Ornith-1.0-35B")
-            .unwrap()
-            .vllm
-            .unwrap();
+        // The Ornith built-in exercises the full mapping. Goes through
+        // `resolve()`, not the raw builtin card directly: the parser fields
+        // now come from the qwen3 family defaults (the card's own [vllm]
+        // table no longer redeclares them), so reading the unresolved card
+        // would see them as absent.
+        let vllm = resolve(
+            newt_core::model_card::builtin_card("Ornith-1.0-35B").unwrap(),
+            &[],
+            None,
+        )
+        .vllm
+        .unwrap();
         let args = card_to_vllm_plan_args(&vllm);
         assert_eq!(args.served_name.as_deref(), Some("Ornith-1.0-35B"));
         assert_eq!(args.max_model_len, Some(262144));
