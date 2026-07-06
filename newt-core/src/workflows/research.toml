@@ -1,0 +1,64 @@
+name = "research"
+enabled = true
+description = "investigate an open-ended question — how something works, why it happens, or what options exist — before making a change"
+
+# Top-level WorkflowConfig fields — MUST stay before [classifier] opens a
+# sub-table, or TOML parses them as unknown (silently ignored) keys of
+# [classifier] instead of top-level fields.
+delegate_hint = "Research parallelizes well when there are several independent angles to check (different files, different search strategies, different hypotheses) — crew can fan work out across isolated worktrees and report back a synthesis, rather than one session serially reading everything. Prefer this when the question spans a large or unfamiliar area; for a narrow, already-scoped question, reading it yourself directly is faster."
+progress_horizon_rounds = 6
+
+[classifier]
+# Deliberately excludes diagnose_failure's failure-specific phrasing
+# ("investigate the failure", "research a failure") so an open-ended,
+# non-failure research question doesn't collide with that workflow.
+min_score = 0.3
+keywords = [
+  "research how",
+  "research this codebase",
+  "investigate how",
+  "look into how",
+  "find out how",
+  "understand how",
+  "explore the codebase for",
+  "explore how",
+  "what are the options for",
+  "survey the",
+  "survey how",
+  "dig into how",
+]
+examples = [
+  "Research how the caching layer decides what to evict.",
+  "Investigate how these two subsystems communicate before we change either one.",
+  "Look into what options exist for handling this without a rewrite.",
+  "Understand how this feature currently works before proposing a change.",
+  "Explore the codebase to find every place this pattern is used.",
+]
+
+[[steps]]
+id = "scope_question"
+title = "Pin down exactly what's being asked"
+steer = "State precisely what a satisfying answer would contain before searching — a vague question invites a vague, unfalsifiable answer"
+
+[[steps]]
+id = "gather_evidence"
+title = "Gather evidence from the real source"
+steer = "Read the actual code/docs/history rather than pattern-matching from memory or training-data assumptions; cite file:line for every concrete claim"
+tools = ["code_search", "read_file", "list_dir", "find", "git", "web_fetch"]
+
+[[steps]]
+id = "consider_parallel_delegation"
+title = "Consider delegating breadth to crew"
+steer = "If the question spans many files or several independent search angles, delegate to crew rather than reading everything serially yourself — each crew member gets its own isolated worktree and reports back, closer to a promise of specific commits/findings than a shared scratch read"
+tools = ["crew"]
+
+[[steps]]
+id = "synthesize"
+title = "Synthesize findings"
+steer = "Separate what you directly confirmed from what you inferred; state which parts of the question remain genuinely open rather than papering over a gap with a plausible-sounding guess"
+
+[[steps]]
+id = "verify_uncertain_claims"
+title = "Verify any load-bearing but uncertain claim"
+steer = "If a conclusion the rest of the answer depends on is still uncertain, check it directly (read the code, run a small probe) rather than presenting an inference as a fact"
+tools = ["read_file", "run_command"]

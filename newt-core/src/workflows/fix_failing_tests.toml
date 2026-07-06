@@ -1,0 +1,79 @@
+name = "fix_failing_tests"
+enabled = true
+description = "run the test suite, fix failures one at a time, and loop until every test passes"
+
+# Top-level WorkflowConfig fields — MUST stay before [classifier] opens a
+# sub-table, or TOML parses them as unknown (silently ignored) keys of
+# [classifier] instead of top-level fields.
+delegate_hint = "This is a mechanical fix-and-reverify loop. If many tests are failing across unrelated areas, or the fixes are likely to take many iterations, consider calling crew or team to delegate the loop to a sub-agent with its own round budget and an isolated worktree, instead of spending this session's rounds cycling through it yourself."
+progress_horizon_rounds = 6
+
+[classifier]
+# Higher than the 0.24 convention elsewhere: this workflow's phrasing shares
+# common connector words ("fix", "the", "and") with `diagnose_failure`'s own
+# test-related examples, and the default threshold let a near-miss steal that
+# workflow's match (found while writing this file's own tests). A tighter bar
+# means only a genuinely close "run tests in a loop until green" phrasing
+# wins here; ambiguous test-adjacent phrasing still falls through to
+# `diagnose_failure`'s broader, deliberately looser match.
+min_score = 0.4
+keywords = [
+  "fix all failing tests",
+  "fix the failing tests",
+  "fix all the failing tests",
+  "make the tests pass",
+  "make all tests pass",
+  "make the test suite pass",
+  "get the tests passing",
+  "get all tests passing",
+  "run the tests until they pass",
+  "loop until the tests pass",
+  "keep running the tests until",
+  "test suite is red",
+  "make the test suite green",
+  "iterate until all tests pass",
+  "fix tests until green",
+  "until every test passes",
+]
+examples = [
+  "Run the test suite and fix any failing tests, looping until everything passes.",
+  "Keep iterating on the tests until the whole suite is green.",
+  "Fix all the failing tests one at a time and re-run until none fail.",
+  "The test suite is red, fix it so every test passes.",
+  "Make the tests pass: run them, fix what's broken, repeat until green.",
+]
+
+# This is a LOOP, not a linear checklist: `loop_or_stop` explicitly sends the
+# model back to `fix_one` while any test still fails. Workflow steps have no
+# native loop primitive (they are quoted to the model via update_plan as an
+# ordered list) — the loop is expressed in `loop_or_stop`'s steer text, which
+# is the mechanism this schema actually has for it.
+[[steps]]
+id = "run_suite"
+title = "Run the full test suite for ground truth"
+steer = "Run the project's actual test command — find or ask for the real one, never assume — and record EVERY failing test, not just the first"
+tools = ["run_command", "read_file"]
+
+[[steps]]
+id = "triage"
+title = "Order the failures"
+steer = "Fix whichever failure is most likely blocking others first (e.g. a compile/import error before an assertion failure); group failures that share one root cause so they're fixed together, not as separate cycles"
+tools = ["read_file", "code_search"]
+
+[[steps]]
+id = "fix_one"
+title = "Fix ONE failure (or one root cause shared by several)"
+steer = "Make the smallest coherent change that addresses the root cause; do not touch unrelated failing tests in this step — one cause at a time keeps each cycle verifiable"
+tools = ["read_file", "edit_file", "write_file"]
+
+[[steps]]
+id = "reverify_suite"
+title = "Re-run the FULL suite, not just the test(s) you touched"
+steer = "A fix can regress a different test; only the full suite proves nothing else broke — re-running a single test is not enough"
+tools = ["run_command"]
+
+[[steps]]
+id = "loop_or_stop"
+title = "Loop back to fix_one, or stop"
+steer = "If any test still fails, return to fix_one for the next failure and repeat run_suite/reverify_suite as needed — do not stop early or hand back a partial summary while failures remain. Stop only when the full suite passes, or when a specific remaining failure is genuinely out of scope or unfixable here — in that case state EXACTLY which test and why, rather than looping on it indefinitely"
+tools = ["update_plan"]

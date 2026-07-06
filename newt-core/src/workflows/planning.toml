@@ -1,0 +1,64 @@
+name = "planning"
+enabled = true
+description = "produce a plan or design before implementing — understand constraints, survey what exists, draft options, and get it checked before committing to an approach"
+
+# Top-level WorkflowConfig fields — MUST stay before [classifier] opens a
+# sub-table, or TOML parses them as unknown (silently ignored) keys of
+# [classifier] instead of top-level fields.
+delegate_hint = "A plan benefits from an independent, skeptical second opinion before it's treated as final — delegate a critique pass to crew (or run several critique angles in parallel) rather than only self-reviewing your own draft, since a single author is the worst judge of their own blind spots."
+progress_horizon_rounds = 6
+
+[classifier]
+# Higher than the 0.24 convention: "plan the implementation" is common enough
+# vocabulary that it near-misses into github_pr's own test phrase ("I need to
+# plan the implementation and open a PR") at the default threshold. A tighter
+# bar keeps genuinely plan-first phrasing here without stealing github_pr's
+# match on a shared word, not a shared intent.
+min_score = 0.42
+keywords = [
+  "design a plan for",
+  "write a design doc",
+  "write a design document",
+  "plan the implementation of",
+  "how should we approach",
+  "propose a design for",
+  "draft a plan for",
+  "before we build this, plan",
+  "come up with a plan for",
+  "design an approach for",
+]
+examples = [
+  "Design a plan for how we'd implement this before writing any code.",
+  "Write a design doc proposing an approach to this problem.",
+  "How should we approach building this — draft a plan first.",
+  "Propose a design for this feature and get it reviewed before implementing.",
+  "Plan the implementation in stages before starting any of them.",
+]
+
+[[steps]]
+id = "understand_goal"
+title = "Clarify the goal and constraints"
+steer = "Pin down the actual goal, non-negotiable constraints, and what's explicitly out of scope before drafting anything — a plan built on an unclear goal has to be redone"
+
+[[steps]]
+id = "survey_existing"
+title = "Survey what already exists"
+steer = "Read the current code, prior art, and related docs so the plan doesn't duplicate or silently contradict what's already there"
+tools = ["code_search", "read_file", "find", "git"]
+
+[[steps]]
+id = "draft_plan"
+title = "Draft the plan"
+steer = "Name concrete files/functions/seams the plan touches, not vague intentions; a plan that could describe any project isn't a plan yet"
+
+[[steps]]
+id = "adversarial_check"
+title = "Get a skeptical second opinion before finalizing"
+steer = "Argue the strongest case against your own draft, or delegate an independent critique to crew — a plan that has never been argued against hasn't really been tested"
+tools = ["crew"]
+
+[[steps]]
+id = "finalize"
+title = "Finalize with rejections stated explicitly"
+steer = "Incorporate defensible objections; for alternatives you rejected, say so and why — an unstated rejection gets silently re-litigated later"
+tools = ["update_plan"]
