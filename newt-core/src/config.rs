@@ -2219,12 +2219,28 @@ pub struct ShellConfig {
     pub engine: Option<ShellEngine>,
 }
 
+/// The engine `--full-access` auto-selects when none is set explicitly: `host`
+/// on unix (a real `/bin/sh` in the kernel jail), but **`brush` on Windows** —
+/// host-shell spawns `/bin/sh -c`, which Windows lacks, so the cross-platform
+/// carried brush engine is the full-grammar option there (with a Windows-usage
+/// warning surfaced at selection).
+#[must_use]
+pub fn full_access_default_engine() -> ShellEngine {
+    #[cfg(windows)]
+    {
+        ShellEngine::Brush
+    }
+    #[cfg(not(windows))]
+    {
+        ShellEngine::Host
+    }
+}
+
 /// Resolve the effective shell engine in precedence order: an explicit CLI
 /// `--shell-engine` wins, then the `[shell] engine` config key, then — only when
-/// neither was set — `--full-access` auto-upgrades to `host` (a full,
-/// unrestricted-authority shell is what full-access implies), otherwise the
-/// `safe-subset` default. Keeping the auto-upgrade *last* means an explicit
-/// choice is never silently overridden.
+/// neither was set — `--full-access` auto-upgrades (to `host` on unix, `brush`
+/// on Windows), otherwise the `safe-subset` default. Keeping the auto-upgrade
+/// *last* means an explicit choice is never silently overridden.
 #[must_use]
 pub fn resolve_shell_engine(
     cli: Option<ShellEngine>,
@@ -2232,7 +2248,7 @@ pub fn resolve_shell_engine(
     full_access: bool,
 ) -> ShellEngine {
     cli.or(configured).unwrap_or(if full_access {
-        ShellEngine::Host
+        full_access_default_engine()
     } else {
         ShellEngine::SafeSubset
     })

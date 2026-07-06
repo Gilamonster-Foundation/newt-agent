@@ -62,7 +62,7 @@ pub async fn run(config_path: Option<&Path>) -> anyhow::Result<()> {
         "    · host        — real /bin/sh in the kernel jail (full grammar; --full-access auto-selects)"
     );
     println!(
-        "    · brush       — carried bash-in-Rust + L2 interceptor (agent-bridle#20; falls back to host)"
+        "    · brush       — carried bash-in-Rust + L2 interceptor (cross-platform; confines restricted exec too; Windows full-access default)"
     );
     println!("  override per-run: --shell-engine <safe-subset|host|brush>");
     let (backend, active) = newt_core::ocap_l3_backend();

@@ -48,30 +48,6 @@ install-lean dest=`echo $HOME/bin`:
     @just _place-binaries {{dest}}
     @echo "Installed (lean, no rich-tui): {{dest}}/newt  {{dest}}/newt-mcp-server"
 
-# Install a build that uses the REAL confined brush shell (agent-bridle `main`,
-# from source) so the `run_command` OCAP confinement is live — instead of the
-# publishable *stub* shell the default/release build links. This is the one-shot
-# form of the chain you'd otherwise type: `just clean && just shell-real &&
-# just install`.
-#
-# The `clean` is required: swapping a dependency *source* (stub branch → main)
-# doesn't always force a rebuild of the dependent crates, so we wipe artefacts
-# first — expect a full from-scratch release build (minutes).
-#
-# DEV ONLY. This LEAVES Cargo.toml/Cargo.lock flipped to the git dep (the
-# `shell-real` override). That tree must NOT be committed — it reintroduces the
-# brush git dep and breaks the crates.io publish (and the pre-push `shell-check`
-# guard will reject it). Run `just shell-stub` before you commit.
-#
-# One-shot DEV install with the real brush OCAP shell (clean + shell-real + install).
-install-real dest=`echo $HOME/bin`:
-    just clean
-    just shell-real
-    just install {{dest}}
-    @echo ""
-    @echo "✅ Installed the REAL-brush-shell build to {{dest}} — OCAP run_command confinement is live."
-    @echo "⚠️  Cargo.toml/Cargo.lock are flipped to agent-bridle 'main'. Run 'just shell-stub' before committing."
-
 # Place freshly built release binaries into DEST with a CLEAN inode and (on
 # macOS) a fresh ad-hoc signature. Why not a plain `cp` over the old binary:
 # on Apple Silicon, overwriting a running/launched binary in place invalidates
@@ -270,7 +246,6 @@ cov-ci:
 ocap-check:
     python3 scripts/ocap_check.py
 
-# --- agent-bridle shell toggle (publishable stub vs. real confined shell) ---
 #
 # `main`/release MUST stay on agent-bridle's `feat/step-up-decision-mvp` branch
 # (advanced from `feat/stub-shell` on 2026-06-19, newt#497 — it adds the `step_up`
@@ -286,40 +261,6 @@ ocap-check:
 # guard. `shell-real` flips the local patch onto the real shell; `shell-stub`
 # flips it back; `shell-check` (run by the pre-push hook + CI) fails if the
 # dev override ever reaches `main`.
-
-# Switch the LOCAL build to the real confined brush shell (agent-bridle `main`).
-# DEV ONLY — the resulting Cargo.toml/Cargo.lock must NOT be committed (it
-# reintroduces the brush git dep and breaks crates.io publish). Run
-# `just shell-stub` before you commit. Rebuild after this to pick it up.
-shell-real:
-    # Portable across GNU and BSD/macOS sed: `[{]` (not `\{`, which BSD ERE
-    # reads as an interval) and a temp-file rewrite (not `sed -i`, whose suffix
-    # arg differs between GNU and BSD). See PR #238 followup.
-    sed -E 's|(agent-bridle[a-z-]*[[:space:]]*= [{] git = "[^"]*agent-bridle", branch = )"feat/step-up-decision-mvp"|\1"main"|' Cargo.toml > Cargo.toml.shelltmp && mv Cargo.toml.shelltmp Cargo.toml
-    @echo "⚠️  agent-bridle → REAL brush shell (agent-bridle main). DEV ONLY."
-    @echo "⚠️  Do NOT commit Cargo.toml / Cargo.lock — run 'just shell-stub' first."
-    @echo "   Now rebuild: cargo build --workspace"
-
-# Switch back to the publishable stub shell (the release / main default).
-shell-stub:
-    # Portable sed (see `shell-real` for why `[{]` + temp-file, not `sed -i -E`).
-    sed -E 's|(agent-bridle[a-z-]*[[:space:]]*= [{] git = "[^"]*agent-bridle", branch = )"main"|\1"feat/step-up-decision-mvp"|' Cargo.toml > Cargo.toml.shelltmp && mv Cargo.toml.shelltmp Cargo.toml
-    @echo "agent-bridle → stub shell (publishable). Safe to commit."
-    @echo "   Now rebuild: cargo build --workspace"
-
-# Guard: fail if the dev (real-shell) override is present in Cargo.toml.
-# Run by the pre-push hook and mirrored inline in CI.
-# PIPELINE PARITY: the same grep lives in .github/workflows/ci.yml (lint job).
-shell-check:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    if grep -Eq 'agent-bridle[a-z-]*[[:space:]]*= [{] git = "[^"]*agent-bridle", branch = "main"' Cargo.toml; then
-        echo "ERROR: [patch.crates-io] points agent-bridle at 'main' (real brush shell)." >&2
-        echo "       That build cannot publish to crates.io. Run 'just shell-stub'" >&2
-        echo "       before committing/pushing — see the shell-toggle note in the justfile." >&2
-        exit 1
-    fi
-    echo "shell guard OK: agent-bridle patch is on the publishable stub branch."
 
 # --- Evaluation ---
 

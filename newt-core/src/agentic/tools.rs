@@ -1201,9 +1201,10 @@ fn shell_engine() -> crate::ShellEngine {
     }
     // No engine was published (e.g. a non-CLI entry point that set
     // NEWT_FULL_ACCESS directly). Honor the same auto-upgrade the CLI applies so
-    // `NEWT_FULL_ACCESS=1` alone still gets the full-grammar `host` engine.
+    // `NEWT_FULL_ACCESS=1` alone still gets the full-grammar engine (`host` on
+    // unix, `brush` on Windows).
     if full_access_requested() {
-        crate::ShellEngine::Host
+        crate::full_access_default_engine()
     } else {
         crate::ShellEngine::default()
     }
@@ -1221,14 +1222,24 @@ fn bridle_registry() -> agent_bridle::Registry {
         crate::ShellEngine::SafeSubset => Arc::new(agent_bridle::ShellTool::new()),
         crate::ShellEngine::Host => Arc::new(agent_bridle::HostShellTool::new()),
         crate::ShellEngine::Brush => {
-            // Track 2 (agent-bridle#20) not shipped: the carried brush engine is
-            // not compiled into this build. `host` is the closest full-grammar
-            // engine, so fall back to it — loudly, never a silent downgrade.
-            tracing::warn!(
-                "shell engine 'brush' is not available in this build \
-                 (agent-bridle#20 / Track 2); falling back to 'host'"
-            );
-            Arc::new(agent_bridle::HostShellTool::new())
+            // The carried brush engine (agent-bridle 0.7): in-process bash + the
+            // L2 CommandInterceptor. The cross-platform engine — and on Windows
+            // the ONLY full-grammar option, since `host` needs `/bin/sh`.
+            #[cfg(windows)]
+            {
+                use std::sync::Once;
+                static WARN: Once = Once::new();
+                WARN.call_once(|| {
+                    tracing::warn!(
+                        "using the 'brush' shell engine on Windows: run_command runs a \
+                         bash-in-Rust shell for internal-tooling compatibility. Native \
+                         PowerShell/cmd code paths are a FUTURE release — not written yet \
+                         (we are opinionated Linux developers who occasionally use a \
+                         MacBook). Bash-isms work; Windows-native shell semantics do not."
+                    );
+                });
+            }
+            Arc::new(agent_bridle::BrushShellTool::new())
         }
     };
     agent_bridle::Registry::builder()
