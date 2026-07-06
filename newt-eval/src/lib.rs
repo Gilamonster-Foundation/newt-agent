@@ -34,6 +34,7 @@ pub mod cases;
 pub mod evaluators;
 pub mod grade;
 pub mod lint;
+pub mod normalize;
 pub mod runner;
 pub mod score;
 pub mod scorecard;

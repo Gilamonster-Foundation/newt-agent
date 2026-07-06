@@ -60,10 +60,9 @@ pub struct TestCase {
 }
 
 /// Run configuration for the `output_matches` result oracle (#957): the argv to
-/// execute the graded worktree's entry point, plus an optional wall-clock budget.
-/// Pure data (three-Cs) — new behavior is new case config, not new Rust. The
-/// normalization strategies (trim / collapse-ws / numeric-tolerance / regex) are
-/// added as further pure-data config in the epic's step 2; step 1 is exact match.
+/// execute the graded worktree's entry point, plus an optional wall-clock budget
+/// and pure-data normalization strategies. Pure data (three-Cs) — new behavior is
+/// new case config, not new Rust.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct OutputMatch {
     /// argv to run against the graded worktree, e.g. `["python3", "solution.py"]`
@@ -74,6 +73,25 @@ pub struct OutputMatch {
     /// runner (epic step 3); recorded here as pure data now.
     #[serde(default)]
     pub timeout_ms: Option<u64>,
+    /// Named normalization strategies (#959), applied **in order** to both the
+    /// actual stdout and `expected_output` before comparison. Bootstrap set:
+    /// `trim`, `collapse_whitespace`, `trailing_newline`, `regex_extract`
+    /// (uses [`extract_pattern`](Self::extract_pattern)), and `numeric_tolerance`
+    /// (compares as numbers within [`epsilon`](Self::epsilon)). An empty list is
+    /// exact-string match (the step-1 default). Unknown names are skipped with a
+    /// warning, never fatal — mirroring the language-pack tolerant-load rule.
+    #[serde(default)]
+    pub normalize: Vec<String>,
+    /// Tolerance for the `numeric_tolerance` strategy: both sides compare equal
+    /// when they parse as numbers and `|a - b| <= epsilon`. Defaults to `1e-9`
+    /// when `numeric_tolerance` is requested without an explicit epsilon.
+    #[serde(default)]
+    pub epsilon: Option<f64>,
+    /// Regex for the `regex_extract` strategy: each side is reduced to capture
+    /// group 1 of the first match, so a program may print noise around the
+    /// answer. Missing/invalid pattern → the strategy is skipped with a warning.
+    #[serde(default)]
+    pub extract_pattern: Option<String>,
 }
 
 /// Canned response body for mock mode.
