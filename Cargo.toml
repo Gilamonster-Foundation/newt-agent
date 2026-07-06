@@ -262,47 +262,9 @@ lto = "thin"
 codegen-units = 1
 strip = true
 
-# ── TRANSITIONAL patch: agent-bridle env seam (newt #783) ─────────────────
-#
-# *** NOT THE FINAL STATE. *** Pins agent-bridle to the exact commit `ed5bb13`,
-# which carries the per-dispatch `"env"` seam the #783 Bug A fix depends on:
-# `ShellArgs` accepts an `"env": {KEY:VALUE}` object and sets it on the spawned
-# child, so the venv vars no longer have to be smuggled in as `export …;` text —
-# which the confined safe-subset engine refuses on a compound command (the #783
-# root cause).
-#
-# This seam is UNRELEASED — not on crates.io. It landed on agent-bridle `main`
-# via agent-bridle PR #105, and the original `fix/shell-env-seam` branch has
-# since been DELETED — so we pin the exact `rev` (still reachable from `main`'s
-# history) rather than a branch that no longer resolves on a cold CI checkout.
-# The commit is brush-free (no active brush git dep), so it stays
-# crates.io-publishable, and a `rev =` pin passes the `just shell-check` guard
-# (which rejects only `branch = "main"`). This supersedes the older
-# `cb7e1ea3` (`feat/step-up-decision-mvp`) pin that newt `main` carried: that
-# rev predates the env seam. `195e1c7` is agent-bridle `main` HEAD and a clean
-# forward move from the prior `ed5bb13` pin (75 commits, ed5bb13 is an
-# ancestor); it retains the `step_up` Gate (agent-bridle#24) and additionally
-# carries **agent-bridle #196** — the egress proxy now surfaces a refused
-# CONNECT host as a structured `net` denial, which newt #905's
-# `net_denial_requests` lifts into a per-host permission prompt. The delta also
-# brings ADR-0018 unbridle (StepUpPolicy in dispatch #179) and the `Disclosure`
-# block on `ToolEnvelope` (#171) — accommodated in this bump.
-#
-# BLOCKER — this PR cannot merge to newt main until:
-#   1. agent-bridle ships a release (or publishable branch) carrying the env seam;
-#   2. this block is replaced by a published-dep version bump;
-#   3. `cargo update -p agent-bridle` + commit the resulting Cargo.lock.
-# See: https://github.com/Gilamonster-Foundation/agent-bridle/issues/20
-#
-# NOTE: `ed5bb13` is main-lineage, so it still carries the `step_up` Gate
-# (agent-bridle#24) the previous `feat/step-up-decision-mvp` patch had.
-
-# BUMP (shell-engine surface): 195e1c7 → 4860146 = agent-bridle `main` after
-# PR #203 (`fix(tool-shell): seed PATH in the sandbox-host engine so full-access
-# resolves bare names`). This carries the `host-shell` engine (ADR 0019, #199)
-# plus the full-access PATH seed, which newt's `[shell] engine = "host"` selects.
-[patch.crates-io]
-agent-bridle            = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", rev = "4860146" }
-agent-bridle-core       = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", rev = "4860146" }
-agent-bridle-tool-shell = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", rev = "4860146" }
-agent-bridle-tool-web   = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", rev = "4860146" }
+# agent-bridle is a published crates.io dependency (`= "0.7"`) as of the 0.7.0
+# release — the real confined shell (brush + host-shell + carried coreutils +
+# AppContainer) ships there, so newt no longer needs a git `[patch.crates-io]`
+# pin or the `shell-real`/`shell-stub`/`shell-check` stub apparatus (all retired).
+# Resolves newt #300 (confined shell restored) + #660 (drop the pin). A bugfix
+# rolls as agent-bridle 0.7.1.

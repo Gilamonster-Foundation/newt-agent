@@ -9,7 +9,6 @@
 # Install: `just install-hooks` (or `git config core.hooksPath .githooks`)
 #
 # PIPELINE PARITY: This hook mirrors .github/workflows/ci.yml.
-#   - `just shell-check` matches the lint job's "agent-bridle stub guard" step
 #   - `just check` matches the lint + test + lean-build jobs (fmt + clippy +
 #     cargo test, plus the `--no-default-features` lean build for issue #416 —
 #     rich-tui is a default feature now, so the main jobs already cover it)
@@ -138,9 +137,6 @@ fi
 
 # Guard: never push a build patched onto the real brush shell (agent-bridle
 # `main`) — it reintroduces the brush git dep and breaks crates.io publish.
-# `just shell-real` is a local dev convenience only.
-echo "[pre-push] running just shell-check..."
-just shell-check
 
 echo "[pre-push] running just check..."
 just check

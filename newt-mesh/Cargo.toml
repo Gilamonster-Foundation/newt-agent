@@ -105,29 +105,6 @@ lto           = "thin"
 codegen-units = 1
 strip         = true
 
-# ── Temporary patch: agent-bridle → crates.io transition ──────────────────
-#
-# Mirrors the root workspace's [patch.crates-io] block (see ../Cargo.toml) —
-# pinned to the SAME immutable commit (formerly the tip of
-# feat/step-up-decision-mvp, carries step_up + is brush-free, newt#497). NOT
-# `main`: main carries the real brush shell (CI-stub-guard-forbidden) plus
-# 60+ unrelated commits landed since this branch was cut. `rev` (a commit
-# SHA), not `branch` or `tag` pointed at a moving ref — a branch pin died
-# once already when the merged branch was deleted (newt#824).
-# Since Step 9.7 moved the agentic loop into newt-core, newt-core itself
-# declares `agent-bridle = "0.1"` — and newt-mesh, being excluded from the
-# parent workspace, is its own workspace root, so the parent's patch does
-# not apply here. Remove this together with the root block once
-# agent-bridle 0.1.0 is indexed on crates.io.
-# See: https://github.com/Gilamonster-Foundation/agent-bridle/issues/20
-
-# Kept in lock-step with the root workspace patch (../Cargo.toml): `4860146` =
-# agent-bridle `main` after PR #203, carrying the `host-shell` engine + the
-# full-access PATH seed. newt-core now enables the `host-shell`/`os-sandbox`
-# features, so this excluded workspace must pin the same rev or feature
-# resolution fails here. Still a `rev` (immutable SHA), never a moving ref.
-[patch.crates-io]
-agent-bridle            = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", rev = "4860146" }
-agent-bridle-core       = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", rev = "4860146" }
-agent-bridle-tool-shell = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", rev = "4860146" }
-agent-bridle-tool-web   = { git = "https://github.com/Gilamonster-Foundation/agent-bridle", rev = "4860146" }
+# agent-bridle is a published crates.io dep as of 0.7.0 (see ../Cargo.toml) — no
+# git patch needed here anymore. newt-core (this crate's path dep) pulls
+# `agent-bridle = "0.7"` from crates.io directly.
