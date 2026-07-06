@@ -15133,10 +15133,14 @@ mod helper_fn_tests {
         // dispatch logic from the Step 27.4 local default.
         let run = |rest: &str| handle_context_command(rest, &cfg, None, &none, BackendKind::Openai);
 
-        // bare status: manager + features summary, no mutation
+        // bare status: manager + features summary, no mutation. `tool_offload`
+        // now defaults on for EVERY backend kind (`base_for` sets it
+        // unconditionally, unlike scratchpad/scheduled/semantic which are
+        // Ollama-only local defaults) — the one feature that's on even on
+        // this deliberately-Openai (all-else-off) baseline.
         let r = run("");
         assert!(r.lines[0].contains("context manager: standard"));
-        assert!(r.lines[0].contains("features on: none"));
+        assert!(r.lines[0].contains("features on: tool_offload"));
         assert!(r.set_manager.is_none() && r.set_feature.is_none());
 
         // manager set (standard is available)

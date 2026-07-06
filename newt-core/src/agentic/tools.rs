@@ -6971,14 +6971,17 @@ mod disable_ocap_tests {
         assert_eq!(out, "(exit 3)");
     }
 
-    /// #726: a verbose `run_command` MUST NOT flood the model's context window.
-    /// Its model-facing output is capped by the shared TOKEN budget (default
-    /// 10k ⇒ ~40k chars) with the same truncation marker `read_file` uses — the
-    /// gap #719 left open for `run_command`. Runs through the real host shell
-    /// (yolo path) so it exercises the actual `shell_envelope_output` → cap
-    /// composition. The global budget is the default 10k in the test binary
-    /// (nothing raises it above default), so the assertions are upper-bounded
-    /// and robust regardless of a smaller racing value.
+    /// #726/#945: a verbose `run_command` MUST NOT flood the model's context
+    /// window, but MUST still surface both ends of the output — a command's
+    /// summary/failure/exit status lives at the TAIL, and #726's original
+    /// head-only cap silently dropped exactly that (the gap #945 closed). Runs
+    /// through the real host shell (yolo path) so it exercises the actual
+    /// `shell_envelope_output` → cap composition. The global budget is the
+    /// default 10k in the test binary (nothing raises it above default), so
+    /// the assertions are upper-bounded and robust regardless of a smaller
+    /// racing value. This test goes through the legacy `execute_tool` path
+    /// (`run_tool`/`run_tool_with_floor` below), which has no spill store —
+    /// the no-spill-id elision marker branch, not the `spill:<id>` one.
     #[cfg(unix)]
     #[tokio::test]
     async fn run_command_output_over_budget_is_token_capped() {
@@ -7000,17 +7003,24 @@ mod disable_ocap_tests {
             out.len()
         );
         assert!(
-            out.contains("output truncated to"),
-            "carries the truncation marker: {:?}",
-            &out[out.len().saturating_sub(160)..]
+            out.contains("chars elided (head+tail shown"),
+            "carries the head+tail elision marker: {:?}",
+            &out[..out.len().min(400)]
         );
+        // #945: the HEAD survives — the earliest lines are still visible.
         assert!(
-            out.ends_with("use read_file with offset+limit]"),
-            "marker steers the model to a narrower read: {:?}",
+            out.starts_with("1\n2\n3\n"),
+            "head preserved: {:?}",
+            &out[..out.len().min(160)]
+        );
+        // #945 (the regression this test now guards): the TAIL survives too —
+        // under the old head-only cap this was the first assertion to break
+        // (it asserted the OPPOSITE: `!out.contains("60000")`).
+        assert!(
+            out.trim_end().ends_with("60000"),
+            "tail preserved, not dropped by the cap: {:?}",
             &out[out.len().saturating_sub(160)..]
         );
-        // Capped early ⇒ the late lines never reach the model.
-        assert!(!out.contains("60000"), "late output dropped by the cap");
     }
 
     // --- #307 floor property: preset clamp WINS over --disable-ocap -------
