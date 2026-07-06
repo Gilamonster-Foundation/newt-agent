@@ -1,0 +1,9 @@
+# Qwen3-family default vLLM serving knobs — shared by every card that sets
+# `family = "qwen3"` (a base layer under that card's own [vllm] table; the
+# card's own fields always win). Extracted from the Ornith cards, which were
+# duplicating these three lines verbatim before family defaults existed.
+
+[vllm]
+reasoning_parser = "qwen3"     # CoT -> a separate `reasoning_content` field.
+tool_call_parser = "qwen3_xml" # native XML tool calls -> OpenAI `tool_calls`.
+enable_auto_tool_choice = true

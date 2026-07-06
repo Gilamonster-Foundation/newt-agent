@@ -97,7 +97,7 @@ pub struct VllmProfile {
 
 impl VllmProfile {
     #[must_use]
-    fn merge(self, o: Self) -> Self {
+    pub(crate) fn merge(self, o: Self) -> Self {
         Self {
             served_name: o.served_name.or(self.served_name),
             max_model_len: o.max_model_len.or(self.max_model_len),
@@ -113,6 +113,19 @@ impl VllmProfile {
             },
         }
     }
+}
+
+/// A named family's default serving knobs — the layer UNDER a card's own
+/// `[vllm]` table in [`resolve`]. Deliberately NOT a full [`ModelCard`]: a
+/// family default is never served directly (no `name`/`backend`/footprint to
+/// carry), it exists purely to be shared, and the card's own declarations
+/// always win field-by-field over it (the same `.or()` precedence every other
+/// override layer in this module uses).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FamilyDefaults {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vllm: Option<VllmProfile>,
 }
 
 /// Ollama serving profile.
@@ -216,6 +229,14 @@ pub struct ModelCard {
     /// `--force`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gated: Option<bool>,
+    /// The model family this card belongs to (e.g. `"qwen3"`), if any — looks
+    /// up [`family_defaults`] as the base layer UNDER this card's own `[vllm]`
+    /// table in [`resolve`], so cards in the same family (different sizes of
+    /// the same tokenizer/parser lineage) don't each duplicate
+    /// `reasoning_parser`/`tool_call_parser`/etc. `None` means no family layer
+    /// applies — today's pre-family behavior, unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub family: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vllm: Option<VllmProfile>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -249,6 +270,7 @@ impl ModelCard {
             backend: overlay.backend.or(self.backend),
             footprint_gib: overlay.footprint_gib.or(self.footprint_gib),
             gated: overlay.gated.or(self.gated),
+            family: overlay.family.or(self.family),
             vllm: merge_opt(self.vllm, overlay.vllm, VllmProfile::merge),
             ollama: merge_opt(self.ollama, overlay.ollama, OllamaProfile::merge),
             tuning: merge_opt(self.tuning, overlay.tuning, Tuning::merge),
@@ -257,13 +279,25 @@ impl ModelCard {
     }
 
     /// Reject a structurally-invalid card **loudly** (never silently): empty name,
-    /// no backend, or a backend whose serving block is absent.
+    /// no backend, a backend whose serving block is absent, or a `family` naming
+    /// no known family defaults (almost always a typo — silently applying no
+    /// defaults would be a quieter, harder-to-notice version of the same
+    /// mistake `deny_unknown_fields` guards against elsewhere in this module).
     ///
     /// # Errors
     /// Returns a human-readable reason when the card cannot be stood up.
     pub fn validate(&self) -> Result<(), String> {
         if self.name.trim().is_empty() {
             return Err("model card: `name` is empty".to_string());
+        }
+        if let Some(family) = self.family.as_deref() {
+            if family_defaults(family).is_none() {
+                return Err(format!(
+                    "model card `{}`: family `{family}` has no known defaults \
+                     (check for a typo, or add cards/families/{family}.toml)",
+                    self.name
+                ));
+            }
         }
         match self.backend {
             None => Err(format!(
@@ -339,12 +373,20 @@ pub fn load_dropin_dir(dir: &Path) -> Vec<ModelCard> {
     out
 }
 
-/// Resolve the effective card for a `builtin`: overlay every drop-in whose `name`
-/// matches (merge-by-name, the language-pack rule), then an optional one-off
-/// (`--card`). **Pure** over the inputs.
+/// Resolve the effective card for a `builtin`: apply the `builtin`'s own
+/// [`family_defaults`] as the base layer under its `[vllm]` table (a card's own
+/// settings always win field-by-field — family defaults only fill gaps), then
+/// overlay every drop-in whose `name` matches (merge-by-name, the language-pack
+/// rule), then an optional one-off (`--card`). **Pure** over the inputs +
+/// the embedded family table.
 #[must_use]
 pub fn resolve(builtin: ModelCard, dropins: &[ModelCard], one_off: Option<ModelCard>) -> ModelCard {
     let mut card = builtin;
+    if let Some(family) = card.family.clone() {
+        if let Some(defaults) = family_defaults(&family) {
+            card.vllm = merge_opt(defaults.vllm, card.vllm, VllmProfile::merge);
+        }
+    }
     let name = card.name.clone();
     for d in dropins.iter().filter(|d| d.name == name) {
         card = card.merge(d.clone());
@@ -353,6 +395,21 @@ pub fn resolve(builtin: ModelCard, dropins: &[ModelCard], one_off: Option<ModelC
         card = card.merge(o);
     }
     card
+}
+
+/// The built-in family-default tables shipped with newt (embedded DATA) — named
+/// serving-knob presets a card opts into via its own `family` field, so cards
+/// sharing a tokenizer/parser lineage (different sizes of the same family)
+/// don't each duplicate the same `[vllm]` settings. Adding a new family is a
+/// new `cards/families/<name>.toml` file plus one entry here — config, not code.
+#[must_use]
+pub fn family_defaults(family: &str) -> Option<FamilyDefaults> {
+    const EMBEDDED: &[(&str, &str)] = &[("qwen3", include_str!("cards/families/qwen3.toml"))];
+    let want = family.trim().to_ascii_lowercase();
+    EMBEDDED
+        .iter()
+        .find(|(name, _)| *name == want)
+        .map(|(_, toml)| toml::from_str(toml).expect("built-in family-defaults file is valid TOML"))
 }
 
 /// The built-in model cards shipped with newt (embedded DATA) — the base layer of
@@ -553,6 +610,111 @@ capability:
         );
     }
 
+    // ── Family defaults ───────────────────────────────────────────────────
+    #[test]
+    fn family_defaults_returns_known_family_case_insensitively() {
+        for name in ["qwen3", "QWEN3", "Qwen3"] {
+            let d = family_defaults(name).unwrap_or_else(|| panic!("{name} should be known"));
+            let v = d.vllm.unwrap();
+            assert_eq!(v.reasoning_parser.as_deref(), Some("qwen3"));
+            assert_eq!(v.tool_call_parser.as_deref(), Some("qwen3_xml"));
+            assert_eq!(v.enable_auto_tool_choice, Some(true));
+        }
+    }
+
+    #[test]
+    fn family_defaults_is_none_for_an_unknown_family() {
+        assert!(family_defaults("nemotron").is_none());
+        assert!(family_defaults("bogus").is_none());
+    }
+
+    #[test]
+    fn resolve_fills_vllm_gaps_from_family_defaults() {
+        let card: ModelCard = toml::from_str(
+            "name = \"test\"\nbackend = \"vllm\"\nfamily = \"qwen3\"\n\
+             [vllm]\nserved_name = \"test\"\nmax_model_len = 8192\n",
+        )
+        .unwrap();
+        let resolved = resolve(card, &[], None);
+        let v = resolved.vllm.unwrap();
+        // The card's own fields stand...
+        assert_eq!(v.served_name.as_deref(), Some("test"));
+        assert_eq!(v.max_model_len, Some(8192));
+        // ...and the family fills what the card didn't set.
+        assert_eq!(v.reasoning_parser.as_deref(), Some("qwen3"));
+        assert_eq!(v.tool_call_parser.as_deref(), Some("qwen3_xml"));
+        assert_eq!(v.enable_auto_tool_choice, Some(true));
+    }
+
+    #[test]
+    fn resolve_cards_own_vllm_field_wins_over_family_default() {
+        let card: ModelCard = toml::from_str(
+            "name = \"test\"\nbackend = \"vllm\"\nfamily = \"qwen3\"\n\
+             [vllm]\ntool_call_parser = \"custom_xml\"\n",
+        )
+        .unwrap();
+        let resolved = resolve(card, &[], None);
+        let v = resolved.vllm.unwrap();
+        assert_eq!(
+            v.tool_call_parser.as_deref(),
+            Some("custom_xml"),
+            "the card's own declaration overrides the family default, never the reverse"
+        );
+        assert_eq!(
+            v.reasoning_parser.as_deref(),
+            Some("qwen3"),
+            "a field the card didn't set still inherits from the family"
+        );
+    }
+
+    #[test]
+    fn resolve_with_no_family_is_unaffected_by_family_defaults() {
+        // Backward compatible: a card with no `family` behaves exactly as
+        // before family defaults existed — no layer applied, no panic.
+        let card: ModelCard =
+            toml::from_str("name = \"test\"\nbackend = \"vllm\"\n[vllm]\nserved_name = \"test\"\n")
+                .unwrap();
+        let resolved = resolve(card, &[], None);
+        assert_eq!(resolved.vllm.unwrap().reasoning_parser, None);
+    }
+
+    #[test]
+    fn resolve_with_an_unknown_family_leaves_vllm_unchanged() {
+        // resolve() itself never errors — validate() is where an unknown
+        // family surfaces as a loud, actionable problem (see below). A card
+        // naming a family with no known defaults just gets no extra layer.
+        let card: ModelCard = toml::from_str(
+            "name = \"test\"\nbackend = \"vllm\"\nfamily = \"bogus\"\n\
+             [vllm]\nserved_name = \"test\"\n",
+        )
+        .unwrap();
+        let resolved = resolve(card, &[], None);
+        assert_eq!(resolved.vllm.unwrap().served_name.as_deref(), Some("test"));
+    }
+
+    #[test]
+    fn validate_rejects_an_unknown_family_name() {
+        let card: ModelCard = toml::from_str(
+            "name = \"test\"\nbackend = \"vllm\"\nfamily = \"qwenn3\"\n\
+             [vllm]\nserved_name = \"test\"\n",
+        )
+        .unwrap();
+        let err = card
+            .validate()
+            .expect_err("unknown family must be rejected");
+        assert!(err.contains("qwenn3"), "{err}");
+    }
+
+    #[test]
+    fn validate_accepts_a_known_family_name() {
+        let card: ModelCard = toml::from_str(
+            "name = \"test\"\nbackend = \"vllm\"\nfamily = \"qwen3\"\n\
+             [vllm]\nserved_name = \"test\"\n",
+        )
+        .unwrap();
+        assert!(card.validate().is_ok());
+    }
+
     // ── Validate ──────────────────────────────────────────────────────────
     #[test]
     fn validate_accepts_a_well_formed_card() {
@@ -656,7 +818,14 @@ capability:
 
     #[test]
     fn ornith_35b_card_has_the_expected_settings() {
-        let c = builtin_card("Ornith-1.0-35B").expect("Ornith-1.0-35B present");
+        // Resolved (not the raw builtin card): reasoning_parser/tool_call_parser/
+        // enable_auto_tool_choice now come from the qwen3 family defaults, not
+        // this card's own [vllm] table — this test asserts the EFFECTIVE
+        // settings a real `card setup` would use, same as before the refactor.
+        // `resolve()` with no dropins/one-off only touches `vllm`, so every
+        // other field is identical to the raw builtin card.
+        let raw = builtin_card("Ornith-1.0-35B").expect("Ornith-1.0-35B present");
+        let c = resolve(raw, &[], None);
         assert_eq!(c.backend, Some(Backend::Vllm));
         assert_eq!(c.gated, None, "the 35B is runnable, not gated");
         let v = c.vllm.unwrap();

@@ -6,13 +6,13 @@ name = "Ornith-1.0-397B"
 backend = "vllm"
 footprint_gib = 400.0 # FP8 (the dgx_registry FP8 row).
 gated = true
+# reasoning_parser/tool_call_parser/enable_auto_tool_choice come from the
+# qwen3 family defaults (cards/families/qwen3.toml).
+family = "qwen3"
 
 [vllm]
 served_name = "Ornith-1.0-397B"
 max_model_len = 262144
-reasoning_parser = "qwen3"
-tool_call_parser = "qwen3_xml"
-enable_auto_tool_choice = true
 extra = ["--enable-prefix-caching", "--trust-remote-code"]
 
 [tuning]
