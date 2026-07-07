@@ -6,8 +6,9 @@ implemented by this PR) · **Companion:**
 single-agent loop side) · **Evidence:** live-session forensics
 2026-07-06 (ornith:35b on dgx1, newt 0.7.1) + source citations at
 `305d56d`. Every mechanism claim below was adversarially re-verified
-against source or the conversations DB before inclusion; two findings
-from that review materially reshaped the menu (see §2.6 and L5).
+against source or the conversations DB before inclusion; the review
+pass and Shawn's PR review both materially reshaped the menu (see
+§2.4, §2.6, and L5).
 
 ## 1. The incident
 
@@ -65,19 +66,40 @@ Discovery is redone because nothing durable survives the turn boundary.
    follows the breadcrumb, not the handle: re-reads burn the remaining
    rounds, and the read-only-exploration nudge (`mod.rs:1302-1322`)
    piles on more messages, regrowing the list toward the next trigger.
-4. **The summarizer is misconfigured into its own documented failure
-   mode.** `~/.newt/summarizer.toml` is absent (only `.backup` files
-   remain); an absent file silently means "reuse the session backend"
-   (`config.rs:2890-2901`, `newt-tui/src/lib.rs:8831-8866`) — so
-   mid-loop compaction runs **ornith:35b on the contended dgx1** with a
-   60s timeout, 1 retry, and **no fallback model**. That violates every
-   rule the backup file encodes (run on gnuc, never a thinking model,
-   150s timeout, explicit fallback); since ornith `emits_thinking`, a
-   thinking-only reply reads as an empty summary → static marker
-   (`lib.rs:4099-4107`, `compress.rs:1047-1049`). This is not
-   theoretical: on 07-05 four consecutive capped turns (conv
-   `…4cc3430a`) carry "*and the final summarization request also
-   failed*" — the summarizer was failing even at cap-exit.
+4. **The summarizer that should never contend was contending — twice
+   over.** Two distinct summarize paths matter. (a) *Mid-loop
+   compaction* resolves through `summarizer.toml`; on the incident
+   night that file was parked at `summarizer.toml.backup` (it has since
+   been renamed back and is active again), and an absent file
+   **silently** means "reuse the session backend"
+   (`config.rs:2890-2901`, `newt-tui/src/lib.rs:8824-8859`) — so
+   compaction ran **ornith:35b on the contended dgx1** with a 60s
+   timeout, 1 retry, no fallback, and no notice of any kind (the only
+   load-time warning fires for a *malformed* file, never an absent
+   one). Since ornith `emits_thinking`, a thinking-only reply reads as
+   an empty summary → static marker (`lib.rs:4099-4107`,
+   `compress.rs:1047-1049`). (b) *Cap-exit* summaries bypass
+   `summarizer.toml` entirely — `final_summary_ollama` always uses the
+   **session** client (`mod.rs:2377-2378`) — which is what actually
+   failed ×4 on 07-05 (conv `…4cc3430a`, "*and the final summarization
+   request also failed*"): dgx1 contention that no summarizer config
+   can fix.
+
+   The deeper miss: an **embedded in-process CPU summarizer built for
+   exactly this** (#639 → #641 scaffold/palette, #659 candle engine,
+   #667 summarizer routing; merged 06-25/26) was reachable the whole
+   time, but its last mile never shipped. It is explicit-opt-in only —
+   "*an embedded summarizer is explicitly configured, never inherited*"
+   (#667) — behind a default-off cargo feature the installed 0.7.1
+   binary was built without, needing a hand-placed GGUF + tokenizer
+   (none exist on this machine; the `newt models pull` command
+   `palette.rs:39-40` mentions was never built), with zero CHANGELOG or
+   release-notes mention and a stale decision-doc status line. Notably,
+   semantic *embeddings* got exactly the smart-default treatment the
+   summarizer lacks (`cd54443`, 07-05: default to embedded when
+   unconfigured) — which also means the feature-off binary likely
+   strands the default-on semantic-retrieval feature; verify with
+   `/context stats`.
 5. **Hallucination recovery burns rounds.** Rounds advance regardless
    of what happened in them (`'round_loop: for round in 0..hard_tool_rounds`,
    `mod.rs:1240`; no refund path). Turn seq 301 (conv `…c21ecf03`) had
@@ -157,15 +179,36 @@ message-count trigger — the clamp is the only lever over that.)
 *Failure mode:* the roadmap's own warning — "Raising `max_tool_rounds`
 only lets it thrash longer" (ROADMAP.md:1326). Pair with T0.2.
 
-**T0.2 — restore `summarizer.toml`.** Copy the `.backup` back into
-place (summarizer on gnuc `gemma3:12b`, 150s timeout, fallback
-`qwen2.5-coder:7b`, `keep_alive 30m`).
-*Buys:* compaction stops contending with the session model, stops
-risking thinking-only empty summaries → static markers (observed ×4 on
-07-05), and stops adding up to ~120s per fired trim.
-*Failure mode:* none known — this restores the configuration the
-backup was explicitly written to preserve. Cheapest,
-highest-confidence fix.
+**T0.2 — get the summarizer off the session backend (two paths).**
+*Immediate — already done:* `summarizer.toml` has been renamed back
+into place (gnuc `gemma3:12b`, 150s timeout, fallback
+`qwen2.5-coder:7b`); the next session's mid-loop compaction runs off-
+box again. Verify it actually loads (`RUST_LOG=info` shows summarizer
+resolution; a manual `/compress` should not report "prune + static
+marker").
+*Durable — the embedded CPU summarizer (#639), which exists but needs
+its three enablers:* (1) build with the feature —
+`just install ~/bin newt-agent/embedded`; (2) fetch the palette model
+by hand (no downloader exists): `qwen2.5-1.5b-instruct-q4_k_m.gguf`
+(~1.0 GB, "balanced default summarizer pick on 16 GB",
+`palette.rs:91`) + `tokenizer.json` **next to it**, from
+`Qwen/Qwen2.5-1.5B-Instruct-GGUF`; (3) point `summarizer.toml` at it
+with an **absolute** `model_path` (no tilde expansion on this path):
+
+```toml
+kind       = "embedded"
+model      = "qwen2.5-1.5b"
+model_path = "/Users/shawnhartsock/.newt/models/qwen2.5-1.5b/qwen2.5-1.5b-instruct-q4_k_m.gguf"
+```
+
+*Buys:* zero-contention, zero-external-dependency compaction — the
+#639 design goal.
+*Failure modes:* a half-setup is worse than gnuc — `kind = "embedded"`
+with a feature-off build or missing GGUF yields a permanently failing
+summarizer → static marker on every compaction (`lib.rs:4290-4297`,
+`compress.rs:1390-1398`), never a fallback to HTTP. Disk check first:
+this machine is at ~12 GiB free (95% full; `newt-agent/target` alone
+holds 18 GB — `cargo clean` reclaims it).
 
 **T0.3 — probe the model's tool-call conformance.** Run `/probe`
 against ornith:35b — its conformance entry is unprobed
@@ -236,7 +279,32 @@ non-empty, honest ledger — turns like seq 304, which had three real
 edits to report, stop being total losses.
 *Failure mode:* banner grows; keep it structured.
 
-**L5 — point the compaction breadcrumb at the handle.** Reword
+**L5 — finish #639's last mile: embedded summarizer as the smart
+default.** The "default to embedded when unconfigured" pattern already
+exists in-tree — applied to *embeddings* on 07-05 (`cd54443`) but
+never to the summarizer, whose wiring stopped at explicit config
+(#667; and `cd49ab4` moved it *further* from auto-detection). Ship the
+increment the design doc's own ethos ("smart defaults") calls for:
+(a) when the `embedded` feature is compiled and a palette GGUF
+resolves, the summarizer defaults to it — explicit config still wins;
+(b) a one-line startup notice of what the summarizer resolved to,
+including the currently-silent absent-file → session-backend fallback;
+(c) `newt models pull <alias>` so setup is one explicit command
+(`palette.rs:39-40` already names it; it was never built — "no silent
+downloads" stays intact); (d) hygiene: update the stale
+`embedded_inference.md` status line, backfill the CHANGELOG (the
+#639/#641/#659/#667 chain appears in no changelog or release notes —
+part of why this work was forgotten), close out #639's unchecked
+BAT/UAT. Decide separately whether default `just install` should
+include the feature (the lean wyvern doctrine says no; `install-lean`
+already exists as the escape hatch, so flipping the human-install
+default is defensible).
+*Buys:* "this should be the default behavior" becomes true, and this
+failure class can't silently recur.
+*Failure mode:* candle deps in the default human build (~larger
+binary, longer builds); the lean tier is unaffected.
+
+**L6 — point the compaction breadcrumb at the handle.** Reword
 `reread_breadcrumb` (`compress.rs:1087-1133`) so its first instruction
 is "fetch the verbatim span via `memory_fetch("compaction:<id>")`,
 then re-read only what the fetch doesn't cover" — today the breadcrumb
@@ -266,15 +334,23 @@ plan-phase read-only caveats enforce that.
 *Measured by:* plan-quality + completion-rate sweep, n≥5.
 
 **F2 — progressive-disclosure compaction (Step 20.4).**
-Today's compaction already stores the evicted span and appends **one
-whole-span** `memory_fetch("compaction:<id>")` handle
-(`compress.rs:662-674`, wiring `lib.rs:6400-6404`, `6546-6547`). The
-gap vs
-[`progressive-disclosure-compaction.md`](progressive-disclosure-compaction.md)
-is granularity and defaults: **per-item page handles + one-line gists
-replacing the lossy summary** (`compaction_mode = disclosure`), the
-anti-thrash latch, and reconciling the contradictory in-message
-guidance (L5 is the cheap forerunner).
+Status at HEAD, precisely: #661 group B (#666) landed the store — the
+whole evicted span is kept and **one whole-span**
+`memory_fetch("compaction:<id>")` handle is appended
+(`compress.rs:662-674`, wiring `lib.rs:6400-6404`, `6546-6547`) — and
+the `[context] manager` selector exists with
+`standard|progressive|distributed`, but only `standard` is
+implemented (`progressive`/`distributed` are stubs "owned by #546 —
+not yet available", `config.rs:773-788`). The per-item mode —
+**page handles + one-line gists replacing the lossy summary**
+(`compaction_mode = disclosure`) — has no implementation
+(`compaction_mode` appears in no `.rs` file); its parked slot is the
+`provenance` context feature, `available() == false`
+(`config.rs:841-842`, `897`). Two wiring contradictions to resolve on
+the way: the compaction text always advertises `memory_fetch`, but the
+tool's advertisement is gated on `[memory] disclosure = "index"`
+(default `frozen` — `lib.rs:6379-6407`); and the reread breadcrumb
+points away from the handle (L6 is the cheap forerunner).
 *Buys:* kills the re-exploration spiral at the source ("never lose"):
 a compacted read costs one `memory_fetch`, not a re-read round.
 *Failure mode:* re-page thrash; the design doc specifies the latch.
@@ -311,11 +387,12 @@ config — the three-Cs ending for this whole menu.
    cap, probe conformance. Zero code; removes the contention/empty-
    summary waste and the tightest artificial limits. Rerun the exact
    #969 planning task as the yardstick.
-2. **This week (L1 → L5 → L3 → L2 → L4)** — plan-gate first (it makes
-   the whole shipped stack reachable and is the incident's
-   evidence-matched fix), then the one-string breadcrumb fix, then the
-   nudge knob; L2 and L4 round out grace and honest exits. Each is
-   one-file-plus-tests-sized.
+2. **This week (L1 → L6 → L5 → L3 → L2 → L4)** — plan-gate first (it
+   makes the whole shipped stack reachable and is the incident's
+   evidence-matched fix), then the one-string breadcrumb fix, then
+   finishing #639's last mile so the summarizer regression can't
+   silently recur; the nudge knob, grace arm, and honest cap-exit
+   round it out. Each increment is one-file-plus-tests-sized.
 3. **Next (F1, then F2)** — `plan_mode` is the better-plans
    investment; disclosure compaction is the never-lose investment. F3
    (auto-continue) only after L1+L2 exist to gate it; F4 wraps the
