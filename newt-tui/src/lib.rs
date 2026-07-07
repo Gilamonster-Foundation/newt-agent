@@ -371,6 +371,19 @@ pub fn run_code(
     if !inline {
         // Default: full ANSI splash in alt screen — blinks off on Enter.
         enable_raw_mode()?;
+        // Flush the tty input queue on taking the terminal. A slow pre-splash step
+        // — notably the first-run summarizer model pull (#661 group C), which runs
+        // for seconds in cooked mode — lets impatient keystrokes or echoed bytes
+        // queue up; entering raw mode does NOT discard them, so the splash's first
+        // input poll would consume one (a lone Esc / q / Ctrl-C reads as quit) and
+        // newt would exit before the splash is ever seen. TCIFLUSH drops the
+        // pending input atomically — no poll/read drain race.
+        #[cfg(unix)]
+        // SAFETY: tcflush on the stdin tty fd passes no pointers and touches no
+        // memory; the worst case on a non-tty fd is a harmless ENOTTY.
+        unsafe {
+            libc::tcflush(libc::STDIN_FILENO, libc::TCIFLUSH);
+        }
         let mut stdout = io::stdout();
         execute!(
             stdout,

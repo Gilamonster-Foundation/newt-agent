@@ -1,10 +1,12 @@
 //! `newt models` — manage the local palette of mini models for the on-host
 //! embedded summarizer (#661 group C).
 //!
-//! `pull` fetches a GGUF to `~/.newt/models/<alias>/`, `list` shows the palette
-//! and what is installed, `path` prints the resolved local path. `pull` is the ONE
-//! explicit fetch (nothing is auto-downloaded anywhere else), which is what lets
-//! the embedded CPU summarizer be the default without a second backend or GPU.
+//! `pull` fetches a model's GGUF **and** its `tokenizer.json` to
+//! `~/.newt/models/<alias>/` (candle needs both — the quant GGUF repos do not
+//! ship a standalone tokenizer, so it comes from `tokenizer_repo`). `list` shows
+//! the palette and what is fully installed, `path` prints the resolved GGUF path.
+//! Besides the interactive first-run auto-provision, `pull` is the explicit fetch
+//! that lets the embedded CPU summarizer be the default without a GPU.
 
 use clap::Subcommand;
 use newt_inference::palette::{self, MiniModel};
@@ -92,29 +94,52 @@ fn print_path(alias: Option<&str>) -> anyhow::Result<()> {
 
 async fn pull(alias: Option<&str>) -> anyhow::Result<()> {
     let m = resolve(alias)?;
-    let dest = palette::local_gguf_path(m)
+    let gguf = palette::local_gguf_path(m)
         .ok_or_else(|| anyhow::anyhow!("cannot resolve ~/.newt/models (no home dir)"))?;
-    if dest.is_file() {
-        println!("{} already present at {}", m.name, dest.display());
-        return Ok(());
-    }
-    // Standard HF GGUF layout: <repo>/resolve/main/<file>.
-    let url = format!(
-        "https://huggingface.co/{}/resolve/main/{}",
-        m.hf_repo, m.gguf_file
-    );
-    println!(
-        "Pulling {} (~{:.1} GB)\n  from {url}\n  to   {}",
-        m.name,
-        m.approx_ram_gb,
-        dest.display()
-    );
-    if let Some(parent) = dest.parent() {
+    let tok = palette::local_tokenizer_path(m)
+        .ok_or_else(|| anyhow::anyhow!("cannot resolve ~/.newt/models (no home dir)"))?;
+    if let Some(parent) = gguf.parent() {
         std::fs::create_dir_all(parent)?;
         write_models_readme(parent);
     }
-    download_to(&url, &dest).await?;
-    println!("OK installed {} -> {}", m.name, dest.display());
+    // The embedded engine needs BOTH the weights and a standalone tokenizer.json.
+    // Weights come from the quant GGUF repo; the tokenizer from `tokenizer_repo`
+    // (the GGUF repo does not ship one — that was the init failure). Each fetch is
+    // skipped when the file is already on disk, so a half-provisioned dir (e.g.
+    // GGUF-only from an older newt) is completed in place.
+    let gguf_url = format!(
+        "https://huggingface.co/{}/resolve/main/{}",
+        m.hf_repo, m.gguf_file
+    );
+    let tok_url = format!(
+        "https://huggingface.co/{}/resolve/main/tokenizer.json",
+        m.tokenizer_repo
+    );
+    println!(
+        "Provisioning {} -> {}",
+        m.name,
+        gguf.parent().unwrap_or(&gguf).display()
+    );
+    fetch_if_absent(
+        &gguf_url,
+        &gguf,
+        &format!("weights (~{:.1} GB)", m.approx_ram_gb),
+    )
+    .await?;
+    fetch_if_absent(&tok_url, &tok, "tokenizer.json").await?;
+    println!("OK {} fully provisioned", m.name);
+    Ok(())
+}
+
+/// Download `url` to `dest` unless it is already present. One-line status; used
+/// by `newt models pull` for both the weights and the tokenizer.
+async fn fetch_if_absent(url: &str, dest: &Path, label: &str) -> anyhow::Result<()> {
+    if dest.is_file() {
+        println!("  {label}: present");
+        return Ok(());
+    }
+    println!("  {label}: fetching from {url}");
+    download_to(url, dest).await?;
     Ok(())
 }
 
@@ -190,7 +215,10 @@ async fn provision_default_model() {
     if palette::resolve_local(m.name).is_some() {
         return;
     }
-    let Some(dest) = palette::local_gguf_path(m) else {
+    let (Some(gguf), Some(tok)) = (
+        palette::local_gguf_path(m),
+        palette::local_tokenizer_path(m),
+    ) else {
         return; // no home dir — resolution will warn/degrade later
     };
     eprintln!(
@@ -200,7 +228,7 @@ async fn provision_default_model() {
          {} to ~/.newt/models now (one time). Set NEWT_NO_MODEL_PULL=1 to skip.",
         m.name
     );
-    if let Some(parent) = dest.parent() {
+    if let Some(parent) = gguf.parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
             eprintln!(
                 "  first pull skipped (cannot create {}): {e}",
@@ -210,20 +238,43 @@ async fn provision_default_model() {
         }
         write_models_readme(parent);
     }
-    let url = format!(
+    let gguf_url = format!(
         "https://huggingface.co/{}/resolve/main/{}",
         m.hf_repo, m.gguf_file
     );
-    match download_to(&url, &dest).await {
-        Ok(()) => eprintln!(
+    let tok_url = format!(
+        "https://huggingface.co/{}/resolve/main/tokenizer.json",
+        m.tokenizer_repo
+    );
+    // The embedded engine needs BOTH weights and tokenizer; a failure on either
+    // degrades to the session model (with a warning) rather than a mid-compaction
+    // init error — which is what happened when only the GGUF was fetched.
+    let ok = provision_one(&gguf_url, &gguf).await && provision_one(&tok_url, &tok).await;
+    if ok {
+        eprintln!(
             "  ready — context compaction now runs on the CPU ({}).",
             m.name
-        ),
-        Err(e) => eprintln!(
-            "  first pull failed ({e}); the summarizer will use the session model\n  \
+        );
+    } else {
+        eprintln!(
+            "  first pull incomplete; the summarizer will use the session model\n  \
              (with a warning) until `newt models pull` succeeds."
-        ),
+        );
     }
+}
+
+/// One best-effort provisioning fetch for the auto-provision path (skip if
+/// present). Errors are reported to stderr, not fatal — the caller degrades.
+#[cfg(feature = "embedded")]
+async fn provision_one(url: &str, dest: &Path) -> bool {
+    if dest.is_file() {
+        return true;
+    }
+    if let Err(e) = download_to(url, dest).await {
+        eprintln!("  pull failed for {}: {e}", dest.display());
+        return false;
+    }
+    true
 }
 
 /// Drop a README into `~/.newt/models/` explaining what these files are and why
