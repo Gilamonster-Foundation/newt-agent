@@ -50,3 +50,24 @@ The unmodified baseline binary FAILS — as it must (#548 not yet implemented):
 {"issue":548,"top_dgx_subs":8,"dgx_help_subs":8,"rolled_up":false,"disclosure":true,"pass":false}
 ```
 A correct rollup ⇒ `top_dgx_subs:0, rolled_up:true, pass:true`.
+
+## Sibling: the loop-completion track (`grade-loop.sh` / `loop-sweep.sh`)
+
+Where `grade-548.sh` asks "does the *feature* work?", `grade-loop.sh` asks "did
+the *turn* reach a usable done state, or die the incident's death?" — the
+yardstick for the [next-loop-levers](../../docs/design/next-loop-levers.md)
+work. It drives `newt` through the verbatim
+[yardstick prompts](../../docs/design/evidence/next-loop-levers-yardstick.md) in
+an **isolated `$HOME`** and reads plan-ledger / cap-salvage / dangling-narration
+/ phantom-reach signals out of the run's own `conversations.db`.
+
+```
+./scripts/eval/grade-loop.sh <newt-binary> --home <throwaway-with-.newt>  # one trial
+./scripts/eval/loop-sweep.sh --out results/loop-sweeps/<name> --newt <bin> \
+    --levers baseline,T0.1,T0.2 --trials 5 --scratch /var/tmp/loop-sweep   # n≥5 A/B
+./scripts/eval/grade-loop.sh --self-test   # offline; no backend
+```
+
+Full method, dgx1 substrate, and the per-lever cells:
+[`docs/design/evidence/next-loop-levers-testplan.md`](../../docs/design/evidence/next-loop-levers-testplan.md).
+The endpoint template (host stays local) is `loop-template.example`.
