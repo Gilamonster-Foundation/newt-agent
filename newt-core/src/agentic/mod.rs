@@ -2323,9 +2323,7 @@ pub async fn chat_complete(
                 // check instead of pretending the tool produced output.
                 match cancellable(cancel, dispatch).await {
                     Some(r) => r,
-                    None => format!(
-                        "error: {name} interrupted — tool cancelled before completion"
-                    ),
+                    None => format!("error: {name} interrupted — tool cancelled before completion"),
                 }
             };
             // 17.6: record the call for the turn's events column — args are
