@@ -1,0 +1,42 @@
+# loop-template.example — LOCAL, UNCOMMITTED endpoint template for loop-sweep.sh.
+#
+# Copy the two blocks below into your operator-local eval-sweeps dir. The real
+# host endpoint lives ONLY here — never in a committed file (RATCHET.md
+# invariant: results/ and scripts name MODELS, not hosts):
+#
+#   ~/.newt/eval-sweeps/loop-backend.toml.tmpl   <- block 1  (always)
+#   ~/.newt/eval-sweeps/loop-summarizer.toml     <- block 2  (T0.2 cell only)
+#
+# loop-sweep.sh substitutes {{MODEL}} and {{MAX_ROUNDS}} per cell and toggles the
+# summarizer file per lever. The [tui.permissions] block MUST grant
+# non-interactive access: the pipe drive has no human to answer a prompt (this
+# also removes the 462s human-latency confound the yardstick calls out). Confirm
+# on the FIRST real run that a tool actually executes — grade-loop.sh ERRORs
+# (never silently FAILs) if nothing persisted.
+
+# ============ block 1 -> loop-backend.toml.tmpl ============
+[[backends]]
+name = "primary"
+endpoint = "http://<your-ollama-host>:11434"   # dgx1 lives ONLY here
+model = "{{MODEL}}"
+kind = "ollama"
+
+[tui]
+max_tool_rounds = {{MAX_ROUNDS}}   # loop-sweep sets 25 (baseline) / 40 (T0.1)
+mid_loop_trim_threshold = 40       # clamps to max_tool_rounds - 3 at runtime
+inference_timeout_secs = 120
+keep_alive = "5m"
+
+[tui.permissions]
+preset = "workspace_dev"
+prompt = false                     # non-interactive: MUST auto-grant, not block
+
+# ============ block 2 -> loop-summarizer.toml (T0.2 cell only) ============
+# Off-box summarizer so mid-loop compaction stops contending with the session
+# model. Endpoint lives here only. (Does NOT fix cap-exit summaries — those
+# always use the session client, mod.rs:2377-2378; that is a separate lever.)
+kind = "ollama"
+endpoint = "http://<your-gnuc-host>:11434"
+model = "gemma3:12b"
+timeout_secs = 150
+fallback_model = "qwen2.5-coder:7b"
