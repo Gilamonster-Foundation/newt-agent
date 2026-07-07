@@ -736,6 +736,22 @@ impl newt_core::agentic::GitTool for LocalGitTool {
         args: &serde_json::Value,
         caps: &GitCaveats,
     ) -> Result<String, String> {
+        // `init` CREATES a repo, so it runs BEFORE opening one — every other op
+        // requires an existing repo (`GitEngine::open` below). It is a write:
+        // gate it on the commit/write capability so a read-only session cannot
+        // create a repo. This is what lets the tool be advertised (and useful)
+        // in a not-yet-a-repo workspace instead of silently disappearing.
+        if op == "init" {
+            if !caps.permits_commit() {
+                return Err(GitError::Denied("init").to_string());
+            }
+            if GitEngine::open(&self.root).is_ok() {
+                return Ok("git: already a repository here".into());
+            }
+            grit_lib::repo::init_repository(&self.root, false, "main", None, "files")
+                .map_err(|e| format!("init failed: {e}"))?;
+            return Ok("initialized empty git repository on branch 'main'".into());
+        }
         let eng = GitEngine::open(&self.root).map_err(|e| e.to_string())?;
         let s = |e: GitError| e.to_string();
         match op {
@@ -834,7 +850,7 @@ impl newt_core::agentic::GitTool for LocalGitTool {
             }
             other => Err(format!(
                 "unknown git op '{other}' \
-                 (use status|log|diff|add|commit|amend|rebase|branch|checkout|branch-delete)"
+                 (use init|status|log|diff|add|commit|amend|rebase|branch|checkout|branch-delete)"
             )),
         }
     }
@@ -1276,6 +1292,65 @@ mod tests {
                 "Co-authored-by: qwen3:30b (newt-agent v0.6.8) <noreply@newt-agent.com>".into(),
             ),
         }
+    }
+
+    #[test]
+    fn dispatch_init_creates_a_repo_in_a_non_repo_dir_then_commit_works() {
+        // Regression: before `op=init`, the embedded git tool was only advertised
+        // inside an existing repo and had NO way to create one — an agent in a
+        // fresh dir saw no git tool and gave up committing. `init` makes the tool
+        // useful there. (Would previously fail: "unknown git op 'init'".)
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            GitEngine::open(dir.path()).is_err(),
+            "precondition: not a repo yet"
+        );
+        let t = tool(dir.path());
+        let out = t
+            .dispatch("init", &serde_json::json!({}), &GitCaveats::top())
+            .unwrap();
+        assert!(out.contains("initialized"), "got: {out}");
+        assert!(
+            GitEngine::open(dir.path()).is_ok(),
+            "init created a real, openable repo"
+        );
+        // ...and the rest of the tool now works against the fresh repo.
+        std::fs::write(dir.path().join("f.txt"), "x\n").unwrap();
+        t.dispatch(
+            "add",
+            &serde_json::json!({"paths": ["f.txt"]}),
+            &GitCaveats::top(),
+        )
+        .unwrap();
+        let c = t
+            .dispatch(
+                "commit",
+                &serde_json::json!({"message": "first"}),
+                &GitCaveats::top(),
+            )
+            .unwrap();
+        assert!(c.contains("committed"), "got: {c}");
+    }
+
+    #[test]
+    fn dispatch_init_is_idempotent_on_an_existing_repo() {
+        let dir = repo_with_commit();
+        let out = tool(dir.path())
+            .dispatch("init", &serde_json::json!({}), &GitCaveats::top())
+            .unwrap();
+        assert!(out.contains("already a repository"), "got: {out}");
+    }
+
+    #[test]
+    fn dispatch_init_is_denied_without_write_permission() {
+        let dir = tempfile::tempdir().unwrap();
+        let res =
+            tool(dir.path()).dispatch("init", &serde_json::json!({}), &GitCaveats::read_only());
+        assert!(res.is_err(), "read-only session must not create a repo");
+        assert!(
+            GitEngine::open(dir.path()).is_err(),
+            "a denied init created nothing"
+        );
     }
 
     #[test]
