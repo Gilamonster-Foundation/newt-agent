@@ -820,6 +820,12 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             // one-line notice (→ `newt dgx adopt`) before the session. Never
             // blocks startup; silent when dgx is unconfigured or unreachable.
             dgx::startup_drift_notice(cli.config.as_deref()).await;
+            // First interactive run: provision the on-host CPU summarizer model so
+            // context compaction never competes with the session GPU model
+            // (#661 group C / #979). Best-effort — a failed pull falls back to the
+            // warn-and-degrade path; no-ops when non-interactive / lean / already
+            // present, or when NEWT_NO_MODEL_PULL is set.
+            models_cmd::ensure_summarizer_model().await;
             newt_tui::run_code(
                 path.as_deref(),
                 no_splash,

@@ -3,7 +3,8 @@
 **Status:** DELIVERED (2026-07-07) — the mid-loop context summarizer **defaults
 to the embedded on-host CPU engine**; the `embedded` feature is **default-on**
 (revised wyvern stance below). Session-reuse and off-box summarizers are
-**overrides that warn**. Provision the model with `newt models pull`.
+**overrides that warn**. The default model **auto-provisions on the first
+interactive run** (or `newt models pull`).
 **Issue:** #639, #661 (group C). **Related:** #559 (bulletproof summarizer), #383 (foreign providers), #548 (the summarizer-contention wedge that motivated it).
 
 ## Why
@@ -79,9 +80,18 @@ must stay lean, so:
   **wyvern included**. `--no-default-features` (install-lean) remains the explicit
   zero-candle opt-out for anyone who truly wants it gone. Still the per-agent
   add/remove switch — the default just flipped to on.
-- **No silent downloads.** A small box (M4 / 16 GB) can't absorb surprise GGUFs;
-  the backend resolves a configured model file and errors clearly when it's
-  absent, naming the palette entry's HF source.
+- **One bounded auto-pull, interactive only (revised 2026-07-07).** For the
+  embedded default to actually *work* out of the box, the **default** summarizer
+  model auto-provisions on the first interactive `newt code` run: a single, small
+  (~350 MB), named GGUF, announced with a `first pull` notice that explains it is
+  offloading compaction from the GPU to the CPU, opt-out via `NEWT_NO_MODEL_PULL`,
+  and gated to a TTY — a headless worker / piped / CI run **never** auto-pulls, and
+  a lean (`--no-default-features`) build has no engine to pull for. A failed pull
+  is **non-fatal**: resolution falls back to the warn-and-degrade (session-model)
+  path. Beyond that one model nothing is silently downloaded — other palette
+  entries need an explicit `newt models pull`, and the backend errors clearly
+  (naming the HF source) when a configured model is absent. A
+  `~/.newt/models/README.md` records what's there and why.
 
 ## The mini-model palette
 

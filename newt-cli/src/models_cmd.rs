@@ -111,6 +111,7 @@ async fn pull(alias: Option<&str>) -> anyhow::Result<()> {
     );
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)?;
+        write_models_readme(parent);
     }
     download_to(&url, &dest).await?;
     println!("OK installed {} -> {}", m.name, dest.display());
@@ -152,3 +153,109 @@ async fn download_to(url: &str, dest: &Path) -> anyhow::Result<()> {
     std::fs::rename(&part, dest)?;
     Ok(())
 }
+
+/// First-run provisioning of the on-host summarizer model (#661 group C).
+///
+/// Called at the start of an interactive `newt code` session. When the embedded
+/// summarizer is the compiled default but its GGUF isn't on disk yet, this
+/// prints a one-time `first pull` notice, fetches the default palette model to
+/// `~/.newt/models/`, and drops a README. Best-effort: a failed pull (offline /
+/// firewalled) leaves the model absent, so summarizer resolution falls back to
+/// the warn-and-degrade (session-model) path — nothing here is fatal.
+///
+/// Silently no-ops unless ALL hold: built with the `embedded` feature, stdout is
+/// a TTY (never auto-pull in a pipe / headless worker / CI), the opt-out env
+/// `NEWT_NO_MODEL_PULL` is unset, and the model is absent.
+pub async fn ensure_summarizer_model() {
+    use std::io::IsTerminal;
+    // Interactive only — a headless worker / piped / CI run must never pull
+    // ~350 MB behind the operator's back. NEWT_NO_MODEL_PULL is the opt-out.
+    let may_pull =
+        std::io::stdout().is_terminal() && std::env::var_os("NEWT_NO_MODEL_PULL").is_none();
+    #[cfg(feature = "embedded")]
+    if may_pull {
+        provision_default_model().await;
+    }
+    #[cfg(not(feature = "embedded"))]
+    let _ = may_pull; // lean build: no embedded engine to provision for
+}
+
+/// The feature-on body of [`ensure_summarizer_model`]. Only compiled when the
+/// embedded engine exists — a lean (`--no-default-features`) build has nothing to
+/// run the model, so it never auto-pulls.
+#[cfg(feature = "embedded")]
+async fn provision_default_model() {
+    let m = palette::default_model();
+    // Already provisioned (every run after the first) → nothing to do.
+    if palette::resolve_local(m.name).is_some() {
+        return;
+    }
+    let Some(dest) = palette::local_gguf_path(m) else {
+        return; // no home dir — resolution will warn/degrade later
+    };
+    eprintln!(
+        "first pull — setting up the on-host summarizer.\n\
+         newt offloads context compaction from your GPU onto a small CPU model, so\n\
+         summarizing never competes with the primary model under load. Fetching\n\
+         {} to ~/.newt/models now (one time). Set NEWT_NO_MODEL_PULL=1 to skip.",
+        m.name
+    );
+    if let Some(parent) = dest.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            eprintln!(
+                "  first pull skipped (cannot create {}): {e}",
+                parent.display()
+            );
+            return;
+        }
+        write_models_readme(parent);
+    }
+    let url = format!(
+        "https://huggingface.co/{}/resolve/main/{}",
+        m.hf_repo, m.gguf_file
+    );
+    match download_to(&url, &dest).await {
+        Ok(()) => eprintln!(
+            "  ready — context compaction now runs on the CPU ({}).",
+            m.name
+        ),
+        Err(e) => eprintln!(
+            "  first pull failed ({e}); the summarizer will use the session model\n  \
+             (with a warning) until `newt models pull` succeeds."
+        ),
+    }
+}
+
+/// Drop a README into `~/.newt/models/` explaining what these files are and why
+/// they're on the CPU. Written once — never clobbers a user-edited one — by both
+/// `newt models pull` and the first-run auto-provision.
+fn write_models_readme(dir: &Path) {
+    let readme = dir.join("README.md");
+    if readme.exists() {
+        return;
+    }
+    let _ = std::fs::write(&readme, MODELS_README);
+}
+
+const MODELS_README: &str = "\
+# newt on-host summarizer models
+
+These GGUF files are the on-host, CPU inference engine newt uses to summarize /
+compact its OWN context mid-session, so context management never competes with
+your GPU (the primary model) under load.
+
+- Managed by `newt models` (`list` / `pull` / `path`).
+- Default summarizer model: qwen2.5-0.5b (Q4_K_M, ~350 MB).
+- Fetched from Hugging Face on the first interactive `newt code` run, or with
+  `newt models pull`. Nothing else auto-downloads.
+- Layout: <alias>/<file>.gguf
+- Safe to delete: newt re-pulls on the next interactive run, or falls back to the
+  session model (with a warning) until you re-pull.
+- Skip the auto-pull with NEWT_NO_MODEL_PULL=1.
+
+Why the CPU? Context compaction fires exactly when context is large — i.e. when
+the GPU is busiest. Running the summarizer on the session GPU model there
+overloads it and can stall the turn (#979). A small CPU model decouples them.
+
+See docs/decisions/embedded_inference.md and issues #639 / #661 / #979.
+";
