@@ -283,8 +283,10 @@ pub enum RoundObservation {
 /// sets `max_ok_input` to 80 % of the parsed limit). `None` (model-default
 /// window) or zero contributes nothing — the zero-is-disabled contract (F3),
 /// never a compress-to-zero.
-fn num_ctx_input_ceiling(num_ctx: Option<u32>) -> Option<usize> {
-    num_ctx.map(|c| (c as usize) * 80 / 100).filter(|&c| c > 0)
+fn num_ctx_input_ceiling(num_ctx: Option<u32>, input_ceiling_pct: u32) -> Option<usize> {
+    num_ctx
+        .map(|c| (c as usize) * (input_ceiling_pct as usize) / 100)
+        .filter(|&c| c > 0)
 }
 
 /// Initial pre-send budget for one turn (issue #282; Phase 20 semantics per
@@ -312,12 +314,13 @@ fn initial_send_budget(
     max_ok_input: Option<u32>,
     safe_context: Option<u32>,
     num_ctx: Option<u32>,
+    input_ceiling_pct: u32,
 ) -> Option<usize> {
     let cached = match (max_ok_input, safe_context) {
         (Some(m), Some(s)) => Some(m.max(s) as usize),
         (m, s) => m.or(s).map(|c| c as usize),
     };
-    match (cached, num_ctx_input_ceiling(num_ctx)) {
+    match (cached, num_ctx_input_ceiling(num_ctx, input_ceiling_pct)) {
         (Some(budget), Some(ceiling)) => Some(budget.min(ceiling)),
         (budget, ceiling) => budget.or(ceiling),
     }
@@ -385,7 +388,7 @@ mod send_budget_tests {
     /// arm the trigger on turn 1 — as a HARD budget (anti-thrash semantics).
     #[test]
     fn first_turn_fresh_cache_trigger_sees_the_num_ctx_ceiling() {
-        let budget = initial_send_budget(None, None, Some(4096));
+        let budget = initial_send_budget(None, None, Some(4096), 80);
         assert_eq!(budget, Some(3276), "80% of 4096 — reply headroom reserved");
         // The measured B6 shape: ~41k estimated tokens, 3 messages, no
         // count/token thresholds in reach — pre-fix this returned None and
@@ -408,11 +411,11 @@ mod send_budget_tests {
     /// never pull the budget BELOW the believed-safe window.
     #[test]
     fn absent_num_ctx_leaves_the_budget_unchanged() {
-        assert_eq!(initial_send_budget(None, None, None), None);
-        assert_eq!(initial_send_budget(Some(2_000), None, None), Some(2_000));
-        assert_eq!(initial_send_budget(None, Some(5_000), None), Some(5_000));
+        assert_eq!(initial_send_budget(None, None, None, 80), None);
+        assert_eq!(initial_send_budget(Some(2_000), None, None, 80), Some(2_000));
+        assert_eq!(initial_send_budget(None, Some(5_000), None, 80), Some(5_000));
         assert_eq!(
-            initial_send_budget(Some(2_000), Some(5_000), None),
+            initial_send_budget(Some(2_000), Some(5_000), None, 80),
             Some(5_000),
             "an HWM below safe_context is a floor, not a cap — safe_context wins"
         );
@@ -433,14 +436,14 @@ mod send_budget_tests {
         // prompt SEEN) while safe_context believed 80% of a 32k window safe.
         // Pre-fix the 6,068 won and refused sends the backend accepted.
         assert_eq!(
-            initial_send_budget(Some(6_068), Some(26_214), None),
+            initial_send_budget(Some(6_068), Some(26_214), None, 80),
             Some(26_214),
             "HWM below safe_context → safe_context"
         );
         // Proven beyond the claim: an accepted 8,734-token prompt outranks a
         // conservative claim-derived window.
         assert_eq!(
-            initial_send_budget(Some(8_734), Some(6_553), None),
+            initial_send_budget(Some(8_734), Some(6_553), None, 80),
             Some(8_734),
             "HWM above safe_context (proven beyond the claim) → HWM"
         );
@@ -449,12 +452,12 @@ mod send_budget_tests {
         // reined safe_context down to equal-or-lower — max() must land on
         // the authoritative cap, not regress to the VRAM-capped figure.
         assert_eq!(
-            initial_send_budget(Some(800_000), Some(64_000), None),
+            initial_send_budget(Some(800_000), Some(64_000), None, 80),
             Some(800_000),
             "post-cw-400: max_ok_input is the authoritative cap"
         );
         assert_eq!(
-            initial_send_budget(Some(800_000), Some(800_000), None),
+            initial_send_budget(Some(800_000), Some(800_000), None, 80),
             Some(800_000)
         );
     }
@@ -526,17 +529,17 @@ mod send_budget_tests {
         // Cached cap tighter than the ceiling: cached wins (mid-loop B5
         // behavior is untouched by #282).
         assert_eq!(
-            initial_send_budget(Some(2_135), None, Some(4_096)),
+            initial_send_budget(Some(2_135), None, Some(4_096), 80),
             Some(2_135)
         );
         // Ceiling tighter than the cached cap: the B6 shape — bootstrap
         // safe_context 104,857 vs forced num_ctx 4,096.
         assert_eq!(
-            initial_send_budget(None, Some(104_857), Some(4_096)),
+            initial_send_budget(None, Some(104_857), Some(4_096), 80),
             Some(3_276)
         );
         assert_eq!(
-            initial_send_budget(Some(104_857), Some(104_857), Some(4_096)),
+            initial_send_budget(Some(104_857), Some(104_857), Some(4_096), 80),
             Some(3_276)
         );
     }
@@ -545,12 +548,12 @@ mod send_budget_tests {
     /// zero-is-disabled contract (F3) holds at the source.
     #[test]
     fn zero_or_tiny_num_ctx_is_no_budget_at_all() {
-        assert_eq!(num_ctx_input_ceiling(None), None);
-        assert_eq!(num_ctx_input_ceiling(Some(0)), None);
-        assert_eq!(num_ctx_input_ceiling(Some(1)), None, "80% rounds to zero");
-        assert_eq!(initial_send_budget(None, None, Some(0)), None);
+        assert_eq!(num_ctx_input_ceiling(None, 80), None);
+        assert_eq!(num_ctx_input_ceiling(Some(0), 80), None);
+        assert_eq!(num_ctx_input_ceiling(Some(1), 80), None, "80% rounds to zero");
+        assert_eq!(initial_send_budget(None, None, Some(0), 80), None);
         // A zero ceiling must not shadow a real cached budget either.
-        assert_eq!(initial_send_budget(Some(2_000), None, Some(0)), Some(2_000));
+        assert_eq!(initial_send_budget(Some(2_000), None, Some(0), 80), Some(2_000));
     }
 }
 
@@ -743,6 +746,15 @@ pub struct ChatCtx<'a> {
     /// `[context] summary_input_cap_floor_chars` — floor for the summarizer
     /// input cap so a tight budget never starves the summarizer of material.
     pub summary_input_cap_floor_chars: usize,
+    /// `[context] input_ceiling_pct` — percent of `num_ctx` usable as input
+    /// before the reply reserve. Historically hardcoded at 80 (20% headroom);
+    /// large-window models (e.g. Opus) can safely raise this to pack more
+    /// context per turn. Applied by `num_ctx_input_ceiling`.
+    pub input_ceiling_pct: u32,
+    /// `[context] low_budget_pct` — remaining-budget percent below which the
+    /// loop treats the turn as "low budget" and nudges toward wrapping up.
+    /// Historically hardcoded at 15.
+    pub low_budget_pct: usize,
     /// #307 named-permission-preset exec FLOOR. When a `/mode` preset is active
     /// its exec clamp is threaded here so the `--disable-ocap` / `--yolo`
     /// bypass in `execute_tool` cannot raise exec authority above the preset:
@@ -1067,6 +1079,8 @@ pub async fn chat_complete(
         estimate_ratio,
         estimation,
         summary_input_cap_floor_chars,
+        input_ceiling_pct,
+        low_budget_pct,
         exec_floor,
         write_ledger,
         cancel,
@@ -1154,8 +1168,8 @@ pub async fn chat_complete(
     // so without the ceiling the first turn dispatched 10× over the real
     // window with zero events — B6). Mutable because a recovered 400 tightens
     // it mid-turn. See #223.
-    let num_ctx_ceiling = num_ctx_input_ceiling(num_ctx);
-    let mut send_budget: Option<usize> = initial_send_budget(max_ok_input, safe_context, num_ctx);
+    let num_ctx_ceiling = num_ctx_input_ceiling(num_ctx, input_ceiling_pct);
+    let mut send_budget: Option<usize> = initial_send_budget(max_ok_input, safe_context, num_ctx, input_ceiling_pct);
     // Step 20.3: is the send budget backed by an authoritative ceiling, or
     // does it rest on the proven-good high-water mark (`max_ok_input`) alone?
     // `safe_context` (a believed/declared window) and the per-request
@@ -2266,8 +2280,10 @@ pub async fn chat_complete(
             let result = if tools::is_context_remaining_call(name) {
                 let report = budget::render_context_budget(
                     prompt_tracker.current(&messages, Some(&tools), cal, estimation),
-                    num_ctx_input_ceiling(num_ctx),
+                    num_ctx_input_ceiling(num_ctx, input_ceiling_pct),
                     num_ctx,
+                    input_ceiling_pct as usize,
+                    low_budget_pct,
                 );
                 display::print_tool_call("get_context_remaining", "", color);
                 display::print_tool_output(&report, tool_output_lines, color);
@@ -3735,6 +3751,8 @@ pub async fn openai_chat_complete(
         estimate_ratio,
         estimation,
         summary_input_cap_floor_chars,
+        input_ceiling_pct,
+        low_budget_pct,
         exec_floor,
         write_ledger,
         cancel,
@@ -3796,7 +3814,7 @@ pub async fn openai_chat_complete(
     // (#223). Phase 20 §2.1 max(proven, believed) semantics — no `num_ctx`
     // ceiling on this wire (limits are server-side, e.g. vLLM
     // --max-model-len), so the ceiling leg is `None`.
-    let mut send_budget: Option<usize> = initial_send_budget(max_ok_input, safe_context, None);
+    let mut send_budget: Option<usize> = initial_send_budget(max_ok_input, safe_context, None, input_ceiling_pct);
     // Step 20.3: on this wire there is no `num_ctx` ceiling, so the send
     // budget is authoritative only when a believed window (`safe_context`)
     // seeds it. Cloud OpenAI-compatible models have no `/api/show` to seed
@@ -4458,8 +4476,10 @@ pub async fn openai_chat_complete(
             let result = if tools::is_context_remaining_call(name) {
                 let report = budget::render_context_budget(
                     prompt_tracker.current(&messages, Some(&tools), cal, estimation),
-                    num_ctx_input_ceiling(num_ctx),
+                    num_ctx_input_ceiling(num_ctx, input_ceiling_pct),
                     num_ctx,
+                    input_ceiling_pct as usize,
+                    low_budget_pct,
                 );
                 display::print_tool_call("get_context_remaining", "", color);
                 display::print_tool_output(&report, tool_output_lines, color);
@@ -4758,6 +4778,8 @@ pub async fn openai_responses_complete(
         // #727: bound for the get_context_remaining used-token estimate.
         estimation,
         summary_input_cap_floor_chars: _,
+        input_ceiling_pct,
+        low_budget_pct,
         exec_floor,
         write_ledger,
         cancel,
@@ -4957,8 +4979,10 @@ pub async fn openai_responses_complete(
             let result = if tools::is_context_remaining_call(name) {
                 let report = budget::render_context_budget(
                     estimate_request_tokens(&input, Some(&tools_chat), estimation),
-                    num_ctx_input_ceiling(num_ctx),
+                    num_ctx_input_ceiling(num_ctx, input_ceiling_pct),
                     num_ctx,
+                    input_ceiling_pct as usize,
+                    low_budget_pct,
                 );
                 display::print_tool_call("get_context_remaining", "", color);
                 display::print_tool_output(&report, tool_output_lines, color);
@@ -6265,6 +6289,8 @@ mod tool_round_cap_tests {
                 debug: false,
                 trace: false,
                 num_ctx: None,
+            input_ceiling_pct: 80,
+            low_budget_pct: 15,
                 connect_timeout_secs: 5,
                 inference_timeout_secs: 120,
                 mid_loop_trim_threshold: 40,
@@ -6426,6 +6452,8 @@ mod tool_round_cap_tests {
                 debug: false,
                 trace: false,
                 num_ctx: None,
+            input_ceiling_pct: 80,
+            low_budget_pct: 15,
                 connect_timeout_secs: 5,
                 inference_timeout_secs: 120,
                 mid_loop_trim_threshold: 40,
@@ -6506,6 +6534,8 @@ mod tool_round_cap_tests {
                 debug: false,
                 trace: false,
                 num_ctx: None,
+            input_ceiling_pct: 80,
+            low_budget_pct: 15,
                 connect_timeout_secs: 5,
                 inference_timeout_secs: 120,
                 mid_loop_trim_threshold: 40,
@@ -6647,6 +6677,8 @@ mod tool_round_cap_tests {
                 debug: false,
                 trace: false,
                 num_ctx: None,
+            input_ceiling_pct: 80,
+            low_budget_pct: 15,
                 connect_timeout_secs: 5,
                 inference_timeout_secs: 120,
                 mid_loop_trim_threshold: 40,
@@ -6725,6 +6757,8 @@ mod tool_round_cap_tests {
                 debug: false,
                 trace: false,
                 num_ctx: None,
+            input_ceiling_pct: 80,
+            low_budget_pct: 15,
                 connect_timeout_secs: 5,
                 inference_timeout_secs: 120,
                 mid_loop_trim_threshold: 40,
@@ -6826,6 +6860,8 @@ mod tool_round_cap_tests {
                 debug: false,
                 trace: false,
                 num_ctx: None,
+            input_ceiling_pct: 80,
+            low_budget_pct: 15,
                 connect_timeout_secs: 5,
                 inference_timeout_secs: 120,
                 mid_loop_trim_threshold: 40,
@@ -6939,6 +6975,8 @@ mod tool_round_cap_tests {
                 debug: false,
                 trace: false,
                 num_ctx: None,
+            input_ceiling_pct: 80,
+            low_budget_pct: 15,
                 connect_timeout_secs: 5,
                 inference_timeout_secs: 120,
                 mid_loop_trim_threshold: 40,
@@ -7044,6 +7082,8 @@ mod tool_round_cap_tests {
                 debug: false,
                 trace: false,
                 num_ctx: None,
+            input_ceiling_pct: 80,
+            low_budget_pct: 15,
                 connect_timeout_secs: 5,
                 inference_timeout_secs: 120,
                 mid_loop_trim_threshold: 40,
@@ -7190,6 +7230,8 @@ mod tool_round_cap_tests {
                 debug: false,
                 trace: false,
                 num_ctx: None,
+            input_ceiling_pct: 80,
+            low_budget_pct: 15,
                 connect_timeout_secs: 5,
                 inference_timeout_secs: 120,
                 mid_loop_trim_threshold: 40,
@@ -7346,6 +7388,8 @@ mod tool_round_cap_tests {
                 debug: false,
                 trace: false,
                 num_ctx: None,
+            input_ceiling_pct: 80,
+            low_budget_pct: 15,
                 connect_timeout_secs: 5,
                 inference_timeout_secs: 30,
                 mid_loop_trim_threshold: 40,
@@ -7441,6 +7485,8 @@ mod http_loop_tests {
             debug: false,
             trace: false,
             num_ctx: None,
+            input_ceiling_pct: 80,
+            low_budget_pct: 15,
             connect_timeout_secs: 5,
             inference_timeout_secs: 30,
             mid_loop_trim_threshold: 40,
@@ -9164,6 +9210,8 @@ mod save_note_loop_tests {
             debug: false,
             trace: false,
             num_ctx: None,
+            input_ceiling_pct: 80,
+            low_budget_pct: 15,
             connect_timeout_secs: 5,
             inference_timeout_secs: 30,
             mid_loop_trim_threshold: 40,
@@ -9649,6 +9697,8 @@ mod compression_loop_tests {
             debug: false,
             trace: false,
             num_ctx: None,
+            input_ceiling_pct: 80,
+            low_budget_pct: 15,
             connect_timeout_secs: 5,
             inference_timeout_secs: 30,
             mid_loop_trim_threshold: 40,
@@ -10799,6 +10849,8 @@ mod observation_hook_tests {
             debug: false,
             trace: false,
             num_ctx: None,
+            input_ceiling_pct: 80,
+            low_budget_pct: 15,
             connect_timeout_secs: 5,
             inference_timeout_secs: 30,
             mid_loop_trim_threshold: 40,

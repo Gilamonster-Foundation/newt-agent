@@ -6627,6 +6627,18 @@ fn run_chat(
                                             .as_ref()
                                             .map(|c| c.summary_input_cap_floor_chars)
                                             .unwrap_or(8_192),
+                                        input_ceiling_pct: cfg
+                                            .context
+                                            .as_ref()
+                                            .map(|c| c.input_ceiling_pct)
+                                            .unwrap_or(80)
+                                            .clamp(1, 99),
+                                        low_budget_pct: cfg
+                                            .context
+                                            .as_ref()
+                                            .map(|c| c.low_budget_pct)
+                                            .unwrap_or(15)
+                                            .clamp(1, 50),
                                         // #307: the active preset's exec floor — the
                                         // ceiling the --disable-ocap bypass cannot
                                         // cross. None when no mode is active.

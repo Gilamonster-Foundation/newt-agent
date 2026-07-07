@@ -19,10 +19,6 @@
 
 use serde_json::{json, Value};
 
-/// At or below this fraction of the ceiling *remaining*, the report appends a
-/// "compact or wrap up soon" hint (issue #727 — the budget-low nudge).
-const LOW_BUDGET_PCT: usize = 15;
-
 /// Self-teaching description: when to call it, and what to do with the answer.
 const DESCRIPTION: &str = "Report your remaining context budget (tokens used / \
     ceiling / remaining). Call this before a large read; if remaining is low, \
@@ -48,10 +44,14 @@ pub fn get_context_remaining_tool_definition() -> Value {
 ///   `PromptTracker::current`, which anchors on the backend-reported prompt size
 ///   and calibrates the chars/4 tail up to real tokens).
 /// * `ceiling` — the input-token ceiling implied by `num_ctx`
-///   ([`super::num_ctx_input_ceiling`] = 80% of `num_ctx`), or `None` when no
-///   `num_ctx` is configured this session.
+///   ([`super::num_ctx_input_ceiling`] = `input_ceiling_pct`% of `num_ctx`), or
+///   `None` when no `num_ctx` is configured this session.
 /// * `num_ctx` — reported verbatim so the model can see the window it derives
 ///   from.
+/// * `input_ceiling_pct` — `[context] input_ceiling_pct`; shown in the report so
+///   the ceiling's derivation is legible.
+/// * `low_budget_pct` — `[context] low_budget_pct`; at or below this fraction of
+///   the ceiling *remaining*, the report appends the "compact or wrap up" hint.
 ///
 /// When `ceiling` is `None` we say so honestly rather than invent a remaining
 /// budget out of a window we don't have.
@@ -59,6 +59,8 @@ pub(crate) fn render_context_budget(
     used: usize,
     ceiling: Option<usize>,
     num_ctx: Option<u32>,
+    input_ceiling_pct: usize,
+    low_budget_pct: usize,
 ) -> String {
     match ceiling {
         Some(ceiling) => {
@@ -68,12 +70,12 @@ pub(crate) fn render_context_budget(
                 .unwrap_or_else(|| "unset".to_string());
             let mut out = format!(
                 "Context budget: ~{used} tokens used of an input ceiling of ~{ceiling} \
-                 (80% of num_ctx {nc}). ~{remaining} tokens remaining."
+                 ({input_ceiling_pct}% of num_ctx {nc}). ~{remaining} tokens remaining."
             );
-            // Integer form of `remaining / ceiling < LOW_BUDGET_PCT / 100`,
+            // Integer form of `remaining / ceiling < low_budget_pct / 100`,
             // so no float and no division-by-zero (ceiling is always > 0 here:
             // num_ctx_input_ceiling filters out zero).
-            if remaining.saturating_mul(100) < ceiling.saturating_mul(LOW_BUDGET_PCT) {
+            if remaining.saturating_mul(100) < ceiling.saturating_mul(low_budget_pct) {
                 out.push_str(
                     " Budget is LOW — compact or wrap up soon: read in pages \
                      (read_file with offset+limit), avoid large reads, and finish with \
@@ -113,24 +115,25 @@ mod tests {
     #[test]
     fn ceiling_minus_used_is_remaining() {
         // 8000 ceiling, 1000 used → 7000 remaining, surfaced verbatim.
-        let out = render_context_budget(1000, Some(8000), Some(10_000));
+        let out = render_context_budget(1000, Some(8000), Some(10_000), 80, 15);
         assert!(out.contains("1000 tokens used"), "{out}");
         assert!(out.contains("ceiling of ~8000"), "{out}");
         assert!(out.contains("7000 tokens remaining"), "{out}");
         assert!(out.contains("num_ctx 10000"), "{out}");
+        assert!(out.contains("80% of num_ctx"), "{out}");
     }
 
     #[test]
     fn ample_budget_omits_low_hint() {
         // 5000 / 10000 = 50% remaining — well above the 15% threshold.
-        let out = render_context_budget(5000, Some(10_000), Some(12_500));
+        let out = render_context_budget(5000, Some(10_000), Some(12_500), 80, 15);
         assert!(!out.contains("LOW"), "ample budget must not nudge: {out}");
     }
 
     #[test]
     fn low_budget_hint_fires_below_threshold() {
         // 9000 / 10000 used → 1000 (10%) remaining, below the 15% threshold.
-        let out = render_context_budget(9000, Some(10_000), Some(12_500));
+        let out = render_context_budget(9000, Some(10_000), Some(12_500), 80, 15);
         assert!(out.contains("1000 tokens remaining"), "{out}");
         assert!(out.contains("LOW"), "low budget must nudge: {out}");
     }
@@ -138,7 +141,7 @@ mod tests {
     #[test]
     fn threshold_boundary_at_15_percent_does_not_nudge() {
         // Exactly 15% remaining (1500 / 10000) is NOT "below" the threshold.
-        let out = render_context_budget(8500, Some(10_000), Some(12_500));
+        let out = render_context_budget(8500, Some(10_000), Some(12_500), 80, 15);
         assert!(out.contains("1500 tokens remaining"), "{out}");
         assert!(!out.contains("LOW"), "15% is not below 15%: {out}");
     }
@@ -146,16 +149,34 @@ mod tests {
     #[test]
     fn used_over_ceiling_saturates_remaining_to_zero() {
         // Over budget: remaining floors at 0 (never underflows) and nudges.
-        let out = render_context_budget(12_000, Some(10_000), Some(12_500));
+        let out = render_context_budget(12_000, Some(10_000), Some(12_500), 80, 15);
         assert!(out.contains("0 tokens remaining"), "{out}");
         assert!(out.contains("LOW"), "{out}");
+    }
+
+    #[test]
+    fn tunable_low_budget_pct_shifts_the_nudge_threshold() {
+        // 8000/10000 used → 2000 (20%) remaining. Default 15% would NOT nudge,
+        // but a tuned 25% threshold DOES — proving the knob is live.
+        let default = render_context_budget(8000, Some(10_000), Some(12_500), 80, 15);
+        assert!(!default.contains("LOW"), "20% is above 15%: {default}");
+        let tuned = render_context_budget(8000, Some(10_000), Some(12_500), 80, 25);
+        assert!(tuned.contains("LOW"), "20% is below 25%: {tuned}");
+    }
+
+    #[test]
+    fn tunable_input_ceiling_pct_shows_in_report() {
+        // The ceiling-derivation percentage is echoed verbatim so the model
+        // can see how its ceiling was derived (90% here, not the default 80%).
+        let out = render_context_budget(1000, Some(9000), Some(10_000), 90, 15);
+        assert!(out.contains("90% of num_ctx"), "{out}");
     }
 
     #[test]
     fn no_ceiling_is_honest_about_no_budget() {
         // num_ctx unset → no ceiling: report usage but admit there is no
         // fixed remaining budget rather than guessing one.
-        let out = render_context_budget(4321, None, None);
+        let out = render_context_budget(4321, None, None, 80, 15);
         assert!(out.contains("4321 tokens used"), "{out}");
         assert!(
             out.contains("No input-token ceiling is configured"),

@@ -1070,10 +1070,34 @@ pub struct ContextConfig {
     /// technique + its pluggable language packs (#669).
     #[serde(default)]
     pub api_surface: ApiSurfaceConfig,
+
+    /// Percent of a request's `num_ctx` window usable as INPUT before the
+    /// pre-send budget gate trims (the rest is reply headroom). The historical
+    /// hardcoded value was 80 (reserve 20% for the reply). Large-window models
+    /// (e.g. Opus) can safely run this higher — raising it lets more context
+    /// ride each turn before trimming kicks in. Clamped to `1..=99`; anything
+    /// outside falls back to 80. See `num_ctx_input_ceiling` (#282).
+    #[serde(default = "default_input_ceiling_pct")]
+    pub input_ceiling_pct: u32,
+
+    /// Percent-of-ceiling below which the loop emits the low-remaining-budget
+    /// nudge to the model. Historical hardcoded value was 15. Raise it to be
+    /// warned earlier, lower it to suppress the nudge on roomy models. Clamped
+    /// to `0..=100`; `0` disables the nudge. See `agentic::budget` (#559).
+    #[serde(default = "default_low_budget_pct")]
+    pub low_budget_pct: usize,
 }
 
 fn default_summary_input_cap_floor_chars() -> usize {
     8_192
+}
+
+fn default_input_ceiling_pct() -> u32 {
+    80
+}
+
+fn default_low_budget_pct() -> usize {
+    15
 }
 
 impl Default for ContextConfig {
@@ -1085,6 +1109,8 @@ impl Default for ContextConfig {
             estimation: crate::tokens::TokenEstimation::default(),
             summary_input_cap_floor_chars: default_summary_input_cap_floor_chars(),
             api_surface: ApiSurfaceConfig::default(),
+            input_ceiling_pct: default_input_ceiling_pct(),
+            low_budget_pct: default_low_budget_pct(),
         }
     }
 }
