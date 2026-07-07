@@ -210,9 +210,18 @@ cov-ci:
     #!/usr/bin/env bash
     set -euo pipefail
     floor=80
+    # Pin the target dir to THIS checkout. A shared/inherited CARGO_TARGET_DIR
+    # is how a sibling worktree's profraw leaks into the report (0%-coverage
+    # ghost files tanking the total — the CLAUDE.md shared-target hazard).
+    # Pinning kills the contamination at the source. The earlier fix — adding
+    # `\.worktrees/` to the ignore regex — matched against ABSOLUTE paths, so
+    # any checkout living under a `.worktrees/` directory (the workspace's own
+    # agent-worktree convention) filtered out its ENTIRE repo and failed the
+    # gate at -%. CI (clean checkout, no shared target) never saw either bug.
+    export CARGO_TARGET_DIR="$(pwd)/target"
     cargo llvm-cov --workspace --features newt-data/kernel --no-report
-    cargo llvm-cov report --lcov --output-path lcov.info --ignore-filename-regex 'pyo3_module\.rs$|\.worktrees/'
-    summary=$(cargo llvm-cov report --summary-only --ignore-filename-regex 'pyo3_module\.rs$|\.worktrees/')
+    cargo llvm-cov report --lcov --output-path lcov.info --ignore-filename-regex 'pyo3_module\.rs$'
+    summary=$(cargo llvm-cov report --summary-only --ignore-filename-regex 'pyo3_module\.rs$')
     echo "$summary"
     # TOTAL row columns: regions missed cov% funcs missed cov% lines missed cov% ...
     # Line coverage is column 10 (3rd "Cover" column).
@@ -230,7 +239,7 @@ cov-ci:
 
 [windows]
 cov-ci:
-    $floor = 80; cargo llvm-cov --workspace --features newt-data/kernel --no-report; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; cargo llvm-cov report --lcov --output-path lcov.info --ignore-filename-regex 'pyo3_module\.rs$|\.worktrees/'; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; $summary = cargo llvm-cov report --summary-only --ignore-filename-regex 'pyo3_module\.rs$|\.worktrees/'; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; $summary; $total = $summary | Where-Object { $_ -match '^TOTAL\s+' } | Select-Object -First 1; if (-not $total) { Write-Error 'ERROR: could not parse line coverage from cargo-llvm-cov summary'; exit 1 }; $cols = $total -split '\s+'; $line_cov = [double]($cols[9].TrimEnd('%')); Write-Output "measured line coverage: $line_cov% (floor: $floor%)"; if ($line_cov -lt $floor) { Write-Error "ERROR: workspace line coverage $line_cov% is below the $floor% floor"; exit 1 }; Write-Output "coverage gate OK: $line_cov% >= $floor%"
+    $floor = 80; $env:CARGO_TARGET_DIR = Join-Path (Get-Location) 'target'; cargo llvm-cov --workspace --features newt-data/kernel --no-report; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; cargo llvm-cov report --lcov --output-path lcov.info --ignore-filename-regex 'pyo3_module\.rs$'; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; $summary = cargo llvm-cov report --summary-only --ignore-filename-regex 'pyo3_module\.rs$'; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; $summary; $total = $summary | Where-Object { $_ -match '^TOTAL\s+' } | Select-Object -First 1; if (-not $total) { Write-Error 'ERROR: could not parse line coverage from cargo-llvm-cov summary'; exit 1 }; $cols = $total -split '\s+'; $line_cov = [double]($cols[9].TrimEnd('%')); Write-Output "measured line coverage: $line_cov% (floor: $floor%)"; if ($line_cov -lt $floor) { Write-Error "ERROR: workspace line coverage $line_cov% is below the $floor% floor"; exit 1 }; Write-Output "coverage gate OK: $line_cov% >= $floor%"
 
 # --- OCAP honesty gate ---
 #
