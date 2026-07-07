@@ -103,12 +103,139 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+  # ── OS installers (tag-only) ──────────────────────────────────────────
+  #
+  # Three packaging jobs turn the built binaries into brew / choco / rpm / deb
+  # installers and upload them as artifacts; `github-release` then attaches all
+  # of them to the release. These are RELEASE-ONLY jobs (no pre-push-hook parity
+  # — the hook mirrors ci.yml, the per-PR unit tier). Distribution to central
+  # channels (a Homebrew tap, chocolatey.org) is a later step (owner decision,
+  # 2026-07-06): for now the artifacts attach to the GitHub release and install
+  # from there. See packaging/ for the configs.
+
+  # deb + rpm from one nfpm config, built from the linux-x86_64 binaries.
+  linux-packages:
+    name: Linux packages (deb + rpm)
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [build-binaries]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download linux archive
+        uses: actions/download-artifact@v4
+        with:
+          name: newt-agent-linux-x86_64
+          path: incoming/
+      - name: Extract binaries into staging/
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          mkdir -p staging
+          tar -xzf "incoming/newt-agent-${TAG}-linux-x86_64.tar.gz" -C incoming/
+          cp "incoming/newt-agent-${TAG}-linux-x86_64/newt" staging/
+          cp "incoming/newt-agent-${TAG}-linux-x86_64/newt-mcp-server" staging/
+          chmod +x staging/newt staging/newt-mcp-server
+      - uses: dtolnay/rust-toolchain@stable
+      # nfpm via `go install` — name-agnostic and version-pinned; Go is
+      # preinstalled on ubuntu-latest.
+      - name: Install nfpm
+        run: |
+          set -euo pipefail
+          go install github.com/goreleaser/nfpm/v2/cmd/nfpm@v2.41.3
+          echo "$HOME/go/bin" >> "$GITHUB_PATH"
+      - name: Build .deb and .rpm
+        run: |
+          set -euo pipefail
+          export VERSION="${GITHUB_REF_NAME#v}"
+          mkdir -p dist
+          nfpm pkg --config packaging/nfpm.yaml --packager deb --target dist/
+          nfpm pkg --config packaging/nfpm.yaml --packager rpm --target dist/
+          ls -la dist/
+      - name: Upload packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: newt-agent-linux-packages
+          path: dist/*
+          if-no-files-found: error
+
+  # Homebrew formula rendered with the release version + per-archive sha256.
+  homebrew-formula:
+    name: Homebrew formula
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [build-binaries]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download all archives
+        uses: actions/download-artifact@v4
+        with:
+          path: incoming/
+      - name: Render newt.rb
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          VER="${GITHUB_REF_NAME#v}"
+          mac="incoming/newt-agent-macos-arm64/newt-agent-${TAG}-macos-arm64.tar.gz"
+          lin="incoming/newt-agent-linux-x86_64/newt-agent-${TAG}-linux-x86_64.tar.gz"
+          sha_mac="$(sha256sum "$mac" | awk '{print $1}')"
+          sha_lin="$(sha256sum "$lin" | awk '{print $1}')"
+          mkdir -p dist
+          sed -e "s/@VERSION@/${VER}/g" \
+              -e "s/@SHA256_MACOS_ARM@/${sha_mac}/g" \
+              -e "s/@SHA256_LINUX_X64@/${sha_lin}/g" \
+              packaging/homebrew/newt.rb.tmpl > dist/newt.rb
+          echo "── rendered newt.rb ──"; cat dist/newt.rb
+      - name: Upload formula
+        uses: actions/upload-artifact@v4
+        with:
+          name: newt-agent-homebrew
+          path: dist/newt.rb
+          if-no-files-found: error
+
+  # Chocolatey .nupkg built on Windows (choco is preinstalled on the runner).
+  chocolatey-package:
+    name: Chocolatey package
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [build-binaries]
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download windows archive
+        uses: actions/download-artifact@v4
+        with:
+          name: newt-agent-windows-x86_64
+          path: incoming
+      - name: Render nuspec + install script and pack
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = $env:GITHUB_REF_NAME
+          $ver = $tag -replace '^v', ''
+          $zip = "incoming/newt-agent-$tag-windows-x86_64.zip"
+          $sha = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          New-Item -ItemType Directory -Force -Path pack/tools | Out-Null
+          (Get-Content packaging/chocolatey/newt.nuspec) `
+            -replace '@VERSION@', $ver | Set-Content pack/newt.nuspec
+          (Get-Content packaging/chocolatey/tools/chocolateyinstall.ps1) `
+            -replace '@VERSION@', $ver -replace '@SHA256_WINDOWS_X64@', $sha |
+            Set-Content pack/tools/chocolateyinstall.ps1
+          Copy-Item LICENSE pack/tools/ -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          choco pack pack/newt.nuspec --outputdirectory dist
+          Get-ChildItem dist
+      - name: Upload nupkg
+        uses: actions/upload-artifact@v4
+        with:
+          name: newt-agent-chocolatey
+          path: dist/*.nupkg
+          if-no-files-found: error
+
   # ── GitHub release (tag-only) ─────────────────────────────────────────
 
   github-release:
     name: GitHub release (${{ github.ref_name }})
     if: startsWith(github.ref, 'refs/tags/')
-    needs: [build-binaries]
+    needs: [build-binaries, linux-packages, homebrew-formula, chocolatey-package]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -119,7 +246,10 @@ jobs:
       - name: Collect archives
         run: |
           mkdir -p dist
-          find all-artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' \) -exec cp {} dist/ \;
+          find all-artifacts -type f \
+            \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.deb' \
+               -o -name '*.rpm' -o -name '*.nupkg' -o -name 'newt.rb' \) \
+            -exec cp {} dist/ \;
           ls -la dist/
       - name: Create or update release
         uses: softprops/action-gh-release@v2

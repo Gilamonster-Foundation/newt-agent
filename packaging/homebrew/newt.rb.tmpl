@@ -1,0 +1,49 @@
+# Homebrew formula TEMPLATE for newt-agent.
+#
+# The release workflow (.github/workflows/release.yml, job `homebrew-formula`)
+# renders this into `newt.rb` by substituting the release version and the
+# sha256 of each platform archive, then attaches `newt.rb` to the GitHub
+# release. There is no tap yet (owner decision, 2026-07-06), so install with:
+#
+#   brew install --formula https://github.com/Gilamonster-Foundation/newt-agent/releases/download/v@VERSION@/newt.rb
+#
+# A tap (`brew tap gilamonster-foundation/newt`) can be added later without
+# changing this formula.
+#
+# We only build macOS arm64 and Linux x86_64 today (the release matrix); the
+# formula exposes exactly those two bottles.
+class Newt < Formula
+  desc "Small, fast, local-first agentic coder (vi to Hermes's emacs)"
+  homepage "https://github.com/Gilamonster-Foundation/newt-agent"
+  version "@VERSION@"
+  license "Apache-2.0"
+
+  on_macos do
+    on_arm do
+      url "https://github.com/Gilamonster-Foundation/newt-agent/releases/download/v@VERSION@/newt-agent-v@VERSION@-macos-arm64.tar.gz"
+      sha256 "@SHA256_MACOS_ARM@"
+    end
+  end
+
+  on_linux do
+    on_intel do
+      url "https://github.com/Gilamonster-Foundation/newt-agent/releases/download/v@VERSION@/newt-agent-v@VERSION@-linux-x86_64.tar.gz"
+      sha256 "@SHA256_LINUX_X64@"
+    end
+  end
+
+  def install
+    # The archive unpacks to a single versioned directory. Homebrew usually
+    # enters it automatically; chdir defensively in case it did not so the
+    # formula is robust to either behavior.
+    target = Dir["newt-agent-*"].find { |d| File.directory?(d) }
+    Dir.chdir(target) if target
+    bin.install "newt"
+    bin.install "newt-mcp-server"
+  end
+
+  test do
+    system bin/"newt", "--version"
+    system bin/"newt-mcp-server", "--version"
+  end
+end
