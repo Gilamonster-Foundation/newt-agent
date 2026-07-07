@@ -45,9 +45,10 @@ pyo3-async-runtimes = { workspace = true, optional = true }
 [features]
 default = []
 # In-process inference backend (#639): the `EmbeddedBackend` over a `palette`
-# mini model, with the candle generation engine. DEFAULT-OFF so the lean /
-# headless (wyvern) build pulls nothing extra; the heavy candle deps never reach
-# the default build. This is also the per-agent add/remove switch.
+# mini model, with the candle generation engine. Enabled by the workspace
+# default via newt-cli (decision 2026-07-07 — the on-host CPU summarizer, #661
+# group C, is non-negotiable and ships in the default build, wyvern included).
+# `--no-default-features` is the explicit zero-candle opt-out.
 embedded = [
     "dep:candle-core",
     "dep:candle-nn",

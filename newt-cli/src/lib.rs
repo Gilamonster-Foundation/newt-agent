@@ -21,6 +21,7 @@ pub mod dgx_status;
 pub mod dgx_vllm;
 mod doctor;
 mod identity_cmd;
+mod models_cmd;
 mod new_project;
 mod skills;
 pub mod stack;
@@ -458,6 +459,12 @@ pub enum Command {
     Tunings {
         #[command(subcommand)]
         cmd: tuning_cmd::TuningsCmd,
+    },
+    /// Manage the on-host mini-model palette for the embedded CPU summarizer
+    /// (#661): `pull` a GGUF to ~/.newt/models, `list` the palette, `path`.
+    Models {
+        #[command(subcommand)]
+        cmd: models_cmd::ModelsCmd,
     },
 }
 
@@ -917,6 +924,7 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         Command::Skills { cmd } => skills::run(cmd, cli.config.as_deref()),
         Command::Dgx { cmd } => dgx::run(cmd, cli.config.as_deref()).await,
         Command::Tunings { cmd } => tuning_cmd::run(cmd, cli.config.as_deref()),
+        Command::Models { cmd } => models_cmd::run(cmd).await,
     }
 }
 

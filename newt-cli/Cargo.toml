@@ -54,7 +54,13 @@ tracing-subscriber.workspace = true
 # (the headless / wyvern tier). The `is_terminal()` runtime gate still falls back
 # to the lean crossterm box when piped/headless even in the rich build.
 [features]
-default = ["rich-tui"]
+# `embedded` is DEFAULT-ON (decision 2026-07-07): the on-host CPU context
+# summarizer (#661 group C) is non-negotiable — context compaction must NOT run
+# on the session GPU model (it fires under peak load → overloads the GPU → stalls
+# the turn, #979). This ships the candle deps in the default build, wyvern
+# included (the "lean build stays candle-free" doctrine is retired, pragmatically).
+# `--no-default-features` (install-lean) remains the explicit zero-candle opt-out.
+default = ["rich-tui", "embedded"]
 rich-tui = ["newt-tui/rich-tui"]
 
 # In-process candle inference (#639), opt-in/default-off. CPU by default;

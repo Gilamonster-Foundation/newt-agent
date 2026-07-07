@@ -280,7 +280,12 @@ edits to report, stop being total losses.
 *Failure mode:* banner grows; keep it structured.
 
 **L5 — finish #639's last mile: embedded summarizer as the smart
-default.** The "default to embedded when unconfigured" pattern already
+default.** ✅ **DELIVERED (2026-07-07):** the summarizer defaults to the
+embedded on-host CPU engine; `embedded` is a **default-on** feature (wyvern
+included — see `docs/decisions/embedded_inference.md`); `newt models pull`
+provisions the palette GGUF; session/off-box are overrides that **warn**; a
+regression test pins the default. Original plan retained below. The "default to
+embedded when unconfigured" pattern already
 exists in-tree — applied to *embeddings* on 07-05 (`cd54443`) but
 never to the summarizer, whose wiring stopped at explicit config
 (#667; and `cd49ab4` moved it *further* from auto-detection). Ship the

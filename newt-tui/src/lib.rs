@@ -8857,11 +8857,58 @@ fn summarizer_opts(
     }
 }
 
-/// Resolve the summarizer's effective backend (Step 24.10, #559): each
-/// `summarizer.toml` field present overrides the corresponding session value;
-/// absent ⇒ reuse the session backend. The session params are read live, so
-/// when `summarizer.toml` does NOT pin a backend a mid-session `/backend`
-/// switch still carries the summarizer along.
+/// The summarizer's DEFAULT backend decision (when the operator pins NO
+/// `[summarizer]` override). The anti-regression seam — the test below pins it,
+/// so the codebase can't quietly slip back to reusing the session model (which
+/// it repeatedly has). See memory `feedback_summarizer_defaults_to_embedded_cpu`.
+#[derive(Debug, PartialEq)]
+enum SummarizerChoice {
+    /// The DEFAULT: the on-host embedded CPU engine (#661 group C), this GGUF.
+    Embedded(String),
+    /// Embedded is unavailable (feature off / no model pulled) → degrade to
+    /// reusing the session model, which contends with the primary model.
+    DegradedSession,
+}
+
+/// With no override, prefer the embedded CPU engine; only degrade to the
+/// session model when no embedded GGUF resolves. REGRESSION GUARD — flipping
+/// this to default to the session model fails the test below.
+fn default_summarizer_choice(embedded_gguf: Option<String>) -> SummarizerChoice {
+    match embedded_gguf {
+        Some(path) => SummarizerChoice::Embedded(path),
+        None => SummarizerChoice::DegradedSession,
+    }
+}
+
+/// The default embedded summarizer GGUF, IFF the `embedded` engine is compiled
+/// AND the default palette model has been pulled to `~/.newt/models`
+/// (`newt models pull`). `None` otherwise → a warned degrade to the session.
+fn embedded_summarizer_default() -> Option<String> {
+    #[cfg(feature = "embedded")]
+    {
+        newt_inference::palette::resolve_local(newt_inference::palette::default_model().name)
+            .map(|p| p.to_string_lossy().into_owned())
+    }
+    #[cfg(not(feature = "embedded"))]
+    {
+        None
+    }
+}
+
+fn warn_summarizer_once(flag: &std::sync::atomic::AtomicBool, msg: &str) {
+    if !flag.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        eprintln!("{msg}");
+    }
+}
+
+/// Resolve the summarizer's effective backend. The DEFAULT is the on-host
+/// embedded CPU engine (#661 group C): context compaction must NOT run on the
+/// session GPU model — compaction fires under peak load, so reusing the loaded
+/// model overloads the GPU and stalls the turn (#979). A `[summarizer]` backend
+/// override (session / off-box) is honored but WARNS; if the embedded engine is
+/// unavailable (feature not compiled, or no model pulled — `newt models pull`)
+/// it degrades to the session model with a loud warning. This default keeps
+/// regressing; `default_summarizer_choice` + its test are the guard.
 fn resolve_summarizer_backend(
     sum_cfg: &newt_core::SummarizerConfig,
     inf_url: &str,
@@ -8875,6 +8922,36 @@ fn resolve_summarizer_backend(
     Option<String>,
     Option<String>,
 ) {
+    let has_override = sum_cfg.kind.is_some()
+        || sum_cfg.endpoint.is_some()
+        || sum_cfg.model.is_some()
+        || sum_cfg.model_path.is_some();
+
+    if !has_override {
+        match default_summarizer_choice(embedded_summarizer_default()) {
+            SummarizerChoice::Embedded(path) => {
+                let model = newt_inference::palette::default_model().name.to_string();
+                // url/key are unused for the in-process embedded engine.
+                return (
+                    String::new(),
+                    model,
+                    newt_core::BackendKind::Embedded,
+                    None,
+                    Some(path),
+                );
+            }
+            SummarizerChoice::DegradedSession => {
+                static WARNED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                warn_summarizer_once(&WARNED, "warning: the on-host embedded CPU summarizer is unavailable — context compaction will REUSE THE SESSION MODEL (on the GPU), which contends with the primary model under load and can stall the turn (see #979/#661). Enable it: `newt models pull`, and build with the `embedded` feature.");
+            }
+        }
+    }
+
+    // Override, or degraded fallback: reuse the session backend (or a pinned
+    // off-box backend). Each present `summarizer.toml` field overrides the
+    // session value; the session params are read live so a mid-session
+    // `/backend` switch still carries a session-reusing summarizer along.
     let url = sum_cfg
         .endpoint
         .clone()
@@ -8884,19 +8961,44 @@ fn resolve_summarizer_backend(
         .clone()
         .unwrap_or_else(|| inf_model.to_string());
     let kind = sum_cfg.kind.unwrap_or(inf_kind);
-    // The GGUF path for an embedded summarizer (#661 group C); not inherited
-    // from the session backend — an embedded summarizer is explicitly configured.
     let model_path = sum_cfg.model_path.clone();
     // A bearer token authenticates a specific host. Only inherit the session
-    // key when the summarizer reuses the session endpoint; a summarizer pinned
-    // to its own endpoint uses its own key (or none) — never leak the session
-    // token to a different host.
+    // key when the summarizer reuses the session endpoint; never leak it to a
+    // pinned different host.
     let key = if sum_cfg.endpoint.is_some() {
         sum_cfg.resolve_api_key()
     } else {
         sum_cfg.resolve_api_key().or_else(|| inf_key.clone())
     };
+    // Warn once when an explicit override picks a NON-embedded backend (embedded
+    // is the default; a session/off-box override can contend with the primary).
+    if has_override && !matches!(kind, newt_core::BackendKind::Embedded) {
+        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        warn_summarizer_once(&WARNED, "warning: using a summarizer OVERRIDE (session / off-box) instead of the on-host embedded CPU default — this can contend with the primary model under load (#661). Drop the `[summarizer]` backend override to use the embedded engine.");
+    }
     (url, model, kind, key, model_path)
+}
+
+#[cfg(test)]
+mod summarizer_default_tests {
+    use super::{default_summarizer_choice, SummarizerChoice};
+
+    #[test]
+    fn summarizer_defaults_to_embedded_never_the_session_model() {
+        // REGRESSION GUARD (#661 / feedback_summarizer_defaults_to_embedded_cpu):
+        // with NO [summarizer] override and the embedded engine available, the
+        // summarizer MUST default to the on-host embedded CPU engine — never the
+        // session GPU model. If this flips, the codebase has slipped back.
+        assert_eq!(
+            default_summarizer_choice(Some("/models/qwen2.5-0.5b/x.gguf".to_string())),
+            SummarizerChoice::Embedded("/models/qwen2.5-0.5b/x.gguf".to_string()),
+        );
+        // Only a genuinely-unavailable embedded engine degrades to the session.
+        assert_eq!(
+            default_summarizer_choice(None),
+            SummarizerChoice::DegradedSession,
+        );
+    }
 }
 
 /// Build a loop summarizer for the current session backend, applying any
