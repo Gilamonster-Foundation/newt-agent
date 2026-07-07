@@ -248,7 +248,12 @@ mod tests {
             let (Some(g), Some(t)) = (local_gguf_path(m), local_tokenizer_path(m)) else {
                 continue; // no home dir in this env — nothing to check structurally
             };
-            assert_eq!(g.parent(), t.parent(), "{}: tokenizer not beside gguf", m.name);
+            assert_eq!(
+                g.parent(),
+                t.parent(),
+                "{}: tokenizer not beside gguf",
+                m.name
+            );
             assert_eq!(
                 t.file_name().and_then(|s| s.to_str()),
                 Some("tokenizer.json"),
