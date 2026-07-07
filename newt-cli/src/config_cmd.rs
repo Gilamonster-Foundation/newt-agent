@@ -27,17 +27,19 @@ pub fn run(config_path: Option<&Path>) -> anyhow::Result<()> {
     println!("# [tui] edit_mode = \"emacs\" | \"vi\"     (shipped default: emacs)");
     println!("# [tui] footer    = \"auto\" | \"on\" | \"off\"   (auto = rich prompt on a TTY)");
     println!("#");
+    println!("# [context] input_ceiling_pct = 80   (% of num_ctx usable as INPUT before trim;");
+    println!("#           raise for large-window models like Opus, e.g. 90; clamped 1..=99)");
+    println!("# [context] low_budget_pct   = 15   (% of ceiling below which the low-budget nudge");
+    println!("#           fires; raise to be warned earlier, 0 disables; clamped 0..=100)");
+    println!("#");
     println!(
-        "# [context] input_ceiling_pct = 80   (% of num_ctx usable as INPUT before trim;"
+        "# [[model_tuning]] model = \"...\", context_window = 200000   (total token window the"
     );
     println!(
-        "#           raise for large-window models like Opus, e.g. 90; clamped 1..=99)"
+        "#           backend accepts; seeds the input budget for OpenAI/NVIDIA endpoints that"
     );
     println!(
-        "# [context] low_budget_pct   = 15   (% of ceiling below which the low-budget nudge"
-    );
-    println!(
-        "#           fires; raise to be warned earlier, 0 disables; clamped 0..=100)"
+        "#           can't self-report a window via /api/show — an empirical probe still wins)"
     );
     println!("#");
     println!("# [tui] prompt — customize with these tokens (or run `/prompt` in a session).");

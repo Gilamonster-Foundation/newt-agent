@@ -957,26 +957,27 @@ impl ContextFeatureSet {
     }
 
     /// The base feature set *before* `[context.features]` / session overrides:
-    /// the `manager` preset's bundle, with `tool_offload` defaulted ON because
-    /// it is local, deterministic spill storage and should not depend on
-    /// semantic embedding availability. Local-assist features (`scratchpad`,
-    /// `semantic`, and `scheduled`) additionally default ON for local
-    /// (`BackendKind::Ollama`) backends. A weak local model needs the `<plan>` /
-    /// `<state>` ledger to carry a checklist across tool-call rounds instead of
-    /// re-deriving state each round (Step 27.4), and semantic retrieval should
-    /// be ready without a live toggle once an embedder is configured. Explicit
-    /// overrides still win — they layer on top via [`ContextFeatures::apply_to`].
+    /// the `manager` preset's bundle, with **every available context-management
+    /// feature defaulted ON** (#727). The one exception is `provenance`, which
+    /// is not yet implemented (`ContextFeature::available()` is `false`) and so
+    /// stays OFF until it lands. This makes the full context toolkit — tool
+    /// offload, the `<state>`/`<plan>` scratchpad ledger, semantic retrieval,
+    /// experiential memory, and the scheduled per-step view — the default on
+    /// EVERY backend rather than only local (`Ollama`) ones. Cloud endpoints
+    /// (NVIDIA `inference.nvidia.com` and other `Openai`-protocol hosts) can't
+    /// auto-discover a context window, so they benefit most from the ledger and
+    /// retrieval being on by default. Explicit overrides still win — they layer
+    /// on top via [`ContextFeatures::apply_to`], so a user can turn any feature
+    /// back off in `[context.features]` or with `/context feature <name> off`.
     ///
-    /// Note: a *local* vLLM / llama.cpp server reports as `Openai` (that's the
-    /// wire protocol, not the host), so those users opt in via
-    /// `[context.features]` rather than getting it by default.
-    pub fn base_for(manager: ContextManager, kind: BackendKind) -> Self {
+    /// `kind` is retained for signature stability and future backend-specific
+    /// tuning; defaults no longer branch on it.
+    pub fn base_for(manager: ContextManager, _kind: BackendKind) -> Self {
         let mut base = manager.base_features();
-        base.tool_offload = true;
-        if matches!(kind, BackendKind::Ollama) {
-            base.scratchpad = true;
-            base.semantic = true;
-            base.scheduled = true;
+        for f in ContextFeature::ALL {
+            if f != ContextFeature::Provenance && f.available() {
+                base.set(f, true);
+            }
         }
         base
     }
@@ -1687,6 +1688,17 @@ pub struct ModelTuning {
     /// derived `safe_context` from `model-capabilities.json`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub num_ctx: Option<u32>,
+
+    /// Per-model context window (total tokens the backend accepts). Unlike
+    /// `num_ctx` — which is Ollama-only and rides `options.num_ctx` — this
+    /// seeds the budget on ANY backend, including the OpenAI-compatible wire
+    /// (NVIDIA/`inference.nvidia.com`) where `num_ctx` is ignored and no
+    /// `/api/show` probe exists to discover a window. When set and the probe
+    /// yields nothing, it becomes the effective `safe_context`, so the loop
+    /// budgets and trims against the model's real window instead of only
+    /// message-count/token thresholds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u32>,
 
     /// Per-model override of `[tui].real_context_discovery`. `Some(true)` opts
     /// this model into empirical conserve-and-ratchet discovery; `Some(false)`
@@ -4022,12 +4034,14 @@ mod tests {
         assert!(local.get(F::Scratchpad));
         assert!(local.get(F::Semantic));
         assert!(local.get(F::Scheduled));
-        // Cloud (OpenAI-compatible) gets offload, but not local-assist features.
+        // Cloud (OpenAI-compatible): per the user's context policy, every
+        // available feature defaults ON except Provenance, regardless of
+        // backend. Semantic degrades to a no-op until an embedder is set.
         let cloud = ContextFeatureSet::base_for(ContextManager::Standard, BackendKind::Openai);
         assert!(cloud.get(F::ToolOffload));
-        assert!(!cloud.get(F::Scratchpad));
-        assert!(!cloud.get(F::Semantic));
-        assert!(!cloud.get(F::Scheduled));
+        assert!(cloud.get(F::Scratchpad));
+        assert!(cloud.get(F::Semantic));
+        assert!(cloud.get(F::Scheduled));
         // An explicit override still wins over the local default (force off).
         let mut ov = ContextFeatures::default();
         ov.set(F::Scheduled, Some(false));

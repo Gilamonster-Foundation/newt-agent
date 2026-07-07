@@ -6169,6 +6169,13 @@ fn run_chat(
                         if updated {
                             probe::save_cache(&cap_cache);
                         }
+                        // A configured per-model `context_window` seeds the
+                        // budget when the probe found nothing (issue: OpenAI /
+                        // NVIDIA wire has no `/api/show`, so `safe_context`
+                        // stays None and the loop never budgets against a real
+                        // window). Only a fallback — an empirical probe result
+                        // always wins.
+                        let sc = sc.or_else(|| model_tune.and_then(|t| t.context_window));
                         (sc, moi, ratio)
                     };
 
@@ -14750,6 +14757,8 @@ mod tool_round_cap_tests {
                     debug: false,
                     trace: false,
                     num_ctx: None,
+                    input_ceiling_pct: 80,
+                    low_budget_pct: 15,
                     connect_timeout_secs: 5,
                     inference_timeout_secs: 120,
                     mid_loop_trim_threshold: 40,
@@ -15062,8 +15071,8 @@ mod helper_fn_tests {
         use newt_core::{
             BackendKind, ContextConfig, ContextFeature as F, ContextFeatures, ContextManager,
         };
-        // Cloud (Openai) base: local spill offload is on by default, while
-        // embedding/plan/state features stay opt-in.
+        // Cloud (Openai) base: per the context policy, every available
+        // feature defaults on except Provenance, regardless of backend.
         let cloud = context_features(
             &newt_core::Config::default(),
             ContextManager::Standard,
@@ -15071,9 +15080,9 @@ mod helper_fn_tests {
             BackendKind::Openai,
         );
         assert!(cloud.get(F::ToolOffload));
-        assert!(!cloud.get(F::Semantic));
-        assert!(!cloud.get(F::Scratchpad));
-        assert!(!cloud.get(F::Scheduled));
+        assert!(cloud.get(F::Semantic));
+        assert!(cloud.get(F::Scratchpad));
+        assert!(cloud.get(F::Scheduled));
         // [context.features] override layers over the preset base.
         let mut cfg_feats = ContextFeatures::default();
         cfg_feats.set(F::Semantic, Some(true));
@@ -15207,9 +15216,11 @@ mod helper_fn_tests {
         assert!(run("feature scratchpad maybe").lines[0].contains("unknown toggle"));
         assert!(run("wat").lines[0].contains("unknown /context subcommand"));
 
-        // feature query (no toggle) shows state + availability
-        assert!(run("feature semantic").lines[0].contains("context feature semantic: off"));
-        assert!(run("semantic").lines[0].contains("context feature semantic: off"));
+        // feature query (no toggle) shows state + availability. Semantic now
+        // defaults ON for every backend under the all-on-except-provenance
+        // policy (`base_for`), so the resolved query reports "on".
+        assert!(run("feature semantic").lines[0].contains("context feature semantic: on"));
+        assert!(run("semantic").lines[0].contains("context feature semantic: on"));
 
         // A feature FORCED on via [context.features] (allowed even before it's
         // implemented): toggling it off is still refused, and the message +
@@ -16548,6 +16559,7 @@ mod env_resolution_tests {
             model_tuning: vec![newt_core::config::ModelTuning {
                 model: "m".into(),
                 num_ctx: None,
+                context_window: None,
                 real_context_discovery: Some(false),
                 mid_loop_trim_threshold: None,
                 mid_loop_trim_tokens: None,
