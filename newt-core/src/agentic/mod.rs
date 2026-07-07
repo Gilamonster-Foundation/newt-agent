@@ -412,14 +412,8 @@ mod send_budget_tests {
     #[test]
     fn absent_num_ctx_leaves_the_budget_unchanged() {
         assert_eq!(initial_send_budget(None, None, None, 80), None);
-        assert_eq!(
-            initial_send_budget(Some(2_000), None, None, 80),
-            Some(2_000)
-        );
-        assert_eq!(
-            initial_send_budget(None, Some(5_000), None, 80),
-            Some(5_000)
-        );
+        assert_eq!(initial_send_budget(Some(2_000), None, None, 80), Some(2_000));
+        assert_eq!(initial_send_budget(None, Some(5_000), None, 80), Some(5_000));
         assert_eq!(
             initial_send_budget(Some(2_000), Some(5_000), None, 80),
             Some(5_000),
@@ -556,17 +550,10 @@ mod send_budget_tests {
     fn zero_or_tiny_num_ctx_is_no_budget_at_all() {
         assert_eq!(num_ctx_input_ceiling(None, 80), None);
         assert_eq!(num_ctx_input_ceiling(Some(0), 80), None);
-        assert_eq!(
-            num_ctx_input_ceiling(Some(1), 80),
-            None,
-            "80% rounds to zero"
-        );
+        assert_eq!(num_ctx_input_ceiling(Some(1), 80), None, "80% rounds to zero");
         assert_eq!(initial_send_budget(None, None, Some(0), 80), None);
         // A zero ceiling must not shadow a real cached budget either.
-        assert_eq!(
-            initial_send_budget(Some(2_000), None, Some(0), 80),
-            Some(2_000)
-        );
+        assert_eq!(initial_send_budget(Some(2_000), None, Some(0), 80), Some(2_000));
     }
 }
 
@@ -1182,8 +1169,7 @@ pub async fn chat_complete(
     // window with zero events — B6). Mutable because a recovered 400 tightens
     // it mid-turn. See #223.
     let num_ctx_ceiling = num_ctx_input_ceiling(num_ctx, input_ceiling_pct);
-    let mut send_budget: Option<usize> =
-        initial_send_budget(max_ok_input, safe_context, num_ctx, input_ceiling_pct);
+    let mut send_budget: Option<usize> = initial_send_budget(max_ok_input, safe_context, num_ctx, input_ceiling_pct);
     // Step 20.3: is the send budget backed by an authoritative ceiling, or
     // does it rest on the proven-good high-water mark (`max_ok_input`) alone?
     // `safe_context` (a believed/declared window) and the per-request
@@ -3828,8 +3814,7 @@ pub async fn openai_chat_complete(
     // (#223). Phase 20 §2.1 max(proven, believed) semantics — no `num_ctx`
     // ceiling on this wire (limits are server-side, e.g. vLLM
     // --max-model-len), so the ceiling leg is `None`.
-    let mut send_budget: Option<usize> =
-        initial_send_budget(max_ok_input, safe_context, None, input_ceiling_pct);
+    let mut send_budget: Option<usize> = initial_send_budget(max_ok_input, safe_context, None, input_ceiling_pct);
     // Step 20.3: on this wire there is no `num_ctx` ceiling, so the send
     // budget is authoritative only when a believed window (`safe_context`)
     // seeds it. Cloud OpenAI-compatible models have no `/api/show` to seed
@@ -6304,8 +6289,8 @@ mod tool_round_cap_tests {
                 debug: false,
                 trace: false,
                 num_ctx: None,
-                input_ceiling_pct: 80,
-                low_budget_pct: 15,
+            input_ceiling_pct: 80,
+            low_budget_pct: 15,
                 connect_timeout_secs: 5,
                 inference_timeout_secs: 120,
                 mid_loop_trim_threshold: 40,
@@ -6467,8 +6452,8 @@ mod tool_round_cap_tests {
                 debug: false,
                 trace: false,
                 num_ctx: None,
-                input_ceiling_pct: 80,
-                low_budget_pct: 15,
+            input_ceiling_pct: 80,
+            low_budget_pct: 15,
                 connect_timeout_secs: 5,
                 inference_timeout_secs: 120,
                 mid_loop_trim_threshold: 40,
@@ -6549,8 +6534,8 @@ mod tool_round_cap_tests {
                 debug: false,
                 trace: false,
                 num_ctx: None,
-                input_ceiling_pct: 80,
-                low_budget_pct: 15,
+            input_ceiling_pct: 80,
+            low_budget_pct: 15,
                 connect_timeout_secs: 5,
                 inference_timeout_secs: 120,
                 mid_loop_trim_threshold: 40,
@@ -6692,8 +6677,8 @@ mod tool_round_cap_tests {
                 debug: false,
                 trace: false,
                 num_ctx: None,
-                input_ceiling_pct: 80,
-                low_budget_pct: 15,
+            input_ceiling_pct: 80,
+            low_budget_pct: 15,
                 connect_timeout_secs: 5,
                 inference_timeout_secs: 120,
                 mid_loop_trim_threshold: 40,
@@ -6772,8 +6757,8 @@ mod tool_round_cap_tests {
                 debug: false,
                 trace: false,
                 num_ctx: None,
-                input_ceiling_pct: 80,
-                low_budget_pct: 15,
+            input_ceiling_pct: 80,
+            low_budget_pct: 15,
                 connect_timeout_secs: 5,
                 inference_timeout_secs: 120,
                 mid_loop_trim_threshold: 40,
@@ -6875,8 +6860,8 @@ mod tool_round_cap_tests {
                 debug: false,
                 trace: false,
                 num_ctx: None,
-                input_ceiling_pct: 80,
-                low_budget_pct: 15,
+            input_ceiling_pct: 80,
+            low_budget_pct: 15,
                 connect_timeout_secs: 5,
                 inference_timeout_secs: 120,
                 mid_loop_trim_threshold: 40,
@@ -6990,8 +6975,8 @@ mod tool_round_cap_tests {
                 debug: false,
                 trace: false,
                 num_ctx: None,
-                input_ceiling_pct: 80,
-                low_budget_pct: 15,
+            input_ceiling_pct: 80,
+            low_budget_pct: 15,
                 connect_timeout_secs: 5,
                 inference_timeout_secs: 120,
                 mid_loop_trim_threshold: 40,
@@ -7097,8 +7082,8 @@ mod tool_round_cap_tests {
                 debug: false,
                 trace: false,
                 num_ctx: None,
-                input_ceiling_pct: 80,
-                low_budget_pct: 15,
+            input_ceiling_pct: 80,
+            low_budget_pct: 15,
                 connect_timeout_secs: 5,
                 inference_timeout_secs: 120,
                 mid_loop_trim_threshold: 40,
@@ -7245,8 +7230,8 @@ mod tool_round_cap_tests {
                 debug: false,
                 trace: false,
                 num_ctx: None,
-                input_ceiling_pct: 80,
-                low_budget_pct: 15,
+            input_ceiling_pct: 80,
+            low_budget_pct: 15,
                 connect_timeout_secs: 5,
                 inference_timeout_secs: 120,
                 mid_loop_trim_threshold: 40,
@@ -7403,8 +7388,8 @@ mod tool_round_cap_tests {
                 debug: false,
                 trace: false,
                 num_ctx: None,
-                input_ceiling_pct: 80,
-                low_budget_pct: 15,
+            input_ceiling_pct: 80,
+            low_budget_pct: 15,
                 connect_timeout_secs: 5,
                 inference_timeout_secs: 30,
                 mid_loop_trim_threshold: 40,
