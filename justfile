@@ -55,11 +55,17 @@ install-lean dest=`echo $HOME/bin`:
 # NEXT launch dies with "Killed: 9" even though `codesign -v` still passes on
 # disk. Removing first gives a new inode; re-signing ad-hoc clears the cache.
 # `codesign` exists only on macOS, so the re-sign is a no-op elsewhere.
+#
+# Copy from ${CARGO_TARGET_DIR:-target}: `cargo build` above honors
+# CARGO_TARGET_DIR when it is set (e.g. a shared /tmp/.cargo-target in some CI /
+# agent sandboxes), so a hardcoded `target/release` would copy a STALE binary
+# from the local ./target while the fresh build actually landed elsewhere —
+# `just install` would then silently install the wrong (old) version.
 _place-binaries dest:
     mkdir -p {{dest}}
     rm -f {{dest}}/newt {{dest}}/newt-mcp-server
-    cp target/release/newt {{dest}}/newt
-    cp target/release/newt-mcp-server {{dest}}/newt-mcp-server
+    cp "${CARGO_TARGET_DIR:-target}/release/newt" {{dest}}/newt
+    cp "${CARGO_TARGET_DIR:-target}/release/newt-mcp-server" {{dest}}/newt-mcp-server
     @if command -v codesign >/dev/null 2>&1; then codesign --force --sign - {{dest}}/newt {{dest}}/newt-mcp-server && echo "re-signed ad-hoc (macOS AMFI)"; fi
 
 # Remove the binaries `just install` placed in DEST (default: ~/bin) — the
