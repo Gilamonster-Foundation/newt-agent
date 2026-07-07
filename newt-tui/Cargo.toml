@@ -52,9 +52,10 @@ tui-textarea = { version = "0.7.0", optional = true }
 # the `is_terminal()` runtime gate still applies on top of the feature.
 rich-tui = ["dep:tui-textarea"]
 
-# In-process candle summarizer (#661 group C): routes a `kind = "embedded"`
-# summarizer through newt-inference's embedded engine. Default-off so the lean
-# build never pulls candle.
+# In-process candle summarizer (#661 group C): routes the (now DEFAULT) embedded
+# summarizer through newt-inference's engine. Enabled by the workspace default
+# via newt-cli (decision 2026-07-07); `--no-default-features` is the zero-candle
+# opt-out.
 embedded = ["newt-inference/embedded"]
 
 # NOTE (Step 9.7): the direct agent-bridle dependency moved to newt-core with

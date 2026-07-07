@@ -21,6 +21,7 @@ pub mod dgx_status;
 pub mod dgx_vllm;
 mod doctor;
 mod identity_cmd;
+mod models_cmd;
 mod new_project;
 mod skills;
 pub mod stack;
@@ -459,6 +460,12 @@ pub enum Command {
         #[command(subcommand)]
         cmd: tuning_cmd::TuningsCmd,
     },
+    /// Manage the on-host mini-model palette for the embedded CPU summarizer
+    /// (#661): `pull` a GGUF to ~/.newt/models, `list` the palette, `path`.
+    Models {
+        #[command(subcommand)]
+        cmd: models_cmd::ModelsCmd,
+    },
 }
 
 /// clap `value_parser` for `--color`: parse a keyword into a
@@ -813,6 +820,12 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             // one-line notice (→ `newt dgx adopt`) before the session. Never
             // blocks startup; silent when dgx is unconfigured or unreachable.
             dgx::startup_drift_notice(cli.config.as_deref()).await;
+            // First interactive run: provision the on-host CPU summarizer model so
+            // context compaction never competes with the session GPU model
+            // (#661 group C / #979). Best-effort — a failed pull falls back to the
+            // warn-and-degrade path; no-ops when non-interactive / lean / already
+            // present, or when NEWT_NO_MODEL_PULL is set.
+            models_cmd::ensure_summarizer_model().await;
             newt_tui::run_code(
                 path.as_deref(),
                 no_splash,
@@ -917,6 +930,7 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         Command::Skills { cmd } => skills::run(cmd, cli.config.as_deref()),
         Command::Dgx { cmd } => dgx::run(cmd, cli.config.as_deref()).await,
         Command::Tunings { cmd } => tuning_cmd::run(cmd, cli.config.as_deref()),
+        Command::Models { cmd } => models_cmd::run(cmd).await,
     }
 }
 

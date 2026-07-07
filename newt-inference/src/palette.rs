@@ -144,6 +144,37 @@ pub fn fitting(ram_budget_gb: f32) -> Vec<&'static MiniModel> {
         .collect()
 }
 
+/// The designated DEFAULT summarizer model — the tiniest palette entry
+/// (qwen2.5-0.5b), chosen for the smallest RAM + download footprint. The
+/// context summarizer defaults to THIS running in-process on the host CPU
+/// (#661 group C); a `[summarizer]` backend override is the only way off it.
+#[must_use]
+pub fn default_model() -> &'static MiniModel {
+    &PALETTE[0]
+}
+
+/// `~/.newt/models` — where `newt models pull` stores palette GGUFs and where
+/// the embedded summarizer looks for them. `None` if the home dir is unknown.
+#[must_use]
+pub fn models_dir() -> Option<std::path::PathBuf> {
+    newt_core::Config::user_config_dir().map(|d| d.join("models"))
+}
+
+/// The on-disk GGUF path for a palette model: `~/.newt/models/<alias>/<file>`.
+#[must_use]
+pub fn local_gguf_path(m: &MiniModel) -> Option<std::path::PathBuf> {
+    models_dir().map(|d| d.join(m.name).join(m.gguf_file))
+}
+
+/// The local GGUF for `alias` IFF it is present on disk (else `None`). The
+/// summarizer resolver uses this to decide whether the embedded default can run
+/// before falling back (with a warning) to a session/off-box override.
+#[must_use]
+pub fn resolve_local(alias: &str) -> Option<std::path::PathBuf> {
+    let p = local_gguf_path(find(alias)?)?;
+    p.is_file().then_some(p)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

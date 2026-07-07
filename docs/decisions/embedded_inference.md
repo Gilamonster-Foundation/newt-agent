@@ -1,7 +1,11 @@
 # Embedded (in-process) inference — engine choice & feature-gating
 
-**Status:** scaffold landed (this PR); engine increment next.
-**Issue:** #639. **Related:** #559 (bulletproof summarizer), #383 (foreign providers), #548 (the summarizer-contention wedge that motivated it).
+**Status:** DELIVERED (2026-07-07) — the mid-loop context summarizer **defaults
+to the embedded on-host CPU engine**; the `embedded` feature is **default-on**
+(revised wyvern stance below). Session-reuse and off-box summarizers are
+**overrides that warn**. The default model **auto-provisions on the first
+interactive run** (or `newt models pull`).
+**Issue:** #639, #661 (group C). **Related:** #559 (bulletproof summarizer), #383 (foreign providers), #548 (the summarizer-contention wedge that motivated it).
 
 ## Why
 
@@ -68,14 +72,26 @@ exactly that.
 newt is amphibious (human CLI + headless swarm). The headless **wyvern** tier
 must stay lean, so:
 
-- **`embedded` cargo feature, default-off.** The `EmbeddedBackend` and (next
-  increment) its candle/Metal deps live entirely behind it. The default + headless
-  builds pull nothing extra; `cargo build/test/clippy/fmt` + `just cov-ci` stay
-  green both ways. This is also the "add/remove from other agents we develop"
-  switch — wyvern-agent (or any agent) opts in or out per build.
-- **No silent downloads.** A small box (M4 / 16 GB) can't absorb surprise GGUFs;
-  the backend resolves a configured model file and errors clearly when it's
-  absent, naming the palette entry's HF source.
+- **`embedded` cargo feature, DEFAULT-ON (revised 2026-07-07).** Originally
+  default-off to keep wyvern lean. That stance is retired, pragmatically: the
+  on-host CPU summarizer is **non-negotiable** — context compaction must never
+  run on the session GPU model (it fires under peak load → overloads the GPU →
+  stalls the turn, #979), so the candle engine ships in the DEFAULT build,
+  **wyvern included**. `--no-default-features` (install-lean) remains the explicit
+  zero-candle opt-out for anyone who truly wants it gone. Still the per-agent
+  add/remove switch — the default just flipped to on.
+- **One bounded auto-pull, interactive only (revised 2026-07-07).** For the
+  embedded default to actually *work* out of the box, the **default** summarizer
+  model auto-provisions on the first interactive `newt code` run: a single, small
+  (~350 MB), named GGUF, announced with a `first pull` notice that explains it is
+  offloading compaction from the GPU to the CPU, opt-out via `NEWT_NO_MODEL_PULL`,
+  and gated to a TTY — a headless worker / piped / CI run **never** auto-pulls, and
+  a lean (`--no-default-features`) build has no engine to pull for. A failed pull
+  is **non-fatal**: resolution falls back to the warn-and-degrade (session-model)
+  path. Beyond that one model nothing is silently downloaded — other palette
+  entries need an explicit `newt models pull`, and the backend errors clearly
+  (naming the HF source) when a configured model is absent. A
+  `~/.newt/models/README.md` records what's there and why.
 
 ## The mini-model palette
 
