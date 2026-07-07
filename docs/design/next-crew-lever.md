@@ -1,5 +1,8 @@
 # The next crew lever: four proposals adversarially verified against the #814 autopsy
 
+> Loop-side companion: [`next-loop-levers.md`](next-loop-levers.md) —
+> the single-agent loop's decision menu; this doc is the crew side.
+>
 > Evidence base: `/propose-verify` over
 > `scripts/eval/results/autopsy/2026-07-02-pr802-baseline.json` (+ its
 > companion `.md`), the root-cause classification of the 17 behavioral
