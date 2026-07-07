@@ -389,19 +389,27 @@ jobs:
           - newt-skills       # (no internal deps)
           - plugins-protocol  # (no internal deps)
           - newt-core         # newt-skills
+          - newt-git          # newt-core — embedded git engine; newt-tui/newt-agent
+                              #   depend on it with a version pin, so it must be
+                              #   published before them (added 0.7.1: prior matrix
+                              #   drift broke the 2026-06-14 release)
           - newt-data         # (no internal deps) — Phase 21 SQLite engine; must
                               #   precede newt-mcp-data, which depends on it
           - newt-identity     # newt-core
           - newt-tools        # newt-core
           - newt-mcp-client   # newt-core
           - newt-inference    # newt-core, newt-identity, plugins-protocol
+          - newt-scheduler    # newt-core, newt-inference — orchestration crate;
+                              #   newt-agent depends on it with a version pin
+                              #   (added 0.7.1 alongside newt-git)
           - newt-mcp-server   # newt-core, newt-inference, newt-tools
           - newt-coder        # newt-core, newt-identity, newt-inference, newt-tools, plugins-protocol
-          - newt-tui          # newt-core, newt-identity, newt-inference, newt-mcp-client, newt-skills, newt-tools
+          - newt-tui          # newt-core, newt-git, newt-identity, newt-inference, newt-mcp-client, newt-skills, newt-tools
           - newt-acp-worker   # newt-coder, newt-core, newt-identity, newt-inference, newt-tools
           # package name for the newt-cli/ dir (binary: `newt`); depends on
           # newt-acp-worker, newt-core, newt-identity, newt-inference,
-          # newt-mcp-client, newt-mcp-server, newt-skills, newt-tools, newt-tui
+          # newt-mcp-client, newt-mcp-server, newt-scheduler, newt-skills,
+          # newt-tools, newt-tui
           - newt-agent
     steps:
       - uses: actions/checkout@v4
