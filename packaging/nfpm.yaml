@@ -1,0 +1,36 @@
+# nfpm config → produces BOTH the .deb and .rpm for the newt-agent binaries.
+#
+#   VERSION=0.7.1 nfpm pkg --config packaging/nfpm.yaml --packager deb --target dist/
+#   VERSION=0.7.1 nfpm pkg --config packaging/nfpm.yaml --packager rpm --target dist/
+#
+# nfpm expands ${VERSION} from the environment. The release workflow
+# (.github/workflows/release.yml, job `linux-packages`) downloads the built
+# linux-x86_64 archive, extracts the two binaries into ./staging/, and runs the
+# two commands above. One config, both Linux package formats — we are opinionated
+# Linux developers and this is the path we actually dogfood.
+name: newt-agent
+arch: amd64
+platform: linux
+version: ${VERSION}
+section: devel
+priority: optional
+maintainer: "Shawn Hartsock <hartsock@users.noreply.github.com>"
+description: |
+  Newt-Agent — small, fast, local-first agentic coder (vi to Hermes's emacs).
+  Installs the `newt` CLI and the `newt-mcp-server` stdio MCP server.
+vendor: "Gilamonster Foundation"
+homepage: "https://github.com/Gilamonster-Foundation/newt-agent"
+license: "Apache-2.0"
+contents:
+  - src: ./staging/newt
+    dst: /usr/bin/newt
+    file_info:
+      mode: 0755
+  - src: ./staging/newt-mcp-server
+    dst: /usr/bin/newt-mcp-server
+    file_info:
+      mode: 0755
+  - src: ./LICENSE
+    dst: /usr/share/doc/newt-agent/LICENSE
+  - src: ./README.md
+    dst: /usr/share/doc/newt-agent/README.md

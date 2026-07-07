@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Chocolatey package for newt-agent (Windows).
+
+  The release workflow (.github/workflows/release.yml, job `chocolatey-package`)
+  substitutes @VERSION@ here and in tools/chocolateyinstall.ps1, runs `choco
+  pack`, and attaches the resulting `newt.@VERSION@.nupkg` to the GitHub release.
+
+  There is no chocolatey.org feed yet (owner decision, 2026-07-06). Install from
+  the attached package:
+
+    choco install newt --source . --version @VERSION@
+
+  Windows note: newt uses the carried `brush` shell engine on Windows for
+  internal-tooling compatibility; native PowerShell code paths are a future
+  release. (We are opinionated Linux developers who happen to use MacBooks.)
+-->
+<package xmlns="http://schemas.microsoft.com/packaging/2015/06/nuspec.xsd">
+  <metadata>
+    <id>newt</id>
+    <version>@VERSION@</version>
+    <title>Newt-Agent</title>
+    <authors>Shawn Hartsock</authors>
+    <owners>Gilamonster Foundation</owners>
+    <projectUrl>https://github.com/Gilamonster-Foundation/newt-agent</projectUrl>
+    <projectSourceUrl>https://github.com/Gilamonster-Foundation/newt-agent</projectSourceUrl>
+    <packageSourceUrl>https://github.com/Gilamonster-Foundation/newt-agent</packageSourceUrl>
+    <licenseUrl>https://github.com/Gilamonster-Foundation/newt-agent/blob/main/LICENSE</licenseUrl>
+    <requireLicenseAcceptance>false</requireLicenseAcceptance>
+    <tags>newt agent cli coder ai llm mcp local-first</tags>
+    <summary>Small, fast, local-first agentic coder.</summary>
+    <description>
+Newt-Agent — a small, fast, local-first agentic coder (vi to Hermes's emacs).
+
+This package installs the `newt` CLI and the `newt-mcp-server` stdio MCP server
+as shimmed executables on your PATH.
+    </description>
+  </metadata>
+  <files>
+    <file src="tools\**" target="tools" />
+  </files>
+</package>
