@@ -137,12 +137,34 @@ grade_home() { # $1=home $2=label  -> JSON on stdout, human on stderr; 0=PASS
 # ---- drive: run the yardstick against an isolated HOME ----
 run_yardstick() { # $1=newt $2=home $3=prompts $4=workdir $5=timeout
   local newt="$1" home="$2" prompts="$3" workdir="$4" timeout_s="$5"
-  [ -x "$newt" ]                 || { echo "grade-loop: not executable: $newt" >&2; return 2; }
+  [ -x "$newt" ]                   || { echo "grade-loop: not executable: $newt" >&2; return 2; }
   [ -f "$home/.newt/config.toml" ] || { echo "grade-loop: seed $home/.newt/config.toml first (backend + incident knobs)" >&2; return 2; }
-  # Feed each prompt line as a user turn, then /exit. --plain (NOT --ephemeral):
-  # we WANT the run to persist to $home/.newt/conversations.db so we can read it.
-  { cat "$prompts"; printf '/exit\n'; } \
-    | ( cd "$workdir" && HOME="$home" timeout "${timeout_s}s" "$newt" --plain ) \
+  command -v python3 >/dev/null    || { echo "grade-loop: python3 required (pty_drive.py)" >&2; return 2; }
+  # Drive the interactive TUI FAITHFULLY via a PTY pacer (pty_drive.py): a blind
+  # pipe can't — `newt --plain` needs a controlling terminal (ENXIO on a pipe).
+  # Each prompt line is one user turn; append /exit. Details:
+  #   HOME + --config-dir $home/.newt : load the seeded backend/knobs AND root
+  #       the run's OWN conversations.db under $home (isolated from ~/.newt).
+  #   NEWT_FULL_ACCESS + NO_PROMPT    : grant authority + non-interactive (no
+  #       human at the pipe; also removes the yardstick's permission-latency
+  #       confound). NB: this still leaves the exec shell CONFINED — a
+  #       run_command WRITE is denied and the agent emits request_permissions
+  #       instead of running it (read-only run_command is routed to built-ins,
+  #       so it still works). For a fully unconfined host shell (how the
+  #       incident agent operated) ALSO `export NEWT_DISABLE_OCAP=1` before
+  #       running — grade-loop passes it through. It is deliberately NOT set by
+  #       default: an unconfined agent loop is a footgun the operator opts into.
+  #       (Needing BOTH full-access AND disable-ocap to get real work done is a
+  #       newt rough edge worth fixing separately.) --no-splash skips the 0.7.1
+  #       start screen. NOT --ephemeral, so the turns persist for the grader.
+  local pf="$home/.yardstick-prompts"
+  { cat "$prompts"; printf '/exit\n'; } > "$pf"
+  # Set GRADE_LOOP_PACER_DEBUG=1 to log the pacer's prime/type/exit trace to
+  # run.stderr.log (troubleshooting a "no turns persisted" drive).
+  local dbg=(); [ -n "${GRADE_LOOP_PACER_DEBUG:-}" ] && dbg=(--debug)
+  HOME="$home" NEWT_FULL_ACCESS=1 NEWT_NO_PROMPT_FOR_PERMISSIONS=1 \
+    python3 "$HERE/pty_drive.py" --prompts "$pf" --workdir "$workdir" --timeout "$timeout_s" "${dbg[@]}" \
+      -- "$newt" --config-dir "$home/.newt" --no-splash --plain \
       >"$home/run.stdout.log" 2>"$home/run.stderr.log"
   return 0
 }
