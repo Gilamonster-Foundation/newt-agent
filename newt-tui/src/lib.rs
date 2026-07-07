@@ -4096,14 +4096,49 @@ async fn summarize_attempt(
         anyhow::bail!("summarizer endpoint {}", resp.status());
     }
     let json: serde_json::Value = resp.json().await?;
-    let content = if openai {
+    extract_summary(&json, openai)
+}
+
+/// Extract the summary text from a chat response, robust to THINKING models.
+/// A thinking model asked to summarize may wrap the summary in inline
+/// `<think>…</think>` (stripped here via `split_reasoning`) or — on Ollama — put
+/// its reasoning in a separate `thinking` field and leave `content` EMPTY. The
+/// request sends `think: false` to prevent the empty-content case for
+/// cooperative models; this is the response-side belt-and-suspenders. A
+/// still-empty result is a genuine empty summary (the caller degrades it to the
+/// static marker) rather than a `<think>`-polluted string masquerading as one.
+fn extract_summary(json: &serde_json::Value, openai: bool) -> anyhow::Result<String> {
+    let raw = if openai {
         json["choices"][0]["message"]["content"].as_str()
     } else {
         json["message"]["content"].as_str()
-    };
-    match content {
-        Some(s) if !s.trim().is_empty() => Ok(s.to_string()),
-        _ => anyhow::bail!("summarizer returned empty content"),
+    }
+    .unwrap_or("");
+    let (clean, _reasoning) = newt_core::split_reasoning(raw);
+    if clean.trim().is_empty() {
+        anyhow::bail!("summarizer returned empty content (thinking-only reply?)");
+    }
+    Ok(clean)
+}
+
+#[cfg(test)]
+mod summarizer_extract_tests {
+    use super::extract_summary;
+
+    #[test]
+    fn strips_inline_think_and_flags_thinking_only() {
+        // Inline <think> is stripped → clean summary (Ollama shape).
+        let j = serde_json::json!({"message": {"content": "<think>let me reason</think>Active task: X. Done."}});
+        assert_eq!(extract_summary(&j, false).unwrap(), "Active task: X. Done.");
+        // OpenAI shape.
+        let o = serde_json::json!({"choices": [{"message": {"content": "<think>hmm</think>Summary."}}]});
+        assert_eq!(extract_summary(&o, true).unwrap(), "Summary.");
+        // Thinking-only reply (empty content, reasoning in a separate field) →
+        // Err, so the caller degrades to the static marker instead of treating
+        // an empty string as a valid summary (silent context loss).
+        let empty =
+            serde_json::json!({"message": {"content": "", "thinking": "all reasoning, no text"}});
+        assert!(extract_summary(&empty, false).is_err());
     }
 }
 
@@ -4154,10 +4189,16 @@ async fn summarize_one_model(
             "stream": false,
         })
     } else {
+        // `think: false` — a summary is a direct extraction task, not a
+        // reasoning one. A thinking model (emits_thinking) otherwise returns a
+        // thinking-only reply with EMPTY content that degrades to the static
+        // marker (silent context loss). Non-thinking models / older Ollama
+        // ignore the field.
         let mut b = serde_json::json!({
             "model": model,
             "messages": [{"role": "user", "content": prompt}],
             "stream": false,
+            "think": false,
             "keep_alive": opts.keep_alive,
         });
         if let Some(ctx_size) = opts.num_ctx {
