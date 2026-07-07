@@ -65,10 +65,12 @@ impl EmbeddedBackend {
             .join("tokenizer.json");
         if !tokenizer_path.exists() {
             anyhow::bail!(
-                "tokenizer not found: {} — place tokenizer.json next to the GGUF (fetch it from \
-                 https://huggingface.co/{})",
+                "tokenizer not found: {} — run `newt models pull {}` (it fetches tokenizer.json \
+                 from https://huggingface.co/{} next to the GGUF; the quant GGUF repo does not \
+                 ship one)",
                 tokenizer_path.display(),
-                model.hf_repo
+                model.name,
+                model.tokenizer_repo
             );
         }
         Ok(Self {

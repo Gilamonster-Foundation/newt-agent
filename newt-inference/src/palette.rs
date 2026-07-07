@@ -41,6 +41,11 @@ pub struct MiniModel {
     pub hf_repo: &'static str,
     /// The GGUF file within [`Self::hf_repo`].
     pub gguf_file: &'static str,
+    /// Hugging Face repo serving the standalone `tokenizer.json`. Candle loads the
+    /// HF fast-tokenizer file, which the quant GGUF repos above generally do NOT
+    /// ship — it lives in the base instruct repo (Qwen) or an open mirror
+    /// (unsloth / HuggingFaceTB). `newt models pull` fetches it next to the GGUF.
+    pub tokenizer_repo: &'static str,
     /// The quantized model implementation the engine loads.
     pub arch: ModelArch,
     /// What this pick is good for.
@@ -57,6 +62,7 @@ pub const PALETTE: &[MiniModel] = &[
         approx_ram_gb: 0.5,
         hf_repo: "Qwen/Qwen2.5-0.5B-Instruct-GGUF",
         gguf_file: "qwen2.5-0.5b-instruct-q4_k_m.gguf",
+        tokenizer_repo: "Qwen/Qwen2.5-0.5B-Instruct",
         arch: ModelArch::Qwen2,
         note: "tiniest; fast summarizer/classifier, lowest RAM",
     },
@@ -67,6 +73,7 @@ pub const PALETTE: &[MiniModel] = &[
         approx_ram_gb: 0.8,
         hf_repo: "bartowski/Llama-3.2-1B-Instruct-GGUF",
         gguf_file: "Llama-3.2-1B-Instruct-Q4_K_M.gguf",
+        tokenizer_repo: "unsloth/Llama-3.2-1B-Instruct",
         arch: ModelArch::Llama,
         note: "strong 1B; good summaries with tiny footprint",
     },
@@ -77,6 +84,7 @@ pub const PALETTE: &[MiniModel] = &[
         approx_ram_gb: 1.0,
         hf_repo: "bartowski/SmolLM2-1.7B-Instruct-GGUF",
         gguf_file: "SmolLM2-1.7B-Instruct-Q4_K_M.gguf",
+        tokenizer_repo: "HuggingFaceTB/SmolLM2-1.7B-Instruct",
         arch: ModelArch::Llama,
         note: "instruction-tuned small; concise summarizer",
     },
@@ -87,6 +95,7 @@ pub const PALETTE: &[MiniModel] = &[
         approx_ram_gb: 1.0,
         hf_repo: "Qwen/Qwen2.5-1.5B-Instruct-GGUF",
         gguf_file: "qwen2.5-1.5b-instruct-q4_k_m.gguf",
+        tokenizer_repo: "Qwen/Qwen2.5-1.5B-Instruct",
         arch: ModelArch::Qwen2,
         note: "balanced default summarizer pick on 16 GB",
     },
@@ -97,6 +106,7 @@ pub const PALETTE: &[MiniModel] = &[
         approx_ram_gb: 1.7,
         hf_repo: "bartowski/gemma-2-2b-it-GGUF",
         gguf_file: "gemma-2-2b-it-Q4_K_M.gguf",
+        tokenizer_repo: "unsloth/gemma-2-2b-it",
         arch: ModelArch::Gemma2,
         note: "fluent 2B; nicer prose, more RAM",
     },
@@ -107,6 +117,7 @@ pub const PALETTE: &[MiniModel] = &[
         approx_ram_gb: 2.0,
         hf_repo: "Qwen/Qwen2.5-3B-Instruct-GGUF",
         gguf_file: "qwen2.5-3b-instruct-q4_k_m.gguf",
+        tokenizer_repo: "Qwen/Qwen2.5-3B-Instruct",
         arch: ModelArch::Qwen2,
         note: "strongest small; upper bound for a 16 GB box",
     },
@@ -117,6 +128,7 @@ pub const PALETTE: &[MiniModel] = &[
         approx_ram_gb: 2.0,
         hf_repo: "bartowski/Llama-3.2-3B-Instruct-GGUF",
         gguf_file: "Llama-3.2-3B-Instruct-Q4_K_M.gguf",
+        tokenizer_repo: "unsloth/Llama-3.2-3B-Instruct",
         arch: ModelArch::Llama,
         note: "capable 3B; upper bound on a 16 GB box",
     },
@@ -166,13 +178,25 @@ pub fn local_gguf_path(m: &MiniModel) -> Option<std::path::PathBuf> {
     models_dir().map(|d| d.join(m.name).join(m.gguf_file))
 }
 
-/// The local GGUF for `alias` IFF it is present on disk (else `None`). The
-/// summarizer resolver uses this to decide whether the embedded default can run
-/// before falling back (with a warning) to a session/off-box override.
+/// The on-disk `tokenizer.json` path for a palette model, beside its GGUF:
+/// `~/.newt/models/<alias>/tokenizer.json`. Candle loads this next to the GGUF,
+/// so `newt models pull` fetches it from [`MiniModel::tokenizer_repo`].
+#[must_use]
+pub fn local_tokenizer_path(m: &MiniModel) -> Option<std::path::PathBuf> {
+    models_dir().map(|d| d.join(m.name).join("tokenizer.json"))
+}
+
+/// The local GGUF for `alias` IFF the model is FULLY provisioned — both the GGUF
+/// **and** its `tokenizer.json` (candle needs both). A GGUF-only install returns
+/// `None`, so the summarizer resolver degrades cleanly at startup (with a warning
+/// to run `newt models pull`) instead of the embedded backend failing to init
+/// mid-compaction — the exact failure that fell back to a static marker.
 #[must_use]
 pub fn resolve_local(alias: &str) -> Option<std::path::PathBuf> {
-    let p = local_gguf_path(find(alias)?)?;
-    p.is_file().then_some(p)
+    let m = find(alias)?;
+    let gguf = local_gguf_path(m)?;
+    let tok = local_tokenizer_path(m)?;
+    (gguf.is_file() && tok.is_file()).then_some(gguf)
 }
 
 #[cfg(test)]
@@ -185,6 +209,13 @@ mod tests {
         for m in PALETTE {
             assert!(!m.name.is_empty());
             assert!(!m.hf_repo.is_empty() && m.gguf_file.ends_with(".gguf"));
+            // Candle needs a standalone tokenizer.json; every entry must name a
+            // repo that serves one (the GGUF quant repos generally do not).
+            assert!(
+                !m.tokenizer_repo.is_empty(),
+                "{}: no tokenizer_repo",
+                m.name
+            );
             // Summarizer-class: every entry must be small enough for a 16 GB box.
             assert!(
                 m.approx_ram_gb > 0.0 && m.approx_ram_gb <= 3.0,
@@ -203,6 +234,27 @@ mod tests {
             assert!(seen.insert(m.name), "duplicate palette name: {}", m.name);
             assert!(m.approx_ram_gb >= last, "palette must be smallest-first");
             last = m.approx_ram_gb;
+        }
+    }
+
+    #[test]
+    fn tokenizer_json_sits_beside_the_gguf() {
+        // Regression (#661 group C): candle loads tokenizer.json NEXT TO the GGUF,
+        // and the quant GGUF repos do not ship one — an earlier pull/auto-provision
+        // fetched only the GGUF, so init failed ("tokenizer not found") and the
+        // summarizer fell back to a static marker. Both files must resolve into the
+        // same per-alias dir, with the tokenizer named exactly `tokenizer.json`.
+        for m in PALETTE {
+            let (Some(g), Some(t)) = (local_gguf_path(m), local_tokenizer_path(m)) else {
+                continue; // no home dir in this env — nothing to check structurally
+            };
+            assert_eq!(g.parent(), t.parent(), "{}: tokenizer not beside gguf", m.name);
+            assert_eq!(
+                t.file_name().and_then(|s| s.to_str()),
+                Some("tokenizer.json"),
+                "{}: tokenizer must be tokenizer.json",
+                m.name
+            );
         }
     }
 
