@@ -1483,15 +1483,46 @@ async fn exec_confined_command(
 }
 
 async fn host_shell_dispatch(cmd: &str, cwd: &str) -> std::io::Result<serde_json::Value> {
-    let output = host_shell_output(cmd, cwd).await?;
+    let run = host_shell_output(cmd, cwd).await?;
     Ok(serde_json::json!({
-        "exit_code": output.status.code().unwrap_or(-1),
-        "stdout": decode_shell_stream(&output.stdout),
-        "stderr": decode_shell_stream(&output.stderr),
+        "exit_code": run.exit_code,
+        "stdout": decode_shell_stream(&run.stdout),
+        "stderr": decode_shell_stream(&run.stderr),
+        // Same `timed_out` flag the confined bridle envelope carries, so the
+        // host-bypass path can never wedge the session on a hung child (#297).
+        "timed_out": run.timed_out,
         // Honest provenance, same field the bridle envelope always carries:
         // nothing sandboxed this run.
         "sandbox_kind": "none",
     }))
+}
+
+/// Result of a host-bypass shell run. Unlike a raw [`std::process::Output`] this
+/// carries an explicit `timed_out` flag so the dispatch layer can emit the same
+/// envelope shape the confined path does when a child is killed for running long.
+struct HostShellRun {
+    exit_code: i64,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    timed_out: bool,
+}
+
+/// Wall-clock ceiling for a single host-bypass shell command. A child that
+/// blocks past this (a REPL awaiting input, an accidental `cat` with no args,
+/// an interactive prompt) is killed rather than wedging the whole turn — the
+/// interrupt keyboard-watcher cannot help once a foreground child owns the tty.
+///
+/// Convention-driven: override with `NEWT_HOST_EXEC_TIMEOUT_SECS` (a positive
+/// integer number of seconds). Absent/blank/invalid/zero falls back to the
+/// 120s default, mirroring the confined shell's bound.
+fn host_exec_timeout() -> std::time::Duration {
+    const DEFAULT_SECS: u64 = 120;
+    let secs = std::env::var("NEWT_HOST_EXEC_TIMEOUT_SECS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_SECS);
+    std::time::Duration::from_secs(secs)
 }
 
 fn decode_shell_stream(bytes: &[u8]) -> String {
@@ -1585,28 +1616,109 @@ fn parse_cat_v_meta_byte(bytes: &[u8], start: usize) -> Option<(u8, usize)> {
 /// INTERIM (#297) host shell selection: `bash -c` with an `sh -c` fallback
 /// when bash is absent — the same sh-compatible free-form mode the confined
 /// shell ran, so [`venv_cmd_prefix`]'s `export …;` prefix works unchanged.
+///
+/// Hardened (#297) so a hung child can never wedge the turn:
+/// - `kill_on_drop(true)` + `process_group(0)` (own process group) so the whole
+///   child *tree* dies when we drop the handle, not just the immediate `bash`.
+/// - stdin redirected from `/dev/null` so a child that reads stdin sees EOF
+///   instead of blocking forever waiting on a tty the agent can't feed.
+/// - a [`host_exec_timeout`] wall-clock ceiling: on expiry the child is killed
+///   and we return `timed_out: true` with exit code 124, matching the confined
+///   path's envelope shape.
 #[cfg(not(windows))]
-async fn host_shell_output(cmd: &str, cwd: &str) -> std::io::Result<std::process::Output> {
+async fn host_shell_output(cmd: &str, cwd: &str) -> std::io::Result<HostShellRun> {
+    use std::process::Stdio;
+
     fn shell(program: &str, cmd: &str, cwd: &str) -> tokio::process::Command {
         let mut c = tokio::process::Command::new(program);
-        c.arg("-c").arg(cmd).current_dir(cwd);
+        c.arg("-c")
+            .arg(cmd)
+            .current_dir(cwd)
+            // A child that reads stdin gets EOF, never a blocking wait on a tty
+            // the agent cannot drive.
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            // Own process group (setsid-equivalent, std-only since Rust 1.64):
+            // detaches the child from our controlling tty so it can't steal the
+            // interrupt byte, and gives the drop-kill a whole group to reap.
+            .process_group(0)
+            // Kill the child *tree* — not just `bash` — if we drop the handle
+            // (timeout, cancel, panic).
+            .kill_on_drop(true);
         c
     }
-    match shell("bash", cmd, cwd).output().await {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => shell("sh", cmd, cwd).output().await,
-        other => other,
+
+    async fn run_one(child: tokio::process::Child) -> std::io::Result<HostShellRun> {
+        // `wait_with_output` consumes the child; if the timeout fires first the
+        // future is dropped and `kill_on_drop` reaps the whole group.
+        let timeout = host_exec_timeout();
+        match tokio::time::timeout(timeout, child.wait_with_output()).await {
+            Ok(Ok(output)) => Ok(HostShellRun {
+                exit_code: output.status.code().unwrap_or(-1) as i64,
+                stdout: output.stdout,
+                stderr: output.stderr,
+                timed_out: false,
+            }),
+            Ok(Err(e)) => Err(e),
+            Err(_elapsed) => Ok(HostShellRun {
+                exit_code: 124,
+                stdout: Vec::new(),
+                stderr: format!(
+                    "command exceeded {}s host-shell timeout and was killed\n",
+                    timeout.as_secs()
+                )
+                .into_bytes(),
+                timed_out: true,
+            }),
+        }
+    }
+
+    match shell("bash", cmd, cwd).spawn() {
+        Ok(child) => run_one(child).await,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            run_one(shell("sh", cmd, cwd).spawn()?).await
+        }
+        Err(e) => Err(e),
     }
 }
 
 /// INTERIM (#297) host shell selection on Windows: `cmd /C`, the same shape
-/// as [`build_check_shell`].
+/// as [`build_check_shell`]. Bounded by [`host_exec_timeout`] with
+/// `kill_on_drop` so a hung child cannot wedge the turn.
 #[cfg(windows)]
-async fn host_shell_output(cmd: &str, cwd: &str) -> std::io::Result<std::process::Output> {
-    tokio::process::Command::new("cmd")
+async fn host_shell_output(cmd: &str, cwd: &str) -> std::io::Result<HostShellRun> {
+    use std::process::Stdio;
+
+    let mut child = tokio::process::Command::new("cmd")
         .args(["/C", cmd])
         .current_dir(cwd)
-        .output()
-        .await
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()?;
+
+    let timeout = host_exec_timeout();
+    match tokio::time::timeout(timeout, child.wait_with_output()).await {
+        Ok(Ok(output)) => Ok(HostShellRun {
+            exit_code: output.status.code().unwrap_or(-1) as i64,
+            stdout: output.stdout,
+            stderr: output.stderr,
+            timed_out: false,
+        }),
+        Ok(Err(e)) => Err(e),
+        Err(_elapsed) => Ok(HostShellRun {
+            exit_code: 124,
+            stdout: Vec::new(),
+            stderr: format!(
+                "command exceeded {}s host-shell timeout and was killed\r\n",
+                timeout.as_secs()
+            )
+            .into_bytes(),
+            timed_out: true,
+        }),
+    }
 }
 
 /// Lexically normalise a path *string* — collapse `.` and `..` components

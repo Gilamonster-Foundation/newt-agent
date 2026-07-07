@@ -2273,7 +2273,16 @@ pub async fn chat_complete(
                 display::print_tool_output(&report, tool_output_lines, color);
                 report
             } else {
-                execute_tool_with_offload(
+                // #297 follow-up: race the tool dispatch against the turn's
+                // cancel flag. A mid-tool interrupt (Esc / Ctrl-C) now drops the
+                // in-flight future here instead of waiting for the tool to
+                // return — and for exec that dropped future triggers
+                // `kill_on_drop` on the child *tree*, so a hung `run_command`
+                // dies the instant the user asks for it rather than at the
+                // host-exec timeout ceiling. `is_cancelled` between rounds still
+                // catches the abandoned turn; this closes the *during-a-tool*
+                // window that a foreground child on the tty used to wedge.
+                let dispatch = execute_tool_with_offload(
                     name,
                     &args,
                     workspace,
@@ -2306,8 +2315,18 @@ pub async fn chat_complete(
                     step_ledger,
                     tool_offload,
                     spill_store,
-                )
-                .await
+                );
+                // If the turn was cancelled mid-tool, `cancellable` returns
+                // None and the dispatch future above is already dropped (its
+                // child reaped via kill_on_drop). Synthesize a cancellation
+                // result so the loop unwinds cleanly on the next `is_cancelled`
+                // check instead of pretending the tool produced output.
+                match cancellable(cancel, dispatch).await {
+                    Some(r) => r,
+                    None => format!(
+                        "error: {name} interrupted — tool cancelled before completion"
+                    ),
+                }
             };
             // 17.6: record the call for the turn's events column — args are
             // digested (never stored raw), duration is a display claim.
