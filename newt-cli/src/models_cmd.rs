@@ -179,65 +179,28 @@ async fn download_to(url: &str, dest: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// First-run provisioning of the on-host summarizer model (#661 group C).
+/// Build a background first-run provisioning task for the interactive splash
+/// (#985, #661 group C). Returns a [`newt_tui::SetupHandle`] the splash covers
+/// with a spinner while the model downloads on a std::thread; `None` when there's
+/// nothing to do.
 ///
-/// Called at the start of an interactive `newt code` session. When the embedded
-/// summarizer is the compiled default but its GGUF isn't on disk yet, this
-/// prints a one-time `first pull` notice, fetches the default palette model to
-/// `~/.newt/models/`, and drops a README. Best-effort: a failed pull (offline /
-/// firewalled) leaves the model absent, so summarizer resolution falls back to
-/// the warn-and-degrade (session-model) path — nothing here is fatal.
-///
-/// Silently no-ops unless ALL hold: built with the `embedded` feature, stdout is
-/// a TTY (never auto-pull in a pipe / headless worker / CI), the opt-out env
-/// `NEWT_NO_MODEL_PULL` is unset, and the model is absent.
-pub async fn ensure_summarizer_model() {
-    use std::io::IsTerminal;
-    // Interactive only — a headless worker / piped / CI run must never pull
-    // ~350 MB behind the operator's back. NEWT_NO_MODEL_PULL is the opt-out.
-    let may_pull =
-        std::io::stdout().is_terminal() && std::env::var_os("NEWT_NO_MODEL_PULL").is_none();
-    #[cfg(feature = "embedded")]
-    if may_pull {
-        provision_default_model().await;
-    }
-    #[cfg(not(feature = "embedded"))]
-    let _ = may_pull; // lean build: no embedded engine to provision for
-}
-
-/// The feature-on body of [`ensure_summarizer_model`]. Only compiled when the
-/// embedded engine exists — a lean (`--no-default-features`) build has nothing to
-/// run the model, so it never auto-pulls.
+/// `None` unless ALL hold: built with the `embedded` feature, stdout is a TTY
+/// (never provision in a pipe / headless worker / CI), the opt-out env
+/// `NEWT_NO_MODEL_PULL` is unset, and the default model isn't fully present.
 #[cfg(feature = "embedded")]
-async fn provision_default_model() {
+pub fn spawn_setup() -> Option<newt_tui::SetupHandle> {
+    use std::io::IsTerminal;
+    if !std::io::stdout().is_terminal() || std::env::var_os("NEWT_NO_MODEL_PULL").is_some() {
+        return None;
+    }
     let m = palette::default_model();
-    // Already provisioned (every run after the first) → nothing to do.
     if palette::resolve_local(m.name).is_some() {
-        return;
+        return None; // already provisioned (GGUF + tokenizer)
     }
-    let (Some(gguf), Some(tok)) = (
-        palette::local_gguf_path(m),
-        palette::local_tokenizer_path(m),
-    ) else {
-        return; // no home dir — resolution will warn/degrade later
-    };
-    eprintln!(
-        "first pull — setting up the on-host summarizer.\n\
-         newt offloads context compaction from your GPU onto a small CPU model, so\n\
-         summarizing never competes with the primary model under load. Fetching\n\
-         {} to ~/.newt/models now (one time). Set NEWT_NO_MODEL_PULL=1 to skip.",
-        m.name
+    let (gguf, tok) = (
+        palette::local_gguf_path(m)?,
+        palette::local_tokenizer_path(m)?,
     );
-    if let Some(parent) = gguf.parent() {
-        if let Err(e) = std::fs::create_dir_all(parent) {
-            eprintln!(
-                "  first pull skipped (cannot create {}): {e}",
-                parent.display()
-            );
-            return;
-        }
-        write_models_readme(parent);
-    }
     let gguf_url = format!(
         "https://huggingface.co/{}/resolve/main/{}",
         m.hf_repo, m.gguf_file
@@ -246,35 +209,114 @@ async fn provision_default_model() {
         "https://huggingface.co/{}/resolve/main/tokenizer.json",
         m.tokenizer_repo
     );
-    // The embedded engine needs BOTH weights and tokenizer; a failure on either
-    // degrades to the session model (with a warning) rather than a mid-compaction
-    // init error — which is what happened when only the GGUF was fetched.
-    let ok = provision_one(&gguf_url, &gguf).await && provision_one(&tok_url, &tok).await;
-    if ok {
-        eprintln!(
-            "  ready — context compaction now runs on the CPU ({}).",
-            m.name
-        );
-    } else {
-        eprintln!(
-            "  first pull incomplete; the summarizer will use the session model\n  \
-             (with a warning) until `newt models pull` succeeds."
-        );
-    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let cancel_thread = std::sync::Arc::clone(&cancel);
+    // A std::thread with its OWN current-thread runtime, so the download is
+    // independent of the main runtime that run_code blocks in — no nesting.
+    std::thread::spawn(move || {
+        run_setup_thread(&gguf_url, &gguf, &tok_url, &tok, &tx, &cancel_thread);
+    });
+    Some(newt_tui::SetupHandle {
+        what: format!("on-host summarizer ({})", m.name),
+        rx,
+        cancel,
+    })
 }
 
-/// One best-effort provisioning fetch for the auto-provision path (skip if
-/// present). Errors are reported to stderr, not fatal — the caller degrades.
+/// Lean build: no embedded engine, so there is nothing to provision.
+#[cfg(not(feature = "embedded"))]
+pub fn spawn_setup() -> Option<newt_tui::SetupHandle> {
+    None
+}
+
+/// The background provisioning body (runs on its own std::thread + runtime):
+/// fetch the GGUF then `tokenizer.json`, emitting [`newt_tui::SetupEvent`]s for
+/// the splash spinner. Each file is skipped if already present, so a GGUF-only
+/// dir is completed in place. Honours `cancel` (triple-Esc from the splash).
 #[cfg(feature = "embedded")]
-async fn provision_one(url: &str, dest: &Path) -> bool {
-    if dest.is_file() {
-        return true;
+fn run_setup_thread(
+    gguf_url: &str,
+    gguf: &Path,
+    tok_url: &str,
+    tok: &Path,
+    tx: &std::sync::mpsc::Sender<newt_tui::SetupEvent>,
+    cancel: &std::sync::atomic::AtomicBool,
+) {
+    use newt_tui::SetupEvent;
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            let _ = tx.send(SetupEvent::Failed(e.to_string()));
+            return;
+        }
+    };
+    rt.block_on(async {
+        if let Some(parent) = gguf.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                let _ = tx.send(SetupEvent::Failed(e.to_string()));
+                return;
+            }
+            write_models_readme(parent);
+        }
+        for (label, url, dest) in [("weights", gguf_url, gguf), ("tokenizer", tok_url, tok)] {
+            let _ = tx.send(SetupEvent::Step(label.into()));
+            if dest.is_file() {
+                continue;
+            }
+            if let Err(e) = download_stream(url, dest, tx, cancel).await {
+                let _ = tx.send(SetupEvent::Failed(e.to_string()));
+                return;
+            }
+        }
+        let _ = tx.send(SetupEvent::Done);
+    });
+}
+
+/// Stream `url` to `dest` (via a `.part` file), emitting one progress event per
+/// MB and aborting promptly if `cancel` is set. Atomic rename on success; the
+/// partial file is removed on cancel.
+#[cfg(feature = "embedded")]
+async fn download_stream(
+    url: &str,
+    dest: &Path,
+    tx: &std::sync::mpsc::Sender<newt_tui::SetupEvent>,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> anyhow::Result<()> {
+    use newt_tui::SetupEvent;
+    use std::io::Write;
+    use std::sync::atomic::Ordering;
+    let mut resp = reqwest::Client::new()
+        .get(url)
+        .send()
+        .await?
+        .error_for_status()?;
+    let total = resp.content_length();
+    let part = dest.with_extension("part");
+    let mut file = std::fs::File::create(&part)?;
+    let mut got: u64 = 0;
+    let mut last_mb: u64 = 0;
+    let _ = tx.send(SetupEvent::Progress { done: 0, total });
+    while let Some(chunk) = resp.chunk().await? {
+        if cancel.load(Ordering::SeqCst) {
+            drop(file);
+            let _ = std::fs::remove_file(&part);
+            anyhow::bail!("cancelled");
+        }
+        file.write_all(&chunk)?;
+        got += chunk.len() as u64;
+        // Throttle: one event per MB (the UI shows whole MB anyway).
+        if got / 1_048_576 > last_mb {
+            last_mb = got / 1_048_576;
+            let _ = tx.send(SetupEvent::Progress { done: got, total });
+        }
     }
-    if let Err(e) = download_to(url, dest).await {
-        eprintln!("  pull failed for {}: {e}", dest.display());
-        return false;
-    }
-    true
+    file.flush()?;
+    std::fs::rename(&part, dest)?;
+    Ok(())
 }
 
 /// Drop a README into `~/.newt/models/` explaining what these files are and why
