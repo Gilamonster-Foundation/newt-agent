@@ -9,6 +9,7 @@
 //! kept out of the default workspace.
 
 mod auth_cmd;
+mod compaction_cmd;
 mod config_cmd;
 pub mod crew;
 pub mod crew_runner;
@@ -388,6 +389,10 @@ pub enum Command {
     Doctor,
     /// Print resolved config.
     Config,
+    /// Diagnose + tune mid-loop context compaction (the summarizer): the
+    /// effective trim trigger, count-vs-token firing, the summarizer backend,
+    /// and warnings for over-aggressive firing / the no-abort hang (#979).
+    Compaction,
     /// Print the resolved agent commit identity (`.newt/agent-identity.toml`):
     /// name, email, the layer it resolved from, the signing-key path +
     /// fingerprint (if it loads), the GitHub App's public coordinates, and the
@@ -898,6 +903,7 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         }
         Command::Doctor => doctor::run(cli.config.as_deref()).await,
         Command::Config => config_cmd::run(cli.config.as_deref()),
+        Command::Compaction => compaction_cmd::run(cli.config.as_deref()),
         Command::Identity => identity_cmd::run(cli.config.as_deref()),
         Command::Init => newt_tui::run_init(newt_tui::color_supported()),
         Command::Setup => newt_tui::run_setup(newt_tui::color_supported()),
