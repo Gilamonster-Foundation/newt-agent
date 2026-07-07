@@ -41,20 +41,24 @@ pub fn git_tool_definition() -> serde_json::Value {
         "function": {
             "name": "git",
             "description": "Run a git operation through the embedded engine \
-                            (NOT run_command). Local-only: read status/log/diff, \
-                            stage with add, commit, amend the last commit, create \
-                            a branch (branch), switch to / create-and-switch a \
-                            branch (checkout), delete a branch (branch-delete), \
-                            and rebase (structured plan: reword/squash/drop). \
-                            Writes (add/commit/amend/branch/checkout/branch-delete/ \
-                            rebase) require the session to permit them; there are \
-                            no network ops (pull/fetch/push are unavailable).",
+                            (NOT run_command; this is always available — do not \
+                            look for a separate git tool). Local-only: initialize \
+                            a repo here with init (when the workspace is not yet a \
+                            git repo), read status/log/diff, stage with add, \
+                            commit, amend the last commit, create a branch \
+                            (branch), switch to / create-and-switch a branch \
+                            (checkout), delete a branch (branch-delete), and \
+                            rebase (structured plan: reword/squash/drop). \
+                            Writes (init/add/commit/amend/branch/checkout/ \
+                            branch-delete/rebase) require the session to permit \
+                            them; there are no network ops (pull/fetch/push are \
+                            unavailable).",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "op": {
                         "type": "string",
-                        "enum": ["status", "log", "diff", "add", "commit", "amend", "branch", "rebase", "checkout", "branch-delete"],
+                        "enum": ["init", "status", "log", "diff", "add", "commit", "amend", "branch", "rebase", "checkout", "branch-delete"],
                         "description": "The git operation to run."
                     },
                     "onto": {
