@@ -5,6 +5,46 @@ Notable changes to the newt-agent workspace. Format follows
 (`0.MINOR.PATCH`, pre-1.0). The workspace version in the top-level `Cargo.toml`
 is inherited by all internal crates.
 
+## [0.7.1] — 2026-07-06
+
+**Theme: harness-graded correctness, an honest shell-authority story, and
+first-class OS installers.** Opens the 0.7.x line by adopting agent-bridle 0.7.1
+wholesale (OCAP shell engine seam + carried coreutils) and shipping the
+result-oracle evaluator.
+
+### Added
+
+- **Result-oracle evaluator (`output_matches`, epic #957).** newt-eval can now
+  grade *what a program prints*, not just its diff. A case declares
+  `expected_output` + an `[output_match]` run command; the oracle executes it and
+  compares stdout through a pure-data **normalization pipeline** (`trim`,
+  `collapse_whitespace`, `trailing_newline`, `regex_extract`, `numeric_tolerance`
+  with `epsilon`). Behind an injected `CommandRunner` seam: mocked in the per-PR
+  unit tier, real `SubprocessRunner` (hard timeout, honest "runtime not found")
+  in a new weekly/release tier (`output-oracle-real.yml`). Opt-in per case; the
+  graded-code trust boundary is documented (see #887). (#958, #959, #960)
+- **Selectable `run_command` shell engine** — `safe-subset` / `host` / `brush`
+  behind the agent-bridle ADR-0005 D2 seam; `--full-access` auto-selects `host`
+  (`brush` on Windows for internal-tooling compatibility). Carried coreutils are
+  enabled cross-platform via dispatch-capable binaries. (#868, #951)
+- **OS installers.** brew formula, Chocolatey `.nupkg`, RPM, and DEB packages of
+  the `newt` + `newt-mcp-server` binaries, built in the release workflow and
+  attached to the GitHub release.
+
+### Changed
+
+- **`--full-access` prose reworked** (#926). The help text now states plainly
+  that `--full-access` lifts the permission preset but is a *distinct* switch from
+  `--yolo` (the shell still honors the active exec floor), and that it does not by
+  itself grant Codex/Claude-Code-style ambient authority. `newt doctor` explains
+  engine selection.
+- **`gather_code_files` honors the language-pack extension allowlist** instead of
+  a hardcoded `rs`/`py` filter (#956).
+
+### Deferred
+
+- Async TUI steering + live command output + Ctrl+T transcript (#952) → 0.7.2.
+
 ## [Unreleased] — targeting 0.6.9
 
 **Theme: the crew / team / overseer orchestration stack + honest, attenuating
