@@ -1690,7 +1690,7 @@ async fn host_shell_output(cmd: &str, cwd: &str) -> std::io::Result<HostShellRun
 async fn host_shell_output(cmd: &str, cwd: &str) -> std::io::Result<HostShellRun> {
     use std::process::Stdio;
 
-    let mut child = tokio::process::Command::new("cmd")
+    let child = tokio::process::Command::new("cmd")
         .args(["/C", cmd])
         .current_dir(cwd)
         .stdin(Stdio::null())
