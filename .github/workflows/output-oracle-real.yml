@@ -1,0 +1,69 @@
+name: Output-oracle real tier (#960)
+
+# Real-subprocess integration tier for the `output_matches` result oracle
+# (epic #957, step 3/3 — #960). It runs the `#[ignore]`d real-resource tests in
+# newt-eval/tests/output_matches_real.rs, which actually EXECUTE a graded program
+# (a tiny python fixture) through SubprocessRunner and assert the oracle's
+# green / mismatch / timeout behavior end-to-end.
+#
+# Tiering (matches the issue): these tests are OUT of the per-PR unit run
+# (they are `#[ignore]`d, and ci.yml's `cargo test --workspace` skips ignored
+# tests). They run here in the WEEKLY tier (schedule) and the RELEASE tier
+# (on v* tags), single-threaded (`--test-threads=1`), never as a push gate.
+#
+# HOOK PARITY EXCEPTION: like eval-live.yml / nightly-eval.yml / mesh-
+# integration.yml, this workflow is intentionally OUTSIDE pre-push-hook parity.
+# It executes untrusted graded code in a real subprocess and needs python3 on
+# the runner — too slow/environmental for a local push gate. The pre-push hook
+# mirrors ci.yml (the per-PR unit tier) only.
+#
+# TRUST BOUNDARY: the graded program is untrusted model output. SubprocessRunner
+# does NOT sandbox it (no network/filesystem confinement beyond cwd) — see its
+# doc comment and the harness-attack surface tracked in #887. Only trusted
+# fixtures live in output_matches_real.rs; do not point this tier at arbitrary
+# graded workspaces until the OCAP-shell confinement story lands.
+
+on:
+  schedule:
+    # Weekly, Sunday 04:00 UTC — inside the low-cost window, off the nightly slot.
+    - cron: "0 4 * * 0"
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: output-oracle-real-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  RUST_BACKTRACE: 1
+  CARGO_TERM_COLOR: always
+
+jobs:
+  real-tier:
+    name: output_matches real subprocess tier
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: output-oracle-real
+
+      # The fixture graded program is a tiny python script; python3 is the one
+      # real runtime this tier needs. Fail loudly if it is somehow absent.
+      - name: Verify python3 is present
+        run: python3 --version
+
+      # Single-threaded per the issue: the real tier runs one graded process at
+      # a time so a hanging fixture's timeout can't race sibling tests.
+      - name: Run output_matches real-resource tests
+        run: |
+          cargo test -p newt-eval --test output_matches_real \
+            -- --ignored --test-threads=1
