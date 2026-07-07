@@ -38,6 +38,89 @@ session backend), scratchpad/plan tools unused by the model until nudged.
    the same issue page, ended on a dangling "Let me look at…" narration
    after the single narration nudge was spent.
 
+## Reproducing on another system
+
+The goal is to reproduce the *baseline failure* first, then flip one
+lever at a time. Everything below is what a clean box needs.
+
+**1. Pin the code.** The incident binary is `v0.7.1` (tag `12eaac5`;
+`305d56d` also reproduces — the delta is an unrelated release fix).
+Build it exactly as the incident did — **without** the `embedded`
+feature (that gap is part of the baseline):
+
+```bash
+git clone https://github.com/Gilamonster-Foundation/newt-agent
+cd newt-agent && git checkout v0.7.1
+just install ~/bin        # plain install = feature-off, as on the incident box
+```
+
+**2. Serve the model.** An Ollama host serving `ornith:35b` (the
+built-in model card ships in-repo — `newt dgx card show` / #854; any
+box Ollama runs on works, GPU strongly recommended for a 35B). The
+failure *class* reproduces on any ~30B thinking model that emits a
+`thinking` field, but exact-comparison runs want ornith. The incident
+host also served other agents concurrently — an idle server softens
+the summarizer-contention leg (§2.4 of the doc); note it when scoring.
+
+**3. Reproduce the incident config.** Minimal `~/.newt/config.toml`
+(the load-bearing knobs are `max_tool_rounds = 25` and the trim
+threshold; everything else shown for fidelity):
+
+```toml
+[[backends]]
+name = "primary"
+endpoint = "http://<ollama-host>:11434"
+model = "ornith:35b"
+kind = "ollama"
+
+[tui]
+max_tool_rounds = 25          # the incident pin (shipped default is 40)
+mid_loop_trim_threshold = 40  # clamps to 22 at runtime (= max_tool_rounds - 3)
+inference_timeout_secs = 120
+keep_alive = "5m"
+
+[tui.permissions]
+preset = "workspace_dev"
+prompt = true
+```
+
+And **no** `~/.newt/summarizer.toml` — its absence is the incident
+condition (mid-loop compaction silently inherits the session backend).
+A fresh box also has an unprobed `model-capabilities.json`; that
+matches the incident (ornith's conformance was never probed there
+either). To remove the human-latency confound from Session A, grant
+session-level full access when prompted instead of leaving the
+permission dialog waiting (the 462s of seq 301 was a human, not the
+loop).
+
+**4. Run the tasks.** Launch `newt` inside the cloned `newt-agent`
+workspace and paste the prompts verbatim. Session B is fully
+reproducible (issue #969 is public in this repo). Session A's issue
+(`hartsock/scrybe#37`) is in a **private** repo — substitute any small,
+concrete issue URL the box can fetch and hold it constant across runs.
+
+**5. Observe.** The baseline failure signature:
+
+- Turn ends in the cap banner: `(reached the tool-call limit of 25
+  rounds … the final tools-disabled summary described future tool
+  actions instead of final state …)` — with **no** "Progress captured"
+  block (empty salvage).
+- A `continue` follow-up re-fetches URLs/files from the prior turn and
+  ends on a dangling "Let me …" narration.
+
+Where to look, per run:
+
+```bash
+# rounds/events, ending text, per-turn tokens
+sqlite3 ~/.newt/conversations.db \
+  "SELECT seq, json_array_length(events), tokens_in, tokens_out,
+          substr(assistant,-300) FROM turns ORDER BY seq DESC LIMIT 3;"
+# hallucination count per turn
+tail -5 ~/.newt/usage.jsonl
+# summarizer resolution + compaction events (stderr)
+RUST_LOG=info newt 2> /tmp/newt-run.log   # grep for 'summariz' after the run
+```
+
 ## Scoring a rerun
 
 Same prompts, same model, one lever changed at a time. Record: rounds
