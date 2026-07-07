@@ -6,10 +6,13 @@
   substitutes @VERSION@ here and in tools/chocolateyinstall.ps1, runs `choco
   pack`, and attaches the resulting `newt.@VERSION@.nupkg` to the GitHub release.
 
-  There is no chocolatey.org feed yet (owner decision, 2026-07-06). Install from
-  the attached package:
+  There is no chocolatey.org feed yet (owner decision, 2026-07-06). Install the
+  attached package from a local source, e.g.:
 
-    choco install newt --source . --version @VERSION@
+    choco install newt (source .) (version @VERSION@)
+
+  NB: XML comments may not contain a double-hyphen, so the real flags are
+  written with parentheses above; substitute the usual leading double-hyphen.
 
   Windows note: newt uses the carried `brush` shell engine on Windows for
   internal-tooling compatibility; native PowerShell code paths are a future
