@@ -6901,6 +6901,16 @@ fn run_chat(
                         effective_caveats(cap.caveats(), active_mode.as_ref()),
                         active_persona.as_ref(),
                     );
+                    // FR-1 part 2 (#997): the active persona's tool allow-list
+                    // (its `tools:` front-matter). Threaded into `ChatCtx` so the
+                    // loop advertises ONLY these tools and the executor refuses
+                    // the rest — the name-scoped complement to `turn_caveats`
+                    // (the axis-scoped clamp above, part 1 / #1002). `None` (no
+                    // persona, or a persona with no `tools:` list) leaves the
+                    // full catalog in play.
+                    let persona_tools = active_persona
+                        .as_ref()
+                        .and_then(|p| p.profile.tools.as_deref());
                     // The active preset clamp threaded to the gate (re-clamps
                     // any session grant); `None` when no mode is active.
                     let preset_clamp = active_mode.as_ref().map(|m| m.clamp.clone());
@@ -7036,6 +7046,7 @@ fn run_chat(
                                         // preset). Identical to `cap.caveats()` when no
                                         // mode is active.
                                         caveats: &turn_caveats,
+                                        persona_tools,
                                         max_tool_rounds: eff_max_tool_rounds,
                                         workflow_grace_rounds: eff_workflow_grace_rounds,
                                         tool_output_lines: tool_output_lines(&cfg),
@@ -15642,6 +15653,7 @@ mod tool_round_cap_tests {
                     experience_store: None,
                     step_ledger: None,
                     caveats: &caveats,
+                    persona_tools: None,
                     max_tool_rounds: 5,
                     workflow_grace_rounds: 0,
                     tool_output_lines: 20,

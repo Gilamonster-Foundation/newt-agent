@@ -492,6 +492,70 @@ pub(crate) fn merged_tool_definitions(
     serde_json::Value::Array(defs)
 }
 
+/// The always-on infra tools ([`Gate::Always`] in [`EXTENDED_TOOL_REGISTRY`]:
+/// resume_context / tool_search / get_context_remaining / request_user_input /
+/// lifecycle). The loop depends on these every round, so a persona allow-list
+/// can NEVER fence them off — they ride every session regardless of `tools:`.
+fn is_always_on_tool(name: &str) -> bool {
+    EXTENDED_TOOL_REGISTRY
+        .iter()
+        .any(|spec| spec.gate == Gate::Always && spec.name == name)
+}
+
+/// FR-1 part 2 (#997): is `name` callable under a persona whose `tools:`
+/// front-matter is `allow`? True when the persona names it, OR it is an
+/// always-on infra tool the loop can't run without. This is the single
+/// predicate behind BOTH the advertise-filter ([`filter_advertised_tools`])
+/// and the executor reject ([`execute_tool_with_offload`]) so the set the model
+/// SEES and the set it may RUN can never drift apart.
+pub(crate) fn persona_tool_allowed(name: &str, allow: &[String]) -> bool {
+    allow.iter().any(|t| t == name) || is_always_on_tool(name)
+}
+
+/// The advertised name of one tool definition (`{"function":{"name":…}}`), or
+/// `None` for a shape without one (kept rather than dropped by the filter).
+fn tool_def_name(def: &serde_json::Value) -> Option<&str> {
+    def.get("function")
+        .and_then(|f| f.get("name"))
+        .and_then(|n| n.as_str())
+}
+
+/// FR-1 part 2 (#997): restrict an advertised catalog to a persona's allow-list.
+/// `allow = None` (no persona / no `tools:` list) returns `defs` untouched — the
+/// zero-cost path for every non-persona session. When `Some`, keep only the
+/// tools [`persona_tool_allowed`] admits (the persona's names ∪ the always-on
+/// infra). Pure over `serde_json::Value`; the caller wraps
+/// [`merged_tool_definitions`] with it at each catalog site.
+pub(crate) fn filter_advertised_tools(
+    defs: serde_json::Value,
+    allow: Option<&[String]>,
+) -> serde_json::Value {
+    let Some(allow) = allow else { return defs };
+    let serde_json::Value::Array(arr) = defs else {
+        return defs;
+    };
+    serde_json::Value::Array(
+        arr.into_iter()
+            .filter(|def| match tool_def_name(def) {
+                Some(name) => persona_tool_allowed(name, allow),
+                None => true,
+            })
+            .collect(),
+    )
+}
+
+/// The refusal returned to the model when it calls a tool the active persona
+/// does not grant (FR-1 part 2, #997). Names the tool and points at the escape
+/// hatch, so the model self-corrects to a granted tool instead of looping.
+fn persona_tool_denied_message(name: &str) -> String {
+    format!(
+        "Tool `{name}` is not available under the active persona: its `tools:` \
+         front-matter restricts which tools it may call. Choose one of the \
+         granted tools, or clear the persona (`/persona clear`) if broader \
+         access is genuinely required."
+    )
+}
+
 /// Direct tool names the model must call as tool invocations, never as shell
 /// commands passed to `run_command`.
 const DIRECT_TOOL_NAMES: &[&str] = &[
@@ -2622,6 +2686,9 @@ pub async fn execute_tool(
         step_ledger,
         false,
         None,
+        // The convenience wrapper carries no persona surface — callers that
+        // enforce a persona allow-list use `execute_tool_with_offload` directly.
+        None,
     )
     .await
 }
@@ -2649,7 +2716,32 @@ pub async fn execute_tool_with_offload(
     step_ledger: Option<&dyn super::scheduled::StepLedger>,
     tool_offload: bool,
     spill_store: Option<&dyn SpillStore>,
+    // FR-1 part 2 (#997): the active persona's tool allow-list (its `tools:`
+    // front-matter), or `None` when no persona is active. The name-scoped
+    // enforcement half — advertisement is only cosmetic, so the boundary is
+    // real ONLY because this executor refuses a disallowed name even if the
+    // model calls it unprompted.
+    persona_tools: Option<&[String]>,
 ) -> String {
+    // FR-1 part 2 (#997): persona tool allow-list — refuse anything the active
+    // persona does not grant BEFORE any routing (MCP, alias, run_command
+    // redirect), so a persona can fence off remote `server__tool` names too.
+    // Checked against the CANONICAL name (aliases resolved first) so a denied
+    // tool can't slip past under a foreign spelling; the always-on infra tools
+    // ([`is_always_on_tool`]) always pass or the loop would wedge.
+    if let Some(allow) = persona_tools {
+        let canonical = match resolve_tool_alias(name) {
+            Some(AliasOutcome::Rewrite(canonical)) => canonical,
+            _ => name,
+        };
+        if !persona_tool_allowed(canonical, allow) {
+            let msg = persona_tool_denied_message(canonical);
+            print_tool_call(name, &args.to_string(), color);
+            print_tool_output(&msg, tool_output_lines, color);
+            return msg;
+        }
+    }
+
     // Remote MCP tools (namespaced `server__tool`) route to their server before
     // the built-in match. They carry no Caveats leash in this build.
     if mcp.handles(name) {
@@ -2842,17 +2934,22 @@ pub async fn execute_tool_with_offload(
         "tool_search" => {
             let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
             print_tool_call("tool_search", query, color);
-            let catalog = merged_tool_definitions(
-                &*mcp,
-                note_sink.is_some(),
-                recall_source.is_some(),
-                memory_source.is_some(),
-                git_tool.is_some(),
-                crew_runner.is_some(),
-                scratchpad_store.is_some(),
-                code_search.is_some(),
-                experience_store.is_some(),
-                step_ledger.is_some(),
+            // FR-1 part 2 (#997): search only what THIS persona may call, so
+            // discovery never surfaces a tool the executor would then refuse.
+            let catalog = filter_advertised_tools(
+                merged_tool_definitions(
+                    &*mcp,
+                    note_sink.is_some(),
+                    recall_source.is_some(),
+                    memory_source.is_some(),
+                    git_tool.is_some(),
+                    crew_runner.is_some(),
+                    scratchpad_store.is_some(),
+                    code_search.is_some(),
+                    experience_store.is_some(),
+                    step_ledger.is_some(),
+                ),
+                persona_tools,
             );
             let out = super::tool_search::execute_tool_search(query, &catalog);
             print_tool_output(&out, tool_output_lines, color);
@@ -3855,6 +3952,144 @@ mod tests {
                 "lifecycle",
             ]
         );
+    }
+
+    /// FR-1 part 2 (#997): a persona's `tools:` allow-list scopes the ADVERTISED
+    /// catalog — only the named tools survive, PLUS the always-on infra tools the
+    /// loop can't run without (which no persona may fence off). `None` leaves the
+    /// catalog whole (the zero-cost path for every non-persona session).
+    #[test]
+    fn persona_allow_list_filters_the_advertised_catalog() {
+        let full =
+            merged_tool_definitions(&NoMcp, true, true, true, true, true, true, true, true, true);
+        let name_set = |v: &serde_json::Value| -> Vec<String> {
+            v.as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|d| d["function"]["name"].as_str().map(str::to_owned))
+                .collect()
+        };
+        // No persona → catalog untouched.
+        assert_eq!(
+            name_set(&filter_advertised_tools(full.clone(), None)),
+            name_set(&full),
+            "None must be a no-op"
+        );
+        // A read-only coach (`tools = ["read_file"]`): read_file survives; the
+        // mutating built-ins are dropped; every always-on infra tool still rides.
+        let allow = vec!["read_file".to_string()];
+        let got = name_set(&filter_advertised_tools(full, Some(&allow)));
+        assert!(got.iter().any(|n| n == "read_file"), "granted tool kept");
+        for denied in ["write_file", "edit_file", "run_command", "list_dir"] {
+            assert!(
+                !got.iter().any(|n| n == denied),
+                "{denied} must be filtered out"
+            );
+        }
+        for infra in [
+            "resume_context",
+            "tool_search",
+            "get_context_remaining",
+            "request_user_input",
+            "lifecycle",
+        ] {
+            assert!(
+                got.iter().any(|n| n == infra),
+                "{infra} is always-on and must survive any persona"
+            );
+        }
+    }
+
+    /// FR-1 part 2 (#997): `persona_tool_allowed` is the single predicate behind
+    /// BOTH the advertise-filter and the executor reject — a tool is callable iff
+    /// the persona names it OR it is always-on infra — so the set the model sees
+    /// and the set it may run can never drift apart.
+    #[test]
+    fn persona_tool_allowed_admits_named_and_always_on_only() {
+        let allow = vec!["read_file".to_string()];
+        assert!(persona_tool_allowed("read_file", &allow), "named → allowed");
+        assert!(
+            persona_tool_allowed("request_user_input", &allow),
+            "always-on infra → allowed even when unlisted"
+        );
+        assert!(
+            !persona_tool_allowed("write_file", &allow),
+            "unlisted non-infra → denied"
+        );
+    }
+
+    /// FR-1 part 2 (#997): the executor is the ENFORCEMENT half. Even a
+    /// hallucinated call the advertise-filter can't intercept is refused BY NAME
+    /// before any side effect — while a granted tool and the always-on infra
+    /// pass. Regression for a coach persona whose `tools:` list must be a real
+    /// boundary, not a cosmetic hint.
+    #[tokio::test]
+    async fn executor_refuses_tools_outside_the_persona_allow_list() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let caveats = crate::caveats::Caveats::top();
+        let allow = vec!["read_file".to_string()];
+        // write_file is NOT granted → refused with the persona message, and the
+        // file is never written (top caveats would otherwise permit it).
+        let target = ws.path().join("blocked.txt");
+        let args = serde_json::json!({
+            "path": target.to_string_lossy(),
+            "content": "should never be written",
+        });
+        let out = call_offload("write_file", &args, &ws, &caveats, Some(&allow)).await;
+        assert!(
+            out.contains("not available under the active persona"),
+            "expected persona refusal, got: {out}"
+        );
+        assert!(!target.exists(), "a denied write must not touch the fs");
+        // An always-on infra tool rides even though it is unlisted.
+        let infra = call_offload(
+            "get_context_remaining",
+            &serde_json::json!({}),
+            &ws,
+            &caveats,
+            Some(&allow),
+        )
+        .await;
+        assert!(
+            !infra.contains("not available under the active persona"),
+            "always-on infra must not be refused: {infra}"
+        );
+    }
+
+    /// Test-only thin wrapper over the 22-arg [`execute_tool_with_offload`] that
+    /// fixes every optional seam to `None` and surfaces just the persona list.
+    async fn call_offload(
+        name: &str,
+        args: &serde_json::Value,
+        ws: &tempfile::TempDir,
+        caveats: &crate::caveats::Caveats,
+        persona_tools: Option<&[String]>,
+    ) -> String {
+        execute_tool_with_offload(
+            name,
+            args,
+            &ws.path().to_string_lossy(),
+            false,
+            20,
+            caveats,
+            &mut NoMcp,
+            None,  // build_check_cmd
+            None,  // note_sink
+            None,  // recall_source
+            None,  // memory_source
+            None,  // permission_gate
+            None,  // exec_floor
+            None,  // git_tool
+            None,  // crew_runner
+            None,  // scratchpad_store
+            None,  // code_search
+            None,  // experience_store
+            None,  // step_ledger
+            false, // tool_offload
+            None,  // spill_store
+            persona_tools,
+        )
+        .await
     }
 
     /// #894: each registry entry's schema-builder produces the SAME name the
