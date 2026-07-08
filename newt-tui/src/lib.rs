@@ -16694,9 +16694,11 @@ mod helper_fn_tests {
             }],
             ..Default::default()
         };
-        let choice = crate::env_resolution_tests::with_env_vars(&[], &["NEWT_DGX_MODEL", "NEWT_BACKEND", "NEWT_PROVIDER"], || {
-            resolve_backend_choice(&cfg)
-        });
+        let choice = crate::env_resolution_tests::with_env_vars(
+            &[],
+            &["NEWT_DGX_MODEL", "NEWT_BACKEND", "NEWT_PROVIDER"],
+            || resolve_backend_choice(&cfg),
+        );
         assert_eq!(choice.kind, newt_core::BackendKind::Openai);
         assert_eq!(choice.url, "http://vllm.example:8000");
         assert_eq!(choice.model, "qwen3:32b");
@@ -17006,7 +17008,11 @@ mod env_resolution_tests {
     /// variable afterwards. Takes the shared env *write* guard so the
     /// env-reading tests elsewhere in this binary (caveat policy / confined
     /// shell) never observe a half-mutated environment.
-    pub(crate) fn with_env_vars<R>(set: &[(&str, &str)], clear: &[&str], f: impl FnOnce() -> R) -> R {
+    pub(crate) fn with_env_vars<R>(
+        set: &[(&str, &str)],
+        clear: &[&str],
+        f: impl FnOnce() -> R,
+    ) -> R {
         let _g = crate::test_env_guard::env_write_guard();
         let touched: Vec<String> = set
             .iter()
