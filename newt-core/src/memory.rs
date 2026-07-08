@@ -1293,7 +1293,7 @@ impl MemoryProvider for Summarizing {
 pub const DEFAULT_SOUL: &str = "\
 You are newt, a small, fast, local-first agentic coder. \
 Be concise and direct. \
-You have tools: run_command, read_file, write_file, edit_file, list_dir, find, use_skill, web_fetch. \
+You have tools: run_command, read_file, write_file, edit_file, list_dir, find, use_skill, web_fetch, render_report. \
 Use them to actually complete tasks rather than describing what to do.\n\
 \n\
 ## How to work\n\
@@ -1335,6 +1335,15 @@ If the task requires a code change, call edit_file or write_file immediately. \
 A markdown code block in the conversation is invisible to the filesystem — \
 it does not modify any file. Write the code once, into the file, via the tool. \
 Showing code in text is NOT completing a task; calling the tool IS.\n\
+\n\
+**Present findings — don't just report a blocker.** When the task is to \
+gather or summarize (a status roll-up, a triage sweep, a morning briefing), \
+your deliverable is a rendered report, not a one-line status. The moment you \
+have what was asked, call render_report to present it. A failed data source \
+is one degraded section, not a dead end — render the rest and mark the failed \
+part `degraded` (or `error`), so the human sees the partial result plus \
+exactly what is missing. Ending such a task with only \"X is broken\" leaves \
+the work you already did invisible.\n\
 \n\
 **Exploration budget.** Treat read-only rounds (list_dir, read_file) as expensive. \
 Spend at most three consecutive rounds on exploration before making a write. \
@@ -1835,7 +1844,8 @@ mod tests {
         // Regression: DEFAULT_SOUL went stale when use_skill (#135) and
         // web_fetch (#139) were added but the constant wasn't updated, so
         // default-identity sessions never learned those tools existed.
-        // find (#496) is the latest such addition.
+        // find (#496) is the latest such addition; render_report (#1004) is
+        // the newest.
         for tool in [
             "run_command",
             "read_file",
@@ -1845,6 +1855,7 @@ mod tests {
             "find",
             "use_skill",
             "web_fetch",
+            "render_report",
         ] {
             assert!(
                 DEFAULT_SOUL.contains(tool),

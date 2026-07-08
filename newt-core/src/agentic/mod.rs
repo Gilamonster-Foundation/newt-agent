@@ -102,6 +102,10 @@ mod note_sink;
 mod observation;
 mod permissions;
 mod recall;
+// #1004: the `render_report` tool — present collected findings as a rendered
+// Markdown document in the plain scroller (the missing "present" affordance a
+// doer-oriented gather-and-report task otherwise lacks).
+mod report;
 // #714: the `resume_context` tool — a self-scoped read of THIS conversation's
 // own pre-interrupt work (the affordance `recall` structurally cannot be).
 mod resume;

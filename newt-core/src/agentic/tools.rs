@@ -10,6 +10,7 @@ use super::memory_fetch::{execute_memory_fetch, memory_fetch_tool_definition, Me
 use super::note_sink::{execute_save_note, save_note_tool_definition, NoteSink};
 use super::permissions::{DenialKind, PermissionDecision, PermissionGate, PermissionRequest};
 use super::recall::{execute_recall, recall_tool_definition, RecallSource};
+use super::report::{execute_render_report, render_report_tool_definition};
 use super::spill::{self, SpillStore};
 use crate::caveats::CaveatsExt as _;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -674,6 +675,14 @@ const EXTENDED_TOOL_REGISTRY: &[ToolSpec] = &[
     ToolSpec {
         name: "lifecycle",
         definition: lifecycle_tool_definition,
+        gate: Gate::Always,
+    },
+    // #1004: present collected findings as a rendered Markdown document. Needs
+    // no injected capability (it writes only to the output sink every session
+    // has), so it rides Always and degrades to raw source when color is off.
+    ToolSpec {
+        name: "render_report",
+        definition: render_report_tool_definition,
         gate: Gate::Always,
     },
     // Presence-gated on an injected capability (one `with_*` flag each).
@@ -3053,6 +3062,11 @@ pub async fn execute_tool_with_offload(
         // [lifecycle]` → matching tooling packs) and run it through the SAME
         // confined exec path as run_command. `action=list` returns the resolved
         // command WITHOUT running it — a pure discovery read.
+        // #1004: present collected findings as a rendered Markdown document in
+        // the plain scroller. Always-on (no injected capability); self-prints
+        // the rendered block and returns a short ack to the model.
+        "render_report" => execute_render_report(args, color),
+
         "lifecycle" => {
             let phase_key = args.get("phase").and_then(|v| v.as_str()).unwrap_or("");
             let Some(phase) = crate::tooling::Phase::from_key(phase_key) else {
@@ -3963,6 +3977,10 @@ mod tests {
                 // degrades honestly with "no command configured"), pushed after
                 // request_user_input.
                 "lifecycle",
+                // #1004: advertised ALWAYS (present-findings surface; needs no
+                // injected capability, degrades to raw source when color is
+                // off), pushed after lifecycle.
+                "render_report",
             ]
         );
     }
