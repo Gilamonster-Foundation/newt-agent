@@ -58,8 +58,12 @@ pub fn git_tool_definition() -> serde_json::Value {
                 "properties": {
                     "op": {
                         "type": "string",
-                        "enum": ["init", "status", "log", "diff", "add", "commit", "amend", "branch", "rebase", "checkout", "branch-delete"],
+                        "enum": ["init", "status", "log", "diff", "add", "commit", "amend", "branch", "rebase", "checkout", "branch-delete", "stash", "stash-list", "stash-pop", "stash-apply", "stash-drop"],
                         "description": "The git operation to run."
+                    },
+                    "index": {
+                        "type": "integer",
+                        "description": "For op=stash-pop/stash-apply/stash-drop: the stash index k (stash@{k}); default 0 (newest)."
                     },
                     "onto": {
                         "type": "string",
