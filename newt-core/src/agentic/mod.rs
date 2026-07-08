@@ -128,7 +128,7 @@ mod warmup;
 
 pub use compress::{
     compress_user_initiated, CompressCounters, CompressState, ManualCompressOutcome, SummarizeFn,
-    SummarizeFuture, Summarizer, SUMMARY_END_MARKER, SUMMARY_PREFIX,
+    SummarizeFuture, Summarizer, CONTINUATION_PREFIX, SUMMARY_END_MARKER, SUMMARY_PREFIX,
 };
 pub use crew_attest::{crew_authz, crew_step_up_policy, CrewAuthz, Presence};
 pub use crew_tool::{compose_roster_tool_definition, crew_tool_definition, CrewRunner};
@@ -642,6 +642,13 @@ pub struct ChatCtx<'a> {
     /// the active workflow still has incomplete work and the recent rounds show
     /// repair evidence or concrete progress. `0` makes the normal cap hard.
     pub workflow_grace_rounds: usize,
+    /// Max narrate-then-stop rescue nudges per turn (from
+    /// `[tui].narration_nudge_cap`, default 1; `[[model_tuning]]` can override
+    /// per model). Once spent, the next no-tool narration is accepted as the
+    /// turn's final answer. The second and later nudges escalate: they name
+    /// the active plan step and demand a bare tool call (lever L3,
+    /// docs/design/next-loop-levers.md).
+    pub narration_nudge_cap: usize,
     /// Max lines of tool output shown inline (from `[tui].tool_output_lines`,
     /// default 20). Resolved once per turn and threaded to `execute_tool` so
     /// the tool loop never re-reads config from disk.
@@ -744,6 +751,12 @@ pub struct ChatCtx<'a> {
     /// per turn like `tool_events`; persisted into the turn's `phantom_reaches`.
     /// `None` (eval / headless) ⇒ nothing recorded.
     pub phantom_reaches: Option<&'a mut Vec<crate::PhantomReach>>,
+    /// Out-param: why the loop ended the turn ([`crate::TurnEndReason`]) —
+    /// narration-acceptance forensics, round cap, empty reply. Lent fresh per
+    /// turn like `tool_events`; the TUI folds it into `TurnMetrics` (footer +
+    /// usage.jsonl). `None` (eval / headless) ⇒ nothing reported. The
+    /// Responses-API loop does not report it.
+    pub end_reason: Option<&'a mut Option<crate::TurnEndReason>>,
     /// Prompted ocap grants (issue #263): when present, a capability denial
     /// inside `execute_tool` consults the human — allow once / session allow
     /// / deny — instead of failing outright; the loop blocks like a long
@@ -1084,6 +1097,7 @@ pub async fn chat_complete(
         persona_tools,
         max_tool_rounds,
         workflow_grace_rounds,
+        narration_nudge_cap,
         tool_output_lines,
         debug,
         trace,
@@ -1104,6 +1118,7 @@ pub async fn chat_complete(
         compress_state,
         mut tool_events,
         mut phantom_reaches,
+        mut end_reason,
         mut permission_gate,
         mut on_round_usage,
         estimate_ratio,
@@ -1250,7 +1265,7 @@ pub async fn chat_complete(
     // in prose ("Let me edit …") and emits no tool call. The loop would treat
     // that zero-tool round as a final answer and end the turn, forcing a human
     // "continue". `narration_nudges` bounds the auto-continue that instead
-    // nudges the model to actually call the tool (≤ NARRATION_NUDGE_CAP per
+    // nudges the model to actually call the tool (≤ `narration_nudge_cap` per
     // turn); the trigger is the configurable NudgeClassifier, so a genuine
     // conclusion (with or without prior tool calls this turn) is never nudged.
     let mut narration_nudges: usize = 0;
@@ -1493,6 +1508,13 @@ pub async fn chat_complete(
                     }
                     messages = outcome.messages;
                     prompt_tracker.invalidate();
+                    apply_post_compaction_continuation(
+                        &mut messages,
+                        &mut narration_nudges,
+                        outcome.action,
+                        step_ledger,
+                        round > 0,
+                    );
                 }
             }
         }
@@ -1663,6 +1685,13 @@ pub async fn chat_complete(
                         if outcome.fired {
                             messages = outcome.messages;
                             prompt_tracker.invalidate();
+                            apply_post_compaction_continuation(
+                                &mut messages,
+                                &mut narration_nudges,
+                                outcome.action,
+                                step_ledger,
+                                round > 0,
+                            );
                         }
                         cw_retries += 1;
                         continue 'round_loop;
@@ -1819,7 +1848,10 @@ pub async fn chat_complete(
                                 }));
                                 messages.push(serde_json::json!({
                                     "role": "user",
-                                    "content": nudge
+                                    "content": format!(
+                                        "{} {}",
+                                        compress::LOOP_GUIDANCE_PREFIX, nudge
+                                    )
                                 }));
                                 accumulated_usage = merge_round_usage(accumulated_usage, $usage);
                                 continue 'round_loop;
@@ -1845,7 +1877,10 @@ pub async fn chat_complete(
                                 }));
                                 messages.push(serde_json::json!({
                                     "role": "user",
-                                    "content": nudge
+                                    "content": format!(
+                                        "{} {}",
+                                        compress::LOOP_GUIDANCE_PREFIX, nudge
+                                    )
                                 }));
                                 pending_plan_nudges += 1;
                                 accumulated_usage = merge_round_usage(accumulated_usage, $usage);
@@ -1868,13 +1903,17 @@ pub async fn chat_complete(
                             }));
                             messages.push(serde_json::json!({
                                 "role": "user",
-                                "content": stale_file_ground_truth_nudge(),
+                                "content": format!(
+                        "{} {}",
+                        compress::LOOP_GUIDANCE_PREFIX,
+                        stale_file_ground_truth_nudge()
+                    ),
                             }));
                             stale_file_nudges += 1;
                             accumulated_usage = merge_round_usage(accumulated_usage, $usage);
                             continue 'round_loop;
                         }
-                        if narration_nudges < NARRATION_NUDGE_CAP
+                        if narration_nudges < narration_nudge_cap
                             && round + 1 < current_tool_round_limit
                             && nudge_classification.is_pending_action()
                         {
@@ -1891,17 +1930,55 @@ pub async fn chat_complete(
                                 "role": "assistant",
                                 "content": content
                             }));
-                            let direction = nudge_classifier
-                                .direction_for(nudge_classification.class)
-                                .map(str::to_string)
-                                .unwrap_or_else(narration_action_nudge);
+                            // First nudge: the (tunable) classifier direction.
+                            // Later nudges (cap > 1): generic text already
+                            // failed to convert intent into action, so
+                            // escalate — name the active step, demand a bare
+                            // tool call.
+                            let direction = if narration_nudges == 0 {
+                                nudge_classifier
+                                    .direction_for(nudge_classification.class)
+                                    .map(str::to_string)
+                                    .unwrap_or_else(narration_action_nudge)
+                            } else {
+                                escalated_narration_action_nudge(
+                                    narration_nudges + 1,
+                                    narration_nudge_cap,
+                                    step_ledger,
+                                )
+                            };
                             messages.push(serde_json::json!({
                                 "role": "user",
-                                "content": direction,
+                                "content": format!("{} {}", compress::LOOP_GUIDANCE_PREFIX, direction),
                             }));
                             narration_nudges += 1;
                             accumulated_usage = merge_round_usage(accumulated_usage, $usage);
                             continue 'round_loop;
+                        }
+                        // Every rescue gate passed on this content: it is
+                        // about to be accepted as the final answer. Record
+                        // WHY — before this, a narration acceptance was
+                        // indistinguishable from a normal completion, even
+                        // under NEWT_DEBUG (2026-07-08 ornith:35b forensics).
+                        let accepted_reason = if nudge_classification.is_pending_action() {
+                            if round + 1 >= current_tool_round_limit {
+                                crate::TurnEndReason::NarrationFinalRound
+                            } else {
+                                crate::TurnEndReason::NarrationCapExhausted
+                            }
+                        } else {
+                            crate::TurnEndReason::Completed
+                        };
+                        if debug && accepted_reason != crate::TurnEndReason::Completed {
+                            print_debug(
+                                &format!(
+                                    "no-tool narration accepted as final answer ({accepted_reason:?})"
+                                ),
+                                color,
+                            );
+                        }
+                        if let Some(slot) = &mut end_reason {
+                            **slot = Some(accepted_reason);
                         }
                     }
                 }};
@@ -1976,6 +2053,11 @@ pub async fn chat_complete(
                         round_est_raw,
                     );
                 }
+                if probe_content.is_empty() {
+                    if let Some(slot) = &mut end_reason {
+                        **slot = Some(crate::TurnEndReason::Empty);
+                    }
+                }
                 return Ok((probe_content, false, accumulated_usage, hallucination_count));
             }
             // Cargo-style reasoning spinner: TTY-gated (`color`) and opt-out via
@@ -2026,6 +2108,11 @@ pub async fn chat_complete(
                             truncation_suspect,
                             round_est_raw,
                         );
+                    }
+                    if probe_content.is_empty() {
+                        if let Some(slot) = &mut end_reason {
+                            **slot = Some(crate::TurnEndReason::Empty);
+                        }
                     }
                     return Ok((probe_content, false, accumulated_usage, hallucination_count));
                 }
@@ -2150,6 +2237,13 @@ pub async fn chat_complete(
                         if outcome.fired {
                             messages = outcome.messages;
                             prompt_tracker.invalidate();
+                            apply_post_compaction_continuation(
+                                &mut messages,
+                                &mut narration_nudges,
+                                outcome.action,
+                                step_ledger,
+                                round > 0,
+                            );
                         } else {
                             // N1: the retry must differ from the request that
                             // just returned empty — when compress was a no-op
@@ -2197,6 +2291,9 @@ pub async fn chat_complete(
                                 hook(RoundObservation::ThinkingOnly);
                             }
                         }
+                        if let Some(slot) = &mut end_reason {
+                            **slot = Some(crate::TurnEndReason::Empty);
+                        }
                         return Ok((
                             suspicious_empty_ollama_diagnostic(&json),
                             false,
@@ -2205,6 +2302,9 @@ pub async fn chat_complete(
                         ));
                     }
                     let msg = "(model returned an empty response — try rephrasing, or check the model with `newt doctor`)";
+                    if let Some(slot) = &mut end_reason {
+                        **slot = Some(crate::TurnEndReason::Empty);
+                    }
                     return Ok((msg.to_string(), false, merged, hallucination_count));
                 }
                 // Use probe content; print it since it was never streamed.
@@ -2228,7 +2328,7 @@ pub async fn chat_complete(
             // call. If it has already acted this turn (mid-task) or the prose
             // reads as intent-to-act, nudge it to actually call the tool and run
             // another round instead of ending the turn — what a human "continue"
-            // does. Bounded by NARRATION_NUDGE_CAP and the round budget so a
+            // does. Bounded by the configured narration_nudge_cap and the round budget so a
             // chronic narrator can't loop; after the cap the prose is accepted
             // as the final answer (the return below). A genuine from-the-start
             // final answer (no prior call, no intent cue) is never nudged.
@@ -2462,6 +2562,9 @@ pub async fn chat_complete(
     // cited path against the workspace and append a visible refutation for
     // any that don't exist. Appends only; the model's prose is never edited.
     let text = claim_check::annotate_against_workspace(text, workspace);
+    if let Some(slot) = &mut end_reason {
+        **slot = Some(crate::TurnEndReason::RoundCap);
+    }
     Ok((text, streamed, usage, hallucination_count))
 }
 
@@ -3082,11 +3185,10 @@ fn is_read_only_shell_probe(command: &str) -> bool {
     }
 }
 
-/// Max "you narrated intent but called no tool" auto-continue nudges per turn.
-/// Bounded so a chronically-narrating weak model can't loop or drain the round
-/// budget; after the cap its narration is accepted as the final answer.
-/// (Candidate for a `[tui] narration_nudge_cap` knob in a follow-up.)
-const NARRATION_NUDGE_CAP: usize = 1;
+// The narrate-then-stop rescue budget is `ChatCtx.narration_nudge_cap`
+// (`[tui] narration_nudge_cap`, default 1, per-model `[[model_tuning]]`
+// override) — promoted from a hardcoded const here (lever L3). After the cap
+// its narration is accepted as the final answer.
 /// Max "you ended while a plan still has open steps" nudges per turn. This is
 /// state-driven from the plan ledger, not prose-matched.
 const PENDING_PLAN_NUDGE_CAP: usize = 1;
@@ -3179,6 +3281,92 @@ fn narration_action_nudge() -> String {
      describe it. If you are genuinely finished, say so explicitly in one \
      sentence."
         .to_string()
+}
+
+/// The act-now directive appended after a mid-turn compaction replaced the
+/// middle with a summary. The summary wrapper deliberately de-actions itself
+/// ("REFERENCE ONLY" — weak models otherwise treat it as fresh instructions);
+/// the inverse hazard is losing momentum entirely: post-compaction is exactly
+/// where a weak model narrates instead of acting, and the corrective text of
+/// an already-spent narration nudge may have just been summarized away. This
+/// re-arms intent: mid-task, active step named, next output a tool call.
+/// Carries [`compress::CONTINUATION_PREFIX`] so later compressions neither
+/// anchor the tail on it nor keep more than one alive.
+fn post_compaction_continuation(step_ledger: Option<&dyn scheduled::StepLedger>) -> String {
+    let step_clause = active_step_description(step_ledger)
+        .map(|step| format!(" Active step: '{step}'."))
+        .unwrap_or_default();
+    format!(
+        "{} You are mid-task: the context above was just compacted, not \
+         completed.{step_clause} Continue working — your next output should be \
+         the next concrete tool call (re-read any file you are about to edit \
+         first, since full file contents were not preserved). Do not summarize \
+         what happened and do not re-plan.",
+        compress::CONTINUATION_PREFIX
+    )
+}
+
+/// After a compaction pass replaced the middle with a summary (or the static
+/// fallback), refund the narrate-then-stop rescue budget and (re-)append the
+/// act-now continuation directive. The refund closes the counter/corrective
+/// asymmetry: the spent-nudge counters are turn-locals that survive
+/// compaction, while the corrective text they refer to lives in `messages`
+/// and may have just been summarized away — leaving the harness refusing to
+/// re-nudge a model that no longer remembers the correction. Prune-only and
+/// fit passes keep the corrective text, so they neither refund nor anchor.
+///
+/// `mid_turn` (`round > 0` at the call sites) gates the directive: the
+/// pre-dispatch compaction also fires on round 0 of a FRESH turn (a long
+/// session's between-turn growth is first measured there), where "You are
+/// mid-task … do not summarize" would be false and would countermand an
+/// informational ask ("summarize what we changed today") sitting right above
+/// it. At round 0 nothing has been spent or lost, so the whole repair is
+/// skipped.
+fn apply_post_compaction_continuation(
+    messages: &mut Vec<serde_json::Value>,
+    narration_nudges: &mut usize,
+    action: CompressAction,
+    step_ledger: Option<&dyn scheduled::StepLedger>,
+    mid_turn: bool,
+) {
+    if !mid_turn
+        || !matches!(
+            action,
+            CompressAction::Summarized | CompressAction::StaticFallback
+        )
+    {
+        return;
+    }
+    *narration_nudges = 0;
+    // At most one directive alive: drop any earlier copy before appending.
+    messages.retain(|m| !compress::is_continuation_message(m));
+    messages.push(serde_json::json!({
+        "role": "user",
+        "content": post_compaction_continuation(step_ledger),
+    }));
+}
+
+/// The stronger corrective for the second and later narration nudges
+/// (`[tui] narration_nudge_cap` > 1). The generic first nudge already failed
+/// to convert intent into action, so this one is state-driven like
+/// [`read_only_action_nudge`]: it names the active plan step and demands the
+/// next output be a bare tool call.
+fn escalated_narration_action_nudge(
+    attempt: usize,
+    cap: usize,
+    step_ledger: Option<&dyn scheduled::StepLedger>,
+) -> String {
+    let step_clause = active_step_description(step_ledger)
+        .map(|step| format!(" Active step: '{step}'."))
+        .unwrap_or_default();
+    format!(
+        "Reminder {attempt}/{cap}: you again described an action without calling \
+         a tool, so nothing has happened.{step_clause} Your NEXT output must be \
+         exactly one tool call that starts that action (for example read_file, \
+         edit_file, or run_command with real arguments) — no prose before it. \
+         If you are blocked, state the one concrete blocker in a single \
+         sentence instead of announcing more intentions."
+    )
 }
 
 fn stale_file_ground_truth_nudge() -> String {
@@ -3763,6 +3951,7 @@ pub async fn openai_chat_complete(
         persona_tools,
         max_tool_rounds,
         workflow_grace_rounds,
+        narration_nudge_cap,
         tool_output_lines,
         debug,
         trace,
@@ -3783,6 +3972,7 @@ pub async fn openai_chat_complete(
         compress_state,
         mut tool_events,
         mut phantom_reaches,
+        mut end_reason,
         mut permission_gate,
         mut on_round_usage,
         estimate_ratio,
@@ -4048,6 +4238,13 @@ pub async fn openai_chat_complete(
                     }
                     messages = outcome.messages;
                     prompt_tracker.invalidate();
+                    apply_post_compaction_continuation(
+                        &mut messages,
+                        &mut narration_nudges,
+                        outcome.action,
+                        step_ledger,
+                        round > 0,
+                    );
                 }
             }
         }
@@ -4172,6 +4369,13 @@ pub async fn openai_chat_complete(
                         if outcome.fired {
                             messages = outcome.messages;
                             prompt_tracker.invalidate();
+                            apply_post_compaction_continuation(
+                                &mut messages,
+                                &mut narration_nudges,
+                                outcome.action,
+                                step_ledger,
+                                round > 0,
+                            );
                         }
                         cw_retries += 1;
                         continue 'round_loop;
@@ -4295,7 +4499,7 @@ pub async fn openai_chat_complete(
             }
             // Narrate-then-stop rescue (mirror of the Ollama loop): non-empty
             // prose with no tool call. Nudge once and continue instead of ending
-            // the turn — bounded by NARRATION_NUDGE_CAP + the round budget.
+            // the turn — bounded by the configured narration_nudge_cap + the round budget.
             let nudge_classification =
                 (!content.is_empty()).then(|| nudge_classifier.classify(&content));
             let workflow_classifier_text = workflow_classifier_text(&messages, &content);
@@ -4322,7 +4526,10 @@ pub async fn openai_chat_complete(
                         );
                     }
                     messages.push(serde_json::json!({ "role": "assistant", "content": content }));
-                    messages.push(serde_json::json!({ "role": "user", "content": nudge }));
+                    messages.push(serde_json::json!({
+                        "role": "user",
+                        "content": format!("{} {}", compress::LOOP_GUIDANCE_PREFIX, nudge)
+                    }));
                     continue 'round_loop;
                 }
             }
@@ -4345,7 +4552,10 @@ pub async fn openai_chat_complete(
                         );
                     }
                     messages.push(serde_json::json!({ "role": "assistant", "content": content }));
-                    messages.push(serde_json::json!({ "role": "user", "content": nudge }));
+                    messages.push(serde_json::json!({
+                        "role": "user",
+                        "content": format!("{} {}", compress::LOOP_GUIDANCE_PREFIX, nudge)
+                    }));
                     pending_plan_nudges += 1;
                     continue 'round_loop;
                 }
@@ -4364,13 +4574,17 @@ pub async fn openai_chat_complete(
                 messages.push(serde_json::json!({ "role": "assistant", "content": content }));
                 messages.push(serde_json::json!({
                     "role": "user",
-                    "content": stale_file_ground_truth_nudge(),
+                    "content": format!(
+                        "{} {}",
+                        compress::LOOP_GUIDANCE_PREFIX,
+                        stale_file_ground_truth_nudge()
+                    ),
                 }));
                 stale_file_nudges += 1;
                 continue 'round_loop;
             }
             if !content.is_empty()
-                && narration_nudges < NARRATION_NUDGE_CAP
+                && narration_nudges < narration_nudge_cap
                 && round + 1 < current_tool_round_limit
                 && nudge_classification
                     .as_ref()
@@ -4383,14 +4597,27 @@ pub async fn openai_chat_complete(
                     );
                 }
                 messages.push(serde_json::json!({ "role": "assistant", "content": content }));
-                let direction = nudge_classification
-                    .as_ref()
-                    .and_then(|classification| nudge_classifier.direction_for(classification.class))
-                    .map(str::to_string)
-                    .unwrap_or_else(narration_action_nudge);
+                // First nudge: the (tunable) classifier direction. Later
+                // nudges (cap > 1) escalate — name the active step, demand a
+                // bare tool call (mirrors the Ollama loop).
+                let direction = if narration_nudges == 0 {
+                    nudge_classification
+                        .as_ref()
+                        .and_then(|classification| {
+                            nudge_classifier.direction_for(classification.class)
+                        })
+                        .map(str::to_string)
+                        .unwrap_or_else(narration_action_nudge)
+                } else {
+                    escalated_narration_action_nudge(
+                        narration_nudges + 1,
+                        narration_nudge_cap,
+                        step_ledger,
+                    )
+                };
                 messages.push(serde_json::json!({
                     "role": "user",
-                    "content": direction,
+                    "content": format!("{} {}", compress::LOOP_GUIDANCE_PREFIX, direction),
                 }));
                 narration_nudges += 1;
                 continue 'round_loop;
@@ -4404,6 +4631,31 @@ pub async fn openai_chat_complete(
                     truncation_suspect,
                     round_est_raw,
                 );
+            }
+            // Acceptance forensics (mirrors the Ollama macro): record WHY
+            // this no-tool reply ends the turn.
+            let accepted_reason = if content.is_empty() {
+                crate::TurnEndReason::Empty
+            } else if nudge_classification
+                .as_ref()
+                .is_some_and(|c| c.is_pending_action())
+            {
+                if round + 1 >= current_tool_round_limit {
+                    crate::TurnEndReason::NarrationFinalRound
+                } else {
+                    crate::TurnEndReason::NarrationCapExhausted
+                }
+            } else {
+                crate::TurnEndReason::Completed
+            };
+            if debug && accepted_reason != crate::TurnEndReason::Completed {
+                print_debug(
+                    &format!("no-tool reply accepted as final answer ({accepted_reason:?})"),
+                    color,
+                );
+            }
+            if let Some(slot) = &mut end_reason {
+                **slot = Some(accepted_reason);
             }
             let out = if content.is_empty() {
                 "(model returned an empty response — try rephrasing, or check the model with `newt doctor`)".to_string()
@@ -4642,6 +4894,9 @@ pub async fn openai_chat_complete(
     .await?;
     // #867: same path-claim refutation as the Ollama cap exit.
     let text = claim_check::annotate_against_workspace(text, workspace);
+    if let Some(slot) = &mut end_reason {
+        **slot = Some(crate::TurnEndReason::RoundCap);
+    }
     Ok((text, streamed, usage, hallucination_count))
 }
 
@@ -4793,6 +5048,7 @@ pub async fn openai_responses_complete(
         persona_tools,
         max_tool_rounds,
         workflow_grace_rounds: _,
+        narration_nudge_cap: _,
         tool_output_lines,
         debug,
         trace,
@@ -4816,6 +5072,7 @@ pub async fn openai_responses_complete(
         compress_state: _,
         mut tool_events,
         mut phantom_reaches,
+        end_reason: _,
         mut permission_gate,
         on_round_usage: _,
         estimate_ratio: _,
@@ -6311,6 +6568,7 @@ mod tool_round_cap_tests {
         let messages = msgs();
         let caveats = Caveats::top();
         let cap = 3;
+        let mut end_reason: Option<crate::TurnEndReason> = None;
         let (reply, streamed, _usage, _hallu) = chat_complete(
             ChatCtx {
                 url: &server.uri(),
@@ -6333,6 +6591,7 @@ mod tool_round_cap_tests {
                 caveats: &caveats,
                 persona_tools: None,
                 max_tool_rounds: cap,
+                narration_nudge_cap: 1,
                 workflow_grace_rounds: 0,
                 tool_output_lines: 20,
                 debug: false,
@@ -6356,6 +6615,7 @@ mod tool_round_cap_tests {
                 compress_state: None,
                 tool_events: None,
                 phantom_reaches: None,
+                end_reason: Some(&mut end_reason),
                 permission_gate: None,
                 on_round_usage: None,
                 estimate_ratio: None,
@@ -6379,6 +6639,8 @@ mod tool_round_cap_tests {
         assert_eq!(reply, "here is my partial summary");
         assert_ne!(reply, "(reached tool-call limit)");
         assert!(!streamed);
+        // The cap exit reports itself (acceptance forensics, commit 4).
+        assert_eq!(end_reason, Some(crate::TurnEndReason::RoundCap));
     }
 
     #[tokio::test]
@@ -6497,6 +6759,7 @@ mod tool_round_cap_tests {
                 caveats: &caveats,
                 persona_tools: None,
                 max_tool_rounds: cap,
+                narration_nudge_cap: 1,
                 workflow_grace_rounds: 0,
                 tool_output_lines: 20,
                 debug: false,
@@ -6520,6 +6783,7 @@ mod tool_round_cap_tests {
                 compress_state: None,
                 tool_events: None,
                 phantom_reaches: None,
+                end_reason: None,
                 permission_gate: None,
                 on_round_usage: None,
                 estimate_ratio: None,
@@ -6580,6 +6844,7 @@ mod tool_round_cap_tests {
                 caveats: &caveats,
                 persona_tools: None,
                 max_tool_rounds: 5,
+                narration_nudge_cap: 1,
                 workflow_grace_rounds: 0,
                 tool_output_lines: 20,
                 debug: false,
@@ -6603,6 +6868,7 @@ mod tool_round_cap_tests {
                 compress_state: None,
                 tool_events: None,
                 phantom_reaches: None,
+                end_reason: None,
                 permission_gate: None,
                 on_round_usage: None,
                 estimate_ratio: None,
@@ -6724,6 +6990,7 @@ mod tool_round_cap_tests {
                 caveats: &caveats,
                 persona_tools: None,
                 max_tool_rounds: 5,
+                narration_nudge_cap: 1,
                 workflow_grace_rounds: 0,
                 tool_output_lines: 20,
                 debug: false,
@@ -6747,6 +7014,7 @@ mod tool_round_cap_tests {
                 compress_state: None,
                 tool_events: None,
                 phantom_reaches: None,
+                end_reason: None,
                 permission_gate: None,
                 on_round_usage: None,
                 estimate_ratio: None,
@@ -6805,6 +7073,7 @@ mod tool_round_cap_tests {
                 caveats: &caveats,
                 persona_tools: None,
                 max_tool_rounds: cap,
+                narration_nudge_cap: 1,
                 workflow_grace_rounds: 0,
                 tool_output_lines: 20,
                 debug: false,
@@ -6828,6 +7097,7 @@ mod tool_round_cap_tests {
                 compress_state: None,
                 tool_events: None,
                 phantom_reaches: None,
+                end_reason: None,
                 permission_gate: None,
                 on_round_usage: None,
                 estimate_ratio: None,
@@ -6909,6 +7179,7 @@ mod tool_round_cap_tests {
                 caveats: &caveats,
                 persona_tools: None,
                 max_tool_rounds: 1,
+                narration_nudge_cap: 1,
                 workflow_grace_rounds: 0,
                 tool_output_lines: 20,
                 debug: false,
@@ -6932,6 +7203,7 @@ mod tool_round_cap_tests {
                 compress_state: None,
                 tool_events: Some(&mut events),
                 phantom_reaches: None,
+                end_reason: None,
                 permission_gate: None,
                 on_round_usage: None,
                 estimate_ratio: None,
@@ -7025,6 +7297,7 @@ mod tool_round_cap_tests {
                 caveats: &caveats,
                 persona_tools: None,
                 max_tool_rounds: 1,
+                narration_nudge_cap: 1,
                 workflow_grace_rounds: 0,
                 tool_output_lines: 20,
                 debug: false,
@@ -7048,6 +7321,7 @@ mod tool_round_cap_tests {
                 compress_state: None,
                 tool_events: Some(&mut events),
                 phantom_reaches: None,
+                end_reason: None,
                 permission_gate: None,
                 on_round_usage: None,
                 estimate_ratio: None,
@@ -7133,6 +7407,7 @@ mod tool_round_cap_tests {
                 caveats: &caveats,
                 persona_tools: None,
                 max_tool_rounds: 2,
+                narration_nudge_cap: 1,
                 workflow_grace_rounds: 0,
                 tool_output_lines: 20,
                 debug: false,
@@ -7156,6 +7431,7 @@ mod tool_round_cap_tests {
                 compress_state: None,
                 tool_events: None,
                 phantom_reaches: None,
+                end_reason: None,
                 permission_gate: None,
                 on_round_usage: None,
                 estimate_ratio: None,
@@ -7282,6 +7558,7 @@ mod tool_round_cap_tests {
                 caveats: &caveats,
                 persona_tools: None,
                 max_tool_rounds: cap,
+                narration_nudge_cap: 1,
                 workflow_grace_rounds: 0,
                 tool_output_lines: 20,
                 debug: false,
@@ -7305,6 +7582,7 @@ mod tool_round_cap_tests {
                 compress_state: None,
                 tool_events: None,
                 phantom_reaches: None,
+                end_reason: None,
                 permission_gate: None,
                 on_round_usage: None,
                 estimate_ratio: None,
@@ -7441,6 +7719,7 @@ mod tool_round_cap_tests {
                 caveats: &caveats,
                 persona_tools: None,
                 max_tool_rounds: 10,
+                narration_nudge_cap: 1,
                 workflow_grace_rounds: 0,
                 tool_output_lines: 5,
                 debug: false,
@@ -7464,6 +7743,7 @@ mod tool_round_cap_tests {
                 compress_state: None,
                 tool_events: None,
                 phantom_reaches: None,
+                end_reason: None,
                 permission_gate: None,
                 on_round_usage: None,
                 estimate_ratio: None,
@@ -7539,6 +7819,7 @@ mod http_loop_tests {
             caveats,
             persona_tools: None,
             max_tool_rounds: 8,
+            narration_nudge_cap: 1,
             workflow_grace_rounds: 0,
             tool_output_lines: 20,
             debug: false,
@@ -7562,6 +7843,7 @@ mod http_loop_tests {
             compress_state: None,
             tool_events: None,
             phantom_reaches: None,
+            end_reason: None,
             permission_gate: None,
             on_round_usage: None,
             estimate_ratio: None,
@@ -8776,6 +9058,32 @@ mod http_loop_tests {
         run_openai_script_with_ledger(script, None).await
     }
 
+    /// Like [`run_openai_script`] but with a configured narrate-then-stop
+    /// rescue budget (`[tui] narration_nudge_cap`, lever L3).
+    async fn run_openai_script_with_cap(
+        script: Vec<serde_json::Value>,
+        narration_nudge_cap: usize,
+    ) -> (String, usize) {
+        let server = MockServer::start().await;
+        let round = Arc::new(AtomicUsize::new(0));
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ScriptedOpenAi {
+                round: round.clone(),
+                script,
+            })
+            .mount(&server)
+            .await;
+        let messages = msgs();
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut c = ctx(&uri, &messages, &caveats);
+        c.kind = BackendKind::Openai;
+        c.narration_nudge_cap = narration_nudge_cap;
+        let (reply, _s, _u, _h) = chat_complete(c, &mut NoMcp).await.expect("dispatch");
+        (reply, round.load(Ordering::SeqCst))
+    }
+
     #[tokio::test]
     async fn narrated_intent_with_no_tool_call_nudges_and_continues() {
         // The model narrates intent to act but calls no tool. Instead of ending
@@ -8815,6 +9123,322 @@ mod http_loop_tests {
             reply.contains("editing"),
             "narration accepted as final: {reply}"
         );
+    }
+
+    #[tokio::test]
+    async fn narration_nudge_cap_two_allows_a_second_escalated_rescue() {
+        // Lever L3: with `narration_nudge_cap = 2` a chronic narrator gets TWO
+        // rescues (the second escalated), and the post-rescue answer is
+        // returned; a genuine recovery on round 3 proves the extra budget is
+        // what converts the stall.
+        let (reply, rounds) = run_openai_script_with_cap(
+            vec![
+                serde_json::json!({ "content": "Let me keep editing now." }),
+                serde_json::json!({ "content": "Let me keep editing now." }),
+                serde_json::json!({ "content": "All done — the edit is complete." }),
+            ],
+            2,
+        )
+        .await;
+        assert_eq!(
+            rounds, 3,
+            "two nudges (cap=2) before the recovery, got {rounds}"
+        );
+        assert!(
+            reply.contains("complete"),
+            "returns the post-nudge answer: {reply}"
+        );
+    }
+
+    #[tokio::test]
+    async fn narration_nudge_cap_two_still_accepts_after_exhaustion() {
+        // The raised cap is still a cap: a model that narrates through both
+        // rescues has its third narration accepted as the final answer.
+        let (reply, rounds) = run_openai_script_with_cap(
+            vec![
+                serde_json::json!({ "content": "Let me keep editing now." }),
+                serde_json::json!({ "content": "Let me keep editing now." }),
+                serde_json::json!({ "content": "Let me keep editing now." }),
+                serde_json::json!({ "content": "Let me keep editing now." }),
+            ],
+            2,
+        )
+        .await;
+        assert_eq!(rounds, 3, "two nudges, then accept, got {rounds}");
+        assert!(
+            reply.contains("editing"),
+            "narration accepted as final: {reply}"
+        );
+    }
+
+    #[test]
+    fn escalated_narration_nudge_names_attempt_cap_and_active_step() {
+        use crate::agentic::scheduled::{SessionStepLedger, StepLedger};
+
+        let ledger = SessionStepLedger::default();
+        ledger.restore(&PlanSnapshot {
+            steps: vec![
+                Step {
+                    description: "inspect".to_string(),
+                    status: StepStatus::Done,
+                },
+                Step {
+                    description: "fix conflict markers".to_string(),
+                    status: StepStatus::Active,
+                },
+            ],
+        });
+        let text = escalated_narration_action_nudge(2, 3, Some(&ledger as &dyn StepLedger));
+        assert!(text.contains("Reminder 2/3"), "{text}");
+        assert!(text.contains("fix conflict markers"), "{text}");
+        assert!(text.contains("tool call"), "{text}");
+
+        // No ledger: no step clause, the demand still stands.
+        let bare = escalated_narration_action_nudge(2, 2, None);
+        assert!(bare.contains("Reminder 2/2"), "{bare}");
+        assert!(!bare.contains("Active step"), "{bare}");
+    }
+
+    #[tokio::test]
+    async fn accepted_narration_reports_cap_exhausted_end_reason() {
+        // The acceptance-forensics record: a narration that exhausts the
+        // rescue budget ends the turn with a visible reason instead of
+        // masquerading as a normal completion.
+        let server = MockServer::start().await;
+        let round = Arc::new(AtomicUsize::new(0));
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ScriptedOpenAi {
+                round: round.clone(),
+                script: vec![
+                    serde_json::json!({ "content": "Let me keep editing now." }),
+                    serde_json::json!({ "content": "Let me keep editing now." }),
+                ],
+            })
+            .mount(&server)
+            .await;
+        let messages = msgs();
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut end_reason: Option<crate::TurnEndReason> = None;
+        let mut c = ctx(&uri, &messages, &caveats);
+        c.kind = BackendKind::Openai;
+        c.end_reason = Some(&mut end_reason);
+        let _ = chat_complete(c, &mut NoMcp).await.expect("dispatch");
+        assert_eq!(
+            end_reason,
+            Some(crate::TurnEndReason::NarrationCapExhausted)
+        );
+    }
+
+    #[tokio::test]
+    async fn genuine_completion_reports_completed_end_reason() {
+        let server = MockServer::start().await;
+        let round = Arc::new(AtomicUsize::new(0));
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ScriptedOpenAi {
+                round: round.clone(),
+                script: vec![serde_json::json!({ "content": "The capital of France is Paris." })],
+            })
+            .mount(&server)
+            .await;
+        let messages = msgs();
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut end_reason: Option<crate::TurnEndReason> = None;
+        let mut c = ctx(&uri, &messages, &caveats);
+        c.kind = BackendKind::Openai;
+        c.end_reason = Some(&mut end_reason);
+        let _ = chat_complete(c, &mut NoMcp).await.expect("dispatch");
+        assert_eq!(end_reason, Some(crate::TurnEndReason::Completed));
+    }
+
+    #[tokio::test]
+    async fn narration_nudge_reaches_the_wire_tagged_as_loop_guidance() {
+        // The rescue nudge must arrive tagged so the compaction pipeline can
+        // keep it (and the model's echo of it) out of later summaries.
+        let server = MockServer::start().await;
+        let saw_tag = Arc::new(AtomicBool::new(false));
+
+        struct TagProbe {
+            saw_tag: Arc<AtomicBool>,
+        }
+        impl Respond for TagProbe {
+            fn respond(&self, req: &Request) -> ResponseTemplate {
+                let body = body_json(req);
+                let tagged = body["messages"].as_array().is_some_and(|ms| {
+                    ms.iter().any(|m| {
+                        m["role"] == "user"
+                            && m["content"]
+                                .as_str()
+                                .is_some_and(|c| c.starts_with(compress::LOOP_GUIDANCE_PREFIX))
+                    })
+                });
+                if tagged {
+                    self.saw_tag.store(true, Ordering::SeqCst);
+                    return ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "choices": [{ "message": { "content": "All done — edit complete." } }]
+                    }));
+                }
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "choices": [{ "message": { "content": "Let me edit the file now." } }]
+                }))
+            }
+        }
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(TagProbe {
+                saw_tag: saw_tag.clone(),
+            })
+            .mount(&server)
+            .await;
+
+        let messages = msgs();
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut c = ctx(&uri, &messages, &caveats);
+        c.kind = BackendKind::Openai;
+        let (reply, _s, _u, _h) = chat_complete(c, &mut NoMcp).await.expect("dispatch");
+        assert!(
+            saw_tag.load(Ordering::SeqCst),
+            "the narration nudge must carry LOOP_GUIDANCE_PREFIX on the wire"
+        );
+        assert!(reply.contains("complete"), "{reply}");
+    }
+
+    #[tokio::test]
+    async fn ollama_loop_honors_cap_two_and_escalates_the_second_nudge() {
+        // Ollama-path parity for lever L3 (the macro chain is separate code
+        // from the OpenAI inline chain): with narration_nudge_cap = 2 the
+        // first rescue carries the [loop-guidance]-tagged generic corrective
+        // and the SECOND carries the escalated "Reminder 2/2" variant — both
+        // observed on the wire — before the model recovers.
+        let server = MockServer::start().await;
+        let saw_first = Arc::new(AtomicBool::new(false));
+        let saw_escalated = Arc::new(AtomicBool::new(false));
+
+        struct EscalationProbe {
+            saw_first: Arc<AtomicBool>,
+            saw_escalated: Arc<AtomicBool>,
+        }
+        impl Respond for EscalationProbe {
+            fn respond(&self, req: &Request) -> ResponseTemplate {
+                let body = body_json(req);
+                let has = |needle: &str| {
+                    body["messages"].as_array().is_some_and(|ms| {
+                        ms.iter()
+                            .any(|m| m["content"].as_str().is_some_and(|c| c.contains(needle)))
+                    })
+                };
+                if has("Reminder 2/2") {
+                    self.saw_escalated.store(true, Ordering::SeqCst);
+                    return ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "message": { "content": "All done — the edit is complete." }
+                    }));
+                }
+                if has(compress::LOOP_GUIDANCE_PREFIX) {
+                    self.saw_first.store(true, Ordering::SeqCst);
+                }
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "message": { "content": "Let me keep editing now." }
+                }))
+            }
+        }
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(EscalationProbe {
+                saw_first: saw_first.clone(),
+                saw_escalated: saw_escalated.clone(),
+            })
+            .mount(&server)
+            .await;
+
+        let messages = msgs();
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut c = ctx(&uri, &messages, &caveats);
+        c.kind = BackendKind::Ollama;
+        c.narration_nudge_cap = 2;
+        let (reply, _s, _u, _h) = chat_complete(c, &mut NoMcp).await.expect("dispatch");
+        assert!(
+            saw_first.load(Ordering::SeqCst),
+            "the first nudge must reach the Ollama wire tagged [loop-guidance]"
+        );
+        assert!(
+            saw_escalated.load(Ordering::SeqCst),
+            "the second nudge must be the escalated Reminder 2/2 variant"
+        );
+        assert!(reply.contains("complete"), "{reply}");
+    }
+
+    #[test]
+    fn post_compaction_refunds_rescue_budget_and_appends_one_directive() {
+        let directive_count = |messages: &[serde_json::Value]| {
+            messages
+                .iter()
+                .filter(|m| {
+                    m["content"]
+                        .as_str()
+                        .is_some_and(|c| c.starts_with(compress::CONTINUATION_PREFIX))
+                })
+                .count()
+        };
+        let mut messages = vec![
+            serde_json::json!({"role": "system", "content": "you are a test"}),
+            serde_json::json!({"role": "user", "content": "do the thing"}),
+            serde_json::json!({
+                "role": "user",
+                "content": format!("{} stale directive", compress::CONTINUATION_PREFIX)
+            }),
+        ];
+        let mut nudges = 1usize;
+
+        // Prune-only passes keep the corrective text: no refund, no anchor.
+        apply_post_compaction_continuation(
+            &mut messages,
+            &mut nudges,
+            CompressAction::Pruned,
+            None,
+            true,
+        );
+        assert_eq!(nudges, 1, "prune must not refund the rescue budget");
+        assert_eq!(messages.len(), 3, "prune must not touch the directive");
+
+        // Round 0 (a FRESH turn whose between-turn growth fired the pre-send
+        // compaction): no directive — "You are mid-task … do not summarize"
+        // would countermand the operator's brand-new ask sitting above it.
+        apply_post_compaction_continuation(
+            &mut messages,
+            &mut nudges,
+            CompressAction::Summarized,
+            None,
+            false,
+        );
+        assert_eq!(nudges, 1, "round 0 must not touch the rescue budget");
+        assert_eq!(messages.len(), 3, "round 0 must not inject the directive");
+
+        // A MID-TURN summarization refunds the budget, drops the stale
+        // directive, and appends exactly one fresh act-now anchor as the last
+        // user message.
+        apply_post_compaction_continuation(
+            &mut messages,
+            &mut nudges,
+            CompressAction::Summarized,
+            None,
+            true,
+        );
+        assert_eq!(nudges, 0, "summarization refunds the rescue budget");
+        assert_eq!(directive_count(&messages), 1, "at most one directive alive");
+        let last = messages.last().unwrap();
+        assert_eq!(last["role"], "user");
+        let content = last["content"].as_str().unwrap();
+        assert!(
+            content.starts_with(compress::CONTINUATION_PREFIX),
+            "{content}"
+        );
+        assert!(content.contains("tool call"), "{content}");
+        assert!(!content.contains("stale directive"), "{content}");
     }
 
     #[tokio::test]
@@ -9265,6 +9889,7 @@ mod save_note_loop_tests {
             caveats,
             persona_tools: None,
             max_tool_rounds: 6,
+            narration_nudge_cap: 1,
             workflow_grace_rounds: 0,
             tool_output_lines: 20,
             debug: false,
@@ -9288,6 +9913,7 @@ mod save_note_loop_tests {
             compress_state: None,
             tool_events: None,
             phantom_reaches: None,
+            end_reason: None,
             permission_gate: None,
             on_round_usage: None,
             estimate_ratio: None,
@@ -9753,6 +10379,7 @@ mod compression_loop_tests {
             caveats,
             persona_tools: None,
             max_tool_rounds: 12,
+            narration_nudge_cap: 1,
             workflow_grace_rounds: 0,
             tool_output_lines: 2,
             debug: false,
@@ -9778,6 +10405,7 @@ mod compression_loop_tests {
             compress_state: None,
             tool_events: None,
             phantom_reaches: None,
+            end_reason: None,
             permission_gate: None,
             on_round_usage: None,
             estimate_ratio: None,
@@ -10162,6 +10790,7 @@ mod compression_loop_tests {
         final_answer: String,
         task_in_marker_request: Arc<AtomicBool>,
         summary_in_marker_request: Arc<AtomicBool>,
+        directive_in_marker_request: Arc<AtomicBool>,
     }
 
     impl Respond for OpenAiGauntletResponder {
@@ -10173,6 +10802,10 @@ mod compression_loop_tests {
                 }
                 if messages_contain(&body, CANNED_SUMMARY) {
                     self.summary_in_marker_request.store(true, Ordering::SeqCst);
+                }
+                if messages_contain(&body, compress::CONTINUATION_PREFIX) {
+                    self.directive_in_marker_request
+                        .store(true, Ordering::SeqCst);
                 }
                 return ResponseTemplate::new(200).set_body_json(serde_json::json!({
                     "choices": [{ "message": { "content": self.final_answer } }]
@@ -10202,12 +10835,14 @@ mod compression_loop_tests {
         let server = MockServer::start().await;
         let task_in_marker = Arc::new(AtomicBool::new(false));
         let summary_in_marker = Arc::new(AtomicBool::new(false));
+        let directive_in_marker = Arc::new(AtomicBool::new(false));
         Mock::given(method("POST"))
             .and(path("/v1/chat/completions"))
             .respond_with(OpenAiGauntletResponder {
                 final_answer: "openai: marker is GAUNTLET-7f3d9c".into(),
                 task_in_marker_request: task_in_marker.clone(),
                 summary_in_marker_request: summary_in_marker.clone(),
+                directive_in_marker_request: directive_in_marker.clone(),
             })
             .mount(&server)
             .await;
@@ -10233,6 +10868,13 @@ mod compression_loop_tests {
         assert!(!prompts.lock().unwrap().is_empty(), "summarizer engaged");
         assert!(task_in_marker.load(Ordering::SeqCst));
         assert!(summary_in_marker.load(Ordering::SeqCst));
+        // This compaction fired MID-TURN (tool rounds preceded it), so the
+        // real pipeline outcome must also carry the act-now continuation
+        // directive to the wire (commit 2's seam, exercised end to end).
+        assert!(
+            directive_in_marker.load(Ordering::SeqCst),
+            "the post-compaction act-now directive must reach the wire"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -10906,6 +11548,7 @@ mod observation_hook_tests {
             caveats,
             persona_tools: None,
             max_tool_rounds: 8,
+            narration_nudge_cap: 1,
             workflow_grace_rounds: 0,
             tool_output_lines: 20,
             debug: false,
@@ -10929,6 +11572,7 @@ mod observation_hook_tests {
             compress_state: None,
             tool_events: None,
             phantom_reaches: None,
+            end_reason: None,
             permission_gate: None,
             on_round_usage: None,
             estimate_ratio: None,

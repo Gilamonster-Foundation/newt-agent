@@ -120,7 +120,7 @@ pub use memory::{
     RollingWindow, SessionContext, SoulProvider, SoulSource, Summarizing, TokenBudget, COACH_SOUL,
     DEFAULT_CONTEXT_TOKENS, DEFAULT_SOUL, MEMORY_INDEX_BUDGET,
 };
-pub use metrics::{TokenUsage, TurnMetrics};
+pub use metrics::{TokenUsage, TurnEndReason, TurnMetrics};
 pub use model_id::ModelId;
 pub use pricing::{ModelRate, PricingConfig};
 pub use reasoning::{split_reasoning, ThinkFilter};

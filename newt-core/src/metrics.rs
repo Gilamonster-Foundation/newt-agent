@@ -35,6 +35,29 @@ impl TokenUsage {
     }
 }
 
+/// Why the agentic loop ended the turn. Before this record existed, a
+/// narrate-then-stop acceptance was indistinguishable from a normal
+/// completion — even under `NEWT_DEBUG` (the 2026-07-08 ornith:35b
+/// forensics could not tell "cap exhausted" from "classifier missed" from
+/// disk). `None` on paths that do not report it (headless callers, the
+/// Responses-API loop, operator cancels).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnEndReason {
+    /// A genuine final answer (no pending-action cue in the closing reply).
+    Completed,
+    /// Pending-action narration accepted because the rescue budget
+    /// (`[tui] narration_nudge_cap`) was already spent this turn.
+    NarrationCapExhausted,
+    /// Pending-action narration accepted on the final allowed round, where
+    /// every rescue nudge is skipped (`round + 1 < limit` guard).
+    NarrationFinalRound,
+    /// The tool-round cap ended the turn via the tools-disabled summary.
+    RoundCap,
+    /// The model produced no usable content (placeholder/diagnostic reply).
+    Empty,
+}
+
 /// Full telemetry record for one inference turn.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TurnMetrics {
@@ -61,6 +84,11 @@ pub struct TurnMetrics {
     /// or invoking a non-existent tool). Omitted from logs when zero.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub hallucinations: u32,
+
+    /// Why the loop ended the turn (see [`TurnEndReason`]). Omitted from
+    /// logs when unreported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_reason: Option<TurnEndReason>,
 }
 
 fn is_zero_u32(n: &u32) -> bool {
@@ -104,13 +132,27 @@ impl TurnMetrics {
         } else {
             format!("{elapsed} · {token_part} · {cost_part}")
         };
-        if self.hallucinations > 0 {
+        let base = if self.hallucinations > 0 {
             format!(
                 "{base} · ⚠ {} hallucination(s) corrected",
                 self.hallucinations
             )
         } else {
             base
+        };
+        // Surface only the anomalous endings — a normal completion stays
+        // quiet, but a turn that ended on unrescued narration (or the round
+        // cap) says so instead of silently looking finished.
+        match self.end_reason {
+            Some(TurnEndReason::NarrationCapExhausted) => {
+                format!("{base} · ⚠ ended on narration (rescue budget spent)")
+            }
+            Some(TurnEndReason::NarrationFinalRound) => {
+                format!("{base} · ⚠ ended on narration (final round)")
+            }
+            Some(TurnEndReason::RoundCap) => format!("{base} · round cap"),
+            Some(TurnEndReason::Empty) => format!("{base} · ⚠ empty response"),
+            Some(TurnEndReason::Completed) | None => base,
         }
     }
 
@@ -264,6 +306,42 @@ mod tests {
         };
         let line = m.display_line();
         assert!(line.contains("tokens unavailable"), "got: {line}");
+    }
+
+    #[test]
+    fn display_end_reason_flags_anomalous_endings() {
+        let mut m = metrics(3200, 100, 50, Some(0.0));
+        assert!(!m.display_line().contains("narration"), "unset stays quiet");
+        m.end_reason = Some(TurnEndReason::Completed);
+        assert!(
+            !m.display_line().contains("narration"),
+            "a normal completion stays quiet"
+        );
+        m.end_reason = Some(TurnEndReason::NarrationCapExhausted);
+        assert!(m
+            .display_line()
+            .contains("ended on narration (rescue budget spent)"));
+        m.end_reason = Some(TurnEndReason::NarrationFinalRound);
+        assert!(m
+            .display_line()
+            .contains("ended on narration (final round)"));
+        m.end_reason = Some(TurnEndReason::RoundCap);
+        assert!(m.display_line().contains("round cap"));
+        m.end_reason = Some(TurnEndReason::Empty);
+        assert!(m.display_line().contains("empty response"));
+    }
+
+    #[test]
+    fn end_reason_serializes_snake_case_and_skips_when_absent() {
+        let mut m = metrics(1, 1, 1, None);
+        let j = serde_json::to_string(&m).unwrap();
+        assert!(!j.contains("end_reason"), "{j}");
+        m.end_reason = Some(TurnEndReason::NarrationCapExhausted);
+        let j = serde_json::to_string(&m).unwrap();
+        assert!(
+            j.contains("\"end_reason\":\"narration_cap_exhausted\""),
+            "{j}"
+        );
     }
 
     #[test]

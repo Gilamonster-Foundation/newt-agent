@@ -1485,6 +1485,18 @@ pub struct TuiConfig {
     #[serde(default = "default_workflow_grace_rounds")]
     pub workflow_grace_rounds: usize,
 
+    /// Maximum "you narrated intent but called no tool" auto-continue nudges
+    /// per turn — the narrate-then-stop rescue. Once spent, the next no-tool
+    /// narration is accepted as the turn's final answer and the turn ends.
+    /// Default: 1. Weak local models that chronically announce actions in
+    /// prose instead of calling tools benefit from 2–3; the second and later
+    /// nudges escalate (they name the active plan step and demand a bare tool
+    /// call). `0` disables the rescue entirely — every no-tool narration is
+    /// accepted as the final answer. See docs/design/next-loop-levers.md,
+    /// lever L3.
+    #[serde(default = "default_narration_nudge_cap")]
+    pub narration_nudge_cap: usize,
+
     /// Tool-call permission policy for the interactive TUI: which tools the
     /// model may invoke and over which targets. This is a *preset that selects
     /// an attenuation* — the host (`newt-identity`) lowers it into a signed,
@@ -1653,6 +1665,10 @@ fn default_workflow_grace_rounds() -> usize {
     5
 }
 
+fn default_narration_nudge_cap() -> usize {
+    1
+}
+
 fn default_connect_timeout_secs() -> u64 {
     5
 }
@@ -1750,6 +1766,13 @@ pub struct ModelTuning {
     /// Per-model `[tui].workflow_grace_rounds` override.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow_grace_rounds: Option<usize>,
+
+    /// Per-model `[tui].narration_nudge_cap` override — how many
+    /// narrate-then-stop rescues a turn gets before a no-tool narration is
+    /// accepted as the final answer. Raise to 2–3 for models that chronically
+    /// narrate instead of acting (next-loop-levers.md, lever L3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub narration_nudge_cap: Option<usize>,
 }
 
 impl Config {
@@ -2730,6 +2753,7 @@ impl Default for TuiConfig {
             tool_output_lines: default_tool_output_lines(),
             max_tool_rounds: default_max_tool_rounds(),
             workflow_grace_rounds: default_workflow_grace_rounds(),
+            narration_nudge_cap: default_narration_nudge_cap(),
             permissions: ToolPermissions::default(),
             debug: None,
             trace: None,
@@ -5740,6 +5764,52 @@ net = [\"already.example.com\"]
         "#;
         let cfg: Config = toml::from_str(toml).unwrap();
         assert_eq!(cfg.tui.unwrap().max_tool_rounds, 7);
+    }
+
+    #[test]
+    fn tui_narration_nudge_cap_defaults_to_one_and_can_be_raised() {
+        // Lever L3 (next-loop-levers.md): the narrate-then-stop rescue budget
+        // is config, not a hardcoded const. Default 1 preserves the historical
+        // behavior; the function default and the struct default agree.
+        assert_eq!(default_narration_nudge_cap(), 1);
+        assert_eq!(TuiConfig::default().narration_nudge_cap, 1);
+
+        // An empty `[tui]` table => serde default kicks in => 1.
+        let cfg: Config = toml::from_str("[tui]\n").unwrap();
+        assert_eq!(cfg.tui.unwrap().narration_nudge_cap, 1);
+
+        // Weak-local-model operators raise it.
+        let cfg: Config = toml::from_str("[tui]\nnarration_nudge_cap = 3\n").unwrap();
+        assert_eq!(cfg.tui.unwrap().narration_nudge_cap, 3);
+    }
+
+    #[test]
+    fn model_tuning_narration_nudge_cap_override_parses() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [[model_tuning]]
+            model = "ornith:35b"
+            narration_nudge_cap = 3
+        "#,
+        )
+        .unwrap();
+        let tune = cfg.find_model_tuning("ornith:35b").unwrap();
+        assert_eq!(tune.narration_nudge_cap, Some(3));
+        // Absent field stays None (inherit the [tui] value).
+        let cfg: Config = toml::from_str(
+            r#"
+            [[model_tuning]]
+            model = "other:7b"
+            max_tool_rounds = 9
+        "#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.find_model_tuning("other:7b")
+                .unwrap()
+                .narration_nudge_cap,
+            None
+        );
     }
 
     #[test]

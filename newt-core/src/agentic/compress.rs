@@ -79,18 +79,73 @@ pub const SUMMARY_PREFIX: &str = "[CONTEXT COMPACTION — REFERENCE ONLY]";
 /// End marker terminating every compaction message.
 pub const SUMMARY_END_MARKER: &str = "--- END OF CONTEXT SUMMARY ---";
 
-/// True when `m` is a compaction message this pipeline previously inserted
-/// (LLM summary and the static fallback both carry [`SUMMARY_PREFIX`]).
-/// Every user-role scan in the pipeline must consult this: anchoring the
-/// boundary on the pipeline's own marker was the F1 self-poisoning bug —
-/// from the second compression of a session on, the tail pinned to the
-/// previous summary, the middle went empty, the message count could never
-/// shrink, and the aggressive fit pass destroyed every fresh tool result
-/// before the model saw it.
+/// Prefix marker on the loop's post-compaction continuation directive — the
+/// act-now anchor appended after a mid-turn summarization so a weak model
+/// resumes ACTING instead of narrating (the summary wrapper deliberately
+/// de-actions itself, and a spent narration-rescue budget may have just had
+/// its corrective text summarized away). User-role but pipeline-owned: like
+/// the summary marker it must never anchor the tail boundary, and the loop
+/// keeps at most one alive.
+pub const CONTINUATION_PREFIX: &str = "[POST-COMPACTION — CONTINUE]";
+
+/// True when `m` is a harness-owned user-role message: a compaction summary
+/// (LLM summary and the static fallback both carry [`SUMMARY_PREFIX`]), the
+/// loop's continuation directive ([`CONTINUATION_PREFIX`]), or an injected
+/// rescue nudge ([`LOOP_GUIDANCE_PREFIX`]). Every user-role scan in the
+/// pipeline must consult this: anchoring the boundary on the pipeline's own
+/// marker was the F1 self-poisoning bug — from the second compression of a
+/// session on, the tail pinned to the previous summary, the middle went
+/// empty, the message count could never shrink, and the aggressive fit pass
+/// destroyed every fresh tool result before the model saw it. Nudges are the
+/// same family: pinning the tail to the harness's own correction would
+/// demote the OPERATOR's most recent real ask into the summarizable middle.
 pub(crate) fn is_compaction_message(m: &Value) -> bool {
+    m["content"].as_str().is_some_and(|c| {
+        c.starts_with(SUMMARY_PREFIX)
+            || c.starts_with(CONTINUATION_PREFIX)
+            || c.starts_with(LOOP_GUIDANCE_PREFIX)
+    })
+}
+
+/// True when `m` is specifically the loop's post-compaction continuation
+/// directive — used by the loop to keep at most one alive across repeated
+/// mid-turn compactions.
+pub(crate) fn is_continuation_message(m: &Value) -> bool {
     m["content"]
         .as_str()
-        .is_some_and(|c| c.starts_with(SUMMARY_PREFIX))
+        .is_some_and(|c| c.starts_with(CONTINUATION_PREFIX))
+}
+
+/// Prefix on every harness-injected rescue nudge (narration, pending-plan,
+/// stale-file, workflow rediscovery). Models see it — it reads as what it
+/// is, loop guidance — and the summarizer input filter uses it to keep
+/// harness process-corrections out of summaries: they describe the loop's
+/// process, not task state, and a small summarizer readily echoes them into
+/// "## In Progress", priming the post-compaction rounds to role-play the
+/// struggle ("I keep describing but never call tools") instead of acting.
+pub const LOOP_GUIDANCE_PREFIX: &str = "[loop-guidance]";
+
+/// Cues marking ASSISTANT self-referential process commentary — the model
+/// echoing harness loop guidance back ("I keep describing instead of
+/// acting"). Matched only on no-tool-call assistant messages in the
+/// summarizer INPUT path; the message itself is untouched on the wire.
+/// Deliberately narrow: analytical no-tool content ("I found the issue: …")
+/// is task state and must keep flowing into summaries.
+const META_NARRATION_CUES: &[&str] = &[
+    "keep describing",
+    "describing what i",
+    "never call tools",
+    "never actually call",
+    "did not call any tool",
+    "without calling a tool",
+    "stop describing and start acting",
+];
+
+/// True when a no-tool-call assistant message is self-referential process
+/// commentary rather than task state (see [`META_NARRATION_CUES`]).
+fn is_meta_narration(content: &str) -> bool {
+    let lc = content.to_lowercase();
+    META_NARRATION_CUES.iter().any(|cue| lc.contains(cue))
 }
 
 /// String form of [`is_compaction_message`] for callers holding plain text
@@ -662,7 +717,7 @@ pub(crate) async fn compress(
         if let Some(store) = req.compaction_store {
             let verbatim: String = middle
                 .iter()
-                .map(render_message)
+                .map(render_message_raw)
                 .collect::<Vec<_>>()
                 .join("\n");
             let id = store.store(redact_secrets(&verbatim));
@@ -1204,6 +1259,10 @@ fn summary_prompt_for(
          Keep the WHOLE summary under ~{words} words (~{tokens} tokens); if it \
          cannot all fit, drop low-salience detail — NEVER the Active Task. \
          Preserve specifics (file names, error messages, decisions). \
+         Do NOT include commentary about the assistant's own behavior or \
+         process (e.g. \"kept describing instead of acting\") — record only \
+         task state: what was done, what remains, and the concrete next \
+         action. \
          NEVER include API keys, tokens, passwords, or other credentials — \
          write [REDACTED] instead.",
     ));
@@ -1405,9 +1464,23 @@ async fn run_summary(summarizer: &SummarizeFn, req: String) -> Option<String> {
 /// pattern to match — the request-level `redact_secrets` pass would then
 /// let it through. (That request-level pass still runs as a second layer.)
 fn render_message(m: &Value) -> String {
+    render_message_with(m, true)
+}
+
+/// The compaction store's span renderer: NO hygiene demotion. The store's
+/// whole point (#661 group B) is lossless recovery of what the lossy summary
+/// dropped — including harness nudges and the model's process commentary,
+/// which are exactly what a post-incident forensic needs to reconstruct
+/// (the 2026-07-08 stall's nudge order was unrecoverable from disk).
+fn render_message_raw(m: &Value) -> String {
+    render_message_with(m, false)
+}
+
+fn render_message_with(m: &Value, hygiene: bool) -> String {
     let role = m["role"].as_str().unwrap_or("unknown");
     let mut line = format!("[{role}]");
-    if let Some(tcs) = m["tool_calls"].as_array() {
+    let tool_calls = m["tool_calls"].as_array();
+    if let Some(tcs) = tool_calls {
         for tc in tcs {
             let name = tc["function"]["name"].as_str().unwrap_or("tool");
             let args = tc["function"]["arguments"].to_string();
@@ -1419,6 +1492,21 @@ fn render_message(m: &Value) -> String {
         }
     }
     if let Some(content) = m["content"].as_str() {
+        // Summary hygiene: harness loop guidance and the model's echoes of it
+        // are process correction, not task state — a small summarizer readily
+        // copies them into the summary, which then primes the post-compaction
+        // rounds to narrate about narrating. Demote to a one-line note (never
+        // touching messages that carry tool_calls — those are task state).
+        let harness_meta = role == "user"
+            && (content.starts_with(LOOP_GUIDANCE_PREFIX)
+                || content.starts_with(CONTINUATION_PREFIX));
+        let narration_echo =
+            role == "assistant" && tool_calls.is_none() && is_meta_narration(content);
+        if hygiene && (harness_meta || narration_echo) {
+            line.push_str(" (loop process correction omitted — not task state)");
+            line.push('\n');
+            return line;
+        }
         if !content.is_empty() {
             line.push(' ');
             line.push_str(&excerpt(&redact_secrets(content), SUMMARY_INPUT_MSG_CAP));
@@ -2524,6 +2612,151 @@ mod tests {
         assert!(
             b2.tail_start <= follow_up,
             "a real user message still anchors the tail"
+        );
+    }
+
+    /// Summary hygiene: harness loop guidance and the model's echoes of it
+    /// are demoted to a one-line note in the summarizer INPUT — they are
+    /// process correction, not task state, and a 0.5B summarizer readily
+    /// echoes them into "## In Progress" (the 2026-07-08 ornith:35b stall's
+    /// summary contained "I keep describing … but never call tools").
+    #[test]
+    fn render_message_demotes_loop_guidance_and_narration_echo() {
+        // A harness rescue nudge (tagged at its push site).
+        let nudge = json!({
+            "role": "user",
+            "content": format!(
+                "{LOOP_GUIDANCE_PREFIX} You described what you were about to \
+                 do but did not call any tool, so nothing actually happened."
+            )
+        });
+        let r = render_message(&nudge);
+        assert!(r.contains("omitted"), "{r}");
+        assert!(!r.contains("did not call any tool"), "{r}");
+
+        // The post-compaction continuation directive is likewise harness meta.
+        let directive = json!({
+            "role": "user",
+            "content": format!("{CONTINUATION_PREFIX} You are mid-task…")
+        });
+        let r = render_message(&directive);
+        assert!(r.contains("omitted"), "{r}");
+        assert!(!r.contains("mid-task"), "{r}");
+
+        // The model echoing the correction back is the other half of the pair.
+        let echo = json!({
+            "role": "assistant",
+            "content": "The user is telling me I keep describing what I'm \
+                        about to do but never call tools. I need to stop \
+                        describing and start acting."
+        });
+        let r = render_message(&echo);
+        assert!(r.contains("omitted"), "{r}");
+        assert!(!r.contains("keep describing"), "{r}");
+
+        // Analytical no-tool assistant content is task state — flows through.
+        let analysis = json!({
+            "role": "assistant",
+            "content": "I found the issue: an extra closing brace at line 490."
+        });
+        let r = render_message(&analysis);
+        assert!(r.contains("extra closing brace"), "{r}");
+
+        // A tool-calling assistant message is never demoted, whatever it says.
+        let acting = json!({
+            "role": "assistant",
+            "content": "I did not call any tool yet — doing it now.",
+            "tool_calls": [{"function": {"name": "read_file", "arguments": {"path": "x"}}}]
+        });
+        let r = render_message(&acting);
+        assert!(r.contains("read_file"), "{r}");
+        assert!(r.contains("doing it now"), "{r}");
+
+        // A plain operator interjection is untouched.
+        let operator = json!({
+            "role": "user",
+            "content": "IMPORTANT: also update the docs"
+        });
+        let r = render_message(&operator);
+        assert!(r.contains("update the docs"), "{r}");
+    }
+
+    /// The summarizer prompt carries the no-process-commentary rule (the
+    /// prompt-level half of the hygiene; the input filter above is the
+    /// deterministic half).
+    #[test]
+    fn summary_prompt_excludes_process_commentary() {
+        let p = summary_prompt_for("task", "body", None, None, 1_200, ConvShape::Coding);
+        assert!(
+            p.contains("Do NOT include commentary about the assistant's own behavior"),
+            "{p}"
+        );
+        assert!(p.contains("record only task state"), "{p}");
+    }
+
+    /// The loop's post-compaction continuation directive is user-role but
+    /// pipeline-owned: like the summary marker (F1a) it must never anchor
+    /// the tail, or from the second compression on the boundary pins to the
+    /// harness's own act-now message instead of the operator's real ask.
+    #[test]
+    fn boundary_anchor_skips_continuation_directive() {
+        let mut msgs = vec![sys("you are newt"), user("the task")];
+        msgs.push(user(&format!(
+            "{CONTINUATION_PREFIX} You are mid-task: continue with a tool call."
+        )));
+        let directive = msgs.len() - 1;
+        for i in 0..6 {
+            msgs.push(assistant_call(
+                "read_file",
+                json!({"path": format!("f{i}")}),
+            ));
+            msgs.push(tool_result(&"q".repeat(4_000)));
+        }
+        assert!(is_compaction_message(&msgs[directive]));
+        assert!(is_continuation_message(&msgs[directive]));
+        let b = compute_boundary(&msgs, 2_000, None, EST);
+        assert!(
+            b.tail_start > directive,
+            "the tail must not pin to the continuation directive at index \
+             {directive} (tail_start {})",
+            b.tail_start
+        );
+    }
+
+    /// A `[loop-guidance]` rescue nudge is likewise harness-owned: pinning
+    /// the tail to the harness's own correction would demote the OPERATOR's
+    /// most recent real ask into the summarizable middle.
+    #[test]
+    fn boundary_anchor_skips_loop_guidance_nudges() {
+        let mut msgs = vec![sys("you are newt"), user("the task")];
+        msgs.push(user("IMPORTANT FOLLOW-UP: also update the docs"));
+        let operator_ask = msgs.len() - 1;
+        for i in 0..3 {
+            msgs.push(assistant_call(
+                "read_file",
+                json!({"path": format!("f{i}")}),
+            ));
+            msgs.push(tool_result(&"q".repeat(4_000)));
+        }
+        msgs.push(user(&format!(
+            "{LOOP_GUIDANCE_PREFIX} You described what you were about to do \
+             but did not call any tool…"
+        )));
+        let nudge = msgs.len() - 1;
+        for i in 0..4 {
+            msgs.push(assistant_call(
+                "read_file",
+                json!({"path": format!("g{i}")}),
+            ));
+            msgs.push(tool_result(&"q".repeat(4_000)));
+        }
+        assert!(is_compaction_message(&msgs[nudge]));
+        let b = compute_boundary(&msgs, 2_000, None, EST);
+        assert!(
+            b.tail_start <= operator_ask,
+            "the anchor must skip the harness nudge at {nudge} and protect \
+             the operator's ask at {operator_ask} (tail_start {})",
+            b.tail_start
         );
     }
 

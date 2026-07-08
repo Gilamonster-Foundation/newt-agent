@@ -6638,6 +6638,9 @@ fn run_chat(
                     let eff_workflow_grace_rounds = model_tune
                         .and_then(|t| t.workflow_grace_rounds)
                         .unwrap_or_else(|| workflow_grace_rounds(&cfg));
+                    let eff_narration_nudge_cap = model_tune
+                        .and_then(|t| t.narration_nudge_cap)
+                        .unwrap_or_else(|| narration_nudge_cap(&cfg));
                     let eff_mid_loop_trim = model_tune
                         .and_then(|t| t.mid_loop_trim_threshold)
                         .unwrap_or_else(|| mid_loop_trim_threshold(&cfg))
@@ -6951,6 +6954,7 @@ fn run_chat(
                     // tool/capability reach; the save site persists them into the
                     // turn's `phantom_reaches` column.
                     let mut turn_phantom_reaches: Vec<newt_core::PhantomReach> = Vec::new();
+                    let mut turn_end_reason: Option<newt_core::TurnEndReason> = None;
                     // #307: the EFFECTIVE caveats for this turn — the session
                     // base intersected with the active mode's preset clamp (a
                     // FLOOR). This single `meet` is what the gate base, the
@@ -7109,6 +7113,7 @@ fn run_chat(
                                         caveats: &turn_caveats,
                                         persona_tools,
                                         max_tool_rounds: eff_max_tool_rounds,
+                                        narration_nudge_cap: eff_narration_nudge_cap,
                                         workflow_grace_rounds: eff_workflow_grace_rounds,
                                         tool_output_lines: tool_output_lines(&cfg),
                                         debug: debug_mode(&cfg),
@@ -7143,6 +7148,7 @@ fn run_chat(
                                         compress_state: Some(&mut compress_state),
                                         tool_events: Some(&mut turn_tool_events),
                                         phantom_reaches: Some(&mut turn_phantom_reaches),
+                                        end_reason: Some(&mut turn_end_reason),
                                         // #263: present only when prompting is on —
                                         // the loop blocks on the prompt like a long
                                         // tool call; None keeps denials verbatim.
@@ -7310,6 +7316,7 @@ fn run_chat(
                                     model_id: inf_model.clone(),
                                     endpoint: inf_url.clone(),
                                     hallucinations,
+                                    end_reason: turn_end_reason,
                                 };
                                 tokio::task::block_in_place(|| {
                                     rt.block_on(memory.sync_all(&task, &reply, &metrics));
@@ -9224,6 +9231,13 @@ fn workflow_grace_rounds(cfg: &newt_core::Config) -> usize {
         .as_ref()
         .map(|t| t.workflow_grace_rounds)
         .unwrap_or(5)
+}
+
+/// Narrate-then-stop rescue budget per turn (`[tui].narration_nudge_cap`).
+/// Defaults to 1 — the historical one-shot rescue; weak local models that
+/// chronically narrate instead of acting benefit from 2-3 (lever L3).
+fn narration_nudge_cap(cfg: &newt_core::Config) -> usize {
+    cfg.tui.as_ref().map(|t| t.narration_nudge_cap).unwrap_or(1)
 }
 
 const EFFECTIVELY_UNLIMITED_TOOL_ROUNDS: usize = 10_000;
@@ -15957,6 +15971,7 @@ mod tool_round_cap_tests {
                     caveats: &caveats,
                     persona_tools: None,
                     max_tool_rounds: 5,
+                    narration_nudge_cap: 1,
                     workflow_grace_rounds: 0,
                     tool_output_lines: 20,
                     debug: false,
@@ -15981,6 +15996,7 @@ mod tool_round_cap_tests {
                     compress_state: None,
                     tool_events: None,
                     phantom_reaches: None,
+                    end_reason: None,
                     permission_gate: None,
                     on_round_usage: None,
                     estimate_ratio: None,
@@ -17837,6 +17853,7 @@ mod env_resolution_tests {
                 mid_loop_trim_tokens: None,
                 max_tool_rounds: None,
                 workflow_grace_rounds: None,
+                narration_nudge_cap: None,
             }],
             ..Default::default()
         };
