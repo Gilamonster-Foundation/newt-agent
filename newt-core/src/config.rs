@@ -5718,7 +5718,9 @@ net = [\"already.example.com\"]
         )
         .unwrap();
         assert_eq!(
-            cfg.find_model_tuning("other:7b").unwrap().narration_nudge_cap,
+            cfg.find_model_tuning("other:7b")
+                .unwrap()
+                .narration_nudge_cap,
             None
         );
     }

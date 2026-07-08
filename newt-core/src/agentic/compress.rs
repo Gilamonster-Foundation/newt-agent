@@ -98,9 +98,9 @@ pub const CONTINUATION_PREFIX: &str = "[POST-COMPACTION — CONTINUE]";
 /// aggressive fit pass destroyed every fresh tool result before the model
 /// saw it.
 pub(crate) fn is_compaction_message(m: &Value) -> bool {
-    m["content"].as_str().is_some_and(|c| {
-        c.starts_with(SUMMARY_PREFIX) || c.starts_with(CONTINUATION_PREFIX)
-    })
+    m["content"]
+        .as_str()
+        .is_some_and(|c| c.starts_with(SUMMARY_PREFIX) || c.starts_with(CONTINUATION_PREFIX))
 }
 
 /// True when `m` is specifically the loop's post-compaction continuation
@@ -110,6 +110,38 @@ pub(crate) fn is_continuation_message(m: &Value) -> bool {
     m["content"]
         .as_str()
         .is_some_and(|c| c.starts_with(CONTINUATION_PREFIX))
+}
+
+/// Prefix on every harness-injected rescue nudge (narration, pending-plan,
+/// stale-file, workflow rediscovery). Models see it — it reads as what it
+/// is, loop guidance — and the summarizer input filter uses it to keep
+/// harness process-corrections out of summaries: they describe the loop's
+/// process, not task state, and a small summarizer readily echoes them into
+/// "## In Progress", priming the post-compaction rounds to role-play the
+/// struggle ("I keep describing but never call tools") instead of acting.
+pub const LOOP_GUIDANCE_PREFIX: &str = "[loop-guidance]";
+
+/// Cues marking ASSISTANT self-referential process commentary — the model
+/// echoing harness loop guidance back ("I keep describing instead of
+/// acting"). Matched only on no-tool-call assistant messages in the
+/// summarizer INPUT path; the message itself is untouched on the wire.
+/// Deliberately narrow: analytical no-tool content ("I found the issue: …")
+/// is task state and must keep flowing into summaries.
+const META_NARRATION_CUES: &[&str] = &[
+    "keep describing",
+    "describing what i",
+    "never call tools",
+    "never actually call",
+    "did not call any tool",
+    "without calling a tool",
+    "stop describing and start acting",
+];
+
+/// True when a no-tool-call assistant message is self-referential process
+/// commentary rather than task state (see [`META_NARRATION_CUES`]).
+fn is_meta_narration(content: &str) -> bool {
+    let lc = content.to_lowercase();
+    META_NARRATION_CUES.iter().any(|cue| lc.contains(cue))
 }
 
 /// String form of [`is_compaction_message`] for callers holding plain text
@@ -1223,6 +1255,10 @@ fn summary_prompt_for(
          Keep the WHOLE summary under ~{words} words (~{tokens} tokens); if it \
          cannot all fit, drop low-salience detail — NEVER the Active Task. \
          Preserve specifics (file names, error messages, decisions). \
+         Do NOT include commentary about the assistant's own behavior or \
+         process (e.g. \"kept describing instead of acting\") — record only \
+         task state: what was done, what remains, and the concrete next \
+         action. \
          NEVER include API keys, tokens, passwords, or other credentials — \
          write [REDACTED] instead.",
     ));
@@ -1426,7 +1462,8 @@ async fn run_summary(summarizer: &SummarizeFn, req: String) -> Option<String> {
 fn render_message(m: &Value) -> String {
     let role = m["role"].as_str().unwrap_or("unknown");
     let mut line = format!("[{role}]");
-    if let Some(tcs) = m["tool_calls"].as_array() {
+    let tool_calls = m["tool_calls"].as_array();
+    if let Some(tcs) = tool_calls {
         for tc in tcs {
             let name = tc["function"]["name"].as_str().unwrap_or("tool");
             let args = tc["function"]["arguments"].to_string();
@@ -1438,6 +1475,21 @@ fn render_message(m: &Value) -> String {
         }
     }
     if let Some(content) = m["content"].as_str() {
+        // Summary hygiene: harness loop guidance and the model's echoes of it
+        // are process correction, not task state — a small summarizer readily
+        // copies them into the summary, which then primes the post-compaction
+        // rounds to narrate about narrating. Demote to a one-line note (never
+        // touching messages that carry tool_calls — those are task state).
+        let harness_meta = role == "user"
+            && (content.starts_with(LOOP_GUIDANCE_PREFIX)
+                || content.starts_with(CONTINUATION_PREFIX));
+        let narration_echo =
+            role == "assistant" && tool_calls.is_none() && is_meta_narration(content);
+        if harness_meta || narration_echo {
+            line.push_str(" (loop process correction omitted — not task state)");
+            line.push('\n');
+            return line;
+        }
         if !content.is_empty() {
             line.push(' ');
             line.push_str(&excerpt(&redact_secrets(content), SUMMARY_INPUT_MSG_CAP));
@@ -2544,6 +2596,85 @@ mod tests {
             b2.tail_start <= follow_up,
             "a real user message still anchors the tail"
         );
+    }
+
+    /// Summary hygiene: harness loop guidance and the model's echoes of it
+    /// are demoted to a one-line note in the summarizer INPUT — they are
+    /// process correction, not task state, and a 0.5B summarizer readily
+    /// echoes them into "## In Progress" (the 2026-07-08 ornith:35b stall's
+    /// summary contained "I keep describing … but never call tools").
+    #[test]
+    fn render_message_demotes_loop_guidance_and_narration_echo() {
+        // A harness rescue nudge (tagged at its push site).
+        let nudge = json!({
+            "role": "user",
+            "content": format!(
+                "{LOOP_GUIDANCE_PREFIX} You described what you were about to \
+                 do but did not call any tool, so nothing actually happened."
+            )
+        });
+        let r = render_message(&nudge);
+        assert!(r.contains("omitted"), "{r}");
+        assert!(!r.contains("did not call any tool"), "{r}");
+
+        // The post-compaction continuation directive is likewise harness meta.
+        let directive = json!({
+            "role": "user",
+            "content": format!("{CONTINUATION_PREFIX} You are mid-task…")
+        });
+        let r = render_message(&directive);
+        assert!(r.contains("omitted"), "{r}");
+        assert!(!r.contains("mid-task"), "{r}");
+
+        // The model echoing the correction back is the other half of the pair.
+        let echo = json!({
+            "role": "assistant",
+            "content": "The user is telling me I keep describing what I'm \
+                        about to do but never call tools. I need to stop \
+                        describing and start acting."
+        });
+        let r = render_message(&echo);
+        assert!(r.contains("omitted"), "{r}");
+        assert!(!r.contains("keep describing"), "{r}");
+
+        // Analytical no-tool assistant content is task state — flows through.
+        let analysis = json!({
+            "role": "assistant",
+            "content": "I found the issue: an extra closing brace at line 490."
+        });
+        let r = render_message(&analysis);
+        assert!(r.contains("extra closing brace"), "{r}");
+
+        // A tool-calling assistant message is never demoted, whatever it says.
+        let acting = json!({
+            "role": "assistant",
+            "content": "I did not call any tool yet — doing it now.",
+            "tool_calls": [{"function": {"name": "read_file", "arguments": {"path": "x"}}}]
+        });
+        let r = render_message(&acting);
+        assert!(r.contains("read_file"), "{r}");
+        assert!(r.contains("doing it now"), "{r}");
+
+        // A plain operator interjection is untouched.
+        let operator = json!({
+            "role": "user",
+            "content": "IMPORTANT: also update the docs"
+        });
+        let r = render_message(&operator);
+        assert!(r.contains("update the docs"), "{r}");
+    }
+
+    /// The summarizer prompt carries the no-process-commentary rule (the
+    /// prompt-level half of the hygiene; the input filter above is the
+    /// deterministic half).
+    #[test]
+    fn summary_prompt_excludes_process_commentary() {
+        let p = summary_prompt_for("task", "body", None, None, 1_200, ConvShape::Coding);
+        assert!(
+            p.contains("Do NOT include commentary about the assistant's own behavior"),
+            "{p}"
+        );
+        assert!(p.contains("record only task state"), "{p}");
     }
 
     /// The loop's post-compaction continuation directive is user-role but

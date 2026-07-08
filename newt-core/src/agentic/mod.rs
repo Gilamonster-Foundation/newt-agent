@@ -1501,7 +1501,12 @@ pub async fn chat_complete(
                     }
                     messages = outcome.messages;
                     prompt_tracker.invalidate();
-                    apply_post_compaction_continuation(&mut messages, &mut narration_nudges, outcome.action, step_ledger);
+                    apply_post_compaction_continuation(
+                        &mut messages,
+                        &mut narration_nudges,
+                        outcome.action,
+                        step_ledger,
+                    );
                 }
             }
         }
@@ -1672,7 +1677,12 @@ pub async fn chat_complete(
                         if outcome.fired {
                             messages = outcome.messages;
                             prompt_tracker.invalidate();
-                            apply_post_compaction_continuation(&mut messages, &mut narration_nudges, outcome.action, step_ledger);
+                            apply_post_compaction_continuation(
+                                &mut messages,
+                                &mut narration_nudges,
+                                outcome.action,
+                                step_ledger,
+                            );
                         }
                         cw_retries += 1;
                         continue 'round_loop;
@@ -1829,7 +1839,10 @@ pub async fn chat_complete(
                                 }));
                                 messages.push(serde_json::json!({
                                     "role": "user",
-                                    "content": nudge
+                                    "content": format!(
+                                        "{} {}",
+                                        compress::LOOP_GUIDANCE_PREFIX, nudge
+                                    )
                                 }));
                                 accumulated_usage = merge_round_usage(accumulated_usage, $usage);
                                 continue 'round_loop;
@@ -1855,7 +1868,10 @@ pub async fn chat_complete(
                                 }));
                                 messages.push(serde_json::json!({
                                     "role": "user",
-                                    "content": nudge
+                                    "content": format!(
+                                        "{} {}",
+                                        compress::LOOP_GUIDANCE_PREFIX, nudge
+                                    )
                                 }));
                                 pending_plan_nudges += 1;
                                 accumulated_usage = merge_round_usage(accumulated_usage, $usage);
@@ -1878,7 +1894,11 @@ pub async fn chat_complete(
                             }));
                             messages.push(serde_json::json!({
                                 "role": "user",
-                                "content": stale_file_ground_truth_nudge(),
+                                "content": format!(
+                        "{} {}",
+                        compress::LOOP_GUIDANCE_PREFIX,
+                        stale_file_ground_truth_nudge()
+                    ),
                             }));
                             stale_file_nudges += 1;
                             accumulated_usage = merge_round_usage(accumulated_usage, $usage);
@@ -1920,7 +1940,7 @@ pub async fn chat_complete(
                             };
                             messages.push(serde_json::json!({
                                 "role": "user",
-                                "content": direction,
+                                "content": format!("{} {}", compress::LOOP_GUIDANCE_PREFIX, direction),
                             }));
                             narration_nudges += 1;
                             accumulated_usage = merge_round_usage(accumulated_usage, $usage);
@@ -2173,7 +2193,12 @@ pub async fn chat_complete(
                         if outcome.fired {
                             messages = outcome.messages;
                             prompt_tracker.invalidate();
-                            apply_post_compaction_continuation(&mut messages, &mut narration_nudges, outcome.action, step_ledger);
+                            apply_post_compaction_continuation(
+                                &mut messages,
+                                &mut narration_nudges,
+                                outcome.action,
+                                step_ledger,
+                            );
                         } else {
                             // N1: the retry must differ from the request that
                             // just returned empty — when compress was a no-op
@@ -4147,7 +4172,12 @@ pub async fn openai_chat_complete(
                     }
                     messages = outcome.messages;
                     prompt_tracker.invalidate();
-                    apply_post_compaction_continuation(&mut messages, &mut narration_nudges, outcome.action, step_ledger);
+                    apply_post_compaction_continuation(
+                        &mut messages,
+                        &mut narration_nudges,
+                        outcome.action,
+                        step_ledger,
+                    );
                 }
             }
         }
@@ -4272,7 +4302,12 @@ pub async fn openai_chat_complete(
                         if outcome.fired {
                             messages = outcome.messages;
                             prompt_tracker.invalidate();
-                            apply_post_compaction_continuation(&mut messages, &mut narration_nudges, outcome.action, step_ledger);
+                            apply_post_compaction_continuation(
+                                &mut messages,
+                                &mut narration_nudges,
+                                outcome.action,
+                                step_ledger,
+                            );
                         }
                         cw_retries += 1;
                         continue 'round_loop;
@@ -4423,7 +4458,10 @@ pub async fn openai_chat_complete(
                         );
                     }
                     messages.push(serde_json::json!({ "role": "assistant", "content": content }));
-                    messages.push(serde_json::json!({ "role": "user", "content": nudge }));
+                    messages.push(serde_json::json!({
+                        "role": "user",
+                        "content": format!("{} {}", compress::LOOP_GUIDANCE_PREFIX, nudge)
+                    }));
                     continue 'round_loop;
                 }
             }
@@ -4446,7 +4484,10 @@ pub async fn openai_chat_complete(
                         );
                     }
                     messages.push(serde_json::json!({ "role": "assistant", "content": content }));
-                    messages.push(serde_json::json!({ "role": "user", "content": nudge }));
+                    messages.push(serde_json::json!({
+                        "role": "user",
+                        "content": format!("{} {}", compress::LOOP_GUIDANCE_PREFIX, nudge)
+                    }));
                     pending_plan_nudges += 1;
                     continue 'round_loop;
                 }
@@ -4465,7 +4506,11 @@ pub async fn openai_chat_complete(
                 messages.push(serde_json::json!({ "role": "assistant", "content": content }));
                 messages.push(serde_json::json!({
                     "role": "user",
-                    "content": stale_file_ground_truth_nudge(),
+                    "content": format!(
+                        "{} {}",
+                        compress::LOOP_GUIDANCE_PREFIX,
+                        stale_file_ground_truth_nudge()
+                    ),
                 }));
                 stale_file_nudges += 1;
                 continue 'round_loop;
@@ -4504,7 +4549,7 @@ pub async fn openai_chat_complete(
                 };
                 messages.push(serde_json::json!({
                     "role": "user",
-                    "content": direction,
+                    "content": format!("{} {}", compress::LOOP_GUIDANCE_PREFIX, direction),
                 }));
                 narration_nudges += 1;
                 continue 'round_loop;
@@ -8984,7 +9029,10 @@ mod http_loop_tests {
             2,
         )
         .await;
-        assert_eq!(rounds, 3, "two nudges (cap=2) before the recovery, got {rounds}");
+        assert_eq!(
+            rounds, 3,
+            "two nudges (cap=2) before the recovery, got {rounds}"
+        );
         assert!(
             reply.contains("complete"),
             "returns the post-nudge answer: {reply}"
@@ -9029,8 +9077,7 @@ mod http_loop_tests {
                 },
             ],
         });
-        let text =
-            escalated_narration_action_nudge(2, 3, Some(&ledger as &dyn StepLedger));
+        let text = escalated_narration_action_nudge(2, 3, Some(&ledger as &dyn StepLedger));
         assert!(text.contains("Reminder 2/3"), "{text}");
         assert!(text.contains("fix conflict markers"), "{text}");
         assert!(text.contains("tool call"), "{text}");
@@ -9039,6 +9086,59 @@ mod http_loop_tests {
         let bare = escalated_narration_action_nudge(2, 2, None);
         assert!(bare.contains("Reminder 2/2"), "{bare}");
         assert!(!bare.contains("Active step"), "{bare}");
+    }
+
+    #[tokio::test]
+    async fn narration_nudge_reaches_the_wire_tagged_as_loop_guidance() {
+        // The rescue nudge must arrive tagged so the compaction pipeline can
+        // keep it (and the model's echo of it) out of later summaries.
+        let server = MockServer::start().await;
+        let saw_tag = Arc::new(AtomicBool::new(false));
+
+        struct TagProbe {
+            saw_tag: Arc<AtomicBool>,
+        }
+        impl Respond for TagProbe {
+            fn respond(&self, req: &Request) -> ResponseTemplate {
+                let body = body_json(req);
+                let tagged = body["messages"].as_array().is_some_and(|ms| {
+                    ms.iter().any(|m| {
+                        m["role"] == "user"
+                            && m["content"]
+                                .as_str()
+                                .is_some_and(|c| c.starts_with(compress::LOOP_GUIDANCE_PREFIX))
+                    })
+                });
+                if tagged {
+                    self.saw_tag.store(true, Ordering::SeqCst);
+                    return ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "choices": [{ "message": { "content": "All done — edit complete." } }]
+                    }));
+                }
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "choices": [{ "message": { "content": "Let me edit the file now." } }]
+                }))
+            }
+        }
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(TagProbe {
+                saw_tag: saw_tag.clone(),
+            })
+            .mount(&server)
+            .await;
+
+        let messages = msgs();
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut c = ctx(&uri, &messages, &caveats);
+        c.kind = BackendKind::Openai;
+        let (reply, _s, _u, _h) = chat_complete(c, &mut NoMcp).await.expect("dispatch");
+        assert!(
+            saw_tag.load(Ordering::SeqCst),
+            "the narration nudge must carry LOOP_GUIDANCE_PREFIX on the wire"
+        );
+        assert!(reply.contains("complete"), "{reply}");
     }
 
     #[test]
@@ -9086,7 +9186,10 @@ mod http_loop_tests {
         let last = messages.last().unwrap();
         assert_eq!(last["role"], "user");
         let content = last["content"].as_str().unwrap();
-        assert!(content.starts_with(compress::CONTINUATION_PREFIX), "{content}");
+        assert!(
+            content.starts_with(compress::CONTINUATION_PREFIX),
+            "{content}"
+        );
         assert!(content.contains("tool call"), "{content}");
         assert!(!content.contains("stale directive"), "{content}");
     }
