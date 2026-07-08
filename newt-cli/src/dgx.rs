@@ -2623,11 +2623,13 @@ mod tests {
     /// Scoped guard that removes an env var for the duration of a test and
     /// restores its prior value on drop. Keeps tests hermetic against ambient
     /// process env (e.g. a sandbox exporting `NEWT_DGX_MODEL`).
+    #[allow(dead_code)]
     struct EnvVarGuard {
         key: String,
         prev: Option<String>,
     }
 
+    #[allow(dead_code)]
     impl EnvVarGuard {
         fn unset(key: &str) -> Self {
             let prev = std::env::var(key).ok();
