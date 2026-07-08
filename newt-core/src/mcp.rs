@@ -65,6 +65,20 @@ pub struct McpServerEntry {
     /// sse/http: extra request headers.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub headers: BTreeMap<String, String>,
+
+    /// Per-request timeout override, in seconds. `None` ⇒ the client's default
+    /// (`newt_mcp_client::DEFAULT_REQUEST_TIMEOUT`). Raise it for a server whose
+    /// tools legitimately run long — e.g. a routine engine that fans out across
+    /// many repos and live APIs in a single `tools/call` — so the client does
+    /// not give up on a call that is still making progress. The client clamps
+    /// the resolved value to a sane ceiling. Accepts `requestTimeoutSecs` in
+    /// Claude-format JSON.
+    #[serde(
+        default,
+        alias = "requestTimeoutSecs",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub request_timeout_secs: Option<u64>,
 }
 
 impl McpServerEntry {
@@ -183,6 +197,7 @@ mod tests {
             env: BTreeMap::new(),
             url: None,
             headers: BTreeMap::new(),
+            request_timeout_secs: None,
         };
         let sse_no_url = McpServerEntry {
             transport: TransportKind::Sse,
@@ -208,6 +223,7 @@ mod tests {
                 env: BTreeMap::new(),
                 url: None,
                 headers: BTreeMap::new(),
+                request_timeout_secs: None,
             },
             McpServerEntry {
                 name: "dup".into(),
@@ -217,6 +233,7 @@ mod tests {
                 env: BTreeMap::new(),
                 url: None,
                 headers: BTreeMap::new(),
+                request_timeout_secs: None,
             },
         ];
         let got = discover(&newt, None, Path::new("/nonexistent"));
