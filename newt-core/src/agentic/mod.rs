@@ -642,6 +642,13 @@ pub struct ChatCtx<'a> {
     /// the active workflow still has incomplete work and the recent rounds show
     /// repair evidence or concrete progress. `0` makes the normal cap hard.
     pub workflow_grace_rounds: usize,
+    /// Max narrate-then-stop rescue nudges per turn (from
+    /// `[tui].narration_nudge_cap`, default 1; `[[model_tuning]]` can override
+    /// per model). Once spent, the next no-tool narration is accepted as the
+    /// turn's final answer. The second and later nudges escalate: they name
+    /// the active plan step and demand a bare tool call (lever L3,
+    /// docs/design/next-loop-levers.md).
+    pub narration_nudge_cap: usize,
     /// Max lines of tool output shown inline (from `[tui].tool_output_lines`,
     /// default 20). Resolved once per turn and threaded to `execute_tool` so
     /// the tool loop never re-reads config from disk.
@@ -1084,6 +1091,7 @@ pub async fn chat_complete(
         persona_tools,
         max_tool_rounds,
         workflow_grace_rounds,
+        narration_nudge_cap,
         tool_output_lines,
         debug,
         trace,
@@ -1250,7 +1258,7 @@ pub async fn chat_complete(
     // in prose ("Let me edit …") and emits no tool call. The loop would treat
     // that zero-tool round as a final answer and end the turn, forcing a human
     // "continue". `narration_nudges` bounds the auto-continue that instead
-    // nudges the model to actually call the tool (≤ NARRATION_NUDGE_CAP per
+    // nudges the model to actually call the tool (≤ `narration_nudge_cap` per
     // turn); the trigger is the configurable NudgeClassifier, so a genuine
     // conclusion (with or without prior tool calls this turn) is never nudged.
     let mut narration_nudges: usize = 0;
@@ -1874,7 +1882,7 @@ pub async fn chat_complete(
                             accumulated_usage = merge_round_usage(accumulated_usage, $usage);
                             continue 'round_loop;
                         }
-                        if narration_nudges < NARRATION_NUDGE_CAP
+                        if narration_nudges < narration_nudge_cap
                             && round + 1 < current_tool_round_limit
                             && nudge_classification.is_pending_action()
                         {
@@ -1891,10 +1899,23 @@ pub async fn chat_complete(
                                 "role": "assistant",
                                 "content": content
                             }));
-                            let direction = nudge_classifier
-                                .direction_for(nudge_classification.class)
-                                .map(str::to_string)
-                                .unwrap_or_else(narration_action_nudge);
+                            // First nudge: the (tunable) classifier direction.
+                            // Later nudges (cap > 1): generic text already
+                            // failed to convert intent into action, so
+                            // escalate — name the active step, demand a bare
+                            // tool call.
+                            let direction = if narration_nudges == 0 {
+                                nudge_classifier
+                                    .direction_for(nudge_classification.class)
+                                    .map(str::to_string)
+                                    .unwrap_or_else(narration_action_nudge)
+                            } else {
+                                escalated_narration_action_nudge(
+                                    narration_nudges + 1,
+                                    narration_nudge_cap,
+                                    step_ledger,
+                                )
+                            };
                             messages.push(serde_json::json!({
                                 "role": "user",
                                 "content": direction,
@@ -2228,7 +2249,7 @@ pub async fn chat_complete(
             // call. If it has already acted this turn (mid-task) or the prose
             // reads as intent-to-act, nudge it to actually call the tool and run
             // another round instead of ending the turn — what a human "continue"
-            // does. Bounded by NARRATION_NUDGE_CAP and the round budget so a
+            // does. Bounded by the configured narration_nudge_cap and the round budget so a
             // chronic narrator can't loop; after the cap the prose is accepted
             // as the final answer (the return below). A genuine from-the-start
             // final answer (no prior call, no intent cue) is never nudged.
@@ -3082,11 +3103,10 @@ fn is_read_only_shell_probe(command: &str) -> bool {
     }
 }
 
-/// Max "you narrated intent but called no tool" auto-continue nudges per turn.
-/// Bounded so a chronically-narrating weak model can't loop or drain the round
-/// budget; after the cap its narration is accepted as the final answer.
-/// (Candidate for a `[tui] narration_nudge_cap` knob in a follow-up.)
-const NARRATION_NUDGE_CAP: usize = 1;
+// The narrate-then-stop rescue budget is `ChatCtx.narration_nudge_cap`
+// (`[tui] narration_nudge_cap`, default 1, per-model `[[model_tuning]]`
+// override) — promoted from a hardcoded const here (lever L3). After the cap
+// its narration is accepted as the final answer.
 /// Max "you ended while a plan still has open steps" nudges per turn. This is
 /// state-driven from the plan ledger, not prose-matched.
 const PENDING_PLAN_NUDGE_CAP: usize = 1;
@@ -3179,6 +3199,29 @@ fn narration_action_nudge() -> String {
      describe it. If you are genuinely finished, say so explicitly in one \
      sentence."
         .to_string()
+}
+
+/// The stronger corrective for the second and later narration nudges
+/// (`[tui] narration_nudge_cap` > 1). The generic first nudge already failed
+/// to convert intent into action, so this one is state-driven like
+/// [`read_only_action_nudge`]: it names the active plan step and demands the
+/// next output be a bare tool call.
+fn escalated_narration_action_nudge(
+    attempt: usize,
+    cap: usize,
+    step_ledger: Option<&dyn scheduled::StepLedger>,
+) -> String {
+    let step_clause = active_step_description(step_ledger)
+        .map(|step| format!(" Active step: '{step}'."))
+        .unwrap_or_default();
+    format!(
+        "Reminder {attempt}/{cap}: you again described an action without calling \
+         a tool, so nothing has happened.{step_clause} Your NEXT output must be \
+         exactly one tool call that starts that action (for example read_file, \
+         edit_file, or run_command with real arguments) — no prose before it. \
+         If you are blocked, state the one concrete blocker in a single \
+         sentence instead of announcing more intentions."
+    )
 }
 
 fn stale_file_ground_truth_nudge() -> String {
@@ -3763,6 +3806,7 @@ pub async fn openai_chat_complete(
         persona_tools,
         max_tool_rounds,
         workflow_grace_rounds,
+        narration_nudge_cap,
         tool_output_lines,
         debug,
         trace,
@@ -4295,7 +4339,7 @@ pub async fn openai_chat_complete(
             }
             // Narrate-then-stop rescue (mirror of the Ollama loop): non-empty
             // prose with no tool call. Nudge once and continue instead of ending
-            // the turn — bounded by NARRATION_NUDGE_CAP + the round budget.
+            // the turn — bounded by the configured narration_nudge_cap + the round budget.
             let nudge_classification =
                 (!content.is_empty()).then(|| nudge_classifier.classify(&content));
             let workflow_classifier_text = workflow_classifier_text(&messages, &content);
@@ -4370,7 +4414,7 @@ pub async fn openai_chat_complete(
                 continue 'round_loop;
             }
             if !content.is_empty()
-                && narration_nudges < NARRATION_NUDGE_CAP
+                && narration_nudges < narration_nudge_cap
                 && round + 1 < current_tool_round_limit
                 && nudge_classification
                     .as_ref()
@@ -4383,11 +4427,24 @@ pub async fn openai_chat_complete(
                     );
                 }
                 messages.push(serde_json::json!({ "role": "assistant", "content": content }));
-                let direction = nudge_classification
-                    .as_ref()
-                    .and_then(|classification| nudge_classifier.direction_for(classification.class))
-                    .map(str::to_string)
-                    .unwrap_or_else(narration_action_nudge);
+                // First nudge: the (tunable) classifier direction. Later
+                // nudges (cap > 1) escalate — name the active step, demand a
+                // bare tool call (mirrors the Ollama loop).
+                let direction = if narration_nudges == 0 {
+                    nudge_classification
+                        .as_ref()
+                        .and_then(|classification| {
+                            nudge_classifier.direction_for(classification.class)
+                        })
+                        .map(str::to_string)
+                        .unwrap_or_else(narration_action_nudge)
+                } else {
+                    escalated_narration_action_nudge(
+                        narration_nudges + 1,
+                        narration_nudge_cap,
+                        step_ledger,
+                    )
+                };
                 messages.push(serde_json::json!({
                     "role": "user",
                     "content": direction,
@@ -4793,6 +4850,7 @@ pub async fn openai_responses_complete(
         persona_tools,
         max_tool_rounds,
         workflow_grace_rounds: _,
+        narration_nudge_cap: _,
         tool_output_lines,
         debug,
         trace,
@@ -6333,6 +6391,7 @@ mod tool_round_cap_tests {
                 caveats: &caveats,
                 persona_tools: None,
                 max_tool_rounds: cap,
+                narration_nudge_cap: 1,
                 workflow_grace_rounds: 0,
                 tool_output_lines: 20,
                 debug: false,
@@ -6497,6 +6556,7 @@ mod tool_round_cap_tests {
                 caveats: &caveats,
                 persona_tools: None,
                 max_tool_rounds: cap,
+                narration_nudge_cap: 1,
                 workflow_grace_rounds: 0,
                 tool_output_lines: 20,
                 debug: false,
@@ -6580,6 +6640,7 @@ mod tool_round_cap_tests {
                 caveats: &caveats,
                 persona_tools: None,
                 max_tool_rounds: 5,
+                narration_nudge_cap: 1,
                 workflow_grace_rounds: 0,
                 tool_output_lines: 20,
                 debug: false,
@@ -6724,6 +6785,7 @@ mod tool_round_cap_tests {
                 caveats: &caveats,
                 persona_tools: None,
                 max_tool_rounds: 5,
+                narration_nudge_cap: 1,
                 workflow_grace_rounds: 0,
                 tool_output_lines: 20,
                 debug: false,
@@ -6805,6 +6867,7 @@ mod tool_round_cap_tests {
                 caveats: &caveats,
                 persona_tools: None,
                 max_tool_rounds: cap,
+                narration_nudge_cap: 1,
                 workflow_grace_rounds: 0,
                 tool_output_lines: 20,
                 debug: false,
@@ -6909,6 +6972,7 @@ mod tool_round_cap_tests {
                 caveats: &caveats,
                 persona_tools: None,
                 max_tool_rounds: 1,
+                narration_nudge_cap: 1,
                 workflow_grace_rounds: 0,
                 tool_output_lines: 20,
                 debug: false,
@@ -7025,6 +7089,7 @@ mod tool_round_cap_tests {
                 caveats: &caveats,
                 persona_tools: None,
                 max_tool_rounds: 1,
+                narration_nudge_cap: 1,
                 workflow_grace_rounds: 0,
                 tool_output_lines: 20,
                 debug: false,
@@ -7133,6 +7198,7 @@ mod tool_round_cap_tests {
                 caveats: &caveats,
                 persona_tools: None,
                 max_tool_rounds: 2,
+                narration_nudge_cap: 1,
                 workflow_grace_rounds: 0,
                 tool_output_lines: 20,
                 debug: false,
@@ -7282,6 +7348,7 @@ mod tool_round_cap_tests {
                 caveats: &caveats,
                 persona_tools: None,
                 max_tool_rounds: cap,
+                narration_nudge_cap: 1,
                 workflow_grace_rounds: 0,
                 tool_output_lines: 20,
                 debug: false,
@@ -7441,6 +7508,7 @@ mod tool_round_cap_tests {
                 caveats: &caveats,
                 persona_tools: None,
                 max_tool_rounds: 10,
+                narration_nudge_cap: 1,
                 workflow_grace_rounds: 0,
                 tool_output_lines: 5,
                 debug: false,
@@ -7539,6 +7607,7 @@ mod http_loop_tests {
             caveats,
             persona_tools: None,
             max_tool_rounds: 8,
+            narration_nudge_cap: 1,
             workflow_grace_rounds: 0,
             tool_output_lines: 20,
             debug: false,
@@ -8776,6 +8845,32 @@ mod http_loop_tests {
         run_openai_script_with_ledger(script, None).await
     }
 
+    /// Like [`run_openai_script`] but with a configured narrate-then-stop
+    /// rescue budget (`[tui] narration_nudge_cap`, lever L3).
+    async fn run_openai_script_with_cap(
+        script: Vec<serde_json::Value>,
+        narration_nudge_cap: usize,
+    ) -> (String, usize) {
+        let server = MockServer::start().await;
+        let round = Arc::new(AtomicUsize::new(0));
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ScriptedOpenAi {
+                round: round.clone(),
+                script,
+            })
+            .mount(&server)
+            .await;
+        let messages = msgs();
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut c = ctx(&uri, &messages, &caveats);
+        c.kind = BackendKind::Openai;
+        c.narration_nudge_cap = narration_nudge_cap;
+        let (reply, _s, _u, _h) = chat_complete(c, &mut NoMcp).await.expect("dispatch");
+        (reply, round.load(Ordering::SeqCst))
+    }
+
     #[tokio::test]
     async fn narrated_intent_with_no_tool_call_nudges_and_continues() {
         // The model narrates intent to act but calls no tool. Instead of ending
@@ -8815,6 +8910,78 @@ mod http_loop_tests {
             reply.contains("editing"),
             "narration accepted as final: {reply}"
         );
+    }
+
+    #[tokio::test]
+    async fn narration_nudge_cap_two_allows_a_second_escalated_rescue() {
+        // Lever L3: with `narration_nudge_cap = 2` a chronic narrator gets TWO
+        // rescues (the second escalated), and the post-rescue answer is
+        // returned; a genuine recovery on round 3 proves the extra budget is
+        // what converts the stall.
+        let (reply, rounds) = run_openai_script_with_cap(
+            vec![
+                serde_json::json!({ "content": "Let me keep editing now." }),
+                serde_json::json!({ "content": "Let me keep editing now." }),
+                serde_json::json!({ "content": "All done — the edit is complete." }),
+            ],
+            2,
+        )
+        .await;
+        assert_eq!(rounds, 3, "two nudges (cap=2) before the recovery, got {rounds}");
+        assert!(
+            reply.contains("complete"),
+            "returns the post-nudge answer: {reply}"
+        );
+    }
+
+    #[tokio::test]
+    async fn narration_nudge_cap_two_still_accepts_after_exhaustion() {
+        // The raised cap is still a cap: a model that narrates through both
+        // rescues has its third narration accepted as the final answer.
+        let (reply, rounds) = run_openai_script_with_cap(
+            vec![
+                serde_json::json!({ "content": "Let me keep editing now." }),
+                serde_json::json!({ "content": "Let me keep editing now." }),
+                serde_json::json!({ "content": "Let me keep editing now." }),
+                serde_json::json!({ "content": "Let me keep editing now." }),
+            ],
+            2,
+        )
+        .await;
+        assert_eq!(rounds, 3, "two nudges, then accept, got {rounds}");
+        assert!(
+            reply.contains("editing"),
+            "narration accepted as final: {reply}"
+        );
+    }
+
+    #[test]
+    fn escalated_narration_nudge_names_attempt_cap_and_active_step() {
+        use crate::agentic::scheduled::{SessionStepLedger, StepLedger};
+
+        let ledger = SessionStepLedger::default();
+        ledger.restore(&PlanSnapshot {
+            steps: vec![
+                Step {
+                    description: "inspect".to_string(),
+                    status: StepStatus::Done,
+                },
+                Step {
+                    description: "fix conflict markers".to_string(),
+                    status: StepStatus::Active,
+                },
+            ],
+        });
+        let text =
+            escalated_narration_action_nudge(2, 3, Some(&ledger as &dyn StepLedger));
+        assert!(text.contains("Reminder 2/3"), "{text}");
+        assert!(text.contains("fix conflict markers"), "{text}");
+        assert!(text.contains("tool call"), "{text}");
+
+        // No ledger: no step clause, the demand still stands.
+        let bare = escalated_narration_action_nudge(2, 2, None);
+        assert!(bare.contains("Reminder 2/2"), "{bare}");
+        assert!(!bare.contains("Active step"), "{bare}");
     }
 
     #[tokio::test]
@@ -9265,6 +9432,7 @@ mod save_note_loop_tests {
             caveats,
             persona_tools: None,
             max_tool_rounds: 6,
+            narration_nudge_cap: 1,
             workflow_grace_rounds: 0,
             tool_output_lines: 20,
             debug: false,
@@ -9753,6 +9921,7 @@ mod compression_loop_tests {
             caveats,
             persona_tools: None,
             max_tool_rounds: 12,
+            narration_nudge_cap: 1,
             workflow_grace_rounds: 0,
             tool_output_lines: 2,
             debug: false,
@@ -10906,6 +11075,7 @@ mod observation_hook_tests {
             caveats,
             persona_tools: None,
             max_tool_rounds: 8,
+            narration_nudge_cap: 1,
             workflow_grace_rounds: 0,
             tool_output_lines: 20,
             debug: false,
