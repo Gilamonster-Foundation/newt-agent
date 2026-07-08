@@ -1350,6 +1350,46 @@ that is Composed, Configured, and Convention-driven, so a new case is config, \
 not code. Don't let this block shipping; do circle back and de-hardcode once it \
 works.";
 
+/// FR-5 (#999): the ADVISE-first identity installed when a persona's altitude is
+/// [`crate::Altitude::Coach`] (front-matter `altitude = "coach"`). It REPLACES
+/// [`DEFAULT_SOUL`] rather than layering over it — the doer soul ("never
+/// describe a change, make it") directly contradicts a coach, so appending a
+/// coach overlay onto the doer soul would ship two opposing identities in one
+/// prompt. This IS the whole base identity for a coaching turn; the persona's
+/// own markdown body still overlays on top, now without self-contradiction.
+pub const COACH_SOUL: &str = "\
+You are newt in COACH mode: an advisor, not a doer. Be concise and direct. \
+You help the human reason about their code and infrastructure — you explain, \
+present options, and recommend the next step. You do NOT make the change \
+yourself.\n\
+\n\
+## How to coach\n\
+\n\
+**Advise; do not act.** Present the command, the edit, or the plan as text, \
+with the reasoning behind it, and let the human decide and execute. A coaching \
+turn's product is UNDERSTANDING and a recommendation — never a mutated file or \
+an executed command. Do not call write_file, edit_file, or a state-changing \
+run_command; if the change needs making, say so and let the human make it (or \
+switch out of coach mode).\n\
+\n\
+**Ground your advice in the real code.** Use the read-only tools — read_file, \
+list_dir, find, web_fetch — to see what is actually there before you advise. \
+Advice built on an assumption about the code is worse than none; confirm \
+against ground truth, then recommend.\n\
+\n\
+**Show the command, don't run it.** When the answer is 'run X', write X in the \
+reply with a one-line explanation of what it does and why — as something the \
+human runs, not something you run. A command in the conversation is guidance; \
+executing it would be doing the human's job for them.\n\
+\n\
+**Teach the reasoning, not just the answer.** Explain WHY, name the trade-offs, \
+and point at the one next step. The human is learning from you, not delegating \
+to you — leave them able to make the next call themselves.\n\
+\n\
+**Stop when unsure.** If you cannot ground a recommendation, say what you would \
+need to check rather than guessing. One honest 'here is what I'd verify first' \
+beats a confident wrong answer.";
+
 /// Loads an agent identity from a Markdown soul file and injects it as a
 /// frozen system-prompt block.
 ///
@@ -1811,6 +1851,36 @@ mod tests {
                 "DEFAULT_SOUL must advertise `{tool}`"
             );
         }
+    }
+
+    /// FR-5 (#999) golden contract: the coach identity must instruct the model
+    /// to ADVISE, not act — name the mutating tools as things NOT to call, frame
+    /// the turn as advising, and drop the doer's imperative. This is the
+    /// deterministic essence of "a scripted incident turn emits no mutating tool
+    /// call": the model's behavior follows from this directive, so if COACH_SOUL
+    /// ever loses it the coach silently regresses into a doer.
+    #[test]
+    fn coach_soul_forbids_mutation_and_mandates_advice() {
+        // Names the mutating tools it must not call.
+        for mutating in ["write_file", "edit_file", "run_command"] {
+            assert!(
+                COACH_SOUL.contains(mutating),
+                "COACH_SOUL must name `{mutating}` (as forbidden)"
+            );
+        }
+        assert!(
+            COACH_SOUL.contains("Do not call write_file"),
+            "COACH_SOUL must carry the explicit no-mutation directive"
+        );
+        assert!(
+            COACH_SOUL.to_lowercase().contains("advis"),
+            "COACH_SOUL must frame the turn as advising"
+        );
+        // And it must NOT carry the doer's act-first imperative.
+        assert!(
+            !COACH_SOUL.contains("Never describe a code change — make it"),
+            "COACH_SOUL must not inherit the doer imperative"
+        );
     }
 
     #[tokio::test]

@@ -123,6 +123,13 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "NAME")]
     pub persona: Option<String>,
 
+    /// Operating altitude (FR-5, #999): `doer` acts (make the change), `coach`
+    /// (alias `advise`) advises without mutating — it REPLACES the base identity
+    /// with the coach soul. Overrides a `--persona`'s own altitude; with no
+    /// `--persona` it runs a coach with no other role overlay.
+    #[arg(long, global = true, value_name = "LEVEL", value_parser = ["doer", "coach", "advise"])]
+    pub altitude: Option<String>,
+
     /// Run with NO conversation persistence: nothing is auto-resumed, no
     /// conversation row is created, and no turn is saved. Equivalent to
     /// setting `NEWT_EPHEMERAL=1`. Takes precedence over
@@ -836,10 +843,18 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             // of dumping raw output before the TUI (which let a stray key dismiss
             // the splash). Non-interactive / lean / already-present → None.
             let setup = models_cmd::spawn_setup();
+            // FR-5 (#999): map the validated `--altitude` string to the enum.
+            // `value_parser` already fenced the input to doer/coach/advise, so a
+            // non-"coach"/"advise" value can only be "doer".
+            let altitude = cli.altitude.as_deref().map(|level| match level {
+                "coach" | "advise" => newt_core::Altitude::Coach,
+                _ => newt_core::Altitude::Doer,
+            });
             newt_tui::run_code(
                 path.as_deref(),
                 no_splash,
                 persona,
+                altitude,
                 team_runner
                     .as_ref()
                     .map(|r| r as &dyn newt_core::agentic::CrewRunner),

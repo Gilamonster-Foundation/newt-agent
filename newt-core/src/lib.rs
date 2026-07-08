@@ -117,7 +117,7 @@ pub use dgx::{DgxConfig, DgxFormation, DgxNode, DgxNotConfigured, EndpointKind};
 pub use error::NewtError;
 pub use memory::{
     MemMessage, MemoryIndex, MemoryManager, MemoryProvider, NoteStore, NotesUnsupported, Role,
-    RollingWindow, SessionContext, SoulProvider, SoulSource, Summarizing, TokenBudget,
+    RollingWindow, SessionContext, SoulProvider, SoulSource, Summarizing, TokenBudget, COACH_SOUL,
     DEFAULT_CONTEXT_TOKENS, DEFAULT_SOUL, MEMORY_INDEX_BUDGET,
 };
 pub use metrics::{TokenUsage, TurnMetrics};
@@ -125,7 +125,7 @@ pub use model_id::ModelId;
 pub use pricing::{ModelRate, PricingConfig};
 pub use reasoning::{split_reasoning, ThinkFilter};
 pub use role_profile::{
-    CaveatProfile, NamedPermissionPreset, RoleProfile, ScopeKeyword, ScopeSpec,
+    Altitude, CaveatProfile, NamedPermissionPreset, RoleProfile, ScopeKeyword, ScopeSpec,
 };
 pub use router::{Router, Tier};
 pub use session::SessionId;
