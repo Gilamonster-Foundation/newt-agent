@@ -231,7 +231,7 @@ use display::{
     emit_compression_notice, emit_overflow_notice, print_debug, print_retry_indicator, print_trace,
 };
 use std::io::{self, Write as _};
-use tools::{is_hallucination, merged_tool_definitions};
+use tools::{filter_advertised_tools, is_hallucination, merged_tool_definitions};
 use trim::{
     estimate_request_tokens, estimate_tokens, estimate_value_tokens, merge_round_usage,
     ollama_usage, openai_usage, PromptTracker,
@@ -619,6 +619,14 @@ pub struct ChatCtx<'a> {
     /// not advertised (scheduled off). Shared `&dyn` (interior mut).
     pub step_ledger: Option<&'a dyn crate::agentic::scheduled::StepLedger>,
     pub caveats: &'a crate::caveats::Caveats,
+    /// FR-1 part 2 (#997): the active persona's tool allow-list (its `tools:`
+    /// front-matter), or `None` when no persona is active / the persona sets no
+    /// list. When `Some`, the loop advertises ONLY these tools (plus the
+    /// always-on infra tools the loop can't run without), and the executor
+    /// REFUSES any tool outside the list — a name-scoped complement to the
+    /// axis-scoped `caveats` (which part 1, #1002, already meets in). Headless
+    /// / driver / eval callers pass `None` (no persona surface).
+    pub persona_tools: Option<&'a [String]>,
     /// Maximum tool-call rounds before forcing a final tools-disabled
     /// completion (from `[tui].max_tool_rounds`, default 40).
     pub max_tool_rounds: usize,
@@ -1065,6 +1073,7 @@ pub async fn chat_complete(
         experience_store,
         step_ledger,
         caveats,
+        persona_tools,
         max_tool_rounds,
         workflow_grace_rounds,
         tool_output_lines,
@@ -1206,6 +1215,10 @@ pub async fn chat_complete(
         advertise_experiential,
         advertise_scheduled,
     );
+    // FR-1 part 2 (#997): scope the advertised catalog to the active persona's
+    // `tools:` allow-list (no-op when `persona_tools` is `None`). The executor
+    // enforces the same set, so what the model sees and what it may run agree.
+    let tools = filter_advertised_tools(tools, persona_tools);
     let tool_tokens = estimate_value_tokens(&tools, estimation);
     // Phase 20 §2.3: one sanitized calibration ratio per turn. The
     // tool-schema overhead converts to real-token space once — the schema
@@ -2345,6 +2358,7 @@ pub async fn chat_complete(
                     step_ledger,
                     tool_offload,
                     spill_store,
+                    persona_tools,
                 );
                 // If the turn was cancelled mid-tool, `cancellable` returns
                 // None and the dispatch future above is already dropped (its
@@ -3738,6 +3752,7 @@ pub async fn openai_chat_complete(
         experience_store,
         step_ledger,
         caveats,
+        persona_tools,
         max_tool_rounds,
         workflow_grace_rounds,
         tool_output_lines,
@@ -3849,6 +3864,10 @@ pub async fn openai_chat_complete(
         advertise_experiential,
         advertise_scheduled,
     );
+    // FR-1 part 2 (#997): scope the advertised catalog to the active persona's
+    // `tools:` allow-list (no-op when `persona_tools` is `None`). The executor
+    // enforces the same set, so what the model sees and what it may run agree.
+    let tools = filter_advertised_tools(tools, persona_tools);
     let tool_tokens = estimate_value_tokens(&tools, estimation);
     // Phase 20 §2.3: per-turn calibration ratio + real-token schema overhead
     // (mirrors the Ollama path).
@@ -4533,6 +4552,7 @@ pub async fn openai_chat_complete(
                     step_ledger,
                     tool_offload,
                     spill_store,
+                    persona_tools,
                 )
                 .await
             };
@@ -4762,6 +4782,7 @@ pub async fn openai_responses_complete(
         experience_store,
         step_ledger,
         caveats,
+        persona_tools,
         max_tool_rounds,
         workflow_grace_rounds: _,
         tool_output_lines,
@@ -4842,6 +4863,9 @@ pub async fn openai_responses_complete(
         advertise_experiential,
         advertise_scheduled,
     );
+    // FR-1 part 2 (#997): scope the advertised catalog to the active persona
+    // (Responses wire). No-op when `persona_tools` is `None`.
+    let tools_chat = filter_advertised_tools(tools_chat, persona_tools);
     let tools = tools_to_responses(&tools_chat);
 
     let mut accumulated_usage: Option<crate::TokenUsage> = None;
@@ -5029,6 +5053,7 @@ pub async fn openai_responses_complete(
                     step_ledger,
                     tool_offload,
                     spill_store,
+                    persona_tools,
                 )
                 .await
             };
@@ -6298,6 +6323,7 @@ mod tool_round_cap_tests {
                 experience_store: None,
                 step_ledger: None,
                 caveats: &caveats,
+                persona_tools: None,
                 max_tool_rounds: cap,
                 workflow_grace_rounds: 0,
                 tool_output_lines: 20,
@@ -6461,6 +6487,7 @@ mod tool_round_cap_tests {
                 experience_store: None,
                 step_ledger: None,
                 caveats: &caveats,
+                persona_tools: None,
                 max_tool_rounds: cap,
                 workflow_grace_rounds: 0,
                 tool_output_lines: 20,
@@ -6543,6 +6570,7 @@ mod tool_round_cap_tests {
                 experience_store: None,
                 step_ledger: None,
                 caveats: &caveats,
+                persona_tools: None,
                 max_tool_rounds: 5,
                 workflow_grace_rounds: 0,
                 tool_output_lines: 20,
@@ -6686,6 +6714,7 @@ mod tool_round_cap_tests {
                 experience_store: None,
                 step_ledger: None,
                 caveats: &caveats,
+                persona_tools: None,
                 max_tool_rounds: 5,
                 workflow_grace_rounds: 0,
                 tool_output_lines: 20,
@@ -6766,6 +6795,7 @@ mod tool_round_cap_tests {
                 experience_store: None,
                 step_ledger: None,
                 caveats: &caveats,
+                persona_tools: None,
                 max_tool_rounds: cap,
                 workflow_grace_rounds: 0,
                 tool_output_lines: 20,
@@ -6869,6 +6899,7 @@ mod tool_round_cap_tests {
                 experience_store: None,
                 step_ledger: None,
                 caveats: &caveats,
+                persona_tools: None,
                 max_tool_rounds: 1,
                 workflow_grace_rounds: 0,
                 tool_output_lines: 20,
@@ -6984,6 +7015,7 @@ mod tool_round_cap_tests {
                 experience_store: None,
                 step_ledger: None,
                 caveats: &caveats,
+                persona_tools: None,
                 max_tool_rounds: 1,
                 workflow_grace_rounds: 0,
                 tool_output_lines: 20,
@@ -7091,6 +7123,7 @@ mod tool_round_cap_tests {
                 experience_store: None,
                 step_ledger: None,
                 caveats: &caveats,
+                persona_tools: None,
                 max_tool_rounds: 2,
                 workflow_grace_rounds: 0,
                 tool_output_lines: 20,
@@ -7239,6 +7272,7 @@ mod tool_round_cap_tests {
                 experience_store: None,
                 step_ledger: None,
                 caveats: &caveats,
+                persona_tools: None,
                 max_tool_rounds: cap,
                 workflow_grace_rounds: 0,
                 tool_output_lines: 20,
@@ -7397,6 +7431,7 @@ mod tool_round_cap_tests {
                 experience_store: None,
                 step_ledger: None,
                 caveats: &caveats,
+                persona_tools: None,
                 max_tool_rounds: 10,
                 workflow_grace_rounds: 0,
                 tool_output_lines: 5,
@@ -7494,6 +7529,7 @@ mod http_loop_tests {
             experience_store: None,
             step_ledger: None,
             caveats,
+            persona_tools: None,
             max_tool_rounds: 8,
             workflow_grace_rounds: 0,
             tool_output_lines: 20,
@@ -9219,6 +9255,7 @@ mod save_note_loop_tests {
             experience_store: None,
             step_ledger: None,
             caveats,
+            persona_tools: None,
             max_tool_rounds: 6,
             workflow_grace_rounds: 0,
             tool_output_lines: 20,
@@ -9706,6 +9743,7 @@ mod compression_loop_tests {
             experience_store: None,
             step_ledger: None,
             caveats,
+            persona_tools: None,
             max_tool_rounds: 12,
             workflow_grace_rounds: 0,
             tool_output_lines: 2,
@@ -10858,6 +10896,7 @@ mod observation_hook_tests {
             experience_store: None,
             step_ledger: None,
             caveats,
+            persona_tools: None,
             max_tool_rounds: 8,
             workflow_grace_rounds: 0,
             tool_output_lines: 20,

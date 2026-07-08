@@ -382,6 +382,8 @@ async fn run_one_turn(
         experience_store: None,
         step_ledger: None,
         caveats: &config.caveats,
+        // Headless cowork driver carries no persona surface (FR-1 part 2, #997).
+        persona_tools: None,
         max_tool_rounds: config.max_tool_rounds,
         workflow_grace_rounds: config.workflow_grace_rounds,
         tool_output_lines: config.tool_output_lines,
