@@ -4085,6 +4085,34 @@ mod caveat_policy_tests {
     // The `permits_*` adaptors live on `CaveatsExt` (post-#95).
     use newt_core::CaveatsExt;
 
+    /// RAII guard neutralizing the ambient `--full-access` / `NEWT_FULL_ACCESS`
+    /// override for the duration of a test, restoring it on drop. These tests
+    /// assert the DEFAULT (unconfigured / read-only) policy; if the test binary
+    /// is launched under `--full-access` (which exports `NEWT_FULL_ACCESS=1`),
+    /// `policy_for` would otherwise short-circuit to `Caveats::top()` and every
+    /// read-only assertion here would fail through no fault of the code. This
+    /// makes the preset assumption explicit and hermetic.
+    struct ForceDefaultPreset {
+        saved: Option<String>,
+    }
+
+    impl ForceDefaultPreset {
+        fn new() -> Self {
+            let saved = std::env::var("NEWT_FULL_ACCESS").ok();
+            std::env::remove_var("NEWT_FULL_ACCESS");
+            Self { saved }
+        }
+    }
+
+    impl Drop for ForceDefaultPreset {
+        fn drop(&mut self) {
+            match self.saved.take() {
+                Some(v) => std::env::set_var("NEWT_FULL_ACCESS", v),
+                None => std::env::remove_var("NEWT_FULL_ACCESS"),
+            }
+        }
+    }
+
     fn tui_with(preset: newt_core::PermissionPreset) -> newt_core::TuiConfig {
         newt_core::TuiConfig {
             permissions: newt_core::ToolPermissions {
@@ -4100,8 +4128,10 @@ mod caveat_policy_tests {
     #[test]
     fn absent_config_is_read_only() {
         // Serialize against env-mutating tests: policy_for reads NEWT_EXEC_PATHS
-        // / NEWT_VENV via scan_cli_exec_grants.
-        let _env = crate::test_env_guard::env_read_guard();
+        // / NEWT_VENV via scan_cli_exec_grants. We also neutralize an ambient
+        // NEWT_FULL_ACCESS, which needs the exclusive (write) guard.
+        let _env = crate::test_env_guard::env_write_guard();
+        let _preset = ForceDefaultPreset::new();
         // #86 regression: with no [tui] config the policy must be READ-ONLY,
         // never `Caveats::top()` (the old fallback granted full access).
         let policy = policy_for(None, "/ws");
@@ -4128,7 +4158,8 @@ mod caveat_policy_tests {
     fn establish_unconfigured_is_signed_read_only() {
         // Serialize against env-mutating tests: policy_for reads NEWT_EXEC_PATHS
         // / NEWT_VENV via scan_cli_exec_grants.
-        let _env = crate::test_env_guard::env_read_guard();
+        let _env = crate::test_env_guard::env_write_guard();
+        let _preset = ForceDefaultPreset::new();
         // #86 end-to-end: no config + a real (temp) key → read-only caveats via
         // the signed-capability path; the per-user key was generated.
         let dir = tempfile::TempDir::new().unwrap();
@@ -4146,7 +4177,8 @@ mod caveat_policy_tests {
     fn establish_without_key_is_read_only_policy() {
         // Serialize against env-mutating tests: policy_for reads NEWT_EXEC_PATHS
         // / NEWT_VENV via scan_cli_exec_grants.
-        let _env = crate::test_env_guard::env_read_guard();
+        let _env = crate::test_env_guard::env_write_guard();
+        let _preset = ForceDefaultPreset::new();
         let cap = SessionCapability::establish(None, None, "/ws");
         assert_ne!(*cap.caveats(), newt_core::caveats::Caveats::top());
         assert!(!cap.caveats().permits_exec("cargo"));
@@ -4222,7 +4254,8 @@ mod caveat_policy_tests {
     fn establish_configured_is_workspace_dev() {
         // Serialize against env-mutating tests: policy_for reads NEWT_EXEC_PATHS
         // / NEWT_VENV via scan_cli_exec_grants.
-        let _env = crate::test_env_guard::env_read_guard();
+        let _env = crate::test_env_guard::env_write_guard();
+        let _preset = ForceDefaultPreset::new();
         let dir = tempfile::TempDir::new().unwrap();
         let cap = SessionCapability::establish(
             Some(newt_core::TuiConfig::default()),
@@ -4238,7 +4271,8 @@ mod caveat_policy_tests {
     fn reapply_narrows_but_cannot_widen() {
         // Serialize against env-mutating tests: policy_for reads NEWT_EXEC_PATHS
         // / NEWT_VENV via scan_cli_exec_grants.
-        let _env = crate::test_env_guard::env_read_guard();
+        let _env = crate::test_env_guard::env_write_guard();
+        let _preset = ForceDefaultPreset::new();
         // The headline runtime property: within a session, a config reload can tighten
         // authority but never loosen it (keyed off a temp identity).
         let dir = tempfile::TempDir::new().unwrap();
@@ -4274,7 +4308,8 @@ mod caveat_policy_tests {
     fn reapply_without_key_still_narrows() {
         // Serialize against env-mutating tests: policy_for reads NEWT_EXEC_PATHS
         // / NEWT_VENV via scan_cli_exec_grants.
-        let _env = crate::test_env_guard::env_read_guard();
+        let _env = crate::test_env_guard::env_write_guard();
+        let _preset = ForceDefaultPreset::new();
         let mut cap = SessionCapability::establish(
             Some(tui_with(newt_core::PermissionPreset::WorkspaceDev)),
             None,
@@ -11224,22 +11259,126 @@ fn bang_shell() -> (String, &'static str) {
 /// Run a `!`-escaped host command interactively: stdio is **inherited** (the
 /// child gets the real TTY, so it can prompt and launch a browser — e.g. the
 /// `pa login` SAML flow), output scrolls live, and control returns to the
-/// prompt. Mirrors `run_newt_subcmd`'s inherited-stdio launch. A non-zero exit
-/// prints a thin status line; a spawn failure surfaces the error.
+/// prompt. A non-zero exit prints a thin status line; a spawn failure surfaces
+/// the error.
+///
+/// Interruptibility (unix, TTY): the child runs as its **own foreground process
+/// group** — like a shell foreground job. `setpgid` in the child (via
+/// `pre_exec`) and `tcsetpgrp` in the parent hand the terminal to the child, so
+/// a terminal `Ctrl-C` is delivered to the *child's* group, not newt's. The
+/// child dies; newt reclaims the terminal and returns to the prompt instead of
+/// being killed alongside a hung command (e.g. `! pa login` waiting on a SAML
+/// browser round-trip that never completes). `SIGTTOU`/`SIGTTIN` are ignored
+/// across the swap so the `tcsetpgrp` calls don't stop newt.
 fn run_bang_escape(cmd: &str, color: bool, verbose: bool) {
     let (shell, flag) = bang_shell();
-    match std::process::Command::new(&shell)
-        .arg(flag)
-        .arg(cmd)
-        .status()
+    let mut command = std::process::Command::new(&shell);
+    command.arg(flag).arg(cmd);
+
+    #[cfg(unix)]
     {
+        run_bang_escape_unix(command, &shell, color, verbose);
+    }
+    #[cfg(not(unix))]
+    {
+        match command.status() {
+            Ok(status) if status.success() => {}
+            Ok(status) => print_newt(
+                &format!("exit {}", status.code().unwrap_or(-1)),
+                color,
+                verbose,
+            ),
+            Err(e) => print_newt(&format!("! failed to run `{shell}`: {e}"), color, verbose),
+        }
+    }
+}
+
+/// Unix launch for `run_bang_escape`: put the child in its own process group and
+/// give it the controlling terminal so `Ctrl-C` interrupts the *command* and
+/// returns to the newt prompt, rather than felling newt itself. Falls back to a
+/// plain inherited-stdio `wait` when stdin is not a TTY (piped / non-interactive)
+/// or the job-control setup fails.
+#[cfg(unix)]
+fn run_bang_escape_unix(
+    mut command: std::process::Command,
+    shell: &str,
+    color: bool,
+    verbose: bool,
+) {
+    use std::os::unix::process::CommandExt as _;
+
+    let tty = libc::STDIN_FILENO;
+    // Only take over the terminal when we actually own it interactively.
+    let interactive = io::stdin().is_terminal();
+
+    if interactive {
+        // Child leads a fresh process group; the parent later foregrounds it.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+
+    let mut child = match command.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            print_newt(&format!("! failed to run `{shell}`: {e}"), color, verbose);
+            return;
+        }
+    };
+
+    // Hand the terminal to the child's group for the duration of the run.
+    // `tcsetpgrp` from a background write would raise SIGTTOU and stop newt, so
+    // ignore SIGTTOU/SIGTTIN across the swap and restore the handlers after.
+    let mut foregrounded = false;
+    let (old_ttou, old_ttin);
+    if interactive {
+        unsafe {
+            old_ttou = libc::signal(libc::SIGTTOU, libc::SIG_IGN);
+            old_ttin = libc::signal(libc::SIGTTIN, libc::SIG_IGN);
+        }
+        let child_pgid = child.id() as libc::pid_t;
+        // setpgid also here in the parent to close the fork/exec race window.
+        unsafe {
+            libc::setpgid(child_pgid, child_pgid);
+        }
+        foregrounded = unsafe { libc::tcsetpgrp(tty, child_pgid) == 0 };
+    } else {
+        old_ttou = libc::SIG_DFL;
+        old_ttin = libc::SIG_DFL;
+    }
+
+    let status = child.wait();
+
+    if interactive {
+        // Reclaim the terminal for newt's process group, then restore handlers.
+        if foregrounded {
+            unsafe {
+                let newt_pgid = libc::getpgrp();
+                libc::tcsetpgrp(tty, newt_pgid);
+            }
+        }
+        unsafe {
+            libc::signal(libc::SIGTTOU, old_ttou);
+            libc::signal(libc::SIGTTIN, old_ttin);
+        }
+    }
+
+    match status {
         Ok(status) if status.success() => {}
-        Ok(status) => print_newt(
-            &format!("exit {}", status.code().unwrap_or(-1)),
-            color,
-            verbose,
-        ),
-        Err(e) => print_newt(&format!("! failed to run `{shell}`: {e}"), color, verbose),
+        Ok(status) => {
+            // A signalled child (e.g. interrupted by Ctrl-C) has no exit code.
+            let msg = match status.code() {
+                Some(code) => format!("exit {code}"),
+                None => "interrupted".to_string(),
+            };
+            print_newt(&msg, color, verbose);
+        }
+        Err(e) => print_newt(&format!("! `{shell}` wait failed: {e}"), color, verbose),
     }
 }
 
@@ -11696,6 +11835,26 @@ mod tests {
         // (SIGTTOU). See bang_shell docs.
         assert_eq!(flag, "-c");
         assert!(!shell.is_empty(), "a shell is always resolved");
+    }
+
+    // A `!`-escape must always RETURN control to newt — the hang bug was
+    // `.status()` blocking the TUI thread forever on a command that never
+    // exits. Under the test harness stdin is not a TTY, so `run_bang_escape`
+    // takes the non-interactive `wait` fallback; these prove that path both
+    // completes (no hang) and reports exit status without felling the process.
+    #[test]
+    #[cfg(not(windows))]
+    fn run_bang_escape_returns_on_success() {
+        // `true` exits 0: the function must return promptly, printing nothing.
+        run_bang_escape("true", false, false);
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn run_bang_escape_returns_on_nonzero_exit() {
+        // `false` exits 1: the function must still return (report + continue),
+        // never propagate the failure up as a panic or block the caller.
+        run_bang_escape("exit 3", false, false);
     }
 
     #[serial_test::serial(real_fs)]
@@ -16535,7 +16694,11 @@ mod helper_fn_tests {
             }],
             ..Default::default()
         };
-        let choice = resolve_backend_choice(&cfg);
+        let choice = crate::env_resolution_tests::with_env_vars(
+            &[],
+            &["NEWT_DGX_MODEL", "NEWT_BACKEND", "NEWT_PROVIDER"],
+            || resolve_backend_choice(&cfg),
+        );
         assert_eq!(choice.kind, newt_core::BackendKind::Openai);
         assert_eq!(choice.url, "http://vllm.example:8000");
         assert_eq!(choice.model, "qwen3:32b");
@@ -16845,7 +17008,11 @@ mod env_resolution_tests {
     /// variable afterwards. Takes the shared env *write* guard so the
     /// env-reading tests elsewhere in this binary (caveat policy / confined
     /// shell) never observe a half-mutated environment.
-    fn with_env_vars<R>(set: &[(&str, &str)], clear: &[&str], f: impl FnOnce() -> R) -> R {
+    pub(crate) fn with_env_vars<R>(
+        set: &[(&str, &str)],
+        clear: &[&str],
+        f: impl FnOnce() -> R,
+    ) -> R {
         let _g = crate::test_env_guard::env_write_guard();
         let touched: Vec<String> = set
             .iter()
