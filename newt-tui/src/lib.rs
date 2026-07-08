@@ -11224,22 +11224,126 @@ fn bang_shell() -> (String, &'static str) {
 /// Run a `!`-escaped host command interactively: stdio is **inherited** (the
 /// child gets the real TTY, so it can prompt and launch a browser — e.g. the
 /// `pa login` SAML flow), output scrolls live, and control returns to the
-/// prompt. Mirrors `run_newt_subcmd`'s inherited-stdio launch. A non-zero exit
-/// prints a thin status line; a spawn failure surfaces the error.
+/// prompt. A non-zero exit prints a thin status line; a spawn failure surfaces
+/// the error.
+///
+/// Interruptibility (unix, TTY): the child runs as its **own foreground process
+/// group** — like a shell foreground job. `setpgid` in the child (via
+/// `pre_exec`) and `tcsetpgrp` in the parent hand the terminal to the child, so
+/// a terminal `Ctrl-C` is delivered to the *child's* group, not newt's. The
+/// child dies; newt reclaims the terminal and returns to the prompt instead of
+/// being killed alongside a hung command (e.g. `! pa login` waiting on a SAML
+/// browser round-trip that never completes). `SIGTTOU`/`SIGTTIN` are ignored
+/// across the swap so the `tcsetpgrp` calls don't stop newt.
 fn run_bang_escape(cmd: &str, color: bool, verbose: bool) {
     let (shell, flag) = bang_shell();
-    match std::process::Command::new(&shell)
-        .arg(flag)
-        .arg(cmd)
-        .status()
+    let mut command = std::process::Command::new(&shell);
+    command.arg(flag).arg(cmd);
+
+    #[cfg(unix)]
     {
+        run_bang_escape_unix(command, &shell, color, verbose);
+    }
+    #[cfg(not(unix))]
+    {
+        match command.status() {
+            Ok(status) if status.success() => {}
+            Ok(status) => print_newt(
+                &format!("exit {}", status.code().unwrap_or(-1)),
+                color,
+                verbose,
+            ),
+            Err(e) => print_newt(&format!("! failed to run `{shell}`: {e}"), color, verbose),
+        }
+    }
+}
+
+/// Unix launch for `run_bang_escape`: put the child in its own process group and
+/// give it the controlling terminal so `Ctrl-C` interrupts the *command* and
+/// returns to the newt prompt, rather than felling newt itself. Falls back to a
+/// plain inherited-stdio `wait` when stdin is not a TTY (piped / non-interactive)
+/// or the job-control setup fails.
+#[cfg(unix)]
+fn run_bang_escape_unix(
+    mut command: std::process::Command,
+    shell: &str,
+    color: bool,
+    verbose: bool,
+) {
+    use std::os::unix::process::CommandExt as _;
+
+    let tty = libc::STDIN_FILENO;
+    // Only take over the terminal when we actually own it interactively.
+    let interactive = io::stdin().is_terminal();
+
+    if interactive {
+        // Child leads a fresh process group; the parent later foregrounds it.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+
+    let mut child = match command.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            print_newt(&format!("! failed to run `{shell}`: {e}"), color, verbose);
+            return;
+        }
+    };
+
+    // Hand the terminal to the child's group for the duration of the run.
+    // `tcsetpgrp` from a background write would raise SIGTTOU and stop newt, so
+    // ignore SIGTTOU/SIGTTIN across the swap and restore the handlers after.
+    let mut foregrounded = false;
+    let (old_ttou, old_ttin);
+    if interactive {
+        unsafe {
+            old_ttou = libc::signal(libc::SIGTTOU, libc::SIG_IGN);
+            old_ttin = libc::signal(libc::SIGTTIN, libc::SIG_IGN);
+        }
+        let child_pgid = child.id() as libc::pid_t;
+        // setpgid also here in the parent to close the fork/exec race window.
+        unsafe {
+            libc::setpgid(child_pgid, child_pgid);
+        }
+        foregrounded = unsafe { libc::tcsetpgrp(tty, child_pgid) == 0 };
+    } else {
+        old_ttou = libc::SIG_DFL;
+        old_ttin = libc::SIG_DFL;
+    }
+
+    let status = child.wait();
+
+    if interactive {
+        // Reclaim the terminal for newt's process group, then restore handlers.
+        if foregrounded {
+            unsafe {
+                let newt_pgid = libc::getpgrp();
+                libc::tcsetpgrp(tty, newt_pgid);
+            }
+        }
+        unsafe {
+            libc::signal(libc::SIGTTOU, old_ttou);
+            libc::signal(libc::SIGTTIN, old_ttin);
+        }
+    }
+
+    match status {
         Ok(status) if status.success() => {}
-        Ok(status) => print_newt(
-            &format!("exit {}", status.code().unwrap_or(-1)),
-            color,
-            verbose,
-        ),
-        Err(e) => print_newt(&format!("! failed to run `{shell}`: {e}"), color, verbose),
+        Ok(status) => {
+            // A signalled child (e.g. interrupted by Ctrl-C) has no exit code.
+            let msg = match status.code() {
+                Some(code) => format!("exit {code}"),
+                None => "interrupted".to_string(),
+            };
+            print_newt(&msg, color, verbose);
+        }
+        Err(e) => print_newt(&format!("! `{shell}` wait failed: {e}"), color, verbose),
     }
 }
 
@@ -11696,6 +11800,26 @@ mod tests {
         // (SIGTTOU). See bang_shell docs.
         assert_eq!(flag, "-c");
         assert!(!shell.is_empty(), "a shell is always resolved");
+    }
+
+    // A `!`-escape must always RETURN control to newt — the hang bug was
+    // `.status()` blocking the TUI thread forever on a command that never
+    // exits. Under the test harness stdin is not a TTY, so `run_bang_escape`
+    // takes the non-interactive `wait` fallback; these prove that path both
+    // completes (no hang) and reports exit status without felling the process.
+    #[test]
+    #[cfg(not(windows))]
+    fn run_bang_escape_returns_on_success() {
+        // `true` exits 0: the function must return promptly, printing nothing.
+        run_bang_escape("true", false, false);
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn run_bang_escape_returns_on_nonzero_exit() {
+        // `false` exits 1: the function must still return (report + continue),
+        // never propagate the failure up as a panic or block the caller.
+        run_bang_escape("exit 3", false, false);
     }
 
     #[serial_test::serial(real_fs)]
