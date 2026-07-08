@@ -485,6 +485,14 @@ pub struct SkillsConfig {
     /// `~/` is expanded to `$HOME`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub search: Vec<String>,
+
+    /// Directory of bundled skills shipped with newt-agent. Scanned *after* the
+    /// user's `search` paths — i.e. at the **lowest** priority — so a user skill
+    /// of the same name shadows the bundled one (earlier directories win a
+    /// collision; see [`newt_skills::discover_paths`]). Empty → no bundled
+    /// directory is scanned. `~/` is expanded to `$HOME`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub bundled_dir: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -3545,6 +3553,9 @@ impl Config {
     /// directories win on a name collision (see `newt_skills::discover_paths`).
     /// The default falls back to a relative `.newt/skills` only when `$HOME`
     /// can't be resolved, so the list is never empty.
+    ///
+    /// A configured `[skills].bundled_dir` is appended **last** (lowest
+    /// priority), so a user skill of the same name shadows the bundled one.
     #[must_use]
     pub fn skill_search_dirs(&self) -> Vec<PathBuf> {
         let configured = self
@@ -3552,13 +3563,28 @@ impl Config {
             .as_ref()
             .map(|s| s.search.as_slice())
             .unwrap_or(&[]);
-        if configured.is_empty() {
+        let mut dirs: Vec<PathBuf> = if configured.is_empty() {
             let default = Self::user_config_dir()
                 .map(|dir| dir.join("skills"))
                 .unwrap_or_else(|| PathBuf::from(".newt/skills"));
-            return vec![default];
+            vec![default]
+        } else {
+            configured.iter().map(|s| expand_tilde(s)).collect()
+        };
+
+        // Bundled skills scanned last: user-configured dirs win a name
+        // collision (first-wins in `discover_paths`), so users can override
+        // any bundled skill by shipping their own of the same name.
+        if let Some(bundled) = self
+            .skills
+            .as_ref()
+            .map(|s| s.bundled_dir.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            dirs.push(expand_tilde(bundled));
         }
-        configured.iter().map(|s| expand_tilde(s)).collect()
+
+        dirs
     }
 
     /// Serialize this config and write it to `path`, creating parent dirs if needed.
@@ -4805,6 +4831,7 @@ mod tests {
         let cfg = Config {
             skills: Some(SkillsConfig {
                 search: vec!["/abs/one".into(), "/abs/two".into()],
+                bundled_dir: String::new(),
             }),
             ..Config::default()
         };
@@ -4819,6 +4846,7 @@ mod tests {
         let cfg = Config {
             skills: Some(SkillsConfig {
                 search: vec!["~/skills-x".into()],
+                bundled_dir: String::new(),
             }),
             ..Config::default()
         };
@@ -4830,10 +4858,67 @@ mod tests {
     }
 
     #[test]
+    fn skill_search_dirs_appends_bundled_dir_last() {
+        // Bundled dir is LOWEST priority: user `search` paths come first so a
+        // user skill of the same name wins the collision (earlier dirs win in
+        // `discover_paths`), and the bundled dir is appended last.
+        let cfg = Config {
+            skills: Some(SkillsConfig {
+                search: vec!["/abs/user".into()],
+                bundled_dir: "/abs/bundled".into(),
+            }),
+            ..Config::default()
+        };
+        assert_eq!(
+            cfg.skill_search_dirs(),
+            vec![PathBuf::from("/abs/user"), PathBuf::from("/abs/bundled")],
+            "user search dirs must precede the bundled dir so users can override"
+        );
+    }
+
+    #[test]
+    fn skill_search_dirs_bundled_after_default_when_search_empty() {
+        // No `search` configured: the host default (`~/.newt/skills`) still
+        // precedes the bundled dir. An empty `bundled_dir` adds nothing.
+        let with_bundled = Config {
+            skills: Some(SkillsConfig {
+                search: vec![],
+                bundled_dir: "/abs/bundled".into(),
+            }),
+            ..Config::default()
+        };
+        let dirs = with_bundled.skill_search_dirs();
+        assert_eq!(dirs.len(), 2, "default host dir + bundled: {dirs:?}");
+        assert!(
+            dirs[0].ends_with("skills"),
+            "default host dir first: {dirs:?}"
+        );
+        assert_eq!(
+            dirs[1],
+            PathBuf::from("/abs/bundled"),
+            "bundled last: {dirs:?}"
+        );
+
+        let no_bundled = Config {
+            skills: Some(SkillsConfig {
+                search: vec![],
+                bundled_dir: String::new(),
+            }),
+            ..Config::default()
+        };
+        assert_eq!(
+            no_bundled.skill_search_dirs().len(),
+            1,
+            "empty bundled_dir contributes no directory"
+        );
+    }
+
+    #[test]
     fn skills_search_round_trips_through_toml() {
         let cfg = Config {
             skills: Some(SkillsConfig {
                 search: vec!["~/.newt/skills".into(), "~/.claude/skills".into()],
+                bundled_dir: String::new(),
             }),
             ..Config::default()
         };
