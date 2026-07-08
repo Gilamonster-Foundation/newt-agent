@@ -7753,7 +7753,7 @@ impl PersonaStore {
     }
 
     fn load(&self, name: &str) -> anyhow::Result<Persona> {
-        self.ensure_defaults_if_empty()?;
+        self.ensure_defaults()?;
         let name = normalize_persona_name(name)?;
         let path = self.dir.join(format!("{name}.md"));
         let raw = match std::fs::read_to_string(&path) {
@@ -7778,7 +7778,7 @@ impl PersonaStore {
     }
 
     fn list(&self) -> anyhow::Result<Vec<PersonaSummary>> {
-        self.ensure_defaults_if_empty()?;
+        self.ensure_defaults()?;
         let mut personas = Vec::new();
         for entry in std::fs::read_dir(&self.dir)? {
             let entry = entry?;
@@ -7827,35 +7827,33 @@ impl PersonaStore {
         Ok(out)
     }
 
-    fn ensure_defaults_if_empty(&self) -> anyhow::Result<()> {
-        if self.has_persona_files()? {
-            return Ok(());
-        }
-        std::fs::create_dir_all(&self.dir)?;
-        std::fs::write(
-            self.dir.join(format!("{}.md", Self::DEFAULT_NAME)),
-            default_coder_persona(),
-        )?;
-        Ok(())
-    }
+    /// Shipped default personas, seeded per-file-idempotently (FR-16, #1000):
+    /// each MISSING one is written on any store access, so an upgrade that
+    /// predates a new default still receives it (the old empty-dir gate would
+    /// strand it forever). `coder` is the doer identity (DEFAULT_SOUL); `coach`
+    /// is the read-only advise-first persona — its `[caveats]` are enforced by
+    /// FR-1 and its `altitude = "coach"` swaps in COACH_SOUL via FR-5. A user who
+    /// deletes a default gets it back next launch; empty the file to suppress it.
+    const DEFAULT_PERSONAS: &'static [(&'static str, &'static str)] = &[
+        (Self::DEFAULT_NAME, newt_core::DEFAULT_SOUL),
+        ("coach", COACH_PERSONA),
+    ];
 
-    fn has_persona_files(&self) -> anyhow::Result<bool> {
-        if !self.dir.exists() {
-            return Ok(false);
-        }
-        for entry in std::fs::read_dir(&self.dir)? {
-            let path = entry?.path();
-            if path.extension().and_then(|e| e.to_str()) == Some("md") {
-                return Ok(true);
+    fn ensure_defaults(&self) -> anyhow::Result<()> {
+        std::fs::create_dir_all(&self.dir)?;
+        for &(name, body) in Self::DEFAULT_PERSONAS {
+            let path = self.dir.join(format!("{name}.md"));
+            if !path.exists() {
+                std::fs::write(&path, body)?;
             }
         }
-        Ok(false)
+        Ok(())
     }
 }
 
-fn default_coder_persona() -> &'static str {
-    newt_core::DEFAULT_SOUL
-}
+/// The read-only coach persona shipped as a repo template (FR-16, #1000), so
+/// `shipped_role_templates_parse` type-checks its front-matter beside the others.
+const COACH_PERSONA: &str = include_str!("../../personas/coach.md");
 
 fn normalize_persona_name(name: &str) -> anyhow::Result<String> {
     let name = name.trim().to_ascii_lowercase();
@@ -14133,20 +14131,59 @@ mod skills_integration_tests {
         );
     }
 
+    /// FR-16 (#1000): per-file idempotent seeding — each MISSING shipped default
+    /// is written beside the user's own personas (so an upgrade receives a
+    /// newly-added default like `coach`), while an existing default the user has
+    /// edited is left untouched. Supersedes the old empty-dir-only contract.
     #[serial_test::serial(real_fs)]
     #[test]
-    fn persona_store_does_not_seed_non_empty_persona_dir() {
+    fn persona_store_seeds_missing_defaults_without_clobbering() {
         let tmp = tempfile::TempDir::new().unwrap();
         let dir = tmp.path().join("personas");
         fs::create_dir_all(&dir).unwrap();
+        // A user's own persona AND a hand-edited coder are present; only the
+        // coach default is missing (the pre-FR-16 upgrader's exact situation).
         fs::write(dir.join("reviewer.md"), "Review from disk.").unwrap();
+        fs::write(dir.join("coder.md"), "MY custom coder").unwrap();
         let store = PersonaStore::new(dir.clone());
 
-        let personas = store.list().unwrap();
+        let names: std::collections::HashSet<String> =
+            store.list().unwrap().into_iter().map(|p| p.name).collect();
 
-        assert_eq!(personas.len(), 1);
-        assert_eq!(personas[0].name, "reviewer");
-        assert!(!dir.join("coder.md").exists());
+        assert!(
+            names.contains("coach"),
+            "missing coach default must be seeded"
+        );
+        assert!(names.contains("reviewer"), "user persona preserved");
+        assert!(names.contains("coder"), "edited coder preserved");
+        assert_eq!(
+            fs::read_to_string(dir.join("coder.md")).unwrap(),
+            "MY custom coder",
+            "an existing default must NOT be overwritten"
+        );
+    }
+
+    /// FR-16 (#1000): the seeded coach is a read-only, coach-altitude persona —
+    /// FR-5 swaps its identity to COACH_SOUL, FR-1 enforces its caveats, and its
+    /// tool allow-list grants no mutating tool.
+    #[serial_test::serial(real_fs)]
+    #[test]
+    fn seeded_coach_is_a_read_only_coach_altitude_persona() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = PersonaStore::new(tmp.path().join("personas"));
+        let coach = store.load("coach").unwrap();
+        assert_eq!(coach.profile.altitude, Some(newt_core::Altitude::Coach));
+        assert!(coach.profile.caveats.is_some(), "coach declares [caveats]");
+        let tools = coach
+            .profile
+            .tools
+            .expect("coach declares a tools allow-list");
+        for banned in ["write_file", "edit_file", "run_command"] {
+            assert!(
+                !tools.contains(&banned.to_string()),
+                "coach must not grant `{banned}`"
+            );
+        }
     }
 
     #[serial_test::serial(real_fs)]
@@ -16932,9 +16969,19 @@ mod persona_helper_tests {
         fs::write(dir.join("notes.txt"), "not a persona").unwrap();
         let store = PersonaStore::new(dir);
         let listed = store.list().unwrap();
-        assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].name, "real");
-        assert_eq!(listed[0].description, "Real persona");
+        // The empty .md and the non-md file are skipped; `real` (and the seeded
+        // coder/coach defaults, FR-16) are listed. Assert on membership rather
+        // than an exact count so the shipped defaults don't pin the number.
+        let names: std::collections::HashSet<&str> =
+            listed.iter().map(|p| p.name.as_str()).collect();
+        assert!(names.contains("real"), "real persona listed");
+        assert!(!names.contains("blank"), "empty .md skipped");
+        assert!(!names.contains("notes"), "non-markdown skipped");
+        let real = listed
+            .iter()
+            .find(|p| p.name == "real")
+            .expect("real is listed");
+        assert_eq!(real.description, "Real persona");
     }
 
     #[serial_test::serial(real_fs)]
@@ -16943,9 +16990,12 @@ mod persona_helper_tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let dir = tmp.path().join("personas");
         fs::create_dir_all(&dir).unwrap();
-        // An .md file exists (so defaults are NOT seeded) but it's empty,
-        // so the listing is empty.
-        fs::write(dir.join("blank.md"), "").unwrap();
+        // Every persona file — including the shipped defaults — is empty. FR-16
+        // per-file seeding SKIPS files that already exist (even empty ones), so
+        // it doesn't refill them, and the listing is genuinely empty → (none).
+        for f in ["coder.md", "coach.md", "blank.md"] {
+            fs::write(dir.join(f), "").unwrap();
+        }
         let store = PersonaStore::new(dir);
         let msg = store.list_message().unwrap();
         assert!(msg.contains("(none)"), "got: {msg}");
@@ -17146,15 +17196,15 @@ mod persona_helper_tests {
         );
     }
 
-    /// All three shipped role templates under `<repo>/personas/` parse into
-    /// valid, role-bound `RoleProfile`s with distinct tool sets.
+    /// All shipped role templates under `<repo>/personas/` parse into valid,
+    /// role-bound `RoleProfile`s with distinct tool sets (incl. the FR-16 coach).
     #[test]
     fn shipped_role_templates_parse() {
         let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("newt-tui is a workspace member");
         let personas = repo_root.join("personas");
-        for name in ["dragon-rider", "wing-commander", "worker"] {
+        for name in ["dragon-rider", "wing-commander", "worker", "coach"] {
             let path = personas.join(format!("{name}.md"));
             let raw = std::fs::read_to_string(&path)
                 .unwrap_or_else(|e| panic!("missing shipped template {}: {e}", path.display()));
