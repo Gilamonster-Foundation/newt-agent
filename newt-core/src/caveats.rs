@@ -144,6 +144,13 @@ pub fn lock_fs_to_workspace(
     };
 }
 
+/// Harness-set env var for full-access grants: `NEWT_FULL_ACCESS=1`.
+const FULL_ACCESS_ENV: &str = "NEWT_FULL_ACCESS";
+/// Harness-set env var for venv fs_read+write grant: `NEWT_VENV=/path/to/venv`.
+const VENV_ENV: &str = "NEWT_VENV";
+/// Harness-set env var for exec grants: `NEWT_EXEC_PATHS=/a,/b`.
+const EXEC_PATHS_ENV: &str = "NEWT_EXEC_PATHS";
+
 /// Apply [`lock_fs_to_workspace`] from the CLI grant env vars `NEWT_READ_PATHS` /
 /// `NEWT_WRITE_PATHS` (absolute paths that `newt-cli` sets from `--read` /
 /// `--write`, joined with the platform path-list separator). The single entry
@@ -163,12 +170,47 @@ pub fn apply_cli_fs_grants(caveats: &mut Caveats, workspace: &str) {
             })
             .unwrap_or_default()
     };
-    lock_fs_to_workspace(
-        caveats,
-        workspace,
-        &parse("NEWT_READ_PATHS"),
-        &parse("NEWT_WRITE_PATHS"),
-    );
+
+    // Ambient-access env vars: when the harness sets these, widen caveats.
+    if std::env::var(FULL_ACCESS_ENV).is_ok_and(|v| v == "1") {
+        caveats.fs_read = Scope::All;
+        caveats.fs_write = Scope::All;
+    } else if let Ok(venv) = std::env::var(VENV_ENV) {
+        // Venv path grants both read and write.
+        match &mut caveats.fs_read {
+            Scope::Only(set) => {
+                let _ = set.insert(venv.clone());
+            }
+            Scope::All => {}
+        }
+        match &mut caveats.fs_write {
+            Scope::Only(set) => {
+                let _ = set.insert(venv);
+            }
+            Scope::All => {}
+        }
+    } else {
+        lock_fs_to_workspace(
+            caveats,
+            workspace,
+            &parse("NEWT_READ_PATHS"),
+            &parse("NEWT_WRITE_PATHS"),
+        );
+    }
+
+    // Exec grants from env (comma-separated absolute paths).
+    if let Ok(exec_paths) = std::env::var(EXEC_PATHS_ENV) {
+        caveats.exec = match &caveats.exec {
+            Scope::All => Scope::All,
+            Scope::Only(set) => {
+                let mut new_set = set.clone();
+                for p in exec_paths.split(',').filter(|s| !s.trim().is_empty()) {
+                    let _ = new_set.insert(p.trim().to_string());
+                }
+                Scope::Only(new_set)
+            }
+        };
+    }
 }
 
 #[cfg(test)]
