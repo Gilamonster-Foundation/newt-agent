@@ -15711,6 +15711,7 @@ mod mode_command_tests {
         let mut cfg = newt_core::Config {
             skills: Some(newt_core::SkillsConfig {
                 search: vec![skills_dir.to_string_lossy().into_owned()],
+                bundled_dir: String::new(),
             }),
             ..newt_core::Config::default()
         };
