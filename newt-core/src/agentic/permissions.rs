@@ -39,6 +39,11 @@ pub enum DenialKind {
     FsWrite,
     /// `net` — a host outside the granted net allowlist.
     Net,
+    /// FR-2 (#1001): a remote MCP `server__tool` the active persona does not
+    /// grant. Unlike the four axes above it maps to NO fs/exec/net caveat — a
+    /// remote tool's leash is name-based — so an `Allow` here is purely "proceed
+    /// with this call" (it widens nothing). `target` is the tool name.
+    RemoteTool,
 }
 
 impl DenialKind {
@@ -49,6 +54,7 @@ impl DenialKind {
             Self::FsRead => "fs_read",
             Self::FsWrite => "fs_write",
             Self::Net => "net",
+            Self::RemoteTool => "remote_tool",
         }
     }
 }
@@ -66,6 +72,7 @@ impl std::str::FromStr for DenialKind {
             "fs_read" => Ok(Self::FsRead),
             "fs_write" => Ok(Self::FsWrite),
             "net" => Ok(Self::Net),
+            "remote_tool" => Ok(Self::RemoteTool),
             _ => Err(()),
         }
     }
@@ -208,6 +215,9 @@ pub fn widen_caveats(base: &Caveats, grants: &[(DenialKind, String)]) -> Caveats
             DenialKind::FsRead => &mut out.fs_read,
             DenialKind::FsWrite => &mut out.fs_write,
             DenialKind::Net => &mut out.net,
+            // FR-2 (#1001): a remote-tool grant maps to no caveat axis — the
+            // `Allow` means "proceed with this call", not "widen an axis". Skip.
+            DenialKind::RemoteTool => continue,
         };
         if let Scope::Only(set) = scope {
             set.insert(target.clone());
