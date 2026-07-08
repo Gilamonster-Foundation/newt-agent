@@ -342,6 +342,12 @@ pub fn run_code(
     path: Option<&std::path::Path>,
     no_splash: bool,
     persona: Option<&str>,
+    // FR-5 (#999): the session operating altitude from `--altitude` (doer vs
+    // coach). `None` ⇒ each persona's own altitude applies (doer when unset).
+    // When set it overrides a loaded persona's altitude, or — with no `--persona`
+    // — synthesizes a minimal altitude-only persona. It rides on `active_persona`
+    // so no session-management helper needs new plumbing.
+    altitude: Option<newt_core::Altitude>,
     // #479 part 2: the crew/team runner, BUILT BY THE BINARY (newt-cli owns
     // newt-scheduler + the worktree) and injected down — newt-tui stays
     // scheduler-free. `None` ⇒ the `/team` tools are never advertised.
@@ -413,14 +419,14 @@ pub fn run_code(
         // covers the provisioning before chat starts.
         print_inline_header(&workspace, color);
         run_setup_inline(&setup);
-        return run_chat(&workspace, color, persona, crew_runner);
+        return run_chat(&workspace, color, persona, altitude, crew_runner);
     }
 
     // The preamble always shows. The splash lives in the alternate screen
     // and vanishes with it, so the inline header is printed into normal
     // scrollback in BOTH modes before chat starts.
     print_inline_header(&workspace, color);
-    run_chat(&workspace, color, persona, crew_runner)
+    run_chat(&workspace, color, persona, altitude, crew_runner)
 }
 
 /// Compact inline header — the session preamble.
@@ -5279,6 +5285,8 @@ fn run_chat(
     workspace: &str,
     color: bool,
     persona: Option<&str>,
+    // FR-5 (#999): the session `--altitude` override, applied to `active_persona`.
+    altitude: Option<newt_core::Altitude>,
     crew_runner: Option<&dyn newt_core::agentic::CrewRunner>,
 ) -> anyhow::Result<()> {
     let verbose = verbose_mode();
@@ -5612,6 +5620,22 @@ fn run_chat(
         Some(name) => Some(persona_store.load(name)?),
         None => None,
     };
+    // FR-5 (#999): apply the `--altitude` flag. It rides on `active_persona`
+    // (already threaded through every prompt rebuild), so an explicit flag either
+    // overrides a loaded persona's altitude or — with no `--persona` — synthesizes
+    // a minimal altitude-only persona. Absent the flag, each persona's own
+    // altitude governs (doer when unset).
+    if let Some(alt) = altitude {
+        match active_persona.as_mut() {
+            Some(p) => p.profile.altitude = Some(alt),
+            // No persona named: only a non-doer altitude needs a carrier — doer
+            // is already the default identity when no persona is active.
+            None if alt != newt_core::Altitude::Doer => {
+                active_persona = Some(synthetic_altitude_persona(alt));
+            }
+            None => {}
+        }
+    }
 
     // Pluggable memory manager — replaces the old conv Vec.
     let mem_cfg = cfg.memory.clone().unwrap_or_default();
@@ -7978,15 +8002,45 @@ fn build_system_prompt_with_soul(workspace: &str, soul: Option<&str>, plan_path:
     build_system_prompt_with_persona(workspace, soul, None, plan_path)
 }
 
+/// FR-5 (#999): the minimal persona that carries ONLY an altitude, used when
+/// `--altitude` is passed without a `--persona`. No role overlay — just the
+/// altitude that selects the base identity — so `--altitude coach` installs
+/// COACH_SOUL and nothing else, and `/persona show` names the active altitude.
+fn synthetic_altitude_persona(altitude: newt_core::Altitude) -> Persona {
+    let name = match altitude {
+        newt_core::Altitude::Coach => "coach",
+        newt_core::Altitude::Doer => "doer",
+    };
+    Persona {
+        name: name.to_string(),
+        prompt: String::new(),
+        path: std::path::PathBuf::new(),
+        profile: newt_core::RoleProfile {
+            altitude: Some(altitude),
+            ..Default::default()
+        },
+    }
+}
+
 fn build_system_prompt_with_persona(
     workspace: &str,
     soul: Option<&str>,
     persona: Option<&Persona>,
     plan_path: &str,
 ) -> String {
-    // Fall back to the single canonical identity in newt-core rather than a
-    // private copy, so the built-in tool list can't drift between the two.
-    let identity = soul.unwrap_or(newt_core::DEFAULT_SOUL);
+    // FR-5 (#999): the active persona's ALTITUDE selects the base identity. A
+    // `Coach` altitude REPLACES the identity with COACH_SOUL (and overrides a
+    // doer-flavored soul.md), so a coaching persona's overlay no longer sits on
+    // top of a contradictory doer soul. Doer (the default, and every persona
+    // that doesn't declare an altitude) keeps today's behavior: the resolved
+    // soul.md, else DEFAULT_SOUL. The `--altitude` flag rides here too — it
+    // seeds/overrides `active_persona`'s altitude at startup (see `run_code`),
+    // so it needs no separate plumbing through the session-management helpers.
+    let effective_altitude = persona.and_then(|p| p.profile.altitude).unwrap_or_default();
+    let identity = match effective_altitude {
+        newt_core::Altitude::Coach => newt_core::COACH_SOUL,
+        newt_core::Altitude::Doer => soul.unwrap_or(newt_core::DEFAULT_SOUL),
+    };
     let mut ctx = format!("{identity}\n\nWorkspace: {workspace}\n");
     if let Some(persona) = persona {
         ctx.push_str(&format!(
@@ -13950,6 +14004,55 @@ mod skills_integration_tests {
         );
         assert!(prompt.contains("Active persona: reviewer"));
         assert!(prompt.contains("Review from a persona file."));
+    }
+
+    /// FR-5 (#999): a persona whose front-matter declares `altitude = "coach"`
+    /// REPLACES the base identity with COACH_SOUL instead of layering a coach
+    /// overlay onto the doer DEFAULT_SOUL (which would ship two contradictory
+    /// identities in one prompt). A persona with no altitude keeps the doer soul.
+    #[serial_test::serial(real_fs)]
+    #[test]
+    fn coach_altitude_replaces_identity_with_coach_soul() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let profile = newt_core::RoleProfile::parse(
+            "+++\naltitude = \"coach\"\n+++\n\nBe a patient reviewer.\n",
+        )
+        .unwrap();
+        let coach = Persona {
+            name: "coach".to_string(),
+            prompt: profile.prompt.clone(),
+            path: tmp.path().join("coach.md"),
+            profile,
+        };
+        let prompt = build_system_prompt_with_persona(
+            tmp.path().to_str().unwrap(),
+            Some(newt_core::DEFAULT_SOUL),
+            Some(&coach),
+            "test-plan.md",
+        );
+        assert!(
+            prompt.contains("COACH mode"),
+            "coach altitude installs COACH_SOUL"
+        );
+        assert!(
+            !prompt.contains("Never describe a code change"),
+            "coach altitude REPLACES the doer soul, it does not append to it"
+        );
+        assert!(
+            prompt.contains("Be a patient reviewer."),
+            "the persona's own overlay still rides on top"
+        );
+
+        // No altitude → the doer identity is unchanged.
+        let doer = test_persona("worker", "Do the work.", tmp.path().join("worker.md"));
+        let doer_prompt = build_system_prompt_with_persona(
+            tmp.path().to_str().unwrap(),
+            Some(newt_core::DEFAULT_SOUL),
+            Some(&doer),
+            "test-plan.md",
+        );
+        assert!(doer_prompt.contains("Never describe a code change"));
+        assert!(!doer_prompt.contains("COACH mode"));
     }
 
     #[test]

@@ -78,6 +78,28 @@ pub struct RoleProfile {
     pub model: Option<String>,
     /// Preferred router tier (router policy hint).
     pub tier: Option<Tier>,
+    /// Operating ALTITUDE — act (doer, the default) vs advise (coach). Selected
+    /// in front-matter as `altitude = "coach"`. `None` = doer. Drives which base
+    /// identity the system prompt installs (FR-5, #999): a `Coach` altitude
+    /// REPLACES `DEFAULT_SOUL` with `COACH_SOUL` so a coaching persona doesn't
+    /// ship two contradictory identities (doer soul + advise overlay).
+    pub altitude: Option<Altitude>,
+}
+
+/// The persona's operating altitude (FR-5, #999). Decides whether the base
+/// identity ("soul") is the doer `DEFAULT_SOUL` or the advise-first
+/// `COACH_SOUL`. Serialized in front-matter as `altitude = "coach"` (or the
+/// synonym `"advise"`); an absent field is [`Altitude::Doer`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Altitude {
+    /// Act: make the change, run the command. Today's behavior.
+    #[default]
+    Doer,
+    /// Advise: explain, present options, recommend — never mutate. Accepts the
+    /// synonym `"advise"` in front-matter.
+    #[serde(alias = "advise")]
+    Coach,
 }
 
 /// The TOML front-matter shape. Kept separate from [`RoleProfile`] so the
@@ -94,6 +116,8 @@ struct FrontMatter {
     model: Option<String>,
     #[serde(default)]
     tier: Option<Tier>,
+    #[serde(default)]
+    altitude: Option<Altitude>,
 }
 
 /// A small, human-friendly serde shape for an agent-bridle capability profile.
@@ -435,6 +459,7 @@ impl RoleProfile {
             caveats: fm.caveats,
             model: fm.model,
             tier: fm.tier,
+            altitude: fm.altitude,
         })
     }
 
@@ -448,6 +473,7 @@ impl RoleProfile {
             || self.caveats.is_some()
             || self.model.is_some()
             || self.tier.is_some()
+            || self.altitude.is_some()
     }
 }
 
@@ -632,6 +658,35 @@ body
         let rp = RoleProfile::parse(text).unwrap();
         assert_eq!(rp.prompt, "# Just a prompt");
         assert!(!rp.is_role_bound());
+    }
+
+    /// FR-5 (#999): `altitude` parses (with `advise` as a synonym for `coach`),
+    /// defaults to `None` when absent, and counts as role-binding front-matter.
+    #[test]
+    fn parses_altitude_with_advise_synonym() {
+        let coach = RoleProfile::parse("+++\naltitude = \"coach\"\n+++\n\nx\n").unwrap();
+        assert_eq!(coach.altitude, Some(Altitude::Coach));
+        assert!(coach.is_role_bound(), "altitude alone binds the role");
+        assert_eq!(
+            RoleProfile::parse("+++\naltitude = \"advise\"\n+++\n\nx\n")
+                .unwrap()
+                .altitude,
+            Some(Altitude::Coach),
+            "`advise` is a synonym for coach"
+        );
+        assert_eq!(
+            RoleProfile::parse("+++\naltitude = \"doer\"\n+++\n\nx\n")
+                .unwrap()
+                .altitude,
+            Some(Altitude::Doer)
+        );
+        assert_eq!(
+            RoleProfile::parse("+++\nrole = \"w\"\n+++\n\nx\n")
+                .unwrap()
+                .altitude,
+            None,
+            "absent altitude is None (doer applies downstream)"
+        );
     }
 
     #[test]
