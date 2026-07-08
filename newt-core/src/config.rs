@@ -4762,6 +4762,7 @@ mod tests {
     fn skill_search_dirs_preserves_configured_order() {
         let cfg = Config {
             skills: Some(SkillsConfig {
+                bundled_dir: String::new(),
                 search: vec!["/abs/one".into(), "/abs/two".into()],
             }),
             ..Config::default()
@@ -4776,6 +4777,7 @@ mod tests {
     fn skill_search_dirs_expands_tilde() {
         let cfg = Config {
             skills: Some(SkillsConfig {
+                bundled_dir: String::new(),
                 search: vec!["~/skills-x".into()],
             }),
             ..Config::default()
@@ -4791,6 +4793,7 @@ mod tests {
     fn skills_search_round_trips_through_toml() {
         let cfg = Config {
             skills: Some(SkillsConfig {
+                bundled_dir: String::new(),
                 search: vec!["~/.newt/skills".into(), "~/.claude/skills".into()],
             }),
             ..Config::default()
