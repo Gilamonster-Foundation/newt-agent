@@ -2723,6 +2723,19 @@ pub async fn execute_tool_with_offload(
     // model calls it unprompted.
     persona_tools: Option<&[String]>,
 ) -> String {
+    // FR-3 (#998): the absolute deny-list — a grant-independent veto checked
+    // FIRST, above every other leash (persona, MCP, alias, routing). It refuses
+    // catastrophic exec (ssh / rm / systemctl restart …) by STRUCTURAL target,
+    // so no capability, mode, or persona grant can unlock it. Runs on the RAW
+    // name + args (pre-rewrite) so a shell alias or a routed command can't slip
+    // past — and only the exec TARGET is matched, so the same words quoted in a
+    // coach's question or a runbook note are untouched.
+    if let Some(denied) = super::deny::deny_check(name, args) {
+        print_tool_call(name, &args.to_string(), color);
+        print_tool_output(&denied.reason, tool_output_lines, color);
+        return denied.reason;
+    }
+
     // FR-1 part 2 (#997): persona tool allow-list — refuse anything the active
     // persona does not grant BEFORE any routing (MCP, alias, run_command
     // redirect), so a persona can fence off remote `server__tool` names too.
@@ -4053,6 +4066,42 @@ mod tests {
         assert!(
             !infra.contains("not available under the active persona"),
             "always-on infra must not be refused: {infra}"
+        );
+    }
+
+    /// FR-3 (#998): the absolute deny-list is wired into the executor and is
+    /// GRANT-INDEPENDENT — even with top caveats and NO persona, a `run_command`
+    /// whose exec target is forbidden (`ssh`) is refused before the shell runs,
+    /// while an ordinary command is untouched. Guards against the deny module
+    /// being present but never called.
+    #[tokio::test]
+    async fn executor_enforces_the_absolute_deny_list() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let caveats = crate::caveats::Caveats::top(); // maximal grant — deny still bites
+        let denied = call_offload(
+            "run_command",
+            &serde_json::json!({ "command": "ssh host 'uptime'" }),
+            &ws,
+            &caveats,
+            None, // no persona — the floor is independent of any grant
+        )
+        .await;
+        assert!(
+            denied.contains("absolute deny-list"),
+            "ssh must hit the deny-list, got: {denied}"
+        );
+        // A benign command sails past the deny gate (it reaches normal exec).
+        let ok = call_offload(
+            "run_command",
+            &serde_json::json!({ "command": "echo coaching" }),
+            &ws,
+            &caveats,
+            None,
+        )
+        .await;
+        assert!(
+            !ok.contains("absolute deny-list"),
+            "an ordinary command must not be denied, got: {ok}"
         );
     }
 

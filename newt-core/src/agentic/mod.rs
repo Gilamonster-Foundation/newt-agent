@@ -105,6 +105,10 @@ mod recall;
 // #714: the `resume_context` tool — a self-scoped read of THIS conversation's
 // own pre-interrupt work (the affordance `recall` structurally cannot be).
 mod resume;
+// FR-3 (#998): the grant-independent absolute deny-list — a fixed exec veto
+// (ssh / rm / systemctl restart …) no capability, mode, or persona unlocks,
+// classified STRUCTURALLY by exec target so a coach's runbook TEXT is untouched.
+mod deny;
 // facade P4 (#780): hidden tool-call routing — promote the model's read-only
 // shell reaches (`cat`/`ls`/`find` + read-only `git`) to a silent rewrite onto
 // the governed built-ins, gate the rest. The route/gate split is pure DATA.
