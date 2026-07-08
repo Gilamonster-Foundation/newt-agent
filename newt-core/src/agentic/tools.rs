@@ -1133,14 +1133,29 @@ pub fn venv_cmd_prefix() -> Option<String> {
 /// Returns an empty map when neither input is set (no env key is sent).
 fn venv_env_map() -> std::collections::BTreeMap<String, String> {
     let mut map = std::collections::BTreeMap::new();
+
+    // Env passthrough: the confined shell has NO ambient shell variables, so
+    // without this brush cannot expand `~` (it resolves `~` from its `HOME` shell
+    // var, erroring "HOME not set") and the command silently used a literal
+    // `~/…` path — leaving `<cwd>/~/…` debris on disk. Seed a minimal,
+    // operator-configurable allow-list from the process env (default HOME+USER;
+    // widened via `[shell] env_passthrough`, published as
+    // NEWT_SHELL_ENV_PASSTHROUGH). Each var is set only when present, so nothing
+    // is fabricated and the default stays narrow (the confined shell is a trust
+    // boundary — a wide passthrough would leak secrets into a sandboxed command).
+    for var in shell_env_passthrough() {
+        if let Ok(val) = std::env::var(&var) {
+            map.insert(var, val);
+        }
+    }
+    // Identify the confined engine so `env` / scripts can tell they're in newt's
+    // shell (e.g. `SHELL=safe-subset` / `brush` / `host`), not the login shell.
+    map.insert("SHELL".to_string(), shell_engine().as_str().to_string());
+
     let venv = std::env::var("NEWT_VENV")
         .or_else(|_| std::env::var("VIRTUAL_ENV"))
         .ok();
     let exec_paths = std::env::var("NEWT_EXEC_PATHS").ok();
-
-    if venv.is_none() && exec_paths.is_none() {
-        return map;
-    }
 
     // Dirs to prepend to PATH (venv/bin first, then any exec-paths), mirroring
     // venv_cmd_prefix's ordering.
@@ -1167,6 +1182,20 @@ fn venv_env_map() -> std::collections::BTreeMap<String, String> {
     }
 
     map
+}
+
+/// The confined-shell env passthrough list: `NEWT_SHELL_ENV_PASSTHROUGH`
+/// (colon-separated, published from `[shell] env_passthrough`) or the minimal
+/// default (`HOME`, `USER`). Empty entries are dropped.
+fn shell_env_passthrough() -> Vec<String> {
+    match std::env::var("NEWT_SHELL_ENV_PASSTHROUGH") {
+        Ok(s) if !s.trim().is_empty() => s
+            .split(':')
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+            .collect(),
+        _ => crate::config::shell_env_passthrough_default(),
+    }
 }
 
 /// Build the dispatch args for agent-bridle's confined `shell` tool (#783): the
@@ -7517,18 +7546,36 @@ mod disable_ocap_tests {
     /// #783: with neither venv input set, the env seam is empty (no spurious
     /// VIRTUAL_ENV / PATH keys) — the no-venv invocation is unaffected.
     #[tokio::test]
-    async fn confined_dispatch_env_seam_empty_without_venv_783() {
+    async fn confined_dispatch_env_seam_without_venv_783() {
         let _l = env_lock().await;
         let _venv = EnvVar::unset("NEWT_VENV");
         let _virtual = EnvVar::unset("VIRTUAL_ENV");
         let _paths = EnvVar::unset("NEWT_EXEC_PATHS");
+        let _pass = EnvVar::unset("NEWT_SHELL_ENV_PASSTHROUGH"); // ⇒ default HOME+USER
+        let _home = EnvVar::set("HOME", "/home/testuser");
 
         let args = confined_dispatch_args("ls -la", "/work/dir");
         assert_eq!(args["cmd"], "ls -la");
+        let env = &args["env"];
+        // #783: without a venv, no VIRTUAL_ENV / PATH override is injected...
+        assert!(
+            env.get("VIRTUAL_ENV").is_none(),
+            "no venv ⇒ no VIRTUAL_ENV: {args}"
+        );
+        assert!(
+            env.get("PATH").is_none(),
+            "no venv/exec-paths ⇒ no PATH override: {args}"
+        );
+        // ...but HOME now passes through so brush can expand `~` (the confined
+        // shell had NO env before, so `~` stayed literal and left `~/…` debris),
+        // and SHELL identifies the confined engine.
         assert_eq!(
-            args["env"],
-            serde_json::json!({}),
-            "no venv inputs ⇒ empty env map: {args}"
+            env["HOME"], "/home/testuser",
+            "HOME must pass through: {args}"
+        );
+        assert!(
+            env.get("SHELL").is_some(),
+            "SHELL must identify the confined engine: {args}"
         );
     }
 
