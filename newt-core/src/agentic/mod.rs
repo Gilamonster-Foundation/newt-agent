@@ -128,7 +128,7 @@ mod warmup;
 
 pub use compress::{
     compress_user_initiated, CompressCounters, CompressState, ManualCompressOutcome, SummarizeFn,
-    SummarizeFuture, Summarizer, SUMMARY_END_MARKER, SUMMARY_PREFIX,
+    SummarizeFuture, Summarizer, CONTINUATION_PREFIX, SUMMARY_END_MARKER, SUMMARY_PREFIX,
 };
 pub use crew_attest::{crew_authz, crew_step_up_policy, CrewAuthz, Presence};
 pub use crew_tool::{compose_roster_tool_definition, crew_tool_definition, CrewRunner};
@@ -1501,6 +1501,7 @@ pub async fn chat_complete(
                     }
                     messages = outcome.messages;
                     prompt_tracker.invalidate();
+                    apply_post_compaction_continuation(&mut messages, &mut narration_nudges, outcome.action, step_ledger);
                 }
             }
         }
@@ -1671,6 +1672,7 @@ pub async fn chat_complete(
                         if outcome.fired {
                             messages = outcome.messages;
                             prompt_tracker.invalidate();
+                            apply_post_compaction_continuation(&mut messages, &mut narration_nudges, outcome.action, step_ledger);
                         }
                         cw_retries += 1;
                         continue 'round_loop;
@@ -2171,6 +2173,7 @@ pub async fn chat_complete(
                         if outcome.fired {
                             messages = outcome.messages;
                             prompt_tracker.invalidate();
+                            apply_post_compaction_continuation(&mut messages, &mut narration_nudges, outcome.action, step_ledger);
                         } else {
                             // N1: the retry must differ from the request that
                             // just returned empty — when compress was a no-op
@@ -3201,6 +3204,58 @@ fn narration_action_nudge() -> String {
         .to_string()
 }
 
+/// The act-now directive appended after a mid-turn compaction replaced the
+/// middle with a summary. The summary wrapper deliberately de-actions itself
+/// ("REFERENCE ONLY" — weak models otherwise treat it as fresh instructions);
+/// the inverse hazard is losing momentum entirely: post-compaction is exactly
+/// where a weak model narrates instead of acting, and the corrective text of
+/// an already-spent narration nudge may have just been summarized away. This
+/// re-arms intent: mid-task, active step named, next output a tool call.
+/// Carries [`compress::CONTINUATION_PREFIX`] so later compressions neither
+/// anchor the tail on it nor keep more than one alive.
+fn post_compaction_continuation(step_ledger: Option<&dyn scheduled::StepLedger>) -> String {
+    let step_clause = active_step_description(step_ledger)
+        .map(|step| format!(" Active step: '{step}'."))
+        .unwrap_or_default();
+    format!(
+        "{} You are mid-task: the context above was just compacted, not \
+         completed.{step_clause} Continue working — your next output should be \
+         the next concrete tool call (re-read any file you are about to edit \
+         first, since full file contents were not preserved). Do not summarize \
+         what happened and do not re-plan.",
+        compress::CONTINUATION_PREFIX
+    )
+}
+
+/// After a compaction pass replaced the middle with a summary (or the static
+/// fallback), refund the narrate-then-stop rescue budget and (re-)append the
+/// act-now continuation directive. The refund closes the counter/corrective
+/// asymmetry: the spent-nudge counters are turn-locals that survive
+/// compaction, while the corrective text they refer to lives in `messages`
+/// and may have just been summarized away — leaving the harness refusing to
+/// re-nudge a model that no longer remembers the correction. Prune-only and
+/// fit passes keep the corrective text, so they neither refund nor anchor.
+fn apply_post_compaction_continuation(
+    messages: &mut Vec<serde_json::Value>,
+    narration_nudges: &mut usize,
+    action: CompressAction,
+    step_ledger: Option<&dyn scheduled::StepLedger>,
+) {
+    if !matches!(
+        action,
+        CompressAction::Summarized | CompressAction::StaticFallback
+    ) {
+        return;
+    }
+    *narration_nudges = 0;
+    // At most one directive alive: drop any earlier copy before appending.
+    messages.retain(|m| !compress::is_continuation_message(m));
+    messages.push(serde_json::json!({
+        "role": "user",
+        "content": post_compaction_continuation(step_ledger),
+    }));
+}
+
 /// The stronger corrective for the second and later narration nudges
 /// (`[tui] narration_nudge_cap` > 1). The generic first nudge already failed
 /// to convert intent into action, so this one is state-driven like
@@ -4092,6 +4147,7 @@ pub async fn openai_chat_complete(
                     }
                     messages = outcome.messages;
                     prompt_tracker.invalidate();
+                    apply_post_compaction_continuation(&mut messages, &mut narration_nudges, outcome.action, step_ledger);
                 }
             }
         }
@@ -4216,6 +4272,7 @@ pub async fn openai_chat_complete(
                         if outcome.fired {
                             messages = outcome.messages;
                             prompt_tracker.invalidate();
+                            apply_post_compaction_continuation(&mut messages, &mut narration_nudges, outcome.action, step_ledger);
                         }
                         cw_retries += 1;
                         continue 'round_loop;
@@ -8982,6 +9039,56 @@ mod http_loop_tests {
         let bare = escalated_narration_action_nudge(2, 2, None);
         assert!(bare.contains("Reminder 2/2"), "{bare}");
         assert!(!bare.contains("Active step"), "{bare}");
+    }
+
+    #[test]
+    fn post_compaction_refunds_rescue_budget_and_appends_one_directive() {
+        let directive_count = |messages: &[serde_json::Value]| {
+            messages
+                .iter()
+                .filter(|m| {
+                    m["content"]
+                        .as_str()
+                        .is_some_and(|c| c.starts_with(compress::CONTINUATION_PREFIX))
+                })
+                .count()
+        };
+        let mut messages = vec![
+            serde_json::json!({"role": "system", "content": "you are a test"}),
+            serde_json::json!({"role": "user", "content": "do the thing"}),
+            serde_json::json!({
+                "role": "user",
+                "content": format!("{} stale directive", compress::CONTINUATION_PREFIX)
+            }),
+        ];
+        let mut nudges = 1usize;
+
+        // Prune-only passes keep the corrective text: no refund, no anchor.
+        apply_post_compaction_continuation(
+            &mut messages,
+            &mut nudges,
+            CompressAction::Pruned,
+            None,
+        );
+        assert_eq!(nudges, 1, "prune must not refund the rescue budget");
+        assert_eq!(messages.len(), 3, "prune must not touch the directive");
+
+        // A summarization refunds the budget, drops the stale directive, and
+        // appends exactly one fresh act-now anchor as the last user message.
+        apply_post_compaction_continuation(
+            &mut messages,
+            &mut nudges,
+            CompressAction::Summarized,
+            None,
+        );
+        assert_eq!(nudges, 0, "summarization refunds the rescue budget");
+        assert_eq!(directive_count(&messages), 1, "at most one directive alive");
+        let last = messages.last().unwrap();
+        assert_eq!(last["role"], "user");
+        let content = last["content"].as_str().unwrap();
+        assert!(content.starts_with(compress::CONTINUATION_PREFIX), "{content}");
+        assert!(content.contains("tool call"), "{content}");
+        assert!(!content.contains("stale directive"), "{content}");
     }
 
     #[tokio::test]

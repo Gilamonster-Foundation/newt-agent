@@ -79,18 +79,37 @@ pub const SUMMARY_PREFIX: &str = "[CONTEXT COMPACTION — REFERENCE ONLY]";
 /// End marker terminating every compaction message.
 pub const SUMMARY_END_MARKER: &str = "--- END OF CONTEXT SUMMARY ---";
 
-/// True when `m` is a compaction message this pipeline previously inserted
-/// (LLM summary and the static fallback both carry [`SUMMARY_PREFIX`]).
-/// Every user-role scan in the pipeline must consult this: anchoring the
-/// boundary on the pipeline's own marker was the F1 self-poisoning bug —
-/// from the second compression of a session on, the tail pinned to the
-/// previous summary, the middle went empty, the message count could never
-/// shrink, and the aggressive fit pass destroyed every fresh tool result
-/// before the model saw it.
+/// Prefix marker on the loop's post-compaction continuation directive — the
+/// act-now anchor appended after a mid-turn summarization so a weak model
+/// resumes ACTING instead of narrating (the summary wrapper deliberately
+/// de-actions itself, and a spent narration-rescue budget may have just had
+/// its corrective text summarized away). User-role but pipeline-owned: like
+/// the summary marker it must never anchor the tail boundary, and the loop
+/// keeps at most one alive.
+pub const CONTINUATION_PREFIX: &str = "[POST-COMPACTION — CONTINUE]";
+
+/// True when `m` is a pipeline-owned user-role message: a compaction summary
+/// (LLM summary and the static fallback both carry [`SUMMARY_PREFIX`]) or the
+/// loop's continuation directive ([`CONTINUATION_PREFIX`]). Every user-role
+/// scan in the pipeline must consult this: anchoring the boundary on the
+/// pipeline's own marker was the F1 self-poisoning bug — from the second
+/// compression of a session on, the tail pinned to the previous summary, the
+/// middle went empty, the message count could never shrink, and the
+/// aggressive fit pass destroyed every fresh tool result before the model
+/// saw it.
 pub(crate) fn is_compaction_message(m: &Value) -> bool {
+    m["content"].as_str().is_some_and(|c| {
+        c.starts_with(SUMMARY_PREFIX) || c.starts_with(CONTINUATION_PREFIX)
+    })
+}
+
+/// True when `m` is specifically the loop's post-compaction continuation
+/// directive — used by the loop to keep at most one alive across repeated
+/// mid-turn compactions.
+pub(crate) fn is_continuation_message(m: &Value) -> bool {
     m["content"]
         .as_str()
-        .is_some_and(|c| c.starts_with(SUMMARY_PREFIX))
+        .is_some_and(|c| c.starts_with(CONTINUATION_PREFIX))
 }
 
 /// String form of [`is_compaction_message`] for callers holding plain text
@@ -2524,6 +2543,35 @@ mod tests {
         assert!(
             b2.tail_start <= follow_up,
             "a real user message still anchors the tail"
+        );
+    }
+
+    /// The loop's post-compaction continuation directive is user-role but
+    /// pipeline-owned: like the summary marker (F1a) it must never anchor
+    /// the tail, or from the second compression on the boundary pins to the
+    /// harness's own act-now message instead of the operator's real ask.
+    #[test]
+    fn boundary_anchor_skips_continuation_directive() {
+        let mut msgs = vec![sys("you are newt"), user("the task")];
+        msgs.push(user(&format!(
+            "{CONTINUATION_PREFIX} You are mid-task: continue with a tool call."
+        )));
+        let directive = msgs.len() - 1;
+        for i in 0..6 {
+            msgs.push(assistant_call(
+                "read_file",
+                json!({"path": format!("f{i}")}),
+            ));
+            msgs.push(tool_result(&"q".repeat(4_000)));
+        }
+        assert!(is_compaction_message(&msgs[directive]));
+        assert!(is_continuation_message(&msgs[directive]));
+        let b = compute_boundary(&msgs, 2_000, None, EST);
+        assert!(
+            b.tail_start > directive,
+            "the tail must not pin to the continuation directive at index \
+             {directive} (tail_start {})",
+            b.tail_start
         );
     }
 
