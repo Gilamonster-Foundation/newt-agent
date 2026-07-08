@@ -1513,6 +1513,7 @@ pub async fn chat_complete(
                         &mut narration_nudges,
                         outcome.action,
                         step_ledger,
+                        round > 0,
                     );
                 }
             }
@@ -1689,6 +1690,7 @@ pub async fn chat_complete(
                                 &mut narration_nudges,
                                 outcome.action,
                                 step_ledger,
+                                round > 0,
                             );
                         }
                         cw_retries += 1;
@@ -2051,6 +2053,11 @@ pub async fn chat_complete(
                         round_est_raw,
                     );
                 }
+                if probe_content.is_empty() {
+                    if let Some(slot) = &mut end_reason {
+                        **slot = Some(crate::TurnEndReason::Empty);
+                    }
+                }
                 return Ok((probe_content, false, accumulated_usage, hallucination_count));
             }
             // Cargo-style reasoning spinner: TTY-gated (`color`) and opt-out via
@@ -2101,6 +2108,11 @@ pub async fn chat_complete(
                             truncation_suspect,
                             round_est_raw,
                         );
+                    }
+                    if probe_content.is_empty() {
+                        if let Some(slot) = &mut end_reason {
+                            **slot = Some(crate::TurnEndReason::Empty);
+                        }
                     }
                     return Ok((probe_content, false, accumulated_usage, hallucination_count));
                 }
@@ -2230,6 +2242,7 @@ pub async fn chat_complete(
                                 &mut narration_nudges,
                                 outcome.action,
                                 step_ledger,
+                                round > 0,
                             );
                         } else {
                             // N1: the retry must differ from the request that
@@ -3301,16 +3314,27 @@ fn post_compaction_continuation(step_ledger: Option<&dyn scheduled::StepLedger>)
 /// and may have just been summarized away — leaving the harness refusing to
 /// re-nudge a model that no longer remembers the correction. Prune-only and
 /// fit passes keep the corrective text, so they neither refund nor anchor.
+///
+/// `mid_turn` (`round > 0` at the call sites) gates the directive: the
+/// pre-dispatch compaction also fires on round 0 of a FRESH turn (a long
+/// session's between-turn growth is first measured there), where "You are
+/// mid-task … do not summarize" would be false and would countermand an
+/// informational ask ("summarize what we changed today") sitting right above
+/// it. At round 0 nothing has been spent or lost, so the whole repair is
+/// skipped.
 fn apply_post_compaction_continuation(
     messages: &mut Vec<serde_json::Value>,
     narration_nudges: &mut usize,
     action: CompressAction,
     step_ledger: Option<&dyn scheduled::StepLedger>,
+    mid_turn: bool,
 ) {
-    if !matches!(
-        action,
-        CompressAction::Summarized | CompressAction::StaticFallback
-    ) {
+    if !mid_turn
+        || !matches!(
+            action,
+            CompressAction::Summarized | CompressAction::StaticFallback
+        )
+    {
         return;
     }
     *narration_nudges = 0;
@@ -4219,6 +4243,7 @@ pub async fn openai_chat_complete(
                         &mut narration_nudges,
                         outcome.action,
                         step_ledger,
+                        round > 0,
                     );
                 }
             }
@@ -4349,6 +4374,7 @@ pub async fn openai_chat_complete(
                                 &mut narration_nudges,
                                 outcome.action,
                                 step_ledger,
+                                round > 0,
                             );
                         }
                         cw_retries += 1;
@@ -6542,6 +6568,7 @@ mod tool_round_cap_tests {
         let messages = msgs();
         let caveats = Caveats::top();
         let cap = 3;
+        let mut end_reason: Option<crate::TurnEndReason> = None;
         let (reply, streamed, _usage, _hallu) = chat_complete(
             ChatCtx {
                 url: &server.uri(),
@@ -6588,7 +6615,7 @@ mod tool_round_cap_tests {
                 compress_state: None,
                 tool_events: None,
                 phantom_reaches: None,
-                end_reason: None,
+                end_reason: Some(&mut end_reason),
                 permission_gate: None,
                 on_round_usage: None,
                 estimate_ratio: None,
@@ -6612,6 +6639,8 @@ mod tool_round_cap_tests {
         assert_eq!(reply, "here is my partial summary");
         assert_ne!(reply, "(reached tool-call limit)");
         assert!(!streamed);
+        // The cap exit reports itself (acceptance forensics, commit 4).
+        assert_eq!(end_reason, Some(crate::TurnEndReason::RoundCap));
     }
 
     #[tokio::test]
@@ -9278,6 +9307,71 @@ mod http_loop_tests {
         assert!(reply.contains("complete"), "{reply}");
     }
 
+    #[tokio::test]
+    async fn ollama_loop_honors_cap_two_and_escalates_the_second_nudge() {
+        // Ollama-path parity for lever L3 (the macro chain is separate code
+        // from the OpenAI inline chain): with narration_nudge_cap = 2 the
+        // first rescue carries the [loop-guidance]-tagged generic corrective
+        // and the SECOND carries the escalated "Reminder 2/2" variant — both
+        // observed on the wire — before the model recovers.
+        let server = MockServer::start().await;
+        let saw_first = Arc::new(AtomicBool::new(false));
+        let saw_escalated = Arc::new(AtomicBool::new(false));
+
+        struct EscalationProbe {
+            saw_first: Arc<AtomicBool>,
+            saw_escalated: Arc<AtomicBool>,
+        }
+        impl Respond for EscalationProbe {
+            fn respond(&self, req: &Request) -> ResponseTemplate {
+                let body = body_json(req);
+                let has = |needle: &str| {
+                    body["messages"].as_array().is_some_and(|ms| {
+                        ms.iter()
+                            .any(|m| m["content"].as_str().is_some_and(|c| c.contains(needle)))
+                    })
+                };
+                if has("Reminder 2/2") {
+                    self.saw_escalated.store(true, Ordering::SeqCst);
+                    return ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "message": { "content": "All done — the edit is complete." }
+                    }));
+                }
+                if has(compress::LOOP_GUIDANCE_PREFIX) {
+                    self.saw_first.store(true, Ordering::SeqCst);
+                }
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "message": { "content": "Let me keep editing now." }
+                }))
+            }
+        }
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(EscalationProbe {
+                saw_first: saw_first.clone(),
+                saw_escalated: saw_escalated.clone(),
+            })
+            .mount(&server)
+            .await;
+
+        let messages = msgs();
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut c = ctx(&uri, &messages, &caveats);
+        c.kind = BackendKind::Ollama;
+        c.narration_nudge_cap = 2;
+        let (reply, _s, _u, _h) = chat_complete(c, &mut NoMcp).await.expect("dispatch");
+        assert!(
+            saw_first.load(Ordering::SeqCst),
+            "the first nudge must reach the Ollama wire tagged [loop-guidance]"
+        );
+        assert!(
+            saw_escalated.load(Ordering::SeqCst),
+            "the second nudge must be the escalated Reminder 2/2 variant"
+        );
+        assert!(reply.contains("complete"), "{reply}");
+    }
+
     #[test]
     fn post_compaction_refunds_rescue_budget_and_appends_one_directive() {
         let directive_count = |messages: &[serde_json::Value]| {
@@ -9306,17 +9400,33 @@ mod http_loop_tests {
             &mut nudges,
             CompressAction::Pruned,
             None,
+            true,
         );
         assert_eq!(nudges, 1, "prune must not refund the rescue budget");
         assert_eq!(messages.len(), 3, "prune must not touch the directive");
 
-        // A summarization refunds the budget, drops the stale directive, and
-        // appends exactly one fresh act-now anchor as the last user message.
+        // Round 0 (a FRESH turn whose between-turn growth fired the pre-send
+        // compaction): no directive — "You are mid-task … do not summarize"
+        // would countermand the operator's brand-new ask sitting above it.
         apply_post_compaction_continuation(
             &mut messages,
             &mut nudges,
             CompressAction::Summarized,
             None,
+            false,
+        );
+        assert_eq!(nudges, 1, "round 0 must not touch the rescue budget");
+        assert_eq!(messages.len(), 3, "round 0 must not inject the directive");
+
+        // A MID-TURN summarization refunds the budget, drops the stale
+        // directive, and appends exactly one fresh act-now anchor as the last
+        // user message.
+        apply_post_compaction_continuation(
+            &mut messages,
+            &mut nudges,
+            CompressAction::Summarized,
+            None,
+            true,
         );
         assert_eq!(nudges, 0, "summarization refunds the rescue budget");
         assert_eq!(directive_count(&messages), 1, "at most one directive alive");
@@ -10680,6 +10790,7 @@ mod compression_loop_tests {
         final_answer: String,
         task_in_marker_request: Arc<AtomicBool>,
         summary_in_marker_request: Arc<AtomicBool>,
+        directive_in_marker_request: Arc<AtomicBool>,
     }
 
     impl Respond for OpenAiGauntletResponder {
@@ -10691,6 +10802,10 @@ mod compression_loop_tests {
                 }
                 if messages_contain(&body, CANNED_SUMMARY) {
                     self.summary_in_marker_request.store(true, Ordering::SeqCst);
+                }
+                if messages_contain(&body, compress::CONTINUATION_PREFIX) {
+                    self.directive_in_marker_request
+                        .store(true, Ordering::SeqCst);
                 }
                 return ResponseTemplate::new(200).set_body_json(serde_json::json!({
                     "choices": [{ "message": { "content": self.final_answer } }]
@@ -10720,12 +10835,14 @@ mod compression_loop_tests {
         let server = MockServer::start().await;
         let task_in_marker = Arc::new(AtomicBool::new(false));
         let summary_in_marker = Arc::new(AtomicBool::new(false));
+        let directive_in_marker = Arc::new(AtomicBool::new(false));
         Mock::given(method("POST"))
             .and(path("/v1/chat/completions"))
             .respond_with(OpenAiGauntletResponder {
                 final_answer: "openai: marker is GAUNTLET-7f3d9c".into(),
                 task_in_marker_request: task_in_marker.clone(),
                 summary_in_marker_request: summary_in_marker.clone(),
+                directive_in_marker_request: directive_in_marker.clone(),
             })
             .mount(&server)
             .await;
@@ -10751,6 +10868,13 @@ mod compression_loop_tests {
         assert!(!prompts.lock().unwrap().is_empty(), "summarizer engaged");
         assert!(task_in_marker.load(Ordering::SeqCst));
         assert!(summary_in_marker.load(Ordering::SeqCst));
+        // This compaction fired MID-TURN (tool rounds preceded it), so the
+        // real pipeline outcome must also carry the act-now continuation
+        // directive to the wire (commit 2's seam, exercised end to end).
+        assert!(
+            directive_in_marker.load(Ordering::SeqCst),
+            "the post-compaction act-now directive must reach the wire"
+        );
     }
 
     // -----------------------------------------------------------------------

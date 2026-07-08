@@ -1483,7 +1483,9 @@ pub struct TuiConfig {
     /// Default: 1. Weak local models that chronically announce actions in
     /// prose instead of calling tools benefit from 2–3; the second and later
     /// nudges escalate (they name the active plan step and demand a bare tool
-    /// call). See docs/design/next-loop-levers.md, lever L3.
+    /// call). `0` disables the rescue entirely — every no-tool narration is
+    /// accepted as the final answer. See docs/design/next-loop-levers.md,
+    /// lever L3.
     #[serde(default = "default_narration_nudge_cap")]
     pub narration_nudge_cap: usize,
 

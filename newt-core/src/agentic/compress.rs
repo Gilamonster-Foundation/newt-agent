@@ -88,19 +88,23 @@ pub const SUMMARY_END_MARKER: &str = "--- END OF CONTEXT SUMMARY ---";
 /// keeps at most one alive.
 pub const CONTINUATION_PREFIX: &str = "[POST-COMPACTION — CONTINUE]";
 
-/// True when `m` is a pipeline-owned user-role message: a compaction summary
-/// (LLM summary and the static fallback both carry [`SUMMARY_PREFIX`]) or the
-/// loop's continuation directive ([`CONTINUATION_PREFIX`]). Every user-role
-/// scan in the pipeline must consult this: anchoring the boundary on the
-/// pipeline's own marker was the F1 self-poisoning bug — from the second
-/// compression of a session on, the tail pinned to the previous summary, the
-/// middle went empty, the message count could never shrink, and the
-/// aggressive fit pass destroyed every fresh tool result before the model
-/// saw it.
+/// True when `m` is a harness-owned user-role message: a compaction summary
+/// (LLM summary and the static fallback both carry [`SUMMARY_PREFIX`]), the
+/// loop's continuation directive ([`CONTINUATION_PREFIX`]), or an injected
+/// rescue nudge ([`LOOP_GUIDANCE_PREFIX`]). Every user-role scan in the
+/// pipeline must consult this: anchoring the boundary on the pipeline's own
+/// marker was the F1 self-poisoning bug — from the second compression of a
+/// session on, the tail pinned to the previous summary, the middle went
+/// empty, the message count could never shrink, and the aggressive fit pass
+/// destroyed every fresh tool result before the model saw it. Nudges are the
+/// same family: pinning the tail to the harness's own correction would
+/// demote the OPERATOR's most recent real ask into the summarizable middle.
 pub(crate) fn is_compaction_message(m: &Value) -> bool {
-    m["content"]
-        .as_str()
-        .is_some_and(|c| c.starts_with(SUMMARY_PREFIX) || c.starts_with(CONTINUATION_PREFIX))
+    m["content"].as_str().is_some_and(|c| {
+        c.starts_with(SUMMARY_PREFIX)
+            || c.starts_with(CONTINUATION_PREFIX)
+            || c.starts_with(LOOP_GUIDANCE_PREFIX)
+    })
 }
 
 /// True when `m` is specifically the loop's post-compaction continuation
@@ -713,7 +717,7 @@ pub(crate) async fn compress(
         if let Some(store) = req.compaction_store {
             let verbatim: String = middle
                 .iter()
-                .map(render_message)
+                .map(render_message_raw)
                 .collect::<Vec<_>>()
                 .join("\n");
             let id = store.store(redact_secrets(&verbatim));
@@ -1460,6 +1464,19 @@ async fn run_summary(summarizer: &SummarizeFn, req: String) -> Option<String> {
 /// pattern to match — the request-level `redact_secrets` pass would then
 /// let it through. (That request-level pass still runs as a second layer.)
 fn render_message(m: &Value) -> String {
+    render_message_with(m, true)
+}
+
+/// The compaction store's span renderer: NO hygiene demotion. The store's
+/// whole point (#661 group B) is lossless recovery of what the lossy summary
+/// dropped — including harness nudges and the model's process commentary,
+/// which are exactly what a post-incident forensic needs to reconstruct
+/// (the 2026-07-08 stall's nudge order was unrecoverable from disk).
+fn render_message_raw(m: &Value) -> String {
+    render_message_with(m, false)
+}
+
+fn render_message_with(m: &Value, hygiene: bool) -> String {
     let role = m["role"].as_str().unwrap_or("unknown");
     let mut line = format!("[{role}]");
     let tool_calls = m["tool_calls"].as_array();
@@ -1485,7 +1502,7 @@ fn render_message(m: &Value) -> String {
                 || content.starts_with(CONTINUATION_PREFIX));
         let narration_echo =
             role == "assistant" && tool_calls.is_none() && is_meta_narration(content);
-        if harness_meta || narration_echo {
+        if hygiene && (harness_meta || narration_echo) {
             line.push_str(" (loop process correction omitted — not task state)");
             line.push('\n');
             return line;
@@ -2702,6 +2719,43 @@ mod tests {
             b.tail_start > directive,
             "the tail must not pin to the continuation directive at index \
              {directive} (tail_start {})",
+            b.tail_start
+        );
+    }
+
+    /// A `[loop-guidance]` rescue nudge is likewise harness-owned: pinning
+    /// the tail to the harness's own correction would demote the OPERATOR's
+    /// most recent real ask into the summarizable middle.
+    #[test]
+    fn boundary_anchor_skips_loop_guidance_nudges() {
+        let mut msgs = vec![sys("you are newt"), user("the task")];
+        msgs.push(user("IMPORTANT FOLLOW-UP: also update the docs"));
+        let operator_ask = msgs.len() - 1;
+        for i in 0..3 {
+            msgs.push(assistant_call(
+                "read_file",
+                json!({"path": format!("f{i}")}),
+            ));
+            msgs.push(tool_result(&"q".repeat(4_000)));
+        }
+        msgs.push(user(&format!(
+            "{LOOP_GUIDANCE_PREFIX} You described what you were about to do \
+             but did not call any tool…"
+        )));
+        let nudge = msgs.len() - 1;
+        for i in 0..4 {
+            msgs.push(assistant_call(
+                "read_file",
+                json!({"path": format!("g{i}")}),
+            ));
+            msgs.push(tool_result(&"q".repeat(4_000)));
+        }
+        assert!(is_compaction_message(&msgs[nudge]));
+        let b = compute_boundary(&msgs, 2_000, None, EST);
+        assert!(
+            b.tail_start <= operator_ask,
+            "the anchor must skip the harness nudge at {nudge} and protect \
+             the operator's ask at {operator_ask} (tail_start {})",
             b.tail_start
         );
     }
