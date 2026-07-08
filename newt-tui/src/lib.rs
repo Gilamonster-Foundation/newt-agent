@@ -2248,6 +2248,8 @@ fn permission_prompt_text(
         DenialKind::FsRead => ("read", "outside the granted fs_read scope"),
         DenialKind::FsWrite => ("write", "outside the granted fs_write scope"),
         DenialKind::Net => ("reach", "outside the granted net allowlist"),
+        // FR-2 (#1001): a remote MCP tool the active persona does not grant.
+        DenialKind::RemoteTool => ("call", "not in the active persona's tool allow-list"),
     };
     let tier = danger.classify(req.kind, &req.target);
 

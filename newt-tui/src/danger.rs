@@ -111,6 +111,10 @@ impl DangerTable {
             // A net allowlist entry is a single host — narrow by construction.
             // No net target is danger-tiered today; net is always Low.
             DenialKind::Net => false,
+            // FR-2 (#1001): a remote-tool grant is Low so a coach can `[s]ession
+            // allow` a remote tool it needs (a High tier would refuse the session
+            // grant). The absolute-catastrophe floor is FR-3's deny-list, not this.
+            DenialKind::RemoteTool => false,
         };
         if high {
             DangerTier::High
@@ -150,9 +154,9 @@ impl DangerTable {
                     ))
                 }
             }
-            // Net is never high-danger (guarded by `classify` above); unreachable
-            // in practice, but keep the arm total.
-            DenialKind::Net => None,
+            // Net and RemoteTool are never high-danger (guarded by `classify`
+            // above); unreachable in practice, but keep the match total.
+            DenialKind::Net | DenialKind::RemoteTool => None,
         }
     }
 

@@ -2745,18 +2745,22 @@ pub async fn execute_tool_with_offload(
         return denied.reason;
     }
 
-    // FR-1 part 2 (#997): persona tool allow-list — refuse anything the active
-    // persona does not grant BEFORE any routing (MCP, alias, run_command
-    // redirect), so a persona can fence off remote `server__tool` names too.
-    // Checked against the CANONICAL name (aliases resolved first) so a denied
-    // tool can't slip past under a foreign spelling; the always-on infra tools
-    // ([`is_always_on_tool`]) always pass or the loop would wedge.
+    // FR-1 part 2 (#997): persona tool allow-list — refuse a BUILT-IN tool the
+    // active persona does not grant, before any routing (alias, run_command
+    // redirect). Checked against the CANONICAL name (aliases resolved first) so a
+    // denied tool can't slip past under a foreign spelling; the always-on infra
+    // tools ([`is_always_on_tool`]) always pass or the loop would wedge.
+    //
+    // Remote MCP tools are EXCLUDED here (FR-2, #1001): they carry no fs/exec/net
+    // axis, so instead of a hard veto they fall through to the `mcp.handles`
+    // branch, which PROMPTS the human for a name-based grant. A built-in stays
+    // hard-vetoed — only remote tools get the softer prompt.
     if let Some(allow) = persona_tools {
         let canonical = match resolve_tool_alias(name) {
             Some(AliasOutcome::Rewrite(canonical)) => canonical,
             _ => name,
         };
-        if !persona_tool_allowed(canonical, allow) {
+        if !persona_tool_allowed(canonical, allow) && !mcp.handles(name) {
             let msg = persona_tool_denied_message(canonical);
             print_tool_call(name, &args.to_string(), color);
             print_tool_output(&msg, tool_output_lines, color);
@@ -2765,8 +2769,42 @@ pub async fn execute_tool_with_offload(
     }
 
     // Remote MCP tools (namespaced `server__tool`) route to their server before
-    // the built-in match. They carry no Caveats leash in this build.
+    // the built-in match. They map to NONE of the fs/exec/net caveat axes, so
+    // FR-2 (#1001) gives them a NAME-based leash: the active persona's tool
+    // allow-list. A tool the persona already grants dispatches directly; one it
+    // does not is PROMPTED through the #263 [`PermissionGate`] (allow once /
+    // session / deny) rather than hard-vetoed — so a human can grant a remote
+    // READ tool on demand while a mutating one stays gated. With no persona
+    // (`persona_tools == None`) remote tools dispatch unleashed, as before.
     if mcp.handles(name) {
+        if let Some(allow) = persona_tools {
+            if !persona_tool_allowed(name, allow) {
+                let request = PermissionRequest {
+                    tool: name.to_string(),
+                    kind: DenialKind::RemoteTool,
+                    target: name.to_string(),
+                    reason: format!(
+                        "remote tool `{name}` is outside the active persona's tool allow-list"
+                    ),
+                };
+                // This branch always returns, so consuming the gate here never
+                // races the later fs/exec dispatch (unreached once mcp handled).
+                let granted = match permission_gate {
+                    Some(gate) => {
+                        matches!(gate.ask(&[request]), PermissionDecision::Allow(_))
+                    }
+                    // Headless / no operator to consult: fail-closed, like every
+                    // other gate this session.
+                    None => false,
+                };
+                if !granted {
+                    let msg = persona_tool_denied_message(name);
+                    print_tool_call(name, &args.to_string(), color);
+                    print_tool_output(&msg, tool_output_lines, color);
+                    return msg;
+                }
+            }
+        }
         print_tool_call(name, &args.to_string(), color);
         let out = mcp.call(name, args).await;
         print_tool_output(&out, tool_output_lines, color);
@@ -6392,6 +6430,153 @@ mod execute_tool_branch_tests {
             None, // step_ledger
         )
         .await
+    }
+
+    /// FR-2 (#1001): a one-tool remote MCP server for testing the remote-tool
+    /// leash — records whether `call` actually dispatched.
+    struct OneRemoteTool {
+        name: &'static str,
+        called: bool,
+    }
+    impl OneRemoteTool {
+        fn new(name: &'static str) -> Self {
+            Self {
+                name,
+                called: false,
+            }
+        }
+    }
+    #[async_trait::async_trait]
+    impl McpTools for OneRemoteTool {
+        fn handles(&self, name: &str) -> bool {
+            name == self.name
+        }
+        fn tool_defs(&self) -> Vec<serde_json::Value> {
+            vec![serde_json::json!({
+                "type": "function",
+                "function": { "name": self.name, "description": "", "parameters": {} }
+            })]
+        }
+        async fn call(&mut self, _name: &str, _args: &serde_json::Value) -> String {
+            self.called = true;
+            "remote-tool-ran".to_string()
+        }
+    }
+
+    async fn run_remote_gated(
+        name: &str,
+        ws: &std::path::Path,
+        caveats: &Caveats,
+        persona_tools: Option<&[String]>,
+        mcp: &mut dyn McpTools,
+        gate: Option<&mut MockGate>,
+    ) -> String {
+        let gate = gate.map(|g| g as &mut dyn super::PermissionGate);
+        execute_tool_with_offload(
+            name,
+            &serde_json::json!({}),
+            &ws.to_string_lossy(),
+            false,
+            20,
+            caveats,
+            mcp,
+            None,
+            None,
+            None,
+            None,
+            gate,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            persona_tools,
+        )
+        .await
+    }
+
+    /// FR-2 (#1001): a remote MCP tool OUTSIDE the persona's allow-list is
+    /// PROMPTED (not hard-vetoed like a built-in). Deny → withheld and `call`
+    /// never runs; Allow → dispatched; a tool the persona already grants
+    /// dispatches with NO prompt; headless (no gate) fails closed.
+    #[tokio::test]
+    async fn remote_tool_outside_allow_list_is_prompted_not_hard_vetoed() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let caveats = crate::caveats::Caveats::top();
+        let coach = vec!["read_file".to_string()]; // no incident__create
+
+        // Gate DENIES → withheld; `call` never invoked; the human WAS prompted,
+        // and prompted as a remote-tool grant (not an fs/exec/net axis).
+        let mut mcp = OneRemoteTool::new("incident__create");
+        let mut gate = MockGate::new(false, &caveats);
+        let out = run_remote_gated(
+            "incident__create",
+            ws.path(),
+            &caveats,
+            Some(&coach),
+            &mut mcp,
+            Some(&mut gate),
+        )
+        .await;
+        assert!(!mcp.called, "denied remote tool must NOT dispatch");
+        assert_eq!(gate.asks.len(), 1, "the human was prompted");
+        assert_eq!(gate.asks[0].1, "remote_tool:incident__create");
+        assert!(out.contains("persona"), "returns a denial: {out}");
+
+        // Gate ALLOWS → dispatched.
+        let mut mcp = OneRemoteTool::new("incident__create");
+        let mut gate = MockGate::new(true, &caveats);
+        let out = run_remote_gated(
+            "incident__create",
+            ws.path(),
+            &caveats,
+            Some(&coach),
+            &mut mcp,
+            Some(&mut gate),
+        )
+        .await;
+        assert!(mcp.called, "granted remote tool dispatches");
+        assert_eq!(out, "remote-tool-ran");
+
+        // A remote tool the persona GRANTS dispatches with NO prompt.
+        let granted = vec!["incident__create".to_string()];
+        let mut mcp = OneRemoteTool::new("incident__create");
+        let mut gate = MockGate::new(false, &caveats); // would deny if asked
+        run_remote_gated(
+            "incident__create",
+            ws.path(),
+            &caveats,
+            Some(&granted),
+            &mut mcp,
+            Some(&mut gate),
+        )
+        .await;
+        assert!(mcp.called, "allow-listed remote tool dispatches");
+        assert!(
+            gate.asks.is_empty(),
+            "no prompt when the persona already grants it"
+        );
+
+        // Headless (no gate) → fail-closed: withheld, `call` never runs.
+        let mut mcp = OneRemoteTool::new("incident__create");
+        let out = run_remote_gated(
+            "incident__create",
+            ws.path(),
+            &caveats,
+            Some(&coach),
+            &mut mcp,
+            None,
+        )
+        .await;
+        assert!(
+            !mcp.called,
+            "headless must fail closed for an ungranted remote tool"
+        );
+        assert!(out.contains("persona"), "headless denial: {out}");
     }
 
     // -- #721 recoverable denials + request_permissions ---------------------
