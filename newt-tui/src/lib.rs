@@ -2792,6 +2792,18 @@ fn effective_caveats(base: &newt_core::Caveats, mode: Option<&ActiveMode>) -> ne
     }
 }
 
+/// FR-1 (#997): a persona's read-only `[caveats]` are now ENFORCED, not merely
+/// shown by `/persona show`. Meet them into the turn's authority — `meet` is the
+/// greatest lower bound, so a persona can only TIGHTEN the session grant (e.g. a
+/// read-only coach drops `fs_write`/`exec`), never widen it. No persona, or a
+/// persona without a `[caveats]` block, leaves the authority unchanged.
+fn meet_persona_caveats(base: newt_core::Caveats, persona: Option<&Persona>) -> newt_core::Caveats {
+    match persona.and_then(|p| p.profile.caveats.as_ref()) {
+        Some(profile) => base.meet(&profile.to_caveats()),
+        None => base,
+    }
+}
+
 /// #774 (P0): the always-on exec FLOOR threaded to `execute_tool` as
 /// `exec_floor`. The operator's `[tui.permissions]` exec clamp is a
 /// NON-OPTIONAL floor — enforced even with NO active `/mode`.
@@ -6885,7 +6897,10 @@ fn run_chat(
                     // the --disable-ocap bypass all enforce, so authority can
                     // never exceed the preset. With no mode it is the base
                     // unchanged. Computed once so all three consult one value.
-                    let turn_caveats = effective_caveats(cap.caveats(), active_mode.as_ref());
+                    let turn_caveats = meet_persona_caveats(
+                        effective_caveats(cap.caveats(), active_mode.as_ref()),
+                        active_persona.as_ref(),
+                    );
                     // The active preset clamp threaded to the gate (re-clamps
                     // any session grant); `None` when no mode is active.
                     let preset_clamp = active_mode.as_ref().map(|m| m.clamp.clone());
@@ -16748,6 +16763,52 @@ mod persona_helper_tests {
         assert!(wc.profile.is_role_bound());
         assert_ne!(wc.profile.tools, coder.tools);
         assert_ne!(wc.profile.caveats, coder.caveats);
+    }
+
+    /// FR-1 (#997): a persona's read-only `[caveats]` are ENFORCED — met into the
+    /// turn authority so they can only TIGHTEN it, never widen the session grant.
+    #[serial_test::serial(real_fs)]
+    #[test]
+    fn persona_read_only_caveats_tighten_the_turn_authority() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("personas");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("coach.md"),
+            "+++\nrole = \"coach\"\n\n[caveats]\nfs_write = \"none\"\nexec = \"none\"\n+++\n\n# Coach\nRead-only.\n",
+        )
+        .unwrap();
+        let coach = PersonaStore::new(dir).load("coach").unwrap();
+        let full = newt_core::Caveats {
+            fs_read: newt_core::Scope::All,
+            fs_write: newt_core::Scope::All,
+            exec: newt_core::Scope::All,
+            net: newt_core::Scope::All,
+            max_calls: newt_core::CountBound::Unlimited,
+            valid_for_generation: newt_core::Scope::All,
+        };
+        // With the persona: fs_write + exec drop to none; read is untouched.
+        let met = super::meet_persona_caveats(full.clone(), Some(&coach));
+        assert_eq!(
+            met.fs_write,
+            newt_core::Scope::none(),
+            "read-only persona drops fs_write"
+        );
+        assert_eq!(
+            met.exec,
+            newt_core::Scope::none(),
+            "read-only persona drops exec"
+        );
+        assert_eq!(
+            met.fs_read,
+            newt_core::Scope::All,
+            "read authority unchanged"
+        );
+        // No persona: the authority is unchanged.
+        assert_eq!(
+            super::meet_persona_caveats(full, None).fs_write,
+            newt_core::Scope::All
+        );
     }
 
     /// `/persona set <name> --keep-context` swaps the role WITHOUT discarding
