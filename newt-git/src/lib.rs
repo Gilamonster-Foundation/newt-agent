@@ -17,16 +17,22 @@ use newt_core::git_caveats::GitCaveats;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-use grit_lib::diff::{diff_index_to_tree, diff_index_to_worktree, DiffEntry};
-use grit_lib::index::{IndexEntry, MODE_REGULAR};
+use grit_lib::diff::{diff_index_to_tree, diff_index_to_worktree, DiffEntry, DiffStatus};
+use grit_lib::index::{entry_from_stat, IndexEntry, MODE_REGULAR};
 use grit_lib::merge_base::resolve_commit_specs;
 use grit_lib::merge_file::MergeFavor;
 use grit_lib::merge_trees::{
     merge_trees_three_way, TreeMergeConflictPresentation, WhitespaceMergeOptions,
 };
 use grit_lib::objects::{parse_commit, serialize_commit, CommitData, ObjectId, ObjectKind};
+use grit_lib::porcelain::checkout::checkout_between_trees;
+use grit_lib::porcelain::stash::apply_stash;
 use grit_lib::porcelain::status::{collect_untracked_and_ignored, IgnoredMode};
-use grit_lib::refs::{delete_ref, read_head, resolve_ref, write_ref, write_symbolic_ref};
+use grit_lib::reflog::{delete_reflog_entries, read_reflog};
+use grit_lib::refs::{
+    append_reflog, delete_ref, read_head, reflog_file_path, resolve_ref, write_ref,
+    write_symbolic_ref,
+};
 use grit_lib::repo::Repository;
 use grit_lib::state::{resolve_head, HeadState};
 use grit_lib::write_tree::write_tree_from_index;
@@ -650,6 +656,212 @@ impl GitEngine {
         delete_ref(&self.repo.git_dir, &refname)?;
         Ok(format!("deleted branch '{name}'"))
     }
+
+    // --- stash (#992): pure-Rust, no git binary. `push` builds the standard
+    // 2-parent stash commit from primitives; list/pop/apply/drop reuse grit-lib's
+    // reflog + `apply_stash`. Scope: TRACKED changes (untracked left in place).
+
+    /// `git stash push` (tracked changes) — gated on the `commit` capability.
+    pub fn stash_push(&self, caps: &GitCaveats, author: &Author) -> Result<String, GitError> {
+        if !caps.permits_commit() {
+            return Err(GitError::Denied("stash"));
+        }
+        let wt = self
+            .repo
+            .work_tree
+            .clone()
+            .ok_or(GitError::Unsupported("cannot stash in a bare repository"))?;
+        let head = self.head_oid()?.ok_or_else(|| {
+            GitError::Refused("nothing to stash: no commits yet (unborn HEAD)".into())
+        })?;
+        let head_tree = self
+            .head_tree()?
+            .ok_or(GitError::Unsupported("cannot resolve HEAD tree"))?;
+
+        let index = self.repo.load_index()?;
+        let staged = diff_index_to_tree(&self.repo.odb, &index, Some(&head_tree), false)?;
+        let unstaged = diff_index_to_worktree(&self.repo.odb, &index, &wt, false, false)?;
+        if staged.is_empty() && unstaged.is_empty() {
+            return Ok("No local changes to save".into());
+        }
+
+        let ident = author.ident_now();
+        let branch = match resolve_head(&self.repo.git_dir)? {
+            HeadState::Branch { short_name, .. } => short_name,
+            _ => "(no branch)".to_string(),
+        };
+        let subj = parse_commit(&self.repo.odb.read(&head)?.data)?
+            .message
+            .lines()
+            .next()
+            .unwrap_or("")
+            .to_string();
+        let head_short = short_oid(&head);
+        let wip_msg = format!("WIP on {branch}: {head_short} {subj}");
+        let idx_msg = format!("index on {branch}: {head_short} {subj}");
+
+        // parent[1] = the index-commit (tree = staged state). ALWAYS written —
+        // apply_stash requires >= 2 parents even when nothing is staged.
+        let i_tree = write_tree_from_index(&self.repo.odb, &index, "")?;
+        let i_oid = self.repo.odb.write(
+            ObjectKind::Commit,
+            &serialize_commit(&CommitData {
+                tree: i_tree,
+                parents: vec![head],
+                author: ident.clone(),
+                committer: ident.clone(),
+                author_raw: Vec::new(),
+                committer_raw: Vec::new(),
+                encoding: None,
+                message: idx_msg,
+                raw_message: None,
+            }),
+        )?;
+
+        // The worktree tree: the index with the unstaged worktree changes folded in.
+        let mut temp = index.clone();
+        for e in &unstaged {
+            let p = e.path();
+            if e.status == DiffStatus::Deleted {
+                temp.remove(p.as_bytes());
+            } else {
+                let bytes = std::fs::read(wt.join(p))?;
+                let oid = self.repo.odb.write(ObjectKind::Blob, &bytes)?;
+                let mode = index
+                    .get(p.as_bytes(), 0)
+                    .map_or(MODE_REGULAR, |ie| ie.mode);
+                temp.add_or_replace(entry_from_stat(&wt.join(p), p.as_bytes(), oid, mode)?);
+            }
+        }
+        temp.sort();
+        let w_tree = write_tree_from_index(&self.repo.odb, &temp, "")?;
+        let w_oid = self.repo.odb.write(
+            ObjectKind::Commit,
+            &serialize_commit(&CommitData {
+                tree: w_tree,
+                parents: vec![head, i_oid],
+                author: ident.clone(),
+                committer: ident.clone(),
+                author_raw: Vec::new(),
+                committer_raw: Vec::new(),
+                encoding: None,
+                message: wip_msg.clone(),
+                raw_message: None,
+            }),
+        )?;
+
+        // Store the ref + reflog (two calls; write_ref never logs). force_create
+        // is MANDATORY — refs/stash is excluded from reflog auto-creation, so
+        // without it `stash list` would silently never exist.
+        let old =
+            resolve_ref(&self.repo.git_dir, "refs/stash").unwrap_or_else(|_| ObjectId::zero());
+        write_ref(&self.repo.git_dir, "refs/stash", &w_oid)?;
+        append_reflog(
+            &self.repo.git_dir,
+            "refs/stash",
+            &old,
+            &w_oid,
+            &ident,
+            &wip_msg,
+            true,
+        )?;
+
+        // Reset the worktree + index to HEAD LAST — this destroys the dirty state,
+        // so it must run only after the stash commit + ref are safely written.
+        checkout_between_trees(&self.repo, Some(&w_tree), &head_tree)?;
+        Ok(format!("Saved working directory and index state {wip_msg}"))
+    }
+
+    /// `git stash list` — the `refs/stash` reflog, newest first. Needs `read`.
+    pub fn stash_list(&self, caps: &GitCaveats) -> Result<Vec<String>, GitError> {
+        if !caps.permits_read() {
+            return Err(GitError::Denied("read"));
+        }
+        Ok(read_reflog(&self.repo.git_dir, "refs/stash")?
+            .iter()
+            .rev()
+            .enumerate()
+            .map(|(i, e)| format!("stash@{{{i}}}: {}", e.message))
+            .collect())
+    }
+
+    /// The stash commit oid for `stash@{k}` (0 = newest), or a Refused error.
+    fn stash_oid_at(&self, k: usize) -> Result<ObjectId, GitError> {
+        let entries = read_reflog(&self.repo.git_dir, "refs/stash")?;
+        if entries.is_empty() {
+            return Err(GitError::Refused("no stash entries found".into()));
+        }
+        entries
+            .iter()
+            .rev()
+            .nth(k)
+            .map(|e| e.new_oid)
+            .ok_or_else(|| GitError::Refused(format!("no stash entry stash@{{{k}}}")))
+    }
+
+    /// `git stash apply stash@{k}` — apply without dropping. Gated on `commit`.
+    pub fn stash_apply(&self, caps: &GitCaveats, k: usize) -> Result<String, GitError> {
+        if !caps.permits_commit() {
+            return Err(GitError::Denied("stash"));
+        }
+        let wt = self
+            .repo
+            .work_tree
+            .clone()
+            .ok_or(GitError::Unsupported("bare repository"))?;
+        let oid = self.stash_oid_at(k)?;
+        let conflicts = apply_stash(&self.repo, &wt, &oid, false, true)?;
+        Ok(if conflicts {
+            format!("applied stash@{{{k}}} with conflicts (resolve, then drop it)")
+        } else {
+            format!("applied stash@{{{k}}}")
+        })
+    }
+
+    /// `git stash pop stash@{k}` — apply, then drop ONLY on a clean apply (git
+    /// keeps the entry on conflict). Gated on `commit`.
+    pub fn stash_pop(&self, caps: &GitCaveats, k: usize) -> Result<String, GitError> {
+        if !caps.permits_commit() {
+            return Err(GitError::Denied("stash"));
+        }
+        let wt = self
+            .repo
+            .work_tree
+            .clone()
+            .ok_or(GitError::Unsupported("bare repository"))?;
+        let oid = self.stash_oid_at(k)?;
+        if apply_stash(&self.repo, &wt, &oid, false, true)? {
+            return Ok(format!(
+                "stash@{{{k}}} applied with conflicts — entry kept (resolve, then drop it)"
+            ));
+        }
+        self.stash_drop_impl(k)?;
+        Ok(format!("popped stash@{{{k}}}"))
+    }
+
+    /// `git stash drop stash@{k}`. Gated on `commit`.
+    pub fn stash_drop(&self, caps: &GitCaveats, k: usize) -> Result<String, GitError> {
+        if !caps.permits_commit() {
+            return Err(GitError::Denied("stash"));
+        }
+        self.stash_drop_impl(k)?;
+        Ok(format!("dropped stash@{{{k}}}"))
+    }
+
+    fn stash_drop_impl(&self, k: usize) -> Result<(), GitError> {
+        let _ = self.stash_oid_at(k)?; // validates the slot exists
+        let git_dir = &self.repo.git_dir;
+        delete_reflog_entries(git_dir, "refs/stash", &[k])?;
+        // delete_reflog_entries only rewrites the log — re-point (or remove) the ref.
+        match read_reflog(git_dir, "refs/stash")?.last() {
+            Some(top) => write_ref(git_dir, "refs/stash", &top.new_oid)?,
+            None => {
+                let _ = delete_ref(git_dir, "refs/stash");
+                let _ = std::fs::remove_file(reflog_file_path(git_dir, "refs/stash"));
+            }
+        }
+        Ok(())
+    }
 }
 
 fn short_oid(oid: &ObjectId) -> String {
@@ -848,9 +1060,21 @@ impl newt_core::agentic::GitTool for LocalGitTool {
                     .ok_or("branch-delete: 'name' is required")?;
                 eng.branch_delete(caps, name).map_err(s)
             }
+            "stash" | "stash-push" => eng.stash_push(caps, &self.author).map_err(s),
+            "stash-list" => {
+                let list = eng.stash_list(caps).map_err(s)?;
+                Ok(if list.is_empty() {
+                    "no stash entries".to_string()
+                } else {
+                    list.join("\n")
+                })
+            }
+            "stash-pop" => eng.stash_pop(caps, stash_index(args)).map_err(s),
+            "stash-apply" => eng.stash_apply(caps, stash_index(args)).map_err(s),
+            "stash-drop" => eng.stash_drop(caps, stash_index(args)).map_err(s),
             other => Err(format!(
-                "unknown git op '{other}' \
-                 (use init|status|log|diff|add|commit|amend|rebase|branch|checkout|branch-delete)"
+                "unknown git op '{other}' (use init|status|log|diff|add|commit|amend|rebase|\
+                 branch|checkout|branch-delete|stash|stash-list|stash-pop|stash-apply|stash-drop)"
             )),
         }
     }
@@ -912,6 +1136,11 @@ fn str_array(args: &serde_json::Value, key: &str) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// The `stash@{k}` index for pop/apply/drop — `index` arg, default 0 (newest).
+fn stash_index(args: &serde_json::Value) -> usize {
+    args.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize
 }
 
 /// Compact, model-readable status (not raw JSON — the model reads prose better).
@@ -1831,5 +2060,65 @@ mod tests {
             .dispatch("commit", &serde_json::json!({}), &GitCaveats::top())
             .unwrap_err();
         assert!(err.contains("message"), "got: {err}");
+    }
+
+    #[test]
+    fn stash_push_resets_worktree_and_pop_restores() {
+        // Regression (#992): pure-Rust `git stash` — push saves tracked changes
+        // (worktree back to HEAD) + lists them; pop restores + drops the entry.
+        let dir = repo_with_commit();
+        let p = dir.path();
+        std::fs::write(p.join("a.txt"), "changed\n").unwrap(); // dirty a tracked file
+        let eng = GitEngine::open(p).unwrap();
+        let author = Author {
+            name: "T".into(),
+            email: "t@e.x".into(),
+        };
+        let out = eng.stash_push(&GitCaveats::top(), &author).unwrap();
+        assert!(out.contains("Saved working directory"), "got: {out}");
+        assert_eq!(
+            std::fs::read_to_string(p.join("a.txt")).unwrap(),
+            "hello\n",
+            "worktree reset to HEAD after push"
+        );
+        let list = eng.stash_list(&GitCaveats::top()).unwrap();
+        assert_eq!(list.len(), 1, "one stash entry: {list:?}");
+        assert!(list[0].starts_with("stash@{0}:"), "{}", list[0]);
+
+        let out = eng.stash_pop(&GitCaveats::top(), 0).unwrap();
+        assert!(out.contains("popped"), "got: {out}");
+        assert_eq!(
+            std::fs::read_to_string(p.join("a.txt")).unwrap(),
+            "changed\n",
+            "pop restored the stashed change"
+        );
+        assert!(
+            eng.stash_list(&GitCaveats::top()).unwrap().is_empty(),
+            "entry dropped after a clean pop"
+        );
+    }
+
+    #[test]
+    fn stash_is_a_known_op_and_write_gated() {
+        // Regression (#992): `git: stash` was "unknown git op 'stash'".
+        let dir = repo_with_commit();
+        let p = dir.path();
+        let t = tool(p);
+        let out = t
+            .dispatch("stash-list", &serde_json::json!({}), &GitCaveats::top())
+            .unwrap();
+        assert!(
+            !out.contains("unknown git op"),
+            "stash-list recognized: {out}"
+        );
+        // Push is a write → denied under read-only caps (fail-closed like commit).
+        std::fs::write(p.join("a.txt"), "dirty\n").unwrap();
+        let err = t
+            .dispatch("stash", &serde_json::json!({}), &GitCaveats::read_only())
+            .unwrap_err();
+        assert!(
+            err.contains("not permitted"),
+            "read-only denies stash push: {err}"
+        );
     }
 }
