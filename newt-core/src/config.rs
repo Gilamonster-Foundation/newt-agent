@@ -485,6 +485,13 @@ pub struct SkillsConfig {
     /// `~/` is expanded to `$HOME`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub search: Vec<String>,
+
+    /// Path to a directory of bundled skills shipped with newt-agent.
+    /// These are loaded before user-configured paths so users can override
+    /// by placing their own skill in `search` directories. Empty → no bundled
+    /// skills directory is scanned. `~/` is expanded to `$HOME`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub bundled_dir: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -3493,8 +3500,20 @@ impl Config {
     /// directories win on a name collision (see `newt_skills::discover_paths`).
     /// The default falls back to a relative `.newt/skills` only when `$HOME`
     /// can't be resolved, so the list is never empty.
+    ///
+    /// If `[skills].bundled_dir` is configured, it is prepended so user-configured
+    /// paths win on collision (users can override bundled skills).
     #[must_use]
     pub fn skill_search_dirs(&self) -> Vec<PathBuf> {
+        let mut dirs = Vec::new();
+
+        // Bundled dir first (lowest priority) if configured.
+        if !self.skills.as_ref().map_or("", |s| s.bundled_dir.as_str()).is_empty() {
+            let bundled = expand_tilde(&self.skills.as_ref().unwrap().bundled_dir);
+            dirs.push(bundled);
+        }
+
+        // User-configured paths (higher priority).
         let configured = self
             .skills
             .as_ref()
@@ -3504,9 +3523,12 @@ impl Config {
             let default = Self::user_config_dir()
                 .map(|dir| dir.join("skills"))
                 .unwrap_or_else(|| PathBuf::from(".newt/skills"));
-            return vec![default];
+            dirs.push(default);
+        } else {
+            dirs.extend(configured.iter().map(|s| expand_tilde(s)));
         }
-        configured.iter().map(|s| expand_tilde(s)).collect()
+
+        dirs
     }
 
     /// Serialize this config and write it to `path`, creating parent dirs if needed.
