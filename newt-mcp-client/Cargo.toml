@@ -26,6 +26,9 @@ reqwest.workspace = true
 
 [dev-dependencies]
 wiremock.workspace = true
+# `test-util` (not in tokio's `full`) enables the paused virtual clock used to
+# test the per-request timeout deterministically, with no real wall-clock.
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

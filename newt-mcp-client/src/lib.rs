@@ -21,10 +21,27 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
 /// MCP protocol version we advertise (matches `newt-mcp-server`).
 const PROTOCOL_VERSION: &str = "2024-11-05";
-/// Per-request timeout — a wedged server must not hang the agent.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+/// Default per-request timeout — a wedged server must not hang the agent. A
+/// server whose tools legitimately run long overrides this per entry via
+/// `McpServerEntry::request_timeout_secs`.
+pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+/// Ceiling for a configured override. Even a deliberately patient server keeps
+/// the "must not hang the agent forever" guarantee — a genuinely wedged call
+/// still gives up here.
+pub const MAX_REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 /// The `server__tool` namespacing separator.
 pub const NS_SEP: &str = "__";
+
+/// Resolve a server entry's per-request timeout: its `request_timeout_secs`
+/// override clamped to `[1s, MAX_REQUEST_TIMEOUT]`, or [`DEFAULT_REQUEST_TIMEOUT`]
+/// when unset. A `0` override is treated as 1s (never "no timeout").
+#[must_use]
+pub fn resolve_timeout(entry: &McpServerEntry) -> Duration {
+    match entry.request_timeout_secs {
+        None => DEFAULT_REQUEST_TIMEOUT,
+        Some(secs) => Duration::from_secs(secs.max(1)).min(MAX_REQUEST_TIMEOUT),
+    }
+}
 
 /// A line-oriented JSON-RPC transport: one JSON message per line.
 ///
@@ -55,14 +72,24 @@ pub struct RemoteTool {
 pub struct McpConnection<T: Transport> {
     transport: T,
     next_id: u64,
+    /// Per-request read timeout (see [`resolve_timeout`]).
+    timeout: Duration,
 }
 
 impl<T: Transport> McpConnection<T> {
-    /// Wrap a transport. Call [`Self::initialize`] before issuing requests.
+    /// Wrap a transport with the [`DEFAULT_REQUEST_TIMEOUT`]. Call
+    /// [`Self::initialize`] before issuing requests.
     pub fn new(transport: T) -> Self {
+        Self::new_with_timeout(transport, DEFAULT_REQUEST_TIMEOUT)
+    }
+
+    /// Wrap a transport with an explicit per-request timeout (from
+    /// [`resolve_timeout`]).
+    pub fn new_with_timeout(transport: T, timeout: Duration) -> Self {
         Self {
             transport,
             next_id: 1,
+            timeout,
         }
     }
 
@@ -75,7 +102,7 @@ impl<T: Transport> McpConnection<T> {
         self.transport.send(serde_json::to_string(&req)?).await?;
 
         loop {
-            let line = tokio::time::timeout(REQUEST_TIMEOUT, self.transport.recv())
+            let line = tokio::time::timeout(self.timeout, self.transport.recv())
                 .await
                 .with_context(|| format!("timed out awaiting `{method}` response"))??
                 .ok_or_else(|| anyhow!("server closed the connection during `{method}`"))?;
@@ -262,7 +289,7 @@ impl HttpTransport {
             headers.insert(name, val);
         }
         let client = reqwest::Client::builder()
-            .timeout(REQUEST_TIMEOUT)
+            .timeout(resolve_timeout(entry))
             .build()
             .with_context(|| format!("building HTTP client for MCP server `{}`", entry.name))?;
         Ok(Self {
@@ -396,8 +423,9 @@ async fn finish_connect(
     entry: &McpServerEntry,
     transport: AnyTransport,
 ) -> Result<ConnectedServer> {
-    let mut conn = McpConnection::new(transport);
-    tokio::time::timeout(REQUEST_TIMEOUT, conn.initialize())
+    let timeout = resolve_timeout(entry);
+    let mut conn = McpConnection::new_with_timeout(transport, timeout);
+    tokio::time::timeout(timeout, conn.initialize())
         .await
         .with_context(|| format!("initializing MCP server `{}`", entry.name))??;
     let tools = conn
@@ -545,5 +573,69 @@ mod tests {
         let body = "data: {\"only\":true}";
         assert_eq!(parse_sse_messages(body), vec!["{\"only\":true}"]);
         assert!(parse_sse_messages("").is_empty());
+    }
+
+    /// Build an entry carrying just a `request_timeout_secs` override (all other
+    /// fields default) — every field is `#[serde(default)]`.
+    fn entry_with_timeout(json: &str) -> McpServerEntry {
+        serde_json::from_str(json).unwrap()
+    }
+
+    #[test]
+    fn resolve_timeout_defaults_when_unset() {
+        assert_eq!(
+            resolve_timeout(&entry_with_timeout("{}")),
+            DEFAULT_REQUEST_TIMEOUT
+        );
+    }
+
+    #[test]
+    fn resolve_timeout_honors_override_and_camel_alias() {
+        assert_eq!(
+            resolve_timeout(&entry_with_timeout(r#"{"request_timeout_secs":180}"#)),
+            Duration::from_secs(180)
+        );
+        // Claude-format JSON uses the camelCase alias.
+        assert_eq!(
+            resolve_timeout(&entry_with_timeout(r#"{"requestTimeoutSecs":45}"#)),
+            Duration::from_secs(45)
+        );
+    }
+
+    #[test]
+    fn resolve_timeout_clamps_zero_up_and_huge_down() {
+        // 0 must never mean "no timeout".
+        assert_eq!(
+            resolve_timeout(&entry_with_timeout(r#"{"request_timeout_secs":0}"#)),
+            Duration::from_secs(1)
+        );
+        // An over-large value is capped so a wedged call still gives up.
+        assert_eq!(
+            resolve_timeout(&entry_with_timeout(r#"{"request_timeout_secs":999999}"#)),
+            MAX_REQUEST_TIMEOUT
+        );
+    }
+
+    /// A transport whose `recv` never resolves — stands in for a wedged server.
+    struct HangingTransport;
+    impl Transport for HangingTransport {
+        async fn send(&mut self, _line: String) -> Result<()> {
+            Ok(())
+        }
+        async fn recv(&mut self) -> Result<Option<String>> {
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn request_gives_up_after_the_configured_timeout() {
+        // Virtual clock (start_paused) auto-advances when idle, so the configured
+        // 5s deadline fires deterministically with no real wall-clock spent.
+        let mut conn = McpConnection::new_with_timeout(HangingTransport, Duration::from_secs(5));
+        let err = conn.list_tools().await.unwrap_err();
+        assert!(
+            err.to_string().contains("timed out awaiting `tools/list`"),
+            "{err}"
+        );
     }
 }

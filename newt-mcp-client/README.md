@@ -14,6 +14,31 @@ subprocess needed.
 Part of [Newt-Agent](https://github.com/Gilamonster-Foundation/newt-agent), a
 small, fast, local-first agentic coder.
 
+## Per-server request timeout
+
+Each `tools/call` is bounded by a per-request timeout so a wedged server
+cannot hang the agent — `DEFAULT_REQUEST_TIMEOUT` (20s) unless the server
+entry overrides it. Raise it for a server whose tools legitimately run long
+(e.g. a routine engine that fans out across many repos and live APIs in one
+call) via `request_timeout_secs` on the entry — `requestTimeoutSecs` in
+Claude-format JSON:
+
+```toml
+# newt TOML — a [[mcp_servers]] entry
+[[mcp_servers]]
+name = "modulex"
+command = "modulex-mcp"
+request_timeout_secs = 180
+```
+
+```json
+// Claude-format .mcp.json
+{ "mcpServers": { "modulex": { "command": "modulex-mcp", "requestTimeoutSecs": 180 } } }
+```
+
+The resolved value is clamped to `[1s, MAX_REQUEST_TIMEOUT]` (600s), so even a
+patient server still gives up on a genuinely wedged call.
+
 ## License
 
 Apache-2.0

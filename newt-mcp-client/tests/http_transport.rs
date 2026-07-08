@@ -20,6 +20,7 @@ fn http_entry(url: String, headers: BTreeMap<String, String>) -> McpServerEntry 
         env: BTreeMap::new(),
         url: Some(url),
         headers,
+        request_timeout_secs: None,
     }
 }
 

@@ -323,6 +323,7 @@ mod tests {
             env: std::collections::BTreeMap::new(),
             url: Some(url.into()),
             headers: std::collections::BTreeMap::new(),
+            request_timeout_secs: None,
         }
     }
 
