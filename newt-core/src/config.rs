@@ -1619,6 +1619,18 @@ pub struct TuiConfig {
     /// this only governs the human. See `docs/decisions/plain_scroller_tui.md`.
     #[serde(default = "default_allow_bang_escape")]
     pub allow_bang_escape: bool,
+    /// `tui-shell-commands`: human-typed navigation/inspection commands
+    /// (`cd`/`pwd`/`ls`/`env`/`date`) handled by the TUI itself, managing a
+    /// session working directory shown in the prompt — distinct from the agent's
+    /// `run_command`. Default `true`. The model never sees these; this governs
+    /// only the human at the keyboard.
+    #[serde(default = "default_allow_shell_commands")]
+    pub allow_shell_commands: bool,
+    /// Whether the `tui-shell-commands` suite may MUTATE the filesystem
+    /// (`mkdir`/`mv`, and `rm` via a recoverable graveyard). Default `false` —
+    /// navigation + inspection only until the operator opts in.
+    #[serde(default = "default_allow_shell_mutations")]
+    pub allow_shell_mutations: bool,
 }
 
 fn default_tool_output_lines() -> usize {
@@ -1663,6 +1675,14 @@ fn default_sanitize_mcp_server_names() -> bool {
 
 fn default_allow_bang_escape() -> bool {
     true
+}
+
+fn default_allow_shell_commands() -> bool {
+    true
+}
+
+fn default_allow_shell_mutations() -> bool {
+    false
 }
 
 // ---------------------------------------------------------------------------
@@ -2717,6 +2737,8 @@ impl Default for TuiConfig {
             sanitize_mcp_server_names: default_sanitize_mcp_server_names(),
             mcp_allow_insecure_hosts: Vec::new(),
             allow_bang_escape: default_allow_bang_escape(),
+            allow_shell_commands: default_allow_shell_commands(),
+            allow_shell_mutations: default_allow_shell_mutations(),
         }
     }
 }
@@ -4089,6 +4111,18 @@ mod tests {
         // Explicit opt-out parses.
         let cfg: TuiConfig = toml::from_str("allow_bang_escape = false").unwrap();
         assert!(!cfg.allow_bang_escape);
+    }
+
+    #[test]
+    fn shell_commands_default_on_mutations_default_off_and_round_trip() {
+        // Navigation/inspection suite on by default; mutations off until opted in.
+        let cfg: TuiConfig = toml::from_str("").unwrap();
+        assert!(cfg.allow_shell_commands);
+        assert!(!cfg.allow_shell_mutations);
+        let cfg: TuiConfig =
+            toml::from_str("allow_shell_commands = false\nallow_shell_mutations = true").unwrap();
+        assert!(!cfg.allow_shell_commands);
+        assert!(cfg.allow_shell_mutations);
     }
 
     #[test]
