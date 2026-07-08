@@ -5371,6 +5371,11 @@ fn run_chat(
     // after each turn from the turn's input tokens + the resolved send budget,
     // and shown in the rich header for the NEXT prompt. `None` until known.
     let mut token_gauge: Option<(u32, u32)> = None;
+    // `/context size <N>` session override (#588): clamps the per-turn send
+    // budget (eff_safe_context / eff_max_ok_input) to a user-chosen ceiling so
+    // a too-tight auto-sized window can be widened for experimentation without
+    // editing config. `None` = use the probed / configured budget.
+    let mut context_size_override: Option<u32> = None;
     // Prompted ocap grants (issue #263 + #721), resolved ONCE per session.
     // #721 flipped the default: an INTERACTIVE human (BOTH stdin and stdout are
     // real terminals) now prompts on a denial BY DEFAULT — a denial that asks
@@ -6167,6 +6172,37 @@ fn run_chat(
                             ) {
                                 print_newt(&line, color, verbose);
                             }
+                        } else if rest == "show" {
+                            // Build the outbound message set fresh and render a
+                            // compact per-message breakdown so the operator can
+                            // see exactly what fills the window right now.
+                            let msgs = memory.build_messages("", "");
+                            let mut total = 0usize;
+                            print_newt("context contents (freshly built):", color, verbose);
+                            for (i, m) in msgs.iter().enumerate() {
+                                let chars = m.content.chars().count();
+                                total += chars;
+                                let preview: String =
+                                    m.content.chars().take(60).collect::<String>();
+                                let preview = preview.replace('\n', " ");
+                                print_newt(
+                                    &format!(
+                                        "  [{i:>2}] {:<9} {chars:>7} chars  {preview}",
+                                        m.role.as_str()
+                                    ),
+                                    color,
+                                    verbose,
+                                );
+                            }
+                            print_newt(
+                                &format!(
+                                    "  total: {} messages, {total} chars (~{} tokens)",
+                                    msgs.len(),
+                                    total / 4
+                                ),
+                                color,
+                                verbose,
+                            );
                         } else {
                             let result = handle_context_command(
                                 rest,
@@ -6183,6 +6219,9 @@ fn run_chat(
                             }
                             if let Some((f, on)) = result.set_feature {
                                 context_features_override.set(f, Some(on));
+                            }
+                            if let Some(sz) = result.set_budget {
+                                context_size_override = if sz == 0 { None } else { Some(sz) };
                             }
                         }
                         surface.save_history();
@@ -6523,7 +6562,24 @@ fn run_chat(
                         if updated {
                             probe::save_cache(&cap_cache);
                         }
+                        // A configured per-model `context_window` seeds the
+                        // budget when the probe found nothing (issue: OpenAI /
+                        // NVIDIA wire has no `/api/show`, so `safe_context`
+                        // stays None and the loop never budgets against a real
+                        // window). Only a fallback — an empirical probe result
+                        // always wins.
+                        let sc = sc.or_else(|| model_tune.and_then(|t| t.context_window));
                         (sc, moi, ratio)
+                    };
+
+                    // Apply the `/context size <N>` session override: it caps
+                    // both the safe-context budget and the max-ok-input guard to
+                    // the user's chosen ceiling. A raise past the probed value is
+                    // honored too — the user is explicitly opting into a larger
+                    // send window for experimentation.
+                    let (eff_safe_context, eff_max_ok_input) = match context_size_override {
+                        Some(n) => (Some(n), Some(n)),
+                        None => (eff_safe_context, eff_max_ok_input),
                     };
 
                     // num_ctx resolution: explicit config > safe_context > model default.
@@ -6981,6 +7037,18 @@ fn run_chat(
                                             .as_ref()
                                             .map(|c| c.summary_input_cap_floor_chars)
                                             .unwrap_or(8_192),
+                                        input_ceiling_pct: cfg
+                                            .context
+                                            .as_ref()
+                                            .map(|c| c.input_ceiling_pct)
+                                            .unwrap_or(80)
+                                            .clamp(1, 99),
+                                        low_budget_pct: cfg
+                                            .context
+                                            .as_ref()
+                                            .map(|c| c.low_budget_pct)
+                                            .unwrap_or(15)
+                                            .clamp(1, 50),
                                         // #307: the active preset's exec floor — the
                                         // ceiling the --disable-ocap bypass cannot
                                         // cross. None when no mode is active.
@@ -9399,6 +9467,9 @@ struct ContextCommandResult {
     lines: Vec<String>,
     set_manager: Option<newt_core::ContextManager>,
     set_feature: Option<(newt_core::ContextFeature, bool)>,
+    /// `/context size <N>` session budget override; `Some(0)` clears it back
+    /// to the probed / configured value.
+    set_budget: Option<u32>,
 }
 
 fn handle_context_feature_arg(
@@ -9506,6 +9577,30 @@ fn handle_context_command(
             "  /context manager <preset>  ·  /context feature <name> [on|off]  ·  /context stats"
                 .to_string(),
         );
+    } else if rest == "size" {
+        out.lines.push(
+            "context size: use /context size <N> to set the per-turn send \
+             budget (tokens), or /context size reset to restore the auto-sized value"
+                .to_string(),
+        );
+    } else if let Some(arg) = rest.strip_prefix("size ") {
+        let arg = arg.trim();
+        if arg == "reset" || arg == "auto" || arg == "0" {
+            out.set_budget = Some(0);
+            out.lines
+                .push("context size → reset (auto-sized budget)".to_string());
+        } else {
+            match arg.parse::<u32>() {
+                Ok(n) if n > 0 => {
+                    out.set_budget = Some(n);
+                    out.lines
+                        .push(format!("context size → {n} tokens (session override)"));
+                }
+                _ => out.lines.push(format!(
+                    "invalid context size '{arg}' — use a positive token count or 'reset'"
+                )),
+            }
+        }
     } else if rest == "manager" {
         out.lines.push(format!(
             "context manager: {} ({mgr_src}) — \
@@ -9547,13 +9642,13 @@ fn handle_context_command(
         } else {
             out.lines.push(format!(
                 "unknown /context subcommand '{rest}' — \
-                 use /context [manager <preset> | feature <name> [on|off] | stats]"
+                 use /context [manager <preset> | feature <name> [on|off] | size <N> | show | stats]"
             ));
         }
     } else {
         out.lines.push(format!(
             "unknown /context subcommand '{rest}' — \
-             use /context [manager <preset> | feature <name> [on|off] | stats]"
+             use /context [manager <preset> | feature <name> [on|off] | size <N> | show | stats]"
         ));
     }
     out
@@ -15194,6 +15289,8 @@ mod tool_round_cap_tests {
                     debug: false,
                     trace: false,
                     num_ctx: None,
+                    input_ceiling_pct: 80,
+                    low_budget_pct: 15,
                     connect_timeout_secs: 5,
                     inference_timeout_secs: 120,
                     mid_loop_trim_threshold: 40,
@@ -15506,8 +15603,8 @@ mod helper_fn_tests {
         use newt_core::{
             BackendKind, ContextConfig, ContextFeature as F, ContextFeatures, ContextManager,
         };
-        // Cloud (Openai) base: local spill offload is on by default, while
-        // embedding/plan/state features stay opt-in.
+        // Cloud (Openai) base: per the context policy, every available
+        // feature defaults on except Provenance, regardless of backend.
         let cloud = context_features(
             &newt_core::Config::default(),
             ContextManager::Standard,
@@ -15515,9 +15612,9 @@ mod helper_fn_tests {
             BackendKind::Openai,
         );
         assert!(cloud.get(F::ToolOffload));
-        assert!(!cloud.get(F::Semantic));
-        assert!(!cloud.get(F::Scratchpad));
-        assert!(!cloud.get(F::Scheduled));
+        assert!(cloud.get(F::Semantic));
+        assert!(cloud.get(F::Scratchpad));
+        assert!(cloud.get(F::Scheduled));
         // [context.features] override layers over the preset base.
         let mut cfg_feats = ContextFeatures::default();
         cfg_feats.set(F::Semantic, Some(true));
@@ -15651,9 +15748,11 @@ mod helper_fn_tests {
         assert!(run("feature scratchpad maybe").lines[0].contains("unknown toggle"));
         assert!(run("wat").lines[0].contains("unknown /context subcommand"));
 
-        // feature query (no toggle) shows state + availability
-        assert!(run("feature semantic").lines[0].contains("context feature semantic: off"));
-        assert!(run("semantic").lines[0].contains("context feature semantic: off"));
+        // feature query (no toggle) shows state + availability. Semantic now
+        // defaults ON for every backend under the all-on-except-provenance
+        // policy (`base_for`), so the resolved query reports "on".
+        assert!(run("feature semantic").lines[0].contains("context feature semantic: on"));
+        assert!(run("semantic").lines[0].contains("context feature semantic: on"));
 
         // A feature FORCED on via [context.features] (allowed even before it's
         // implemented): toggling it off is still refused, and the message +
@@ -16992,6 +17091,7 @@ mod env_resolution_tests {
             model_tuning: vec![newt_core::config::ModelTuning {
                 model: "m".into(),
                 num_ctx: None,
+                context_window: None,
                 real_context_discovery: Some(false),
                 mid_loop_trim_threshold: None,
                 mid_loop_trim_tokens: None,

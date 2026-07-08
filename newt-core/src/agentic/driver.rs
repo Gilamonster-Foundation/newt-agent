@@ -102,6 +102,10 @@ pub struct TurnDriverConfig {
     pub build_check_cmd: Option<String>,
     /// Empirically safe context size used to detect likely overflow.
     pub safe_context: Option<u32>,
+    /// #727: percent of `num_ctx` used as the input-token ceiling (default 80).
+    pub input_ceiling_pct: u32,
+    /// #727: remaining-budget percent below which the loop nudges (default 15).
+    pub low_budget_pct: usize,
 }
 
 impl TurnDriverConfig {
@@ -133,6 +137,8 @@ impl TurnDriverConfig {
             max_ok_input: None,
             build_check_cmd: None,
             safe_context: None,
+            input_ceiling_pct: 80,
+            low_budget_pct: 15,
         }
     }
 }
@@ -382,6 +388,10 @@ async fn run_one_turn(
         debug: false,
         trace: false,
         num_ctx: config.num_ctx,
+        // #727 tunables: headless driver keeps the historical defaults
+        // (80% input ceiling, 15% low-budget nudge threshold).
+        input_ceiling_pct: config.input_ceiling_pct,
+        low_budget_pct: config.low_budget_pct,
         connect_timeout_secs: config.connect_timeout_secs,
         inference_timeout_secs: config.inference_timeout_secs,
         mid_loop_trim_threshold: config.mid_loop_trim_threshold,

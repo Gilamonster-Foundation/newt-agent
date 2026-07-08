@@ -992,6 +992,17 @@ fn resolve_warm_model(
     evict_vllm: bool,
     dgx: &DgxConfig,
 ) -> anyhow::Result<String> {
+    resolve_warm_model_with(model, evict_vllm, dgx, &|k| std::env::var(k).ok())
+}
+
+/// [`resolve_warm_model`] with injectable env so tests need not mutate the
+/// process-global environment (which is unsound under parallel test threads).
+fn resolve_warm_model_with(
+    model: Option<String>,
+    evict_vllm: bool,
+    dgx: &DgxConfig,
+    get_env: &dyn Fn(&str) -> Option<String>,
+) -> anyhow::Result<String> {
     if let Some(m) = model {
         return Ok(m);
     }
@@ -1003,7 +1014,7 @@ fn resolve_warm_model(
             dgx.active_model.as_deref().unwrap_or("<none>")
         );
     }
-    Ok(dgx.resolve_active_model()?)
+    Ok(dgx.resolve_active_model_with(get_env)?)
 }
 
 async fn warm(
@@ -2609,6 +2620,36 @@ mod tests {
     use wiremock::matchers::{method, path as wm_path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    /// Scoped guard that removes an env var for the duration of a test and
+    /// restores its prior value on drop. Keeps tests hermetic against ambient
+    /// process env (e.g. a sandbox exporting `NEWT_DGX_MODEL`).
+    #[allow(dead_code)]
+    struct EnvVarGuard {
+        key: String,
+        prev: Option<String>,
+    }
+
+    #[allow(dead_code)]
+    impl EnvVarGuard {
+        fn unset(key: &str) -> Self {
+            let prev = std::env::var(key).ok();
+            std::env::remove_var(key);
+            Self {
+                key: key.to_string(),
+                prev,
+            }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => std::env::set_var(&self.key, v),
+                None => std::env::remove_var(&self.key),
+            }
+        }
+    }
+
     /// A recorded SSH call: `(user, host, port, command)`.
     type SshCall = (String, String, Option<u16>, String);
 
@@ -3635,6 +3676,9 @@ tiers = ["FAST", "STANDARD"]
 
     #[test]
     fn resolve_warm_model_evict_vllm_requires_explicit_model() {
+        // Hermetic: inject an empty env so ambient NEWT_DGX_MODEL cannot leak
+        // in via resolve_active_model() and override the config's active model.
+        let no_env = |_: &str| None;
         // After `vllm up`, active_model is the vLLM served name; warming it on
         // Ollama would 404, so --evict-vllm with no arg must refuse helpfully.
         let mut dgx = DgxConfig {
@@ -3642,7 +3686,7 @@ tiers = ["FAST", "STANDARD"]
             active_model: Some("qwen3.6-35b".to_string()),
             ..Default::default()
         };
-        let err = resolve_warm_model(None, true, &dgx)
+        let err = resolve_warm_model_with(None, true, &dgx, &no_env)
             .unwrap_err()
             .to_string();
         assert!(err.contains("--evict-vllm") && err.contains("qwen3.6-35b"));
@@ -3650,7 +3694,7 @@ tiers = ["FAST", "STANDARD"]
         dgx.active_endpoint = EndpointKind::Ollama;
         dgx.active_model = Some("llama3.1:8b".to_string());
         assert_eq!(
-            resolve_warm_model(None, false, &dgx).unwrap(),
+            resolve_warm_model_with(None, false, &dgx, &no_env).unwrap(),
             "llama3.1:8b"
         );
     }
@@ -3658,7 +3702,10 @@ tiers = ["FAST", "STANDARD"]
     #[test]
     fn resolve_warm_model_errors_when_no_active_and_no_arg() {
         // No arg, no --evict-vllm, no active model → the usual NoActiveModel.
-        assert!(resolve_warm_model(None, false, &DgxConfig::default()).is_err());
+        // Hermetic: inject an empty env so ambient NEWT_DGX_MODEL cannot leak
+        // in via resolve_active_model() and make this branch resolve.
+        let no_env = |_: &str| None;
+        assert!(resolve_warm_model_with(None, false, &DgxConfig::default(), &no_env).is_err());
     }
 
     // --- switch (Step 14.14) ----------------------------------------------
