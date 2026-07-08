@@ -9296,6 +9296,12 @@ fn resolve_summarizer_backend(
     inf_model: &str,
     inf_kind: newt_core::BackendKind,
     inf_key: &Option<String>,
+    // The resolved embedded-default GGUF path, or `None` when no on-host model is
+    // available (→ degrade to session). INJECTED so resolution is hermetic in
+    // tests; production passes `embedded_summarizer_default()`, which reads the
+    // real `~/.newt/models`. (Reading it inline made this machine-dependent — a
+    // provisioned box resolved to embedded and flipped the session-reuse test.)
+    embedded_gguf: Option<String>,
 ) -> (
     String,
     String,
@@ -9309,7 +9315,7 @@ fn resolve_summarizer_backend(
         || sum_cfg.model_path.is_some();
 
     if !has_override {
-        match default_summarizer_choice(embedded_summarizer_default()) {
+        match default_summarizer_choice(embedded_gguf) {
             SummarizerChoice::Embedded(path) => {
                 let model = newt_inference::palette::default_model().name.to_string();
                 // url/key are unused for the in-process embedded engine.
@@ -9396,8 +9402,14 @@ fn build_session_summarizer(
     num_ctx: Option<u32>,
     color: bool,
 ) -> newt_core::Summarizer {
-    let (url, model, kind, key, model_path) =
-        resolve_summarizer_backend(sum_cfg, inf_url, inf_model, inf_kind, inf_key);
+    let (url, model, kind, key, model_path) = resolve_summarizer_backend(
+        sum_cfg,
+        inf_url,
+        inf_model,
+        inf_kind,
+        inf_key,
+        embedded_summarizer_default(),
+    );
     make_loop_summarizer(
         url,
         model,
@@ -17657,6 +17669,7 @@ mod http_loop_tests {
             "session-model:27b",
             newt_core::BackendKind::Ollama,
             &Some("session-key".into()),
+            None, // override set ⇒ embedded lookup unused; keep hermetic
         );
         assert_eq!(url, "http://REDACTED-HOST:11434");
         assert_eq!(model, "qwen2.5-1.5b");
@@ -17699,6 +17712,7 @@ mod http_loop_tests {
             "session-model:27b",
             newt_core::BackendKind::Ollama,
             &Some("session-key".into()),
+            None, // no on-host model ⇒ deterministically degrade to session (hermetic)
         );
         assert_eq!(url, "http://REDACTED-HOST:11434");
         assert_eq!(model, "session-model:27b");

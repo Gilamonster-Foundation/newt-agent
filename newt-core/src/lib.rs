@@ -92,14 +92,14 @@ pub use classifiers::{
     classifier_config_dir, NudgeClass, NudgeClassification, NudgeClassifier, NudgeClassifierConfig,
 };
 pub use config::{
-    full_access_default_engine, ocap_l3_backend, resolve_shell_engine, AgentsConfig, BackendConfig,
-    BackendKind, BundleConfig, ChatStyle, ColorMode, Config, ContextConfig, ContextFeature,
-    ContextFeatureSet, ContextFeatures, ContextManager, ConversationsConfig, CrewPolicyConfig,
-    EditMode, FooterMode, Loadout, LoadoutSettings, LogConfig, MarkdownMode, MemoryConfig,
-    MemoryDisclosure, MemoryProviderKind, OnEmbedFailure, OpenAiApi, PermissionPreset, PickVia,
-    PlanConfig, PlanPruneConfig, ProfilePick, ProviderConfig, ScratchConfig, SemanticConfig,
-    ShellConfig, ShellEngine, SkillsConfig, SummarizerConfig, ThinkingMode, ToolPermissions,
-    TuiConfig,
+    full_access_default_engine, ocap_l3_backend, resolve_shell_engine,
+    shell_env_passthrough_default, AgentsConfig, BackendConfig, BackendKind, BundleConfig,
+    ChatStyle, ColorMode, Config, ContextConfig, ContextFeature, ContextFeatureSet,
+    ContextFeatures, ContextManager, ConversationsConfig, CrewPolicyConfig, EditMode, FooterMode,
+    Loadout, LoadoutSettings, LogConfig, MarkdownMode, MemoryConfig, MemoryDisclosure,
+    MemoryProviderKind, OnEmbedFailure, OpenAiApi, PermissionPreset, PickVia, PlanConfig,
+    PlanPruneConfig, ProfilePick, ProviderConfig, ScratchConfig, SemanticConfig, ShellConfig,
+    ShellEngine, SkillsConfig, SummarizerConfig, ThinkingMode, ToolPermissions, TuiConfig,
 };
 pub use conversation::{
     new_conversation_id, session_plan_dir, session_plan_path, ConversationRecord,

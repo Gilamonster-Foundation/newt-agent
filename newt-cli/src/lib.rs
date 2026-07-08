@@ -760,12 +760,22 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             // `safe-subset` — and published via NEWT_SHELL_ENGINE for newt-core's
             // dispatch to read (same env pattern as NEWT_FULL_ACCESS).
             {
-                let configured = newt_core::Config::resolve()
-                    .ok()
-                    .and_then(|c| c.shell.and_then(|s| s.engine));
-                let engine =
-                    newt_core::resolve_shell_engine(cli.shell_engine, configured, cli.full_access);
+                let shell_cfg = newt_core::Config::resolve().ok().and_then(|c| c.shell);
+                let engine = newt_core::resolve_shell_engine(
+                    cli.shell_engine,
+                    shell_cfg.as_ref().and_then(|s| s.engine),
+                    cli.full_access,
+                );
                 unsafe { std::env::set_var("NEWT_SHELL_ENGINE", engine.as_str()) };
+                // Confined-shell env passthrough (so `~` expands — brush needs
+                // HOME): `[shell] env_passthrough` (default HOME+USER), published
+                // colon-separated for newt-core's confined dispatch to seed.
+                let passthrough = shell_cfg
+                    .and_then(|s| s.env_passthrough)
+                    .unwrap_or_else(newt_core::shell_env_passthrough_default);
+                unsafe {
+                    std::env::set_var("NEWT_SHELL_ENV_PASSTHROUGH", passthrough.join(":"));
+                }
             }
             // facade P4 (#780): --no-route turns OFF the convenience tool-call
             // routing (run_command reads the var per call). A DISTINCT switch
