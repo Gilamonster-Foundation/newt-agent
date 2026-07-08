@@ -751,6 +751,12 @@ pub struct ChatCtx<'a> {
     /// per turn like `tool_events`; persisted into the turn's `phantom_reaches`.
     /// `None` (eval / headless) ⇒ nothing recorded.
     pub phantom_reaches: Option<&'a mut Vec<crate::PhantomReach>>,
+    /// Out-param: why the loop ended the turn ([`crate::TurnEndReason`]) —
+    /// narration-acceptance forensics, round cap, empty reply. Lent fresh per
+    /// turn like `tool_events`; the TUI folds it into `TurnMetrics` (footer +
+    /// usage.jsonl). `None` (eval / headless) ⇒ nothing reported. The
+    /// Responses-API loop does not report it.
+    pub end_reason: Option<&'a mut Option<crate::TurnEndReason>>,
     /// Prompted ocap grants (issue #263): when present, a capability denial
     /// inside `execute_tool` consults the human — allow once / session allow
     /// / deny — instead of failing outright; the loop blocks like a long
@@ -1112,6 +1118,7 @@ pub async fn chat_complete(
         compress_state,
         mut tool_events,
         mut phantom_reaches,
+        mut end_reason,
         mut permission_gate,
         mut on_round_usage,
         estimate_ratio,
@@ -1946,6 +1953,31 @@ pub async fn chat_complete(
                             accumulated_usage = merge_round_usage(accumulated_usage, $usage);
                             continue 'round_loop;
                         }
+                        // Every rescue gate passed on this content: it is
+                        // about to be accepted as the final answer. Record
+                        // WHY — before this, a narration acceptance was
+                        // indistinguishable from a normal completion, even
+                        // under NEWT_DEBUG (2026-07-08 ornith:35b forensics).
+                        let accepted_reason = if nudge_classification.is_pending_action() {
+                            if round + 1 >= current_tool_round_limit {
+                                crate::TurnEndReason::NarrationFinalRound
+                            } else {
+                                crate::TurnEndReason::NarrationCapExhausted
+                            }
+                        } else {
+                            crate::TurnEndReason::Completed
+                        };
+                        if debug && accepted_reason != crate::TurnEndReason::Completed {
+                            print_debug(
+                                &format!(
+                                    "no-tool narration accepted as final answer ({accepted_reason:?})"
+                                ),
+                                color,
+                            );
+                        }
+                        if let Some(slot) = &mut end_reason {
+                            **slot = Some(accepted_reason);
+                        }
                     }
                 }};
             }
@@ -2246,6 +2278,9 @@ pub async fn chat_complete(
                                 hook(RoundObservation::ThinkingOnly);
                             }
                         }
+                        if let Some(slot) = &mut end_reason {
+                            **slot = Some(crate::TurnEndReason::Empty);
+                        }
                         return Ok((
                             suspicious_empty_ollama_diagnostic(&json),
                             false,
@@ -2254,6 +2289,9 @@ pub async fn chat_complete(
                         ));
                     }
                     let msg = "(model returned an empty response — try rephrasing, or check the model with `newt doctor`)";
+                    if let Some(slot) = &mut end_reason {
+                        **slot = Some(crate::TurnEndReason::Empty);
+                    }
                     return Ok((msg.to_string(), false, merged, hallucination_count));
                 }
                 // Use probe content; print it since it was never streamed.
@@ -2511,6 +2549,9 @@ pub async fn chat_complete(
     // cited path against the workspace and append a visible refutation for
     // any that don't exist. Appends only; the model's prose is never edited.
     let text = claim_check::annotate_against_workspace(text, workspace);
+    if let Some(slot) = &mut end_reason {
+        **slot = Some(crate::TurnEndReason::RoundCap);
+    }
     Ok((text, streamed, usage, hallucination_count))
 }
 
@@ -3907,6 +3948,7 @@ pub async fn openai_chat_complete(
         compress_state,
         mut tool_events,
         mut phantom_reaches,
+        mut end_reason,
         mut permission_gate,
         mut on_round_usage,
         estimate_ratio,
@@ -4564,6 +4606,31 @@ pub async fn openai_chat_complete(
                     round_est_raw,
                 );
             }
+            // Acceptance forensics (mirrors the Ollama macro): record WHY
+            // this no-tool reply ends the turn.
+            let accepted_reason = if content.is_empty() {
+                crate::TurnEndReason::Empty
+            } else if nudge_classification
+                .as_ref()
+                .is_some_and(|c| c.is_pending_action())
+            {
+                if round + 1 >= current_tool_round_limit {
+                    crate::TurnEndReason::NarrationFinalRound
+                } else {
+                    crate::TurnEndReason::NarrationCapExhausted
+                }
+            } else {
+                crate::TurnEndReason::Completed
+            };
+            if debug && accepted_reason != crate::TurnEndReason::Completed {
+                print_debug(
+                    &format!("no-tool reply accepted as final answer ({accepted_reason:?})"),
+                    color,
+                );
+            }
+            if let Some(slot) = &mut end_reason {
+                **slot = Some(accepted_reason);
+            }
             let out = if content.is_empty() {
                 "(model returned an empty response — try rephrasing, or check the model with `newt doctor`)".to_string()
             } else {
@@ -4801,6 +4868,9 @@ pub async fn openai_chat_complete(
     .await?;
     // #867: same path-claim refutation as the Ollama cap exit.
     let text = claim_check::annotate_against_workspace(text, workspace);
+    if let Some(slot) = &mut end_reason {
+        **slot = Some(crate::TurnEndReason::RoundCap);
+    }
     Ok((text, streamed, usage, hallucination_count))
 }
 
@@ -4976,6 +5046,7 @@ pub async fn openai_responses_complete(
         compress_state: _,
         mut tool_events,
         mut phantom_reaches,
+        end_reason: _,
         mut permission_gate,
         on_round_usage: _,
         estimate_ratio: _,
@@ -6517,6 +6588,7 @@ mod tool_round_cap_tests {
                 compress_state: None,
                 tool_events: None,
                 phantom_reaches: None,
+                end_reason: None,
                 permission_gate: None,
                 on_round_usage: None,
                 estimate_ratio: None,
@@ -6682,6 +6754,7 @@ mod tool_round_cap_tests {
                 compress_state: None,
                 tool_events: None,
                 phantom_reaches: None,
+                end_reason: None,
                 permission_gate: None,
                 on_round_usage: None,
                 estimate_ratio: None,
@@ -6766,6 +6839,7 @@ mod tool_round_cap_tests {
                 compress_state: None,
                 tool_events: None,
                 phantom_reaches: None,
+                end_reason: None,
                 permission_gate: None,
                 on_round_usage: None,
                 estimate_ratio: None,
@@ -6911,6 +6985,7 @@ mod tool_round_cap_tests {
                 compress_state: None,
                 tool_events: None,
                 phantom_reaches: None,
+                end_reason: None,
                 permission_gate: None,
                 on_round_usage: None,
                 estimate_ratio: None,
@@ -6993,6 +7068,7 @@ mod tool_round_cap_tests {
                 compress_state: None,
                 tool_events: None,
                 phantom_reaches: None,
+                end_reason: None,
                 permission_gate: None,
                 on_round_usage: None,
                 estimate_ratio: None,
@@ -7098,6 +7174,7 @@ mod tool_round_cap_tests {
                 compress_state: None,
                 tool_events: Some(&mut events),
                 phantom_reaches: None,
+                end_reason: None,
                 permission_gate: None,
                 on_round_usage: None,
                 estimate_ratio: None,
@@ -7215,6 +7292,7 @@ mod tool_round_cap_tests {
                 compress_state: None,
                 tool_events: Some(&mut events),
                 phantom_reaches: None,
+                end_reason: None,
                 permission_gate: None,
                 on_round_usage: None,
                 estimate_ratio: None,
@@ -7324,6 +7402,7 @@ mod tool_round_cap_tests {
                 compress_state: None,
                 tool_events: None,
                 phantom_reaches: None,
+                end_reason: None,
                 permission_gate: None,
                 on_round_usage: None,
                 estimate_ratio: None,
@@ -7474,6 +7553,7 @@ mod tool_round_cap_tests {
                 compress_state: None,
                 tool_events: None,
                 phantom_reaches: None,
+                end_reason: None,
                 permission_gate: None,
                 on_round_usage: None,
                 estimate_ratio: None,
@@ -7634,6 +7714,7 @@ mod tool_round_cap_tests {
                 compress_state: None,
                 tool_events: None,
                 phantom_reaches: None,
+                end_reason: None,
                 permission_gate: None,
                 on_round_usage: None,
                 estimate_ratio: None,
@@ -7733,6 +7814,7 @@ mod http_loop_tests {
             compress_state: None,
             tool_events: None,
             phantom_reaches: None,
+            end_reason: None,
             permission_gate: None,
             on_round_usage: None,
             estimate_ratio: None,
@@ -9089,6 +9171,61 @@ mod http_loop_tests {
     }
 
     #[tokio::test]
+    async fn accepted_narration_reports_cap_exhausted_end_reason() {
+        // The acceptance-forensics record: a narration that exhausts the
+        // rescue budget ends the turn with a visible reason instead of
+        // masquerading as a normal completion.
+        let server = MockServer::start().await;
+        let round = Arc::new(AtomicUsize::new(0));
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ScriptedOpenAi {
+                round: round.clone(),
+                script: vec![
+                    serde_json::json!({ "content": "Let me keep editing now." }),
+                    serde_json::json!({ "content": "Let me keep editing now." }),
+                ],
+            })
+            .mount(&server)
+            .await;
+        let messages = msgs();
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut end_reason: Option<crate::TurnEndReason> = None;
+        let mut c = ctx(&uri, &messages, &caveats);
+        c.kind = BackendKind::Openai;
+        c.end_reason = Some(&mut end_reason);
+        let _ = chat_complete(c, &mut NoMcp).await.expect("dispatch");
+        assert_eq!(
+            end_reason,
+            Some(crate::TurnEndReason::NarrationCapExhausted)
+        );
+    }
+
+    #[tokio::test]
+    async fn genuine_completion_reports_completed_end_reason() {
+        let server = MockServer::start().await;
+        let round = Arc::new(AtomicUsize::new(0));
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ScriptedOpenAi {
+                round: round.clone(),
+                script: vec![serde_json::json!({ "content": "The capital of France is Paris." })],
+            })
+            .mount(&server)
+            .await;
+        let messages = msgs();
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut end_reason: Option<crate::TurnEndReason> = None;
+        let mut c = ctx(&uri, &messages, &caveats);
+        c.kind = BackendKind::Openai;
+        c.end_reason = Some(&mut end_reason);
+        let _ = chat_complete(c, &mut NoMcp).await.expect("dispatch");
+        assert_eq!(end_reason, Some(crate::TurnEndReason::Completed));
+    }
+
+    #[tokio::test]
     async fn narration_nudge_reaches_the_wire_tagged_as_loop_guidance() {
         // The rescue nudge must arrive tagged so the compaction pipeline can
         // keep it (and the model's echo of it) out of later summaries.
@@ -9666,6 +9803,7 @@ mod save_note_loop_tests {
             compress_state: None,
             tool_events: None,
             phantom_reaches: None,
+            end_reason: None,
             permission_gate: None,
             on_round_usage: None,
             estimate_ratio: None,
@@ -10157,6 +10295,7 @@ mod compression_loop_tests {
             compress_state: None,
             tool_events: None,
             phantom_reaches: None,
+            end_reason: None,
             permission_gate: None,
             on_round_usage: None,
             estimate_ratio: None,
@@ -11309,6 +11448,7 @@ mod observation_hook_tests {
             compress_state: None,
             tool_events: None,
             phantom_reaches: None,
+            end_reason: None,
             permission_gate: None,
             on_round_usage: None,
             estimate_ratio: None,

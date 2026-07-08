@@ -259,9 +259,19 @@ eligibility arm, or it only pays off after L1 lands.
 *Failure mode:* an aimless reader gets +grace rounds of aimless
 reading; bounded by `workflow_grace_rounds`.
 
-**L3 — `[tui] narration_nudge_cap` knob.** Promote the hard-coded
-`NARRATION_NUDGE_CAP = 1` (`mod.rs:3020` — the comment already
-nominates the knob). Default 1; weak-local-model operators set 2–3.
+**L3 — `[tui] narration_nudge_cap` knob.** ✅ **DELIVERED
+(2026-07-08):** `[tui] narration_nudge_cap` (default 1) with a
+per-model `[[model_tuning]]` override; the second and later nudges
+escalate (they name the active plan step and demand a bare tool call).
+Shipped alongside three siblings the 2026-07-08 ornith:35b forensics
+demanded: (a) a mid-turn compaction now REFUNDS the narration-rescue
+budget and appends a marked act-now continuation directive (the spent
+counter used to survive compaction while the corrective text it
+referred to was summarized away); (b) summary hygiene — rescue nudges
+are tagged `[loop-guidance]` and, together with the model's echoes of
+them, demoted out of summarizer input; (c) `TurnEndReason` acceptance
+forensics in `TurnMetrics`/usage.jsonl — a narration acceptance now
+says WHY it ended (cap exhausted vs final round) in the turn footer.
 *Buys:* each increment converts one more "Let me look at…" stall into
 an automated in-turn continue — seq 225 stalled this way after only 3
 tool calls, and seq 305 after its single nudge was spent.

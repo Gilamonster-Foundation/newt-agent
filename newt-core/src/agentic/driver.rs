@@ -418,6 +418,7 @@ async fn run_one_turn(
         compress_state: None,
         tool_events: None,
         phantom_reaches: None,
+        end_reason: None,
         permission_gate: None,
         // Phase 20 (spec §5): headless surfaces neither read nor write the
         // capability cache — the hook stays absent and no calibration is

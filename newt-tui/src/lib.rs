@@ -6954,6 +6954,7 @@ fn run_chat(
                     // tool/capability reach; the save site persists them into the
                     // turn's `phantom_reaches` column.
                     let mut turn_phantom_reaches: Vec<newt_core::PhantomReach> = Vec::new();
+                    let mut turn_end_reason: Option<newt_core::TurnEndReason> = None;
                     // #307: the EFFECTIVE caveats for this turn — the session
                     // base intersected with the active mode's preset clamp (a
                     // FLOOR). This single `meet` is what the gate base, the
@@ -7147,6 +7148,7 @@ fn run_chat(
                                         compress_state: Some(&mut compress_state),
                                         tool_events: Some(&mut turn_tool_events),
                                         phantom_reaches: Some(&mut turn_phantom_reaches),
+                                        end_reason: Some(&mut turn_end_reason),
                                         // #263: present only when prompting is on —
                                         // the loop blocks on the prompt like a long
                                         // tool call; None keeps denials verbatim.
@@ -7314,6 +7316,7 @@ fn run_chat(
                                     model_id: inf_model.clone(),
                                     endpoint: inf_url.clone(),
                                     hallucinations,
+                                    end_reason: turn_end_reason,
                                 };
                                 tokio::task::block_in_place(|| {
                                     rt.block_on(memory.sync_all(&task, &reply, &metrics));
@@ -15992,6 +15995,7 @@ mod tool_round_cap_tests {
                     compress_state: None,
                     tool_events: None,
                     phantom_reaches: None,
+                    end_reason: None,
                     permission_gate: None,
                     on_round_usage: None,
                     estimate_ratio: None,
