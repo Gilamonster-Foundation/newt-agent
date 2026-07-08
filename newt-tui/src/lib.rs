@@ -5402,6 +5402,14 @@ fn run_chat(
     let bang_escape_enabled = resolve_tui(&cfg)
         .map(|t| t.allow_bang_escape)
         .unwrap_or(true);
+    // tui-shell-commands (default on): the human cd/pwd/ls/env/date suite;
+    // `allow_shell_mutations` (default off) gates rm/mv/mkdir. Model never sees them.
+    let shell_commands_enabled = resolve_tui(&cfg)
+        .map(|t| t.allow_shell_commands)
+        .unwrap_or(true);
+    let shell_mutations_enabled = resolve_tui(&cfg)
+        .map(|t| t.allow_shell_mutations)
+        .unwrap_or(false);
     let permission_log_path =
         newt_core::Config::user_config_path().map(|p| p.with_file_name("permission-log.jsonl"));
     // #904: the durable denylist lives next to the log; load it into the session
@@ -5543,6 +5551,11 @@ fn run_chat(
 
     // `mut` so a runtime `/vi` / `/emacs` switch is reflected in the next prompt.
     let mut is_vi = resolve_edit_mode() == newt_core::EditMode::Vi;
+
+    // Human tui-shell-commands session working directory — SEPARATE from the
+    // OCAP-load-bearing `workspace`. `cd` moves it (confined below `workspace`),
+    // the prompt shows it; it never mutates `workspace` or the process cwd.
+    let mut session_cwd = std::path::PathBuf::from(workspace);
 
     // system prompt is built AFTER initialize_all (see below) so soul files are loaded.
     // Placeholder until then.
@@ -5845,7 +5858,9 @@ fn run_chat(
             // idle and it stays in scrollback (the per-turn log marker) on
             // submit — no region, no cursor games. The EMFILE probe and the
             // panic guard now live inside the surface (returned as `Fatal`).
-            let prompt = prompt_str(workspace, is_vi, &inf_model, footer_on);
+            // Show the session cwd (its name) in the prompt — `cd` moves it.
+            let cwd_display = session_cwd.to_string_lossy();
+            let prompt = prompt_str(&cwd_display, is_vi, &inf_model, footer_on);
             // Refresh the rich status header's model @ endpoint each turn (#527)
             // so a mid-session `/model` switch is reflected (no-op for lean).
             surface.set_runtime_context(&inf_model, &inf_url, token_gauge);
@@ -5877,6 +5892,30 @@ fn run_chat(
                     } else {
                         print_newt(
                             "! bang-escape is disabled ([tui] allow_bang_escape = false)",
+                            color,
+                            verbose,
+                        );
+                    }
+                    println!();
+                    continue;
+                }
+                // tui-shell-commands: human navigation/inspection (cd/pwd/ls/env/
+                // date) + gated mutations, handled here and NEVER sent to the
+                // model. Placed after `!` and before the slash/chat paths.
+                if let Some((verb, arg)) = shell_builtin(&task) {
+                    if shell_commands_enabled {
+                        run_shell_builtin(
+                            verb,
+                            arg,
+                            &mut session_cwd,
+                            workspace,
+                            shell_mutations_enabled,
+                            color,
+                            verbose,
+                        );
+                    } else {
+                        print_newt(
+                            "shell commands are disabled ([tui] allow_shell_commands = false)",
                             color,
                             verbose,
                         );
@@ -10396,6 +10435,7 @@ fn help_lines() -> &'static [&'static str] {
         "  /vi  /emacs  /nano       - switch line-editor key bindings for this session",
         "  /version                 - print newt version",
         "  ! <command>              - run a host command interactively (e.g. ! pa login) — you, not the agent",
+        "  cd/pwd/ls/env/date       - tui-shell-commands: navigate the session working dir (shown in prompt); rm/mv/mkdir need [tui] allow_shell_mutations — you, not the agent",
         "  Esc                      - while the agent is working: interrupt the turn, back to your prompt",
         "  /exit  /quit  exit  quit - leave the session",
         "",
@@ -11200,6 +11240,298 @@ fn run_bang_escape(cmd: &str, color: bool, verbose: bool) {
             verbose,
         ),
         Err(e) => print_newt(&format!("! failed to run `{shell}`: {e}"), color, verbose),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// tui-shell-commands: human-typed, TUI-handled navigation/inspection commands
+// that manage a SESSION working directory (distinct from the agent's
+// OCAP-load-bearing `workspace`) and never reach the model. Gated by `[tui]
+// allow_shell_commands` (nav/inspect) + `allow_shell_mutations` (rm/mv/mkdir).
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShellVerb {
+    Cd,
+    Pwd,
+    Ls,
+    Env,
+    Date,
+    Rm,
+    Mv,
+    Mkdir,
+}
+
+impl ShellVerb {
+    /// Filesystem-mutating verbs, gated behind `allow_shell_mutations`.
+    fn is_mutation(self) -> bool {
+        matches!(self, Self::Rm | Self::Mv | Self::Mkdir)
+    }
+}
+
+/// Pure detector: recognize a leading `tui-shell-commands` verb and return it
+/// with the remainder of the line as its argument string. Whole-first-word only
+/// (like [`bang_command`]) so it can't misfire on prose and is unit-testable.
+fn shell_builtin(input: &str) -> Option<(ShellVerb, &str)> {
+    let trimmed = input.trim();
+    let (word, rest) = match trimmed.split_once(char::is_whitespace) {
+        Some((w, r)) => (w, r.trim()),
+        None => (trimmed, ""),
+    };
+    let verb = match word {
+        "cd" => ShellVerb::Cd,
+        "pwd" => ShellVerb::Pwd,
+        "ls" => ShellVerb::Ls,
+        "env" => ShellVerb::Env,
+        "date" => ShellVerb::Date,
+        "rm" => ShellVerb::Rm,
+        "mv" => ShellVerb::Mv,
+        "mkdir" => ShellVerb::Mkdir,
+        _ => return None,
+    };
+    Some((verb, rest))
+}
+
+/// Lexically resolve `.` / `..` WITHOUT touching the filesystem, so a symlinked
+/// workspace keeps its symlink path (matching the confined shell's intent) and
+/// `..` can't be used to climb — escapes are then rejected by the root check.
+fn lexical_normalize(p: &std::path::Path) -> std::path::PathBuf {
+    let mut out = std::path::PathBuf::new();
+    for comp in p.components() {
+        match comp {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            c => out.push(c.as_os_str()),
+        }
+    }
+    out
+}
+
+/// Resolve `arg` against `session_cwd` and CONFINE it under `root` (the session
+/// workspace) — the human suite stays inside the same tree the agent is confined
+/// to. `None` when the path escapes the root (can't climb above it).
+fn confine_under_root(
+    root: &std::path::Path,
+    session_cwd: &std::path::Path,
+    arg: &str,
+) -> Option<std::path::PathBuf> {
+    let joined = if arg.is_empty() {
+        session_cwd.to_path_buf()
+    } else {
+        let p = std::path::Path::new(arg);
+        if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            session_cwd.join(p)
+        }
+    };
+    let normalized = lexical_normalize(&joined);
+    let root_norm = lexical_normalize(root);
+    normalized.starts_with(&root_norm).then_some(normalized)
+}
+
+/// Execute a `tui-shell-commands` verb against `session_cwd`. Never touches the
+/// agent's `workspace`, the OCAP fence, or the process cwd — only the local
+/// `session_cwd`, confined under `root`.
+fn run_shell_builtin(
+    verb: ShellVerb,
+    arg: &str,
+    session_cwd: &mut std::path::PathBuf,
+    root: &str,
+    allow_mutations: bool,
+    color: bool,
+    verbose: bool,
+) {
+    // Slash-less commands bypass the `/cmd --help` path — handle it here.
+    if matches!(arg.trim(), "--help" | "-h") {
+        print_newt(shell_builtin_help(verb), color, verbose);
+        return;
+    }
+    if verb.is_mutation() && !allow_mutations {
+        print_newt(
+            "mutating commands are off — set `[tui] allow_shell_mutations = true` to enable mkdir/mv/rm",
+            color,
+            verbose,
+        );
+        return;
+    }
+    let root_path = std::path::Path::new(root);
+    let confine = |a: &str| confine_under_root(root_path, session_cwd, a);
+    match verb {
+        ShellVerb::Cd => match confine(arg) {
+            Some(t) if t.is_dir() => *session_cwd = t,
+            Some(t) => print_newt(
+                &format!("cd: not a directory: {}", t.display()),
+                color,
+                verbose,
+            ),
+            None => print_newt(
+                "cd: outside the session root (can't climb above it)",
+                color,
+                verbose,
+            ),
+        },
+        ShellVerb::Pwd => println!("{}", session_cwd.display()),
+        ShellVerb::Ls => match std::fs::read_dir(&*session_cwd) {
+            Ok(rd) => {
+                let mut names: Vec<String> = rd
+                    .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+                    .collect();
+                names.sort();
+                println!("{}", names.join("  "));
+            }
+            Err(e) => print_newt(&format!("ls: {e}"), color, verbose),
+        },
+        ShellVerb::Env => {
+            let mut vars: Vec<(String, String)> = std::env::vars().collect();
+            vars.sort();
+            for (k, v) in vars {
+                println!("{k}={v}");
+            }
+        }
+        ShellVerb::Date => println!("{}", chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z")),
+        ShellVerb::Mkdir => match confine(arg) {
+            Some(t) => match std::fs::create_dir_all(&t) {
+                Ok(()) => println!("created {}", t.display()),
+                Err(e) => print_newt(&format!("mkdir: {e}"), color, verbose),
+            },
+            None => print_newt("mkdir: outside the session root", color, verbose),
+        },
+        ShellVerb::Mv => {
+            let mut parts = arg.split_whitespace();
+            match (parts.next(), parts.next()) {
+                (Some(src), Some(dst)) => match (confine(src), confine(dst)) {
+                    (Some(s), Some(d)) => match std::fs::rename(&s, &d) {
+                        Ok(()) => println!("{} -> {}", s.display(), d.display()),
+                        Err(e) => print_newt(&format!("mv: {e}"), color, verbose),
+                    },
+                    _ => print_newt("mv: a path is outside the session root", color, verbose),
+                },
+                _ => print_newt("mv: usage: mv <src> <dst>", color, verbose),
+            }
+        }
+        ShellVerb::Rm => match confine(arg) {
+            Some(t) => rm_to_graveyard(&t, color, verbose),
+            None => print_newt("rm: outside the session root", color, verbose),
+        },
+    }
+}
+
+/// `rm` moves the target into a timestamped graveyard under `~/.newt/graveyard/`
+/// rather than unlinking — recoverable by design (no hard-delete without an
+/// explicit future opt-in). Matches the workspace "prefer mv-to-graveyard" rule.
+fn rm_to_graveyard(target: &std::path::Path, color: bool, verbose: bool) {
+    if !target.exists() {
+        print_newt(
+            &format!("rm: no such path: {}", target.display()),
+            color,
+            verbose,
+        );
+        return;
+    }
+    let Some(grave) = newt_core::Config::user_config_dir().map(|d| {
+        d.join("graveyard")
+            .join(chrono::Local::now().format("%Y%m%d-%H%M%S").to_string())
+    }) else {
+        print_newt("rm: cannot resolve ~/.newt/graveyard", color, verbose);
+        return;
+    };
+    let name = target
+        .file_name()
+        .map_or_else(|| "item".into(), |n| n.to_os_string());
+    let dest = grave.join(&name);
+    if let Err(e) = std::fs::create_dir_all(&grave) {
+        print_newt(&format!("rm: cannot create graveyard: {e}"), color, verbose);
+        return;
+    }
+    match std::fs::rename(target, &dest) {
+        Ok(()) => println!(
+            "moved to graveyard: {} (recover from {})",
+            target.display(),
+            dest.display()
+        ),
+        Err(e) => print_newt(&format!("rm: {e}"), color, verbose),
+    }
+}
+
+/// One-line help per verb (slash-less commands bypass the `/cmd --help` path).
+fn shell_builtin_help(verb: ShellVerb) -> &'static str {
+    match verb {
+        ShellVerb::Cd => "cd [dir] — change the session working dir (below the start dir); bare `cd` returns to the root",
+        ShellVerb::Pwd => "pwd — print the session working directory",
+        ShellVerb::Ls => "ls — list the session working directory",
+        ShellVerb::Env => "env — print the environment",
+        ShellVerb::Date => "date — print the current date/time",
+        ShellVerb::Rm => "rm <path> — move a path into ~/.newt/graveyard (recoverable); needs allow_shell_mutations",
+        ShellVerb::Mv => "mv <src> <dst> — move/rename within the session root; needs allow_shell_mutations",
+        ShellVerb::Mkdir => "mkdir <dir> — create a directory under the session root; needs allow_shell_mutations",
+    }
+}
+
+#[cfg(test)]
+mod shell_builtin_tests {
+    use super::{confine_under_root, lexical_normalize, shell_builtin, ShellVerb};
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn detects_verbs_and_args_whole_word_only() {
+        assert_eq!(shell_builtin("pwd"), Some((ShellVerb::Pwd, "")));
+        assert_eq!(
+            shell_builtin("cd newt-agent"),
+            Some((ShellVerb::Cd, "newt-agent"))
+        );
+        assert_eq!(shell_builtin("  ls  "), Some((ShellVerb::Ls, "")));
+        assert_eq!(shell_builtin("mv a b"), Some((ShellVerb::Mv, "a b")));
+        // Prose / non-verbs are NOT claimed — they go to the model, not the suite.
+        assert_eq!(shell_builtin("cdate"), None);
+        assert_eq!(shell_builtin("please cd there"), None);
+        assert_eq!(shell_builtin("/cd"), None);
+    }
+
+    #[test]
+    fn mutation_flag_gates_the_right_verbs() {
+        assert!(ShellVerb::Rm.is_mutation());
+        assert!(ShellVerb::Mv.is_mutation());
+        assert!(ShellVerb::Mkdir.is_mutation());
+        assert!(!ShellVerb::Cd.is_mutation());
+        assert!(!ShellVerb::Ls.is_mutation());
+    }
+
+    #[test]
+    fn confine_stays_under_root_and_rejects_escapes() {
+        let root = Path::new("/home/op/ws");
+        let cwd = Path::new("/home/op/ws/newt-agent");
+        assert_eq!(
+            confine_under_root(root, cwd, "src"),
+            Some(PathBuf::from("/home/op/ws/newt-agent/src"))
+        );
+        // `..` within the root is fine…
+        assert_eq!(
+            confine_under_root(root, cwd, ".."),
+            Some(PathBuf::from("/home/op/ws"))
+        );
+        // …but climbing ABOVE the root is rejected (the confinement).
+        assert_eq!(confine_under_root(root, cwd, "../.."), None);
+        assert_eq!(confine_under_root(root, cwd, "/etc"), None);
+        // bare arg keeps the cwd.
+        assert_eq!(
+            confine_under_root(root, cwd, ""),
+            Some(PathBuf::from("/home/op/ws/newt-agent"))
+        );
+    }
+
+    #[test]
+    fn lexical_normalize_resolves_dot_and_dotdot() {
+        assert_eq!(
+            lexical_normalize(Path::new("/a/b/../c")),
+            PathBuf::from("/a/c")
+        );
+        assert_eq!(
+            lexical_normalize(Path::new("/a/./b")),
+            PathBuf::from("/a/b")
+        );
     }
 }
 
