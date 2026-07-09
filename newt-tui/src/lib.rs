@@ -10173,6 +10173,21 @@ toward a topic. Runs automatically when the window fills; this forces it early.
   /compress
   /compress the auth refactor"
         }
+        "summarizer" => {
+            "\
+/summarizer [subcommand] — inspect or manage the mid-loop summarizer
+
+  /summarizer                  show the effective backend + knobs
+  /summarizer setup [alias]    provision the default/named embedded mini-model
+  /summarizer embedded [alias] pin an explicit embedded summarizer override
+  /summarizer fallback <m>     set fallback_model (use 'none' to clear)
+  /summarizer timeout <secs>   set timeout_secs
+  /summarizer retries <n>      set retries
+  /summarizer keep-alive <v>   set keep_alive (use 'none' to clear)
+  /summarizer clear            remove summarizer.toml, return to built-in default
+
+This is the interactive wrapper around `newt summarizer ...`."
+        }
         "rounds" => {
             "\
 /rounds [show|<n>|double|reset|unlimited] — session tool-call round limit
@@ -10396,6 +10411,7 @@ fn help_lines() -> &'static [&'static str] {
         "  /probe reset             - wipe all learned probe values (conformance, windows, calibration)",
         "  /memory                  - show context window / notes usage",
         "  /compress [focus]        - compress context now, optionally focused on a topic",
+        "  /summarizer              - show or change the summarizer backend and knobs",
         "  /rounds [n|double|reset|unlimited] - set this session's tool-call round limit",
         "  /context                 - show the active context manager + features",
         "  /context manager [preset] - show or set the strategy preset (standard; progressive/distributed pending #546)",
@@ -11010,6 +11026,17 @@ fn dispatch_slash(
             }
             _ => print_newt("usage: /thinking <on|off>", color, verbose),
         },
+
+        "summarizer" => {
+            let mut args = vec!["summarizer"];
+            if !arg1.is_empty() {
+                args.push(arg1);
+            }
+            if !arg2.is_empty() {
+                args.push(arg2);
+            }
+            run_newt_subcmd(&args, color, verbose)?;
+        }
 
         "dgx" => {
             if arg1.is_empty() {
@@ -12272,6 +12299,7 @@ mod tests {
             "probe",
             "memory",
             "compress",
+            "summarizer",
             "rounds",
             "tool-rounds",
             "max-rounds",

@@ -1,9 +1,9 @@
 //! `newt compaction` — diagnose the mid-loop context-compaction (summarizer)
-//! configuration and *tune* it. It reads the resolved config + `summarizer.toml`
-//! and reports the **effective** trim trigger (after the `max_tool_rounds - 3`
-//! clamp), whether the trigger is count- or token-based, and the summarizer
-//! backend — with warnings for the two failure modes that bite weak local
-//! models:
+//! configuration and *tune* it. It reads the resolved config + effective
+//! summarizer state and reports the **effective** trim trigger (after the
+//! `max_tool_rounds - 3` clamp), whether the trigger is count- or token-based,
+//! and the summarizer backend — with warnings for the two failure modes that
+//! bite weak local models:
 //!   1. over-aggressive firing (a small `max_tool_rounds` clamps the threshold
 //!      down, so compaction trims almost every multi-step turn); and
 //!   2. a stalled summarizer that hangs the turn — there is no time-based abort,
@@ -12,7 +12,8 @@
 //! It is a pure, offline config diagnosis (no backend connection), like
 //! `newt config`.
 
-use newt_core::{BackendKind, Config, SummarizerConfig};
+use crate::summarizer_cmd::{resolve_status, EffectiveSummarizer};
+use newt_core::Config;
 use std::path::Path;
 
 /// The effective mid-loop trim COUNT trigger: the configured
@@ -73,34 +74,63 @@ pub fn run(config_path: Option<&Path>) -> anyhow::Result<()> {
         }
     }
 
-    // Summarizer (runs when compaction fires). A malformed summarizer.toml
-    // shouldn't crash the diagnosis — fall back to the default (reuse-session).
-    let sum = SummarizerConfig::resolve().unwrap_or_default();
-    let reuse_session = sum.endpoint.is_none() && sum.model.is_none() && sum.kind.is_none();
-    let embedded = matches!(sum.kind, Some(BackendKind::Embedded));
+    // Summarizer (runs when compaction fires). Use the same effective-backend
+    // logic as the runtime so this diagnosis matches what a real session does.
+    let status = resolve_status()?;
+    let embedded = matches!(
+        &status.effective,
+        EffectiveSummarizer::DefaultEmbedded { .. }
+            | EffectiveSummarizer::OverrideEmbedded { .. }
+    );
 
     println!("\nSummarizer (runs when compaction fires)");
-    if reuse_session {
-        println!(
-            "  backend                       : no summarizer.toml -> reuses the SESSION model"
-        );
-    } else {
-        println!(
-            "  backend                       : {} {} @ {}",
-            sum.kind
-                .map(|k| format!("{k:?}"))
-                .unwrap_or_else(|| "(session kind)".into()),
-            sum.model.as_deref().unwrap_or("(session model)"),
-            sum.endpoint.as_deref().unwrap_or("(session endpoint)"),
-        );
+    println!("  config path                   : {}", status.config_path.display());
+    match &status.effective {
+        EffectiveSummarizer::DefaultEmbedded { model, model_path } => {
+            println!("  backend                       : embedded default (on-host CPU)");
+            println!("  model / model_path            : {model} @ {model_path}");
+            if status.config_exists && !status.backend_override {
+                println!("  config file                   : present (knobs only; backend still defaults)");
+            }
+        }
+        EffectiveSummarizer::DefaultDegradedSession { reason } => {
+            println!("  backend                       : session model (degraded default)");
+            println!("       WARN: {reason}");
+        }
+        EffectiveSummarizer::OverrideEmbedded { model, model_path } => {
+            println!("  backend                       : embedded override");
+            println!("  model / model_path            : {model} @ {model_path}");
+        }
+        EffectiveSummarizer::OverrideBackend {
+            kind,
+            model,
+            endpoint,
+        } => {
+            println!(
+                "  backend                       : {} {} @ {}",
+                kind.map(|k| format!("{k:?}"))
+                    .unwrap_or_else(|| "(session kind)".to_string()),
+                model.as_deref().unwrap_or("(session model)"),
+                endpoint.as_deref().unwrap_or("(session endpoint)"),
+            );
+            println!("       WARN: explicit override can contend with the session model under load.");
+        }
     }
     println!(
         "  timeout_secs / retries        : {} / {}",
-        sum.timeout_secs, sum.retries
+        status.config.timeout_secs, status.config.retries
     );
     println!(
         "  fallback_model                : {}",
-        sum.fallback_model.as_deref().unwrap_or("none")
+        status.config.fallback_model.as_deref().unwrap_or("none")
+    );
+    println!(
+        "  keep_alive                    : {}",
+        status
+            .config
+            .keep_alive
+            .as_deref()
+            .unwrap_or("(inherits session)")
     );
     println!("  overall abort on stall        : NONE");
     println!("       WARN: a stalled summarize has no time-based abort — only a human Esc stops");
@@ -117,9 +147,9 @@ pub fn run(config_path: Option<&Path>) -> anyhow::Result<()> {
     );
     println!("  - Set  [tui].mid_loop_trim_tokens : add a token-pressure gate (vs count-only).");
     println!(
-        "  - Set  ~/.newt/summarizer.toml    : an off-box or embedded summarizer + fallback_model,"
+        "  - Run  newt summarizer            : inspect or change backend, fallback, timeout, retries,"
     );
-    println!("                                      so compaction stops contending with the session model.");
+    println!("                                      keep_alive, or reset to the built-in default.");
     println!("\n  (Per-model [[model_tuning]] overrides of these knobs also apply when set.)");
     Ok(())
 }
