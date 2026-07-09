@@ -7403,7 +7403,15 @@ fn run_chat(
                                     // Step 24.6 (#559): refresh the context-budget
                                     // gauge for the next header — this turn's input
                                     // tokens against the resolved send budget.
-                                    if let Some(budget) = eff_max_ok_input.or(eff_safe_context) {
+                                    // Match initial_send_budget's max semantics: take the
+                                    // larger of the empirical ratchet and the declared/probed
+                                    // context so a configured context_window shows through
+                                    // even when the ratchet hasn't grown that large yet.
+                                    let gauge_budget = match (eff_max_ok_input, eff_safe_context) {
+                                        (Some(m), Some(s)) => Some(m.max(s)),
+                                        (m, s) => m.or(s),
+                                    };
+                                    if let Some(budget) = gauge_budget {
                                         token_gauge = Some((input_tokens, budget));
                                     }
                                 }
