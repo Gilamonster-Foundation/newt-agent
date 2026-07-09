@@ -50,11 +50,23 @@ const EXEC_TOOL_NAMES: &[&str] = &[
 /// raw destructive / disk / power operations. Matched against the RESOLVED
 /// leading token of a shell command (after `sudo` / `env VAR=val` prefixes,
 /// reduced to the basename of a path), never against arbitrary args.
+#[rustfmt::skip]
 const DENY_EXEC_LEADERS: &[&str] = &[
     // lateral movement off this host
-    "ssh", "scp", "sftp", "rsh", "rlogin", "telnet",
-    // destructive / raw-disk (deletions belong in the graveyard, not raw rm)
-    "rm", "rmdir", "shred", "dd", "mkfs", "fdisk", "parted", "wipefs",
+    "ssh",
+    "scp",
+    "sftp",
+    "rsh",
+    "rlogin",
+    "telnet",
+    // destructive / raw-disk
+    "rmdir",
+    "shred",
+    "dd",
+    "mkfs",
+    "fdisk",
+    "parted",
+    "wipefs",
     // host power state (would take down the machine newt runs on)
     "shutdown", "reboot", "halt", "poweroff",
 ];
@@ -127,6 +139,16 @@ fn deny_exec(command: &str) -> Option<Denied> {
     // `/usr/bin/ssh` → `ssh`; `./rm` → `rm`.
     let leader = raw_leader.rsplit(['/', '\\']).next().unwrap_or(raw_leader);
 
+    if leader == "rm" || leader == "unlink" {
+        let rest: Vec<&str> = tokens.collect();
+        if simple_one_file_delete(leader, &rest) {
+            return None;
+        }
+        return Some(Denied {
+            reason: deny_message(leader, "an absolutely forbidden command"),
+        });
+    }
+
     if DENY_EXEC_LEADERS.contains(&leader) {
         return Some(Denied {
             reason: deny_message(leader, "an absolutely forbidden command"),
@@ -140,6 +162,31 @@ fn deny_exec(command: &str) -> Option<Denied> {
     }
 
     None
+}
+
+fn simple_one_file_delete(leader: &str, rest: &[&str]) -> bool {
+    const SHELL_META: &[char] = &['&', '|', ';', '`', '$', '\n', '>', '<', '(', ')'];
+    let mut operands = Vec::new();
+    let mut end_of_flags = false;
+    for token in rest {
+        if token.contains(SHELL_META) {
+            return false;
+        }
+        if !end_of_flags && *token == "--" {
+            end_of_flags = true;
+            continue;
+        }
+        if !end_of_flags && token.starts_with('-') {
+            match leader {
+                // `rm -f file` is still a one-file delete; recursive / dir /
+                // forceful tree forms stay absolutely denied.
+                "rm" if token.chars().skip(1).all(|c| c == 'f') => continue,
+                _ => return false,
+            }
+        }
+        operands.push(*token);
+    }
+    operands.len() == 1
 }
 
 fn deny_message(target: &str, what: &str) -> String {
@@ -163,8 +210,10 @@ mod tests {
     #[test]
     fn denies_lateral_movement_destruction_and_service_changes() {
         assert!(cmd("ssh host 'uptime'").is_some(), "ssh denied");
-        assert!(cmd("rm -rf build/").is_some(), "rm denied");
-        assert!(cmd("sudo rm -rf /").is_some(), "sudo rm denied");
+        assert!(cmd("rm -rf build/").is_some(), "recursive rm denied");
+        assert!(cmd("rm -r build/").is_some(), "recursive rm denied");
+        assert!(cmd("rm a b").is_some(), "multi-target rm denied");
+        assert!(cmd("sudo rm -rf /").is_some(), "sudo recursive rm denied");
         assert!(
             cmd("/usr/bin/scp a b:").is_some(),
             "path-qualified scp denied"
@@ -183,6 +232,22 @@ mod tests {
         );
         assert!(cmd("shutdown -h now").is_some(), "shutdown denied");
         assert!(cmd("dd if=/dev/zero of=/dev/sda").is_some(), "dd denied");
+    }
+
+    #[test]
+    fn allows_simple_one_file_delete_for_governed_routing() {
+        assert!(
+            cmd("rm src/cockpit.rs").is_none(),
+            "plain one-file rm should reach routing/delete_file"
+        );
+        assert!(
+            cmd("rm -f src/cockpit.rs").is_none(),
+            "force one-file rm should reach routing/delete_file"
+        );
+        assert!(
+            cmd("unlink src/cockpit.rs").is_none(),
+            "unlink one-file delete should reach routing/delete_file"
+        );
     }
 
     /// The absolute floor ignores the tool NAME's spelling: a shell alias that
