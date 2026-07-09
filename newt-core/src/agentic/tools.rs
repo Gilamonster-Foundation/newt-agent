@@ -265,6 +265,23 @@ pub fn tool_definitions() -> serde_json::Value {
         {
             "type": "function",
             "function": {
+                "name": "delete_file",
+                "description": "Delete one file in the workspace. Use this when a file should be \
+                                removed entirely; it is governed by the same fs_write permission \
+                                and operator prompt path as write_file and edit_file. Refuses \
+                                directories, missing files, and paths outside the granted write scope.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "File path relative to workspace root" }
+                    },
+                    "required": ["path"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
                 "name": "list_dir",
                 "description": "List files in a directory",
                 "parameters": {
@@ -564,42 +581,45 @@ const DIRECT_TOOL_NAMES: &[&str] = &[
     "read_file",
     "write_file",
     "edit_file",
+    "delete_file",
     "use_skill",
     "web_fetch",
     // #496: `find …` typed at run_command redirects to the embedded `find`
     // tool — which works even when the shell is unavailable in this build.
     "find",
     // PR4: `git …` typed at run_command redirects to the embedded `git` tool —
-    // but ONLY its LOCAL ops; the network ops fall through (see
-    // [`GIT_NETWORK_SUBCOMMANDS`] / [`run_command_redirect`], #898).
+    // but ONLY its built-in-served local ops; passthrough ops fall through (see
+    // [`GIT_PASSTHROUGH_SUBCOMMANDS`] / [`run_command_redirect`], #898/#1022).
     "git",
 ];
 
-/// #898: git subcommands that reach the network. The embedded `git` tool
+/// #898/#1022: git subcommands that must pass through to the shell. The embedded `git` tool
 /// (newt-git) is LOCAL-ONLY — `clone`/`fetch`/`push` are deferred — so if
 /// run_command bounced *every* `git …` back to that pushless tool, a model
 /// could never push a branch (and then never see the "Create a pull request …
-/// by visiting: <URL>" line git prints, and never open a PR — issue #898).
-/// These ops are therefore allowed to fall through to the confined shell, where
-/// the `net` caveat still gates whether the remote is reachable. Local ops
-/// (`status`/`log`/`diff`/`add`/`commit`/…) keep redirecting to the embedded
-/// tool, which does them better and works even when the shell is unavailable.
-const GIT_NETWORK_SUBCOMMANDS: &[&str] = &["push", "fetch", "pull", "clone"];
+/// by visiting: <URL>" line git prints, and never open a PR — issue #898). `rm`
+/// also passes through because `git rm` has index semantics that plain
+/// `delete_file` cannot reproduce (#1022). These ops are therefore allowed to
+/// fall through to the confined shell, where the `exec` / `net` / fs leashes
+/// still apply. Local read/edit ops (`status`/`log`/`diff`/`add`/`commit`/…)
+/// keep redirecting to the embedded tool when it can serve them.
+const GIT_PASSTHROUGH_SUBCOMMANDS: &[&str] = &["push", "fetch", "pull", "clone", "rm"];
 
 /// Decide whether a `run_command` invocation is really a misdirected call to a
 /// direct tool (`list_dir`/`read_file`/…/`git`), and if so which one — so the
 /// executor can bounce it with a correction and [`is_hallucination`] can count
 /// it. Returns `None` when the command should run in the shell as-is.
 ///
-/// `git` is special (#898): only its LOCAL ops redirect to the embedded git
-/// tool; its network ops ([`GIT_NETWORK_SUBCOMMANDS`]) fall through so the model
-/// can actually push a branch and read the PR-creation URL git prints.
+/// `git` is special (#898/#1022): only its built-in-served LOCAL ops redirect
+/// to the embedded git tool; its passthrough ops
+/// ([`GIT_PASSTHROUGH_SUBCOMMANDS`]) fall through so the model can actually
+/// push a branch, run `git rm`, and read any PR-creation URL git prints.
 fn run_command_redirect(command: &str) -> Option<&'static str> {
     let mut tokens = command.split_ascii_whitespace();
     let first = tokens.next().unwrap_or("");
     if first == "git" {
         let sub = tokens.next().unwrap_or("");
-        if GIT_NETWORK_SUBCOMMANDS.contains(&sub) {
+        if GIT_PASSTHROUGH_SUBCOMMANDS.contains(&sub) {
             return None;
         }
         return Some("git");
@@ -768,6 +788,7 @@ const BASE_TOOL_NAMES: &[&str] = &[
     "read_file",
     "write_file",
     "edit_file",
+    "delete_file",
     "list_dir",
     "find",
     "use_skill",
@@ -887,6 +908,17 @@ pub(crate) fn resolve_tool_alias(name: &str) -> Option<AliasOutcome> {
                  write_file with {{\"path\", \"content\"}}. To change part of an \
                  existing file, call edit_file with \
                  {{\"path\", \"old_string\", \"new_string\"}}."
+            )))
+        }
+        // Delete-file aliases — point at delete_file. `rm` typed as a shell
+        // command is redirected separately by `run_command_redirect`; `git rm`
+        // deliberately falls through to the shell/git path because it has index
+        // semantics beyond plain file deletion.
+        "remove_file" | "delete" | "remove" | "unlink" | "rm_file" => {
+            Some(AliasOutcome::Correct(format!(
+                "'{name}' is not a newt tool. To remove one file, call delete_file \
+                 with {{\"path\"}}. It is governed by fs_write permissions and \
+                 prompts the operator when a grant is needed."
             )))
         }
         // #721 mkdir coach — newt has no directory-creation tool, and the model
@@ -1124,7 +1156,7 @@ fn nearest_tool_name(name: &str) -> Option<&'static str> {
 /// `unknown tool: {name}`-prefixed so existing `starts_with` checks hold.
 fn unknown_tool_message(name: &str) -> String {
     const BASE: &str =
-        "run_command, read_file, write_file, edit_file, list_dir, find, use_skill, web_fetch";
+        "run_command, read_file, write_file, edit_file, delete_file, list_dir, find, use_skill, web_fetch";
     match nearest_tool_name(name) {
         Some(sugg) => format!(
             "unknown tool: {name}. Did you mean '{sugg}'? Available tools include: \
@@ -2007,8 +2039,8 @@ fn crew_off_recovery_result(name: &str) -> String {
 /// #721: the model-facing capability-denial message for an fs tool — the base
 /// "{kind} does not permit '{path}'" line plus the recoverable, model-actionable
 /// [`DENIAL_RECOVERY_HINT`]. One factored message + regression point shared by
-/// every fs denial (read_file / write_file / edit_file / list_dir / find), so
-/// the recoverable wording can never drift between them.
+/// every fs denial (read_file / write_file / edit_file / delete_file / list_dir /
+/// find), so the recoverable wording can never drift between them.
 fn denied_fs_result(kind: &str, path: &str) -> String {
     format!("capability denied: {kind} does not permit '{path}'. {DENIAL_RECOVERY_HINT}")
 }
@@ -3291,6 +3323,71 @@ pub async fn execute_tool_with_offload(
             }
         }
 
+        "delete_file" => {
+            let path = args["path"].as_str().unwrap_or("");
+            if path.trim().is_empty() {
+                return "error: path is required".to_string();
+            }
+            let full = std::path::Path::new(workspace).join(path);
+            let full_str = full.to_string_lossy();
+            if !tui_permits_path(&caveats.fs_write, &full_str) {
+                // #1022: deletion is a normal fs_write operation. A denial
+                // consults the same prompted-grant path as write_file/edit_file,
+                // so deletion is possible with operator approval instead of
+                // being structurally unavailable.
+                let allowed = permission_gate.is_some_and(|gate| {
+                    fs_gate_allows(gate, "delete_file", DenialKind::FsWrite, &full_str, |c| {
+                        &c.fs_write
+                    })
+                });
+                if !allowed {
+                    let msg = denied_fs_result("fs_write", path);
+                    print_denied("fs_write", path, color);
+                    return msg;
+                }
+            }
+
+            let meta = match std::fs::symlink_metadata(&full) {
+                Ok(meta) => meta,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return format!("error deleting {path}: file does not exist");
+                }
+                Err(e) => return format!("error deleting {path}: {e}"),
+            };
+            if meta.file_type().is_dir() {
+                return format!("error deleting {path}: delete_file refuses directories");
+            }
+
+            print_tool_call("delete_file", path, color);
+            let needs_confirm = matches!(caveats.fs_write, crate::caveats::Scope::All);
+            let confirmed = if needs_confirm {
+                print!("Delete this file? [y/N] ");
+                use std::io::Write as _;
+                std::io::stdout().flush().ok();
+                let mut answer = String::new();
+                std::io::stdin().read_line(&mut answer).is_ok()
+                    && answer.trim().eq_ignore_ascii_case("y")
+            } else {
+                true
+            };
+
+            if !confirmed {
+                println!("skipped");
+                return format!("user declined to delete {path}");
+            }
+
+            match std::fs::remove_file(&full) {
+                Ok(_) => {
+                    println!("✓ deleted {path}");
+                    let check = build_check_cmd
+                        .map(|cmd| run_build_check(cmd, workspace))
+                        .unwrap_or_default();
+                    format!("deleted {path}{check}")
+                }
+                Err(e) => format!("error deleting {path}: {e}"),
+            }
+        }
+
         "edit_file" => {
             let path = args["path"].as_str().unwrap_or("");
             let old_string = args["old_string"].as_str().unwrap_or("");
@@ -3992,6 +4089,7 @@ mod tests {
                 "read_file",
                 "write_file",
                 "edit_file",
+                "delete_file",
                 "list_dir",
                 "find",
                 "use_skill",
@@ -4049,7 +4147,13 @@ mod tests {
         let allow = vec!["read_file".to_string()];
         let got = name_set(&filter_advertised_tools(full, Some(&allow)));
         assert!(got.iter().any(|n| n == "read_file"), "granted tool kept");
-        for denied in ["write_file", "edit_file", "run_command", "list_dir"] {
+        for denied in [
+            "write_file",
+            "edit_file",
+            "delete_file",
+            "run_command",
+            "list_dir",
+        ] {
             assert!(
                 !got.iter().any(|n| n == denied),
                 "{denied} must be filtered out"
@@ -4083,6 +4187,10 @@ mod tests {
         );
         assert!(
             !persona_tool_allowed("write_file", &allow),
+            "unlisted non-infra → denied"
+        );
+        assert!(
+            !persona_tool_allowed("delete_file", &allow),
             "unlisted non-infra → denied"
         );
     }
@@ -4474,6 +4582,8 @@ mod tests {
             "list_dir",
             "read_file",
             "write_file",
+            "edit_file",
+            "delete_file",
             "use_skill",
             "web_fetch",
             "save_note",
@@ -4483,19 +4593,19 @@ mod tests {
         }
     }
 
-    /// #898: `run_command_redirect` bounces LOCAL git ops (and other direct
-    /// tools) to their embedded tool, but lets git NETWORK ops fall through to
-    /// the shell — otherwise a model can never `git push` (the pushless embedded
-    /// git tool + the blanket bounce were a hard dead-end).
+    /// #898/#1022: `run_command_redirect` bounces embedded-tool-served LOCAL git
+    /// ops (and other direct tools), but lets git passthrough ops fall through
+    /// to the shell — otherwise a model can never `git push` or `git rm`.
     #[test]
     fn run_command_redirect_lets_git_network_ops_through() {
-        // Network ops the embedded git tool cannot do → fall through (None).
+        // Ops the embedded git tool cannot do faithfully → fall through (None).
         for cmd in [
             "git push origin fix/foo",
             "git push",
             "git fetch origin",
             "git pull",
             "git clone https://example.com/r.git",
+            "git rm src/cockpit.rs",
         ] {
             assert_eq!(run_command_redirect(cmd), None, "{cmd} must fall through");
         }
@@ -4531,6 +4641,10 @@ mod tests {
         assert!(!is_hallucination(
             "run_command",
             &serde_json::json!({"command": "git fetch"})
+        ));
+        assert!(!is_hallucination(
+            "run_command",
+            &serde_json::json!({"command": "git rm src/cockpit.rs"})
         ));
         assert!(is_hallucination(
             "run_command",
@@ -5995,6 +6109,74 @@ mod execute_tool_branch_tests {
     }
 
     #[tokio::test]
+    async fn delete_file_removes_one_file_and_appends_build_check() {
+        let ws = tempfile::TempDir::new().unwrap();
+        std::fs::write(ws.path().join("old.rs"), "fn main() {}\n").unwrap();
+        let caveats = caveats_rw(ws.path());
+        let out = run_tool(
+            "delete_file",
+            serde_json::json!({"path": "old.rs"}),
+            ws.path(),
+            &caveats,
+            Some(passing_build_check_cmd()),
+        )
+        .await;
+        assert!(out.starts_with("deleted old.rs"), "got: {out}");
+        assert!(out.contains("✓ build check passed"), "got: {out}");
+        assert!(
+            !ws.path().join("old.rs").exists(),
+            "delete_file must remove the target file"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_file_denies_missing_files_directories_and_fs_write_misses() {
+        let ws = tempfile::TempDir::new().unwrap();
+        std::fs::write(ws.path().join("secret.txt"), "x").unwrap();
+        std::fs::create_dir(ws.path().join("dir")).unwrap();
+
+        let denied = Caveats {
+            fs_write: Scope::none(),
+            ..caveats_rw(ws.path())
+        };
+        let out = run_tool(
+            "delete_file",
+            serde_json::json!({"path": "secret.txt"}),
+            ws.path(),
+            &denied,
+            None,
+        )
+        .await;
+        assert!(out.contains("capability denied: fs_write"), "got: {out}");
+        assert!(
+            ws.path().join("secret.txt").exists(),
+            "denied delete must not remove the file"
+        );
+
+        let caveats = caveats_rw(ws.path());
+        let out = run_tool(
+            "delete_file",
+            serde_json::json!({"path": "missing.txt"}),
+            ws.path(),
+            &caveats,
+            None,
+        )
+        .await;
+        assert!(out.contains("file does not exist"), "got: {out}");
+
+        let out = run_tool(
+            "delete_file",
+            serde_json::json!({"path": "dir"}),
+            ws.path(),
+            &caveats,
+            None,
+        )
+        .await;
+        assert!(out.contains("refuses directories"), "got: {out}");
+        assert!(ws.path().join("dir").is_dir(), "directory must remain");
+    }
+
+    #[tokio::test]
     async fn read_file_denial_and_missing_file_errors() {
         let ws = tempfile::TempDir::new().unwrap();
         std::fs::write(ws.path().join("secret.txt"), "x").unwrap();
@@ -6121,6 +6303,13 @@ mod execute_tool_branch_tests {
             };
             assert!(msg.contains("write_file"), "{n}: {msg}");
         }
+        for n in ["remove_file", "delete", "remove", "unlink", "rm_file"] {
+            let Some(AliasOutcome::Correct(msg)) = resolve_tool_alias(n) else {
+                panic!("{n} should produce a Correct outcome");
+            };
+            assert!(msg.contains("delete_file"), "{n}: {msg}");
+            assert!(msg.contains("fs_write"), "{n}: {msg}");
+        }
     }
 
     #[test]
@@ -6157,6 +6346,7 @@ mod execute_tool_branch_tests {
             "read_file",
             "write_file",
             "edit_file",
+            "delete_file",
             "git",
             "update_plan",
             "plan_get",
@@ -7013,6 +7203,15 @@ mod execute_tool_branch_tests {
         )
         .await;
         assert_eq!(out, denied_fs_result("fs_write", "a.txt"));
+        let out = run_tool(
+            "delete_file",
+            serde_json::json!({"path": "secret.txt"}),
+            ws.path(),
+            &denied,
+            None,
+        )
+        .await;
+        assert_eq!(out, denied_fs_result("fs_write", "secret.txt"));
         // #721: every fs denial now carries the model-actionable recovery path.
         assert!(out.contains("request_permissions"), "got: {out}");
     }
@@ -7077,11 +7276,12 @@ mod execute_tool_branch_tests {
         assert_eq!(gate.asks.len(), 1, "the human was asked exactly once");
     }
 
-    /// Gate allows fs_write denials → write_file and edit_file proceed.
+    /// Gate allows fs_write denials → write_file, edit_file, and delete_file proceed.
     #[tokio::test]
     async fn gate_allow_turns_fs_write_denials_into_real_writes() {
         let ws = tempfile::TempDir::new().unwrap();
         std::fs::write(ws.path().join("f.txt"), "old\n").unwrap();
+        std::fs::write(ws.path().join("stale.txt"), "remove me\n").unwrap();
         let denied = Caveats {
             fs_write: Scope::none(),
             ..caveats_rw(ws.path())
@@ -7109,13 +7309,27 @@ mod execute_tool_branch_tests {
         )
         .await;
         assert!(out.starts_with("edited f.txt"), "got: {out}");
-        assert_eq!(gate.asks.len(), 2);
+        let out = run_tool_gated(
+            "delete_file",
+            serde_json::json!({"path": "stale.txt"}),
+            ws.path(),
+            &denied,
+            &mut gate,
+        )
+        .await;
+        assert!(out.starts_with("deleted stale.txt"), "got: {out}");
+        assert!(
+            !ws.path().join("stale.txt").exists(),
+            "gate-approved delete must remove the file"
+        );
+        assert_eq!(gate.asks.len(), 3);
         assert_eq!(gate.asks[0].0, "write_file");
         assert!(
             gate.asks[1].1.starts_with("fs_write:"),
             "got: {:?}",
             gate.asks[1]
         );
+        assert_eq!(gate.asks[2].0, "delete_file");
     }
 
     /// list_dir consults the gate on an fs_read denial like read_file does.
@@ -8087,6 +8301,15 @@ mod disable_ocap_tests {
         assert!(!std::path::Path::new(escape).exists());
 
         let out = run_tool(
+            "delete_file",
+            serde_json::json!({"path": escape}),
+            ws.path(),
+            &caveats,
+        )
+        .await;
+        assert_eq!(out, denied_fs_result("fs_write", escape));
+
+        let out = run_tool(
             "read_file",
             serde_json::json!({"path": "/etc/hostname"}),
             ws.path(),
@@ -8277,6 +8500,30 @@ mod disable_ocap_tests {
         assert!(
             out.contains("routed via git built-in"),
             "git status must route to the governed git built-in; got: {out}"
+        );
+    }
+
+    /// #1022: `run_command("rm file")` routes to the governed delete_file arm,
+    /// so deletion works under fs_write without requiring raw shell `rm`.
+    #[tokio::test]
+    async fn routed_rm_dispatches_through_delete_file() {
+        let _l = env_lock().await;
+        let _route_on = EnvVar::unset("NEWT_NO_ROUTE");
+        let _ocap_off = EnvVar::unset("NEWT_DISABLE_OCAP");
+        let ws = tempfile::TempDir::new().unwrap();
+        std::fs::write(ws.path().join("stale.txt"), "remove me\n").unwrap();
+        let caveats = caveats_no_exec(ws.path());
+        let out = run_tool(
+            "run_command",
+            serde_json::json!({ "command": "rm stale.txt" }),
+            ws.path(),
+            &caveats,
+        )
+        .await;
+        assert!(out.starts_with("deleted stale.txt"), "got: {out}");
+        assert!(
+            !ws.path().join("stale.txt").exists(),
+            "routed rm must remove the file through delete_file"
         );
     }
 

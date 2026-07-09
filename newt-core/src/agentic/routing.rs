@@ -3,13 +3,13 @@
 //!
 //! Capable models emit tool calls learned from *other* harnesses —
 //! `run_command("cat X")`, `run_command("ls")`, `run_command("find … ")`,
-//! `run_command("git status")` — instead of newt's governed built-ins
-//! (`read_file` / `list_dir` / `find` / the embedded `git` tool). Each such
-//! reach lands as a wasted round, and worse, a read the model could have done
-//! *within authority* can trip an **exec** denial when it arrives as a shell
-//! command (§4.1).
+//! `run_command("rm X")`, `run_command("git status")` — instead of newt's
+//! governed built-ins (`read_file` / `list_dir` / `find` / `delete_file` / the
+//! embedded `git` tool). Each such reach lands as a wasted round, and worse, an
+//! operation the model could have done *within authority* can trip an **exec**
+//! denial when it arrives as a shell command (§4.1).
 //!
-//! P4 **promotes the read-only reaches to a silent rewrite**: the call is
+//! P4 **promotes faithful one-tool reaches to a silent rewrite**: the call is
 //! transparently re-dispatched to the OCAP-governed built-in (no model
 //! retraining), and **everything else is gated** as ordinary exec.
 //!
@@ -28,7 +28,7 @@
 //!
 //! Per the repo's language-pack / lexicon convention (`CLAUDE.md` → "the three
 //! Cs"), the knowledge of *which* shell reaches route, and *which git
-//! subcommands are read-only*, lives in pure data — the [`READ_ROUTES`] slice
+//! subcommands are read-only*, lives in pure data — the [`SHELL_ROUTES`] slice
 //! and the [`GIT_READ_ONLY_SUBCOMMANDS`] set — read by [`RouteTable::classify`],
 //! a pure function (no fs, no env, no I/O). A new read reach, or a newly
 //! read-only git subcommand, is a **data edit** (and a future drop-in
@@ -49,34 +49,42 @@ pub(crate) enum RouteDecision {
     Exec,
 }
 
-/// A whole-command read reach that maps cleanly onto a governed read built-in.
+/// A whole-command shell reach that maps cleanly onto a governed built-in.
 /// Pure DATA (three-Cs): a new reach is one slice entry.
 #[derive(Debug)]
-struct ReadRoute {
+struct ShellRoute {
     /// The shell program the model typed (the leading token).
     program: &'static str,
     /// The governed built-in it routes to.
     tool: &'static str,
 }
 
-/// The read reaches that route to a governed built-in — pure DATA.
+/// The shell reaches that route to a governed built-in — pure DATA.
 ///
-/// `cat`→`read_file`, `ls`→`list_dir`, `find`→the embedded `find` tool. The
-/// per-tool argument translation (how the command's operands become the
-/// built-in's `{path}` / `{name}` / `{type}`) is the pure rule in
-/// [`build_read_route`]; *which* programs route is this slice.
-const READ_ROUTES: &[ReadRoute] = &[
-    ReadRoute {
+/// `cat`→`read_file`, `ls`→`list_dir`, `find`→the embedded `find` tool,
+/// `rm`/`unlink`→`delete_file`. The per-tool argument translation (how the
+/// command's operands become the built-in's `{path}` / `{name}` / `{type}`) is
+/// the pure rule in [`build_shell_route`]; *which* programs route is this slice.
+const SHELL_ROUTES: &[ShellRoute] = &[
+    ShellRoute {
         program: "cat",
         tool: "read_file",
     },
-    ReadRoute {
+    ShellRoute {
         program: "ls",
         tool: "list_dir",
     },
-    ReadRoute {
+    ShellRoute {
         program: "find",
         tool: "find",
+    },
+    ShellRoute {
+        program: "rm",
+        tool: "delete_file",
+    },
+    ShellRoute {
+        program: "unlink",
+        tool: "delete_file",
     },
 ];
 
@@ -110,18 +118,18 @@ const GLOB: &[char] = &['*', '?', '[', ']'];
 /// The route/gate table — pure DATA, read by [`RouteTable::classify`].
 #[derive(Debug, Clone)]
 pub(crate) struct RouteTable {
-    reads: &'static [ReadRoute],
+    shell_routes: &'static [ShellRoute],
     git_read_only: &'static [&'static str],
 }
 
 impl RouteTable {
-    /// The built-in table: the [`READ_ROUTES`] reaches plus the
+    /// The built-in table: the [`SHELL_ROUTES`] reaches plus the
     /// [`GIT_READ_ONLY_SUBCOMMANDS`] set. Composed from data (three-Cs) so a
     /// future `[tui.permissions]` override layers on the same shape.
     #[must_use]
     pub(crate) fn builtin() -> Self {
         Self {
-            reads: READ_ROUTES,
+            shell_routes: SHELL_ROUTES,
             git_read_only: GIT_READ_ONLY_SUBCOMMANDS,
         }
     }
@@ -157,20 +165,20 @@ impl RouteTable {
             };
         }
 
-        // Whole-command read reaches (cat / ls / find).
-        let Some(route) = self.reads.iter().find(|r| r.program == program) else {
+        // Whole-command reaches that map onto governed built-ins.
+        let Some(route) = self.shell_routes.iter().find(|r| r.program == program) else {
             return RouteDecision::Exec;
         };
         let rest: Vec<&str> = tokens.collect();
-        build_read_route(route.tool, &rest)
+        build_shell_route(route.tool, &rest)
     }
 }
 
-/// Translate a whole-command read reach's operands into the governed built-in's
+/// Translate a whole-command shell reach's operands into the governed built-in's
 /// argument shape — the pure per-tool rule. Returns [`RouteDecision::Exec`]
 /// whenever the shape is ambiguous (so a routed call is always faithful to the
 /// command the model typed).
-fn build_read_route(tool: &'static str, rest: &[&str]) -> RouteDecision {
+fn build_shell_route(tool: &'static str, rest: &[&str]) -> RouteDecision {
     match tool {
         // read_file reads exactly ONE file. Zero or many operands, or a glob
         // (which the shell would expand to a set), are ambiguous → gate.
@@ -194,7 +202,8 @@ fn build_read_route(tool: &'static str, rest: &[&str]) -> RouteDecision {
             _ => RouteDecision::Exec,
         },
         "find" => build_find_route(rest),
-        // Unreachable for READ_ROUTES, but keep the rule total.
+        "delete_file" => build_delete_route(rest),
+        // Unreachable for SHELL_ROUTES, but keep the rule total.
         _ => RouteDecision::Exec,
     }
 }
@@ -207,6 +216,34 @@ fn operands<'a>(rest: &[&'a str]) -> Vec<&'a str> {
         .copied()
         .filter(|t| !t.starts_with('-'))
         .collect()
+}
+
+/// Translate `rm [-f] <path>` / `unlink <path>` into `delete_file`.
+/// Recursive/tree deletes, multiple operands, globs, and unknown flags stay on
+/// the exec path, where the absolute deny-list refuses them before the shell.
+fn build_delete_route(rest: &[&str]) -> RouteDecision {
+    let mut operands = Vec::new();
+    let mut end_of_flags = false;
+    for token in rest {
+        if !end_of_flags && *token == "--" {
+            end_of_flags = true;
+            continue;
+        }
+        if !end_of_flags && token.starts_with('-') {
+            if token.chars().skip(1).all(|c| c == 'f') {
+                continue;
+            }
+            return RouteDecision::Exec;
+        }
+        operands.push(*token);
+    }
+    match operands.as_slice() {
+        [path] if !path.contains(GLOB) => RouteDecision::Route {
+            tool: "delete_file",
+            args: json!({ "path": path }),
+        },
+        _ => RouteDecision::Exec,
+    }
 }
 
 /// Translate a `find [path] [-name PAT] [-type f|d]` reach into the embedded
@@ -404,6 +441,36 @@ mod tests {
         assert_eq!(classify("find . -newer ref.txt"), RouteDecision::Exec);
     }
 
+    /// #1022: a simple shell-delete instinct routes to the governed fs_write
+    /// tool instead of dead-ending on exec/absolute-deny. Recursive or
+    /// multi-target deletes stay gated/denied.
+    #[test]
+    fn simple_delete_routes_to_delete_file() {
+        for cmd in [
+            "rm src/cockpit.rs",
+            "rm -f src/cockpit.rs",
+            "unlink src/cockpit.rs",
+        ] {
+            assert_eq!(
+                classify(cmd),
+                RouteDecision::Route {
+                    tool: "delete_file",
+                    args: json!({ "path": "src/cockpit.rs" }),
+                },
+                "{cmd}"
+            );
+        }
+        for cmd in [
+            "rm -rf src",
+            "rm -r src",
+            "rm a.txt b.txt",
+            "rm *.tmp",
+            "unlink a.txt b.txt",
+        ] {
+            assert_eq!(classify(cmd), RouteDecision::Exec, "{cmd}");
+        }
+    }
+
     /// Compound / redirected / substituted commands NEVER route — a single
     /// built-in cannot reproduce a pipe/chain/redirect, so they gate and the
     /// confined shell mediates each spawn. This is the routing-is-not-a-bypass
@@ -432,11 +499,11 @@ mod tests {
         assert_eq!(classify("cat a.txt b.txt"), RouteDecision::Exec);
     }
 
-    /// Non-routable programs (rm, echo, grep, an interpreter) gate — only the
+    /// Non-routable programs (echo, grep, an interpreter) gate — only the
     /// data-table reaches route.
     #[test]
     fn unknown_programs_gate() {
-        for cmd in ["rm -rf /", "echo hi", "grep foo bar", "bash script.sh", ""] {
+        for cmd in ["echo hi", "grep foo bar", "bash script.sh", ""] {
             assert_eq!(classify(cmd), RouteDecision::Exec, "{cmd:?}");
         }
     }
