@@ -1903,6 +1903,28 @@ pub(crate) fn tui_permits_path(scope: &crate::caveats::Scope<String>, full_path:
     }
 }
 
+/// Full-access/custom unrestricted writes keep the final y/N guard in ordinary
+/// interactive mode. Under --yolo the operator already chose an explicit
+/// auto-run mode, so do not let EOF on stdin become a fake human denial.
+fn confirm_unrestricted_fs_mutation(
+    caveats: &crate::caveats::Caveats,
+    gate: &mut Option<&mut dyn PermissionGate>,
+    question: &str,
+) -> bool {
+    if !matches!(caveats.fs_write, crate::caveats::Scope::All) {
+        return true;
+    }
+    if ocap_disabled() {
+        return true;
+    }
+    match gate {
+        Some(g) => g
+            .ask_question(question)
+            .is_some_and(|answer| answer.trim().eq_ignore_ascii_case("y")),
+        None => false,
+    }
+}
+
 /// Run the configured build-check command in `workspace` and return a compact
 /// result string appended to the tool output so the model sees it immediately.
 pub(crate) fn run_build_check(cmd: &str, workspace: &str) -> String {
@@ -2747,7 +2769,7 @@ pub async fn execute_tool_with_offload(
     note_sink: Option<&mut dyn NoteSink>,
     recall_source: Option<&dyn RecallSource>,
     memory_source: Option<&dyn MemorySource>,
-    permission_gate: Option<&mut dyn PermissionGate>,
+    mut permission_gate: Option<&mut dyn PermissionGate>,
     exec_floor: Option<&crate::caveats::Scope<String>>,
     git_tool: Option<&dyn GitTool>,
     crew_runner: Option<&dyn CrewRunner>,
@@ -3238,7 +3260,7 @@ pub async fn execute_tool_with_offload(
                 // the prompt is the consent — the y/N confirm below stays
                 // governed by the original scope shape, which a denial here
                 // proves is `Only`, i.e. no second confirm).
-                let allowed = permission_gate.is_some_and(|gate| {
+                let allowed = permission_gate.as_deref_mut().is_some_and(|gate| {
                     fs_gate_allows(gate, "write_file", DenialKind::FsWrite, &full_str, |c| {
                         &c.fs_write
                     })
@@ -3286,20 +3308,14 @@ pub async fn execute_tool_with_offload(
             );
 
             // Auto-write when the caveat explicitly scopes fs_write (the
-            // preset itself is the user's consent).  Ask y/N only under
-            // full_access / custom where fs_write == Scope::All.
-            let needs_confirm = matches!(caveats.fs_write, crate::caveats::Scope::All);
-
-            let confirmed = if needs_confirm {
-                print!("Write this file? [y/N] ");
-                use std::io::Write as _;
-                std::io::stdout().flush().ok();
-                let mut answer = String::new();
-                std::io::stdin().read_line(&mut answer).is_ok()
-                    && answer.trim().eq_ignore_ascii_case("y")
-            } else {
-                true
-            };
+            // preset itself is the user's consent). Unrestricted writes still
+            // confirm, but through the TUI gate so stdin is guarded out of
+            // cbreak/nonblocking mode. --yolo is the explicit auto-accept mode.
+            let confirmed = confirm_unrestricted_fs_mutation(
+                caveats,
+                &mut permission_gate,
+                "Write this file? [y/N]",
+            );
 
             if confirmed {
                 let full = std::path::Path::new(workspace).join(path);
@@ -3335,7 +3351,7 @@ pub async fn execute_tool_with_offload(
                 // consults the same prompted-grant path as write_file/edit_file,
                 // so deletion is possible with operator approval instead of
                 // being structurally unavailable.
-                let allowed = permission_gate.is_some_and(|gate| {
+                let allowed = permission_gate.as_deref_mut().is_some_and(|gate| {
                     fs_gate_allows(gate, "delete_file", DenialKind::FsWrite, &full_str, |c| {
                         &c.fs_write
                     })
@@ -3359,17 +3375,11 @@ pub async fn execute_tool_with_offload(
             }
 
             print_tool_call("delete_file", path, color);
-            let needs_confirm = matches!(caveats.fs_write, crate::caveats::Scope::All);
-            let confirmed = if needs_confirm {
-                print!("Delete this file? [y/N] ");
-                use std::io::Write as _;
-                std::io::stdout().flush().ok();
-                let mut answer = String::new();
-                std::io::stdin().read_line(&mut answer).is_ok()
-                    && answer.trim().eq_ignore_ascii_case("y")
-            } else {
-                true
-            };
+            let confirmed = confirm_unrestricted_fs_mutation(
+                caveats,
+                &mut permission_gate,
+                "Delete this file? [y/N]",
+            );
 
             if !confirmed {
                 println!("skipped");
@@ -8205,6 +8215,132 @@ mod disable_ocap_tests {
         )
         .await;
         assert_eq!(out, "/opt/fake-venv\n");
+    }
+
+    /// In --yolo mode an unrestricted fs mutation prompt must not read EOF as
+    /// a human decline. The flag is already an explicit interactive override,
+    /// so final write/delete confirms auto-accept instead of auto-skipping.
+    #[tokio::test]
+    async fn yolo_auto_confirms_unrestricted_write_and_delete_prompts() {
+        let _l = env_lock().await;
+        let _on = EnvVar::set("NEWT_DISABLE_OCAP", "1");
+        let ws = tempfile::TempDir::new().unwrap();
+        let caveats = Caveats::top();
+
+        let out = run_tool(
+            "write_file",
+            serde_json::json!({"path": "auto.txt", "content": "ok\n"}),
+            ws.path(),
+            &caveats,
+        )
+        .await;
+        assert!(out.starts_with("wrote auto.txt"), "got: {out}");
+        assert_eq!(
+            std::fs::read_to_string(ws.path().join("auto.txt")).unwrap(),
+            "ok\n"
+        );
+
+        let out = run_tool(
+            "delete_file",
+            serde_json::json!({"path": "auto.txt"}),
+            ws.path(),
+            &caveats,
+        )
+        .await;
+        assert!(out.starts_with("deleted auto.txt"), "got: {out}");
+        assert!(
+            !ws.path().join("auto.txt").exists(),
+            "yolo-confirmed delete must remove the file"
+        );
+    }
+
+    /// Non-yolo unrestricted fs mutations still ask, but through the
+    /// PermissionGate question seam. In the TUI that seam owns
+    /// PromptStdinGuard, so cbreak/VMIN=0 stdin cannot auto-answer "not y".
+    #[tokio::test]
+    async fn unrestricted_write_and_delete_confirm_through_permission_gate() {
+        struct ConfirmGate {
+            answer: Option<String>,
+            questions: Vec<String>,
+        }
+        impl super::PermissionGate for ConfirmGate {
+            fn ask(&mut self, _requests: &[super::PermissionRequest]) -> super::PermissionDecision {
+                super::PermissionDecision::Deny
+            }
+            fn ask_question(&mut self, question: &str) -> Option<String> {
+                self.questions.push(question.to_string());
+                self.answer.clone()
+            }
+        }
+
+        let _l = env_lock().await;
+        let _off = EnvVar::unset("NEWT_DISABLE_OCAP");
+        let ws = tempfile::TempDir::new().unwrap();
+        let caveats = Caveats::top();
+        let mut gate = ConfirmGate {
+            answer: Some("y".to_string()),
+            questions: Vec::new(),
+        };
+
+        let out = execute_tool(
+            "write_file",
+            &serde_json::json!({"path": "guarded.txt", "content": "ok\n"}),
+            &ws.path().to_string_lossy(),
+            false,
+            20,
+            &caveats,
+            &mut NoMcp,
+            None,
+            None,
+            None,
+            None, // memory_source
+            Some(&mut gate),
+            None,
+            None, // git_tool
+            None, // crew_runner
+            None, // scratchpad_store
+            None, // code_search
+            None, // experience_store
+            None, // step_ledger
+        )
+        .await;
+        assert!(out.starts_with("wrote guarded.txt"), "got: {out}");
+        assert_eq!(
+            std::fs::read_to_string(ws.path().join("guarded.txt")).unwrap(),
+            "ok\n"
+        );
+
+        let out = execute_tool(
+            "delete_file",
+            &serde_json::json!({"path": "guarded.txt"}),
+            &ws.path().to_string_lossy(),
+            false,
+            20,
+            &caveats,
+            &mut NoMcp,
+            None,
+            None,
+            None,
+            None, // memory_source
+            Some(&mut gate),
+            None,
+            None, // git_tool
+            None, // crew_runner
+            None, // scratchpad_store
+            None, // code_search
+            None, // experience_store
+            None, // step_ledger
+        )
+        .await;
+        assert!(out.starts_with("deleted guarded.txt"), "got: {out}");
+        assert!(!ws.path().join("guarded.txt").exists());
+        assert_eq!(
+            gate.questions,
+            vec![
+                "Write this file? [y/N]".to_string(),
+                "Delete this file? [y/N]".to_string()
+            ]
+        );
     }
 
     /// #783 regression (Bug A): the confined-shell dispatch carries the RAW

@@ -1159,7 +1159,11 @@ fn mark_fds_cloexec() {
 ///
 /// Uses only `std::fs` (no libc dep) so it compiles on all platforms.
 fn terminal_fd_available() -> bool {
-    std::fs::File::open(null_device_path()).is_ok()
+    terminal_fd_available_from_probe(|| std::fs::File::open(null_device_path()).map(drop))
+}
+
+fn terminal_fd_available_from_probe(probe: impl FnOnce() -> std::io::Result<()>) -> bool {
+    probe().is_ok()
 }
 
 #[cfg(windows)]
@@ -2320,9 +2324,9 @@ fn production_danger_table() -> danger::DangerTable {
     table
 }
 
-/// Production prompt: print the question, read one line from stdin — the
-/// same blocking-confirm shape as `write_file`'s y/N. Any read error is a
-/// deny (never a hang, never an allow).
+/// Production prompt: print the question, read one line from stdin under
+/// [`PromptStdinGuard`]. Any read error is a deny (never a hang, never an
+/// allow).
 fn prompt_permission_choice(prompt_text: &str) -> PromptChoice {
     let _stdin = PromptStdinGuard::enter();
     print!("{prompt_text}");
@@ -16108,39 +16112,20 @@ mod fd_exhaustion_tests {
         );
     }
 
-    /// After exhausting the fd table, terminal_fd_available returns false.
-    /// After releasing, it returns true again.
+    /// If the fd-table probe cannot open the null device, terminal_fd_available
+    /// returns false. Do not exhaust the real process fd table here: Rust runs
+    /// tests in one process, so a real EMFILE window can starve unrelated tests.
     #[test]
-    fn terminal_fd_available_false_when_exhausted_then_true_after_release() {
-        // Open files until we hit EMFILE or a reasonable limit.
-        let mut holders: Vec<std::fs::File> = Vec::new();
-        let mut hit_limit = false;
-        for _ in 0..4096 {
-            match std::fs::File::open("/dev/null") {
-                Ok(f) => holders.push(f),
-                Err(e) if e.raw_os_error() == Some(libc::EMFILE) => {
-                    hit_limit = true;
-                    break;
-                }
-                Err(_) => break,
-            }
-        }
-
-        if hit_limit {
-            // At this point the fd table is full.
-            assert!(
-                !terminal_fd_available(),
-                "terminal_fd_available must return false when fd table is full"
-            );
-        }
-
-        // Release all holders — regardless of whether we hit the limit.
-        drop(holders);
-
-        // After release, the fd table has free slots again.
+    fn terminal_fd_available_false_when_probe_open_fails() {
+        assert!(
+            !terminal_fd_available_from_probe(|| {
+                Err(std::io::Error::from_raw_os_error(libc::EMFILE))
+            }),
+            "terminal_fd_available must return false when the probe cannot open"
+        );
         assert!(
             terminal_fd_available(),
-            "terminal_fd_available must return true after releasing fds"
+            "fd table should still have free slots after the synthetic failure"
         );
     }
 
