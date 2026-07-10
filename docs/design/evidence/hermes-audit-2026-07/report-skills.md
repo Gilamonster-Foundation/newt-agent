@@ -1,0 +1,65 @@
+All evidence gathered. Report follows.
+
+---
+
+# Hermes skills system survey — mechanism vs. marketing
+
+All paths relative to `hermes-agent@830165473`.
+
+## Scale
+
+The skills subsystem is ~18K lines of Python: `tools/skill_manager_tool.py` (1542), `tools/skills_tool.py` (1662), `tools/skills_hub.py` (4109), `hermes_cli/skills_hub.py` (1997), `agent/curator.py` (1976), `agent/curator_backup.py` (711), `tools/skill_usage.py` (947), `tools/skills_guard.py` (1086), `agent/background_review.py` (960), `agent/skill_utils.py` (767), plus prompt-builder/commands/bundles glue. This sits inside a monolith: `cli.py` is 16,184 lines (728KB), `run_agent.py` 6,013 lines, `gateway/run.py` 972KB. 67 bundled `SKILL.md` files (~866KB of body text) ship in `skills/`; `optional-skills/` adds ~19 more categories installed on demand.
+
+## Skill format & agentskills.io compatibility — real
+
+A skill is a directory with `SKILL.md` (YAML frontmatter: `name`, `description`, `version`, `platforms`, `metadata.hermes.tags` — see `skills/software-development/systematic-debugging/SKILL.md:1-13`) plus support dirs `references/`, `templates/`, `scripts/`, `assets/` (`skill_utils.py:50`). This is the same format newt already reads (`newt-skills/src/lib.rs:1-31` declares agentskills.io compatibility explicitly). Compatibility is format-level plus a hub: `tools/skills_guard.py:40-47` hardcodes `openai/skills`, `anthropics/skills`, `huggingface/skills`, `NVIDIA/skills` as trusted install sources with a trust×verdict install policy matrix (`skills_guard.py:52-60`). Hermes-specific extensions: `platforms:`/`environments:` offer-time gating (`skill_utils.py:163-304`), `requires_tools`/`fallback_for_tools` conditional visibility (`skill_utils.py:541-556`), `${HERMES_SKILL_DIR}` templating and inline `` !`shell` `` execution capped at 4000 chars (`agent/skill_preprocessing.py:16-23`).
+
+## Discovery/injection per turn — index only, but with a heavy preamble
+
+The system prompt carries a category-grouped index: one line per skill, description truncated to 60 chars (`skill_utils.py:710-718`), built by `build_skills_system_prompt` (`agent/prompt_builder.py:1417`) with a two-layer cache (in-process LRU + disk snapshot validated by an mtime/size manifest, `prompt_builder.py:1424-1428` — added because ~120 skills made cold-start take "10+ seconds of pure waste", `skill_utils.py:404-407`). Full bodies load only via the `skill_view` tool (progressive disclosure, `skills_tool.py:54,864`), so per-turn token cost is the index (~1.5-3K tokens at 67-120 skills) plus a ~300-word imperative preamble: "**Skills (mandatory)** … you MUST load it with skill_view(name) … Err on the side of loading" (`prompt_builder.py:1647-1673`). A "coding posture" demotes non-coding categories to names-only lines, never hiding names, because "models don't reach for skills_list to rediscover what the index stops showing them" (`prompt_builder.py:1599-1619`).
+
+## "Creates skills from experience" — the actual trigger
+
+Real and wired. A counter `_iters_since_skill` increments on every tool-calling iteration (`agent/conversation_loop.py:690-692`); when a turn ends with ≥10 accumulated iterations (default, `agent/agent_init.py:1423-1426`, configurable via `skills.creation_nudge_interval`), `turn_finalizer.py:455-478` spawns a **background review fork**: a daemon-thread `AIAgent` clone that replays the conversation snapshot and is prompted to update the skill library (`agent/background_review.py:607-830`). "After complex tasks" in the README is marketing for "after ≥10 tool iterations". A parallel memory review fires every 10 turns (`agent_init.py:1330-1338`).
+
+The fork's engineering is the most instructive part:
+- **Tool whitelist**: only memory/skill tools; everything else denied at runtime (`background_review.py:789-804`).
+- **Prompt-cache parity**: inherits the parent's cached system prompt, session_id, and byte-identical `tools[]` so the replay hits the warm prefix cache — measured ~26% end-to-end cost reduction (`background_review.py:734-758`). When routed to a cheaper aux model (cold cache anyway), it replays a compact digest instead (`background_review.py:31-43,112-153`).
+- **Persistence isolation**: `_persist_disabled` hard-stops session-DB writes because an earlier bug wrote the harness prompt into the user's real session and the agent "became the curator", refusing actual tasks (`background_review.py:712-723`). Compression is disabled to prevent a session-rotation race (#38727, lines 766-776).
+
+## The review prompt is the quality-control policy
+
+`_SKILL_REVIEW_PROMPT` (`background_review.py:171-273`) encodes: a bias to act ("Be ACTIVE — most sessions produce at least one skill update… A pass that does nothing is a missed learning opportunity"); a target shape (class-level umbrella skills with `references/`, not one-session-one-skill entries); a preference order (patch the loaded skill → patch an existing umbrella → add a support file → only then create); user-frustration signals as first-class skill signals; and a **negative-space taxonomy** — do NOT capture environment-dependent failures, negative tool claims ("browser tools do not work" hardens "into refusals the agent cites against itself for months"), transient errors, or one-off task narratives (lines 250-269). This is "skills self-improve during use" in practice: channel (a) the foreground preamble instructs "If a skill has issues, fix it with skill_manage(action='patch') … update it before finishing" (`prompt_builder.py:1663-1667`); channel (b) the background fork's patch-first preference order.
+
+## Gates, versioning, rollback
+
+Structural guards exist; **no human or outcome-based gate does**:
+- Background fork may not write to bundled/hub/external/pinned skills (`skill_manager_tool.py:281-315`); foreground user-directed edits may.
+- **Read-before-write**: the fork must have actually `skill_view`'d a file (ContextVar mark, `skill_manager_tool.py:50-89`) before patching it — it "must not patch or rewrite content it has only inferred from the transcript".
+- Size cap 100K chars (`skill_manager_tool.py:455`); regex security scan with in-call rollback on block — but **off by default for agent-created skills**, with the honest rationale that "the agent can already execute the same code paths via terminal() with no gate" (`skill_manager_tool.py:100-115`).
+- No per-edit version history. The `version:` frontmatter field is never auto-bumped; the only rollback for background-review edits is the in-call revert on scan-block (`skill_manager_tool.py:868-878`). The user sees a one-line `💾 Self-improvement review:` summary after the fact (`background_review.py:881-885`).
+- The **curator** (`agent/curator.py`) is a second, slower loop: idle-triggered (default every 7 days, ≥2h idle), deterministic stale(30d)→archive(90d) transitions via a `.usage.json` sidecar (`skill_usage.py:1-23`), never deletes (archives to `.archive/`, recoverable), respects pins, only touches provenance-marked agent-created skills (`tools/skill_provenance.py`). Before any mutating pass it takes a tar.gz snapshot with undoable rollback (`agent/curator_backup.py:1-38`) — but this covers curator passes only, **not** the per-turn background-review edits. The LLM consolidation pass is OFF by default after it "archived whole clusters of active skills" (`skill_manager_tool.py:418-424`, `curator.py:57-63`).
+
+## Verdict: real and load-bearing, but unmeasured
+
+The loop is genuinely wired in and production-hardened — the density of referenced incident numbers (#14944, #25322, #25839, #38727, #54937, #59437) proves it runs enough to break in interesting ways. What it lacks entirely is **outcome measurement**: nothing checks whether a skill edit improved anything. Quality control = write-time LLM judgment shaped by prompt taxonomy + usage-decay afterward. The "be ACTIVE" bias guarantees sediment accretion, which is why a 2,700-line curator/backup subsystem exists to garbage-collect it.
+
+Newt's adjacent territory: `newt-skills` is read-only (index + `use_skill`, parse-only caveats for future leash-meeting, `newt-skills/src/lib.rs:41-48`); newt has **no skill write path at all**. The experience store (`newt-core/src/agentic/experiential.rs`) has a structural write-gate (≥12-char lesson) and hard char caps but is pure in-memory — it does not survive process restart. Workflow-steer TOMLs are hand-authored.
+
+## Candidate learnings for newt
+
+1. **A post-task skill-sediment reviewer, as a caveat-confined crew job.** Mechanism: hermes's tool-iteration counter + background fork. Newt plug-in: after the agent loop finalizes a task with ≥N tool rounds, newt-scheduler spawns a bounded subagent whose caveats are met down to `fs_write: only ~/.newt/skills/**` + transcript read — newt's OCAP lattice replaces hermes's ad-hoc thread whitelist (`background_review.py:791-804`) with a *provable* confinement, and the read-before-write mark becomes a caveat too. Payoff: the missing bridge from per-session experience to durable, portable procedural memory; per eval discipline, adopt only behind an n≥5 Fisher-exact sweep.
+2. **The negative-space capture taxonomy** (`background_review.py:250-269`). Directly portable into the experiential write-gate (today only length-based) or a nudge-classifier TOML: reject environment-dependent failures, negative tool claims, resolved transients, one-off narratives. Payoff: prevents the poisoned-memory failure mode hermes learned the hard way, at near-zero cost — it's a data file under the Three Cs.
+3. **Patch-first preference order + umbrella shaping.** "Update the loaded skill > update an existing umbrella > add a references/ file > create new class-level skill" (`background_review.py:197-231`) is the anti-sprawl policy that makes a skill library converge instead of fragment. If newt ever writes skills, adopt the ordering verbatim as steer text.
+4. **Provenance + lifecycle sidecar.** Agent-created flag, usage counters, stale→archive-never-delete, pin (`skill_usage.py:18-23`, `skill_provenance.py`). Newt version: `git init ~/.newt/skills` gives per-edit versioning, diff review, and rollback for free — strictly better than hermes's tarball snapshots *and* its missing per-edit history, and matches the workspace's plain-text/provenance philosophy.
+5. **Conditional index gating**: `requires_tools`/`fallback_for_tools`/`platforms`/`environments` frontmatter (`skill_utils.py:163-304,541-556`) and posture-based names-only demotion (`prompt_builder.py:1599-1619`). Cheap token-cost control for a growing `~/.newt/skills` index; slots into newt-skills' index renderer.
+6. **Fork cache-parity + digest-replay economics** (`background_review.py:31-43,734-758`): pin the parent's cached prompt when same-model, digest the transcript when routed cheaper. Relevant to any newt crew role that re-reads the primary transcript.
+
+## Avoid replicating
+
+1. **The "be ACTIVE, most sessions produce a skill update" bias** (`background_review.py:172-175`). It manufactures sediment, which then requires a curator, consolidation pass, pin system, protected-builtin list, and backup/rollback subsystem (~4,300 lines) to manage — and the consolidation pass still had to be turned off by default after archiving live skills (`skill_manager_tool.py:418-424`). Newt's write-gate philosophy (high-signal or nothing) is correct; keep "nothing to save" the default.
+2. **Unmeasured autonomous mutation of behavior-steering artifacts.** Hermes has no inertness-oracle, no A/B, no regression check on skill edits — the gate is prompt text. This contradicts newt's eval discipline directly. If newt adopts sediment, land edits as reviewable proposals (git branch in the skills repo) or gate adoption on sweeps.
+3. **The fork-the-god-object pattern.** The review fork shares the parent's mutable session_id and needs six hand-pinned flags (`_persist_disabled`, `_end_session_on_close`, `compression_enabled=False`, `_skip_mcp_refresh`, …, `background_review.py:698-776`) to avoid corrupting the parent — the curator-takeover and sibling-compression bugs were direct consequences. Newt's isolated-worktree, fresh-process crew model is the antidote; keep it.
+4. **The 300-word "mandatory, you MUST load" prompt preamble** (`prompt_builder.py:1647-1673`). Permanent token tax and instruction pressure in every turn; in newt this belongs in droppable steer/LanguagePack data with measured value, not hardcoded prompt.
+5. **Regex security scanning as the agent-write gate** (`skills_guard.py`) — 1,086 lines that hermes itself ships disabled for agent-created skills because terminal access already bypasses it (`skill_manager_tool.py:104-107`). Newt's caveat lattice answers the actual threat; scan hub *installs* if a hub ever exists, not self-writes.
+6. **Single-file monolith scale** (`cli.py` 16K lines; `gateway/run.py` 972KB). Self-evident; noted because the skills system's worst bugs all trace to shared mutable state that small crates make unrepresentable.
