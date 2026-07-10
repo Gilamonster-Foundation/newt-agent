@@ -39,6 +39,7 @@ use newt_inference::local::LocalVllmBackend;
 use crate::dgx_registry::{self, InferenceTool, ModelVariant};
 use crate::dgx_status;
 use crate::dgx_vllm;
+use crate::dgx_model_switcher;
 
 /// `newt dgx <cmd>` subcommands.
 #[derive(Subcommand, Debug)]
