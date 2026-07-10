@@ -2385,9 +2385,75 @@ struct PermissionPromptState {
     /// at session start and auto-denied without re-prompting, across restarts.
     /// Deny-only, so reading it back can never widen authority.
     persistent_denials: std::collections::BTreeSet<(newt_core::DenialKind, String)>,
+    /// #1057: one-shot exec grants left by a model-driven `request_permissions`
+    /// allow-once. That grant authorizes the model's UPCOMING retry (a separate
+    /// tool call), but the consult that recorded it executes nothing and its
+    /// widened caveats are discarded — so without carrying it the retry
+    /// re-denies. Each entry is consumed by the NEXT matching `run_command`
+    /// (exactly once, so allow-once semantics hold). Exec targets are stored by
+    /// basename so a `python3` grant covers `/usr/bin/python3`, consistent with
+    /// the enforcement leash. Grant-only, and folded through `mint` (⊑ root), so
+    /// the attenuation-only invariant holds.
+    pending_once_grants: std::collections::BTreeSet<(newt_core::DenialKind, String)>,
     /// Every prompted decision this session, in prompt order — what
     /// `/permissions` lists. Also appended to the durable log as made.
     decisions: Vec<newt_core::PermissionRecord>,
+}
+
+/// The exec program basename — mirrors `newt_core` `exec_allowlist_name` (splits
+/// on `/` and `\`) so a grant of `python3` reconciles with a run of
+/// `/usr/bin/python3`. Used ONLY for the prompt-skip memo and the one-shot
+/// pending-grant match; the authority check itself (`permits_exec`) stays EXACT
+/// — that method is the sole *unconfined* gate for model-authored `verify`
+/// strings, and basename-matching it would be an ACE primitive (#1057 review).
+fn exec_grant_basename(cmd: &str) -> &str {
+    cmd.rsplit(['/', '\\'])
+        .find(|p| !p.is_empty())
+        .unwrap_or(cmd)
+}
+
+/// Does a durable session grant cover `req`? Exact for every axis; for exec the
+/// set is consulted the way the enforcement leash matches — the target verbatim
+/// OR its basename in the set — so a `python3` grant covers `/usr/bin/python3`,
+/// while a full-path grant does NOT widen to a bare or different-path program
+/// (pin-exact preserved). This mirrors agent-bridle `exec_scope_allows`, so the
+/// prompt is never skipped for something the leash would then deny.
+fn session_grant_covers(
+    grants: &std::collections::BTreeSet<(newt_core::DenialKind, String)>,
+    req: &newt_core::PermissionRequest,
+) -> bool {
+    if grants.contains(&(req.kind, req.target.clone())) {
+        return true;
+    }
+    req.kind == newt_core::DenialKind::Exec
+        && grants.contains(&(
+            newt_core::DenialKind::Exec,
+            exec_grant_basename(&req.target).to_string(),
+        ))
+}
+
+/// Consume a one-shot pending grant matching `req`, returning the grant key to
+/// fold into the minted caveats so the retry actually runs. Exec entries are
+/// basename-keyed, and the query is basename-normalized to match. One-shot:
+/// removed on hit, so the next identical op re-prompts (allow-once preserved).
+fn take_pending_once(
+    pending: &mut std::collections::BTreeSet<(newt_core::DenialKind, String)>,
+    req: &newt_core::PermissionRequest,
+) -> Option<(newt_core::DenialKind, String)> {
+    let exact = (req.kind, req.target.clone());
+    if pending.remove(&exact) {
+        return Some(exact);
+    }
+    if req.kind == newt_core::DenialKind::Exec {
+        let base = (
+            newt_core::DenialKind::Exec,
+            exec_grant_basename(&req.target).to_string(),
+        );
+        if pending.remove(&base) {
+            return Some(base);
+        }
+    }
+    None
 }
 
 impl PermissionPromptState {
@@ -2530,17 +2596,43 @@ impl<F: FnMut(&str) -> PromptChoice> newt_core::PermissionGate for PromptPermiss
         for req in requests {
             // A session grant covers this target: no re-prompt, no new
             // record — the decision was recorded when the human made it.
-            if self
-                .state
-                .session_grants
-                .contains(&(req.kind, req.target.clone()))
-            {
+            // (Exec matches by basename so a `python3` grant covers
+            // `/usr/bin/python3`, consistent with the enforcement leash.)
+            if session_grant_covers(&self.state.session_grants, req) {
                 continue;
+            }
+            // #1057: a one-shot pending grant left by a prior request_permissions
+            // allow-once covers this retry — consume it (exactly once) and fold
+            // it into the minted caveats so the command actually runs. Only an
+            // actual operation (a `run_command` retry) consumes it, never another
+            // request_permissions ask (which would burn the grant before the
+            // retry and re-deny it).
+            if req.tool != "request_permissions" {
+                if let Some(key) = take_pending_once(&mut self.state.pending_once_grants, req) {
+                    self.record(req, "allow", "once");
+                    once_grants.push(key);
+                    continue;
+                }
             }
             match (self.ask_human)(&permission_prompt_text(req, &self.danger)) {
                 PromptChoice::AllowOnce => {
                     self.record(req, "allow", "once");
                     once_grants.push((req.kind, req.target.clone()));
+                    // #1057: a model-driven `request_permissions` allow-once is
+                    // authorizing the model's UPCOMING retry — a separate tool
+                    // call whose caveats are re-derived from scratch, so the
+                    // widening above is discarded. Carry it as a ONE-SHOT pending
+                    // grant (exec keyed by basename) the retry consumes exactly
+                    // once. A denial-driven allow-once re-execs in place and
+                    // needs no carry, so this is scoped to request_permissions.
+                    if req.tool == "request_permissions" {
+                        let key = if req.kind == newt_core::DenialKind::Exec {
+                            (req.kind, exec_grant_basename(&req.target).to_string())
+                        } else {
+                            (req.kind, req.target.clone())
+                        };
+                        self.state.pending_once_grants.insert(key);
+                    }
                 }
                 PromptChoice::AllowSession => {
                     // Facade P1b (§7-F3/F4): a high-danger target (interpreter
@@ -3538,6 +3630,129 @@ mod permission_prompt_tests {
         assert_eq!(state.decisions.len(), 2);
         assert_eq!(state.decisions[0].decision, "allow");
         assert_eq!(state.decisions[0].scope, "once");
+    }
+
+    /// #1057: a model-driven `request_permissions` allow-once must cover the
+    /// model's SEPARATE `run_command` retry — its widened caveats are otherwise
+    /// discarded by `execute_request_permissions`, so the retry re-denied and
+    /// wasted a round (the live Ornith repro: grant `python3`, then
+    /// `/usr/bin/python3` re-prompts). It must also be ONE-SHOT.
+    #[test]
+    fn request_permissions_allow_once_carries_to_the_run_command_retry() {
+        let mut state = PermissionPromptState::default();
+        let prompts = Rc::new(Cell::new(0));
+        let base = base_caveats("/ws");
+        let mut gate = scripted_gate(
+            &mut state,
+            base,
+            None,
+            None,
+            vec![PromptChoice::AllowOnce, PromptChoice::AllowOnce],
+            prompts.clone(),
+        );
+        // The model pre-asks via request_permissions for `python3` (bare name).
+        let ask = PermissionRequest {
+            tool: "request_permissions".to_string(),
+            kind: DenialKind::Exec,
+            target: "python3".to_string(),
+            reason: "need to run the tests".to_string(),
+        };
+        assert!(matches!(
+            gate.ask(&[ask]),
+            newt_core::PermissionDecision::Allow(_)
+        ));
+        assert_eq!(prompts.get(), 1);
+        // The retry arrives as a run_command denial, path-resolved to /usr/bin/python3.
+        match gate.ask(&[exec_request("/usr/bin/python3")]) {
+            newt_core::PermissionDecision::Allow(c) => {
+                assert!(
+                    c.permits_exec("python3"),
+                    "the carried grant widened the caveats so the retry runs"
+                );
+            }
+            newt_core::PermissionDecision::Deny => panic!("carried grant should cover the retry"),
+        }
+        assert_eq!(
+            prompts.get(),
+            1,
+            "no second prompt — the pending grant covered the /usr/bin/python3 retry"
+        );
+        // One-shot: another python3 op must re-prompt (allow-once preserved).
+        assert!(matches!(
+            gate.ask(&[exec_request("/usr/bin/python3")]),
+            newt_core::PermissionDecision::Allow(_)
+        ));
+        assert_eq!(
+            prompts.get(),
+            2,
+            "the one-shot pending grant was consumed; the next op re-prompts"
+        );
+    }
+
+    /// #1057: a durable exec session grant matches by basename, so granting a
+    /// bare `mytool` covers a later path-resolved `/opt/bin/mytool` — but a
+    /// different program is still not covered (no over-grant).
+    #[test]
+    fn session_grant_exec_matches_by_basename() {
+        let mut state = PermissionPromptState::default();
+        let prompts = Rc::new(Cell::new(0));
+        let mut gate = scripted_gate(
+            &mut state,
+            base_caveats("/ws"),
+            None,
+            None,
+            vec![PromptChoice::AllowSession, PromptChoice::AllowSession],
+            prompts.clone(),
+        );
+        assert!(matches!(
+            gate.ask(&[exec_request("mytool")]),
+            newt_core::PermissionDecision::Allow(_)
+        ));
+        assert_eq!(prompts.get(), 1);
+        // Same program, path-resolved: covered — no re-prompt.
+        assert!(matches!(
+            gate.ask(&[exec_request("/opt/bin/mytool")]),
+            newt_core::PermissionDecision::Allow(_)
+        ));
+        assert_eq!(prompts.get(), 1, "basename covers the resolved path");
+        // A DIFFERENT program still prompts.
+        assert!(matches!(
+            gate.ask(&[exec_request("othertool")]),
+            newt_core::PermissionDecision::Allow(_)
+        ));
+        assert_eq!(prompts.get(), 2, "a different program is not covered");
+    }
+
+    /// #1057 pin-exact: granting a FULL PATH must NOT widen to a bare name (which
+    /// could resolve to a different binary) — the basename relaxation is one-way,
+    /// bare-grant → resolved-run, never full-grant → bare-run.
+    #[test]
+    fn full_path_session_grant_does_not_cover_a_bare_name() {
+        let mut state = PermissionPromptState::default();
+        let prompts = Rc::new(Cell::new(0));
+        let mut gate = scripted_gate(
+            &mut state,
+            base_caveats("/ws"),
+            None,
+            None,
+            vec![PromptChoice::AllowSession, PromptChoice::AllowSession],
+            prompts.clone(),
+        );
+        assert!(matches!(
+            gate.ask(&[exec_request("/opt/bin/mytool")]),
+            newt_core::PermissionDecision::Allow(_)
+        ));
+        assert_eq!(prompts.get(), 1);
+        // A bare `mytool` is NOT covered by the full-path grant — re-prompts.
+        assert!(matches!(
+            gate.ask(&[exec_request("mytool")]),
+            newt_core::PermissionDecision::Allow(_)
+        ));
+        assert_eq!(
+            prompts.get(),
+            2,
+            "full-path grant must not widen to a bare name (pin-exact)"
+        );
     }
 
     /// #307 FLOOR TEST (b) — the security contract: a session-grant CANNOT
