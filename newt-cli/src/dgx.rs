@@ -39,7 +39,6 @@ use newt_inference::local::LocalVllmBackend;
 use crate::dgx_registry::{self, InferenceTool, ModelVariant};
 use crate::dgx_status;
 use crate::dgx_vllm;
-use crate::dgx_model_switcher;
 
 /// `newt dgx <cmd>` subcommands.
 #[derive(Subcommand, Debug)]
@@ -393,6 +392,30 @@ pub enum CardCmd {
         /// The checkpoint to serve (HF `<org>/<repo>` or an on-node path). The
         /// card carries the serving KNOBS, not WHICH checkpoint; defaults to the
         /// card's `served_name` when omitted.
+        #[arg(long)]
+        model: Option<String>,
+        /// SSH node name (defaults to the active node).
+        #[arg(long)]
+        node: Option<String>,
+        /// Override the card's backend (`vllm` | `ollama`).
+        #[arg(long)]
+        backend: Option<String>,
+        /// Render the plan + remote script without SSHing or writing config.
+        #[arg(long)]
+        dry_run: bool,
+        /// Proceed even when the model exceeds the node memory budget.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Interactively pick a card from the catalog, then stand it up.
+    ///
+    /// Prints the same catalog as `card list` as a numbered menu, reads a
+    /// selection on the TTY, and hands the chosen card straight to the `setup`
+    /// path — no new orchestration, just a discovery front-end. Non-interactive
+    /// callers (no TTY / piped stdin) should use `card setup <name>` directly.
+    Pick {
+        /// The checkpoint to serve (HF `<org>/<repo>` or an on-node path);
+        /// defaults to the chosen card's `served_name`.
         #[arg(long)]
         model: Option<String>,
         /// SSH node name (defaults to the active node).

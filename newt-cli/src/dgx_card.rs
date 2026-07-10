@@ -16,6 +16,7 @@
 //! the render/validate/resolve logic is fully unit-testable fs-free (the
 //! `dgx_pull.rs` pattern).
 
+use std::io::{IsTerminal as _, Write as _};
 use std::path::{Path, PathBuf};
 
 use newt_core::model_card::{
@@ -255,27 +256,111 @@ pub async fn run(cmd: CardCmd, config_path: Option<&Path>) -> anyhow::Result<()>
             backend,
             dry_run,
             force,
+        } => setup_card(config_path, &name, model, node, backend, dry_run, force).await,
+        CardCmd::Pick {
+            model,
+            node,
+            backend,
+            dry_run,
+            force,
         } => {
-            let card =
-                resolve_from(&name, builtin_cards(), dropins()).map_err(|e| anyhow::anyhow!(e))?;
-            // Validate (schema + host/LAN-IP leak) BEFORE standing anything up.
-            validate_report(&card).map_err(|e| anyhow::anyhow!(e))?;
-            let backend = match backend.as_deref() {
-                Some(b) => b.parse::<Backend>().map_err(|e| anyhow::anyhow!(e))?,
-                None => card.backend.ok_or_else(|| {
-                    anyhow::anyhow!("card `{}` has no backend; pass --backend", card.name)
-                })?,
-            };
-            match backend {
-                Backend::Vllm => setup_vllm(config_path, &card, model, node, force, dry_run).await,
-                Backend::Ollama => {
-                    setup_ollama_stub(&card);
-                    Ok(())
-                }
-                Backend::LlamaCpp => {
-                    anyhow::bail!("card setup: the llama_cpp backend is not supported yet")
-                }
+            let entries = catalog(builtin_cards(), dropins());
+            if entries.is_empty() {
+                anyhow::bail!("no cards found — nothing to pick from");
             }
+            if !std::io::stdin().is_terminal() {
+                anyhow::bail!(
+                    "`card pick` is interactive and needs a TTY — use `card setup <name>` \
+                     for a non-interactive stand-up (see `card list`)"
+                );
+            }
+            print!("{}", render_menu(&entries));
+            print!("? Choose a card (1-{}): ", entries.len());
+            std::io::stdout().flush().ok();
+            let mut input = String::new();
+            std::io::stdin().read_line(&mut input)?;
+            let idx = parse_selection(&input, entries.len()).map_err(|e| anyhow::anyhow!(e))?;
+            let name = entries[idx].card.name.clone();
+            setup_card(config_path, &name, model, node, backend, dry_run, force).await
+        }
+    }
+}
+
+/// Render the card catalog as a numbered interactive menu — the `card pick`
+/// front-end for `card list`. Pure; the TTY read lives in [`run`].
+#[must_use]
+pub fn render_menu(entries: &[CardEntry]) -> String {
+    let mut out = String::from("\nAvailable model cards:\n\n");
+    for (i, e) in entries.iter().enumerate() {
+        let backend = e.card.backend.map_or("-", |b| b.as_str());
+        let gib = e
+            .card
+            .footprint_gib
+            .map_or_else(|| "-".to_string(), |f| format!("{f:.0}GiB"));
+        out.push_str(&format!(
+            "  {:>2}. {:<22} {:<8} {:>7}  {}\n",
+            i + 1,
+            e.card.name,
+            backend,
+            gib,
+            e.source
+        ));
+    }
+    out.push('\n');
+    out
+}
+
+/// Parse a 1-based menu selection into a 0-based catalog index. Pure — the
+/// impure TTY read is in [`run`].
+///
+/// # Errors
+/// Returns a human-readable message when the input is not a number or is out of
+/// the `1..=len` range.
+pub fn parse_selection(input: &str, len: usize) -> Result<usize, String> {
+    let choice: usize = input
+        .trim()
+        .parse()
+        .map_err(|_| format!("`{}` is not a number", input.trim()))?;
+    if choice < 1 || choice > len {
+        return Err(format!("selection {choice} out of range (1-{len})"));
+    }
+    Ok(choice - 1)
+}
+
+/// Resolve a card by name, validate it, and stand its backend up. Shared by
+/// `card setup <name>` and the interactive `card pick`.
+///
+/// # Errors
+/// Surfaces an unknown/invalid/leaky card or a stand-up failure as `anyhow`.
+async fn setup_card(
+    config_path: Option<&Path>,
+    name: &str,
+    model: Option<String>,
+    node: Option<String>,
+    backend: Option<String>,
+    dry_run: bool,
+    force: bool,
+) -> anyhow::Result<()> {
+    let dropins = dropin_dir(config_path)
+        .map(|d| load_dropin_dir(&d))
+        .unwrap_or_default();
+    let card = resolve_from(name, builtin_cards(), dropins).map_err(|e| anyhow::anyhow!(e))?;
+    // Validate (schema + host/LAN-IP leak) BEFORE standing anything up.
+    validate_report(&card).map_err(|e| anyhow::anyhow!(e))?;
+    let backend = match backend.as_deref() {
+        Some(b) => b.parse::<Backend>().map_err(|e| anyhow::anyhow!(e))?,
+        None => card.backend.ok_or_else(|| {
+            anyhow::anyhow!("card `{}` has no backend; pass --backend", card.name)
+        })?,
+    };
+    match backend {
+        Backend::Vllm => setup_vllm(config_path, &card, model, node, force, dry_run).await,
+        Backend::Ollama => {
+            setup_ollama_stub(&card);
+            Ok(())
+        }
+        Backend::LlamaCpp => {
+            anyhow::bail!("card setup: the llama_cpp backend is not supported yet")
         }
     }
 }
@@ -400,6 +485,30 @@ mod tests {
     fn render_list_empty_is_friendly() {
         assert_eq!(render_list(&[], false), "no cards found");
         assert_eq!(render_list(&[], true), "[]");
+    }
+
+    #[test]
+    fn render_menu_numbers_every_card() {
+        let entries = catalog(vec![vllm_card("aaa", 0.6), vllm_card("bbb", 0.6)], vec![]);
+        let out = render_menu(&entries);
+        // 1-based numbering, one line per card, backend shown.
+        assert!(out.contains(" 1. aaa"));
+        assert!(out.contains(" 2. bbb"));
+        assert!(out.contains("vllm"));
+    }
+
+    #[test]
+    fn parse_selection_accepts_in_range_1_based() {
+        assert_eq!(parse_selection("1\n", 3), Ok(0));
+        assert_eq!(parse_selection("  3 ", 3), Ok(2));
+    }
+
+    #[test]
+    fn parse_selection_rejects_out_of_range_and_garbage() {
+        assert!(parse_selection("0", 3).is_err());
+        assert!(parse_selection("4", 3).is_err());
+        assert!(parse_selection("abc", 3).is_err());
+        assert!(parse_selection("", 3).is_err());
     }
 
     #[test]

@@ -15,7 +15,6 @@ pub mod crew;
 pub mod crew_runner;
 mod dgx;
 mod dgx_card;
-mod dgx_model_switcher;
 mod dgx_pull;
 pub mod dgx_registry;
 pub mod dgx_status;
