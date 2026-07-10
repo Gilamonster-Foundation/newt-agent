@@ -8359,12 +8359,16 @@ fn parse_persona_command(input: &str) -> anyhow::Result<PersonaCommand> {
             name: PersonaStore::DEFAULT_NAME.into(),
             keep_context,
         }),
-        Some("set") => match positional.next() {
+        // FR-PA-1 (#1021): `switch` is a discoverable alias for `set` — same
+        // handling, same usage shape. `/persona <name>` (the bare fallthrough
+        // below) already does this too; `switch` just names the verb
+        // explicitly for an operator reaching for it by that word.
+        Some(verb @ ("set" | "switch")) => match positional.next() {
             Some(name) => Ok(PersonaCommand::Set {
                 name: name.to_string(),
                 keep_context,
             }),
-            None => anyhow::bail!("usage: /persona set <name> [--keep-context]"),
+            None => anyhow::bail!("usage: /persona {verb} <name> [--keep-context]"),
         },
         Some(name) => Ok(PersonaCommand::Set {
             name: name.to_string(),
@@ -11509,10 +11513,11 @@ this is how #1030 keeps multiple newts from colliding."
             "\
 /persona <sub> — configured personas
 
-  /persona list        list configured personas
-  /persona show        show the active persona
-  /persona <name>      start a fresh conversation with that persona
-  /persona clear       start fresh with no persona
+  /persona list           list configured personas
+  /persona show           show the active persona
+  /persona <name>         start a fresh conversation with that persona
+  /persona switch <name>  same as /persona <name> (an explicit verb)
+  /persona clear          start fresh with no persona
 
 Setting or clearing a persona starts a new conversation (the system prompt
 changes). Define personas in config."
@@ -11719,6 +11724,7 @@ fn help_lines() -> &'static [&'static str] {
         "  /persona list            - list configured personas",
         "  /persona show            - show the active persona",
         "  /persona <name>          - start fresh with a persona",
+        "  /persona switch <name>   - same as /persona <name> (an explicit verb)",
         "  /persona clear           - start fresh with no persona",
         "  /crew edit [name]        - edit a crew's settings (roles, control loop, test, budgets)",
         "  /dgx status              - DGX endpoint health + running models",
@@ -15279,6 +15285,11 @@ mod skills_integration_tests {
             parse_persona_command("/persona set security").unwrap(),
             PersonaCommand::set("security")
         );
+        // FR-PA-1 (#1021): `switch` is a discoverable alias for `set`.
+        assert_eq!(
+            parse_persona_command("/persona switch personal-assistant").unwrap(),
+            PersonaCommand::set("personal-assistant")
+        );
         assert_eq!(
             parse_persona_command("/persona clear").unwrap(),
             PersonaCommand::Clear
@@ -18410,6 +18421,8 @@ mod persona_helper_tests {
         assert!(parse_persona_command("/help").is_err());
         let err = parse_persona_command("/persona set").unwrap_err();
         assert!(err.to_string().contains("usage: /persona set"));
+        let err = parse_persona_command("/persona switch").unwrap_err();
+        assert!(err.to_string().contains("usage: /persona switch"));
         // `off` is an alias for clear.
         assert_eq!(
             parse_persona_command("/persona off").unwrap(),
