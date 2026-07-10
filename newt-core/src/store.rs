@@ -801,7 +801,11 @@ impl ConversationStore {
         roadmap_id: Option<&str>,
         node_id: Option<&str>,
     ) -> anyhow::Result<()> {
-        let id = self.resolve_id(id)?;
+        // NOT `resolve_id`: a session can bind its active conversation to a Plan
+        // node BEFORE its first turn is saved (so no row exists yet). The exact
+        // id is used; the UPDATE is a no-op until the conversation row exists,
+        // and the node→conversation forward pointer (on the roadmap side) is what
+        // /roadmap next reads either way.
         let conn = self.lock_conn();
         conn.execute(
             "UPDATE conversations SET roadmap_id = ?2, node_id = ?3

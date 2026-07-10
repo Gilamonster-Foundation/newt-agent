@@ -6819,8 +6819,82 @@ fn run_chat(
                         };
                         match conversation_store.as_ref() {
                             Some(store) => {
-                                match handle_roadmap_command(&cmd, store, &mut active_roadmap_id) {
-                                    Ok(msg) => print_newt(&msg, color, verbose),
+                                match handle_roadmap_command(
+                                    &cmd,
+                                    store,
+                                    &mut active_roadmap_id,
+                                    &active_conversation_id,
+                                ) {
+                                    Ok(outcome) => {
+                                        print_newt(&outcome.message, color, verbose);
+                                        // #1030 resume-to-cursor: /roadmap next on a bound Plan
+                                        // node switches to that node's conversation (same
+                                        // claim-guarded restore as /resume).
+                                        if let Some(target) = outcome.switch_to {
+                                            if target != active_conversation_id {
+                                                match store.claim(&target) {
+                                                    Ok(newt_core::ClaimOutcome::HeldBy {
+                                                        host,
+                                                        pid,
+                                                    }) => print_newt(
+                                                        &format!(
+                                                            "that node's conversation is open in \
+                                                             another newt (pid {pid} on {host}) — \
+                                                             not switching",
+                                                        ),
+                                                        color,
+                                                        verbose,
+                                                    ),
+                                                    Ok(newt_core::ClaimOutcome::Claimed) => {
+                                                        let outgoing =
+                                                            active_conversation_id.clone();
+                                                        let _ = store.release(&outgoing);
+                                                        let mut ctx = ConversationCommandContext {
+                                                            store,
+                                                            persona_store: &persona_store,
+                                                            workspace,
+                                                            memory: &mut memory,
+                                                            system: &mut system,
+                                                            active_persona: &mut active_persona,
+                                                            active_conversation_id:
+                                                                &mut active_conversation_id,
+                                                            compress_state: &mut compress_state,
+                                                            scratchpad: &scratchpad_store
+                                                                as &dyn newt_core::ScratchpadStore,
+                                                            step_ledger: &step_ledger
+                                                                as &dyn newt_core::StepLedger,
+                                                        };
+                                                        match resume_session_conversation(
+                                                            &mut ctx, &target,
+                                                        ) {
+                                                            Ok(banner) => {
+                                                                turns_this_conversation = 0;
+                                                                print_newt(&banner, color, verbose);
+                                                            }
+                                                            Err(e) => {
+                                                                let _ = store.release(&target);
+                                                                let _ = store.claim(&outgoing);
+                                                                print_newt(
+                                                                    &format!(
+                                                                        "could not resume: {e}"
+                                                                    ),
+                                                                    color,
+                                                                    verbose,
+                                                                );
+                                                            }
+                                                        }
+                                                    }
+                                                    Err(e) => print_newt(
+                                                        &format!(
+                                                            "could not claim conversation: {e}"
+                                                        ),
+                                                        color,
+                                                        verbose,
+                                                    ),
+                                                }
+                                            }
+                                        }
+                                    }
                                     Err(e) => print_newt(&format!("error: {e}"), color, verbose),
                                 }
                             }
@@ -9442,6 +9516,15 @@ enum RoadmapCommand {
         title: String,
         under: Option<String>,
     },
+    /// `/roadmap next` — the DFS cursor: report (and, if it is a bound Plan node,
+    /// resume) the next-ready node.
+    Next,
+    /// `/roadmap bind [node-id]` — bind THIS conversation to a Plan node (default:
+    /// the next-ready node) and mark it Running.
+    Bind(Option<String>),
+    /// `/roadmap done [node-id]` — mark a node Done (default: the node bound to
+    /// this conversation) and advance the cursor.
+    Done(Option<String>),
 }
 
 fn parse_node_kind(s: &str) -> Option<newt_core::plan::NodeKind> {
@@ -9489,8 +9572,14 @@ fn parse_roadmap_command(input: &str) -> anyhow::Result<RoadmapCommand> {
             }
             Ok(RoadmapCommand::Add { kind, title, under })
         }
+        Some("next") | Some("work") => Ok(RoadmapCommand::Next),
+        Some("bind") => Ok(RoadmapCommand::Bind(parts.next().map(str::to_string))),
+        Some("done") => Ok(RoadmapCommand::Done(parts.next().map(str::to_string))),
         Some(other) => {
-            anyhow::bail!("unknown /roadmap subcommand `{other}` (try: list, new, show, use, add)")
+            anyhow::bail!(
+                "unknown /roadmap subcommand `{other}` \
+                 (try: list, new, show, use, add, next, bind, done)"
+            )
         }
     }
 }
@@ -9527,6 +9616,17 @@ fn next_roadmap_node_id(tree: &newt_core::plan::Plan) -> String {
     }
 }
 
+/// The #1030 DFS cursor: the node to act on now — the first Running node (work
+/// in progress) if any, else the next-ready (Pending) node. `/roadmap next` and
+/// the `/tree` `▶` marker both use this, so an in-progress node stays the cursor
+/// until it is marked done rather than the cursor jumping past it.
+fn roadmap_cursor(tree: &newt_core::plan::Plan) -> Option<&newt_core::plan::Subtask> {
+    tree.subtasks
+        .iter()
+        .find(|s| s.status == newt_core::plan::SubtaskStatus::Running)
+        .or_else(|| tree.next_ready_node())
+}
+
 /// Render a roadmap's tree as a depth-first plain-scroller outline (#1030): one
 /// line per node — status glyph, kind, id, instruction — indented by depth.
 fn render_roadmap_tree(roadmap: &newt_core::Roadmap) -> String {
@@ -9539,10 +9639,13 @@ fn render_roadmap_tree(roadmap: &newt_core::Roadmap) -> String {
         out.push_str("\n  (no nodes yet — add one with /roadmap add <phase|plan|task> <title>)");
         return out;
     }
+    // #1030 DFS cursor: the next node to act on (see /roadmap next).
+    let cursor = roadmap_cursor(&roadmap.tree).map(|n| n.id.clone());
     fn walk(
         plan: &newt_core::plan::Plan,
         node: &newt_core::plan::Subtask,
         depth: usize,
+        cursor: Option<&str>,
         out: &mut String,
     ) {
         // Depth cap: a real roadmap is shallow; this bounds a hand-corrupted
@@ -9553,22 +9656,28 @@ fn render_roadmap_tree(roadmap: &newt_core::Roadmap) -> String {
             out.push_str("\n  … (tree too deep — possible cycle in parent pointers)");
             return;
         }
+        let mark = if Some(node.id.as_str()) == cursor {
+            "▶"
+        } else {
+            " "
+        };
         out.push_str(&format!(
-            "\n{}{} {} [{}]  {}",
+            "\n{}{} {} {} [{}]  {}",
             "  ".repeat(depth + 1),
+            mark,
             node_status_glyph(node.status),
             node_kind_label(node.kind),
             node.id,
             node.instruction,
         ));
         for child in plan.children(&node.id) {
-            walk(plan, child, depth + 1, out);
+            walk(plan, child, depth + 1, cursor, out);
         }
     }
     for root in roadmap.tree.roots() {
-        walk(&roadmap.tree, root, 0, &mut out);
+        walk(&roadmap.tree, root, 0, cursor.as_deref(), &mut out);
     }
-    out.push_str("\n  ○ pending · ◐ running · ✓ done · ✗ failed");
+    out.push_str("\n  ▶ next · ○ pending · ◐ running · ✓ done · ✗ failed");
     out
 }
 
@@ -9594,16 +9703,55 @@ fn resolve_roadmap_id(
     }
 }
 
+/// The result of a /roadmap subcommand: a message to print, plus an optional
+/// conversation to make active — #1030 resume-to-cursor: `/roadmap next` resumes
+/// a bound Plan node's conversation.
+struct RoadmapOutcome {
+    message: String,
+    switch_to: Option<String>,
+}
+
+impl RoadmapOutcome {
+    fn msg(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            switch_to: None,
+        }
+    }
+}
+
+/// One-line summary of the next-ready node, for `/roadmap done` / `next` feedback.
+fn roadmap_next_hint(tree: &newt_core::plan::Plan) -> String {
+    match tree.next_ready_node() {
+        Some(n) => format!(
+            "Next ready: {} node [{}] — {}",
+            node_kind_label(n.kind),
+            n.id,
+            n.instruction
+        ),
+        None => "Roadmap complete (or all remaining nodes are blocked).".to_string(),
+    }
+}
+
 fn handle_roadmap_command(
     input: &str,
     store: &newt_core::ConversationStore,
     active_roadmap_id: &mut Option<String>,
-) -> anyhow::Result<String> {
+    active_conversation_id: &str,
+) -> anyhow::Result<RoadmapOutcome> {
+    // The active roadmap id, or a friendly error naming how to get one.
+    let require_active = |active: &Option<String>| -> anyhow::Result<String> {
+        active.clone().ok_or_else(|| {
+            anyhow::anyhow!("no active roadmap — /roadmap new <title> or /roadmap use <id>")
+        })
+    };
     match parse_roadmap_command(input)? {
         RoadmapCommand::List => {
             let roadmaps = store.list_roadmaps()?;
             if roadmaps.is_empty() {
-                return Ok("No roadmaps yet — create one with /roadmap new <title>.".to_string());
+                return Ok(RoadmapOutcome::msg(
+                    "No roadmaps yet — create one with /roadmap new <title>.",
+                ));
             }
             let mut out = String::from("Roadmaps (most recently updated first):");
             for r in &roadmaps {
@@ -9623,42 +9771,38 @@ fn handle_roadmap_command(
             out.push_str(
                 "\nView with /roadmap show <id> or /tree; set active with /roadmap use <id>.",
             );
-            Ok(out)
+            Ok(RoadmapOutcome::msg(out))
         }
         RoadmapCommand::New(title) => {
             let id = newt_core::new_conversation_id();
             store.create_roadmap(&id, &title, &newt_core::plan::Plan::default())?;
             *active_roadmap_id = Some(id.clone());
-            Ok(format!(
+            Ok(RoadmapOutcome::msg(format!(
                 "Created roadmap \"{title}\" [{}] and set it active. Add nodes with \
                  /roadmap add <kind> <title>; view with /tree.",
                 short_conversation_id(&id)
-            ))
+            )))
         }
         RoadmapCommand::Use(id_or_prefix) => {
             let id = resolve_roadmap_id(store, &id_or_prefix)?;
             *active_roadmap_id = Some(id.clone());
-            Ok(format!(
+            Ok(RoadmapOutcome::msg(format!(
                 "Active roadmap set to [{}].",
                 short_conversation_id(&id)
-            ))
+            )))
         }
         RoadmapCommand::Show(maybe) => {
             let id = match maybe {
                 Some(p) => resolve_roadmap_id(store, &p)?,
-                None => active_roadmap_id.clone().ok_or_else(|| {
-                    anyhow::anyhow!("no active roadmap — /roadmap new <title> or /roadmap use <id>")
-                })?,
+                None => require_active(active_roadmap_id)?,
             };
             let rm = store.load_roadmap(&id)?.ok_or_else(|| {
                 anyhow::anyhow!("roadmap [{}] not found", short_conversation_id(&id))
             })?;
-            Ok(render_roadmap_tree(&rm))
+            Ok(RoadmapOutcome::msg(render_roadmap_tree(&rm)))
         }
         RoadmapCommand::Add { kind, title, under } => {
-            let id = active_roadmap_id
-                .clone()
-                .ok_or_else(|| anyhow::anyhow!("no active roadmap — /roadmap new <title> first"))?;
+            let id = require_active(active_roadmap_id)?;
             let mut rm = store.load_roadmap(&id)?.ok_or_else(|| {
                 anyhow::anyhow!("active roadmap [{}] not found", short_conversation_id(&id))
             })?;
@@ -9676,11 +9820,113 @@ fn handle_roadmap_command(
                 &node_id, title, kind, parent,
             ));
             store.update_roadmap(&id, &rm.tree)?;
-            Ok(format!(
+            Ok(RoadmapOutcome::msg(format!(
                 "Added {} node [{}]. /tree to view.",
                 node_kind_label(kind),
                 node_id
-            ))
+            )))
+        }
+        RoadmapCommand::Next => {
+            let id = require_active(active_roadmap_id)?;
+            let rm = store.load_roadmap(&id)?.ok_or_else(|| {
+                anyhow::anyhow!("active roadmap [{}] not found", short_conversation_id(&id))
+            })?;
+            match roadmap_cursor(&rm.tree) {
+                None => Ok(RoadmapOutcome::msg(
+                    "Roadmap complete (or all remaining nodes are blocked).",
+                )),
+                Some(node) if node.kind == newt_core::plan::NodeKind::Plan => {
+                    match &node.conversation_id {
+                        // Bound Plan node → resume-to-cursor (switch to its conversation).
+                        Some(cid) => Ok(RoadmapOutcome {
+                            message: format!(
+                                "Resuming plan node [{}] — {}",
+                                node.id, node.instruction
+                            ),
+                            switch_to: Some(cid.clone()),
+                        }),
+                        None => Ok(RoadmapOutcome::msg(format!(
+                            "Next: plan node [{}] — {}. Bind this conversation to it with \
+                             /roadmap bind.",
+                            node.id, node.instruction
+                        ))),
+                    }
+                }
+                Some(node) => Ok(RoadmapOutcome::msg(format!(
+                    "Next ready: {} node [{}] — {}. Mark it done with /roadmap done [{}].",
+                    node_kind_label(node.kind),
+                    node.id,
+                    node.instruction,
+                    node.id
+                ))),
+            }
+        }
+        RoadmapCommand::Bind(maybe_node) => {
+            let id = require_active(active_roadmap_id)?;
+            let mut rm = store.load_roadmap(&id)?.ok_or_else(|| {
+                anyhow::anyhow!("active roadmap [{}] not found", short_conversation_id(&id))
+            })?;
+            let node_id = match maybe_node {
+                Some(n) => {
+                    if rm.tree.subtask(&n).is_none() {
+                        anyhow::bail!("no node `{n}` in this roadmap (see /tree)");
+                    }
+                    n
+                }
+                None => rm
+                    .tree
+                    .next_ready_node()
+                    .map(|n| n.id.clone())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("no ready node to bind — the roadmap may be complete")
+                    })?,
+            };
+            if let Some(node) = rm.tree.subtasks.iter_mut().find(|s| s.id == node_id) {
+                node.conversation_id = Some(active_conversation_id.to_string());
+                node.status = newt_core::plan::SubtaskStatus::Running;
+            }
+            store.update_roadmap(&id, &rm.tree)?;
+            store.link_conversation_to_node(
+                active_conversation_id,
+                Some(id.as_str()),
+                Some(node_id.as_str()),
+            )?;
+            Ok(RoadmapOutcome::msg(format!(
+                "Bound this conversation to node [{node_id}] (now running). /end or /roadmap done \
+                 [{node_id}] when the node is complete."
+            )))
+        }
+        RoadmapCommand::Done(maybe_node) => {
+            let id = require_active(active_roadmap_id)?;
+            let mut rm = store.load_roadmap(&id)?.ok_or_else(|| {
+                anyhow::anyhow!("active roadmap [{}] not found", short_conversation_id(&id))
+            })?;
+            let node_id = match maybe_node {
+                Some(n) => {
+                    if rm.tree.subtask(&n).is_none() {
+                        anyhow::bail!("no node `{n}` in this roadmap (see /tree)");
+                    }
+                    n
+                }
+                None => rm
+                    .tree
+                    .subtasks
+                    .iter()
+                    .find(|s| s.conversation_id.as_deref() == Some(active_conversation_id))
+                    .map(|s| s.id.clone())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "no node is bound to this conversation — name one: /roadmap done <node-id>"
+                        )
+                    })?,
+            };
+            rm.tree
+                .mark(&node_id, newt_core::plan::SubtaskStatus::Done, None);
+            store.update_roadmap(&id, &rm.tree)?;
+            Ok(RoadmapOutcome::msg(format!(
+                "Marked node [{node_id}] done. {}",
+                roadmap_next_hint(&rm.tree)
+            )))
         }
     }
 }
@@ -11369,8 +11615,8 @@ fn help_lines() -> &'static [&'static str] {
         "  /conversation rm <id>    - alias for /conversation delete",
         "  /recall [query]          - recent conversations, or full-text search",
         "  /resume [query|n|id]     - find & reopen a past conversation (listed by liveness, searchable)",
-        "  /roadmap [sub]           - #1030 plan tree: new <title> · list · show <id> · use <id> · add <kind> <title>",
-        "  /tree                    - render the active roadmap's Roadmap→Phase→Plan→Task tree",
+        "  /roadmap [sub]           - #1030 plan tree: new·list·show·use·add · next·bind·done (drive the tree)",
+        "  /tree                    - render the active roadmap tree (▶ marks the next-ready node / DFS cursor)",
         "  /persona list            - list configured personas",
         "  /persona show            - show the active persona",
         "  /persona <name>          - start fresh with a persona",
@@ -15391,6 +15637,107 @@ parent = \"road\"
             None,
         ));
         assert_eq!(next_roadmap_node_id(&tree), "node-2");
+    }
+
+    #[test]
+    fn roadmap_drive_subcommands_parse() {
+        assert_eq!(
+            parse_roadmap_command("/roadmap next").unwrap(),
+            RoadmapCommand::Next
+        );
+        assert_eq!(
+            parse_roadmap_command("/roadmap work").unwrap(),
+            RoadmapCommand::Next
+        );
+        assert_eq!(
+            parse_roadmap_command("/roadmap bind").unwrap(),
+            RoadmapCommand::Bind(None)
+        );
+        assert_eq!(
+            parse_roadmap_command("/roadmap bind node-3").unwrap(),
+            RoadmapCommand::Bind(Some("node-3".into()))
+        );
+        assert_eq!(
+            parse_roadmap_command("/roadmap done").unwrap(),
+            RoadmapCommand::Done(None)
+        );
+        assert_eq!(
+            parse_roadmap_command("/roadmap done node-3").unwrap(),
+            RoadmapCommand::Done(Some("node-3".into()))
+        );
+    }
+
+    #[test]
+    fn render_marks_the_next_ready_node_with_the_cursor() {
+        // road (branch, pending) → task-1 (leaf, pending). next_ready_node = task-1.
+        let toml = "\
+[[subtask]]
+id = \"road\"
+instruction = \"the roadmap\"
+kind = \"roadmap\"
+
+[[subtask]]
+id = \"task-1\"
+instruction = \"do it\"
+kind = \"task\"
+parent = \"road\"
+";
+        let tree = newt_core::plan::Plan::from_toml_str(toml).unwrap();
+        let rm = newt_core::Roadmap {
+            id: "rm-1".into(),
+            title: "Demo".into(),
+            tree,
+        };
+        let out = render_roadmap_tree(&rm);
+        // The cursor ▶ sits on task-1 (the next-ready node), not on the branch.
+        let task_line = out.lines().find(|l| l.contains("[task-1]")).unwrap();
+        assert!(task_line.contains('▶'), "cursor on next-ready node: {out}");
+        let road_line = out.lines().find(|l| l.contains("[road]")).unwrap();
+        assert!(!road_line.contains('▶'), "branch is not the cursor: {out}");
+    }
+
+    #[test]
+    fn roadmap_bind_and_done_drive_a_node_through_its_status() {
+        let (_state, _ws, store) = recall_test_store();
+        let conv = "1781000000000000000-abcd"; // a stand-in active conversation id
+        let mut active_roadmap: Option<String> = None;
+
+        // Author a roadmap with one Plan node.
+        handle_roadmap_command("/roadmap new Build it", &store, &mut active_roadmap, conv).unwrap();
+        handle_roadmap_command(
+            "/roadmap add plan Parser",
+            &store,
+            &mut active_roadmap,
+            conv,
+        )
+        .unwrap();
+        let rm_id = active_roadmap.clone().unwrap();
+
+        // /roadmap next reports the plan node needs a conversation (unbound).
+        let next =
+            handle_roadmap_command("/roadmap next", &store, &mut active_roadmap, conv).unwrap();
+        assert!(
+            next.message.contains("Bind"),
+            "unbound plan: {}",
+            next.message
+        );
+        assert!(next.switch_to.is_none());
+
+        // Bind THIS conversation to it → node goes Running and gets the conv id.
+        handle_roadmap_command("/roadmap bind", &store, &mut active_roadmap, conv).unwrap();
+        let node = store.load_roadmap(&rm_id).unwrap().unwrap().tree.subtasks[0].clone();
+        assert_eq!(node.status, newt_core::plan::SubtaskStatus::Running);
+        assert_eq!(node.conversation_id.as_deref(), Some(conv));
+
+        // /roadmap next now resumes-to-cursor: it hands back the bound conversation.
+        let next2 =
+            handle_roadmap_command("/roadmap next", &store, &mut active_roadmap, conv).unwrap();
+        assert_eq!(next2.switch_to.as_deref(), Some(conv));
+
+        // /roadmap done (defaulting to the bound node) marks it Done.
+        handle_roadmap_command("/roadmap done", &store, &mut active_roadmap, conv).unwrap();
+        let done = store.load_roadmap(&rm_id).unwrap().unwrap().tree.subtasks[0].status;
+        assert_eq!(done, newt_core::plan::SubtaskStatus::Done);
     }
 
     #[test]
