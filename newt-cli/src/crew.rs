@@ -796,7 +796,7 @@ fn extract_json_object(s: &str) -> Option<&str> {
 /// `{…}` object with a non-empty `subtasks` list (each with `id` + `instruction`)
 /// is found. Parsed with `serde_json::Value` (newt-cli has no `serde` derive dep).
 fn parse_authored_plan(raw: &str) -> Option<newt_core::plan::Plan> {
-    use newt_core::plan::{Aggregation, CaveatPolicy, Plan, Subtask, SubtaskStatus};
+    use newt_core::plan::{Aggregation, CaveatPolicy, NodeKind, Plan, Subtask, SubtaskStatus};
     use std::collections::HashSet;
     let v: serde_json::Value = serde_json::from_str(extract_json_object(raw)?).ok()?;
     let arr = v.get("subtasks")?.as_array()?;
@@ -848,6 +848,9 @@ fn parse_authored_plan(raw: &str) -> Option<newt_core::plan::Plan> {
             status: SubtaskStatus::Pending,
             result: None,
             parent: None,
+            kind: NodeKind::Task,
+            conversation_id: None,
+            artifact_ref: None,
             caveat_policy: CaveatPolicy::default(), // default-DENY: model proposes work, not authority
         });
     }
@@ -1943,6 +1946,9 @@ mod tests {
             status: newt_core::plan::SubtaskStatus::Pending,
             result: None,
             parent: None,
+            kind: newt_core::plan::NodeKind::Task,
+            conversation_id: None,
+            artifact_ref: None,
             caveat_policy: newt_core::plan::CaveatPolicy::default(),
         }
     }
