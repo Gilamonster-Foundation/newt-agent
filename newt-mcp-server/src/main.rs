@@ -21,5 +21,67 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
-    newt_mcp_server::run_stdio().await
+    // #1021 PR 5.3: this binary has no clap parser of its own (unlike `newt
+    // mcp --persona`, which reuses newt-cli's global flag) — a minimal
+    // `--persona <name>` here keeps the standalone binary (e.g. `claude mcp
+    // add newt -- newt-mcp-server --persona personal-assistant`) capable of
+    // the same restriction.
+    let persona = parse_persona_arg(std::env::args());
+    newt_mcp_server::run_stdio(persona.as_deref()).await
+}
+
+/// `--persona <name>` (or `--persona=<name>`) from an argument iterator.
+/// `None` when absent or malformed (no value follows a bare `--persona`).
+fn parse_persona_arg(args: impl Iterator<Item = String>) -> Option<String> {
+    let mut args = args.peekable();
+    while let Some(arg) = args.next() {
+        if let Some(value) = arg.strip_prefix("--persona=") {
+            return Some(value.to_string());
+        }
+        if arg == "--persona" {
+            return args.next();
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_space_and_equals_forms() {
+        assert_eq!(
+            parse_persona_arg(
+                ["newt-mcp-server", "--persona", "coach"]
+                    .map(String::from)
+                    .into_iter()
+            ),
+            Some("coach".to_string())
+        );
+        assert_eq!(
+            parse_persona_arg(
+                ["newt-mcp-server", "--persona=coach"]
+                    .map(String::from)
+                    .into_iter()
+            ),
+            Some("coach".to_string())
+        );
+    }
+
+    #[test]
+    fn absent_or_dangling_flag_is_none() {
+        assert_eq!(
+            parse_persona_arg(["newt-mcp-server"].map(String::from).into_iter()),
+            None
+        );
+        assert_eq!(
+            parse_persona_arg(
+                ["newt-mcp-server", "--persona"]
+                    .map(String::from)
+                    .into_iter()
+            ),
+            None
+        );
+    }
 }

@@ -26,6 +26,11 @@ newt-core.workspace = true
 newt-git.workspace = true
 newt-inference.workspace = true
 newt-tools.workspace = true
+# #1021 PR 5.3: connects declared MCP servers (modulex, etc.) so a
+# `--persona`-activated session's tools/list can include them alongside the
+# built-in catalog below. Already a newt-core dependent, no new dependency
+# cycle (newt-mcp-server -> newt-mcp-client -> newt-core).
+newt-mcp-client.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true

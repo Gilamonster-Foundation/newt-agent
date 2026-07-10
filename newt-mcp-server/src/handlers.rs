@@ -14,7 +14,9 @@ use std::sync::Arc;
 use agent_bridle::{Caveats, Registry, ToolError};
 use newt_core::router::{Router, Tier};
 use newt_inference::BackendRegistry;
+use newt_mcp_client::McpToolset;
 use serde_json::Value;
+use tokio::sync::Mutex;
 
 use crate::caveats::GrantedCaveats;
 use crate::server::McpServer;
@@ -29,10 +31,21 @@ use crate::server::McpServer;
 /// [`Caveats`] leash sourced from `~/.newt/config.toml` (see
 /// [`crate::caveats`]). The bridle [`Registry`] and the granted leash are
 /// built once here and shared (via `Arc`) into the `tools/call` closure.
+///
+/// `toolset` (#1021 PR 5.3) is the session's connected remote MCP servers
+/// (e.g. `modulex`) — `McpToolset::empty()` when none/no persona. `persona_tools`
+/// is the active persona's `tools:` allow-list (`None` = unconstrained, the
+/// zero-cost path for every non-persona session): it restricts BOTH the
+/// built-in catalog above and the remote MCP tools to exactly the persona's
+/// list, via [`newt_core::agentic::persona_tool_allowed`] — the same
+/// predicate the TUI's advertise/execute symmetry depends on, so this
+/// server's `tools/list` and `tools/call` can't drift apart either.
 pub fn register_handlers(
     server: &mut McpServer,
     registry: Arc<BackendRegistry>,
     router: Arc<Router>,
+    toolset: Arc<Mutex<McpToolset>>,
+    persona_tools: Arc<Option<Vec<String>>>,
 ) {
     let granted = GrantedCaveats::load();
     // Surface, loudly, whether shell_run is confined or running with full
@@ -40,13 +53,15 @@ pub fn register_handlers(
     granted.warn_to_stderr();
 
     register_initialize(server);
-    register_tools_list(server);
+    register_tools_list(server, toolset.clone(), persona_tools.clone());
     register_tools_call(
         server,
         registry,
         router,
         Arc::new(agent_bridle::registry()),
         Arc::new(granted.caveats),
+        toolset,
+        persona_tools,
     );
 }
 
@@ -67,11 +82,35 @@ fn register_initialize(server: &mut McpServer) {
 
 // ── tools/list ─────────────────────────────────────────────────────────────
 
-fn register_tools_list(server: &mut McpServer) {
-    server.register("tools/list", |_params| async move {
-        Ok(serde_json::json!({
-            "tools": tool_definitions()
-        }))
+/// Restrict `tools` (MCP-native `{name, description, inputSchema}` entries)
+/// to a persona's allow-list. `allow = None` returns `tools` untouched.
+fn filter_persona_tool_list(tools: Vec<Value>, allow: Option<&[String]>) -> Vec<Value> {
+    let Some(allow) = allow else { return tools };
+    tools
+        .into_iter()
+        .filter(|t| match t.get("name").and_then(Value::as_str) {
+            Some(name) => newt_core::agentic::persona_tool_allowed(name, allow),
+            None => true,
+        })
+        .collect()
+}
+
+fn register_tools_list(
+    server: &mut McpServer,
+    toolset: Arc<Mutex<McpToolset>>,
+    persona_tools: Arc<Option<Vec<String>>>,
+) {
+    server.register("tools/list", move |_params| {
+        let toolset = toolset.clone();
+        let persona_tools = persona_tools.clone();
+        async move {
+            let Value::Array(mut tools) = tool_definitions() else {
+                unreachable!("tool_definitions always returns a JSON array");
+            };
+            tools.extend(toolset.lock().await.mcp_tool_list());
+            let tools = filter_persona_tool_list(tools, persona_tools.as_deref());
+            Ok(serde_json::json!({ "tools": tools }))
+        }
     });
 }
 
@@ -225,12 +264,15 @@ fn tool_definitions() -> Value {
 
 // ── tools/call ─────────────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 fn register_tools_call(
     server: &mut McpServer,
     registry: Arc<BackendRegistry>,
     router: Arc<Router>,
     bridle: Arc<Registry>,
     granted: Arc<Caveats>,
+    toolset: Arc<Mutex<McpToolset>>,
+    persona_tools: Arc<Option<Vec<String>>>,
 ) {
     server.register("tools/call", move |params| {
         // Move clones into the async block so each invocation owns its
@@ -239,6 +281,8 @@ fn register_tools_call(
         let router = router.clone();
         let bridle = bridle.clone();
         let granted = granted.clone();
+        let toolset = toolset.clone();
+        let persona_tools = persona_tools.clone();
         async move {
             let name = params
                 .get("name")
@@ -250,6 +294,15 @@ fn register_tools_call(
                 .cloned()
                 .unwrap_or_else(|| Value::Object(Default::default()));
 
+            // #1021 PR 5.3: re-check the SAME allow-list `tools/list`
+            // filtered by — advertisement-hiding a tool doesn't stop it
+            // being called directly, so this is the load-bearing half.
+            if let Some(allow) = persona_tools.as_deref() {
+                if !newt_core::agentic::persona_tool_allowed(&name, allow) {
+                    anyhow::bail!("tool `{name}` is not permitted by the active persona");
+                }
+            }
+
             match name.as_str() {
                 "code_read" => handle_code_read(&arguments),
                 "code_edit" => handle_code_edit(&arguments),
@@ -259,6 +312,13 @@ fn register_tools_call(
                 "git" => handle_git(&arguments, &granted),
                 "shell_run" => Ok(handle_shell_run(arguments, &bridle, &granted).await),
                 "web_fetch" => Ok(handle_web_fetch(arguments, &bridle, &granted).await),
+                other if newt_mcp_client::split_namespaced(other).is_some() => {
+                    let mut toolset = toolset.lock().await;
+                    if !toolset.handles(other) {
+                        anyhow::bail!("unknown tool: {other}");
+                    }
+                    Ok(mcp_text_content(&toolset.call(other, &arguments).await))
+                }
                 other => anyhow::bail!("unknown tool: {other}"),
             }
         }
@@ -619,14 +679,34 @@ mod tests {
     }
 
     /// Like [`rpc`], but with a caller-supplied registry and router so
-    /// goal_run tests can swap in a mock backend.
+    /// goal_run tests can swap in a mock backend. No persona (empty toolset,
+    /// unrestricted catalog) — see [`rpc_with_persona`] for that.
     async fn rpc_with(
         registry: Arc<BackendRegistry>,
         router: Arc<Router>,
         request: &Value,
     ) -> Value {
+        rpc_with_persona(registry, router, McpToolset::empty(), None, request).await
+    }
+
+    /// Like [`rpc_with`], but with an explicit (possibly non-empty) toolset
+    /// and persona `tools:` allow-list — the harness a persona-restriction
+    /// test drives directly (#1021 PR 5.3).
+    async fn rpc_with_persona(
+        registry: Arc<BackendRegistry>,
+        router: Arc<Router>,
+        toolset: McpToolset,
+        persona_tools: Option<Vec<String>>,
+        request: &Value,
+    ) -> Value {
         let mut server = McpServer::new();
-        register_handlers(&mut server, registry, router);
+        register_handlers(
+            &mut server,
+            registry,
+            router,
+            Arc::new(Mutex::new(toolset)),
+            Arc::new(persona_tools),
+        );
 
         let input = format!("{}\n", serde_json::to_string(request).unwrap());
         let mut output: Vec<u8> = Vec::new();
@@ -642,14 +722,18 @@ mod tests {
     /// on.) This drives `register_tools_call` directly with a chosen grant.
     async fn rpc_with_caveats(granted: Caveats, request: &Value) -> Value {
         let mut server = McpServer::new();
+        let toolset = Arc::new(Mutex::new(McpToolset::empty()));
+        let persona_tools = Arc::new(None);
         register_initialize(&mut server);
-        register_tools_list(&mut server);
+        register_tools_list(&mut server, toolset.clone(), persona_tools.clone());
         register_tools_call(
             &mut server,
             Arc::new(BackendRegistry::new()),
             Arc::new(Router::new()),
             Arc::new(agent_bridle::registry()),
             Arc::new(granted),
+            toolset,
+            persona_tools,
         );
 
         let input = format!("{}\n", serde_json::to_string(request).unwrap());
@@ -726,6 +810,124 @@ mod tests {
                 tool["name"]
             );
         }
+    }
+
+    // ── #1021 PR 5.3: persona tool-allowlist restriction ────────────────────
+    //
+    // No live MCP server connection is exercised here: `AnyTransport::Mock`
+    // is `#[cfg(test)]`-gated INSIDE newt-mcp-client, so it only exists in
+    // that crate's own test build — a downstream crate (this one) depending
+    // on it normally sees none of that, only its real (non-test) surface.
+    // These tests cover what's actually reachable here: the built-in
+    // catalog's persona filtering, and a namespaced call correctly failing
+    // closed (`unknown tool`) against an empty (unconnected) toolset — the
+    // same "not handled" path a real disconnected/misconfigured server
+    // would hit.
+
+    #[tokio::test]
+    async fn persona_restricts_tools_list_to_its_allow_list() {
+        let resp = rpc_with_persona(
+            Arc::new(BackendRegistry::new()),
+            Arc::new(Router::new()),
+            McpToolset::empty(),
+            Some(vec!["code_read".to_string()]),
+            &serde_json::json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}
+            }),
+        )
+        .await;
+        let names: Vec<&str> = resp["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["code_read"], "only the allowed tool is listed");
+    }
+
+    #[tokio::test]
+    async fn no_persona_advertises_the_full_catalog_unrestricted() {
+        // Regression: `persona_tools = None` must be the exact zero-cost
+        // path — every built-in tool still listed, byte-for-byte the
+        // pre-#1021 behavior.
+        let resp = rpc_with_persona(
+            Arc::new(BackendRegistry::new()),
+            Arc::new(Router::new()),
+            McpToolset::empty(),
+            None,
+            &serde_json::json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}
+            }),
+        )
+        .await;
+        let names: Vec<&str> = resp["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"code_read"));
+        assert!(names.contains(&"shell_run"));
+        assert!(names.contains(&"web_fetch"));
+    }
+
+    #[tokio::test]
+    async fn persona_rejects_a_call_to_a_tool_outside_its_allow_list() {
+        // Advertise/execute symmetry: hiding a tool from tools/list doesn't
+        // stop a direct tools/call for it — this is the load-bearing half.
+        let resp = rpc_with_persona(
+            Arc::new(BackendRegistry::new()),
+            Arc::new(Router::new()),
+            McpToolset::empty(),
+            Some(vec!["code_read".to_string()]),
+            &serde_json::json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": { "name": "shell_run", "arguments": { "command": "echo hi" } }
+            }),
+        )
+        .await;
+        let err = resp["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            err.contains("not permitted by the active persona"),
+            "got: {resp}"
+        );
+    }
+
+    #[tokio::test]
+    async fn persona_allows_a_call_to_a_tool_inside_its_allow_list() {
+        let resp = rpc_with_persona(
+            Arc::new(BackendRegistry::new()),
+            Arc::new(Router::new()),
+            McpToolset::empty(),
+            Some(vec!["fs_list".to_string()]),
+            &serde_json::json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": { "name": "fs_list", "arguments": { "path": "." } }
+            }),
+        )
+        .await;
+        assert!(resp.get("error").is_none(), "got: {resp}");
+    }
+
+    #[tokio::test]
+    async fn namespaced_call_against_an_unconnected_toolset_fails_closed() {
+        // A persona whose allow-list names a namespaced MCP tool, but whose
+        // toolset has no connected server for it (e.g. modulex misconfigured
+        // or unreachable) — the call must fail with "unknown tool", not
+        // silently no-op or panic.
+        let resp = rpc_with_persona(
+            Arc::new(BackendRegistry::new()),
+            Arc::new(Router::new()),
+            McpToolset::empty(),
+            Some(vec!["modulex__routine_run".to_string()]),
+            &serde_json::json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": { "name": "modulex__routine_run", "arguments": { "routine": "morning" } }
+            }),
+        )
+        .await;
+        let err = resp["error"]["message"].as_str().unwrap_or_default();
+        assert!(err.contains("unknown tool"), "got: {resp}");
     }
 
     // ── tools/call — code_read ──────────────────────────────────────────────

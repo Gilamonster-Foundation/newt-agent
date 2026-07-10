@@ -873,7 +873,9 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             operator_key_path,
             allow_no_key,
         } => run_worker(coder, operator_key_path, allow_no_key).await,
-        Command::Mcp => run_mcp().await,
+        // #1021 PR 5.3: `--persona` is already a global flag (parsed for
+        // every subcommand); it was just silently dropped here before now.
+        Command::Mcp => run_mcp(cli.persona.as_deref()).await,
         Command::Crew {
             task,
             edit,
@@ -1098,26 +1100,33 @@ fn maybe_start_metrics_server() -> Option<std::sync::Arc<newt_acp_worker::NewtMe
 
 /// Spawn the MCP server with the same stdio safety dance as
 /// [`run_worker`].
-async fn run_mcp() -> anyhow::Result<()> {
+///
+/// `persona` (#1021 PR 5.3) is the already-global `--persona` flag, wired
+/// into this subcommand for the first time: when set, the server loads that
+/// role profile, connects its declared MCP servers (e.g. `modulex`), and
+/// restricts the advertised `tools/list` to the persona's `tools:`
+/// allow-list — the same enforcement the TUI applies, reused via
+/// `newt_core::agentic::filter_advertised_tools`.
+async fn run_mcp(persona: Option<&str>) -> anyhow::Result<()> {
     #[cfg(unix)]
     {
         match stdio_guard::redirect_stdout_to_stderr() {
             Ok(private_stdout) => {
                 let tokio_stdout = tokio::fs::File::from_std(private_stdout);
-                newt_mcp_server::run_with_io(tokio::io::stdin(), tokio_stdout).await
+                newt_mcp_server::run_with_io(tokio::io::stdin(), tokio_stdout, persona).await
             }
             Err(e) => {
                 tracing::warn!(
                     error = %e,
                     "stdio_guard fd redirect failed; falling back to raw stdout"
                 );
-                newt_mcp_server::run_stdio().await
+                newt_mcp_server::run_stdio(persona).await
             }
         }
     }
     #[cfg(not(unix))]
     {
-        newt_mcp_server::run_stdio().await
+        newt_mcp_server::run_stdio(persona).await
     }
 }
 
