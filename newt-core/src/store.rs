@@ -527,7 +527,8 @@ impl ConversationStore {
         let (mut record, scratchpad_json, plan_json) = conn
             .query_row(
                 "SELECT id, title, workspace_path, workspace_key, persona,
-                        started_at_claim, updated_at_claim, scratchpad, plan
+                        started_at_claim, updated_at_claim, scratchpad, plan,
+                        roadmap_id, node_id
                    FROM conversations
                   WHERE id = ?1 AND workspace_key = ?2",
                 rusqlite::params![id, self.workspace_id],
@@ -542,6 +543,8 @@ impl ConversationStore {
                             turns: Vec::new(),
                             scratchpad: std::collections::BTreeMap::new(),
                             plan: crate::PlanSnapshot::default(),
+                            roadmap_id: row.get(9)?,
+                            node_id: row.get(10)?,
                             created_at_unix_nanos: claim_to_u128(row.get(5)?),
                             updated_at_unix_nanos: claim_to_u128(row.get(6)?),
                         },
@@ -764,6 +767,29 @@ impl ConversationStore {
             "UPDATE conversations SET end_reason = ?2, updated_at_claim = ?3
               WHERE id = ?1 AND workspace_key = ?4",
             rusqlite::params![id, reason.trim(), now, self.workspace_id],
+        )?;
+        Ok(())
+    }
+
+    /// #1030: bind (or clear) a conversation's place in a roadmap tree — the
+    /// Plan node whose context window this conversation IS. `roadmap_id` +
+    /// `node_id` together locate the [`crate::plan::Subtask`] node; passing
+    /// `None`/`None` clears the link (back to an ad-hoc chat). Workspace-fenced
+    /// and idempotent. Like [`rename`](Self::rename) this is metadata, not
+    /// activity: it does NOT tick the §6 clock, so it cannot perturb MRU
+    /// ordering — the pointers ride the row exactly like `scratchpad`/`plan`.
+    pub fn link_conversation_to_node(
+        &self,
+        id: &str,
+        roadmap_id: Option<&str>,
+        node_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let id = self.resolve_id(id)?;
+        let conn = self.lock_conn();
+        conn.execute(
+            "UPDATE conversations SET roadmap_id = ?2, node_id = ?3
+              WHERE id = ?1 AND workspace_key = ?4",
+            rusqlite::params![id, roadmap_id, node_id, self.workspace_id],
         )?;
         Ok(())
     }
@@ -1363,7 +1389,9 @@ fn create_schema(conn: &Connection) -> anyhow::Result<()> {
              started_at_claim   INTEGER NOT NULL,         -- DISPLAY ONLY (wall-clock claim, unix nanos)
              updated_at_claim   INTEGER NOT NULL,         -- DISPLAY ONLY
              scratchpad         TEXT NOT NULL DEFAULT '{}', -- JSON scratchpad <state> snapshot (#713); working memory, NOT hashed (§6 chain unchanged)
-             plan               TEXT NOT NULL DEFAULT '{}' -- JSON plan-ledger snapshot (#715); working memory, NOT hashed (§6 chain unchanged)
+             plan               TEXT NOT NULL DEFAULT '{}', -- JSON plan-ledger snapshot (#715); working memory, NOT hashed (§6 chain unchanged)
+             roadmap_id         TEXT,                      -- #1030: roadmap this conv's Plan node belongs to (NULL = ad-hoc chat); thin pointer, tree lives in `roadmaps`
+             node_id            TEXT                       -- #1030: the `roadmaps` tree Subtask id this conversation realizes (NULL = ad-hoc chat)
          );
          CREATE TABLE IF NOT EXISTS turns (
              conversation_id    TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
@@ -1386,7 +1414,34 @@ fn create_schema(conn: &Connection) -> anyhow::Result<()> {
              last_tick          INTEGER NOT NULL
          );
          CREATE INDEX IF NOT EXISTS idx_conversations_ws_tick
-             ON conversations (workspace_key, activity_tick);",
+             ON conversations (workspace_key, activity_tick);
+         -- #1030 Plans within Plans: the roadmap tree, persisted as a serialized
+         -- plan.rs::Plan blob (Roadmap->Phase->Plan->Task Subtask nodes). A Plan
+         -- node binds a conversations row via conversations.node_id; the tree's
+         -- shape lives HERE, never on the hash-chained transcript rows.
+         CREATE TABLE IF NOT EXISTS roadmaps (
+             id                 TEXT PRIMARY KEY,
+             workspace_key      TEXT NOT NULL,
+             title              TEXT NOT NULL DEFAULT '',
+             tree               TEXT NOT NULL DEFAULT '',   -- serialized plan.rs::Plan (TOML); empty = no nodes yet
+             schema_version     INTEGER NOT NULL DEFAULT 1,
+             created_at_claim   INTEGER NOT NULL DEFAULT 0,
+             updated_at_claim   INTEGER NOT NULL DEFAULT 0
+         );
+         CREATE INDEX IF NOT EXISTS idx_roadmaps_ws
+             ON roadmaps (workspace_key);
+         -- #1030 collision fix: at most ONE live process owns a conversation.
+         -- conversation_id is the global PK, so a second live newt cannot claim a
+         -- conversation another holds; a stale claim (dead pid / new boot_id) is
+         -- reclaimed on the next claim. Also the source of the /resume liveness column.
+         CREATE TABLE IF NOT EXISTS live_owners (
+             conversation_id    TEXT PRIMARY KEY,
+             host               TEXT NOT NULL,
+             boot_id            TEXT NOT NULL,
+             pid                INTEGER NOT NULL,
+             writer_fingerprint TEXT NOT NULL,
+             heartbeat_tick     INTEGER NOT NULL
+         );",
     )?;
     Ok(())
 }
@@ -1419,6 +1474,12 @@ const EXPECTED_COLUMNS: &[(&str, &[(&str, &str)])] = &[
             // default). It rides the conversation row, NOT a turn, so it is NEVER
             // part of the §6 canonical encoding: working memory, not provenance.
             ("plan", "TEXT NOT NULL DEFAULT '{}'"),
+            // #1030: thin pointers locating this conversation in a roadmap tree.
+            // Additive — an older db gains them on open with the NULL backfill
+            // (an ad-hoc chat). Metadata, NOT part of the §6 canonical encoding,
+            // so every existing tip_hash chain still verifies byte-for-byte.
+            ("roadmap_id", "TEXT"),
+            ("node_id", "TEXT"),
         ],
     ),
     (

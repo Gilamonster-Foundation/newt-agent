@@ -201,6 +201,22 @@ pub struct ConversationRecord {
     /// is NOT a turn field and never enters `canonical_encoding_v1`).
     #[serde(default, skip_serializing_if = "crate::PlanSnapshot::is_empty")]
     pub plan: crate::PlanSnapshot,
+    /// #1030 "Plans within Plans": the roadmap this conversation's Plan node
+    /// belongs to. `None` for an ad-hoc chat — the legacy/default shape, and by
+    /// far the common case. A **thin pointer INTO** the tree; the tree's
+    /// authoritative shape (the `plan.rs::Plan` of Roadmap/Phase/Plan/Task
+    /// nodes) lives in the `roadmaps` table, never duplicated onto this row.
+    /// Additive: `#[serde(default)]` + skip-when-`None` keeps legacy records
+    /// loadable and never bloats the file. Metadata, NOT provenance — kept OUT
+    /// of the §6 content chain (never a turn field, never in `canonical_encoding_v1`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub roadmap_id: Option<String>,
+    /// #1030: the id of the `plan.rs::Subtask` node (within [`roadmap_id`]'s
+    /// tree) that THIS conversation realizes — the Plan node whose context
+    /// window this conversation is. `None` for an ad-hoc chat. Same additive /
+    /// metadata-not-provenance discipline as [`roadmap_id`](Self::roadmap_id).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<String>,
     pub created_at_unix_nanos: u128,
     pub updated_at_unix_nanos: u128,
 }
