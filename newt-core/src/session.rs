@@ -664,12 +664,13 @@ mod attach_tests {
     }
 
     #[test]
-    fn detach_stops_fanout() {
+    fn detach_stops_fanout_and_invalidates_attachment() {
         let mut reg = SessionRegistry::new();
         let s = reg.open();
         let cd = Collector::default();
         let co = Collector::default();
         let sess = reg.get_mut(s).unwrap();
+
         let d = sess.attach(AttachRole::Driver, Caveats::top(), Box::new(cd.clone()));
         let obs = sess.attach(
             AttachRole::Observer,
@@ -679,11 +680,19 @@ mod attach_tests {
 
         assert_eq!(sess.attachment_count(), 2);
         assert!(sess.detach(obs));
+        assert!(!sess.detach(obs));
         assert_eq!(sess.attachment_count(), 1);
 
         sess.submit_input(d, "go").unwrap();
         sess.emit(OutputStream::Stdout, "after detach", true);
         assert_eq!(cd.count(), 1);
         assert_eq!(co.count(), 0, "detached attachment receives nothing");
+
+        assert!(sess.detach(d));
+        let result = sess.submit_input(d, "broken command");
+        assert!(
+            result.is_err(),
+            "Should error when trying to submit after detaching the only attachment."
+        );
     }
 }
