@@ -9789,6 +9789,71 @@ impl newt_core::roadmap_eval::VerifyRunner for CommandVerifyRunner {
     }
 }
 
+/// Production [`ForgeFacts`](newt_core::roadmap_eval::ForgeFacts): a Phase's PR
+/// merge state via `gh pr view`. `None` (Unsupported) when `gh` is missing, the
+/// workspace has no GitHub remote, or the call fails — never a false "merged".
+struct GhForgeFacts {
+    workspace: std::path::PathBuf,
+}
+
+impl newt_core::roadmap_eval::ForgeFacts for GhForgeFacts {
+    fn pr_merged(&self, pr: u64) -> Option<bool> {
+        let out = std::process::Command::new("gh")
+            .args([
+                "pr",
+                "view",
+                &pr.to_string(),
+                "--json",
+                "state",
+                "-q",
+                ".state",
+            ])
+            .current_dir(&self.workspace)
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let state = String::from_utf8_lossy(&out.stdout);
+        Some(state.trim() == "MERGED")
+    }
+}
+
+/// Production [`CiFacts`](newt_core::roadmap_eval::CiFacts): the latest pipeline
+/// run's conclusion via `gh run list`. `None` (Unsupported) when `gh`/CI is
+/// unavailable or no run has concluded yet — never a false "green".
+struct GhCiFacts {
+    workspace: std::path::PathBuf,
+}
+
+impl newt_core::roadmap_eval::CiFacts for GhCiFacts {
+    fn pipelines_green(&self) -> Option<bool> {
+        let out = std::process::Command::new("gh")
+            .args([
+                "run",
+                "list",
+                "--limit",
+                "1",
+                "--json",
+                "conclusion",
+                "-q",
+                ".[0].conclusion",
+            ])
+            .current_dir(&self.workspace)
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let concl = String::from_utf8_lossy(&out.stdout);
+        let c = concl.trim();
+        if c.is_empty() {
+            return None; // no runs, or the latest is still in progress
+        }
+        Some(c == "success")
+    }
+}
+
 fn handle_roadmap_command(
     input: &str,
     store: &newt_core::ConversationStore,
@@ -10004,12 +10069,26 @@ fn handle_roadmap_command(
                     })?,
             };
             let node = rm.tree.subtask(&node_id).cloned().expect("resolved above");
-            // Objective evaluation: git for the commit, a subprocess for verify.
+            // Objective evaluation: git for the commit, a subprocess for verify,
+            // `gh` for the phase PR and the roadmap's CI. Any missing source
+            // yields Unsupported, never a false Done.
             let git = LocalGitFacts::open(workspace);
             let verify = CommandVerifyRunner {
                 workspace: std::path::PathBuf::from(workspace),
             };
-            match newt_core::roadmap_eval::evaluate(&node, &rm.tree, &git, &verify) {
+            let forge = GhForgeFacts {
+                workspace: std::path::PathBuf::from(workspace),
+            };
+            let ci = GhCiFacts {
+                workspace: std::path::PathBuf::from(workspace),
+            };
+            let facts = newt_core::roadmap_eval::Facts {
+                git: &git,
+                verify: &verify,
+                forge: &forge,
+                ci: &ci,
+            };
+            match newt_core::roadmap_eval::evaluate(&node, &rm.tree, &facts) {
                 newt_core::roadmap_eval::NodeVerdict::Done => {
                     rm.tree
                         .mark(&node_id, newt_core::plan::SubtaskStatus::Done, None);
