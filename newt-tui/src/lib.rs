@@ -5847,6 +5847,9 @@ fn run_chat(
     // conversation ended so the next launch starts fresh — the same close-out
     // `/end` does, but folded into the quit.
     let mut end_conversation_on_exit = false;
+    // #1030: the ids from the most recent `/resume` listing, so `/resume <n>`
+    // selects by the number the user just saw. Rebuilt on every browse/search.
+    let mut last_resume_listing: Vec<String> = Vec::new();
 
     // 17.7 session-start resume. Both arms go through the SAME restore
     // implementation `/conversation restore` uses — one restore path.
@@ -6653,6 +6656,147 @@ fn run_chat(
                                 Ok(msg) => print_newt(&msg, color, verbose),
                                 Err(e) => print_newt(&format!("error: {e}"), color, verbose),
                             },
+                            None => print_newt(EPHEMERAL_SESSION_NOTICE, color, verbose),
+                        }
+                        surface.save_history();
+                        println!();
+                        continue;
+                    }
+                    // #1030: `/resume` — find and reopen a past conversation,
+                    // listed by liveness and searchable. Bare = browse; <query> =
+                    // FTS5 search (or an id/prefix to open directly); <n> = pick
+                    // the n-th row from the last listing. Reopening is claim-guarded
+                    // so a conversation a live newt already holds is refused.
+                    if slash_body == "resume" || slash_body.starts_with("resume ") {
+                        match conversation_store.as_ref() {
+                            Some(store) => {
+                                let target: Option<String> = match parse_resume_command(&task) {
+                                    ResumeCommand::Browse => {
+                                        match resume_browse_message(store, &active_conversation_id)
+                                        {
+                                            Ok((msg, ids)) => {
+                                                last_resume_listing = ids;
+                                                print_newt(&msg, color, verbose);
+                                            }
+                                            Err(e) => {
+                                                print_newt(&format!("error: {e}"), color, verbose);
+                                            }
+                                        }
+                                        None
+                                    }
+                                    ResumeCommand::Select(n) => {
+                                        match n
+                                            .checked_sub(1)
+                                            .and_then(|i| last_resume_listing.get(i))
+                                        {
+                                            Some(id) => Some(id.clone()),
+                                            None => {
+                                                print_newt(
+                                                    "no such row — run /resume to list, then /resume <n>",
+                                                    color,
+                                                    verbose,
+                                                );
+                                                None
+                                            }
+                                        }
+                                    }
+                                    ResumeCommand::Query(token) => match store.resolve_id(&token) {
+                                        Ok(id) => Some(id),
+                                        Err(_) => {
+                                            match resume_search_message(
+                                                store,
+                                                &token,
+                                                &active_conversation_id,
+                                            ) {
+                                                Ok((msg, ids)) => {
+                                                    last_resume_listing = ids;
+                                                    print_newt(&msg, color, verbose);
+                                                }
+                                                Err(e) => print_newt(
+                                                    &format!("error: {e}"),
+                                                    color,
+                                                    verbose,
+                                                ),
+                                            }
+                                            None
+                                        }
+                                    },
+                                };
+                                if let Some(id) = target {
+                                    if id == active_conversation_id {
+                                        // #1030: resuming the CURRENT conversation is a
+                                        // no-op — short-circuit so we never release +
+                                        // (fail to) re-acquire our own claim, nor reset
+                                        // this session's turn count (which would suppress
+                                        // its close-time note extraction).
+                                        print_newt("already in this conversation.", color, verbose);
+                                    } else {
+                                        // Claim-guard: refuse to reopen a conversation a
+                                        // DIFFERENT live newt holds (that would mix turns).
+                                        match store.claim(&id) {
+                                            Ok(newt_core::ClaimOutcome::HeldBy { host, pid }) => {
+                                                print_newt(
+                                                &format!(
+                                                    "conversation {} is open in another newt \
+                                                     (pid {pid} on {host}) — /resume a different one",
+                                                    short_conversation_id(&id)
+                                                ),
+                                                color,
+                                                verbose,
+                                            );
+                                            }
+                                            Ok(newt_core::ClaimOutcome::Claimed) => {
+                                                let outgoing = active_conversation_id.clone();
+                                                if outgoing != id {
+                                                    let _ = store.release(&outgoing);
+                                                }
+                                                let mut resume_ctx = ConversationCommandContext {
+                                                    store,
+                                                    persona_store: &persona_store,
+                                                    workspace,
+                                                    memory: &mut memory,
+                                                    system: &mut system,
+                                                    active_persona: &mut active_persona,
+                                                    active_conversation_id:
+                                                        &mut active_conversation_id,
+                                                    compress_state: &mut compress_state,
+                                                    scratchpad: &scratchpad_store
+                                                        as &dyn newt_core::ScratchpadStore,
+                                                    step_ledger: &step_ledger
+                                                        as &dyn newt_core::StepLedger,
+                                                };
+                                                match resume_session_conversation(
+                                                    &mut resume_ctx,
+                                                    &id,
+                                                ) {
+                                                    Ok(banner) => {
+                                                        turns_this_conversation = 0;
+                                                        print_newt(&banner, color, verbose);
+                                                    }
+                                                    Err(e) => {
+                                                        // Restore failed — undo the swap: hand
+                                                        // `id` back and re-claim the outgoing.
+                                                        let _ = store.release(&id);
+                                                        if outgoing != id {
+                                                            let _ = store.claim(&outgoing);
+                                                        }
+                                                        print_newt(
+                                                            &format!("could not resume: {e}"),
+                                                            color,
+                                                            verbose,
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                            Err(e) => print_newt(
+                                                &format!("could not claim conversation: {e}"),
+                                                color,
+                                                verbose,
+                                            ),
+                                        }
+                                    }
+                                }
+                            }
                             None => print_newt(EPHEMERAL_SESSION_NOTICE, color, verbose),
                         }
                         surface.save_history();
@@ -9118,6 +9262,141 @@ fn recall_search_message(
     Ok(out)
 }
 
+// ── #1030 /resume — find and reopen a past conversation, listed by liveness ──
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ResumeCommand {
+    /// Bare `/resume` — browse recent conversations, annotated by liveness.
+    Browse,
+    /// `/resume <n>` — reopen the n-th row from the last listing.
+    Select(usize),
+    /// `/resume <token>` — an id/prefix to reopen, else an FTS5 search query.
+    Query(String),
+}
+
+fn parse_resume_command(input: &str) -> ResumeCommand {
+    let body = input.trim().trim_start_matches('/').trim();
+    let rest = body.strip_prefix("resume").map(str::trim).unwrap_or("");
+    if rest.is_empty() {
+        return ResumeCommand::Browse;
+    }
+    if let Ok(n) = rest.parse::<usize>() {
+        // Only a plausible ROW number (1..=RECALL_LIMIT, the most rows a listing
+        // shows) is a selection. A larger all-digits token is an id PREFIX — the
+        // short id shown per row is the ~19-digit unix-nanos head of the id — so
+        // it must fall through to Query/resolve_id, or the displayed handle would
+        // be un-typeable (#1030).
+        if (1..=RECALL_LIMIT).contains(&n) {
+            return ResumeCommand::Select(n);
+        }
+    }
+    ResumeCommand::Query(rest.to_string())
+}
+
+/// The liveness marker for a conversation in a `/resume` listing (#1030):
+/// `▶` this session's current conversation, `●` open in ANOTHER live newt
+/// (reopening it would mix turns — `/resume` refuses), `○` resumable.
+fn resume_liveness_marker(
+    store: &newt_core::ConversationStore,
+    id: &str,
+    active_id: &str,
+) -> &'static str {
+    if id == active_id {
+        return "▶";
+    }
+    match store.live_owner(id) {
+        Ok(Some(owner)) if store.is_owner_live(&owner) => "●",
+        _ => "○",
+    }
+}
+
+const RESUME_LEGEND: &str = "\n  ▶ current · ● open in another newt · ○ resumable — \
+     reopen with /resume <n> or /resume <id>.";
+
+/// Browse: the workspace's conversations, most recent first, numbered and
+/// liveness-annotated. Returns the rendered text plus the ordered ids so
+/// `/resume <n>` selects by the number shown.
+fn resume_browse_message(
+    store: &newt_core::ConversationStore,
+    active_id: &str,
+) -> anyhow::Result<(String, Vec<String>)> {
+    let mut summaries = store.list()?;
+    if summaries.is_empty() {
+        return Ok((
+            "No saved conversations for this workspace.".to_string(),
+            Vec::new(),
+        ));
+    }
+    summaries.reverse(); // list() is least-recently-active first (§6 tick).
+    let total = summaries.len();
+    let mut out = String::from("Conversations (most recent first):");
+    let mut ids = Vec::new();
+    for (i, s) in summaries.iter().take(RECALL_LIMIT).enumerate() {
+        out.push_str(&format!(
+            "\n  {:>2}. {}  {}  {}  ({} turns, ~{})",
+            i + 1,
+            resume_liveness_marker(store, &s.id, active_id),
+            short_conversation_id(&s.id),
+            recall_display_title(store, &s.id, &s.title),
+            s.turn_count,
+            claim_timestamp(s.updated_at_unix_nanos),
+        ));
+        ids.push(s.id.clone());
+    }
+    if total > RECALL_LIMIT {
+        out.push_str(&format!(
+            "\n  … {} more — refine with /resume <query>.",
+            total - RECALL_LIMIT
+        ));
+    }
+    out.push_str(RESUME_LEGEND);
+    Ok((out, ids))
+}
+
+/// Search: FTS5 over this workspace's turns, numbered + liveness-annotated,
+/// with match snippets. One row per conversation (its first, best hit) so a
+/// `/resume <n>` maps to a conversation. Returns the text plus the ordered ids.
+fn resume_search_message(
+    store: &newt_core::ConversationStore,
+    query: &str,
+    active_id: &str,
+) -> anyhow::Result<(String, Vec<String>)> {
+    if newt_core::sanitize_fts5_query(query).is_err() {
+        return Ok((
+            format!(
+                "Nothing searchable in `{query}` — every term was FTS5 syntax or \
+                 punctuation. Try plain keywords, e.g. /resume tokio panic."
+            ),
+            Vec::new(),
+        ));
+    }
+    let hits = store.search(query, RECALL_LIMIT)?;
+    if hits.is_empty() {
+        return Ok((
+            format!("No matches for `{query}` in this workspace's conversations."),
+            Vec::new(),
+        ));
+    }
+    let mut out = format!("Matches for `{query}`:");
+    let mut ids: Vec<String> = Vec::new();
+    for hit in &hits {
+        if ids.iter().any(|existing| existing == &hit.conversation_id) {
+            continue; // a conversation can match on several turns — show it once
+        }
+        out.push_str(&format!(
+            "\n  {:>2}. {}  {}  {}\n        {}",
+            ids.len() + 1,
+            resume_liveness_marker(store, &hit.conversation_id, active_id),
+            short_conversation_id(&hit.conversation_id),
+            recall_display_title(store, &hit.conversation_id, &hit.title),
+            readable_snippet(&hit.snippet),
+        ));
+        ids.push(hit.conversation_id.clone());
+    }
+    out.push_str(RESUME_LEGEND);
+    Ok((out, ids))
+}
+
 /// Make a raw FTS5 snippet readable in the TUI: collapse internal whitespace
 /// (turn text is multi-line; each snippet must stay on its own row) and
 /// replace the store's `>>>`/`<<<` match markers with `«`/`»`, which read as
@@ -10577,7 +10856,21 @@ ids accept a unique prefix. Search bodies with /recall."
   /recall            recent conversations in this workspace
   /recall <query>    full-text search across this workspace's turns
 
-Read-only and workspace-fenced. Bring one back with /conversation restore <id>."
+Read-only and workspace-fenced. Bring one back with /conversation restore <id>
+or /resume."
+        }
+        "resume" => {
+            "\
+/resume [query|n|id] — find and REOPEN a past conversation (#1030)
+
+  /resume            list recent conversations, annotated by liveness
+  /resume <query>    full-text search this workspace's turns
+  /resume <n>        reopen the n-th row from the last listing
+  /resume <id>       reopen by id or unique prefix
+
+Markers: ▶ current · ● open in another newt · ○ resumable. Reopening a
+conversation another live newt holds is refused (it would mix turns) —
+this is how #1030 keeps multiple newts from colliding."
         }
         "persona" => {
             "\
@@ -10787,6 +11080,7 @@ fn help_lines() -> &'static [&'static str] {
         "  /conversation delete <id> - delete a saved conversation",
         "  /conversation rm <id>    - alias for /conversation delete",
         "  /recall [query]          - recent conversations, or full-text search",
+        "  /resume [query|n|id]     - find & reopen a past conversation (listed by liveness, searchable)",
         "  /persona list            - list configured personas",
         "  /persona show            - show the active persona",
         "  /persona <name>          - start fresh with a persona",
@@ -14641,6 +14935,62 @@ mod skills_integration_tests {
         // `/recallx` is some other (unknown) command, not `/recall x`.
         assert!(parse_recall_command("/recallx").is_err());
         assert!(parse_recall_command("/conversation list").is_err());
+    }
+
+    #[test]
+    fn resume_commands_parse_expected_actions() {
+        assert_eq!(parse_resume_command("/resume"), ResumeCommand::Browse);
+        assert_eq!(parse_resume_command("/resume   "), ResumeCommand::Browse);
+        assert_eq!(parse_resume_command("/resume 3"), ResumeCommand::Select(3));
+        assert_eq!(
+            parse_resume_command("/resume tokio panic"),
+            ResumeCommand::Query("tokio panic".into())
+        );
+        // #1030: a big all-digits token (the displayed short id is ~19 nanos
+        // digits) is an id PREFIX, not a row number — routed to Query/resolve_id
+        // so the short id the UI prints is typeable.
+        assert_eq!(
+            parse_resume_command("/resume 175200000000"),
+            ResumeCommand::Query("175200000000".into())
+        );
+    }
+
+    #[test]
+    fn help_lists_the_resume_command() {
+        assert!(help_lines().iter().any(|l| l.contains("/resume")));
+    }
+
+    #[test]
+    fn resume_browse_numbers_rows_and_marks_liveness() {
+        let (_state, _ws, mut store) = recall_test_store();
+        store.set_owner_for_test("host", "boot", 1);
+        let a = store.create("Alpha", None).unwrap();
+        let b = store.create("Bravo", None).unwrap();
+        // Bravo is held by a live owner -> ● ; Alpha is unclaimed but is the
+        // "active" id passed below -> ▶.
+        store.set_liveness_for_test(|_, _| true);
+        store.claim(&b).unwrap();
+        let (msg, ids) = resume_browse_message(&store, &a).unwrap();
+        // list() is MRU, so Bravo (created last) is row 1, Alpha row 2.
+        assert_eq!(ids, vec![b.clone(), a.clone()]);
+        assert!(msg.contains("1. ●"), "held conversation marked live: {msg}");
+        assert!(msg.contains("2. ▶"), "the active id marked current: {msg}");
+        assert!(msg.contains("Alpha") && msg.contains("Bravo"));
+    }
+
+    #[test]
+    fn resume_search_lists_one_row_per_conversation() {
+        let (_state, _ws, store) = recall_test_store();
+        let id = store.create("Parser work", None).unwrap();
+        store
+            .append_turn(&id, "fix the parser tokens", "done")
+            .unwrap();
+        store.append_turn(&id, "more parser tokens", "ok").unwrap();
+        let (msg, ids) = resume_search_message(&store, "parser", "other-active").unwrap();
+        // Two matching turns in ONE conversation -> a single numbered row.
+        assert_eq!(ids, vec![id]);
+        assert!(msg.contains("1. "), "numbered: {msg}");
+        assert!(msg.contains("Parser work"));
     }
 
     #[test]
