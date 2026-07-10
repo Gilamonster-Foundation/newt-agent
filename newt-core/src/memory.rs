@@ -2104,7 +2104,7 @@ mod tests {
         assert!(
             reqs[0].contains("CHAIN-ME"),
             "the previous summary must be summarizer INPUT (the chain), got: {}",
-            &reqs[0]
+            reqs[0]
         );
         // The Original-Task anchor (the text right under the header) must be
         // the first REAL user message, not the compaction message.
