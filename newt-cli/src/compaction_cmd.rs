@@ -79,12 +79,14 @@ pub fn run(config_path: Option<&Path>) -> anyhow::Result<()> {
     let status = resolve_status()?;
     let embedded = matches!(
         &status.effective,
-        EffectiveSummarizer::DefaultEmbedded { .. }
-            | EffectiveSummarizer::OverrideEmbedded { .. }
+        EffectiveSummarizer::DefaultEmbedded { .. } | EffectiveSummarizer::OverrideEmbedded { .. }
     );
 
     println!("\nSummarizer (runs when compaction fires)");
-    println!("  config path                   : {}", status.config_path.display());
+    println!(
+        "  config path                   : {}",
+        status.config_path.display()
+    );
     match &status.effective {
         EffectiveSummarizer::DefaultEmbedded { model, model_path } => {
             println!("  backend                       : embedded default (on-host CPU)");
@@ -113,7 +115,9 @@ pub fn run(config_path: Option<&Path>) -> anyhow::Result<()> {
                 model.as_deref().unwrap_or("(session model)"),
                 endpoint.as_deref().unwrap_or("(session endpoint)"),
             );
-            println!("       WARN: explicit override can contend with the session model under load.");
+            println!(
+                "       WARN: explicit override can contend with the session model under load."
+            );
         }
     }
     println!(

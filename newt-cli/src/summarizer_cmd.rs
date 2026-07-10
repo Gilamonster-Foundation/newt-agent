@@ -52,9 +52,17 @@ pub enum SummarizerCmd {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum EffectiveSummarizer {
-    DefaultEmbedded { model: String, model_path: String },
-    DefaultDegradedSession { reason: String },
-    OverrideEmbedded { model: String, model_path: String },
+    DefaultEmbedded {
+        model: String,
+        model_path: String,
+    },
+    DefaultDegradedSession {
+        reason: String,
+    },
+    OverrideEmbedded {
+        model: String,
+        model_path: String,
+    },
     OverrideBackend {
         kind: Option<BackendKind>,
         model: Option<String>,
@@ -157,8 +165,7 @@ pub(crate) fn resolve_effective_backend(
             },
             (true, None) => EffectiveSummarizer::DefaultDegradedSession {
                 reason: format!(
-                    "default embedded model '{}' is not provisioned; run `newt summarizer setup`",
-                    default_model
+                    "default embedded model '{default_model}' is not provisioned; run `newt summarizer setup`"
                 ),
             },
         };
@@ -185,7 +192,10 @@ pub(crate) fn resolve_effective_backend(
 fn show() -> anyhow::Result<()> {
     let status = resolve_status()?;
     println!("Summarizer — status\n");
-    println!("  config path                  : {}", status.config_path.display());
+    println!(
+        "  config path                  : {}",
+        status.config_path.display()
+    );
     if status.config_exists {
         println!("  config file                  : present");
     } else {
@@ -193,10 +203,17 @@ fn show() -> anyhow::Result<()> {
     }
     println!(
         "  embedded feature             : {}",
-        if status.embedded_compiled { "yes" } else { "no" }
+        if status.embedded_compiled {
+            "yes"
+        } else {
+            "no"
+        }
     );
     println!("  default on-host model        : {}", status.default_model);
-    println!("  default model path           : {}", status.default_model_path);
+    println!(
+        "  default model path           : {}",
+        status.default_model_path
+    );
     println!(
         "  default model installed      : {}",
         if status.default_model_installed {
@@ -240,9 +257,7 @@ fn show() -> anyhow::Result<()> {
             );
             println!(
                 "  override endpoint            : {}",
-                endpoint
-                    .as_deref()
-                    .unwrap_or("(inherits session endpoint)")
+                endpoint.as_deref().unwrap_or("(inherits session endpoint)")
             );
         }
     }
@@ -256,18 +271,16 @@ fn show() -> anyhow::Result<()> {
     );
     println!(
         "  keep_alive                   : {}",
-        status.config.keep_alive.as_deref().unwrap_or("(inherits session)")
+        status
+            .config
+            .keep_alive
+            .as_deref()
+            .unwrap_or("(inherits session)")
     );
     println!("\nSetup");
-    println!(
-        "  - Provision the default model : newt summarizer setup"
-    );
-    println!(
-        "  - Pin a specific embedded one : newt summarizer embedded [alias]"
-    );
-    println!(
-        "  - Return to built-in default  : newt summarizer clear"
-    );
+    println!("  - Provision the default model : newt summarizer setup");
+    println!("  - Pin a specific embedded one : newt summarizer embedded [alias]");
+    println!("  - Return to built-in default  : newt summarizer clear");
     Ok(())
 }
 
