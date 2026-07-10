@@ -193,6 +193,77 @@ impl Plan {
             .iter()
             .all(|s| s.status == SubtaskStatus::Done)
     }
+
+    /// #1030 tree cursor: the next node to act on in depth-first, sibling order
+    /// — the leftmost [`SubtaskStatus::Pending`] subtask whose every [`dep`] is
+    /// `Done` **and** whose direct children are all `Done`. Generalizes
+    /// [`next_ready_leaf`] to interior nodes: a leaf (no children) is ready as
+    /// soon as its deps clear; a branch (Roadmap/Phase/Plan grouping) becomes
+    /// ready only once its subtree has completed — which is exactly when its
+    /// evaluator should run and fold the children's results upward, then the
+    /// cursor returns to the branch's parent. Document order encodes sibling
+    /// order, so "leftmost" is the first match. `None` when nothing is ready
+    /// (all done, or every pending node is blocked by a dep or an open child).
+    ///
+    /// [`next_ready_leaf`]: Plan::next_ready_leaf
+    /// [`dep`]: Subtask::deps
+    #[must_use]
+    pub fn next_ready_node(&self) -> Option<&Subtask> {
+        self.subtasks.iter().find(|s| {
+            s.status == SubtaskStatus::Pending
+                && s.deps
+                    .iter()
+                    .all(|d| matches!(self.subtask(d).map(|t| t.status), Some(SubtaskStatus::Done)))
+                && self
+                    .children(&s.id)
+                    .iter()
+                    .all(|c| c.status == SubtaskStatus::Done)
+        })
+    }
+
+    /// #1030: is node `id` **and its entire subtree** `Done`? A missing id is
+    /// `false` — a node we cannot see is not provably complete (mirroring the
+    /// unsatisfied-absent-`dep` rule). The traversal uses this to decide when a
+    /// branch's children have all finished so it may return up to the parent.
+    #[must_use]
+    pub fn subtree_complete(&self, id: &str) -> bool {
+        match self.subtask(id) {
+            None => false,
+            Some(node) => {
+                node.status == SubtaskStatus::Done
+                    && self
+                        .children(id)
+                        .iter()
+                        .all(|c| self.subtree_complete(&c.id))
+            }
+        }
+    }
+
+    /// #1030: the ancestor chain from the root down to `id` (inclusive) as a vec
+    /// of ids — the breadcrumb a driver shows and a resume uses to descend.
+    /// Empty when `id` is absent. A cycle in the soft [`parent`](Subtask::parent)
+    /// pointers is broken by stopping at the first revisited id.
+    #[must_use]
+    pub fn path_to(&self, id: &str) -> Vec<String> {
+        let mut chain = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut cur = self.subtask(id);
+        while let Some(node) = cur {
+            if !seen.insert(node.id.as_str()) {
+                break; // cycle guard: a parent pointer looped back
+            }
+            chain.push(node.id.clone());
+            cur = node.parent.as_deref().and_then(|p| self.subtask(p));
+        }
+        chain.reverse();
+        chain
+    }
+
+    /// #1030: all subtasks of a given [`NodeKind`], in document (sibling) order.
+    #[must_use]
+    pub fn nodes_of_kind(&self, kind: NodeKind) -> Vec<&Subtask> {
+        self.subtasks.iter().filter(|s| s.kind == kind).collect()
+    }
 }
 
 /// One unit of work in a [`Plan`] — the serialized form of a single scheduler
@@ -242,6 +313,25 @@ pub struct Subtask {
     /// the slice (the pointer is soft, like a cross-fragment `dep`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<String>,
+    /// #1030 tree node kind — this subtask's role in a Roadmap→Phase→Plan→Task
+    /// tree. Defaults to [`NodeKind::Task`] so a legacy flat plan (every subtask
+    /// a work unit) is unchanged: the existing leaf/crew semantics read
+    /// `status`/`parent`/`deps`, never `kind`. A scalar — precedes the tables.
+    #[serde(default)]
+    pub kind: NodeKind,
+    /// #1030: for a [`NodeKind::Plan`] node, the id of the `conversations` row
+    /// that IS this plan's context window ("each plan is a conversational
+    /// context"). `None` for Roadmap/Phase grouping nodes, Task leaves, and
+    /// every legacy subtask — a soft pointer, like [`Subtask::parent`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation_id: Option<String>,
+    /// #1030: the objective work artifact an evaluator reads to close this node
+    /// (a branch/commit for a Task or Plan, a PR for a Phase). `None` until the
+    /// node is bound to real work. Serialized as a sub-table, so — like
+    /// [`caveat_policy`](Subtask::caveat_policy) — every scalar field precedes
+    /// it; it is placed before `caveat_policy` and both tables trail the scalars.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_ref: Option<ArtifactRef>,
     /// The authority this subtask declares it needs. **Default-deny**: an
     /// omitted policy denies every capability axis (see [`CaveatPolicy`]).
     ///
@@ -322,6 +412,57 @@ pub enum SubtaskStatus {
     Done,
     /// Failed (verify gate or execution error).
     Failed,
+}
+
+/// #1030 "Plans within Plans": the role of a [`Subtask`] node in a
+/// Roadmap→Phase→Plan→Task tree.
+///
+/// - `Roadmap` / `Phase` are lightweight grouping nodes (no bound conversation,
+///   no turns) — the outline a tiny model never has to hold all at once.
+/// - `Plan` is the pivot: it binds a whole `conversations` row via
+///   [`Subtask::conversation_id`] — that row IS the model's bounded context
+///   window ("each plan is a conversational context").
+/// - `Task` is a commit-granular leaf; git is the source of truth, read from
+///   [`Subtask::artifact_ref`].
+///
+/// Defaults to `Task` so a legacy flat plan (every subtask a work unit)
+/// deserializes unchanged — `kind` is additive working metadata the existing
+/// leaf/crew semantics (`status`/`parent`/`deps`) never read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum NodeKind {
+    /// The tree root — the whole body of work. Done when every child Phase is
+    /// merged to main and the pipelines are green.
+    Roadmap,
+    /// A group of Plans that lands as one PR. Done when every child Plan is
+    /// complete and the PR is merged to main.
+    Phase,
+    /// One conversational context (a `conversations` row). Done when every
+    /// child Task is on the branch and the branch's tests pass.
+    Plan,
+    /// A commit-granular leaf. Done when its commit is on the branch and its
+    /// [`verify`](Subtask::verify) gate passes. The default kind.
+    #[default]
+    Task,
+}
+
+/// #1030: the objective work artifact an evaluator resolves to decide whether a
+/// node is done — never the model's self-reported "done". Every field is
+/// optional and skipped when empty; the whole ref is `None` on an unbound node.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct ArtifactRef {
+    /// The branch a Task's commit / a Plan's tasks land on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    /// The commit that realizes a Task (its "done" is this commit on `branch`
+    /// with the [`verify`](Subtask::verify) gate passing).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
+    /// The pull-request number a Phase merges (its "done" is this PR merged to
+    /// main).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr: Option<u64>,
 }
 
 /// The authority a [`Subtask`] declares it needs — **default-deny**.
@@ -511,6 +652,9 @@ instruction = "x"
                 status: SubtaskStatus::Done,
                 result: Some("done".to_string()),
                 parent: Some("epic".to_string()),
+                kind: NodeKind::Task,
+                conversation_id: None,
+                artifact_ref: None,
             }],
         };
         let text = plan.to_toml_string().unwrap();
@@ -780,5 +924,190 @@ deps = ["a"]
         plan.mark("nope", SubtaskStatus::Done, Some("ignored".into()));
         assert_eq!(plan.subtask("a").unwrap().status, SubtaskStatus::Pending);
         assert!(Plan::from_toml_str("").unwrap().is_complete());
+    }
+
+    // ── #1030 "Plans within Plans": tree node kind, artifact ref, traversal ──
+
+    #[test]
+    fn node_kind_defaults_to_task_on_a_legacy_plan() {
+        // Adding `kind` must not perturb a pre-#1030 flat plan: every subtask
+        // that omits `kind` deserializes as a Task work unit, so the existing
+        // crew/leaf semantics are byte-identical.
+        let toml = r#"
+[[subtask]]
+id = "a"
+instruction = "x"
+
+[[subtask]]
+id = "b"
+instruction = "y"
+deps = ["a"]
+"#;
+        let plan = Plan::from_toml_str(toml).unwrap();
+        assert!(plan.subtasks.iter().all(|s| s.kind == NodeKind::Task));
+        assert_eq!(NodeKind::default(), NodeKind::Task);
+    }
+
+    #[test]
+    fn node_kind_and_artifact_ref_round_trip_through_toml() {
+        // A Plan node bound to a conversation and a Task node bound to a commit
+        // survive a TOML round-trip unchanged (the roadmaps table will persist
+        // exactly this serialized shape).
+        let toml = r#"
+[[subtask]]
+id = "plan-1"
+instruction = "implement the parser"
+kind = "plan"
+conversation_id = "1720000000000-abc"
+
+[[subtask]]
+id = "task-1"
+instruction = "commit the AST"
+kind = "task"
+parent = "plan-1"
+
+[subtask.artifact_ref]
+branch = "feat/parser"
+commit = "deadbeef"
+"#;
+        let plan = Plan::from_toml_str(toml).unwrap();
+        let p = plan.subtask("plan-1").unwrap();
+        assert_eq!(p.kind, NodeKind::Plan);
+        assert_eq!(p.conversation_id.as_deref(), Some("1720000000000-abc"));
+        let t = plan.subtask("task-1").unwrap();
+        assert_eq!(t.kind, NodeKind::Task);
+        assert_eq!(
+            t.artifact_ref.as_ref().unwrap().commit.as_deref(),
+            Some("deadbeef")
+        );
+        // Round-trip: scalars (incl. `kind`, `conversation_id`) precede both the
+        // `artifact_ref` and `caveat_policy` sub-tables, so TOML re-serializes.
+        let back = Plan::from_toml_str(&plan.to_toml_string().unwrap()).unwrap();
+        assert_eq!(back, plan);
+    }
+
+    #[test]
+    fn next_ready_node_generalizes_the_cursor_to_branches() {
+        // The cursor now also visits interior nodes: a Phase branch becomes
+        // "ready" (for its evaluator) only once its child Tasks finish, then the
+        // traversal returns up to it. Leaves still lead.
+        let toml = r#"
+[[subtask]]
+id = "phase-1"
+instruction = "phase"
+kind = "phase"
+
+[[subtask]]
+id = "t1"
+instruction = "task 1"
+kind = "task"
+parent = "phase-1"
+
+[[subtask]]
+id = "t2"
+instruction = "task 2"
+kind = "task"
+parent = "phase-1"
+deps = ["t1"]
+"#;
+        let mut plan = Plan::from_toml_str(toml).unwrap();
+        assert_eq!(plan.next_ready_node().map(|s| s.id.as_str()), Some("t1"));
+        plan.mark("t1", SubtaskStatus::Done, None);
+        assert_eq!(plan.next_ready_node().map(|s| s.id.as_str()), Some("t2"));
+        plan.mark("t2", SubtaskStatus::Done, None);
+        // Children all Done → the branch is now the cursor (evaluate + fold up).
+        assert_eq!(
+            plan.next_ready_node().map(|s| s.id.as_str()),
+            Some("phase-1")
+        );
+        plan.mark("phase-1", SubtaskStatus::Done, None);
+        assert_eq!(plan.next_ready_node(), None);
+    }
+
+    #[test]
+    fn subtree_complete_tracks_the_whole_subtree() {
+        let toml = r#"
+[[subtask]]
+id = "p"
+instruction = "parent"
+kind = "phase"
+
+[[subtask]]
+id = "c1"
+instruction = "child 1"
+parent = "p"
+
+[[subtask]]
+id = "c2"
+instruction = "child 2"
+parent = "p"
+"#;
+        let mut plan = Plan::from_toml_str(toml).unwrap();
+        assert!(!plan.subtree_complete("p"));
+        assert!(!plan.subtree_complete("absent"));
+        plan.mark("c1", SubtaskStatus::Done, None);
+        plan.mark("c2", SubtaskStatus::Done, None);
+        // Children done, but the branch itself is not yet marked → incomplete.
+        assert!(!plan.subtree_complete("p"));
+        plan.mark("p", SubtaskStatus::Done, None);
+        assert!(plan.subtree_complete("p"));
+        assert!(plan.subtree_complete("c1"));
+    }
+
+    #[test]
+    fn path_to_returns_the_root_to_node_breadcrumb() {
+        let toml = r#"
+[[subtask]]
+id = "road"
+instruction = "roadmap"
+kind = "roadmap"
+
+[[subtask]]
+id = "ph"
+instruction = "phase"
+kind = "phase"
+parent = "road"
+
+[[subtask]]
+id = "pl"
+instruction = "plan"
+kind = "plan"
+parent = "ph"
+"#;
+        let plan = Plan::from_toml_str(toml).unwrap();
+        assert_eq!(plan.path_to("pl"), ["road", "ph", "pl"]);
+        assert_eq!(plan.path_to("road"), ["road"]);
+        assert!(plan.path_to("absent").is_empty());
+    }
+
+    #[test]
+    fn nodes_of_kind_filters_by_kind() {
+        let toml = r#"
+[[subtask]]
+id = "road"
+instruction = "roadmap"
+kind = "roadmap"
+
+[[subtask]]
+id = "pl1"
+instruction = "plan 1"
+kind = "plan"
+parent = "road"
+
+[[subtask]]
+id = "pl2"
+instruction = "plan 2"
+kind = "plan"
+parent = "road"
+"#;
+        let plan = Plan::from_toml_str(toml).unwrap();
+        let plans: Vec<_> = plan
+            .nodes_of_kind(NodeKind::Plan)
+            .iter()
+            .map(|s| s.id.clone())
+            .collect();
+        assert_eq!(plans, ["pl1", "pl2"]);
+        assert_eq!(plan.nodes_of_kind(NodeKind::Roadmap).len(), 1);
+        assert!(plan.nodes_of_kind(NodeKind::Task).is_empty());
     }
 }
