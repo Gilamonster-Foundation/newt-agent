@@ -15468,6 +15468,8 @@ mod skills_integration_tests {
             turns: Vec::new(),
             scratchpad: std::collections::BTreeMap::new(),
             plan: newt_core::PlanSnapshot::default(),
+            roadmap_id: None,
+            node_id: None,
             created_at_unix_nanos: 0,
             // 2026-06-11 00:00:00 UTC in nanos — must render ~-prefixed (§6:
             // a display claim, never the ordering key).

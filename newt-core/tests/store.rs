@@ -612,6 +612,10 @@ fn opening_a_drifted_schema_adds_missing_columns() {
         // an older db (this hand-built v1) gains them on open.
         ("conversations", "scratchpad"),
         ("conversations", "plan"),
+        // #1030: the thin roadmap-tree pointer columns are additive too — an
+        // older db (this hand-built v1) gains them on open via reconciliation.
+        ("conversations", "roadmap_id"),
+        ("conversations", "node_id"),
         ("turns", "events"),
         ("turns", "tokens_in"),
         ("turns", "tokens_out"),
@@ -640,6 +644,24 @@ fn opening_a_drifted_schema_adds_missing_columns() {
     // snapshot (load would have errored on invalid JSON) — proving the additive
     // column is loadable, not garbage, on an older db.
     assert!(legacy.plan.is_empty(), "back-filled plan parses empty");
+    // #1030: the thin pointer columns back-fill to NULL — a migrated legacy
+    // conversation reads as an ad-hoc chat, not part of any roadmap tree.
+    assert!(
+        legacy.roadmap_id.is_none() && legacy.node_id.is_none(),
+        "migrated legacy conversation must be an unlinked ad-hoc chat"
+    );
+    // #1030: the new tables are created on open (CREATE TABLE IF NOT EXISTS),
+    // so an older db additively gains the roadmap tree + live-owner store.
+    for table in ["roadmaps", "live_owners"] {
+        let n: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                [table],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1, "{table} table must exist after open");
+    }
 
     // …and new activity ticks past the drifted data's max (the rebuilt
     // writer_clock seeds from existing rows; monotonicity survives).
@@ -662,6 +684,34 @@ fn opening_a_drifted_schema_adds_missing_columns() {
     store
         .verify_chain("legacy-conv")
         .expect("migrated conversation must verify after a post-migration append");
+}
+
+/// #1030: the roadmap-tree pointer columns round-trip through the store — a
+/// fresh conversation is an ad-hoc chat (NULL pointers), `link_conversation_to_node`
+/// binds it to a (roadmap, node), and passing `None` clears it back.
+#[test]
+fn conversation_roadmap_link_round_trips_and_defaults_to_none() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let store = ConversationStore::new(root.path(), workspace.path(), 100).unwrap();
+
+    let id = store.create("plan node", None).unwrap();
+    // A freshly created conversation is unlinked — an ad-hoc chat.
+    let rec = store.load(&id).unwrap();
+    assert!(rec.roadmap_id.is_none() && rec.node_id.is_none());
+
+    // Bind it to a Plan node in a roadmap tree.
+    store
+        .link_conversation_to_node(&id, Some("roadmap-1"), Some("plan-node-7"))
+        .unwrap();
+    let linked = store.load(&id).unwrap();
+    assert_eq!(linked.roadmap_id.as_deref(), Some("roadmap-1"));
+    assert_eq!(linked.node_id.as_deref(), Some("plan-node-7"));
+
+    // Clearing the link returns it to an ad-hoc chat.
+    store.link_conversation_to_node(&id, None, None).unwrap();
+    let cleared = store.load(&id).unwrap();
+    assert!(cleared.roadmap_id.is_none() && cleared.node_id.is_none());
 }
 
 /// On a healthy local filesystem WAL applies cleanly: no fallback notice.
@@ -759,6 +809,8 @@ fn legacy_record(
             .collect(),
         scratchpad: std::collections::BTreeMap::new(),
         plan: newt_core::PlanSnapshot::default(),
+        roadmap_id: None,
+        node_id: None,
         created_at_unix_nanos: created,
         updated_at_unix_nanos: updated,
     }
