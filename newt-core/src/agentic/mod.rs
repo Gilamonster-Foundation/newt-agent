@@ -124,6 +124,10 @@ mod tool_search;
 mod tools;
 mod transcript;
 mod trim;
+// Scoped FR-14 (#1042): wrap a remote MCP tool's result as explicitly
+// untrusted data before it re-enters context — an injection-guard framing,
+// not a filter.
+mod untrusted;
 mod warmup;
 
 pub use compress::{
@@ -227,6 +231,7 @@ pub use transcript::{
     transcript_lines, transcript_lines_styled, TranscriptLine, TranscriptRole, TranscriptStyle,
 };
 pub use trim::trim_for_summary;
+pub use untrusted::wrap_untrusted;
 pub use warmup::warmup_if_cold;
 
 use crate::retry::{with_backoff_notify, RetryPolicy};

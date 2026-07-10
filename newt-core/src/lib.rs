@@ -72,6 +72,7 @@ pub use agent_mesh_protocol::{Caveats, CountBound, Scope};
 // same pipeline) + CompressCounters (read-only `/memory` snapshot).
 // Issue #263: the prompted-ocap-grant seam (PermissionGate + friends) joins
 // the surface — the TUI implements the gate; headless callers pass None.
+pub use agentic::wrap_untrusted;
 pub use agentic::{
     append_denial, chat_complete, compress_user_initiated, execute_tool, experience_block,
     gather_code_files, index_files, load_denials, memory_fetch_tool_definition,
