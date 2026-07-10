@@ -129,7 +129,9 @@ pub use role_profile::{
 };
 pub use router::{Router, Tier};
 pub use session::SessionId;
-pub use store::{sanitize_fts5_query, ConversationStore, SearchHit};
+pub use store::{
+    sanitize_fts5_query, ClaimOutcome, ConversationStore, LivenessFn, SearchHit, StoredOwner,
+};
 pub use tokens::TokenEstimation;
 pub use workflows::{
     builtin_workflows, load_workflows_from_dir, merge_workflows, workflow_config_dir,

@@ -8366,8 +8366,8 @@ const EPHEMERAL_SESSION_NOTICE: &str =
 /// How this session treats conversation persistence. Resolved ONCE at
 /// session start by [`resolve_session_start`]; precedence:
 /// `--ephemeral`/`NEWT_EPHEMERAL` > `NEWT_CONVERSATION_ID` >
-/// `[conversations] resume` (default true; `resume = false` is the
-/// off-switch).
+/// `[conversations] resume` (#1030: default FALSE = fresh-on-launch;
+/// `resume = true` opts back into auto-resuming the folder's latest).
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SessionStart {
     /// No persistence at all: no store handle is constructed, so no

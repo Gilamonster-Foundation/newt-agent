@@ -232,6 +232,18 @@ pub struct ConversationStore {
     /// so tests can drive the clock backwards mid-conversation and prove
     /// ordering never consults it (§6 clock-skew test).
     claim_clock: fn() -> i64,
+    /// #1030: this process's hostname + kernel boot id, captured once at open —
+    /// the machine-identity half of a `live_owners` claim (paired with `pid`).
+    host: String,
+    boot_id: String,
+    /// This process's OS pid — the process-unique half of a claim. The writer
+    /// fingerprint is shared per machine (derived from `identity.pem`), so it
+    /// cannot identify a process on its own; `pid` + `host` + `boot_id` does.
+    pid: i64,
+    /// Liveness oracle used by `claim` / `is_owner_live` to decide whether a
+    /// stored claim is still a running process. Injectable for tests (default
+    /// [`system_liveness`]).
+    liveness: LivenessFn,
 }
 
 impl ConversationStore {
@@ -288,6 +300,7 @@ impl ConversationStore {
         // THIS workspace's rows from the retired UUIDv5 derivation to v2.
         migrate_workspace_key(&conn, &workspace, &workspace_id)?;
 
+        let (host, boot_id) = current_host_boot();
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             workspace,
@@ -296,6 +309,10 @@ impl ConversationStore {
             max_per_workspace,
             wal_fallback,
             claim_clock: now_claim_nanos,
+            host,
+            boot_id,
+            pid: i64::from(std::process::id()),
+            liveness: system_liveness,
         })
     }
 
@@ -794,6 +811,98 @@ impl ConversationStore {
         Ok(())
     }
 
+    /// #1030 collision fix: attempt to become the SINGLE live owner of `id`.
+    /// Atomic (`BEGIN IMMEDIATE`): if the conversation is unclaimed, or its
+    /// claim is our own, or its claim is STALE (the owner is not live — a
+    /// crashed or rebooted process), this process takes ownership and returns
+    /// [`Claimed`](ClaimOutcome::Claimed). If a DIFFERENT, LIVE process owns it,
+    /// returns [`HeldBy`](ClaimOutcome::HeldBy) and writes nothing — the caller
+    /// must not attach (attaching is exactly the turn-interleaving bug #1030
+    /// fixes). Identity is `host`+`boot_id`+`pid`, never the (machine-shared)
+    /// writer fingerprint.
+    pub fn claim(&self, id: &str) -> anyhow::Result<ClaimOutcome> {
+        // NOT `resolve_id`: a session claims its freshly-minted id at startup,
+        // BEFORE the conversation row is lazily created on the first turn.
+        // `live_owners` is keyed by the (globally-unique) conversation id with
+        // no FK, so the exact id is all that is needed.
+        validate_record_id(id)?;
+        let now = (self.claim_clock)();
+        let conn = self.lock_conn();
+        let tx = rusqlite::Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
+        let existing = live_owner_row(&tx, id)?;
+        if let Some(owner) = &existing {
+            let is_ours =
+                owner.host == self.host && owner.boot_id == self.boot_id && owner.pid == self.pid;
+            if !is_ours && (self.liveness)(owner, now) {
+                return Ok(ClaimOutcome::HeldBy {
+                    host: owner.host.clone(),
+                    pid: owner.pid,
+                });
+            }
+            // Ours, or a stale remnant of a dead session → fall through and take it.
+        }
+        tx.execute(
+            "INSERT OR REPLACE INTO live_owners
+               (conversation_id, host, boot_id, pid, writer_fingerprint, heartbeat_tick)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                id,
+                self.host,
+                self.boot_id,
+                self.pid,
+                self.writer_fingerprint,
+                now
+            ],
+        )?;
+        tx.commit()?;
+        Ok(ClaimOutcome::Claimed)
+    }
+
+    /// Release THIS process's claim on `id` (best-effort). Only deletes a claim
+    /// this exact process holds (`host`+`boot_id`+`pid`), so it can never free
+    /// another live session's conversation. Called on clean exit / conversation
+    /// switch; a crash simply leaves a stale claim the next [`claim`](Self::claim)
+    /// reclaims. A missing / foreign id is a silent no-op.
+    pub fn release(&self, id: &str) -> anyhow::Result<()> {
+        let conn = self.lock_conn();
+        conn.execute(
+            "DELETE FROM live_owners
+              WHERE conversation_id = ?1 AND host = ?2 AND boot_id = ?3 AND pid = ?4",
+            rusqlite::params![id, self.host, self.boot_id, self.pid],
+        )?;
+        Ok(())
+    }
+
+    /// Refresh THIS process's heartbeat on `id` — the freshness signal a
+    /// cross-host / post-reboot liveness check reads. Cheap; meant to piggyback
+    /// the per-turn save. No-op if this process does not hold the claim.
+    pub fn heartbeat(&self, id: &str) -> anyhow::Result<()> {
+        let now = (self.claim_clock)();
+        let conn = self.lock_conn();
+        conn.execute(
+            "UPDATE live_owners SET heartbeat_tick = ?2
+              WHERE conversation_id = ?1 AND host = ?3 AND boot_id = ?4 AND pid = ?5",
+            rusqlite::params![id, now, self.host, self.boot_id, self.pid],
+        )?;
+        Ok(())
+    }
+
+    /// The raw `live_owners` row for `id`, WITHOUT a liveness judgement — `None`
+    /// when unclaimed. `/resume` pairs this with [`is_owner_live`](Self::is_owner_live)
+    /// to render each conversation's ● live / ○ open marker.
+    pub fn live_owner(&self, id: &str) -> anyhow::Result<Option<StoredOwner>> {
+        let conn = self.lock_conn();
+        live_owner_row(&conn, id)
+    }
+
+    /// Whether `owner` is a running process right now, per the store's (injected)
+    /// liveness oracle — the SAME judgement [`claim`](Self::claim) uses, exposed
+    /// so `/resume` renders a consistent marker.
+    #[must_use]
+    pub fn is_owner_live(&self, owner: &StoredOwner) -> bool {
+        (self.liveness)(owner, (self.claim_clock)())
+    }
+
     /// Rename a conversation. Updates the display claim but does NOT tick
     /// the activity clock: a rename is metadata, not activity, so it cannot
     /// perturb MRU ordering (§6 dissolved the old rename-bumps-`updated_at`
@@ -1048,6 +1157,24 @@ impl ConversationStore {
     #[doc(hidden)]
     pub fn set_claim_clock_for_test(&mut self, clock: fn() -> i64) {
         self.claim_clock = clock;
+    }
+
+    /// Inject a fake liveness oracle for tests (mirrors
+    /// [`set_claim_clock_for_test`](Self::set_claim_clock_for_test)) so #1030
+    /// claim contention is unit-testable without touching real OS pids.
+    #[doc(hidden)]
+    pub fn set_liveness_for_test(&mut self, liveness: LivenessFn) {
+        self.liveness = liveness;
+    }
+
+    /// Force this store's owner identity for tests — lets one test process
+    /// simulate a SECOND newt (a different pid/host) contending for the same
+    /// conversation, without spawning a real process.
+    #[doc(hidden)]
+    pub fn set_owner_for_test(&mut self, host: &str, boot_id: &str, pid: i64) {
+        self.host = host.to_string();
+        self.boot_id = boot_id.to_string();
+        self.pid = pid;
     }
 
     fn prune_to_cap(&self) -> anyhow::Result<()> {
@@ -2116,6 +2243,114 @@ fn now_claim_nanos() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX))
         .unwrap_or(0)
+}
+
+// ── #1030 collision fix: one live owner per conversation (live_owners) ──────
+
+/// A `live_owners` row (#1030) — a process that has a conversation open —
+/// handed to the [`LivenessFn`] to decide whether it is still LIVE.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredOwner {
+    /// Hostname of the owning process's machine.
+    pub host: String,
+    /// Kernel boot id at claim time. A different boot id on the same host means
+    /// the machine rebooted, so every prior pid is gone (the claim is stale).
+    pub boot_id: String,
+    /// OS process id of the owner.
+    pub pid: i64,
+    /// The owner's writer fingerprint. Shared per machine (from `identity.pem`),
+    /// so it is NOT a process-unique key — stored for provenance, not identity.
+    pub writer_fingerprint: String,
+    /// Claim-clock tick of the owner's last heartbeat — the freshness signal a
+    /// cross-host / post-reboot liveness check falls back to.
+    pub heartbeat_tick: i64,
+}
+
+/// The outcome of [`ConversationStore::claim`] (#1030 collision fix).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClaimOutcome {
+    /// This process now owns the conversation — a fresh claim, a re-affirmation
+    /// of its own claim, or a reclaim of a stale (crashed/rebooted) owner.
+    Claimed,
+    /// A DIFFERENT, LIVE process owns it. The fields drive an honest message
+    /// ("open in another newt, pid N on host H"); the caller must NOT attach.
+    HeldBy { host: String, pid: i64 },
+}
+
+/// Liveness oracle: is `owner` still a running process, as of `now`? Injectable
+/// (like the claim clock) so the unit tier is fully mocked — the production
+/// [`system_liveness`] touches the OS (pid probe + boot id); a test double
+/// decides from the row alone. A plain `fn`, so it carries no captured state.
+pub type LivenessFn = fn(owner: &StoredOwner, now: i64) -> bool;
+
+/// A held conversation whose owner's last heartbeat is older than this is
+/// treated as stale (reclaimable) — but ONLY on the fallback path where the pid
+/// probe is not authoritative (a foreign host, or the same host after a reboot).
+/// One hour: comfortably longer than the gap between a live session's per-turn
+/// heartbeats, short enough that a genuinely dead cross-host session frees its
+/// conversation the same day.
+const LIVENESS_STALE_AFTER_NANOS: i64 = 3_600 * 1_000_000_000;
+
+/// The production [`LivenessFn`]. Same machine and boot: the pid probe is
+/// authoritative. Otherwise (a foreign host, or this host after a reboot — where
+/// the stored pid is meaningless) fall back to heartbeat freshness.
+fn system_liveness(owner: &StoredOwner, now: i64) -> bool {
+    let (host, boot_id) = current_host_boot();
+    if owner.host == host && owner.boot_id == boot_id {
+        return pid_is_alive(owner.pid);
+    }
+    now.saturating_sub(owner.heartbeat_tick) < LIVENESS_STALE_AFTER_NANOS
+}
+
+/// Is `pid` a currently-running process? `kill(pid, 0)` delivers no signal but
+/// performs the existence + permission check: `0` = alive; `EPERM` = alive but
+/// owned by another user (still alive); `ESRCH` = gone.
+fn pid_is_alive(pid: i64) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    if pid <= 0 {
+        return false;
+    }
+    // SAFETY: `kill` with signal 0 only probes a pid; it never delivers a signal.
+    let rc = unsafe { libc::kill(pid, 0) };
+    rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// This machine's `(hostname, kernel boot id)`. Both come from `/proc` (Linux —
+/// the dev + CI + deploy target) and degrade to `("localhost", "")` off-Linux,
+/// which simply makes the pid probe the sole liveness signal on the local host.
+fn current_host_boot() -> (String, String) {
+    let host = std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "localhost".to_string());
+    let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    (host, boot_id)
+}
+
+/// Read a raw `live_owners` row (no liveness judgement). Shared by `claim`
+/// (inside its `BEGIN IMMEDIATE` txn) and `live_owner`.
+fn live_owner_row(conn: &Connection, conversation_id: &str) -> anyhow::Result<Option<StoredOwner>> {
+    conn.query_row(
+        "SELECT host, boot_id, pid, writer_fingerprint, heartbeat_tick
+           FROM live_owners WHERE conversation_id = ?1",
+        rusqlite::params![conversation_id],
+        |row| {
+            Ok(StoredOwner {
+                host: row.get(0)?,
+                boot_id: row.get(1)?,
+                pid: row.get(2)?,
+                writer_fingerprint: row.get(3)?,
+                heartbeat_tick: row.get(4)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(Into::into)
 }
 
 fn claim_to_u128(claim: i64) -> u128 {

@@ -426,14 +426,19 @@ pub struct ConversationsConfig {
     pub max_per_workspace: usize,
 
     /// Auto-resume this workspace's most recently active conversation at TUI
-    /// session start (Step 17.7, issue #246). "Most recently active" means
-    /// the highest §6 activity tick — never a wall-clock comparison.
+    /// session start. "Most recently active" means the highest §6 activity
+    /// tick — never a wall-clock comparison.
     ///
-    /// **Default: true.** The off-switch:
+    /// **Default: false** (#1030). Each launch starts a FRESH conversation, so
+    /// running `newt` several times in one folder no longer drags every session
+    /// into — and interleaves their turns onto — that folder's single latest
+    /// conversation (the collision the old `true` default caused). Find and
+    /// reopen a past conversation explicitly with `/resume` instead. Opt back
+    /// into the old auto-resume-latest behavior with:
     ///
     /// ```toml
     /// [conversations]
-    /// resume = false      # always start fresh
+    /// resume = true       # auto-resume the folder's most recent conversation
     /// ```
     ///
     /// Per-session overrides win over this key either way: `--ephemeral`
@@ -448,7 +453,11 @@ fn default_conversations_max_per_workspace() -> usize {
 }
 
 fn default_conversations_resume() -> bool {
-    true
+    // #1030: fresh-on-launch. The old `true` made every launch in a folder
+    // auto-resume that folder's latest conversation, so concurrent `newt`
+    // processes interleaved their turns into one record. `/resume` is now the
+    // explicit way back into a past conversation.
+    false
 }
 
 impl Default for ConversationsConfig {
@@ -4908,8 +4917,9 @@ mod tests {
         let cfg = Config::default();
         let conversations = cfg.conversations.unwrap_or_default();
         assert_eq!(conversations.max_per_workspace, 100);
-        // 17.7: auto-resume defaults ON; `resume = false` is the off-switch.
-        assert!(conversations.resume);
+        // #1030: fresh-on-launch — auto-resume defaults OFF now; `resume = true`
+        // is the opt-in back to auto-resuming the folder's latest conversation.
+        assert!(!conversations.resume);
     }
 
     #[test]
@@ -4924,21 +4934,24 @@ max_per_workspace = 25
 
         let conversations = cfg.conversations.unwrap_or_default();
         assert_eq!(conversations.max_per_workspace, 25);
-        // Partial [conversations] table: unset keys keep their defaults.
-        assert!(conversations.resume);
+        // Partial [conversations] table: unset keys keep their defaults
+        // (#1030: `resume` now defaults false = fresh-on-launch).
+        assert!(!conversations.resume);
     }
 
     #[test]
-    fn conversations_resume_off_switch_parses() {
+    fn conversations_resume_opt_in_parses() {
+        // #1030: `resume = true` opts back into auto-resuming the folder's
+        // latest conversation (the pre-#1030 default, now off by default).
         let cfg: Config = toml::from_str(
             r#"
 [conversations]
-resume = false
+resume = true
 "#,
         )
         .unwrap();
 
-        assert!(!cfg.conversations.unwrap_or_default().resume);
+        assert!(cfg.conversations.unwrap_or_default().resume);
     }
 
     #[test]

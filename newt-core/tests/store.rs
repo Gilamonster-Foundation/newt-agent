@@ -714,6 +714,122 @@ fn conversation_roadmap_link_round_trips_and_defaults_to_none() {
     assert!(cleared.roadmap_id.is_none() && cleared.node_id.is_none());
 }
 
+// ── #1030 collision fix: live_owners claim / release / heartbeat ────────────
+
+#[test]
+fn claim_grants_a_fresh_conversation_and_reaffirms_its_own_claim() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let mut store = ConversationStore::new(root.path(), workspace.path(), 100).unwrap();
+    store.set_owner_for_test("hostA", "boot-1", 1001);
+    // A session claims its freshly-minted id at startup — before any turn is
+    // saved, so the conversation row does not exist yet.
+    let id = newt_core::new_conversation_id();
+
+    assert_eq!(store.claim(&id).unwrap(), newt_core::ClaimOutcome::Claimed);
+    // Re-claiming our OWN conversation is idempotent, not a conflict.
+    assert_eq!(store.claim(&id).unwrap(), newt_core::ClaimOutcome::Claimed);
+
+    let owner = store.live_owner(&id).unwrap().expect("claimed");
+    assert_eq!(owner.host, "hostA");
+    assert_eq!(owner.pid, 1001);
+}
+
+#[test]
+fn a_second_live_process_is_refused_the_same_conversation() {
+    // THE #1030 bug, prevented: two LIVE newts cannot both own one conversation
+    // (which is how their turns interleaved into one record).
+    let root = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let mut store = ConversationStore::new(root.path(), workspace.path(), 100).unwrap();
+    let id = newt_core::new_conversation_id();
+
+    // Process A claims.
+    store.set_owner_for_test("host", "boot-1", 1001);
+    assert_eq!(store.claim(&id).unwrap(), newt_core::ClaimOutcome::Claimed);
+
+    // Process B (different pid) finds A's claim LIVE -> refused, writes nothing.
+    store.set_liveness_for_test(|_owner, _now| true);
+    store.set_owner_for_test("host", "boot-1", 2002);
+    match store.claim(&id).unwrap() {
+        newt_core::ClaimOutcome::HeldBy { pid, host } => {
+            assert_eq!(pid, 1001);
+            assert_eq!(host, "host");
+        }
+        other => panic!("expected HeldBy A, got {other:?}"),
+    }
+    // A still owns it — B did not overwrite the claim.
+    assert_eq!(store.live_owner(&id).unwrap().unwrap().pid, 1001);
+}
+
+#[test]
+fn a_stale_claim_from_a_dead_process_is_reclaimed() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let mut store = ConversationStore::new(root.path(), workspace.path(), 100).unwrap();
+    let id = newt_core::new_conversation_id();
+
+    store.set_owner_for_test("host", "boot-1", 1001);
+    store.claim(&id).unwrap();
+
+    // A has died: the oracle reports its claim not-live. B reclaims cleanly.
+    store.set_liveness_for_test(|_owner, _now| false);
+    store.set_owner_for_test("host", "boot-1", 2002);
+    assert_eq!(store.claim(&id).unwrap(), newt_core::ClaimOutcome::Claimed);
+    assert_eq!(store.live_owner(&id).unwrap().unwrap().pid, 2002);
+}
+
+#[test]
+fn release_frees_only_this_processs_own_claim() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let mut store = ConversationStore::new(root.path(), workspace.path(), 100).unwrap();
+    let id = newt_core::new_conversation_id();
+
+    store.set_owner_for_test("host", "boot-1", 1001);
+    store.claim(&id).unwrap();
+
+    // A different process's release does NOT free A's live claim.
+    store.set_owner_for_test("host", "boot-1", 9999);
+    store.release(&id).unwrap();
+    assert!(
+        store.live_owner(&id).unwrap().is_some(),
+        "a foreign release must be a no-op"
+    );
+
+    // A's own release frees it.
+    store.set_owner_for_test("host", "boot-1", 1001);
+    store.release(&id).unwrap();
+    assert!(store.live_owner(&id).unwrap().is_none());
+}
+
+#[test]
+fn heartbeat_refreshes_freshness_and_is_owner_live_uses_the_oracle() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let mut store = ConversationStore::new(root.path(), workspace.path(), 100).unwrap();
+    let id = newt_core::new_conversation_id();
+
+    store.set_owner_for_test("host", "boot-1", 1001);
+    store.set_claim_clock_for_test(|| 1_000);
+    store.claim(&id).unwrap();
+    assert_eq!(
+        store.live_owner(&id).unwrap().unwrap().heartbeat_tick,
+        1_000
+    );
+
+    store.set_claim_clock_for_test(|| 5_000);
+    store.heartbeat(&id).unwrap();
+    let owner = store.live_owner(&id).unwrap().unwrap();
+    assert_eq!(owner.heartbeat_tick, 5_000);
+
+    // is_owner_live delegates to the injected oracle.
+    store.set_liveness_for_test(|_owner, _now| false);
+    assert!(!store.is_owner_live(&owner));
+    store.set_liveness_for_test(|_owner, _now| true);
+    assert!(store.is_owner_live(&owner));
+}
+
 /// On a healthy local filesystem WAL applies cleanly: no fallback notice.
 /// (The NFS failure itself can't be simulated portably in CI; the error
 /// classifier has unit tests in src/store.rs.)
