@@ -2305,6 +2305,7 @@ fn system_liveness(owner: &StoredOwner, now: i64) -> bool {
 /// Is `pid` a currently-running process? `kill(pid, 0)` delivers no signal but
 /// performs the existence + permission check: `0` = alive; `EPERM` = alive but
 /// owned by another user (still alive); `ESRCH` = gone.
+#[cfg(unix)]
 fn pid_is_alive(pid: i64) -> bool {
     let Ok(pid) = libc::pid_t::try_from(pid) else {
         return false;
@@ -2315,6 +2316,35 @@ fn pid_is_alive(pid: i64) -> bool {
     // SAFETY: `kill` with signal 0 only probes a pid; it never delivers a signal.
     let rc = unsafe { libc::kill(pid, 0) };
     rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// Windows analogue of the `kill(pid, 0)` probe above: `OpenProcess` with the
+/// lightest query right performs the same "does this pid exist" check without
+/// acting on the process. A live pid opens; a dead/reused pid fails with
+/// `ERROR_INVALID_PARAMETER`. `ERROR_ACCESS_DENIED` also means alive — the
+/// process exists but this process lacks rights to query it, the Windows
+/// analogue of the Unix `EPERM` case above.
+#[cfg(windows)]
+fn pid_is_alive(pid: i64) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ACCESS_DENIED};
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+
+    let Ok(pid) = u32::try_from(pid) else {
+        return false;
+    };
+    if pid == 0 {
+        return false;
+    }
+    // SAFETY: `OpenProcess` only queries a handle; it takes no action on the
+    // target process.
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        return std::io::Error::last_os_error().raw_os_error() == Some(ERROR_ACCESS_DENIED as i32);
+    }
+    // SAFETY: `handle` was just returned by the successful `OpenProcess` call
+    // above and is not used again after this call.
+    unsafe { CloseHandle(handle) };
+    true
 }
 
 /// This machine's `(hostname, kernel boot id)`. Both come from `/proc` (Linux —
