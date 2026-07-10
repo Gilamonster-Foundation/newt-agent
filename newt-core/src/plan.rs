@@ -366,6 +366,34 @@ pub struct CrewTask {
 }
 
 impl Subtask {
+    /// #1030: a tree node with the given `id`, `instruction`, [`NodeKind`], and
+    /// optional `parent`, everything else defaulted — `Pending`, no deps/verify/
+    /// result/artifact/conversation, and the default-deny [`CaveatPolicy`]. The
+    /// convenience constructor for authoring a roadmap tree node by node.
+    #[must_use]
+    pub fn node(
+        id: impl Into<String>,
+        instruction: impl Into<String>,
+        kind: NodeKind,
+        parent: Option<String>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            instruction: instruction.into(),
+            deps: Vec::new(),
+            parallel_ok: false,
+            context: Vec::new(),
+            verify: None,
+            status: SubtaskStatus::default(),
+            result: None,
+            parent,
+            kind,
+            conversation_id: None,
+            artifact_ref: None,
+            caveat_policy: CaveatPolicy::default(),
+        }
+    }
+
     /// Project this subtask into the [`CrewTask`] the active topology's
     /// `CrewRunner` dispatches — the *same* projection for `/mode
     /// single|crew|mesh|remote`, so a plan authored once lifts across runners
