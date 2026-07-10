@@ -130,7 +130,8 @@ pub use role_profile::{
 pub use router::{Router, Tier};
 pub use session::SessionId;
 pub use store::{
-    sanitize_fts5_query, ClaimOutcome, ConversationStore, LivenessFn, SearchHit, StoredOwner,
+    sanitize_fts5_query, ClaimOutcome, ConversationStore, LivenessFn, Roadmap, RoadmapSummary,
+    SearchHit, StoredOwner,
 };
 pub use tokens::TokenEstimation;
 pub use workflows::{

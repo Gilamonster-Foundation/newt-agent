@@ -830,6 +830,71 @@ fn heartbeat_refreshes_freshness_and_is_owner_live_uses_the_oracle() {
     assert!(store.is_owner_live(&owner));
 }
 
+// ── #1030 roadmap CRUD ──────────────────────────────────────────────────────
+
+#[test]
+fn roadmap_crud_round_trips_the_tree() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let store = ConversationStore::new(root.path(), workspace.path(), 100).unwrap();
+
+    // A small Roadmap→Phase→Plan tree authored as a plan.rs::Plan.
+    let toml = r#"
+[[subtask]]
+id = "road"
+instruction = "the roadmap"
+kind = "roadmap"
+
+[[subtask]]
+id = "phase-1"
+instruction = "phase one"
+kind = "phase"
+parent = "road"
+
+[[subtask]]
+id = "plan-1"
+instruction = "implement it"
+kind = "plan"
+parent = "phase-1"
+"#;
+    let tree = newt_core::plan::Plan::from_toml_str(toml).unwrap();
+    store
+        .create_roadmap("rm-1", "Mermaid in Rust", &tree)
+        .unwrap();
+
+    // Load round-trips the tree byte-for-byte (same Plan value).
+    let loaded = store.load_roadmap("rm-1").unwrap().expect("roadmap exists");
+    assert_eq!(loaded.title, "Mermaid in Rust");
+    assert_eq!(loaded.tree, tree);
+    assert_eq!(loaded.tree.subtasks.len(), 3);
+
+    // Update replaces the tree (grow a Task under the plan).
+    let grown_toml = format!(
+        "{toml}\n[[subtask]]\nid = \"task-1\"\ninstruction = \"commit\"\nkind = \"task\"\nparent = \"plan-1\"\n"
+    );
+    let grown = newt_core::plan::Plan::from_toml_str(&grown_toml).unwrap();
+    store.update_roadmap("rm-1", &grown).unwrap();
+    assert_eq!(
+        store
+            .load_roadmap("rm-1")
+            .unwrap()
+            .unwrap()
+            .tree
+            .subtasks
+            .len(),
+        4
+    );
+
+    // list_roadmaps surfaces it with a node count.
+    let list = store.list_roadmaps().unwrap();
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0].id, "rm-1");
+    assert_eq!(list[0].node_count, 4);
+
+    // An absent id loads as None (not an error).
+    assert!(store.load_roadmap("nope").unwrap().is_none());
+}
+
 /// On a healthy local filesystem WAL applies cleanly: no fallback notice.
 /// (The NFS failure itself can't be simulated portably in CI; the error
 /// classifier has unit tests in src/store.rs.)

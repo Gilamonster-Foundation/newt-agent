@@ -903,6 +903,107 @@ impl ConversationStore {
         (self.liveness)(owner, (self.claim_clock)())
     }
 
+    // ── #1030 roadmap CRUD: the Roadmap→Phase→Plan→Task tree, persisted as a
+    //    serialized plan.rs::Plan blob in the workspace-fenced `roadmaps` table ──
+
+    /// Create (or overwrite) a roadmap with `id`, `title`, and `tree` — the
+    /// serialized [`crate::plan::Plan`] of Roadmap/Phase/Plan/Task nodes.
+    /// Workspace-fenced. Overwrite is intentional (re-create replaces the tree),
+    /// matching the conversation store's `create_with_id` semantics.
+    pub fn create_roadmap(
+        &self,
+        id: &str,
+        title: &str,
+        tree: &crate::plan::Plan,
+    ) -> anyhow::Result<()> {
+        validate_record_id(id)?;
+        let now = (self.claim_clock)();
+        let toml = tree.to_toml_string()?;
+        let conn = self.lock_conn();
+        conn.execute(
+            "INSERT OR REPLACE INTO roadmaps
+               (id, workspace_key, title, tree, schema_version, created_at_claim, updated_at_claim)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
+            rusqlite::params![
+                id,
+                self.workspace_id,
+                title.trim(),
+                toml,
+                ROADMAP_SCHEMA_VERSION,
+                now
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Load roadmap `id` (workspace-fenced), deserializing its `tree` blob back
+    /// into a [`crate::plan::Plan`]. `None` when absent. A tree column that is
+    /// not valid plan TOML is a hard error — never hand back a garbage tree.
+    pub fn load_roadmap(&self, id: &str) -> anyhow::Result<Option<Roadmap>> {
+        let conn = self.lock_conn();
+        let row = conn
+            .query_row(
+                "SELECT title, tree FROM roadmaps WHERE id = ?1 AND workspace_key = ?2",
+                rusqlite::params![id, self.workspace_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        let Some((title, toml)) = row else {
+            return Ok(None);
+        };
+        let tree = crate::plan::Plan::from_toml_str(&toml).map_err(|e| {
+            anyhow::anyhow!("roadmap `{id}`: tree column is not valid plan TOML ({e})")
+        })?;
+        Ok(Some(Roadmap {
+            id: id.to_string(),
+            title,
+            tree,
+        }))
+    }
+
+    /// Replace roadmap `id`'s tree (workspace-fenced). A no-op if absent.
+    pub fn update_roadmap(&self, id: &str, tree: &crate::plan::Plan) -> anyhow::Result<()> {
+        let now = (self.claim_clock)();
+        let toml = tree.to_toml_string()?;
+        let conn = self.lock_conn();
+        conn.execute(
+            "UPDATE roadmaps SET tree = ?2, updated_at_claim = ?3
+              WHERE id = ?1 AND workspace_key = ?4",
+            rusqlite::params![id, toml, now, self.workspace_id],
+        )?;
+        Ok(())
+    }
+
+    /// This workspace's roadmaps, most-recently-updated first.
+    pub fn list_roadmaps(&self) -> anyhow::Result<Vec<RoadmapSummary>> {
+        let conn = self.lock_conn();
+        let mut stmt = conn.prepare(
+            "SELECT id, title, tree FROM roadmaps
+              WHERE workspace_key = ?1
+              ORDER BY updated_at_claim DESC, id DESC",
+        )?;
+        let rows = stmt.query_map([&self.workspace_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, title, toml) = row?;
+            let node_count = crate::plan::Plan::from_toml_str(&toml)
+                .map(|p| p.subtasks.len())
+                .unwrap_or(0);
+            out.push(RoadmapSummary {
+                id,
+                title,
+                node_count,
+            });
+        }
+        Ok(out)
+    }
+
     /// Rename a conversation. Updates the display claim but does NOT tick
     /// the activity clock: a rename is metadata, not activity, so it cannot
     /// perturb MRU ordering (§6 dissolved the old rename-bumps-`updated_at`
@@ -2246,6 +2347,28 @@ fn now_claim_nanos() -> i64 {
 }
 
 // ── #1030 collision fix: one live owner per conversation (live_owners) ──────
+
+/// The current on-disk schema version of a roadmap's serialized tree (#1030).
+/// Bumped only on a forward-incompatible change to the `plan.rs::Plan` shape;
+/// `Subtask`'s `deny_unknown_fields` makes such a change loud, not silent.
+const ROADMAP_SCHEMA_VERSION: i64 = 1;
+
+/// A #1030 roadmap loaded from the store: the Roadmap→Phase→Plan→Task tree as a
+/// [`crate::plan::Plan`], plus its id and title.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Roadmap {
+    pub id: String,
+    pub title: String,
+    pub tree: crate::plan::Plan,
+}
+
+/// A one-line roadmap summary for listings (#1030).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoadmapSummary {
+    pub id: String,
+    pub title: String,
+    pub node_count: usize,
+}
 
 /// A `live_owners` row (#1030) — a process that has a conversation open —
 /// handed to the [`LivenessFn`] to decide whether it is still LIVE.

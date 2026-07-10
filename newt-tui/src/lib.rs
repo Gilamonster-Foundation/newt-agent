@@ -5850,6 +5850,9 @@ fn run_chat(
     // #1030: the ids from the most recent `/resume` listing, so `/resume <n>`
     // selects by the number the user just saw. Rebuilt on every browse/search.
     let mut last_resume_listing: Vec<String> = Vec::new();
+    // #1030: the roadmap this session is authoring/viewing (via /roadmap new|use);
+    // /roadmap add and /tree operate on it. None until one is created or selected.
+    let mut active_roadmap_id: Option<String> = None;
 
     // 17.7 session-start resume. Both arms go through the SAME restore
     // implementation `/conversation restore` uses — one restore path.
@@ -6795,6 +6798,30 @@ fn run_chat(
                                             ),
                                         }
                                     }
+                                }
+                            }
+                            None => print_newt(EPHEMERAL_SESSION_NOTICE, color, verbose),
+                        }
+                        surface.save_history();
+                        println!();
+                        continue;
+                    }
+                    // #1030: /roadmap — author + view a Roadmap→Phase→Plan→Task
+                    // tree; /tree renders the active roadmap (alias of /roadmap show).
+                    if slash_body == "roadmap"
+                        || slash_body.starts_with("roadmap ")
+                        || slash_body == "tree"
+                    {
+                        let cmd = if slash_body == "tree" {
+                            "/roadmap show".to_string()
+                        } else {
+                            task.clone()
+                        };
+                        match conversation_store.as_ref() {
+                            Some(store) => {
+                                match handle_roadmap_command(&cmd, store, &mut active_roadmap_id) {
+                                    Ok(msg) => print_newt(&msg, color, verbose),
+                                    Err(e) => print_newt(&format!("error: {e}"), color, verbose),
                                 }
                             }
                             None => print_newt(EPHEMERAL_SESSION_NOTICE, color, verbose),
@@ -9397,6 +9424,267 @@ fn resume_search_message(
     Ok((out, ids))
 }
 
+// ── #1030 /roadmap — author + view a Roadmap→Phase→Plan→Task tree ────────────
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RoadmapCommand {
+    /// `/roadmap` or `/roadmap show [id]` — render a roadmap's tree.
+    Show(Option<String>),
+    /// `/roadmap list` — list this workspace's roadmaps.
+    List,
+    /// `/roadmap new <title>` — create an empty roadmap and make it active.
+    New(String),
+    /// `/roadmap use <id>` — set the active roadmap.
+    Use(String),
+    /// `/roadmap add <kind> <title> [under <node-id>]` — append a node.
+    Add {
+        kind: newt_core::plan::NodeKind,
+        title: String,
+        under: Option<String>,
+    },
+}
+
+fn parse_node_kind(s: &str) -> Option<newt_core::plan::NodeKind> {
+    use newt_core::plan::NodeKind;
+    match s.to_ascii_lowercase().as_str() {
+        "roadmap" => Some(NodeKind::Roadmap),
+        "phase" => Some(NodeKind::Phase),
+        "plan" => Some(NodeKind::Plan),
+        "task" => Some(NodeKind::Task),
+        _ => None,
+    }
+}
+
+fn parse_roadmap_command(input: &str) -> anyhow::Result<RoadmapCommand> {
+    let body = input.trim().trim_start_matches('/').trim();
+    let rest = body.strip_prefix("roadmap").map(str::trim).unwrap_or("");
+    let mut parts = rest.split_whitespace();
+    match parts.next() {
+        None | Some("show") => Ok(RoadmapCommand::Show(parts.next().map(str::to_string))),
+        Some("list") => Ok(RoadmapCommand::List),
+        Some("new") => {
+            let title = parts.collect::<Vec<_>>().join(" ");
+            if title.trim().is_empty() {
+                anyhow::bail!("usage: /roadmap new <title>");
+            }
+            Ok(RoadmapCommand::New(title.trim().to_string()))
+        }
+        Some("use") => match parts.next() {
+            Some(id) => Ok(RoadmapCommand::Use(id.to_string())),
+            None => anyhow::bail!("usage: /roadmap use <id>"),
+        },
+        Some("add") => {
+            let kind = parts.next().and_then(parse_node_kind).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "usage: /roadmap add <roadmap|phase|plan|task> <title> [under <node-id>]"
+                )
+            })?;
+            let joined = parts.collect::<Vec<_>>().join(" ");
+            let (title, under) = match joined.rsplit_once(" under ") {
+                Some((t, u)) => (t.trim().to_string(), Some(u.trim().to_string())),
+                None => (joined.trim().to_string(), None),
+            };
+            if title.is_empty() {
+                anyhow::bail!("usage: /roadmap add <kind> <title> [under <node-id>]");
+            }
+            Ok(RoadmapCommand::Add { kind, title, under })
+        }
+        Some(other) => {
+            anyhow::bail!("unknown /roadmap subcommand `{other}` (try: list, new, show, use, add)")
+        }
+    }
+}
+
+fn node_kind_label(kind: newt_core::plan::NodeKind) -> &'static str {
+    use newt_core::plan::NodeKind;
+    match kind {
+        NodeKind::Roadmap => "roadmap",
+        NodeKind::Phase => "phase",
+        NodeKind::Plan => "plan",
+        NodeKind::Task => "task",
+    }
+}
+
+fn node_status_glyph(status: newt_core::plan::SubtaskStatus) -> &'static str {
+    use newt_core::plan::SubtaskStatus;
+    match status {
+        SubtaskStatus::Pending => "○",
+        SubtaskStatus::Running => "◐",
+        SubtaskStatus::Done => "✓",
+        SubtaskStatus::Failed => "✗",
+    }
+}
+
+/// The next auto node id for a roadmap (`node-N`), skipping any already taken.
+fn next_roadmap_node_id(tree: &newt_core::plan::Plan) -> String {
+    let mut n = tree.subtasks.len() + 1;
+    loop {
+        let id = format!("node-{n}");
+        if tree.subtask(&id).is_none() {
+            return id;
+        }
+        n += 1;
+    }
+}
+
+/// Render a roadmap's tree as a depth-first plain-scroller outline (#1030): one
+/// line per node — status glyph, kind, id, instruction — indented by depth.
+fn render_roadmap_tree(roadmap: &newt_core::Roadmap) -> String {
+    let mut out = format!(
+        "Roadmap: {}  [{}]",
+        roadmap.title,
+        short_conversation_id(&roadmap.id)
+    );
+    if roadmap.tree.subtasks.is_empty() {
+        out.push_str("\n  (no nodes yet — add one with /roadmap add <phase|plan|task> <title>)");
+        return out;
+    }
+    fn walk(
+        plan: &newt_core::plan::Plan,
+        node: &newt_core::plan::Subtask,
+        depth: usize,
+        out: &mut String,
+    ) {
+        // Depth cap: a real roadmap is shallow; this bounds a hand-corrupted
+        // tree whose soft parent pointers form a cycle so render can't overflow
+        // the stack (authoring via /roadmap add can't create one — a new node is
+        // always a leaf — but a hand-edited tree blob could).
+        if depth > 64 {
+            out.push_str("\n  … (tree too deep — possible cycle in parent pointers)");
+            return;
+        }
+        out.push_str(&format!(
+            "\n{}{} {} [{}]  {}",
+            "  ".repeat(depth + 1),
+            node_status_glyph(node.status),
+            node_kind_label(node.kind),
+            node.id,
+            node.instruction,
+        ));
+        for child in plan.children(&node.id) {
+            walk(plan, child, depth + 1, out);
+        }
+    }
+    for root in roadmap.tree.roots() {
+        walk(&roadmap.tree, root, 0, &mut out);
+    }
+    out.push_str("\n  ○ pending · ◐ running · ✓ done · ✗ failed");
+    out
+}
+
+/// Resolve a roadmap id or unique short-prefix against this workspace's
+/// roadmaps (roadmaps have no FTS `resolve_id`; scan the small list).
+fn resolve_roadmap_id(
+    store: &newt_core::ConversationStore,
+    id_or_prefix: &str,
+) -> anyhow::Result<String> {
+    let matches: Vec<String> = store
+        .list_roadmaps()?
+        .into_iter()
+        .map(|r| r.id)
+        .filter(|id| id == id_or_prefix || id.starts_with(id_or_prefix))
+        .collect();
+    match matches.as_slice() {
+        [one] => Ok(one.clone()),
+        [] => anyhow::bail!("no roadmap matches `{id_or_prefix}`"),
+        many => anyhow::bail!(
+            "`{id_or_prefix}` is ambiguous ({} roadmaps match)",
+            many.len()
+        ),
+    }
+}
+
+fn handle_roadmap_command(
+    input: &str,
+    store: &newt_core::ConversationStore,
+    active_roadmap_id: &mut Option<String>,
+) -> anyhow::Result<String> {
+    match parse_roadmap_command(input)? {
+        RoadmapCommand::List => {
+            let roadmaps = store.list_roadmaps()?;
+            if roadmaps.is_empty() {
+                return Ok("No roadmaps yet — create one with /roadmap new <title>.".to_string());
+            }
+            let mut out = String::from("Roadmaps (most recently updated first):");
+            for r in &roadmaps {
+                let marker = if active_roadmap_id.as_deref() == Some(r.id.as_str()) {
+                    "▶"
+                } else {
+                    " "
+                };
+                out.push_str(&format!(
+                    "\n  {} {}  {}  ({} nodes)",
+                    marker,
+                    short_conversation_id(&r.id),
+                    r.title,
+                    r.node_count,
+                ));
+            }
+            out.push_str(
+                "\nView with /roadmap show <id> or /tree; set active with /roadmap use <id>.",
+            );
+            Ok(out)
+        }
+        RoadmapCommand::New(title) => {
+            let id = newt_core::new_conversation_id();
+            store.create_roadmap(&id, &title, &newt_core::plan::Plan::default())?;
+            *active_roadmap_id = Some(id.clone());
+            Ok(format!(
+                "Created roadmap \"{title}\" [{}] and set it active. Add nodes with \
+                 /roadmap add <kind> <title>; view with /tree.",
+                short_conversation_id(&id)
+            ))
+        }
+        RoadmapCommand::Use(id_or_prefix) => {
+            let id = resolve_roadmap_id(store, &id_or_prefix)?;
+            *active_roadmap_id = Some(id.clone());
+            Ok(format!(
+                "Active roadmap set to [{}].",
+                short_conversation_id(&id)
+            ))
+        }
+        RoadmapCommand::Show(maybe) => {
+            let id = match maybe {
+                Some(p) => resolve_roadmap_id(store, &p)?,
+                None => active_roadmap_id.clone().ok_or_else(|| {
+                    anyhow::anyhow!("no active roadmap — /roadmap new <title> or /roadmap use <id>")
+                })?,
+            };
+            let rm = store.load_roadmap(&id)?.ok_or_else(|| {
+                anyhow::anyhow!("roadmap [{}] not found", short_conversation_id(&id))
+            })?;
+            Ok(render_roadmap_tree(&rm))
+        }
+        RoadmapCommand::Add { kind, title, under } => {
+            let id = active_roadmap_id
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("no active roadmap — /roadmap new <title> first"))?;
+            let mut rm = store.load_roadmap(&id)?.ok_or_else(|| {
+                anyhow::anyhow!("active roadmap [{}] not found", short_conversation_id(&id))
+            })?;
+            let parent = match under {
+                Some(p) => {
+                    if rm.tree.subtask(&p).is_none() {
+                        anyhow::bail!("no node `{p}` in this roadmap (see /tree)");
+                    }
+                    Some(p)
+                }
+                None => None,
+            };
+            let node_id = next_roadmap_node_id(&rm.tree);
+            rm.tree.subtasks.push(newt_core::plan::Subtask::node(
+                &node_id, title, kind, parent,
+            ));
+            store.update_roadmap(&id, &rm.tree)?;
+            Ok(format!(
+                "Added {} node [{}]. /tree to view.",
+                node_kind_label(kind),
+                node_id
+            ))
+        }
+    }
+}
+
 /// Make a raw FTS5 snippet readable in the TUI: collapse internal whitespace
 /// (turn text is multi-line; each snippet must stay on its own row) and
 /// replace the store's `>>>`/`<<<` match markers with `«`/`»`, which read as
@@ -11081,6 +11369,8 @@ fn help_lines() -> &'static [&'static str] {
         "  /conversation rm <id>    - alias for /conversation delete",
         "  /recall [query]          - recent conversations, or full-text search",
         "  /resume [query|n|id]     - find & reopen a past conversation (listed by liveness, searchable)",
+        "  /roadmap [sub]           - #1030 plan tree: new <title> · list · show <id> · use <id> · add <kind> <title>",
+        "  /tree                    - render the active roadmap's Roadmap→Phase→Plan→Task tree",
         "  /persona list            - list configured personas",
         "  /persona show            - show the active persona",
         "  /persona <name>          - start fresh with a persona",
@@ -14991,6 +15281,116 @@ mod skills_integration_tests {
         assert_eq!(ids, vec![id]);
         assert!(msg.contains("1. "), "numbered: {msg}");
         assert!(msg.contains("Parser work"));
+    }
+
+    #[test]
+    fn roadmap_commands_parse_expected_actions() {
+        use newt_core::plan::NodeKind;
+        assert_eq!(
+            parse_roadmap_command("/roadmap").unwrap(),
+            RoadmapCommand::Show(None)
+        );
+        assert_eq!(
+            parse_roadmap_command("/roadmap list").unwrap(),
+            RoadmapCommand::List
+        );
+        assert_eq!(
+            parse_roadmap_command("/roadmap show rm-1").unwrap(),
+            RoadmapCommand::Show(Some("rm-1".into()))
+        );
+        assert_eq!(
+            parse_roadmap_command("/roadmap new Mermaid in Rust").unwrap(),
+            RoadmapCommand::New("Mermaid in Rust".into())
+        );
+        assert_eq!(
+            parse_roadmap_command("/roadmap use rm-1").unwrap(),
+            RoadmapCommand::Use("rm-1".into())
+        );
+        assert_eq!(
+            parse_roadmap_command("/roadmap add phase Build the parser").unwrap(),
+            RoadmapCommand::Add {
+                kind: NodeKind::Phase,
+                title: "Build the parser".into(),
+                under: None
+            }
+        );
+        assert_eq!(
+            parse_roadmap_command("/roadmap add plan Implement it under phase-1").unwrap(),
+            RoadmapCommand::Add {
+                kind: NodeKind::Plan,
+                title: "Implement it".into(),
+                under: Some("phase-1".into())
+            }
+        );
+        assert!(parse_roadmap_command("/roadmap new").is_err());
+        assert!(parse_roadmap_command("/roadmap add nonsense x").is_err());
+    }
+
+    #[test]
+    fn help_lists_the_roadmap_and_tree_commands() {
+        assert!(help_lines().iter().any(|l| l.contains("/roadmap")));
+        assert!(help_lines().iter().any(|l| l.contains("/tree")));
+    }
+
+    #[test]
+    fn render_roadmap_tree_outlines_nodes_by_depth() {
+        let toml = "\
+[[subtask]]
+id = \"road\"
+instruction = \"the roadmap\"
+kind = \"roadmap\"
+
+[[subtask]]
+id = \"phase-1\"
+instruction = \"phase one\"
+kind = \"phase\"
+parent = \"road\"
+";
+        let tree = newt_core::plan::Plan::from_toml_str(toml).unwrap();
+        let rm = newt_core::Roadmap {
+            id: "rm-123456789012".into(),
+            title: "Demo".into(),
+            tree,
+        };
+        let out = render_roadmap_tree(&rm);
+        assert!(out.contains("Roadmap: Demo"));
+        assert!(out.contains("roadmap [road]"));
+        assert!(out.contains("phase [phase-1]"));
+        // The child (phase-1) is indented deeper than its parent (road).
+        let road_indent = out
+            .lines()
+            .find(|l| l.contains("[road]"))
+            .unwrap()
+            .find('○');
+        let phase_indent = out
+            .lines()
+            .find(|l| l.contains("[phase-1]"))
+            .unwrap()
+            .find('○');
+        assert!(phase_indent > road_indent, "child indented deeper: {out}");
+    }
+
+    #[test]
+    fn empty_roadmap_renders_a_hint() {
+        let rm = newt_core::Roadmap {
+            id: "rm-1".into(),
+            title: "Empty".into(),
+            tree: newt_core::plan::Plan::default(),
+        };
+        assert!(render_roadmap_tree(&rm).contains("no nodes yet"));
+    }
+
+    #[test]
+    fn next_roadmap_node_id_avoids_collisions() {
+        let mut tree = newt_core::plan::Plan::default();
+        assert_eq!(next_roadmap_node_id(&tree), "node-1");
+        tree.subtasks.push(newt_core::plan::Subtask::node(
+            "node-1",
+            "x",
+            newt_core::plan::NodeKind::Task,
+            None,
+        ));
+        assert_eq!(next_roadmap_node_id(&tree), "node-2");
     }
 
     #[test]
