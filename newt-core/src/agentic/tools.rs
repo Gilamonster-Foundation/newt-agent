@@ -526,7 +526,11 @@ fn is_always_on_tool(name: &str) -> bool {
 /// predicate behind BOTH the advertise-filter ([`filter_advertised_tools`])
 /// and the executor reject ([`execute_tool_with_offload`]) so the set the model
 /// SEES and the set it may RUN can never drift apart.
-pub(crate) fn persona_tool_allowed(name: &str, allow: &[String]) -> bool {
+///
+/// `pub` (not `pub(crate)`) since #1021 PR 5.2: a headless entry point
+/// (`newt-mcp-server`) filters its own, separately-built catalog by the same
+/// rule rather than reimplementing it.
+pub fn persona_tool_allowed(name: &str, allow: &[String]) -> bool {
     allow.iter().any(|t| t == name) || is_always_on_tool(name)
 }
 
@@ -544,7 +548,11 @@ fn tool_def_name(def: &serde_json::Value) -> Option<&str> {
 /// tools [`persona_tool_allowed`] admits (the persona's names ∪ the always-on
 /// infra). Pure over `serde_json::Value`; the caller wraps
 /// [`merged_tool_definitions`] with it at each catalog site.
-pub(crate) fn filter_advertised_tools(
+///
+/// `pub` (not `pub(crate)`) since #1021 PR 5.2: a headless entry point
+/// (`newt-mcp-server`) filters its own, separately-built catalog by the same
+/// rule rather than reimplementing it.
+pub fn filter_advertised_tools(
     defs: serde_json::Value,
     allow: Option<&[String]>,
 ) -> serde_json::Value {

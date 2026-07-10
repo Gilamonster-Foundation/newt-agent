@@ -483,6 +483,43 @@ impl RoleProfile {
             || self.tier.is_some()
             || self.altitude.is_some()
     }
+
+    /// Load a named persona `.md` file from `dir` (#1021 PR 5.2 — the
+    /// headless counterpart of `newt-tui`'s `PersonaStore::load`).
+    ///
+    /// Deliberately does **not** seed a shipped default when the file is
+    /// missing — `PersonaStore`'s per-file-idempotent seeding (FR-16, #1000)
+    /// is correct first-run UX for an interactive session, but a stdio
+    /// server silently writing files into `~/.newt/personas/` on every
+    /// startup is a footgun under CI/systemd. A headless caller with an
+    /// unresolvable `--persona <name>` should fail loudly instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `name` isn't a valid persona name (letters,
+    /// numbers, `-`, `_` only — the same rule `PersonaStore` enforces, kept
+    /// in sync deliberately rather than shared, since crossing the
+    /// `newt-core`/`newt-tui` boundary for an 8-line check isn't worth the
+    /// coupling), if the file doesn't exist, or if it fails to parse.
+    pub fn load_from_dir(name: &str, dir: &std::path::Path) -> anyhow::Result<Self> {
+        let name = name.trim().to_ascii_lowercase();
+        if name.is_empty()
+            || !name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            anyhow::bail!("persona names may only contain letters, numbers, '-' and '_'");
+        }
+        let path = dir.join(format!("{name}.md"));
+        let raw = std::fs::read_to_string(&path).map_err(|e| {
+            anyhow::anyhow!("persona `{name}` not found at {}: {e}", path.display())
+        })?;
+        let profile = Self::parse(&raw).map_err(|e| anyhow::anyhow!("persona `{name}`: {e}"))?;
+        if profile.prompt.is_empty() {
+            anyhow::bail!("persona `{name}` is empty: {}", path.display());
+        }
+        Ok(profile)
+    }
 }
 
 /// Split optional `+++`-fenced TOML front-matter from a markdown body.
@@ -954,5 +991,60 @@ fs_read = [\"src/\", \"docs/\"]
             p.clamp().fs_read,
             Scope::only(["src/".to_string(), "docs/".to_string()])
         );
+    }
+
+    // --- #1021 PR 5.2: headless `RoleProfile::load_from_dir` -------------
+
+    #[test]
+    fn load_from_dir_parses_an_existing_persona() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("personal-assistant.md"),
+            "+++\nrole = \"personal-assistant\"\ntools = [\"a\"]\n+++\n\n# PA\nbody\n",
+        )
+        .unwrap();
+        let rp = RoleProfile::load_from_dir("personal-assistant", tmp.path()).unwrap();
+        assert_eq!(rp.role.as_deref(), Some("personal-assistant"));
+        assert_eq!(rp.prompt, "# PA\nbody");
+    }
+
+    #[test]
+    fn load_from_dir_errors_loudly_on_a_missing_file_no_seeding() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let err = RoleProfile::load_from_dir("nope", tmp.path())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not found"), "got: {err}");
+        assert!(
+            !tmp.path().join("nope.md").exists(),
+            "a missing persona must NOT be silently seeded (headless callers fail loudly instead)"
+        );
+    }
+
+    #[test]
+    fn load_from_dir_rejects_invalid_names() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let err = RoleProfile::load_from_dir("bad name!", tmp.path())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("letters, numbers"), "got: {err}");
+    }
+
+    #[test]
+    fn load_from_dir_rejects_an_empty_persona_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("blank.md"), "   \n").unwrap();
+        let err = RoleProfile::load_from_dir("blank", tmp.path())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("is empty"), "got: {err}");
+    }
+
+    #[test]
+    fn load_from_dir_lowercases_the_name() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("coach.md"), "# Coach\nbody\n").unwrap();
+        let rp = RoleProfile::load_from_dir("  CoAcH  ", tmp.path()).unwrap();
+        assert_eq!(rp.prompt, "# Coach\nbody");
     }
 }
