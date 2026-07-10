@@ -3560,6 +3560,18 @@ impl Config {
         dirs
     }
 
+    /// The personas directory: sibling of `~/.newt/config.toml`, i.e.
+    /// `~/.newt/personas`. Falls back to a relative `./personas` only when
+    /// `$HOME` can't be resolved. The same default `newt-tui`'s
+    /// `PersonaStore::default_dir()` uses; a headless caller (#1021 PR 5.2)
+    /// resolves it the same way without depending on `newt-tui`.
+    #[must_use]
+    pub fn personas_dir() -> PathBuf {
+        Self::user_config_path()
+            .map(|p| p.with_file_name("personas"))
+            .unwrap_or_else(|| PathBuf::from("personas"))
+    }
+
     /// Serialize this config and write it to `path`, creating parent dirs if needed.
     pub fn save(&self, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
@@ -4795,6 +4807,19 @@ mod tests {
         // The parent component is `.newt`.
         assert_eq!(
             dirs[0].parent().and_then(|p| p.file_name()),
+            Some(".newt".as_ref())
+        );
+    }
+
+    /// #1021 PR 5.2: `personas_dir()` is the sibling-of-config default
+    /// `PersonaStore::default_dir()` (newt-tui) also resolves to — a headless
+    /// caller gets the exact same location without depending on newt-tui.
+    #[test]
+    fn personas_dir_is_a_sibling_of_the_newt_config_dir() {
+        let dir = Config::personas_dir();
+        assert!(dir.ends_with("personas"));
+        assert_eq!(
+            dir.parent().and_then(|p| p.file_name()),
             Some(".newt".as_ref())
         );
     }
