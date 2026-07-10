@@ -9904,6 +9904,11 @@ enum RoadmapCommand {
     /// it closes, ripple completion up the tree, halting at the first node that
     /// still needs work. Closes only nodes whose OBJECTIVE evaluator passes.
     Drive,
+    /// `/roadmap task <node-id> commit [<sha>]` (#1062) — bind a Task node to the
+    /// commit that realizes it (default: current `HEAD`), setting
+    /// `artifact_ref.commit`/`branch` so `/roadmap eval` closes the Task from git
+    /// truth instead of a manual `/roadmap done`.
+    TaskCommit { node: String, sha: Option<String> },
 }
 
 fn parse_node_kind(s: &str) -> Option<newt_core::plan::NodeKind> {
@@ -9956,10 +9961,23 @@ fn parse_roadmap_command(input: &str) -> anyhow::Result<RoadmapCommand> {
         Some("done") => Ok(RoadmapCommand::Done(parts.next().map(str::to_string))),
         Some("eval") => Ok(RoadmapCommand::Eval(parts.next().map(str::to_string))),
         Some("drive") => Ok(RoadmapCommand::Drive),
+        Some("task") => {
+            let node = parts
+                .next()
+                .map(str::to_string)
+                .ok_or_else(|| anyhow::anyhow!("usage: /roadmap task <node-id> commit [<sha>]"))?;
+            match parts.next() {
+                Some("commit") => Ok(RoadmapCommand::TaskCommit {
+                    node,
+                    sha: parts.next().map(str::to_string),
+                }),
+                _ => anyhow::bail!("usage: /roadmap task <node-id> commit [<sha>]"),
+            }
+        }
         Some(other) => {
             anyhow::bail!(
                 "unknown /roadmap subcommand `{other}` \
-                 (try: list, new, show, use, add, next, bind, done, eval, drive)"
+                 (try: list, new, show, use, add, next, bind, done, eval, drive, task)"
             )
         }
     }
@@ -10533,6 +10551,50 @@ fn handle_roadmap_command(
                 roadmap_next_hint(&rm.tree)
             ));
             Ok(RoadmapOutcome::msg(out))
+        }
+        RoadmapCommand::TaskCommit { node, sha } => {
+            let id = require_active(active_roadmap_id)?;
+            let mut rm = store.load_roadmap(&id)?.ok_or_else(|| {
+                anyhow::anyhow!("active roadmap [{}] not found", short_conversation_id(&id))
+            })?;
+            let target = rm
+                .tree
+                .subtask(&node)
+                .ok_or_else(|| anyhow::anyhow!("no node `{node}` in this roadmap (see /tree)"))?;
+            if target.kind != newt_core::plan::NodeKind::Task {
+                anyhow::bail!(
+                    "node [{node}] is a {} — only a Task binds a commit",
+                    node_kind_label(target.kind)
+                );
+            }
+            // Resolve the commit: the given sha, or the workspace's current HEAD.
+            let engine = newt_git::GitEngine::open(std::path::Path::new(workspace)).ok();
+            let status = engine.as_ref().and_then(|e| {
+                e.status(&newt_core::git_caveats::GitCaveats::read_only())
+                    .ok()
+            });
+            let branch = status.as_ref().and_then(|s| s.branch.clone());
+            let commit = match sha {
+                Some(s) => s,
+                None => status
+                    .as_ref()
+                    .and_then(|s| s.head.clone())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "no HEAD to bind (not a git repo, or an unborn HEAD) — \
+                             make a commit first, or pass one: /roadmap task {node} commit <sha>"
+                        )
+                    })?,
+            };
+            rm.tree
+                .set_artifact_commit(&node, &commit, branch.as_deref());
+            store.update_roadmap(&id, &rm.tree)?;
+            let short = commit.get(..8).unwrap_or(&commit);
+            let on = branch.map(|b| format!(" on {b}")).unwrap_or_default();
+            Ok(RoadmapOutcome::msg(format!(
+                "Bound task [{node}] to commit {short}{on}. \
+                 /roadmap eval [{node}] now checks it against git."
+            )))
         }
     }
 }
@@ -12221,7 +12283,7 @@ fn help_lines() -> &'static [&'static str] {
         "  /conversation rm <id>    - alias for /conversation delete",
         "  /recall [query]          - recent conversations, or full-text search",
         "  /resume [query|n|id]     - find & reopen a past conversation (listed by liveness, searchable)",
-        "  /roadmap [sub]           - #1030 plan tree: new·list·show·use·add · next·bind·done·eval·drive (headless cascade)",
+        "  /roadmap [sub]           - #1030 plan tree: new·list·show·use·add · next·bind·done·eval·drive · task <n> commit [sha]",
         "  /tree                    - render the active roadmap tree (▶ marks the next-ready node / DFS cursor)",
         "  /persona list            - list configured personas",
         "  /persona show            - show the active persona",
@@ -16282,6 +16344,29 @@ parent = \"road\"
         assert_eq!(
             parse_roadmap_command("/roadmap drive").unwrap(),
             RoadmapCommand::Drive
+        );
+        // #1062: task <node> commit [sha] — HEAD when the sha is omitted.
+        assert_eq!(
+            parse_roadmap_command("/roadmap task node-4 commit").unwrap(),
+            RoadmapCommand::TaskCommit {
+                node: "node-4".into(),
+                sha: None
+            }
+        );
+        assert_eq!(
+            parse_roadmap_command("/roadmap task node-4 commit b56fefa").unwrap(),
+            RoadmapCommand::TaskCommit {
+                node: "node-4".into(),
+                sha: Some("b56fefa".into())
+            }
+        );
+        assert!(
+            parse_roadmap_command("/roadmap task node-4").is_err(),
+            "task without `commit` is a usage error"
+        );
+        assert!(
+            parse_roadmap_command("/roadmap task").is_err(),
+            "task without a node is a usage error"
         );
     }
 

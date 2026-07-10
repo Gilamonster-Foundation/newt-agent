@@ -184,6 +184,22 @@ impl Plan {
         }
     }
 
+    /// #1062: bind a node to the commit that realizes it — set
+    /// [`artifact_ref.commit`](ArtifactRef::commit) (and `branch` when given),
+    /// preserving any existing `pr`/`branch`. This is what lets the objective
+    /// evaluator ([`crate::roadmap_eval`]) close a Task from git truth instead of
+    /// a human `mark`. No-op if `id` is absent.
+    pub fn set_artifact_commit(&mut self, id: &str, commit: &str, branch: Option<&str>) {
+        if let Some(s) = self.subtasks.iter_mut().find(|s| s.id == id) {
+            let existing = s.artifact_ref.take().unwrap_or_default();
+            s.artifact_ref = Some(ArtifactRef {
+                commit: Some(commit.to_string()),
+                branch: branch.map(str::to_string).or(existing.branch),
+                ..existing
+            });
+        }
+    }
+
     /// Every leaf is `Done` — the plan finished successfully (branches are
     /// grouping nodes, so only leaf completion is load-bearing). An empty plan is
     /// trivially complete.
@@ -1137,5 +1153,54 @@ parent = "road"
         assert_eq!(plans, ["pl1", "pl2"]);
         assert_eq!(plan.nodes_of_kind(NodeKind::Roadmap).len(), 1);
         assert!(plan.nodes_of_kind(NodeKind::Task).is_empty());
+    }
+
+    #[test]
+    fn set_artifact_commit_binds_the_commit_preserving_pr_and_branch() {
+        // #1062: binding a Task's commit is what lets the objective evaluator
+        // close it from git truth. It must preserve any existing pr, keep the
+        // branch when none is given, create a fresh ref on a bare node, and no-op
+        // an absent id.
+        let toml = r#"
+[[subtask]]
+id = "t1"
+instruction = "task 1"
+kind = "task"
+
+[subtask.artifact_ref]
+pr = 42
+branch = "feat/x"
+
+[[subtask]]
+id = "t2"
+instruction = "task 2"
+kind = "task"
+"#;
+        let mut plan = Plan::from_toml_str(toml).unwrap();
+
+        // No explicit branch → existing branch kept, pr preserved.
+        plan.set_artifact_commit("t1", "b56fefadeadbeef", None);
+        let a = plan.subtask("t1").unwrap().artifact_ref.as_ref().unwrap();
+        assert_eq!(a.commit.as_deref(), Some("b56fefadeadbeef"));
+        assert_eq!(a.branch.as_deref(), Some("feat/x"), "existing branch kept");
+        assert_eq!(a.pr, Some(42), "existing pr preserved");
+
+        // Explicit branch overrides; pr still preserved.
+        plan.set_artifact_commit("t1", "cafef00d", Some("main"));
+        let a = plan.subtask("t1").unwrap().artifact_ref.as_ref().unwrap();
+        assert_eq!(a.commit.as_deref(), Some("cafef00d"));
+        assert_eq!(a.branch.as_deref(), Some("main"));
+        assert_eq!(a.pr, Some(42));
+
+        // A bare node gets a fresh ref (just the commit + branch).
+        plan.set_artifact_commit("t2", "abc123", Some("main"));
+        let a = plan.subtask("t2").unwrap().artifact_ref.as_ref().unwrap();
+        assert_eq!(a.commit.as_deref(), Some("abc123"));
+        assert_eq!(a.branch.as_deref(), Some("main"));
+        assert_eq!(a.pr, None);
+
+        // Absent id is a no-op (no panic, no phantom node).
+        plan.set_artifact_commit("nope", "x", None);
+        assert!(plan.subtask("nope").is_none());
     }
 }
