@@ -679,6 +679,26 @@ impl McpToolset {
         out
     }
 
+    /// MCP-protocol-native tool definitions (`{name, description,
+    /// inputSchema}` per tool, namespaced `server__tool`) — the shape a
+    /// `tools/list` JSON-RPC response needs (#1021 PR 5.3, `newt-mcp-server`).
+    /// Distinct from [`Self::tool_defs`]'s OpenAI function-calling shape,
+    /// which is what a chat-completions request needs instead; same
+    /// underlying data and namespacing, different wire format.
+    pub fn mcp_tool_list(&self) -> Vec<Value> {
+        let mut out = Vec::new();
+        for server in &self.servers {
+            for tool in &server.tools {
+                out.push(json!({
+                    "name": namespaced(&server_prefix(&server.name, self.sanitize_server_names), &tool.name),
+                    "description": tool.description,
+                    "inputSchema": tool.input_schema,
+                }));
+            }
+        }
+        out
+    }
+
     /// Whether `name` is a namespaced tool belonging to a connected server.
     pub fn handles(&self, name: &str) -> bool {
         match split_namespaced(name) {

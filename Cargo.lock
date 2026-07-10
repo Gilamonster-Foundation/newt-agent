@@ -3710,6 +3710,7 @@ dependencies = [
  "newt-core",
  "newt-git",
  "newt-inference",
+ "newt-mcp-client",
  "newt-tools",
  "pyo3",
  "serde",

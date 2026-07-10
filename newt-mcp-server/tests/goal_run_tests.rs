@@ -24,15 +24,25 @@ use std::sync::Arc;
 use newt_core::router::Tier;
 use newt_core::Router;
 use newt_inference::BackendRegistry;
+use newt_mcp_client::McpToolset;
 use newt_mcp_server::handlers::register_handlers;
 use newt_mcp_server::server::McpServer;
 use serde_json::Value;
 use tests_common::MockBackend;
+use tokio::sync::Mutex;
 
-/// Drive a single JSON-RPC request through a freshly-built server.
+/// Drive a single JSON-RPC request through a freshly-built server. No
+/// persona (empty toolset, unrestricted catalog) — these tests are about
+/// `goal_run`, not #1021's persona restriction.
 async fn rpc_with(registry: Arc<BackendRegistry>, router: Arc<Router>, request: &Value) -> Value {
     let mut server = McpServer::new();
-    register_handlers(&mut server, registry, router);
+    register_handlers(
+        &mut server,
+        registry,
+        router,
+        Arc::new(Mutex::new(McpToolset::empty())),
+        Arc::new(None),
+    );
 
     let input = format!("{}\n", serde_json::to_string(request).unwrap());
     let mut output: Vec<u8> = Vec::new();

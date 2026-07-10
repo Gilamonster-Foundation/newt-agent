@@ -27,8 +27,8 @@ pub mod pyo3_module;
 /// drive the same model by default.
 const DEFAULT_OLLAMA_MODEL: &str = "llama3.1:8b";
 
-pub async fn run_stdio() -> anyhow::Result<()> {
-    run_with_io(tokio::io::stdin(), tokio::io::stdout()).await
+pub async fn run_stdio(persona: Option<&str>) -> anyhow::Result<()> {
+    run_with_io(tokio::io::stdin(), tokio::io::stdout(), persona).await
 }
 
 /// Run the MCP server against an explicit reader/writer pair.
@@ -39,16 +39,58 @@ pub async fn run_stdio() -> anyhow::Result<()> {
 /// server *after* fd 1 has been redirected to stderr. That sequence
 /// is what protects the JSON-RPC wire from rogue `println!` calls in
 /// dependencies.
-pub async fn run_with_io<R, W>(reader: R, mut writer: W) -> anyhow::Result<()>
+///
+/// `persona` (#1021 PR 5.3) is the already-global `--persona` CLI flag,
+/// wired into this subcommand for the first time — see [`connect_persona`].
+pub async fn run_with_io<R, W>(
+    reader: R,
+    mut writer: W,
+    persona: Option<&str>,
+) -> anyhow::Result<()>
 where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
 {
     let registry = build_default_registry().await?;
     let router = Arc::new(Router::new());
+    let (toolset, persona_tools) = connect_persona(persona).await?;
     let mut server = server::McpServer::new();
-    handlers::register_handlers(&mut server, registry, router);
+    handlers::register_handlers(
+        &mut server,
+        registry,
+        router,
+        Arc::new(tokio::sync::Mutex::new(toolset)),
+        Arc::new(persona_tools),
+    );
     server.run(reader, &mut writer).await
+}
+
+/// Resolve `persona` (#1021 PR 5.3) into its connected MCP toolset and
+/// `tools:` allow-list.
+///
+/// `None` (no `--persona`) returns an empty toolset and no restriction —
+/// today's behavior, byte-for-byte unchanged. `Some(name)` that fails to
+/// resolve is a loud error, not a silent fallback: see
+/// [`newt_core::RoleProfile::load_from_dir`]'s doc comment for why a
+/// headless server doesn't seed a missing persona the way the TUI does.
+async fn connect_persona(
+    persona: Option<&str>,
+) -> anyhow::Result<(newt_mcp_client::McpToolset, Option<Vec<String>>)> {
+    let Some(name) = persona else {
+        return Ok((newt_mcp_client::McpToolset::empty(), None));
+    };
+    let profile = newt_core::RoleProfile::load_from_dir(name, &newt_core::Config::personas_dir())?;
+    let cfg = newt_core::Config::resolve().unwrap_or_default();
+    let workspace = std::env::current_dir().unwrap_or_default();
+    let toolset =
+        newt_mcp_client::McpToolset::connect(&workspace.to_string_lossy(), &cfg.mcp_servers, true)
+            .await;
+    tracing::info!(
+        persona = name,
+        connected_servers = toolset.summary().len(),
+        "MCP server: persona activated"
+    );
+    Ok((toolset, profile.tools))
 }
 
 /// Build the default backend registry for the MCP server.
