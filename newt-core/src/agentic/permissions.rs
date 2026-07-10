@@ -44,6 +44,17 @@ pub enum DenialKind {
     /// remote tool's leash is name-based — so an `Allow` here is purely "proceed
     /// with this call" (it widens nothing). `target` is the tool name.
     RemoteTool,
+    /// #1056: a LOCAL git write (`add`/`commit`/`reset`/`branch`/…) the embedded
+    /// git tool's projected [`GitCaveats`](crate::git_caveats::GitCaveats) does
+    /// not grant. Like [`RemoteTool`](Self::RemoteTool) it maps to NO
+    /// fs/exec/net caveat — the git tool's leash is its own op-class lattice, not
+    /// the shell allowlist — so an `Allow` means "proceed with local git writes
+    /// this call" (it widens no `Caveats` axis; the git arm re-dispatches under a
+    /// local-write `GitCaveats`). `target` is the git op (`commit`, `add`, …).
+    /// The network verbs (push/fetch/clone) are NOT this capability — they stay
+    /// deferred / shell-net-gated. A readonly `/mode` still denies it (the gate
+    /// refuses the grant when the preset floor projects no git write).
+    GitWrite,
 }
 
 impl DenialKind {
@@ -55,6 +66,7 @@ impl DenialKind {
             Self::FsWrite => "fs_write",
             Self::Net => "net",
             Self::RemoteTool => "remote_tool",
+            Self::GitWrite => "git_write",
         }
     }
 }
@@ -73,6 +85,7 @@ impl std::str::FromStr for DenialKind {
             "fs_write" => Ok(Self::FsWrite),
             "net" => Ok(Self::Net),
             "remote_tool" => Ok(Self::RemoteTool),
+            "git_write" => Ok(Self::GitWrite),
             _ => Err(()),
         }
     }
@@ -218,6 +231,10 @@ pub fn widen_caveats(base: &Caveats, grants: &[(DenialKind, String)]) -> Caveats
             // FR-2 (#1001): a remote-tool grant maps to no caveat axis — the
             // `Allow` means "proceed with this call", not "widen an axis". Skip.
             DenialKind::RemoteTool => continue,
+            // #1056: a git-write grant maps to no caveat axis either — the git
+            // tool's authority is projected separately (GitCaveats); the git arm
+            // re-dispatches under a local-write surface on Allow. Widen nothing.
+            DenialKind::GitWrite => continue,
         };
         if let Scope::Only(set) = scope {
             set.insert(target.clone());

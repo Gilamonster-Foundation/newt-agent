@@ -2254,6 +2254,11 @@ fn permission_prompt_text(
         DenialKind::Net => ("reach", "outside the granted net allowlist"),
         // FR-2 (#1001): a remote MCP tool the active persona does not grant.
         DenialKind::RemoteTool => ("call", "not in the active persona's tool allow-list"),
+        // #1056: a local git write the session's projected git authority denies.
+        DenialKind::GitWrite => (
+            "commit/stage via git",
+            "outside the granted git-write authority",
+        ),
     };
     let tier = danger.classify(req.kind, &req.target);
 
@@ -2594,6 +2599,20 @@ impl<F: FnMut(&str) -> PromptChoice> newt_core::PermissionGate for PromptPermiss
         }
         let mut once_grants: Vec<(newt_core::DenialKind, String)> = Vec::new();
         for req in requests {
+            // #1056 FLOOR: a readonly `/mode` denies LOCAL git writes just as it
+            // denies fs writes. The git-write capability is non-axis, so `mint`'s
+            // preset re-clamp can't attenuate it (it widens nothing) — enforce the
+            // floor HERE: if a preset is active and projects no git commit
+            // authority, refuse the grant outright (even `[a]llow once`), so a git
+            // write can never pierce the readonly clamp.
+            if req.kind == newt_core::DenialKind::GitWrite {
+                if let Some(clamp) = &self.preset_clamp {
+                    if !newt_core::git_caveats::GitCaveats::from_session(clamp).permits_commit() {
+                        self.record(req, "deny", "preset-floor-git-readonly");
+                        return Deny;
+                    }
+                }
+            }
             // A session grant covers this target: no re-prompt, no new
             // record — the decision was recorded when the human made it.
             // (Exec matches by basename so a `python3` grant covers
@@ -3753,6 +3772,69 @@ mod permission_prompt_tests {
             2,
             "full-path grant must not widen to a bare name (pin-exact)"
         );
+    }
+
+    /// #1056 FLOOR: a readonly `/mode` projects no git-commit authority, so the
+    /// gate REFUSES a git-write grant outright — even `[a]llow once` cannot pierce
+    /// it, and it does not even prompt (the git-write capability is non-axis, so
+    /// `mint`'s re-clamp can't attenuate it — this explicit check is the floor).
+    #[test]
+    fn git_write_grant_refused_under_readonly_preset() {
+        let mut state = PermissionPromptState::default();
+        let prompts = Rc::new(Cell::new(0));
+        let clamp = newt_core::NamedPermissionPreset {
+            readonly: true,
+            ..Default::default()
+        }
+        .clamp();
+        let base = base_caveats("/ws").meet(&clamp);
+        let mut gate = scripted_gate_with_clamp(
+            &mut state,
+            base,
+            None,
+            None,
+            clamp,
+            vec![PromptChoice::AllowOnce],
+            prompts.clone(),
+        );
+        let req = PermissionRequest {
+            tool: "git".to_string(),
+            kind: DenialKind::GitWrite,
+            target: "commit".to_string(),
+            reason: "commit the work".to_string(),
+        };
+        assert!(
+            matches!(gate.ask(&[req]), newt_core::PermissionDecision::Deny),
+            "a readonly preset must refuse a git-write grant"
+        );
+        assert_eq!(prompts.get(), 0, "the floor refuses WITHOUT prompting");
+    }
+
+    /// #1056: with NO preset active the floor doesn't bite — a git-write grant is
+    /// allowed (allow-once), so a coder can commit in a normal session.
+    #[test]
+    fn git_write_grant_allowed_without_a_preset() {
+        let mut state = PermissionPromptState::default();
+        let prompts = Rc::new(Cell::new(0));
+        let mut gate = scripted_gate(
+            &mut state,
+            base_caveats("/ws"),
+            None,
+            None,
+            vec![PromptChoice::AllowOnce],
+            prompts.clone(),
+        );
+        let req = PermissionRequest {
+            tool: "git".to_string(),
+            kind: DenialKind::GitWrite,
+            target: "commit".to_string(),
+            reason: "commit the work".to_string(),
+        };
+        assert!(matches!(
+            gate.ask(&[req]),
+            newt_core::PermissionDecision::Allow(_)
+        ));
+        assert_eq!(prompts.get(), 1);
     }
 
     /// #307 FLOOR TEST (b) — the security contract: a session-grant CANNOT
