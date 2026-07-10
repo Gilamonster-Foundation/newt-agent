@@ -663,18 +663,15 @@ mod attach_tests {
         assert_eq!(from3.iter().map(|c| c.seq).collect::<Vec<_>>(), vec![3, 4]);
     }
 
-    /// Test case for detachment and observation count consistency.
     #[test]
-    fn tops_fanout_correctness() {
+    fn detach_stops_fanout_and_invalidates_attachment() {
         let mut reg = SessionRegistry::new();
         let s = reg.open();
         let cd = Collector::default();
         let co = Collector::default();
         let sess = reg.get_mut(s).unwrap();
 
-        // 1. Attach driver/collector
         let d = sess.attach(AttachRole::Driver, Caveats::top(), Box::new(cd.clone()));
-        // 2. Attach observer/collector
         let obs = sess.attach(
             AttachRole::Observer,
             observer_caveats(),
@@ -682,22 +679,16 @@ mod attach_tests {
         );
 
         assert_eq!(sess.attachment_count(), 2);
-
-        // Detaching an attachment returns true on success, false if no such attachment exists
-        assert!(sess.detach(obs), "Failed to detach observer");
-
+        assert!(sess.detach(obs));
+        assert!(!sess.detach(obs));
         assert_eq!(sess.attachment_count(), 1);
 
-        // Submission still works after detachment
         sess.submit_input(d, "go").unwrap();
-
-        // Emit should only be counted by the remaining active attachment (the driver)
         sess.emit(OutputStream::Stdout, "after detach", true);
         assert_eq!(cd.count(), 1);
         assert_eq!(co.count(), 0, "detached attachment receives nothing");
 
-        // Test a case where input submission might fail (e.g., if attachments are broken)
-        sess.detach(d); // Detach the driver to test subsequent failure modes
+        assert!(sess.detach(d));
         let result = sess.submit_input(d, "broken command");
         assert!(
             result.is_err(),
