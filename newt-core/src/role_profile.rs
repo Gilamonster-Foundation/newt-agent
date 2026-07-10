@@ -72,6 +72,10 @@ pub struct RoleProfile {
     /// Allow-list of tool names this role may use. `None` = unconstrained
     /// (today's behavior); enforcement is a follow-up.
     pub tools: Option<Vec<String>>,
+    /// Skill names (matching a `SKILL.md` `name` under `skill_search_dirs`)
+    /// this role binds on activation (FR-4, #1041). `None` = no bound
+    /// skills — today's behavior, unaffected.
+    pub skills: Option<Vec<String>>,
     /// Capability profile (agent-bridle caveats) this role carries.
     pub caveats: Option<CaveatProfile>,
     /// Preferred backend model id (router policy hint).
@@ -110,6 +114,8 @@ struct FrontMatter {
     role: Option<String>,
     #[serde(default)]
     tools: Option<Vec<String>>,
+    #[serde(default)]
+    skills: Option<Vec<String>>,
     #[serde(default)]
     caveats: Option<CaveatProfile>,
     #[serde(default)]
@@ -456,6 +462,7 @@ impl RoleProfile {
             prompt: body,
             role: fm.role,
             tools: fm.tools,
+            skills: fm.skills,
             caveats: fm.caveats,
             model: fm.model,
             tier: fm.tier,
@@ -464,12 +471,13 @@ impl RoleProfile {
     }
 
     /// `true` when this profile declares more than a prompt (i.e. front-matter
-    /// bound a role, tools, caveats, model, or tier). A prompt-only persona
-    /// returns `false`.
+    /// bound a role, tools, skills, caveats, model, or tier). A prompt-only
+    /// persona returns `false`.
     #[must_use]
     pub fn is_role_bound(&self) -> bool {
         self.role.is_some()
             || self.tools.is_some()
+            || self.skills.is_some()
             || self.caveats.is_some()
             || self.model.is_some()
             || self.tier.is_some()
@@ -686,6 +694,31 @@ body
                 .altitude,
             None,
             "absent altitude is None (doer applies downstream)"
+        );
+    }
+
+    /// FR-4 (#1041): `skills` parses as a list of skill names, defaults to
+    /// `None` when absent, and counts as role-binding front-matter.
+    #[test]
+    fn parses_skills_field() {
+        let rp = RoleProfile::parse(
+            "+++\nskills = [\"gila-personal-assistant\", \"other-skill\"]\n+++\n\nx\n",
+        )
+        .unwrap();
+        assert_eq!(
+            rp.skills,
+            Some(vec![
+                "gila-personal-assistant".to_string(),
+                "other-skill".to_string(),
+            ])
+        );
+        assert!(rp.is_role_bound(), "skills alone binds the role");
+        assert_eq!(
+            RoleProfile::parse("+++\nrole = \"w\"\n+++\n\nx\n")
+                .unwrap()
+                .skills,
+            None,
+            "absent skills is None (no bound skills)"
         );
     }
 

@@ -5648,6 +5648,12 @@ fn run_chat(
         Some(name) => Some(persona_store.load(name)?),
         None => None,
     };
+    warn_on_missing_bound_skills(
+        active_persona.as_ref(),
+        &cfg.skill_search_dirs(),
+        color,
+        verbose,
+    );
     // FR-5 (#999): apply the `--altitude` flag. It rides on `active_persona`
     // (already threaded through every prompt rebuild), so an explicit flag either
     // overrides a loaded persona's altitude or — with no `--persona` — synthesizes
@@ -6910,6 +6916,7 @@ fn run_chat(
                         // itself for the cases that start a new conversation
                         // (clear / set without --keep-context), so the per-session
                         // plan path follows (issue #220).
+                        let persona_name_before = active_persona.as_ref().map(|p| p.name.clone());
                         match handle_persona_command(
                             &task,
                             workspace,
@@ -6921,6 +6928,18 @@ fn run_chat(
                         ) {
                             Ok(msg) => print_newt(&msg, color, verbose),
                             Err(e) => print_newt(&format!("error: {e}"), color, verbose),
+                        }
+                        // FR-4 (#1041): only warn when this command actually
+                        // activated a (possibly new) persona — not on every
+                        // `/persona show`/`list` re-check of an unchanged one.
+                        if active_persona.as_ref().map(|p| &p.name) != persona_name_before.as_ref()
+                        {
+                            warn_on_missing_bound_skills(
+                                active_persona.as_ref(),
+                                &cfg.skill_search_dirs(),
+                                color,
+                                verbose,
+                            );
                         }
                         surface.save_history();
                         println!();
@@ -8290,6 +8309,53 @@ impl PersonaStore {
 /// `shipped_role_templates_parse` type-checks its front-matter beside the others.
 const COACH_PERSONA: &str = include_str!("../../personas/coach.md");
 
+/// FR-4 (#1041): names in `skills` that do NOT resolve to a `SKILL.md` under
+/// `search_dirs` — a persona's declared-but-missing skill bindings. Empty when
+/// every declared skill resolves (or none are declared). Checked eagerly at
+/// activation (not just on the model's first `use_skill` call) so a
+/// misconfigured persona surfaces the problem immediately.
+fn missing_bound_skills(skills: &[String], search_dirs: &[std::path::PathBuf]) -> Vec<String> {
+    if skills.is_empty() {
+        return Vec::new();
+    }
+    let available: std::collections::HashSet<String> = newt_skills::discover_paths(search_dirs)
+        .into_iter()
+        .map(|s| s.name)
+        .collect();
+    skills
+        .iter()
+        .filter(|name| !available.contains(*name))
+        .cloned()
+        .collect()
+}
+
+/// FR-4 (#1041): warn (non-fatal — matches `PersonaStore::list`'s soft-fail
+/// style for bad data) when an active persona's `skills:` front-matter names a
+/// skill that doesn't resolve under `search_dirs`.
+fn warn_on_missing_bound_skills(
+    persona: Option<&Persona>,
+    search_dirs: &[std::path::PathBuf],
+    color: bool,
+    verbose: bool,
+) {
+    let Some(persona) = persona else { return };
+    let Some(skills) = &persona.profile.skills else {
+        return;
+    };
+    let missing = missing_bound_skills(skills, search_dirs);
+    if !missing.is_empty() {
+        print_newt(
+            &format!(
+                "warning: persona `{}` declares skill(s) not found in any skill search dir: {}",
+                persona.name,
+                missing.join(", ")
+            ),
+            color,
+            verbose,
+        );
+    }
+}
+
 fn normalize_persona_name(name: &str) -> anyhow::Result<String> {
     let name = name.trim().to_ascii_lowercase();
     if name.is_empty()
@@ -8705,6 +8771,14 @@ fn persona_status(active: Option<&Persona>) -> String {
         }
         Some(_) => out.push_str("\n  tools: (none)"),
         None => out.push_str("\n  tools: (unconstrained)"),
+    }
+    // FR-4 (#1041): list the persona's bound skill names, same shape as `tools`.
+    if let Some(skills) = &profile.skills {
+        if skills.is_empty() {
+            out.push_str("\n  skills: (none)");
+        } else {
+            out.push_str(&format!("\n  skills: {}", skills.join(", ")));
+        }
     }
     if let Some(caveats) = &profile.caveats {
         out.push_str(&format!("\n  caveats: {}", caveats.summary()));
@@ -18429,6 +18503,56 @@ mod persona_helper_tests {
         assert!(status.contains("Active persona: terse"));
         assert!(status.contains("Keep it short."));
         assert!(status.contains("/p/terse.md"));
+    }
+
+    /// FR-4 (#1041): `/persona show` lists a persona's bound skills.
+    #[test]
+    fn persona_status_lists_bound_skills() {
+        let mut p = test_persona(
+            "assistant",
+            "Coach on state.",
+            std::path::PathBuf::from("/p/assistant.md"),
+        );
+        p.profile.skills = Some(vec!["gila-personal-assistant".to_string()]);
+        let status = persona_status(Some(&p));
+        assert!(
+            status.contains("skills: gila-personal-assistant"),
+            "got: {status}"
+        );
+    }
+
+    /// FR-4 (#1041): `missing_bound_skills` resolves declared names against the
+    /// real search dirs (this file's other `PersonaStore` tests already exercise
+    /// real fs, `#[serial(real_fs)]`) and reports only the ones that don't exist.
+    #[serial_test::serial(real_fs)]
+    #[test]
+    fn missing_bound_skills_reports_only_unresolved_names() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let skills_dir = tmp.path().join("skills");
+        let one = skills_dir.join("gila-personal-assistant");
+        fs::create_dir_all(&one).unwrap();
+        fs::write(
+            one.join("SKILL.md"),
+            "---\nname: gila-personal-assistant\ndescription: coach on modulex reports\n---\nBody.\n",
+        )
+        .unwrap();
+
+        let dirs = vec![skills_dir];
+        assert_eq!(
+            missing_bound_skills(&["gila-personal-assistant".to_string()], &dirs),
+            Vec::<String>::new(),
+            "the declared skill resolves"
+        );
+        assert_eq!(
+            missing_bound_skills(&["not-installed".to_string()], &dirs),
+            vec!["not-installed".to_string()],
+            "an unresolved declared skill is reported"
+        );
+        assert_eq!(
+            missing_bound_skills(&[], &dirs),
+            Vec::<String>::new(),
+            "no declared skills ⇒ nothing missing"
+        );
     }
 
     #[serial_test::serial(real_fs)]
