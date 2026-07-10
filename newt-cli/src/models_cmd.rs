@@ -93,6 +93,13 @@ fn print_path(alias: Option<&str>) -> anyhow::Result<()> {
 }
 
 async fn pull(alias: Option<&str>) -> anyhow::Result<()> {
+    provision(alias).await?;
+    Ok(())
+}
+
+/// Ensure a palette model is fully provisioned locally (GGUF + tokenizer), and
+/// return its palette entry so callers can wire it into config.
+pub async fn provision(alias: Option<&str>) -> anyhow::Result<&'static MiniModel> {
     let m = resolve(alias)?;
     let gguf = palette::local_gguf_path(m)
         .ok_or_else(|| anyhow::anyhow!("cannot resolve ~/.newt/models (no home dir)"))?;
@@ -128,7 +135,7 @@ async fn pull(alias: Option<&str>) -> anyhow::Result<()> {
     .await?;
     fetch_if_absent(&tok_url, &tok, "tokenizer.json").await?;
     println!("OK {} fully provisioned", m.name);
-    Ok(())
+    Ok(m)
 }
 
 /// Download `url` to `dest` unless it is already present. One-line status; used

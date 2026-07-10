@@ -26,6 +26,7 @@ mod new_project;
 mod skills;
 pub mod stack;
 pub mod stdio_guard;
+mod summarizer_cmd;
 mod tuning_cmd;
 
 use clap::{Parser, Subcommand};
@@ -472,6 +473,11 @@ pub enum Command {
     Models {
         #[command(subcommand)]
         cmd: models_cmd::ModelsCmd,
+    },
+    /// Inspect and configure the mid-loop summarizer backend.
+    Summarizer {
+        #[command(subcommand)]
+        cmd: Option<summarizer_cmd::SummarizerCmd>,
     },
 }
 
@@ -957,6 +963,7 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         Command::Dgx { cmd } => dgx::run(cmd, cli.config.as_deref()).await,
         Command::Tunings { cmd } => tuning_cmd::run(cmd, cli.config.as_deref()),
         Command::Models { cmd } => models_cmd::run(cmd).await,
+        Command::Summarizer { cmd } => summarizer_cmd::run(cmd).await,
     }
 }
 
