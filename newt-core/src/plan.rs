@@ -200,6 +200,28 @@ impl Plan {
         }
     }
 
+    /// #1062 auto-capture: the next Task under `plan_id` that still needs a commit
+    /// — the leftmost `Pending` Task in `plan_id`'s subtree whose
+    /// [`artifact_ref.commit`](ArtifactRef::commit) is unset. `None` if `plan_id`
+    /// isn't a Plan, or every Task beneath it is already captured or closed.
+    /// Document order encodes sibling order, so "leftmost" is the first match —
+    /// the same rule the DFS cursor uses — giving the 1-commit-→-1-Task default.
+    #[must_use]
+    pub fn next_uncaptured_task_under(&self, plan_id: &str) -> Option<&Subtask> {
+        if self.subtask(plan_id)?.kind != NodeKind::Plan {
+            return None;
+        }
+        self.subtasks.iter().find(|s| {
+            s.kind == NodeKind::Task
+                && s.status == SubtaskStatus::Pending
+                && s.artifact_ref
+                    .as_ref()
+                    .and_then(|a| a.commit.as_deref())
+                    .is_none()
+                && self.path_to(&s.id).iter().any(|p| p == plan_id)
+        })
+    }
+
     /// Every leaf is `Done` — the plan finished successfully (branches are
     /// grouping nodes, so only leaf completion is load-bearing). An empty plan is
     /// trivially complete.
@@ -1202,5 +1224,48 @@ kind = "task"
         // Absent id is a no-op (no panic, no phantom node).
         plan.set_artifact_commit("nope", "x", None);
         assert!(plan.subtask("nope").is_none());
+    }
+
+    #[test]
+    fn next_uncaptured_task_under_walks_the_plan_in_order() {
+        // #1062: auto-capture picks the leftmost Pending Task under the Plan whose
+        // commit is unset — the 1-commit-→-1-Task cursor.
+        let toml = r#"
+[[subtask]]
+id = "ph"
+instruction = "phase"
+kind = "phase"
+
+[[subtask]]
+id = "pl"
+instruction = "plan"
+kind = "plan"
+parent = "ph"
+
+[[subtask]]
+id = "t1"
+instruction = "task 1"
+kind = "task"
+parent = "pl"
+
+[[subtask]]
+id = "t2"
+instruction = "task 2"
+kind = "task"
+parent = "pl"
+"#;
+        let mut plan = Plan::from_toml_str(toml).unwrap();
+        let id = |o: Option<&Subtask>| o.map(|s| s.id.clone());
+        assert_eq!(id(plan.next_uncaptured_task_under("pl")), Some("t1".into()));
+        // Capturing t1 advances the cursor to t2.
+        plan.set_artifact_commit("t1", "abc", None);
+        assert_eq!(id(plan.next_uncaptured_task_under("pl")), Some("t2".into()));
+        // Both captured → nothing left.
+        plan.set_artifact_commit("t2", "def", None);
+        assert_eq!(plan.next_uncaptured_task_under("pl"), None);
+        // A non-Plan target yields None (a phase or a task is not a Plan).
+        assert!(plan.next_uncaptured_task_under("ph").is_none());
+        assert!(plan.next_uncaptured_task_under("t1").is_none());
+        assert!(plan.next_uncaptured_task_under("absent").is_none());
     }
 }
