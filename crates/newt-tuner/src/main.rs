@@ -8,7 +8,11 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "newt-tuner", version, about = "Model tuning configuration manager")]
+#[command(
+    name = "newt-tuner",
+    version,
+    about = "Model tuning configuration manager"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -47,36 +51,36 @@ fn main() -> Result<()> {
                 println!("No model_tuning directory found. Run `newt-tuner init` first.");
                 return Ok(());
             }
-            
+
             let mut configs: Vec<_> = std::fs::read_dir(&dir)?
                 .filter_map(|entry| entry.ok())
-                .filter(|e| e.path().extension().map_or(false, |ext| ext == "toml"))
+                .filter(|e| e.path().extension().is_some_and(|ext| ext == "toml"))
                 .collect();
-            
+
             configs.sort_by_key(|e| e.file_name());
-            
+
             if configs.is_empty() {
                 println!("No model configurations found.");
             } else {
                 println!("Available models:");
                 for entry in &configs {
                     let name = entry.file_name().to_string_lossy().into_owned();
-                    let name = name.trim_end_matches(".toml").trim_end_matches(".default.toml");
+                    let name = name
+                        .trim_end_matches(".toml")
+                        .trim_end_matches(".default.toml");
                     println!("  - {}", name);
                 }
             }
         }
-        Commands::Get { model } => {
-            match newt_tuner::load_model_config(&model) {
-                Ok(config) => {
-                    println!("{}", toml::to_string_pretty(&config)?);
-                }
-                Err(e) => {
-                    eprintln!("Error: {}", e);
-                    std::process::exit(1);
-                }
+        Commands::Get { model } => match newt_tuner::load_model_config(&model) {
+            Ok(config) => {
+                println!("{}", toml::to_string_pretty(&config)?);
             }
-        }
+            Err(e) => {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        },
     }
 
     Ok(())

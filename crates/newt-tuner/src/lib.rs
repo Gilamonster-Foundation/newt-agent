@@ -29,7 +29,11 @@ impl std::fmt::Display for TunerError {
             Self::ReadConfigDir(path) => write!(f, "Cannot read config dir: {}", path),
             Self::ParseTOML(path, msg) => write!(f, "Failed to parse {}: {}", path.display(), msg),
             Self::UserConfigExists(path) => {
-                write!(f, "User config exists at {}, refusing to overwrite", path.display())
+                write!(
+                    f,
+                    "User config exists at {}, refusing to overwrite",
+                    path.display()
+                )
             }
             Self::ModelNotFound(model) => write!(f, "Model not found: {}", model),
         }
@@ -89,21 +93,22 @@ pub struct ModelTuning {
 ///
 /// Returns the user's config if it exists, otherwise returns the bundled default.
 pub fn load_model_config(model_name: &str) -> Result<toml::Value, TunerError> {
-    let home = dirs::home_dir().ok_or_else(|| {
-        TunerError::ReadConfigDir("Cannot determine home directory".to_string())
-    })?;
+    let home = dirs::home_dir()
+        .ok_or_else(|| TunerError::ReadConfigDir("Cannot determine home directory".to_string()))?;
     let config_dir = home.join(".newt").join("model_tuning");
 
     // Check for user config first
     let user_config_path = config_dir.join(format!("{}.toml", model_name));
     if user_config_path.exists() {
-        return load_toml(&user_config_path).map_err(|e| TunerError::ParseTOML(user_config_path, e.to_string()));
+        return load_toml(&user_config_path)
+            .map_err(|e| TunerError::ParseTOML(user_config_path, e.to_string()));
     }
 
     // Fall back to bundled default
     let default_path = config_dir.join(format!("{}.default.toml", model_name));
     if default_path.exists() {
-        return load_toml(&default_path).map_err(|e| TunerError::ParseTOML(default_path, e.to_string()));
+        return load_toml(&default_path)
+            .map_err(|e| TunerError::ParseTOML(default_path, e.to_string()));
     }
 
     Err(TunerError::ModelNotFound(model_name.to_string()))
@@ -111,9 +116,8 @@ pub fn load_model_config(model_name: &str) -> Result<toml::Value, TunerError> {
 
 /// Initialize the model tuning directory with bundled defaults.
 pub fn init_model_tuning() -> Result<(), TunerError> {
-    let home = dirs::home_dir().ok_or_else(|| {
-        TunerError::ReadConfigDir("Cannot determine home directory".to_string())
-    })?;
+    let home = dirs::home_dir()
+        .ok_or_else(|| TunerError::ReadConfigDir("Cannot determine home directory".to_string()))?;
     let config_dir = home.join(".newt").join("model_tuning");
 
     if config_dir.exists() {
@@ -130,9 +134,8 @@ pub fn init_model_tuning() -> Result<(), TunerError> {
 
 /// Get the path to the model tuning configuration directory.
 pub fn model_tuning_dir() -> Result<PathBuf, TunerError> {
-    let home = dirs::home_dir().ok_or_else(|| {
-        TunerError::ReadConfigDir("Cannot determine home directory".to_string())
-    })?;
+    let home = dirs::home_dir()
+        .ok_or_else(|| TunerError::ReadConfigDir("Cannot determine home directory".to_string()))?;
     Ok(home.join(".newt").join("model_tuning"))
 }
 
@@ -144,7 +147,7 @@ fn load_toml(path: &Path) -> Result<toml::Value, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_model_tuning_dir() {
         let dir = model_tuning_dir().expect("Should return config dir");

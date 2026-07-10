@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{NewtError, Result};
 use crate::router::Tier;
-use newt_tuner::ModelConfig;
+pub use newt_tuner::ModelTuning;
 
 /// Process-scoped user config root override, set by the CLI's `--config-dir`.
 pub const NEWT_CONFIG_DIR_ENV: &str = "NEWT_CONFIG_DIR";
@@ -129,11 +129,26 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skills: Option<SkillsConfig>,
 
-    /// Per-model tuning overrides loaded at runtime from per-model TOML files
-    /// under `[workspace]/tuner/` (or a configured dir) via [`newt_tuner::load_model_config`].
-    /// Keys are model names; values are the tuned parameters.
-    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
-    pub model_tuning: std::collections::BTreeMap<String, newt_tuner::ModelConfig>,
+    /// Per-model inference tuning overrides (`[[model_tuning]]`).
+    ///
+    /// Each entry locks specific parameters for a named model. Values here
+    /// take precedence over empirically derived values from
+    /// `model-capabilities.json` and over global `[tui]` defaults.
+    ///
+    /// Example `~/.newt/config.toml`:
+    /// ```toml
+    /// [[model_tuning]]
+    /// model = "nemotron3:33b"
+    /// num_ctx = 24576            # explicit Ollama context window
+    /// mid_loop_trim_threshold = 12
+    /// max_tool_rounds = 20
+    /// ```
+    ///
+    /// Human-authored entries are never overwritten by the auto-tuner.
+    /// Auto-tuned entries are **appended** by the harness when
+    /// `tune_confidence` reaches `High`; delete or edit them freely.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub model_tuning: Vec<ModelTuning>,
 
     /// Durable conversation save/restore policy. `None` uses built-in defaults.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1699,7 +1714,15 @@ fn default_allow_shell_mutations() -> bool {
 // Per-model tuning helpers
 // ---------------------------------------------------------------------------
 
-/// Look up and validate a named profile (`[profiles.<name>]`). The caller
+impl Config {
+    /// Find the first `[[model_tuning]]` entry whose `model` field matches
+    /// `name` exactly. Returns `None` when no entry exists.
+    #[must_use]
+    pub fn find_model_tuning(&self, name: &str) -> Option<&ModelTuning> {
+        self.model_tuning.iter().find(|t| t.model == name)
+    }
+
+    /// Look up and validate a named profile (`[profiles.<name>]`). The caller
     /// selects it via `--profile <name>` / `NEWT_PROFILE`.
     ///
     /// # Errors
