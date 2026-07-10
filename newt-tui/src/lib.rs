@@ -7796,6 +7796,13 @@ fn run_chat(
                     let turn_hard = std::sync::atomic::AtomicBool::new(false);
                     let interruptible = io::stdin().is_terminal() && io::stdout().is_terminal();
                     // (tool_offload_on / scratchpad_on resolved at the turn head.)
+                    // #1062 auto-capture: snapshot HEAD before the turn so the
+                    // after-turn hook can tell whether the model committed. Only
+                    // when a roadmap is active (a possibly-bound turn) — otherwise
+                    // skip the git read entirely.
+                    let head_before_turn = active_roadmap_id
+                        .as_ref()
+                        .and_then(|_| git_head_short(workspace));
                     let response =
                         with_interrupt_watch(interruptible, &turn_cancel, &turn_hard, || {
                             tokio::task::block_in_place(|| {
@@ -8109,6 +8116,21 @@ fn run_chat(
                                         color,
                                         verbose,
                                     );
+                                }
+                                // #1062 auto-capture: if this bound conversation's
+                                // turn produced a commit, attribute it to the bound
+                                // Plan's next Task so /roadmap eval|drive close it
+                                // from git truth — no manual /roadmap task … commit.
+                                if let Some(store) = conversation_store.as_ref() {
+                                    if let Some(note) = autocapture_commit_after_turn(
+                                        store,
+                                        &active_roadmap_id,
+                                        &active_conversation_id,
+                                        workspace,
+                                        head_before_turn.as_deref(),
+                                    ) {
+                                        print_newt(&note, color, verbose);
+                                    }
                                 }
                                 print_metrics(&metrics, color);
                                 // Append to usage log and enforce rotation policy.
@@ -10330,6 +10352,67 @@ fn production_fact_sources(
             workspace: std::path::PathBuf::from(workspace),
         },
     )
+}
+
+/// #1062 auto-capture — the current git HEAD (short oid), or `None` when the
+/// workspace isn't a repo or HEAD is unborn. Read-only via newt-git. Snapshotted
+/// before a turn so the after-turn hook can tell whether a commit landed.
+fn git_head_short(workspace: &str) -> Option<String> {
+    newt_git::GitEngine::open(std::path::Path::new(workspace))
+        .ok()?
+        .status(&newt_core::git_caveats::GitCaveats::read_only())
+        .ok()?
+        .head
+}
+
+/// #1062 auto-capture, PURE core: which Task should absorb the turn's commit? If
+/// HEAD advanced (`head_now != head_before`) AND this conversation is bound to a
+/// Plan node with a next-uncaptured Task, return that Task's id. No git/store —
+/// the caller reads HEAD and persists; this is the unit-testable decision.
+fn autocapture_target(
+    tree: &newt_core::plan::Plan,
+    conversation_id: &str,
+    head_before: Option<&str>,
+    head_now: &str,
+) -> Option<String> {
+    if Some(head_now) == head_before {
+        return None; // no new commit this turn
+    }
+    let plan_node = tree.subtasks.iter().find(|s| {
+        s.conversation_id.as_deref() == Some(conversation_id)
+            && s.kind == newt_core::plan::NodeKind::Plan
+    })?;
+    tree.next_uncaptured_task_under(&plan_node.id)
+        .map(|t| t.id.clone())
+}
+
+/// #1062 auto-capture: after a bound conversation's turn, if a commit landed,
+/// attribute it to the bound Plan's next-uncaptured Task and persist. Returns a
+/// one-line notice, or `None` (no active roadmap / no new commit / not bound to a
+/// Plan / no ready Task). Orchestration around [`autocapture_target`]; the git
+/// read + [`ConversationStore::update_roadmap`] live here.
+fn autocapture_commit_after_turn(
+    store: &newt_core::ConversationStore,
+    active_roadmap_id: &Option<String>,
+    active_conversation_id: &str,
+    workspace: &str,
+    head_before: Option<&str>,
+) -> Option<String> {
+    let roadmap_id = active_roadmap_id.as_deref()?;
+    let status = newt_git::GitEngine::open(std::path::Path::new(workspace))
+        .ok()?
+        .status(&newt_core::git_caveats::GitCaveats::read_only())
+        .ok()?;
+    let head_now = status.head?;
+    let mut rm = store.load_roadmap(roadmap_id).ok().flatten()?;
+    let task_id = autocapture_target(&rm.tree, active_conversation_id, head_before, &head_now)?;
+    rm.tree
+        .set_artifact_commit(&task_id, &head_now, status.branch.as_deref());
+    store.update_roadmap(roadmap_id, &rm.tree).ok()?;
+    let short = &head_now[..head_now.len().min(8)];
+    Some(format!(
+        "⟲ auto-captured commit {short} → task [{task_id}] — /roadmap eval closes it from git."
+    ))
 }
 
 fn handle_roadmap_command(
@@ -16456,6 +16539,50 @@ parent = \"road\"
         assert!(
             parse_roadmap_command("/roadmap task").is_err(),
             "task without a node is a usage error"
+        );
+    }
+
+    /// #1062 auto-capture decision (pure): a new commit in a bound Plan's turn
+    /// targets that Plan's next uncaptured Task; no commit / unbound / no ready
+    /// task → nothing captured.
+    #[test]
+    fn autocapture_target_picks_the_bound_plans_next_task_on_a_new_commit() {
+        let toml = r#"
+[[subtask]]
+id = "pl"
+instruction = "plan"
+kind = "plan"
+conversation_id = "conv-1"
+
+[[subtask]]
+id = "t1"
+instruction = "task 1"
+kind = "task"
+parent = "pl"
+"#;
+        let mut tree = newt_core::plan::Plan::from_toml_str(toml).unwrap();
+        // No new commit → nothing.
+        assert_eq!(
+            autocapture_target(&tree, "conv-1", Some("abc"), "abc"),
+            None
+        );
+        // New commit + bound Plan with a pending Task → that Task.
+        assert_eq!(
+            autocapture_target(&tree, "conv-1", Some("abc"), "def"),
+            Some("t1".into())
+        );
+        // A first commit from an unborn HEAD (None before) still counts.
+        assert_eq!(
+            autocapture_target(&tree, "conv-1", None, "def"),
+            Some("t1".into())
+        );
+        // A conversation NOT bound to any Plan → nothing.
+        assert_eq!(autocapture_target(&tree, "other-conv", None, "def"), None);
+        // Once the Plan's only Task is captured, a later commit finds no target.
+        tree.set_artifact_commit("t1", "def", None);
+        assert_eq!(
+            autocapture_target(&tree, "conv-1", Some("abc"), "ghi"),
+            None
         );
     }
 
