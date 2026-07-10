@@ -383,14 +383,47 @@ fn parse_sse_messages(body: &str) -> Vec<String> {
     messages
 }
 
+/// In-memory transport: discards sends, returns canned lines in order.
+/// `#[cfg(test)]`, crate-scoped so both `mod tests` and `mod toolset_tests`
+/// (and `AnyTransport`'s test-only `Mock` variant below) can build a real
+/// [`ConnectedServer`] without a subprocess or socket.
+#[cfg(test)]
+pub struct MockTransport {
+    responses: std::collections::VecDeque<String>,
+}
+
+#[cfg(test)]
+impl MockTransport {
+    pub fn new(lines: impl IntoIterator<Item = &'static str>) -> Self {
+        Self {
+            responses: lines.into_iter().map(str::to_string).collect(),
+        }
+    }
+}
+
+#[cfg(test)]
+impl Transport for MockTransport {
+    async fn send(&mut self, _line: String) -> Result<()> {
+        Ok(())
+    }
+    async fn recv(&mut self) -> Result<Option<String>> {
+        Ok(self.responses.pop_front())
+    }
+}
+
 /// A [`Transport`] that is either stdio or streamable-HTTP, chosen per server.
 ///
 /// An enum (rather than `Box<dyn Transport>`) keeps static dispatch — the
 /// trait's `async fn`s are not object-safe — and lets one `Vec<ConnectedServer>`
-/// hold a mix of transports.
+/// hold a mix of transports. The `#[cfg(test)] Mock` arm exists so a test can
+/// build a real [`ConnectedServer`] (whose `conn` field is the concrete
+/// `McpConnection<AnyTransport>`, not generic) against [`MockTransport`]
+/// instead of spawning a subprocess or dialing a socket.
 pub enum AnyTransport {
     Stdio(Box<StdioTransport>),
     Http(HttpTransport),
+    #[cfg(test)]
+    Mock(MockTransport),
 }
 
 impl Transport for AnyTransport {
@@ -398,12 +431,16 @@ impl Transport for AnyTransport {
         match self {
             Self::Stdio(t) => t.send(line).await,
             Self::Http(t) => t.send(line).await,
+            #[cfg(test)]
+            Self::Mock(t) => t.send(line).await,
         }
     }
     async fn recv(&mut self) -> Result<Option<String>> {
         match self {
             Self::Stdio(t) => t.recv().await,
             Self::Http(t) => t.recv().await,
+            #[cfg(test)]
+            Self::Mock(t) => t.recv().await,
         }
     }
 }
@@ -478,32 +515,338 @@ pub fn split_namespaced(qualified: &str) -> Option<(&str, &str)> {
     qualified.split_once(NS_SEP)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::collections::VecDeque;
+// ---------------------------------------------------------------------------
+// McpToolset (#1021 PR 5.1): a session's connected MCP servers, shared
+// ---------------------------------------------------------------------------
+//
+// Promoted out of `newt-tui/src/mcp.rs`'s TUI-only `Mcp` struct so a headless
+// entry point (`newt-mcp-server`, `newt-acp-worker`) can connect to the same
+// servers — `modulex` and friends — without depending on `newt-tui`. The TUI
+// keeps its own `Mcp` type unchanged (a follow-up may migrate it onto this
+// one; not required for headless support to work). Connects **stdio** and
+// **streamable-HTTP** servers, and carries **no Caveats leash** on the remote
+// tools — they run with whatever authority their own server has, same as the
+// TUI's version.
+//
+// Deliberately narrower than the TUI's `Mcp::connect`: it does not perform
+// the TUI's interactive OAuth-bearer-token lookup (`mcp_token::load_bearer_token`,
+// a persisted-login convenience with no headless-server analogue). A headless
+// caller that needs auth sets an explicit `Authorization` header on the
+// server's config entry (`McpServerEntry::headers`, already resolved by
+// `newt_core::mcp::discover`); the insecure-transport WARNING behavior below
+// is preserved regardless, since that's a real security signal, not a UX nicety.
 
-    /// In-memory transport: discards sends, returns canned lines in order.
-    struct MockTransport {
-        responses: VecDeque<String>,
+/// Apply or skip the hyphen→underscore normalisation for a server name.
+fn server_prefix(name: &str, sanitize: bool) -> String {
+    if sanitize {
+        name.replace('-', "_")
+    } else {
+        name.to_owned()
+    }
+}
+
+/// Best-effort `(scheme, host)` from a URL — lowercased, port/userinfo/path
+/// stripped, IPv6 brackets removed. Empty strings when absent/unparseable (which
+/// the policy treats as insecure → no token). Manual parse to avoid a url dep;
+/// good enough for the scheme+host decision below.
+fn parse_scheme_host(url: Option<&str>) -> (String, String) {
+    let Some(url) = url else {
+        return (String::new(), String::new());
+    };
+    let (scheme, rest) = url.split_once("://").unwrap_or(("", url));
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    let authority = authority.rsplit_once('@').map_or(authority, |(_, h)| h); // drop userinfo
+    let host = if let Some(v6) = authority.strip_prefix('[') {
+        v6.split(']').next().unwrap_or(v6) // [::1]:port → ::1
+    } else {
+        authority.split(':').next().unwrap_or(authority) // host:port → host
+    };
+    (scheme.to_ascii_lowercase(), host.to_ascii_lowercase())
+}
+
+/// A loopback host — the dev exception that needs no https and emits no warning.
+fn host_is_loopback(host: &str) -> bool {
+    host == "localhost" || host == "::1" || host.starts_with("127.")
+}
+
+/// Warn on every non-loopback unencrypted (non-`https`) connection — the same
+/// secure-by-default transport policy the TUI enforces
+/// (`docs/decisions/mcp_transport_security.md`), minus the OAuth-token
+/// injection half (headless callers pass any auth via explicit config headers,
+/// so there is no token to conditionally withhold here).
+fn warn_on_insecure_transport(entry: &McpServerEntry) {
+    let (scheme, host) = parse_scheme_host(entry.url.as_deref());
+    if scheme != "https" && !host_is_loopback(&host) {
+        tracing::warn!(
+            "MCP server `{}`: UNENCRYPTED connection to `{}` (no TLS).",
+            entry.name,
+            host
+        );
+    }
+}
+
+/// The session's connected MCP servers — the headless-crate-independent
+/// counterpart of `newt-tui/src/mcp.rs`'s `Mcp`.
+pub struct McpToolset {
+    servers: Vec<ConnectedServer>,
+    /// When `true`, hyphens in server names are replaced with underscores in
+    /// advertised tool names and routing lookups, matching the TUI's
+    /// `[tui].sanitize_mcp_server_names` behavior (default: `true`).
+    sanitize_server_names: bool,
+}
+
+impl McpToolset {
+    /// An empty toolset — connects to nothing. Used by tests and by any
+    /// no-persona / no-configured-servers session.
+    pub fn empty() -> Self {
+        Self {
+            servers: Vec::new(),
+            sanitize_server_names: true,
+        }
     }
 
-    impl MockTransport {
-        fn new(lines: impl IntoIterator<Item = &'static str>) -> Self {
-            Self {
-                responses: lines.into_iter().map(str::to_string).collect(),
+    /// Discover (newt config + Claude Code config) and connect to every
+    /// configured MCP server. A server that fails to spawn/initialize is
+    /// logged and skipped — one bad server never blocks the caller or the
+    /// others.
+    pub async fn connect(
+        workspace: &str,
+        cfg_servers: &[McpServerEntry],
+        sanitize_server_names: bool,
+    ) -> Self {
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+        let entries = newt_core::mcp::discover(
+            cfg_servers,
+            home.as_deref(),
+            std::path::Path::new(workspace),
+        );
+        let mut servers = Vec::new();
+        for entry in &entries {
+            let result = match entry.transport {
+                TransportKind::Stdio => connect_stdio(entry).await,
+                TransportKind::Http => {
+                    warn_on_insecure_transport(entry);
+                    connect_http(entry).await
+                }
+                TransportKind::Sse => {
+                    tracing::warn!(
+                        "MCP server `{}`: legacy SSE transport is not supported \
+                         (use streamable-HTTP, `type = \"http\"`) — skipped",
+                        entry.name
+                    );
+                    continue;
+                }
+            };
+            match result {
+                Ok(connected) => servers.push(connected),
+                Err(e) => tracing::warn!("MCP server `{}` skipped: {e:#}", entry.name),
+            }
+        }
+        Self {
+            servers,
+            sanitize_server_names,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.servers.is_empty()
+    }
+
+    /// `(server_name, tool_count)` for each connected server.
+    pub fn summary(&self) -> Vec<(String, usize)> {
+        self.servers
+            .iter()
+            .map(|s| (s.name.clone(), s.tools.len()))
+            .collect()
+    }
+
+    /// OpenAI-style function tool definitions for every remote tool, with names
+    /// namespaced `server__tool` so two servers cannot collide.
+    pub fn tool_defs(&self) -> Vec<Value> {
+        let mut out = Vec::new();
+        for server in &self.servers {
+            for tool in &server.tools {
+                out.push(json!({
+                    "type": "function",
+                    "function": {
+                        "name": namespaced(&server_prefix(&server.name, self.sanitize_server_names), &tool.name),
+                        "description": tool.description,
+                        "parameters": tool.input_schema,
+                    }
+                }));
+            }
+        }
+        out
+    }
+
+    /// Whether `name` is a namespaced tool belonging to a connected server.
+    pub fn handles(&self, name: &str) -> bool {
+        match split_namespaced(name) {
+            Some((server, _)) => self
+                .servers
+                .iter()
+                .any(|s| server_prefix(&s.name, self.sanitize_server_names) == server),
+            None => false,
+        }
+    }
+
+    /// Route a `server__tool` call to its server and render the result as the
+    /// string a tool-calling loop feeds back as the tool message — wrapped as
+    /// untrusted data ([`newt_core::wrap_untrusted`]) since it originates from
+    /// an external server, not from newt itself.
+    pub async fn call(&mut self, name: &str, args: &Value) -> String {
+        let Some((server_name, tool)) = split_namespaced(name) else {
+            return format!("error: `{name}` is not a namespaced MCP tool");
+        };
+        let Some(server) = self
+            .servers
+            .iter_mut()
+            .find(|s| server_prefix(&s.name, self.sanitize_server_names) == server_name)
+        else {
+            return format!("error: no connected MCP server `{server_name}`");
+        };
+        match server.conn.call_tool(tool, args.clone()).await {
+            // The result is external data, not a newt-generated message — wrap
+            // it. `e` below is OUR OWN connection-error text, not external
+            // content, so it is NOT wrapped.
+            Ok(result) => newt_core::wrap_untrusted(name, &format_toolset_result(&result)),
+            Err(e) => format!("error: {e}"),
+        }
+    }
+}
+
+/// Flatten an MCP `tools/call` result (`{ content: [{type,text}], isError? }`)
+/// into agent-facing text. Falls back to raw JSON if there is no text content.
+/// Same shape as `newt-tui/src/mcp.rs`'s private `format_result` — kept as a
+/// separate copy rather than shared, since the TUI's version stays untouched.
+fn format_toolset_result(result: &Value) -> String {
+    let mut text = String::new();
+    if let Some(items) = result.get("content").and_then(Value::as_array) {
+        for item in items {
+            if let Some(t) = item.get("text").and_then(Value::as_str) {
+                if !text.is_empty() {
+                    text.push('\n');
+                }
+                text.push_str(t);
             }
         }
     }
-
-    impl Transport for MockTransport {
-        async fn send(&mut self, _line: String) -> Result<()> {
-            Ok(())
-        }
-        async fn recv(&mut self) -> Result<Option<String>> {
-            Ok(self.responses.pop_front())
-        }
+    if text.is_empty() {
+        text = result.to_string();
     }
+    if result
+        .get("isError")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        format!("tool error: {text}")
+    } else {
+        text
+    }
+}
+
+#[cfg(test)]
+mod toolset_tests {
+    use super::*;
+
+    #[test]
+    fn empty_toolset_has_no_tools_and_handles_nothing() {
+        let toolset = McpToolset::empty();
+        assert!(toolset.is_empty());
+        assert!(toolset.tool_defs().is_empty());
+        assert!(!toolset.handles("modulex__routine_run"));
+        assert!(toolset.summary().is_empty());
+    }
+
+    #[test]
+    fn server_prefix_sanitizes_hyphens_when_enabled() {
+        assert_eq!(server_prefix("my-server", true), "my_server");
+        assert_eq!(server_prefix("my-server", false), "my-server");
+    }
+
+    #[test]
+    fn handles_matches_sanitized_prefix_only() {
+        let toolset = McpToolset {
+            servers: vec![ConnectedServer {
+                name: "modulex".to_string(),
+                conn: McpConnection::new(AnyTransport::Mock(MockTransport::new([]))),
+                tools: vec![RemoteTool {
+                    name: "routine_run".to_string(),
+                    description: String::new(),
+                    input_schema: json!({}),
+                }],
+            }],
+            sanitize_server_names: true,
+        };
+        assert!(toolset.handles("modulex__routine_run"));
+        // `handles` matches the SERVER prefix only, not the specific tool
+        // name — same as the TUI's `Mcp::handles` it's ported from. A
+        // namespaced call for an unlisted tool on a connected server still
+        // routes there; the server itself rejects an unknown tool name.
+        assert!(toolset.handles("modulex__some_other_tool_on_the_same_server"));
+        assert!(!toolset.handles("no_separator_here"));
+        assert!(!toolset.handles("other_server__routine_run"));
+
+        let defs = toolset.tool_defs();
+        assert_eq!(defs.len(), 1);
+        assert_eq!(
+            defs[0]["function"]["name"],
+            Value::String("modulex__routine_run".to_string())
+        );
+    }
+
+    #[test]
+    fn format_toolset_result_joins_text_and_flags_errors() {
+        let r = json!({"content": [{"type": "text", "text": "hello"}, {"type": "text", "text": "world"}]});
+        assert_eq!(format_toolset_result(&r), "hello\nworld");
+        let err = json!({"content": [{"type":"text","text":"boom"}], "isError": true});
+        assert_eq!(format_toolset_result(&err), "tool error: boom");
+    }
+
+    #[tokio::test]
+    async fn call_wraps_a_successful_result_as_untrusted_data() {
+        let mut toolset = McpToolset {
+            servers: vec![ConnectedServer {
+                name: "modulex".to_string(),
+                conn: McpConnection::new(AnyTransport::Mock(MockTransport::new([
+                    r#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"3 dirty trees"}]}}"#,
+                ]))),
+                tools: vec![],
+            }],
+            sanitize_server_names: true,
+        };
+        let out = toolset
+            .call("modulex__routine_run", &json!({"routine": "morning"}))
+            .await;
+        assert!(out.starts_with("<untrusted-data source=\"modulex__routine_run\">"));
+        assert!(out.contains("3 dirty trees"));
+    }
+
+    #[tokio::test]
+    async fn call_reports_unknown_server_without_wrapping() {
+        let mut toolset = McpToolset::empty();
+        let out = toolset.call("ghost__tool", &json!({})).await;
+        assert_eq!(out, "error: no connected MCP server `ghost`");
+    }
+
+    #[test]
+    fn call_reports_non_namespaced_name_without_wrapping() {
+        // Sync check of the pre-dispatch branch via a blocking runtime, since
+        // `call` is async but this path returns before touching a connection.
+        let out = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let mut toolset = McpToolset::empty();
+                toolset.call("not_namespaced", &json!({})).await
+            });
+        assert_eq!(out, "error: `not_namespaced` is not a namespaced MCP tool");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
 
     #[tokio::test]
     async fn initialize_then_list_tools_parses_entries() {
