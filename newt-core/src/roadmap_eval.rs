@@ -196,17 +196,32 @@ pub enum DriveStep {
     Complete,
 }
 
-/// The #1030 headless traversal cursor: the first `Running` node (work in
-/// progress) if any, else the next-ready (`Pending`) node. Mirrors the TUI's
-/// `roadmap_cursor` so the interactive and headless drives agree on "the node
-/// to act on now" — an in-progress node stays the cursor until it is marked
-/// done rather than the cursor jumping past it.
+/// The #1030 headless traversal cursor: the leftmost **not-yet-closed** node
+/// (`Pending` OR `Running`) whose deps AND children are all `Done` — the next
+/// node `drive` can evaluate to close.
+///
+/// Unlike the interactive [`roadmap_cursor`](../../newt_tui) this is deliberately
+/// NOT "Running-first" (#1080): a bound Plan is `Running`, and Running-first made
+/// `drive` evaluate the *Plan* (→ "children not done" → Blocked) and never
+/// descend to its ready child Task — so a bound Plan's Tasks (even with commits)
+/// never closed. Descending instead evaluates the ready Task first (closing it
+/// from git), and — because a `Running` node is *also* eligible here (whereas
+/// [`Plan::next_ready_node`] only returns `Pending`) — the bound Plan itself
+/// closes once its children are `Done`. `Failed` nodes are excluded: they block
+/// honestly (their dependents' `Done` deps stay unmet). The interactive cursor
+/// keeps Running-first — staying on the bound node is right for `/roadmap next`.
 #[must_use]
 pub fn drive_cursor(tree: &Plan) -> Option<&Subtask> {
-    tree.subtasks
-        .iter()
-        .find(|s| s.status == SubtaskStatus::Running)
-        .or_else(|| tree.next_ready_node())
+    tree.subtasks.iter().find(|s| {
+        matches!(s.status, SubtaskStatus::Pending | SubtaskStatus::Running)
+            && s.deps
+                .iter()
+                .all(|d| matches!(tree.subtask(d).map(|t| t.status), Some(SubtaskStatus::Done)))
+            && tree
+                .children(&s.id)
+                .iter()
+                .all(|c| c.status == SubtaskStatus::Done)
+    })
 }
 
 /// Evaluate the cursor node once and, if it is [`NodeVerdict::Done`], mark it —
@@ -676,11 +691,59 @@ parent = "plan-1"
     }
 
     #[test]
-    fn drive_cursor_prefers_a_running_node_over_the_next_ready() {
+    fn drive_cursor_descends_past_a_running_plan_then_closes_it() {
+        // #1080: a bound Plan is Running. The headless cursor must DESCEND to its
+        // ready Task (not block on the Plan) — and once the Tasks are Done, the
+        // Running Plan itself becomes the cursor so drive can close it (a Running
+        // node is eligible here, unlike next_ready_node which returns only Pending).
+        let mut tree = cascade_tree(); // ph → plan-1 → {t1, t2}
+        tree.mark("plan-1", SubtaskStatus::Running, None); // bind the Plan
+        assert_eq!(
+            drive_cursor(&tree).map(|s| s.id.as_str()),
+            Some("t1"),
+            "descend past the Running plan-1 to the leftmost ready Task"
+        );
+        // With both Tasks Done, the Running Plan becomes the cursor.
+        tree.mark("t1", SubtaskStatus::Done, None);
+        tree.mark("t2", SubtaskStatus::Done, None);
+        assert_eq!(
+            drive_cursor(&tree).map(|s| s.id.as_str()),
+            Some("plan-1"),
+            "a Running Plan with Done children is the cursor so drive closes it"
+        );
+    }
+
+    #[test]
+    fn drive_to_fixpoint_closes_a_bound_running_plan_and_its_tasks() {
+        // #1080 end-to-end regression: bind the Plan (Running), its Tasks carry
+        // commits + verify passes + the Phase PR is merged → drive closes
+        // Task→Task→Plan→Phase unattended (the old Running-first cursor stalled at
+        // the Plan and drove 0 nodes).
         let mut tree = cascade_tree();
-        // Mark t2 Running while t1 is still Pending: the cursor must be t2 (work
-        // in progress), not the leftmost-ready t1.
-        tree.mark("t2", SubtaskStatus::Running, None);
-        assert_eq!(drive_cursor(&tree).map(|s| s.id.as_str()), Some("t2"));
+        tree.mark("plan-1", SubtaskStatus::Running, None); // the bound Plan
+        let (git, verify, forge, ci) = (
+            FakeGit(&["c1", "c2"]),
+            FakeVerify(true),
+            FakeForge(Some(true)),
+            FakeCi(None),
+        );
+        let steps = drive_to_fixpoint(&mut tree, &facts(&git, &verify, &forge, &ci));
+        assert_eq!(
+            steps,
+            vec![
+                DriveStep::Advanced { node: "t1".into() },
+                DriveStep::Advanced { node: "t2".into() },
+                DriveStep::Advanced {
+                    node: "plan-1".into()
+                },
+                DriveStep::Advanced { node: "ph".into() },
+                DriveStep::Complete,
+            ],
+            "the bound Running Plan and its Tasks close from git truth, unattended"
+        );
+        assert!(tree
+            .subtasks
+            .iter()
+            .all(|s| s.status == SubtaskStatus::Done));
     }
 }
