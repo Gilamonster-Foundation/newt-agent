@@ -32,6 +32,8 @@ toml.workspace = true
 # permanently" grant (append a host to `[tui.permissions] net` without the
 # whole-config clobber that `Config::save`/`toml::to_string` would cause).
 toml_edit = "0.25"
+# newt-tuner: model tuning persistence (Step 19.6)
+newt-tuner = { path = "../crates/newt-tuner" }
 serde_yaml.workspace = true
 tracing.workspace = true
 uuid.workspace = true

@@ -16,6 +16,7 @@ members = [
     "newt-identity",
     "newt-scheduler",
     "newt-git",
+    "crates/newt-tuner",
     "newt-eval",
     "newt-agent-py",
     "plugins-protocol",

@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{NewtError, Result};
 use crate::router::Tier;
+pub use newt_tuner::ModelTuning;
 
 /// Process-scoped user config root override, set by the CLI's `--config-dir`.
 pub const NEWT_CONFIG_DIR_ENV: &str = "NEWT_CONFIG_DIR";
@@ -1710,74 +1711,13 @@ fn default_allow_shell_mutations() -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Per-model tuning
+// Per-model tuning helpers
 // ---------------------------------------------------------------------------
-
-/// Inference-parameter overrides for a specific model name.
-///
-/// Matched against the active model by exact string equality.  Add entries
-/// under `[[model_tuning]]` in `~/.newt/config.toml` to pin parameters
-/// for models whose defaults cause problems (e.g. context overflow).
-///
-/// Human-authored entries are never touched by the auto-tuner.  Auto-tuned
-/// entries are appended (not modified) when the harness gains high confidence
-/// in its empirical measurements.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ModelTuning {
-    /// Model name as it appears in Ollama (e.g. `"nemotron3:33b"`).
-    pub model: String,
-
-    /// Ollama `options.num_ctx` — hard cap on KV-cache allocation.
-    /// Overrides both the global `[tui].num_ctx` and the empirically
-    /// derived `safe_context` from `model-capabilities.json`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub num_ctx: Option<u32>,
-
-    /// Per-model context window (total tokens the backend accepts). Unlike
-    /// `num_ctx` — which is Ollama-only and rides `options.num_ctx` — this
-    /// seeds the budget on ANY backend, including the OpenAI-compatible wire
-    /// (NVIDIA/`inference.nvidia.com`) where `num_ctx` is ignored and no
-    /// `/api/show` probe exists to discover a window. When set and the probe
-    /// yields nothing, it becomes the effective `safe_context`, so the loop
-    /// budgets and trims against the model's real window instead of only
-    /// message-count/token thresholds.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub context_window: Option<u32>,
-
-    /// Per-model override of `[tui].real_context_discovery`. `Some(true)` opts
-    /// this model into empirical conserve-and-ratchet discovery; `Some(false)`
-    /// forces trust-the-declared-window even when the global default is
-    /// empirical; `None` inherits the global setting.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub real_context_discovery: Option<bool>,
-
-    /// Per-model `mid_loop_trim_threshold` override.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mid_loop_trim_threshold: Option<usize>,
-
-    /// Per-model `mid_loop_trim_tokens` override (estimated-token trim trigger).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mid_loop_trim_tokens: Option<usize>,
-
-    /// Per-model `max_tool_rounds` override.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_tool_rounds: Option<usize>,
-
-    /// Per-model `[tui].workflow_grace_rounds` override.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub workflow_grace_rounds: Option<usize>,
-
-    /// Per-model `[tui].narration_nudge_cap` override — how many
-    /// narrate-then-stop rescues a turn gets before a no-tool narration is
-    /// accepted as the final answer. Raise to 2–3 for models that chronically
-    /// narrate instead of acting (next-loop-levers.md, lever L3).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub narration_nudge_cap: Option<usize>,
-}
 
 impl Config {
     /// Find the first `[[model_tuning]]` entry whose `model` field matches
-    /// `name` exactly.  Returns `None` when no entry exists.
+    /// `name` exactly. Returns `None` when no entry exists.
+    #[must_use]
     pub fn find_model_tuning(&self, name: &str) -> Option<&ModelTuning> {
         self.model_tuning.iter().find(|t| t.model == name)
     }
