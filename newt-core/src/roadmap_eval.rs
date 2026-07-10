@@ -178,6 +178,94 @@ pub fn evaluate(node: &Subtask, tree: &Plan, facts: &Facts) -> NodeVerdict {
     evaluate_node(node, &gather_facts(node, tree, facts))
 }
 
+/// What one headless traversal step did at the cursor node.
+///
+/// The driver only *closes* nodes whose OBJECTIVE evaluator already passes — it
+/// never runs a model. A [`Blocked`](DriveStep::Blocked) step is exactly where a
+/// real driver (interactive or wyvern) would dispatch work on the node before
+/// trying again; [`Complete`](DriveStep::Complete) means the tree is finished
+/// (or every remaining node is blocked by a dep / open child).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DriveStep {
+    /// The cursor node evaluated [`NodeVerdict::Done`] and was marked Done.
+    Advanced { node: String },
+    /// The cursor node is not (yet) completable — traversal halts honestly here.
+    /// `reason` carries the evaluator's `NotYet`/`Unsupported` message.
+    Blocked { node: String, reason: String },
+    /// No node is ready — the tree is complete, or nothing more can advance.
+    Complete,
+}
+
+/// The #1030 headless traversal cursor: the first `Running` node (work in
+/// progress) if any, else the next-ready (`Pending`) node. Mirrors the TUI's
+/// `roadmap_cursor` so the interactive and headless drives agree on "the node
+/// to act on now" — an in-progress node stays the cursor until it is marked
+/// done rather than the cursor jumping past it.
+#[must_use]
+pub fn drive_cursor(tree: &Plan) -> Option<&Subtask> {
+    tree.subtasks
+        .iter()
+        .find(|s| s.status == SubtaskStatus::Running)
+        .or_else(|| tree.next_ready_node())
+}
+
+/// Evaluate the cursor node once and, if it is [`NodeVerdict::Done`], mark it —
+/// the headless analogue of `/roadmap eval` on the cursor. This is the pure,
+/// fully-mockable core of the wyvern tree driver: it does NOT run a model or
+/// touch the network directly; every objective fact arrives through [`Facts`].
+///
+/// - cursor Done → [`DriveStep::Advanced`] (node marked Done, so the next call
+///   sees the next-ready node and completion ripples up the tree).
+/// - cursor `NotYet`/`Unsupported` → [`DriveStep::Blocked`] (the reason names
+///   what a real driver must make true — a commit, a passing verify, a merged
+///   PR, green CI).
+/// - no cursor → [`DriveStep::Complete`].
+pub fn drive_once(tree: &mut Plan, facts: &Facts) -> DriveStep {
+    let Some(node_id) = drive_cursor(tree).map(|s| s.id.clone()) else {
+        return DriveStep::Complete;
+    };
+    // The cursor was just read from `tree`, so the node exists.
+    let node = tree
+        .subtask(&node_id)
+        .cloned()
+        .expect("cursor node exists in the tree");
+    match evaluate(&node, tree, facts) {
+        NodeVerdict::Done => {
+            tree.mark(&node_id, SubtaskStatus::Done, None);
+            DriveStep::Advanced { node: node_id }
+        }
+        NodeVerdict::NotYet(reason) | NodeVerdict::Unsupported(reason) => DriveStep::Blocked {
+            node: node_id,
+            reason,
+        },
+    }
+}
+
+/// Drive the tree to a fixpoint: repeatedly [`drive_once`] until it stops
+/// advancing. Because [`drive_once`] closes the leftmost-ready node and marking
+/// it Done can make its parent ready, one call ripples completion as far *up*
+/// the tree as the objective facts allow, halting honestly at the first node
+/// that still needs work (`Blocked`) or when the tree is finished (`Complete`).
+///
+/// The loop is bounded by `subtasks.len() + 1` — each `Advanced` closes a
+/// distinct node, so no run can advance more times than there are nodes; the
+/// bound is a hard backstop against a pathological cursor that never converges.
+/// The returned log ends in exactly one non-`Advanced` step (`Blocked` or
+/// `Complete`) on any well-formed tree.
+pub fn drive_to_fixpoint(tree: &mut Plan, facts: &Facts) -> Vec<DriveStep> {
+    let bound = tree.subtasks.len() + 1;
+    let mut steps = Vec::new();
+    for _ in 0..bound {
+        let step = drive_once(tree, facts);
+        let advanced = matches!(step, DriveStep::Advanced { .. });
+        steps.push(step);
+        if !advanced {
+            break;
+        }
+    }
+    steps
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -428,5 +516,171 @@ parent = "rd"
             evaluate(&plan, &tree, &facts(&git, &verify, &forge, &ci)),
             NodeVerdict::NotYet(_)
         ));
+    }
+
+    /// A Phase→Plan→{Task,Task} tree whose commits, verify, and PR are all
+    /// objectively satisfied drives to completion in one fixpoint call: the two
+    /// Tasks close, which makes the Plan ready (children done + verify), which
+    /// makes the Phase ready (children done + PR merged) — completion ripples
+    /// all the way up, then `Complete`.
+    fn cascade_tree() -> Plan {
+        let toml = r#"
+[[subtask]]
+id = "ph"
+instruction = "phase one"
+kind = "phase"
+
+[[subtask]]
+id = "plan-1"
+instruction = "a plan"
+kind = "plan"
+parent = "ph"
+
+[[subtask]]
+id = "t1"
+instruction = "task 1"
+kind = "task"
+parent = "plan-1"
+
+[[subtask]]
+id = "t2"
+instruction = "task 2"
+kind = "task"
+parent = "plan-1"
+"#;
+        let mut tree = Plan::from_toml_str(toml).unwrap();
+        for (id, commit) in [("t1", "c1"), ("t2", "c2")] {
+            if let Some(t) = tree.subtasks.iter_mut().find(|s| s.id == id) {
+                t.artifact_ref = Some(ArtifactRef {
+                    branch: Some("feat/x".into()),
+                    commit: Some(commit.into()),
+                    pr: None,
+                });
+            }
+        }
+        if let Some(ph) = tree.subtasks.iter_mut().find(|s| s.id == "ph") {
+            ph.artifact_ref = Some(ArtifactRef {
+                branch: None,
+                commit: None,
+                pr: Some(42),
+            });
+        }
+        tree
+    }
+
+    #[test]
+    fn drive_once_advances_a_completable_task_and_marks_it_done() {
+        let mut tree = cascade_tree();
+        let (git, verify, forge, ci) = (
+            FakeGit(&["c1", "c2"]),
+            FakeVerify(true),
+            FakeForge(Some(true)),
+            FakeCi(None),
+        );
+        // The cursor is the leftmost ready node — task t1 (a leaf whose deps and
+        // children are clear).
+        let step = drive_once(&mut tree, &facts(&git, &verify, &forge, &ci));
+        assert_eq!(
+            step,
+            DriveStep::Advanced {
+                node: "t1".to_string()
+            }
+        );
+        assert_eq!(tree.subtask("t1").unwrap().status, SubtaskStatus::Done);
+    }
+
+    #[test]
+    fn drive_once_blocks_on_a_task_without_a_commit() {
+        let mut tree = cascade_tree();
+        // No commits present → the cursor task cannot close.
+        let (git, verify, forge, ci) = (
+            FakeGit(&[]),
+            FakeVerify(true),
+            FakeForge(None),
+            FakeCi(None),
+        );
+        let step = drive_once(&mut tree, &facts(&git, &verify, &forge, &ci));
+        match step {
+            DriveStep::Blocked { node, reason } => {
+                assert_eq!(node, "t1");
+                assert!(reason.contains("commit"), "reason was: {reason}");
+            }
+            other => panic!("expected Blocked, got {other:?}"),
+        }
+        // Blocked never mutates status.
+        assert_eq!(tree.subtask("t1").unwrap().status, SubtaskStatus::Pending);
+    }
+
+    #[test]
+    fn drive_to_fixpoint_cascades_completion_up_the_tree() {
+        let mut tree = cascade_tree();
+        let (git, verify, forge, ci) = (
+            FakeGit(&["c1", "c2"]),
+            FakeVerify(true),
+            FakeForge(Some(true)),
+            FakeCi(None),
+        );
+        let steps = drive_to_fixpoint(&mut tree, &facts(&git, &verify, &forge, &ci));
+        // t1, t2, plan-1, ph advance in DFS order, then Complete.
+        assert_eq!(
+            steps,
+            vec![
+                DriveStep::Advanced { node: "t1".into() },
+                DriveStep::Advanced { node: "t2".into() },
+                DriveStep::Advanced {
+                    node: "plan-1".into()
+                },
+                DriveStep::Advanced { node: "ph".into() },
+                DriveStep::Complete,
+            ]
+        );
+        assert!(tree
+            .subtasks
+            .iter()
+            .all(|s| s.status == SubtaskStatus::Done));
+    }
+
+    #[test]
+    fn drive_to_fixpoint_halts_at_the_first_blocked_node() {
+        let mut tree = cascade_tree();
+        // t1's commit is present but t2's is not: t1 closes, then t2 blocks and
+        // the run stops honestly (the Plan/Phase above never falsely close).
+        let (git, verify, forge, ci) = (
+            FakeGit(&["c1"]),
+            FakeVerify(true),
+            FakeForge(Some(true)),
+            FakeCi(None),
+        );
+        let steps = drive_to_fixpoint(&mut tree, &facts(&git, &verify, &forge, &ci));
+        assert_eq!(steps.len(), 2);
+        assert_eq!(steps[0], DriveStep::Advanced { node: "t1".into() });
+        assert!(matches!(&steps[1], DriveStep::Blocked { node, .. } if node == "t2"));
+        assert_eq!(
+            tree.subtask("plan-1").unwrap().status,
+            SubtaskStatus::Pending
+        );
+        assert_eq!(tree.subtask("ph").unwrap().status, SubtaskStatus::Pending);
+    }
+
+    #[test]
+    fn drive_to_fixpoint_on_an_empty_tree_is_a_single_complete_step() {
+        let mut tree = Plan::default();
+        let (git, verify, forge, ci) = (
+            FakeGit(&[]),
+            FakeVerify(true),
+            FakeForge(None),
+            FakeCi(None),
+        );
+        let steps = drive_to_fixpoint(&mut tree, &facts(&git, &verify, &forge, &ci));
+        assert_eq!(steps, vec![DriveStep::Complete]);
+    }
+
+    #[test]
+    fn drive_cursor_prefers_a_running_node_over_the_next_ready() {
+        let mut tree = cascade_tree();
+        // Mark t2 Running while t1 is still Pending: the cursor must be t2 (work
+        // in progress), not the leftmost-ready t1.
+        tree.mark("t2", SubtaskStatus::Running, None);
+        assert_eq!(drive_cursor(&tree).map(|s| s.id.as_str()), Some("t2"));
     }
 }

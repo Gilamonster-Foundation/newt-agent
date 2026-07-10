@@ -9529,6 +9529,10 @@ enum RoadmapCommand {
     /// `/roadmap eval [node-id]` — evaluate a node against OBJECTIVE git state
     /// (Task = commit+verify, Plan = children+verify); mark it Done if it passes.
     Eval(Option<String>),
+    /// `/roadmap drive` — headless traversal: evaluate the cursor node and, while
+    /// it closes, ripple completion up the tree, halting at the first node that
+    /// still needs work. Closes only nodes whose OBJECTIVE evaluator passes.
+    Drive,
 }
 
 fn parse_node_kind(s: &str) -> Option<newt_core::plan::NodeKind> {
@@ -9580,10 +9584,11 @@ fn parse_roadmap_command(input: &str) -> anyhow::Result<RoadmapCommand> {
         Some("bind") => Ok(RoadmapCommand::Bind(parts.next().map(str::to_string))),
         Some("done") => Ok(RoadmapCommand::Done(parts.next().map(str::to_string))),
         Some("eval") => Ok(RoadmapCommand::Eval(parts.next().map(str::to_string))),
+        Some("drive") => Ok(RoadmapCommand::Drive),
         Some(other) => {
             anyhow::bail!(
                 "unknown /roadmap subcommand `{other}` \
-                 (try: list, new, show, use, add, next, bind, done)"
+                 (try: list, new, show, use, add, next, bind, done, eval, drive)"
             )
         }
     }
@@ -9854,6 +9859,28 @@ impl newt_core::roadmap_eval::CiFacts for GhCiFacts {
     }
 }
 
+/// The production objective-fact sources for `workspace`, owned so the caller
+/// can borrow them into a `roadmap_eval::Facts` bundle. Git reads the repo, the
+/// verify runner shells a subprocess, and the forge/CI sources shell `gh`; any
+/// unreachable source degrades to Unsupported (never a false Done). Shared by
+/// `/roadmap eval` (one node) and `/roadmap drive` (the whole cursor cascade).
+fn production_fact_sources(
+    workspace: &str,
+) -> (LocalGitFacts, CommandVerifyRunner, GhForgeFacts, GhCiFacts) {
+    (
+        LocalGitFacts::open(workspace),
+        CommandVerifyRunner {
+            workspace: std::path::PathBuf::from(workspace),
+        },
+        GhForgeFacts {
+            workspace: std::path::PathBuf::from(workspace),
+        },
+        GhCiFacts {
+            workspace: std::path::PathBuf::from(workspace),
+        },
+    )
+}
+
 fn handle_roadmap_command(
     input: &str,
     store: &newt_core::ConversationStore,
@@ -10072,16 +10099,7 @@ fn handle_roadmap_command(
             // Objective evaluation: git for the commit, a subprocess for verify,
             // `gh` for the phase PR and the roadmap's CI. Any missing source
             // yields Unsupported, never a false Done.
-            let git = LocalGitFacts::open(workspace);
-            let verify = CommandVerifyRunner {
-                workspace: std::path::PathBuf::from(workspace),
-            };
-            let forge = GhForgeFacts {
-                workspace: std::path::PathBuf::from(workspace),
-            };
-            let ci = GhCiFacts {
-                workspace: std::path::PathBuf::from(workspace),
-            };
+            let (git, verify, forge, ci) = production_fact_sources(workspace);
             let facts = newt_core::roadmap_eval::Facts {
                 git: &git,
                 verify: &verify,
@@ -10105,6 +10123,45 @@ fn handle_roadmap_command(
                     Ok(RoadmapOutcome::msg(format!("node [{node_id}]: {reason}")))
                 }
             }
+        }
+        RoadmapCommand::Drive => {
+            use newt_core::roadmap_eval::DriveStep;
+            let id = require_active(active_roadmap_id)?;
+            let mut rm = store.load_roadmap(&id)?.ok_or_else(|| {
+                anyhow::anyhow!("active roadmap [{}] not found", short_conversation_id(&id))
+            })?;
+            let (git, verify, forge, ci) = production_fact_sources(workspace);
+            let facts = newt_core::roadmap_eval::Facts {
+                git: &git,
+                verify: &verify,
+                forge: &forge,
+                ci: &ci,
+            };
+            let steps = newt_core::roadmap_eval::drive_to_fixpoint(&mut rm.tree, &facts);
+            // Persist whatever the cascade closed even if it later halted — the
+            // Advanced marks are real, objective completions.
+            store.update_roadmap(&id, &rm.tree)?;
+            let advanced = steps
+                .iter()
+                .filter(|s| matches!(s, DriveStep::Advanced { .. }))
+                .count();
+            let mut out = String::new();
+            for step in &steps {
+                match step {
+                    DriveStep::Advanced { node } => {
+                        out.push_str(&format!("✓ advanced [{node}]\n"));
+                    }
+                    DriveStep::Blocked { node, reason } => {
+                        out.push_str(&format!("⏸ blocked at [{node}]: {reason}\n"));
+                    }
+                    DriveStep::Complete => out.push_str("✓ roadmap complete\n"),
+                }
+            }
+            out.push_str(&format!(
+                "\nDrove {advanced} node(s) to done. {}",
+                roadmap_next_hint(&rm.tree)
+            ));
+            Ok(RoadmapOutcome::msg(out))
         }
     }
 }
@@ -11793,7 +11850,7 @@ fn help_lines() -> &'static [&'static str] {
         "  /conversation rm <id>    - alias for /conversation delete",
         "  /recall [query]          - recent conversations, or full-text search",
         "  /resume [query|n|id]     - find & reopen a past conversation (listed by liveness, searchable)",
-        "  /roadmap [sub]           - #1030 plan tree: new·list·show·use·add · next·bind·done·eval (drive the tree)",
+        "  /roadmap [sub]           - #1030 plan tree: new·list·show·use·add · next·bind·done·eval·drive (headless cascade)",
         "  /tree                    - render the active roadmap tree (▶ marks the next-ready node / DFS cursor)",
         "  /persona list            - list configured personas",
         "  /persona show            - show the active persona",
@@ -15850,6 +15907,10 @@ parent = \"road\"
         assert_eq!(
             parse_roadmap_command("/roadmap eval node-3").unwrap(),
             RoadmapCommand::Eval(Some("node-3".into()))
+        );
+        assert_eq!(
+            parse_roadmap_command("/roadmap drive").unwrap(),
+            RoadmapCommand::Drive
         );
     }
 
