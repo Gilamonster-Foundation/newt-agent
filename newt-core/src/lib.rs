@@ -32,6 +32,8 @@ pub mod pricing;
 pub mod prune;
 pub mod reasoning;
 pub mod retry;
+/// #1030 node evaluators: Task/Plan done-ness from objective git state.
+pub mod roadmap_eval;
 pub mod role_profile;
 pub mod router;
 pub mod scope_grounding;

@@ -6824,6 +6824,7 @@ fn run_chat(
                                     store,
                                     &mut active_roadmap_id,
                                     &active_conversation_id,
+                                    workspace,
                                 ) {
                                     Ok(outcome) => {
                                         print_newt(&outcome.message, color, verbose);
@@ -9525,6 +9526,9 @@ enum RoadmapCommand {
     /// `/roadmap done [node-id]` — mark a node Done (default: the node bound to
     /// this conversation) and advance the cursor.
     Done(Option<String>),
+    /// `/roadmap eval [node-id]` — evaluate a node against OBJECTIVE git state
+    /// (Task = commit+verify, Plan = children+verify); mark it Done if it passes.
+    Eval(Option<String>),
 }
 
 fn parse_node_kind(s: &str) -> Option<newt_core::plan::NodeKind> {
@@ -9575,6 +9579,7 @@ fn parse_roadmap_command(input: &str) -> anyhow::Result<RoadmapCommand> {
         Some("next") | Some("work") => Ok(RoadmapCommand::Next),
         Some("bind") => Ok(RoadmapCommand::Bind(parts.next().map(str::to_string))),
         Some("done") => Ok(RoadmapCommand::Done(parts.next().map(str::to_string))),
+        Some("eval") => Ok(RoadmapCommand::Eval(parts.next().map(str::to_string))),
         Some(other) => {
             anyhow::bail!(
                 "unknown /roadmap subcommand `{other}` \
@@ -9733,11 +9738,63 @@ fn roadmap_next_hint(tree: &newt_core::plan::Plan) -> String {
     }
 }
 
+/// Production [`GitFacts`](newt_core::roadmap_eval::GitFacts): a node's commit is
+/// "present" iff it appears in the repo's HEAD history (checked via newt-git).
+/// A non-repo workspace has no engine, so every commit reads absent.
+struct LocalGitFacts {
+    engine: Option<newt_git::GitEngine>,
+}
+
+impl LocalGitFacts {
+    fn open(workspace: &str) -> Self {
+        Self {
+            engine: newt_git::GitEngine::open(std::path::Path::new(workspace)).ok(),
+        }
+    }
+}
+
+impl newt_core::roadmap_eval::GitFacts for LocalGitFacts {
+    fn commit_present(&self, commit: &str, _branch: Option<&str>) -> bool {
+        let Some(engine) = &self.engine else {
+            return false;
+        };
+        engine
+            .log(&newt_core::git_caveats::GitCaveats::read_only(), 1000)
+            .map(|commits| {
+                commits
+                    .iter()
+                    .any(|c| c.id.starts_with(commit) || c.short_id.starts_with(commit))
+            })
+            .unwrap_or(false)
+    }
+}
+
+/// Production [`VerifyRunner`](newt_core::roadmap_eval::VerifyRunner): run a
+/// node's verify command as a subprocess in the workspace, success = pass.
+struct CommandVerifyRunner {
+    workspace: std::path::PathBuf,
+}
+
+impl newt_core::roadmap_eval::VerifyRunner for CommandVerifyRunner {
+    fn run(&self, cmd: &str) -> bool {
+        std::process::Command::new("sh")
+            .arg("-c")
+            .arg(cmd)
+            .current_dir(&self.workspace)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+}
+
 fn handle_roadmap_command(
     input: &str,
     store: &newt_core::ConversationStore,
     active_roadmap_id: &mut Option<String>,
     active_conversation_id: &str,
+    workspace: &str,
 ) -> anyhow::Result<RoadmapOutcome> {
     // The active roadmap id, or a friendly error naming how to get one.
     let require_active = |active: &Option<String>| -> anyhow::Result<String> {
@@ -9927,6 +9984,48 @@ fn handle_roadmap_command(
                 "Marked node [{node_id}] done. {}",
                 roadmap_next_hint(&rm.tree)
             )))
+        }
+        RoadmapCommand::Eval(maybe_node) => {
+            let id = require_active(active_roadmap_id)?;
+            let mut rm = store.load_roadmap(&id)?.ok_or_else(|| {
+                anyhow::anyhow!("active roadmap [{}] not found", short_conversation_id(&id))
+            })?;
+            let node_id = match maybe_node {
+                Some(n) => {
+                    if rm.tree.subtask(&n).is_none() {
+                        anyhow::bail!("no node `{n}` in this roadmap (see /tree)");
+                    }
+                    n
+                }
+                None => roadmap_cursor(&rm.tree)
+                    .map(|n| n.id.clone())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("no node to evaluate — the roadmap may be complete")
+                    })?,
+            };
+            let node = rm.tree.subtask(&node_id).cloned().expect("resolved above");
+            // Objective evaluation: git for the commit, a subprocess for verify.
+            let git = LocalGitFacts::open(workspace);
+            let verify = CommandVerifyRunner {
+                workspace: std::path::PathBuf::from(workspace),
+            };
+            match newt_core::roadmap_eval::evaluate(&node, &rm.tree, &git, &verify) {
+                newt_core::roadmap_eval::NodeVerdict::Done => {
+                    rm.tree
+                        .mark(&node_id, newt_core::plan::SubtaskStatus::Done, None);
+                    store.update_roadmap(&id, &rm.tree)?;
+                    Ok(RoadmapOutcome::msg(format!(
+                        "✓ node [{node_id}] evaluates DONE — marked done. {}",
+                        roadmap_next_hint(&rm.tree)
+                    )))
+                }
+                newt_core::roadmap_eval::NodeVerdict::NotYet(reason) => Ok(RoadmapOutcome::msg(
+                    format!("node [{node_id}] not done yet: {reason}"),
+                )),
+                newt_core::roadmap_eval::NodeVerdict::Unsupported(reason) => {
+                    Ok(RoadmapOutcome::msg(format!("node [{node_id}]: {reason}")))
+                }
+            }
         }
     }
 }
@@ -11615,7 +11714,7 @@ fn help_lines() -> &'static [&'static str] {
         "  /conversation rm <id>    - alias for /conversation delete",
         "  /recall [query]          - recent conversations, or full-text search",
         "  /resume [query|n|id]     - find & reopen a past conversation (listed by liveness, searchable)",
-        "  /roadmap [sub]           - #1030 plan tree: new·list·show·use·add · next·bind·done (drive the tree)",
+        "  /roadmap [sub]           - #1030 plan tree: new·list·show·use·add · next·bind·done·eval (drive the tree)",
         "  /tree                    - render the active roadmap tree (▶ marks the next-ready node / DFS cursor)",
         "  /persona list            - list configured personas",
         "  /persona show            - show the active persona",
@@ -15665,6 +15764,14 @@ parent = \"road\"
             parse_roadmap_command("/roadmap done node-3").unwrap(),
             RoadmapCommand::Done(Some("node-3".into()))
         );
+        assert_eq!(
+            parse_roadmap_command("/roadmap eval").unwrap(),
+            RoadmapCommand::Eval(None)
+        );
+        assert_eq!(
+            parse_roadmap_command("/roadmap eval node-3").unwrap(),
+            RoadmapCommand::Eval(Some("node-3".into()))
+        );
     }
 
     #[test]
@@ -15697,25 +15804,34 @@ parent = \"road\"
     }
 
     #[test]
-    fn roadmap_bind_and_done_drive_a_node_through_its_status() {
-        let (_state, _ws, store) = recall_test_store();
+    fn roadmap_bind_eval_and_done_drive_a_node_through_its_status() {
+        let (_state, ws_dir, store) = recall_test_store();
+        let ws = ws_dir.path().to_str().unwrap();
         let conv = "1781000000000000000-abcd"; // a stand-in active conversation id
         let mut active_roadmap: Option<String> = None;
 
         // Author a roadmap with one Plan node.
-        handle_roadmap_command("/roadmap new Build it", &store, &mut active_roadmap, conv).unwrap();
+        handle_roadmap_command(
+            "/roadmap new Build it",
+            &store,
+            &mut active_roadmap,
+            conv,
+            ws,
+        )
+        .unwrap();
         handle_roadmap_command(
             "/roadmap add plan Parser",
             &store,
             &mut active_roadmap,
             conv,
+            ws,
         )
         .unwrap();
         let rm_id = active_roadmap.clone().unwrap();
 
         // /roadmap next reports the plan node needs a conversation (unbound).
         let next =
-            handle_roadmap_command("/roadmap next", &store, &mut active_roadmap, conv).unwrap();
+            handle_roadmap_command("/roadmap next", &store, &mut active_roadmap, conv, ws).unwrap();
         assert!(
             next.message.contains("Bind"),
             "unbound plan: {}",
@@ -15724,18 +15840,32 @@ parent = \"road\"
         assert!(next.switch_to.is_none());
 
         // Bind THIS conversation to it → node goes Running and gets the conv id.
-        handle_roadmap_command("/roadmap bind", &store, &mut active_roadmap, conv).unwrap();
+        handle_roadmap_command("/roadmap bind", &store, &mut active_roadmap, conv, ws).unwrap();
         let node = store.load_roadmap(&rm_id).unwrap().unwrap().tree.subtasks[0].clone();
         assert_eq!(node.status, newt_core::plan::SubtaskStatus::Running);
         assert_eq!(node.conversation_id.as_deref(), Some(conv));
 
         // /roadmap next now resumes-to-cursor: it hands back the bound conversation.
         let next2 =
-            handle_roadmap_command("/roadmap next", &store, &mut active_roadmap, conv).unwrap();
+            handle_roadmap_command("/roadmap next", &store, &mut active_roadmap, conv, ws).unwrap();
         assert_eq!(next2.switch_to.as_deref(), Some(conv));
 
-        // /roadmap done (defaulting to the bound node) marks it Done.
-        handle_roadmap_command("/roadmap done", &store, &mut active_roadmap, conv).unwrap();
+        // /roadmap eval on the (childless) Plan node evaluates NOT done — no
+        // objective evidence (no child tasks) — so it is not marked Done.
+        let eval =
+            handle_roadmap_command("/roadmap eval", &store, &mut active_roadmap, conv, ws).unwrap();
+        assert!(
+            eval.message.contains("not done yet"),
+            "eval: {}",
+            eval.message
+        );
+        assert_ne!(
+            store.load_roadmap(&rm_id).unwrap().unwrap().tree.subtasks[0].status,
+            newt_core::plan::SubtaskStatus::Done
+        );
+
+        // /roadmap done (defaulting to the bound node) marks it Done manually.
+        handle_roadmap_command("/roadmap done", &store, &mut active_roadmap, conv, ws).unwrap();
         let done = store.load_roadmap(&rm_id).unwrap().unwrap().tree.subtasks[0].status;
         assert_eq!(done, newt_core::plan::SubtaskStatus::Done);
     }
