@@ -5940,6 +5940,16 @@ fn run_chat(
     // system prompt is built AFTER initialize_all (see below) so soul files are loaded.
     // Placeholder until then.
     let mut system: String;
+    // #1021: seed the shipped gila-personal-assistant skill (best-effort — a
+    // seeding failure shouldn't block the session; the persona's declared
+    // `skills:` binding would just warn as unresolved instead).
+    if let Err(e) = ensure_default_skills() {
+        print_newt(
+            &format!("warning: could not seed default skills: {e}"),
+            color,
+            verbose,
+        );
+    }
     let persona_store = PersonaStore::default();
     let mut active_persona: Option<Persona> = match persona {
         Some(name) => Some(persona_store.load(name)?),
@@ -8651,6 +8661,41 @@ fn warn_on_missing_bound_skills(
             verbose,
         );
     }
+}
+
+/// The shipped `gila-personal-assistant` skill (#1021) — coaches on a
+/// `modulex` MCP routine report. Seeded into the default skill dir
+/// per-file-idempotently, the same shipped-template pattern
+/// `PersonaStore::DEFAULT_PERSONAS` uses (FR-16, #1000), so a
+/// `personal-assistant` persona's declared `skills:` binding resolves out of
+/// the box with no manual `[skills] bundled_dir` opt-in required.
+const GILA_SKILL: &str =
+    include_str!("../../.newt/bundled-skills/gila-personal-assistant/SKILL.md");
+
+/// Seed [`GILA_SKILL`] into the default skill directory
+/// (`newt_skills::default_skills_dir()`, i.e. `~/.newt/skills`) if missing. A
+/// `None` default dir (unresolvable `$HOME`) is a silent no-op, matching how
+/// `current_host_boot`-style host lookups degrade elsewhere in this codebase.
+fn ensure_default_skills() -> anyhow::Result<()> {
+    match newt_skills::default_skills_dir() {
+        Some(dir) => seed_gila_skill(&dir),
+        None => Ok(()),
+    }
+}
+
+/// Write [`GILA_SKILL`] to `<skills_root>/gila-personal-assistant/SKILL.md`
+/// if missing. Per-file-idempotent like `PersonaStore::ensure_defaults`: a
+/// user who deletes it gets it back next launch; an empty file suppresses it.
+/// Split out from [`ensure_default_skills`] so the write itself is testable
+/// against an explicit temp dir rather than the real `$HOME`.
+fn seed_gila_skill(skills_root: &std::path::Path) -> anyhow::Result<()> {
+    let skill_dir = skills_root.join("gila-personal-assistant");
+    let path = skill_dir.join("SKILL.md");
+    if !path.exists() {
+        std::fs::create_dir_all(&skill_dir)?;
+        std::fs::write(&path, GILA_SKILL)?;
+    }
+    Ok(())
 }
 
 fn normalize_persona_name(name: &str) -> anyhow::Result<String> {
@@ -19003,6 +19048,43 @@ mod persona_helper_tests {
         let err = store.load("nope").unwrap_err().to_string();
         assert!(err.contains("unknown persona `nope`"), "got: {err}");
         assert!(err.contains("reviewer"), "lists what IS available: {err}");
+    }
+
+    /// #1021: `GILA_SKILL` is a real, parseable `SKILL.md` — required frontmatter
+    /// present, matching `newt_skills::Skill::parse`'s expectations.
+    #[test]
+    fn gila_skill_template_parses() {
+        let skill = newt_skills::Skill::parse(GILA_SKILL, "").unwrap();
+        assert_eq!(skill.name, "gila-personal-assistant");
+        assert!(!skill.description.is_empty());
+    }
+
+    #[serial_test::serial(real_fs)]
+    #[test]
+    fn seed_gila_skill_writes_when_missing_and_is_idempotent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().join("skills");
+        seed_gila_skill(&root).unwrap();
+        let path = root.join("gila-personal-assistant").join("SKILL.md");
+        assert_eq!(fs::read_to_string(&path).unwrap(), GILA_SKILL);
+
+        // A user's locally-edited copy is NOT clobbered on the next seed.
+        fs::write(&path, "edited by the user").unwrap();
+        seed_gila_skill(&root).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "edited by the user");
+    }
+
+    #[serial_test::serial(real_fs)]
+    #[test]
+    fn seed_gila_skill_is_discoverable_via_newt_skills() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().join("skills");
+        seed_gila_skill(&root).unwrap();
+        let found = newt_skills::discover(&root);
+        assert!(
+            found.iter().any(|s| s.name == "gila-personal-assistant"),
+            "seeded skill resolves via newt_skills::discover"
+        );
     }
 
     #[serial_test::serial(real_fs)]

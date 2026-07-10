@@ -249,7 +249,12 @@ impl Mcp {
             return format!("error: no connected MCP server `{server_name}`");
         };
         match server.conn.call_tool(tool, args.clone()).await {
-            Ok(result) => format_result(&result),
+            // Scoped FR-14 (#1042): the result body is external data from the
+            // connected server, not a newt-generated message — wrap it so the
+            // model treats it as information, not instructions. `e` below is
+            // OUR OWN connection-error text, not external content, so it is
+            // NOT wrapped.
+            Ok(result) => newt_core::wrap_untrusted(name, &format_result(&result)),
             Err(e) => format!("error: {e}"),
         }
     }
