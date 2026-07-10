@@ -21,6 +21,10 @@ base64.workspace = true
 # agents search the workspace without the shell, which can be unavailable in a
 # given build (the stub-shell case that motivated the issue).
 ignore.workspace = true
+# #1030 collision fix (store.rs live_owners): pid-liveness probe
+# (`libc::kill(pid, 0)`) so a conversation claimed by a crashed/rebooted
+# process is reclaimable rather than stuck claimed forever.
+libc.workspace = true
 # Step 19.2 (issue #248): the write-time security scan's injection-pattern
 # table (notes_scan.rs). Already a workspace dep used by newt-eval/newt-tools.
 regex.workspace = true
