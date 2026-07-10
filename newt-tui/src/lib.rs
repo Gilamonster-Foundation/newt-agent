@@ -8593,11 +8593,19 @@ impl PersonaStore {
     /// predates a new default still receives it (the old empty-dir gate would
     /// strand it forever). `coder` is the doer identity (DEFAULT_SOUL); `coach`
     /// is the read-only advise-first persona — its `[caveats]` are enforced by
-    /// FR-1 and its `altitude = "coach"` swaps in COACH_SOUL via FR-5. A user who
-    /// deletes a default gets it back next launch; empty the file to suppress it.
+    /// FR-1 and its `altitude = "coach"` swaps in COACH_SOUL via FR-5.
+    /// `personal-assistant` (#1021, FR-PA-3) is `coach`'s domain-specific
+    /// specialization for enterprise routine automation — its `skills:`
+    /// binding (FR-4, #1041) preloads `gila-personal-assistant`, and its
+    /// `tools:` allow-list (already enforced by FR-1) restricts it to that
+    /// skill's `modulex__*` MCP tools plus infra tools; FR-PA-4 needed no new
+    /// code since `filter_advertised_tools` already does this. A user who
+    /// deletes a default gets it back next launch; empty the file to suppress
+    /// it.
     const DEFAULT_PERSONAS: &'static [(&'static str, &'static str)] = &[
         (Self::DEFAULT_NAME, newt_core::DEFAULT_SOUL),
         ("coach", COACH_PERSONA),
+        ("personal-assistant", PERSONAL_ASSISTANT_PERSONA),
     ];
 
     fn ensure_defaults(&self) -> anyhow::Result<()> {
@@ -8615,6 +8623,11 @@ impl PersonaStore {
 /// The read-only coach persona shipped as a repo template (FR-16, #1000), so
 /// `shipped_role_templates_parse` type-checks its front-matter beside the others.
 const COACH_PERSONA: &str = include_str!("../../personas/coach.md");
+
+/// The Personal Assistant persona shipped as a repo template (#1021, FR-PA-3),
+/// so `shipped_role_templates_parse` type-checks its front-matter beside the
+/// others.
+const PERSONAL_ASSISTANT_PERSONA: &str = include_str!("../../personas/personal-assistant.md");
 
 /// FR-4 (#1041): names in `skills` that do NOT resolve to a `SKILL.md` under
 /// `search_dirs` — a persona's declared-but-missing skill bindings. Empty when
@@ -15954,6 +15967,26 @@ mod skills_integration_tests {
         }
     }
 
+    /// #1021 FR-PA-3: `personal-assistant` seeds as the third default
+    /// persona, per-file-idempotently — same seeding mechanism FR-16 proved
+    /// for `coach` above, extended to the newest default.
+    #[serial_test::serial(real_fs)]
+    #[test]
+    fn seeded_personal_assistant_binds_gila_skill() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = PersonaStore::new(tmp.path().join("personas"));
+        let names: Vec<String> = store.list().unwrap().into_iter().map(|p| p.name).collect();
+        assert!(
+            names.contains(&"personal-assistant".to_string()),
+            "seeded alongside coder/coach: {names:?}"
+        );
+        let pa = store.load("personal-assistant").unwrap();
+        assert_eq!(
+            pa.profile.skills,
+            Some(vec!["gila-personal-assistant".to_string()])
+        );
+    }
+
     #[serial_test::serial(real_fs)]
     #[tokio::test]
     async fn persona_set_starts_fresh_conversation_with_overlay() {
@@ -19136,7 +19169,7 @@ mod persona_helper_tests {
         // Every persona file — including the shipped defaults — is empty. FR-16
         // per-file seeding SKIPS files that already exist (even empty ones), so
         // it doesn't refill them, and the listing is genuinely empty → (none).
-        for f in ["coder.md", "coach.md", "blank.md"] {
+        for f in ["coder.md", "coach.md", "personal-assistant.md", "blank.md"] {
             fs::write(dir.join(f), "").unwrap();
         }
         let store = PersonaStore::new(dir);
@@ -19340,14 +19373,21 @@ mod persona_helper_tests {
     }
 
     /// All shipped role templates under `<repo>/personas/` parse into valid,
-    /// role-bound `RoleProfile`s with distinct tool sets (incl. the FR-16 coach).
+    /// role-bound `RoleProfile`s with distinct tool sets (incl. the FR-16
+    /// coach and the #1021 personal-assistant).
     #[test]
     fn shipped_role_templates_parse() {
         let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("newt-tui is a workspace member");
         let personas = repo_root.join("personas");
-        for name in ["dragon-rider", "wing-commander", "worker", "coach"] {
+        for name in [
+            "dragon-rider",
+            "wing-commander",
+            "worker",
+            "coach",
+            "personal-assistant",
+        ] {
             let path = personas.join(format!("{name}.md"));
             let raw = std::fs::read_to_string(&path)
                 .unwrap_or_else(|e| panic!("missing shipped template {}: {e}", path.display()));
@@ -19360,6 +19400,38 @@ mod persona_helper_tests {
             // Converts to canonical caveats without panicking.
             let _ = rp.caveats.unwrap().to_caveats();
         }
+    }
+
+    /// #1021 FR-PA-3/FR-PA-4: the shipped `personal-assistant` persona binds
+    /// the `gila-personal-assistant` skill (FR-4, #1041) and its `tools:`
+    /// allow-list is exactly its modulex MCP tools plus the infra tools the
+    /// agentic loop needs every round — nothing else. FR-PA-4 itself (persona
+    /// tool-allowlist filtering) needed no new code: `filter_advertised_tools`
+    /// / `persona_tool_allowed` (newt-core's `agentic::tools`) already
+    /// enforce this generically, covered by their own existing test suite
+    /// (e.g. `persona_tool_allowed_admits_named_and_always_on_only`); this
+    /// test only asserts the persona's *data* is what FR-PA-4 depends on.
+    #[test]
+    fn personal_assistant_persona_binds_gila_skill_and_modulex_tools_only() {
+        let rp = newt_core::RoleProfile::parse(PERSONAL_ASSISTANT_PERSONA).unwrap();
+        assert_eq!(
+            rp.skills,
+            Some(vec!["gila-personal-assistant".to_string()]),
+            "binds exactly the gila skill"
+        );
+        let tools = rp.tools.expect("personal-assistant must declare tools");
+        for expected in ["modulex__routine_run", "modulex__report_get"] {
+            assert!(
+                tools.iter().any(|t| t == expected),
+                "must advertise {expected}: {tools:?}"
+            );
+        }
+        assert!(
+            !tools
+                .iter()
+                .any(|t| t.starts_with("write_") || t == "run_command"),
+            "must not advertise a mutating tool: {tools:?}"
+        );
     }
 }
 
