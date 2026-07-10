@@ -131,6 +131,33 @@ check:
 check:
     $rc = 0; cargo fmt --all -- --check; if ($LASTEXITCODE -ne 0) { $rc = 1 }; cargo clippy --workspace --all-targets --features newt-data/kernel -- -D warnings; if ($LASTEXITCODE -ne 0) { $rc = 1 }; cargo test --workspace --features newt-data/kernel; if ($LASTEXITCODE -ne 0) { $rc = 1 }; cargo clippy -p newt-agent --no-default-features --all-targets -- -D warnings; if ($LASTEXITCODE -ne 0) { $rc = 1 }; exit $rc
 
+# README staleness lint (#1023): the README states invariants and links to
+# live sources of truth — it must never carry operator-local paths, cluster
+# hostnames, or time-anchored phrasing that rots. Candidate release-gate step.
+[unix]
+readme-check:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    rc=0
+    # Forbidden: private/local paths, redacted infra, staleness vocabulary.
+    patterns=(
+        '~/workspaces' '~/\.claude' 'REDACTED'
+        'for now' 'coming soon' 'recently' 'planned as a follow-up'
+        'now includes' 'will soon'
+    )
+    for p in "${patterns[@]}"; do
+        if grep -Einq "$p" README.md; then
+            echo "readme-check: forbidden pattern '$p' in README.md:" >&2
+            grep -Ein "$p" README.md >&2
+            rc=1
+        fi
+    done
+    # Every relative markdown link target must exist in the repo.
+    while IFS= read -r target; do
+        [ -e "$target" ] || { echo "readme-check: dead link ./$target" >&2; rc=1; }
+    done < <(grep -oE '\]\(\./[^)#]+' README.md | sed 's/](\.\///')
+    exit $rc
+
 # Build + test the out-of-workspace newt-mesh crate. Requires the
 # sibling `../agent-mesh/` checkout. Not run by `just check` /
 # CI — see docs/decisions/mesh_integration.md.
