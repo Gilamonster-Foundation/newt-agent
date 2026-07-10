@@ -2331,6 +2331,36 @@ fn fs_gate_allows(
     }
 }
 
+/// #1056: is `out` the embedded git tool's capability-denial for a WRITE op
+/// (`add`/`commit`/`reset`/`branch`/…), as opposed to an engine error (e.g.
+/// "nothing to commit") or a read? newt-git returns `capability denied: git <op>
+/// not permitted` when the projected [`GitCaveats`](crate::git_caveats::GitCaveats)
+/// deny a write; read ops (`status`/`log`/`diff`) are ungated so they never
+/// produce this, and engine errors don't carry the `capability denied` marker.
+fn is_git_write_denial(out: &str) -> bool {
+    out.contains("capability denied: git ") && out.contains("not permitted")
+}
+
+/// #1056: route a denied LOCAL git write through the gate — the git sibling of
+/// [`fs_gate_allows`]. The git-write capability is **non-axis** (it widens no
+/// `Caveats` axis), so the decision is binary: `Allow` ⇒ the git arm re-dispatches
+/// under the local-write surface; `Deny` (or no gate, i.e. headless) ⇒ keep the
+/// denial. The readonly-`/mode` FLOOR is enforced inside
+/// [`PermissionGate::ask`], which refuses the grant when the active preset
+/// projects no git-commit authority — so a git write can never pierce it here.
+fn git_gate_allows(gate: &mut dyn PermissionGate, op: &str) -> bool {
+    let request = PermissionRequest {
+        tool: "git".to_string(),
+        kind: DenialKind::GitWrite,
+        target: op.to_string(),
+        reason: format!("git {op} is outside the granted git-write authority"),
+    };
+    matches!(
+        gate.ask(std::slice::from_ref(&request)),
+        PermissionDecision::Allow(_)
+    )
+}
+
 /// #721: map the model-supplied `capability` string for `request_permissions`
 /// onto a [`DenialKind`] axis. A small synonym set absorbs the names a weak
 /// local model tends to emit; an unrecognized value returns `None` so the tool
@@ -3080,12 +3110,31 @@ pub async fn execute_tool_with_offload(
                 let gc = crate::git_caveats::GitCaveats::from_session(caveats);
                 let op = args.get("op").and_then(|v| v.as_str()).unwrap_or("");
                 print_tool_call("git", op, color);
-                let out = match tool.dispatch(op, args, &gc) {
+                let mut out = match tool.dispatch(op, args, &gc) {
                     Ok(rendered) => rendered,
                     // Denials + engine errors surface verbatim so the model
                     // sees WHY (e.g. "denied: commit" on a read-only session).
                     Err(e) => format!("error: {e}"),
                 };
+                // #1056: a LOCAL git WRITE denied by the projected authority is
+                // NOT a dead end (the trap that stranded the model between the git
+                // tool and `run_command git`). Route it through the gate like
+                // exec/fs: on an operator grant, re-dispatch under the local-write
+                // surface (`GitCaveats::top()` — all LOCAL ops; network stays
+                // closed / shell-net-gated). No gate (headless) or a decline keeps
+                // the denial. The readonly-`/mode` floor is enforced in the gate.
+                if is_git_write_denial(&out) {
+                    let granted = permission_gate
+                        .as_deref_mut()
+                        .is_some_and(|gate| git_gate_allows(gate, op));
+                    if granted {
+                        out = match tool.dispatch(op, args, &crate::git_caveats::GitCaveats::top())
+                        {
+                            Ok(rendered) => rendered,
+                            Err(e) => format!("error: {e}"),
+                        };
+                    }
+                }
                 print_tool_output(&out, tool_output_lines, color);
                 out
             }
@@ -5484,6 +5533,100 @@ mod execute_tool_branch_tests {
         // The same session can still run a read op.
         let out = run_git("status", &read_only, Some(&StubGit)).await;
         assert!(out.contains("on branch main"), "got: {out}");
+    }
+
+    /// Same as `run_git` but with a gate AND the git tool both injected — the
+    /// #1056 path where a denied git write consults the operator.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_git_gated(
+        op: &str,
+        caveats: &Caveats,
+        git: &dyn crate::agentic::GitTool,
+        gate: &mut MockGate,
+    ) -> String {
+        let ws = tempfile::TempDir::new().unwrap();
+        execute_tool(
+            "git",
+            &serde_json::json!({ "op": op }),
+            &ws.path().to_string_lossy(),
+            false,
+            20,
+            caveats,
+            &mut NoMcp,
+            None,
+            None,
+            None,
+            None,
+            Some(gate), // permission_gate
+            None,       // exec_floor
+            Some(git),  // git_tool
+            None,       // crew_runner
+            None,       // scratchpad_store
+            None,       // code_search
+            None,       // experience_store
+            None,       // step_ledger
+        )
+        .await
+    }
+
+    /// #1056: a git WRITE the projected authority denies is no longer a dead end
+    /// — with a gate that ALLOWS, the arm re-dispatches under the local-write
+    /// surface and the commit lands (the deadlock fix). The gate is consulted for
+    /// a `git_write` capability.
+    #[tokio::test]
+    async fn git_write_denial_routes_through_gate_and_commits_on_allow() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let read_only = Caveats {
+            fs_write: Scope::none(),
+            ..caveats_rw(ws.path())
+        };
+        let mut gate = MockGate::new(true, &read_only);
+        let out = run_git_gated("commit", &read_only, &StubGit, &mut gate).await;
+        assert!(
+            out.contains("committed"),
+            "gate-granted commit should land: {out}"
+        );
+        assert!(
+            gate.asks
+                .iter()
+                .any(|(t, k)| t == "git" && k.starts_with("git_write:commit")),
+            "a git_write grant was requested: {:?}",
+            gate.asks
+        );
+    }
+
+    /// Deny-by-default invariant: a gate that DECLINES keeps the git write denied.
+    #[tokio::test]
+    async fn git_write_denied_when_operator_declines() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let read_only = Caveats {
+            fs_write: Scope::none(),
+            ..caveats_rw(ws.path())
+        };
+        let mut gate = MockGate::new(false, &read_only);
+        let out = run_git_gated("commit", &read_only, &StubGit, &mut gate).await;
+        assert!(
+            out.contains("capability denied: git commit not permitted"),
+            "a declined git write stays denied: {out}"
+        );
+    }
+
+    /// #1056: a git READ is never gated — the arm only routes WRITE denials, so a
+    /// read op never even consults the gate.
+    #[tokio::test]
+    async fn git_read_is_never_gated() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let read_only = Caveats {
+            fs_write: Scope::none(),
+            ..caveats_rw(ws.path())
+        };
+        let mut gate = MockGate::new(false, &read_only);
+        let out = run_git_gated("status", &read_only, &StubGit, &mut gate).await;
+        assert!(
+            out.contains("on branch main"),
+            "read op runs ungated: {out}"
+        );
+        assert!(gate.asks.is_empty(), "a read must not consult the gate");
     }
 
     #[tokio::test]

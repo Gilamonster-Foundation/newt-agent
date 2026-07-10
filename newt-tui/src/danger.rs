@@ -115,6 +115,12 @@ impl DangerTable {
             // allow` a remote tool it needs (a High tier would refuse the session
             // grant). The absolute-catastrophe floor is FR-3's deny-list, not this.
             DenialKind::RemoteTool => false,
+            // #1056: a LOCAL git write is Low — a commit is not an interpreter or
+            // a broad-tree grant, and it must be `[s]ession allow`-able so a coder
+            // can commit its work without a prompt per op. The floor that still
+            // denies it under a readonly `/mode` is the gate's preset check, not a
+            // High tier (which would only block the session grant, not once).
+            DenialKind::GitWrite => false,
         };
         if high {
             DangerTier::High
@@ -154,9 +160,9 @@ impl DangerTable {
                     ))
                 }
             }
-            // Net and RemoteTool are never high-danger (guarded by `classify`
-            // above); unreachable in practice, but keep the match total.
-            DenialKind::Net | DenialKind::RemoteTool => None,
+            // Net, RemoteTool, and GitWrite are never high-danger (guarded by
+            // `classify` above); unreachable in practice, but keep the match total.
+            DenialKind::Net | DenialKind::RemoteTool | DenialKind::GitWrite => None,
         }
     }
 
