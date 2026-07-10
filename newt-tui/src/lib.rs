@@ -4057,6 +4057,28 @@ mod permission_prompt_tests {
     fn help_lists_the_mode_command() {
         assert!(help_lines().iter().any(|l| l.contains("/mode")));
     }
+
+    #[test]
+    fn help_lists_the_start_and_rename_commands() {
+        // #1030 lifecycle verbs must be discoverable in /help.
+        assert!(help_lines().iter().any(|l| l.contains("/start")));
+        assert!(help_lines().iter().any(|l| l.contains("/rename")));
+    }
+
+    #[test]
+    fn close_out_message_reflects_the_rotation_kind() {
+        // Persisted outgoing: /new is bare; /start says stays-open; the finalizers
+        // point at /resume (no more "won't resume next launch").
+        assert_eq!(close_out_message("new", "NEW", true), "NEW");
+        assert!(close_out_message("start", "NEW", true).contains("stays open"));
+        assert!(close_out_message("start", "NEW", true).contains("/resume"));
+        assert!(close_out_message("end", "NEW", true).contains("/resume to reopen"));
+        assert!(close_out_message("restart", "NEW", true).contains("/resume to reopen"));
+        // Nothing persisted (empty conversation or ephemeral session): no resume
+        // promise for ANY verb — just the plain new-conversation line.
+        assert_eq!(close_out_message("start", "NEW", false), "NEW");
+        assert_eq!(close_out_message("end", "NEW", false), "NEW");
+    }
 }
 
 /// Process-environment synchronization for tests.
@@ -5868,6 +5890,50 @@ fn run_chat(
         }
     }
 
+    // #1030: become the live owner of the active conversation. With
+    // fresh-on-launch (the default) this id is brand-new so the claim is
+    // granted; only a NEWT_CONVERSATION_ID / `resume = true` opt-in can point at
+    // a conversation another live newt already holds — we refuse to attach (that
+    // is the turn-interleaving bug) and start a fresh conversation instead.
+    if let Some(store) = conversation_store.as_ref() {
+        match store.claim(&active_conversation_id) {
+            Ok(newt_core::ClaimOutcome::Claimed) => {}
+            Ok(newt_core::ClaimOutcome::HeldBy { host, pid }) => {
+                print_newt(
+                    &format!(
+                        "that conversation is open in another newt (pid {pid} on {host}) — \
+                         starting a fresh one instead (/resume to pick another)"
+                    ),
+                    color,
+                    verbose,
+                );
+                handle_new_conversation(
+                    workspace,
+                    &mut memory,
+                    &mut system,
+                    active_persona.as_ref(),
+                    &mut active_conversation_id,
+                    &mut compress_state,
+                    &mut session_opted_fresh,
+                );
+                {
+                    use newt_core::ScratchpadStore;
+                    scratchpad_store.clear();
+                }
+                {
+                    use newt_core::StepLedger;
+                    step_ledger.clear();
+                }
+                let _ = store.claim(&active_conversation_id);
+            }
+            Err(e) => print_newt(
+                &format!("warning: could not claim the conversation ({e})"),
+                color,
+                verbose,
+            ),
+        }
+    }
+
     // retry technique (increment 2b): the re-prompt budget for the *current* user
     // turn, and a queued corrective re-prompt. When `pending_retry` is `Some`, the
     // next loop iteration runs it instead of reading user input — so a fabricating
@@ -6354,50 +6420,71 @@ fn run_chat(
                         println!();
                         continue;
                     }
-                    // `/new` · `/end` · `/restart` all close out the current
-                    // conversation and start a fresh one (the three are aliases
-                    // per the user's "end/restart vocabulary" choice). The only
-                    // difference is the `end_reason` recorded and the wording.
-                    let close_word = match task.trim_start_matches('/') {
+                    // `/new` · `/end` · `/restart` finalize the current
+                    // conversation and drop into a fresh one; `/start [title]`
+                    // SWITCHES to a fresh one but leaves the outgoing OPEN and
+                    // resumable (#1030). All stay in the session — `/exit` ·
+                    // `/quit` · vi `:wq` leave. The `end_reason`, the message,
+                    // and (for /start) an optional pre-title are what differ.
+                    let slash_verb = task.trim_start_matches('/');
+                    let (verb, verb_arg) = slash_verb
+                        .split_once(char::is_whitespace)
+                        .map_or((slash_verb, ""), |(v, a)| (v, a.trim()));
+                    let close_word = match verb {
                         "new" => Some("new"),
                         "end" => Some("end"),
                         "restart" => Some("restart"),
+                        "start" => Some("start"),
                         _ => None,
                     };
                     if let Some(reason) = close_word {
-                        // 19.4: extraction runs BEFORE the reset below wipes
-                        // the history it reads. Failure never blocks the reset.
-                        let close_complete = build_session_summarizer(
-                            &sum_cfg,
-                            &cfg,
-                            &inf_url,
-                            &inf_model,
-                            inf_kind,
-                            &inf_key,
-                            Some(mem_budget),
-                            color,
-                        );
-                        if let Some(notice) = tokio::task::block_in_place(|| {
-                            rt.block_on(run_close_extraction(
-                                extract_on_close,
-                                ephemeral_session,
-                                turns_this_conversation,
-                                &mut memory,
-                                &close_complete,
-                            ))
-                        }) {
-                            print_newt(&notice, color, verbose);
+                        // #1030: /start SWITCHES (leaves the outgoing conversation
+                        // OPEN), so it does NOT finalize — skip close-time note
+                        // extraction, which is a finalization action (running it on
+                        // a still-open conversation also double-extracts when it is
+                        // later /resumed and /ended). The finalizers (/new · /end ·
+                        // /restart) extract as before; 19.4: extraction runs BEFORE
+                        // the reset below wipes the history it reads, and failure
+                        // never blocks the reset.
+                        if reason != "start" {
+                            let close_complete = build_session_summarizer(
+                                &sum_cfg,
+                                &cfg,
+                                &inf_url,
+                                &inf_model,
+                                inf_kind,
+                                &inf_key,
+                                Some(mem_budget),
+                                color,
+                            );
+                            if let Some(notice) = tokio::task::block_in_place(|| {
+                                rt.block_on(run_close_extraction(
+                                    extract_on_close,
+                                    ephemeral_session,
+                                    turns_this_conversation,
+                                    &mut memory,
+                                    &close_complete,
+                                ))
+                            }) {
+                                print_newt(&notice, color, verbose);
+                            }
                         }
-                        // Mark the OUTGOING conversation ended so the next launch
-                        // does not auto-resume it (`latest_open` skips ended
-                        // rows) — yet it stays in `/recall`. Only when it was
-                        // actually persisted: an empty conversation (no turn
-                        // saved yet) has no row to resolve.
+                        let outgoing_id = active_conversation_id.clone();
+                        // #1030: was the outgoing conversation actually persisted
+                        // (a turn saved)? Drives both the `end_reason` marking and
+                        // the close-out message — no "saved / /resume" promise for
+                        // an empty or ephemeral conversation.
+                        let outgoing_persisted = conversation_store
+                            .as_ref()
+                            .is_some_and(|store| store.exists(&outgoing_id).unwrap_or(false));
                         if let Some(store) = conversation_store.as_ref() {
-                            if store.exists(&active_conversation_id).unwrap_or(false) {
-                                if let Err(e) =
-                                    store.end_conversation(&active_conversation_id, reason)
-                                {
+                            // `/start` leaves the outgoing conversation OPEN so it
+                            // stays resumable via `/resume`; the finalizers mark it
+                            // ended (`end_reason`, shown as ✓ in `/resume`). Only
+                            // when actually persisted — an empty conversation (no
+                            // turn saved yet) has no row to resolve.
+                            if reason != "start" && outgoing_persisted {
+                                if let Err(e) = store.end_conversation(&outgoing_id, reason) {
                                     print_newt(
                                         &format!("warning: could not mark conversation ended: {e}"),
                                         color,
@@ -6405,6 +6492,10 @@ fn run_chat(
                                     );
                                 }
                             }
+                            // #1030: hand the outgoing conversation back — this
+                            // process is no longer its live owner, so another newt
+                            // (or a later /resume) may take it.
+                            let _ = store.release(&outgoing_id);
                         }
                         turns_this_conversation = 0;
                         let started = handle_new_conversation(
@@ -6416,6 +6507,22 @@ fn run_chat(
                             &mut compress_state,
                             &mut session_opted_fresh,
                         );
+                        // #1030: pre-title a `/start <title>` conversation by
+                        // creating its (empty) record up front, so it appears in
+                        // `/resume` with that title immediately; the first turn
+                        // then appends rather than deriving a title. Then claim the
+                        // new conversation for THIS process (a brand-new id — the
+                        // claim is always granted).
+                        if let Some(store) = conversation_store.as_ref() {
+                            if reason == "start" && !verb_arg.is_empty() {
+                                let _ = store.create_with_id(
+                                    &active_conversation_id,
+                                    verb_arg,
+                                    active_persona.as_ref().map(|p| p.name.as_str()),
+                                );
+                            }
+                            let _ = store.claim(&active_conversation_id);
+                        }
                         // Step 26.4 (#583): drop scratchpad state so a fresh task
                         // never inherits the previous conversation's variables.
                         {
@@ -6438,25 +6545,79 @@ fn run_chat(
                             use newt_core::StepLedger;
                             step_ledger.clear();
                         }
-                        // `/new` keeps its historical message verbatim; the
-                        // end/restart aliases say so explicitly (the previous
-                        // conversation won't resume next launch).
-                        let msg = if reason == "new" {
-                            started
-                        } else {
-                            format!(
-                                "Ended this conversation — it won't resume next launch. {started}"
-                            )
-                        };
+                        let msg = close_out_message(reason, &started, outgoing_persisted);
                         print_newt(&msg, color, verbose);
                         surface.save_history();
                         println!();
-                        if reason == "end" {
-                            clean_exit = true;
-                            break;
-                        } else {
-                            continue;
+                        // #1030: /end now finalizes-and-CONTINUES like /new and
+                        // /restart (it no longer exits the program) — /exit ·
+                        // /quit · vi :wq are the leave-the-session verbs.
+                        continue;
+                    }
+                    // #1030: `/rename <title>` retitles the CURRENT conversation
+                    // so it is easy to find later in `/resume` (titles are what
+                    // `/resume` lists and searches). Renaming before the first
+                    // turn pre-titles an (empty) record so it shows up titled.
+                    if verb == "rename" {
+                        match conversation_store.as_ref() {
+                            Some(store) => {
+                                let title = verb_arg.trim();
+                                if title.is_empty() {
+                                    print_newt("usage: /rename <new title>", color, verbose);
+                                } else {
+                                    // #1030: match on exists() so a transient store
+                                    // error (SQLITE_BUSY / NFS IO under concurrent-
+                                    // newt contention) can NEVER read as "absent" and
+                                    // route into create_with_id, whose INSERT OR
+                                    // REPLACE would destroy the live conversation and
+                                    // CASCADE-drop its turns. The save path guards the
+                                    // same hazard with `exists()?`.
+                                    match store.exists(&active_conversation_id) {
+                                        Ok(true) => {
+                                            match store.rename(&active_conversation_id, title) {
+                                                Ok(()) => print_newt(
+                                                    &format!(
+                                                        "Renamed this conversation to \"{title}\"."
+                                                    ),
+                                                    color,
+                                                    verbose,
+                                                ),
+                                                Err(e) => print_newt(
+                                                    &format!("could not rename: {e}"),
+                                                    color,
+                                                    verbose,
+                                                ),
+                                            }
+                                        }
+                                        Ok(false) => match store.create_with_id(
+                                            &active_conversation_id,
+                                            title,
+                                            active_persona.as_ref().map(|p| p.name.as_str()),
+                                        ) {
+                                            Ok(()) => print_newt(
+                                                &format!("Titled this conversation \"{title}\"."),
+                                                color,
+                                                verbose,
+                                            ),
+                                            Err(e) => print_newt(
+                                                &format!("could not title: {e}"),
+                                                color,
+                                                verbose,
+                                            ),
+                                        },
+                                        Err(e) => print_newt(
+                                            &format!("could not rename (store error: {e})"),
+                                            color,
+                                            verbose,
+                                        ),
+                                    }
+                                }
+                            }
+                            None => print_newt(EPHEMERAL_SESSION_NOTICE, color, verbose),
                         }
+                        surface.save_history();
+                        println!();
+                        continue;
                     }
                     let slash_body = task.trim_start_matches('/');
                     if slash_body == "conversation" || slash_body.starts_with("conversation ") {
@@ -7484,6 +7645,13 @@ fn run_chat(
         }
     }
 
+    // #1030: release this process's live-owner claim on the way out so the next
+    // launch, another newt, or a later /resume can take the conversation. A
+    // crash that skips this leaves a stale claim the next claim reclaims.
+    if let Some(store) = conversation_store.as_ref() {
+        let _ = store.release(&active_conversation_id);
+    }
+
     surface.save_history();
     Ok(())
 }
@@ -8332,6 +8500,30 @@ fn new_conversation_message(active_persona: Option<&Persona>) -> String {
     }
 }
 
+/// The line printed after a `/new` · `/end` · `/restart` · `/start` rotation
+/// (#1030). `started` is [`new_conversation_message`]. `/new` keeps its bare
+/// historical message; the finalizers (`/end`, `/restart`) note the old
+/// conversation is saved and `/resume`-able; `/start` notes it stays OPEN. The
+/// old "won't resume next launch" wording is retired — with fresh-on-launch
+/// nothing auto-resumes, so `/resume` is how you get back either way.
+///
+/// `outgoing_persisted` is false for an empty conversation (no turn saved) or an
+/// ephemeral session: nothing was written, so the message makes NO "saved /
+/// stays open — /resume" promise it cannot keep — just the plain new line.
+fn close_out_message(reason: &str, started: &str, outgoing_persisted: bool) -> String {
+    if !outgoing_persisted {
+        return started.to_string();
+    }
+    match reason {
+        "start" => {
+            format!("{started} The previous conversation stays open — /resume to return to it.")
+        }
+        "new" => started.to_string(),
+        // "end" | "restart"
+        _ => format!("{started} The previous conversation is saved — /resume to reopen it."),
+    }
+}
+
 fn handle_new_conversation(
     workspace: &str,
     memory: &mut newt_core::MemoryManager,
@@ -8509,7 +8701,11 @@ fn save_successful_conversation_turn(
     // the scratchpad and under the same discipline — working memory, not
     // provenance (rides the conversation row, never enters the §6 content
     // chain). Saved every turn so the row always carries the most recent plan.
-    store.update_plan_snapshot(conversation_id, plan)
+    store.update_plan_snapshot(conversation_id, plan)?;
+    // #1030: refresh this process's live_owners heartbeat every turn — the
+    // freshness signal a cross-host / post-reboot liveness check reads. A no-op
+    // if this process does not hold the claim.
+    store.heartbeat(conversation_id)
 }
 
 /// The run loop's per-turn save seam (17.7): persistent sessions route to
@@ -10353,12 +10549,14 @@ NOTES). Survives /new. View usage with /memory.
         }
         "new" => {
             "\
-/new · /end · /restart — close out this conversation and start fresh
+/new · /end · /restart · /start — begin a new conversation
 
-All three end the current conversation (its summary is extracted to memory) and
-begin a new one; the old one will NOT auto-resume next launch but stays in
-/recall. /end and /restart are aliases of /new. To resume-on-restart instead,
-just /exit. To send a final prompt THEN end, use vi :wq."
+/new, /end, and /restart FINALIZE the current conversation (its summary is
+extracted to memory) and start a fresh one, staying in the session. /start
+switches to a fresh one too but leaves the previous conversation OPEN so you can
+/resume it. /start <title> and /rename <title> name a conversation so it is easy
+to find in /resume. Nothing auto-resumes on next launch (#1030) — use /resume to
+reopen a past conversation. /exit · /quit · vi :wq leave the session."
         }
         "conversation" => {
             "\
@@ -10478,8 +10676,9 @@ Persist with [tui] edit_mode. Press Ctrl-h/^G/:help in-editor for the cheatsheet
             "\
 /exit · /quit (or bare exit/quit, Ctrl-D) — leave the session
 
-Ends the session; with conversation persistence on, the SAME conversation
-auto-resumes next launch. To start fresh next time, use /end (or vi :wq) first."
+Ends the session. Conversations do NOT auto-resume on next launch (#1030): each
+launch starts fresh — use /resume to reopen a past conversation. (Opt into
+auto-resuming the folder's latest with [conversations] resume = true.)"
         }
         "help" => {
             "\
@@ -10533,7 +10732,25 @@ fn help_request(task: &str) -> Option<String> {
         // `/help <cmd>` → that cmd's page; bare `/help` is the full list (None).
         return rest.first().map(|c| c.to_string());
     }
-    if rest.iter().any(|a| matches!(*a, "--help" | "-h" | "help")) {
+    let is_help_token = |a: &&str| matches!(*a, "--help" | "-h" | "help");
+    // #1030: `/start` and `/rename` take a free-text TITLE, so a `help`/`-h`/
+    // `--help` token INSIDE a title must NOT be read as a help request — only an
+    // invocation whose SOLE argument is the help token asks for help (folded to
+    // the page documenting each: /start under /new, /rename under /conversation).
+    if matches!(cmd, "start" | "rename") {
+        if rest.len() == 1 && is_help_token(&rest[0]) {
+            return Some(
+                if cmd == "start" {
+                    "new"
+                } else {
+                    "conversation"
+                }
+                .to_string(),
+            );
+        }
+        return None;
+    }
+    if rest.iter().any(is_help_token) {
         return Some(cmd.to_string());
     }
     None
@@ -10559,8 +10776,10 @@ fn help_lines() -> &'static [&'static str] {
         "  /context feature <name> [on|off] - toggle a composable context feature (all pending #582-#586)",
         "  /context stats           - experimentation dashboard: budget, compression, feature states",
         "  /remember <fact>         - add a fact to persistent NOTES.md",
-        "  /new                     - start a fresh conversation (ends the current one; it won't auto-resume)",
-        "  /end  /restart           - aliases for /new — close out this conversation and start fresh",
+        "  /new                     - finalize this conversation and start a fresh one (stays in the session)",
+        "  /end  /restart           - finalize this conversation and start fresh (aliases of /new; /end no longer exits)",
+        "  /start [title]           - begin a new conversation, leaving the current one open to /resume",
+        "  /rename <title>          - retitle the current conversation so it is easy to find in /resume",
         "  /conversation list       - list saved conversations",
         "  /conversation show <id>  - show a saved conversation",
         "  /conversation restore <id> - restore a saved conversation",
@@ -12551,6 +12770,18 @@ mod tests {
         // Ordinary commands (and their args) are not help requests.
         assert_eq!(help_request("/models capabilities"), None);
         assert_eq!(help_request("/model qwen3:30b"), None);
+    }
+
+    #[test]
+    fn help_request_treats_start_and_rename_titles_as_titles_not_help() {
+        // #1030: /start and /rename take a free-text title, so a help token INSIDE
+        // the title must not be swallowed by the help interceptor.
+        assert_eq!(help_request("/start help me debug"), None);
+        assert_eq!(help_request("/rename fix the -h flag"), None);
+        assert_eq!(help_request("/start My Title"), None);
+        // A SOLE help token still asks for help, folded to the documenting page.
+        assert_eq!(help_request("/start --help").as_deref(), Some("new"));
+        assert_eq!(help_request("/rename -h").as_deref(), Some("conversation"));
     }
 
     #[test]
