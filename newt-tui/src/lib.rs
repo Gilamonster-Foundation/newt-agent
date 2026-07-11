@@ -9993,6 +9993,14 @@ enum RoadmapCommand {
     /// `artifact_ref.commit`/`branch` so `/roadmap eval` closes the Task from git
     /// truth instead of a manual `/roadmap done`.
     TaskCommit { node: String, sha: Option<String> },
+    /// `/roadmap export [path]` (#1082) — write the active roadmap to the
+    /// on-repo TOML file (default `.newt/roadmap.toml`); the repo copy is the
+    /// authority, the store row a working copy.
+    Export(Option<String>),
+    /// `/roadmap import [path]` (#1082) — load a roadmap file and upsert it by
+    /// id into this workspace's store, then set it active. Fresh checkouts
+    /// bootstrap their roadmap with this.
+    Import(Option<String>),
 }
 
 fn parse_node_kind(s: &str) -> Option<newt_core::plan::NodeKind> {
@@ -10024,6 +10032,8 @@ fn parse_roadmap_command(input: &str) -> anyhow::Result<RoadmapCommand> {
             Some(id) => Ok(RoadmapCommand::Use(id.to_string())),
             None => anyhow::bail!("usage: /roadmap use <id>"),
         },
+        Some("export") => Ok(RoadmapCommand::Export(parts.next().map(str::to_string))),
+        Some("import") => Ok(RoadmapCommand::Import(parts.next().map(str::to_string))),
         Some("add") => {
             let kind = parts.next().and_then(parse_node_kind).ok_or_else(|| {
                 anyhow::anyhow!(
@@ -10189,6 +10199,7 @@ fn resolve_roadmap_id(
 /// The result of a /roadmap subcommand: a message to print, plus an optional
 /// conversation to make active — #1030 resume-to-cursor: `/roadmap next` resumes
 /// a bound Plan node's conversation.
+#[derive(Debug)]
 struct RoadmapOutcome {
     message: String,
     switch_to: Option<String>,
@@ -10415,6 +10426,79 @@ fn autocapture_commit_after_turn(
     ))
 }
 
+/// #1082: resolve where the roadmap file lives — an explicit `path` argument
+/// (workspace-relative unless absolute) or the checked-in default
+/// [`newt_core::roadmap_file::DEFAULT_ROADMAP_FILE`].
+fn roadmap_file_path(workspace: &str, arg: Option<&str>) -> std::path::PathBuf {
+    let base = std::path::Path::new(workspace);
+    match arg {
+        Some(p) if std::path::Path::new(p).is_absolute() => std::path::PathBuf::from(p),
+        Some(p) => base.join(p),
+        None => base.join(newt_core::roadmap_file::DEFAULT_ROADMAP_FILE),
+    }
+}
+
+/// #1082 `/roadmap export` body. `write` is the injected file edge (real
+/// `std::fs` in the command arm, in-memory in the unit tier) so the logic
+/// stays in the fully-mocked tier.
+fn export_roadmap_to(
+    store: &newt_core::ConversationStore,
+    id: &str,
+    path: &std::path::Path,
+    write: &dyn Fn(&std::path::Path, &str) -> std::io::Result<()>,
+) -> anyhow::Result<RoadmapOutcome> {
+    let rm = store
+        .load_roadmap(id)?
+        .ok_or_else(|| anyhow::anyhow!("active roadmap `{id}` not found in this workspace"))?;
+    let nodes = rm.tree.subtasks.len();
+    let file = newt_core::roadmap_file::RoadmapFile::new(rm.id, rm.title.clone(), rm.tree);
+    let text = file.to_toml_string()?;
+    write(path, &text)
+        .map_err(|e| anyhow::anyhow!("cannot write roadmap file {}: {e}", path.display()))?;
+    Ok(RoadmapOutcome::msg(format!(
+        "Exported roadmap \"{}\" [{}] → {} ({nodes} nodes). Check it in — the repo \
+         copy is the authority; /roadmap import loads it on any checkout.",
+        rm.title,
+        short_conversation_id(id),
+        path.display()
+    )))
+}
+
+/// #1082 `/roadmap import` body. Parses BEFORE touching the store — a corrupt
+/// or future-versioned file is a hard error that leaves the working copy
+/// untouched. Upserts by the file's roadmap id (same id → update in place)
+/// and sets the roadmap active. `read` is the injected file edge.
+fn import_roadmap_from(
+    store: &newt_core::ConversationStore,
+    active_roadmap_id: &mut Option<String>,
+    path: &std::path::Path,
+    read: &dyn Fn(&std::path::Path) -> std::io::Result<String>,
+) -> anyhow::Result<RoadmapOutcome> {
+    let text = read(path).map_err(|e| {
+        anyhow::anyhow!(
+            "cannot read roadmap file {}: {e} — /roadmap export writes one, or pass a \
+             path: /roadmap import <path>",
+            path.display()
+        )
+    })?;
+    let file = newt_core::roadmap_file::RoadmapFile::from_toml_str(&text)?;
+    let existed = store.load_roadmap(&file.id)?.is_some();
+    store.create_roadmap(&file.id, &file.title, &file.tree)?;
+    *active_roadmap_id = Some(file.id.clone());
+    Ok(RoadmapOutcome::msg(format!(
+        "Imported roadmap \"{}\" [{}] from {} ({} nodes, {}) and set it active.",
+        file.title,
+        short_conversation_id(&file.id),
+        path.display(),
+        file.tree.subtasks.len(),
+        if existed {
+            "updated existing"
+        } else {
+            "created new"
+        }
+    )))
+}
+
 fn handle_roadmap_command(
     input: &str,
     store: &newt_core::ConversationStore,
@@ -10473,6 +10557,22 @@ fn handle_roadmap_command(
                 "Active roadmap set to [{}].",
                 short_conversation_id(&id)
             )))
+        }
+        RoadmapCommand::Export(arg) => {
+            let id = require_active(active_roadmap_id)?;
+            let path = roadmap_file_path(workspace, arg.as_deref());
+            export_roadmap_to(store, &id, &path, &|p, s| {
+                if let Some(dir) = p.parent() {
+                    std::fs::create_dir_all(dir)?;
+                }
+                std::fs::write(p, s)
+            })
+        }
+        RoadmapCommand::Import(arg) => {
+            let path = roadmap_file_path(workspace, arg.as_deref());
+            import_roadmap_from(store, active_roadmap_id, &path, &|p| {
+                std::fs::read_to_string(p)
+            })
         }
         RoadmapCommand::Show(maybe) => {
             let id = match maybe {
@@ -12429,7 +12529,7 @@ fn help_lines() -> &'static [&'static str] {
         "  /conversation rm <id>    - alias for /conversation delete",
         "  /recall [query]          - recent conversations, or full-text search",
         "  /resume [query|n|id]     - find & reopen a past conversation (listed by liveness, searchable)",
-        "  /roadmap [sub]           - #1030 plan tree: new·list·show·use·add · next·bind·done·eval·drive · task <n> commit [sha]",
+        "  /roadmap [sub]           - #1030 plan tree: new·list·show·use·add · next·bind·done·eval·drive · task <n> commit [sha] · export·import [path]",
         "  /tree                    - render the active roadmap tree (▶ marks the next-ready node / DFS cursor)",
         "  /persona list            - list configured personas",
         "  /persona show            - show the active persona",
@@ -16680,6 +16780,195 @@ parent = \"road\"
         handle_roadmap_command("/roadmap done", &store, &mut active_roadmap, conv, ws).unwrap();
         let done = store.load_roadmap(&rm_id).unwrap().unwrap().tree.subtasks[0].status;
         assert_eq!(done, newt_core::plan::SubtaskStatus::Done);
+    }
+
+    // ── #1082 roadmap-as-code: /roadmap export + import ─────────────────────
+    // The file edge is injected (in-memory closures), so these stay in the
+    // fully-mocked unit tier — no fs I/O beyond the store the shared
+    // `recall_test_store()` helper already provides.
+
+    #[test]
+    fn roadmap_export_import_commands_parse() {
+        assert_eq!(
+            parse_roadmap_command("/roadmap export").unwrap(),
+            RoadmapCommand::Export(None)
+        );
+        assert_eq!(
+            parse_roadmap_command("/roadmap export plans/r.toml").unwrap(),
+            RoadmapCommand::Export(Some("plans/r.toml".into()))
+        );
+        assert_eq!(
+            parse_roadmap_command("/roadmap import").unwrap(),
+            RoadmapCommand::Import(None)
+        );
+        assert_eq!(
+            parse_roadmap_command("/roadmap import /tmp/r.toml").unwrap(),
+            RoadmapCommand::Import(Some("/tmp/r.toml".into()))
+        );
+    }
+
+    #[test]
+    fn roadmap_file_path_resolves_default_relative_and_absolute() {
+        let default = roadmap_file_path("/ws", None);
+        assert_eq!(
+            default,
+            std::path::Path::new("/ws").join(newt_core::roadmap_file::DEFAULT_ROADMAP_FILE)
+        );
+        // Relative args are workspace-relative — the file belongs to the repo.
+        assert_eq!(
+            roadmap_file_path("/ws", Some("plans/r.toml")),
+            std::path::PathBuf::from("/ws/plans/r.toml")
+        );
+        assert_eq!(
+            roadmap_file_path("/ws", Some("/abs/r.toml")),
+            std::path::PathBuf::from("/abs/r.toml")
+        );
+    }
+
+    #[test]
+    fn roadmap_export_then_import_round_trips_and_upserts_by_id() {
+        let (_state, ws_dir, store) = recall_test_store();
+        let ws = ws_dir.path().to_str().unwrap();
+        let conv = "1781000000000000000-abcd";
+        let mut active: Option<String> = None;
+
+        // Author a two-node roadmap, then export it through a fake fs.
+        handle_roadmap_command("/roadmap new Chartered", &store, &mut active, conv, ws).unwrap();
+        handle_roadmap_command("/roadmap add phase P1", &store, &mut active, conv, ws).unwrap();
+        handle_roadmap_command(
+            "/roadmap add plan Body under node-1",
+            &store,
+            &mut active,
+            conv,
+            ws,
+        )
+        .unwrap();
+        let rm_id = active.clone().unwrap();
+
+        let written: std::cell::RefCell<Option<String>> = std::cell::RefCell::new(None);
+        let out = export_roadmap_to(
+            &store,
+            &rm_id,
+            std::path::Path::new("/repo/.newt/roadmap.toml"),
+            &|_, text| {
+                *written.borrow_mut() = Some(text.to_string());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(out.message.contains("2 nodes"), "{}", out.message);
+        let exported = written.borrow().clone().unwrap();
+
+        // Drift the working copy past the export…
+        handle_roadmap_command("/roadmap add phase Stray", &store, &mut active, conv, ws).unwrap();
+        assert_eq!(
+            store
+                .load_roadmap(&rm_id)
+                .unwrap()
+                .unwrap()
+                .tree
+                .subtasks
+                .len(),
+            3
+        );
+
+        // …then import restores the repo authority IN PLACE (same id, updated).
+        let mut fresh_active: Option<String> = None;
+        let out = import_roadmap_from(
+            &store,
+            &mut fresh_active,
+            std::path::Path::new("/repo/.newt/roadmap.toml"),
+            &|_| Ok(exported.clone()),
+        )
+        .unwrap();
+        assert!(out.message.contains("updated existing"), "{}", out.message);
+        assert_eq!(fresh_active.as_deref(), Some(rm_id.as_str()));
+        let restored = store.load_roadmap(&rm_id).unwrap().unwrap();
+        assert_eq!(restored.tree.subtasks.len(), 2);
+        assert_eq!(restored.title, "Chartered");
+
+        // Round-trip is byte-identical: re-export matches the imported text.
+        let rewritten: std::cell::RefCell<Option<String>> = std::cell::RefCell::new(None);
+        export_roadmap_to(&store, &rm_id, std::path::Path::new("/x"), &|_, text| {
+            *rewritten.borrow_mut() = Some(text.to_string());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(rewritten.borrow().clone().unwrap(), exported);
+    }
+
+    #[test]
+    fn roadmap_import_into_empty_workspace_creates_and_activates() {
+        let (_state, _ws, store) = recall_test_store();
+        let text = newt_core::roadmap_file::RoadmapFile::new(
+            "rm-fresh",
+            "Bootstrapped",
+            newt_core::plan::Plan::default(),
+        )
+        .to_toml_string()
+        .unwrap();
+        let mut active: Option<String> = None;
+        let out = import_roadmap_from(
+            &store,
+            &mut active,
+            std::path::Path::new("/repo/.newt/roadmap.toml"),
+            &|_| Ok(text.clone()),
+        )
+        .unwrap();
+        assert!(out.message.contains("created new"), "{}", out.message);
+        assert_eq!(active.as_deref(), Some("rm-fresh"));
+        assert!(store.load_roadmap("rm-fresh").unwrap().is_some());
+    }
+
+    #[test]
+    fn roadmap_import_corrupt_file_fails_loud_and_leaves_store_untouched() {
+        let (_state, ws_dir, store) = recall_test_store();
+        let ws = ws_dir.path().to_str().unwrap();
+        let conv = "1781000000000000000-abcd";
+        let mut active: Option<String> = None;
+        handle_roadmap_command("/roadmap new Keep me", &store, &mut active, conv, ws).unwrap();
+        let rm_id = active.clone().unwrap();
+
+        // Corrupt file: parse fails BEFORE any store write; active id keeps.
+        let err = import_roadmap_from(
+            &store,
+            &mut active,
+            std::path::Path::new("/repo/.newt/roadmap.toml"),
+            &|_| Ok("not = [toml".to_string()),
+        )
+        .unwrap_err();
+        assert!(!err.to_string().is_empty());
+        assert_eq!(active.as_deref(), Some(rm_id.as_str()));
+        assert_eq!(store.list_roadmaps().unwrap().len(), 1);
+
+        // Missing file: a friendly error naming the path and the bootstrap hint.
+        let err = import_roadmap_from(
+            &store,
+            &mut active,
+            std::path::Path::new("/repo/.newt/roadmap.toml"),
+            &|_| Err(std::io::Error::new(std::io::ErrorKind::NotFound, "gone")),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains(".newt/roadmap.toml"), "{err}");
+        assert!(err.contains("/roadmap export"), "{err}");
+    }
+
+    #[test]
+    fn roadmap_export_without_active_roadmap_is_a_friendly_error() {
+        let (_state, ws_dir, store) = recall_test_store();
+        let ws = ws_dir.path().to_str().unwrap();
+        let mut active: Option<String> = None;
+        let err = handle_roadmap_command(
+            "/roadmap export",
+            &store,
+            &mut active,
+            "1781000000000000000-abcd",
+            ws,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("no active roadmap"), "{err}");
     }
 
     #[test]
