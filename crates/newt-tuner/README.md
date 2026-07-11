@@ -4,4 +4,4 @@ Model tuning configuration for Newt-Agent. Loads per-model TOML profiles from `~
 
 ## License
 
-MIT OR Apache-2.0 (same as workspace)
+Apache-2.0 (same as workspace)
