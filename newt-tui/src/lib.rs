@@ -9993,6 +9993,10 @@ enum RoadmapCommand {
     /// `artifact_ref.commit`/`branch` so `/roadmap eval` closes the Task from git
     /// truth instead of a manual `/roadmap done`.
     TaskCommit { node: String, sha: Option<String> },
+    /// `/roadmap issue <node-id> <number>` (#1083) — bind any node to the forge
+    /// issue it realizes; `/roadmap eval` then additionally requires the issue
+    /// CLOSED before the node may be Done (a verdict input, never a direct Done).
+    IssueSet { node: String, number: u64 },
     /// `/roadmap export [path]` (#1082) — write the active roadmap to the
     /// on-repo TOML file (default `.newt/roadmap.toml`); the repo copy is the
     /// authority, the store row a working copy.
@@ -10068,10 +10072,20 @@ fn parse_roadmap_command(input: &str) -> anyhow::Result<RoadmapCommand> {
                 _ => anyhow::bail!("usage: /roadmap task <node-id> commit [<sha>]"),
             }
         }
+        Some("issue") => {
+            let usage = || anyhow::anyhow!("usage: /roadmap issue <node-id> <number>");
+            let node = parts.next().map(str::to_string).ok_or_else(usage)?;
+            let number = parts
+                .next()
+                .and_then(|s| s.trim_start_matches('#').parse::<u64>().ok())
+                .ok_or_else(usage)?;
+            Ok(RoadmapCommand::IssueSet { node, number })
+        }
         Some(other) => {
             anyhow::bail!(
                 "unknown /roadmap subcommand `{other}` \
-                 (try: list, new, show, use, add, next, bind, done, eval, drive, task)"
+                 (try: list, new, show, use, add, next, bind, done, eval, drive, task, \
+                 issue, export, import)"
             )
         }
     }
@@ -10305,6 +10319,29 @@ impl newt_core::roadmap_eval::ForgeFacts for GhForgeFacts {
         }
         let state = String::from_utf8_lossy(&out.stdout);
         Some(state.trim() == "MERGED")
+    }
+
+    fn issue_closed(&self, issue: u64) -> Option<bool> {
+        // #1083: CLOSED regardless of stateReason — a not-planned close also
+        // releases the gate; the node's other facts still decide Done.
+        let out = std::process::Command::new("gh")
+            .args([
+                "issue",
+                "view",
+                &issue.to_string(),
+                "--json",
+                "state",
+                "-q",
+                ".state",
+            ])
+            .current_dir(&self.workspace)
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let state = String::from_utf8_lossy(&out.stdout);
+        Some(state.trim() == "CLOSED")
     }
 }
 
@@ -10839,6 +10876,21 @@ fn handle_roadmap_command(
             Ok(RoadmapOutcome::msg(format!(
                 "Bound task [{node}] to commit {short}{on}. \
                  /roadmap eval [{node}] now checks it against git."
+            )))
+        }
+        RoadmapCommand::IssueSet { node, number } => {
+            let id = require_active(active_roadmap_id)?;
+            let mut rm = store.load_roadmap(&id)?.ok_or_else(|| {
+                anyhow::anyhow!("active roadmap [{}] not found", short_conversation_id(&id))
+            })?;
+            if rm.tree.subtask(&node).is_none() {
+                anyhow::bail!("no node `{node}` in this roadmap (see /tree)");
+            }
+            rm.tree.set_artifact_issue(&node, number);
+            store.update_roadmap(&id, &rm.tree)?;
+            Ok(RoadmapOutcome::msg(format!(
+                "Bound [{node}] to issue #{number}. \
+                 /roadmap eval [{node}] now also requires it CLOSED before Done."
             )))
         }
     }
@@ -12529,7 +12581,7 @@ fn help_lines() -> &'static [&'static str] {
         "  /conversation rm <id>    - alias for /conversation delete",
         "  /recall [query]          - recent conversations, or full-text search",
         "  /resume [query|n|id]     - find & reopen a past conversation (listed by liveness, searchable)",
-        "  /roadmap [sub]           - #1030 plan tree: new·list·show·use·add · next·bind·done·eval·drive · task <n> commit [sha] · export·import [path]",
+        "  /roadmap [sub]           - #1030 plan tree: new·list·show·use·add · next·bind·done·eval·drive · task <n> commit [sha] · issue <n> <#> · export·import [path]",
         "  /tree                    - render the active roadmap tree (▶ marks the next-ready node / DFS cursor)",
         "  /persona list            - list configured personas",
         "  /persona show            - show the active persona",
@@ -16805,6 +16857,55 @@ parent = \"road\"
             parse_roadmap_command("/roadmap import /tmp/r.toml").unwrap(),
             RoadmapCommand::Import(Some("/tmp/r.toml".into()))
         );
+    }
+
+    // ── #1083: /roadmap issue — bind a node to the forge issue it realizes ──
+
+    #[test]
+    fn roadmap_issue_command_parses_plain_and_hash_numbers() {
+        assert_eq!(
+            parse_roadmap_command("/roadmap issue node-1 39").unwrap(),
+            RoadmapCommand::IssueSet {
+                node: "node-1".into(),
+                number: 39
+            }
+        );
+        // The friendly `#39` form binds the same.
+        assert_eq!(
+            parse_roadmap_command("/roadmap issue node-1 #39").unwrap(),
+            RoadmapCommand::IssueSet {
+                node: "node-1".into(),
+                number: 39
+            }
+        );
+        assert!(parse_roadmap_command("/roadmap issue node-1").is_err());
+        assert!(parse_roadmap_command("/roadmap issue node-1 nope").is_err());
+        assert!(parse_roadmap_command("/roadmap issue").is_err());
+    }
+
+    #[test]
+    fn roadmap_issue_binds_the_ref_on_any_node_and_rejects_unknown_ids() {
+        let (_state, ws_dir, store) = recall_test_store();
+        let ws = ws_dir.path().to_str().unwrap();
+        let conv = "1781000000000000000-abcd";
+        let mut active: Option<String> = None;
+        handle_roadmap_command("/roadmap new Gated", &store, &mut active, conv, ws).unwrap();
+        handle_roadmap_command("/roadmap add phase P1", &store, &mut active, conv, ws).unwrap();
+        let rm_id = active.clone().unwrap();
+
+        // Binds on a PHASE (the gate is kind-agnostic), persists to the store.
+        let out =
+            handle_roadmap_command("/roadmap issue node-1 #39", &store, &mut active, conv, ws)
+                .unwrap();
+        assert!(out.message.contains("issue #39"), "{}", out.message);
+        let node = store.load_roadmap(&rm_id).unwrap().unwrap().tree.subtasks[0].clone();
+        assert_eq!(node.artifact_ref.as_ref().and_then(|a| a.issue), Some(39));
+
+        // Unknown node id fails loud, store unchanged.
+        let err = handle_roadmap_command("/roadmap issue ghost 1", &store, &mut active, conv, ws)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no node `ghost`"), "{err}");
     }
 
     #[test]
