@@ -5,6 +5,64 @@ Notable changes to the newt-agent workspace. Format follows
 (`0.MINOR.PATCH`, pre-1.0). The workspace version in the top-level `Cargo.toml`
 is inherited by all internal crates.
 
+## [0.7.2] — 2026-07-11
+
+**Theme: plans within plans — a durable multi-conversation workspace and the
+#1030 roadmap tree, made portable as repo-owned data.** newt gains a real
+notion of multiple conversations per workspace and an objective, git-grounded
+roadmap it can drive node by node — then `/roadmap export`/`import` lift that
+tree out of the per-machine store into a checked-in file.
+
+### Added
+
+- **Multi-conversation workspace (#1030).** Each `newt` process mints and claims
+  its own conversation; a `live_owners` table enforces one live owner per
+  conversation (unix `kill(pid,0)` / Windows `OpenProcess` liveness, a crashed
+  owner's stale claim reclaimed on next attempt). New verbs: `/start [title]`,
+  `/rename <title>`, `/end` (finalize & continue in place), and `/resume
+  [query|n|id]` — an MRU list annotated `● live` / `○ open` / `✓ ended` with
+  FTS5 search. Fresh-on-launch by default (no more auto-glomming onto a folder's
+  latest transcript). (#1036–#1039)
+- **The "Plans within Plans" roadmap tree (#1030).** A persisted `roadmaps`
+  table holds a `Roadmap → Phase → Plan → Task` tree (a serialized `plan.rs`
+  `Plan`); `conversations` gains thin nullable `roadmap_id`/`node_id` pointers
+  (additive migration; the §6 hash chains still verify). `/roadmap`
+  (`new`·`list`·`show`·`use`·`add`·`next`·`bind`·`done`·`eval`·`drive`) and
+  `/tree` author and render it, with a DFS cursor and resume-to-cursor. (#1038,
+  #1039)
+- **Objective node evaluators (#1030).** A pure reducer decides done-ness from
+  *objective* state, never self-report: Task = commit-on-branch + verify; Plan =
+  children-done + verify; Phase = children-done + PR merged; Roadmap =
+  children-done + CI green. Missing remote facts degrade to `Unsupported` — never
+  a false `Done`. Local git truth via `newt-git`; forge/CI via `gh`. (#1040,
+  #1043) Plus the headless **`TreeDriver`** (`/roadmap drive`): evaluate the
+  cursor, ripple completion up the tree, halt at the first node that still needs
+  work. (#1044)
+- **Roadmap-as-code (#1082).** `/roadmap export [path]` / `import [path]`
+  (default `.newt/roadmap.toml`) move the tree between the store and a checked-in
+  file — the repo is the authority, the store a working copy; a fresh checkout
+  bootstraps with one command.
+- **Issue-close forge-fact eval gate (#1083).** `/roadmap issue <node> <#>` binds
+  a node to the forge issue it realizes; `/roadmap eval` then additionally
+  requires that issue **closed** before the node may be `Done` (a verdict input,
+  never a direct `Done`), via `gh issue view`.
+- **Personas & MCP.** A personal-assistant persona and a `/persona` switch verb,
+  an MCP toolset connector, a headless persona loader + headless MCP persona, a
+  `skills` field on `RoleProfile`, and the `gila` / `gila-personal-assistant`
+  skills with untrusted-MCP-result wrapping. (#1045–#1058, #1021/#1042)
+- **DGX.** An interactive vLLM model switcher (`newt dgx models`) and the DGX
+  unboxing plan. (#1032, #1055)
+
+### Fixed
+
+- **Roadmap import could steal a roadmap across workspaces (#1086).** The
+  `roadmaps` primary key is now composite `(id, workspace_key)` (with an
+  idempotent, lossless rebuild migration), so an import of an id that exists
+  under another workspace inserts a separate row instead of replacing it — the
+  write path is now workspace-fenced like the read path. (#1087)
+- **`pid_is_alive` liveness probe** gated its `libc::kill` call to unix and added
+  a Windows `OpenProcess` path. (#1037)
+
 ## [0.7.1] — 2026-07-06
 
 **Theme: harness-graded correctness, an honest shell-authority story, and
