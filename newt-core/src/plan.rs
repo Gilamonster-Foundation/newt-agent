@@ -200,6 +200,21 @@ impl Plan {
         }
     }
 
+    /// #1083: bind node `id` to the forge issue it realizes, preserving any
+    /// existing branch/commit/pr refs, so the objective evaluator
+    /// ([`crate::roadmap_eval`]) can require the issue CLOSED before Done.
+    /// No-op if `id` is absent (same contract as
+    /// [`set_artifact_commit`](Self::set_artifact_commit)).
+    pub fn set_artifact_issue(&mut self, id: &str, issue: u64) {
+        if let Some(s) = self.subtasks.iter_mut().find(|s| s.id == id) {
+            let existing = s.artifact_ref.take().unwrap_or_default();
+            s.artifact_ref = Some(ArtifactRef {
+                issue: Some(issue),
+                ..existing
+            });
+        }
+    }
+
     /// #1062 auto-capture: the next Task under `plan_id` that still needs a commit
     /// — the leftmost `Pending` Task in `plan_id`'s subtree whose
     /// [`artifact_ref.commit`](ArtifactRef::commit) is unset. `None` if `plan_id`
@@ -529,6 +544,11 @@ pub struct ArtifactRef {
     /// main).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pr: Option<u64>,
+    /// The forge issue this node realizes (#1083). When set, the objective
+    /// evaluator additionally requires the issue to be CLOSED before the node
+    /// may be Done — a verdict input, never a direct Done.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issue: Option<u64>,
 }
 
 /// The authority a [`Subtask`] declares it needs — **default-deny**.
@@ -1223,6 +1243,48 @@ kind = "task"
 
         // Absent id is a no-op (no panic, no phantom node).
         plan.set_artifact_commit("nope", "x", None);
+        assert!(plan.subtask("nope").is_none());
+    }
+
+    #[test]
+    fn set_artifact_issue_binds_the_issue_preserving_other_refs() {
+        // #1083: an issue ref is an ADDITIONAL evaluator gate; binding it must
+        // not disturb branch/commit/pr, must round-trip through TOML, and must
+        // no-op an absent id.
+        let toml = r#"
+[[subtask]]
+id = "t1"
+instruction = "task 1"
+kind = "task"
+
+[subtask.artifact_ref]
+pr = 42
+branch = "feat/x"
+"#;
+        let mut plan = Plan::from_toml_str(toml).unwrap();
+        plan.set_artifact_issue("t1", 1083);
+        let a = plan.subtask("t1").unwrap().artifact_ref.as_ref().unwrap();
+        assert_eq!(a.issue, Some(1083));
+        assert_eq!(a.pr, Some(42), "existing pr preserved");
+        assert_eq!(a.branch.as_deref(), Some("feat/x"), "branch preserved");
+
+        // Round-trips through TOML (and old files without the field parse:
+        // this very fixture had none).
+        let text = plan.to_toml_string().unwrap();
+        assert!(text.contains("issue = 1083"), "{text}");
+        let back = Plan::from_toml_str(&text).unwrap();
+        assert_eq!(
+            back.subtask("t1")
+                .unwrap()
+                .artifact_ref
+                .as_ref()
+                .unwrap()
+                .issue,
+            Some(1083)
+        );
+
+        // Absent id is a no-op.
+        plan.set_artifact_issue("nope", 1);
         assert!(plan.subtask("nope").is_none());
     }
 

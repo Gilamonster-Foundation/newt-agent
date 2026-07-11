@@ -44,6 +44,23 @@ pub struct NodeFacts {
     /// The pipelines' green state (Roadmap): `Some(true)` green, `Some(false)`
     /// red, `None` = no CI access.
     pub ci_green: Option<bool>,
+    /// The referenced forge issue's state (#1083, any node kind): `None` = no
+    /// `artifact_ref.issue` reference — the issue gate does not apply.
+    pub issue: Option<IssueState>,
+}
+
+/// The state of a node's referenced forge issue (#1083). An additional gate on
+/// the node's completion rule: an [`Open`](IssueState::Open) issue blocks Done,
+/// an [`Unknown`](IssueState::Unknown) one is Unsupported — a verdict input,
+/// never a direct Done.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IssueState {
+    /// The forge reports the issue CLOSED.
+    Closed,
+    /// The forge reports the issue still open.
+    Open,
+    /// The issue is referenced but the forge cannot answer (no `gh`, no remote).
+    Unknown,
 }
 
 /// Read objective git state. Mocked in the unit tier; the real impl (newt-tui)
@@ -64,6 +81,13 @@ pub trait VerifyRunner {
 pub trait ForgeFacts {
     /// Is pull-request `pr` merged? `None` when it cannot be determined.
     fn pr_merged(&self, pr: u64) -> Option<bool>;
+    /// Is forge issue `issue` closed (#1083)? `None` when it cannot be
+    /// determined. Default `None` keeps the trait additive: an impl that
+    /// doesn't override degrades to Unsupported, never a false answer.
+    fn issue_closed(&self, issue: u64) -> Option<bool> {
+        let _ = issue;
+        None
+    }
 }
 
 /// Read CI/pipeline state. Mocked in the unit tier; the real impl (newt-tui)
@@ -110,18 +134,44 @@ pub fn gather_facts(node: &Subtask, tree: &Plan, facts: &Facts) -> NodeFacts {
     } else {
         None
     };
+    // #1083: the issue gate applies to any node that carries a reference —
+    // "no answer from the forge" is distinct from "no reference".
+    let issue = artifact
+        .and_then(|a| a.issue)
+        .map(|n| match facts.forge.issue_closed(n) {
+            Some(true) => IssueState::Closed,
+            Some(false) => IssueState::Open,
+            None => IssueState::Unknown,
+        });
     NodeFacts {
         commit_present,
         verify,
         children_all_done,
         pr_merged,
         ci_green,
+        issue,
     }
 }
 
 /// Apply `node`'s #1030 completion rule to its [`NodeFacts`] (a pure reducer).
 #[must_use]
 pub fn evaluate_node(node: &Subtask, facts: &NodeFacts) -> NodeVerdict {
+    // #1083: the issue gate is common to every kind — a referenced issue must
+    // be CLOSED before any other rule may conclude Done. It only ever blocks;
+    // a closed issue proves nothing by itself.
+    match facts.issue {
+        Some(IssueState::Open) => {
+            return NodeVerdict::NotYet("the referenced issue is still open".into());
+        }
+        Some(IssueState::Unknown) => {
+            return NodeVerdict::Unsupported(
+                "the node references an issue but its state is unavailable — ensure `gh` \
+                 can reach the forge"
+                    .into(),
+            );
+        }
+        Some(IssueState::Closed) | None => {}
+    }
     // A verify command that ran and FAILED blocks; absent (`None`) or passing is fine.
     let verify_ok = facts.verify != Some(false);
     match node.kind {
@@ -333,6 +383,7 @@ mod tests {
             branch: Some("feat/x".into()),
             commit: Some(c.into()),
             pr: None,
+            issue: None,
         });
         t.verify = verify.map(str::to_string);
         t
@@ -375,6 +426,107 @@ mod tests {
             evaluate(&task_with(None, None), &tree, &ok),
             NodeVerdict::NotYet(_)
         ));
+    }
+
+    // ── #1083: the issue gate ────────────────────────────────────────────────
+
+    /// Forge fake answering BOTH seams: `.0` = pr_merged, `.1` = issue_closed.
+    struct FakeIssueForge(Option<bool>, Option<bool>);
+    impl ForgeFacts for FakeIssueForge {
+        fn pr_merged(&self, _pr: u64) -> Option<bool> {
+            self.0
+        }
+        fn issue_closed(&self, _issue: u64) -> Option<bool> {
+            self.1
+        }
+    }
+
+    /// An otherwise-Done Task (commit present, no verify) referencing `issue`.
+    fn done_task_with_issue(issue: u64) -> Subtask {
+        let mut t = task_with(Some("deadbeef"), None);
+        t.artifact_ref.as_mut().unwrap().issue = Some(issue);
+        t
+    }
+
+    #[test]
+    fn issue_gate_blocks_done_while_the_referenced_issue_is_open() {
+        let tree = Plan::default();
+        let (git, verify, ci) = (FakeGit(&["deadbeef"]), FakeVerify(true), FakeCi(None));
+        let open = FakeIssueForge(None, Some(false));
+        let closed = FakeIssueForge(None, Some(true));
+        let t = done_task_with_issue(1083);
+
+        let verdict = evaluate(
+            &t,
+            &tree,
+            &Facts {
+                git: &git,
+                verify: &verify,
+                forge: &open,
+                ci: &ci,
+            },
+        );
+        assert!(
+            matches!(&verdict, NodeVerdict::NotYet(r) if r.contains("issue")),
+            "open issue must block: {verdict:?}"
+        );
+        assert_eq!(
+            evaluate(
+                &t,
+                &tree,
+                &Facts {
+                    git: &git,
+                    verify: &verify,
+                    forge: &closed,
+                    ci: &ci,
+                }
+            ),
+            NodeVerdict::Done
+        );
+    }
+
+    #[test]
+    fn issue_gate_unknown_state_is_unsupported_never_done() {
+        // The default trait method answers None — an impl that never learned
+        // about issues degrades to Unsupported, not a false Done (#1083).
+        let tree = Plan::default();
+        let (git, verify, ci) = (FakeGit(&["deadbeef"]), FakeVerify(true), FakeCi(None));
+        let legacy = FakeForge(None); // no issue_closed override
+        let verdict = evaluate(
+            &done_task_with_issue(1083),
+            &tree,
+            &Facts {
+                git: &git,
+                verify: &verify,
+                forge: &legacy,
+                ci: &ci,
+            },
+        );
+        assert!(
+            matches!(&verdict, NodeVerdict::Unsupported(r) if r.contains("issue")),
+            "unknown issue state must be Unsupported: {verdict:?}"
+        );
+    }
+
+    #[test]
+    fn nodes_without_an_issue_ref_ignore_the_issue_gate() {
+        // A forge screaming "open!" must not gate a node with no reference.
+        let tree = Plan::default();
+        let (git, verify, ci) = (FakeGit(&["deadbeef"]), FakeVerify(true), FakeCi(None));
+        let open = FakeIssueForge(None, Some(false));
+        assert_eq!(
+            evaluate(
+                &task_with(Some("deadbeef"), None),
+                &tree,
+                &Facts {
+                    git: &git,
+                    verify: &verify,
+                    forge: &open,
+                    ci: &ci,
+                }
+            ),
+            NodeVerdict::Done
+        );
     }
 
     #[test]
@@ -443,6 +595,7 @@ pr = 42
                 branch: None,
                 commit: None,
                 pr: Some(42),
+                issue: None,
             });
         }
         let git = FakeGit(&[]);
@@ -570,6 +723,7 @@ parent = "plan-1"
                     branch: Some("feat/x".into()),
                     commit: Some(commit.into()),
                     pr: None,
+                    issue: None,
                 });
             }
         }
@@ -578,6 +732,7 @@ parent = "plan-1"
                 branch: None,
                 commit: None,
                 pr: Some(42),
+                issue: None,
             });
         }
         tree
