@@ -34,6 +34,8 @@ pub mod reasoning;
 pub mod retry;
 /// #1030 node evaluators: Task/Plan done-ness from objective git state.
 pub mod roadmap_eval;
+/// #1082 roadmap-as-code: the on-repo TOML codec (`.newt/roadmap.toml`).
+pub mod roadmap_file;
 pub mod role_profile;
 pub mod router;
 pub mod scope_grounding;
