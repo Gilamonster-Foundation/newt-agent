@@ -1,8 +1,12 @@
 [package]
 name = "newt-tuner"
-version = "0.7.1"
-edition = "2021"
-license = "Apache-2.0"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
 description = "Model tuning configuration for Newt-Agent — per-model TOML profiles in ~/.newt/model_tuning/"
 
 [[bin]]

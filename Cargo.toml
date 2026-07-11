@@ -234,6 +234,7 @@ newt-mcp-data     = { path = "newt-mcp-data",     version = "=0.7.2" }
 newt-mcp-client   = { path = "newt-mcp-client",   version = "=0.7.2" }
 newt-coder        = { path = "newt-coder",        version = "=0.7.2" }
 newt-identity     = { path = "newt-identity",     version = "=0.7.2" }
+newt-tuner        = { path = "crates/newt-tuner", version = "=0.7.2" }
 newt-eval         = { path = "newt-eval",         version = "=0.7.2" }
 plugins-protocol  = { path = "plugins-protocol",  version = "=0.7.2" }
 
