@@ -10,9 +10,9 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "agent-bridle"
-version = "0.7.1"
+version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7e0916b76efd3d3742a9167947ce45f7bf2b3ea953d1bcf4e0cf1033db23f72a"
+checksum = "2fcc09a9f310228ac0bb1e63da012fdd9b76772523ad3aeeae651e6af8416c28"
 dependencies = [
  "agent-bridle-core",
  "agent-bridle-tool-shell",
@@ -21,9 +21,9 @@ dependencies = [
 
 [[package]]
 name = "agent-bridle-core"
-version = "0.7.1"
+version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "654d554fba964359336fc05249ebd261156ad424eba622859f21db292525ce46"
+checksum = "0f3a3b05b9e5915b1d6b6464b52e1f3484e5b17847f1c0b54fca5522c1d28b4a"
 dependencies = [
  "agent-mesh-protocol",
  "anyhow",
@@ -35,9 +35,9 @@ dependencies = [
 
 [[package]]
 name = "agent-bridle-tool-shell"
-version = "0.7.1"
+version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e1bb6e645f7fdff3e83fb960a0d2634c3db55c56d4ce52548639480e6c7dda2e"
+checksum = "c7020fd9c9a94ba1515969a86f63fcea0fa2ccefb2861a267e26d2be175d2d5f"
 dependencies = [
  "agent-bridle-core",
  "anyhow",
@@ -52,9 +52,9 @@ dependencies = [
 
 [[package]]
 name = "agent-bridle-tool-web"
-version = "0.7.1"
+version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dc3ae0fea3f195a5cca859abeb591fcc07e7179533d2ecca7a7ec9e649c58cce"
+checksum = "891ec0f262d895cbc6b9e565aa6b9fa84006ebb885a8b1745c56fc15f1ab01a3"
 dependencies = [
  "agent-bridle-core",
  "anyhow",
@@ -71,9 +71,9 @@ dependencies = [
 
 [[package]]
 name = "agent-mesh-protocol"
-version = "0.6.1"
+version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eca2348e2ef39fb8b3d01d64ff626d73dea03e0379bafc01ee48e2d6d6e1e119"
+checksum = "dca4b64ebb314a1060f98ebb8f378983034d72a7547140855edad17556be2805"
 dependencies = [
  "blake3",
  "ed25519-dalek",
@@ -3435,7 +3435,7 @@ checksum = "650eef8c711430f1a879fdd01d4745a7deea475becfb90269c06775983bbf086"
 
 [[package]]
 name = "newt-acp-worker"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3458,7 +3458,7 @@ dependencies = [
 
 [[package]]
 name = "newt-agent"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -3490,7 +3490,7 @@ dependencies = [
 
 [[package]]
 name = "newt-agent-py"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "newt-acp-worker",
  "newt-coder",
@@ -3507,7 +3507,7 @@ dependencies = [
 
 [[package]]
 name = "newt-coder"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "agent-mesh-protocol",
  "anyhow",
@@ -3530,7 +3530,7 @@ dependencies = [
 
 [[package]]
 name = "newt-core"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "agent-bridle",
  "agent-mesh-protocol",
@@ -3568,7 +3568,7 @@ dependencies = [
 
 [[package]]
 name = "newt-data"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3591,7 +3591,7 @@ dependencies = [
 
 [[package]]
 name = "newt-eval"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -3616,7 +3616,7 @@ dependencies = [
 
 [[package]]
 name = "newt-git"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "grit-lib",
  "newt-core",
@@ -3628,7 +3628,7 @@ dependencies = [
 
 [[package]]
 name = "newt-identity"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "agent-mesh-protocol",
  "base64 0.22.1",
@@ -3641,7 +3641,7 @@ dependencies = [
 
 [[package]]
 name = "newt-inference"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "agent-mesh-protocol",
  "anyhow",
@@ -3672,7 +3672,7 @@ dependencies = [
 
 [[package]]
 name = "newt-mcp-client"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "anyhow",
  "newt-core",
@@ -3686,7 +3686,7 @@ dependencies = [
 
 [[package]]
 name = "newt-mcp-data"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -3702,7 +3702,7 @@ dependencies = [
 
 [[package]]
 name = "newt-mcp-server"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "agent-bridle",
  "agent-mesh-protocol",
@@ -3726,7 +3726,7 @@ dependencies = [
 
 [[package]]
 name = "newt-provider-openai"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -3744,7 +3744,7 @@ dependencies = [
 
 [[package]]
 name = "newt-scheduler"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3757,7 +3757,7 @@ dependencies = [
 
 [[package]]
 name = "newt-skills"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "anyhow",
  "serde",
@@ -3767,7 +3767,7 @@ dependencies = [
 
 [[package]]
 name = "newt-tools"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "anyhow",
  "diffy",
@@ -3783,7 +3783,7 @@ dependencies = [
 
 [[package]]
 name = "newt-tui"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "agent-mesh-protocol",
  "anyhow",
@@ -3816,7 +3816,7 @@ dependencies = [
 
 [[package]]
 name = "newt-tuner"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "anyhow",
  "clap",
@@ -4389,7 +4389,7 @@ checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 
 [[package]]
 name = "plugins-protocol"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "async-trait",
  "serde",
@@ -5870,7 +5870,7 @@ checksum = "8f50febec83f5ee1df3015341d8bd429f2d1cc62bcba7ea2076759d315084683"
 
 [[package]]
 name = "tests-common"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "anyhow",
  "async-trait",

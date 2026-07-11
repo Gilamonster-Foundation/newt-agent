@@ -5,6 +5,35 @@ Notable changes to the newt-agent workspace. Format follows
 (`0.MINOR.PATCH`, pre-1.0). The workspace version in the top-level `Cargo.toml`
 is inherited by all internal crates.
 
+## [0.7.3] — 2026-07-11
+
+**Theme: release-pipeline repair.** v0.7.2's crates.io publish stage broke at
+`newt-core` — its `newt-tuner` dependency (new in Step 19.6) was path-only
+(no version requirement), which `cargo publish` rejects, and `newt-tuner` was
+missing from the publish matrix entirely. Only `newt-skills`, `newt-data`, and
+`plugins-protocol` reached crates.io at 0.7.2; the tag can't be reused, so
+0.7.3 re-ships 0.7.2's content with the pipeline fixed. No functional changes.
+
+### Fixed
+
+- **`newt-tuner` now publishes** (#1091): inherits the workspace version,
+  carries a `=` pin in the workspace dependency block, and sits in the publish
+  matrix ahead of `newt-core`.
+- **`check-publish-order` blind spot closed** (#1091): the pre-flight treated
+  every `req == "*"` dependency as a stripped dev-dep; it now errors on
+  path-only NORMAL/BUILD deps (a hard `cargo publish` failure), keeps
+  version-pinned dev-deps in the ordering graph, and flags wildcard reqs
+  pointing outside the workspace.
+
+### Changed
+
+- **Dependency refresh via the lock**: agent-mesh 0.6.3 (fail-closed
+  causal-generation enforcement §9.1, proof-of-possession for external-pubkey
+  certification §9.2, atomic 0600 UserKey creation) and agent-bridle 0.7.2 —
+  both semver-compatible with the existing `"0.6"` / `"0.7"` pins.
+- Stray top-level `newt-tuner/` scaffold removed; the crate README now lives
+  in `crates/newt-tuner/` (#1092).
+
 ## [0.7.2] — 2026-07-11
 
 **Theme: plans within plans — a durable multi-conversation workspace and the
