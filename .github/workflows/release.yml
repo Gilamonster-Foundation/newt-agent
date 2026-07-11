@@ -467,6 +467,12 @@ jobs:
         #     matrix job (cargo's own post-publish index wait can time out
         #     without failing). Back off and retry; a dep that is GENUINELY
         #     missing (ordering bug) still fails after the retries exhaust.
+        #   - 403-throttle-aware: a long publish batch (v0.7.3 shipped 17
+        #     crates) can trip a crates.io throttle that answers 403 Forbidden
+        #     with an "API data access policy" body rather than 429 — the last
+        #     two crates hit it and needed a manual re-run. Treat that specific
+        #     403 like a 429 (back off and retry). A 403 WITHOUT that body
+        #     (a genuine auth/ownership rejection) stays fatal.
         #   - Any other error is fatal.
         run: |
           for attempt in 1 2 3 4 5 6; do
@@ -482,6 +488,11 @@ jobs:
               cat publish.err >&2
               wait=$((attempt * 90))
               echo "::warning::crates.io rate-limited (429) on ${{ matrix.crate }} — waiting ${wait}s, retry ${attempt}/6"
+              sleep "$wait"
+            elif grep -qi '403 Forbidden' publish.err && grep -qi 'data access policy' publish.err; then
+              cat publish.err >&2
+              wait=$((attempt * 90))
+              echo "::warning::crates.io throttled (403 data-access-policy) on ${{ matrix.crate }} — waiting ${wait}s, retry ${attempt}/6"
               sleep "$wait"
             elif grep -qiE 'no matching package named|failed to select a version for the requirement' publish.err; then
               cat publish.err >&2
