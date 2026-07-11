@@ -294,13 +294,24 @@ jobs:
 
           pkgs = json.load(open("/tmp/workspace-metadata.json"))["packages"]
           names = {p["name"] for p in pkgs}
-          # Internal deps that survive `cargo publish`: path deps carrying a
-          # version requirement (the `=0.6.x` workspace pins). Path-ONLY deps
-          # (req == "*", e.g. the tests-common dev-dep) are stripped from the
-          # published manifest and impose no ordering constraint.
+          # Internal deps that survive `cargo publish`: all NORMAL and BUILD
+          # deps (kind null/"build"), plus any dev-dep carrying a version
+          # requirement. Only path-only DEV-deps (kind "dev", req "*", e.g.
+          # tests-common) are stripped from the published manifest and impose
+          # no ordering constraint. A NORMAL dep that is path-only (req "*")
+          # is NOT stripped — `cargo publish` fails outright on it ("all
+          # dependencies must have a version requirement"). That blind spot
+          # let the v0.7.2 release through with a path-only newt-tuner dep
+          # in newt-core; flag it as an error here instead. Same for a
+          # wildcard/path-only dep pointing OUTSIDE the workspace — cargo
+          # rejects those at publish time too, so flag any non-dev `*` req.
           deps = {p["name"]: sorted({d["name"] for d in p["dependencies"]
-                                     if d["name"] in names and d.get("req") != "*"})
+                                     if d["name"] in names
+                                     and (d.get("kind") != "dev" or d.get("req") != "*")})
                   for p in pkgs}
+          pathonly = {p["name"]: sorted({d["name"] for d in p["dependencies"]
+                                         if d.get("kind") != "dev" and d.get("req") == "*"})
+                      for p in pkgs}
 
           pos = {c: i for i, c in enumerate(matrix)}
           errors = []
@@ -308,6 +319,8 @@ jobs:
               if c not in names:
                   errors.append(f"'{c}' is in the publish matrix but is not a workspace package")
                   continue
+              for d in pathonly[c]:
+                  errors.append(f"'{c}' has a path-only dependency on '{d}' (no version requirement) — cargo publish will fail; pin it with a version")
               for d in deps[c]:
                   if d not in pos:
                       errors.append(f"'{c}' depends on '{d}', which is missing from the publish matrix")
@@ -377,7 +390,8 @@ jobs:
         #   pkgs = json.load(sys.stdin)["packages"]
         #   names = {p["name"] for p in pkgs}
         #   deps = {p["name"]: {d["name"] for d in p["dependencies"]
-        #           if d["name"] in names and d.get("req") != "*"} for p in pkgs}
+        #           if d["name"] in names
+        #           and (d.get("kind") != "dev" or d.get("req") != "*")} for p in pkgs}
         #   order = []
         #   while deps:
         #       ready = sorted(n for n, ds in deps.items() if ds <= set(order))
@@ -394,7 +408,11 @@ jobs:
         crate:
           - newt-skills       # (no internal deps)
           - plugins-protocol  # (no internal deps)
-          - newt-core         # newt-skills
+          - newt-tuner        # (no internal deps) — model tuning persistence
+                              #   (Step 19.6); newt-core depends on it, so it
+                              #   must be published first (missing from the
+                              #   matrix broke the v0.7.2 release)
+          - newt-core         # newt-skills, newt-tuner
           - newt-git          # newt-core — embedded git engine; newt-tui/newt-agent
                               #   depend on it with a version pin, so it must be
                               #   published before them (added 0.7.1: prior matrix
