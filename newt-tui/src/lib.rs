@@ -3911,7 +3911,11 @@ fn run_chat(
                         continue;
                     }
                     let slash_word = task.trim_start_matches('/');
-                    if slash_word == "compress" || slash_word.starts_with("compress ") {
+                    if slash_word == "compress"
+                        || slash_word.starts_with("compress ")
+                        || slash_word == "compact"
+                        || slash_word.starts_with("compact ")
+                    {
                         // Manual compression (Step 18.6, #247): the SAME
                         // prune → boundary → redacted summary → marker
                         // pipeline the loop's triggers call, run because the
@@ -4206,7 +4210,8 @@ fn run_chat(
                         .split_once(char::is_whitespace)
                         .map_or((slash_verb, ""), |(v, a)| (v, a.trim()));
                     let close_word = match verb {
-                        "new" => Some("new"),
+                        // `/clear` is the Claude-Code-parity alias for `/new`.
+                        "new" | "clear" => Some("new"),
                         "end" => Some("end"),
                         "restart" => Some("restart"),
                         "start" => Some("start"),
@@ -8430,7 +8435,11 @@ fn recall_display_title(store: &newt_core::ConversationStore, id: &str, title: &
 /// (a user can type a secret into the focus).
 fn parse_compress_command(input: &str) -> anyhow::Result<Option<String>> {
     let body = input.trim().trim_start_matches('/').trim();
-    let Some(rest) = body.strip_prefix("compress") else {
+    // `/compact` is the Claude-Code-parity alias for `/compress`.
+    let Some(rest) = body
+        .strip_prefix("compress")
+        .or_else(|| body.strip_prefix("compact"))
+    else {
         anyhow::bail!("not a compress command");
     };
     if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
@@ -9642,7 +9651,8 @@ impl Drop for CbreakGuard {
 fn canonical_help_topic(cmd: &str) -> &str {
     match cmd {
         "quit" => "exit",
-        "end" | "restart" => "new",
+        "end" | "restart" | "clear" => "new",
+        "compact" => "compress",
         "vi" | "vim" | "emacs" | "nano" | "edit-mode" => "editor",
         "tool-rounds" | "max-rounds" => "rounds",
         _ => cmd,
@@ -10020,7 +10030,7 @@ pub(crate) fn help_lines() -> &'static [&'static str] {
         "  /probe window [model]    - empirical input-boundary search (records max input at High confidence)",
         "  /probe reset             - wipe all learned probe values (conformance, windows, calibration)",
         "  /memory                  - show context window / notes usage",
-        "  /compress [focus]        - compress context now, optionally focused on a topic",
+        "  /compress [focus]        - compress context now, optionally focused on a topic (alias: /compact)",
         "  /summarizer              - show or change the summarizer backend and knobs",
         "  /rounds [n|double|reset|unlimited] - set this session's tool-call round limit",
         "  /context                 - show the active context manager + features",
@@ -10028,7 +10038,7 @@ pub(crate) fn help_lines() -> &'static [&'static str] {
         "  /context feature <name> [on|off] - toggle a composable context feature (all pending #582-#586)",
         "  /context stats           - experimentation dashboard: budget, compression, feature states",
         "  /remember <fact>         - add a fact to persistent NOTES.md",
-        "  /new                     - finalize this conversation and start a fresh one (stays in the session)",
+        "  /new                     - finalize this conversation and start a fresh one (stays in the session; alias: /clear)",
         "  /end  /restart           - finalize this conversation and start fresh (aliases of /new; /end no longer exits)",
         "  /start [title]           - begin a new conversation, leaving the current one open to /resume",
         "  /rename <title>          - retitle the current conversation so it is easy to find in /resume",
@@ -10061,7 +10071,7 @@ pub(crate) fn help_lines() -> &'static [&'static str] {
         "  /mode                    - show the active mode; /mode off clears it",
         "  /loadout                 - show the active loadout: declared axes vs what resolved",
         "  /workspace               - show current workspace path",
-        "  /config                  - dump the resolved config (secrets redacted) for audit",
+        "  /config show             - dump the resolved config (secrets redacted) for audit (bare /config: settings UI, not yet implemented)",
         "  /prompt                  - list prompt tokens ($MODEL, $DATE, …) + current prompt",
         "  /prompt set \"<template>\"  - set the prompt for this session; /prompt reset to revert",
         "  /vi  /emacs  /nano       - switch line-editor key bindings for this session",
@@ -10092,7 +10102,7 @@ fn dispatch_slash(
 
     match cmd {
         "exit" | "quit" | "help" | "version" | "workspace" | "config" => {
-            commands::meta::dispatch(cmd, workspace, color, verbose)
+            commands::meta::dispatch(cmd, arg1, workspace, color, verbose)
         }
         "prompt" | "vi" | "emacs" | "nano" | "edit-mode" | "thinking" => {
             commands::settings::dispatch(cmd, arg1, input, workspace, color, verbose)
