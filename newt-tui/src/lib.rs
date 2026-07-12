@@ -835,7 +835,7 @@ pub const PROMPT_TOKENS: &[(&str, &str, &str)] = &[
 
 /// Strip one matching pair of surrounding quotes (`"` or `'`), if present.
 /// Preserves everything inside, including trailing spaces. Pure for testing.
-fn strip_one_quote_pair(s: &str) -> &str {
+pub(crate) fn strip_one_quote_pair(s: &str) -> &str {
     let bytes = s.as_bytes();
     if bytes.len() >= 2
         && ((bytes[0] == b'"' && bytes[bytes.len() - 1] == b'"')
@@ -848,7 +848,7 @@ fn strip_one_quote_pair(s: &str) -> &str {
 }
 
 /// Render [`PROMPT_TOKENS`] as aligned help lines (for `/prompt`).
-fn prompt_token_help() -> Vec<String> {
+pub(crate) fn prompt_token_help() -> Vec<String> {
     PROMPT_TOKENS
         .iter()
         .map(|(name, slash, desc)| format!("  {name:<11} {slash:<3}  {desc}"))
@@ -859,7 +859,7 @@ fn prompt_token_help() -> Vec<String> {
 /// default) and its live expansion, for `/prompt`'s preview line. Resolving the
 /// model + edit mode here lets the preview show the *expanded* result so a
 /// backslash/TOML escaping mistake is visible at a glance.
-fn current_prompt_and_preview(workspace: &str) -> (String, String) {
+pub(crate) fn current_prompt_and_preview(workspace: &str) -> (String, String) {
     let template = std::env::var("NEWT_PROMPT")
         .ok()
         .or_else(|| {
@@ -10091,173 +10091,25 @@ fn dispatch_slash(
     let arg2 = parts.next().unwrap_or("").trim();
 
     match cmd {
-        "exit" | "quit" => return Ok(false),
-
-        "help" => {
-            print_newt("Available commands:", color, verbose);
-            for line in help_lines() {
-                println!("{line}");
-            }
+        "exit" | "quit" | "help" | "version" | "workspace" | "config" => {
+            commands::meta::dispatch(cmd, workspace, color, verbose)
         }
-
-        "version" => print_newt(&format!("v{VERSION}"), color, verbose),
-
-        "workspace" => print_newt(workspace, color, verbose),
-
-        "prompt" if arg1 == "set" => {
-            // Everything after "prompt set " is the literal template — taken
-            // from the RAW input so internal/trailing spaces survive, with one
-            // layer of surrounding quotes stripped. Applies for the session
-            // (via NEWT_PROMPT, which the per-turn prompt build reads first);
-            // put it in `[tui] prompt` to persist.
-            let template = input
-                .trim_start_matches('/')
-                .strip_prefix("prompt")
-                .and_then(|s| s.trim_start().strip_prefix("set"))
-                .map(|s| s.strip_prefix(' ').unwrap_or(s))
-                .map(strip_one_quote_pair)
-                .unwrap_or("");
-            if template.is_empty() {
-                print_newt(
-                    "usage: /prompt set \"<template>\"  (try /prompt for the token list)",
-                    color,
-                    verbose,
-                );
-            } else {
-                // SAFETY: single-threaded REPL; the next prompt is built right
-                // after this returns.
-                unsafe { std::env::set_var("NEWT_PROMPT", template) };
-                let (_t, preview) = current_prompt_and_preview(workspace);
-                print_newt(
-                    &format!("prompt set for this session — preview: {preview}"),
-                    color,
-                    verbose,
-                );
-                print_newt(
-                    "(add to [tui] prompt to persist — use $NAME macros there to avoid TOML escaping)",
-                    color,
-                    verbose,
-                );
-            }
+        "prompt" | "vi" | "emacs" | "nano" | "edit-mode" | "thinking" => {
+            commands::settings::dispatch(cmd, arg1, input, workspace, color, verbose)
         }
-
-        "prompt" if matches!(arg1, "reset" | "default" | "clear") => {
-            // SAFETY: single-threaded REPL.
-            unsafe { std::env::remove_var("NEWT_PROMPT") };
+        "models" | "probe" | "model" | "backend" | "backends" | "summarizer" | "dgx" => {
+            commands::model::dispatch(cmd, arg1, arg2, color, verbose)
+        }
+        "crew" => commands::crew::dispatch(arg1, arg2, color, verbose),
+        other => {
             print_newt(
-                "prompt reset to your [tui] prompt / the built-in default.",
+                &format!("unknown command: /{other}  (try /help)"),
                 color,
                 verbose,
             );
+            Ok(true)
         }
-
-        "prompt" => {
-            print_newt(
-                "Prompt tokens — `/prompt set \"<template>\"` to change, or `[tui] prompt` to persist:",
-                color,
-                verbose,
-            );
-            for line in prompt_token_help() {
-                println!("{line}");
-            }
-            print_newt(
-                "In config.toml prefer the $NAME macros — the \\x forms are eaten by TOML \
-                 (use a 'literal string' or doubled \\\\).",
-                color,
-                verbose,
-            );
-            let (tmpl, preview) = current_prompt_and_preview(workspace);
-            print_newt(&format!("current: {tmpl:?}"), color, verbose);
-            print_newt(&format!("preview: {preview}"), color, verbose);
-        }
-
-        "vi" | "emacs" | "nano" | "edit-mode" => {
-            // Switch the line-editor key bindings for the rest of the session.
-            // Sets NEWT_EDIT_MODE; the editor rebuild + the is_vi/caret recompute
-            // back in `run_chat` (after every slash command) pick it up.
-            let want = match cmd {
-                "vi" => Some("vi"),
-                "emacs" => Some("emacs"),
-                "nano" => Some("nano"),
-                _ => match arg1.to_lowercase().as_str() {
-                    "vi" | "vim" => Some("vi"),
-                    "emacs" => Some("emacs"),
-                    "nano" => Some("nano"),
-                    _ => None,
-                },
-            };
-            match want {
-                Some(m) => {
-                    // SAFETY: single-threaded REPL; the editor is rebuilt right
-                    // after this returns, before any further input is read.
-                    unsafe { std::env::set_var("NEWT_EDIT_MODE", m) };
-                    print_newt(&format!("edit mode: {m}"), color, verbose);
-                }
-                None => print_newt(
-                    "usage: /edit-mode <vi|emacs|nano>  (or just /vi, /emacs, /nano)",
-                    color,
-                    verbose,
-                ),
-            }
-        }
-
-        "config" => match newt_core::Config::resolve() {
-            Ok(cfg) => match cfg.to_redacted_toml() {
-                Ok(toml_str) => {
-                    print_newt("Resolved config (secrets redacted):", color, verbose);
-                    println!("{toml_str}");
-                }
-                Err(e) => print_newt(&format!("error serializing config: {e}"), color, verbose),
-            },
-            Err(e) => print_newt(&format!("error resolving config: {e}"), color, verbose),
-        },
-
-        "models" | "probe" | "model" | "backend" | "backends" => {
-            return commands::model::dispatch(cmd, arg1, arg2, color, verbose)
-        }
-        "thinking" => match arg1 {
-            "on" | "off" => {
-                // SAFETY: single-threaded REPL.
-                unsafe { std::env::set_var("NEWT_THINKING", arg1) };
-                print_newt(&format!("thinking spinner: {arg1}"), color, verbose);
-            }
-            _ => print_newt("usage: /thinking <on|off>", color, verbose),
-        },
-
-        "summarizer" | "dgx" => return commands::model::dispatch(cmd, arg1, arg2, color, verbose),
-        "crew" => match arg1 {
-            // `/crew edit [name]` runs the same interactive settings form as
-            // `newt crew --edit`. read_turn() drops the rich surface to cooked
-            // mode before slash dispatch, so the form's line input works
-            // in-session for both surfaces (no raw-mode wrestling here).
-            "edit" => {
-                let name = (!arg2.is_empty()).then_some(arg2);
-                if let Err(e) = run_crew_edit(name, color) {
-                    print_newt(&format!("crew edit failed: {e}"), color, verbose);
-                }
-            }
-            // Running a crew in-session (`/crew "<task>"`) is the separate
-            // workflow-TUI step; today the slash only edits settings.
-            "" => print_newt(
-                "usage: /crew edit [name] — edit a crew's settings \
-                 (planner/navigator/triage loadouts, control loop, test, budgets)",
-                color,
-                verbose,
-            ),
-            other => print_newt(
-                &format!("unknown /crew subcommand '{other}' — try /crew edit [name]"),
-                color,
-                verbose,
-            ),
-        },
-
-        other => print_newt(
-            &format!("unknown command: /{other}  (try /help)"),
-            color,
-            verbose,
-        ),
     }
-    Ok(true)
 }
 
 /// Fetch model names from an Ollama endpoint's `/api/tags`.
