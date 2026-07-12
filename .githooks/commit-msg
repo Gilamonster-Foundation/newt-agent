@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# commit-msg hook — block Claude session URLs / trailers from entering history.
+#
+# WHY: a `Claude-Session: https://claude.ai/code/session_…` trailer (or any
+# claude.ai/code/session link) is agent-session plumbing, not repository
+# provenance. Once committed to a public repo it is cloned, forked, and cached
+# forever — it clutters `git log`/`git blame` and leaks an internal session
+# handle. It slipped into public history once (commit dc6a167); this hook makes
+# that mechanically impossible going forward.
+#
+# Policy: agents MUST NOT put Claude session URLs in commit messages (or PR
+# bodies). `Co-Authored-By:` attribution is fine — only the session link is
+# banned. See WORKSPACE_RULES.md / CLAUDE.md "expunge Claude sessions".
+#
+# PIPELINE PARITY: message hygiene only — not a CI-mirror step. The pre-push
+# hook (.githooks/pre-push) is the lint/test/coverage gate; this is orthogonal.
+set -euo pipefail
+
+msg_file="$1"
+
+# Match the session URL in any form, and the trailer key, case-insensitively.
+if grep -qiE 'claude\.ai/code/session|^[[:space:]]*Claude-Session[[:space:]]*:' "$msg_file"; then
+    cat >&2 <<'EOF'
+✗ commit blocked: Claude session URL / trailer found in the commit message.
+
+  A `Claude-Session:` trailer or a claude.ai/code/session link is agent-session
+  plumbing — it does not belong in repository history (it leaks into public
+  clones/forks forever). Remove it and commit again.
+
+  Keep `Co-Authored-By:` attribution if you like — only the session link is
+  banned. Policy: CLAUDE.md → "expunge Claude sessions".
+EOF
+    exit 1
+fi
+
+exit 0

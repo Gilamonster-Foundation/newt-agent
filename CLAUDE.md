@@ -93,6 +93,15 @@ green before opening any PR.
 - If multiple LLMs contribute to the same commit, include one trailer per
   contributing model.
 
+### Expunge Claude sessions
+
+**Never** put a Claude session URL — a `Claude-Session:` trailer or any
+`https://claude.ai/code/session_…` link — in a commit message or a PR body.
+It is agent-session plumbing, not repository provenance, and once pushed to a
+public repo it is cloned/forked/cached forever. `Co-authored-by:` attribution
+is welcome; the session link is not. The `.githooks/commit-msg` hook blocks it
+mechanically (installed by `just install-hooks` via `core.hooksPath`).
+
 ## Coverage gate
 
 Workspace coverage is enforced by `just cov-ci` and the matching
