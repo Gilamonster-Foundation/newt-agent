@@ -21,6 +21,8 @@ pub mod terminal_hyperlink;
 // and headless/wyvern builds never compile it in — newt stays amphibious.
 #[cfg(feature = "rich-tui")]
 mod rich_input;
+#[cfg(feature = "rich-tui")]
+mod vi;
 // The lean input surface (issue #527): a dead-simple word-wrapped text box, the
 // flight/wyvern morphology. Always built — it is the footer-off / lean tier.
 mod lean_input;
