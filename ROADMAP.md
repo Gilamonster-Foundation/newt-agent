@@ -132,9 +132,44 @@ Per `docs/dgx-unboxing-experience.md`.
 **Exit:** the plan's phase-1 experience works end-to-end on the GB10
 bring-up target.
 
+## Phase 6 — TUI command surface & module cohesion (#1096)
+
+Align the TUI input line to Claude Code's clean two-namespace model
+(`/slash` + `!shell`), and split the surfaces it touches out of the
+`newt-tui/src/lib.rs` + `rich_input.rs` god-modules by **functional
+cohesion**, non-breaking code-motion first, so the behavioral command work
+lands in small, legible modules. Tracking checklist: **#1096**.
+
+**Cohesion ratchets** — pure code-motion, no behavior change, each its own PR:
+
+| Item | PR | Status |
+|---|---|---|
+| Extract splash screen → `splash.rs` | #1097 | ✅ merged |
+| Extract vi state machine → `vi.rs` | #1100 | ✅ merged |
+| Extract first-run setup/download screen → `setup_tui.rs` | — | 🔨 in progress |
+| Extract permission prompts → `permissions.rs` | — | ⬜ next |
+| Break command handlers into per-group modules | — | ⬜ |
+
+**Command-surface ratchets** — behavioral, land into the reorganized modules:
+
+| Item | Status |
+|---|---|
+| Retire bare shell verbs (`cd pwd ls rm …`); add `/cd` | ⬜ |
+| `/clear`+`/compact` CC aliases; `/config show` + bare-`/config` stub | ⬜ |
+| `/effort [low\|medium\|high\|max\|auto]` preset dial over the nudge knobs | ⬜ |
+| Fold `/memory` usage into `/context` (optional) | ⬜ |
+
+**Enabling infra:** #1098 restructures the pre-push hook to lint/test only
+*changed* code (the current whole-workspace hook is ~50 min); temporary
+`--no-verify` is permitted until it lands (see Branch + PR policy).
+
+**Exit:** input line is the CC two-namespace model with no bare-verb
+interception, and every surface it touches lives in a cohesively-named
+module under `newt-tui/src/`.
+
 ## v0.8.0 release criteria
 
-- Phases 0–5 exit criteria met (or items explicitly re-scoped with issue
+- Phases 0–6 exit criteria met (or items explicitly re-scoped with issue
   comments + a roadmap update in the same PR).
 - CHANGELOG.md entry summarizing the release by phase.
 - `just check` + `just cov-ci` green; coverage ratchet not lowered.
