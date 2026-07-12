@@ -1,0 +1,10 @@
+# Grind it out. max_tool_rounds = 10000 is the "effectively unlimited" sentinel.
+# PROVISIONAL starter values.
+name = "effort-max"
+rank = 40
+description = "grind it out — effectively-unlimited rounds, maximum grace and nudges"
+
+[knobs]
+max_tool_rounds = 10000
+workflow_grace_rounds = 10
+narration_nudge_cap = 8

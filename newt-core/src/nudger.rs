@@ -208,6 +208,96 @@ pub fn parse_profile(contents: &str, ext: &str) -> Result<NudgerProfile, String>
     }
 }
 
+/// The built-in seed profiles, embedded at compile time (mirrors
+/// [`crate::model_card`]'s `include_str!` seed array). Adding a built-in = a new
+/// `.toml` under `nudger/profiles/` + one row here — config, not code. The
+/// `effort-*` names deliberately hint at the future `/effort` projection while
+/// the *mechanism* (a generic `rank`, no `/effort` command) stays clean;
+/// `effort-crew` is unranked to demonstrate an off-axis posture. Values are
+/// PROVISIONAL — meant to be tuned / data-mined.
+const BUILTIN_SEEDS: &[(&str, &str)] = &[
+    (
+        "effort-low",
+        include_str!("nudger/profiles/effort-low.toml"),
+    ),
+    (
+        "effort-medium",
+        include_str!("nudger/profiles/effort-medium.toml"),
+    ),
+    (
+        "effort-high",
+        include_str!("nudger/profiles/effort-high.toml"),
+    ),
+    (
+        "effort-max",
+        include_str!("nudger/profiles/effort-max.toml"),
+    ),
+    (
+        "effort-crew",
+        include_str!("nudger/profiles/effort-crew.toml"),
+    ),
+];
+
+/// Parse the embedded built-in seed profiles. A broken seed is a bug in the
+/// tree (not user input), so it panics — caught by the `builtin_profiles_*`
+/// tests, exactly as model cards do with `.expect()`.
+pub fn builtin_profiles() -> Vec<NudgerProfile> {
+    BUILTIN_SEEDS
+        .iter()
+        .map(|(name, contents)| {
+            parse_profile(contents, "toml")
+                .unwrap_or_else(|e| panic!("built-in nudger seed `{name}` is invalid: {e}"))
+        })
+        .collect()
+}
+
+/// Load user profile drop-ins from `dir` (e.g. `~/.newt/nudger`). Best-effort,
+/// mirroring [`crate::model_card`]'s loader: a missing dir → empty; an
+/// unreadable or unparsable file → skipped (not an error). Loud validation is
+/// deferred to `nudger validate`.
+pub fn load_dropin_dir(dir: &std::path::Path) -> Vec<NudgerProfile> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+            continue;
+        };
+        if !matches!(ext.to_ascii_lowercase().as_str(), "toml" | "yaml" | "yml") {
+            continue;
+        }
+        let Ok(contents) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        if let Ok(profile) = parse_profile(&contents, ext) {
+            out.push(profile);
+        }
+    }
+    out
+}
+
+/// The profile registry: built-ins overlaid by same-named user drop-ins
+/// (merge-by-name, drop-in wins), plus any drop-in with a new name. Returned
+/// sorted by name; the ordering *axis* is a separate projection (a later PR).
+/// Precedence — built-in < user drop-in — matches the model-card registry.
+pub fn resolve(builtin: Vec<NudgerProfile>, dropins: Vec<NudgerProfile>) -> Vec<NudgerProfile> {
+    let mut by_name: BTreeMap<String, NudgerProfile> =
+        builtin.into_iter().map(|p| (p.name.clone(), p)).collect();
+    for d in dropins {
+        match by_name.remove(&d.name) {
+            Some(base) => {
+                by_name.insert(d.name.clone(), base.merge(d));
+            }
+            None => {
+                by_name.insert(d.name.clone(), d);
+            }
+        }
+    }
+    by_name.into_values().collect()
+}
+
 /// The outcome of [`NudgerProfile::validate`]: hard `errors` (a malformed
 /// profile) vs soft `warnings` (unknown / out-of-range knobs). The command
 /// layer decides exit codes; the runtime never calls this.
@@ -359,5 +449,84 @@ mod tests {
             KnobScope::SessionOnce
         );
         assert!(known_knob("not_a_knob").is_none());
+    }
+
+    #[test]
+    fn builtin_seeds_all_parse_and_validate() {
+        let profiles = builtin_profiles();
+        assert_eq!(profiles.len(), 5, "5 seeds ship");
+        for p in &profiles {
+            assert!(
+                p.validate().is_ok(),
+                "seed `{}` must have no hard errors: {:?}",
+                p.name,
+                p.validate().errors
+            );
+            assert!(
+                p.validate().is_clean(),
+                "seed `{}` must be clean (known, in-range knobs): {:?}",
+                p.name,
+                p.validate().warnings
+            );
+        }
+        let names: Vec<&str> = profiles.iter().map(|p| p.name.as_str()).collect();
+        assert!(names.contains(&"effort-low") && names.contains(&"effort-max"));
+    }
+
+    #[test]
+    fn builtin_medium_is_the_identity_and_crew_is_off_axis() {
+        let by = |n: &str| {
+            builtin_profiles()
+                .into_iter()
+                .find(|p| p.name == n)
+                .unwrap()
+        };
+        // medium == today's defaults: no knob overrides.
+        assert!(by("effort-medium").knobs.is_empty());
+        assert_eq!(by("effort-medium").rank, Some(20));
+        // crew is off the axis purely by omitting rank.
+        assert_eq!(by("effort-crew").rank, None);
+    }
+
+    #[test]
+    fn resolve_dropin_overrides_builtin_by_name_and_adds_new() {
+        let builtin = vec![parse_profile(
+            "name = \"effort-high\"\nrank = 30\n[knobs]\nmax_tool_rounds = 40\n",
+            "toml",
+        )
+        .unwrap()];
+        let dropins = vec![
+            // same name → overlays the built-in (drop-in wins per knob)
+            parse_profile(
+                "name = \"effort-high\"\n[knobs]\nmax_tool_rounds = 99\n",
+                "toml",
+            )
+            .unwrap(),
+            // new name → added
+            parse_profile(
+                "name = \"my-custom\"\n[knobs]\nmax_tool_rounds = 7\n",
+                "toml",
+            )
+            .unwrap(),
+        ];
+        let out = resolve(builtin, dropins);
+        let high = out.iter().find(|p| p.name == "effort-high").unwrap();
+        assert_eq!(high.knobs.get("max_tool_rounds"), Some(&99), "drop-in wins");
+        assert_eq!(
+            high.rank,
+            Some(30),
+            "built-in rank survives (drop-in didn't set it)"
+        );
+        assert!(
+            out.iter().any(|p| p.name == "my-custom"),
+            "new drop-in added"
+        );
+    }
+
+    #[test]
+    fn load_dropin_dir_missing_is_empty_not_an_error() {
+        // A nonexistent dir yields an empty list (best-effort) — no real fs.
+        let out = load_dropin_dir(std::path::Path::new("/no/such/nudger/dir/xyz"));
+        assert!(out.is_empty());
     }
 }

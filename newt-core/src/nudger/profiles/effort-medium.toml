@@ -1,0 +1,5 @@
+# The identity profile: no knob overrides, so activating it yields exactly the
+# configured defaults. "medium == today's defaults" falls out of an empty map.
+name = "effort-medium"
+rank = 20
+description = "today's configured defaults (the identity profile — no overrides)"

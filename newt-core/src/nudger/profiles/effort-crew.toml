@@ -1,0 +1,9 @@
+# OFF-AXIS (no rank): a different KIND of posture, not "more than max". This is
+# a placeholder marker for the future multi-agent / workflow shape — its real
+# behavior is not built yet. It lives off the effort slider purely by omitting
+# `rank` (the same mechanism as an unranked user drop-in). PROVISIONAL.
+name = "effort-crew"
+description = "off-axis placeholder for the multi-agent workflow posture (not yet built)"
+
+[knobs]
+max_tool_rounds = 60

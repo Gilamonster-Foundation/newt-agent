@@ -1,0 +1,10 @@
+# Light touch: stop sooner, fewer nudges. PROVISIONAL starter values — these
+# .toml seeds are data, meant to be tuned / data-mined, not settled numbers.
+name = "effort-low"
+rank = 10
+description = "light touch — fewer tool rounds and nudges, stops sooner"
+
+[knobs]
+max_tool_rounds = 10
+workflow_grace_rounds = 1
+narration_nudge_cap = 2

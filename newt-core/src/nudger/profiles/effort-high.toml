@@ -1,0 +1,9 @@
+# More persistent. PROVISIONAL starter values — tune / mine, don't treat as final.
+name = "effort-high"
+rank = 30
+description = "more persistent — more rounds, grace, and nudges"
+
+[knobs]
+max_tool_rounds = 40
+workflow_grace_rounds = 5
+narration_nudge_cap = 5
