@@ -549,9 +549,14 @@ pub(crate) fn logo_for_size(cols: u16, rows: u16) -> (Cow<'static, str>, u16) {
 // (`setup.rs` is the config wizard logic; `wizard.rs` is the silent prober.)
 use crate::permissions::{
     permission_prompting_configured, production_danger_table, prompt_permission_choice,
-    prompt_stdin_active, should_prompt_permissions, PermissionPromptState, PromptChoice,
-    PromptPermissionGate,
+    should_prompt_permissions, PermissionPromptState, PromptChoice, PromptPermissionGate,
 };
+// `prompt_stdin_active` is defined `#[cfg(any(unix, test))]` and its only
+// consumer in this crate is the `#[cfg(unix)]` interrupt watcher
+// (`watch_for_interrupt`). Gate the import to match, or a Windows build trips
+// `-D warnings` on the unresolved import / an unused import under `test`.
+#[cfg(unix)]
+use crate::permissions::prompt_stdin_active;
 use crate::setup_tui::{run_setup_inline, run_setup_screen};
 pub use crate::setup_tui::{SetupEvent, SetupHandle};
 
