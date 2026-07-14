@@ -568,6 +568,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fetch_openai_models_auth_sends_bearer() {
+        // Regression: the session-start adopt probe hit authenticated
+        // gateways WITHOUT the backend's bearer token -> 401 -> a spurious
+        // "unreachable" banner every launch and no adoption.
+        use wiremock::matchers::header;
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .and(header("authorization", "Bearer sekrit"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{"id": "gated-model"}]
+            })))
+            .mount(&server)
+            .await;
+        let client = reqwest::Client::new();
+        let models = newt_core::backend_probe::fetch_openai_models_auth(
+            &client,
+            &server.uri(),
+            Some("sekrit"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(models, vec!["gated-model".to_string()]);
+        // Without the token the mock does not match -> error, never a silent [].
+        assert!(
+            newt_core::backend_probe::fetch_openai_models(&client, &server.uri())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
     async fn fetch_openai_models_parses_data() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))

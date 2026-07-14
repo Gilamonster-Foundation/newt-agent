@@ -5815,8 +5815,16 @@ fn adopt_backend_choice(choice: &mut BackendChoice) -> Vec<String> {
         return Vec::new();
     }
     let mut lines = Vec::new();
+    // Local endpoints answer in well under a second; a remote authenticated
+    // HTTPS gateway needs a TLS + auth round-trip — still a bounded beat,
+    // just a wider one.
+    let secs = if choice.url.starts_with("https://") {
+        3
+    } else {
+        1
+    };
     let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(1))
+        .timeout(std::time::Duration::from_secs(secs))
         .build()
     {
         Ok(c) => c,
@@ -5827,7 +5835,12 @@ fn adopt_backend_choice(choice: &mut BackendChoice) -> Vec<String> {
         tokio::runtime::Handle::current().block_on(async {
             match choice.kind {
                 newt_core::BackendKind::Openai => {
-                    backend_probe::fetch_openai_models(&client, &choice.url).await
+                    backend_probe::fetch_openai_models_auth(
+                        &client,
+                        &choice.url,
+                        choice.api_key.as_deref(),
+                    )
+                    .await
                 }
                 _ => backend_probe::fetch_ollama_models(&client, &choice.url).await,
             }

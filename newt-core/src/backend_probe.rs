@@ -121,13 +121,21 @@ pub async fn fetch_ollama_models(
         .unwrap_or_default())
 }
 
-/// List models from an OpenAI-compatible endpoint via `GET /v1/models`.
-pub async fn fetch_openai_models(
+/// List models from an OpenAI-compatible endpoint via `GET /v1/models`,
+/// sending `Authorization: Bearer <token>` when the backend has one —
+/// authenticated gateways 401 the probe otherwise and the session never
+/// adopts.
+pub async fn fetch_openai_models_auth(
     client: &reqwest::Client,
     url: &str,
+    api_key: Option<&str>,
 ) -> anyhow::Result<Vec<String>> {
     let models_url = format!("{}/v1/models", url.trim_end_matches('/'));
-    let resp = client.get(&models_url).send().await?;
+    let mut req = client.get(&models_url);
+    if let Some(key) = api_key.filter(|k| !k.is_empty()) {
+        req = req.bearer_auth(key);
+    }
+    let resp = req.send().await?;
     if !resp.status().is_success() {
         anyhow::bail!("HTTP {}", resp.status());
     }
@@ -140,6 +148,14 @@ pub async fn fetch_openai_models(
                 .collect()
         })
         .unwrap_or_default())
+}
+
+/// Unauthenticated variant (kept for callers without a key in hand).
+pub async fn fetch_openai_models(
+    client: &reqwest::Client,
+    url: &str,
+) -> anyhow::Result<Vec<String>> {
+    fetch_openai_models_auth(client, url, None).await
 }
 
 #[cfg(test)]
