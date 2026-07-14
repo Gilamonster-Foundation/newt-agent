@@ -74,6 +74,44 @@ pub(crate) fn fit_line(s: &str, max_cols: usize) -> FittedLine {
     }
 }
 
+/// Word-wrap `s` into lines no wider than `width` columns (#1153): the tool-call
+/// display must show the FULL command/path so the operator can audit exactly
+/// what ran — truncating a `grep … | grep …` with `…` hid it. Wraps on
+/// whitespace when possible; a single token longer than `width` is hard-split
+/// so nothing is ever dropped. Width counted in `char`s (this path is ASCII
+/// commands/paths). Returns at least one line (possibly empty for empty input).
+pub(crate) fn wrap_to_width(s: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut lines = Vec::new();
+    for logical in s.split('\n') {
+        let mut cur = String::new();
+        let mut cur_len = 0usize;
+        for word in logical.split_inclusive(' ') {
+            let wlen = word.chars().count();
+            if cur_len + wlen > width && cur_len > 0 {
+                lines.push(std::mem::take(&mut cur));
+                cur_len = 0;
+            }
+            // A single word wider than the line: hard-split it so nothing is lost.
+            if wlen > width {
+                for ch in word.chars() {
+                    if cur_len == width {
+                        lines.push(std::mem::take(&mut cur));
+                        cur_len = 0;
+                    }
+                    cur.push(ch);
+                    cur_len += 1;
+                }
+            } else {
+                cur.push_str(word);
+                cur_len += wlen;
+            }
+        }
+        lines.push(cur);
+    }
+    lines
+}
+
 /// Print a newt narrator line.
 ///
 /// The `▸` marker stays the **default text color**: a colored sigil on every
@@ -381,31 +419,48 @@ pub(crate) fn print_retry_indicator(attempt: u32, delay: std::time::Duration, co
 
 /// Print a tool-call header so the user can see what the agent is doing.
 pub(crate) fn print_tool_call(name: &str, detail: &str, color: bool) {
-    // Keep the "⚙  {name}: " prefix whole (it's short) and fit only the detail
-    // into the cells that remain, so a long path/command can't wrap the line.
+    // #1153: WORD-WRAP the full detail across as many lines as it needs — the
+    // operator must be able to audit exactly what command/path ran, so the
+    // command is never truncated with `…`. Continuation lines are indented to
+    // align under the detail. Keep the "⚙  {name}: " prefix whole (it's short).
     let cols = term_cols();
     let prefix_w = 3 + name.chars().count() + 2; // "⚙  " + name + ": "
-    let fitted = fit_line(detail, cols.saturating_sub(prefix_w));
+    let detail_w = cols.saturating_sub(prefix_w).max(8);
+    let wrapped = wrap_to_width(detail, detail_w);
+    let indent = " ".repeat(prefix_w);
     if color {
-        execute!(
-            io::stdout(),
-            SetForegroundColor(NEWT_ORANGE_CT),
-            Print(format!("⚙  {name}")),
-            ResetColor,
-            SetForegroundColor(CtColor::DarkGrey),
-            Print(format!(": {}", fitted.head)),
-            SetForegroundColor(FADE_CT),
-            Print(&fitted.fade),
-            Print(fitted.ellipsis),
-            ResetColor,
-            Print("\n"),
-        )
-        .ok();
+        for (i, line) in wrapped.iter().enumerate() {
+            if i == 0 {
+                execute!(
+                    io::stdout(),
+                    SetForegroundColor(NEWT_ORANGE_CT),
+                    Print(format!("⚙  {name}")),
+                    ResetColor,
+                    SetForegroundColor(CtColor::DarkGrey),
+                    Print(format!(": {line}")),
+                    ResetColor,
+                    Print("\n"),
+                )
+                .ok();
+            } else {
+                execute!(
+                    io::stdout(),
+                    SetForegroundColor(CtColor::DarkGrey),
+                    Print(format!("{indent}{line}")),
+                    ResetColor,
+                    Print("\n"),
+                )
+                .ok();
+            }
+        }
     } else {
-        println!(
-            "⚙  {name}: {}{}{}",
-            fitted.head, fitted.fade, fitted.ellipsis
-        );
+        for (i, line) in wrapped.iter().enumerate() {
+            if i == 0 {
+                println!("⚙  {name}: {line}");
+            } else {
+                println!("{indent}{line}");
+            }
+        }
     }
     io::stdout().flush().ok();
 }
@@ -478,6 +533,31 @@ pub(crate) fn print_denied(axis: &str, target: &str, color: bool) {
 #[cfg(test)]
 mod tests {
     use super::{fit_line, fmt_tokens, print_harness_notice, print_list_item, print_newt};
+
+    #[test]
+    fn wrap_to_width_never_drops_and_hard_splits_long_tokens() {
+        // #1153: the full command must survive — reassembling the wrap yields
+        // the original (spaces preserved via split_inclusive).
+        let cmd = "grep -rn \"NudgerProfile|resolve.*knob|KNOWN_KNOBS\" --include=*.rs newt-core/src newt-cli/src";
+        let wrapped = super::wrap_to_width(cmd, 20);
+        assert_eq!(wrapped.join(""), cmd, "no characters lost");
+        assert!(
+            wrapped.iter().all(|l| l.chars().count() <= 20),
+            "each line fits"
+        );
+        assert!(wrapped.len() > 1, "long command actually wraps");
+
+        // A single token longer than the width is hard-split, not dropped.
+        let long = "a".repeat(50);
+        let w = super::wrap_to_width(&long, 10);
+        assert_eq!(w.join(""), long);
+        assert_eq!(w.len(), 5);
+
+        // Short input stays one line.
+        assert_eq!(super::wrap_to_width("cargo build", 40), vec!["cargo build"]);
+        // Embedded newlines split into separate logical lines.
+        assert_eq!(super::wrap_to_width("a\nb", 40), vec!["a", "b"]);
+    }
 
     #[test]
     fn fit_line_passes_through_when_it_fits() {
