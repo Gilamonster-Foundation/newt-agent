@@ -225,8 +225,8 @@ pub use recall::{recall_tool_definition, RecallSource, StoreRecallSource};
 pub use resume::resume_context_tool_definition;
 pub use tools::{
     execute_tool, execute_tool_with_offload, filter_advertised_tools, full_access_requested,
-    ocap_disabled, persona_tool_allowed, set_max_output_tokens, set_output_head_tokens,
-    tool_definitions, venv_cmd_prefix,
+    in_plan_phase, ocap_disabled, persona_tool_allowed, plan_phase_clamp, set_max_output_tokens,
+    set_output_head_tokens, tool_definitions, venv_cmd_prefix,
 };
 pub use transcript::{
     transcript_lines, transcript_lines_styled, TranscriptLine, TranscriptRole, TranscriptStyle,
