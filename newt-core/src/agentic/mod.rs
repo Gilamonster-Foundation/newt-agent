@@ -1283,6 +1283,18 @@ pub async fn chat_complete(
     // of letting it hand the stale-context claim back to the human.
     let mut stale_file_nudges: usize = 0;
     let nudge_classifier = crate::NudgeClassifier::load_default();
+    // #1152/#1162: action-pressure nudges (narration rescue, workflow repair
+    // steering, pending-plan pushes) fire ONLY when the user's turn actually
+    // invited action. A question or acknowledgment gets none — narration IS
+    // the deliverable, and pressuring a model answering a question is how the
+    // "I'm genuinely finished" defense loop (#1158) gets seeded.
+    let action_turn = messages
+        .iter()
+        .rev()
+        .find(|m| m["role"].as_str() == Some("user") && !compress::is_compaction_message(m))
+        .and_then(|m| m["content"].as_str())
+        .map(crate::classifiers::user_turn_invites_action)
+        .unwrap_or(true);
     let workflow_steerer = crate::WorkflowSteerer::load_default();
     let mut workflow_runtime = WorkflowRuntimeState::default();
     // The matching workflow's round-cap grace horizon override, resolved once
@@ -1922,6 +1934,7 @@ pub async fn chat_complete(
                         if narration_nudges < narration_nudge_cap
                             && round + 1 < current_tool_round_limit
                             && nudge_classification.is_pending_action()
+                            && action_turn
                         {
                             if debug {
                                 print_debug(
@@ -4092,6 +4105,14 @@ pub async fn openai_chat_complete(
     // Unverified stale-file blocker rescue counter (mirror of the Ollama path).
     let mut stale_file_nudges: usize = 0;
     let nudge_classifier = crate::NudgeClassifier::load_default();
+    // #1152/#1162: same intent gate as the primary loop — see the comment there.
+    let action_turn = messages
+        .iter()
+        .rev()
+        .find(|m| m["role"].as_str() == Some("user") && !compress::is_compaction_message(m))
+        .and_then(|m| m["content"].as_str())
+        .map(crate::classifiers::user_turn_invites_action)
+        .unwrap_or(true);
     let workflow_steerer = crate::WorkflowSteerer::load_default();
     let mut workflow_runtime = WorkflowRuntimeState::default();
     // See the Ollama path: a matching workflow's grace-horizon override.
@@ -4519,7 +4540,7 @@ pub async fn openai_chat_complete(
                 .and_then(|_| nudge_classifier.direction_for(crate::NudgeClass::PlanUpdate));
             let plan_nudge_hint =
                 combine_nudge_hints(classifier_plan_direction, workflow_hint.as_deref());
-            if !content.is_empty() && round + 1 < current_tool_round_limit {
+            if !content.is_empty() && round + 1 < current_tool_round_limit && action_turn {
                 if let Some(nudge) = workflow_runtime.rediscovery_nudge(
                     nudge_classification.as_ref(),
                     &content,
@@ -4542,6 +4563,7 @@ pub async fn openai_chat_complete(
             if !content.is_empty()
                 && pending_plan_nudges < PENDING_PLAN_NUDGE_CAP
                 && round + 1 < current_tool_round_limit
+                && action_turn
             {
                 let needs_plan_update = nudge_classification
                     .as_ref()
@@ -4592,6 +4614,7 @@ pub async fn openai_chat_complete(
             if !content.is_empty()
                 && narration_nudges < narration_nudge_cap
                 && round + 1 < current_tool_round_limit
+                && action_turn
                 && nudge_classification
                     .as_ref()
                     .is_some_and(|c| c.is_pending_action())
@@ -9088,6 +9111,50 @@ mod http_loop_tests {
         c.narration_nudge_cap = narration_nudge_cap;
         let (reply, _s, _u, _h) = chat_complete(c, &mut NoMcp).await.expect("dispatch");
         (reply, round.load(Ordering::SeqCst))
+    }
+
+    #[tokio::test]
+    async fn question_turns_are_never_nudged() {
+        // Regression #1152/#1162 (the 2026-07-14 Opus session): the user asked
+        // a QUESTION; the model's narrated answer classified as pending-action
+        // and got nudged, seeding the "I'm genuinely finished" defense loop
+        // (#1158). With the intent gate, a question turn takes its narration
+        // as the final answer on ROUND ONE — no rescue, no residue.
+        let server = MockServer::start().await;
+        let round = Arc::new(AtomicUsize::new(0));
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ScriptedOpenAi {
+                round: round.clone(),
+                // Phrasing the classifier reads as pending-action ("Let me…").
+                script: vec![
+                    serde_json::json!({ "content": "Let me look into the harness next." }),
+                    serde_json::json!({ "content": "SHOULD NEVER BE REQUESTED" }),
+                ],
+            })
+            .mount(&server)
+            .await;
+        let messages = vec![
+            MemMessage::system("you are a test"),
+            MemMessage::user(
+                "Give me your top 5 improvements to make LLM effectiveness better inside this harness please?",
+            ),
+        ];
+        let caveats = Caveats::top();
+        let uri = server.uri();
+        let mut c = ctx(&uri, &messages, &caveats);
+        c.kind = BackendKind::Openai;
+        c.narration_nudge_cap = 2; // budget available — the GATE must stop it
+        let (reply, _s, _u, _h) = chat_complete(c, &mut NoMcp).await.expect("dispatch");
+        assert_eq!(
+            round.load(Ordering::SeqCst),
+            1,
+            "a question turn must never consume a rescue round"
+        );
+        assert!(
+            reply.contains("look into"),
+            "narration IS the answer: {reply}"
+        );
     }
 
     #[tokio::test]
