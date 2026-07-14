@@ -3142,6 +3142,11 @@ fn run_chat(
     // Resolve the inference backend and permission caveats once at session
     // start.  Both are re-read after each slash command (config.toml on disk).
     let mut choice = resolve_backend_choice(&cfg);
+    // #1126 C1b: the server dictates — adopt what the endpoint actually
+    // serves (bounded ~1s; offline keeps the file hint + says so).
+    for line in adopt_backend_choice(&mut choice) {
+        print_newt(&line, color, verbose);
+    }
     let (mut inf_url, mut inf_model) = (choice.url.clone(), choice.model.clone());
 
     // Resolve + validate the active profile against config, now that the model is
@@ -4760,6 +4765,15 @@ fn run_chat(
                     }
                     let prev_inf_url = inf_url.clone();
                     choice = resolve_backend_choice(&cfg);
+                    // #1126 C1b: adopt served reality on a backend/model
+                    // switch too — but only when the endpoint or session
+                    // override actually changed (a plain slash command must
+                    // not re-probe every time).
+                    if choice.url != prev_inf_url || choice.model != inf_model {
+                        for line in adopt_backend_choice(&mut choice) {
+                            print_newt(&line, color, verbose);
+                        }
+                    }
                     inf_url = choice.url.clone();
                     inf_model = choice.model.clone();
                     inf_kind = choice.kind;
@@ -5701,13 +5715,10 @@ fn run_chat(
 /// resolved bearer token.
 pub(crate) struct BackendChoice {
     /// The configured backend's name ("" for env-synthesized/legacy choices) —
-    /// feeds cap_key (instance keying) and honest status lines. Read from C1b
-    /// (session-start adopt) onward.
-    #[allow(dead_code)]
+    /// feeds cap_key (instance keying) and honest status lines.
     pub(crate) name: String,
     /// Declared serving axis when the backend file pins one; None = derive at
-    /// probe/adopt time. Read from C1b onward.
-    #[allow(dead_code)]
+    /// probe/adopt time; session-start adopt caches the derived value here.
     pub(crate) serving: Option<newt_core::Serving>,
     pub(crate) url: String,
     pub(crate) model: String,
@@ -5791,6 +5802,85 @@ pub(crate) fn active_backend_name(cfg: &newt_core::Config) -> Option<String> {
         .iter()
         .find(|b| b.endpoint == choice.url && b.kind == choice.kind)
         .map(|b| b.name.clone())
+}
+
+/// Session-start / backend-switch adoption (#1139 C1b, epic #1126): ask the
+/// chosen backend what it ACTUALLY serves (bounded ~1s) and adopt served
+/// reality via [`newt_core::backend_probe::adopt`]. Returns status lines to
+/// print. Offline/timeout → keep the file-hint model and say so — NEVER a
+/// silent failover to another backend. Embedded backends are not probed.
+fn adopt_backend_choice(choice: &mut BackendChoice) -> Vec<String> {
+    use newt_core::backend_probe::{self, Served};
+    if choice.kind == newt_core::BackendKind::Embedded {
+        return Vec::new();
+    }
+    let mut lines = Vec::new();
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(1))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    // run_chat is sync inside the tokio runtime — bridge like wizard.rs does.
+    let fetched = tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(async {
+            match choice.kind {
+                newt_core::BackendKind::Openai => {
+                    backend_probe::fetch_openai_models(&client, &choice.url).await
+                }
+                _ => backend_probe::fetch_ollama_models(&client, &choice.url).await,
+            }
+        })
+    });
+    match fetched {
+        Ok(models) => {
+            // Synthesize the backend view adopt() reasons over: the choice
+            // already carries name/kind/serving and the file-hint model.
+            let synth = newt_core::BackendConfig {
+                name: choice.name.clone(),
+                endpoint: choice.url.clone(),
+                model: (!choice.model.is_empty()).then(|| choice.model.clone()),
+                kind: choice.kind,
+                serving: choice.serving,
+                ..Default::default()
+            };
+            let requested = std::env::var("NEWT_DGX_MODEL")
+                .ok()
+                .filter(|s| !s.is_empty());
+            let adoption = backend_probe::adopt(&synth, &Served { models }, requested.as_deref());
+            choice.serving = Some(adoption.serving);
+            match adoption.model {
+                Some(m) => {
+                    if adoption.requested_ignored {
+                        lines.push(format!(
+                            "model is fixed by this {} instance: {m} — restart the server                              with another model, or /backends to switch endpoints",
+                            choice.kind.label()
+                        ));
+                    }
+                    choice.model = m;
+                }
+                None => lines.push(format!(
+                    "{} listed no models — pull one (or start the server with a model),                      then /models",
+                    choice.url
+                )),
+            }
+        }
+        Err(e) => {
+            if choice.model.is_empty() {
+                lines.push(format!(
+                    "{} is unreachable ({e}) and no model is configured — check the                      endpoint, then /backends",
+                    choice.url
+                ));
+            } else {
+                lines.push(format!(
+                    "{} is unreachable ({e}) — using configured model {} until it answers",
+                    choice.url, choice.model
+                ));
+            }
+        }
+    }
+    lines
 }
 
 /// One item per configured backend for `/backends`: the `name · kind · model @
