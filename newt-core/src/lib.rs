@@ -17,6 +17,7 @@ pub mod dgx;
 pub mod error;
 pub mod ffi_manifest;
 pub mod ffi_surface;
+pub mod flight_recorder;
 pub mod git_caveats;
 pub mod kit;
 pub mod lazy_emission;

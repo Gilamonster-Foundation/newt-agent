@@ -1576,6 +1576,11 @@ async fn exec_confined_command(
     // which enforces the already-clamped `caveats`. `None` keeps the bypass
     // bit-for-bit.
     if ocap_disabled() && exec_floor_permits(exec_floor, cmd) {
+        // #1176: shadow-OCAP — the command is about to run UNCONFINED. Record
+        // the authority a leash would have gated on (no-op unless recording
+        // is armed), so a --full-access session builds its own policy-gap
+        // catalog + bridle repro fixtures instead of learning nothing.
+        crate::flight_recorder::log_unconfined(cmd);
         return match host_shell_dispatch(&cmd_with_venv, cwd).await {
             Ok(envelope) => shell_envelope_output(
                 &envelope,
