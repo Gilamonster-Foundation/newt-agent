@@ -417,6 +417,7 @@ fn build_openai_config(
         api: Default::default(),
         api_key_file: None,
         api_key_env,
+        ..Default::default()
     }];
     base
 }

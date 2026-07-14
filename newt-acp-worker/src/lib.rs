@@ -197,6 +197,7 @@ mod backend_selection_tests {
             api: Default::default(),
             api_key_file: None,
             api_key_env: None,
+            ..Default::default()
         }
     }
 

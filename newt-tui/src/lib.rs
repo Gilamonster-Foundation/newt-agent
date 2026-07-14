@@ -16211,6 +16211,7 @@ mod helper_fn_tests {
                 api: Default::default(),
                 api_key_file: None,
                 api_key_env: None,
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -16978,6 +16979,7 @@ mod env_resolution_tests {
             api: Default::default(),
             api_key_file: None,
             api_key_env: None,
+            ..Default::default()
         }
     }
 

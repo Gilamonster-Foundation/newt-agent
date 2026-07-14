@@ -128,6 +128,7 @@ async fn from_config_wires_bearer_auth_from_env() {
         api: Default::default(),
         api_key_file: None,
         api_key_env: Some(var.into()),
+        ..Default::default()
     };
     let backend = LocalVllmBackend::from_config(&cfg);
     std::env::remove_var(var);

@@ -2809,9 +2809,68 @@ pub enum OpenAiApi {
 ///
 /// Two ways to define one: an inline `[[backends]]` array element in
 /// `config.toml`, or a per-file drop-in `~/.newt/backends/<name>.toml` (the
+/// How a backend SERVES models — orthogonal to [`BackendKind`] (the wire
+/// protocol). The out-of-the-box epic's (#1126) second axis:
+///
+/// - **Multiplexer** (Ollama; also an OpenAI-compatible gateway fronting many
+///   models): many models, the client picks per request (`/model` swaps
+///   freely), capabilities are learned **per model**.
+/// - **Instance** (vLLM; the embedded engine): bound to ONE base model at
+///   startup — `/v1/models` exists only to *declare* it. newt ADOPTS the
+///   served model; capabilities attach to the **backend**; `/model` reports
+///   "fixed — restart the server or `/backends` to switch".
+///
+/// Usually left unset in the file and DERIVED by probing (see
+/// [`derive_serving`]), then cached back as provenance by `newt setup`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Serving {
+    Multiplexer,
+    Instance,
+}
+
+/// Derive the serving axis from what a probe saw: the wire kind plus how many
+/// models the endpoint reported. Pure — Phase B's probe/adopt calls this; kept
+/// here so the rule lives beside the type. `served_count` = models listed by
+/// `/api/tags` (ollama) or `/v1/models` (openai).
+pub fn derive_serving(kind: BackendKind, served_count: usize) -> Serving {
+    match kind {
+        // Ollama loads models on demand — always a multiplexer, even if only
+        // one model happens to be pulled today.
+        BackendKind::Ollama => Serving::Multiplexer,
+        // A vLLM instance declares exactly one model; an OpenAI-compatible
+        // gateway fronting a fleet lists many.
+        BackendKind::Openai => {
+            if served_count == 1 {
+                Serving::Instance
+            } else {
+                Serving::Multiplexer
+            }
+        }
+        // The in-process engine runs one GGUF.
+        BackendKind::Embedded => Serving::Instance,
+    }
+}
+
+/// Where a backend file came from — written by `newt setup`, hand-authored,
+/// or probe-derived. Pure data; nothing branches on it. Makes a generated
+/// file self-describing and lets `doctor` show declared-vs-derived drift.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct BackendProvenance {
+    /// Who wrote the file (e.g. `newt setup v0.7.3`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// When the endpoint was last probed (ISO 8601 date or datetime).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probed: Option<String>,
+    /// True when `serving` was derived by the probe rather than hand-declared.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub derived_serving: Option<bool>,
+}
+
 /// filename stem is the `name`, so a drop-in omits it). `name` and `tiers`
 /// therefore default — a minimal drop-in is just `endpoint` + `model`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BackendConfig {
     /// Backend name. For a per-file drop-in this is overwritten by the filename
     /// stem, so the file body may omit it.
@@ -2856,6 +2915,41 @@ pub struct BackendConfig {
     /// resolve to a non-empty value.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key_env: Option<String>,
+    /// The serving axis (multiplexer | instance) — see [`Serving`]. Unset =
+    /// derive by probing (Phase B); `newt setup` caches the derivation here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serving: Option<Serving>,
+    /// The physical host this endpoint lives on, for same-host reasoning (the
+    /// vLLM-starves-ollama rule, crew spread). Unset = derived from the
+    /// endpoint URL's host part; set it only to group endpoints the URL
+    /// doesn't reveal as co-located.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    /// Big-box escape hatch: `true` asserts this host has room to run this
+    /// backend ALONGSIDE others (e.g. a huge-RAM ollama next to a small vLLM),
+    /// suppressing the default "vLLM resident ⇒ same-host ollama is starved"
+    /// rule. Unset = the conservative default applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coexist: Option<bool>,
+    /// Host memory available for serving (GiB), for the crew fit-gate
+    /// (Σ model `footprint_gib` ≤ `ram_gib`). Unset = unknown (fit-gate
+    /// falls back to the conservative one-model law).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ram_gib: Option<f64>,
+    /// Model-card pointer: the card whose serving/tuning/capability blocks
+    /// apply to this backend's model (instance backends especially).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub card: Option<String>,
+    /// Inline capability overrides for THIS backend — same shape as a model
+    /// card's `[capability]` (reused type). On an instance backend this is
+    /// where adopted capabilities live; a multiplexer keeps per-model
+    /// capabilities in the probe cache instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability: Option<crate::model_card::Capability>,
+    /// Self-description of how this file came to be — see
+    /// [`BackendProvenance`]. Written by `newt setup`; never read at runtime.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<BackendProvenance>,
 }
 
 impl BackendConfig {
@@ -3044,12 +3138,9 @@ fn fallback_localhost_backend() -> BackendConfig {
         name: "ollama".into(),
         endpoint: "http://127.0.0.1:11434".into(),
         model: Some("llama3.1:8b".into()),
-        model_path: None,
         tiers: vec![Tier::Fast, Tier::Standard, Tier::Complex, Tier::Review],
         kind: BackendKind::Ollama,
-        api: Default::default(),
-        api_key_file: None,
-        api_key_env: None,
+        ..Default::default()
     }
 }
 
@@ -4628,6 +4719,58 @@ mod tests {
     }
 
     #[test]
+    fn serving_axis_fields_round_trip_and_stay_minimal() {
+        // #1129 (epic #1126): the serving axis + host/coexist/ram_gib/card/
+        // capability/provenance are all OPTIONAL — a legacy file with none of
+        // them parses (None everywhere), and a full file round-trips.
+        let legacy: BackendConfig =
+            toml::from_str("endpoint=\"http://h:1\"\nmodel=\"m\"\n").unwrap();
+        assert_eq!(legacy.serving, None);
+        assert_eq!(legacy.host, None);
+        assert_eq!(legacy.coexist, None);
+
+        let full: BackendConfig = toml::from_str(
+            "endpoint=\"http://dgx:8000\"\nkind=\"openai\"\nserving=\"instance\"\n\
+             host=\"dgx1\"\ncoexist=true\nram_gib=480.0\ncard=\"ornith-1.0-35b\"\n\
+             [capability]\nthinking_default=true\n\
+             [provenance]\nsource=\"newt setup v0.7.3\"\nderived_serving=true\n",
+        )
+        .unwrap();
+        assert_eq!(full.serving, Some(Serving::Instance));
+        assert_eq!(full.host.as_deref(), Some("dgx1"));
+        assert_eq!(full.coexist, Some(true));
+        assert_eq!(full.ram_gib, Some(480.0));
+        assert_eq!(full.card.as_deref(), Some("ornith-1.0-35b"));
+        assert_eq!(
+            full.capability.as_ref().and_then(|c| c.thinking_default),
+            Some(true)
+        );
+        assert_eq!(
+            full.provenance.as_ref().and_then(|p| p.derived_serving),
+            Some(true)
+        );
+
+        // Serialization stays minimal: unset optional fields are skipped, so a
+        // generated backends/<name>.toml doesn't bloat with nulls.
+        let out = toml::to_string(&legacy).unwrap();
+        assert!(!out.contains("serving"), "unset fields are skipped: {out}");
+        assert!(!out.contains("provenance"));
+    }
+
+    #[test]
+    fn derive_serving_rules() {
+        // Ollama is ALWAYS a multiplexer, even with one model pulled today.
+        assert_eq!(derive_serving(BackendKind::Ollama, 1), Serving::Multiplexer);
+        assert_eq!(derive_serving(BackendKind::Ollama, 7), Serving::Multiplexer);
+        // A vLLM instance declares exactly one model on /v1/models.
+        assert_eq!(derive_serving(BackendKind::Openai, 1), Serving::Instance);
+        // An OpenAI-compatible gateway fronting a fleet lists many.
+        assert_eq!(derive_serving(BackendKind::Openai, 3), Serving::Multiplexer);
+        // The in-process engine runs one GGUF.
+        assert_eq!(derive_serving(BackendKind::Embedded, 1), Serving::Instance);
+    }
+
+    #[test]
     fn backend_model_is_optional_and_read_via_effective_model() {
         // #1128 (epic #1126): a model-less backend file PARSES — "the server
         // dictates"; Phase B's adopt() fills it at session start. Previously
@@ -4677,6 +4820,7 @@ mod tests {
                     api: Default::default(),
                     api_key_file: None,
                     api_key_env: None,
+                    ..Default::default()
                 },
                 BackendConfig {
                     name: "gnuc".into(),
@@ -4688,6 +4832,7 @@ mod tests {
                     api: Default::default(),
                     api_key_file: None,
                     api_key_env: None,
+                    ..Default::default()
                 },
             ],
             ..Default::default()
@@ -5653,6 +5798,7 @@ net = [\"already.example.com\"]
             api: Default::default(),
             api_key_file,
             api_key_env,
+            ..Default::default()
         }
     }
 

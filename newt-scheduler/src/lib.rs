@@ -449,6 +449,7 @@ mod tests {
             api: Default::default(),
             api_key_file: None,
             api_key_env: None,
+            ..Default::default()
         };
         let pb = PoolBackend::from(&cfg);
         assert_eq!(pb.name, "remote");
