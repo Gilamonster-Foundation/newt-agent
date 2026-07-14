@@ -3342,8 +3342,21 @@ fn post_compaction_continuation(
     step_ledger: Option<&dyn scheduled::StepLedger>,
     instruction: Option<&str>,
 ) -> String {
-    let step_clause = active_step_description(step_ledger)
-        .map(|step| format!(" Active step: '{step}'."))
+    // #1163 (F): re-inject the FULL plan verbatim — every step with its
+    // status — not just the active one. The corporate-box repro showed the
+    // model, post-compaction, REWRITE its own plan (dropping the in-progress
+    // implement steps for "stop implementation"). Showing the whole plan back
+    // + ordering "advance, don't rewrite" makes the plan an anchor the model
+    // continues from instead of re-deriving.
+    let plan_clause = step_ledger
+        .and_then(scheduled::plan_block)
+        .map(|plan| {
+            format!(
+                " Your active plan is below — CONTINUE from the `→` step; call \
+                 update_plan only to mark a step done (advance), NEVER to \
+                 replace or shrink it:\n{plan}\n"
+            )
+        })
         .unwrap_or_default();
     // Quote the operator's instruction so the model re-anchors on what was
     // ACTUALLY asked, not a summary-derived paraphrase. Bounded so a huge
@@ -3356,7 +3369,7 @@ fn post_compaction_continuation(
         .unwrap_or_default();
     format!(
         "{} You are mid-task: the context above was just compacted, not \
-         completed.{instruction_clause}{step_clause} Continue working — your \
+         completed.{instruction_clause}{plan_clause} Continue working — your \
          next output should be the next concrete tool call (re-read any file \
          you are about to edit first, since full file contents were not \
          preserved). Before concluding ANYTHING about prior work, re-anchor on \
@@ -9588,6 +9601,43 @@ mod http_loop_tests {
             "{d}"
         );
         assert!(d.contains("do not repeat work"), "{d}");
+    }
+
+    #[test]
+    fn post_compaction_continuation_reinjects_the_full_plan_advance_not_rewrite() {
+        // #1163 (F): the corporate-box repro showed the model REWRITE its own
+        // plan post-compaction (dropping the implement steps for "stop
+        // implementation"). The directive must re-inject the WHOLE plan (every
+        // step + status) and order advance-not-rewrite, so the plan is an
+        // anchor the model continues from.
+        use crate::agentic::scheduled::{SessionStepLedger, StepLedger};
+        let ledger = SessionStepLedger::default();
+        ledger.set_plan(&[
+            "verify state".to_string(),
+            "wire the lazy-emission guard".to_string(),
+            "wire nudger profiles".to_string(),
+        ]);
+        ledger.advance(); // step 1 done, step 2 active
+        let d = post_compaction_continuation(Some(&ledger), None);
+        // The full plan is present — including the not-yet-reached step.
+        assert!(
+            d.contains("wire the lazy-emission guard"),
+            "active step: {d}"
+        );
+        assert!(
+            d.contains("wire nudger profiles"),
+            "future step present: {d}"
+        );
+        assert!(d.contains("verify state"), "done step present: {d}");
+        // The advance-not-rewrite instruction.
+        assert!(
+            d.contains("NEVER to \\\n                 replace") || d.contains("NEVER to replace"),
+            "{d}"
+        );
+        assert!(d.contains("advance"), "{d}");
+        // No plan → no plan clause (and no panic).
+        let empty = post_compaction_continuation(None, None);
+        assert!(!empty.contains("active plan is below"), "{empty}");
     }
 
     #[test]
