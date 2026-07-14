@@ -192,7 +192,13 @@ pub fn tool_definitions() -> serde_json::Value {
             "type": "function",
             "function": {
                 "name": "run_command",
-                "description": "Run a shell command in the workspace directory and return its output",
+                "description": "Run a shell command in the workspace directory and return its output. \
+                                Runs in a CONFINED shell: stream redirects to a target outside your \
+                                fs_write scope are DENIED (e.g. `2>/dev/null`, `> /dev/null`) — drop \
+                                the redirect and read stdout/stderr from the result instead. Prefer the \
+                                dedicated tools over shelling out: `find`/`read_file`/`list_dir` over \
+                                `find`/`cat`/`ls`, the `git` tool over `git`, and `lifecycle` over raw \
+                                build/test/lint commands.",
                 "parameters": {
                     "type": "object",
                     "properties": {
