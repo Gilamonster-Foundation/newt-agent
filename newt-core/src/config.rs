@@ -50,6 +50,18 @@ pub struct Config {
     #[serde(default = "Vec::new")]
     pub backends: Vec<BackendConfig>,
 
+    /// Which backend the session starts on when several are configured and no
+    /// env/loadout pins one (#1130, epic #1126). Unset + multiple backends =
+    /// today's heuristic (prefer openai). Points at a backend NAME.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_backend: Option<String>,
+
+    /// `[discovery]` — where `newt setup` looks for live inference endpoints
+    /// (#1130). Defaults cover the localhost unboxing case; add hosts for a
+    /// home-lab sweep. Pure data; only `setup`/`doctor` read it.
+    #[serde(default)]
+    pub discovery: Discovery,
+
     /// External provider-plugin definitions.
     pub providers: Vec<ProviderConfig>,
 
@@ -2852,6 +2864,33 @@ pub fn derive_serving(kind: BackendKind, served_count: usize) -> Serving {
     }
 }
 
+/// Endpoint-discovery configuration (`[discovery]`, #1130): the hosts and
+/// ports `newt setup` probes for live inference servers. Each host is tried
+/// on every listed Ollama port (`/api/tags`) and vLLM/OpenAI port
+/// (`/v1/models`); each hit becomes a `~/.newt/backends/<name>.toml`. Pure
+/// data — the three Cs: adding a lab host is config, not code.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Discovery {
+    /// Hostnames to probe. Default: just localhost (the unboxing case).
+    pub hosts: Vec<String>,
+    /// Ports probed with the Ollama protocol (`/api/tags`).
+    pub ollama_ports: Vec<u16>,
+    /// Ports probed as OpenAI-compatible (`/v1/models`) — the vLLM range;
+    /// several ports = several single-model instances (space multiplexing).
+    pub vllm_ports: Vec<u16>,
+}
+
+impl Default for Discovery {
+    fn default() -> Self {
+        Self {
+            hosts: vec!["localhost".into()],
+            ollama_ports: vec![11434],
+            vllm_ports: vec![8000, 8001, 8002, 8003],
+        }
+    }
+}
+
 /// Where a backend file came from — written by `newt setup`, hand-authored,
 /// or probe-derived. Pure data; nothing branches on it. Makes a generated
 /// file self-describing and lets `doctor` show declared-vs-derived drift.
@@ -3148,6 +3187,8 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             backends: vec![fallback_localhost_backend()],
+            default_backend: None,
+            discovery: Discovery::default(),
             providers: Vec::new(),
             scratch: None,
             default_tier_order: vec![Tier::Fast, Tier::Standard, Tier::Complex, Tier::Review],
@@ -4716,6 +4757,28 @@ mod tests {
         let alias: BackendConfig =
             toml::from_str("endpoint=\"http://h:1\"\nmodel=\"m\"\napi=\"chat\"\n").unwrap();
         assert_eq!(alias.api, OpenAiApi::ChatCompletions);
+    }
+
+    #[test]
+    fn discovery_defaults_cover_localhost_unboxing() {
+        // #1130: absent [discovery] seeds the localhost sweep — ollama's port
+        // plus the vLLM range (several ports = several one-model instances).
+        let cfg: Config = toml::from_str("").unwrap();
+        assert_eq!(cfg.discovery.hosts, vec!["localhost".to_string()]);
+        assert_eq!(cfg.discovery.ollama_ports, vec![11434]);
+        assert_eq!(cfg.discovery.vllm_ports, vec![8000, 8001, 8002, 8003]);
+        assert_eq!(cfg.default_backend, None);
+
+        // Declared values override wholesale (no merge magic).
+        let cfg: Config = toml::from_str(
+            "default_backend=\"dgx1-vllm\"\n[discovery]\nhosts=[\"localhost\",\"dgx1\"]\nvllm_ports=[8000]\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.default_backend.as_deref(), Some("dgx1-vllm"));
+        assert_eq!(cfg.discovery.hosts.len(), 2);
+        assert_eq!(cfg.discovery.vllm_ports, vec![8000]);
+        // Unlisted keys keep their defaults ([serde(default)] per-field).
+        assert_eq!(cfg.discovery.ollama_ports, vec![11434]);
     }
 
     #[test]
