@@ -35,6 +35,9 @@ pub enum TransportKind {
     /// Streamable-HTTP endpoint.
     Http,
 }
+fn default_true() -> bool {
+    true
+}
 
 /// One discovered MCP server, in a shape that parses from both Claude Code's
 /// `mcpServers` JSON entries and newt's `[[mcp_servers]]` TOML tables.
@@ -44,6 +47,12 @@ pub struct McpServerEntry {
     /// is injected from the `mcpServers` map key (see [`parse_claude_mcp`]).
     #[serde(default)]
     pub name: String,
+
+    /// Whether this server is connected at launch (`/mcp enable|disable` —
+    /// #1149). Default true; a disabled entry stays in config, shows in
+    /// `/mcp` as disabled, and costs nothing at startup.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
 
     /// Transport. Defaults to [`TransportKind::Stdio`] when absent.
     #[serde(default, rename = "type")]
@@ -190,6 +199,7 @@ mod tests {
     fn invalid_entries_are_dropped() {
         // stdio with no command, and sse with no url — both invalid.
         let stdio_no_cmd = McpServerEntry {
+            enabled: true,
             name: "a".into(),
             transport: TransportKind::Stdio,
             command: None,
@@ -216,6 +226,7 @@ mod tests {
         // the same name is ignored.
         let newt = vec![
             McpServerEntry {
+                enabled: true,
                 name: "dup".into(),
                 transport: TransportKind::Stdio,
                 command: Some("newt-one".into()),
@@ -226,6 +237,7 @@ mod tests {
                 request_timeout_secs: None,
             },
             McpServerEntry {
+                enabled: true,
                 name: "dup".into(),
                 transport: TransportKind::Stdio,
                 command: Some("newt-two".into()),

@@ -3753,6 +3753,36 @@ impl Config {
     /// host is already listed. PURE (no I/O), so it unit-tests without a
     /// filesystem. This is the durable "allow permanently" grant path — it is
     /// only ever driven by an explicit human keypress at the permission prompt.
+    /// Set `enabled` on the named `[[mcp_servers]]` entry, preserving comments
+    /// and formatting (`/mcp enable|disable`, #1149). PURE (no I/O) like
+    /// [`with_net_host`](Self::with_net_host); the caller does the read/write.
+    /// Errors when the server name isn't present.
+    pub fn with_mcp_enabled(text: &str, name: &str, enabled: bool) -> Result<String> {
+        let mut doc = text
+            .parse::<toml_edit::DocumentMut>()
+            .map_err(|e| NewtError::Config(format!("config is not valid TOML: {e}")))?;
+        let servers =
+            doc.as_table_mut()
+                .entry("mcp_servers")
+                .or_insert(toml_edit::Item::ArrayOfTables(
+                    toml_edit::ArrayOfTables::new(),
+                ));
+        let arr = servers.as_array_of_tables_mut().ok_or_else(|| {
+            NewtError::Config("[[mcp_servers]] is not an array of tables".to_string())
+        })?;
+        let entry = arr
+            .iter_mut()
+            .find(|t| t.get("name").and_then(|v| v.as_str()) == Some(name))
+            .ok_or_else(|| NewtError::Config(format!("no [[mcp_servers]] entry named `{name}`")))?;
+        if enabled {
+            // Default is enabled: remove the key so the file stays minimal.
+            entry.remove("enabled");
+        } else {
+            entry["enabled"] = toml_edit::value(false);
+        }
+        Ok(doc.to_string())
+    }
+
     pub fn with_net_host(text: &str, host: &str) -> Result<String> {
         let mut doc = text
             .parse::<toml_edit::DocumentMut>()
@@ -5811,6 +5841,29 @@ max_tool_rounds = 25
         assert!(toml.contains("bacon"));
         let back: ToolPermissions = toml::from_str(&toml).unwrap();
         assert_eq!(back, perms);
+    }
+
+    // ---- #1149: /mcp enable|disable config writer ----
+
+    #[test]
+    fn with_mcp_enabled_toggles_and_preserves_comments() {
+        let text = "# my config\n[[mcp_servers]]\nname = \"modulex\"\ncommand = \"modulex-mcp\"\n";
+        // disable → enabled = false written, comment preserved
+        let off = Config::with_mcp_enabled(text, "modulex", false).unwrap();
+        assert!(off.contains("enabled = false"));
+        assert!(off.contains("# my config"));
+        // re-enable → key REMOVED (default is enabled; file stays minimal)
+        let on = Config::with_mcp_enabled(&off, "modulex", true).unwrap();
+        assert!(!on.contains("enabled"));
+        // unknown name errors loudly
+        assert!(Config::with_mcp_enabled(text, "nope", false).is_err());
+        // entry parses with default enabled=true; explicit false honored
+        let e: crate::mcp::McpServerEntry =
+            toml::from_str("name = \"x\"\ncommand = \"x\"\n").unwrap();
+        assert!(e.enabled);
+        let d: crate::mcp::McpServerEntry =
+            toml::from_str("name = \"x\"\ncommand = \"x\"\nenabled = false\n").unwrap();
+        assert!(!d.enabled);
     }
 
     // ---- #904: comment-preserving "allow permanently" net writer ----

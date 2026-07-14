@@ -3841,6 +3841,104 @@ fn run_chat(
                         println!();
                         continue;
                     }
+                    // `/mcp` — MCP management surface (#1149): status table +
+                    // enable/disable persisted to config. Handled here because
+                    // it needs the live `mcp` instance.
+                    {
+                        let w = task.trim_start_matches('/');
+                        let (c, rest) = w
+                            .split_once(char::is_whitespace)
+                            .map_or((w, ""), |(a, b)| (a, b.trim()));
+                        if c == "mcp" {
+                            let (verb, name) = rest
+                                .split_once(char::is_whitespace)
+                                .map_or((rest, ""), |(a, b)| (a, b.trim()));
+                            match (verb, name) {
+                                ("", _) => {
+                                    if mcp.statuses.is_empty() {
+                                        print_newt(
+                                            "no MCP servers configured — add [[mcp_servers]] to ~/.newt/config.toml",
+                                            color,
+                                            verbose,
+                                        );
+                                    } else {
+                                        print_newt("MCP servers:", color, verbose);
+                                        for (n, st) in &mcp.statuses {
+                                            let line = match st {
+                                                crate::mcp::McpStatus::Connected(t) => {
+                                                    format!("  {n}  ✓ connected ({t} tools)")
+                                                }
+                                                crate::mcp::McpStatus::Skipped(r) => {
+                                                    let hint = if r.contains("401")
+                                                        || r.to_lowercase().contains("auth")
+                                                    {
+                                                        format!(" — `newt auth {n}` to re-authenticate")
+                                                    } else {
+                                                        String::new()
+                                                    };
+                                                    format!("  {n}  ✗ skipped: {r}{hint}")
+                                                }
+                                                crate::mcp::McpStatus::Disabled => {
+                                                    format!("  {n}  ⏸ disabled (/mcp enable {n})")
+                                                }
+                                            };
+                                            println!("{line}");
+                                        }
+                                        print_newt(
+                                            "usage: /mcp [enable|disable|auth] <name>",
+                                            color,
+                                            verbose,
+                                        );
+                                    }
+                                }
+                                ("enable", n) | ("disable", n) if !n.is_empty() => {
+                                    let on = verb == "enable";
+                                    match newt_core::Config::user_config_path()
+                                        .ok_or_else(|| anyhow::anyhow!("no config path"))
+                                        .and_then(|p| {
+                                            let text = std::fs::read_to_string(&p)?;
+                                            let out =
+                                                newt_core::Config::with_mcp_enabled(&text, n, on)
+                                                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                                            std::fs::write(&p, out)?;
+                                            Ok(())
+                                        }) {
+                                        Ok(()) if on => print_newt(
+                                            &format!(
+                                                "{n} enabled — connects at next launch                                                  (live connect: #1148)"
+                                            ),
+                                            color,
+                                            verbose,
+                                        ),
+                                        Ok(()) => {
+                                            // Drop the live server immediately (#1149):
+                                            // its tools vanish from the surface now.
+                                            mcp.drop_server(n);
+                                            for st in &mut mcp.statuses {
+                                                if st.0 == n {
+                                                    st.1 = crate::mcp::McpStatus::Disabled;
+                                                }
+                                            }
+                                            print_newt(
+                                                &format!("{n} disabled — tools removed from this session"),
+                                                color,
+                                                verbose,
+                                            );
+                                        }
+                                        Err(e) => print_newt(&format!("mcp {verb}: {e}"), color, verbose),
+                                    }
+                                }
+                                ("auth", n) if !n.is_empty() => print_newt(
+                                    &format!("run `newt auth {n}` in a shell to (re)authenticate, then relaunch"),
+                                    color,
+                                    verbose,
+                                ),
+                                _ => print_newt("usage: /mcp [enable|disable|auth] <name>", color, verbose),
+                            }
+                            println!();
+                            continue;
+                        }
+                    }
                     // Commands that need direct access to `memory` are handled here
                     // before delegating to the generic slash dispatcher.
                     if task.trim_start_matches('/').starts_with("memory") {
