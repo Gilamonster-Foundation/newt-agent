@@ -1053,9 +1053,11 @@ pub async fn author_plan_to_plan(
     let model = cfg
         .backends
         .first()
-        .map(|b| b.model.clone())
+        .and_then(|b| b.effective_model().map(str::to_string))
         .ok_or_else(|| {
-            anyhow::anyhow!("no backend configured to author a plan (add a [[backends]])")
+            anyhow::anyhow!(
+                "no backend with a model configured to author a plan                  (add a [[backends]] with `model`, or run against an adopted backend)"
+            )
         })?;
     let pool = BackendPool::from_source(&StaticSource::from_configs(cfg.backends.iter()));
     let mut effective_goal = goal.to_string();
@@ -1530,7 +1532,9 @@ pub(crate) fn model_for_role(cfg: &Config, loadout_name: &str) -> anyhow::Result
     }
     if let Some(p) = &l.provider {
         if let Some(b) = cfg.backends.iter().find(|b| &b.name == p) {
-            return Ok(b.model.clone());
+            if let Some(m) = b.effective_model() {
+                return Ok(m.to_string());
+            }
         }
     }
     anyhow::bail!(

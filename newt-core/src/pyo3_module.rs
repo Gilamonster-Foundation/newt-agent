@@ -306,7 +306,7 @@ impl PyBackendConfig {
             inner: BackendConfig {
                 name,
                 endpoint,
-                model,
+                model: Some(model),
                 model_path: None,
                 tiers: tiers.into_iter().map(PyTier::to_inner).collect(),
                 kind: Default::default(),
@@ -329,7 +329,7 @@ impl PyBackendConfig {
 
     #[getter]
     fn model(&self) -> &str {
-        &self.inner.model
+        self.inner.effective_model().unwrap_or_default()
     }
 
     #[getter]

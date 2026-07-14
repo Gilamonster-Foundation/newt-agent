@@ -146,7 +146,7 @@ impl From<&BackendConfig> for PoolBackend {
     fn from(c: &BackendConfig) -> Self {
         PoolBackend::new(c.name.clone(), c.endpoint.clone(), c.kind)
             .with_tiers(c.tiers.clone())
-            .with_models([c.model.clone()])
+            .with_models(c.effective_model().map(str::to_string))
             .with_api_key(c.resolve_api_key())
             .with_model_path(c.model_path.clone())
     }
@@ -442,7 +442,7 @@ mod tests {
         let cfg = BackendConfig {
             name: "remote".into(),
             endpoint: "http://remote:8000".into(),
-            model: "qwen3:32b".into(),
+            model: Some("qwen3:32b".into()),
             model_path: None,
             tiers: vec![Tier::Standard],
             kind: BackendKind::Openai,
@@ -463,7 +463,7 @@ mod tests {
         let emb = BackendConfig {
             kind: BackendKind::Embedded,
             endpoint: String::new(),
-            model: "qwen2.5-1.5b".into(),
+            model: Some("qwen2.5-1.5b".into()),
             model_path: Some("/models/qwen.gguf".into()),
             ..cfg.clone()
         };
