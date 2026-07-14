@@ -3326,8 +3326,12 @@ fn post_compaction_continuation(step_ledger: Option<&dyn scheduled::StepLedger>)
         "{} You are mid-task: the context above was just compacted, not \
          completed.{step_clause} Continue working — your next output should be \
          the next concrete tool call (re-read any file you are about to edit \
-         first, since full file contents were not preserved). Do not summarize \
-         what happened and do not re-plan.",
+         first, since full file contents were not preserved). Before concluding \
+         ANYTHING about prior work, re-anchor on ground truth: check the current \
+         git branch and the last few commits — work from earlier in this task \
+         may already be COMMITTED (by you), so a clean working tree does NOT \
+         mean no work happened (#1163). Do not summarize what happened, do not \
+         re-plan, and do not repeat work the log shows is done.",
         compress::CONTINUATION_PREFIX
     )
 }
@@ -9464,6 +9468,23 @@ mod http_loop_tests {
             "the second nudge must be the escalated Reminder 2/2 variant"
         );
         assert!(reply.contains("complete"), "{reply}");
+    }
+
+    #[test]
+    fn post_compaction_continuation_reanchors_on_ground_truth() {
+        // Regression #1163 (2026-07-14 Opus session): after a mid-turn
+        // compaction the model saw an empty `git diff`, concluded "the
+        // worktree is clean, start fresh", DISOWNED its own branch+commit and
+        // repeated finished work. The continuation directive must order a
+        // ground-truth re-anchor and state the clean-tree≠no-work rule.
+        let d = post_compaction_continuation(None);
+        assert!(d.contains("re-anchor on ground truth"), "{d}");
+        assert!(d.contains("git branch"), "{d}");
+        assert!(
+            d.contains("clean working tree does NOT mean no work happened"),
+            "{d}"
+        );
+        assert!(d.contains("do not repeat work"), "{d}");
     }
 
     #[test]
