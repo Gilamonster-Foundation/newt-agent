@@ -4933,6 +4933,9 @@ fn run_chat(
                     let eff_workflow_grace_rounds = model_tune
                         .and_then(|t| t.workflow_grace_rounds)
                         .unwrap_or_else(|| workflow_grace_rounds(&cfg));
+                    // #1162: the operator's live nudge dial (/nudge off|on).
+                    let nudges_off =
+                        std::env::var("NEWT_NUDGE").is_ok_and(|v| v.eq_ignore_ascii_case("off"));
                     let eff_narration_nudge_cap = model_tune
                         .and_then(|t| t.narration_nudge_cap)
                         .unwrap_or_else(|| narration_nudge_cap(&cfg));
@@ -5416,6 +5419,9 @@ fn run_chat(
                                         persona_tools,
                                         max_tool_rounds: eff_max_tool_rounds,
                                         narration_nudge_cap: eff_narration_nudge_cap,
+                                        // #1162: the /nudge dial — env set by the
+                                        // /nudge command; off = no action-pressure.
+                                        action_nudges: !nudges_off,
                                         workflow_grace_rounds: eff_workflow_grace_rounds,
                                         tool_output_lines: tool_output_lines(&cfg),
                                         debug: debug_mode(&cfg),
@@ -10290,6 +10296,7 @@ pub(crate) fn help_lines() -> &'static [&'static str] {
         "  /mode                    - show the active mode; /mode off clears it",
         "  /loadout                 - show the active loadout: declared axes vs what resolved",
         "  /workspace               - show current workspace path",
+        "  /nudge <on|off|status>   - action-pressure nudges (narration rescue etc.); off = answer-in-peace mode",
         "  /config show             - dump the resolved config (secrets redacted) for audit (bare /config: settings UI, not yet implemented)",
         "  /prompt                  - list prompt tokens ($MODEL, $DATE, …) + current prompt",
         "  /prompt set \"<template>\"  - set the prompt for this session; /prompt reset to revert",
@@ -10323,7 +10330,7 @@ fn dispatch_slash(
         "exit" | "quit" | "help" | "version" | "workspace" | "config" => {
             commands::meta::dispatch(cmd, arg1, workspace, color, verbose)
         }
-        "prompt" | "vi" | "emacs" | "nano" | "edit-mode" | "thinking" => {
+        "prompt" | "vi" | "emacs" | "nano" | "edit-mode" | "thinking" | "nudge" => {
             commands::settings::dispatch(cmd, arg1, input, workspace, color, verbose)
         }
         "models" | "probe" | "model" | "backend" | "backends" | "summarizer" | "dgx" => {
@@ -15557,6 +15564,7 @@ mod tool_round_cap_tests {
                     persona_tools: None,
                     max_tool_rounds: 5,
                     narration_nudge_cap: 1,
+                    action_nudges: true,
                     workflow_grace_rounds: 0,
                     tool_output_lines: 20,
                     debug: false,

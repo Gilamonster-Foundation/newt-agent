@@ -368,6 +368,9 @@ async fn run_one_turn(
         model: &config.model,
         kind: config.kind,
         api_key: config.api_key.as_deref(),
+        // Headless driver: action nudges stay on (the interactive /nudge dial
+        // is a TUI-session concern, #1162).
+        action_nudges: true,
         messages,
         task,
         workspace: &config.workspace,

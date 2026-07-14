@@ -655,6 +655,11 @@ pub struct ChatCtx<'a> {
     /// the active plan step and demand a bare tool call (lever L3,
     /// docs/design/next-loop-levers.md).
     pub narration_nudge_cap: usize,
+    /// Master switch for ACTION-pressure nudges (#1162: the operator's live
+    /// dial — `/nudge off` / `NEWT_NUDGE=off`). `false` disables the narration
+    /// rescue, workflow repair steering, and pending-plan pushes for the
+    /// session; factual-correction nudges are unaffected. Default `true`.
+    pub action_nudges: bool,
     /// Max lines of tool output shown inline (from `[tui].tool_output_lines`,
     /// default 20). Resolved once per turn and threaded to `execute_tool` so
     /// the tool loop never re-reads config from disk.
@@ -1104,6 +1109,7 @@ pub async fn chat_complete(
         max_tool_rounds,
         workflow_grace_rounds,
         narration_nudge_cap,
+        action_nudges,
         tool_output_lines,
         debug,
         trace,
@@ -1288,13 +1294,14 @@ pub async fn chat_complete(
     // invited action. A question or acknowledgment gets none — narration IS
     // the deliverable, and pressuring a model answering a question is how the
     // "I'm genuinely finished" defense loop (#1158) gets seeded.
-    let action_turn = messages
-        .iter()
-        .rev()
-        .find(|m| m["role"].as_str() == Some("user") && !compress::is_compaction_message(m))
-        .and_then(|m| m["content"].as_str())
-        .map(crate::classifiers::user_turn_invites_action)
-        .unwrap_or(true);
+    let action_turn = action_nudges
+        && messages
+            .iter()
+            .rev()
+            .find(|m| m["role"].as_str() == Some("user") && !compress::is_compaction_message(m))
+            .and_then(|m| m["content"].as_str())
+            .map(crate::classifiers::user_turn_invites_action)
+            .unwrap_or(true);
     let workflow_steerer = crate::WorkflowSteerer::load_default();
     let mut workflow_runtime = WorkflowRuntimeState::default();
     // The matching workflow's round-cap grace horizon override, resolved once
@@ -3971,6 +3978,7 @@ pub async fn openai_chat_complete(
         max_tool_rounds,
         workflow_grace_rounds,
         narration_nudge_cap,
+        action_nudges,
         tool_output_lines,
         debug,
         trace,
@@ -4106,13 +4114,14 @@ pub async fn openai_chat_complete(
     let mut stale_file_nudges: usize = 0;
     let nudge_classifier = crate::NudgeClassifier::load_default();
     // #1152/#1162: same intent gate as the primary loop — see the comment there.
-    let action_turn = messages
-        .iter()
-        .rev()
-        .find(|m| m["role"].as_str() == Some("user") && !compress::is_compaction_message(m))
-        .and_then(|m| m["content"].as_str())
-        .map(crate::classifiers::user_turn_invites_action)
-        .unwrap_or(true);
+    let action_turn = action_nudges
+        && messages
+            .iter()
+            .rev()
+            .find(|m| m["role"].as_str() == Some("user") && !compress::is_compaction_message(m))
+            .and_then(|m| m["content"].as_str())
+            .map(crate::classifiers::user_turn_invites_action)
+            .unwrap_or(true);
     let workflow_steerer = crate::WorkflowSteerer::load_default();
     let mut workflow_runtime = WorkflowRuntimeState::default();
     // See the Ollama path: a matching workflow's grace-horizon override.
@@ -5078,6 +5087,7 @@ pub async fn openai_responses_complete(
         max_tool_rounds,
         workflow_grace_rounds: _,
         narration_nudge_cap: _,
+        action_nudges: _,
         tool_output_lines,
         debug,
         trace,
@@ -6621,6 +6631,7 @@ mod tool_round_cap_tests {
                 persona_tools: None,
                 max_tool_rounds: cap,
                 narration_nudge_cap: 1,
+                action_nudges: true,
                 workflow_grace_rounds: 0,
                 tool_output_lines: 20,
                 debug: false,
@@ -6789,6 +6800,7 @@ mod tool_round_cap_tests {
                 persona_tools: None,
                 max_tool_rounds: cap,
                 narration_nudge_cap: 1,
+                action_nudges: true,
                 workflow_grace_rounds: 0,
                 tool_output_lines: 20,
                 debug: false,
@@ -6874,6 +6886,7 @@ mod tool_round_cap_tests {
                 persona_tools: None,
                 max_tool_rounds: 5,
                 narration_nudge_cap: 1,
+                action_nudges: true,
                 workflow_grace_rounds: 0,
                 tool_output_lines: 20,
                 debug: false,
@@ -7020,6 +7033,7 @@ mod tool_round_cap_tests {
                 persona_tools: None,
                 max_tool_rounds: 5,
                 narration_nudge_cap: 1,
+                action_nudges: true,
                 workflow_grace_rounds: 0,
                 tool_output_lines: 20,
                 debug: false,
@@ -7103,6 +7117,7 @@ mod tool_round_cap_tests {
                 persona_tools: None,
                 max_tool_rounds: cap,
                 narration_nudge_cap: 1,
+                action_nudges: true,
                 workflow_grace_rounds: 0,
                 tool_output_lines: 20,
                 debug: false,
@@ -7209,6 +7224,7 @@ mod tool_round_cap_tests {
                 persona_tools: None,
                 max_tool_rounds: 1,
                 narration_nudge_cap: 1,
+                action_nudges: true,
                 workflow_grace_rounds: 0,
                 tool_output_lines: 20,
                 debug: false,
@@ -7327,6 +7343,7 @@ mod tool_round_cap_tests {
                 persona_tools: None,
                 max_tool_rounds: 1,
                 narration_nudge_cap: 1,
+                action_nudges: true,
                 workflow_grace_rounds: 0,
                 tool_output_lines: 20,
                 debug: false,
@@ -7437,6 +7454,7 @@ mod tool_round_cap_tests {
                 persona_tools: None,
                 max_tool_rounds: 2,
                 narration_nudge_cap: 1,
+                action_nudges: true,
                 workflow_grace_rounds: 0,
                 tool_output_lines: 20,
                 debug: false,
@@ -7588,6 +7606,7 @@ mod tool_round_cap_tests {
                 persona_tools: None,
                 max_tool_rounds: cap,
                 narration_nudge_cap: 1,
+                action_nudges: true,
                 workflow_grace_rounds: 0,
                 tool_output_lines: 20,
                 debug: false,
@@ -7749,6 +7768,7 @@ mod tool_round_cap_tests {
                 persona_tools: None,
                 max_tool_rounds: 10,
                 narration_nudge_cap: 1,
+                action_nudges: true,
                 workflow_grace_rounds: 0,
                 tool_output_lines: 5,
                 debug: false,
@@ -7849,6 +7869,7 @@ mod http_loop_tests {
             persona_tools: None,
             max_tool_rounds: 8,
             narration_nudge_cap: 1,
+            action_nudges: true,
             workflow_grace_rounds: 0,
             tool_output_lines: 20,
             debug: false,
@@ -9963,6 +9984,7 @@ mod save_note_loop_tests {
             persona_tools: None,
             max_tool_rounds: 6,
             narration_nudge_cap: 1,
+            action_nudges: true,
             workflow_grace_rounds: 0,
             tool_output_lines: 20,
             debug: false,
@@ -10453,6 +10475,7 @@ mod compression_loop_tests {
             persona_tools: None,
             max_tool_rounds: 12,
             narration_nudge_cap: 1,
+            action_nudges: true,
             workflow_grace_rounds: 0,
             tool_output_lines: 2,
             debug: false,
@@ -11622,6 +11645,7 @@ mod observation_hook_tests {
             persona_tools: None,
             max_tool_rounds: 8,
             narration_nudge_cap: 1,
+            action_nudges: true,
             workflow_grace_rounds: 0,
             tool_output_lines: 20,
             debug: false,
