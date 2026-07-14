@@ -286,40 +286,9 @@ fn ask_model_name(console: &mut dyn Console) -> anyhow::Result<String> {
 // ---------------------------------------------------------------------------
 
 /// List models from an Ollama endpoint via `GET /api/tags`.
-async fn fetch_ollama_models(client: &reqwest::Client, url: &str) -> anyhow::Result<Vec<String>> {
-    let tags_url = format!("{}/api/tags", url.trim_end_matches('/'));
-    let resp = client.get(&tags_url).send().await?;
-    if !resp.status().is_success() {
-        anyhow::bail!("HTTP {}", resp.status());
-    }
-    let json: serde_json::Value = resp.json().await?;
-    Ok(json["models"]
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|m| m["name"].as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default())
-}
-
-/// List models from an OpenAI-compatible endpoint via `GET /v1/models`.
-async fn fetch_openai_models(client: &reqwest::Client, url: &str) -> anyhow::Result<Vec<String>> {
-    let models_url = format!("{}/v1/models", url.trim_end_matches('/'));
-    let resp = client.get(&models_url).send().await?;
-    if !resp.status().is_success() {
-        anyhow::bail!("HTTP {}", resp.status());
-    }
-    let json: serde_json::Value = resp.json().await?;
-    Ok(json["data"]
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|m| m["id"].as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default())
-}
+// The endpoint fetchers moved to `newt_core::backend_probe` (#1136) so the
+// TUI session, setup, and doctor share one probe path.
+use newt_core::backend_probe::{fetch_ollama_models, fetch_openai_models};
 
 // ---------------------------------------------------------------------------
 // Pure helpers (unit-tested directly)

@@ -8,6 +8,7 @@ pub mod agent_identity;
 pub mod agentic;
 pub mod agents;
 pub mod api_surface;
+pub mod backend_probe;
 pub mod caveats;
 pub mod classifiers;
 pub mod config;
