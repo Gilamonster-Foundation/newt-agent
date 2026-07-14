@@ -767,6 +767,31 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             if cli.full_access {
                 unsafe { std::env::set_var("NEWT_FULL_ACCESS", "1") };
             }
+            // #1176: arm the shadow-OCAP flight recorder whenever the session
+            // runs UNCONFINED (--full-access or --yolo/--disable-ocap). Every
+            // unconfined command then records the authority a leash would have
+            // gated on, building a policy-gap catalog + bridle repro fixtures.
+            // Respects an explicit NEWT_FLIGHT_RECORDER (a chosen path, or
+            // `off`/`0` to opt out); default is ~/.newt/flight-recorder/
+            // unconfined.jsonl (append-only across runs).
+            if (cli.full_access || cli.disable_ocap)
+                && std::env::var_os(newt_core::flight_recorder::CAPTURE_PATH_ENV).is_none()
+            {
+                if let Some(cfg_path) = newt_core::Config::user_config_path() {
+                    let capture = cfg_path
+                        .with_file_name("flight-recorder")
+                        .join("unconfined.jsonl");
+                    unsafe {
+                        std::env::set_var(newt_core::flight_recorder::CAPTURE_PATH_ENV, &capture);
+                    }
+                }
+            }
+            // Explicit opt-out (`off`/`0`) clears the recorder for this run.
+            if let Ok(v) = std::env::var(newt_core::flight_recorder::CAPTURE_PATH_ENV) {
+                if v.eq_ignore_ascii_case("off") || v == "0" {
+                    unsafe { std::env::remove_var(newt_core::flight_recorder::CAPTURE_PATH_ENV) };
+                }
+            }
             // --shell-engine selects which agent-bridle engine run_command uses
             // (ADR 0005 D2 seam). Resolved ONCE here — precedence
             // `--shell-engine` > `[shell] engine` > `--full-access`→`host` >
