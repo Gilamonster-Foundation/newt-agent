@@ -14,8 +14,22 @@ use newt_core::mcp::{McpServerEntry, TransportKind};
 use newt_mcp_client::{connect_http, connect_stdio, namespaced, split_namespaced, ConnectedServer};
 use serde_json::{json, Value};
 
+/// Per-server launch outcome for the `/mcp` surface (#1149).
+#[derive(Debug, Clone)]
+pub(crate) enum McpStatus {
+    /// Connected, with this many tools registered.
+    Connected(usize),
+    /// Skipped at launch (auth failure, timeout, spawn error, legacy SSE…).
+    Skipped(String),
+    /// `enabled = false` in config — not attempted.
+    Disabled,
+}
+
 /// The session's connected MCP servers.
 pub(crate) struct Mcp {
+    /// (server name, launch outcome) for every DISCOVERED entry — the `/mcp`
+    /// status table (#1149). Includes disabled + skipped servers.
+    pub(crate) statuses: Vec<(String, McpStatus)>,
     servers: Vec<ConnectedServer>,
     /// When `true`, hyphens in server names are replaced with underscores in
     /// advertised tool names and routing lookups.  Matches the behaviour of
@@ -114,11 +128,18 @@ fn apply_transport_security(
 }
 
 impl Mcp {
+    /// Remove a live server by name (`/mcp disable`, #1149): its tools leave
+    /// the surface immediately; config persistence is the caller's job.
+    pub(crate) fn drop_server(&mut self, name: &str) {
+        self.servers.retain(|s| s.name != name);
+    }
+
     /// An empty set — connects to nothing. Used by tests (the live session
     /// always builds via [`Self::connect`]).
     #[cfg(test)]
     pub(crate) fn empty() -> Self {
         Self {
+            statuses: Vec::new(),
             servers: Vec::new(),
             sanitize_server_names: true,
         }
@@ -140,7 +161,12 @@ impl Mcp {
             std::path::Path::new(workspace),
         );
         let mut servers = Vec::new();
+        let mut statuses: Vec<(String, McpStatus)> = Vec::new();
         for entry in &entries {
+            if !entry.enabled {
+                statuses.push((entry.name.clone(), McpStatus::Disabled));
+                continue;
+            }
             // Dispatch on transport. The legacy SSE-only transport (a separate
             // GET event-stream + POST endpoint) is not implemented; modern
             // servers use streamable-HTTP (`type: "http"`).
@@ -170,15 +196,29 @@ impl Mcp {
                          (use streamable-HTTP, `type = \"http\"`) — skipped",
                         entry.name
                     );
+                    statuses.push((
+                        entry.name.clone(),
+                        McpStatus::Skipped("legacy SSE transport (use type = \"http\")".into()),
+                    ));
                     continue;
                 }
             };
             match result {
-                Ok(connected) => servers.push(connected),
-                Err(e) => tracing::warn!("MCP server `{}` skipped: {e:#}", entry.name),
+                Ok(connected) => {
+                    statuses.push((
+                        entry.name.clone(),
+                        McpStatus::Connected(connected.tools.len()),
+                    ));
+                    servers.push(connected);
+                }
+                Err(e) => {
+                    tracing::warn!("MCP server `{}` skipped: {e:#}", entry.name);
+                    statuses.push((entry.name.clone(), McpStatus::Skipped(format!("{e:#}"))));
+                }
             }
         }
         Self {
+            statuses,
             servers,
             sanitize_server_names,
         }
@@ -321,6 +361,7 @@ mod tests {
 
     fn http_entry(url: &str) -> McpServerEntry {
         McpServerEntry {
+            enabled: true,
             name: "MaaS".into(),
             transport: TransportKind::Http,
             command: None,

@@ -13,6 +13,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn http_entry(url: String, headers: BTreeMap<String, String>) -> McpServerEntry {
     McpServerEntry {
+        enabled: true,
         name: "test-http".to_string(),
         transport: TransportKind::Http,
         command: None,
