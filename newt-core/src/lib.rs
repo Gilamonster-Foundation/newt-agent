@@ -26,6 +26,7 @@ pub mod model_card;
 pub mod model_id;
 pub mod notes;
 pub mod notes_scan;
+pub mod nudger;
 pub mod ocap;
 pub mod plan;
 pub mod pricing;
