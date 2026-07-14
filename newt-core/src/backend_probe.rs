@@ -41,6 +41,10 @@ pub struct Adoption {
     /// backend's served reality — the caller should tell the user (`/model` is
     /// fixed on an instance; restart the server or `/backends` to switch).
     pub requested_ignored: bool,
+    /// True when a requested model is NOT in a multiplexer's served list
+    /// (#1122 fail-soft: a restored/typo'd model must not brick the session) —
+    /// the caller warns and the adoption fell back to declared/first-served.
+    pub requested_unavailable: bool,
 }
 
 /// The pure adoption rule. `served` is what the probe saw; `requested` is the
@@ -69,16 +73,30 @@ pub fn adopt(backend: &BackendConfig, served: &Served, requested: Option<&str>) 
                 model: adopted.or(asked),
                 serving,
                 requested_ignored,
+                requested_unavailable: false,
             }
         }
-        Serving::Multiplexer => Adoption {
-            model: requested
+        Serving::Multiplexer => {
+            // #1122 fail-soft: a requested model (session override OR the
+            // settings-restore channel) that the endpoint does NOT serve is
+            // dropped with a flag — a typo'd restore must never brick every
+            // future launch. An EMPTY served list (endpoint mid-restart)
+            // trusts the request rather than second-guessing it.
+            let requested_ok =
+                requested.map(|r| served.models.is_empty() || served.models.iter().any(|m| m == r));
+            let requested_unavailable = requested_ok == Some(false);
+            let model = requested
+                .filter(|_| requested_ok == Some(true))
                 .map(str::to_string)
                 .or_else(|| backend.effective_model().map(str::to_string))
-                .or_else(|| served.models.first().cloned()),
-            serving,
-            requested_ignored: false,
-        },
+                .or_else(|| served.models.first().cloned());
+            Adoption {
+                model,
+                serving,
+                requested_ignored: false,
+                requested_unavailable,
+            }
+        }
     }
 }
 
@@ -178,18 +196,21 @@ mod tests {
             kind: BackendKind::Ollama,
             ..Default::default()
         };
-        let s = served(&["first", "second"]);
+        // (C3/#1122: a request must be SERVED to win — unserved requests
+        // drop fail-soft, covered by its own test below.)
+        let s = served(&["asked", "first", "second"]);
         assert_eq!(
             adopt(&b, &s, Some("asked")).model.as_deref(),
             Some("asked"),
-            "session request wins on a multiplexer"
+            "a served session request wins on a multiplexer"
         );
         assert_eq!(adopt(&b, &s, None).model.as_deref(), Some("declared"));
         let bare = BackendConfig {
             model: None,
             ..b.clone()
         };
-        assert_eq!(adopt(&bare, &s, None).model.as_deref(), Some("first"));
+        // First-SERVED (server order) when nothing is requested or declared.
+        assert_eq!(adopt(&bare, &s, None).model.as_deref(), Some("asked"));
         assert!(!adopt(&b, &s, Some("asked")).requested_ignored);
     }
 
@@ -209,6 +230,33 @@ mod tests {
         let a = adopt(&b, &served(&["x", "y"]), None);
         assert_eq!(a.serving, Serving::Instance);
         assert_eq!(a.model.as_deref(), Some("x"));
+    }
+
+    #[test]
+    fn multiplexer_drops_an_unserved_requested_model_fail_soft() {
+        // #1122 (C3): the kid's-account case — a typo persisted to
+        // settings.toml restores as `requested` forever. The endpoint doesn't
+        // serve it → drop it (flagged), fall back to declared/first-served,
+        // and the session comes up usable instead of 404ing every launch.
+        let b = BackendConfig {
+            name: "o".into(),
+            endpoint: "http://h:11434".into(),
+            model: Some("declared".into()),
+            kind: BackendKind::Ollama,
+            ..Default::default()
+        };
+        let s = served(&["declared", "other"]);
+        let a = adopt(&b, &s, Some("quen2.5-coder:7b"));
+        assert_eq!(a.model.as_deref(), Some("declared"));
+        assert!(a.requested_unavailable);
+        // A SERVED requested model is honored, unflagged.
+        let ok = adopt(&b, &s, Some("other"));
+        assert_eq!(ok.model.as_deref(), Some("other"));
+        assert!(!ok.requested_unavailable);
+        // Empty served list (mid-restart): trust the request, unflagged.
+        let trust = adopt(&b, &served(&[]), Some("anything"));
+        assert_eq!(trust.model.as_deref(), Some("anything"));
+        assert!(!trust.requested_unavailable);
     }
 
     #[test]
