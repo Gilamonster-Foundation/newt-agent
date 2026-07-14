@@ -6902,6 +6902,21 @@ fn new_conversation_message(active_persona: Option<&Persona>) -> String {
 /// ephemeral session: nothing was written, so the message makes NO "saved /
 /// stays open — /resume" promise it cannot keep — just the plain new line.
 pub(crate) fn close_out_message(reason: &str, started: &str, outgoing_persisted: bool) -> String {
+    // #1165/#1170: `/end` must LEAD with the ending regardless of whether the
+    // outgoing conversation was persisted — the operator typed "end" and
+    // expects ending language, not "Started a new conversation." An EMPTY
+    // conversation had nothing to save, so drop the "/resume to reopen" that
+    // it cannot honor; a persisted one keeps it.
+    if reason == "end" {
+        return if outgoing_persisted {
+            "Conversation ended and saved — /resume to reopen it, /exit to leave newt. \
+             (A fresh conversation is now open.)"
+                .to_string()
+        } else {
+            "Conversation ended — /exit to leave newt. (A fresh conversation is now open.)"
+                .to_string()
+        };
+    }
     if !outgoing_persisted {
         return started.to_string();
     }
@@ -6910,13 +6925,6 @@ pub(crate) fn close_out_message(reason: &str, started: &str, outgoing_persisted:
             format!("{started} The previous conversation stays open — /resume to return to it.")
         }
         "new" => started.to_string(),
-        // #1165: "end" must LEAD with the ending — the old copy ("Started a
-        // new conversation.") read as end doing its antonym's job. A fresh
-        // conversation still opens underneath (the session always has one);
-        // the message now says so parenthetically instead of headlining it.
-        "end" => "Conversation ended and saved — /resume to reopen it, /exit to leave newt. \
-                  (A fresh conversation is now open.)"
-            .to_string(),
         // "restart"
         _ => format!("{started} The previous conversation is saved — /resume to reopen it."),
     }
