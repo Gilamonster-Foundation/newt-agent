@@ -99,9 +99,9 @@ pub use classifiers::{
     classifier_config_dir, NudgeClass, NudgeClassification, NudgeClassifier, NudgeClassifierConfig,
 };
 pub use config::{
-    full_access_default_engine, ocap_l3_backend, resolve_shell_engine,
-    shell_env_passthrough_default, AgentsConfig, BackendConfig, BackendKind, BundleConfig,
-    ChatStyle, ColorMode, Config, ContextConfig, ContextFeature, ContextFeatureSet,
+    derive_serving, full_access_default_engine, ocap_l3_backend, resolve_shell_engine,
+    shell_env_passthrough_default, write_backend_dropin, AgentsConfig, BackendConfig, BackendKind,
+    BundleConfig, ChatStyle, ColorMode, Config, ContextConfig, ContextFeature, ContextFeatureSet,
     ContextFeatures, ContextManager, ConversationsConfig, CrewPolicyConfig, EditMode, FooterMode,
     Loadout, LoadoutSettings, LogConfig, MarkdownMode, MemoryConfig, MemoryDisclosure,
     MemoryProviderKind, OnEmbedFailure, OpenAiApi, PermissionPreset, PickVia, PlanConfig,

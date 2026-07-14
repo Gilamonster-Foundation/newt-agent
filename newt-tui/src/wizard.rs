@@ -7,7 +7,7 @@
 //! functional bootstrap, not a settings UX. Edit `~/.newt/config.toml`
 //! directly to change anything (see `newt config` to print the resolved view).
 
-use newt_core::{Config, DgxConfig};
+use newt_core::Config;
 
 // ---------------------------------------------------------------------------
 // Entry points
@@ -84,18 +84,32 @@ fn run_setup(color: bool, config_path: &std::path::Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Write the first-run config (#1140, epic #1126): ONE backend drop-in
+/// `~/.newt/backends/ollama.toml` (endpoint + probed-model hint + provenance)
+/// and a minimal `config.toml` whose `default_backend` points at it. No legacy
+/// `[dgx]` block, no inline `[[backends]]` — the two-dialect chimera is dead.
 fn save_config(path: &std::path::Path, url: &str, model: &str) -> anyhow::Result<()> {
-    let mut config = Config::default();
-    let node = newt_core::DgxNode {
-        name: "default".into(),
-        ollama: Some(url.to_string()),
+    let backend = newt_core::BackendConfig {
+        name: "ollama".into(),
+        endpoint: url.to_string(),
+        // A HINT, not authority: session start adopts what the server
+        // actually serves (#1139); this keeps offline launches sane.
+        model: Some(model.to_string()),
+        kind: newt_core::BackendKind::Ollama,
+        serving: Some(newt_core::Serving::Multiplexer),
+        provenance: Some(newt_core::config::BackendProvenance {
+            source: Some(format!("newt init v{}", env!("CARGO_PKG_VERSION"))),
+            probed: Some(chrono::Local::now().format("%Y-%m-%d").to_string()),
+            derived_serving: Some(true),
+        }),
         ..Default::default()
     };
-    config.dgx = Some(DgxConfig {
-        active_model: Some(model.to_string()),
-        nodes: vec![node],
+    newt_core::write_backend_dropin(path, &backend).map_err(|e| anyhow::anyhow!(e))?;
+    let config = Config {
+        backends: vec![], // the drop-in IS the backend list
+        default_backend: Some(backend.name.clone()),
         ..Default::default()
-    });
+    };
     config.save(path)?;
     Ok(())
 }
@@ -240,13 +254,22 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         save_config(&path, "http://localhost:11434", "gemma4:e2b").unwrap();
+        // The endpoint + model live in the DROP-IN now, not config.toml (#1140).
+        let raw_dropin =
+            std::fs::read_to_string(path.with_file_name("backends").join("ollama.toml")).unwrap();
+        assert!(raw_dropin.contains("11434"));
+        assert!(raw_dropin.contains("gemma4:e2b"));
         let written = std::fs::read_to_string(&path).unwrap();
-        assert!(written.contains("11434"));
-        assert!(written.contains("gemma4:e2b"));
-        // Round-trips through the real loader.
+        assert!(!written.contains("[dgx]"), "chimera dead: {written}");
+        // Round-trips through the real loader: minimal config + drop-in.
         let cfg = Config::load(&path).unwrap();
+        assert!(cfg.dgx.is_none(), "no legacy [dgx] block (#1140)");
+        assert_eq!(cfg.default_backend.as_deref(), Some("ollama"));
+        let dropin = path.with_file_name("backends").join("ollama.toml");
+        let b: newt_core::BackendConfig =
+            toml::from_str(&std::fs::read_to_string(&dropin).unwrap()).unwrap();
         assert_eq!(
-            cfg.dgx.and_then(|d| d.active_model).as_deref(),
+            b.effective_model().map(str::to_string).as_deref(),
             Some("gemma4:e2b")
         );
     }

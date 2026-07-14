@@ -26,7 +26,7 @@
 //! - **vLLM / OpenAI-compatible** endpoints → a `[[backends]]` entry with
 //!   `kind = "openai"`. `resolve_backend_choice` prefers the first such backend.
 
-use newt_core::{BackendConfig, BackendKind, Config, DgxConfig, DgxNode, EndpointKind, Tier};
+use newt_core::{BackendConfig, BackendKind, Config, EndpointKind, Tier};
 use std::io::{self, Write};
 use std::path::Path;
 
@@ -110,15 +110,16 @@ async fn run_with(
         }
     }
 
-    let cfg = match choose_backend(console)? {
+    let (cfg, backend) = match choose_backend(console)? {
         BackendChoice::Ollama => configure_ollama(console, client).await?,
         BackendChoice::Dgx => configure_dgx(console, client).await?,
     };
 
-    // Preview before committing anything to disk.
-    let preview = toml::to_string_pretty(&cfg)
+    // Preview before committing anything to disk: the backend drop-in is the
+    // interesting file; config.toml just points at it.
+    let preview = toml::to_string_pretty(&backend)
         .unwrap_or_else(|e| format!("# (could not render preview: {e})"));
-    console.say("\nResulting config:\n");
+    console.say(&format!("\nbackends/{}.toml:\n", backend.name));
     console.say(&preview);
 
     let ans = console.ask(&format!("Write to {}? [Y/n] ", config_path.display()))?;
@@ -126,8 +127,14 @@ async fn run_with(
         console.say("Aborted. Nothing written.");
         return Ok(());
     }
+    let dropin =
+        newt_core::write_backend_dropin(config_path, &backend).map_err(|e| anyhow::anyhow!(e))?;
     cfg.save(config_path)?;
-    console.say(&format!("Wrote {}.", config_path.display()));
+    console.say(&format!(
+        "Wrote {} and {}.",
+        config_path.display(),
+        dropin.display()
+    ));
     console.say("Edit that file (or re-run `newt setup`) to change anything.");
     Ok(())
 }
@@ -156,7 +163,7 @@ fn choose_backend(console: &mut dyn Console) -> anyhow::Result<BackendChoice> {
 async fn configure_ollama(
     console: &mut dyn Console,
     client: &reqwest::Client,
-) -> anyhow::Result<Config> {
+) -> anyhow::Result<(Config, BackendConfig)> {
     let default_url = "http://127.0.0.1:11434";
     let raw = console.ask(&format!("Ollama host [{default_url}]: "))?;
     let url = normalize_url(
@@ -182,7 +189,7 @@ async fn configure_ollama(
 async fn configure_dgx(
     console: &mut dyn Console,
     client: &reqwest::Client,
-) -> anyhow::Result<Config> {
+) -> anyhow::Result<(Config, BackendConfig)> {
     // Host is required for DGX — keep asking until we get something.
     let host = loop {
         let raw = console.ask("DGX host (e.g. REDACTED-HOST or http://REDACTED-IP:8000): ")?;
@@ -333,62 +340,80 @@ fn normalize_url(raw: &str, default_scheme: &str, default_port: u16) -> String {
     format!("{default_scheme}://{raw}:{default_port}")
 }
 
-/// Build a config for an Ollama-protocol endpoint (local or DGX flavour).
-///
-/// The URL is written into the node's `ollama` field regardless of `kind`
-/// (all three Ollama flavours speak the native wire protocol, and the runtime
-/// resolver reads `dgx.nodes[0].ollama`); the kind-specific field is set too
-/// for fidelity, and `active_endpoint` records the user's choice.
+/// Build the new-shape setup result (#1140): a backend DROP-IN (one endpoint,
+/// one file) + a minimal config whose `default_backend` points at it. No
+/// legacy `[dgx]` block, no inline `[[backends]]` — the chimera is dead.
+fn build_backend_pair(
+    name: &str,
+    endpoint: &str,
+    model: &str,
+    kind: BackendKind,
+    serving: newt_core::Serving,
+    api_key_env: Option<String>,
+    source_note: &str,
+) -> (Config, BackendConfig) {
+    let backend = BackendConfig {
+        name: name.to_string(),
+        endpoint: endpoint.to_string(),
+        // A hint, not authority — session start adopts served reality (#1139).
+        model: Some(model.to_string()),
+        tiers: vec![Tier::Fast, Tier::Standard, Tier::Complex, Tier::Review],
+        kind,
+        api_key_env,
+        serving: Some(serving),
+        provenance: Some(newt_core::config::BackendProvenance {
+            source: Some(format!(
+                "newt setup v{} ({source_note})",
+                env!("CARGO_PKG_VERSION")
+            )),
+            probed: Some(chrono::Local::now().format("%Y-%m-%d").to_string()),
+            derived_serving: Some(true),
+        }),
+        ..Default::default()
+    };
+    let config = Config {
+        backends: vec![], // the drop-in IS the backend list
+        default_backend: Some(backend.name.clone()),
+        ..Default::default()
+    };
+    (config, backend)
+}
+
 fn build_ollama_config(
-    mut base: Config,
+    _base: Config,
     node_name: &str,
     kind: EndpointKind,
     url: &str,
     model: &str,
-) -> Config {
-    let mut node = DgxNode {
-        name: node_name.to_string(),
-        ollama: Some(url.to_string()),
-        ..Default::default()
-    };
-    match kind {
-        EndpointKind::OllamaLb => node.ollama_lb = Some(url.to_string()),
-        EndpointKind::InCluster => node.in_cluster = Some(url.to_string()),
-        // Ollama (already in `ollama`) and Vllm (handled elsewhere) need nothing extra.
-        _ => {}
-    }
-    base.dgx = Some(DgxConfig {
-        active_node: Some(node_name.to_string()),
-        active_endpoint: kind,
-        active_model: Some(model.to_string()),
-        nodes: vec![node],
-        ..Default::default()
-    });
-    base
+) -> (Config, BackendConfig) {
+    build_backend_pair(
+        node_name,
+        url,
+        model,
+        BackendKind::Ollama,
+        newt_core::Serving::Multiplexer,
+        None,
+        kind.as_str(),
+    )
 }
 
-/// Build a config for a vLLM / OpenAI-compatible endpoint: a single
-/// `kind = "openai"` backend, which `resolve_backend_choice` prefers.
+/// vLLM / OpenAI-compatible endpoint: a single-model INSTANCE backend.
 fn build_openai_config(
-    mut base: Config,
+    _base: Config,
     name: &str,
     endpoint: &str,
     model: &str,
     api_key_env: Option<String>,
-) -> Config {
-    base.backends = vec![BackendConfig {
-        name: name.to_string(),
-        endpoint: endpoint.to_string(),
-        model: Some(model.to_string()),
-        model_path: None,
-        tiers: vec![Tier::Fast, Tier::Standard, Tier::Complex, Tier::Review],
-        kind: BackendKind::Openai,
-        api: Default::default(),
-        api_key_file: None,
+) -> (Config, BackendConfig) {
+    build_backend_pair(
+        name,
+        endpoint,
+        model,
+        BackendKind::Openai,
+        newt_core::Serving::Instance,
         api_key_env,
-        ..Default::default()
-    }];
-    base
+        "vllm",
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -418,6 +443,15 @@ mod tests {
         fn transcript(&self) -> String {
             self.output.join("\n")
         }
+    }
+
+    /// Read the backend drop-in `<config dir>/backends/<name>.toml` the new
+    /// writer (#1140) produces beside the config file.
+    fn read_dropin(config_path: &std::path::Path, name: &str) -> BackendConfig {
+        let p = config_path
+            .with_file_name("backends")
+            .join(format!("{name}.toml"));
+        toml::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap()
     }
 
     impl Console for ScriptedConsole {
@@ -472,51 +506,48 @@ mod tests {
     }
 
     #[test]
-    fn build_ollama_config_writes_resolvable_node() {
-        let cfg = build_ollama_config(
+    fn build_ollama_config_writes_dropin_pair_no_dgx() {
+        // #1140: the wizard's chimera is dead — the result is ONE backend
+        // drop-in + a minimal config pointing at it. No [dgx], no inline
+        // [[backends]].
+        let (cfg, backend) = build_ollama_config(
             Config::default(),
             "default",
             EndpointKind::Ollama,
             "http://127.0.0.1:11434",
             "qwen2.5-coder:7b",
         );
-        let dgx = cfg.dgx.unwrap();
-        assert_eq!(dgx.active_model.as_deref(), Some("qwen2.5-coder:7b"));
-        // The URL must land in `ollama` so resolve_backend_config picks it up.
-        assert_eq!(
-            dgx.nodes[0].ollama.as_deref(),
-            Some("http://127.0.0.1:11434")
+        assert!(cfg.dgx.is_none(), "no legacy [dgx] block ever again");
+        assert!(cfg.backends.is_empty(), "the drop-in IS the backend list");
+        assert_eq!(cfg.default_backend.as_deref(), Some("default"));
+        assert_eq!(backend.endpoint, "http://127.0.0.1:11434");
+        assert_eq!(backend.effective_model(), Some("qwen2.5-coder:7b"));
+        assert_eq!(backend.kind, BackendKind::Ollama);
+        assert_eq!(backend.serving, Some(newt_core::Serving::Multiplexer));
+        assert!(
+            backend.provenance.is_some(),
+            "generated files self-describe"
         );
     }
 
     #[test]
-    fn build_ollama_config_mirrors_lb_url_into_ollama_field() {
-        let cfg = build_ollama_config(
-            Config::default(),
-            "dgx",
-            EndpointKind::OllamaLb,
-            "https://REDACTED-HOST",
-            "llama3.1:70b",
-        );
-        let node = &cfg.dgx.unwrap().nodes[0];
-        // Both the flavour-specific field and the resolver-read `ollama` field.
-        assert_eq!(node.ollama_lb.as_deref(), Some("https://REDACTED-HOST"));
-        assert_eq!(node.ollama.as_deref(), Some("https://REDACTED-HOST"));
-    }
-
-    #[test]
-    fn build_openai_config_sets_openai_kind() {
-        let cfg = build_openai_config(
+    fn build_openai_config_sets_openai_instance() {
+        let (cfg, backend) = build_openai_config(
             Config::default(),
             "dgx-vllm",
-            "http://REDACTED-HOST:8000",
-            "llama3.1:8b",
-            Some("DGX_API_KEY".to_string()),
+            "http://dgx:8000",
+            "meta/llama-3.1-8b-instruct",
+            Some("DGX_API_KEY".into()),
         );
-        let b = &cfg.backends[0];
-        assert_eq!(b.kind, BackendKind::Openai);
-        assert_eq!(b.endpoint, "http://REDACTED-HOST:8000");
-        assert_eq!(b.api_key_env.as_deref(), Some("DGX_API_KEY"));
+        assert_eq!(cfg.default_backend.as_deref(), Some("dgx-vllm"));
+        assert!(cfg.dgx.is_none() && cfg.backends.is_empty());
+        assert_eq!(backend.kind, BackendKind::Openai);
+        assert_eq!(backend.serving, Some(newt_core::Serving::Instance));
+        assert_eq!(backend.api_key_env.as_deref(), Some("DGX_API_KEY"));
+        assert_eq!(
+            backend.effective_model(),
+            Some("meta/llama-3.1-8b-instruct")
+        );
     }
 
     // --- HTTP probes ------------------------------------------------------
@@ -584,9 +615,11 @@ mod tests {
         run_with(&mut console, &client, &path).await.unwrap();
 
         let cfg = Config::load(&path).unwrap();
-        let dgx = cfg.dgx.unwrap();
-        assert_eq!(dgx.active_model.as_deref(), Some("qwen2.5-coder:7b"));
-        assert_eq!(dgx.nodes[0].ollama.as_deref(), Some(server.uri().as_str()));
+        assert!(cfg.dgx.is_none(), "no legacy [dgx] block (#1140)");
+        assert_eq!(cfg.default_backend.as_deref(), Some("default"));
+        let b = read_dropin(&path, "default");
+        assert_eq!(b.effective_model(), Some("qwen2.5-coder:7b"));
+        assert_eq!(b.endpoint, server.uri());
     }
 
     #[serial_test::serial(real_fs)]
@@ -608,8 +641,10 @@ mod tests {
         run_with(&mut console, &client, &path).await.unwrap();
 
         let cfg = Config::load(&path).unwrap();
-        let b = &cfg.backends[0];
+        assert_eq!(cfg.default_backend.as_deref(), Some("dgx-vllm"));
+        let b = read_dropin(&path, "dgx-vllm");
         assert_eq!(b.kind, BackendKind::Openai);
+        assert_eq!(b.serving, Some(newt_core::Serving::Instance));
         assert_eq!(b.effective_model(), Some("meta/llama-3.1-8b-instruct"));
         assert_eq!(b.endpoint, server.uri());
     }
@@ -632,7 +667,11 @@ mod tests {
         ]);
         run_with(&mut console, &client, &path).await.unwrap();
         let cfg = Config::load(&path).unwrap();
-        assert_eq!(cfg.dgx.unwrap().active_model.as_deref(), Some("phi3:mini"));
+        assert_eq!(cfg.default_backend.as_deref(), Some("default"));
+        assert_eq!(
+            read_dropin(&path, "default").effective_model(),
+            Some("phi3:mini")
+        );
     }
 
     #[serial_test::serial(real_fs)]
@@ -687,8 +726,9 @@ mod tests {
         let mut console = ScriptedConsole::new(&["2", "", &server.uri(), "1", "1", "y"]);
         run_with(&mut console, &client, &path).await.unwrap();
         let cfg = Config::load(&path).unwrap();
+        assert_eq!(cfg.default_backend.as_deref(), Some("dgx"));
         assert_eq!(
-            cfg.dgx.unwrap().active_model.as_deref(),
+            read_dropin(&path, "dgx").effective_model(),
             Some("qwen2.5-coder:32b")
         );
         // The reprompt message was shown.
