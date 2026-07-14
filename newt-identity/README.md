@@ -13,7 +13,7 @@ attenuation at every link, so a confused or compromised agent can only ever
 narrow its authority, never widen it.
 
 Part of [Newt-Agent](https://github.com/Gilamonster-Foundation/newt-agent), a
-small, fast, local-first agentic coder.
+free, friendly, local agentic coder.
 
 ## License
 

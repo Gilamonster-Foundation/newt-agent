@@ -15,7 +15,7 @@ from newt_agent.coder import build_prompt, normalize_emission
 Distributed on PyPI as `newt-agent-py` (`pip install newt-agent-py`).
 
 Part of [Newt-Agent](https://github.com/Gilamonster-Foundation/newt-agent), a
-small, fast, local-first agentic coder.
+free, friendly, local agentic coder.
 
 ## License
 

@@ -15,7 +15,7 @@ paths. Built-in file tools include `read_file`, `write_file`, `edit_file`,
 prompted-permission checks.
 
 Part of [Newt-Agent](https://github.com/Gilamonster-Foundation/newt-agent), a
-small, fast, local-first agentic coder.
+free, friendly, local agentic coder.
 
 ## License
 

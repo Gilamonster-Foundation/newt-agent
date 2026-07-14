@@ -12,7 +12,7 @@ generic over `Transport` and unit-tested against an in-memory mock — no
 subprocess needed.
 
 Part of [Newt-Agent](https://github.com/Gilamonster-Foundation/newt-agent), a
-small, fast, local-first agentic coder.
+free, friendly, local agentic coder.
 
 ## Per-server request timeout
 

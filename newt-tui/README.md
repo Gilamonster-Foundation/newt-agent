@@ -10,7 +10,7 @@ setup wizards (`newt init` / `newt setup`) probe for local models and write
 that file.
 
 Part of [Newt-Agent](https://github.com/Gilamonster-Foundation/newt-agent), a
-small, fast, local-first agentic coder.
+free, friendly, local agentic coder.
 
 ## License
 

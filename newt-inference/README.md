@@ -14,7 +14,7 @@ Also provides the `BackendRegistry`, streaming chat types, and retry/backoff
 helpers used by the rest of the workspace.
 
 Part of [Newt-Agent](https://github.com/Gilamonster-Foundation/newt-agent), a
-small, fast, local-first agentic coder.
+free, friendly, local agentic coder.
 
 ## License
 

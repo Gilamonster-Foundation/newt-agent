@@ -181,7 +181,7 @@ pub(crate) const LOGO_PLAIN: &str = include_str!("../../docs/logos/newt-ascii-40
 // partial override (or a wrong path) degrades gracefully rather than crashing.
 
 const DEFAULT_BRAND_NAME: &str = "newt";
-const DEFAULT_BRAND_TAGLINE: &str = "Small, fast, local-first agentic coder";
+const DEFAULT_BRAND_TAGLINE: &str = "Free, friendly, local agentic coder";
 
 /// Pure core of [`brand_logo`]: resolve a logo from explicit override inputs so
 /// it is testable without mutating process-wide env. A missing dir, empty dir,
@@ -11293,7 +11293,7 @@ mod tests {
     #[test]
     fn inline_header_color_contains_brand_and_ready_lines() {
         let s = render_inline_header("/w", true);
-        assert!(s.contains("Small, fast, local-first agentic coder"));
+        assert!(s.contains("Free, friendly, local agentic coder"));
         assert!(s.contains(concat!("v", env!("CARGO_PKG_VERSION"))));
         assert!(s.contains("ready — type a task, /help for commands, /exit to quit"));
         // Text is placed just past the 20-col logo via absolute column moves.

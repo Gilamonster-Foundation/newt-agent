@@ -42,11 +42,7 @@ fn parse_shell_engine(
 }
 
 #[derive(Parser, Debug)]
-#[command(
-    name = "newt",
-    version,
-    about = "Small, fast, local-first agentic coder"
-)]
+#[command(name = "newt", version, about = "Free, friendly, local agentic coder")]
 pub struct Cli {
     /// Path to config file (overrides default search order).
     #[arg(short, long, global = true)]
