@@ -61,11 +61,10 @@ fn run_setup(color: bool, config_path: &std::path::Path) -> anyhow::Result<()> {
     // so a config file always gets written for the user to edit.
     let (url, model, note) = match found.into_iter().next() {
         Some(ep) => {
-            let model = ep
-                .models
-                .into_iter()
-                .next()
-                .unwrap_or_else(|| "llama3.1:8b".to_string());
+            // Skip embedding-only models (issue: first-run picked nomic-embed-text
+            // as the chat default — it can't converse). Fall back to a real chat
+            // model name when the endpoint served only embedding models.
+            let model = pick_default_model(&ep.models).unwrap_or_else(|| "llama3.1:8b".to_string());
             (ep.url, model, "reachable")
         }
         None => (
@@ -108,6 +107,21 @@ fn save_config(path: &std::path::Path, url: &str, model: &str) -> anyhow::Result
 struct FoundEndpoint {
     url: String,
     models: Vec<String>,
+}
+
+/// Whether a model name looks embedding-only — a heuristic on the name (Ollama's
+/// `/api/tags` doesn't flag capability). Auto-setup must not pick one as the chat
+/// default; catches the common families (`nomic-embed-text`, `mxbai-embed`,
+/// `*-embed-*`). A mislabelled model is one `config.toml` edit away.
+fn is_embedding_model(name: &str) -> bool {
+    name.to_ascii_lowercase().contains("embed")
+}
+
+/// The auto-setup default model: the first served model that isn't
+/// embedding-only, else `None` (the caller supplies the chat-model fallback, so
+/// an endpoint serving only embedding models still writes a usable name to edit).
+fn pick_default_model(models: &[String]) -> Option<String> {
+    models.iter().find(|m| !is_embedding_model(m)).cloned()
 }
 
 fn probe_candidates() -> Vec<String> {
@@ -176,6 +190,33 @@ async fn fetch_models(client: &reqwest::Client, url: &str) -> anyhow::Result<Vec
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn pick_default_model_skips_embedding_models() {
+        // Regression: first-run picked nomic-embed-text (an embedding model) as
+        // the chat default because it sorted first. Prefer a real chat model.
+        let models = vec![
+            "nomic-embed-text:latest".to_string(),
+            "qwen2.5-coder:7b".to_string(),
+        ];
+        assert_eq!(
+            super::pick_default_model(&models).as_deref(),
+            Some("qwen2.5-coder:7b")
+        );
+    }
+
+    #[test]
+    fn pick_default_model_none_when_all_embedding_or_empty() {
+        // Only embedding models → None, so the caller keeps its chat-model
+        // fallback rather than writing an unusable embedding default.
+        let embed = vec![
+            "nomic-embed-text:latest".to_string(),
+            "mxbai-embed-large".to_string(),
+        ];
+        assert!(super::pick_default_model(&embed).is_none());
+        assert!(super::pick_default_model(&[]).is_none());
+    }
+
     use super::*;
 
     #[test]

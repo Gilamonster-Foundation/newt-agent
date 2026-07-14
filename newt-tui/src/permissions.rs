@@ -333,7 +333,41 @@ pub(crate) fn prompt_user_input(question: &str) -> Option<String> {
     io::stdout().flush().ok();
     let mut answer = String::new();
     let read = io::stdin().read_line(&mut answer);
-    interpret_user_line(read, &answer)
+    let line = interpret_user_line(read, &answer)?;
+    if is_slash_command_at_prompt(&line) {
+        // A leading-slash answer is a TUI command intent, NOT an answer for the
+        // model — never hand it over. A small model will try to *run* it (e.g.
+        // `/exit` -> `run_command exit`), which OCAP then denies. Refuse here;
+        // Ctrl-C returns to the main prompt where slash commands work.
+        println!("(slash commands aren't answers to this question - Ctrl-C to return to the prompt, then use /exit, /model, ...)");
+        io::stdout().flush().ok();
+        return None;
+    }
+    Some(line)
+}
+
+/// A leading-slash answer at a `request_user_input` prompt is a TUI command
+/// intent, not an answer to hand to the model. Pure, so it's unit-testable.
+fn is_slash_command_at_prompt(answer: &str) -> bool {
+    answer.trim_start().starts_with('/')
+}
+
+#[cfg(test)]
+mod slash_prompt_tests {
+    use super::is_slash_command_at_prompt;
+
+    #[test]
+    fn refuses_slash_commands_as_tool_answers() {
+        // Regression: `/exit` typed at a `request_user_input` prompt was sent to
+        // the model, which ran it as a shell command -> OCAP denial.
+        assert!(is_slash_command_at_prompt("/exit"));
+        assert!(is_slash_command_at_prompt("  /quit"));
+        assert!(is_slash_command_at_prompt("/model qwen2.5-coder:7b"));
+        // A plain answer (even one containing a slash) is a real answer.
+        assert!(!is_slash_command_at_prompt("qwen2.5-coder:7b"));
+        assert!(!is_slash_command_at_prompt("use a/b testing"));
+        assert!(!is_slash_command_at_prompt(""));
+    }
 }
 
 /// Session-owned prompted-permission state, lent to the gate each turn (the
