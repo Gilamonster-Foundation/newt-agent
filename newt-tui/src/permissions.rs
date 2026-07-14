@@ -2074,7 +2074,14 @@ mod permission_prompt_tests {
         assert_eq!(close_out_message("new", "NEW", true), "NEW");
         assert!(close_out_message("start", "NEW", true).contains("stays open"));
         assert!(close_out_message("start", "NEW", true).contains("/resume"));
-        assert!(close_out_message("end", "NEW", true).contains("/resume to reopen"));
+        // #1165: /end LEADS with the ending, never "Started a new conversation".
+        let end = close_out_message("end", "NEW", true);
+        assert!(end.starts_with("Conversation ended"), "{end}");
+        assert!(end.contains("/resume to reopen"), "{end}");
+        assert!(
+            !end.starts_with("NEW"),
+            "end must not headline the new conversation: {end}"
+        );
         assert!(close_out_message("restart", "NEW", true).contains("/resume to reopen"));
         // Nothing persisted (empty conversation or ephemeral session): no resume
         // promise for ANY verb — just the plain new-conversation line.
