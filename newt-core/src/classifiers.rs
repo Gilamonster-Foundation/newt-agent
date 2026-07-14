@@ -454,3 +454,170 @@ matchers = ["No changes are needed."]
         assert!(dir.ends_with("classifiers"));
     }
 }
+
+/// Does this USER turn invite harness action-pressure at all? (#1152/#1162)
+///
+/// The nudge classifier reads only the ASSISTANT's words, so it cannot tell
+/// "dodging work" from "answering a question" — a model answering *"give me
+/// your top 5 improvements"* classifies identically to one narrating instead
+/// of fixing a bug. This gate supplies the missing half: action-pressure
+/// nudges (narration rescue, workflow repair steering, pending-plan pushes)
+/// fire ONLY when the user's turn actually asked for actions.
+///
+/// Rules (conservative — unknown shapes default to TODAY's behavior, true):
+/// - Social acknowledgments ("thanks!", "excellent!", "lgtm") → false.
+/// - Reporting/analysis imperatives ("give me…", "show…", "explain…",
+///   "review…", "what do you think…") → false: narration IS the deliverable.
+/// - Questions default to false UNLESS they name a mutating action
+///   ("can you push the branch?" → true).
+/// - Everything else → true.
+pub fn user_turn_invites_action(task: &str) -> bool {
+    let t = task.trim().trim_end_matches(['!', '.', ' ']).to_lowercase();
+    if t.is_empty() {
+        return true; // continuation/unknown — keep today's behavior
+    }
+    // Social acknowledgment: short, and led by a pleasantry.
+    const SOCIAL: &[&str] = &[
+        "thanks",
+        "thank you",
+        "ok",
+        "okay",
+        "great",
+        "excellent",
+        "nice",
+        "cool",
+        "awesome",
+        "perfect",
+        "good",
+        "lgtm",
+        "sounds good",
+        "got it",
+        "you're welcome",
+        "no worries",
+    ];
+    if t.len() <= 60 && SOCIAL.iter().any(|w| t.starts_with(w)) {
+        return false;
+    }
+    // Judge the LEADING verb (after politeness prefixes) — a verb buried in a
+    // descriptive phrase ("…to make X better") is not the ask's deliverable.
+    let mut lead = t.as_str();
+    for prefix in [
+        "please ",
+        "can you ",
+        "could you ",
+        "would you ",
+        "will you ",
+        "now ",
+    ] {
+        if let Some(rest) = lead.strip_prefix(prefix) {
+            lead = rest;
+        }
+    }
+    // Leading verbs whose deliverable is a MUTATION — invite action even
+    // inside a question ("can you push…?").
+    const MUTATING: &[&str] = &[
+        "fix",
+        "push",
+        "commit",
+        "edit",
+        "create",
+        "make",
+        "write",
+        "build",
+        "run ",
+        "install",
+        "deploy",
+        "merge",
+        "delete",
+        "remove",
+        "refactor",
+        "implement",
+        "add ",
+        "apply",
+        "rebase",
+        "rename",
+        "move",
+        "update",
+        "patch",
+        "revert",
+        "release",
+        "publish",
+        "start",
+        "stop",
+        "restart",
+        "clean",
+        "format",
+        "test ",
+    ];
+    let leads_mutating = MUTATING.iter().any(|v| lead.starts_with(v));
+    // Leading verbs whose deliverable is TEXT — narration is the answer.
+    const REPORTING: &[&str] = &[
+        "give me",
+        "show",
+        "list",
+        "tell me",
+        "explain",
+        "summarize",
+        "summarise",
+        "describe",
+        "analyze",
+        "analyse",
+        "review",
+        "compare",
+        "what",
+        "which",
+        "why",
+        "how",
+        "who",
+        "where",
+        "assess",
+        "evaluate",
+        "your top",
+        "your take",
+        "thoughts on",
+        "read ",
+    ];
+    let leads_reporting = REPORTING.iter().any(|v| lead.starts_with(v));
+    if leads_reporting {
+        return false;
+    }
+    if t.ends_with('?') {
+        // A question invites action only when it LEADS with a mutation.
+        return leads_mutating;
+    }
+    true
+}
+
+#[cfg(test)]
+mod invites_action_tests {
+    use super::user_turn_invites_action;
+
+    #[test]
+    fn transcript_cases_from_the_2026_07_14_session() {
+        // The misfires (#1152/#1162) — none of these may invite action-pressure:
+        assert!(!user_turn_invites_action("excellent! Thank you!"));
+        assert!(!user_turn_invites_action("thank you!"));
+        assert!(!user_turn_invites_action(
+            "Give me your top 5 improvements to make LLM effectiveness better inside this harness please?"
+        ));
+        assert!(!user_turn_invites_action(
+            "what do you think of the MCP integration story?"
+        ));
+        assert!(!user_turn_invites_action(
+            "review the OCAP confinement model"
+        ));
+        // Genuine action asks — pressure stays available:
+        assert!(user_turn_invites_action(
+            "Make a branch for me to examine with your commits on them please."
+        ));
+        assert!(user_turn_invites_action(
+            "can you push the branch to origin for me?"
+        ));
+        assert!(user_turn_invites_action(
+            "fix the failing test in backend_probe"
+        ));
+        // Unknown/imperative default = today's behavior:
+        assert!(user_turn_invites_action("continue"));
+        assert!(user_turn_invites_action(""));
+    }
+}
