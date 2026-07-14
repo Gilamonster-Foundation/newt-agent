@@ -4713,14 +4713,23 @@ mod tests {
         assert_eq!(resolve_exec_cwd("/ws", None), "/ws");
         assert_eq!(resolve_exec_cwd("/ws", Some("")), "/ws");
         assert_eq!(resolve_exec_cwd("/ws", Some("  ")), "/ws");
-        assert_eq!(
-            resolve_exec_cwd("/ws", Some("crates/foo")),
-            "/ws/crates/foo"
-        );
-        assert_eq!(resolve_exec_cwd("/ws", Some("/ws/sub")), "/ws/sub");
+        // Relative join uses the platform separator (correct — the cwd feeds
+        // the confined shell on this OS); compare against the same join.
+        let joined = std::path::Path::new("/ws")
+            .join("crates/foo")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(resolve_exec_cwd("/ws", Some("crates/foo")), joined);
+        // An absolute path passes through verbatim (platform-appropriate).
+        let abs = if cfg!(windows) {
+            "C:\\ws\\sub"
+        } else {
+            "/ws/sub"
+        };
+        assert_eq!(resolve_exec_cwd("/ws", Some(abs)), abs);
         // The dispatch args carry it verbatim.
-        let a = confined_dispatch_args("ls", "/ws/crates/foo");
-        assert_eq!(a["cwd"], "/ws/crates/foo");
+        let a = confined_dispatch_args("ls", &joined);
+        assert_eq!(a["cwd"], joined);
     }
 
     #[test]
