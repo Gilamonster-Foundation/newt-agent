@@ -2089,6 +2089,9 @@ mod permission_prompt_tests {
         assert_eq!(close_out_message("start", "NEW", false), "NEW");
         let end_empty = close_out_message("end", "NEW", false);
         assert!(end_empty.starts_with("Conversation ended"), "{end_empty}");
-        assert!(!end_empty.contains("/resume"), "nothing to reopen: {end_empty}");
+        assert!(
+            !end_empty.contains("/resume"),
+            "nothing to reopen: {end_empty}"
+        );
     }
 }
