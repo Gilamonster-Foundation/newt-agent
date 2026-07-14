@@ -6909,7 +6909,14 @@ pub(crate) fn close_out_message(reason: &str, started: &str, outgoing_persisted:
             format!("{started} The previous conversation stays open — /resume to return to it.")
         }
         "new" => started.to_string(),
-        // "end" | "restart"
+        // #1165: "end" must LEAD with the ending — the old copy ("Started a
+        // new conversation.") read as end doing its antonym's job. A fresh
+        // conversation still opens underneath (the session always has one);
+        // the message now says so parenthetically instead of headlining it.
+        "end" => "Conversation ended and saved — /resume to reopen it, /exit to leave newt. \
+                  (A fresh conversation is now open.)"
+            .to_string(),
+        // "restart"
         _ => format!("{started} The previous conversation is saved — /resume to reopen it."),
     }
 }
