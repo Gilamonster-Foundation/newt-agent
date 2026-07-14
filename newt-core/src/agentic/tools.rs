@@ -2425,6 +2425,39 @@ fn is_git_write_denial(out: &str) -> bool {
 /// denial. The readonly-`/mode` FLOOR is enforced inside
 /// [`PermissionGate::ask`], which refuses the grant when the active preset
 /// projects no git-commit authority — so a git write can never pierce it here.
+/// #1191: git operations that DESTROY work irrecoverably — `stash-drop` (drops
+/// a saved stash for good) and `branch-delete` (loses a branch's unique
+/// commits). These are the `rm -rf` of git: a compaction-confused model ran
+/// exactly this sequence (stash → checkout main → stash-drop → branch-delete)
+/// and destroyed 136 lines of the operator's requested work. Unlike a normal
+/// git WRITE (commit/add/checkout), a data-loss op is NEVER blanket-allowed —
+/// not even under --full-access — so the operator always gets a say before
+/// work is destroyed (the danger-table principle: some ops can't be granted
+/// away). Read-side and constructive ops (commit/branch/checkout/stash-pop…)
+/// are unaffected.
+fn is_git_data_loss_op(op: &str) -> bool {
+    matches!(op, "stash-drop" | "branch-delete")
+}
+
+/// Ask the operator to confirm a data-loss git op (#1191). Returns true only on
+/// an explicit Allow; no gate (headless) or a decline means DON'T destroy the
+/// work. Distinct reason text so the prompt reads as a destructive-action
+/// confirmation, not a routine authority grant.
+fn git_data_loss_confirmed(gate: &mut dyn PermissionGate, op: &str) -> bool {
+    let request = PermissionRequest {
+        tool: "git".to_string(),
+        kind: DenialKind::GitWrite,
+        target: op.to_string(),
+        reason: format!(
+            "git {op} DESTROYS work irrecoverably (a dropped stash / deleted              branch cannot be recovered) — confirm before proceeding"
+        ),
+    };
+    matches!(
+        gate.ask(std::slice::from_ref(&request)),
+        PermissionDecision::Allow(_)
+    )
+}
+
 fn git_gate_allows(gate: &mut dyn PermissionGate, op: &str) -> bool {
     let request = PermissionRequest {
         tool: "git".to_string(),
@@ -3187,6 +3220,27 @@ pub async fn execute_tool_with_offload(
                 let gc = crate::git_caveats::GitCaveats::from_session(caveats);
                 let op = args.get("op").and_then(|v| v.as_str()).unwrap_or("");
                 print_tool_call("git", op, color);
+                // #1191: data-loss ops (stash-drop / branch-delete) are gated
+                // ALWAYS — even under --full-access — because they destroy work
+                // irrecoverably. A confused (e.g. post-compaction) model must
+                // not be able to `rm -rf` the operator's in-progress work; the
+                // operator gets the final say. No gate / a decline refuses.
+                if is_git_data_loss_op(op) {
+                    let confirmed = permission_gate
+                        .as_deref_mut()
+                        .is_some_and(|gate| git_data_loss_confirmed(gate, op));
+                    if !confirmed {
+                        let refusal = format!(
+                            "refused: git {op} destroys work irrecoverably and was not \
+                             confirmed by the operator. If you stashed changes you still \
+                             need, restore them with stash-pop/stash-apply instead of \
+                             dropping; do NOT delete a branch that holds unmerged work. \
+                             The operator must confirm any data-loss git op."
+                        );
+                        print_tool_output(&refusal, tool_output_lines, color);
+                        return refusal;
+                    }
+                }
                 let mut out = match tool.dispatch(op, args, &gc) {
                     Ok(rendered) => rendered,
                     // Denials + engine errors surface verbatim so the model
@@ -5629,6 +5683,10 @@ mod execute_tool_branch_tests {
                     Err("capability denied: git commit not permitted".to_string())
                 }
                 "commit" => Ok("committed abc123: msg".to_string()),
+                // #1191: data-loss ops the gate guards — if we reach here, the
+                // gate ALLOWED (the refusal path returns before dispatch).
+                "stash-drop" => Ok("dropped stash@{0}".to_string()),
+                "branch-delete" => Ok("deleted branch feature".to_string()),
                 other => Err(format!("unknown git op '{other}'")),
             }
         }
@@ -5727,6 +5785,67 @@ mod execute_tool_branch_tests {
     /// — with a gate that ALLOWS, the arm re-dispatches under the local-write
     /// surface and the commit lands (the deadlock fix). The gate is consulted for
     /// a `git_write` capability.
+    #[tokio::test]
+    async fn git_data_loss_ops_are_gated_even_under_full_write_authority() {
+        // #1191: the exact catastrophe — a confused model tries to destroy
+        // work (stash-drop / branch-delete). Even with FULL write authority
+        // (the --full-access analogue), the op is refused without an explicit
+        // operator confirmation, and proceeds only WITH it. Safe ops never
+        // consult the data-loss gate.
+        let ws = tempfile::TempDir::new().unwrap();
+        let full = caveats_rw(ws.path());
+
+        // Gate DECLINES → refused, StubGit never dropped the stash.
+        let mut deny = MockGate::new(false, &full);
+        let out = run_git_gated("stash-drop", &full, &StubGit, &mut deny).await;
+        assert!(
+            out.starts_with("refused:"),
+            "must refuse without confirm: {out}"
+        );
+        assert!(
+            !out.contains("dropped stash"),
+            "the drop must NOT have run: {out}"
+        );
+        assert!(
+            deny.asks
+                .iter()
+                .any(|(t, k)| t == "git" && k.contains("stash-drop")),
+            "the data-loss confirmation was asked: {:?}",
+            deny.asks
+        );
+
+        // Gate ALLOWS → proceeds.
+        let mut allow = MockGate::new(true, &full);
+        let out = run_git_gated("branch-delete", &full, &StubGit, &mut allow).await;
+        assert!(
+            out.contains("deleted branch"),
+            "confirmed → proceeds: {out}"
+        );
+
+        // A SAFE op is never gated as data-loss.
+        let mut g = MockGate::new(false, &full);
+        let out = run_git_gated("status", &full, &StubGit, &mut g).await;
+        assert!(out.contains("on branch main"), "safe op runs: {out}");
+        assert!(
+            !g.asks
+                .iter()
+                .any(|(_, k)| k.contains("stash-drop") || k.contains("branch-delete")),
+            "status must not trip the data-loss gate: {:?}",
+            g.asks
+        );
+    }
+
+    #[tokio::test]
+    async fn git_data_loss_op_refused_headless_no_gate() {
+        // No permission gate (headless) → a data-loss op is refused, never run.
+        let ws = tempfile::TempDir::new().unwrap();
+        let out = run_git("stash-drop", &caveats_rw(ws.path()), Some(&StubGit)).await;
+        assert!(
+            out.starts_with("refused:"),
+            "headless data-loss refused: {out}"
+        );
+    }
+
     #[tokio::test]
     async fn git_write_denial_routes_through_gate_and_commits_on_allow() {
         let ws = tempfile::TempDir::new().unwrap();
