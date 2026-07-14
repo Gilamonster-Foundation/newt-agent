@@ -3321,20 +3321,50 @@ fn narration_action_nudge() -> String {
 /// re-arms intent: mid-task, active step named, next output a tool call.
 /// Carries [`compress::CONTINUATION_PREFIX`] so later compressions neither
 /// anchor the tail on it nor keep more than one alive.
-fn post_compaction_continuation(step_ledger: Option<&dyn scheduled::StepLedger>) -> String {
+/// The operator's actual instruction for this turn, recovered from the message
+/// list so the post-compaction directive can quote it VERBATIM (#1163, second
+/// repro): compaction summarizes the middle, and a multi-round turn's summary
+/// can drown the operator's imperative ("make a branch, write a commit for
+/// each") under the transcript it produced — the model then re-derives a WRONG
+/// task from the summary and confabulates ("you asked me to name them, not
+/// build them"). The first non-harness user message is the turn's instruction;
+/// harness-owned messages (summaries, continuations, nudges) are skipped.
+fn turn_instruction(messages: &[serde_json::Value]) -> Option<String> {
+    messages
+        .iter()
+        .find(|m| m["role"].as_str() == Some("user") && !compress::is_compaction_message(m))
+        .and_then(|m| m["content"].as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn post_compaction_continuation(
+    step_ledger: Option<&dyn scheduled::StepLedger>,
+    instruction: Option<&str>,
+) -> String {
     let step_clause = active_step_description(step_ledger)
         .map(|step| format!(" Active step: '{step}'."))
         .unwrap_or_default();
+    // Quote the operator's instruction so the model re-anchors on what was
+    // ACTUALLY asked, not a summary-derived paraphrase. Bounded so a huge
+    // paste can't itself blow the budget.
+    let instruction_clause = instruction
+        .map(|t| {
+            let quoted: String = t.chars().take(400).collect();
+            format!(" The operator's instruction for this turn was: \"{quoted}\" — keep executing THAT, exactly.")
+        })
+        .unwrap_or_default();
     format!(
         "{} You are mid-task: the context above was just compacted, not \
-         completed.{step_clause} Continue working — your next output should be \
-         the next concrete tool call (re-read any file you are about to edit \
-         first, since full file contents were not preserved). Before concluding \
-         ANYTHING about prior work, re-anchor on ground truth: check the current \
-         git branch and the last few commits — work from earlier in this task \
-         may already be COMMITTED (by you), so a clean working tree does NOT \
-         mean no work happened (#1163). Do not summarize what happened, do not \
-         re-plan, and do not repeat work the log shows is done.",
+         completed.{instruction_clause}{step_clause} Continue working — your \
+         next output should be the next concrete tool call (re-read any file \
+         you are about to edit first, since full file contents were not \
+         preserved). Before concluding ANYTHING about prior work, re-anchor on \
+         ground truth: check the current git branch and the last few commits — \
+         work from earlier in this task may already be COMMITTED (by you), so a \
+         clean working tree does NOT mean no work happened (#1163). Do not \
+         summarize what happened, do not re-plan, do not narrow the task, and \
+         do not repeat work the log shows is done.",
         compress::CONTINUATION_PREFIX
     )
 }
@@ -3371,11 +3401,15 @@ fn apply_post_compaction_continuation(
         return;
     }
     *narration_nudges = 0;
+    // Recover the operator's instruction BEFORE dropping the prior directive
+    // (the search skips harness-owned messages anyway, but order-independence
+    // keeps it robust).
+    let instruction = turn_instruction(messages);
     // At most one directive alive: drop any earlier copy before appending.
     messages.retain(|m| !compress::is_continuation_message(m));
     messages.push(serde_json::json!({
         "role": "user",
-        "content": post_compaction_continuation(step_ledger),
+        "content": post_compaction_continuation(step_ledger, instruction.as_deref()),
     }));
 }
 
@@ -9546,7 +9580,7 @@ mod http_loop_tests {
         // worktree is clean, start fresh", DISOWNED its own branch+commit and
         // repeated finished work. The continuation directive must order a
         // ground-truth re-anchor and state the clean-tree≠no-work rule.
-        let d = post_compaction_continuation(None);
+        let d = post_compaction_continuation(None, None);
         assert!(d.contains("re-anchor on ground truth"), "{d}");
         assert!(d.contains("git branch"), "{d}");
         assert!(
@@ -9554,6 +9588,48 @@ mod http_loop_tests {
             "{d}"
         );
         assert!(d.contains("do not repeat work"), "{d}");
+    }
+
+    #[test]
+    fn post_compaction_continuation_quotes_the_operators_instruction() {
+        // Regression #1163 (second repro, corporate-box Opus 2026-07-14):
+        // compaction summarized the middle and the model re-derived a WRONG
+        // task ("deliver a report") from the summary, dropping the operator's
+        // actual instruction ("make a branch, write a commit for each") and
+        // confabulating. The directive must quote the instruction verbatim so
+        // the model re-anchors on what was ASKED, not a paraphrase.
+        let d = post_compaction_continuation(
+            None,
+            Some("make a plan, make a branch, write me a commit for each suggestion"),
+        );
+        assert!(
+            d.contains("make a plan, make a branch, write me a commit for each"),
+            "the instruction is quoted verbatim: {d}"
+        );
+        assert!(d.contains("keep executing THAT"), "{d}");
+        assert!(d.contains("do not narrow the task"), "{d}");
+    }
+
+    #[test]
+    fn turn_instruction_finds_the_operators_message_skipping_harness_noise() {
+        use serde_json::json;
+        let sum = format!("{} earlier context", compress::SUMMARY_PREFIX);
+        let nudge = format!("{} act now", compress::LOOP_GUIDANCE_PREFIX);
+        let msgs = vec![
+            json!({"role": "system", "content": "you are newt"}),
+            json!({"role": "user", "content": sum}), // harness summary
+            json!({"role": "user", "content": "make a branch and write commits"}),
+            json!({"role": "assistant", "content": "Let me start."}),
+            json!({"role": "user", "content": nudge}), // harness nudge
+        ];
+        assert_eq!(
+            turn_instruction(&msgs).as_deref(),
+            Some("make a branch and write commits"),
+            "the real instruction, not the summary or the nudge"
+        );
+        // No real user message → None (directive omits the clause).
+        let only_noise = vec![json!({"role": "system", "content": "x"})];
+        assert_eq!(turn_instruction(&only_noise), None);
     }
 
     #[test]
