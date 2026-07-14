@@ -164,7 +164,7 @@ async fn resolve_backend() -> anyhow::Result<Arc<dyn newt_inference::InferenceBa
         tracing::info!(
             name = %openai.name,
             endpoint = %openai.endpoint,
-            model = %openai.model,
+            model = %openai.effective_model().unwrap_or("(server decides)"),
             authenticated = openai.resolve_api_key().is_some(),
             "worker: using configured OpenAI-compatible backend"
         );
@@ -190,7 +190,7 @@ mod backend_selection_tests {
         BackendConfig {
             name: name.into(),
             endpoint: "http://e".into(),
-            model: "m".into(),
+            model: Some("m".into()),
             model_path: None,
             tiers: vec![Tier::Fast],
             kind,

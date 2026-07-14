@@ -5836,7 +5836,7 @@ pub(crate) fn backends_list_items(
                 "{} · {} · {} @ {}",
                 b.name,
                 b.kind.label(),
-                b.model,
+                b.effective_model().unwrap_or("(server decides)"),
                 b.endpoint
             );
             (label, active == Some(b.name.as_str()))
@@ -5855,7 +5855,8 @@ pub(crate) fn resolve_backend_choice(cfg: &newt_core::Config) -> BackendChoice {
             let model = std::env::var("NEWT_DGX_MODEL")
                 .ok()
                 .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| b.model.clone());
+                .or_else(|| b.effective_model().map(str::to_string))
+                .unwrap_or_default();
             return BackendChoice {
                 url: b.endpoint.clone(),
                 model,
@@ -5885,7 +5886,8 @@ pub(crate) fn resolve_backend_choice(cfg: &newt_core::Config) -> BackendChoice {
             let model = std::env::var("NEWT_DGX_MODEL")
                 .ok()
                 .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| b.model.clone());
+                .or_else(|| b.effective_model().map(str::to_string))
+                .unwrap_or_default();
             return BackendChoice {
                 url: b.endpoint.clone(),
                 model,
@@ -16202,7 +16204,7 @@ mod helper_fn_tests {
             backends: vec![newt_core::BackendConfig {
                 name: "vllm".into(),
                 endpoint: "http://vllm.example:8000".into(),
-                model: "qwen3:32b".into(),
+                model: Some("qwen3:32b".into()),
                 model_path: None,
                 tiers: vec![],
                 kind: newt_core::BackendKind::Openai,
@@ -16969,7 +16971,7 @@ mod env_resolution_tests {
         newt_core::BackendConfig {
             name: name.into(),
             endpoint: endpoint.into(),
-            model: model.into(),
+            model: Some(model.into()),
             model_path: None,
             tiers: vec![],
             kind,

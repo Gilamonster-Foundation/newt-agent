@@ -312,7 +312,11 @@ impl LocalVllmBackend {
     /// `api_key_env` / `api_key_file`. Used by the worker to construct an
     /// authenticated OpenAI-compatible backend from `~/.newt/config.toml`.
     pub fn from_config(cfg: &newt_core::BackendConfig) -> Self {
-        Self::new(cfg.endpoint.clone(), cfg.model.clone()).with_api_key(cfg.resolve_api_key())
+        // A model-less backend (server dictates, #1128) yields "" here until
+        // Phase B's adopt() supplies the served model; callers today always
+        // pass configs with a declared model.
+        let model = cfg.effective_model().unwrap_or_default().to_string();
+        Self::new(cfg.endpoint.clone(), model).with_api_key(cfg.resolve_api_key())
     }
 
     /// Apply bearer auth to a request builder when a token is configured.

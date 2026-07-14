@@ -121,7 +121,7 @@ async fn from_config_wires_bearer_auth_from_env() {
     let cfg = BackendConfig {
         name: "remote".into(),
         endpoint: server.uri(),
-        model: "m".into(),
+        model: Some("m".into()),
         model_path: None,
         tiers: vec![Tier::Fast],
         kind: BackendKind::Openai,

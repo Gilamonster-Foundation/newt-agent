@@ -2821,7 +2821,13 @@ pub struct BackendConfig {
     /// backend — which runs in-process and has no URL — can omit it.
     #[serde(default)]
     pub endpoint: String,
-    pub model: String,
+    /// The model this backend serves. OPTIONAL (#1128, epic #1126): an unset
+    /// model means "the server dictates" — Phase B's probe/adopt fills it in at
+    /// session start. Configs that set it keep exactly today's behavior; read
+    /// through [`effective_model`](Self::effective_model), never directly, so a
+    /// `None` can never misroute a request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     /// For `kind = "embedded"`: the local GGUF model file (the in-process engine
     /// has no `endpoint`). `~/` is expanded at use. Ignored for HTTP backends.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2853,6 +2859,13 @@ pub struct BackendConfig {
 }
 
 impl BackendConfig {
+    /// The declared model, if any — empty strings count as unset. This is the
+    /// ONLY sanctioned way to read `model`; when it returns `None` the backend
+    /// expects the served model to be adopted from the endpoint (Phase B).
+    pub fn effective_model(&self) -> Option<&str> {
+        self.model.as_deref().filter(|m| !m.trim().is_empty())
+    }
+
     /// Resolve this backend's bearer token, if any.
     ///
     /// Checks [`api_key_env`](Self::api_key_env) first (environment
@@ -3030,7 +3043,7 @@ fn fallback_localhost_backend() -> BackendConfig {
     BackendConfig {
         name: "ollama".into(),
         endpoint: "http://127.0.0.1:11434".into(),
-        model: "llama3.1:8b".into(),
+        model: Some("llama3.1:8b".into()),
         model_path: None,
         tiers: vec![Tier::Fast, Tier::Standard, Tier::Complex, Tier::Review],
         kind: BackendKind::Ollama,
@@ -4615,6 +4628,28 @@ mod tests {
     }
 
     #[test]
+    fn backend_model_is_optional_and_read_via_effective_model() {
+        // #1128 (epic #1126): a model-less backend file PARSES — "the server
+        // dictates"; Phase B's adopt() fills it at session start. Previously
+        // `model` was required, so such a drop-in failed to parse and was
+        // silently skipped.
+        let serverless: BackendConfig =
+            toml::from_str("endpoint=\"http://h:8000\"\nkind=\"openai\"\n").unwrap();
+        assert_eq!(serverless.model, None);
+        assert_eq!(serverless.effective_model(), None);
+
+        // A declared model reads through effective_model unchanged.
+        let pinned: BackendConfig =
+            toml::from_str("endpoint=\"http://h:1\"\nmodel=\"qwen3:32b\"\n").unwrap();
+        assert_eq!(pinned.effective_model(), Some("qwen3:32b"));
+
+        // An EMPTY model string counts as unset — it must never be sent as a
+        // model name in a request.
+        let empty: BackendConfig = toml::from_str("endpoint=\"http://h:1\"\nmodel=\"\"\n").unwrap();
+        assert_eq!(empty.effective_model(), None);
+    }
+
+    #[test]
     fn disk_backends_load_per_file_by_stem_and_override_inline() {
         let dir = tempfile::tempdir().unwrap();
         // A minimal drop-in: name omitted (filename is authoritative), tiers
@@ -4635,7 +4670,7 @@ mod tests {
                 BackendConfig {
                     name: "dgx1".into(),
                     endpoint: "http://stale:11434".into(),
-                    model: "old-model".into(),
+                    model: Some("old-model".into()),
                     model_path: None,
                     tiers: vec![],
                     kind: BackendKind::Ollama,
@@ -4646,7 +4681,7 @@ mod tests {
                 BackendConfig {
                     name: "gnuc".into(),
                     endpoint: "http://gnuc:11434".into(),
-                    model: "qwen2.5-coder:14b".into(),
+                    model: Some("qwen2.5-coder:14b".into()),
                     model_path: None,
                     tiers: vec![],
                     kind: BackendKind::Ollama,
@@ -4663,7 +4698,7 @@ mod tests {
         assert_eq!(cfg.backends.len(), 2, "only the valid .toml loads, no dup");
         let dgx1 = cfg.backends.iter().find(|b| b.name == "dgx1").unwrap();
         assert_eq!(dgx1.endpoint, "http://REDACTED-HOST:11434", "disk wins");
-        assert_eq!(dgx1.model, "qwen3:30b");
+        assert_eq!(dgx1.effective_model(), Some("qwen3:30b"));
         assert_eq!(dgx1.kind, BackendKind::Ollama, "kind defaults to ollama");
         assert!(cfg.backends.iter().any(|b| b.name == "gnuc"), "gnuc kept");
     }
@@ -5043,7 +5078,7 @@ default_tier_order = ["FAST", "STANDARD", "COMPLEX", "REVIEW"]
         let cfg = Config::load(f.path()).unwrap();
         assert_eq!(cfg.backends.len(), 1);
         assert_eq!(cfg.backends[0].name, "local-ollama");
-        assert_eq!(cfg.backends[0].model, "mistral:7b");
+        assert_eq!(cfg.backends[0].effective_model(), Some("mistral:7b"));
         assert_eq!(cfg.backends[0].tiers, vec![Tier::Fast, Tier::Standard]);
         assert_eq!(cfg.providers.len(), 1);
         assert_eq!(cfg.providers[0].name, "cloud");
@@ -5611,7 +5646,7 @@ net = [\"already.example.com\"]
         BackendConfig {
             name: "remote".into(),
             endpoint: "https://example.test".into(),
-            model: "some-model".into(),
+            model: Some("some-model".into()),
             model_path: None,
             tiers: vec![Tier::Fast],
             kind: BackendKind::Openai,

@@ -410,7 +410,7 @@ fn build_openai_config(
     base.backends = vec![BackendConfig {
         name: name.to_string(),
         endpoint: endpoint.to_string(),
-        model: model.to_string(),
+        model: Some(model.to_string()),
         model_path: None,
         tiers: vec![Tier::Fast, Tier::Standard, Tier::Complex, Tier::Review],
         kind: BackendKind::Openai,
@@ -640,7 +640,7 @@ mod tests {
         let cfg = Config::load(&path).unwrap();
         let b = &cfg.backends[0];
         assert_eq!(b.kind, BackendKind::Openai);
-        assert_eq!(b.model, "meta/llama-3.1-8b-instruct");
+        assert_eq!(b.effective_model(), Some("meta/llama-3.1-8b-instruct"));
         assert_eq!(b.endpoint, server.uri());
     }
 
