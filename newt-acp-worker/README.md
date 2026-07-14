@@ -16,7 +16,7 @@ Also exposes diff capture helpers, worker identity/caveat handling, and
 Prometheus metrics.
 
 Part of [Newt-Agent](https://github.com/Gilamonster-Foundation/newt-agent), a
-small, fast, local-first agentic coder.
+free, friendly, local agentic coder.
 
 ## License
 

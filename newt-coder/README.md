@@ -15,7 +15,7 @@ Activated via `NEWT_CODER=1` or the per-session ACP param
 `{ "coder": true }`; the legacy path remains the default.
 
 Part of [Newt-Agent](https://github.com/Gilamonster-Foundation/newt-agent), a
-small, fast, local-first agentic coder.
+free, friendly, local agentic coder.
 
 ## License
 

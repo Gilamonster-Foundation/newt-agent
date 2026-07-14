@@ -12,7 +12,7 @@ A stdio JSON-RPC MCP server exposing the vi-minimal v0 tool surface:
   BackendRegistry; discovers a local Ollama on startup)
 
 Part of [Newt-Agent](https://github.com/Gilamonster-Foundation/newt-agent), a
-small, fast, local-first agentic coder.
+free, friendly, local agentic coder.
 
 ## License
 

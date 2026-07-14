@@ -4,7 +4,7 @@
   <img src="docs/logos/newt-agent-logo_source.png" alt="Newt-Agent logo" width="256" />
 </p>
 
-> Small, fast, local-first agentic coder.
+> Free, friendly, local agentic coder.
 > **vi to Hermes-Agent's emacs.**
 
 A single Rust binary with a sharp, minimal tool set. It runs against your
