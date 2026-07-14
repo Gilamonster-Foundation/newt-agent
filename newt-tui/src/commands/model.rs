@@ -283,6 +283,41 @@ pub(crate) fn dispatch(
                 // it wrote the DGX `active_model`, but a pinned named backend
                 // resolves its OWN static `model`, so the saved value was never
                 // consulted and the switch silently did nothing.
+                // #1122: validate the model is actually SERVED by the active
+                // backend BEFORE applying or persisting. A typo would otherwise
+                // be written to ~/.newt/settings.toml, which silently overrides
+                // config.toml and 404s every future launch. Best-effort: an
+                // unreachable backend (can't list models) is not blocked.
+                let gate_cfg = newt_core::Config::resolve().unwrap_or_default();
+                let gate_choice = resolve_backend_choice(&gate_cfg);
+                let served: Option<Vec<String>> = match gate_choice.kind {
+                    newt_core::BackendKind::Openai => {
+                        fetch_openai_models(&gate_choice.url, gate_choice.api_key.as_deref()).ok()
+                    }
+                    _ => fetch_models_from_url(&gate_choice.url).ok(),
+                };
+                if !model_choice_ok(arg1, served.as_deref()) {
+                    let served = served.unwrap_or_default();
+                    match suggest_model(arg1, &served) {
+                        Some(s) => print_newt(
+                            &format!(
+                                "no model `{arg1}` on {} — did you mean `{s}`? (not applied)",
+                                gate_choice.url
+                            ),
+                            color,
+                            verbose,
+                        ),
+                        None => print_newt(
+                            &format!(
+                                "no model `{arg1}` on {} — run /models to list (not applied)",
+                                gate_choice.url
+                            ),
+                            color,
+                            verbose,
+                        ),
+                    }
+                    return Ok(true);
+                }
                 // SAFETY: single-threaded REPL; the post-command re-resolve reads it.
                 unsafe { std::env::set_var("NEWT_DGX_MODEL", arg1) };
                 // Persist the choice so it sticks across runs (#545): records
@@ -479,4 +514,78 @@ pub(crate) fn dispatch(
         other => unreachable!("commands::model::dispatch routed a non-model command: {other:?}"),
     }
     Ok(true)
+}
+
+/// The #1122 gate: may this model choice be applied/persisted? A `None` served
+/// list means the backend couldn't be listed (unreachable) — allowed
+/// best-effort, since we can't validate an offline endpoint. A `Some` list must
+/// contain the exact name.
+fn model_choice_ok(name: &str, served: Option<&[String]>) -> bool {
+    served.is_none_or(|models| models.iter().any(|m| m == name))
+}
+
+/// Suggest the served model closest to a mistyped name (within a few edits), for
+/// a "did you mean?" hint. `None` when nothing is close enough.
+fn suggest_model(typo: &str, served: &[String]) -> Option<String> {
+    served
+        .iter()
+        .map(|m| (levenshtein(typo, m), m))
+        .filter(|(d, _)| *d >= 1 && *d <= 3)
+        .min_by_key(|(d, _)| *d)
+        .map(|(_, m)| m.clone())
+}
+
+/// Plain Levenshtein edit distance (two-row DP), for the typo suggestion.
+fn levenshtein(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0usize; b.len() + 1];
+    for (i, &ca) in a.iter().enumerate() {
+        cur[0] = i + 1;
+        for (j, &cb) in b.iter().enumerate() {
+            let cost = usize::from(ca != cb);
+            cur[j + 1] = (prev[j + 1] + 1).min(cur[j] + 1).min(prev[j] + cost);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
+}
+
+#[cfg(test)]
+mod validate_tests {
+    use super::{levenshtein, model_choice_ok, suggest_model};
+
+    #[test]
+    fn model_choice_gate() {
+        let served = ["qwen2.5-coder:7b".to_string(), "llama3.1:8b".to_string()];
+        // Served → OK.
+        assert!(model_choice_ok("qwen2.5-coder:7b", Some(&served)));
+        // Regression (#1122): a typo is NOT ok → not applied/persisted.
+        assert!(!model_choice_ok("quen2.5-coder:7b", Some(&served)));
+        // Backend unreachable (None) → allowed best-effort (can't validate).
+        assert!(model_choice_ok("anything", None));
+    }
+
+    #[test]
+    fn suggest_catches_a_small_typo_only() {
+        let served = vec![
+            "qwen2.5-coder:7b".to_string(),
+            "nomic-embed-text:latest".to_string(),
+        ];
+        // The exact bug: `quen` (missing w) → suggests `qwen…`.
+        assert_eq!(
+            suggest_model("quen2.5-coder:7b", &served).as_deref(),
+            Some("qwen2.5-coder:7b")
+        );
+        // Nothing close → no misleading suggestion.
+        assert_eq!(suggest_model("totally-different", &served), None);
+    }
+
+    #[test]
+    fn levenshtein_basics() {
+        assert_eq!(levenshtein("qwen", "quen"), 1);
+        assert_eq!(levenshtein("abc", "abc"), 0);
+        assert_eq!(levenshtein("", "abc"), 3);
+    }
 }
