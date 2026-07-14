@@ -3342,6 +3342,7 @@ fn run_chat(
             &cfg_mcp_servers,
             sanitize_mcp,
             &allow_insecure_hosts,
+            &cap.caveats().net,
         ))
     });
     if !mcp.is_empty() {
