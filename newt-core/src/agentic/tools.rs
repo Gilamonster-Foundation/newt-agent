@@ -2262,6 +2262,20 @@ fn pr_next_step_hint(url: &str) -> String {
 /// allowlist name, same basename rule as the config hint). Any other kind
 /// (e.g. an `open` refused inside the shell) keeps the standard denial:
 /// guessing which fs axis an opaque `open` maps to would over-grant.
+/// #1150: a STRUCTURAL refusal is a can't, not a may-not — the confined shell
+/// engine cannot interpret the construct (`$(...)`, backgrounding `&`, heredocs,
+/// fd duplication), so NO grant unlocks it. Offering "allow once / session /
+/// always" for one is a grant→denial contradiction that destroys trust in the
+/// whole permission loop (the operator grants, the engine denies anyway). We
+/// detect it by the stable markers agent-bridle's `Refusal::Display` emits, so
+/// these fall through to the plain denial (which already names the --yolo
+/// escape) with no grant menu.
+fn is_structural_refusal(reason: &str) -> bool {
+    reason.contains("refused by design:")
+        || reason.contains("dynamic construct the confined shell")
+        || reason.contains("not yet supported by the confined shell")
+}
+
 fn exec_denial_requests(envelope: &serde_json::Value) -> Option<Vec<PermissionRequest>> {
     let denials = envelope.get("denials")?.as_array()?;
     if denials.is_empty() {
@@ -2270,6 +2284,14 @@ fn exec_denial_requests(envelope: &serde_json::Value) -> Option<Vec<PermissionRe
     let mut requests = Vec::with_capacity(denials.len());
     for d in denials {
         if d.get("kind")?.as_str()? != "exec" {
+            return None;
+        }
+        // A structural refusal anywhere in the batch: grants are meaningless,
+        // so surface the plain denial for the whole call (#1150).
+        if d.get("reason")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(is_structural_refusal)
+        {
             return None;
         }
         let target = d.get("target")?.as_str().filter(|t| !t.is_empty())?;
@@ -4962,6 +4984,40 @@ mod tests {
             "denials": [{"kind": "exec", "reason": "r"}]
         });
         assert!(exec_denial_requests(&no_target).is_none());
+
+        // #1150: a STRUCTURAL refusal must NOT be promptable — offering a grant
+        // for `$(` (which the engine cannot interpret) is a grant->denial
+        // contradiction. The exact reason strings are agent-bridle's
+        // Refusal::Display output (verified against parse.rs).
+        let dynamic = serde_json::json!({
+            "denied": true,
+            "denials": [{
+                "kind": "exec",
+                "target": "command/arithmetic substitution `$(`",
+                "reason": "refused by design: command/arithmetic substitution `$(` is a \
+                           dynamic construct the confined shell does not interpret (use the \
+                           embedder's unbridled/--yolo path for a full shell)"
+            }]
+        });
+        assert!(
+            exec_denial_requests(&dynamic).is_none(),
+            "structural refusal must not offer a grant menu (#1150)"
+        );
+        let unsupported = serde_json::json!({
+            "denials": [{
+                "kind": "exec",
+                "target": "heredoc/herestring `<<`",
+                "reason": "not yet supported by the confined shell engine: \
+                           heredoc/herestring `<<` (tracked on agent-bridle#34)"
+            }]
+        });
+        assert!(exec_denial_requests(&unsupported).is_none());
+        // A genuine authority denial (not structural) STAYS promptable.
+        let authority = serde_json::json!({
+            "denials": [{"kind": "exec", "target": "cargo",
+                         "reason": "exec of \"cargo\" is not within the granted authority"}]
+        });
+        assert!(exec_denial_requests(&authority).is_some());
     }
 
     /// #905: a NET denial envelope (agent-bridle #196 shape) lifts to a per-host
