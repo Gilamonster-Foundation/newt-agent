@@ -2083,9 +2083,12 @@ mod permission_prompt_tests {
             "end must not headline the new conversation: {end}"
         );
         assert!(close_out_message("restart", "NEW", true).contains("/resume to reopen"));
-        // Nothing persisted (empty conversation or ephemeral session): no resume
-        // promise for ANY verb — just the plain new-conversation line.
+        // Nothing persisted (empty conversation or ephemeral session): no
+        // resume promise — the plain new-conversation line for start/new/
+        // restart, but /end STILL leads with the ending (#1170 UAT gap).
         assert_eq!(close_out_message("start", "NEW", false), "NEW");
-        assert_eq!(close_out_message("end", "NEW", false), "NEW");
+        let end_empty = close_out_message("end", "NEW", false);
+        assert!(end_empty.starts_with("Conversation ended"), "{end_empty}");
+        assert!(!end_empty.contains("/resume"), "nothing to reopen: {end_empty}");
     }
 }
