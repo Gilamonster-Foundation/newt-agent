@@ -204,7 +204,8 @@ pub fn tool_definitions() -> serde_json::Value {
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "command": { "type": "string", "description": "The shell command to run" }
+                        "command": { "type": "string", "description": "The shell command to run" },
+                        "cwd": { "type": "string", "description": "Optional working directory for this command, relative to the workspace root (e.g. \"crates/foo\") or an absolute path inside it. Confined to the workspace. Prefer this over `cd` (which the confined shell rejects)." }
                     },
                     "required": ["command"]
                 }
@@ -1326,10 +1327,25 @@ fn shell_env_passthrough() -> Vec<String> {
 /// compound command (the #783 root cause); the env seam sets `VIRTUAL_ENV` /
 /// `PATH` on the spawned child instead. The host-bypass (`--yolo`) path keeps
 /// the prefix form because it runs on a real `/bin/sh` where `export` works.
-fn confined_dispatch_args(cmd: &str, workspace: &str) -> serde_json::Value {
+/// Resolve an optional model-supplied `cwd` (#1159) against the workspace: a
+/// relative dir joins under the workspace root; an absolute one is taken as-is
+/// (the confined shell's fs fence rejects any path that escapes the workspace,
+/// so this never widens reach). `None` runs at the workspace root, as before.
+fn resolve_exec_cwd(workspace: &str, cwd: Option<&str>) -> String {
+    match cwd.map(str::trim).filter(|c| !c.is_empty()) {
+        None => workspace.to_string(),
+        Some(c) if std::path::Path::new(c).is_absolute() => c.to_string(),
+        Some(c) => std::path::Path::new(workspace)
+            .join(c)
+            .to_string_lossy()
+            .into_owned(),
+    }
+}
+
+fn confined_dispatch_args(cmd: &str, cwd: &str) -> serde_json::Value {
     serde_json::json!({
         "cmd": cmd,
-        "cwd": workspace,
+        "cwd": cwd,
         "env": venv_env_map(),
     })
 }
@@ -1528,7 +1544,9 @@ fn exec_floor_permits(floor: Option<&crate::caveats::Scope<String>>, cmd: &str) 
 #[allow(clippy::too_many_arguments)]
 async fn exec_confined_command(
     cmd: &str,
-    workspace: &str,
+    // The directory the command runs in (#1159): the workspace root for
+    // lifecycle, or a resolved workspace-confined cwd for run_command.
+    cwd: &str,
     color: bool,
     tool_output_lines: usize,
     caveats: &crate::caveats::Caveats,
@@ -1558,7 +1576,7 @@ async fn exec_confined_command(
     // which enforces the already-clamped `caveats`. `None` keeps the bypass
     // bit-for-bit.
     if ocap_disabled() && exec_floor_permits(exec_floor, cmd) {
-        return match host_shell_dispatch(&cmd_with_venv, workspace).await {
+        return match host_shell_dispatch(&cmd_with_venv, cwd).await {
             Ok(envelope) => shell_envelope_output(
                 &envelope,
                 tool_output_lines,
@@ -1572,7 +1590,7 @@ async fn exec_confined_command(
 
     // #783: RAW cmd + venv via the env seam — never the `export …;` prefix,
     // which the confined safe-subset engine refuses.
-    let dispatch_args = confined_dispatch_args(cmd, workspace);
+    let dispatch_args = confined_dispatch_args(cmd, cwd);
     match bridle_registry()
         .dispatch("shell", dispatch_args.clone(), caveats)
         .await
@@ -3216,9 +3234,10 @@ pub async fn execute_tool_with_offload(
             // (free-form `cmd` mode) under the SAME Caveats the TUI resolved from
             // `[tui].permissions`. The confined-exec core is shared with the
             // `lifecycle` arm (#891) so both honor identical exec caveats.
+            let run_cwd = resolve_exec_cwd(workspace, args["cwd"].as_str());
             exec_confined_command(
                 cmd,
-                workspace,
+                &run_cwd,
                 color,
                 tool_output_lines,
                 caveats,
@@ -4687,6 +4706,23 @@ mod tests {
     /// #898/#1022: `run_command_redirect` bounces embedded-tool-served LOCAL git
     /// ops (and other direct tools), but lets git passthrough ops fall through
     /// to the shell — otherwise a model can never `git push` or `git rm`.
+    #[test]
+    fn resolve_exec_cwd_confines_to_workspace() {
+        // #1159: relative cwd joins under the workspace; absolute passes through
+        // (the fs fence rejects escapes); empty/None → workspace root.
+        assert_eq!(resolve_exec_cwd("/ws", None), "/ws");
+        assert_eq!(resolve_exec_cwd("/ws", Some("")), "/ws");
+        assert_eq!(resolve_exec_cwd("/ws", Some("  ")), "/ws");
+        assert_eq!(
+            resolve_exec_cwd("/ws", Some("crates/foo")),
+            "/ws/crates/foo"
+        );
+        assert_eq!(resolve_exec_cwd("/ws", Some("/ws/sub")), "/ws/sub");
+        // The dispatch args carry it verbatim.
+        let a = confined_dispatch_args("ls", "/ws/crates/foo");
+        assert_eq!(a["cwd"], "/ws/crates/foo");
+    }
+
     #[test]
     fn run_command_redirect_lets_git_network_ops_through() {
         // Ops the embedded git tool cannot do faithfully → fall through (None).
