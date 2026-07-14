@@ -199,6 +199,7 @@ fn show_splash_plain(_out: &mut io::Stdout, workspace: &str) -> anyhow::Result<b
     // stdout is a singleton and we already hold raw mode + alt screen.
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
+    let mut polls: u32 = 0;
     let result = loop {
         terminal.draw(|f| {
             let area = f.area();
@@ -241,9 +242,20 @@ fn show_splash_plain(_out: &mut io::Stdout, workspace: &str) -> anyhow::Result<b
         if let Some(cont) = splash_poll_event()? {
             break cont;
         }
+        polls += 1;
+        if polls >= SPLASH_AUTO_CONTINUE_POLLS {
+            // ~3 s with no input: auto-continue instead of hanging (#1127).
+            break true;
+        }
     };
     Ok(result)
 }
+
+/// How many 100 ms polls the splash waits for a key before auto-continuing —
+/// 30 × 100 ms ≈ 3 s (#1127). The splash used to wait FOREVER with no on-screen
+/// hint, so every launch looked hung; now it's a branding beat, not a gate. A
+/// keypress still skips (or quits) immediately.
+const SPLASH_AUTO_CONTINUE_POLLS: u32 = 30;
 
 /// Poll for a splash keypress. Returns `Some(true)` = continue, `Some(false)` = quit, `None` = keep waiting.
 fn splash_poll_event() -> anyhow::Result<Option<bool>> {
@@ -253,13 +265,15 @@ fn splash_poll_event() -> anyhow::Result<Option<bool>> {
     Ok(None)
 }
 
-/// Block until the user presses Enter (true) or a quit key (false).
+/// Wait for the user to press Enter (true) or a quit key (false) — or
+/// auto-continue (true) after [`SPLASH_AUTO_CONTINUE_POLLS`] quiet polls.
 fn splash_wait_for_continue() -> anyhow::Result<bool> {
-    loop {
+    for _ in 0..SPLASH_AUTO_CONTINUE_POLLS {
         if event::poll(std::time::Duration::from_millis(100))? {
             return Ok(splash_key_action(&event::read()?));
         }
     }
+    Ok(true)
 }
 
 /// Map a key event to splash intent: `true` = continue, `false` = quit.
