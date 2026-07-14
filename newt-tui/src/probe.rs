@@ -321,8 +321,28 @@ pub fn apply_observation(
     }
 }
 
-/// The full cache: model name → capability entry.
+/// The full cache: capability key → entry. See [`cap_key`] for the keying
+/// discipline (#1126 Phase B2): per-MODEL for multiplexer backends (today's
+/// bare model name, unchanged), per-BACKEND for instance backends.
 pub type CapabilityCache = HashMap<String, CapabilityEntry>;
+
+/// The capability-cache key for a backend/model pair (#1126 B2).
+///
+/// - **Multiplexer** (ollama; many-model gateways): capabilities are a property
+///   of the MODEL — key by bare model name, exactly today's scheme, so every
+///   existing model-capabilities.json entry keeps working.
+/// - **Instance** (vLLM): the backend serves one model whose behavior can also
+///   depend on the instance's launch flags — capabilities attach to the
+///   BACKEND: key `backend:<name>`. Re-probing after a restart with a new
+///   model naturally overwrites the same key (the old model's entry would be
+///   stale anyway), and two instances serving the same model name don't
+///   collide.
+pub fn cap_key(serving: newt_core::Serving, backend_name: &str, model: &str) -> String {
+    match serving {
+        newt_core::Serving::Multiplexer => model.to_string(),
+        newt_core::Serving::Instance => format!("backend:{backend_name}"),
+    }
+}
 
 /// Metadata about a model from Ollama's `/api/tags`.
 #[derive(Debug, Clone)]
@@ -352,6 +372,37 @@ thread_local! {
 #[cfg(test)]
 pub(crate) fn set_cache_dir_override(dir: Option<PathBuf>) {
     CACHE_DIR_OVERRIDE.with(|c| *c.borrow_mut() = dir);
+}
+
+#[cfg(test)]
+mod cap_key_tests {
+    use super::cap_key;
+    use newt_core::Serving;
+
+    #[test]
+    fn multiplexer_keys_by_bare_model_name_backwards_compatible() {
+        // Every existing model-capabilities.json entry keeps working: the
+        // multiplexer key IS the model name, byte-for-byte.
+        assert_eq!(
+            cap_key(Serving::Multiplexer, "gnuc-ollama", "qwen2.5-coder:7b"),
+            "qwen2.5-coder:7b"
+        );
+    }
+
+    #[test]
+    fn instance_keys_by_backend_so_restarts_overwrite_and_twins_dont_collide() {
+        // Capabilities attach to the BACKEND for an instance: a vLLM restart
+        // with a new model overwrites the same key (stale-by-definition), and
+        // two instances serving the same model name stay distinct.
+        assert_eq!(
+            cap_key(Serving::Instance, "dgx1-vllm-8000", "ornith-1.0-35b"),
+            "backend:dgx1-vllm-8000"
+        );
+        assert_ne!(
+            cap_key(Serving::Instance, "dgx1-vllm-8000", "m"),
+            cap_key(Serving::Instance, "dgx1-vllm-8001", "m")
+        );
+    }
 }
 
 fn cache_path() -> Option<PathBuf> {
