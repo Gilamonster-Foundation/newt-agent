@@ -2285,6 +2285,36 @@ pub fn shell_env_passthrough_default() -> Vec<String> {
     vec!["HOME".to_string(), "USER".to_string()]
 }
 
+/// The env allow-list for a spawned **stdio MCP subprocess** (newt#1155).
+///
+/// A stdio MCP server was inheriting newt's ENTIRE environment — every API
+/// key and token in the process — making it strictly LESS confined than a
+/// `run_command` (which passes only [`shell_env_passthrough_default`]). This
+/// is the opposite of the OCAP model. The subprocess still needs enough to
+/// *execute* (unlike a shell builtin), so this is a deliberately-wider but
+/// still CLOSED list: the shell defaults plus the vars a child process needs
+/// to find its interpreter/libraries and render output. Server-specific
+/// secrets belong in the entry's own explicit `env` map, overlaid on top —
+/// never leaked by inheritance.
+#[must_use]
+pub fn mcp_stdio_env_passthrough() -> Vec<&'static str> {
+    vec![
+        "HOME",
+        "USER",
+        "PATH",
+        "LANG",
+        "LC_ALL",
+        "TERM",
+        "TMPDIR",
+        "SHELL",
+        // interpreter/runtime discovery a language MCP server commonly needs
+        "PYTHONPATH",
+        "NODE_PATH",
+        "LD_LIBRARY_PATH",
+        "DYLD_LIBRARY_PATH",
+    ]
+}
+
 /// The engine `--full-access` auto-selects when none is set explicitly: `host`
 /// on unix (a real `/bin/sh` in the kernel jail), but **`brush` on Windows** —
 /// host-shell spawns `/bin/sh -c`, which Windows lacks, so the cross-platform
@@ -4880,6 +4910,31 @@ mod tests {
         assert_eq!(derive_serving(BackendKind::Openai, 3), Serving::Multiplexer);
         // The in-process engine runs one GGUF.
         assert_eq!(derive_serving(BackendKind::Embedded, 1), Serving::Instance);
+    }
+
+    #[test]
+    fn mcp_stdio_env_allowlist_excludes_secrets_and_is_closed() {
+        // #1155: the stdio-MCP env allow-list must NOT be a passthrough of the
+        // whole environment — secret-bearing vars are absent, and it stays a
+        // superset of the shell default (a subprocess needs PATH to exec).
+        let allow = mcp_stdio_env_passthrough();
+        for secret in [
+            "OPENAI_API_KEY",
+            "ANTHROPIC_API_KEY",
+            "AWS_SECRET_ACCESS_KEY",
+            "GITHUB_TOKEN",
+            "DGX_API_KEY",
+            "NVIDIA_API_KEY",
+        ] {
+            assert!(!allow.contains(&secret), "{secret} must never be inherited");
+        }
+        assert!(allow.contains(&"PATH"), "a child needs PATH to exec");
+        for base in shell_env_passthrough_default() {
+            assert!(
+                allow.contains(&base.as_str()),
+                "{base} (shell default) should be covered"
+            );
+        }
     }
 
     #[test]

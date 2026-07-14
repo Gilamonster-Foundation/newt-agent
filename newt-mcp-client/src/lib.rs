@@ -193,16 +193,28 @@ pub struct StdioTransport {
 }
 
 impl StdioTransport {
-    /// Spawn a stdio MCP server from a discovered entry. The child inherits the
-    /// parent environment with `entry.env` overlaid; its stderr is discarded so
+    /// Spawn a stdio MCP server from a discovered entry. The child gets a
+    /// CLEARED environment overlaid with a closed allow-list
+    /// ([`newt_core::mcp_stdio_env_passthrough`]) plus the entry's own explicit
+    /// `env` — NEVER newt's full inherited environment (newt#1155: inheriting
+    /// it leaked every API key/token to the subprocess, making a stdio MCP
+    /// server less confined than a shell command). Its stderr is discarded so
     /// server logging cannot corrupt the JSON-RPC stream.
     pub fn spawn(entry: &McpServerEntry) -> Result<Self> {
         let command = entry
             .command
             .as_deref()
             .ok_or_else(|| anyhow!("stdio MCP server `{}` has no command", entry.name))?;
+        // Closed allow-list from the parent env (what a child needs to exec),
+        // then the entry's explicit env on top (where server secrets belong).
+        let allow = newt_core::mcp_stdio_env_passthrough();
+        let inherited = allow.iter().filter_map(|k| {
+            std::env::var_os(k).map(|v| (k.to_string(), v.to_string_lossy().into_owned()))
+        });
         let mut child = Command::new(command)
             .args(&entry.args)
+            .env_clear()
+            .envs(inherited)
             .envs(&entry.env)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -1000,5 +1012,48 @@ mod tests {
             err.to_string().contains("timed out awaiting `tools/list`"),
             "{err}"
         );
+    }
+}
+
+#[cfg(test)]
+mod env_isolation_tests {
+    use super::*;
+    use newt_core::mcp::{McpServerEntry, TransportKind};
+
+    // A real subprocess is the ONLY way to observe env leakage (this is the
+    // security boundary, not mockable logic) — kept out of the mocked unit
+    // tier by #[ignore]; run explicitly / on the integration lane.
+    #[tokio::test]
+    #[ignore = "spawns a real `sh` subprocess (integration tier)"]
+    async fn stdio_spawn_does_not_leak_secret_env() {
+        // A secret in newt's environment must NOT reach the child.
+        std::env::set_var("LEAKY_SECRET_TOKEN", "sk-should-not-appear");
+        let entry = McpServerEntry {
+            name: "envprobe".into(),
+            enabled: true,
+            transport: TransportKind::Stdio,
+            command: Some("sh".into()),
+            args: vec!["-c".into(), "env; sleep 0.1".into()],
+            env: std::collections::BTreeMap::new(),
+            url: None,
+            headers: std::collections::BTreeMap::new(),
+            request_timeout_secs: None,
+        };
+        let mut t = StdioTransport::spawn(&entry).expect("spawn");
+        let mut leaked = false;
+        let mut saw_path = false;
+        while let Ok(Some(line)) = t.stdout.next_line().await {
+            if line.starts_with("LEAKY_SECRET_TOKEN=") {
+                leaked = true;
+            }
+            if line.starts_with("PATH=") {
+                saw_path = true;
+            }
+        }
+        assert!(
+            !leaked,
+            "secret env leaked into the stdio MCP subprocess (#1155)"
+        );
+        assert!(saw_path, "PATH should be passed so the child can exec");
     }
 }
