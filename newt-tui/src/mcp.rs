@@ -67,6 +67,15 @@ fn parse_scheme_host(url: Option<&str>) -> (String, String) {
 }
 
 /// A loopback host — the dev exception that needs no https and emits no warning.
+/// Whether an HTTP MCP server at `host` may be dialed under the session net
+/// scope (#1156). Empty host (no URL) and loopback are always allowed (dev /
+/// no-egress); any other host must be permitted by the net allow-list.
+fn http_egress_permitted(net: &newt_core::caveats::Scope<String>, host: &str) -> bool {
+    host.is_empty()
+        || host_is_loopback(host)
+        || newt_core::caveats::ScopeExt::permits(net, &host.to_string())
+}
+
 fn host_is_loopback(host: &str) -> bool {
     host == "localhost" || host == "::1" || host.starts_with("127.")
 }
@@ -153,6 +162,10 @@ impl Mcp {
         cfg_servers: &[McpServerEntry],
         sanitize_server_names: bool,
         allow_insecure_hosts: &[String],
+        // #1156: the session's net capability — an HTTP MCP server's egress is
+        // gated by the SAME net allow-list as a shell `curl`, so a confined
+        // session can't reach an un-granted host via a rogue MCP config.
+        net: &newt_core::caveats::Scope<String>,
     ) -> Self {
         let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
         let entries = newt_core::mcp::discover(
@@ -173,6 +186,23 @@ impl Mcp {
             let result = match entry.transport {
                 TransportKind::Stdio => connect_stdio(entry).await,
                 TransportKind::Http => {
+                    // #1156: net-gate egress. A loopback host is the dev
+                    // exception (never leaves the box); any other host must be
+                    // permitted by the session net scope or the server is
+                    // skipped (shown in /mcp), never silently dialed.
+                    let (_scheme, host) = parse_scheme_host(entry.url.as_deref());
+                    if !http_egress_permitted(net, &host) {
+                        tracing::warn!(
+                            "MCP server `{}`: egress to {host} is outside the session net \
+                             allow-list — skipped (grant it in [tui.permissions] net)",
+                            entry.name
+                        );
+                        statuses.push((
+                            entry.name.clone(),
+                            McpStatus::Skipped(format!("net not granted: {host}")),
+                        ));
+                        continue;
+                    }
                     let mut enriched = entry.clone();
                     // Load the stored hermes OAuth token only when the operator
                     // hasn't already configured an explicit Authorization header.
@@ -416,6 +446,22 @@ mod tests {
             Some("http://API.MaaS.com/mcp"),
             &allow
         ));
+    }
+
+    #[test]
+    fn http_egress_net_gate() {
+        use newt_core::caveats::Scope;
+        // #1156: loopback + empty always allowed; a remote host needs a grant.
+        let none: Scope<String> = Scope::only::<Vec<String>>(vec![]);
+        assert!(http_egress_permitted(&none, ""));
+        assert!(http_egress_permitted(&none, "127.0.0.1"));
+        assert!(http_egress_permitted(&none, "localhost"));
+        assert!(!http_egress_permitted(&none, "mcp.example.com"));
+        let granted = Scope::only(["mcp.example.com".to_string()]);
+        assert!(http_egress_permitted(&granted, "mcp.example.com"));
+        assert!(!http_egress_permitted(&granted, "evil.example.com"));
+        // Scope::All (unconfined / --full-access) permits any host.
+        assert!(http_egress_permitted(&Scope::All, "anything.example.com"));
     }
 
     #[test]
