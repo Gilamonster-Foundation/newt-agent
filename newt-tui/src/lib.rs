@@ -5850,6 +5850,14 @@ fn adopt_backend_choice(choice: &mut BackendChoice) -> Vec<String> {
                 .filter(|s| !s.is_empty());
             let adoption = backend_probe::adopt(&synth, &Served { models }, requested.as_deref());
             choice.serving = Some(adoption.serving);
+            if adoption.requested_unavailable {
+                // #1122 fail-soft: a restored/typo'd model must not brick the
+                // session — say what happened and what we used instead.
+                lines.push(format!(
+                    "requested model isn't on {} — falling back (was it a typo, or                      removed from the endpoint?); /models to list",
+                    choice.url
+                ));
+            }
             match adoption.model {
                 Some(m) => {
                     if adoption.requested_ignored {
