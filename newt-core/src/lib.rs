@@ -105,8 +105,9 @@ pub use config::{
     ContextFeatures, ContextManager, ConversationsConfig, CrewPolicyConfig, EditMode, FooterMode,
     Loadout, LoadoutSettings, LogConfig, MarkdownMode, MemoryConfig, MemoryDisclosure,
     MemoryProviderKind, OnEmbedFailure, OpenAiApi, PermissionPreset, PickVia, PlanConfig,
-    PlanPruneConfig, ProfilePick, ProviderConfig, ScratchConfig, SemanticConfig, ShellConfig,
-    ShellEngine, SkillsConfig, SummarizerConfig, ThinkingMode, ToolPermissions, TuiConfig,
+    PlanPruneConfig, ProfilePick, ProviderConfig, ScratchConfig, SemanticConfig, Serving,
+    ShellConfig, ShellEngine, SkillsConfig, SummarizerConfig, ThinkingMode, ToolPermissions,
+    TuiConfig,
 };
 pub use conversation::{
     new_conversation_id, session_plan_dir, session_plan_path, ConversationRecord,
