@@ -1,4 +1,4 @@
-//! `/prompt` · `/vi` · `/emacs` · `/nano` · `/edit-mode` · `/thinking` — the
+//! `/prompt` · `/vi` · `/emacs` · `/nano` · `/edit-mode` · `/thinking` · `/nudge` — the
 //! session-setting commands, each of which sets an `NEWT_*` env var that a
 //! later step in `run_chat` picks up. Moved verbatim from the `dispatch_slash`
 //! match in `lib.rs`.
@@ -114,6 +114,36 @@ pub(crate) fn dispatch(
                 ),
             }
         }
+
+        "nudge" => match arg1 {
+            "off" => {
+                // SAFETY: single-threaded REPL; next turn's ChatCtx reads it.
+                unsafe { std::env::set_var("NEWT_NUDGE", "off") };
+                print_newt(
+                    "action-pressure nudges OFF for this session (narration rescue, \
+                     workflow repair steering, plan pushes) — factual corrections stay on",
+                    color,
+                    verbose,
+                );
+            }
+            "on" => {
+                // SAFETY: single-threaded REPL.
+                unsafe { std::env::remove_var("NEWT_NUDGE") };
+                print_newt("action-pressure nudges ON (default)", color, verbose);
+            }
+            "" | "status" => {
+                let off = std::env::var("NEWT_NUDGE").is_ok_and(|v| v.eq_ignore_ascii_case("off"));
+                print_newt(
+                    &format!(
+                        "action-pressure nudges: {}  (/nudge <on|off>)",
+                        if off { "OFF" } else { "on" }
+                    ),
+                    color,
+                    verbose,
+                );
+            }
+            _ => print_newt("usage: /nudge <on|off|status>", color, verbose),
+        },
 
         "thinking" => match arg1 {
             "on" | "off" => {
