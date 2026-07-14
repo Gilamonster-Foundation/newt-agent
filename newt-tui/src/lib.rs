@@ -5696,38 +5696,19 @@ fn run_chat(
     Ok(())
 }
 
-/// Resolve Ollama URL + model from env vars then config.
-/// Priority: NEWT_DGX_OLLAMA_URL > NEWT_DGX_HOST synthesis > DGX config node > localhost.
-fn resolve_backend_config(cfg: &newt_core::Config) -> (String, String) {
-    let url = std::env::var("NEWT_DGX_OLLAMA_URL")
-        .ok()
-        .or_else(|| {
-            std::env::var("NEWT_DGX_HOST").ok().map(|h| {
-                let scheme = std::env::var("NEWT_DGX_SCHEME").unwrap_or_else(|_| "http".into());
-                let port = std::env::var("NEWT_DGX_OLLAMA_PORT").unwrap_or_else(|_| "11434".into());
-                format!("{scheme}://{h}:{port}")
-            })
-        })
-        .or_else(|| {
-            cfg.dgx
-                .as_ref()
-                .and_then(|d| d.nodes.first())
-                .and_then(|n| n.ollama.clone())
-        })
-        .unwrap_or_else(|| "http://localhost:11434".into());
-
-    let model = std::env::var("NEWT_DGX_MODEL")
-        .ok()
-        .or_else(|| cfg.dgx.as_ref().and_then(|d| d.active_model.clone()))
-        .unwrap_or_else(|| "llama3.1:8b".into());
-
-    (url, model)
-}
-
 /// The inference backend the TUI session should talk to: endpoint, model,
 /// wire protocol, and (for authenticated OpenAI-compatible endpoints) the
 /// resolved bearer token.
 pub(crate) struct BackendChoice {
+    /// The configured backend's name ("" for env-synthesized/legacy choices) —
+    /// feeds cap_key (instance keying) and honest status lines. Read from C1b
+    /// (session-start adopt) onward.
+    #[allow(dead_code)]
+    pub(crate) name: String,
+    /// Declared serving axis when the backend file pins one; None = derive at
+    /// probe/adopt time. Read from C1b onward.
+    #[allow(dead_code)]
+    pub(crate) serving: Option<newt_core::Serving>,
     pub(crate) url: String,
     pub(crate) model: String,
     pub(crate) kind: newt_core::BackendKind,
@@ -5774,26 +5755,18 @@ fn resolve_embeddings_target(
     }
 }
 
-/// Whether to use the OpenAI backend, given a `NEWT_BACKEND` override and
-/// whether an OpenAI backend is configured. `openai`/`ollama` force the choice;
-/// otherwise the historical default (prefer OpenAI if present). Pure for testing.
-fn prefer_openai(force_backend: Option<&str>, has_openai: bool) -> bool {
-    match force_backend {
-        Some("openai") => true,
-        Some("ollama") => false,
-        _ => has_openai,
-    }
-}
-
 /// Resolve the backend for the TUI. Precedence (unifies the loadout provider
 /// axis with the `/backend` live toggle):
 ///
 /// 1. **`NEWT_PROVIDER`** names a `[backends]` entry — the loadout's `provider`
 ///    axis (Slice 2). The named backend supplies endpoint/kind/auth; `NEWT_DGX_MODEL`
 ///    (the loadout's `model`) overrides the backend's default model when set.
-/// 2. **`NEWT_BACKEND`** (set by `/backend`) forces the openai-vs-ollama *kind*;
-///    absent, the historical default prefers a configured OpenAI backend.
-/// 3. Otherwise the historical Ollama/DGX resolution ([`resolve_backend_config`]).
+/// 2. Legacy env shim: `NEWT_DGX_OLLAMA_URL`/`NEWT_DGX_HOST` synthesize an
+///    ollama endpoint (one release, #1126).
+/// 3. **`default_backend`** (#1130) names the configured start backend.
+/// 4. **`NEWT_BACKEND`** (set by `/backend`) forces the openai-vs-ollama *kind*.
+/// 5. A sole backend; then the legacy `[dgx]` node shim; then prefer-openai
+///    among several; then the localhost fallback.
 ///
 /// `NEWT_PROVIDER` is the most specific (a named entry); `NEWT_BACKEND` is the
 /// coarse kind toggle `/backend` uses. A loadout-sourced provider is hard-error-
@@ -5845,63 +5818,113 @@ pub(crate) fn backends_list_items(
 }
 
 pub(crate) fn resolve_backend_choice(cfg: &newt_core::Config) -> BackendChoice {
+    let session_model = || {
+        std::env::var("NEWT_DGX_MODEL")
+            .ok()
+            .filter(|s| !s.is_empty())
+    };
+    let from_backend = |b: &newt_core::BackendConfig| BackendChoice {
+        name: b.name.clone(),
+        serving: b.serving,
+        url: b.endpoint.clone(),
+        // Session override > declared model > empty-until-adopted (#1126: the
+        // server dictates; adopt() fills an empty model at session start).
+        model: session_model()
+            .or_else(|| b.effective_model().map(str::to_string))
+            .unwrap_or_default(),
+        kind: b.kind,
+        api_key: b.resolve_api_key(),
+        api: b.api,
+    };
     // 1. A pinned provider (loadout `provider` axis → NEWT_PROVIDER) selects a
-    //    named [backends] entry by name, regardless of its wire protocol.
+    //    named backend, regardless of wire protocol. Unknown name falls through
+    //    (the loadout path validates before setting the env var).
     if let Some(name) = std::env::var("NEWT_PROVIDER")
         .ok()
         .filter(|s| !s.is_empty())
     {
         if let Some(b) = cfg.backends.iter().find(|b| b.name == name) {
-            let model = std::env::var("NEWT_DGX_MODEL")
-                .ok()
-                .filter(|s| !s.is_empty())
-                .or_else(|| b.effective_model().map(str::to_string))
-                .unwrap_or_default();
-            return BackendChoice {
-                url: b.endpoint.clone(),
-                model,
-                kind: b.kind,
-                api_key: b.resolve_api_key(),
-                api: b.api,
-            };
+            return from_backend(b);
         }
-        // Unknown provider name: fall through. The loadout path validates the
-        // name before we get here, so this only happens for a hand-set env var.
     }
-    // 2. NEWT_BACKEND forces the openai-vs-ollama kind; else prefer openai if present.
-    let force = std::env::var("NEWT_BACKEND").ok();
-    let has_openai = cfg
+    // 2. Legacy env shim (one release, #1126): explicit NEWT_DGX_OLLAMA_URL /
+    //    NEWT_DGX_HOST synthesize an ollama endpoint, exactly as before.
+    let env_url = std::env::var("NEWT_DGX_OLLAMA_URL").ok().or_else(|| {
+        std::env::var("NEWT_DGX_HOST").ok().map(|h| {
+            let scheme = std::env::var("NEWT_DGX_SCHEME").unwrap_or_else(|_| "http".into());
+            let port = std::env::var("NEWT_DGX_OLLAMA_PORT").unwrap_or_else(|_| "11434".into());
+            format!("{scheme}://{h}:{port}")
+        })
+    });
+    if let Some(url) = env_url {
+        return BackendChoice {
+            name: String::new(),
+            serving: None,
+            url,
+            model: session_model().unwrap_or_else(|| "llama3.1:8b".into()),
+            kind: newt_core::BackendKind::Ollama,
+            api_key: None,
+            api: newt_core::OpenAiApi::default(),
+        };
+    }
+    // 3. The configured default (#1130): a named pointer beats every heuristic.
+    if let Some(name) = cfg.default_backend.as_deref() {
+        if let Some(b) = cfg.backends.iter().find(|b| b.name == name) {
+            return from_backend(b);
+        }
+    }
+    // 4. NEWT_BACKEND forces the wire kind (`/backend openai|ollama`).
+    if let Some(force) = std::env::var("NEWT_BACKEND").ok().filter(|s| !s.is_empty()) {
+        let want = if force.eq_ignore_ascii_case("openai") {
+            newt_core::BackendKind::Openai
+        } else {
+            newt_core::BackendKind::Ollama
+        };
+        if let Some(b) = cfg.backends.iter().find(|b| b.kind == want) {
+            return from_backend(b);
+        }
+    }
+    // 5. A sole backend is the obvious choice.
+    if cfg.backends.len() == 1 {
+        return from_backend(&cfg.backends[0]);
+    }
+    // 6. Legacy [dgx] node (one-release shim): configs written by the old
+    //    wizard resolve their dgx endpoint + active_model as before.
+    if let Some((url, model)) = cfg.dgx.as_ref().and_then(|d| {
+        d.nodes.first().and_then(|n| n.ollama.clone()).map(|url| {
+            let model = session_model()
+                .or_else(|| d.active_model.clone())
+                .unwrap_or_else(|| "llama3.1:8b".into());
+            (url, model)
+        })
+    }) {
+        return BackendChoice {
+            name: String::new(),
+            serving: None,
+            url,
+            model,
+            kind: newt_core::BackendKind::Ollama,
+            api_key: None,
+            api: newt_core::OpenAiApi::default(),
+        };
+    }
+    // 7. Multiple backends, nothing pinned: prefer an OpenAI-compatible entry
+    //    (today's heuristic), else the first.
+    if let Some(b) = cfg
         .backends
         .iter()
-        .any(|b| b.kind == newt_core::BackendKind::Openai);
-    if prefer_openai(force.as_deref(), has_openai) {
-        if let Some(b) = cfg
-            .backends
-            .iter()
-            .find(|b| b.kind == newt_core::BackendKind::Openai)
-        {
-            // Honor the session model override (`/model <name>` → NEWT_DGX_MODEL)
-            // here too, so switching the model works when an OpenAI backend is
-            // active — not just on the pinned-provider and historical paths.
-            let model = std::env::var("NEWT_DGX_MODEL")
-                .ok()
-                .filter(|s| !s.is_empty())
-                .or_else(|| b.effective_model().map(str::to_string))
-                .unwrap_or_default();
-            return BackendChoice {
-                url: b.endpoint.clone(),
-                model,
-                kind: newt_core::BackendKind::Openai,
-                api_key: b.resolve_api_key(),
-                api: b.api,
-            };
-        }
+        .find(|b| b.kind == newt_core::BackendKind::Openai)
+        .or_else(|| cfg.backends.first())
+    {
+        return from_backend(b);
     }
-    // 3. Historical Ollama/DGX resolution.
-    let (url, model) = resolve_backend_config(cfg);
+    // 8. Bare fallback: localhost ollama (Config::resolve normally restores
+    //    this backend already; this is the belt-and-braces path).
     BackendChoice {
-        url,
-        model,
+        name: String::new(),
+        serving: None,
+        url: "http://localhost:11434".into(),
+        model: session_model().unwrap_or_else(|| "llama3.1:8b".into()),
         kind: newt_core::BackendKind::Ollama,
         api_key: None,
         api: newt_core::OpenAiApi::default(),
@@ -16028,15 +16051,46 @@ mod helper_fn_tests {
     }
 
     #[test]
-    fn prefer_openai_honors_the_backend_override() {
-        // Forced choices win regardless of what's configured.
-        assert!(prefer_openai(Some("openai"), false));
-        assert!(!prefer_openai(Some("ollama"), true));
-        // No override → historical default (prefer OpenAI iff one is configured).
-        assert!(prefer_openai(None, true));
-        assert!(!prefer_openai(None, false));
-        // An unknown value falls back to the default too.
-        assert!(prefer_openai(Some("weird"), true));
+    fn resolver_default_backend_beats_the_openai_heuristic() {
+        // #1139 (C1): with several backends and a default_backend pointer, the
+        // pointer wins; without it, the historical prefer-openai heuristic
+        // applies; a sole backend is always chosen.
+        let ollama = newt_core::BackendConfig {
+            name: "gnuc".into(),
+            endpoint: "http://gnuc:11434".into(),
+            model: Some("m1".into()),
+            kind: newt_core::BackendKind::Ollama,
+            ..Default::default()
+        };
+        let vllm = newt_core::BackendConfig {
+            name: "dgx1-8000".into(),
+            endpoint: "http://dgx1:8000".into(),
+            kind: newt_core::BackendKind::Openai,
+            serving: Some(newt_core::Serving::Instance),
+            ..Default::default()
+        };
+        let mut cfg = newt_core::Config {
+            backends: vec![ollama.clone(), vllm.clone()],
+            ..Default::default()
+        };
+        // No default → prefer-openai heuristic picks the vllm entry; its
+        // model is EMPTY (server dictates; adopt() fills it), and name/serving
+        // ride along for the adopt wiring.
+        let c = resolve_backend_choice(&cfg);
+        assert_eq!(c.name, "dgx1-8000");
+        assert_eq!(c.model, "", "unset model stays empty until adopted");
+        assert_eq!(c.serving, Some(newt_core::Serving::Instance));
+        // default_backend pointer beats the heuristic.
+        cfg.default_backend = Some("gnuc".into());
+        let c = resolve_backend_choice(&cfg);
+        assert_eq!(c.name, "gnuc");
+        assert_eq!(c.model, "m1");
+        // Sole backend is the obvious choice.
+        let solo = newt_core::Config {
+            backends: vec![ollama],
+            ..Default::default()
+        };
+        assert_eq!(resolve_backend_choice(&solo).name, "gnuc");
     }
 
     #[test]
@@ -16884,9 +16938,10 @@ mod env_resolution_tests {
             ],
             DGX_VARS,
             || {
-                let (url, model) = resolve_backend_config(&newt_core::Config::default());
-                assert_eq!(url, "http://envhost:1234");
-                assert_eq!(model, "env-model:7b");
+                let choice = resolve_backend_choice(&newt_core::Config::default());
+                assert_eq!(choice.url, "http://envhost:1234");
+                assert_eq!(choice.model, "env-model:7b");
+                assert_eq!(choice.kind, newt_core::BackendKind::Ollama);
             },
         );
     }
@@ -16910,20 +16965,20 @@ mod env_resolution_tests {
             ],
             DGX_VARS,
             || {
-                let (url, _) = resolve_backend_config(&newt_core::Config::default());
+                let choice = resolve_backend_choice(&newt_core::Config::default());
                 if !host_still("dgx1.lab") {
                     return; // raced with the wizard env test
                 }
-                assert_eq!(url, "https://dgx1.lab:8443");
+                assert_eq!(choice.url, "https://dgx1.lab:8443");
             },
         );
         // Host alone uses http + 11434 defaults.
         with_env_vars(&[("NEWT_DGX_HOST", "dgx2")], DGX_VARS, || {
-            let (url, _) = resolve_backend_config(&newt_core::Config::default());
+            let choice = resolve_backend_choice(&newt_core::Config::default());
             if !host_still("dgx2") {
                 return; // raced with the wizard env test
             }
-            assert_eq!(url, "http://dgx2:11434");
+            assert_eq!(choice.url, "http://dgx2:11434");
         });
     }
 
@@ -16942,17 +16997,29 @@ mod env_resolution_tests {
             ..Default::default()
         };
         with_env_vars(&[], DGX_VARS, || {
-            let (url, model) = resolve_backend_config(&cfg);
-
-            // No env, no config → documented localhost defaults, and the
-            // backend choice wrapper reports the Ollama wire protocol.
-            let choice = resolve_backend_choice(&newt_core::Config::default());
-
             if std::env::var("NEWT_DGX_HOST").is_ok() {
                 return; // raced with the wizard env test (see host_still)
             }
-            assert_eq!(url, "http://cfg-node:11434");
-            assert_eq!(model, "cfg-model:8b");
+            // Legacy [dgx] shim (one release, #1126): a config whose ONLY
+            // extra backend knowledge is the [dgx] block... but note the
+            // default Config carries the localhost fallback backend, which as
+            // a SOLE backend now outranks the [dgx] shim — the [dgx] path is
+            // reached when several backends exist without a default. Pin the
+            // shim directly: no backends at all.
+            let bare = newt_core::Config {
+                backends: vec![],
+                ..cfg.clone()
+            };
+            let choice = resolve_backend_choice(&bare);
+            assert_eq!(choice.url, "http://cfg-node:11434");
+            assert_eq!(choice.model, "cfg-model:8b");
+            // No env, no config → documented localhost defaults.
+            let bare2 = newt_core::Config {
+                backends: vec![],
+                dgx: None,
+                ..Default::default()
+            };
+            let choice = resolve_backend_choice(&bare2);
             assert_eq!(choice.url, "http://localhost:11434");
             assert_eq!(choice.model, "llama3.1:8b");
             assert_eq!(choice.kind, newt_core::BackendKind::Ollama);
