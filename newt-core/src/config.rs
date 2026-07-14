@@ -3168,6 +3168,25 @@ pub struct ProviderConfig {
 // Default
 // ---------------------------------------------------------------------------
 
+/// Write one backend as a per-file drop-in `<config dir>/backends/<name>.toml`
+/// (#1140, epic #1126) — the shape `merge_backends_from_dir` reads back. The
+/// canonical writer for `newt init` / `newt setup`: one endpoint, one file,
+/// provenance-stamped by the caller. Returns the written path.
+pub fn write_backend_dropin(
+    config_path: &std::path::Path,
+    backend: &BackendConfig,
+) -> std::result::Result<std::path::PathBuf, String> {
+    if backend.name.trim().is_empty() {
+        return Err("backend drop-in needs a name (it becomes the filename)".into());
+    }
+    let dir = config_path.with_file_name("backends");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    let path = dir.join(format!("{}.toml", backend.name));
+    let body = toml::to_string(backend).map_err(|e| format!("serialize backend: {e}"))?;
+    std::fs::write(&path, body).map_err(|e| format!("write {}: {e}", path.display()))?;
+    Ok(path)
+}
+
 /// The last-resort localhost Ollama backend: used both as `Config::default()`'s
 /// sole backend (no config file at all) and as the [`Config::resolve`] fallback
 /// when neither inline `[[backends]]` nor per-file drop-ins supply any, so a
