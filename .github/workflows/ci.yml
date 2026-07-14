@@ -99,6 +99,20 @@ jobs:
     name: Workspace coverage (cargo-llvm-cov)
     runs-on: ubuntu-latest
     steps:
+      # The instrumented `--workspace` coverage build (candle / pyo3 /
+      # tokenizers + roughly-doubled instrumented artifacts) can exceed the
+      # runner's default free space -> "No space left on device" -> the linker
+      # dies with a Bus error and the job fails with a misleading exit 101.
+      # Reclaim ~20 GB of preinstalled tooling this job never uses. Runner
+      # provisioning only -- NOT a test-scope change, so `just cov-ci` is
+      # unaffected (PIPELINE PARITY: N/A, no local-hook mirror needed).
+      - name: Free up disk space (instrumented coverage build is disk-heavy)
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+            /usr/local/.ghcup /usr/local/share/boost /usr/share/swift \
+            /opt/hostedtoolcache/CodeQL "${AGENT_TOOLSDIRECTORY:-}" || true
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          df -h /
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
