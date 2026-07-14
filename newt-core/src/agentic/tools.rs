@@ -2047,16 +2047,24 @@ fn exec_allowlist_name(target: &str) -> &str {
 /// call is STILL denied; only the coaching is added. In a headless flow with no
 /// operator, `request_permissions` answers "no operator available", which is
 /// itself a recoverable signal (switch strategy) rather than a config edit.
-const DENIAL_RECOVERY_HINT: &str =
-    "This is outside your granted authority — call request_permissions with the \
-     capability, a target, and a reason to ask the operator to grant it, or take \
-     a different approach that stays within your current authority.";
+/// #1160: the copy-pasteable recovery hint — when the denial site KNOWS the axis and
+/// target, the hint names the exact recovery call instead of describing it.
+/// The model shouldn't have to infer parameters the harness already holds
+/// (headless there is no operator to guess-and-check against).
+fn denial_recovery_hint(capability: &str, target: &str) -> String {
+    format!(
+        "This is outside your granted authority — to ask the operator, call \
+         request_permissions(capability=\"{capability}\", target=\"{target}\", \
+         reason=\"<why you need it>\"), or take a different approach that stays \
+         within your current authority."
+    )
+}
 
 /// #479 (G4): the model-facing recovery coach when `crew`/`compose_roster` is
 /// reached while the crew/team surface is OFF — the DEFAULT, since the runner is
 /// only built when the operator sets `NEWT_TEAM`. Replaces the flat
 /// `unknown tool: … (no crew surface …)` dead-end (which left the model nowhere
-/// to go) with a model-actionable message in the #721 [`DENIAL_RECOVERY_HINT`]
+/// to go) with a model-actionable message in the #721 [`denial_recovery_hint`]
 /// style: it names the operator gesture that enables the surface (`NEWT_TEAM`)
 /// AND a real solo alternative (the always-available file/exec tools), so the
 /// reach is recoverable instead of a wall. The OCAP presence-gate is unchanged —
@@ -2076,11 +2084,14 @@ fn crew_off_recovery_result(name: &str) -> String {
 
 /// #721: the model-facing capability-denial message for an fs tool — the base
 /// "{kind} does not permit '{path}'" line plus the recoverable, model-actionable
-/// [`DENIAL_RECOVERY_HINT`]. One factored message + regression point shared by
+/// [`denial_recovery_hint`]. One factored message + regression point shared by
 /// every fs denial (read_file / write_file / edit_file / delete_file / list_dir /
 /// find), so the recoverable wording can never drift between them.
 fn denied_fs_result(kind: &str, path: &str) -> String {
-    format!("capability denied: {kind} does not permit '{path}'. {DENIAL_RECOVERY_HINT}")
+    format!(
+        "capability denied: {kind} does not permit '{path}'. {}",
+        denial_recovery_hint(kind, path)
+    )
 }
 
 /// The standard `run_command` capability-denial result, composed EXACTLY ONCE:
@@ -2099,7 +2110,7 @@ fn denied_fs_result(kind: &str, path: &str) -> String {
 ///    uses via [`denied_fs_result`]).
 /// 2. The stale `extra_exec` config hint is gone from the model-facing message.
 ///    #721 superseded "edit your `[tui.permissions]` config" with the
-///    model-actionable [`DENIAL_RECOVERY_HINT`] (`request_permissions`), so the
+///    model-actionable [`denial_recovery_hint`] (`request_permissions`), so the
 ///    model now sees the bare reason once plus that hint — never a config edit
 ///    it cannot perform mid-turn.
 ///
@@ -2114,10 +2125,15 @@ fn denied_run_command_result(envelope: &serde_json::Value, color: bool) -> Strin
         &exec_denial_target_label(envelope),
         color,
     );
-    // Model-facing message: composed exactly once.
+    // Model-facing message: composed exactly once — and it names the exact
+    // recovery call (#1160), since the envelope carries axis + target.
     format!(
-        "capability denied: {}. {DENIAL_RECOVERY_HINT}",
-        envelope_denial_reason(envelope)
+        "capability denied: {}. {}",
+        envelope_denial_reason(envelope),
+        denial_recovery_hint(
+            denial_axis_label(envelope),
+            &exec_denial_target_label(envelope)
+        )
     )
 }
 
@@ -4989,6 +5005,22 @@ mod tests {
 
     /// #905: the human denial NOTICE labels a pure-net refusal `net` (not `exec`),
     /// so it never reads "exec does not permit '<host>'". Exec / mixed stay `exec`.
+    #[test]
+    fn denials_name_the_exact_recovery_call() {
+        // #1160: the model shouldn't infer parameters the harness holds — a
+        // denial carries the copy-pasteable request_permissions(...) call.
+        let fs = denied_fs_result("fs_write", "/etc/hosts");
+        assert!(
+            fs.contains(r#"request_permissions(capability="fs_write", target="/etc/hosts""#),
+            "{fs}"
+        );
+        let hint = denial_recovery_hint("exec", "cargo");
+        assert!(
+            hint.contains(r#"capability="exec""#) && hint.contains(r#"target="cargo""#),
+            "{hint}"
+        );
+    }
+
     #[test]
     fn denial_axis_label_is_net_only_for_pure_net() {
         let net = serde_json::json!({"denials": [{"kind": "net", "target": "github.com"}]});
