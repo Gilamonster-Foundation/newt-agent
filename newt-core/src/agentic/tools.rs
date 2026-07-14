@@ -3183,7 +3183,7 @@ pub async fn execute_tool_with_offload(
             // SAFETY: single-threaded session tool dispatch; the TUI reads it
             // between turns (same pattern as NEWT_FULL_ACCESS / NEWT_DISABLE_OCAP).
             unsafe { std::env::set_var("NEWT_PLAN_PHASE", "1") };
-            let out = "entered PLAN MODE (read-only): writes are denied until you call                        exit_plan_mode. Read/search the relevant code, draft the ordered steps                        with update_plan, then exit_plan_mode to execute."
+            let out = "entered PLAN MODE (read-only): writes are denied until you call exit_plan_mode. Read/search the relevant code, draft the ordered steps with update_plan, then exit_plan_mode to execute."
                 .to_string();
             print_tool_output(&out, tool_output_lines, color);
             out
@@ -3192,7 +3192,7 @@ pub async fn execute_tool_with_offload(
             print_tool_call("exit_plan_mode", "", color);
             // SAFETY: as above.
             unsafe { std::env::remove_var("NEWT_PLAN_PHASE") };
-            let out = "exited PLAN MODE: writes re-enabled. Execute your plan step by step,                        marking each done with update_plan as you go."
+            let out = "exited PLAN MODE: writes re-enabled. Execute your plan step by step, marking each done with update_plan as you go."
                 .to_string();
             print_tool_output(&out, tool_output_lines, color);
             out
