@@ -1949,6 +1949,9 @@ pub async fn chat_complete(
                                     color,
                                 );
                             }
+                            // #1158: drop the PRIOR nudge exchange first so
+                            // successive nudges replace rather than pile up.
+                            strip_trailing_nudge_exchange(&mut messages);
                             // Record the model's own narration, then the
                             // corrective, so the next round sees both (mirrors
                             // the has-tools assistant turn).
@@ -3535,6 +3538,32 @@ fn read_only_action_nudge(
 /// message in the list per the memory-manager contract. Defensive fallback:
 /// if the last message somehow isn't a user turn, push a standalone user
 /// message instead (mirrors the read-only-rounds nudge injection).
+/// Make narration nudges EPHEMERAL (#1158): remove the previously-injected
+/// nudge exchange — a trailing `[assistant: narration][user: LOOP_GUIDANCE …]`
+/// pair — before the loop injects the next one. Without this, a narrate →
+/// nudge → narrate → nudge sequence PILES its own dithering into the
+/// transcript, and the accumulated "I said I'd act, I was told to act, I said
+/// I'd act…" residue is exactly what drove the model (Opus 4.8, 2026-07-14)
+/// to defend its idleness ("I'm genuinely finished") and then refuse fresh
+/// prompts. Keeping only the CURRENT correction means the model sees the
+/// steer once, not a wall of its own hesitation. The escalation counter still
+/// climbs, so the escalated wording still fires — only the stale pairs are
+/// dropped. A no-op unless the tail actually is a nudge exchange.
+fn strip_trailing_nudge_exchange(messages: &mut Vec<serde_json::Value>) {
+    let tail_is_nudge = messages.last().is_some_and(|m| {
+        m["role"] == "user"
+            && m["content"]
+                .as_str()
+                .is_some_and(|c| c.starts_with(compress::LOOP_GUIDANCE_PREFIX))
+    });
+    if tail_is_nudge {
+        messages.pop(); // the LOOP_GUIDANCE nudge
+        if messages.last().is_some_and(|m| m["role"] == "assistant") {
+            messages.pop(); // the narration it corrected
+        }
+    }
+}
+
 fn append_nudge_line(messages: &mut Vec<serde_json::Value>, line: &str) {
     match messages.last_mut() {
         Some(last) if last["role"] == "user" => {
@@ -4638,6 +4667,8 @@ pub async fn openai_chat_complete(
                         color,
                     );
                 }
+                // #1158: ephemeral — replace the prior nudge, don't stack.
+                strip_trailing_nudge_exchange(&mut messages);
                 messages.push(serde_json::json!({ "role": "assistant", "content": content }));
                 // First nudge: the (tunable) classifier direction. Later
                 // nudges (cap > 1) escalate — name the active step, demand a
@@ -9136,6 +9167,44 @@ mod http_loop_tests {
         c.narration_nudge_cap = narration_nudge_cap;
         let (reply, _s, _u, _h) = chat_complete(c, &mut NoMcp).await.expect("dispatch");
         (reply, round.load(Ordering::SeqCst))
+    }
+
+    #[test]
+    fn strip_trailing_nudge_keeps_only_the_current_correction() {
+        // #1158: successive nudges must REPLACE, not pile up — otherwise the
+        // model's own accumulated dithering drives the "genuinely finished"
+        // defense loop. After stripping, the tail nudge pair is gone; a
+        // non-nudge tail is untouched.
+        use serde_json::json;
+        let guidance = format!("{} act now", compress::LOOP_GUIDANCE_PREFIX);
+        let mut msgs = vec![
+            json!({"role": "user", "content": "do the thing"}),
+            json!({"role": "assistant", "content": "Let me start."}),
+            json!({"role": "user", "content": guidance.clone()}),
+        ];
+        strip_trailing_nudge_exchange(&mut msgs);
+        assert_eq!(msgs.len(), 1, "the narration + nudge pair is removed");
+        assert_eq!(msgs[0]["content"], "do the thing");
+
+        let mut clean = vec![
+            json!({"role": "user", "content": "do the thing"}),
+            json!({"role": "assistant", "content": "here is the answer"}),
+        ];
+        let before = clean.clone();
+        strip_trailing_nudge_exchange(&mut clean);
+        assert_eq!(clean, before, "a real answer tail is never stripped");
+
+        let mut loop_msgs = vec![json!({"role": "user", "content": "fix it"})];
+        for i in 0..3 {
+            strip_trailing_nudge_exchange(&mut loop_msgs);
+            loop_msgs.push(json!({"role": "assistant", "content": format!("narration {i}")}));
+            loop_msgs.push(json!({"role": "user", "content": guidance.clone()}));
+        }
+        assert_eq!(
+            loop_msgs.len(),
+            3,
+            "user task + exactly one (narration, nudge) pair — not three"
+        );
     }
 
     #[tokio::test]
