@@ -1342,6 +1342,61 @@ fn resolve_exec_cwd(workspace: &str, cwd: Option<&str>) -> String {
     }
 }
 
+/// Split a leading `cd <path> &&` (or `cd <path> ;`) off a `run_command`
+/// string so the `cd` — a shell **builtin**, not an executable — never reaches
+/// the confined exec layer, which would try to `execvp("cd")` and fail (on
+/// macOS: `sandbox-exec: execvp() of 'cd' failed`). The models reliably prefix
+/// `cd <workspace> && <real command>` out of habit; folding the `cd` into the
+/// command's cwd runs the real command where the model meant, and — as a bonus
+/// — the OCAP prompt then names the *real* capability (`git checkout -b …`)
+/// instead of the opaque `cd … && git …`.
+///
+/// Only a SINGLE leading `cd` at the very start is folded (not `cd a && cd b`,
+/// and not a `cd` deeper in a pipeline — those are left for the shell engine).
+/// Folding happens only when the path is followed by a sequential connective
+/// (`&&` / `;`) or end-of-string; an unusual `cd x | y` is left whole.
+/// Returns `(cd_path, remainder)`; `remainder` is empty for a bare `cd <path>`.
+fn split_leading_cd(cmd: &str) -> (Option<String>, String) {
+    let rest = match cmd.trim_start().strip_prefix("cd") {
+        Some(r) if r.starts_with(char::is_whitespace) => r.trim_start(),
+        _ => return (None, cmd.to_string()),
+    };
+    let (path, after) = parse_cd_path(rest);
+    if path.is_empty() {
+        return (None, cmd.to_string());
+    }
+    let after = after.trim_start();
+    let remainder = if let Some(r) = after.strip_prefix("&&") {
+        r.trim_start().to_string()
+    } else if let Some(r) = after.strip_prefix(';') {
+        r.trim_start().to_string()
+    } else if after.is_empty() {
+        String::new()
+    } else {
+        // `cd <path>` followed by something we don't confidently understand
+        // (a pipe, `||`, a redirection) — don't fold; hand the whole string to
+        // the engine.
+        return (None, cmd.to_string());
+    };
+    (Some(path), remainder)
+}
+
+/// Parse the first path token of a `cd` argument: a single/double-quoted string
+/// (returned unquoted) or an unquoted run up to the next whitespace. Returns
+/// `(path, remainder_after_the_token)`.
+fn parse_cd_path(s: &str) -> (String, &str) {
+    let first = s.chars().next();
+    if let Some(q @ ('"' | '\'')) = first {
+        if let Some(end) = s[1..].find(q) {
+            return (s[1..=end].to_string(), &s[end + 2..]);
+        }
+    }
+    match s.find(char::is_whitespace) {
+        Some(i) => (s[..i].to_string(), &s[i..]),
+        None => (s.to_string(), ""),
+    }
+}
+
 fn confined_dispatch_args(cmd: &str, cwd: &str) -> serde_json::Value {
     serde_json::json!({
         "cmd": cmd,
@@ -3294,7 +3349,28 @@ pub async fn execute_tool_with_offload(
         },
 
         "run_command" => {
-            let cmd = args["command"].as_str().unwrap_or("");
+            let raw_cmd = args["command"].as_str().unwrap_or("");
+
+            // Fold a leading `cd <path> &&` into the run cwd so the `cd`
+            // builtin never reaches exec (it isn't an executable — `execvp("cd")`
+            // fails). The remainder runs where the model meant, and the OCAP
+            // prompt names the real capability, not `cd … && …`.
+            let (cd_path, cmd_owned) = split_leading_cd(raw_cmd);
+            let cmd = cmd_owned.as_str();
+
+            // A bare `cd <path>` with nothing after it: directory changes don't
+            // persist between independent commands (#1159 carries cwd per call),
+            // so there is nothing to run. Guide the model to the mechanism that
+            // works instead of failing on an un-exec'able builtin.
+            if cd_path.is_some() && cmd.trim().is_empty() {
+                let path = cd_path.as_deref().unwrap_or("");
+                return format!(
+                    "note: a bare `cd` has no effect — each command runs \
+                     independently, so there is no persistent shell to change. \
+                     Prefix the command instead (`cd {path} && <command>`, which \
+                     newt runs in `{path}`) or pass `cwd`."
+                );
+            }
 
             // Corrective guard: the model tried to call a tool as a shell binary.
             // Return a correction so the model can retry with the right tool call.
@@ -3314,8 +3390,11 @@ pub async fn execute_tool_with_offload(
             // Route the WHOLE command through agent-bridle's confined shell
             // (free-form `cmd` mode) under the SAME Caveats the TUI resolved from
             // `[tui].permissions`. The confined-exec core is shared with the
-            // `lifecycle` arm (#891) so both honor identical exec caveats.
-            let run_cwd = resolve_exec_cwd(workspace, args["cwd"].as_str());
+            // `lifecycle` arm (#891) so both honor identical exec caveats. A
+            // folded leading `cd` becomes the cwd (it wins over an explicit
+            // `cwd` arg — it's the more specific, in-command intent).
+            let run_cwd =
+                resolve_exec_cwd(workspace, cd_path.as_deref().or_else(|| args["cwd"].as_str()));
             exec_confined_command(
                 cmd,
                 &run_cwd,
@@ -4811,6 +4890,54 @@ mod tests {
         // The dispatch args carry it verbatim.
         let a = confined_dispatch_args("ls", &joined);
         assert_eq!(a["cwd"], joined);
+    }
+
+    #[test]
+    fn split_leading_cd_folds_the_habitual_cd_prefix() {
+        // The reported failure: `cd <workspace> && git checkout -b …` tried to
+        // exec the `cd` builtin. Fold it: cwd = the path, run the real command.
+        let (path, rest) = split_leading_cd("cd /ws/newt-agent && git checkout -b x");
+        assert_eq!(path.as_deref(), Some("/ws/newt-agent"));
+        assert_eq!(rest, "git checkout -b x");
+
+        // `;` connective folds the same way.
+        let (path, rest) = split_leading_cd("cd sub ; ls -la");
+        assert_eq!(path.as_deref(), Some("sub"));
+        assert_eq!(rest, "ls -la");
+
+        // A quoted path with spaces is returned unquoted; the remainder is kept.
+        let (path, rest) = split_leading_cd("cd \"/a b/c\" && cargo test");
+        assert_eq!(path.as_deref(), Some("/a b/c"));
+        assert_eq!(rest, "cargo test");
+
+        // Only the FIRST cd is folded — a second cd stays in the remainder for
+        // the shell engine (we don't chase chdir chains).
+        let (path, rest) = split_leading_cd("cd a && cd b && ls");
+        assert_eq!(path.as_deref(), Some("a"));
+        assert_eq!(rest, "cd b && ls");
+
+        // A bare `cd <path>` folds to an empty remainder (the caller turns this
+        // into a guidance note — nothing to exec).
+        let (path, rest) = split_leading_cd("cd /somewhere");
+        assert_eq!(path.as_deref(), Some("/somewhere"));
+        assert!(rest.is_empty());
+    }
+
+    #[test]
+    fn split_leading_cd_leaves_non_cd_and_ambiguous_commands_whole() {
+        // Not a cd at all → unchanged.
+        assert_eq!(split_leading_cd("git status"), (None, "git status".into()));
+        // `cd` as a substring of another word is not a match.
+        assert_eq!(
+            split_leading_cd("cding foo"),
+            (None, "cding foo".into())
+        );
+        // `cd <path>` followed by something other than a sequential connective
+        // (a pipe here) is left whole — we only fold the safe `&&`/`;` shapes.
+        assert_eq!(
+            split_leading_cd("cd x | grep y"),
+            (None, "cd x | grep y".into())
+        );
     }
 
     #[test]
