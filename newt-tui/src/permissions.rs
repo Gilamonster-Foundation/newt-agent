@@ -1186,12 +1186,14 @@ mod permission_prompt_tests {
     /// accumulation loop earns.
     #[test]
     fn durable_ocap_approve_allows_without_prompting_and_grants_authority() {
-        let mut state = PermissionPromptState::default();
         // `git` is not in base exec (only `cargo`) — normally this prompts.
-        state.ocap_policy = ocap(
-            newt_core::ocap_store::Verdict::Approve,
-            "[[exec]]\ntarget = \"git\"\n",
-        );
+        let mut state = PermissionPromptState {
+            ocap_policy: ocap(
+                newt_core::ocap_store::Verdict::Approve,
+                "[[exec]]\ntarget = \"git\"\n",
+            ),
+            ..Default::default()
+        };
         let prompts = Rc::new(Cell::new(0));
         let mut gate = scripted_gate(
             &mut state,
@@ -1222,11 +1224,13 @@ mod permission_prompt_tests {
     /// durable sibling of `[D]eny always`, sourced from `deny.toml`.
     #[test]
     fn durable_ocap_deny_refuses_without_prompting() {
-        let mut state = PermissionPromptState::default();
-        state.ocap_policy = ocap(
-            newt_core::ocap_store::Verdict::Deny,
-            "[[exec]]\ntarget = \"git\"\n",
-        );
+        let mut state = PermissionPromptState {
+            ocap_policy: ocap(
+                newt_core::ocap_store::Verdict::Deny,
+                "[[exec]]\ntarget = \"git\"\n",
+            ),
+            ..Default::default()
+        };
         let prompts = Rc::new(Cell::new(0));
         let mut gate = scripted_gate(
             &mut state,
@@ -1253,11 +1257,13 @@ mod permission_prompt_tests {
     /// this is the belt-and-suspenders enforcement at the gate.
     #[test]
     fn durable_ocap_approve_of_high_danger_still_prompts() {
-        let mut state = PermissionPromptState::default();
-        state.ocap_policy = ocap(
-            newt_core::ocap_store::Verdict::Approve,
-            "[[exec]]\ntarget = \"bash\"\n",
-        );
+        let mut state = PermissionPromptState {
+            ocap_policy: ocap(
+                newt_core::ocap_store::Verdict::Approve,
+                "[[exec]]\ntarget = \"bash\"\n",
+            ),
+            ..Default::default()
+        };
         let prompts = Rc::new(Cell::new(0));
         let mut gate = scripted_gate(
             &mut state,
