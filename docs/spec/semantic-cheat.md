@@ -776,7 +776,7 @@ family" means per *benched* family — initially Ornith only; other families
 inherit the Ornith-derived defaults until benched, which is exactly what the
 #1218 chain is for. **Run budget (costed before PR-0 lands):**
 ≈ (3 map-size + 5 fixed arms) × 2 models × N=5 ≈ **80 full agentic runs**
-(dgx1 + Claude API) — the gate cadence is priced, not assumed.
+(the local DGX node + Claude API) — the gate cadence is priced, not assumed.
 
 | Arm | Rung gated | What it measures / decides |
 |---|---|---|
