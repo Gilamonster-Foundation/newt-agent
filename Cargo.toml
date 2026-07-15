@@ -279,4 +279,3 @@ strip = true
 # pin or the `shell-real`/`shell-stub`/`shell-check` stub apparatus (all retired).
 # Resolves newt #300 (confined shell restored) + #660 (drop the pin). A bugfix
 # rolls as agent-bridle 0.7.1.
-
