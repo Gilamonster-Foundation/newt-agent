@@ -3266,8 +3266,18 @@ fn run_chat(
     // durable deny refuses, a durable approve pre-answers (danger-gated). A
     // missing store is an empty policy (no behavior change); a malformed file is
     // skipped loudly so a bad rule never bricks startup.
+    //
+    // #1207: durable approves must be SIGNED by the operator's root key — the
+    // same key the session's operating authority is minted from (loaded here,
+    // generated on first use, so an interactive session always has one).
+    // Unsigned/tampered approve entries are dropped loudly at load, fail-closed
+    // to the prompt; deny/ask load unsigned (narrowing is fail-safe).
     if let Some(config_path) = permission_config_path.as_deref() {
-        let (policy, warnings) = newt_core::ocap_store::load_store(config_path);
+        let root_vk = key_path
+            .as_deref()
+            .and_then(|p| newt_identity::load_or_generate(p).ok())
+            .map(|user| user.public().as_bytes());
+        let (policy, warnings) = newt_core::ocap_store::load_store(config_path, root_vk);
         for w in warnings {
             print_newt(&format!("warning: OCAP policy: {w}"), color, verbose);
         }
