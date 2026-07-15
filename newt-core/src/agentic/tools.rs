@@ -793,6 +793,16 @@ const EXTENDED_TOOL_REGISTRY: &[ToolSpec] = &[
         definition: super::scheduled::plan_get_tool_definition,
         gate: Gate::Scheduled,
     },
+    ToolSpec {
+        name: "enter_plan_mode",
+        definition: super::scheduled::enter_plan_mode_tool_definition,
+        gate: Gate::Scheduled,
+    },
+    ToolSpec {
+        name: "exit_plan_mode",
+        definition: super::scheduled::exit_plan_mode_tool_definition,
+        gate: Gate::Scheduled,
+    },
 ];
 
 /// The base tools inlined in [`tool_definitions`], by name. The base array is
@@ -968,8 +978,7 @@ pub(crate) fn resolve_tool_alias(name: &str) -> Option<AliasOutcome> {
         // model still gets a coherent answer rather than a dead end. `update_plan`
         // itself is the REAL tool now (falls through to `None`), so it is never an
         // alias of itself; `set_plan`/`plan_advance` no longer exist.
-        "enter_plan" | "enter_plan_mode" | "plan_mode" | "start_plan" | "begin_plan"
-        | "make_plan" | "create_plan" | "plan" | "planning" | "todo" | "todos" | "todo_write" => {
+        "make_plan" | "create_plan" | "plan" | "planning" | "todo" | "todos" | "todo_write" => {
             Some(AliasOutcome::Correct(format!(
                 "'{name}' is not a newt tool. To start or revise your plan, call update_plan with \
                  {{\"plan\":[{{\"step\",\"status\"}}]}} — send the full ordered list each time, \
@@ -1463,6 +1472,33 @@ pub fn ocap_disabled() -> bool {
 /// force. `--yolo --full-access` together yield an unrestricted host shell.
 pub fn full_access_requested() -> bool {
     std::env::var("NEWT_FULL_ACCESS").is_ok_and(|v| v == "1")
+}
+
+/// #1193: is the session in the read-only PLAN phase? Set by `enter_plan_mode`,
+/// cleared by `exit_plan_mode`. Env-signalled like [`ocap_disabled`] /
+/// [`full_access_requested`] so the TUI can read it when resolving per-turn
+/// caveats (it MEETs the read-only clamp in, which only narrows authority —
+/// the model voluntarily restricting itself is always safe). Value must be
+/// exactly "1".
+pub fn in_plan_phase() -> bool {
+    std::env::var("NEWT_PLAN_PHASE").is_ok_and(|v| v == "1")
+}
+
+/// The read-only authority a plan phase clamps the session to (#1193): reads
+/// everywhere, but NO writes, NO exec, NO net. MEETing this into the session
+/// caveats enforces "planning is read-only" — the design's safety guarantee,
+/// not the model's good intentions. `net`/max_calls left permissive here; the
+/// TUI `meet` intersects with the real session net so nothing widens.
+pub fn plan_phase_clamp() -> crate::caveats::Caveats {
+    use crate::caveats::{CountBound, Scope};
+    crate::caveats::Caveats {
+        fs_read: Scope::All,
+        fs_write: Scope::none(),
+        exec: Scope::none(),
+        net: Scope::none(),
+        max_calls: CountBound::Unlimited,
+        valid_for_generation: Scope::All,
+    }
 }
 
 /// facade P4 (#780): is the convenience **routing** turned OFF for this call?
@@ -3136,6 +3172,31 @@ pub async fn execute_tool_with_offload(
             Some(l) => super::scheduled::execute_update_plan(args, l, color, tool_output_lines),
             None => "unknown tool: update_plan (scheduled planning is off)".to_string(),
         },
+
+        // #1193: enter/exit the read-only PLAN phase. The env flag is read by
+        // the TUI when resolving per-turn caveats (it MEETs plan_phase_clamp,
+        // which only narrows authority — self-restriction is always safe). The
+        // clamp takes effect on the NEXT turn; this turn's remaining calls stay
+        // under the current authority.
+        "enter_plan_mode" => {
+            print_tool_call("enter_plan_mode", "", color);
+            // SAFETY: single-threaded session tool dispatch; the TUI reads it
+            // between turns (same pattern as NEWT_FULL_ACCESS / NEWT_DISABLE_OCAP).
+            unsafe { std::env::set_var("NEWT_PLAN_PHASE", "1") };
+            let out = "entered PLAN MODE (read-only): writes are denied until you call exit_plan_mode. Read/search the relevant code, draft the ordered steps with update_plan, then exit_plan_mode to execute."
+                .to_string();
+            print_tool_output(&out, tool_output_lines, color);
+            out
+        }
+        "exit_plan_mode" => {
+            print_tool_call("exit_plan_mode", "", color);
+            // SAFETY: as above.
+            unsafe { std::env::remove_var("NEWT_PLAN_PHASE") };
+            let out = "exited PLAN MODE: writes re-enabled. Execute your plan step by step, marking each done with update_plan as you go."
+                .to_string();
+            print_tool_output(&out, tool_output_lines, color);
+            out
+        }
         // #716: read-only plan view (the alias target for "what was I doing?"
         // probes) — same presence gate as update_plan.
         "plan_get" => match step_ledger {
@@ -5692,6 +5753,35 @@ mod execute_tool_branch_tests {
         }
     }
 
+    async fn run_scheduled_tool(
+        name: &str,
+        ws: &tempfile::TempDir,
+        ledger: &crate::agentic::scheduled::SessionStepLedger,
+    ) -> String {
+        execute_tool(
+            name,
+            &serde_json::json!({}),
+            &ws.path().to_string_lossy(),
+            false,
+            20,
+            &caveats_rw(ws.path()),
+            &mut NoMcp,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(ledger as &dyn crate::agentic::scheduled::StepLedger),
+        )
+        .await
+    }
+
     async fn run_git(
         op: &str,
         caveats: &Caveats,
@@ -5785,6 +5875,43 @@ mod execute_tool_branch_tests {
     /// — with a gate that ALLOWS, the arm re-dispatches under the local-write
     /// surface and the commit lands (the deadlock fix). The gate is consulted for
     /// a `git_write` capability.
+    #[test]
+    fn plan_phase_seam_and_clamp() {
+        use crate::caveats::ScopeExt as _;
+        // The clamp is read-only: reads yes, writes/exec/net no.
+        let c = plan_phase_clamp();
+        assert!(c.fs_read.permits(&"/anything".to_string()));
+        assert!(!c.fs_write.permits(&"/anything".to_string()));
+        assert!(!c.exec.permits(&"cargo".to_string()));
+        assert!(!c.net.permits(&"github.com".to_string()));
+        // MEETing it into a full grant yields read-only (never widens).
+        let full = crate::caveats::Caveats::top();
+        let planned = full.meet(&c);
+        assert!(
+            !planned.fs_write.permits(&"/x".to_string()),
+            "writes denied in plan phase"
+        );
+        assert!(planned.fs_read.permits(&"/x".to_string()), "reads allowed");
+    }
+
+    #[tokio::test]
+    async fn enter_and_exit_plan_mode_toggle_the_phase_flag() {
+        // enter_plan_mode / exit_plan_mode are REAL tools that flip the
+        // read-only-phase env the TUI reads when clamping caveats (#1193).
+        let ws = tempfile::TempDir::new().unwrap();
+        // Ensure a clean starting state.
+        // SAFETY: single-threaded test.
+        unsafe { std::env::remove_var("NEWT_PLAN_PHASE") };
+        assert!(!in_plan_phase());
+        let ledger = crate::agentic::scheduled::SessionStepLedger::default();
+        let enter = run_scheduled_tool("enter_plan_mode", &ws, &ledger).await;
+        assert!(enter.contains("PLAN MODE"), "{enter}");
+        assert!(in_plan_phase(), "enter_plan_mode set the phase");
+        let exit = run_scheduled_tool("exit_plan_mode", &ws, &ledger).await;
+        assert!(exit.contains("exited PLAN MODE"), "{exit}");
+        assert!(!in_plan_phase(), "exit_plan_mode cleared the phase");
+    }
+
     #[tokio::test]
     async fn git_data_loss_ops_are_gated_even_under_full_write_authority() {
         // #1191: the exact catastrophe — a confused model tries to destroy
@@ -6789,12 +6916,10 @@ mod execute_tool_branch_tests {
 
     #[test]
     fn alias_corrects_plan_names_to_update_plan() {
+        // #1193: enter_plan_mode / exit_plan_mode are now REAL tools (a
+        // read-only plan phase), so they no longer coach to update_plan — they
+        // dispatch. The plan-CONTENT verbs still coach to update_plan.
         for n in [
-            "enter_plan",
-            "enter_plan_mode",
-            "plan_mode",
-            "start_plan",
-            "begin_plan",
             "make_plan",
             "create_plan",
             "plan",
@@ -6807,6 +6932,13 @@ mod execute_tool_branch_tests {
                 panic!("{n} should produce a Correct outcome");
             };
             assert!(msg.contains("update_plan"), "{n}: {msg}");
+        }
+        // The phase verbs are real tools now — NOT aliases.
+        for n in ["enter_plan_mode", "exit_plan_mode"] {
+            assert!(
+                resolve_tool_alias(n).is_none(),
+                "{n} is a real tool, not an alias"
+            );
         }
         // #715 PR2: the advance-ish verbs coach update_plan + "completed" too.
         for n in [

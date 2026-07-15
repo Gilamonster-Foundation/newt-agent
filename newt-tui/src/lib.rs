@@ -5261,10 +5261,19 @@ fn run_chat(
                     // the --disable-ocap bypass all enforce, so authority can
                     // never exceed the preset. With no mode it is the base
                     // unchanged. Computed once so all three consult one value.
-                    let turn_caveats = meet_persona_caveats(
+                    let mut turn_caveats = meet_persona_caveats(
                         effective_caveats(cap.caveats(), active_mode.as_ref()),
                         active_persona.as_ref(),
                     );
+                    // #1193: in the read-only PLAN phase, MEET the read-only
+                    // clamp so writes/exec are DENIED while the model plans —
+                    // the design's safety guarantee, not the model's good
+                    // intentions. `meet` only narrows, so this can never widen
+                    // the session grant; exit_plan_mode drops the flag and the
+                    // next turn returns to the base authority.
+                    if newt_core::agentic::in_plan_phase() {
+                        turn_caveats = turn_caveats.meet(&newt_core::agentic::plan_phase_clamp());
+                    }
                     // FR-1 part 2 (#997): the active persona's tool allow-list
                     // (its `tools:` front-matter). Threaded into `ChatCtx` so the
                     // loop advertises ONLY these tools and the executor refuses
