@@ -1,0 +1,139 @@
+# Tier-1 workspace map — hand-written seed (semantic-cheat spec §3.1, D2).
+# One pointer card per crate: the untruncatable navigation layer (SC-L4·i).
+# Rendered verbatim into the frozen head; merge key = name (SC-L1).
+# House rules: ONE purpose line each; workspace-relative paths; no hosts,
+# IPs, GPUs, or machine-specific facts (#852).
+
+v = 1
+
+[[crate]]
+name = "newt-core"
+purpose = "agent loop, tools, permissions/OCAP, memory, compression, config"
+paths = ["newt-core/src/agentic/", "newt-core/src/config.rs", "newt-core/src/api_surface.rs"]
+entry = "newt-core/src/lib.rs"
+
+[[crate]]
+name = "newt-tui"
+purpose = "terminal UI: chat scroller, SLASH COMMANDS, permission prompts, setup wizard"
+paths = ["newt-tui/src/commands/", "newt-tui/src/permissions.rs", "newt-tui/src/lib.rs"]
+entry = "newt-tui/src/lib.rs"
+
+[[crate]]
+name = "newt-cli"
+purpose = "the `newt` binary: clap surface, doctor, crew/plan CLI, dgx expert commands"
+paths = ["newt-cli/src/lib.rs", "newt-cli/src/doctor.rs", "newt-cli/src/dgx.rs", "newt-cli/src/crew.rs"]
+entry = "newt-cli/src/main.rs"
+
+[[crate]]
+name = "newt-inference"
+purpose = "inference backends: Ollama, OpenAI-compatible/vLLM, embedded candle"
+paths = ["newt-inference/src/"]
+entry = "newt-inference/src/lib.rs"
+
+[[crate]]
+name = "newt-scheduler"
+purpose = "crew engine: run_crew role loop, team decomposition, dispatch transport"
+paths = ["newt-scheduler/src/crew.rs", "newt-scheduler/src/team.rs", "newt-scheduler/src/dispatch.rs"]
+entry = "newt-scheduler/src/lib.rs"
+
+[[crate]]
+name = "newt-identity"
+purpose = "user/agent keys, signed attenuated caveats, operating-key minting"
+paths = ["newt-identity/src/"]
+entry = "newt-identity/src/lib.rs"
+
+[[crate]]
+name = "newt-git"
+purpose = "embedded git tool (GitEngine over grit-lib) behind the GitTool seam"
+paths = ["newt-git/src/"]
+entry = "newt-git/src/lib.rs"
+
+[[crate]]
+name = "newt-tools"
+purpose = "file tools: ls, read, patch, search"
+paths = ["newt-tools/src/"]
+entry = "newt-tools/src/lib.rs"
+
+[[crate]]
+name = "newt-data"
+purpose = "data/notebook integration (jupyter kernel transport behind a feature)"
+paths = ["newt-data/src/"]
+entry = "newt-data/src/lib.rs"
+
+[[crate]]
+name = "newt-skills"
+purpose = "SKILL.md loader for bundled + drop-in skills"
+paths = ["newt-skills/src/", ".newt/bundled-skills/"]
+entry = "newt-skills/src/lib.rs"
+
+[[crate]]
+name = "newt-eval"
+purpose = "eval harness: task suites, output oracles, grading"
+paths = ["newt-eval/src/"]
+entry = "newt-eval/src/lib.rs"
+
+[[crate]]
+name = "newt-mesh"
+purpose = "agent-mesh integration: inference over the bus (OUT of workspace; sibling ../agent-mesh)"
+paths = ["newt-mesh/src/", "newt-mesh/tests/"]
+entry = "newt-mesh/src/lib.rs"
+
+[[crate]]
+name = "newt-mcp-server"
+purpose = "newt as an MCP server"
+paths = ["newt-mcp-server/src/"]
+entry = "newt-mcp-server/src/main.rs"
+
+[[crate]]
+name = "newt-mcp-client"
+purpose = "MCP client: stdio connect, tool discovery"
+paths = ["newt-mcp-client/src/"]
+entry = "newt-mcp-client/src/lib.rs"
+
+[[crate]]
+name = "newt-mcp-data"
+purpose = "MCP wire types shared by client/server"
+paths = ["newt-mcp-data/src/"]
+entry = "newt-mcp-data/src/lib.rs"
+
+[[crate]]
+name = "newt-acp-worker"
+purpose = "headless ACP worker tier"
+paths = ["newt-acp-worker/src/"]
+entry = "newt-acp-worker/src/lib.rs"
+
+[[crate]]
+name = "newt-coder"
+purpose = "coder-persona binary tier"
+paths = ["newt-coder/src/"]
+entry = "newt-coder/src/main.rs"
+
+[[crate]]
+name = "newt-tuner"
+purpose = "per-model tuning types: ModelTuning knobs (rounds, context, nudges)"
+paths = ["crates/newt-tuner/src/"]
+entry = "crates/newt-tuner/src/lib.rs"
+
+[[crate]]
+name = "newt-agent-py"
+purpose = "PyO3 bindings"
+paths = ["newt-agent-py/src/"]
+entry = "newt-agent-py/src/lib.rs"
+
+[[crate]]
+name = "plugins-protocol"
+purpose = "plugin envelope + subprocess protocol"
+paths = ["plugins-protocol/src/"]
+entry = "plugins-protocol/src/lib.rs"
+
+[[crate]]
+name = "newt-provider-openai"
+purpose = "OpenAI provider plugin"
+paths = ["providers/openai/src/"]
+entry = "providers/openai/src/main.rs"
+
+[[crate]]
+name = "tests-common"
+purpose = "shared test helpers: MockBackend, fixtures (mocked-unit-tier law)"
+paths = ["tests/common/src/"]
+entry = "tests/common/src/lib.rs"
