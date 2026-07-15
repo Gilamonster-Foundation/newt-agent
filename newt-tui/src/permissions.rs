@@ -399,6 +399,12 @@ pub(crate) struct PermissionPromptState {
     /// Every prompted decision this session, in prompt order — what
     /// `/permissions` lists. Also appended to the durable log as made.
     pub(crate) decisions: Vec<newt_core::PermissionRecord>,
+    /// Track O (#1131): the durable OCAP policy loaded from `~/.newt/ocap/*.toml`
+    /// at session start (empty when the store is absent). Consulted by the gate
+    /// BEFORE prompting — a durable `deny` refuses, a durable `approve`
+    /// pre-answers (danger-gated) — so the accumulation loop loosens the leash
+    /// with use. Read-only this session; never widens the default-deny floor.
+    pub(crate) ocap_policy: newt_core::ocap_store::PolicySet,
 }
 
 /// The exec program basename — mirrors `newt_core` `exec_allowlist_name` (splits
@@ -586,10 +592,20 @@ impl<F: FnMut(&str) -> PromptChoice> newt_core::PermissionGate for PromptPermiss
         // both short-circuit without re-prompting and without re-recording —
         // the deny was recorded when chosen. The persistent set was loaded from
         // disk at session start, so a permanent deny survives restarts.
+        // A durable OCAP `deny` (`~/.newt/ocap/deny.toml`) refuses before any
+        // prompt, exactly like a session/permanent deny — same short-circuit,
+        // no re-record (the policy file IS the audit record). The store applies
+        // the contract precedence (deny > passkey > ask > approve), so a target
+        // that is both denied and approved returns `Deny` here.
         if requests.iter().any(|r| {
             let key = (r.kind, r.target.clone());
             self.state.session_denials.contains(&key)
                 || self.state.persistent_denials.contains(&key)
+                || newt_core::ocap_store::evaluate_request(
+                    &self.state.ocap_policy,
+                    r.kind,
+                    &r.target,
+                ) == Some(newt_core::ocap_store::Verdict::Deny)
         }) {
             return Deny;
         }
@@ -614,6 +630,27 @@ impl<F: FnMut(&str) -> PromptChoice> newt_core::PermissionGate for PromptPermiss
             // (Exec matches by basename so a `python3` grant covers
             // `/usr/bin/python3`, consistent with the enforcement leash.)
             if session_grant_covers(&self.state.session_grants, req) {
+                continue;
+            }
+            // Track O (#1131): a durable OCAP `approve` pre-answers the prompt —
+            // the "Always allow" the accumulation loop earns. It is folded into
+            // the minted authority via `once_grants` (like an allow-once), so the
+            // enforcement leash actually permits the op, not merely skips the
+            // ask. Danger-gated: a high-danger target (interpreter exec / broad
+            // fs root) is NEVER auto-allowed from the store — it fails closed to
+            // the prompt, the same P1b ceiling that refuses a plain `[s]ession
+            // allow` for high-danger. (`validate_approve` keeps such targets out
+            // of approve.toml in the first place; this is the belt-and-suspenders
+            // enforcement.)
+            if newt_core::ocap_store::evaluate_request(
+                &self.state.ocap_policy,
+                req.kind,
+                &req.target,
+            ) == Some(newt_core::ocap_store::Verdict::Approve)
+                && self.danger.classify(req.kind, &req.target) != danger::DangerTier::High
+            {
+                self.record(req, "allow", "ocap-approve");
+                once_grants.push((req.kind, req.target.clone()));
                 continue;
             }
             // #1057: a one-shot pending grant left by a prior request_permissions
@@ -1132,6 +1169,122 @@ mod permission_prompt_tests {
         drop(once_gate);
         // Allow-once leaves no standing grant — the per-op nature is preserved.
         assert!(once_state.session_grants.is_empty());
+    }
+
+    /// Track O (#1131): build a `PolicySet` for the given verdict + inline TOML,
+    /// the way the store loads `~/.newt/ocap/<verdict>.toml`.
+    fn ocap(
+        verdict: newt_core::ocap_store::Verdict,
+        toml: &str,
+    ) -> newt_core::ocap_store::PolicySet {
+        newt_core::ocap_store::build_store(&[(verdict, Some(toml.to_string()))]).0
+    }
+
+    /// Track O (#1131): a durable OCAP `approve` pre-answers the prompt — no ask,
+    /// and the target is folded into the minted authority so the op actually
+    /// runs (not merely prompt-skipped). This is the "Always allow" the
+    /// accumulation loop earns.
+    #[test]
+    fn durable_ocap_approve_allows_without_prompting_and_grants_authority() {
+        // `git` is not in base exec (only `cargo`) — normally this prompts.
+        let mut state = PermissionPromptState {
+            ocap_policy: ocap(
+                newt_core::ocap_store::Verdict::Approve,
+                "[[exec]]\ntarget = \"git\"\n",
+            ),
+            ..Default::default()
+        };
+        let prompts = Rc::new(Cell::new(0));
+        let mut gate = scripted_gate(
+            &mut state,
+            base_caveats("/ws"),
+            None,
+            None,
+            vec![], // any prompt would panic (script exhausted)
+            prompts.clone(),
+        );
+        match gate.ask(&[exec_request("git")]) {
+            newt_core::PermissionDecision::Allow(c) => assert!(
+                c.permits_exec("git"),
+                "a durable approve must fold `git` into the minted authority"
+            ),
+            newt_core::PermissionDecision::Deny => panic!("durable approve must allow"),
+        }
+        assert_eq!(prompts.get(), 0, "durable approve must NOT prompt");
+        drop(gate);
+        assert_eq!(state.decisions.len(), 1);
+        assert_eq!(state.decisions[0].decision, "allow");
+        assert_eq!(state.decisions[0].scope, "ocap-approve");
+        // Durable, not session: the store answers again next time; no standing
+        // session grant is minted.
+        assert!(state.session_grants.is_empty());
+    }
+
+    /// Track O (#1131): a durable OCAP `deny` refuses before any prompt — the
+    /// durable sibling of `[D]eny always`, sourced from `deny.toml`.
+    #[test]
+    fn durable_ocap_deny_refuses_without_prompting() {
+        let mut state = PermissionPromptState {
+            ocap_policy: ocap(
+                newt_core::ocap_store::Verdict::Deny,
+                "[[exec]]\ntarget = \"git\"\n",
+            ),
+            ..Default::default()
+        };
+        let prompts = Rc::new(Cell::new(0));
+        let mut gate = scripted_gate(
+            &mut state,
+            base_caveats("/ws"),
+            None,
+            None,
+            vec![],
+            prompts.clone(),
+        );
+        assert!(
+            matches!(
+                gate.ask(&[exec_request("git")]),
+                newt_core::PermissionDecision::Deny
+            ),
+            "a durable deny must refuse"
+        );
+        assert_eq!(prompts.get(), 0, "durable deny must NOT prompt");
+    }
+
+    /// Track O (#1131) danger-gate: a durable `approve` of a HIGH-danger target
+    /// (an interpreter) is NOT honored as auto-allow — it fails closed to the
+    /// prompt, the same P1b ceiling that refuses a plain `[s]ession allow` for
+    /// high-danger. `validate_approve` keeps such targets out of approve.toml;
+    /// this is the belt-and-suspenders enforcement at the gate.
+    #[test]
+    fn durable_ocap_approve_of_high_danger_still_prompts() {
+        let mut state = PermissionPromptState {
+            ocap_policy: ocap(
+                newt_core::ocap_store::Verdict::Approve,
+                "[[exec]]\ntarget = \"bash\"\n",
+            ),
+            ..Default::default()
+        };
+        let prompts = Rc::new(Cell::new(0));
+        let mut gate = scripted_gate(
+            &mut state,
+            base_caveats("/ws"),
+            None,
+            None,
+            vec![PromptChoice::Deny], // the human still gets to decide
+            prompts.clone(),
+        );
+        assert!(
+            matches!(
+                gate.ask(&[exec_request("bash")]),
+                newt_core::PermissionDecision::Deny
+            ),
+            "a durable approve must not bypass the danger prompt for an interpreter"
+        );
+        assert_eq!(
+            prompts.get(),
+            1,
+            "high-danger falls through to the human even with a durable approve"
+        );
     }
 
     /// #904: `[P]ermanently deny` persists the `(kind, target)` to disk and, in a

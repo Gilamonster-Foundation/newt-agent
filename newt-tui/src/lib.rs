@@ -3261,6 +3261,18 @@ fn run_chat(
     let permission_config_path = newt_core::Config::user_config_path();
     let mut permission_state =
         PermissionPromptState::with_persistent_denials(permission_denials_path.as_deref());
+    // Track O (#1131): load the durable OCAP policy from `~/.newt/ocap/*.toml`
+    // (beside the config file). The gate consults it before prompting — a
+    // durable deny refuses, a durable approve pre-answers (danger-gated). A
+    // missing store is an empty policy (no behavior change); a malformed file is
+    // skipped loudly so a bad rule never bricks startup.
+    if let Some(config_path) = permission_config_path.as_deref() {
+        let (policy, warnings) = newt_core::ocap_store::load_store(config_path);
+        for w in warnings {
+            print_newt(&format!("warning: OCAP policy: {w}"), color, verbose);
+        }
+        permission_state.ocap_policy = policy;
+    }
     print_newt(
         &ready_line(VERSION, &inf_model, &inf_url, inf_kind),
         color,
