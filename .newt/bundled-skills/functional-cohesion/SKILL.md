@@ -150,9 +150,10 @@ Afterward, "which code runs `/probe`?" answers itself.
 ## Relationship to the other doctrines
 
 - **The three Cs** (Composition, Configuration, Convention — knowledge belongs
-  in data, not logic) decides *what a unit is made of*. Functional cohesion
-  decides *where units live and how they connect*. They compose: a
-  cohesive, loosely-coupled module whose knowledge is pure data is the target.
+  in data, not logic; see the `three-cs` skill) decides *what a unit is made
+  of*. Functional cohesion decides *where units live and how they connect*.
+  They compose: a cohesive, loosely-coupled module whose knowledge is pure
+  data is the target.
 - **TDD** is the partner discipline: it proves each unit and, by making
   tightly-coupled code painful to test, pulls the design toward seams. Cohesion
   is what you reach for when the corpus is too big for the tests alone to keep
