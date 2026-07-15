@@ -15,8 +15,16 @@ pub async fn run(config_path: Option<&Path>) -> anyhow::Result<()> {
 
     println!("Configured backends:");
     for backend in &config.backends {
-        let status = probe_backend(&backend.endpoint).await;
-        println!("  {} ({}) — {status}", backend.name, backend.endpoint);
+        // #1212: probe by the backend's declared KIND via the BackendApi trait
+        // — an openai/vLLM backend answers `/v1/models`, not Ollama's
+        // `/api/tags`, and probing the wrong surface reported healthy
+        // endpoints as `HTTP 404`. The kind knowledge lives in `api_for`,
+        // not here (three-Cs).
+        let status = probe_configured_backend(backend).await;
+        println!(
+            "  {} ({}, {:?}) — {status}",
+            backend.name, backend.endpoint, backend.kind
+        );
     }
 
     println!("\nConfigured providers:");
@@ -154,6 +162,31 @@ async fn probe_dgx(dgx: &DgxConfig) {
     match dgx.resolve_endpoint() {
         Ok(url) => println!("  Active: {active_model} @ {active_endpoint} → {url}"),
         Err(e) => println!("  Active endpoint: unresolved ({e})"),
+    }
+}
+
+/// Probe a `[[backends]]` entry the way a session would reach it (#1212):
+/// route by `kind` through [`newt_core::backend_probe::api_for`] — the same
+/// list-models call session-start adoption makes, with the same auth. An
+/// `embedded` backend has no endpoint to probe; report it as in-process.
+async fn probe_configured_backend(backend: &newt_core::config::BackendConfig) -> String {
+    if backend.kind == newt_core::config::BackendKind::Embedded {
+        return "in-process (embedded — no endpoint to probe)".to_string();
+    }
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()
+        .unwrap();
+    let api_key = backend.resolve_api_key();
+    match newt_core::backend_probe::api_for(backend.kind)
+        .list_models(&client, &backend.endpoint, api_key.as_deref())
+        .await
+    {
+        Ok(models) => format!("OK ({} model(s) served)", models.len()),
+        // The fetchers bail with `HTTP <status>` for a reachable-but-erroring
+        // endpoint — keep that distinct from a connection failure.
+        Err(e) if e.to_string().starts_with("HTTP ") => e.to_string(),
+        Err(e) => format!("unreachable: {e}"),
     }
 }
 
