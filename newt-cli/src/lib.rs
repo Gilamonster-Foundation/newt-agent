@@ -391,7 +391,15 @@ pub enum Command {
         locked_verify: Option<String>,
     },
     /// Health-check local backends + provider plugins.
-    Doctor,
+    Doctor {
+        /// #1207: bless ~/.newt/ocap/approve.toml — sign every entry with your
+        /// root key so it loads as a valid durable grant (unsigned entries drop
+        /// fail-closed at session start). Running this IS the authorization:
+        /// you are vouching for the file as it stands. High-danger targets are
+        /// refused and reported (exit 2).
+        #[arg(long = "sign-ocap")]
+        sign_ocap: bool,
+    },
     /// Print resolved config.
     Config,
     /// Diagnose + tune mid-loop context compaction (the summarizer): the
@@ -969,7 +977,17 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             }
             Ok(())
         }
-        Command::Doctor => doctor::run(cli.config.as_deref()).await,
+        Command::Doctor { sign_ocap } => {
+            if sign_ocap {
+                let code = doctor::sign_ocap()?;
+                if code != 0 {
+                    std::process::exit(code);
+                }
+                Ok(())
+            } else {
+                doctor::run(cli.config.as_deref()).await
+            }
+        }
         Command::Config => config_cmd::run(cli.config.as_deref()),
         Command::Compaction => compaction_cmd::run(cli.config.as_deref()),
         Command::Identity => identity_cmd::run(cli.config.as_deref()),

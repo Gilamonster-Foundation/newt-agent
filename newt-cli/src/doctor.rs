@@ -195,3 +195,76 @@ fn probe_provider(command: &str) -> &'static str {
         Err(_) => "not found on PATH",
     }
 }
+
+/// `newt doctor --sign-ocap` (#1207): the blessing ceremony for
+/// `~/.newt/ocap/approve.toml`. A PRESENT human running this command is
+/// explicitly vouching for the file as it stands — every entry is re-signed
+/// with the operator's root key (the same newt-identity root the session's
+/// operating authority is minted from), which is the ONLY way hand-edited
+/// entries become valid durable grants. High-danger targets (interpreters,
+/// broad fs roots — the production danger table's judgment) are REFUSED a
+/// signature, per the contract's mandatory `validate_approve` check, and are
+/// reported so the operator can move them to `passkey.toml` or delete them.
+///
+/// Returns the process exit code: 0 = blessed (or nothing to sign); 2 = one
+/// or more entries were refused (the file was still written — valid entries
+/// are blessed, refused ones stay unsigned and will drop at load,
+/// fail-closed). Errors bubble as `Err` (exit 1).
+pub fn sign_ocap() -> anyhow::Result<i32> {
+    use newt_core::ocap_store::{self, PolicyFile, Verdict};
+
+    let Some(config_path) = newt_core::Config::user_config_path() else {
+        anyhow::bail!("cannot resolve the user config directory (~/.newt)");
+    };
+    let approve_path = config_path
+        .with_file_name("ocap")
+        .join(Verdict::Approve.filename());
+    let text = match std::fs::read_to_string(&approve_path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            println!("nothing to sign: {} does not exist", approve_path.display());
+            return Ok(0);
+        }
+        Err(e) => anyhow::bail!("cannot read {}: {e}", approve_path.display()),
+    };
+    let mut file = PolicyFile::parse(&text).map_err(|e| anyhow::anyhow!(e))?;
+
+    let key_path = newt_identity::default_key_path()?;
+    let user = newt_identity::load_or_generate(&key_path)?;
+
+    let (signed, refused) = ocap_store::sign_approves(
+        &mut file,
+        newt_tui::ocap_high_danger_predicate(),
+        |payload| user.sign(payload).to_bytes(),
+    );
+    std::fs::write(
+        &approve_path,
+        file.to_toml().map_err(|e| anyhow::anyhow!(e))?,
+    )
+    .map_err(|e| anyhow::anyhow!("cannot write {}: {e}", approve_path.display()))?;
+
+    println!(
+        "blessed {}: {signed} entr{} signed with the root key ({})",
+        approve_path.display(),
+        if signed == 1 { "y" } else { "ies" },
+        key_path.display()
+    );
+    for r in &refused {
+        println!("  REFUSED: {r}");
+    }
+
+    // Prove the result the way the session will see it: reload through the
+    // same verify-at-load path and report the live durable grants.
+    let (set, warnings) = ocap_store::load_store(&config_path, Some(user.public().as_bytes()));
+    for w in &warnings {
+        println!("  load warning: {w}");
+    }
+    let live = set
+        .files
+        .get(&Verdict::Approve)
+        .map(|f| f.exec.len() + f.fs.len() + f.net.len())
+        .unwrap_or(0);
+    println!("verified: {live} durable grant(s) live at load");
+
+    Ok(if refused.is_empty() { 0 } else { 2 })
+}

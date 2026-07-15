@@ -291,6 +291,27 @@ pub(crate) fn production_danger_table() -> danger::DangerTable {
     table
 }
 
+/// The #1207 blessing judgment, exported as the ONE narrow seam `newt doctor
+/// --sign-ocap` (newt-cli) needs from this subsystem: is an ocap-store target
+/// high-danger by the production danger table? Passed to
+/// [`newt_core::ocap_store::sign_approves`] as its `validate_approve`
+/// predicate, so the blessing ceremony can never launder an interpreter or a
+/// broad fs root into `approve.toml`. Fs classifies as a WRITE — the
+/// conservative reading of a durable fs grant, and the table's High tier is
+/// about broad roots on either axis.
+pub fn ocap_high_danger_predicate() -> impl Fn(newt_core::ocap_store::CapabilityClass, &str) -> bool
+{
+    let table = production_danger_table();
+    move |class, target| {
+        let kind = match class {
+            newt_core::ocap_store::CapabilityClass::Exec => newt_core::DenialKind::Exec,
+            newt_core::ocap_store::CapabilityClass::Fs => newt_core::DenialKind::FsWrite,
+            newt_core::ocap_store::CapabilityClass::Net => newt_core::DenialKind::Net,
+        };
+        table.classify(kind, target) == danger::DangerTier::High
+    }
+}
+
 /// Production prompt: print the question, read one line from stdin under
 /// [`PromptStdinGuard`]. Any read error is a deny (never a hang, never an
 /// allow).
