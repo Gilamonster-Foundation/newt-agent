@@ -1,0 +1,5 @@
+[
+  { "key": "darwin-arm64", "os": "darwin", "cpu": "arm64", "rustTarget": "aarch64-apple-darwin" },
+  { "key": "linux-x64",    "os": "linux",  "cpu": "x64",   "libc": "glibc", "rustTarget": "x86_64-unknown-linux-gnu" },
+  { "key": "win32-x64",    "os": "win32",  "cpu": "x64",   "rustTarget": "x86_64-pc-windows-msvc" }
+]
