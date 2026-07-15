@@ -3148,6 +3148,9 @@ fn run_chat(
         print_newt(&line, color, verbose);
     }
     let (mut inf_url, mut inf_model) = (choice.url.clone(), choice.model.clone());
+    // #1199: the server-declared window from adopt, fresh per session — feeds
+    // the budget without the persisted cache.
+    let mut inf_context_window: Option<u32> = choice.context_window;
 
     // Resolve + validate the active profile against config, now that the model is
     // known. Precedence: --profile (explicit) > --bundle > a bundle inferred from
@@ -3471,6 +3474,7 @@ fn run_chat(
                 &inf_url,
                 &inf_model,
                 !real_context_discovery(&cfg, &inf_model),
+                inf_kind,
             );
         if updated {
             probe::save_cache(&cap_cache);
@@ -4889,6 +4893,7 @@ fn run_chat(
                     inf_model = choice.model.clone();
                     inf_kind = choice.kind;
                     inf_key = choice.api_key.clone();
+                    inf_context_window = choice.context_window;
                     apply_openai_api_env(choice.api);
                     // Re-probe DCGM ONLY when the backend URL actually changed
                     // (and only in verbose mode, where the snapshot is shown).
@@ -4975,26 +4980,35 @@ fn run_chat(
                     // estimate-calibration ratio (Phase 20 §2.3).
                     let (eff_safe_context, eff_max_ok_input, eff_estimate_ratio) = {
                         let entry = cap_cache.entry(inf_model.clone()).or_default();
-                        let updated = ctx_window_probed.insert(inf_model.clone())
+                        // #1199: the server-declared window from session-start
+                        // adopt (`inf_context_window`) is authoritative and
+                        // cache-independent. Only fall back to the cache-side
+                        // probe (`ensure_context_window`) when adopt got NONE —
+                        // e.g. an authed gateway adopt couldn't reach — so a
+                        // stale cached None can never starve a discovered
+                        // window. The cache still holds the LEARNED facts
+                        // (max_ok_input, estimate_ratio).
+                        let updated = inf_context_window.is_none()
+                            && ctx_window_probed.insert(inf_model.clone())
                             && probe::ensure_context_window(
                                 entry,
                                 &inf_url,
                                 &inf_model,
                                 !real_context_discovery(&cfg, &inf_model),
+                                inf_kind,
                             );
-                        let sc = entry.safe_context;
+                        let cached_sc = entry.safe_context;
                         let moi = entry.max_ok_input;
                         let ratio = entry.estimate_ratio;
                         if updated {
                             probe::save_cache(&cap_cache);
                         }
-                        // A configured per-model `context_window` seeds the
-                        // budget when the probe found nothing (issue: OpenAI /
-                        // NVIDIA wire has no `/api/show`, so `safe_context`
-                        // stays None and the loop never budgets against a real
-                        // window). Only a fallback — an empirical probe result
-                        // always wins.
-                        let sc = sc.or_else(|| model_tune.and_then(|t| t.context_window));
+                        // The fresh server window (at 80%) wins; the cached
+                        // probe and a configured `context_window` are fallback.
+                        let sc = inf_context_window
+                            .map(|w| w * 80 / 100)
+                            .or(cached_sc)
+                            .or_else(|| model_tune.and_then(|t| t.context_window));
                         (sc, moi, ratio)
                     };
 
@@ -5273,10 +5287,19 @@ fn run_chat(
                     // the --disable-ocap bypass all enforce, so authority can
                     // never exceed the preset. With no mode it is the base
                     // unchanged. Computed once so all three consult one value.
-                    let turn_caveats = meet_persona_caveats(
+                    let mut turn_caveats = meet_persona_caveats(
                         effective_caveats(cap.caveats(), active_mode.as_ref()),
                         active_persona.as_ref(),
                     );
+                    // #1193: in the read-only PLAN phase, MEET the read-only
+                    // clamp so writes/exec are DENIED while the model plans —
+                    // the design's safety guarantee, not the model's good
+                    // intentions. `meet` only narrows, so this can never widen
+                    // the session grant; exit_plan_mode drops the flag and the
+                    // next turn returns to the base authority.
+                    if newt_core::agentic::in_plan_phase() {
+                        turn_caveats = turn_caveats.meet(&newt_core::agentic::plan_phase_clamp());
+                    }
                     // FR-1 part 2 (#997): the active persona's tool allow-list
                     // (its `tools:` front-matter). Threaded into `ChatCtx` so the
                     // loop advertises ONLY these tools and the executor refuses
@@ -5844,6 +5867,11 @@ pub(crate) struct BackendChoice {
     /// For an OpenAI backend: which HTTP surface (chat/completions vs the newer
     /// /v1/responses). Surfaced to the agent loop via `NEWT_OPENAI_API`.
     pub(crate) api: newt_core::OpenAiApi,
+    /// The server-declared context window (#1199), probed FRESH at session-start
+    /// adopt — not read from the persisted cache (which could hold a stale
+    /// None). `None` when the API can't be asked; the budget then falls back to
+    /// config / the learned cache.
+    pub(crate) context_window: Option<u32>,
 }
 
 /// The session-start ready preamble. Includes the backend wire protocol
@@ -5950,17 +5978,9 @@ fn adopt_backend_choice(choice: &mut BackendChoice) -> Vec<String> {
     // run_chat is sync inside the tokio runtime — bridge like wizard.rs does.
     let fetched = tokio::task::block_in_place(|| {
         tokio::runtime::Handle::current().block_on(async {
-            match choice.kind {
-                newt_core::BackendKind::Openai => {
-                    backend_probe::fetch_openai_models_auth(
-                        &client,
-                        &choice.url,
-                        choice.api_key.as_deref(),
-                    )
-                    .await
-                }
-                _ => backend_probe::fetch_ollama_models(&client, &choice.url).await,
-            }
+            backend_probe::api_for(choice.kind)
+                .list_models(&client, &choice.url, choice.api_key.as_deref())
+                .await
         })
     });
     match fetched {
@@ -6003,6 +6023,22 @@ fn adopt_backend_choice(choice: &mut BackendChoice) -> Vec<String> {
                     choice.url
                 )),
             }
+            // #1199: auto-detect the context window from the SERVER, fresh —
+            // vLLM's max_model_len / Ollama's /api/show. Held on the choice and
+            // fed to the budget; never read from the persisted cache (which
+            // could pin a stale None and starve a 256k model).
+            choice.context_window = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async {
+                    backend_probe::api_for(choice.kind)
+                        .context_window(
+                            &client,
+                            &choice.url,
+                            &choice.model,
+                            choice.api_key.as_deref(),
+                        )
+                        .await
+                })
+            });
         }
         Err(e) => {
             if choice.model.is_empty() {
@@ -6063,6 +6099,7 @@ pub(crate) fn resolve_backend_choice(cfg: &newt_core::Config) -> BackendChoice {
         kind: b.kind,
         api_key: b.resolve_api_key(),
         api: b.api,
+        context_window: None,
     };
     // 1. A pinned provider (loadout `provider` axis → NEWT_PROVIDER) selects a
     //    named backend, regardless of wire protocol. Unknown name falls through
@@ -6093,6 +6130,7 @@ pub(crate) fn resolve_backend_choice(cfg: &newt_core::Config) -> BackendChoice {
             kind: newt_core::BackendKind::Ollama,
             api_key: None,
             api: newt_core::OpenAiApi::default(),
+            context_window: None,
         };
     }
     // 3. The configured default (#1130): a named pointer beats every heuristic.
@@ -6134,6 +6172,7 @@ pub(crate) fn resolve_backend_choice(cfg: &newt_core::Config) -> BackendChoice {
             kind: newt_core::BackendKind::Ollama,
             api_key: None,
             api: newt_core::OpenAiApi::default(),
+            context_window: None,
         };
     }
     // 7. Multiple backends, nothing pinned: prefer an OpenAI-compatible entry
@@ -6156,6 +6195,7 @@ pub(crate) fn resolve_backend_choice(cfg: &newt_core::Config) -> BackendChoice {
         kind: newt_core::BackendKind::Ollama,
         api_key: None,
         api: newt_core::OpenAiApi::default(),
+        context_window: None,
     }
 }
 
@@ -10377,104 +10417,25 @@ fn dispatch_slash(
 }
 
 /// Fetch model names from an Ollama endpoint's `/api/tags`.
-pub(crate) fn fetch_models_from_url(url: &str) -> anyhow::Result<Vec<String>> {
-    let tags_url = format!("{}/api/tags", url.trim_end_matches('/'));
-    let json: serde_json::Value = tokio::task::block_in_place(|| {
+/// Sync model-listing over any backend API (#backend-trait): builds a client
+/// and asks `api_for(kind)`, bridging the async trait via block_in_place. The
+/// ONE place the TUI lists models — /models, /model, setup, and doctor all
+/// route here instead of each matching on `kind`.
+pub(crate) fn fetch_models_for(
+    url: &str,
+    kind: newt_core::BackendKind,
+    api_key: Option<&str>,
+) -> anyhow::Result<Vec<String>> {
+    tokio::task::block_in_place(|| {
         tokio::runtime::Handle::current().block_on(async {
-            let resp = reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(5))
-                .build()?
-                .get(&tags_url)
-                .send()
-                .await?;
-            if !resp.status().is_success() {
-                anyhow::bail!("HTTP {}", resp.status());
-            }
-            resp.json::<serde_json::Value>().await.map_err(Into::into)
-        })
-    })?;
-    Ok(parse_model_names(&json))
-}
-
-/// Fetch model ids from an OpenAI-compatible endpoint's `/v1/models`, with
-/// optional bearer auth.
-pub(crate) fn fetch_openai_models(url: &str, api_key: Option<&str>) -> anyhow::Result<Vec<String>> {
-    let models_url = format!("{}/v1/models", url.trim_end_matches('/'));
-    let api_key = api_key.map(str::to_string);
-    let json: serde_json::Value = tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(async {
-            let mut req = reqwest::Client::builder()
+            let client = reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(10))
-                .build()?
-                .get(&models_url);
-            if let Some(key) = api_key {
-                req = req.bearer_auth(key);
-            }
-            let resp = req.send().await?;
-            if !resp.status().is_success() {
-                anyhow::bail!("HTTP {}", resp.status());
-            }
-            resp.json::<serde_json::Value>().await.map_err(Into::into)
+                .build()?;
+            newt_core::backend_probe::api_for(kind)
+                .list_models(&client, url, api_key)
+                .await
         })
-    })?;
-    Ok(parse_openai_model_ids(&json))
-}
-
-/// Extract model ids from an OpenAI `/v1/models` body (`data[].id`).
-fn parse_openai_model_ids(json: &serde_json::Value) -> Vec<String> {
-    json["data"]
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|m| m["id"].as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-/// Extract model names from an Ollama `/api/tags` JSON body. Tolerant of a
-/// missing / non-array `models` field (returns empty) and of entries without a
-/// string `name`.
-fn parse_model_names(json: &serde_json::Value) -> Vec<String> {
-    json["models"]
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|m| m["name"].as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-#[cfg(test)]
-mod model_list_tests {
-    use super::parse_model_names;
-    use serde_json::json;
-
-    #[test]
-    fn parses_names_and_tolerates_shape() {
-        let names = parse_model_names(&json!({
-            "models": [{"name": "llama3.1:8b"}, {"name": "gemma4:e2b"}, {"size": 1}]
-        }));
-        assert_eq!(
-            names,
-            vec!["llama3.1:8b".to_string(), "gemma4:e2b".to_string()]
-        );
-        // Missing or non-array `models` → empty, never a panic.
-        assert!(parse_model_names(&json!({})).is_empty());
-        assert!(parse_model_names(&json!({ "models": "nope" })).is_empty());
-    }
-
-    #[test]
-    fn parses_openai_model_ids_and_tolerates_shape() {
-        use super::parse_openai_model_ids;
-        let ids = parse_openai_model_ids(&json!({
-            "data": [{"id": "gpt-5", "object": "model"}, {"id": "claude"}, {"object": "x"}]
-        }));
-        assert_eq!(ids, vec!["gpt-5".to_string(), "claude".to_string()]);
-        assert!(parse_openai_model_ids(&json!({})).is_empty());
-        assert!(parse_openai_model_ids(&json!({ "data": 5 })).is_empty());
-    }
+    })
 }
 
 /// Run `newt <args>` as a subprocess using the current executable path so
@@ -17819,59 +17780,8 @@ mod env_resolution_tests {
 #[cfg(test)]
 mod http_loop_tests {
     use super::*;
-    use wiremock::matchers::{header, method, path};
+    use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn fetch_models_from_url_lists_tags_or_errors() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/api/tags"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "models": [{"name": "llama3.1:8b"}, {"name": "gemma:2b"}]
-            })))
-            .mount(&server)
-            .await;
-        let names = fetch_models_from_url(&server.uri()).unwrap();
-        assert_eq!(
-            names,
-            vec!["llama3.1:8b".to_string(), "gemma:2b".to_string()]
-        );
-
-        // Non-2xx surfaces as an error naming the status.
-        let err_server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/api/tags"))
-            .respond_with(ResponseTemplate::new(503))
-            .mount(&err_server)
-            .await;
-        let err = fetch_models_from_url(&err_server.uri()).unwrap_err();
-        assert!(err.to_string().contains("HTTP 503"), "got: {err}");
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn fetch_openai_models_sends_bearer_and_parses_ids() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/v1/models"))
-            .and(header("authorization", "Bearer sk-test"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "data": [{"id": "qwen3:32b"}, {"id": "devstral"}]
-            })))
-            .mount(&server)
-            .await;
-        let ids = fetch_openai_models(&server.uri(), Some("sk-test")).unwrap();
-        assert_eq!(ids, vec!["qwen3:32b".to_string(), "devstral".to_string()]);
-
-        let err_server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/v1/models"))
-            .respond_with(ResponseTemplate::new(401))
-            .mount(&err_server)
-            .await;
-        let err = fetch_openai_models(&err_server.uri(), None).unwrap_err();
-        assert!(err.to_string().contains("HTTP 401"), "got: {err}");
-    }
 
     /// F5: the loop summarizer's Ollama request must carry the same
     /// `options.num_ctx` the main loop sends — without it Ollama silently

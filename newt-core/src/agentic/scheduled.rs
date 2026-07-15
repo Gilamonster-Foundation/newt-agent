@@ -316,6 +316,30 @@ pub fn plan_get_tool_definition() -> serde_json::Value {
     })
 }
 
+/// #1193: `enter_plan_mode` — flip the session into the READ-ONLY plan phase.
+pub fn enter_plan_mode_tool_definition() -> serde_json::Value {
+    serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": "enter_plan_mode",
+            "description": "Enter PLAN MODE: a read-only phase for figuring out WHAT to do before                             doing it. While in plan mode, writes are DENIED — edit_file, write_file,                             and shell writes fail — so you can read, search, and draft your plan                             (update_plan) without changing anything. Use this when a task needs                             several steps: read the relevant code, then call update_plan with the                             ordered steps, then call exit_plan_mode to start executing. No args.",
+            "parameters": { "type": "object", "properties": {}, "required": [] }
+        }
+    })
+}
+
+/// #1193: `exit_plan_mode` — leave plan mode and begin executing the plan.
+pub fn exit_plan_mode_tool_definition() -> serde_json::Value {
+    serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": "exit_plan_mode",
+            "description": "Leave PLAN MODE and begin EXECUTING: writes are re-enabled (back to the                             session's normal authority). Call this once your update_plan plan is                             ready, then work the plan step by step. No args.",
+            "parameters": { "type": "object", "properties": {}, "required": [] }
+        }
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Executors (every branch returns a tool-result String, never a loop abort)
 // ---------------------------------------------------------------------------

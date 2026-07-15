@@ -10,9 +10,9 @@ use newt_core::agentic::{print_newt, warmup_if_cold, NEWT_ORANGE_CT};
 
 use crate::probe;
 use crate::{
-    active_backend_name, backends_list_items, fetch_models_from_url, fetch_openai_models,
-    is_ephemeral_session, keep_alive_str, resolve_backend_choice, run_newt_subcmd, today_date,
-    with_interrupt_watch, BackendChoice,
+    active_backend_name, backends_list_items, fetch_models_for, is_ephemeral_session,
+    keep_alive_str, resolve_backend_choice, run_newt_subcmd, today_date, with_interrupt_watch,
+    BackendChoice,
 };
 
 /// Handle the model/backend command family. `dispatch_slash` routes exactly the
@@ -44,11 +44,8 @@ pub(crate) fn dispatch(
                 }
             } else {
                 // Plain list, with cached conformance symbol where known.
-                let fetched = if choice.kind == newt_core::BackendKind::Openai {
-                    fetch_openai_models(&url, choice.api_key.as_deref())
-                } else {
-                    fetch_models_from_url(&url)
-                };
+                // Ask the backend (#backend-trait) — one path for every kind.
+                let fetched = fetch_models_for(&url, choice.kind, choice.api_key.as_deref());
                 match fetched {
                     Ok(names) if names.is_empty() => {
                         print_newt(&format!("No models found on {url}"), color, verbose);
@@ -202,6 +199,7 @@ pub(crate) fn dispatch(
                                 .as_ref()
                                 .map(|c| c.estimation)
                                 .unwrap_or_default(),
+                            choice.kind,
                         );
                         cache.insert(model.clone(), entry);
                         probe::save_cache(&cache);
@@ -290,12 +288,12 @@ pub(crate) fn dispatch(
                 // unreachable backend (can't list models) is not blocked.
                 let gate_cfg = newt_core::Config::resolve().unwrap_or_default();
                 let gate_choice = resolve_backend_choice(&gate_cfg);
-                let served: Option<Vec<String>> = match gate_choice.kind {
-                    newt_core::BackendKind::Openai => {
-                        fetch_openai_models(&gate_choice.url, gate_choice.api_key.as_deref()).ok()
-                    }
-                    _ => fetch_models_from_url(&gate_choice.url).ok(),
-                };
+                let served: Option<Vec<String>> = fetch_models_for(
+                    &gate_choice.url,
+                    gate_choice.kind,
+                    gate_choice.api_key.as_deref(),
+                )
+                .ok();
                 if !model_choice_ok(arg1, served.as_deref()) {
                     let served = served.unwrap_or_default();
                     match suggest_model(arg1, &served) {
