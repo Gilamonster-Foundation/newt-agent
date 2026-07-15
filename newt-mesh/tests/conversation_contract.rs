@@ -132,6 +132,7 @@ async fn raw_ask(bus: &Bus, responder_fp: Fingerprint, prompt: &str) -> serde_js
 
 #[tokio::test(flavor = "multi_thread")]
 #[serial_test::serial(mesh_mdns)]
+#[ignore = "live transport — nightly only (#1190; agent-mesh #61/#62)"]
 async fn raw_bus_client_round_trips_the_wire_contract() {
     let _ = tracing_subscriber::fmt().with_test_writer().try_init();
     let user = UserKey::generate();
@@ -159,6 +160,7 @@ async fn raw_bus_client_round_trips_the_wire_contract() {
 
 #[tokio::test(flavor = "multi_thread")]
 #[serial_test::serial(mesh_mdns)]
+#[ignore = "live transport — nightly only (#1190; agent-mesh #61/#62)"]
 async fn raw_bus_client_holds_a_threaded_conversation() {
     let _ = tracing_subscriber::fmt().with_test_writer().try_init();
     let user = UserKey::generate();
@@ -195,6 +197,7 @@ async fn raw_bus_client_holds_a_threaded_conversation() {
 
 #[tokio::test(flavor = "multi_thread")]
 #[serial_test::serial(mesh_mdns)]
+#[ignore = "live transport — nightly only (#1190; agent-mesh #61/#62)"]
 async fn quiet_client_gets_replies_via_dial_back() {
     let _ = tracing_subscriber::fmt().with_test_writer().try_init();
     let user = UserKey::generate();

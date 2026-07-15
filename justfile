@@ -161,6 +161,11 @@ readme-check:
 # Build + test the out-of-workspace newt-mesh crate. Requires the
 # sibling `../agent-mesh/` checkout. Not run by `just check` /
 # CI — see docs/decisions/mesh_integration.md.
+#
+# Mirrors the mesh-integration per-PR gate: `cargo test` skips the
+# `#[ignore]`d live-transport round-trip tests (flaky pending agent-mesh
+# #61/#62, #1190). To exercise the live transport locally, append
+# `-- --include-ignored` (that's the nightly/dispatch lane).
 check-mesh:
     cargo fmt --manifest-path newt-mesh/Cargo.toml -- --check
     cargo clippy --manifest-path newt-mesh/Cargo.toml --all-targets -- -D warnings

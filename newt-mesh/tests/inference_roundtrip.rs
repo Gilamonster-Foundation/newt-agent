@@ -50,6 +50,11 @@ fn agent(user: &UserKey, role: &str, caps: Vec<String>) -> AgentKey {
 
 #[tokio::test(flavor = "multi_thread")]
 #[serial_test::serial(mesh_mdns)]
+// Live iroh transport (mDNS discovery + dial-back). Flaky on CI runners until
+// the agent-mesh dial-back fix (#61/#62); runs nightly via `--include-ignored`,
+// not on the per-PR gate (#1190). The responder logic it exercises is covered
+// deterministically by the `handle_inference_*` unit tests in src/service.rs.
+#[ignore = "live transport — nightly only (#1190; agent-mesh #61/#62)"]
 async fn ask_receives_inference_reply() {
     let _ = tracing_subscriber::fmt().with_test_writer().try_init();
 
