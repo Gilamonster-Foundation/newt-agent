@@ -3393,8 +3393,10 @@ pub async fn execute_tool_with_offload(
             // `lifecycle` arm (#891) so both honor identical exec caveats. A
             // folded leading `cd` becomes the cwd (it wins over an explicit
             // `cwd` arg — it's the more specific, in-command intent).
-            let run_cwd =
-                resolve_exec_cwd(workspace, cd_path.as_deref().or_else(|| args["cwd"].as_str()));
+            let run_cwd = resolve_exec_cwd(
+                workspace,
+                cd_path.as_deref().or_else(|| args["cwd"].as_str()),
+            );
             exec_confined_command(
                 cmd,
                 &run_cwd,
@@ -4928,10 +4930,7 @@ mod tests {
         // Not a cd at all → unchanged.
         assert_eq!(split_leading_cd("git status"), (None, "git status".into()));
         // `cd` as a substring of another word is not a match.
-        assert_eq!(
-            split_leading_cd("cding foo"),
-            (None, "cding foo".into())
-        );
+        assert_eq!(split_leading_cd("cding foo"), (None, "cding foo".into()));
         // `cd <path>` followed by something other than a sequential connective
         // (a pipe here) is left whole — we only fold the safe `&&`/`;` shapes.
         assert_eq!(
