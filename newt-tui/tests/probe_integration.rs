@@ -125,7 +125,7 @@ async fn fetch_context_window_reads_arch_limit() {
         .await;
 
     assert_eq!(
-        fetch_context_window(&server.uri(), "llama3:8b"),
+        fetch_context_window(&server.uri(), "llama3:8b", newt_core::BackendKind::Ollama),
         Some(32768)
     );
 }
@@ -142,7 +142,10 @@ async fn fetch_context_window_takes_smaller_modelfile_num_ctx() {
         .mount(&server)
         .await;
 
-    assert_eq!(fetch_context_window(&server.uri(), "m"), Some(8192));
+    assert_eq!(
+        fetch_context_window(&server.uri(), "m", newt_core::BackendKind::Ollama),
+        Some(8192)
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -156,12 +159,18 @@ async fn fetch_context_window_none_when_response_lacks_fields() {
         .mount(&server)
         .await;
 
-    assert_eq!(fetch_context_window(&server.uri(), "m"), None);
+    assert_eq!(
+        fetch_context_window(&server.uri(), "m", newt_core::BackendKind::Ollama),
+        None
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fetch_context_window_none_when_unreachable() {
-    assert_eq!(fetch_context_window(DEAD_ENDPOINT, "m"), None);
+    assert_eq!(
+        fetch_context_window(DEAD_ENDPOINT, "m", newt_core::BackendKind::Ollama),
+        None
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -183,7 +192,13 @@ async fn ensure_context_window_skips_when_already_known() {
     // DEAD_ENDPOINT proves no HTTP call is attempted: if it were, the fetch
     // would fail and... actually it would return false either way, so the
     // real assertion is that the entry is untouched and the call is cheap.
-    assert!(!ensure_context_window(&mut e, DEAD_ENDPOINT, "m", false));
+    assert!(!ensure_context_window(
+        &mut e,
+        DEAD_ENDPOINT,
+        "m",
+        false,
+        newt_core::BackendKind::Ollama
+    ));
     assert_eq!(e.context_window, Some(4096));
     assert_eq!(e.safe_context, None, "safe_context must not be invented");
 }
@@ -201,7 +216,13 @@ async fn ensure_context_window_bootstraps_safe_context_at_80_percent() {
         .await;
 
     let mut e = entry_with(ToolConformance::Native);
-    assert!(ensure_context_window(&mut e, &server.uri(), "m", false));
+    assert!(ensure_context_window(
+        &mut e,
+        &server.uri(),
+        "m",
+        false,
+        newt_core::BackendKind::Ollama
+    ));
     assert_eq!(e.context_window, Some(32768));
     assert_eq!(e.safe_context, Some(32768 * 80 / 100)); // 26214
 }
@@ -219,7 +240,13 @@ async fn ensure_context_window_preserves_existing_safe_context() {
 
     let mut e = entry_with(ToolConformance::Native);
     e.safe_context = Some(1234); // e.g. tuned down after an overflow
-    assert!(ensure_context_window(&mut e, &server.uri(), "m", false));
+    assert!(ensure_context_window(
+        &mut e,
+        &server.uri(),
+        "m",
+        false,
+        newt_core::BackendKind::Ollama
+    ));
     assert_eq!(e.context_window, Some(32768));
     assert_eq!(e.safe_context, Some(1234), "tuned value must survive");
 }
@@ -227,7 +254,13 @@ async fn ensure_context_window_preserves_existing_safe_context() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ensure_context_window_false_when_fetch_fails() {
     let mut e = entry_with(ToolConformance::Native);
-    assert!(!ensure_context_window(&mut e, DEAD_ENDPOINT, "m", false));
+    assert!(!ensure_context_window(
+        &mut e,
+        DEAD_ENDPOINT,
+        "m",
+        false,
+        newt_core::BackendKind::Ollama
+    ));
     assert_eq!(e.context_window, None);
     assert_eq!(e.safe_context, None);
 }
@@ -254,7 +287,13 @@ async fn refresh_context_window_updates_changed_window_and_bootstraps_when_unset
     e.context_window = Some(32768); // stale, larger
     e.safe_context = None; // unset → eligible for re-bootstrap
     assert!(
-        refresh_context_window(&mut e, &server.uri(), "m", false),
+        refresh_context_window(
+            &mut e,
+            &server.uri(),
+            "m",
+            false,
+            newt_core::BackendKind::Ollama
+        ),
         "a changed window must report dirty"
     );
     assert_eq!(e.context_window, Some(16384), "window updated to fetched");
@@ -281,7 +320,13 @@ async fn refresh_context_window_never_raises_existing_safe_context() {
     e.safe_context = Some(4096); // tuned down after an overflow — must survive
                                  // Window did not change → not dirty; safe_context never auto-raised.
     assert!(
-        !refresh_context_window(&mut e, &server.uri(), "m", false),
+        !refresh_context_window(
+            &mut e,
+            &server.uri(),
+            "m",
+            false,
+            newt_core::BackendKind::Ollama
+        ),
         "unchanged window is not dirty"
     );
     assert_eq!(e.context_window, Some(32768));
@@ -301,7 +346,13 @@ async fn ensure_context_window_trust_declared_raises_reined_safe_context() {
     let mut e = entry_with(ToolConformance::Native);
     e.context_window = Some(1_048_576); // declared 1M (e.g. nemotron-3-nano:30b)
     e.safe_context = Some(6_000); // reined down by a past overflow and stuck
-    assert!(ensure_context_window(&mut e, DEAD_ENDPOINT, "m", true));
+    assert!(ensure_context_window(
+        &mut e,
+        DEAD_ENDPOINT,
+        "m",
+        true,
+        newt_core::BackendKind::Ollama
+    ));
     assert_eq!(e.context_window, Some(1_048_576));
     assert_eq!(
         e.safe_context,
@@ -325,7 +376,13 @@ async fn refresh_context_window_trust_declared_raises_safe_context() {
     e.context_window = Some(32768); // unchanged
     e.safe_context = Some(4096); // reined down — trust-declared must raise it
     assert!(
-        refresh_context_window(&mut e, &server.uri(), "m", true),
+        refresh_context_window(
+            &mut e,
+            &server.uri(),
+            "m",
+            true,
+            newt_core::BackendKind::Ollama
+        ),
         "trust-declared refresh raises safe_context → reports dirty"
     );
     assert_eq!(

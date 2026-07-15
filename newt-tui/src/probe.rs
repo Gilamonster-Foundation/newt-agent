@@ -576,68 +576,25 @@ pub fn fetch_ollama_models(endpoint: &str) -> anyhow::Result<Vec<ModelInfo>> {
 /// 2. `num_ctx` line in the `parameters` string — Modelfile override
 ///
 /// Returns `None` if the endpoint is unreachable or the response lacks both fields.
-pub fn fetch_context_window(endpoint: &str, model: &str) -> Option<u32> {
-    let url = format!("{}/api/show", endpoint.trim_end_matches('/'));
-    let body = serde_json::json!({"name": model});
-    let json: serde_json::Value = tokio::task::block_in_place(|| {
+pub fn fetch_context_window(
+    endpoint: &str,
+    model: &str,
+    kind: newt_core::BackendKind,
+) -> Option<u32> {
+    // Ask the backend (#backend-trait): Ollama reads /api/show, vLLM reads
+    // /v1/models max_model_len (#1195) — the per-API impl owns which. Sync
+    // bridge (block_in_place) since the probe path is sync.
+    tokio::task::block_in_place(|| {
         tokio::runtime::Handle::current().block_on(async {
-            reqwest::Client::builder()
+            let client = reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(10))
                 .build()
-                .ok()?
-                .post(&url)
-                .json(&body)
-                .send()
+                .ok()?;
+            newt_core::backend_probe::api_for(kind)
+                .context_window(&client, endpoint, model, None)
                 .await
-                .ok()?
-                .json::<serde_json::Value>()
-                .await
-                .ok()
         })
-    })?;
-
-    parse_show_response(&json)
-}
-
-/// Extract the context window from a parsed `/api/show` response.
-/// Separated from the HTTP call so it can be unit-tested without a server.
-pub(crate) fn parse_show_response(json: &serde_json::Value) -> Option<u32> {
-    // 1. Architecture limit from model_info.
-    // Ollama returns the field as "model_info" (with underscore). The key name
-    // is architecture-prefixed (e.g. "llama.context_length",
-    // "nemotron_h_omni.context_length") — scan for any key ending in
-    // ".context_length" so new architectures work without code changes.
-    let arch_limit: Option<u32> = json["model_info"].as_object().and_then(|info| {
-        // Exact bare key first (unlikely but defensive).
-        if let Some(v) = info.get("context_length").and_then(|v| v.as_u64()) {
-            return Some(v as u32);
-        }
-        // Any architecture-prefixed key ending in ".context_length".
-        info.iter()
-            .filter(|(k, _)| k.ends_with(".context_length"))
-            .filter_map(|(_, v)| v.as_u64())
-            .map(|v| v as u32)
-            .min() // take the smallest if there are multiple (conservative)
-    });
-
-    // 2. Modelfile `num_ctx` parameter line (user override, takes precedence if smaller).
-    let modelfile_ctx: Option<u32> = json["parameters"].as_str().and_then(|params| {
-        params.lines().find_map(|line| {
-            let mut parts = line.split_whitespace();
-            if parts.next()? == "num_ctx" {
-                parts.next()?.parse::<u32>().ok()
-            } else {
-                None
-            }
-        })
-    });
-
-    match (arch_limit, modelfile_ctx) {
-        (Some(a), Some(b)) => Some(a.min(b)),
-        (Some(a), None) => Some(a),
-        (None, Some(b)) => Some(b),
-        (None, None) => None,
-    }
+    })
 }
 
 /// Ensure `entry` has a `context_window` and an initial `safe_context`.
@@ -654,6 +611,7 @@ pub fn ensure_context_window(
     endpoint: &str,
     model: &str,
     trust_declared: bool,
+    kind: newt_core::BackendKind,
 ) -> bool {
     // Empirical mode keeps the original fetch-once contract: when the window is
     // already known, do nothing — a reined-down safe_context must persist.
@@ -665,7 +623,7 @@ pub fn ensure_context_window(
     // safe_context below in trust-declared mode.
     let mut changed = false;
     if entry.context_window.is_none() {
-        let Some(window) = fetch_context_window(endpoint, model) else {
+        let Some(window) = fetch_context_window(endpoint, model, kind) else {
             return false;
         };
         entry.context_window = Some(window);
@@ -722,8 +680,9 @@ pub fn refresh_context_window(
     endpoint: &str,
     model: &str,
     trust_declared: bool,
+    kind: newt_core::BackendKind,
 ) -> bool {
-    let Some(window) = fetch_context_window(endpoint, model) else {
+    let Some(window) = fetch_context_window(endpoint, model, kind) else {
         return false;
     };
     let mut changed = entry.context_window != Some(window);
@@ -1226,6 +1185,7 @@ pub struct FullProbeReport {
 /// thinking quirk, updates `conformance` / `tested_date`, and **mutates
 /// `entry` in place** so the caller's `..existing` 20.1 fields are preserved.
 /// Persisting is the caller's job; the report is for display.
+#[allow(clippy::too_many_arguments)]
 pub fn full_probe(
     endpoint: &str,
     model: &str,
@@ -1234,6 +1194,7 @@ pub fn full_probe(
     today: &str,
     mut progress: impl FnMut(&str),
     est: TokenEstimation,
+    kind: newt_core::BackendKind,
 ) -> FullProbeReport {
     let mut notes = Vec::new();
 
@@ -1262,7 +1223,7 @@ pub fn full_probe(
     // the active (empirical) discovery driver, so it keeps the conservative
     // bootstrap-if-none behaviour; the passive session path
     // (`ensure_context_window`) delivers the trust-declared default.
-    refresh_context_window(entry, endpoint, model, false);
+    refresh_context_window(entry, endpoint, model, false, kind);
 
     // 3. Thinking probe + calibration bootstrap (§4.3 / §4.4).
     let mut emits_thinking = entry.emits_thinking.unwrap_or(false);
@@ -2438,19 +2399,28 @@ mod tests {
     #[test]
     fn parse_show_response_reads_llama_key() {
         let json = serde_json::json!({"model_info": {"llama.context_length": 32768}});
-        assert_eq!(super::parse_show_response(&json), Some(32768));
+        assert_eq!(
+            newt_core::backend_probe::parse_ollama_show_window(&json),
+            Some(32768)
+        );
     }
 
     #[test]
     fn parse_show_response_reads_nemotron_key() {
         let json = serde_json::json!({"model_info": {"nemotron_h_omni.context_length": 131072}});
-        assert_eq!(super::parse_show_response(&json), Some(131072));
+        assert_eq!(
+            newt_core::backend_probe::parse_ollama_show_window(&json),
+            Some(131072)
+        );
     }
 
     #[test]
     fn parse_show_response_bare_context_length_key() {
         let json = serde_json::json!({"model_info": {"context_length": 8192}});
-        assert_eq!(super::parse_show_response(&json), Some(8192));
+        assert_eq!(
+            newt_core::backend_probe::parse_ollama_show_window(&json),
+            Some(8192)
+        );
     }
 
     #[test]
@@ -2459,7 +2429,10 @@ mod tests {
             "model_info": {"llama.context_length": 131072},
             "parameters": "num_ctx 32768\ntemperature 0.7"
         });
-        assert_eq!(super::parse_show_response(&json), Some(32768));
+        assert_eq!(
+            newt_core::backend_probe::parse_ollama_show_window(&json),
+            Some(32768)
+        );
     }
 
     #[test]
@@ -2468,13 +2441,19 @@ mod tests {
             "model_info": {"llama.context_length": 4096},
             "parameters": "num_ctx 32768"
         });
-        assert_eq!(super::parse_show_response(&json), Some(4096));
+        assert_eq!(
+            newt_core::backend_probe::parse_ollama_show_window(&json),
+            Some(4096)
+        );
     }
 
     #[test]
     fn parse_show_response_returns_none_when_no_keys() {
         let json = serde_json::json!({"model_info": {"general.architecture": "llama"}});
-        assert_eq!(super::parse_show_response(&json), None);
+        assert_eq!(
+            newt_core::backend_probe::parse_ollama_show_window(&json),
+            None
+        );
     }
 
     #[test]
@@ -2485,7 +2464,10 @@ mod tests {
                 "gemma.context_length": 8192
             }
         });
-        assert_eq!(super::parse_show_response(&json), Some(8192));
+        assert_eq!(
+            newt_core::backend_probe::parse_ollama_show_window(&json),
+            Some(8192)
+        );
     }
 
     #[test]
@@ -2494,32 +2476,47 @@ mod tests {
         let json = serde_json::json!({
             "parameters": "stop \"<|end|>\"\nnum_ctx 16384\ntemperature 0.2"
         });
-        assert_eq!(super::parse_show_response(&json), Some(16384));
+        assert_eq!(
+            newt_core::backend_probe::parse_ollama_show_window(&json),
+            Some(16384)
+        );
     }
 
     #[test]
     fn parse_show_response_ignores_unparsable_num_ctx() {
         // num_ctx value that isn't a u32 must be skipped, not panic.
         let json = serde_json::json!({"parameters": "num_ctx lots"});
-        assert_eq!(super::parse_show_response(&json), None);
+        assert_eq!(
+            newt_core::backend_probe::parse_ollama_show_window(&json),
+            None
+        );
     }
 
     #[test]
     fn parse_show_response_parameters_without_num_ctx() {
         let json = serde_json::json!({"parameters": "temperature 0.7\ntop_p 0.9"});
-        assert_eq!(super::parse_show_response(&json), None);
+        assert_eq!(
+            newt_core::backend_probe::parse_ollama_show_window(&json),
+            None
+        );
     }
 
     #[test]
     fn parse_show_response_non_numeric_context_length_ignored() {
         // A context_length that isn't a u64 (e.g. a string) must not match.
         let json = serde_json::json!({"model_info": {"llama.context_length": "32768"}});
-        assert_eq!(super::parse_show_response(&json), None);
+        assert_eq!(
+            newt_core::backend_probe::parse_ollama_show_window(&json),
+            None
+        );
     }
 
     #[test]
     fn parse_show_response_empty_json() {
-        assert_eq!(super::parse_show_response(&serde_json::json!({})), None);
+        assert_eq!(
+            newt_core::backend_probe::parse_ollama_show_window(&serde_json::json!({})),
+            None
+        );
     }
 
     // --- probe_tool_schema ---
