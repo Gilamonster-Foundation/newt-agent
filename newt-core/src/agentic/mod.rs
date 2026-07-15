@@ -1319,6 +1319,9 @@ pub async fn chat_complete(
     // collected as the rounds happen so it survives the cap-exit trim.
     let mut observed_paths = claim_check::ObservedPaths::default();
     let observed_resolver = claim_check::workspace_resolver(workspace);
+    // #1214: HEAD at turn start — the ground truth "did THIS turn actually
+    // commit anything" compares against at cap-exit.
+    let turn_start_head = claim_check::git_head(workspace);
 
     // Agentic loop — up to `max_tool_rounds` tool-call rounds, with an optional
     // evidence-backed grace window when the normal cap lands during active
@@ -2591,6 +2594,13 @@ pub async fn chat_complete(
     // cited path against the workspace and append a visible refutation for
     // any that don't exist. Appends only; the model's prose is never edited.
     let text = claim_check::annotate_against_workspace(text, workspace);
+    // #1214: the sibling check for claimed ACTIONS (commits, branches, pushes,
+    // passing tests) — refuted against the workspace's real git state across
+    // this turn. Fail-quiet off-repo (no evidence, no annotation).
+    let text = claim_check::annotate_action_claims(
+        text,
+        claim_check::collect_git_evidence(workspace, turn_start_head.as_deref()).as_ref(),
+    );
     if let Some(slot) = &mut end_reason {
         **slot = Some(crate::TurnEndReason::RoundCap);
     }
@@ -3715,7 +3725,12 @@ fn cap_exit_nudge(max_tool_rounds: usize, progress: Option<&str>, observed: &[St
          was in the omitted messages, say so plainly instead of reconstructing \
          file names or line numbers from memory. Do not answer with an intention \
          to keep working (for example, \"let me read/edit/verify\"); if work remains, \
-         list it as remaining work and state that the round cap stopped further tool calls."
+         list it as remaining work and state that the round cap stopped further tool calls. \
+         Report an ACTION (an edit made, a test run or passing, a branch created, a \
+         commit, a push, a PR opened) ONLY if a successful tool result above confirms \
+         it — if you did not see the tool result, the action did not happen; list it \
+         as remaining work instead. The workspace's real git state is checked against \
+         this summary."
     );
     // #867 Part A: the ledger survived the trim — hand the model the REAL
     // manifest so grounded citation is possible, not just demanded.
@@ -4185,6 +4200,8 @@ pub async fn openai_chat_complete(
     // #867 Part A: observed-paths ledger (matches the Ollama path).
     let mut observed_paths = claim_check::ObservedPaths::default();
     let observed_resolver = claim_check::workspace_resolver(workspace);
+    // #1214: HEAD at turn start (mirror of the Ollama path).
+    let turn_start_head = claim_check::git_head(workspace);
 
     // Narrate-then-stop rescue counter (mirror of the Ollama path).
     let mut narration_nudges: usize = 0;
@@ -5014,6 +5031,13 @@ pub async fn openai_chat_complete(
     .await?;
     // #867: same path-claim refutation as the Ollama cap exit.
     let text = claim_check::annotate_against_workspace(text, workspace);
+    // #1214: the sibling check for claimed ACTIONS (commits, branches, pushes,
+    // passing tests) — refuted against the workspace's real git state across
+    // this turn. Fail-quiet off-repo (no evidence, no annotation).
+    let text = claim_check::annotate_action_claims(
+        text,
+        claim_check::collect_git_evidence(workspace, turn_start_head.as_deref()).as_ref(),
+    );
     if let Some(slot) = &mut end_reason {
         **slot = Some(crate::TurnEndReason::RoundCap);
     }
