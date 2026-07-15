@@ -54,7 +54,7 @@ proves each unit; cohesion decides where the units live.
 > approximation* of our thoughts. If we are not swimming well — if our own model
 > of the problem is a tangle — the machine cannot mechanically swim well either.
 > Organizing for cohesion is organizing your own thinking first; the code is the
-> cast of it.
+> cast of it. -- Shawn Hartsock
 
 ## Cohesion has kinds — insist on the *functional* one
 
