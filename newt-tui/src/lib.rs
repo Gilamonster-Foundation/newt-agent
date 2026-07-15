@@ -555,6 +555,7 @@ use crate::permissions::{
 // consumer in this crate is the `#[cfg(unix)]` interrupt watcher
 // (`watch_for_interrupt`). Gate the import to match, or a Windows build trips
 // `-D warnings` on the unresolved import / an unused import under `test`.
+pub use crate::permissions::ocap_high_danger_predicate;
 #[cfg(unix)]
 use crate::permissions::prompt_stdin_active;
 use crate::setup_tui::{run_setup_inline, run_setup_screen};
