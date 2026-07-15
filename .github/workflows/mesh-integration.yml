@@ -30,6 +30,15 @@ name: Mesh integration
 # The tests use real mDNS + QUIC on ephemeral UDP ports, entirely
 # inside the runner — no external services, no inference backends
 # (deterministic mock/echo backends only).
+#
+# TEST TIERING (#1190): the live cross-peer round-trip tests are
+# `#[ignore]`d — real mDNS discovery / dial-back is unreliable on CI
+# runners (flaky pending agent-mesh #61/#62). Per-PR / push runs the
+# DETERMINISTIC subset (`cargo test`, ignored skipped) incl. the
+# `src/service.rs` responder-logic unit tests; the nightly cron and
+# manual dispatch run the FULL suite (`-- --include-ignored`) to catch
+# real transport drift. Locally, `just check-mesh` mirrors the per-PR
+# subset; add `-- --include-ignored` to exercise the live transport.
 
 on:
   push:
@@ -98,7 +107,21 @@ jobs:
         working-directory: newt-agent
         run: cargo clippy --manifest-path newt-mesh/Cargo.toml --all-targets -- -D warnings
 
-      - name: tests (roundtrip + conversation contract)
-        if: always()
+      # Per-PR / push: the DETERMINISTIC gate. The live-transport round-trip
+      # tests (real mDNS discovery + dial-back) are `#[ignore]`d — they need
+      # networking the CI runner can't provide reliably (flaky pending the
+      # agent-mesh dial-back fix #61/#62, see #1190), so they must NOT gate
+      # every PR. Responder LOGIC is covered by the deterministic
+      # `src/service.rs` unit tests, which run here. `cargo test` skips ignored.
+      - name: tests (deterministic — per-PR gate)
+        if: always() && github.event_name != 'schedule' && github.event_name != 'workflow_dispatch'
         working-directory: newt-agent
         run: cargo test --manifest-path newt-mesh/Cargo.toml
+      # Nightly drift + on-demand: the FULL suite INCLUDING the live iroh
+      # transport round-trips (`--include-ignored`). This is where transport
+      # drift against agent-mesh@main is actually caught; its flakiness is
+      # isolated to this non-blocking lane.
+      - name: tests (full incl. live transport — nightly/dispatch)
+        if: always() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+        working-directory: newt-agent
+        run: cargo test --manifest-path newt-mesh/Cargo.toml -- --include-ignored

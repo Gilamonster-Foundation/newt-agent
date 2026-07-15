@@ -1,11 +1,22 @@
-//! End-to-end smoke: a responder newt and an asker newt in the same
-//! process exchange an inference request and reply, using
-//! [`tests_common::MockBackend`] to keep the test fast and
-//! deterministic. This is the canonical mock-mode proof that the
-//! agent-mesh-bus + newt-inference wiring round-trips end-to-end.
+//! **Transport smoke only** (#1190). A responder newt and an asker newt in
+//! the same process exchange one inference request/reply over the *real*
+//! agent-mesh bus (iroh QUIC + mDNS on ephemeral UDP ports) — the proof that
+//! the WIRE works: an asker can reach a responder and get a well-formed reply
+//! back.
 //!
-//! No external services. The bus + transport stack runs entirely
-//! in-process on ephemeral UDP ports.
+//! This file deliberately asserts **transport**, not **logic**. The
+//! responder's request→reply logic (reply content/model_id, malformed-request
+//! handling, model-pin mismatch naming the bad pin) is covered deterministically
+//! and socket-free by the `handle_inference_*` unit tests in
+//! `src/service.rs` — the fully-mocked unit tier per the repo's testing law.
+//! Re-asserting that logic here would only re-couple it to the live transport's
+//! flakiness (the agent-mesh dial-back / link-local-address issue, #61/#62),
+//! which is exactly the masking #1190 removes: a transport timeout and a logic
+//! regression must not look identical.
+//!
+//! No external services; the bus runs entirely in-process. The live transport
+//! remains flaky under CI until the agent-mesh dial-back fix (#61/#62) lands;
+//! that flake is isolated to this cross-project `mesh-integration` lane.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -39,6 +50,11 @@ fn agent(user: &UserKey, role: &str, caps: Vec<String>) -> AgentKey {
 
 #[tokio::test(flavor = "multi_thread")]
 #[serial_test::serial(mesh_mdns)]
+// Live iroh transport (mDNS discovery + dial-back). Flaky on CI runners until
+// the agent-mesh dial-back fix (#61/#62); runs nightly via `--include-ignored`,
+// not on the per-PR gate (#1190). The responder logic it exercises is covered
+// deterministically by the `handle_inference_*` unit tests in src/service.rs.
+#[ignore = "live transport — nightly only (#1190; agent-mesh #61/#62)"]
 async fn ask_receives_inference_reply() {
     let _ = tracing_subscriber::fmt().with_test_writer().try_init();
 
@@ -50,7 +66,6 @@ async fn ask_receives_inference_reply() {
 
     let backend: Arc<dyn newt_inference::backend::InferenceBackend> =
         Arc::new(MockBackend::all_tiers("rt-backend", "rename complete"));
-    let backend_model = backend.model_id().to_string();
 
     let service = NewtMeshService::bind(&user, responder_agent, backend, 0)
         .await
@@ -81,68 +96,19 @@ async fn ask_receives_inference_reply() {
     .await
     .expect("ask round-trip");
 
+    // Assert the WIRE, not the logic (#1190): a well-formed reply came back
+    // across the real transport — non-error, with the body intact (a non-empty
+    // content proves the responder's bytes survived the round-trip). The exact
+    // content/model_id are the responder logic's contract, pinned socket-free by
+    // the `handle_inference_*` unit tests in src/service.rs.
     assert!(
         !reply.is_error(),
         "responder reported error: {:?}",
         reply.error
     );
-    assert_eq!(reply.content, "rename complete");
-    assert_eq!(reply.model_id, backend_model);
-
-    service.close().await.unwrap();
-    asker.close().await.unwrap();
-}
-
-#[tokio::test(flavor = "multi_thread")]
-#[serial_test::serial(mesh_mdns)]
-async fn ask_surfaces_responder_error_for_bad_model_pin() {
-    let _ = tracing_subscriber::fmt().with_test_writer().try_init();
-
-    let user = UserKey::generate();
-
-    let responder_agent = agent(&user, "test-responder", vec!["newt-inference".to_string()]);
-    let asker_agent = agent(&user, "test-asker", vec!["newt-asker".to_string()]);
-    let responder_fp = responder_agent.fingerprint();
-
-    let backend: Arc<dyn newt_inference::backend::InferenceBackend> =
-        Arc::new(MockBackend::all_tiers("rt-backend", "ignored"));
-
-    let service = NewtMeshService::bind(&user, responder_agent, backend, 0)
-        .await
-        .expect("bind service");
-
-    let asker = MeshAsker::bind(&user, asker_agent)
-        .await
-        .expect("bind asker");
-
-    // First contact via poll-with-deadline — see #274 note above.
-    let reply = util::with_announce_grace(
-        || {
-            asker.ask(
-                responder_fp,
-                InferenceRequest {
-                    prompt: "irrelevant".into(),
-                    tier: None,
-                    model: Some("model-that-does-not-exist".into()),
-                    max_tokens: None,
-                },
-                Duration::from_secs(10),
-            )
-        },
-        ask_unannounced,
-    )
-    .await
-    .expect("ask round-trip");
-
     assert!(
-        reply.is_error(),
-        "expected error reply, got content={}",
-        reply.content
-    );
-    let msg = reply.error.unwrap();
-    assert!(
-        msg.contains("model-that-does-not-exist"),
-        "error did not mention the bad pin: {msg}"
+        !reply.content.is_empty() && !reply.model_id.is_empty(),
+        "reply body did not survive the wire: {reply:?}"
     );
 
     service.close().await.unwrap();
