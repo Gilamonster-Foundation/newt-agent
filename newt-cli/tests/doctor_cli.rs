@@ -97,6 +97,20 @@ async fn doctor_reports_backend_and_provider_statuses() {
         .mount(&err_server)
         .await;
 
+    // #1212: an openai-kind backend must be probed via /v1/models (it
+    // false-404'd via /api/tags before the fix — this mock serves ONLY the
+    // openai surface, so the old probe path fails loudly here).
+    let openai_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"data": [{"id": "test-model"}]})),
+        )
+        .expect(1)
+        .mount(&openai_server)
+        .await;
+
     let provider_dir = tempfile::tempdir().unwrap();
     let present_command = write_provider_probe(provider_dir.path(), "newt-provider-present", 0);
     let broken_command = write_provider_probe(provider_dir.path(), "newt-provider-broken", 1);
@@ -113,6 +127,13 @@ tiers = ["FAST"]
 name = "bad-status"
 endpoint = "{err}"
 model = "m"
+tiers = ["FAST"]
+
+[[backends]]
+name = "vllm-like"
+endpoint = "{openai}"
+model = "test-model"
+kind = "openai"
 tiers = ["FAST"]
 
 [[backends]]
@@ -140,6 +161,7 @@ tiers = ["FAST"]
 "#,
         ok = ok_server.uri(),
         err = err_server.uri(),
+        openai = openai_server.uri(),
         present_command = present_command,
         broken_command = broken_command,
     ));
@@ -150,16 +172,21 @@ tiers = ["FAST"]
 
     cmd.assert()
         .success()
+        // #1212: probes route by KIND and report the served-model count.
         .stdout(predicate::str::contains(format!(
-            "good ({}) — OK",
+            "good ({}, Ollama) — OK (0 model(s) served)",
             ok_server.uri()
         )))
         .stdout(predicate::str::contains(format!(
-            "bad-status ({}) — HTTP 500",
+            "vllm-like ({}, Openai) — OK (1 model(s) served)",
+            openai_server.uri()
+        )))
+        .stdout(predicate::str::contains(format!(
+            "bad-status ({}, Ollama) — HTTP 500",
             err_server.uri()
         )))
         .stdout(predicate::str::contains(
-            "down (http://127.0.0.1:1) — unreachable",
+            "down (http://127.0.0.1:1, Ollama) — unreachable",
         ))
         .stdout(predicate::str::contains(format!(
             "present (command: {present_command}) — found on PATH"

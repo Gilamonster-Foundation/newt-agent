@@ -183,6 +183,9 @@ async fn probe_configured_backend(backend: &newt_core::config::BackendConfig) ->
         .await
     {
         Ok(models) => format!("OK ({} model(s) served)", models.len()),
+        // The fetchers bail with `HTTP <status>` for a reachable-but-erroring
+        // endpoint — keep that distinct from a connection failure.
+        Err(e) if e.to_string().starts_with("HTTP ") => e.to_string(),
         Err(e) => format!("unreachable: {e}"),
     }
 }
