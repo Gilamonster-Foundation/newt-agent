@@ -396,8 +396,15 @@ mod tests {
             "data": [{ "id": "ornith", "max_model_len": 262144u64 }]
         });
         assert_eq!(parse_openai_models_window(&json, "ornith"), Some(262144));
-        assert_eq!(parse_openai_models_window(&json, "other"), Some(262144), "single-instance fallback");
-        assert_eq!(parse_openai_models_window(&serde_json::json!({"data":[{"id":"m"}]}), "m"), None);
+        assert_eq!(
+            parse_openai_models_window(&json, "other"),
+            Some(262144),
+            "single-instance fallback"
+        );
+        assert_eq!(
+            parse_openai_models_window(&serde_json::json!({"data":[{"id":"m"}]}), "m"),
+            None
+        );
     }
 
     #[test]

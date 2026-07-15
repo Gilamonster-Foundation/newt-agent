@@ -3148,6 +3148,9 @@ fn run_chat(
         print_newt(&line, color, verbose);
     }
     let (mut inf_url, mut inf_model) = (choice.url.clone(), choice.model.clone());
+    // #1199: the server-declared window from adopt, fresh per session — feeds
+    // the budget without the persisted cache.
+    let mut inf_context_window: Option<u32> = choice.context_window;
 
     // Resolve + validate the active profile against config, now that the model is
     // known. Precedence: --profile (explicit) > --bundle > a bundle inferred from
@@ -4878,6 +4881,7 @@ fn run_chat(
                     inf_model = choice.model.clone();
                     inf_kind = choice.kind;
                     inf_key = choice.api_key.clone();
+                    inf_context_window = choice.context_window;
                     apply_openai_api_env(choice.api);
                     // Re-probe DCGM ONLY when the backend URL actually changed
                     // (and only in verbose mode, where the snapshot is shown).
@@ -4964,7 +4968,16 @@ fn run_chat(
                     // estimate-calibration ratio (Phase 20 §2.3).
                     let (eff_safe_context, eff_max_ok_input, eff_estimate_ratio) = {
                         let entry = cap_cache.entry(inf_model.clone()).or_default();
-                        let updated = ctx_window_probed.insert(inf_model.clone())
+                        // #1199: the server-declared window from session-start
+                        // adopt (`inf_context_window`) is authoritative and
+                        // cache-independent. Only fall back to the cache-side
+                        // probe (`ensure_context_window`) when adopt got NONE —
+                        // e.g. an authed gateway adopt couldn't reach — so a
+                        // stale cached None can never starve a discovered
+                        // window. The cache still holds the LEARNED facts
+                        // (max_ok_input, estimate_ratio).
+                        let updated = inf_context_window.is_none()
+                            && ctx_window_probed.insert(inf_model.clone())
                             && probe::ensure_context_window(
                                 entry,
                                 &inf_url,
@@ -4972,19 +4985,18 @@ fn run_chat(
                                 !real_context_discovery(&cfg, &inf_model),
                                 inf_kind,
                             );
-                        let sc = entry.safe_context;
+                        let cached_sc = entry.safe_context;
                         let moi = entry.max_ok_input;
                         let ratio = entry.estimate_ratio;
                         if updated {
                             probe::save_cache(&cap_cache);
                         }
-                        // A configured per-model `context_window` seeds the
-                        // budget when the probe found nothing (issue: OpenAI /
-                        // NVIDIA wire has no `/api/show`, so `safe_context`
-                        // stays None and the loop never budgets against a real
-                        // window). Only a fallback — an empirical probe result
-                        // always wins.
-                        let sc = sc.or_else(|| model_tune.and_then(|t| t.context_window));
+                        // The fresh server window (at 80%) wins; the cached
+                        // probe and a configured `context_window` are fallback.
+                        let sc = inf_context_window
+                            .map(|w| w * 80 / 100)
+                            .or(cached_sc)
+                            .or_else(|| model_tune.and_then(|t| t.context_window));
                         (sc, moi, ratio)
                     };
 
@@ -5834,6 +5846,11 @@ pub(crate) struct BackendChoice {
     /// For an OpenAI backend: which HTTP surface (chat/completions vs the newer
     /// /v1/responses). Surfaced to the agent loop via `NEWT_OPENAI_API`.
     pub(crate) api: newt_core::OpenAiApi,
+    /// The server-declared context window (#1199), probed FRESH at session-start
+    /// adopt — not read from the persisted cache (which could hold a stale
+    /// None). `None` when the API can't be asked; the budget then falls back to
+    /// config / the learned cache.
+    pub(crate) context_window: Option<u32>,
 }
 
 /// The session-start ready preamble. Includes the backend wire protocol
@@ -5985,6 +6002,22 @@ fn adopt_backend_choice(choice: &mut BackendChoice) -> Vec<String> {
                     choice.url
                 )),
             }
+            // #1199: auto-detect the context window from the SERVER, fresh —
+            // vLLM's max_model_len / Ollama's /api/show. Held on the choice and
+            // fed to the budget; never read from the persisted cache (which
+            // could pin a stale None and starve a 256k model).
+            choice.context_window = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async {
+                    backend_probe::api_for(choice.kind)
+                        .context_window(
+                            &client,
+                            &choice.url,
+                            &choice.model,
+                            choice.api_key.as_deref(),
+                        )
+                        .await
+                })
+            });
         }
         Err(e) => {
             if choice.model.is_empty() {
@@ -6045,6 +6078,7 @@ pub(crate) fn resolve_backend_choice(cfg: &newt_core::Config) -> BackendChoice {
         kind: b.kind,
         api_key: b.resolve_api_key(),
         api: b.api,
+        context_window: None,
     };
     // 1. A pinned provider (loadout `provider` axis → NEWT_PROVIDER) selects a
     //    named backend, regardless of wire protocol. Unknown name falls through
@@ -6075,6 +6109,7 @@ pub(crate) fn resolve_backend_choice(cfg: &newt_core::Config) -> BackendChoice {
             kind: newt_core::BackendKind::Ollama,
             api_key: None,
             api: newt_core::OpenAiApi::default(),
+            context_window: None,
         };
     }
     // 3. The configured default (#1130): a named pointer beats every heuristic.
@@ -6116,6 +6151,7 @@ pub(crate) fn resolve_backend_choice(cfg: &newt_core::Config) -> BackendChoice {
             kind: newt_core::BackendKind::Ollama,
             api_key: None,
             api: newt_core::OpenAiApi::default(),
+            context_window: None,
         };
     }
     // 7. Multiple backends, nothing pinned: prefer an OpenAI-compatible entry
@@ -6138,6 +6174,7 @@ pub(crate) fn resolve_backend_choice(cfg: &newt_core::Config) -> BackendChoice {
         kind: newt_core::BackendKind::Ollama,
         api_key: None,
         api: newt_core::OpenAiApi::default(),
+        context_window: None,
     }
 }
 
