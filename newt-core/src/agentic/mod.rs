@@ -1251,6 +1251,7 @@ pub async fn chat_complete(
                         &mut narration_nudges,
                         outcome.action,
                         step_ledger,
+                        task,
                         round > 0,
                     );
                 }
@@ -1428,6 +1429,7 @@ pub async fn chat_complete(
                                 &mut narration_nudges,
                                 outcome.action,
                                 step_ledger,
+                                task,
                                 round > 0,
                             );
                         }
@@ -1984,6 +1986,7 @@ pub async fn chat_complete(
                                 &mut narration_nudges,
                                 outcome.action,
                                 step_ledger,
+                                task,
                                 round > 0,
                             );
                         } else {
@@ -3041,26 +3044,14 @@ fn narration_action_nudge() -> String {
 /// re-arms intent: mid-task, active step named, next output a tool call.
 /// Carries [`compress::CONTINUATION_PREFIX`] so later compressions neither
 /// anchor the tail on it nor keep more than one alive.
-/// The operator's actual instruction for this turn, recovered from the message
-/// list so the post-compaction directive can quote it VERBATIM (#1163, second
-/// repro): compaction summarizes the middle, and a multi-round turn's summary
-/// can drown the operator's imperative ("make a branch, write a commit for
-/// each") under the transcript it produced — the model then re-derives a WRONG
-/// task from the summary and confabulates ("you asked me to name them, not
-/// build them"). The first non-harness user message is the turn's instruction;
-/// harness-owned messages (summaries, continuations, nudges) are skipped.
-fn turn_instruction(messages: &[serde_json::Value]) -> Option<String> {
-    messages
-        .iter()
-        .find(|m| m["role"].as_str() == Some("user") && !compress::is_compaction_message(m))
-        .and_then(|m| m["content"].as_str())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-}
-
+/// The operator's actual instruction for this turn comes from the caller's
+/// authoritative task, not from rediscovering a user message in compacted
+/// history. Compaction may retain an older conversation prompt while replacing
+/// the current one with a lossy summary, so role-scanning cannot identify the
+/// active task reliably (#1163, 2026-07-16 multi-turn repro).
 fn post_compaction_continuation(
     step_ledger: Option<&dyn scheduled::StepLedger>,
-    instruction: Option<&str>,
+    task: &str,
 ) -> String {
     // #1163 (F): re-inject the FULL plan verbatim — every step with its
     // status — not just the active one. The corporate-box repro showed the
@@ -3081,12 +3072,12 @@ fn post_compaction_continuation(
     // Quote the operator's instruction so the model re-anchors on what was
     // ACTUALLY asked, not a summary-derived paraphrase. Bounded so a huge
     // paste can't itself blow the budget.
-    let instruction_clause = instruction
-        .map(|t| {
-            let quoted: String = t.chars().take(400).collect();
-            format!(" The operator's instruction for this turn was: \"{quoted}\" — keep executing THAT, exactly.")
-        })
-        .unwrap_or_default();
+    let instruction_clause = if task.trim().is_empty() {
+        String::new()
+    } else {
+        let quoted: String = task.chars().take(400).collect();
+        format!(" The operator's instruction for this turn was: \"{quoted}\" — keep executing THAT, exactly.")
+    };
     format!(
         "{} You are mid-task: the context above was just compacted, not \
          completed.{instruction_clause}{plan_clause} Continue working — your \
@@ -3123,6 +3114,7 @@ fn apply_post_compaction_continuation(
     narration_nudges: &mut usize,
     action: CompressAction,
     step_ledger: Option<&dyn scheduled::StepLedger>,
+    task: &str,
     mid_turn: bool,
 ) {
     if !mid_turn
@@ -3134,15 +3126,11 @@ fn apply_post_compaction_continuation(
         return;
     }
     *narration_nudges = 0;
-    // Recover the operator's instruction BEFORE dropping the prior directive
-    // (the search skips harness-owned messages anyway, but order-independence
-    // keeps it robust).
-    let instruction = turn_instruction(messages);
     // At most one directive alive: drop any earlier copy before appending.
     messages.retain(|m| !compress::is_continuation_message(m));
     messages.push(serde_json::json!({
         "role": "user",
-        "content": post_compaction_continuation(step_ledger, instruction.as_deref()),
+        "content": post_compaction_continuation(step_ledger, task),
     }));
 }
 
@@ -4086,6 +4074,7 @@ pub async fn openai_chat_complete(
                         &mut narration_nudges,
                         outcome.action,
                         step_ledger,
+                        task,
                         round > 0,
                     );
                 }
@@ -4217,6 +4206,7 @@ pub async fn openai_chat_complete(
                                 &mut narration_nudges,
                                 outcome.action,
                                 step_ledger,
+                                task,
                                 round > 0,
                             );
                         }

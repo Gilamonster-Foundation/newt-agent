@@ -879,6 +879,122 @@ async fn mid_loop_compression_fires_when_message_list_grows() {
     assert_eq!(reply, "final after trim");
 }
 
+/// OpenAI-path transcript regression for the 2026-07-16 amnesia failure:
+/// after turn A completed, turn B grew large enough to compact mid-loop. The
+/// continuation must quote authoritative `ChatCtx.task` B, never rediscover
+/// the first user message (A) from retained conversation history.
+struct OpenAiTaskAnchoringResponder {
+    directive_seen: Arc<AtomicBool>,
+    current_task_in_directive: Arc<AtomicBool>,
+    historical_task_in_directive: Arc<AtomicBool>,
+}
+
+impl Respond for OpenAiTaskAnchoringResponder {
+    fn respond(&self, req: &Request) -> ResponseTemplate {
+        let body = body_json(req);
+        let messages = body["messages"].as_array();
+        let has_summary = messages.is_some_and(|messages| {
+            messages.iter().any(|message| {
+                message["content"]
+                    .as_str()
+                    .is_some_and(|content| content.contains(SUMMARY_PREFIX))
+            })
+        });
+
+        if has_summary {
+            let directive = messages.and_then(|messages| {
+                messages.iter().find_map(|message| {
+                    message["content"]
+                        .as_str()
+                        .filter(|content| content.starts_with(compress::CONTINUATION_PREFIX))
+                })
+            });
+            if let Some(directive) = directive {
+                self.directive_seen.store(true, Ordering::SeqCst);
+                if directive.contains(CURRENT_TASK) {
+                    self.current_task_in_directive.store(true, Ordering::SeqCst);
+                }
+                if directive.contains(HISTORICAL_TASK) {
+                    self.historical_task_in_directive
+                        .store(true, Ordering::SeqCst);
+                }
+            }
+            return ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"content": "continued the current task"}}]
+            }));
+        }
+
+        ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{"message": {
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "definitely_not_a_real_tool",
+                        "arguments": "{}"
+                    }
+                }]
+            }}]
+        }))
+    }
+}
+
+const HISTORICAL_TASK: &str = "OLD TASK: probe every ambient MCP server and report its health";
+const CURRENT_TASK: &str =
+    "CURRENT TASK: modify the newt-agent source code and implement MCP management";
+
+#[tokio::test]
+async fn openai_mid_loop_compaction_anchors_the_current_turn_not_historical_prompt() {
+    let server = MockServer::start().await;
+    let directive_seen = Arc::new(AtomicBool::new(false));
+    let current_task_in_directive = Arc::new(AtomicBool::new(false));
+    let historical_task_in_directive = Arc::new(AtomicBool::new(false));
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(OpenAiTaskAnchoringResponder {
+            directive_seen: directive_seen.clone(),
+            current_task_in_directive: current_task_in_directive.clone(),
+            historical_task_in_directive: historical_task_in_directive.clone(),
+        })
+        .mount(&server)
+        .await;
+
+    let messages = vec![
+        MemMessage::system("you are a test"),
+        MemMessage::user(HISTORICAL_TASK),
+        MemMessage::assistant("Ten ambient MCP servers are reachable."),
+        MemMessage::user(CURRENT_TASK),
+    ];
+    let caveats = Caveats::top();
+    let uri = server.uri();
+    let mut c = ctx(&uri, &messages, &caveats);
+    c.kind = BackendKind::Openai;
+    c.task = CURRENT_TASK;
+    c.max_tool_rounds = 3;
+    // Four historical messages fit on round 0; the first tool exchange grows
+    // the list past five, forcing the regression's MID-TURN compaction.
+    c.mid_loop_trim_threshold = 5;
+
+    let (reply, _, _, _) = chat_complete(c, &mut NoMcp)
+        .await
+        .expect("openai loop should continue after compaction");
+
+    assert_eq!(reply, "continued the current task");
+    assert!(
+        directive_seen.load(Ordering::SeqCst),
+        "the post-compaction directive must reach the wire"
+    );
+    assert!(
+        current_task_in_directive.load(Ordering::SeqCst),
+        "the wire continuation must quote current ChatCtx.task B"
+    );
+    assert!(
+        !historical_task_in_directive.load(Ordering::SeqCst),
+        "the wire continuation must not relabel historical task A as current"
+    );
+}
+
 /// The cap-exit summary round returns 200 with EMPTY content: the loop
 /// must surface the named fallback, not the empty string.
 struct EmptyFinalSummary;
@@ -1707,7 +1823,7 @@ fn post_compaction_continuation_reanchors_on_ground_truth() {
     // worktree is clean, start fresh", DISOWNED its own branch+commit and
     // repeated finished work. The continuation directive must order a
     // ground-truth re-anchor and state the clean-tree≠no-work rule.
-    let d = post_compaction_continuation(None, None);
+    let d = post_compaction_continuation(None, "");
     assert!(d.contains("re-anchor on ground truth"), "{d}");
     assert!(d.contains("git branch"), "{d}");
     assert!(
@@ -1732,7 +1848,7 @@ fn post_compaction_continuation_reinjects_the_full_plan_advance_not_rewrite() {
         "wire nudger profiles".to_string(),
     ]);
     ledger.advance(); // step 1 done, step 2 active
-    let d = post_compaction_continuation(Some(&ledger), None);
+    let d = post_compaction_continuation(Some(&ledger), "");
     // The full plan is present — including the not-yet-reached step.
     assert!(
         d.contains("wire the lazy-emission guard"),
@@ -1750,7 +1866,7 @@ fn post_compaction_continuation_reinjects_the_full_plan_advance_not_rewrite() {
     );
     assert!(d.contains("advance"), "{d}");
     // No plan → no plan clause (and no panic).
-    let empty = post_compaction_continuation(None, None);
+    let empty = post_compaction_continuation(None, "");
     assert!(!empty.contains("active plan is below"), "{empty}");
 }
 
@@ -1764,7 +1880,7 @@ fn post_compaction_continuation_quotes_the_operators_instruction() {
     // the model re-anchors on what was ASKED, not a paraphrase.
     let d = post_compaction_continuation(
         None,
-        Some("make a plan, make a branch, write me a commit for each suggestion"),
+        "make a plan, make a branch, write me a commit for each suggestion",
     );
     assert!(
         d.contains("make a plan, make a branch, write me a commit for each"),
@@ -1775,25 +1891,44 @@ fn post_compaction_continuation_quotes_the_operators_instruction() {
 }
 
 #[test]
-fn turn_instruction_finds_the_operators_message_skipping_harness_noise() {
-    use serde_json::json;
-    let sum = format!("{} earlier context", compress::SUMMARY_PREFIX);
-    let nudge = format!("{} act now", compress::LOOP_GUIDANCE_PREFIX);
-    let msgs = vec![
-        json!({"role": "system", "content": "you are newt"}),
-        json!({"role": "user", "content": sum}), // harness summary
-        json!({"role": "user", "content": "make a branch and write commits"}),
-        json!({"role": "assistant", "content": "Let me start."}),
-        json!({"role": "user", "content": nudge}), // harness nudge
+fn post_compaction_uses_the_current_turn_task_not_the_first_conversation_prompt() {
+    // Regression (2026-07-16 Opus transcript): turn A asked Newt to probe
+    // ambient MCP servers. Turn B asked it to implement MCP management.
+    // After a mid-turn compaction the harness rediscovered turn A with
+    // `find()` and injected it as "the instruction for this turn", causing
+    // the model to abandon the repository work and repeat the old probes.
+    let old_task = "can you access any of the ambient MCP servers?";
+    let current_task = "modify the newt-agent source code and implement MCP management";
+    let mut messages = vec![
+        serde_json::json!({"role": "system", "content": "you are newt"}),
+        serde_json::json!({"role": "user", "content": old_task}),
+        serde_json::json!({"role": "assistant", "content": "Ten servers are reachable."}),
+        serde_json::json!({"role": "user", "content": current_task}),
+        serde_json::json!({"role": "assistant", "content": "I will inspect the repository."}),
     ];
-    assert_eq!(
-        turn_instruction(&msgs).as_deref(),
-        Some("make a branch and write commits"),
-        "the real instruction, not the summary or the nudge"
+    let mut nudges = 1usize;
+
+    apply_post_compaction_continuation(
+        &mut messages,
+        &mut nudges,
+        CompressAction::Summarized,
+        None,
+        current_task,
+        true,
     );
-    // No real user message → None (directive omits the clause).
-    let only_noise = vec![json!({"role": "system", "content": "x"})];
-    assert_eq!(turn_instruction(&only_noise), None);
+
+    let directive = messages
+        .last()
+        .and_then(|message| message["content"].as_str())
+        .expect("post-compaction continuation");
+    assert!(
+        directive.contains(current_task),
+        "the continuation must preserve the current turn task: {directive}"
+    );
+    assert!(
+        !directive.contains(old_task),
+        "the first conversation prompt must not be relabeled as current: {directive}"
+    );
 }
 
 #[test]
@@ -1824,6 +1959,7 @@ fn post_compaction_refunds_rescue_budget_and_appends_one_directive() {
         &mut nudges,
         CompressAction::Pruned,
         None,
+        "do the thing",
         true,
     );
     assert_eq!(nudges, 1, "prune must not refund the rescue budget");
@@ -1837,6 +1973,7 @@ fn post_compaction_refunds_rescue_budget_and_appends_one_directive() {
         &mut nudges,
         CompressAction::Summarized,
         None,
+        "do the thing",
         false,
     );
     assert_eq!(nudges, 1, "round 0 must not touch the rescue budget");
@@ -1850,6 +1987,7 @@ fn post_compaction_refunds_rescue_budget_and_appends_one_directive() {
         &mut nudges,
         CompressAction::Summarized,
         None,
+        "do the thing",
         true,
     );
     assert_eq!(nudges, 0, "summarization refunds the rescue budget");
