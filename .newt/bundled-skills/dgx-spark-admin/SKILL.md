@@ -134,6 +134,28 @@ Notes:
   back to copying when it isn't.
 - **Cloud/remote-only models** (no local weights layer) are skipped — they
   were never local to begin with.
+- **Not every Ollama blob loads in upstream llama.cpp.** Models that run on
+  Ollama's own engine are converted with Ollama-specific GGUF metadata and
+  fail in two recognizable ways: `unknown model architecture: '<name>'` (an
+  arch string upstream doesn't know) or `wrong number of tensors; expected
+  N, got M` (an Ollama-specific tensor layout). Neither is fixable in place
+  — re-pull the HF-canonical GGUF (e.g. the Unsloth quant) for those and
+  quarantine the broken export. Models that were pulled via
+  `ollama pull hf.co/...` are canonical GGUFs and migrate cleanly.
+- **Verify every migrated model, not just one.** Sweep the library with a
+  1-line chat request per model and quarantine failures:
+
+  ```bash
+  for m in $(curl -s localhost:8080/models | jq -r '.models[].id'); do
+    curl -s -m 300 localhost:8080/v1/chat/completions \
+      -H 'Content-Type: application/json' \
+      -d "{\"model\":\"$m\",\"messages\":[{\"role\":\"user\",\"content\":\"say ok\"}],\"max_tokens\":10}" \
+      | grep -q '"content"' && echo "PASS $m" || echo "FAIL $m"
+  done
+  ```
+
+  Skip models larger than the memory a co-hosted engine leaves free — they
+  only load when the co-tenant is stopped (note them as such).
 - **Chat templates**: Ollama keeps its own Go-format template in the
   manifest, which does NOT transfer. Serve with `--jinja` so the template
   embedded in the GGUF is used — HF-converted models virtually always carry
