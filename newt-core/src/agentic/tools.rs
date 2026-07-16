@@ -1807,7 +1807,28 @@ fn artifact_open_regular_file(path: &std::path::Path) -> std::io::Result<std::fs
     Ok(file)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn artifact_open_regular_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+
+    // Open the final component itself, rather than following a symlink or
+    // another reparse point that could have replaced it after the lexical
+    // check. This is the Windows analogue of Unix O_NOFOLLOW.
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    if !file.metadata()?.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "artifact path is not a regular file",
+        ));
+    }
+    Ok(file)
+}
+
+#[cfg(not(any(unix, windows)))]
 fn artifact_open_regular_file(_path: &std::path::Path) -> std::io::Result<std::fs::File> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
@@ -5360,6 +5381,7 @@ mod execute_tool_branch_tests {
             artifacts[0].clone()
         }
 
+        #[cfg(unix)]
         fn is_empty(&self) -> bool {
             self.artifacts.lock().unwrap().is_empty()
         }

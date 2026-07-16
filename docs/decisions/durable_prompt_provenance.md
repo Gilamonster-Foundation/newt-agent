@@ -107,7 +107,10 @@ provenance automatically:
 - `update_plan` creates a `plan_revision`.
 - compaction creates a `compaction_checkpoint`.
 - a successful file mutation creates a `file_change` with a workspace-relative
-  locator and before/after digests, not a duplicate file body.
+  locator and before/after digests, not a duplicate file body. Capture opens
+  the final file component without following links (Unix `O_NOFOLLOW`; Windows
+  `FILE_FLAG_OPEN_REPARSE_POINT`); platforms without an equivalent primitive
+  fail closed rather than emitting unverified file provenance.
 - a completed response creates a `turn_outcome`.
 - a commit or observed HEAD transition creates a `commit` artifact.
 - an explicit decision operation may create a `decision` artifact.
