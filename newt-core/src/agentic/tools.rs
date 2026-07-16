@@ -1143,8 +1143,12 @@ fn shell_envelope_output(
         .and_then(serde_json::Value::as_str)
         .unwrap_or("");
     let out = format!("{stdout}{stderr}");
-    // DISPLAY path: on-screen tool output is capped by LINES (unchanged).
-    print_tool_output(&out, tool_output_lines, color);
+    // DISPLAY path (#1235): shell output renders as the tail-biased SPILL
+    // VIEW (▲/▒▓/… gutter, `[tui] spill_lines` high, default 3) — grep hits
+    // and errors live at the END of output, and unbounded dim dumps fill
+    // operator attention. `tool_output_lines` keeps governing non-shell echo.
+    let _ = tool_output_lines;
+    super::display::print_spill_view(&out, super::display::spill_lines(), color);
     if out.trim().is_empty() {
         let code = envelope
             .get("exit_code")

@@ -467,6 +467,83 @@ pub(crate) fn print_tool_call(name: &str, detail: &str, color: bool) {
 
 /// Print tool output truncated to the configured line limit.
 /// The model always receives the full content regardless.
+/// #1235: the SPILL VIEW — a bounded, TAIL-biased rendering of completed
+/// tool output. Pure: returns the exact lines to print (gutter glyphs
+/// included) so the unit tier tests the geometry without a terminal.
+///
+/// Shape (per the issue sketch): when the output fits in `view` lines it is
+/// shown whole with the `▒` gutter and the `…` end-of-output marker; when it
+/// overflows, the LAST `view` lines are shown (the tail is where grep hits
+/// and errors live), the `▲` boundary line carries the hidden count, and the
+/// `▓` thumb marks the tail position. `view == 0` means unbounded (no gutter
+/// — the raw historical behavior). This is the completion-time "first round
+/// fix"; the live tail-follow variant is gated on a superseding decision doc
+/// (plain_scroller_tui.md bans multi-line redraws) and a streaming dispatch
+/// seam — see #1235 for the ladder.
+/// #1235: the resolved spill-view height — a process-wide knob following the
+/// `output_budget` atomics precedent (set at per-turn config resolve, read at
+/// the display site) so the value reaches the shell echo without threading a
+/// parallel param through every tool signature. Default 3 (`[tui] spill_lines`).
+static SPILL_LINES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(3);
+
+/// Set the spill-view height (per-turn, from the resolved config).
+pub fn set_spill_lines(n: usize) {
+    SPILL_LINES.store(n, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The current spill-view height.
+pub(crate) fn spill_lines() -> usize {
+    SPILL_LINES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub(crate) fn spill_view_lines(output: &str, view: usize) -> Vec<String> {
+    let lines: Vec<&str> = output.lines().collect();
+    if lines.is_empty() {
+        return Vec::new();
+    }
+    if view == 0 {
+        return lines.iter().map(|l| l.to_string()).collect();
+    }
+    let mut out = Vec::new();
+    if lines.len() <= view {
+        for l in &lines {
+            out.push(format!("▒ {l}"));
+        }
+        out.push("…".to_string());
+        return out;
+    }
+    let hidden = lines.len() - view;
+    out.push(format!("▲ {hidden} more lines above"));
+    let tail = &lines[hidden..];
+    for (i, l) in tail.iter().enumerate() {
+        let glyph = if i + 1 == tail.len() { '▓' } else { '▒' };
+        out.push(format!("{glyph} {l}"));
+    }
+    out.push("…".to_string());
+    out
+}
+
+/// Print the #1235 spill view dim, one line at a time (scrolled lines only —
+/// no repaint, no region; the plain-scroller doctrine's happy path).
+pub(crate) fn print_spill_view(output: &str, view: usize, color: bool) {
+    if output.is_empty() {
+        return;
+    }
+    let rendered = spill_view_lines(output, view).join("\n");
+    if color {
+        execute!(
+            io::stdout(),
+            SetForegroundColor(CtColor::DarkGrey),
+            Print(format!("{rendered}\n")),
+            ResetColor,
+        )
+        .ok();
+    } else {
+        println!("{rendered}");
+    }
+    io::stdout().flush().ok();
+}
+
 pub(crate) fn print_tool_output(output: &str, max_lines: usize, color: bool) {
     if output.is_empty() {
         return;
@@ -532,7 +609,33 @@ pub(crate) fn print_denied(axis: &str, target: &str, color: bool) {
 
 #[cfg(test)]
 mod tests {
-    use super::{fit_line, fmt_tokens, print_harness_notice, print_list_item, print_newt};
+    use super::{
+        fit_line, fmt_tokens, print_harness_notice, print_list_item, print_newt, spill_view_lines,
+    };
+
+    /// #1235: the spill view is TAIL-biased with the issue's gutter glyphs —
+    /// small outputs show whole (▒ gutter + … end marker), overflow shows the
+    /// LAST `view` lines with the ▲ hidden-count boundary and the ▓ thumb on
+    /// the tail line. view=0 = unbounded raw (historical behavior).
+    #[test]
+    fn spill_view_is_tail_biased_with_gutter_glyphs() {
+        // Fits: whole output, ▒ gutter, end marker.
+        let small = spill_view_lines("a\nb\nc", 3);
+        assert_eq!(small, vec!["▒ a", "▒ b", "▒ c", "…"]);
+
+        // Overflows: LAST view lines (tail is where errors/hits live),
+        // ▲ carries the hidden count, ▓ thumbs the tail.
+        let big = spill_view_lines("l1\nl2\nl3\nl4\nl5", 3);
+        assert_eq!(
+            big,
+            vec!["▲ 2 more lines above", "▒ l3", "▒ l4", "▓ l5", "…"]
+        );
+
+        // Unbounded: raw lines, no gutter.
+        assert_eq!(spill_view_lines("x\ny", 0), vec!["x", "y"]);
+        // Empty: nothing.
+        assert!(spill_view_lines("", 3).is_empty());
+    }
 
     #[test]
     fn wrap_to_width_never_drops_and_hard_splits_long_tokens() {

@@ -5481,6 +5481,12 @@ fn tool_output_lines(cfg: &newt_core::Config) -> usize {
     cfg.tui.as_ref().map(|t| t.tool_output_lines).unwrap_or(20)
 }
 
+/// #1235: the spill-view height (`[tui] spill_lines`, default 3 — keep in
+/// sync with `default_spill_lines` in newt-core config).
+fn spill_lines(cfg: &newt_core::Config) -> usize {
+    cfg.tui.as_ref().map(|t| t.spill_lines).unwrap_or(3)
+}
+
 /// Maximum tool-call rounds per turn, from `[tui].max_tool_rounds`.
 /// Defaults to 25 when there's no `[tui]` table or no config file.
 fn max_tool_rounds(cfg: &newt_core::Config) -> usize {
