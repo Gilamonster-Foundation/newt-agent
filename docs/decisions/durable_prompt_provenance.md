@@ -57,7 +57,8 @@ post-compaction continuation receives that value directly.
 Exactly one compression-immune active-prompt card reaches every primary-model
 request. The card names the active operator prompt and objective root, and names
 the submitted attempt plus its chronological/semantic links when they differ or
-lead elsewhere. The exact active operator text remains at user priority. If
+lead elsewhere. The exact active operator `model_text` remains at user priority.
+If
 system instructions, required schemas, and that exact prompt cannot fit the hard
 context window, Newt refuses before dispatch rather than substituting a
 paraphrase.

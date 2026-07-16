@@ -986,8 +986,8 @@ async fn mid_loop_compression_fires_when_message_list_grows() {
 
 /// OpenAI-path transcript regression for the 2026-07-16 amnesia failure:
 /// after turn A completed, turn B grew large enough to compact mid-loop. The
-/// continuation must quote authoritative `ChatCtx.task` B, never rediscover
-/// the first user message (A) from retained conversation history.
+/// continuation must point at the authoritative protected prompt B, never
+/// rediscover the first user message (A) from retained conversation history.
 struct OpenAiTaskAnchoringResponder {
     directive_seen: Arc<AtomicBool>,
     current_task_in_directive: Arc<AtomicBool>,
@@ -1077,8 +1077,9 @@ async fn openai_mid_loop_compaction_anchors_the_current_turn_not_historical_prom
     c.kind = BackendKind::Openai;
     c.task = CURRENT_TASK;
     c.max_tool_rounds = 3;
-    // Four historical messages fit on round 0; the first tool exchange grows
-    // the list past five, forcing the regression's MID-TURN compaction.
+    // The protected active-prompt pair and four historical messages fit on
+    // round 0; the first tool exchange grows the list past seven, forcing the
+    // regression's MID-TURN compaction.
     c.mid_loop_trim_threshold = 7;
 
     let (reply, _, _, _) = chat_complete(c, &mut NoMcp)
