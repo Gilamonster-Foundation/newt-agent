@@ -7,6 +7,7 @@
 //! optional general-memory disclosure surface.
 
 use super::display::{print_tool_call, print_tool_output};
+use super::prompt_intake::{PromptIntake, PROMPT_COMPREHENSION_MODEL_CARD_PREFIX};
 use crate::{
     ConversationStore, NewPrompt, PromptId, PromptOrigin, PromptReceipt, TurnPromptContext,
 };
@@ -400,17 +401,50 @@ pub(crate) fn ensure_active_prompt_card(
     messages: &mut Vec<serde_json::Value>,
     context: PromptReadContext<'_>,
 ) {
-    let card = active_prompt_card(context);
+    let base_card = active_prompt_card(context);
+    insert_active_prompt_card(messages, context, &base_card, base_card.clone());
+}
+
+/// Insert the protected active-prompt pair with the harness-validated prompt
+/// comprehension projection inside the existing system card.
+///
+/// This deliberately does not create a second system message: compression and
+/// protected-head logic continue to see exactly one [`ACTIVE_PROMPT_PREFIX`]
+/// card adjacent to the exact operator text at user priority. `model_card` is a
+/// content-free projection owned by [`PromptIntake`]; raw operator, atomic-ask,
+/// decision, and clarification text remain outside the system card.
+pub(crate) fn ensure_active_prompt_card_with_intake(
+    messages: &mut Vec<serde_json::Value>,
+    context: PromptReadContext<'_>,
+    intake: &PromptIntake,
+) {
+    let base_card = active_prompt_card(context);
+    let card = active_prompt_card_with_intake(base_card.clone(), intake);
+    insert_active_prompt_card(messages, context, &base_card, card);
+}
+
+fn insert_active_prompt_card(
+    messages: &mut Vec<serde_json::Value>,
+    context: PromptReadContext<'_>,
+    base_card: &str,
+    card: String,
+) {
     let mut cleaned = Vec::with_capacity(messages.len());
     let mut index = 0;
     while index < messages.len() {
-        // Remove only the exact pair this harness instance would have
-        // inserted. A configured system prompt is untrusted presentation data:
-        // matching the public prefix alone could mistake it for our card and
+        // Remove only this harness instance's exact base/current card or a
+        // marker-validated comprehension extension of that exact base. A
+        // configured system prompt is untrusted presentation data: matching the
+        // public active-prompt prefix alone could mistake it for our card and
         // erase the live user message that follows it.
+        let is_owned_card = messages[index]["role"] == "system"
+            && messages[index]["content"].as_str().is_some_and(|content| {
+                content == base_card
+                    || content == card.as_str()
+                    || is_augmented_active_prompt_card(content, base_card)
+            });
         let is_owned_pair = index + 1 < messages.len()
-            && messages[index]["role"] == "system"
-            && messages[index]["content"].as_str() == Some(card.as_str())
+            && is_owned_card
             && messages[index + 1]["role"] == "user"
             && messages[index + 1]["content"].as_str() == Some(context.active_text());
         if is_owned_pair {
@@ -437,6 +471,34 @@ pub(crate) fn ensure_active_prompt_card(
             serde_json::json!({"role": "user", "content": context.active_text()}),
         ],
     );
+}
+
+fn active_prompt_card_with_intake(base_card: String, intake: &PromptIntake) -> String {
+    append_prompt_comprehension_model_card(base_card, &intake.model_card())
+}
+
+fn append_prompt_comprehension_model_card(mut active_card: String, model_card: &str) -> String {
+    let model_card = model_card.trim();
+    if !model_card.is_empty() {
+        active_card.push('\n');
+        if !has_prompt_comprehension_marker(model_card) {
+            active_card.push_str(PROMPT_COMPREHENSION_MODEL_CARD_PREFIX);
+            active_card.push('\n');
+        }
+        active_card.push_str(model_card);
+    }
+    active_card
+}
+
+fn is_augmented_active_prompt_card(content: &str, base_card: &str) -> bool {
+    content
+        .strip_prefix(base_card)
+        .and_then(|suffix| suffix.strip_prefix('\n'))
+        .is_some_and(has_prompt_comprehension_marker)
+}
+
+fn has_prompt_comprehension_marker(content: &str) -> bool {
+    content.lines().next() == Some(PROMPT_COMPREHENSION_MODEL_CARD_PREFIX)
 }
 
 pub(crate) fn active_prompt_card(context: PromptReadContext<'_>) -> String {
@@ -1070,6 +1132,158 @@ mod tests {
                 operator.submitted().id()
             )),
             "{card}"
+        );
+    }
+
+    #[test]
+    fn comprehension_projection_replaces_base_and_prior_projection_in_one_active_card() {
+        let exact = "PRIVATE OPERATOR PROMPT that remains at user priority";
+        let context = PromptReadContext::new(None, exact, None);
+        let base_card = active_prompt_card(context);
+        let research_card = append_prompt_comprehension_model_card(
+            base_card.clone(),
+            &format!(
+                "{PROMPT_COMPREHENSION_MODEL_CARD_PREFIX}\n\
+                 disposition: research\n\
+                 atomic_ask_count: 2\n\
+                 decision_count: 1"
+            ),
+        );
+        let act_card = append_prompt_comprehension_model_card(
+            base_card.clone(),
+            &format!(
+                "{PROMPT_COMPREHENSION_MODEL_CARD_PREFIX}\n\
+                 disposition: act\n\
+                 atomic_ask_count: 2\n\
+                 decision_count: 1"
+            ),
+        );
+        let mut messages = vec![
+            serde_json::json!({"role":"system", "content":"base"}),
+            serde_json::json!({"role":"user", "content":exact}),
+        ];
+
+        ensure_active_prompt_card(&mut messages, context);
+        insert_active_prompt_card(&mut messages, context, &base_card, research_card);
+        insert_active_prompt_card(&mut messages, context, &base_card, act_card);
+
+        let cards: Vec<_> = messages
+            .iter()
+            .filter(|message| {
+                message["role"] == "system"
+                    && message["content"]
+                        .as_str()
+                        .is_some_and(|content| content.starts_with(ACTIVE_PROMPT_PREFIX))
+            })
+            .collect();
+        assert_eq!(cards.len(), 1, "{messages:#?}");
+        let card = cards[0]["content"].as_str().unwrap();
+        assert!(
+            card.contains(PROMPT_COMPREHENSION_MODEL_CARD_PREFIX),
+            "{card}"
+        );
+        assert!(card.contains("disposition: act"), "{card}");
+        assert!(!card.contains("disposition: research"), "{card}");
+        assert!(!card.contains(exact), "{card}");
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| {
+                    message["role"] == "system"
+                        && message["content"].as_str().is_some_and(|content| {
+                            content.starts_with(PROMPT_COMPREHENSION_MODEL_CARD_PREFIX)
+                        })
+                })
+                .count(),
+            0,
+            "the comprehension projection is nested, never a second system card"
+        );
+        assert_eq!(messages[1]["role"], "system");
+        assert_eq!(messages[2]["role"], "user");
+        assert_eq!(messages[2]["content"], exact);
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| {
+                    message["role"] == "user" && message["content"].as_str() == Some(exact)
+                })
+                .count(),
+            2,
+            "one protected recovery copy plus the tail presentation copy"
+        );
+    }
+
+    #[test]
+    fn intake_helper_nests_content_free_projection_without_exposing_asks_or_clarification() {
+        let exact = "Implement either PRIVATE_SQLITE_ALPHA or SECRET_POSTGRES_BETA; \
+                     create PRIVATE_MIGRATION_GAMMA and open a PR.";
+        let intake = PromptIntake::analyze(exact);
+        let clarification = intake.clarification_batch();
+        assert!(clarification.contains("PRIVATE_SQLITE_ALPHA"));
+        assert!(clarification.contains("SECRET_POSTGRES_BETA"));
+        assert_eq!(intake.atomic_asks().len(), 2);
+
+        let context = PromptReadContext::new(None, exact, None);
+        let mut messages = vec![
+            serde_json::json!({"role":"system", "content":"base"}),
+            serde_json::json!({"role":"user", "content":exact}),
+        ];
+
+        // Intake runs after receipt/card creation. Repeated insertion models a
+        // retry or compression rebuild and must still replace, not accumulate.
+        ensure_active_prompt_card(&mut messages, context);
+        ensure_active_prompt_card_with_intake(&mut messages, context, &intake);
+        ensure_active_prompt_card_with_intake(&mut messages, context, &intake);
+
+        let cards = messages
+            .iter()
+            .filter(|message| {
+                message["role"] == "system"
+                    && message["content"]
+                        .as_str()
+                        .is_some_and(|content| content.starts_with(ACTIVE_PROMPT_PREFIX))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(cards.len(), 1, "{messages:#?}");
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| message["role"] == "system")
+                .count(),
+            2,
+            "base system prompt plus one protected active-prompt card"
+        );
+
+        let card = cards[0]["content"].as_str().unwrap();
+        assert!(card.starts_with(ACTIVE_PROMPT_PREFIX), "{card}");
+        assert_eq!(
+            card.matches(PROMPT_COMPREHENSION_MODEL_CARD_PREFIX).count(),
+            1,
+            "{card}"
+        );
+        assert!(card.contains("disposition: ask"), "{card}");
+        assert!(card.contains("atomic_ask_count: 2"), "{card}");
+        for private_text in [
+            exact,
+            "PRIVATE_SQLITE_ALPHA",
+            "SECRET_POSTGRES_BETA",
+            "PRIVATE_MIGRATION_GAMMA",
+            clarification.as_str(),
+        ] {
+            assert!(!card.contains(private_text), "{card}");
+        }
+        for ask in intake.atomic_asks() {
+            assert!(!card.contains(ask.text()), "{card}");
+        }
+
+        assert_eq!(messages[1]["role"], "system");
+        assert_eq!(
+            messages[2],
+            serde_json::json!({"role":"user", "content":exact})
+        );
+        assert_eq!(
+            messages.last(),
+            Some(&serde_json::json!({"role":"user", "content":exact}))
         );
     }
 

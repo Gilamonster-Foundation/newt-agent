@@ -8864,6 +8864,8 @@ mod tool_round_cap_tests {
                     max_tool_rounds: 5,
                     narration_nudge_cap: 1,
                     action_nudges: true,
+                    prompt_disposition: newt_core::agentic::PromptDisposition::Act,
+                    prompt_intake: None,
                     workflow_grace_rounds: 0,
                     tool_output_lines: 20,
                     debug: false,

@@ -55,7 +55,7 @@ use std::thread::JoinHandle;
 use tokio::sync::oneshot;
 
 use super::observation::ShellObservation;
-use super::{chat_complete, openai_chat_complete, ChatCtx, NoMcp};
+use super::{chat_complete, openai_chat_complete, ChatCtx, NoMcp, PromptDisposition};
 use crate::{BackendKind, CompactionTriggerPolicy, MemMessage, Role, TokenUsage};
 
 /// Owned, `'static` configuration for one [`TurnDriver`] — the cloneable
@@ -376,6 +376,10 @@ async fn run_one_turn(
         // Headless driver: action nudges stay on (the interactive /nudge dial
         // is a TUI-session concern, #1162).
         action_nudges: true,
+        // Headless callers preserve the historical execute-capable contract
+        // unless they opt into the prompt-comprehension ingress in the TUI.
+        prompt_disposition: PromptDisposition::Act,
+        prompt_intake: None,
         messages,
         task,
         workspace: &config.workspace,

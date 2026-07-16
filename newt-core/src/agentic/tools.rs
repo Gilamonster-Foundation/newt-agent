@@ -10,6 +10,7 @@ use super::mcp::McpTools;
 use super::memory_fetch::{execute_memory_fetch, memory_fetch_tool_definition, MemorySource};
 use super::note_sink::{execute_save_note, save_note_tool_definition, NoteSink};
 use super::permissions::{DenialKind, PermissionDecision, PermissionGate, PermissionRequest};
+use super::prompt_intake::PromptDisposition;
 use super::prompt_read::{execute_prompt_read, PromptReadContext};
 use super::recall::{execute_recall, recall_tool_definition, RecallSource};
 use super::report::{execute_render_report, render_report_tool_definition};
@@ -32,12 +33,18 @@ pub(crate) use catalog::{
     classify_gated_off_reach, classify_phantom_reach, is_context_remaining_call, is_hallucination,
     known_builtin_tool_name, merged_tool_definitions, resolve_tool_alias, AliasOutcome,
 };
-pub use catalog::{filter_advertised_tools, persona_tool_allowed, tool_definitions};
+use catalog::{
+    disposition_tool_denied_message, persona_tool_denied_message, run_command_redirect,
+    unknown_tool_message,
+};
+pub use catalog::{
+    filter_advertised_tools, filter_tools_for_disposition, persona_tool_allowed, tool_allowed,
+    tool_definitions,
+};
 #[cfg(test)]
 use catalog::{
     levenshtein, nearest_tool_name, ALL_TOOL_NAMES, BASE_TOOL_NAMES, EXTENDED_TOOL_REGISTRY,
 };
-use catalog::{persona_tool_denied_message, run_command_redirect, unknown_tool_message};
 /// Build a shell prefix that exports venv/exec-path vars into the agent-bridle
 /// confined shell.
 ///
@@ -2116,6 +2123,7 @@ pub async fn execute_tool_with_offload_and_prompt(
         tool_offload,
         spill_store,
         persona_tools,
+        PromptDisposition::Act,
     )
     .await
 }
@@ -2154,9 +2162,35 @@ pub async fn execute_tool_with_offload_and_prompt_and_artifacts(
     // real ONLY because this executor refuses a disallowed name even if the
     // model calls it unprompted.
     persona_tools: Option<&[String]>,
+    // The prompt's validated disposition. This is deliberately a required
+    // dispatcher input: catalog filtering is cosmetic, whereas this check is
+    // the boundary that refuses fabricated tool names before MCP routing,
+    // aliases, or permission widening can run.
+    disposition: PromptDisposition,
 ) -> String {
+    // Prompt-comprehension boundary: enforce the validated disposition BEFORE
+    // every other routing or grant path. In particular, unknown names (including
+    // generic `server__tool` MCP calls) fail closed under a non-Act disposition;
+    // there is no safe way to infer a remote tool's authority from its name.
+    if !tool_allowed(disposition, name) {
+        let msg = disposition_tool_denied_message(disposition, name);
+        print_tool_call(name, &args.to_string(), color);
+        print_tool_output(&msg, tool_output_lines, color);
+        return msg;
+    }
+
+    // A read/recovery tool can itself hit a caveat denial (for example
+    // `web_fetch` outside the net allow-list). Non-Act turns must never turn
+    // that into an authority grant, so remove the human grant seam even for the
+    // narrow tools the disposition permits. The existing caveats still decide
+    // whether the read is legal.
+    if disposition != PromptDisposition::Act {
+        permission_gate = None;
+    }
+
     // FR-3 (#998): the absolute deny-list — a grant-independent veto checked
-    // FIRST, above every other leash (persona, MCP, alias, routing). It refuses
+    // immediately after the prompt-disposition boundary, above every other
+    // leash (persona, MCP, alias, routing). It refuses
     // catastrophic exec (ssh / rm / systemctl restart …) by STRUCTURAL target,
     // so no capability, mode, or persona grant can unlock it. Runs on the RAW
     // name + args (pre-rewrite) so a shell alias or a routed command can't slip
@@ -2496,6 +2530,7 @@ pub async fn execute_tool_with_offload_and_prompt_and_artifacts(
                 ),
                 persona_tools,
             );
+            let catalog = filter_tools_for_disposition(catalog, disposition);
             let out = super::tool_search::execute_tool_search(query, &catalog);
             print_tool_output(&out, tool_output_lines, color);
             out
@@ -3872,6 +3907,53 @@ mod tests {
         assert!(
             !persona_tool_allowed("delete_file", &allow),
             "unlisted non-infra → denied"
+        );
+    }
+
+    /// Prompt disposition is an independent, fail-closed catalog boundary:
+    /// non-Act turns retain only explicit read/recovery tools, so a generic MCP
+    /// name cannot appear merely because its schema was connected to the session.
+    #[test]
+    fn prompt_disposition_filters_catalog_and_unknown_names_fail_closed() {
+        let defs = serde_json::json!([
+            { "type": "function", "function": { "name": "read_file" } },
+            { "type": "function", "function": { "name": "write_file" } },
+            { "type": "function", "function": { "name": "run_command" } },
+            { "type": "function", "function": { "name": "request_permissions" } },
+            { "type": "function", "function": { "name": "incident__read" } },
+            { "not": "a callable definition" }
+        ]);
+        let names = |defs: &serde_json::Value| {
+            defs.as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|def| def["function"]["name"].as_str())
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+
+        let research = filter_tools_for_disposition(defs.clone(), PromptDisposition::Research);
+        assert_eq!(names(&research), vec!["read_file"]);
+        assert!(tool_allowed(PromptDisposition::Explain, "read_file"));
+        assert!(!tool_allowed(PromptDisposition::Explain, "write_file"));
+        assert!(!tool_allowed(PromptDisposition::Research, "incident__read"));
+        assert!(!tool_allowed(PromptDisposition::Ask, "read_file"));
+        assert!(tool_allowed(PromptDisposition::Act, "incident__write"));
+        assert_eq!(
+            filter_tools_for_disposition(
+                serde_json::json!({ "not": "a catalog" }),
+                PromptDisposition::Research
+            ),
+            serde_json::json!([]),
+            "a non-Act catalog with no enumerable tool names must fail closed"
+        );
+
+        // Act is the compatibility/default path: it preserves definitions,
+        // including an opaque extension definition the disposition filter cannot
+        // classify by name.
+        assert_eq!(
+            filter_tools_for_disposition(defs.clone(), PromptDisposition::Act),
+            defs
         );
     }
 
@@ -5350,6 +5432,7 @@ mod execute_tool_branch_tests {
             false, // tool_offload
             None,  // spill_store
             None,  // persona_tools
+            PromptDisposition::Act,
         )
         .await
     }
@@ -7031,6 +7114,176 @@ mod execute_tool_branch_tests {
             persona_tools,
         )
         .await
+    }
+
+    /// Directly exercise the disposition-aware dispatcher. Unlike
+    /// [`execute_tool_with_offload`], this reaches the new required boundary
+    /// argument while fixing all unrelated optional seams to their inert shape.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_tool_with_disposition(
+        name: &str,
+        args: serde_json::Value,
+        ws: &std::path::Path,
+        caveats: &Caveats,
+        mcp: &mut dyn McpTools,
+        gate: Option<&mut MockGate>,
+        disposition: PromptDisposition,
+    ) -> String {
+        let gate = gate.map(|gate| gate as &mut dyn PermissionGate);
+        execute_tool_with_offload_and_prompt_and_artifacts(
+            name,
+            &args,
+            &ws.to_string_lossy(),
+            false,
+            20,
+            caveats,
+            mcp,
+            None, // build_check_cmd
+            None, // note_sink
+            None, // recall_source
+            None, // memory_source
+            None, // prompt_context
+            None, // artifact_context
+            None, // artifact_sink
+            gate,
+            None,  // exec_floor
+            None,  // git_tool
+            None,  // crew_runner
+            None,  // scratchpad_store
+            None,  // code_search
+            None,  // experience_store
+            None,  // step_ledger
+            false, // tool_offload
+            None,  // spill_store
+            None,  // persona_tools
+            disposition,
+        )
+        .await
+    }
+
+    /// A non-Act disposition is an executor boundary, not just a reduced tool
+    /// schema: fabricated mutations, exec, capability requests, and remote MCP
+    /// calls must be refused before they reach their own dispatch logic.
+    #[tokio::test]
+    async fn non_act_disposition_denies_mutation_exec_grants_and_generic_mcp() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let caveats = Caveats::top(); // prove disposition wins over ambient authority
+
+        let mut no_mcp = NoMcp;
+        let write = run_tool_with_disposition(
+            "write_file",
+            serde_json::json!({ "path": "must-not-write.txt", "content": "no" }),
+            ws.path(),
+            &caveats,
+            &mut no_mcp,
+            None,
+            PromptDisposition::Research,
+        )
+        .await;
+        assert!(write.contains("current prompt disposition"), "got: {write}");
+        assert!(
+            !ws.path().join("must-not-write.txt").exists(),
+            "disposition rejection must precede the write handler"
+        );
+
+        let exec = run_tool_with_disposition(
+            "run_command",
+            serde_json::json!({ "command": "touch must-not-exec.txt" }),
+            ws.path(),
+            &caveats,
+            &mut no_mcp,
+            None,
+            PromptDisposition::Explain,
+        )
+        .await;
+        assert!(exec.contains("current prompt disposition"), "got: {exec}");
+        assert!(
+            !ws.path().join("must-not-exec.txt").exists(),
+            "disposition rejection must precede the shell handler"
+        );
+
+        let mut gate = MockGate::new(true, &caveats);
+        let grant = run_tool_with_disposition(
+            "request_permissions",
+            serde_json::json!({
+                "capability": "fs_write",
+                "target": "/tmp/should-not-be-granted",
+                "reason": "test",
+            }),
+            ws.path(),
+            &caveats,
+            &mut no_mcp,
+            Some(&mut gate),
+            PromptDisposition::Research,
+        )
+        .await;
+        assert!(grant.contains("current prompt disposition"), "got: {grant}");
+        assert!(
+            gate.asks.is_empty(),
+            "non-Act must not consult a grant gate"
+        );
+
+        let mut mcp = OneRemoteTool::new("incident__read");
+        let remote = run_tool_with_disposition(
+            "incident__read",
+            serde_json::json!({}),
+            ws.path(),
+            &caveats,
+            &mut mcp,
+            None,
+            PromptDisposition::Research,
+        )
+        .await;
+        assert!(
+            remote.contains("current prompt disposition"),
+            "got: {remote}"
+        );
+        assert!(
+            !mcp.called,
+            "generic MCP must be denied before remote routing in non-Act"
+        );
+
+        std::fs::write(ws.path().join("evidence.txt"), "durable evidence\n").unwrap();
+        let read = run_tool_with_disposition(
+            "read_file",
+            serde_json::json!({ "path": "evidence.txt" }),
+            ws.path(),
+            &caveats,
+            &mut no_mcp,
+            None,
+            PromptDisposition::Research,
+        )
+        .await;
+        assert!(
+            read.contains("durable evidence"),
+            "safe read must remain usable: {read}"
+        );
+    }
+
+    /// Permitted non-Act reads still honor their caveats, but they must not
+    /// silently turn a denial into an interactive authority grant.
+    #[tokio::test]
+    async fn non_act_read_tools_do_not_consult_permission_gate() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let mut caveats = Caveats::top();
+        caveats.net = crate::caveats::Scope::none();
+        let mut gate = MockGate::new(true, &caveats);
+        let mut mcp = NoMcp;
+
+        let _ = run_tool_with_disposition(
+            "web_fetch",
+            serde_json::json!({ "url": "https://example.com" }),
+            ws.path(),
+            &caveats,
+            &mut mcp,
+            Some(&mut gate),
+            PromptDisposition::Research,
+        )
+        .await;
+        assert!(
+            gate.asks.is_empty(),
+            "a non-Act web read may be caveat-denied but must never mint net authority"
+        );
     }
 
     /// FR-2 (#1001): a remote MCP tool OUTSIDE the persona's allow-list is

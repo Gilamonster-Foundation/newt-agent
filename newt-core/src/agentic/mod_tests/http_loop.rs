@@ -37,6 +37,8 @@ fn ctx<'a>(server_uri: &'a str, messages: &'a [MemMessage], caveats: &'a Caveats
         max_tool_rounds: 8,
         narration_nudge_cap: 1,
         action_nudges: true,
+        prompt_disposition: PromptDisposition::Act,
+        prompt_intake: None,
         workflow_grace_rounds: 0,
         tool_output_lines: 20,
         debug: false,
@@ -2027,6 +2029,7 @@ fn post_compaction_uses_the_current_turn_task_not_the_first_conversation_prompt(
         None,
         prompt_context,
         true,
+        true,
     );
 
     let directive = messages
@@ -2079,6 +2082,7 @@ fn post_compaction_refunds_rescue_budget_and_appends_one_directive() {
         None,
         prompt_context,
         true,
+        true,
     );
     assert_eq!(nudges, 1, "prune must not refund the rescue budget");
     assert_eq!(messages.len(), 3, "prune must not touch the directive");
@@ -2093,6 +2097,7 @@ fn post_compaction_refunds_rescue_budget_and_appends_one_directive() {
         None,
         prompt_context,
         false,
+        true,
     );
     assert_eq!(nudges, 1, "round 0 must not touch the rescue budget");
     assert_eq!(messages.len(), 3, "round 0 must not inject the directive");
@@ -2106,6 +2111,7 @@ fn post_compaction_refunds_rescue_budget_and_appends_one_directive() {
         CompressAction::Summarized,
         None,
         prompt_context,
+        true,
         true,
     );
     assert_eq!(nudges, 0, "summarization refunds the rescue budget");

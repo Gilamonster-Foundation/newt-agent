@@ -196,6 +196,37 @@ its objective root. The artifact body includes its `root:prompt:<uuid>`
 selector. This audit record never stores prompt text, message payloads, or tool
 output; a deferred count-only decision writes no artifact to avoid ledger spam.
 
+### PR5 prompt-comprehension contract
+
+Immediately after a prompt receipt is accepted, Newt derives a bounded
+prompt-comprehension manifest: atomic-ask count/digests, a disposition, and
+decision locks whose sources are only `operator`, deterministic `policy`, or
+an explicitly authorized low-risk `authorized_assumption`. The manifest is
+recorded as a prompt-rooted `decision` artifact without copying prompt text or
+clarification text into the artifact ledger.
+
+The only dispositions are `ask`, `act`, `explain`, and `research`. `ask` is a
+harness-owned, bounded clarification batch that ends before model/tool work;
+the next direct operator answer is persisted as an explicit
+`operator_continuation` of the pending objective. Fully specified multi-part
+requests are `act`, not automatically ambiguous. Informational requests are
+`explain`; evidence-gathering requests are `research` and receive a fixed,
+read-only catalog.
+
+Pending clarification is not session-local state: restore rebuilds it from the
+verified semantic lineage of immutable operator receipts, ending at the latest
+unresolved continuation. A malformed or over-bound lineage fails closed rather
+than recasting the next reply as a new executable objective. Intake truncation
+also fails closed: an over-capacity request remains `ask` until the operator
+starts a smaller task with `/new`.
+
+Catalog filtering is an ergonomic surface, not the authority boundary. The
+tool dispatcher rejects non-`act` mutations, exec, permission-grant attempts,
+and every generic MCP tool before aliasing, routing, or interactive grants can
+run. `act` is the sole disposition with execution-oriented nudges; the default
+agent identity must not override a per-turn `ask`, `explain`, or `research`
+gate with unconditional "act now" language.
+
 Newt-Agent owns storage, assembly, retrieval, and lifecycle behavior. Backend
 adapters must preserve the active-prompt invariant. TUI code owns capturing raw
 and model-normalized prompt forms. The operator owns retention through existing
