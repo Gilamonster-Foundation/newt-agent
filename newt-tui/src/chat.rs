@@ -68,6 +68,12 @@ pub(crate) enum ReadOutcome {
 #[derive(Debug, Clone)]
 enum ModelInputOrigin {
     Operator,
+    /// A direct operator answer to a bounded harness clarification. It is a
+    /// fresh operator receipt, but keeps the original objective root through
+    /// an explicit semantic parent rather than silently becoming a new task.
+    OperatorContinuation {
+        parent: Box<newt_core::TurnPromptContext>,
+    },
     HarnessRetry {
         parent: Box<newt_core::TurnPromptContext>,
     },
@@ -75,7 +81,7 @@ enum ModelInputOrigin {
 
 impl ModelInputOrigin {
     fn is_operator(&self) -> bool {
-        matches!(self, Self::Operator)
+        matches!(self, Self::Operator | Self::OperatorContinuation { .. })
     }
 }
 
@@ -83,6 +89,109 @@ impl ModelInputOrigin {
 struct PendingRetry {
     text: String,
     parent: Box<newt_core::TurnPromptContext>,
+}
+
+/// A harness-owned clarification handoff. The live copy avoids repeated store
+/// reads during a session; durable restore deterministically rebuilds it from
+/// the immutable prompt-receipt lineage. Its content-free projection is also
+/// recorded as a prompt-rooted artifact, while the next direct operator answer
+/// becomes a receipt whose parent preserves this objective's lineage.
+#[derive(Debug, Clone)]
+struct PendingClarification {
+    parent: Box<newt_core::TurnPromptContext>,
+    intake: newt_core::agentic::PromptIntake,
+}
+
+/// Rebuild an outstanding clarification from its durable operator-receipt
+/// lineage. A prompt that reached model work cannot be pending: `Ask` exits
+/// before inference, so every descendant while it remains pending must be an
+/// explicit operator continuation. The bounded walk refuses malformed
+/// ancestry instead of treating a resumed answer as a new action objective.
+fn rehydrate_pending_clarification(
+    store: &newt_core::ConversationStore,
+    conversation_id: &str,
+    parent: &newt_core::TurnPromptContext,
+) -> anyhow::Result<Option<PendingClarification>> {
+    const MAX_LINEAGE_DEPTH: usize = 256;
+
+    let submitted = parent.submitted_prompt().receipt();
+    if submitted.origin() != newt_core::PromptOrigin::Operator {
+        return Ok(None);
+    }
+
+    let chain = store.prompt_chain(conversation_id)?;
+    let by_id = chain
+        .iter()
+        .map(|receipt| (receipt.id(), receipt))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let mut lineage = Vec::new();
+    let mut cursor = by_id
+        .get(&submitted.id())
+        .copied()
+        .ok_or_else(|| anyhow::anyhow!("restored prompt is absent from its conversation"))?;
+
+    for _ in 0..=MAX_LINEAGE_DEPTH {
+        lineage.push(cursor);
+        if cursor.id() == cursor.root_prompt_id() {
+            break;
+        }
+        let parent_id = cursor.parent_prompt_id().ok_or_else(|| {
+            anyhow::anyhow!("non-root clarification receipt lacks a semantic parent")
+        })?;
+        cursor = by_id.get(&parent_id).copied().ok_or_else(|| {
+            anyhow::anyhow!("clarification parent is absent from its conversation")
+        })?;
+    }
+
+    if lineage
+        .last()
+        .is_none_or(|receipt| receipt.id() != receipt.root_prompt_id())
+    {
+        anyhow::bail!("clarification receipt lineage exceeds its bounded depth");
+    }
+    lineage.reverse();
+
+    let root = lineage
+        .first()
+        .copied()
+        .ok_or_else(|| anyhow::anyhow!("clarification receipt lineage is empty"))?;
+    if root.origin() != newt_core::PromptOrigin::Operator {
+        anyhow::bail!("clarification objective root is not an operator prompt");
+    }
+    let root_text = root
+        .model_text_utf8()
+        .map_err(|_| anyhow::anyhow!("clarification objective root is not UTF-8"))?;
+    let mut intake = newt_core::agentic::PromptIntake::analyze(root_text);
+    if intake.disposition() != newt_core::agentic::PromptDisposition::Ask {
+        return Ok(None);
+    }
+
+    for answer in lineage.into_iter().skip(1) {
+        // A harness retry proves this objective left the Ask terminal path;
+        // never replay arbitrary model text as a decision answer.
+        if answer.origin() != newt_core::PromptOrigin::Operator {
+            return Ok(None);
+        }
+        let answer_text = answer
+            .model_text_utf8()
+            .map_err(|_| anyhow::anyhow!("clarification answer is not UTF-8"))?;
+        intake = intake.resolve_with_operator_answer(answer_text);
+        if intake.disposition() != newt_core::agentic::PromptDisposition::Ask {
+            return Ok(None);
+        }
+    }
+
+    Ok(Some(PendingClarification {
+        parent: Box::new(parent.clone()),
+        intake,
+    }))
+}
+
+fn restored_clarification_notice(pending: &PendingClarification) -> String {
+    format!(
+        "Restored pending prompt clarification:\n{}",
+        pending.intake.clarification_batch()
+    )
 }
 
 /// Mint the prompt receipt that must exist before inference or tool work.
@@ -112,6 +221,16 @@ fn begin_model_prompt(
             persona,
             newt_core::NewPrompt::operator(raw.to_vec(), model.to_vec()),
         ),
+        (Some(store), ModelInputOrigin::OperatorContinuation { parent }) => store.begin_prompt(
+            conversation_id,
+            title,
+            persona,
+            newt_core::NewPrompt::operator_continuation(
+                raw.to_vec(),
+                model.to_vec(),
+                parent.submitted_prompt().id(),
+            ),
+        ),
         (Some(store), ModelInputOrigin::HarnessRetry { parent }) => store.begin_prompt(
             conversation_id,
             title,
@@ -126,6 +245,16 @@ fn begin_model_prompt(
             conversation_id,
             newt_core::NewPrompt::operator(raw.to_vec(), model.to_vec()),
         ),
+        (None, ModelInputOrigin::OperatorContinuation { parent }) => {
+            ingress.ephemeral.begin_prompt(
+                conversation_id,
+                newt_core::NewPrompt::operator_continuation(
+                    raw.to_vec(),
+                    model.to_vec(),
+                    parent.submitted_prompt().id(),
+                ),
+            )
+        }
         (None, ModelInputOrigin::HarnessRetry { parent }) => ingress.ephemeral.begin_prompt(
             conversation_id,
             newt_core::NewPrompt::harness_retry(
@@ -813,9 +942,10 @@ pub(crate) fn run_chat(
     let mut active_roadmap_id: Option<String> = None;
     // The most recently submitted receipt in the active conversation. Restore
     // rehydrates this metadata for addressability only; it never queues the
-    // prompt for execution. A new operator submission replaces it before the
-    // model sees that turn.
+    // prompt for execution. An outstanding clarification is separately
+    // reconstructed from this receipt's durable lineage below.
     let mut active_prompt_context: Option<newt_core::TurnPromptContext> = None;
+    let mut pending_clarification: Option<PendingClarification> = None;
 
     // 17.7 session-start resume. Both arms go through the SAME restore
     // implementation `/conversation restore` uses — one restore path.
@@ -858,6 +988,14 @@ pub(crate) fn run_chat(
             }
             SessionStart::Ephemeral | SessionStart::Fresh => {}
         }
+        if let Some(parent) = active_prompt_context.as_ref() {
+            if let Some(pending) =
+                rehydrate_pending_clarification(store, &active_conversation_id, parent)?
+            {
+                print_newt(&restored_clarification_notice(&pending), color, verbose);
+                pending_clarification = Some(pending);
+            }
+        }
     }
 
     // #1030: become the live owner of the active conversation. With
@@ -887,6 +1025,7 @@ pub(crate) fn run_chat(
                     &mut session_opted_fresh,
                 );
                 active_prompt_context = None;
+                pending_clarification = None;
                 {
                     use newt_core::ScratchpadStore;
                     scratchpad_store.clear();
@@ -983,7 +1122,15 @@ pub(crate) fn run_chat(
             // Refresh the rich status header's model @ endpoint each turn (#527)
             // so a mid-session `/model` switch is reflected (no-op for lean).
             surface.set_runtime_context(&inf_model, &inf_url, token_gauge);
-            (surface.read_line(&prompt)?, ModelInputOrigin::Operator)
+            let origin =
+                pending_clarification
+                    .as_ref()
+                    .map_or(ModelInputOrigin::Operator, |pending| {
+                        ModelInputOrigin::OperatorContinuation {
+                            parent: pending.parent.clone(),
+                        }
+                    });
+            (surface.read_line(&prompt)?, origin)
         };
         match outcome {
             ReadOutcome::Line(line) => {
@@ -1683,6 +1830,7 @@ pub(crate) fn run_chat(
                             &mut session_opted_fresh,
                         );
                         active_prompt_context = None;
+                        pending_clarification = None;
                         ephemeral_artifact_store =
                             session_artifact_store(ephemeral_session, &active_conversation_id)?;
                         // #1030: pre-title a `/start <title>` conversation by
@@ -1799,6 +1947,7 @@ pub(crate) fn run_chat(
                     }
                     let slash_body = task.trim_start_matches('/');
                     if slash_body == "conversation" || slash_body.starts_with("conversation ") {
+                        let conversation_id_before = active_conversation_id.clone();
                         match conversation_store.as_ref() {
                             Some(store) => {
                                 let mut conversation_ctx = ConversationCommandContext {
@@ -1821,6 +1970,29 @@ pub(crate) fn run_chat(
                                 }
                             }
                             None => print_newt(EPHEMERAL_SESSION_NOTICE, color, verbose),
+                        }
+                        if active_conversation_id != conversation_id_before {
+                            let store = conversation_store.as_ref().ok_or_else(|| {
+                                anyhow::anyhow!("durable conversation restore lost its store")
+                            })?;
+                            pending_clarification = match active_prompt_context.as_ref() {
+                                Some(parent) => match rehydrate_pending_clarification(
+                                    store,
+                                    &active_conversation_id,
+                                    parent,
+                                ) {
+                                    Ok(pending) => pending,
+                                    Err(e) => {
+                                        return Err(anyhow::anyhow!(
+                                            "could not safely restore a pending clarification: {e}"
+                                        ));
+                                    }
+                                },
+                                None => None,
+                            };
+                            if let Some(pending) = pending_clarification.as_ref() {
+                                print_newt(&restored_clarification_notice(pending), color, verbose);
+                            }
                         }
                         surface.save_history();
                         println!();
@@ -1949,7 +2121,33 @@ pub(crate) fn run_chat(
                                                 ) {
                                                     Ok(banner) => {
                                                         turns_this_conversation = 0;
+                                                        pending_clarification = match active_prompt_context.as_ref() {
+                                                            Some(parent) => match rehydrate_pending_clarification(
+                                                                store,
+                                                                &active_conversation_id,
+                                                                parent,
+                                                            ) {
+                                                                Ok(pending) => pending,
+                                                                Err(e) => {
+                                                                    return Err(anyhow::anyhow!(
+                                                                        "could not safely restore a pending clarification: {e}"
+                                                                    ));
+                                                                }
+                                                            },
+                                                            None => None,
+                                                        };
                                                         print_newt(&banner, color, verbose);
+                                                        if let Some(pending) =
+                                                            pending_clarification.as_ref()
+                                                        {
+                                                            print_newt(
+                                                                &restored_clarification_notice(
+                                                                    pending,
+                                                                ),
+                                                                color,
+                                                                verbose,
+                                                            );
+                                                        }
                                                     }
                                                     Err(e) => {
                                                         // Restore failed — undo the swap: hand
@@ -2047,7 +2245,31 @@ pub(crate) fn run_chat(
                                                         ) {
                                                             Ok(banner) => {
                                                                 turns_this_conversation = 0;
+                                                                pending_clarification = match active_prompt_context.as_ref() {
+                                                                    Some(parent) => match rehydrate_pending_clarification(
+                                                                        store,
+                                                                        &active_conversation_id,
+                                                                        parent,
+                                                                    ) {
+                                                                        Ok(pending) => pending,
+                                                                        Err(e) => {
+                                                                            return Err(anyhow::anyhow!(
+                                                                                "could not safely restore a pending clarification: {e}"
+                                                                            ));
+                                                                        }
+                                                                    },
+                                                                    None => None,
+                                                                };
                                                                 print_newt(&banner, color, verbose);
+                                                                if let Some(pending) =
+                                                                    pending_clarification.as_ref()
+                                                                {
+                                                                    print_newt(
+                                                                        &restored_clarification_notice(pending),
+                                                                        color,
+                                                                        verbose,
+                                                                    );
+                                                                }
                                                             }
                                                             Err(e) => {
                                                                 let _ = store.release(&target);
@@ -2103,6 +2325,7 @@ pub(crate) fn run_chat(
                         }
                         if active_conversation_id != conversation_id_before {
                             active_prompt_context = None;
+                            pending_clarification = None;
                             ephemeral_artifact_store =
                                 session_artifact_store(ephemeral_session, &active_conversation_id)?;
                         }
@@ -2260,6 +2483,105 @@ pub(crate) fn run_chat(
                         }
                     }
 
+                    // Prompt comprehension is deliberately after receipt
+                    // creation (so every manifest has a durable origin) and
+                    // before hardware discovery, retrieval, inference, or any
+                    // tool-capable path. A direct answer is resolved against
+                    // the pending manifest, not reclassified in isolation.
+                    let is_clarification_answer = matches!(
+                        &model_input_origin,
+                        ModelInputOrigin::OperatorContinuation { .. }
+                    );
+                    let prompt_intake = if is_clarification_answer {
+                        pending_clarification
+                            .as_ref()
+                            .map(|pending| pending.intake.resolve_with_operator_answer(&task))
+                            .unwrap_or_else(|| newt_core::agentic::PromptIntake::analyze(&task))
+                    } else {
+                        newt_core::agentic::PromptIntake::analyze(&task)
+                    };
+
+                    // The manifest artifact deliberately contains only bounded
+                    // counts and digests. It is written before an Ask handoff
+                    // and before Act inference so a later compacted or resumed
+                    // session can audit why the harness chose its disposition.
+                    {
+                        let durable_artifact_store_owner =
+                            conversation_store.as_ref().map(|store| {
+                                newt_core::agentic::StoreArtifactStore::new(
+                                    store,
+                                    active_conversation_id.clone(),
+                                )
+                            });
+                        let artifact_source: Option<&dyn newt_core::agentic::ArtifactSource> =
+                            durable_artifact_store_owner
+                                .as_ref()
+                                .map(|store| store as &dyn newt_core::agentic::ArtifactSource)
+                                .or_else(|| {
+                                    ephemeral_artifact_store.as_ref().map(|store| {
+                                        store as &dyn newt_core::agentic::ArtifactSource
+                                    })
+                                });
+                        let artifact_sink: Option<&dyn newt_core::agentic::PromptArtifactSink> =
+                            durable_artifact_store_owner
+                                .as_ref()
+                                .map(|store| store as &dyn newt_core::agentic::PromptArtifactSink)
+                                .or_else(|| {
+                                    ephemeral_artifact_store.as_ref().map(|store| {
+                                        store as &dyn newt_core::agentic::PromptArtifactSink
+                                    })
+                                });
+                        if let (Some(turn), Some(sink)) =
+                            (active_prompt_context.as_ref(), artifact_sink)
+                        {
+                            let context = newt_core::agentic::ArtifactReadContext::from_turn(
+                                turn,
+                                artifact_source,
+                            );
+                            if let Err(e) = newt_core::agentic::record_prompt_comprehension_manifest(
+                                sink,
+                                context,
+                                &prompt_intake,
+                            ) {
+                                print_newt(
+                                    &format!(
+                                        "warning: could not record prompt-comprehension manifest: {e}"
+                                    ),
+                                    color,
+                                    verbose,
+                                );
+                            }
+                        }
+                    }
+
+                    if prompt_intake.disposition() == newt_core::agentic::PromptDisposition::Ask {
+                        let Some(parent) = active_prompt_context.clone() else {
+                            print_newt(
+                                "prompt comprehension could not preserve the accepted receipt; no clarification was queued",
+                                color,
+                                verbose,
+                            );
+                            println!();
+                            continue;
+                        };
+                        let clarification = prompt_intake.clarification_batch();
+                        pending_clarification = Some(PendingClarification {
+                            parent: Box::new(parent),
+                            intake: prompt_intake,
+                        });
+                        print_newt(&clarification, color, verbose);
+                        println!();
+                        continue;
+                    }
+
+                    // The successor receipt and its resolved manifest are now
+                    // durable; it is safe to forget the session-only pending
+                    // handoff. A still-unresolved answer takes the Ask branch
+                    // above and replaces this state with a new parent.
+                    if is_clarification_answer {
+                        pending_clarification = None;
+                    }
+
                     // Pre-turn hardware snapshot: read the latest value the
                     // background sampler published (instant, never blocks). None
                     // unless verbose + a reachable DCGM (issue #414).
@@ -2393,6 +2715,13 @@ pub(crate) fn run_chat(
                         workspace_state_block(workspace),
                         runtime_context_block(&inf_model, &inf_url, inf_kind)
                     );
+                    if is_clarification_answer {
+                        turn_system = format!(
+                            "<clarification_context>\n\
+                             This accepted operator line is a clarification continuation. The protected prompt card names its objective root; use prompt_read {{\"address\":\"root\"}} to re-read the original objective before acting whenever the answer alone is insufficient.\n\
+                             </clarification_context>\n\n{turn_system}"
+                        );
+                    }
                     // Step 26.4 (#583): inject the <state> block at the HEAD of the
                     // turn — it rides the ephemeral message[0] (regenerated each
                     // turn from turn_system) and is NEVER persisted to the log.
@@ -2847,6 +3176,8 @@ pub(crate) fn run_chat(
                                         // #1162: the /nudge dial — env set by the
                                         // /nudge command; off = no action-pressure.
                                         action_nudges: !nudges_off,
+                                        prompt_disposition: prompt_intake.disposition(),
+                                        prompt_intake: Some(&prompt_intake),
                                         workflow_grace_rounds: eff_workflow_grace_rounds,
                                         tool_output_lines: tool_output_lines(&cfg),
                                         debug: debug_mode(&cfg),
@@ -3731,6 +4062,139 @@ mod prompt_ingress_tests {
             active_operator_task(Some(&retry_again), "ground it again"),
             "fix the parser",
             "derived memory must never relabel retry prose as the active task"
+        );
+    }
+
+    #[test]
+    fn clarification_answer_is_an_operator_continuation_of_the_pending_objective() {
+        let (_tmp, store, conversation_id) = prompt_store();
+        let ephemeral_prompts = newt_core::agentic::SessionPromptStore::default();
+        let original = begin_model_prompt(
+            PromptIngress {
+                durable: Some(&store),
+                ephemeral: &ephemeral_prompts,
+            },
+            &conversation_id,
+            "implement the selected storage backend",
+            None,
+            b"implement either SQLite or Postgres",
+            b"implement either SQLite or Postgres",
+            &ModelInputOrigin::Operator,
+        )
+        .unwrap();
+        let answer_origin = ModelInputOrigin::OperatorContinuation {
+            parent: Box::new(original.clone()),
+        };
+        let answer = begin_model_prompt(
+            PromptIngress {
+                durable: Some(&store),
+                ephemeral: &ephemeral_prompts,
+            },
+            &conversation_id,
+            "implement the selected storage backend",
+            None,
+            b"1: SQLite",
+            b"1: SQLite",
+            &answer_origin,
+        )
+        .unwrap();
+
+        assert!(answer_origin.is_operator());
+        assert_eq!(
+            answer.submitted_prompt().receipt().parent_prompt_id(),
+            Some(original.submitted_prompt().id())
+        );
+        assert_eq!(
+            answer.submitted_prompt().receipt().root_prompt_id(),
+            original.submitted_prompt().receipt().root_prompt_id(),
+            "a clarification answer must retain the original objective root"
+        );
+        assert_eq!(
+            answer.active_operator_prompt().id(),
+            answer.submitted_prompt().id(),
+            "the direct clarification answer is new operator authority"
+        );
+    }
+
+    #[test]
+    fn durable_pending_clarification_rehydrates_its_lineage_after_resume() {
+        let (_tmp, store, conversation_id) = prompt_store();
+        let ephemeral_prompts = newt_core::agentic::SessionPromptStore::default();
+        let original = begin_model_prompt(
+            PromptIngress {
+                durable: Some(&store),
+                ephemeral: &ephemeral_prompts,
+            },
+            &conversation_id,
+            "select storage",
+            None,
+            b"Implement either SQLite or Postgres.",
+            b"Implement either SQLite or Postgres.",
+            &ModelInputOrigin::Operator,
+        )
+        .unwrap();
+        let unclear_answer = begin_model_prompt(
+            PromptIngress {
+                durable: Some(&store),
+                ephemeral: &ephemeral_prompts,
+            },
+            &conversation_id,
+            "select storage",
+            None,
+            b"continue",
+            b"continue",
+            &ModelInputOrigin::OperatorContinuation {
+                parent: Box::new(original.clone()),
+            },
+        )
+        .unwrap();
+
+        let restored = store
+            .turn_prompt_context(&conversation_id, unclear_answer.submitted_prompt().id())
+            .unwrap()
+            .expect("durable prompt context");
+        let pending = rehydrate_pending_clarification(&store, &conversation_id, &restored)
+            .unwrap()
+            .expect("unclear answer must remain an outstanding clarification");
+        assert_eq!(
+            pending.parent.submitted_prompt().id(),
+            unclear_answer.submitted_prompt().id(),
+            "the next answer must descend from the durable latest clarification receipt"
+        );
+        assert_eq!(
+            pending.intake.disposition(),
+            newt_core::agentic::PromptDisposition::Ask
+        );
+
+        let resolved = begin_model_prompt(
+            PromptIngress {
+                durable: Some(&store),
+                ephemeral: &ephemeral_prompts,
+            },
+            &conversation_id,
+            "select storage",
+            None,
+            b"1: SQLite",
+            b"1: SQLite",
+            &ModelInputOrigin::OperatorContinuation {
+                parent: pending.parent.clone(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            resolved.submitted_prompt().receipt().root_prompt_id(),
+            original.submitted_prompt().receipt().root_prompt_id(),
+            "the resumed answer remains in the original objective"
+        );
+        let resolved_context = store
+            .turn_prompt_context(&conversation_id, resolved.submitted_prompt().id())
+            .unwrap()
+            .expect("durable resolved context");
+        assert!(
+            rehydrate_pending_clarification(&store, &conversation_id, &resolved_context)
+                .unwrap()
+                .is_none(),
+            "a fully explicit answer must clear the recovered pending state"
         );
     }
 }

@@ -103,6 +103,9 @@ mod memory_fetch;
 mod note_sink;
 mod observation;
 mod permissions;
+// PR5: deterministic prompt-comprehension intake owns the turn disposition,
+// bounded clarification manifest, and content-free model projection.
+mod prompt_intake;
 mod prompt_read;
 mod recall;
 // #1004: the `render_report` tool — present collected findings as a rendered
@@ -136,7 +139,8 @@ mod warmup;
 
 pub use artifact_hooks::{
     record_manual_compaction_checkpoint, record_memory_compaction_checkpoint,
-    record_observed_head_transition, record_retry_revert_file, record_turn_outcome,
+    record_observed_head_transition, record_prompt_comprehension_manifest,
+    record_retry_revert_file, record_turn_outcome,
 };
 pub use artifact_read::{
     artifact_read_tool_definition, ArtifactPage, ArtifactReadContext, ArtifactReadRecord,
@@ -164,6 +168,10 @@ pub use git_tool::{git_tool_definition, GitTool};
 pub use markdown::{render_markdown, MarkdownStreamWriter, RenderOpts};
 pub use mcp::{McpTools, NoMcp};
 pub use plan_exec::{run_plan, run_plan_with_reground, NoReground, PlanRun, Reground};
+pub use prompt_intake::{
+    AtomicAsk, DecisionLock, DecisionSource, DecisionStatus, PromptComprehensionManifest,
+    PromptDisposition, PromptIntake,
+};
 pub use prompt_read::{
     prompt_read_tool_definition, PromptReadContext, PromptSource, SessionPromptSource,
     SessionPromptStore, StorePromptSource,
@@ -243,8 +251,9 @@ pub use resume::resume_context_tool_definition;
 pub use tools::{
     execute_tool, execute_tool_with_offload, execute_tool_with_offload_and_prompt,
     execute_tool_with_offload_and_prompt_and_artifacts, filter_advertised_tools,
-    full_access_requested, in_plan_phase, ocap_disabled, persona_tool_allowed, plan_phase_clamp,
-    set_max_output_tokens, set_output_head_tokens, tool_definitions, venv_cmd_prefix,
+    filter_tools_for_disposition, full_access_requested, in_plan_phase, ocap_disabled,
+    persona_tool_allowed, plan_phase_clamp, set_max_output_tokens, set_output_head_tokens,
+    tool_definitions, venv_cmd_prefix,
 };
 pub use transcript::{
     transcript_lines, transcript_lines_styled, TranscriptLine, TranscriptRole, TranscriptStyle,
@@ -515,6 +524,16 @@ pub struct ChatCtx<'a> {
     /// rescue, workflow repair steering, and pending-plan pushes for the
     /// session; factual-correction nudges are unaffected. Default `true`.
     pub action_nudges: bool,
+    /// Validated prompt-comprehension disposition for this turn. The loop
+    /// advertises only the corresponding catalog and lets only `Act` retain
+    /// execution-pressure nudges; the dispatcher remains the final authority
+    /// boundary for fabricated tool names.
+    pub prompt_disposition: PromptDisposition,
+    /// The resolved prompt-comprehension manifest for this turn, when the
+    /// caller owns an intake boundary. It is borrowed only to place its
+    /// content-free model card inside the protected active-prompt card;
+    /// headless compatibility callers can leave it `None`.
+    pub prompt_intake: Option<&'a PromptIntake>,
     /// Max lines of tool output shown inline (from `[tui].tool_output_lines`,
     /// default 20). Resolved once per turn and threaded to `execute_tool` so
     /// the tool loop never re-reads config from disk.
@@ -1024,6 +1043,8 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         workflow_grace_rounds,
         narration_nudge_cap,
         action_nudges,
+        prompt_disposition,
+        prompt_intake,
         tool_output_lines,
         debug,
         trace,
@@ -1059,6 +1080,10 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         git_tool,
         crew_runner,
     } = ctx;
+    // Explain / Research / Ask turns may still use bounded read-only tools, but
+    // must never inherit the harness's execution-pressure repairs.
+    let action_nudges = action_nudges && prompt_disposition == PromptDisposition::Act;
+    let max_tool_rounds = prompt_disposition.tool_round_limit(max_tool_rounds);
     // Headless callers may pass no session state — compression still works,
     // with per-turn anti-thrash accounting.
     let mut local_compress_state = CompressState::new();
@@ -1122,7 +1147,11 @@ pub async fn chat_complete_with_prompt_and_artifacts(
     let artifact_context = turn_prompt_context
         .map(|turn| artifact_read::ArtifactReadContext::from_turn(turn, artifact_source));
     let active_task = prompt_context.active_text();
-    prompt_read::ensure_active_prompt_card(&mut messages, prompt_context);
+    if let Some(intake) = prompt_intake {
+        prompt_read::ensure_active_prompt_card_with_intake(&mut messages, prompt_context, intake);
+    } else {
+        prompt_read::ensure_active_prompt_card(&mut messages, prompt_context);
+    }
 
     // In-band memory nudge (Step 19.3): after `[memory] note_nudge_interval`
     // user turns with zero organic save_note use, append a one-line reminder
@@ -1183,6 +1212,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
     // `tools:` allow-list (no-op when `persona_tools` is `None`). The executor
     // enforces the same set, so what the model sees and what it may run agree.
     let tools = filter_advertised_tools(tools, persona_tools);
+    let tools = filter_tools_for_disposition(tools, prompt_disposition);
     let tool_tokens = estimate_value_tokens(&tools, estimation);
     // Phase 20 §2.3: one sanitized calibration ratio per turn. The
     // tool-schema overhead converts to real-token space once — the schema
@@ -1264,6 +1294,9 @@ pub async fn chat_complete_with_prompt_and_artifacts(
             if workflow_grace_active {
                 break;
             }
+            if !action_nudges {
+                break;
+            }
             let Some(nudge) = workflow_runtime.cap_grace_nudge(
                 step_ledger,
                 max_tool_rounds,
@@ -1306,7 +1339,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         // 8/12 under drift). Compact + gated to multi-step in-progress plans.
         // Supersedes the env-gated NEWT_RESEAT_PLAN experiment that #629 carried
         // to main by accident.
-        if round > 0 {
+        if round > 0 && action_nudges {
             if let Some(ptr) = step_ledger.and_then(plan_reseat_pointer) {
                 messages.push(serde_json::json!({ "role": "user", "content": ptr }));
             }
@@ -1322,7 +1355,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
         // "endless exploration → empty response" failure mode seen with some
         // local models (e.g. nemotron3:33b).
         const READ_ONLY_NUDGE_AFTER: usize = 3;
-        if read_only_rounds >= READ_ONLY_NUDGE_AFTER {
+        if action_nudges && read_only_rounds >= READ_ONLY_NUDGE_AFTER {
             let remaining = current_tool_round_limit.saturating_sub(round + 1);
             // Sustained read-only exploration on a task that classifies as a
             // diagnose/fix workflow is exactly the shape `crew`/`team`
@@ -1487,6 +1520,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                         step_ledger,
                         prompt_context,
                         round > 0,
+                        action_nudges,
                     );
                     // Persist provenance only after the transformed working
                     // set and its continuation have been installed.
@@ -1699,6 +1733,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                                 step_ledger,
                                 prompt_context,
                                 round > 0,
+                                action_nudges,
                             );
                             record_compaction_artifact(
                                 artifact_sink,
@@ -1851,7 +1886,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                             .flatten();
                         let plan_nudge_hint =
                             combine_nudge_hints(classifier_plan_direction, workflow_hint.as_deref());
-                        if round + 1 < current_tool_round_limit {
+                        if action_nudges && round + 1 < current_tool_round_limit {
                             if let Some(nudge) = workflow_runtime.rediscovery_nudge(
                                 Some(&nudge_classification),
                                 content,
@@ -1878,7 +1913,8 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                                 continue 'round_loop;
                             }
                         }
-                        if pending_plan_nudges < PENDING_PLAN_NUDGE_CAP
+                        if action_nudges
+                            && pending_plan_nudges < PENDING_PLAN_NUDGE_CAP
                             && round + 1 < current_tool_round_limit
                         {
                             if let Some(nudge) = pending_plan_completion_nudge(
@@ -1910,6 +1946,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                         }
                         if stale_file_nudges < STALE_FILE_NUDGE_CAP
                             && round + 1 < current_tool_round_limit
+                            && action_nudges
                             && looks_like_unverified_stale_file_blocker(content)
                         {
                             if debug {
@@ -2269,6 +2306,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                                 step_ledger,
                                 prompt_context,
                                 round > 0,
+                                action_nudges,
                             );
                             record_compaction_artifact(
                                 artifact_sink,
@@ -2524,6 +2562,7 @@ pub async fn chat_complete_with_prompt_and_artifacts(
                     tool_offload,
                     spill_store,
                     persona_tools,
+                    prompt_disposition,
                 );
                 // If the turn was cancelled mid-tool, `cancellable` returns
                 // None and the dispatch future above is already dropped (its
@@ -3490,8 +3529,10 @@ fn apply_post_compaction_continuation(
     step_ledger: Option<&dyn scheduled::StepLedger>,
     prompt_context: prompt_read::PromptReadContext<'_>,
     mid_turn: bool,
+    action_nudges: bool,
 ) {
-    if !mid_turn
+    if !action_nudges
+        || !mid_turn
         || !matches!(
             action,
             CompressAction::Summarized | CompressAction::StaticFallback
@@ -4236,6 +4277,8 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         workflow_grace_rounds,
         narration_nudge_cap,
         action_nudges,
+        prompt_disposition,
+        prompt_intake,
         tool_output_lines,
         debug,
         trace,
@@ -4271,6 +4314,10 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
         git_tool,
         crew_runner,
     } = ctx;
+    // See the Ollama path: a non-Act turn is allowed bounded reads but never
+    // execution-pressure nudges.
+    let action_nudges = action_nudges && prompt_disposition == PromptDisposition::Act;
+    let max_tool_rounds = prompt_disposition.tool_round_limit(max_tool_rounds);
     // Headless callers may pass no session state (mirrors the Ollama path).
     let mut local_compress_state = CompressState::new();
     let compress_state = match compress_state {
@@ -4317,7 +4364,11 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
     let artifact_context = turn_prompt_context
         .map(|turn| artifact_read::ArtifactReadContext::from_turn(turn, artifact_source));
     let active_task = prompt_context.active_text();
-    prompt_read::ensure_active_prompt_card(&mut messages, prompt_context);
+    if let Some(intake) = prompt_intake {
+        prompt_read::ensure_active_prompt_card_with_intake(&mut messages, prompt_context, intake);
+    } else {
+        prompt_read::ensure_active_prompt_card(&mut messages, prompt_context);
+    }
 
     // In-band memory nudge (Step 19.3) — mirrors the Ollama path.
     if note_sink.is_some() {
@@ -4365,6 +4416,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
     // `tools:` allow-list (no-op when `persona_tools` is `None`). The executor
     // enforces the same set, so what the model sees and what it may run agree.
     let tools = filter_advertised_tools(tools, persona_tools);
+    let tools = filter_tools_for_disposition(tools, prompt_disposition);
     let tool_tokens = estimate_value_tokens(&tools, estimation);
     // Phase 20 §2.3: per-turn calibration ratio + real-token schema overhead
     // (mirrors the Ollama path).
@@ -4415,6 +4467,9 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             if workflow_grace_active {
                 break;
             }
+            if !action_nudges {
+                break;
+            }
             let Some(nudge) = workflow_runtime.cap_grace_nudge(
                 step_ledger,
                 max_tool_rounds,
@@ -4452,7 +4507,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
 
         // Conditional plan re-seat (#630 b) — mirror of the Ollama path: re-show
         // the active step each round so a multi-step plan doesn't go stale.
-        if round > 0 {
+        if round > 0 && action_nudges {
             if let Some(ptr) = step_ledger.and_then(plan_reseat_pointer) {
                 messages.push(serde_json::json!({ "role": "user", "content": ptr }));
             }
@@ -4567,6 +4622,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                         step_ledger,
                         prompt_context,
                         round > 0,
+                        action_nudges,
                     );
                     record_compaction_artifact(
                         artifact_sink,
@@ -4729,6 +4785,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                                 step_ledger,
                                 prompt_context,
                                 round > 0,
+                                action_nudges,
                             );
                             record_compaction_artifact(
                                 artifact_sink,
@@ -4934,6 +4991,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
             if !content.is_empty()
                 && stale_file_nudges < STALE_FILE_NUDGE_CAP
                 && round + 1 < current_tool_round_limit
+                && action_nudges
                 && looks_like_unverified_stale_file_blocker(&content)
             {
                 if debug {
@@ -5197,6 +5255,7 @@ async fn openai_chat_complete_with_prompt_and_artifacts(
                     tool_offload,
                     spill_store,
                     persona_tools,
+                    prompt_disposition,
                 )
                 .await
             };
@@ -5478,6 +5537,8 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         workflow_grace_rounds: _,
         narration_nudge_cap: _,
         action_nudges: _,
+        prompt_disposition,
+        prompt_intake,
         tool_output_lines,
         debug,
         trace,
@@ -5517,6 +5578,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         git_tool,
         crew_runner,
     } = ctx;
+    let max_tool_rounds = prompt_disposition.tool_round_limit(max_tool_rounds);
     // The OpenAI-Responses loop offloads tool output (spill_store) but does not
     // run the compressor, so it never stores compaction spans.
     let _ = compaction_store;
@@ -5557,7 +5619,11 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
         prompt_read::PromptReadContext::new(turn_prompt_context, task, prompt_source);
     let artifact_context = turn_prompt_context
         .map(|turn| artifact_read::ArtifactReadContext::from_turn(turn, artifact_source));
-    prompt_read::ensure_active_prompt_card(&mut msgs_json, prompt_context);
+    if let Some(intake) = prompt_intake {
+        prompt_read::ensure_active_prompt_card_with_intake(&mut msgs_json, prompt_context, intake);
+    } else {
+        prompt_read::ensure_active_prompt_card(&mut msgs_json, prompt_context);
+    }
     let (instructions, mut input) = build_responses_input(&msgs_json);
     let tools_chat = merged_tool_definitions(
         mcp,
@@ -5574,6 +5640,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
     // FR-1 part 2 (#997): scope the advertised catalog to the active persona
     // (Responses wire). No-op when `persona_tools` is `None`.
     let tools_chat = filter_advertised_tools(tools_chat, persona_tools);
+    let tools_chat = filter_tools_for_disposition(tools_chat, prompt_disposition);
     let tools = tools_to_responses(&tools_chat);
     let tools_for_estimate = serde_json::Value::Array(tools.clone());
     let cal = sanitize_estimate_ratio(estimate_ratio);
@@ -5792,6 +5859,7 @@ async fn openai_responses_complete_with_prompt_and_artifacts(
                     tool_offload,
                     spill_store,
                     persona_tools,
+                    prompt_disposition,
                 )
                 .await
             };
@@ -7144,6 +7212,8 @@ mod tool_round_cap_tests {
             max_tool_rounds: 1,
             narration_nudge_cap: 1,
             action_nudges: true,
+            prompt_disposition: PromptDisposition::Act,
+            prompt_intake: None,
             workflow_grace_rounds: 0,
             tool_output_lines: 20,
             debug: false,
@@ -7310,6 +7380,8 @@ mod tool_round_cap_tests {
                 max_tool_rounds: cap,
                 narration_nudge_cap: 1,
                 action_nudges: true,
+                prompt_disposition: PromptDisposition::Act,
+                prompt_intake: None,
                 workflow_grace_rounds: 0,
                 tool_output_lines: 20,
                 debug: false,
@@ -7606,6 +7678,8 @@ mod tool_round_cap_tests {
                 max_tool_rounds: cap,
                 narration_nudge_cap: 1,
                 action_nudges: true,
+                prompt_disposition: PromptDisposition::Act,
+                prompt_intake: None,
                 workflow_grace_rounds: 0,
                 tool_output_lines: 20,
                 debug: false,
@@ -7693,6 +7767,8 @@ mod tool_round_cap_tests {
                 max_tool_rounds: 5,
                 narration_nudge_cap: 1,
                 action_nudges: true,
+                prompt_disposition: PromptDisposition::Act,
+                prompt_intake: None,
                 workflow_grace_rounds: 0,
                 tool_output_lines: 20,
                 debug: false,
@@ -8276,6 +8352,8 @@ mod tool_round_cap_tests {
                 max_tool_rounds: 5,
                 narration_nudge_cap: 1,
                 action_nudges: true,
+                prompt_disposition: PromptDisposition::Act,
+                prompt_intake: None,
                 workflow_grace_rounds: 0,
                 tool_output_lines: 20,
                 debug: false,
@@ -8375,6 +8453,8 @@ mod tool_round_cap_tests {
                 max_tool_rounds: cap,
                 narration_nudge_cap: 1,
                 action_nudges: true,
+                prompt_disposition: PromptDisposition::Act,
+                prompt_intake: None,
                 workflow_grace_rounds: 0,
                 tool_output_lines: 20,
                 debug: false,
@@ -8483,6 +8563,8 @@ mod tool_round_cap_tests {
                 max_tool_rounds: 1,
                 narration_nudge_cap: 1,
                 action_nudges: true,
+                prompt_disposition: PromptDisposition::Act,
+                prompt_intake: None,
                 workflow_grace_rounds: 0,
                 tool_output_lines: 20,
                 debug: false,
@@ -8603,6 +8685,8 @@ mod tool_round_cap_tests {
                 max_tool_rounds: 1,
                 narration_nudge_cap: 1,
                 action_nudges: true,
+                prompt_disposition: PromptDisposition::Act,
+                prompt_intake: None,
                 workflow_grace_rounds: 0,
                 tool_output_lines: 20,
                 debug: false,
@@ -8715,6 +8799,8 @@ mod tool_round_cap_tests {
                 max_tool_rounds: 2,
                 narration_nudge_cap: 1,
                 action_nudges: true,
+                prompt_disposition: PromptDisposition::Act,
+                prompt_intake: None,
                 workflow_grace_rounds: 0,
                 tool_output_lines: 20,
                 debug: false,
@@ -8868,6 +8954,8 @@ mod tool_round_cap_tests {
                 max_tool_rounds: cap,
                 narration_nudge_cap: 1,
                 action_nudges: true,
+                prompt_disposition: PromptDisposition::Act,
+                prompt_intake: None,
                 workflow_grace_rounds: 0,
                 tool_output_lines: 20,
                 debug: false,
@@ -9031,6 +9119,8 @@ mod tool_round_cap_tests {
                 max_tool_rounds: 10,
                 narration_nudge_cap: 1,
                 action_nudges: true,
+                prompt_disposition: PromptDisposition::Act,
+                prompt_intake: None,
                 workflow_grace_rounds: 0,
                 tool_output_lines: 5,
                 debug: false,
@@ -9155,6 +9245,8 @@ mod save_note_loop_tests {
             max_tool_rounds: 6,
             narration_nudge_cap: 1,
             action_nudges: true,
+            prompt_disposition: PromptDisposition::Act,
+            prompt_intake: None,
             workflow_grace_rounds: 0,
             tool_output_lines: 20,
             debug: false,
@@ -9647,6 +9739,8 @@ mod compression_loop_tests {
             max_tool_rounds: 12,
             narration_nudge_cap: 1,
             action_nudges: true,
+            prompt_disposition: PromptDisposition::Act,
+            prompt_intake: None,
             workflow_grace_rounds: 0,
             tool_output_lines: 2,
             debug: false,
@@ -10894,6 +10988,8 @@ mod observation_hook_tests {
             max_tool_rounds: 8,
             narration_nudge_cap: 1,
             action_nudges: true,
+            prompt_disposition: PromptDisposition::Act,
+            prompt_intake: None,
             workflow_grace_rounds: 0,
             tool_output_lines: 20,
             debug: false,

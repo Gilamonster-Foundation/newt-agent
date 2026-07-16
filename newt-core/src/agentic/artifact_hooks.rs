@@ -11,6 +11,7 @@ use std::path::{Component, Path, PathBuf};
 
 use super::artifact_read::{ArtifactReadContext, ArtifactReadRecord, PromptArtifactSink};
 use super::compress::{CompressAction, CompressTrigger};
+use super::prompt_intake::PromptIntake;
 use super::scheduled::{PlanSnapshot, Step, StepStatus, MAX_STEPS, STEP_DESC_CAP};
 use crate::artifact::{ArtifactKind, ArtifactRelation, NewPromptArtifact};
 use crate::{TokenUsage, TurnEndReason};
@@ -18,6 +19,26 @@ use crate::{TokenUsage, TurnEndReason};
 const COMPACTION_REASON_CHARS: usize = 512;
 const GIT_OID_CHARS: usize = 128;
 const GIT_BRANCH_CHARS: usize = 512;
+const PROMPT_COMPREHENSION_SCHEMA: &str = "prompt_comprehension_manifest_v1";
+const PROMPT_COMPREHENSION_LOCATOR: &str = "prompt-comprehension";
+const MAX_ATOMIC_ASK_DIGESTS: usize = 64;
+const MAX_CLARIFICATION_DIGESTS: usize = 16;
+const MAX_DECISION_AGGREGATE_COUNT: u64 = 1_024;
+
+const PROMPT_COMPREHENSION_FIELDS: [&str; 9] = [
+    "schema",
+    "disposition",
+    "atomic_ask_count",
+    "clarification_count",
+    "decision_count",
+    "decision_status_counts",
+    "decision_source_counts",
+    "atomic_ask_digests",
+    "clarification_digests",
+];
+const DECISION_STATUS_FIELDS: [&str; 2] = ["pending", "locked"];
+const DECISION_SOURCE_FIELDS: [&str; 3] = ["operator", "policy", "authorized_assumption"];
+const DIGEST_FIELDS: [&str; 2] = ["digest", "bytes"];
 
 /// Append one artifact using only harness-owned prompt identities.
 ///
@@ -36,6 +57,195 @@ fn append(
         .root_prompt_id()
         .context("cannot record a prompt artifact without an objective root receipt")?;
     sink.append_artifact(originating, root, artifact)
+}
+
+/// Record the harness-validated prompt-comprehension result without retaining
+/// any operator or clarification text.
+///
+/// [`PromptIntake::artifact_metadata`] is deliberately treated as untrusted at
+/// this persistence boundary. The hook accepts one exact scalar/aggregate
+/// schema, validates every digest, and reconstructs a fresh JSON object from a
+/// whitelist. Unknown or missing fields fail closed instead of creating a
+/// second prompt transcript through artifact metadata.
+pub fn record_prompt_comprehension_manifest(
+    sink: &dyn PromptArtifactSink,
+    context: ArtifactReadContext<'_>,
+    intake: &PromptIntake,
+) -> anyhow::Result<ArtifactReadRecord> {
+    let metadata = intake.artifact_metadata();
+    record_prompt_comprehension_metadata(sink, context, &metadata)
+}
+
+fn record_prompt_comprehension_metadata(
+    sink: &dyn PromptArtifactSink,
+    context: ArtifactReadContext<'_>,
+    metadata: &Value,
+) -> anyhow::Result<ArtifactReadRecord> {
+    let metadata = bounded_prompt_comprehension_metadata(metadata)?;
+    append(
+        sink,
+        context,
+        NewPromptArtifact::new(ArtifactKind::Decision, ArtifactRelation::DerivedFrom)
+            .with_locator(PROMPT_COMPREHENSION_LOCATOR)
+            .with_metadata(metadata),
+    )
+}
+
+fn bounded_prompt_comprehension_metadata(metadata: &Value) -> anyhow::Result<Value> {
+    let object = exact_object(
+        metadata,
+        &PROMPT_COMPREHENSION_FIELDS,
+        "prompt-comprehension metadata",
+    )?;
+
+    let schema = required_string(object, "schema", "prompt-comprehension schema")?;
+    if schema != PROMPT_COMPREHENSION_SCHEMA {
+        anyhow::bail!("prompt-comprehension metadata has an unsupported schema");
+    }
+    let disposition = required_string(object, "disposition", "prompt-comprehension disposition")?;
+    if !matches!(disposition, "ask" | "act" | "explain" | "research") {
+        anyhow::bail!("prompt-comprehension metadata has an invalid disposition");
+    }
+
+    let atomic_ask_count = required_count(object, "atomic_ask_count")?;
+    let clarification_count = required_count(object, "clarification_count")?;
+    let decision_count = required_count(object, "decision_count")?;
+    if decision_count > MAX_DECISION_AGGREGATE_COUNT {
+        anyhow::bail!("prompt-comprehension decision count exceeds the artifact bound");
+    }
+
+    let status_counts = bounded_aggregate(
+        object.get("decision_status_counts"),
+        &DECISION_STATUS_FIELDS,
+        "decision-status aggregate",
+    )?;
+    let source_counts = bounded_aggregate(
+        object.get("decision_source_counts"),
+        &DECISION_SOURCE_FIELDS,
+        "decision-source aggregate",
+    )?;
+    let pending = status_counts["pending"].as_u64().unwrap_or(0);
+    let locked = status_counts["locked"].as_u64().unwrap_or(0);
+    let status_total = pending
+        .checked_add(locked)
+        .context("prompt-comprehension decision-status aggregate overflow")?;
+    if status_total != decision_count {
+        anyhow::bail!("prompt-comprehension decision-status aggregate does not match its count");
+    }
+    let source_total = DECISION_SOURCE_FIELDS
+        .iter()
+        .try_fold(0_u64, |total, key| {
+            total
+                .checked_add(source_counts[*key].as_u64().unwrap_or(0))
+                .context("prompt-comprehension decision-source aggregate overflow")
+        })?;
+    if source_total != locked {
+        anyhow::bail!(
+            "prompt-comprehension decision-source aggregate does not match locked decisions"
+        );
+    }
+
+    let atomic_ask_digests = bounded_digests(
+        object.get("atomic_ask_digests"),
+        MAX_ATOMIC_ASK_DIGESTS,
+        "atomic-ask digests",
+    )?;
+    let clarification_digests = bounded_digests(
+        object.get("clarification_digests"),
+        MAX_CLARIFICATION_DIGESTS,
+        "clarification digests",
+    )?;
+    if atomic_ask_count != u64::try_from(atomic_ask_digests.len()).unwrap_or(u64::MAX) {
+        anyhow::bail!("prompt-comprehension atomic-ask digests do not match their count");
+    }
+    if clarification_count != u64::try_from(clarification_digests.len()).unwrap_or(u64::MAX) {
+        anyhow::bail!("prompt-comprehension clarification digests do not match their count");
+    }
+
+    Ok(json!({
+        "schema": PROMPT_COMPREHENSION_SCHEMA,
+        "disposition": disposition,
+        "atomic_ask_count": atomic_ask_count,
+        "clarification_count": clarification_count,
+        "decision_count": decision_count,
+        "decision_status_counts": status_counts,
+        "decision_source_counts": source_counts,
+        "atomic_ask_digests": atomic_ask_digests,
+        "clarification_digests": clarification_digests,
+    }))
+}
+
+fn exact_object<'a>(
+    value: &'a Value,
+    fields: &[&str],
+    label: &str,
+) -> anyhow::Result<&'a serde_json::Map<String, Value>> {
+    let object = value
+        .as_object()
+        .with_context(|| format!("{label} must be a JSON object"))?;
+    if fields.iter().any(|field| !object.contains_key(*field)) {
+        anyhow::bail!("{label} is missing a required field");
+    }
+    if object.keys().any(|field| !fields.contains(&field.as_str())) {
+        anyhow::bail!("{label} contains an unexpected field");
+    }
+    Ok(object)
+}
+
+fn required_string<'a>(
+    object: &'a serde_json::Map<String, Value>,
+    field: &str,
+    label: &str,
+) -> anyhow::Result<&'a str> {
+    object
+        .get(field)
+        .and_then(Value::as_str)
+        .with_context(|| format!("{label} must be a string"))
+}
+
+fn required_count(object: &serde_json::Map<String, Value>, field: &str) -> anyhow::Result<u64> {
+    object
+        .get(field)
+        .and_then(Value::as_u64)
+        .with_context(|| format!("prompt-comprehension `{field}` must be an unsigned integer"))
+}
+
+fn bounded_aggregate(value: Option<&Value>, fields: &[&str], label: &str) -> anyhow::Result<Value> {
+    let value = value.with_context(|| format!("{label} is required"))?;
+    let object = exact_object(value, fields, label)?;
+    let mut bounded = serde_json::Map::new();
+    for field in fields {
+        let count = required_count(object, field)?;
+        if count > MAX_DECISION_AGGREGATE_COUNT {
+            anyhow::bail!("{label} count exceeds the artifact bound");
+        }
+        bounded.insert((*field).to_string(), Value::from(count));
+    }
+    Ok(Value::Object(bounded))
+}
+
+fn bounded_digests(value: Option<&Value>, max: usize, label: &str) -> anyhow::Result<Vec<Value>> {
+    let digests = value
+        .and_then(Value::as_array)
+        .with_context(|| format!("{label} must be an array"))?;
+    if digests.len() > max {
+        anyhow::bail!("{label} exceeds the artifact bound");
+    }
+    digests
+        .iter()
+        .map(|entry| {
+            let object = exact_object(entry, &DIGEST_FIELDS, label)?;
+            let digest = required_string(object, "digest", label)?;
+            if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                anyhow::bail!("{label} contains an invalid digest");
+            }
+            let bytes = required_count(object, "bytes")?;
+            Ok(json!({
+                "digest": digest,
+                "bytes": bytes,
+            }))
+        })
+        .collect()
 }
 
 /// Record the normalized plan state produced by a successful `update_plan`.
@@ -571,6 +781,46 @@ mod tests {
         )
     }
 
+    fn digest_metadata(text: &str) -> Value {
+        json!({
+            "digest": blake3::hash(text.as_bytes()).to_hex().to_string(),
+            "bytes": text.len(),
+        })
+    }
+
+    fn valid_prompt_comprehension_metadata() -> Value {
+        json!({
+            "schema": PROMPT_COMPREHENSION_SCHEMA,
+            "disposition": "ask",
+            "atomic_ask_count": 2,
+            "clarification_count": 1,
+            "decision_count": 3,
+            "decision_status_counts": {
+                "pending": 1,
+                "locked": 2,
+            },
+            "decision_source_counts": {
+                "operator": 1,
+                "policy": 1,
+                "authorized_assumption": 0,
+            },
+            "atomic_ask_digests": [
+                digest_metadata("private atomic ask one"),
+                digest_metadata("private atomic ask two"),
+            ],
+            "clarification_digests": [
+                digest_metadata("private clarification question"),
+            ],
+        })
+    }
+
+    fn assert_prompt_comprehension_metadata_rejected(metadata: &Value) {
+        let sink = RecordingSink::default();
+        let (_, _, context) = context();
+        assert!(record_prompt_comprehension_metadata(&sink, context, metadata).is_err());
+        assert!(sink.artifacts().is_empty());
+    }
+
     #[test]
     fn append_uses_submitted_origin_not_active_selector() {
         let sink = RecordingSink::default();
@@ -579,6 +829,100 @@ mod tests {
         let writes = sink.writes.lock().unwrap();
         assert_eq!(writes[0].0, originating);
         assert_eq!(writes[0].1, root);
+    }
+
+    #[test]
+    fn prompt_comprehension_manifest_records_only_bounded_aggregates_and_digests() {
+        let sink = RecordingSink::default();
+        let (originating, root, context) = context();
+        record_prompt_comprehension_metadata(
+            &sink,
+            context,
+            &valid_prompt_comprehension_metadata(),
+        )
+        .unwrap();
+
+        let writes = sink.writes.lock().unwrap();
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0].0, originating);
+        assert_eq!(writes[0].1, root);
+        let artifact = &writes[0].2;
+        assert_eq!(artifact.kind(), ArtifactKind::Decision);
+        assert_eq!(artifact.relation(), ArtifactRelation::DerivedFrom);
+        assert_eq!(artifact.locator(), Some(PROMPT_COMPREHENSION_LOCATOR));
+        assert!(artifact.body().is_none());
+        assert_eq!(artifact.metadata()["schema"], PROMPT_COMPREHENSION_SCHEMA);
+        assert_eq!(artifact.metadata()["disposition"], "ask");
+        assert_eq!(artifact.metadata()["atomic_ask_count"], 2);
+        assert_eq!(artifact.metadata()["clarification_count"], 1);
+        assert_eq!(artifact.metadata()["decision_status_counts"]["pending"], 1);
+        assert_eq!(artifact.metadata()["decision_source_counts"]["policy"], 1);
+        assert_eq!(
+            artifact.metadata()["atomic_ask_digests"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+
+        let persisted = artifact.metadata().to_string();
+        for private_text in [
+            "private atomic ask one",
+            "private atomic ask two",
+            "private clarification question",
+        ] {
+            assert!(!persisted.contains(private_text), "{persisted}");
+        }
+    }
+
+    #[test]
+    fn prompt_comprehension_manifest_rejects_text_bearing_or_unknown_fields() {
+        let mut missing_field = valid_prompt_comprehension_metadata();
+        missing_field.as_object_mut().unwrap().remove("schema");
+        assert_prompt_comprehension_metadata_rejected(&missing_field);
+
+        let mut root_text = valid_prompt_comprehension_metadata();
+        root_text["prompt_text"] = Value::from("private operator prompt");
+        assert_prompt_comprehension_metadata_rejected(&root_text);
+
+        let mut status_text = valid_prompt_comprehension_metadata();
+        status_text["decision_status_counts"]["private decision text"] = Value::from(1);
+        assert_prompt_comprehension_metadata_rejected(&status_text);
+
+        let mut source_text = valid_prompt_comprehension_metadata();
+        source_text["decision_source_counts"]["model_assertion"] = Value::from(1);
+        assert_prompt_comprehension_metadata_rejected(&source_text);
+
+        let mut digest_text = valid_prompt_comprehension_metadata();
+        digest_text["atomic_ask_digests"][0]["text"] = Value::from("private atomic ask");
+        assert_prompt_comprehension_metadata_rejected(&digest_text);
+    }
+
+    #[test]
+    fn prompt_comprehension_manifest_rejects_invalid_digests_counts_and_bounds() {
+        let mut invalid_digest = valid_prompt_comprehension_metadata();
+        invalid_digest["atomic_ask_digests"][0]["digest"] =
+            Value::from("private atomic ask, not a digest");
+        assert_prompt_comprehension_metadata_rejected(&invalid_digest);
+
+        let mut ask_count_mismatch = valid_prompt_comprehension_metadata();
+        ask_count_mismatch["atomic_ask_count"] = Value::from(1);
+        assert_prompt_comprehension_metadata_rejected(&ask_count_mismatch);
+
+        let mut decision_count_mismatch = valid_prompt_comprehension_metadata();
+        decision_count_mismatch["decision_count"] = Value::from(4);
+        assert_prompt_comprehension_metadata_rejected(&decision_count_mismatch);
+
+        let mut source_count_mismatch = valid_prompt_comprehension_metadata();
+        source_count_mismatch["decision_source_counts"]["operator"] = Value::from(0);
+        assert_prompt_comprehension_metadata_rejected(&source_count_mismatch);
+
+        let digest = digest_metadata("bounded ask");
+        let mut too_many_asks = valid_prompt_comprehension_metadata();
+        too_many_asks["atomic_ask_count"] = Value::from(MAX_ATOMIC_ASK_DIGESTS + 1);
+        too_many_asks["atomic_ask_digests"] =
+            Value::Array(vec![digest; MAX_ATOMIC_ASK_DIGESTS + 1]);
+        assert_prompt_comprehension_metadata_rejected(&too_many_asks);
     }
 
     #[test]

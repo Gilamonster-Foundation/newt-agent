@@ -183,7 +183,7 @@ fn coach_altitude_replaces_identity_with_coach_soul() {
         "coach altitude installs COACH_SOUL"
     );
     assert!(
-        !prompt.contains("Never describe a code change"),
+        !prompt.contains("On an `act` turn, never describe a code change"),
         "coach altitude REPLACES the doer soul, it does not append to it"
     );
     assert!(
@@ -199,7 +199,7 @@ fn coach_altitude_replaces_identity_with_coach_soul() {
         Some(&doer),
         "test-plan.md",
     );
-    assert!(doer_prompt.contains("Never describe a code change"));
+    assert!(doer_prompt.contains("On an `act` turn, never describe a code change"));
     assert!(!doer_prompt.contains("COACH mode"));
 }
 

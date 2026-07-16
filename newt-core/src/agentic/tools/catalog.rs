@@ -1,3 +1,4 @@
+use super::super::prompt_intake::PromptDisposition;
 use super::*;
 use std::sync::LazyLock;
 
@@ -394,6 +395,96 @@ pub fn filter_advertised_tools(
             })
             .collect(),
     )
+}
+
+/// Whether `name` is available under the prompt's validated disposition.
+///
+/// `Act` retains the complete catalog. `Explain` and `Research` are deliberately
+/// a small, explicit read/recovery set: an unknown name is denied rather than
+/// assumed safe, which also fences every generic MCP name (`server__tool`) until
+/// MCP supplies machine-readable authority metadata. `Ask` is terminal at the
+/// harness layer, so no model tool invocation is admitted as defense in depth.
+///
+/// This predicate is shared by advertisement and dispatch. The latter remains
+/// the security boundary: a model can always fabricate an omitted tool name.
+pub fn tool_allowed(disposition: PromptDisposition, name: &str) -> bool {
+    match disposition {
+        PromptDisposition::Act => true,
+        PromptDisposition::Ask => false,
+        PromptDisposition::Explain | PromptDisposition::Research => matches!(
+            name,
+            // Workspace / prompt / artifact recovery.
+            "read_file"
+                | "list_dir"
+                | "find"
+                | "prompt_read"
+                | "artifact_read"
+                | "resume_context"
+                // Read-only evidence and memory retrieval. `web_fetch` remains
+                // subject to the existing net caveat; dispatch removes the
+                // permission gate in non-Act modes so it cannot mint a grant.
+                | "web_fetch"
+                | "use_skill"
+                | "recall"
+                | "memory_fetch"
+                | "state_get"
+                | "code_search"
+                | "experience_recall"
+                | "plan_get"
+                // Read-only harness utilities / presentation.
+                | "tool_search"
+                | "get_context_remaining"
+                | "render_report"
+        ),
+    }
+}
+
+/// Restrict an advertised tool catalog to the current prompt disposition.
+///
+/// Apply this alongside [`filter_advertised_tools`]: the persona filter scopes
+/// an operator-selected role, while this filter scopes the authority implied by
+/// the current prompt. Under a non-Act disposition, malformed definitions are
+/// dropped too because their callable name cannot be proven safe.
+pub fn filter_tools_for_disposition(
+    defs: serde_json::Value,
+    disposition: PromptDisposition,
+) -> serde_json::Value {
+    if disposition == PromptDisposition::Act {
+        return defs;
+    }
+    let serde_json::Value::Array(arr) = defs else {
+        // Unlike the persona filter, non-Act disposition filtering is an
+        // authority boundary. A non-array value cannot prove any callable
+        // name safe, so advertise no tools rather than forwarding it.
+        return serde_json::Value::Array(Vec::new());
+    };
+    serde_json::Value::Array(
+        arr.into_iter()
+            .filter(|def| tool_def_name(def).is_some_and(|name| tool_allowed(disposition, name)))
+            .collect(),
+    )
+}
+
+/// The refusal returned when a model calls a tool outside the current prompt
+/// disposition. Kept distinct from a persona refusal: changing personas cannot
+/// widen a non-Act prompt into an execution turn.
+pub(super) fn disposition_tool_denied_message(
+    disposition: PromptDisposition,
+    name: &str,
+) -> String {
+    let guidance = match disposition {
+        PromptDisposition::Ask => {
+            "The harness is awaiting the operator's clarification; this turn cannot run tools."
+        }
+        PromptDisposition::Explain => {
+            "This is an Explain turn: only the bounded read-only evidence and recovery tools are available."
+        }
+        PromptDisposition::Research => {
+            "This is a Research turn: only the bounded read-only evidence and recovery tools are available; capability grants, execution, mutations, and generic MCP calls require an Act disposition."
+        }
+        PromptDisposition::Act => unreachable!("Act permits every tool"),
+    };
+    format!("Tool `{name}` is unavailable under the current prompt disposition. {guidance}")
 }
 
 /// The refusal returned to the model when it calls a tool the active persona
